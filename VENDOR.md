@@ -1,4 +1,4 @@
-# Vendored fork — `neutral-tsnet-rs`
+# Vendored fork — `tailscale-rs`
 
 This repo is a **vendored fork** of [`tailscale/tailscale-rs`](https://github.com/tailscale/tailscale-rs),
 the official pure-Rust (no Go, no cgo) Tailscale node implementation. It exists to
@@ -14,7 +14,7 @@ See `this project/docs/research/tsnet-rust-port.md` for the full rationale.
 - **Upstream:** https://github.com/tailscale/tailscale-rs (BSD-3-Clause)
 - **Pinned at:** `29d87ee17e734c8d7c2dc5db60f4c67df566aa30` (2026-05-28)
 - **Upstream remote** is preserved as `upstream`; this fork's `origin` is
-  `GeiserX/neutral-tsnet-rs`.
+  `GeiserX/tailscale-rs`.
 
 ## Why a fork, not a crates.io dependency
 
