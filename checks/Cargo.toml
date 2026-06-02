@@ -1,0 +1,16 @@
+[package]
+name = "checks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+globwalk = "0.9"
+serde.workspace = true
+toml = "1"
+
+[lints]
+workspace = true

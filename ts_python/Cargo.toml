@@ -1,0 +1,27 @@
+[package]
+name = "ts_python"
+version.workspace = true
+description = "pyo3-based python bindings for tailscale"
+categories = ["api-bindings", "network-programming"]
+keywords = ["tailscale", "python", "bindings", "pyo3"]
+
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tailscale.workspace = true
+
+hex.workspace = true
+pyo3 = { version = "0.28", features = ["bytes", "abi3-py312"] }
+pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime", "attributes"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lib]
+name = "tailscale"
+crate-type = ["cdylib"]
+doc = false # collides with `tailscale` root crate
+
+[lints]
+workspace = true

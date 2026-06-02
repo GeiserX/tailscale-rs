@@ -1,0 +1,18 @@
+[package]
+name = "ts_transport"
+version.workspace = true
+description = "packet transport traits and types for tailscale"
+categories = ["network-programming", "asynchronous"]
+keywords = ["tailscale", "packet", "network", "transport"]
+
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Our crates.
+ts_packet.workspace = true
+
+[lints]
+workspace = true

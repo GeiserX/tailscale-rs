@@ -1,0 +1,24 @@
+[package]
+name = "ts_dynbitset"
+version.workspace = true
+description = "dynamically-growable bitset based on ts_bitset"
+categories = ["data-structures", "no-std"]
+keywords = ["tailscale", "bitset"]
+
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Our crates.
+ts_bitset.workspace = true
+
+# Unconditionally required dependencies.
+smallvec = { workspace = true, features = ["const_generics", "const_new"] }
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

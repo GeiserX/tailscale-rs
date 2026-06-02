@@ -1,0 +1,28 @@
+[package]
+name = "ts_devtools"
+version.workspace = true
+description = "tailscale-rs repo dev utilities and tools"
+categories = ["network-programming", "command-line-interface"]
+keywords = ["tailscale", "dev", "tools", "cli", "utils"]
+
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+bytes.workspace = true
+clap.workspace = true
+tokio = { workspace = true, features = ["full"] }
+futures.workspace = true
+tracing.workspace = true
+
+ts_cli_util.workspace = true
+ts_keys.workspace = true
+ts_packetfilter.workspace = true
+ts_packetfilter_state.workspace = true
+ts_derp.workspace = true
+
+[lints]
+workspace = true

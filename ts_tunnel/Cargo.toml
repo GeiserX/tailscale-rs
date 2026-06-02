@@ -1,0 +1,41 @@
+[package]
+name = "ts_tunnel"
+version.workspace = true
+description = "secure packet tunnel over udp"
+categories = ["cryptography", "network-programming", "encoding"]
+keywords = ["tailscale", "wireguard", "tunnel", "udp", "sans-io"]
+
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Our crates.
+ts_keys.workspace = true
+ts_packet.workspace = true
+ts_time.workspace = true
+
+# Unconditionally required dependencies.
+aead.workspace = true
+blake2.workspace = true
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+itertools.workspace = true
+rand.workspace = true
+tracing.workspace = true
+x25519-dalek.workspace = true
+zerocopy.workspace = true
+
+[dev-dependencies]
+# Dependencies required for examples.
+base64.workspace = true
+bytes.workspace = true
+clap = { workspace = true, features = ["derive", "env"] }
+hex = "0.4"
+tokio = { workspace = true, features = ["full", "macros"] }
+ts_cli_util.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,50 @@
+[package]
+name = "ts_derp"
+version.workspace = true
+description = "tailscale derp client"
+categories = ["network-programming", "encoding", "asynchronous"]
+keywords = ["tailscale", "packet", "derp", "network", "transport"]
+
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Our crates.
+ts_hexdump.workspace = true
+ts_http_util.workspace = true
+ts_keys.workspace = true
+ts_packet.workspace = true
+ts_tls_util.workspace = true
+ts_transport.workspace = true
+
+# Unconditionally required dependencies.
+bytes.workspace = true
+crypto_box.workspace = true
+futures.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+url.workspace = true
+yoke = { workspace = true, features = ["alloc", "derive"] }
+zerocopy.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true
+tokio = { workspace = true, features = ["full"] }
+ts_cli_util.workspace = true
+ts_control_serde.workspace = true
+
+[features]
+# Enable insecure TLS connections for running in test configurations
+insecure-for-tests = [
+    "ts_tls_util/insecure"
+]
+
+[lints]
+workspace = true

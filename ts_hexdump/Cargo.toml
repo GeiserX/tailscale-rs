@@ -1,0 +1,21 @@
+[package]
+name = "ts_hexdump"
+version.workspace = true
+description = "hexdumps for byte iterators"
+categories = ["encoding"]
+keywords = ["tailscale", "hexdump", "hex", "bytes"]
+
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["alloc"]
+alloc = []
+
+[dependencies]
+heapless.workspace = true
+
+[lints]
+workspace = true

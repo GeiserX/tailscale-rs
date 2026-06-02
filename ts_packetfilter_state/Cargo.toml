@@ -1,0 +1,29 @@
+[package]
+name = "ts_packetfilter_state"
+version.workspace = true
+description = "stateful update logic for tailscale packet filters"
+categories = ["no-std", "network-programming"]
+keywords = ["tailscale", "packet", "filter", "network"]
+
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Our crates.
+ts_packetfilter.workspace = true
+ts_packetfilter_serde.workspace = true
+
+[dev-dependencies]
+divan.workspace = true
+serde_json.workspace = true
+ts_bart_packetfilter = { workspace = true }
+ts_packetfilter = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "access"
+harness = false

@@ -1,0 +1,27 @@
+[package]
+name = "ts_tls_util"
+version.workspace = true
+description = "tailscale-specific tls utilities"
+categories = ["network-programming", "asynchronous", "cryptography"]
+keywords = ["tailscale", "network", "tls", "ssl"]
+
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+
+rust-version.workspace = true
+
+[dependencies]
+# Unconditionally required dependencies.
+tokio.workspace = true
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
+tracing.workspace = true
+url.workspace = true
+webpki-roots = { version = "1.0" }
+
+[features]
+# enable the connect_insecure function, which doesn't validate tls certs
+insecure = []
+
+[lints]
+workspace = true

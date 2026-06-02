@@ -1,0 +1,23 @@
+language = "C"
+include_guard = "TAILSCALE_H"
+cpp_compat = true
+documentation = true
+
+[export]
+prefix = "ts_"
+renaming_overrides_prefixing = true
+
+include = [
+    "sockaddr",
+    "sockaddr_in",
+    "sockaddr_in6",
+    "sockaddr_storage",
+    "in_addr",
+    "in6_addr",
+    "sa_family",
+]
+
+[export.rename]
+AF_INET = "TS_AF_INET"
+AF_INET6 = "TS_AF_INET6"
+MAX_SOCKADDR_DATA_SIZE = "TS_MAX_SOCKADDR_DATA_SIZE"

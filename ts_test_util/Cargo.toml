@@ -1,0 +1,17 @@
+[package]
+name = "ts_test_util"
+version.workspace = true
+description = "test utilities for tailscale-rs"
+categories = ["development-tools::testing"]
+keywords = ["tailscale", "test"]
+
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

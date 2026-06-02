@@ -1,0 +1,33 @@
+[package]
+name = "ts_transport_tun"
+version.workspace = true
+description = "tailscale tun transport"
+categories = ["network-programming", "asynchronous"]
+keywords = ["tailscale", "packet", "tun", "network", "transport"]
+
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Our crates.
+ts_hexdump.workspace = true
+ts_packet.workspace = true
+ts_transport.workspace = true
+
+# Unconditionally required dependencies.
+bytes.workspace = true
+ipnet.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tun-rs = { version = "2.7", features = ["async"] }
+
+# Required dependencies for the "serde" feature.
+serde = { workspace = true, optional = true }
+
+[features]
+serde = ["dep:serde"]
+
+[lints]
+workspace = true

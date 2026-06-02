@@ -1,0 +1,38 @@
+[package]
+name = "ts_cli_util"
+version.workspace = true
+description = "tailscale utilities for writing command-line tools"
+categories = ["command-line-interface"]
+keywords = ["tailscale", "cli", "util"]
+publish = false
+
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Our crates.
+tailscale.workspace = true
+ts_control.workspace = true
+ts_netcheck.workspace = true
+ts_derp.workspace = true
+
+# Unconditionally required dependencies.
+cfg-if.workspace = true
+clap = { workspace = true, features = ["derive", "env"] }
+futures-util.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }
+
+
+[target.'cfg(not(all(target_os = "windows", target_env = "gnu")))'.dependencies]
+# Required dependencies for the "tracy" feature.
+tracy-client = { version = "0.18", optional = true }
+tracing-tracy = { version = "0.11", optional = true }
+
+[features]
+tracy = ["dep:tracing-tracy", "dep:tracy-client"]
+
+[lints]
+workspace = true

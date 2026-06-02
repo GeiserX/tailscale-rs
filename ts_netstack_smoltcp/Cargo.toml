@@ -1,0 +1,101 @@
+[package]
+name = "ts_netstack_smoltcp"
+version.workspace = true
+description = "userspace netstack built on smoltcp"
+categories = ["no-std", "network-programming"]
+keywords = ["tailscale", "socket", "network", "smoltcp", "netstack"]
+
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Our crates.
+ts_netstack_smoltcp_core.workspace = true
+ts_netstack_smoltcp_socket.workspace = true
+
+# Unconditionally required dependencies.
+bytes.workspace = true
+futures-util = { workspace = true, features = ["async-await", "async-await-macro"] }
+tracing.workspace = true
+
+# Required dependencies for the "tokio" feature.
+tokio = { workspace = true, optional = true, features = ["time"] }
+
+# Required dependencies for the "tun" feature.
+tun-rs = { version = "2.8", optional = true, features = ["interruptible"] }
+
+[dev-dependencies]
+# Required dependencies for benchmarks and examples.
+axum = "0.8"
+console-subscriber = "0.5"
+clap.workspace = true
+include_dir = "0.7"
+mime_guess = "2.0"
+rand.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true, features = ["release_max_level_off"] }
+tracing-panic = "0.1"
+ts_cli_util.workspace = true
+tun-rs = { version = "2.8", features = ["async", "async_framed"] }
+
+[features]
+std = ["ts_netstack_smoltcp_socket/std"]
+tokio = ["dep:tokio", "ts_netstack_smoltcp_socket/tokio", "std"]
+futures-io = ["ts_netstack_smoltcp_socket/futures-io", "std"]
+# provide a device driver using tun-rs
+tun = ["dep:tun-rs"]
+
+[[example]]
+name = "udp_tun"
+required-features = ["tun", "std"]
+
+[[example]]
+name = "tcp_listen_tun"
+required-features = ["tun", "std"]
+
+[[example]]
+name = "tcp_connect_tun"
+required-features = ["tun", "std"]
+
+[[example]]
+name = "udp_tun_async"
+required-features = ["tun", "std", "tokio"]
+
+[[example]]
+name = "tcp_listen_tun_async"
+required-features = ["tun", "std", "tokio"]
+
+[[example]]
+name = "tcp_connect_tun_async"
+required-features = ["tun", "std", "tokio"]
+
+[[example]]
+name = "tcp_pingpong_pipe"
+required-features = ["std"]
+
+[[example]]
+name = "tcp_pingpong_pipe_async"
+required-features = ["tokio"]
+
+[[example]]
+name = "axum_tun"
+required-features = ["tun", "tokio"]
+
+[[bench]]
+name = "throughput_udp"
+required-features = ["tokio"]
+harness = false
+
+[[bench]]
+name = "throughput_tcp"
+required-features = ["tokio"]
+harness = false
+
+[[test]]
+name = "wrong_ip_version"
+required-features = ["tokio"]

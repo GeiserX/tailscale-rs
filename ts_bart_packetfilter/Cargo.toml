@@ -1,0 +1,30 @@
+[package]
+name = "ts_bart_packetfilter"
+version.workspace = true
+description = "fast tailscale packet filter implemented using ts_bart"
+categories = ["data-structures", "no-std", "network-programming"]
+keywords = ["tailscale", "network", "packet", "filter", "bart"]
+
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Our crates.
+ts_array256 = { workspace = true, features = ["smallvec"] }
+ts_bart.workspace = true
+ts_bitset.workspace = true
+ts_dynbitset.workspace = true
+ts_packetfilter.workspace = true
+
+# Unconditionally required dependencies.
+hashbrown.workspace = true
+smallvec.workspace = true
+
+[dev-dependencies]
+ipnet.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true

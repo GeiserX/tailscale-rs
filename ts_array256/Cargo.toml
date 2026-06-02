@@ -1,0 +1,32 @@
+[package]
+name = "ts_array256"
+version.workspace = true
+description = "fast sparse 256-element array with configurable backing storage"
+categories = ["data-structures", "no-std"]
+keywords = ["tailscale", "sparse", "array", "vec"]
+
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Our crates.
+ts_bitset.workspace = true
+
+# Unconditionally required dependencies.
+heapless.workspace = true
+static_assertions.workspace = true
+
+# Required dependencies for the "smallvec" feature.
+smallvec = { workspace = true, optional = true, features = ["const_generics", "const_new", "union"] }
+
+[dev-dependencies]
+lazy_static.workspace = true
+proptest.workspace = true
+
+[features]
+smallvec = ["dep:smallvec"]
+
+[lints]
+workspace = true

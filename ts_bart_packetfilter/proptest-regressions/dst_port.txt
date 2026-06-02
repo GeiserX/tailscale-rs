@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b8496aca8459f405942834bdb2c56952ac3f113fb6e452c58ca0737ad3e12246 # shrinks to ops = [Insert { rule_id: 1, dstmatch: DstMatch { ports: 0..=0, ips: [] } }]
+cc f948f7e8893d39b5c76e576f6bf7849b73a3fd2d877346a8092f43eca3a3fd57 # shrinks to ops = [Insert { rule_id: 0, dstmatch: DstMatch { ports: 0..=0, ips: [127.0.0.0/16, 0.0.0.0/0] } }, Insert { rule_id: 1, dstmatch: DstMatch { ports: 0..=0, ips: [0.0.0.0/0] } }]

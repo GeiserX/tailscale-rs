@@ -1,0 +1,56 @@
+[package]
+name = "ts_bart"
+version.workspace = true
+description = "fast, memory-efficient routing table"
+categories = ["data-structures", "network-programming", "no-std"]
+keywords = ["tailscale", "bart", "routing", "vec", "radix"]
+
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Our crates.
+ts_array256.workspace = true
+ts_bitset.workspace = true
+
+# Unconditionally required dependencies.
+cfg-if.workspace = true
+heapless.workspace = true
+ipnet.workspace = true
+static_assertions.workspace = true
+
+# Required dependencies for the "smallvec" feature.
+smallvec = { workspace = true, optional = true, features = ["const_new", "const_generics", "union"] }
+
+[features]
+default = ["lut"]
+
+# Enable generation of lookup tables for runtime efficiency; currently costs 32KiB.
+lut = ["ts_bitset/lut"]
+
+# Support `smallvec` as a backing array type.
+smallvec = [
+    "dep:smallvec",
+    "ts_array256/smallvec",
+]
+
+[dev-dependencies]
+divan.workspace = true
+flate2 = "1.1"
+itertools.workspace = true
+lazy_static.workspace = true
+proptest.workspace = true
+rand.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "table"
+harness = false
+
+[[bench]]
+name = "table_mut"
+harness = false

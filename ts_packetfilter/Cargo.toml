@@ -1,0 +1,25 @@
+[package]
+name = "ts_packetfilter"
+version.workspace = true
+description = "tailscale packet filters"
+categories = ["no-std", "network-programming"]
+keywords = ["tailscale", "packet", "filter", "network"]
+
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Unconditionally required dependencies.
+hashbrown.workspace = true
+ipnet.workspace = true
+static_assertions.workspace = true
+tracing.workspace = true
+
+[features]
+checking-filter = []
+std = []
+
+[lints]
+workspace = true
