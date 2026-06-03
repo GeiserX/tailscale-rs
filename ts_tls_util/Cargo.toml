@@ -14,10 +14,24 @@ rust-version.workspace = true
 [dependencies]
 # Unconditionally required dependencies.
 tokio.workspace = true
-tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tracing.workspace = true
 url.workspace = true
 webpki-roots = { version = "1.0" }
+# Pure-Rust PEM decoder for loading a private control-plane CA (a self-hosted control plane) into
+# the root store via TS_RS_EXTRA_CA_PEM. No C toolchain dep (keeps musl-static).
+rustls-pemfile = "2"
+# SHA-256 over the leaf cert DER for self-signed DERP cert pinning. Same `ring`
+# the rest of the stack already links, so no new crypto backend is introduced.
+ring = "0.17"
+# Constant-time digest comparison for the cert pin (avoid timing side-channels).
+subtle = "2"
+
+[dev-dependencies]
+# Generate ephemeral self-signed certs in pinned-verifier unit tests.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# End-to-end pinned-handshake test needs a TCP loopback + a TLS server acceptor.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
 
 [features]
 # enable the connect_insecure function, which doesn't validate tls certs

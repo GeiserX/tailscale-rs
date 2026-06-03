@@ -9,10 +9,124 @@ use tokio::sync::watch;
 
 use crate::{Error, error::ResultExt};
 
+/// The forwarding / routing preferences that flow from [`ts_control::Config`] into the runtime's
+/// dataplane actors, grouped into one named-field struct.
+///
+/// These are pure client-side dataplane preferences: `ts_control` does not read them (control
+/// always sends the full advertised route set; the runtime trims and forwards). Grouping them
+/// here removes the positional-argument hazard of the old `Env::new` — in particular the two
+/// adjacent `bool`s [`forward_all_ports`](ForwarderConfig::forward_all_ports) and
+/// [`forward_exit_egress`](ForwarderConfig::forward_exit_egress), which a positional constructor
+/// could silently swap. Named fields make a swap a compile error.
+#[derive(Clone)]
+pub struct ForwarderConfig {
+    /// Whether to accept subnet routes advertised by peers (`--accept-routes` / `RouteAll`).
+    ///
+    /// Fixed for the life of the runtime. Consulted by the route updater (outbound routing) and
+    /// the source filter (inbound source validation), which must agree so a peer can only source
+    /// traffic from subnets we actually route to it.
+    pub accept_routes: bool,
+
+    /// Which peer (if any) is selected as this node's exit node (`ExitNodeID`).
+    ///
+    /// Fixed for the life of the runtime, but the selector is *unresolved*: the route updater and
+    /// the source filter each call [`ExitNodeSelector::resolve`](ts_control::ExitNodeSelector::resolve)
+    /// against the live peer set on every rebuild, so an IP/name selection follows the peer across
+    /// netmap changes. Because `resolve` is deterministic, both actors resolve to the same stable
+    /// id and stay coupled: only the selected exit peer gets a default route installed (outbound)
+    /// and may legitimately source arbitrary internet IPs (inbound). `None` (or an unresolvable
+    /// selector) means no exit node — internet-bound traffic is dropped (fail-closed).
+    pub exit_node: Option<ts_control::ExitNodeSelector>,
+
+    /// The set of prefixes the inbound forwarder accepts and dials to real OS sockets.
+    ///
+    /// This is exactly [`Config::advertised_routes`](ts_control::Config::advertised_routes): we
+    /// forward precisely what we advertise (advertise == forward), so there is no prefix we
+    /// advertise but won't forward (which would be a black hole) and none we forward but didn't
+    /// advertise. v4-only (IPv6-off posture). Empty means "subnet-router/exit-node forwarding
+    /// disabled" — the forwarder netstack still exists but its route table is empty.
+    pub forward_routes: Vec<ipnet::IpNet>,
+
+    /// TCP ports the inbound forwarder splices per advertised route. See
+    /// [`Config::forward_tcp_ports`](ts_control::Config::forward_tcp_ports).
+    pub forward_tcp_ports: Vec<u16>,
+
+    /// UDP ports the inbound forwarder splices per advertised route. See
+    /// [`Config::forward_udp_ports`](ts_control::Config::forward_udp_ports).
+    pub forward_udp_ports: Vec<u16>,
+
+    /// Whether the inbound forwarder forwards **all** TCP/UDP ports per advertised route.
+    ///
+    /// When `true`, the explicit [`forward_tcp_ports`](ForwarderConfig::forward_tcp_ports) /
+    /// [`forward_udp_ports`](ForwarderConfig::forward_udp_ports) sets are ignored and the forwarder
+    /// runs in all-port mode (driven by a raw-socket port observer). See
+    /// [`Config::forward_all_ports`](ts_control::Config::forward_all_ports).
+    pub forward_all_ports: bool,
+
+    /// Whether exit-node (`0.0.0.0/0`) inbound flows are egressed via this host's real origin IP.
+    ///
+    /// Anti-leak opt-in. When `false` (the default, fail-closed), the forwarder is wired with a
+    /// dialer that structurally refuses exit-node egress, so a `0.0.0.0/0` flow is dropped at dial
+    /// time rather than leaking out our real IP. See
+    /// [`Config::forward_exit_egress`](ts_control::Config::forward_exit_egress).
+    pub forward_exit_egress: bool,
+}
+
+impl ForwarderConfig {
+    /// Extract the runtime's forwarding preferences from a [`ts_control::Config`].
+    ///
+    /// `ts_control::Config` carries these dataplane fields for transport only (it never reads
+    /// them); this is the boundary where they are grouped for the runtime.
+    pub fn from_control_config(config: &ts_control::Config) -> Self {
+        Self {
+            accept_routes: config.accept_routes,
+            exit_node: config.exit_node.clone(),
+            forward_routes: config.advertised_routes(),
+            forward_tcp_ports: config.forward_tcp_ports.clone(),
+            forward_udp_ports: config.forward_udp_ports.clone(),
+            forward_all_ports: config.forward_all_ports,
+            forward_exit_egress: config.forward_exit_egress,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Env {
     pub bus: ActorRef<MessageBus>,
     pub keys: Arc<ts_keys::NodeState>,
+
+    /// Whether to accept subnet routes advertised by peers (`--accept-routes` / `RouteAll`).
+    ///
+    /// See [`ForwarderConfig::accept_routes`].
+    pub accept_routes: bool,
+
+    /// Which peer (if any) is selected as this node's exit node (`ExitNodeID`).
+    ///
+    /// See [`ForwarderConfig::exit_node`].
+    pub exit_node: Option<ts_control::ExitNodeSelector>,
+
+    /// The set of prefixes the inbound forwarder accepts and dials to real OS sockets.
+    ///
+    /// See [`ForwarderConfig::forward_routes`].
+    pub forward_routes: Arc<Vec<ipnet::IpNet>>,
+
+    /// TCP ports the inbound forwarder splices per advertised route. See
+    /// [`ForwarderConfig::forward_tcp_ports`].
+    pub forward_tcp_ports: Arc<Vec<u16>>,
+
+    /// UDP ports the inbound forwarder splices per advertised route. See
+    /// [`ForwarderConfig::forward_udp_ports`].
+    pub forward_udp_ports: Arc<Vec<u16>>,
+
+    /// Whether the inbound forwarder forwards **all** TCP/UDP ports per advertised route.
+    ///
+    /// See [`ForwarderConfig::forward_all_ports`].
+    pub forward_all_ports: bool,
+
+    /// Whether exit-node (`0.0.0.0/0`) inbound flows are egressed via this host's real origin IP.
+    ///
+    /// See [`ForwarderConfig::forward_exit_egress`].
+    pub forward_exit_egress: bool,
 
     /// Whether the runtime is shutdown.
     ///
@@ -26,11 +140,31 @@ pub struct Env {
 }
 
 impl Env {
-    pub fn new(keys: ts_keys::NodeState, shutdown: watch::Receiver<bool>) -> Self {
+    pub fn new(
+        keys: ts_keys::NodeState,
+        shutdown: watch::Receiver<bool>,
+        forwarding: ForwarderConfig,
+    ) -> Self {
+        let ForwarderConfig {
+            accept_routes,
+            exit_node,
+            forward_routes,
+            forward_tcp_ports,
+            forward_udp_ports,
+            forward_all_ports,
+            forward_exit_egress,
+        } = forwarding;
         Self {
             bus: MessageBus::spawn_default(),
             keys: Arc::new(keys),
             shutdown,
+            accept_routes,
+            exit_node,
+            forward_routes: Arc::new(forward_routes),
+            forward_tcp_ports: Arc::new(forward_tcp_ports),
+            forward_udp_ports: Arc::new(forward_udp_ports),
+            forward_all_ports,
+            forward_exit_egress,
         }
     }
 

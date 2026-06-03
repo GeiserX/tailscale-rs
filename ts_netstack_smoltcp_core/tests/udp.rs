@@ -63,6 +63,7 @@ fn udp_by_steps() -> ts_cli_util::Result<()> {
             Some(handle),
             udp::Command::Send {
                 endpoint: ep,
+                local: None,
                 buf: Bytes::copy_from_slice(b"hello"),
             },
         )?;
@@ -70,6 +71,7 @@ fn udp_by_steps() -> ts_cli_util::Result<()> {
         let Response::Udp(udp::Response::RecvFrom {
             buf,
             remote,
+            local,
             truncated,
         }) = channel.request_blocking(Some(handle), udp::Command::Recv { max_len: None })?
         else {
@@ -77,8 +79,11 @@ fn udp_by_steps() -> ts_cli_util::Result<()> {
         };
 
         assert!(truncated.is_none());
+        // The looped-back packet was addressed to `ep`; the captured local (destination)
+        // address must reflect that, which is what a forwarder dials.
+        assert_eq!(local, ep);
 
-        tracing::debug!(who = %remote, buf = %core::str::from_utf8(&buf)?, "packet received");
+        tracing::debug!(who = %remote, dst = %local, buf = %core::str::from_utf8(&buf)?, "packet received");
 
         // Default configuration has no routes, but that shouldn't impede this packet from going
         // out, since we're single-interface L3 (functionally point-to-point): we can't actually
@@ -87,6 +92,7 @@ fn udp_by_steps() -> ts_cli_util::Result<()> {
             Some(handle),
             udp::Command::Send {
                 endpoint: SocketAddr::from(([1, 2, 3, 4], 53)),
+                local: None,
                 buf: Bytes::copy_from_slice(b"hello"),
             },
         )?;

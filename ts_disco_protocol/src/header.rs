@@ -21,7 +21,7 @@ use crate::Error;
 )]
 #[repr(C, packed)]
 pub struct Header {
-    magic: [u8; Header::MAGIC.len()],
+    pub(crate) magic: [u8; Header::MAGIC.len()],
     pub(crate) sender_pub: DiscoPublicKey,
     pub(crate) nonce: [u8; Header::NONCE_LEN],
 }
@@ -49,6 +49,20 @@ impl Header {
         slf.validate()?;
 
         Ok((slf, rest))
+    }
+
+    /// The disco public key of the node that sent this message.
+    ///
+    /// Incoming disco packets carry the sender's disco key in cleartext (it is needed to
+    /// open the [`crypto_box`][crypto_box] seal), so this identifies the peer that a
+    /// received [`Ping`][crate::Ping]/[`Pong`][crate::Pong] came from.
+    pub const fn sender_pub(&self) -> DiscoPublicKey {
+        self.sender_pub
+    }
+
+    /// The nonce used to seal this message.
+    pub const fn nonce(&self) -> [u8; Header::NONCE_LEN] {
+        self.nonce
     }
 
     /// Report whether this is a valid disco header.

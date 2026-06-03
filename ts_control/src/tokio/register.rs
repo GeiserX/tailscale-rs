@@ -121,6 +121,10 @@ pub async fn register(
             hostname: config.hostname.as_deref(),
             app: &config.format_client_name(),
             ipn_version: crate::PKG_VERSION,
+            routable_ips: {
+                let routes = config.advertised_routes();
+                (!routes.is_empty()).then_some(routes)
+            },
             ..Default::default()
         },
         nl_key: Some(network_lock_public_key),

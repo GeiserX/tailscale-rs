@@ -33,6 +33,78 @@ pub struct Config {
 
     /// Tags this node will request.
     pub requested_tags: Vec<String>,
+
+    /// Whether to accept (and route traffic to) subnet routes advertised by peers.
+    ///
+    /// This is the equivalent of `tailscale up --accept-routes`. Defaults to `false`: only each
+    /// peer's own tailnet address is reachable. Set to `true` to use peers that act as subnet
+    /// routers, so traffic destined for an advertised subnet egresses via the advertising peer.
+    pub accept_routes: bool,
+
+    /// The peer to route internet-bound traffic through (exit node).
+    ///
+    /// This is the equivalent of `tailscale up --exit-node`. The peer may be named by stable node
+    /// ID, tailnet IP, or MagicDNS name via [`ExitNodeSelector`](crate::ExitNodeSelector) (a bare
+    /// IP or name can be parsed with `selector.parse()`). Defaults to `None`: internet-bound
+    /// traffic has no overlay route and is dropped (fail-closed). When set to a peer that
+    /// advertises a default route, all traffic not matching a more-specific route egresses through
+    /// that peer. The selection is re-resolved as the netmap changes.
+    pub exit_node: Option<ts_control::ExitNodeSelector>,
+
+    /// Subnet routes to advertise as a subnet router.
+    ///
+    /// This is the equivalent of `tailscale up --advertise-routes`. Defaults to empty: this node
+    /// advertises no routes. Each prefix is sent to the control server in `HostInfo.RoutableIPs`;
+    /// once the route is approved, peers with `accept_routes` may send traffic for that subnet
+    /// through this node. Only IPv4 prefixes are advertised — IPv6 prefixes are dropped to uphold
+    /// the IPv6-off posture (we never forward IPv6, so advertising it would be a black hole).
+    pub advertise_routes: Vec<ipnet::IpNet>,
+
+    /// Whether to advertise this node as an exit node.
+    ///
+    /// This is the equivalent of `tailscale up --advertise-exit-node`. Defaults to `false`. When
+    /// `true`, the default route `0.0.0.0/0` is advertised so that, once approved, other peers may
+    /// route their internet-bound traffic out through this node's real origin IP. Because that
+    /// means *other* peers' traffic egresses via our IP, it is strictly opt-in. `::/0` is never
+    /// advertised (IPv6-off).
+    pub advertise_exit_node: bool,
+
+    /// TCP ports the inbound forwarder accepts and splices to real OS sockets, for every advertised
+    /// route ([`advertise_routes`](Config::advertise_routes) / [`advertise_exit_node`](Config::advertise_exit_node)).
+    ///
+    /// Acting as a subnet router or exit node means inbound overlay flows to advertised
+    /// destinations are dialed out as real OS connections (mirroring Go `tsnet`'s forwarders). The
+    /// underlying netstack has no all-port accept mode, so the set of forwarded ports is explicit
+    /// rather than the full 1–65535 range. Defaults to empty: a node may advertise routes but
+    /// forward nothing until ports are configured (fail-closed — nothing is dialed).
+    pub forward_tcp_ports: Vec<u16>,
+
+    /// UDP ports the inbound forwarder accepts and splices to real OS sockets, for every advertised
+    /// route. See [`forward_tcp_ports`](Config::forward_tcp_ports); defaults to empty.
+    pub forward_udp_ports: Vec<u16>,
+
+    /// Forward **all** TCP/UDP ports (1–65535) on every advertised route, like a Go subnet router.
+    ///
+    /// This is the equivalent of a `tailscale up --advertise-routes` node forwarding every port,
+    /// instead of the explicit [`forward_tcp_ports`](Config::forward_tcp_ports) /
+    /// [`forward_udp_ports`](Config::forward_udp_ports) sets. When `true`, those explicit sets are
+    /// ignored and the forwarder runs an on-demand per-port listener manager. Anti-leak is
+    /// unchanged: every flow still routes through the same dialer chokepoint, so
+    /// [`forward_exit_egress`](Config::forward_exit_egress) still governs exit-node egress. Defaults
+    /// to `false`.
+    pub forward_all_ports: bool,
+
+    /// Whether exit-node (`0.0.0.0/0`) inbound flows are actually egressed via **this host's real
+    /// origin IP**.
+    ///
+    /// Anti-leak opt-in, separate from [`advertise_exit_node`](Config::advertise_exit_node):
+    /// advertising the default route only offers this node as an exit to control; it does not by
+    /// itself egress a peer's internet-bound traffic. Defaults to `false` (fail-closed): the
+    /// forwarder structurally refuses exit-node egress, dropping `0.0.0.0/0` flows at dial time
+    /// rather than leaking them out our real IP. Set to `true` only on a node whose real IP *is* the
+    /// intended egress (e.g. a residential exit), never on a host whose IP must stay hidden (e.g. a
+    /// cloud VPS). Subnet routes are dialed identically regardless of this flag.
+    pub forward_exit_egress: bool,
 }
 
 impl Config {
@@ -162,6 +234,14 @@ impl From<&Config> for ts_control::Config {
             hostname: value.requested_hostname.clone(),
             server_url: value.control_server_url.clone(),
             tags: value.requested_tags.clone(),
+            accept_routes: value.accept_routes,
+            exit_node: value.exit_node.clone(),
+            advertise_routes: value.advertise_routes.clone(),
+            advertise_exit_node: value.advertise_exit_node,
+            forward_tcp_ports: value.forward_tcp_ports.clone(),
+            forward_udp_ports: value.forward_udp_ports.clone(),
+            forward_all_ports: value.forward_all_ports,
+            forward_exit_egress: value.forward_exit_egress,
         }
     }
 }
@@ -174,6 +254,14 @@ impl Default for Config {
             control_server_url: ts_control::DEFAULT_CONTROL_SERVER.clone(),
             requested_hostname: None,
             requested_tags: vec![],
+            accept_routes: false,
+            exit_node: None,
+            advertise_routes: vec![],
+            advertise_exit_node: false,
+            forward_tcp_ports: vec![],
+            forward_udp_ports: vec![],
+            forward_all_ports: false,
+            forward_exit_egress: false,
         }
     }
 }

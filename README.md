@@ -122,6 +122,17 @@ These are features that we currently implement:
 - Basics
   - Create TCP and UDP sockets on the tailnet
   - Communicate with peers via public DERP relays
+  - Direct connections via NAT traversal (STUN-discovered endpoints and Disco, with `CallMeMaybe`
+    hole-punching over DERP); falls back to DERP when no direct path is available
+  - Peer lookups (addressing peers by MagicDNS name, in-process)
+  - MagicDNS (an in-netstack resolver on `100.100.100.100:53` answering A/AAAA/PTR for tailnet
+    peers and control-pushed static records (`ExtraRecords`); fail-closed — non-tailnet names get
+    NXDOMAIN, never forwarded to an upstream resolver)
+  - Using a subnet router (accepting peer-advertised subnet routes via `accept_routes`; opt-in,
+    fail-closed off by default)
+  - Using an exit node (routing internet-bound traffic through a chosen peer via `exit_node`,
+    selectable by Tailscale stable ID, tailnet IP, or MagicDNS name; opt-in, fail-closed off by
+    default)
   - Communicate with the Tailscale Go client, `tsnet`, and `libtailscale`
 - Language support
   - Rust API
@@ -132,8 +143,6 @@ These are features that we currently implement:
 These are features or efforts we have in the pipeline and are actively working towards, but provide
 no guarantees on timeline or completion:
 
-- Direct connections (NAT traversal, STUN, and Disco)
-- Peer lookups (addressing peers by hostname)
 - Third-party code and cryptography audit
 
 ### Unsupported
@@ -150,11 +159,13 @@ Unsupported features
 
 - Networking
   - Peer relays
-  - Exit Nodes (either being one, or using one)
-  - MagicDNS
+  - Exit Nodes (being one — advertising a default route; *using* one is supported)
+  - Exit node DNS (`ExitNodeDNSResolvers` — routing DNS through the exit node)
+  - Upstream/recursive DNS forwarding (MagicDNS answers tailnet names only; non-tailnet queries
+    are not forwarded to public/configured resolvers — fail-closed by design)
   - Private DERP relays
-  - Split DNS
-  - Subnet Routers (either being one, or using one)
+  - Split DNS (per-domain routing to configured resolvers)
+  - Subnet Routers (being one — advertising routes; *using* one is supported)
 - Platforms
   - AIX
   - Android

@@ -140,6 +140,7 @@ impl Packet<Plaintext> {
     ) -> Result<&mut Packet<Encrypted>, Error> {
         let bx = crypto_box::SalsaBox::new(&receiver.into(), &secret.into());
 
+        self.header.magic = Header::MAGIC;
         self.header.sender_pub = secret.public_key();
         self.header.nonce = nonce;
 

@@ -1,14 +1,99 @@
-use core::net::{IpAddr, SocketAddr};
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use chrono::{DateTime, Utc};
 use ts_keys::{DiscoPublicKey, MachinePublicKey, NodePublicKey};
+
+/// Whether `addr` falls in a range Tailscale assigns to nodes: the CGNAT range for IPv4
+/// (`100.64.0.0/10`, excluding the ChromeOS VM carve-out `100.115.92.0/23`) and the Tailscale
+/// ULA for IPv6 (`fd7a:115c:a1e0::/48`).
+///
+/// Mirrors `tsaddr.IsTailscaleIP` in the Go client. Used to tell a peer's own node addresses
+/// (always single Tailscale IPs) apart from the larger subnet routes it advertises.
+pub fn is_tailscale_ip(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(v4) => {
+            let cgnat = ipnet::Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 10).unwrap();
+            let chromeos = ipnet::Ipv4Net::new(Ipv4Addr::new(100, 115, 92, 0), 23).unwrap();
+            cgnat.contains(&v4) && !chromeos.contains(&v4)
+        }
+        IpAddr::V6(v6) => {
+            let ula = ipnet::Ipv6Net::new(Ipv6Addr::new(0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0, 0), 48)
+                .unwrap();
+            ula.contains(&v6)
+        }
+    }
+}
 
 /// The unique id of a node.
 pub type Id = i64;
 
 /// The stable ID of a node.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct StableId(pub String);
+
+/// How this node selects which peer to use as its exit node (`--exit-node` in the Go client).
+///
+/// Mirrors the Go client's `--exit-node`, which accepts a tailnet IP, a MagicDNS name, or a stable
+/// node ID, and resolves it to a `StableNodeID` (`resolveExitNodeIPLocked`). We keep the selector
+/// *unresolved* and re-run [`ExitNodeSelector::resolve`] against the live peer set on every route
+/// rebuild, so an IP- or name-based selection follows the peer as the netmap changes (e.g. the
+/// exit node re-registers under a new stable id).
+///
+/// A selector can be parsed from a string with [`str::parse`]/[`FromStr`](core::str::FromStr),
+/// auto-detecting the variant the way the Go CLI's `--exit-node` does: a value that parses as an IP
+/// address becomes [`ExitNodeSelector::Ip`], anything else becomes [`ExitNodeSelector::Name`].
+/// Stable-id selection is available only by constructing [`ExitNodeSelector::StableId`] directly
+/// (it is not auto-detected, since a stable id is otherwise indistinguishable from a hostname).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ExitNodeSelector {
+    /// Select the peer with this exact stable node id.
+    StableId(StableId),
+    /// Select the peer whose tailnet address is this IP.
+    Ip(IpAddr),
+    /// Select the peer matching this bare hostname or MagicDNS name (case-insensitive, optional
+    /// trailing dot), as per [`Node::matches_name`].
+    Name(String),
+}
+
+impl core::str::FromStr for ExitNodeSelector {
+    type Err = core::convert::Infallible;
+
+    /// Parse a selector from a string, auto-detecting IP vs. name (matching the Go CLI's
+    /// `--exit-node`). Parsing never fails: a non-IP string is taken as a MagicDNS name.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.parse::<IpAddr>() {
+            Ok(ip) => ExitNodeSelector::Ip(ip),
+            Err(_) => ExitNodeSelector::Name(s.to_owned()),
+        })
+    }
+}
+
+impl ExitNodeSelector {
+    /// Resolve this selector to the stable id of the matching peer, if any, given the current set
+    /// of peers.
+    ///
+    /// Resolution is **deterministic**: if a selector somehow matches more than one peer (e.g. two
+    /// peers sharing a MagicDNS name during a transient netmap state), the peer with the smallest
+    /// [`StableId`] is chosen. This matters because both the outbound route table and the inbound
+    /// source filter resolve independently; a deterministic tiebreak guarantees they pick the
+    /// *same* peer, preserving the cryptokey-routing coupling that prevents source-spoofing.
+    ///
+    /// Returns `None` when no peer matches (a stale/typo'd selector). Callers treat `None` as
+    /// fail-closed: no peer is granted a default route, so internet-bound traffic is dropped.
+    pub fn resolve<'a>(&self, peers: impl Iterator<Item = &'a Node>) -> Option<StableId> {
+        peers
+            .filter(|node| match self {
+                ExitNodeSelector::StableId(id) => &node.stable_id == id,
+                ExitNodeSelector::Ip(ip) => node.tailnet_address.contains(*ip),
+                ExitNodeSelector::Name(name) => node.matches_name(name),
+            })
+            .map(|node| &node.stable_id)
+            .min()
+            .cloned()
+    }
+}
 
 /// A node in a tailnet.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -81,26 +166,91 @@ impl Node {
     /// Report whether this node matches the given `name`.
     ///
     /// `name` is checked for equality with both this node's bare hostname and its fqdn. A
-    /// trailing `.` may be present.
+    /// trailing `.` may be present. Matching is case-insensitive (DNS names are
+    /// case-insensitive), so this agrees with the canonicalized MagicDNS-name index used for
+    /// peer lookups.
     pub fn matches_name(&self, name: &str) -> bool {
-        // This approach is taken to avoid allocating a buffer just for the sake of making this
-        // comparison: try to chop `.tailnet.` off of the end of `name` and compare the
-        // remainder to our hostname. If `.tailnet.` doesn't match `name`, we'll end up comparing
-        // our hostname to `hostname.other_tailnet.`, which won't succeed. If `name` was just the
-        // hostname, nothing will have been chopped, so the comparison will still be hostname-to-
-        // hostname.
+        // Strip an optional trailing root dot, then chop our `.tailnet` suffix off the end (if it
+        // matches, case-insensitively) and compare the remainder to our hostname. If the tailnet
+        // suffix doesn't match, the final case-insensitive compare against our bare hostname fails
+        // naturally; if `name` was just the hostname, nothing is chopped and we compare directly.
 
         let name = name.strip_suffix('.').unwrap_or(name);
 
         let name = if let Some(tailnet) = &self.tailnet {
-            name.strip_suffix(tailnet.as_str())
+            name.get(name.len().saturating_sub(tailnet.len())..)
+                .filter(|suffix| suffix.eq_ignore_ascii_case(tailnet))
+                .and_then(|_| name.get(..name.len() - tailnet.len()))
                 .and_then(|name| name.strip_suffix('.'))
                 .unwrap_or(name)
         } else {
             name
         };
 
-        name == self.hostname
+        name.eq_ignore_ascii_case(&self.hostname)
+    }
+
+    /// Report whether `route` is an advertised *subnet* route (as opposed to one of this node's
+    /// own tailnet addresses).
+    ///
+    /// Mirrors `cidrIsSubnet` in the Go client (`wgengine/wgcfg/nmcfg/nmcfg.go`). A route is *not*
+    /// a subnet route (i.e. it's a self-address) when it is a single host IP that is either a
+    /// Tailscale-assigned IP or exactly one of this node's [`TailnetAddress`] addresses. Everything
+    /// else — multi-IP CIDRs, and single IPs outside the Tailscale ranges — is a subnet route.
+    ///
+    /// The default route (`0.0.0.0/0` / `::/0`) is treated as a subnet route here; exit-node
+    /// handling is a separate concern.
+    pub fn is_subnet_route(&self, route: &ipnet::IpNet) -> bool {
+        let host_prefix = match route {
+            ipnet::IpNet::V4(_) => 32,
+            ipnet::IpNet::V6(_) => 128,
+        };
+
+        if route.prefix_len() != host_prefix {
+            // Any multi-IP CIDR (including the default route) is a subnet route.
+            return true;
+        }
+
+        let addr = route.addr();
+        !(is_tailscale_ip(addr) || self.tailnet_address.contains(addr))
+    }
+
+    /// The routes that should be installed for this peer, given whether this node accepts
+    /// advertised subnet routes (`--accept-routes` / `RouteAll` in the Go client) and which peer
+    /// (if any) is the selected exit node (`--exit-node` / `ExitNodeID` in the Go client).
+    ///
+    /// This node's own addresses (the peer's `/32` and `/128`) are always installed so the peer
+    /// itself stays reachable. Larger advertised subnet routes are only installed when
+    /// `accept_routes` is set; otherwise they are dropped (fail-closed). The same filtered set
+    /// governs both outbound routing to the peer and inbound source validation, exactly as
+    /// WireGuard cryptokey routing couples them in the Go client.
+    ///
+    /// The default route (`0.0.0.0/0` / `::/0`) is installed *only* for the peer whose
+    /// [`StableId`] equals `exit_node`, mirroring `nmcfg.go`'s `if allowedIP.Bits()==0 &&
+    /// peer.StableID()!=exitNode { skip }`. Exit-node use is gated behind this separate, explicit
+    /// preference (`ExitNodeID`, not `RouteAll`): conflating the two would let enabling
+    /// subnet-route acceptance silently route every packet through any peer advertising a default
+    /// route — unacceptable for a fail-closed privacy posture. When `exit_node` is `None` (the
+    /// default) no peer ever receives a `/0`, so internet-bound traffic has no overlay route and is
+    /// dropped by the userspace netstack (fail-closed, no leak). Longest-prefix-match means a peer
+    /// selected as the exit node still loses more-specific destinations to other peers; only
+    /// residual default-route traffic egresses through it.
+    pub fn routes_to_install<'a>(
+        &'a self,
+        accept_routes: bool,
+        exit_node: Option<&StableId>,
+    ) -> impl Iterator<Item = &'a ipnet::IpNet> + 'a {
+        // Computed eagerly so the returned iterator doesn't borrow `exit_node`.
+        let is_selected_exit = exit_node == Some(&self.stable_id);
+        self.accepted_routes.iter().filter(move |route| {
+            if route.prefix_len() == 0 {
+                // Default route: installed only when this peer is the selected exit node. Both the
+                // outbound route table and the inbound source filter call this, so the exit peer
+                // may legitimately source arbitrary internet IPs on return traffic — and only it.
+                return is_selected_exit;
+            }
+            accept_routes || !self.is_subnet_route(route)
+        })
     }
 }
 
@@ -168,5 +318,214 @@ impl From<&ts_control_serde::Node<'_>> for Node {
                 .or_else(|| value.host_info.net_info.as_ref()?.preferred_derp)
                 .map(|x| ts_derp::RegionId(x.into())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(hostname: &str, tailnet: Option<&str>) -> Node {
+        Node {
+            id: 1,
+            stable_id: StableId("n1".to_string()),
+            hostname: hostname.to_string(),
+            tailnet: tailnet.map(str::to_string),
+            tags: vec![],
+            tailnet_address: TailnetAddress {
+                ipv4: "100.64.0.1/32".parse().unwrap(),
+                ipv6: "fd7a::1/128".parse().unwrap(),
+            },
+            node_key: [0u8; 32].into(),
+            node_key_expiry: None,
+            machine_key: None,
+            disco_key: None,
+            accepted_routes: vec![],
+            underlay_addresses: vec![],
+            derp_region: None,
+        }
+    }
+
+    #[test]
+    fn matches_name_is_case_and_trailing_dot_insensitive() {
+        let n = node("MyHost", Some("tail-scale.ts.net"));
+
+        // bare hostname, any case
+        assert!(n.matches_name("myhost"));
+        assert!(n.matches_name("MYHOST"));
+        assert!(n.matches_name("MyHost"));
+
+        // fqdn, any case, with and without trailing dot
+        assert!(n.matches_name("myhost.tail-scale.ts.net"));
+        assert!(n.matches_name("MYHOST.TAIL-SCALE.TS.NET"));
+        assert!(n.matches_name("myhost.tail-scale.ts.net."));
+        assert!(n.matches_name("MyHost.Tail-Scale.TS.NET."));
+
+        // wrong host / wrong tailnet must not match
+        assert!(!n.matches_name("other"));
+        assert!(!n.matches_name("myhost.other.ts.net"));
+    }
+
+    #[test]
+    fn matches_name_no_tailnet() {
+        let n = node("solo", None);
+        assert!(n.matches_name("solo"));
+        assert!(n.matches_name("SOLO."));
+        assert!(!n.matches_name("solo.ts.net"));
+    }
+
+    #[test]
+    fn is_tailscale_ip_ranges() {
+        // CGNAT v4
+        assert!(is_tailscale_ip("100.64.0.1".parse().unwrap()));
+        assert!(is_tailscale_ip("100.127.255.254".parse().unwrap()));
+        // ChromeOS carve-out is excluded
+        assert!(!is_tailscale_ip("100.115.92.5".parse().unwrap()));
+        // outside CGNAT
+        assert!(!is_tailscale_ip("10.0.0.1".parse().unwrap()));
+        assert!(!is_tailscale_ip("100.128.0.1".parse().unwrap()));
+        // Tailscale ULA v6
+        assert!(is_tailscale_ip("fd7a:115c:a1e0::1".parse().unwrap()));
+        assert!(!is_tailscale_ip("fd00::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn is_subnet_route_distinguishes_self_from_subnet() {
+        let n = node("host", Some("ts.net"));
+
+        // The node's own /32 and /128 are self-addresses, not subnet routes.
+        assert!(!n.is_subnet_route(&"100.64.0.1/32".parse().unwrap()));
+        assert!(!n.is_subnet_route(&"fd7a::1/128".parse().unwrap()));
+        // A different single Tailscale IP is still a self-address (Tailscale-assigned host).
+        assert!(!n.is_subnet_route(&"100.64.5.5/32".parse().unwrap()));
+        // A LAN /24 the node advertises is a subnet route.
+        assert!(n.is_subnet_route(&"192.168.1.0/24".parse().unwrap()));
+        // A single non-Tailscale host IP counts as a subnet route.
+        assert!(n.is_subnet_route(&"8.8.8.8/32".parse().unwrap()));
+        // The default route is treated as a subnet route.
+        assert!(n.is_subnet_route(&"0.0.0.0/0".parse().unwrap()));
+        assert!(n.is_subnet_route(&"::/0".parse().unwrap()));
+    }
+
+    #[test]
+    fn routes_to_install_gates_subnets_on_accept_routes() {
+        let mut n = node("host", Some("ts.net"));
+        let self4: ipnet::IpNet = "100.64.0.1/32".parse().unwrap();
+        let self6: ipnet::IpNet = "fd7a::1/128".parse().unwrap();
+        let subnet: ipnet::IpNet = "192.168.1.0/24".parse().unwrap();
+        n.accepted_routes = vec![self4, self6, subnet];
+
+        // accept_routes off: only the self addresses are installed.
+        let off: Vec<_> = n.routes_to_install(false, None).copied().collect();
+        assert_eq!(off, vec![self4, self6]);
+
+        // accept_routes on: the advertised subnet is installed too.
+        let on: Vec<_> = n.routes_to_install(true, None).copied().collect();
+        assert_eq!(on, vec![self4, self6, subnet]);
+    }
+
+    #[test]
+    fn routes_to_install_default_route_only_for_selected_exit_node() {
+        let mut n = node("host", Some("ts.net"));
+        n.stable_id = StableId("exit1".to_string());
+        let self4: ipnet::IpNet = "100.64.0.1/32".parse().unwrap();
+        let default4: ipnet::IpNet = "0.0.0.0/0".parse().unwrap();
+        let default6: ipnet::IpNet = "::/0".parse().unwrap();
+        n.accepted_routes = vec![self4, default4, default6];
+
+        // No exit node selected: default routes are excluded even with accept_routes on
+        // (fail-closed — internet-bound traffic has no overlay route and is dropped).
+        let none_off: Vec<_> = n.routes_to_install(false, None).copied().collect();
+        assert_eq!(none_off, vec![self4]);
+        let none_on: Vec<_> = n.routes_to_install(true, None).copied().collect();
+        assert_eq!(none_on, vec![self4]);
+
+        // A *different* peer selected as exit node: this peer still gets no default route.
+        let other = StableId("exit2".to_string());
+        let other_sel: Vec<_> = n.routes_to_install(false, Some(&other)).copied().collect();
+        assert_eq!(other_sel, vec![self4]);
+
+        // This peer selected as the exit node: its default routes are installed.
+        let me = StableId("exit1".to_string());
+        let sel: Vec<_> = n.routes_to_install(false, Some(&me)).copied().collect();
+        assert_eq!(sel, vec![self4, default4, default6]);
+    }
+
+    fn exit_node_with(id: &str, ipv4: &str, hostname: &str, tailnet: Option<&str>) -> Node {
+        let mut n = node(hostname, tailnet);
+        n.stable_id = StableId(id.to_string());
+        n.tailnet_address.ipv4 = format!("{ipv4}/32").parse().unwrap();
+        n
+    }
+
+    #[test]
+    fn exit_node_selector_resolves_by_id_ip_and_name() {
+        let a = exit_node_with("nA", "100.64.0.5", "alpha", Some("ts.net"));
+        let b = exit_node_with("nB", "100.64.0.6", "beta", Some("ts.net"));
+        let peers = [a, b];
+        let it = || peers.iter();
+
+        // By stable id.
+        assert_eq!(
+            ExitNodeSelector::StableId(StableId("nB".into())).resolve(it()),
+            Some(StableId("nB".into()))
+        );
+        // By tailnet IP.
+        assert_eq!(
+            ExitNodeSelector::Ip("100.64.0.5".parse().unwrap()).resolve(it()),
+            Some(StableId("nA".into()))
+        );
+        // By MagicDNS name (fqdn, case-insensitive).
+        assert_eq!(
+            ExitNodeSelector::Name("BETA.ts.net".into()).resolve(it()),
+            Some(StableId("nB".into()))
+        );
+        // By bare hostname.
+        assert_eq!(
+            ExitNodeSelector::Name("alpha".into()).resolve(it()),
+            Some(StableId("nA".into()))
+        );
+        // Unresolvable selector => None (fail-closed at the call site).
+        assert_eq!(
+            ExitNodeSelector::Ip("100.64.0.99".parse().unwrap()).resolve(it()),
+            None
+        );
+        assert_eq!(ExitNodeSelector::Name("ghost".into()).resolve(it()), None);
+    }
+
+    #[test]
+    fn exit_node_selector_resolution_is_deterministic_on_ties() {
+        // Two peers sharing a name (transient netmap state): the smallest stable id wins, so the
+        // outbound table and inbound source filter — which resolve independently — agree.
+        let a = exit_node_with("nZ", "100.64.0.5", "dup", Some("ts.net"));
+        let b = exit_node_with("nA", "100.64.0.6", "dup", Some("ts.net"));
+        let peers = [a, b];
+
+        assert_eq!(
+            ExitNodeSelector::Name("dup".into()).resolve(peers.iter()),
+            Some(StableId("nA".into())),
+            "smallest stable id wins the tie"
+        );
+        // Order of iteration must not change the result.
+        assert_eq!(
+            ExitNodeSelector::Name("dup".into()).resolve(peers.iter().rev()),
+            Some(StableId("nA".into()))
+        );
+    }
+
+    #[test]
+    fn exit_node_selector_parses_ip_vs_name() {
+        assert_eq!(
+            "100.64.0.5".parse::<ExitNodeSelector>().unwrap(),
+            ExitNodeSelector::Ip("100.64.0.5".parse().unwrap())
+        );
+        assert_eq!(
+            "fd7a::5".parse::<ExitNodeSelector>().unwrap(),
+            ExitNodeSelector::Ip("fd7a::5".parse().unwrap())
+        );
+        assert_eq!(
+            "my-exit.ts.net".parse::<ExitNodeSelector>().unwrap(),
+            ExitNodeSelector::Name("my-exit.ts.net".into())
+        );
     }
 }

@@ -12,9 +12,15 @@ use kameo::{
     reply::DelegatedReply,
 };
 use tokio::sync::watch;
-use ts_control::{AsyncControlClient, Error as ControlError, Node, StateUpdate};
+use ts_control::{
+    AsyncControlClient, Endpoint, EndpointType, Error as ControlError, Node, StateUpdate,
+};
+use ts_magicsock::SelfEndpointType;
 
-use crate::derp_latency::{DerpLatencyMeasurement, DerpLatencyMeasurer};
+use crate::{
+    derp_latency::{DerpLatencyMeasurement, DerpLatencyMeasurer},
+    direct::EndpointAdvertisement,
+};
 
 /// Actor responsible for maintaining the connection to control.
 ///
@@ -80,6 +86,7 @@ impl kameo::Actor for ControlRunner {
         DerpLatencyMeasurer::spawn_link(&slf, params.env.clone()).await;
 
         params.env.subscribe::<DerpLatencyMeasurement>(&slf).await?;
+        params.env.subscribe::<EndpointAdvertisement>(&slf).await?;
         slf.attach_stream(stream.boxed(), (), ());
 
         Ok(Self {
@@ -225,5 +232,30 @@ impl Message<DerpLatencyMeasurement> for ControlRunner {
         tracing::debug!(selected_region_id = ?result.id, "updating home region");
 
         self.client.set_home_region(result.id, iter).await;
+    }
+}
+
+impl Message<EndpointAdvertisement> for ControlRunner {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: EndpointAdvertisement, _ctx: &mut Context<Self, Self::Reply>) {
+        let endpoints: Vec<Endpoint> = msg
+            .endpoints
+            .iter()
+            .map(|ep| Endpoint {
+                endpoint: ep.addr,
+                ty: match ep.ty {
+                    SelfEndpointType::Local => EndpointType::Local,
+                    SelfEndpointType::Stun => EndpointType::Stun,
+                },
+            })
+            .collect();
+
+        tracing::debug!(
+            n_endpoints = endpoints.len(),
+            "advertising endpoints to control"
+        );
+
+        self.client.set_endpoints(endpoints).await;
     }
 }

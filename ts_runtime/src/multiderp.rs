@@ -9,7 +9,10 @@ use kameo::{
     error::SendError,
     message::{Context, Message},
 };
-use tokio::{sync::watch, task::JoinSet};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinSet,
+};
 use ts_control::DerpRegion;
 use ts_derp::RegionId;
 use ts_keys::{NodeKeyPair, NodePublicKey};
@@ -35,6 +38,9 @@ pub struct Multiderp {
     env: Env,
     dataplane: ActorRef<DataplaneActor>,
     derps: HashMap<RegionId, RegionEntry>,
+    /// Cached region info from the last derp map, so a `send_disco` to a not-yet-connected
+    /// region can re-enter [`Multiderp::ensure_region`] with the region's servers.
+    regions: HashMap<RegionId, DerpRegion>,
     current_home_derp: Option<RegionId>,
     peer_db: Arc<RwLock<Option<Arc<PeerDb>>>>,
     tasks: JoinSet<()>,
@@ -43,6 +49,10 @@ pub struct Multiderp {
 struct RegionEntry {
     transport_id: UnderlayTransportId,
     home_derp: watch::Sender<bool>,
+    /// Sender for raw sealed disco frames (e.g. CallMeMaybe) to relay through this region's
+    /// DERP client, keyed by the destination peer's node public key. Bounded; a dropped frame
+    /// is retried on the next CallMeMaybe cadence.
+    disco_tx: mpsc::Sender<(NodePublicKey, Vec<u8>)>,
 }
 
 impl Multiderp {
@@ -75,6 +85,7 @@ impl Multiderp {
             Err(e) => unreachable!("{}", e),
         };
         let (home_derp_tx, mut home_derp_rx) = watch::channel(false);
+        let (disco_tx, mut disco_rx) = mpsc::channel::<(NodePublicKey, Vec<u8>)>(8);
 
         let peer_db = self.peer_db.clone();
 
@@ -91,6 +102,7 @@ impl Multiderp {
                         &down,
                         &mut up,
                         &mut home_derp_rx,
+                        &mut disco_rx,
                         &peer_db,
                     ) => if let Err(e) = ret {
                         tracing::error!(error = %e, region_id = %id, "running derp client");
@@ -115,6 +127,7 @@ impl Multiderp {
             RegionEntry {
                 transport_id,
                 home_derp: home_derp_tx,
+                disco_tx,
             },
         );
     }
@@ -125,6 +138,31 @@ impl Multiderp {
     #[message]
     pub fn transport_id_for_region(&self, id: RegionId) -> Option<UnderlayTransportId> {
         Some(self.derps.get(&id)?.transport_id)
+    }
+
+    /// Relay a raw sealed disco frame (e.g. a CallMeMaybe) to `peer` through DERP region `region`.
+    ///
+    /// Wakes the region's connection if it is not currently established (the queued frame counts
+    /// as activity). If the region is unknown (not in the last derp map) the frame is dropped with
+    /// a warning. A full per-region queue also drops the frame; it is retried on the next cadence.
+    #[message]
+    pub async fn send_disco(&mut self, peer: NodePublicKey, region: RegionId, frame: Vec<u8>) {
+        let Some(region_info) = self.regions.get(&region).cloned() else {
+            tracing::warn!(region_id = %region, "no derp region info, dropping disco frame");
+            return;
+        };
+
+        self.ensure_region(region, &region_info, self.env.shutdown.clone())
+            .await;
+
+        let Some(entry) = self.derps.get(&region) else {
+            tracing::warn!(region_id = %region, "region not established, dropping disco frame");
+            return;
+        };
+
+        if let Err(e) = entry.disco_tx.try_send((peer, frame)) {
+            tracing::trace!(error = %e, region_id = %region, "disco relay queue full or closed, dropping frame");
+        }
     }
 }
 
@@ -159,12 +197,14 @@ async fn run_derp_once(
     to_dataplane: &UnderlayToDataplane,
     from_dataplane: &mut UnderlayFromDataplane,
     home_derp_rx: &mut watch::Receiver<bool>,
+    disco_rx: &mut mpsc::Receiver<(NodePublicKey, Vec<u8>)>,
     peer_db: &RwLock<Option<Arc<PeerDb>>>,
 ) -> Result<(), ts_derp::Error> {
     const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(10);
 
     loop {
         let mut pending = None;
+        let mut pending_disco = None;
 
         tracing::trace!("waiting for packet activity or for this to become home derp");
 
@@ -179,17 +219,31 @@ async fn run_derp_once(
                     pending = from_net;
                     break;
                 }
+
+                disco = disco_rx.recv() => {
+                    tracing::trace!("received disco frame to relay, waking connection");
+                    pending_disco = disco;
+                    break;
+                }
             }
         }
 
         tracing::trace!("establishing derp connection");
 
-        let client = ts_derp::DefaultClient::connect(&region.servers, &keys).await?;
-        let transport = client.with_key_lookup(PeerDbLookup(peer_db));
+        // Hold the client in an `Arc` so we can both wrap a clone with the PeerId<->NodeKey
+        // lookup (for dataplane traffic) and keep a raw handle for `send_one` (disco frames
+        // addressed directly by node public key, bypassing the PeerId mapping).
+        let client = Arc::new(ts_derp::DefaultClient::connect(&region.servers, &keys).await?);
+        let transport = client.clone().with_key_lookup(PeerDbLookup(peer_db));
 
         if let Some(pending) = pending {
             tracing::trace!("sending queued packet");
             transport.send([pending]).await?;
+        }
+
+        if let Some((node_key, frame)) = pending_disco {
+            tracing::trace!("relaying queued disco frame");
+            client.send_one(node_key, &frame).await?;
         }
 
         let mut last_activity = Instant::now();
@@ -204,6 +258,12 @@ async fn run_derp_once(
                 from_derp = transport.recv() => {
                     last_activity = Instant::now();
 
+                    // TODO(npts-C2): inbound disco-over-DERP demux. A peer's CallMeMaybe (or any
+                    // disco frame) relayed to us arrives here and is forwarded to the dataplane as
+                    // if it were WireGuard data. Until we demux disco on this path, hole punching
+                    // relies on the peer pinging our direct socket (where `handle_disco` answers).
+                    // This is sufficient for the common NAT case; symmetric-NAT-both-sides still
+                    // stays on DERP until this seam exists.
                     for ret in from_derp.batch_iter() {
                         let (peer_id, pkts) = ret?;
                         let pkts = pkts.into_iter().collect::<Vec<_>>();
@@ -215,6 +275,18 @@ async fn run_derp_once(
                             break;
                         };
                     }
+                },
+
+                disco = disco_rx.recv() => {
+                    last_activity = Instant::now();
+
+                    let Some((node_key, frame)) = disco else {
+                        tracing::warn!(parent: &span, "disco relay queue closed");
+                        break;
+                    };
+
+                    tracing::trace!(parent: &span, "relaying disco frame over derp");
+                    client.send_one(node_key, &frame).await?;
                 },
 
                 from_net = from_dataplane.recv() => {
@@ -269,6 +341,7 @@ impl kameo::Actor for Multiderp {
             dataplane,
             peer_db: Default::default(),
             derps: Default::default(),
+            regions: Default::default(),
             tasks: JoinSet::new(),
             current_home_derp: None,
         })
@@ -289,6 +362,7 @@ impl Message<Arc<ts_control::StateUpdate>> for Multiderp {
         };
 
         for (id, region) in derp_map {
+            self.regions.insert(*id, region.clone());
             self.ensure_region(*id, region, self.env.shutdown.clone())
                 .await;
 

@@ -50,6 +50,11 @@ pub enum Response {
     Accepted {
         /// Address of the remote that initiated the connection.
         remote: SocketAddr,
+        /// The local (destination) address the remote connected to.
+        ///
+        /// Under any-IP acceptance this is the original packet destination, which may be an
+        /// address the netstack does not own. A forwarder uses this to know where to dial.
+        local: SocketAddr,
         /// Handle of the new TCP connection.
         handle: SocketHandle,
     },

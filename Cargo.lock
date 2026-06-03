@@ -622,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "checks"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "clap",
  "globwalk",
@@ -3271,6 +3271,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pem"
+version = "3.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
+dependencies = [
+ "base64 0.22.1",
+ "serde_core",
+]
+
+[[package]]
 name = "pem-rfc7468"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4027,6 +4037,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcgen"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
+dependencies = [
+ "pem",
+ "ring",
+ "rustls-pki-types",
+ "time",
+ "yasna",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4370,6 +4393,7 @@ checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -4386,6 +4410,15 @@ dependencies = [
  "rustls-pki-types",
  "schannel",
  "security-framework",
+]
+
+[[package]]
+name = "rustls-pemfile"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]
@@ -5074,13 +5107,14 @@ dependencies = [
 
 [[package]]
 name = "tailscale"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "axum",
  "bytes",
  "chrono",
  "clap",
  "include_dir",
+ "ipnet",
  "itertools",
  "mime_guess",
  "rand 0.10.1",
@@ -5650,7 +5684,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "ts_array256"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "heapless",
  "lazy_static",
@@ -5662,7 +5696,7 @@ dependencies = [
 
 [[package]]
 name = "ts_bart"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "cfg-if",
  "divan",
@@ -5681,7 +5715,7 @@ dependencies = [
 
 [[package]]
 name = "ts_bart_packetfilter"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "hashbrown 0.17.1",
  "ipnet",
@@ -5696,7 +5730,7 @@ dependencies = [
 
 [[package]]
 name = "ts_bitset"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "cfg-if",
  "divan",
@@ -5706,14 +5740,14 @@ dependencies = [
 
 [[package]]
 name = "ts_capabilityversion"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "ts_cli_util"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "cfg-if",
  "clap",
@@ -5730,7 +5764,7 @@ dependencies = [
 
 [[package]]
 name = "ts_control"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -5739,10 +5773,13 @@ dependencies = [
  "ipnet",
  "lazy_static",
  "pin-project-lite",
+ "rcgen",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tokio-util",
  "tracing",
@@ -5764,7 +5801,7 @@ dependencies = [
 
 [[package]]
 name = "ts_control_noise"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -5789,7 +5826,7 @@ dependencies = [
 
 [[package]]
 name = "ts_control_serde"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -5807,7 +5844,7 @@ dependencies = [
 
 [[package]]
 name = "ts_dataplane"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "etherparse",
  "tokio",
@@ -5824,7 +5861,7 @@ dependencies = [
 
 [[package]]
 name = "ts_derp"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "crypto_box",
@@ -5852,7 +5889,7 @@ dependencies = [
 
 [[package]]
 name = "ts_devtools"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "clap",
@@ -5868,7 +5905,7 @@ dependencies = [
 
 [[package]]
 name = "ts_disco_protocol"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "aead 0.5.2",
  "crypto_box",
@@ -5881,8 +5918,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ts_dns_wire"
+version = "0.4.0"
+
+[[package]]
 name = "ts_dynbitset"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "proptest",
  "smallvec",
@@ -5891,7 +5932,7 @@ dependencies = [
 
 [[package]]
 name = "ts_elixir"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "rustler",
  "tailscale",
@@ -5901,7 +5942,7 @@ dependencies = [
 
 [[package]]
 name = "ts_ffi"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "cbindgen",
  "tailscale",
@@ -5912,15 +5953,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "ts_forwarder"
+version = "0.4.0"
+dependencies = [
+ "bytes",
+ "ipnet",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "ts_netstack_smoltcp",
+]
+
+[[package]]
 name = "ts_hexdump"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "heapless",
 ]
 
 [[package]]
 name = "ts_http_util"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "futures",
@@ -5941,7 +5994,7 @@ dependencies = [
 
 [[package]]
 name = "ts_keys"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "crypto_box",
  "serde",
@@ -5951,8 +6004,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "ts_magicsock"
+version = "0.4.0"
+dependencies = [
+ "rand 0.10.1",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-test",
+ "ts_disco_protocol",
+ "ts_keys",
+ "ts_packet",
+ "ts_transport",
+ "zerocopy",
+]
+
+[[package]]
 name = "ts_netcheck"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "dashmap",
@@ -5973,7 +6042,7 @@ dependencies = [
 
 [[package]]
 name = "ts_netstack_smoltcp"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "axum",
  "bytes",
@@ -5994,7 +6063,7 @@ dependencies = [
 
 [[package]]
 name = "ts_netstack_smoltcp_core"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "flume",
@@ -6008,7 +6077,7 @@ dependencies = [
 
 [[package]]
 name = "ts_netstack_smoltcp_socket"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "futures-io",
@@ -6019,7 +6088,7 @@ dependencies = [
 
 [[package]]
 name = "ts_nodecapability"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "cfg-if",
  "serde",
@@ -6028,7 +6097,7 @@ dependencies = [
 
 [[package]]
 name = "ts_overlay_router"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "itertools",
  "tracing",
@@ -6039,7 +6108,7 @@ dependencies = [
 
 [[package]]
 name = "ts_packet"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "crypto_box",
@@ -6048,7 +6117,7 @@ dependencies = [
 
 [[package]]
 name = "ts_packetfilter"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "hashbrown 0.17.1",
  "ipnet",
@@ -6058,7 +6127,7 @@ dependencies = [
 
 [[package]]
 name = "ts_packetfilter_serde"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "ipnet",
  "nom 8.0.0",
@@ -6071,7 +6140,7 @@ dependencies = [
 
 [[package]]
 name = "ts_packetfilter_state"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "divan",
  "serde_json",
@@ -6082,7 +6151,7 @@ dependencies = [
 
 [[package]]
 name = "ts_peercapability"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "serde",
  "url",
@@ -6090,7 +6159,7 @@ dependencies = [
 
 [[package]]
 name = "ts_python"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "hex",
  "pyo3",
@@ -6101,7 +6170,7 @@ dependencies = [
 
 [[package]]
 name = "ts_runtime"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "futures",
  "ipnet",
@@ -6119,7 +6188,10 @@ dependencies = [
  "ts_control",
  "ts_dataplane",
  "ts_derp",
+ "ts_dns_wire",
+ "ts_forwarder",
  "ts_keys",
+ "ts_magicsock",
  "ts_netcheck",
  "ts_netstack_smoltcp",
  "ts_overlay_router",
@@ -6132,19 +6204,23 @@ dependencies = [
 
 [[package]]
 name = "ts_test_util"
-version = "0.3.3"
+version = "0.4.0"
 
 [[package]]
 name = "ts_time"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "ts_tls_util"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
+ "rcgen",
+ "ring",
+ "rustls-pemfile",
+ "subtle",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -6154,14 +6230,14 @@ dependencies = [
 
 [[package]]
 name = "ts_transport"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "ts_packet",
 ]
 
 [[package]]
 name = "ts_transport_tun"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "ipnet",
@@ -6176,7 +6252,7 @@ dependencies = [
 
 [[package]]
 name = "ts_tunnel"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "aead 0.5.2",
  "base64 0.22.1",
@@ -6201,7 +6277,7 @@ dependencies = [
 
 [[package]]
 name = "ts_underlay_router"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "ts_packet",
  "ts_transport",
@@ -7208,6 +7284,15 @@ dependencies = [
  "getrandom 0.4.2",
  "rand_core 0.10.1",
  "zeroize",
+]
+
+[[package]]
+name = "yasna"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
+dependencies = [
+ "time",
 ]
 
 [[package]]

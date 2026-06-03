@@ -175,10 +175,10 @@ pub enum IpUsage<T> {
 /// Configuration for TLS certificate validation.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TlsValidationConfig {
-    /// The certificate is self-signed and has this SHA256 signature.
+    /// The certificate is self-signed and its DER encoding has this SHA-256 digest.
     SelfSigned {
-        /// The signature of the self-signed cert.
-        sha256: [u8; 64],
+        /// The SHA-256 digest (32 bytes) of the expected self-signed cert's DER.
+        sha256: [u8; 32],
     },
     /// The certificate has the given common name.
     CommonName {
@@ -202,7 +202,7 @@ impl TlsValidationConfig {
                 common_name: hostname.to_owned(),
             },
             x if x.starts_with(Self::TLS_SELFSIGNED_PREFIX) => {
-                let mut buf = [0u8; 64];
+                let mut buf = [0u8; 32];
                 let bs = x.strip_prefix(Self::TLS_SELFSIGNED_PREFIX).unwrap().trim();
 
                 match hex::decode_to_slice(bs, &mut buf) {

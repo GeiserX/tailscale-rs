@@ -35,10 +35,14 @@ macro_rules! socket_requestor_impl {
 mod create_socket;
 pub use create_socket::CreateSocket;
 
+pub mod ping;
 mod raw;
 mod tcp;
 mod udp;
 
+pub use ping::PingError;
+#[cfg(feature = "tokio")]
+pub use ping::ping;
 pub use raw::RawSocket;
 pub use tcp::{TcpListener, TcpStream};
 pub use udp::UdpSocket;

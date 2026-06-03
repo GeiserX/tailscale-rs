@@ -1,5 +1,5 @@
 use ts_capabilityversion::CapabilityVersion;
-use ts_control_serde::{HostInfo, MapRequest, NetInfo};
+use ts_control_serde::{Endpoint, HostInfo, MapRequest, NetInfo};
 
 /// Builder type for [`MapRequest`]s; smooths over the annoying parts of creating a request.
 #[derive(Debug, Clone)]
@@ -80,11 +80,76 @@ impl<'a> MapRequestBuilder<'a> {
         self
     }
 
+    /// Advertise the node's magicsock UDP endpoints (ip:port candidates) to the control
+    /// server so peers can learn where to attempt direct connections.
+    pub fn endpoints(mut self, endpoints: impl IntoIterator<Item = Endpoint>) -> Self {
+        self.req.endpoints = endpoints.into_iter().collect();
+        self
+    }
+
+    /// Advertise the set of IP prefixes this node can route (`HostInfo.RoutableIPs`), so the
+    /// control server can grant it as a subnet router and/or exit node. When the iterator yields
+    /// nothing, the field is left as `None` and omitted from the wire request (advertise nothing).
+    pub fn routable_ips(mut self, routes: impl IntoIterator<Item = ipnet::IpNet>) -> Self {
+        let routes: alloc::vec::Vec<ipnet::IpNet> = routes.into_iter().collect();
+        self.host_info_mut().routable_ips = (!routes.is_empty()).then_some(routes);
+        self
+    }
+
     fn host_info_mut(&mut self) -> &mut HostInfo<'a> {
         self.req.host_info.get_or_insert_default()
     }
 
     fn net_info_mut(&mut self) -> &mut NetInfo<'a> {
         self.host_info_mut().net_info.get_or_insert_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ts_control_serde::EndpointType;
+
+    use super::*;
+
+    #[test]
+    fn endpoints_setter_populates_request() {
+        let node_state = ts_keys::NodeState::generate();
+
+        let endpoint = Endpoint {
+            endpoint: "203.0.113.7:41641".parse().unwrap(),
+            ty: EndpointType::Stun,
+        };
+
+        let req = MapRequestBuilder::new(&node_state)
+            .endpoints([endpoint])
+            .build();
+
+        assert_eq!(req.endpoints.len(), 1);
+        assert_eq!(req.endpoints[0], endpoint);
+    }
+
+    #[test]
+    fn routable_ips_setter_populates_host_info() {
+        let node_state = ts_keys::NodeState::generate();
+
+        let route: ipnet::IpNet = "10.0.0.0/24".parse().unwrap();
+        let req = MapRequestBuilder::new(&node_state)
+            .routable_ips([route])
+            .build();
+
+        assert_eq!(
+            req.host_info.unwrap().routable_ips,
+            Some(alloc::vec![route])
+        );
+    }
+
+    #[test]
+    fn routable_ips_setter_empty_leaves_field_none() {
+        let node_state = ts_keys::NodeState::generate();
+
+        let req = MapRequestBuilder::new(&node_state).routable_ips([]).build();
+
+        // Empty advertise set: the field stays None and is omitted from the wire request.
+        assert_eq!(req.host_info.unwrap().routable_ips, None);
     }
 }

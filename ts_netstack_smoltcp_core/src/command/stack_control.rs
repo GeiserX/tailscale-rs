@@ -20,6 +20,20 @@ pub enum Command {
         /// `iface-max-addr-count-*` (feature flag).
         new_ips: Vec<IpAddr>,
     },
+
+    /// Enable or disable "any-IP" acceptance on the interface.
+    ///
+    /// When enabled, the interface accepts inbound packets addressed to destinations it does
+    /// not own (i.e. arbitrary non-local addresses), capturing the original destination so a
+    /// forwarder can splice the flow to a real OS socket. This is the mechanism that lets a
+    /// node act as a subnet router / exit node.
+    ///
+    /// This MUST only be enabled on a dedicated forwarder netstack -- never on the shared
+    /// application netstack, where it would silently capture traffic not destined for us.
+    SetAnyIp {
+        /// Whether any-IP acceptance is enabled.
+        enabled: bool,
+    },
 }
 
 impl From<Command> for command::Command {

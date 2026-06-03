@@ -74,6 +74,7 @@ fn main() -> Result<(), netcore::Error> {
     // Issue a command to send a UDP packet over the channel:
     channel.request_nonblocking(Some(handle), udp::Command::Send {
         endpoint: SocketAddr::from(([1, 2, 3, 4], 80)),
+        local: None,
         buf: Bytes::copy_from_slice(b"hello"),
     })?;
     println!("sent udp packet");

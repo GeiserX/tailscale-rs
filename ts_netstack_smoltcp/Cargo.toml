@@ -99,3 +99,7 @@ harness = false
 [[test]]
 name = "wrong_ip_version"
 required-features = ["tokio"]
+
+[[test]]
+name = "ping"
+required-features = ["tokio"]

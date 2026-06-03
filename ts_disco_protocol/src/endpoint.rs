@@ -81,10 +81,29 @@ impl Endpoint {
         };
 
         Self {
-            addr: zerocopy::transmute!(ip.segments()),
+            addr: addr_segments(ip),
             port: zerocopy::U16::new(sa.port()),
         }
     }
+}
+
+/// Encode IPv6 segments as big-endian wire values.
+///
+/// Built element-by-element via [`U16::new`][zerocopy::U16::new] rather than a bitwise
+/// transmute of [`Ipv6Addr::segments`]: the segments are in host byte order, and a transmute
+/// would skip the byte swap, corrupting every address on little-endian hosts.
+const fn addr_segments(ip: Ipv6Addr) -> [zerocopy::U16<NetworkEndian>; 8] {
+    let s = ip.segments();
+    [
+        zerocopy::U16::new(s[0]),
+        zerocopy::U16::new(s[1]),
+        zerocopy::U16::new(s[2]),
+        zerocopy::U16::new(s[3]),
+        zerocopy::U16::new(s[4]),
+        zerocopy::U16::new(s[5]),
+        zerocopy::U16::new(s[6]),
+        zerocopy::U16::new(s[7]),
+    ]
 }
 
 impl PartialOrd for Endpoint {
@@ -114,7 +133,7 @@ impl From<Endpoint> for SocketAddr {
 impl From<SocketAddrV6> for Endpoint {
     fn from(value: SocketAddrV6) -> Self {
         Self {
-            addr: zerocopy::transmute!(value.ip().segments()),
+            addr: addr_segments(*value.ip()),
             port: value.port().into(),
         }
     }
@@ -123,5 +142,36 @@ impl From<SocketAddrV6> for Endpoint {
 impl From<SocketAddr> for Endpoint {
     fn from(value: SocketAddr) -> Self {
         Self::from_socket_addr(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use zerocopy::{FromBytes, IntoBytes};
+
+    use super::*;
+
+    #[test]
+    fn ipv4_roundtrips_through_bytes() {
+        // Encoding then decoding through the on-wire bytes must preserve the address: a
+        // naive transmute of the host-order segments would byte-swap on little-endian hosts.
+        let sa: SocketAddr = "203.0.113.7:41641".parse().unwrap();
+        let ep = Endpoint::from(sa);
+
+        let bytes = ep.as_bytes().to_vec();
+        let decoded = Endpoint::ref_from_bytes(&bytes).unwrap();
+
+        assert_eq!(decoded.socket_addr(), sa);
+    }
+
+    #[test]
+    fn ipv6_roundtrips_through_bytes() {
+        let sa: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let ep = Endpoint::from(sa);
+
+        let bytes = ep.as_bytes().to_vec();
+        let decoded = Endpoint::ref_from_bytes(&bytes).unwrap();
+
+        assert_eq!(decoded.socket_addr(), sa);
     }
 }

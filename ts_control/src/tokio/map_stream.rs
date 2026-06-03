@@ -95,6 +95,8 @@ pub struct StateUpdate {
     pub pop_browser_url: Option<Url>,
     /// New dial plan sent by control.
     pub dial_plan: Option<DialPlan>,
+    /// New DNS configuration for the MagicDNS responder. `None` means no change.
+    pub dns_config: Option<crate::DnsConfig>,
 }
 
 pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpdate> {
@@ -168,6 +170,10 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
                         .ok()
                 }),
                 dial_plan: map_response.control_dial_plan.map(Into::into),
+                dns_config: map_response
+                    .dns_config
+                    .as_ref()
+                    .map(crate::DnsConfig::from_serde),
             },
             reader,
         ))

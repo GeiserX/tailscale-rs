@@ -11,24 +11,45 @@ const PKG_VERSION: &str = if let Some(version) = option_env!("CARGO_PKG_VERSION"
     ""
 };
 
+#[cfg(feature = "async_tokio")]
+mod cert;
 mod config;
 mod control_dialer;
 mod derp;
 mod dial_plan;
+mod dns;
 #[cfg_attr(not(feature = "async_tokio"), expect(dead_code))]
 mod map_request_builder;
 mod node;
+#[cfg(feature = "async_tokio")]
+mod serve;
 #[cfg(feature = "async_tokio")]
 mod tokio;
 
 use std::fmt;
 
+#[cfg(feature = "async_tokio")]
+pub use cert::{
+    CertError, MISSING_CERT_RPC, certified_key_from_pem, get_certificate, is_tailnet_name,
+};
 #[doc(inline)]
 pub use config::{Config, DEFAULT_CONTROL_SERVER};
 pub use control_dialer::{ControlDialer, TcpDialer, complete_connection};
 pub use derp::{Map as DerpMap, Region as DerpRegion, convert_derp_map};
 pub use dial_plan::{DialCandidate, DialMode, DialPlan};
-pub use node::{Id as NodeId, Node, StableId as StableNodeId, TailnetAddress};
+pub use dns::{DnsConfig, ExtraRecord, Resolver as DnsResolver};
+pub use node::{ExitNodeSelector, Id as NodeId, Node, StableId as StableNodeId, TailnetAddress};
+#[cfg(feature = "async_tokio")]
+pub use serve::{ServeConfig, ServeTarget, accept_tls, listen_tls, tls_acceptor};
+pub use ts_control_serde::{Endpoint, EndpointType};
+
+/// Re-exported TLS types from the `tokio-rustls`/`ring` stack used by [`cert`]/[`serve`], so
+/// embedders can name [`get_certificate`]/[`listen_tls`] return types without taking their own
+/// direct `tokio-rustls` dependency (and risking a second, mismatched crypto provider).
+#[cfg(feature = "async_tokio")]
+pub mod tls {
+    pub use tokio_rustls::{TlsAcceptor, rustls::sign::CertifiedKey, server::TlsStream};
+}
 
 #[cfg(feature = "async_tokio")]
 pub use crate::tokio::{AsyncControlClient, FilterUpdate, PeerUpdate, StateUpdate};

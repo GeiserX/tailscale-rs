@@ -1,7 +1,7 @@
 use alloc::{collections::VecDeque, vec};
 use core::net::SocketAddr;
 
-use smoltcp::{iface::SocketHandle, socket::tcp};
+use smoltcp::{iface::SocketHandle, socket::tcp, wire::IpListenEndpoint};
 
 use crate::{
     Netstack,
@@ -10,6 +10,24 @@ use crate::{
         tcp::listen::{Command as TcpListenCommand, Response as TcpListenResponse},
     },
 };
+
+/// Translate a listen [`SocketAddr`] into a smoltcp [`IpListenEndpoint`].
+///
+/// A wildcard address (`0.0.0.0` / `::`) must become `addr: None` so smoltcp's `accepts()`
+/// matches *any* destination IP. The blanket `From<SocketAddr>` instead yields
+/// `addr: Some(0.0.0.0)`, which only matches a literal `0.0.0.0` destination and silently
+/// breaks any-IP forwarding (every SYN gets RST). Keep the explicit address for non-wildcard
+/// binds so a normal listener stays pinned to its own IP.
+fn listen_endpoint(addr: SocketAddr) -> IpListenEndpoint {
+    if addr.ip().is_unspecified() {
+        IpListenEndpoint {
+            addr: None,
+            port: addr.port(),
+        }
+    } else {
+        addr.into()
+    }
+}
 
 /// Opaque handle to a TCP listener.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -63,7 +81,7 @@ impl Netstack {
             TcpListenCommand::Listen { local_endpoint } => {
                 let mut listener = tcp::Socket::new(self.tcp_buffer(), self.tcp_buffer());
 
-                if let Err(e) = listener.listen(local_endpoint) {
+                if let Err(e) = listener.listen(listen_endpoint(local_endpoint)) {
                     return Response::Error(e.into());
                 }
 
@@ -171,9 +189,14 @@ impl Netstack {
                     }
 
                     let remote = sock.remote_endpoint().unwrap();
+                    // Under any-IP acceptance, `local_endpoint` is the original packet
+                    // destination -- possibly an address the netstack doesn't own. A forwarder
+                    // dials this to splice the flow to a real OS socket.
+                    let local = sock.local_endpoint().unwrap();
                     return TcpListenResponse::Accepted {
                         handle: accept,
                         remote: SocketAddr::new(remote.addr.into(), remote.port),
+                        local: SocketAddr::new(local.addr.into(), local.port),
                     }
                     .into();
                 }
@@ -275,7 +298,7 @@ impl Netstack {
                 tcp::SocketBuffer::new(vec![0; self.config.tcp_buffer_size]),
             );
 
-            if let Err(e) = new_listener.listen(listener.local_endpoint) {
+            if let Err(e) = new_listener.listen(listen_endpoint(listener.local_endpoint)) {
                 // invariant failure: the only variants for ListenError are
                 // InvalidState and Unaddressable. InvalidState isn't possible here because we just
                 // created the socket. Unaddressable only occurs if listener.local_endpoint has

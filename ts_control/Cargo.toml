@@ -28,6 +28,11 @@ ts_derp.workspace = true
 
 # Unconditionally required dependencies.
 bytes.workspace = true
+# TLS server material for `Device::listen_tls` / `get_certificate`. Same
+# `tokio-rustls`/`ring` provider the rest of the stack (`ts_tls_util`) uses, so
+# no second crypto backend is introduced. Pure-Rust PEM decoder keeps musl-static.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rustls-pemfile = "2"
 chrono = { workspace = true, features = ["serde"] }
 gethostname.workspace = true
 ipnet = { workspace = true, features = ["serde"] }
@@ -45,6 +50,12 @@ zerocopy.workspace = true
 futures-util = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tokio-stream = { version = "0.1", optional = true, default-features = false, features = ["sync"] }
+
+[dev-dependencies]
+# TEST-ONLY ephemeral self-signed cert to exercise the rustls acceptor wiring in
+# `serve`/`cert` tests. Never a production issuance path.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
 
 [features]
 default = ["async_tokio"]
