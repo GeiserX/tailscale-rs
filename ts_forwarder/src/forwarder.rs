@@ -25,7 +25,7 @@ use crate::{
 ///
 /// [`PortSpec::All`] is the closest *usable* mechanism: a raw-socket observer suppresses the
 /// unmatched-SYN RST and reveals each new destination port, and a per-port any-IP listener is
-/// started **on demand** for that port (see [`crate::all_port`]). Every port is forwarded
+/// started **on demand** for that port (the private `all_port` module). Every port is forwarded
 /// through the identical accept → classify → dial chokepoint; steady-state socket count is the
 /// number of *active* ports, not the full range.
 #[derive(Clone, Debug)]
@@ -121,7 +121,7 @@ impl<D: RealDialer> Forwarder<D> {
     /// Run the forwarder.
     ///
     /// For [`PortSpec::Ports`] this spawns one eager listener/bind task per configured port.
-    /// For [`PortSpec::All`] it spawns the on-demand all-port manager (see [`crate::all_port`]),
+    /// For [`PortSpec::All`] it spawns the on-demand all-port manager (the private `all_port` module),
     /// which lazily starts a per-port listener the first time a flow to that port is seen.
     ///
     /// Returns when any spawned task exits (which only happens if the netstack channel closes),
@@ -167,10 +167,22 @@ impl<D: RealDialer> Forwarder<D> {
         // channel close while tasks are live.
         let _routes_tx = self.routes_tx;
 
-        if let Some(res) = tasks.join_next().await {
-            // A spawned task finished; propagate its result (Ok is unexpected — they loop
-            // forever — so any return is effectively shutdown).
-            return res.expect("forwarder task panicked");
+        // Drain tasks as they finish. A per-port/manager task only returns when the netstack
+        // channel closes (returning its error), so the *first* clean return is treated as
+        // shutdown and propagated. A `JoinError` (a per-port task panicked or was cancelled)
+        // must NOT collapse the whole forwarder: it is logged at ERROR and we keep draining the
+        // remaining tasks so the rest of the forwarding plane stays up.
+        while let Some(res) = tasks.join_next().await {
+            match res {
+                Ok(task_result) => return task_result,
+                Err(join_err) => {
+                    tracing::error!(
+                        error = %join_err,
+                        "forwarder task failed (panic/cancel); continuing with remaining tasks"
+                    );
+                    // Continue draining; one dead flow/port task must not kill all forwarding.
+                }
+            }
         }
 
         Ok(())

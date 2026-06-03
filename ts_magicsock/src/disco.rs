@@ -15,6 +15,8 @@ use ts_disco_protocol::{
     CallMeMaybe, Endpoint, Header, MessageType, Packet, Ping, Pong, is_disco_message,
 };
 use ts_keys::{DiscoPrivateKey, DiscoPublicKey, NodePublicKey};
+// `IntoBytes` is only needed by the test-only `magic_prefix` wire-format guard.
+#[cfg(test)]
 use zerocopy::IntoBytes;
 
 use crate::error::DiscoError;
@@ -113,7 +115,14 @@ pub enum Inbound {
     Ping {
         /// The disco key that sealed the ping.
         sender: DiscoPublicKey,
-        /// The node key the sender claims (to be cross-checked against the netmap).
+        /// The node key the sender claims for its disco key.
+        ///
+        /// Disco intends this to be bound to the disco key via the control netmap (i.e. verify
+        /// control really advertised this node key for this disco key). That binding is NOT
+        /// enforced here: this codec/socket layer has no netmap. The magicsock consumer
+        /// (`handle_disco`) does not have the netmap either, so the cross-check is the
+        /// responsibility of the route layer that owns the netmap.
+        /// TODO(parity): enforce the disco<->node-key binding in the netmap-owning layer.
         claimed_node_key: NodePublicKey,
         /// The ping's transaction id, to be echoed in the pong.
         tx_id: TxId,
@@ -178,9 +187,13 @@ fn random_nonce() -> [u8; Header::NONCE_LEN] {
     nonce
 }
 
-/// Test helper: assert the disco magic prefix is what every demux site keys on. Kept here
+/// The disco magic prefix that every demux site keys on (see [`looks_like_disco`]). Kept here
 /// so a wire-format change is caught by this crate's own tests, not only the protocol crate.
-#[allow(dead_code)]
+///
+/// Test-only: this is a wire-format guard exercised by `magic_prefix_is_the_demux_key`; it has
+/// no runtime caller, so it is compiled only under `cfg(test)` rather than carrying an
+/// `#[allow(dead_code)]`.
+#[cfg(test)]
 pub(crate) fn magic_prefix() -> &'static [u8] {
     Header::MAGIC.as_bytes()
 }
@@ -283,5 +296,34 @@ mod tests {
         // A WireGuard data packet starts with type byte 0x04, never the disco magic.
         let wg = [0x04u8, 0, 0, 0, 1, 2, 3, 4];
         assert!(!looks_like_disco(&wg));
+    }
+
+    #[test]
+    fn magic_prefix_is_the_demux_key() {
+        // The magic prefix is load-bearing: it is exactly what `looks_like_disco`/the codec
+        // keys on to separate disco from WireGuard. Guard the wire format from this crate.
+        let prefix = magic_prefix();
+        assert_eq!(prefix, b"TS\xf0\x9f\x92\xac", "disco magic prefix changed");
+
+        // A real sealed disco datagram must begin with exactly this prefix, and that is what
+        // makes `looks_like_disco` accept it. This ties the helper to the predicate every
+        // reader of the underlay socket uses.
+        let (a_sk, _a_pk) = keypair();
+        let (_b_sk, b_pk) = keypair();
+        let node_key = ts_keys::NodePrivateKey::random().public_key();
+        let mut wire = seal_ping(&a_sk, node_key, &b_pk, random_tx_id()).unwrap();
+
+        assert!(
+            wire.starts_with(prefix),
+            "sealed disco must carry the magic prefix"
+        );
+        assert!(looks_like_disco(&wire), "magic prefix must demux as disco");
+
+        // Flipping a prefix byte must break the demux — proving the prefix is the key.
+        wire[0] ^= 0xff;
+        assert!(
+            !looks_like_disco(&wire),
+            "a corrupted prefix must not demux as disco"
+        );
     }
 }

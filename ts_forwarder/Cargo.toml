@@ -2,6 +2,7 @@
 name = "ts_forwarder"
 version.workspace = true
 description = "inbound subnet-router / exit-node forwarding dataplane (overlay accept -> real OS dial)"
+readme = "README.md"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

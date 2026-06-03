@@ -17,6 +17,7 @@ use ts_forwarder::{DirectDialer, Forwarder, HostExitDialer, PortSpec, RouteTable
 use ts_netstack_smoltcp::{
     CreateSocket, Netstack, WakingPipe, WakingPipeDev,
     netcore::{self, Channel, HasChannel, NetstackControl, smoltcp},
+    netsock::{TcpStream as OverlayTcpStream, UdpSocket as OverlayUdpSocket},
 };
 
 const PEER_IP: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 1);
@@ -77,6 +78,81 @@ async fn spawn_counting_sink() -> (SocketAddr, Arc<AtomicUsize>) {
         }
     });
     (addr, count)
+}
+
+/// Spawn a loopback UDP echo server, returning its address. The UDP analogue of [`spawn_echo`]:
+/// stands in for a "real OS socket" destination that the forwarder dials, echoing every datagram
+/// back to its sender so a reply can be observed over the overlay.
+async fn spawn_udp_echo() -> SocketAddr {
+    let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        loop {
+            match echo.recv_from(&mut buf).await {
+                Ok((n, from)) => {
+                    if echo.send_to(&buf[..n], from).await.is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    echo_addr
+}
+
+/// Spawn a loopback UDP socket that counts received datagrams, returning `(addr, recv_count)`. The
+/// UDP analogue of [`spawn_counting_sink`]: the anti-leak drop tests assert deterministically that
+/// the forwarder relayed **zero** datagrams to the real socket — distinguishing "correctly refused
+/// at dial time" from "the test runtime was merely slow" (a wall-clock timeout alone can't tell
+/// them apart).
+async fn spawn_udp_counting_sink() -> (SocketAddr, Arc<AtomicUsize>) {
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = sock.local_addr().unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let count_for_task = count.clone();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        loop {
+            match sock.recv_from(&mut buf).await {
+                Ok(_) => {
+                    count_for_task.fetch_add(1, Ordering::SeqCst);
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    (addr, count)
+}
+
+/// Connect to `dst` over the overlay with bounded retries, returning the established stream.
+///
+/// The forwarder registers its per-port listen socket asynchronously after `run()` is spawned;
+/// until that socket exists smoltcp RSTs an inbound SYN. Rather than guess a fixed sleep (racy
+/// under CI load — too short spuriously RSTs, too long wastes time), we retry the connect until the
+/// listener is live. Bounded so a genuinely-never-registered listener still fails the test.
+async fn connect_with_retry(
+    peer_ch: &Channel,
+    local: SocketAddr,
+    dst: SocketAddr,
+) -> OverlayTcpStream {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut attempt = 0u32;
+    loop {
+        match peer_ch.tcp_connect(local, dst).await {
+            Ok(stream) => return stream,
+            Err(e) => {
+                if tokio::time::Instant::now() >= deadline {
+                    panic!(
+                        "overlay connect to {dst} never succeeded after {attempt} attempts: {e}"
+                    );
+                }
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
 }
 
 /// Spawn a piped pair: `(peer_channel, forwarder_channel)`. The forwarder stack has any-IP
@@ -159,14 +235,12 @@ async fn forwarder_splices_subnet_route_to_real_socket() {
         let _ = forwarder.run().await;
     });
 
-    // Give the forwarder's per-port listen task time to register its listen socket before the
-    // peer's SYN arrives; otherwise smoltcp RSTs the connection (no matching listener yet).
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
     // Peer dials the echo server's address *over the overlay*. The forwarder captures it
-    // (any-IP), classifies 127.0.0.1 as Subnet, and DirectDialer connects to the real echo.
+    // (any-IP), classifies 127.0.0.1 as Subnet, and DirectDialer connects to the real echo. The
+    // forwarder registers its per-port listen socket asynchronously, so retry the connect until
+    // the listener is live (a fixed sleep is racy under CI load).
     let peer_local = SocketAddr::new(PEER_IP.into(), PEER_PORT);
-    let mut client = peer_ch.tcp_connect(peer_local, echo_addr).await.unwrap();
+    let mut client = connect_with_retry(&peer_ch, peer_local, echo_addr).await;
 
     client.write_all(b"hello forwarder").await.unwrap();
 
@@ -196,10 +270,12 @@ async fn advertised_but_no_ports_forwards_nothing() {
         let _ = forwarder.run().await;
     });
 
+    // Let the forwarder finish starting up (it spawns no listeners here). Unlike the splice/drop
+    // tests we deliberately do NOT connect-retry: with zero ports configured no listener will ever
+    // register, so the connect is *expected* to RST or stall — the absence of a listener is the
+    // behavior under test, not a race to wait out.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // No per-port listener exists, so the peer's flow is never accepted/spliced. The connect may
-    // RST or stall; either way the forwarder must never dial the real sink.
     let peer_local = SocketAddr::new(PEER_IP.into(), PEER_PORT);
     let _ = tokio::time::timeout(Duration::from_secs(2), async {
         if let Ok(mut client) = peer_ch.tcp_connect(peer_local, sink_addr).await {
@@ -237,15 +313,17 @@ async fn exit_node_flow_is_dropped_under_direct_dialer() {
         let _ = forwarder.run().await;
     });
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
+    // Retry the connect until the per-port listener is live, so the overlay flow is actually
+    // accepted (reaching classify → dial). This proves the drop comes from the dialer refusing
+    // exit egress, not from the SYN racing a not-yet-registered listener.
     let peer_local = SocketAddr::new(PEER_IP.into(), PEER_PORT);
-    let _ = tokio::time::timeout(Duration::from_secs(2), async {
-        if let Ok(mut client) = peer_ch.tcp_connect(peer_local, sink_addr).await {
-            client.write_all(b"leak attempt").await.ok();
-        }
-    })
-    .await;
+    let mut client = connect_with_retry(&peer_ch, peer_local, sink_addr).await;
+    client.write_all(b"leak attempt").await.ok();
+
+    // Give the accepted flow ample time to be classified and (incorrectly) dialed if the dialer
+    // were leaky. The count can only ever increase, so a generous settle keeps the zero-assertion
+    // deterministic rather than timing-lucky.
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Deterministic anti-leak proof: the real destination saw zero connections, so the host IP
     // never egressed the exit-node flow.
@@ -278,10 +356,8 @@ async fn exit_node_flow_egresses_under_host_exit_dialer() {
         let _ = forwarder.run().await;
     });
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
     let peer_local = SocketAddr::new(PEER_IP.into(), PEER_PORT);
-    let mut client = peer_ch.tcp_connect(peer_local, echo_addr).await.unwrap();
+    let mut client = connect_with_retry(&peer_ch, peer_local, echo_addr).await;
     client.write_all(b"exit egress").await.unwrap();
 
     let mut buf = [0u8; 64];
@@ -311,12 +387,11 @@ async fn all_ports_forwards_unlisted_port_for_subnet_route() {
         let _ = forwarder.run().await;
     });
 
-    // All-port mode registers many listeners; give the actor time to register the one for the
-    // echo port before the peer's SYN arrives.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
+    // All-port mode lazily registers the listener for the echo port on first sight of a flow to
+    // it; retry the connect until that on-demand listener is live (a fixed sleep is racy under
+    // CI load).
     let peer_local = SocketAddr::new(PEER_IP.into(), PEER_PORT);
-    let mut client = peer_ch.tcp_connect(peer_local, echo_addr).await.unwrap();
+    let mut client = connect_with_retry(&peer_ch, peer_local, echo_addr).await;
     client.write_all(b"all ports hello").await.unwrap();
 
     let mut buf = [0u8; 64];
@@ -348,15 +423,16 @@ async fn all_ports_still_drops_exit_node_flow_under_direct_dialer() {
         let _ = forwarder.run().await;
     });
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
+    // Retry the connect until the on-demand listener materializes and accepts the flow, so the
+    // flow definitely reaches classify → dial. This proves the drop comes from the dialer refusing
+    // exit egress, not from the SYN racing the on-demand listener's creation.
     let peer_local = SocketAddr::new(PEER_IP.into(), PEER_PORT);
-    let _ = tokio::time::timeout(Duration::from_secs(3), async {
-        if let Ok(mut client) = peer_ch.tcp_connect(peer_local, sink_addr).await {
-            drop(client.write_all(b"all-ports leak attempt").await);
-        }
-    })
-    .await;
+    let mut client = connect_with_retry(&peer_ch, peer_local, sink_addr).await;
+    client.write_all(b"all-ports leak attempt").await.ok();
+
+    // The count can only ever increase, so a generous settle keeps the zero-assertion
+    // deterministic rather than timing-lucky.
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
     assert_eq!(
         dial_count.load(Ordering::SeqCst),
@@ -390,4 +466,101 @@ async fn ipv6_destination_is_never_forwarded() {
 
     // Sanity: a v4 destination in the same table still classifies (the table isn't simply empty).
     assert!(routes.classify("10.1.2.3".parse().unwrap()).is_some());
+}
+
+/// UDP analogue of [`forwarder_splices_subnet_route_to_real_socket`]. The forwarder runs a full
+/// parallel UDP relay; this asserts that path end-to-end: a peer sends a UDP datagram over the
+/// overlay to a subnet-route (`127.0.0.0/8`) destination, the forwarder classifies it as Subnet,
+/// `DirectDialer` opens a real OS UDP socket, the datagram reaches the real echo, and the reply is
+/// relayed back over the overlay with the source spoofed as the original destination.
+#[tokio::test]
+async fn udp_forwarder_splices_subnet_route_to_real_socket() {
+    let echo_addr = spawn_udp_echo().await;
+    let (peer_ch, fwd_ch) = spawn_pair().await;
+
+    // 127.0.0.0/8 is a (narrow) subnet route -> DirectDialer will dial it over real UDP.
+    let routes = RouteTable::new(["127.0.0.0/8".parse().unwrap()]);
+    let forwarder = Forwarder::new(fwd_ch, routes, DirectDialer, vec![], vec![echo_addr.port()]);
+    tokio::spawn(async move {
+        let _ = forwarder.run().await;
+    });
+
+    // Peer binds a UDP socket on the overlay and sends to the echo address. UDP is connectionless,
+    // so there is no connect handshake to retry against; instead we retransmit the datagram with a
+    // bounded poll until the round-trip reply arrives. This both waits out the relay's async
+    // `0.0.0.0:port` bind (a fixed sleep would be racy) and tolerates UDP's inherent best-effort
+    // delivery, while a bounded deadline still fails a genuinely-never-forwarded regression.
+    let peer_local = SocketAddr::new(PEER_IP.into(), PEER_PORT);
+    let peer_sock: OverlayUdpSocket = peer_ch.udp_bind(peer_local).await.unwrap();
+
+    let payload = b"hello udp forwarder";
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut buf = [0u8; 64];
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "udp datagram was never spliced back from the real echo"
+        );
+
+        peer_sock.send_to(echo_addr, payload).await.unwrap();
+
+        match tokio::time::timeout(Duration::from_millis(250), peer_sock.recv_from(&mut buf)).await
+        {
+            Ok(Ok((remote, n))) => {
+                assert_eq!(&buf[..n], payload, "echoed payload must round-trip intact");
+                // The reply is source-spoofed as the original destination the peer targeted, so
+                // it appears to come straight from the echo address.
+                assert_eq!(
+                    remote, echo_addr,
+                    "reply source must be spoofed as the original destination"
+                );
+                return;
+            }
+            // Reply not back yet (relay still binding, or datagram dropped): retransmit and poll.
+            Ok(Err(_)) | Err(_) => continue,
+        }
+    }
+}
+
+/// UDP analogue of [`exit_node_flow_is_dropped_under_direct_dialer`] — the anti-leak proof for the
+/// UDP path. With only a default route (`0.0.0.0/0`) the destination classifies as ExitNode;
+/// `DirectDialer` structurally refuses exit egress, so the relay drops the datagram and never
+/// opens a real OS socket. A per-port UDP relay DOES exist (the port is explicitly configured), so
+/// the drop is proven to come from the dialer, not a missing relay. The counting sink asserts the
+/// real socket received ZERO datagrams — a deterministic leak proof, not a wall-clock timeout.
+#[tokio::test]
+async fn udp_exit_node_flow_is_dropped_under_direct_dialer() {
+    let (sink_addr, recv_count) = spawn_udp_counting_sink().await;
+    let (peer_ch, fwd_ch) = spawn_pair().await;
+
+    // Only a default route is advertised, so the sink IP (127.0.0.1) classifies as ExitNode.
+    // DirectDialer refuses exit egress at dial time -> the relay never opens the real socket.
+    let routes = RouteTable::new(["0.0.0.0/0".parse().unwrap()]);
+    let forwarder = Forwarder::new(fwd_ch, routes, DirectDialer, vec![], vec![sink_addr.port()]);
+    tokio::spawn(async move {
+        let _ = forwarder.run().await;
+    });
+
+    // Wait for the relay's `0.0.0.0:port` bind to register, then send the datagram repeatedly so
+    // the relay definitely observes it (the bind is async; a single too-early datagram could be
+    // dropped before the socket exists, masking a real leak). Each datagram reaches the relay's
+    // classify -> dial path, which must refuse it.
+    let peer_local = SocketAddr::new(PEER_IP.into(), PEER_PORT);
+    let peer_sock: OverlayUdpSocket = peer_ch.udp_bind(peer_local).await.unwrap();
+    for _ in 0..20 {
+        peer_sock.send_to(sink_addr, b"udp leak attempt").await.ok();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Give any (erroneous) egress ample time to land. The count can only ever increase, so a
+    // generous settle keeps the zero-assertion deterministic rather than timing-lucky.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Deterministic anti-leak proof: the real destination received zero datagrams, so the host IP
+    // never egressed the exit-node UDP flow.
+    assert_eq!(
+        recv_count.load(Ordering::SeqCst),
+        0,
+        "DirectDialer must never egress an exit-node UDP flow (anti-leak)"
+    );
 }

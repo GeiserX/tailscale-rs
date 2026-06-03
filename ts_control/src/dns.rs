@@ -73,10 +73,14 @@ impl DnsConfig {
     pub fn from_serde(c: &ts_control_serde::DnsConfig<'_>) -> Self {
         DnsConfig {
             magic_dns: c.magic_dns,
+            // Drop any search domain whose canonical suffix is empty (e.g. "" or ".").
+            // An empty suffix used in `ends_with` matching matches every name, which would
+            // silently turn the resolver into a match-all/block-all wildcard. Fail closed.
             search_domains: c
                 .search_domains
                 .iter()
                 .map(|domain| canon(domain))
+                .filter(|domain| !domain.is_empty())
                 .collect(),
             extra_records: c
                 .extra_records
@@ -95,6 +99,9 @@ impl DnsConfig {
                 })
                 .collect(),
             resolvers: resolvers_from_serde(&c.resolvers),
+            // Canonicalize route keys and drop any whose suffix is empty (e.g. "" or ".").
+            // An empty route key used in `ends_with` matching matches every name, which would
+            // silently capture all names as a route (match-all). Fail closed.
             routes: c
                 .routes
                 .iter()
@@ -105,6 +112,7 @@ impl DnsConfig {
                         .unwrap_or_default();
                     (canon(suffix), upstreams)
                 })
+                .filter(|(suffix, _)| !suffix.is_empty())
                 .collect(),
             fallback_resolvers: resolvers_from_serde(&c.fallback_resolvers),
         }
@@ -189,6 +197,45 @@ mod tests {
         assert_eq!(
             config.extra_records[1].addr,
             "fd00::5".parse::<core::net::IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn from_serde_drops_empty_route_keys_and_keeps_normal_suffix() {
+        let mut routes = BTreeMap::new();
+        // Both "" and "." canonicalize to "" and must be dropped so they never become a
+        // match-all wildcard in `ends_with` route matching.
+        routes.insert("", None);
+        routes.insert(".", None);
+        routes.insert("corp.ts.net", None);
+
+        let serde_config = ts_control_serde::DnsConfig {
+            magic_dns: true,
+            routes,
+            ..Default::default()
+        };
+
+        let config = DnsConfig::from_serde(&serde_config);
+
+        assert!(!config.routes.contains_key(""));
+        assert!(config.routes.contains_key("corp.ts.net"));
+        assert_eq!(config.routes.len(), 1);
+    }
+
+    #[test]
+    fn from_serde_drops_empty_search_domains_and_keeps_normal_suffix() {
+        let serde_config = ts_control_serde::DnsConfig {
+            magic_dns: true,
+            // "" and "." both canonicalize to "" and must be dropped; "corp.ts.net" survives.
+            search_domains: alloc::vec!["", ".", "corp.ts.net"],
+            ..Default::default()
+        };
+
+        let config = DnsConfig::from_serde(&serde_config);
+
+        assert_eq!(
+            config.search_domains,
+            alloc::vec!["corp.ts.net".to_string()]
         );
     }
 }

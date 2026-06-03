@@ -58,6 +58,31 @@ impl From<netcore::Error> for PingError {
 
 const PING_PAYLOAD: &[u8] = b"ts_netstack_smoltcp ping";
 
+/// Per-call counter mixed into the ICMP `ident`.
+///
+/// The raw ICMP socket each `ping` call opens intercepts *all* ICMPv4, so two concurrent calls
+/// on the same netstack would otherwise share a fixed ident+seq and cross-match each other's
+/// replies (resolving the wrong awaiter with the wrong RTT). To avoid same-process collisions we
+/// derive a unique `ident` per call: the low byte of `std::process::id()` (non-deterministic
+/// across runs, no crate dependency) combined with a monotonically incrementing `AtomicU16`. Two
+/// in-flight pings in the same process get distinct idents (the counter differs), and pings from
+/// different processes are unlikely to share the high byte. We do not depend on the `rand` crate
+/// because it is not a dependency of this `no-std`-flavored crate (see `Cargo.toml`); the
+/// `tokio`-gated `ping` path enables `std`, so `std::process::id()` is available.
+#[cfg(feature = "tokio")]
+static PING_IDENT_COUNTER: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+
+/// Produce a per-call ICMP `ident` that does not collide with other concurrent `ping` calls in
+/// this process. See [`PING_IDENT_COUNTER`] for the rationale and source of (weak) randomness.
+#[cfg(feature = "tokio")]
+fn next_ident() -> u16 {
+    let counter = PING_IDENT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // High byte: process-randomized seed; low byte: per-call counter. The counter guarantees
+    // distinct idents for concurrent in-process calls regardless of the seed.
+    let seed = (std::process::id() as u16) & 0xFF00;
+    seed ^ counter
+}
+
 /// Send an ICMPv4 Echo Request from `src` to `dst` over the overlay netstack `chan` and wait
 /// for the matching Echo Reply, returning the round-trip time.
 ///
@@ -79,9 +104,10 @@ pub async fn ping<C: CreateSocket + Sync>(
         IpAddr::V6(_) => return Err(PingError::Ipv6Unsupported),
     };
 
-    // A fixed ident/seq is fine: the raw socket intercepts all ICMPv4, but we only match on our
-    // own ident+seq, so a single in-flight echo is unambiguous.
-    let ident: u16 = 0x7473;
+    // The raw socket intercepts *all* ICMPv4, so a fixed ident/seq would cross-match concurrent
+    // pings on the same netstack. Use a per-call unique ident (see `next_ident`) and match strictly
+    // on both ident and seq, so concurrent calls never resolve each other's replies.
+    let ident: u16 = next_ident();
     let seq_no: u16 = 1;
 
     let sock = chan.raw_open(true, IpProtocol::Icmp).await?;
@@ -192,4 +218,80 @@ fn matches_reply(
         icmp_repr,
         Icmpv4Repr::EchoReply { ident: i, seq_no: s, .. } if i == ident && s == seq_no
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SRC: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 1);
+    const DST: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 2);
+
+    /// Build a full IPv4 Echo *Reply* datagram travelling `from` -> `to` with the given
+    /// ident/seq, mirroring what a peer responder emits.
+    fn build_echo_reply(from: Ipv4Addr, to: Ipv4Addr, ident: u16, seq_no: u16) -> vec::Vec<u8> {
+        let checksum_caps = ChecksumCapabilities::default();
+        let icmp_repr = Icmpv4Repr::EchoReply {
+            ident,
+            seq_no,
+            data: PING_PAYLOAD,
+        };
+        let ipv4_repr = Ipv4Repr {
+            src_addr: from,
+            dst_addr: to,
+            next_header: IpProtocol::Icmp,
+            payload_len: icmp_repr.buffer_len(),
+            hop_limit: 64,
+        };
+        let mut buf = vec![0u8; IPV4_HEADER_LEN + icmp_repr.buffer_len()];
+        {
+            let mut p = Ipv4Packet::new_unchecked(&mut buf[..]);
+            ipv4_repr.emit(&mut p, &checksum_caps);
+        }
+        {
+            let mut p = Icmpv4Packet::new_unchecked(&mut buf[IPV4_HEADER_LEN..]);
+            icmp_repr.emit(&mut p, &checksum_caps);
+        }
+        buf
+    }
+
+    #[test]
+    fn matches_reply_accepts_matching_ident_and_seq() {
+        let reply = build_echo_reply(DST, SRC, 0xABCD, 7);
+        assert!(matches_reply(&reply, SRC, DST, 0xABCD, 7));
+    }
+
+    #[test]
+    fn matches_reply_rejects_foreign_ident() {
+        // A concurrent ping's reply: correct addressing and seq, but a different ident. It must
+        // NOT satisfy this call (otherwise concurrent pings cross-match).
+        let foreign = build_echo_reply(DST, SRC, 0x1111, 7);
+        assert!(!matches_reply(&foreign, SRC, DST, 0xABCD, 7));
+    }
+
+    #[test]
+    fn matches_reply_rejects_foreign_seq() {
+        let foreign = build_echo_reply(DST, SRC, 0xABCD, 99);
+        assert!(!matches_reply(&foreign, SRC, DST, 0xABCD, 7));
+    }
+
+    #[test]
+    fn matches_reply_rejects_non_echo_reply() {
+        // An Echo *Request* with our exact ident/seq must not be accepted as our reply.
+        let request = build_echo_request(DST, SRC, 0xABCD, 7, PING_PAYLOAD);
+        assert!(!matches_reply(&request, SRC, DST, 0xABCD, 7));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn next_ident_is_unique_for_concurrent_calls() {
+        // Distinct calls get distinct idents (the per-call counter differs), so concurrent pings
+        // never share an ident and thus never cross-match.
+        let a = next_ident();
+        let b = next_ident();
+        let c = next_ident();
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(a, c);
+    }
 }

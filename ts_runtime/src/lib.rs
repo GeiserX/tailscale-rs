@@ -63,13 +63,7 @@ impl Runtime {
         let env = Env::new(
             keys,
             shutdown_rx,
-            config.accept_routes,
-            config.exit_node.clone(),
-            config.advertised_routes(),
-            config.forward_tcp_ports.clone(),
-            config.forward_udp_ports.clone(),
-            config.forward_all_ports,
-            config.forward_exit_egress,
+            env::ForwarderConfig::from_control_config(&config),
         );
 
         let dataplane = DataplaneActor::spawn(env.clone());

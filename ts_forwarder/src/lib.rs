@@ -33,7 +33,7 @@
 //! Eagerly opening one listener per port across the full `1..=65535` range would be correct but
 //! unusable: smoltcp scans every socket in `accepts()` per inbound packet, so 65535 listeners
 //! make every packet `O(65535)`. Instead, [`Forwarder::all_ports`] (and [`PortSpec::All`]) use
-//! an **on-demand** listener manager (see [`all_port`]): a raw `(Ipv4, Tcp)` socket both
+//! an **on-demand** listener manager (the private `all_port` module): a raw `(Ipv4, Tcp)` socket both
 //! suppresses smoltcp's unmatched-SYN RST (a raw socket that `accepts()` a packet sets
 //! `handled_by_raw_socket`, and `process_tcp` then returns `None` instead of `rst_reply`) and
 //! reveals each new destination port; a per-port any-IP listener is started the first time a
@@ -51,7 +51,7 @@
 
 #![forbid(unsafe_code)]
 
-pub mod all_port;
+mod all_port;
 mod class;
 mod dialer;
 mod forwarder;

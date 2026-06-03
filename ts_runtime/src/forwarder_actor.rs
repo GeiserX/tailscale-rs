@@ -45,16 +45,54 @@ fn spawn_forwarder<D: RealDialer>(
     tcp_ports: Vec<u16>,
     udp_ports: Vec<u16>,
 ) {
-    let forwarder = if all_ports {
-        Forwarder::all_ports(channel, routes, dialer)
-    } else {
-        Forwarder::new(channel, routes, dialer, tcp_ports, udp_ports)
+    let forwarder = match forwarder_mode(all_ports) {
+        ForwarderMode::AllPorts => Forwarder::all_ports(channel, routes, dialer),
+        ForwarderMode::Ports => Forwarder::new(channel, routes, dialer, tcp_ports, udp_ports),
     };
     joinset.spawn(async move {
         if let Err(e) = forwarder.run().await {
             tracing::error!(error = %e, "forwarder run loop exited");
         }
     });
+}
+
+/// Which concrete dialer the forwarder is wired with — the anti-leak gate's only output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DialerChoice {
+    /// Fail-closed default: structurally refuses exit-node egress.
+    Direct,
+    /// Explicit opt-in: egresses exit-node flows via this host's real IP.
+    HostExit,
+}
+
+/// Pure selection of the forwarder dialer from the `forward_exit_egress` gate, factored out of
+/// `on_start` so it can be unit-tested without a netstack. `HostExitDialer` is chosen iff (and
+/// only iff) exit egress is enabled; otherwise the fail-closed `DirectDialer`.
+fn dialer_choice(forward_exit_egress: bool) -> DialerChoice {
+    if forward_exit_egress {
+        DialerChoice::HostExit
+    } else {
+        DialerChoice::Direct
+    }
+}
+
+/// Whether the forwarder runs in all-port mode or forwards an explicit port set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwarderMode {
+    /// All TCP/UDP ports per advertised route (raw-socket port observer).
+    AllPorts,
+    /// Exactly the configured TCP/UDP port sets.
+    Ports,
+}
+
+/// Pure selection of the forwarder port mode from the `forward_all_ports` flag. All-port mode is
+/// chosen iff (and only iff) `forward_all_ports` is set; otherwise the explicit port sets.
+fn forwarder_mode(forward_all_ports: bool) -> ForwarderMode {
+    if forward_all_ports {
+        ForwarderMode::AllPorts
+    } else {
+        ForwarderMode::Ports
+    }
 }
 
 impl kameo::Actor for ForwarderActor {
@@ -143,8 +181,8 @@ impl kameo::Actor for ForwarderActor {
         let n_tcp_ports = tcp_ports.len();
         let n_udp_ports = udp_ports.len();
 
-        if env.forward_exit_egress {
-            spawn_forwarder(
+        match dialer_choice(env.forward_exit_egress) {
+            DialerChoice::HostExit => spawn_forwarder(
                 &mut joinset,
                 channel.clone(),
                 routes,
@@ -152,9 +190,8 @@ impl kameo::Actor for ForwarderActor {
                 all_ports,
                 tcp_ports,
                 udp_ports,
-            );
-        } else {
-            spawn_forwarder(
+            ),
+            DialerChoice::Direct => spawn_forwarder(
                 &mut joinset,
                 channel.clone(),
                 routes,
@@ -162,7 +199,7 @@ impl kameo::Actor for ForwarderActor {
                 all_ports,
                 tcp_ports,
                 udp_ports,
-            );
+            ),
         }
 
         tracing::debug!(
@@ -186,5 +223,69 @@ impl ForwarderActor {
     #[message]
     pub fn get_channel(&self) -> (Channel,) {
         (self.channel.clone(),)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::env::ForwarderConfig;
+
+    /// Build a `ForwarderConfig` toggling only the two gate bools (the historically swap-prone
+    /// adjacent params), leaving everything else fail-closed/empty.
+    fn cfg(forward_all_ports: bool, forward_exit_egress: bool) -> ForwarderConfig {
+        ForwarderConfig {
+            accept_routes: false,
+            exit_node: None,
+            forward_routes: vec![],
+            forward_tcp_ports: vec![],
+            forward_udp_ports: vec![],
+            forward_all_ports,
+            forward_exit_egress,
+        }
+    }
+
+    #[test]
+    fn host_exit_dialer_iff_forward_exit_egress() {
+        // Fail-closed default: no exit egress => the direct (refusing) dialer.
+        assert_eq!(
+            dialer_choice(cfg(false, false).forward_exit_egress),
+            DialerChoice::Direct
+        );
+        // Opt-in: exit egress => the host-exit dialer that egresses via the real IP.
+        assert_eq!(
+            dialer_choice(cfg(false, true).forward_exit_egress),
+            DialerChoice::HostExit
+        );
+        // The all-ports flag is orthogonal: it must not affect the dialer gate.
+        assert_eq!(
+            dialer_choice(cfg(true, false).forward_exit_egress),
+            DialerChoice::Direct
+        );
+        assert_eq!(
+            dialer_choice(cfg(true, true).forward_exit_egress),
+            DialerChoice::HostExit
+        );
+    }
+
+    #[test]
+    fn all_ports_mode_iff_forward_all_ports() {
+        assert_eq!(
+            forwarder_mode(cfg(false, false).forward_all_ports),
+            ForwarderMode::Ports
+        );
+        assert_eq!(
+            forwarder_mode(cfg(true, false).forward_all_ports),
+            ForwarderMode::AllPorts
+        );
+        // Orthogonal to the exit-egress gate.
+        assert_eq!(
+            forwarder_mode(cfg(false, true).forward_all_ports),
+            ForwarderMode::Ports
+        );
+        assert_eq!(
+            forwarder_mode(cfg(true, true).forward_all_ports),
+            ForwarderMode::AllPorts
+        );
     }
 }

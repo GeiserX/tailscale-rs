@@ -1,6 +1,6 @@
 //! The UDP socket engine: one socket carrying disco + WireGuard, demuxed by magic prefix.
 
-use core::net::SocketAddr;
+use core::net::{IpAddr, SocketAddr};
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -38,6 +38,49 @@ pub struct ReceivedData {
 
 /// Shared, per-peer path state keyed by the peer's disco key.
 type Paths = Arc<Mutex<HashMap<DiscoPublicKey, PeerPaths>>>;
+
+/// Whether a peer-supplied candidate endpoint is safe to probe with a disco ping.
+///
+/// Disco datagrams are emitted from the node's single real host socket, so a candidate
+/// address advertised by a remote peer (in a `CallMeMaybe`, or as a ping/data source) is an
+/// attacker-controllable target: an authenticated-but-malicious tailnet peer could otherwise
+/// make this node spray host-sourced UDP probes at arbitrary hosts (an SSRF-style internal
+/// scan, or a reachability oracle via pong timing). This filter is the choke point that drops
+/// addresses that must never be probed, fail-closed (drop on any doubt).
+///
+/// Rejected:
+/// - any IPv6 address — the underlay is IPv4-only in this deployment (IPv6 is disabled), so an
+///   IPv6 candidate can only be noise or an attempt to reach a forbidden surface;
+/// - unspecified (`0.0.0.0`);
+/// - loopback (`127.0.0.0/8`) — would let a peer probe this host's own services;
+/// - link-local (`169.254.0.0/16`);
+/// - multicast and broadcast (`255.255.255.255`);
+/// - RFC1918 private ranges (`10/8`, `172.16/12`, `192.168/16`). This fork's topology is
+///   known-public-VPS (see `path.rs`); there is no supported direct-LAN connectivity path, so
+///   private candidates are dropped rather than letting a peer steer host-sourced probes onto
+///   the local network. If LAN connectivity ever becomes a supported path, relax *only* this
+///   clause and keep every other rejection.
+///
+/// Accepted: any other (public, routable) IPv4 address.
+fn is_pingable_candidate(addr: &SocketAddr) -> bool {
+    let ip = match addr.ip() {
+        IpAddr::V4(ip) => ip,
+        // IPv6 underlay is disabled; never probe an IPv6 candidate.
+        IpAddr::V6(_) => return false,
+    };
+
+    if ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+        || ip.is_private()
+    {
+        return false;
+    }
+
+    true
+}
 
 /// A direct UDP transport over a single shared socket.
 ///
@@ -148,7 +191,25 @@ impl MagicSock {
         peer: DiscoPublicKey,
         endpoints: impl IntoIterator<Item = SocketAddr>,
     ) {
-        let eps: Vec<SocketAddr> = endpoints.into_iter().collect();
+        // These addresses are peer-supplied (a CallMeMaybe's endpoint list, or an inbound
+        // ping's source). Sanitize them before they can become disco-ping targets emitted from
+        // the real host socket: drop anything that must never be probed (loopback, link-local,
+        // private, multicast, IPv6, etc). Fail-closed — a dropped candidate just means the peer
+        // stays on DERP, which is the safe default. See [`is_pingable_candidate`].
+        let eps: Vec<SocketAddr> = endpoints
+            .into_iter()
+            .filter(|ep| {
+                let ok = is_pingable_candidate(ep);
+                if !ok {
+                    tracing::debug!(%ep, "dropping non-pingable peer candidate endpoint");
+                }
+                ok
+            })
+            .collect();
+
+        if eps.is_empty() {
+            return;
+        }
 
         {
             let mut a2d = self.addr_to_disco.lock().unwrap();
@@ -157,6 +218,29 @@ impl MagicSock {
             }
         }
 
+        let mut paths = self.paths.lock().unwrap();
+        paths.entry(peer).or_default().add_learned_candidates(eps);
+    }
+
+    /// Test-only: register candidate endpoints *without* the [`is_pingable_candidate`] filter.
+    ///
+    /// The end-to-end tests run two magicsocks over loopback, but loopback is (correctly)
+    /// rejected by the production filter. This seam lets those tests exercise the real
+    /// ping/pong/data path over loopback without weakening the filter that guards the live
+    /// entry point [`MagicSock::add_peer_endpoints`].
+    #[cfg(test)]
+    fn add_peer_endpoints_unfiltered(
+        &self,
+        peer: DiscoPublicKey,
+        endpoints: impl IntoIterator<Item = SocketAddr>,
+    ) {
+        let eps: Vec<SocketAddr> = endpoints.into_iter().collect();
+        {
+            let mut a2d = self.addr_to_disco.lock().unwrap();
+            for ep in &eps {
+                a2d.insert(*ep, peer);
+            }
+        }
         let mut paths = self.paths.lock().unwrap();
         paths.entry(peer).or_default().add_learned_candidates(eps);
     }
@@ -300,7 +384,21 @@ impl MagicSock {
 
     async fn handle_disco(&self, msg: Inbound, from: SocketAddr) -> Result<(), Error> {
         match msg {
-            Inbound::Ping { sender, tx_id, .. } => {
+            Inbound::Ping {
+                sender,
+                tx_id,
+                claimed_node_key: _,
+            } => {
+                // The ping carries a `claimed_node_key`, which disco intends to be cross-checked
+                // against the control netmap (does this disco key really belong to this node
+                // key?). That binding cannot be enforced at this layer: `MagicSock` has no netmap
+                // / disco-key->node-key map (see the struct fields above), only path state keyed
+                // by disco key. The check therefore lives in the route layer that owns the
+                // netmap. We deliberately do not fabricate a half-check here. The ping is still
+                // authenticated (it opened under our disco key), so learning the source and
+                // ponging is sound; it just is not yet bound to a control-advertised node key.
+                // TODO(parity): enforce the disco<->node-key binding in the netmap-owning layer.
+                //
                 // Learn this source as a candidate path for the sender and answer the ping.
                 self.add_peer_endpoints(sender, [from]);
                 let pong = disco::seal_pong(&self.our_disco, &sender, tx_id, from)?;
@@ -430,6 +528,111 @@ mod tests {
         "127.0.0.1:0".parse().unwrap()
     }
 
+    #[test]
+    fn is_pingable_candidate_rejects_forbidden_classes() {
+        // Each must be dropped before it can become a host-sourced ping target.
+        let forbidden: &[&str] = &[
+            "0.0.0.0:41641",         // unspecified
+            "127.0.0.1:41641",       // loopback
+            "127.5.6.7:41641",       // loopback (whole /8)
+            "169.254.1.1:41641",     // link-local
+            "224.0.0.1:41641",       // multicast
+            "255.255.255.255:41641", // broadcast
+            "10.0.0.5:41641",        // RFC1918 (10/8)
+            "172.16.3.4:41641",      // RFC1918 (172.16/12)
+            "192.168.1.1:41641",     // RFC1918 (192.168/16)
+            "[::1]:41641",           // IPv6 loopback (underlay is IPv4-only)
+            "[2001:db8::1]:41641",   // IPv6 public (still dropped: no IPv6 underlay)
+        ];
+        for s in forbidden {
+            let addr: SocketAddr = s.parse().unwrap();
+            assert!(
+                !is_pingable_candidate(&addr),
+                "{s} must be rejected as a ping candidate"
+            );
+        }
+    }
+
+    #[test]
+    fn is_pingable_candidate_accepts_public_ipv4() {
+        // Documentation/test ranges (RFC5737) are public/routable from the filter's view.
+        for s in ["203.0.113.7:41641", "198.51.100.2:3478"] {
+            let addr: SocketAddr = s.parse().unwrap();
+            assert!(
+                is_pingable_candidate(&addr),
+                "{s} should be accepted as a ping candidate"
+            );
+        }
+    }
+
+    /// A peer-supplied candidate that is a forbidden target (e.g. a loopback or private
+    /// address) must never be learned as a path, so `send_pings` cannot emit a host-sourced
+    /// probe to it. A public candidate offered alongside it is still accepted.
+    #[tokio::test]
+    async fn add_peer_endpoints_drops_forbidden_candidates() {
+        let a = MagicSock::bind(
+            localhost(),
+            DiscoPrivateKey::random(),
+            ts_keys::NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap();
+
+        let peer = DiscoPrivateKey::random().public_key();
+        let loopback: SocketAddr = "127.0.0.1:41641".parse().unwrap();
+        let private: SocketAddr = "192.168.1.50:41641".parse().unwrap();
+        let public: SocketAddr = "203.0.113.9:41641".parse().unwrap();
+
+        a.add_peer_endpoints(peer, [loopback, private, public]);
+
+        let candidates = {
+            let paths = a.paths.lock().unwrap();
+            paths.get(&peer).unwrap().candidate_addrs()
+        };
+        assert_eq!(
+            candidates,
+            vec![public],
+            "only the public candidate should be retained: {candidates:?}"
+        );
+
+        // And the reverse attribution map must not have learned the forbidden addresses.
+        let a2d = a.addr_to_disco.lock().unwrap();
+        assert!(a2d.contains_key(&public), "public addr is attributed");
+        assert!(!a2d.contains_key(&loopback), "loopback must not be learned");
+        assert!(!a2d.contains_key(&private), "private must not be learned");
+    }
+
+    /// If every offered candidate is forbidden, the peer is not even created as a paths entry
+    /// (nothing to ping), and no attribution is learned.
+    #[tokio::test]
+    async fn add_peer_endpoints_all_forbidden_is_noop() {
+        let a = MagicSock::bind(
+            localhost(),
+            DiscoPrivateKey::random(),
+            ts_keys::NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap();
+
+        let peer = DiscoPrivateKey::random().public_key();
+        a.add_peer_endpoints(
+            peer,
+            [
+                "127.0.0.1:1".parse().unwrap(),
+                "10.0.0.1:2".parse().unwrap(),
+            ],
+        );
+
+        assert!(
+            a.paths.lock().unwrap().get(&peer).is_none(),
+            "no path entry should be created for an all-forbidden candidate set"
+        );
+        assert!(
+            a.addr_to_disco.lock().unwrap().is_empty(),
+            "no attribution should be learned"
+        );
+    }
+
     /// Two magicsocks on loopback: A pings B's endpoint, B pongs, A confirms a direct path,
     /// then A sends WireGuard data that B receives. This is the npts.4 MVP end-to-end with
     /// no control server or DERP.
@@ -443,7 +646,12 @@ mod tests {
         let a = Arc::new(MagicSock::bind(localhost(), a_disco, a_node).await.unwrap());
         let b = Arc::new(MagicSock::bind(localhost(), b_disco, b_node).await.unwrap());
 
+        let a_addr = a.local_addr().unwrap();
         let b_addr = b.local_addr().unwrap();
+
+        // The production candidate filter (correctly) rejects loopback, so seed both directions
+        // through the test-only unfiltered seam to exercise the real ping/pong/data path here.
+        b.add_peer_endpoints_unfiltered(a_disco.public_key(), [a_addr]);
 
         // Run B's receive loop in the background; it answers pings and yields data.
         let b_for_pump = b.clone();
@@ -461,7 +669,7 @@ mod tests {
             tokio::spawn(async move { while let Ok(Some(_)) = a_for_pump.recv_data().await {} });
 
         // A learns B's endpoint and pings it.
-        a.add_peer_endpoints(b_disco.public_key(), [b_addr]);
+        a.add_peer_endpoints_unfiltered(b_disco.public_key(), [b_addr]);
         let sent = a.send_pings().await.unwrap();
         assert_eq!(sent, 1, "should ping B's one endpoint");
 
@@ -531,7 +739,8 @@ mod tests {
         let a_pump =
             tokio::spawn(async move { while let Ok(Some(_)) = a_for_pump.recv_data().await {} });
 
-        a.add_peer_endpoints(b_disco.public_key(), [b_addr]);
+        // Loopback is rejected by the production filter; use the test-only unfiltered seam.
+        a.add_peer_endpoints_unfiltered(b_disco.public_key(), [b_addr]);
         a.send_pings().await.unwrap();
 
         // Wait until A has learned a reflexive endpoint (driven by B's pong echoing A's src).
@@ -624,14 +833,19 @@ mod tests {
 
         let a_sock = Arc::new(MagicSock::bind(localhost(), a_disco, a_node).await.unwrap());
         let b_sock = Arc::new(MagicSock::bind(localhost(), b_disco, b_node).await.unwrap());
+        let a_addr = a_sock.local_addr().unwrap();
         let b_addr = b_sock.local_addr().unwrap();
+
+        // Loopback is rejected by the production filter; seed both directions via the test-only
+        // unfiltered seam so the real ping/pong/data path is exercised over loopback.
+        b_sock.add_peer_endpoints_unfiltered(a_disco.public_key(), [a_addr]);
 
         // Wrap both in DirectTransport: each spawns a recv pump that answers pings/pongs.
         let a_xport = DirectTransport::new(a_sock.clone());
         let b_xport = DirectTransport::new(b_sock);
 
         // A learns B's endpoint and pings it; the pumps confirm the path.
-        a_sock.add_peer_endpoints(b_disco.public_key(), [b_addr]);
+        a_sock.add_peer_endpoints_unfiltered(b_disco.public_key(), [b_addr]);
         a_sock.send_pings().await.unwrap();
 
         let confirm = async {

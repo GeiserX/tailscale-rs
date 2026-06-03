@@ -64,9 +64,14 @@ pub struct EndpointAdvertisement {
 const BIND_ADDR: &str = "0.0.0.0:0";
 
 /// Owns the direct (disco) UDP underlay and bridges it to the dataplane.
+///
+/// `sock`/`transport_id` are `Option`: if the underlay UDP socket fails to bind at startup the
+/// manager stays **inert** (both `None`) rather than panicking, and the runtime continues
+/// DERP-only. DERP-only is the anti-leak-safe fallback — there is simply no direct path to offer,
+/// so no peer is ever upgraded off DERP and the real origin IP cannot leak.
 pub struct DirectManager {
-    sock: Arc<MagicSock>,
-    transport_id: UnderlayTransportId,
+    sock: Option<Arc<MagicSock>>,
+    transport_id: Option<UnderlayTransportId>,
     peer_db: Arc<RwLock<Option<Arc<PeerDb>>>>,
     #[allow(dead_code)]
     tasks: JoinSet<()>,
@@ -76,11 +81,12 @@ pub struct DirectManager {
 impl DirectManager {
     /// The id of the single direct underlay transport registered with the dataplane.
     ///
-    /// Wrapped in `Option` to satisfy kameo's `Reply` bound (a bare newtype is not a reply);
-    /// it is always `Some` once the actor has started.
+    /// `Some` once the actor has started and the underlay socket bound; `None` if the bind failed
+    /// at startup, in which case the route updater stays DERP-only (fail-closed). The `Option`
+    /// also satisfies kameo's `Reply` bound (a bare newtype is not a reply).
     #[message]
     pub fn direct_transport_id(&self) -> Option<UnderlayTransportId> {
-        Some(self.transport_id)
+        self.transport_id
     }
 
     /// Of the given peers, return those that currently have a trusted direct path.
@@ -91,6 +97,11 @@ impl DirectManager {
     #[message]
     pub fn peers_with_direct_path(&self, ids: Vec<PeerId>) -> HashSet<PeerId> {
         let mut ready = HashSet::new();
+
+        // No bound underlay socket (bind failed => inert, DERP-only): no peer has a direct path.
+        let Some(sock) = self.sock.as_ref() else {
+            return ready;
+        };
 
         let db = self.peer_db.read().unwrap();
         let Some(db) = db.as_ref() else {
@@ -104,7 +115,7 @@ impl DirectManager {
             let Some(disco) = node.disco_key else {
                 continue;
             };
-            if self.sock.best_addr(&disco).is_some() {
+            if sock.best_addr(&disco).is_some() {
                 ready.insert(id);
             }
         }
@@ -319,20 +330,39 @@ impl kameo::Actor for DirectManager {
     ) -> Result<Self, Self::Error> {
         env.subscribe::<Arc<PeerState>>(&slf).await?;
 
-        let bind_addr: SocketAddr = BIND_ADDR.parse().expect("valid bind address");
-        // Binding an ephemeral IPv4 UDP port is infallible in practice; a failure here means
-        // the host has no sockets available, in which case the runtime cannot function at all.
-        let sock = Arc::new(
-            MagicSock::bind(
-                bind_addr,
-                env.keys.disco_keys.private,
-                env.keys.node_keys.public,
-            )
-            .await
-            .expect("bind direct underlay socket"),
-        );
-
         let peer_db: Arc<RwLock<Option<Arc<PeerDb>>>> = Default::default();
+        let mut tasks = JoinSet::new();
+
+        // The bind address is a hardcoded, infallible constant; only the parse can't fail.
+        let bind_addr: SocketAddr = BIND_ADDR.parse().expect("valid bind address");
+
+        // Bind the direct underlay UDP socket. A bind failure is transient/environmental (e.g. no
+        // ephemeral ports available); rather than panicking the actor we degrade to **DERP-only**
+        // and stay inert. DERP-only is the anti-leak-safe fallback (no direct path is ever offered,
+        // so the real origin IP can't leak), mirroring the MagicDNS responder's bind-failure
+        // posture. The route updater treats a `None` transport id as "stay on DERP" (fail-closed).
+        let sock = match MagicSock::bind(
+            bind_addr,
+            env.keys.disco_keys.private,
+            env.keys.node_keys.public,
+        )
+        .await
+        {
+            Ok(sock) => Arc::new(sock),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    %bind_addr,
+                    "direct underlay udp bind failed; direct manager inert, staying DERP-only",
+                );
+                return Ok(Self {
+                    sock: None,
+                    transport_id: None,
+                    peer_db,
+                    tasks,
+                });
+            }
+        };
 
         let (transport_id, from_dataplane, to_dataplane) =
             dataplane.ask(NewUnderlayTransport).await?;
@@ -340,7 +370,6 @@ impl kameo::Actor for DirectManager {
         let transport =
             DirectTransport::new(sock.clone()).with_key_lookup(DiscoPeerLookup(peer_db.clone()));
 
-        let mut tasks = JoinSet::new();
         tasks.spawn(run_direct(
             transport,
             from_dataplane,
@@ -361,8 +390,8 @@ impl kameo::Actor for DirectManager {
         ));
 
         Ok(Self {
-            sock,
-            transport_id,
+            sock: Some(sock),
+            transport_id: Some(transport_id),
             peer_db,
             tasks,
         })
@@ -377,16 +406,22 @@ impl Message<Arc<PeerState>> for DirectManager {
         // so an address it stops advertising must be pruned (otherwise a revoked/reassigned addr
         // stays a ping candidate forever and could be re-confirmed as a direct path). Peers that
         // leave the netmap entirely are dropped so both path and attribution maps stay bounded.
-        let mut live = HashSet::new();
-        for node in msg.peers.peers().values() {
-            let Some(disco) = node.disco_key else {
-                continue;
-            };
-            live.insert(disco);
-            self.sock
-                .set_netmap_endpoints(disco, node.underlay_addresses.iter().copied());
+        //
+        // When the underlay bind failed at startup (`sock == None`) we're inert/DERP-only: there is
+        // no socket to reconcile endpoints against, so skip it. We still keep `peer_db` current for
+        // any other consumers and so the manager recovers no worse than the route-updater's
+        // DERP-only path.
+        if let Some(sock) = self.sock.as_ref() {
+            let mut live = HashSet::new();
+            for node in msg.peers.peers().values() {
+                let Some(disco) = node.disco_key else {
+                    continue;
+                };
+                live.insert(disco);
+                sock.set_netmap_endpoints(disco, node.underlay_addresses.iter().copied());
+            }
+            sock.retain_peers(&live);
         }
-        self.sock.retain_peers(&live);
 
         let mut db = self.peer_db.write().unwrap();
         *db = Some(msg.peers.clone());

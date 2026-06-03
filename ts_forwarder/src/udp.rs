@@ -14,6 +14,15 @@ use crate::{class::RouteTable, dialer::RealDialer};
 
 /// How long a UDP flow may sit idle before it is reaped.
 const UDP_IDLE: Duration = Duration::from_secs(30);
+/// How often the idle reaper runs. Set to half [`UDP_IDLE`] so the worst-case idle lifetime of a
+/// flow is ~`UDP_IDLE * 1.5` rather than ~`2 * UDP_IDLE` (the granularity error of reaping only
+/// once per idle window).
+const UDP_REAP_INTERVAL: Duration = Duration::from_secs(15);
+/// Max time to wait for the real backend UDP dial to complete before dropping the flow.
+///
+/// `dial_udp` binds + `connect`s a real socket; a stalled dial must not block the per-port recv
+/// loop indefinitely. On timeout the datagram is dropped (fail-closed) — never direct-dialed.
+const UDP_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Max payload we read from a real reply socket in one go.
 const MAX_DATAGRAM: usize = 65_535;
 
@@ -49,7 +58,7 @@ pub(crate) async fn run_udp_port<D: RealDialer>(
     tracing::debug!(%port, "udp forwarder listening");
 
     let mut flows: HashMap<(SocketAddr, SocketAddr), FlowState> = HashMap::new();
-    let mut reap = tokio::time::interval(UDP_IDLE);
+    let mut reap = tokio::time::interval(UDP_REAP_INTERVAL);
     reap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
@@ -67,10 +76,19 @@ pub(crate) async fn run_udp_port<D: RealDialer>(
                             tracing::warn!(%dst, %peer, "drop: destination not advertised");
                             continue;
                         };
-                        let dialed = match dialer.dial_udp(class, dst).await {
-                            Ok(d) => d,
-                            Err(e) => {
+                        let dialed = match tokio::time::timeout(
+                            UDP_DIAL_TIMEOUT,
+                            dialer.dial_udp(class, dst),
+                        )
+                        .await
+                        {
+                            Ok(Ok(d)) => d,
+                            Ok(Err(e)) => {
                                 tracing::warn!(%dst, %peer, ?class, error = %e, "udp dial refused or failed");
+                                continue;
+                            }
+                            Err(_elapsed) => {
+                                tracing::warn!(%dst, %peer, ?class, "drop: udp dial timed out");
                                 continue;
                             }
                         };

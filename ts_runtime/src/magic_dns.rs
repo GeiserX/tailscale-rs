@@ -150,12 +150,7 @@ impl DnsView {
     fn route_for(&self, name: &str) -> Upstreams<'_> {
         let mut best: Option<(&str, &Vec<DnsResolver>)> = None;
         for (suffix, upstreams) in &self.cfg.routes {
-            let matches = name == suffix
-                || (name.len() > suffix.len() && name.ends_with(suffix.as_str()) && {
-                    // Boundary must be a label boundary: "a.corp" matches "corp", "acorp" does not.
-                    name.as_bytes()[name.len() - suffix.len() - 1] == b'.'
-                });
-            if matches && best.is_none_or(|(b, _)| suffix.len() > b.len()) {
+            if suffix_matches(name, suffix) && best.is_none_or(|(b, _)| suffix.len() > b.len()) {
                 best = Some((suffix.as_str(), upstreams));
             }
         }
@@ -205,16 +200,36 @@ enum Decision {
     },
 }
 
+/// Whether `name` is `suffix` or sits under it at a label boundary: `"a.corp"` matches `"corp"`,
+/// `"acorp"` does not. An **empty** suffix never matches (defense-in-depth: an empty suffix would
+/// otherwise make `ends_with("")` match every name and either over-route or treat everything as a
+/// tailnet name — both leak-prone).
+fn suffix_matches(name: &str, suffix: &str) -> bool {
+    if suffix.is_empty() {
+        return false;
+    }
+    name == suffix
+        || (name.len() > suffix.len()
+            && name.ends_with(suffix)
+            && name.as_bytes()[name.len() - suffix.len() - 1] == b'.')
+}
+
 /// Returns `true` if `name` falls under one of the tailnet search domains. Such names are
 /// authoritative MagicDNS names and are NEVER forwarded to an upstream resolver — anti-leak: a
 /// tailnet name (and the fact that it was queried) must not escape to a third-party resolver.
 fn is_tailnet_name(view: &DnsView, name: &str) -> bool {
-    view.cfg.search_domains.iter().any(|suffix| {
-        name == suffix
-            || (name.len() > suffix.len()
-                && name.ends_with(suffix.as_str())
-                && name.as_bytes()[name.len() - suffix.len() - 1] == b'.')
-    })
+    view.cfg
+        .search_domains
+        .iter()
+        .any(|suffix| suffix_matches(name, suffix))
+}
+
+/// Whether `name` is an IPv6 reverse-DNS (`PTR`) name (ends in `ip6.arpa`). This fork is IPv4-only
+/// on the tailnet; an IPv6 reverse lookup must NEVER be forwarded to a third-party resolver
+/// (anti-leak: it would reveal that a tailnet v6 address — e.g. a ULA `fd7a:…` — was probed). All
+/// such queries fail closed to NXDOMAIN.
+fn is_ip6_arpa(name: &str) -> bool {
+    suffix_matches(name, "ip6.arpa")
 }
 
 /// Whether `ip` is in the Tailscale CGNAT range `100.64.0.0/10` (RFC 6598, the tailnet IPv4 space).
@@ -281,6 +296,10 @@ fn decide(view: &DnsView, buf: &[u8]) -> Option<Decision> {
                     None => forward_or_nxdomain(view, &canon, buf, id, q),
                 }
             }
+            // Anti-leak / IPv4-only-tailnet: an IPv6 reverse (`ip6.arpa`) PTR must never be
+            // forwarded — relaying it would reveal that a tailnet v6 address (e.g. a ULA `fd7a:…`)
+            // was probed. Fail closed to NXDOMAIN, exactly like the IPv4 CGNAT guard above.
+            None if is_ip6_arpa(&canon) => reply(Rcode::NxDomain, &[]),
             None => forward_or_nxdomain(view, &canon, buf, id, q),
         },
         // Anything else (TXT, SRV, ...) is refused: we only serve MagicDNS host records and
@@ -330,17 +349,77 @@ fn forward_or_nxdomain(
     }
 }
 
-/// Whether `resp` is a plausible DNS response to `query`: same 16-bit transaction id and the QR
-/// (response) bit set. Both buffers carry the DNS header in the first 4 bytes (id at [0..2], flags
-/// at [2..4], QR is the high bit of byte 2). Used to reject off-path/forged datagrams before
-/// relaying them back to the stub resolver as authoritative.
+/// Cap a forwarded upstream response to a single UDP datagram ([`MAX_UPSTREAM_RESPONSE`]). When the
+/// response is too large it is truncated mid-message, so we set the `TC` (truncation) flag in the
+/// DNS header (byte 2, bit `0x02`) telling the stub resolver to retry over TCP — relaying a chopped
+/// answer without `TC` would surface a malformed-but-"complete" message. The flag is only set when
+/// truncation actually occurs.
+fn cap_response(mut resp: Vec<u8>) -> Vec<u8> {
+    if resp.len() > MAX_UPSTREAM_RESPONSE {
+        resp.truncate(MAX_UPSTREAM_RESPONSE);
+        // The header is 12 bytes; the TC bit lives in the second flags byte (header byte 2). A
+        // capped datagram is always >= the header length, but guard anyway to never panic.
+        if let Some(flags_hi) = resp.get_mut(2) {
+            *flags_hi |= 0x02;
+        }
+    }
+    resp
+}
+
+/// The byte length of a fixed DNS header.
+const DNS_HEADER_LEN: usize = 12;
+
+/// Return the byte range of the first question section (QNAME + QTYPE + QCLASS) within `msg`,
+/// starting just after the 12-byte header. Returns [`None`] if the name is malformed, uses a
+/// compression pointer (illegal in a question), or runs past the buffer. Used to byte-compare a
+/// forwarded query's question against the upstream response's question.
+fn question_range(msg: &[u8]) -> Option<std::ops::Range<usize>> {
+    let mut off = DNS_HEADER_LEN;
+    // Walk the QNAME label sequence to the terminating root label (0x00).
+    loop {
+        let len = *msg.get(off)? as usize;
+        // A compression pointer (top two bits set) is not valid in a question section.
+        if len & 0xC0 != 0 {
+            return None;
+        }
+        off += 1;
+        if len == 0 {
+            break; // root label: QNAME complete.
+        }
+        off = off.checked_add(len)?;
+        if off > msg.len() {
+            return None;
+        }
+    }
+    // QTYPE (2) + QCLASS (2) follow the name.
+    let end = off.checked_add(4)?;
+    if end > msg.len() {
+        return None;
+    }
+    Some(DNS_HEADER_LEN..end)
+}
+
+/// Whether `resp` is a plausible DNS response to `query`: same 16-bit transaction id, the QR
+/// (response) bit set, and a byte-identical question section (QNAME + QTYPE + QCLASS). Both buffers
+/// carry the DNS header in the first 12 bytes (id at [0..2], flags at [2..4], QR is the high bit of
+/// byte 2). Used to reject off-path/forged datagrams before relaying them back to the stub resolver
+/// as authoritative: matching only the id + QR lets an injector that guesses the id swap in an
+/// answer for a different question, so we also require the echoed question to match.
 fn response_matches_query(query: &[u8], resp: &[u8]) -> bool {
-    if query.len() < 4 || resp.len() < 4 {
+    if query.len() < DNS_HEADER_LEN || resp.len() < DNS_HEADER_LEN {
         return false;
     }
     let id_matches = query[0..2] == resp[0..2];
     let is_response = resp[2] & 0x80 != 0;
-    id_matches && is_response
+    if !id_matches || !is_response {
+        return false;
+    }
+    // The response must echo the exact question we asked. Parse both question sections and compare
+    // their bytes; a parse failure on either side is treated as a non-match (fail closed).
+    match (question_range(query), question_range(resp)) {
+        (Some(q), Some(r)) => query[q] == resp[r],
+        _ => false,
+    }
 }
 
 /// Forward `query` to each upstream in order over the **overlay** netstack, returning the first
@@ -383,9 +462,7 @@ async fn forward_query(
                     tracing::debug!(%upstream, %from, "magic dns dropping unsolicited/mismatched response");
                     continue;
                 }
-                let mut out = resp.to_vec();
-                out.truncate(MAX_UPSTREAM_RESPONSE);
-                return out;
+                return cap_response(resp.to_vec());
             }
             Ok(Ok(_)) => continue,
             Ok(Err(e)) => {
@@ -1122,6 +1199,150 @@ mod tests {
                 assert_eq!(ancount, 1);
             }
             Decision::Forward { .. } => panic!("overlay match must not forward"),
+        }
+    }
+
+    #[test]
+    fn ipv6_reverse_ptr_is_nxdomain_not_forwarded() {
+        // Anti-leak: an `ip6.arpa` reverse PTR for a tailnet ULA (fd7a:…) must fail closed to
+        // NXDOMAIN, never be forwarded — even with an upstream resolver configured. This fork is
+        // IPv4-only on the tailnet; forwarding would reveal that a v6 address was probed.
+        let view = view_with_routes(
+            std::collections::BTreeMap::new(),
+            vec![udp("8.8.8.8:53")],
+            vec![udp("1.1.1.1:53")],
+        );
+        // Reverse name for fd7a::1 (nibble-reversed) under ip6.arpa. The exact nibble labels don't
+        // matter to the guard — any name ending in ip6.arpa must fail closed.
+        let labels = vec![
+            "1", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0",
+            "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "a", "7", "d", "f", "ip6",
+            "arpa",
+        ];
+        let buf = build_query(0x200, &labels, 12, 1);
+
+        match decide(&view, &buf).expect("decides") {
+            Decision::Reply(resp) => {
+                let (_, rcode, _) = parse_header(&resp);
+                assert_eq!(
+                    rcode, 3,
+                    "NxDomain: ip6.arpa reverse must not leak upstream"
+                );
+            }
+            Decision::Forward { .. } => panic!("ip6.arpa PTR must never be forwarded"),
+        }
+    }
+
+    #[test]
+    fn cap_response_sets_tc_when_truncated() {
+        // An oversize upstream answer is capped to a single datagram AND marked truncated (TC bit)
+        // so the stub resolver retries over TCP rather than trusting a chopped message.
+        let mut big = build_query(0x300, &["example", "com"], 1, 1);
+        big[2] |= 0x80; // make it a response (QR=1)
+        big.resize(MAX_UPSTREAM_RESPONSE + 500, 0xAB);
+
+        let out = cap_response(big);
+        assert_eq!(out.len(), MAX_UPSTREAM_RESPONSE, "capped to one datagram");
+        assert_ne!(out[2] & 0x02, 0, "TC bit set on truncation");
+    }
+
+    #[test]
+    fn cap_response_leaves_small_response_untouched() {
+        // A response that fits is returned verbatim with no TC bit forced on.
+        let mut small = build_query(0x301, &["example", "com"], 1, 1);
+        small[2] |= 0x80;
+        let before = small.clone();
+
+        let out = cap_response(small);
+        assert_eq!(out, before, "small response unchanged");
+        assert_eq!(out[2] & 0x02, 0, "TC bit not set when no truncation");
+    }
+
+    #[test]
+    fn response_matches_query_rejects_mismatched_question() {
+        // id + QR match but the echoed question differs (different QNAME) => rejected. This guards
+        // against an off-path injector that guesses the id but answers a different question.
+        let query = build_query(0x1234, &["a", "com"], 1, 1);
+
+        let mut wrong_question = build_query(0x1234, &["b", "com"], 1, 1);
+        wrong_question[2] |= 0x80; // QR=1, same id
+        assert!(
+            !response_matches_query(&query, &wrong_question),
+            "different QNAME must be rejected"
+        );
+
+        // A different QTYPE with the same name is also rejected.
+        let mut wrong_qtype = build_query(0x1234, &["a", "com"], 28, 1);
+        wrong_qtype[2] |= 0x80;
+        assert!(
+            !response_matches_query(&query, &wrong_qtype),
+            "different QTYPE must be rejected"
+        );
+
+        // The exact echoed question with QR=1 is accepted.
+        let mut good = query.clone();
+        good[2] |= 0x80;
+        assert!(
+            response_matches_query(&query, &good),
+            "matching question accepted"
+        );
+    }
+
+    #[test]
+    fn suffix_matches_handles_boundaries_and_empty() {
+        // Exact and label-boundary matches.
+        assert!(suffix_matches("corp", "corp"));
+        assert!(suffix_matches("a.corp", "corp"));
+        assert!(suffix_matches("a.b.corp", "corp"));
+        // Not a label boundary.
+        assert!(!suffix_matches("acorp", "corp"));
+        // Empty suffix never matches (defense-in-depth against `ends_with("")`).
+        assert!(!suffix_matches("anything.example", ""));
+        assert!(!suffix_matches("", ""));
+    }
+
+    #[test]
+    fn empty_search_domain_does_not_capture_everything() {
+        // Defense-in-depth: an empty search domain must NOT make every name look like a tailnet
+        // name (which would fail-close legitimate recursive queries / mis-route). With an empty
+        // suffix present alongside a real resolver, an off-tailnet name still forwards.
+        let mut view = view_with_routes(
+            std::collections::BTreeMap::new(),
+            vec![udp("8.8.8.8:53")],
+            vec![],
+        );
+        view.cfg.search_domains = vec![String::new()];
+        let buf = build_query(0x400, &["example", "com"], 1, 1);
+
+        match decide(&view, &buf).expect("decides") {
+            Decision::Forward { upstreams, .. } => {
+                assert_eq!(upstreams, vec!["8.8.8.8:53".parse().unwrap()]);
+            }
+            Decision::Reply(_) => {
+                panic!("empty search domain must not treat every name as tailnet")
+            }
+        }
+    }
+
+    #[test]
+    fn empty_route_suffix_does_not_capture_everything() {
+        // Defense-in-depth: an empty route suffix must not match every name (which would route all
+        // queries to that route's upstreams). With an empty-suffix route present, an unrelated name
+        // still falls through to the global resolver.
+        let mut routes = std::collections::BTreeMap::new();
+        routes.insert(String::new(), vec![udp("10.9.9.9:53")]);
+        let view = view_with_routes(routes, vec![udp("8.8.8.8:53")], vec![]);
+        let buf = build_query(0x401, &["example", "com"], 1, 1);
+
+        match decide(&view, &buf).expect("decides") {
+            Decision::Forward { upstreams, .. } => {
+                assert_eq!(
+                    upstreams,
+                    vec!["8.8.8.8:53".parse().unwrap()],
+                    "empty route suffix must not capture; falls through to global"
+                );
+            }
+            Decision::Reply(_) => panic!("expected forward to global resolver"),
         }
     }
 }
