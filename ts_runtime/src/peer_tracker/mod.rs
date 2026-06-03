@@ -7,10 +7,11 @@ use kameo::{
     message::{Context, Message},
     reply::ReplySender,
 };
+use tokio::sync::watch;
 use ts_control::Node;
 use ts_transport::PeerId;
 
-use crate::{Error, env::Env};
+use crate::{Error, env::Env, status::StatusNode};
 
 mod peer_db;
 
@@ -21,17 +22,36 @@ pub struct PeerTracker {
     peer_db: PeerDb,
     seen_state_update: bool,
     pending_requests: Vec<Pending>,
+    /// Latest peer snapshot, published on every netmap update so embedders can watch for peer
+    /// changes ([`WatchNetmap`]).
+    peer_watch: watch::Sender<Vec<StatusNode>>,
     env: Env,
 }
 
 impl PeerTracker {
     fn peer_by_name_opt(&self, name: &str) -> Option<&Node> {
-        let name = name.trim_end_matches('.');
+        // Canonicalization (case + trailing dot) is handled inside the name index lookup.
         self.peer_db.get(&name).map(|(_id, node)| node)
     }
 
     fn peer_by_tailnet_ip_opt(&self, ip: IpAddr) -> Option<&Node> {
         self.peer_db.get(&ip).map(|(_id, node)| node)
+    }
+
+    /// Build the peer entries for a [`Status`](crate::Status) snapshot from the current peer db.
+    fn status_peers(&self) -> Vec<StatusNode> {
+        self.peer_db
+            .peers()
+            .values()
+            .map(StatusNode::from_node)
+            .collect()
+    }
+
+    fn whois_opt(&self, addr: std::net::SocketAddr) -> Option<crate::status::WhoIs> {
+        let ip = crate::status::whois_addr(addr);
+        self.peer_by_tailnet_ip_opt(ip)
+            .cloned()
+            .map(crate::status::WhoIs::from_node)
     }
 }
 
@@ -42,10 +62,13 @@ impl kameo::Actor for PeerTracker {
     async fn on_start(env: Self::Args, slf: ActorRef<Self>) -> Result<Self, Self::Error> {
         env.subscribe::<Arc<ts_control::StateUpdate>>(&slf).await?;
 
+        let (peer_watch, _) = watch::channel(Vec::new());
+
         Ok(Self {
             peer_db: PeerDb::default(),
             pending_requests: Default::default(),
             seen_state_update: false,
+            peer_watch,
             env,
         })
     }
@@ -55,6 +78,8 @@ enum Pending {
     PeerByName(PeerByName, ReplySender<Option<Node>>),
     AcceptedRoute(PeerByAcceptedRoute, ReplySender<Vec<Node>>),
     TailnetIp(PeerByTailnetIp, ReplySender<Option<Node>>),
+    Status(ReplySender<Vec<StatusNode>>),
+    WhoIs(Whois, ReplySender<Option<crate::status::WhoIs>>),
 }
 
 // For messages with arguments, a struct is generated with the args as fields. They aren't
@@ -161,6 +186,76 @@ mod msg_impl {
 
             deleg
         }
+
+        /// Build the peer entries of a [`Status`](crate::Status) snapshot.
+        ///
+        /// Returns one [`StatusNode`] per known peer. The self node is *not* included here (it
+        /// lives in the control runner); [`Runtime::status`](crate::Runtime::status) combines both.
+        ///
+        /// Waits until we've received at least one peer update from control.
+        #[message(ctx)]
+        pub fn get_status(
+            &mut self,
+            ctx: &mut Context<Self, DelegatedReply<Vec<StatusNode>>>,
+        ) -> DelegatedReply<Vec<StatusNode>> {
+            let (deleg, sender) = ctx.reply_sender();
+            let Some(sender) = sender else { return deleg };
+
+            if !self.seen_state_update {
+                tracing::debug!("no peer state seen yet, queueing status request");
+                self.pending_requests.push(Pending::Status(sender));
+                return deleg;
+            }
+
+            sender.send(self.status_peers());
+
+            deleg
+        }
+
+        /// Resolve which node owns a tailnet source address.
+        ///
+        /// Maps the source IP of `addr` to the owning node via the tailnet-IP index, returning a
+        /// [`WhoIs`](crate::WhoIs). The port is ignored (a tailnet IP uniquely identifies a node).
+        ///
+        /// The resulting [`WhoIs`](crate::WhoIs) carries no user/login or capability data: this
+        /// fork's domain [`Node`](ts_control::Node) does not retain those wire fields. See the
+        /// [`status`](crate::status) module docs for the gap.
+        ///
+        /// Waits until we've received at least one peer update from control.
+        #[message(ctx)]
+        pub fn whois(
+            &mut self,
+            ctx: &mut Context<Self, DelegatedReply<Option<crate::status::WhoIs>>>,
+            addr: std::net::SocketAddr,
+        ) -> DelegatedReply<Option<crate::status::WhoIs>> {
+            let (deleg, sender) = ctx.reply_sender();
+            let Some(sender) = sender else { return deleg };
+
+            if !self.seen_state_update {
+                tracing::debug!(query = %addr, "no peer state seen yet, queueing whois request");
+                self.pending_requests
+                    .push(Pending::WhoIs(Whois { addr }, sender));
+                return deleg;
+            }
+
+            sender.send(self.whois_opt(addr));
+
+            deleg
+        }
+
+        /// Subscribe to netmap peer-change events.
+        ///
+        /// Returns a [`watch::Receiver`] whose value is the current set of peer
+        /// [`StatusNode`]s, updated on every netmap state update from control. Embedders can await
+        /// changes via [`watch::Receiver::changed`] to react to peers joining, leaving, or changing.
+        ///
+        /// The receiver's initial value is the peer set at subscription time (empty before the
+        /// first netmap update). This is a peer-only view; combine with the self node from
+        /// [`Runtime::status`](crate::Runtime::status) when a full snapshot is needed.
+        #[message(derive(Clone))]
+        pub fn watch_netmap(&self) -> watch::Receiver<Vec<StatusNode>> {
+            self.peer_watch.subscribe()
+        }
     }
 }
 
@@ -244,6 +339,10 @@ impl Message<Arc<ts_control::StateUpdate>> for PeerTracker {
 
         self.service_pending_requests();
 
+        // Publish the latest peer snapshot to netmap watchers. `send_replace` keeps the receiver's
+        // value current even when there are no subscribers, so a late subscriber sees fresh state.
+        self.peer_watch.send_replace(self.status_peers());
+
         if let Err(e) = self
             .env
             .publish(Arc::new(PeerState {
@@ -288,6 +387,12 @@ impl PeerTracker {
                             .map(|(_id, node)| node.clone())
                             .collect(),
                     );
+                }
+                Pending::Status(reply) => {
+                    reply.send(self.status_peers());
+                }
+                Pending::WhoIs(Whois { addr }, reply) => {
+                    reply.send(self.whois_opt(addr));
                 }
             }
         }

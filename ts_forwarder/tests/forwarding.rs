@@ -1,0 +1,393 @@
+//! Integration tests for the inbound forwarder.
+//!
+//! These use a pair of in-memory-piped netstacks: one plays the remote peer dialing over the
+//! overlay, the other is the forwarder's dedicated any-IP netstack. No external networking is
+//! used beyond a loopback echo server that stands in for a "real OS socket" destination.
+
+use core::net::{Ipv4Addr, SocketAddr};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+
+use ts_forwarder::{DirectDialer, Forwarder, HostExitDialer, PortSpec, RouteTable};
+use ts_netstack_smoltcp::{
+    CreateSocket, Netstack, WakingPipe, WakingPipeDev,
+    netcore::{self, Channel, HasChannel, NetstackControl, smoltcp},
+};
+
+const PEER_IP: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 1);
+const PEER_PORT: u16 = 1000;
+
+/// Spawn a loopback TCP echo server, returning its address. Stands in for a "real OS socket"
+/// destination that the forwarder dials.
+async fn spawn_echo() -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = echo.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => {
+                            if sock.write_all(&buf[..n]).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    echo_addr
+}
+
+/// Spawn a loopback TCP server that counts accepted connections (then drains them), returning
+/// `(addr, accept_count)`. Used by the fail-closed drop tests to assert deterministically that the
+/// forwarder dialed the real socket **zero** times — distinguishing "correctly refused at dial
+/// time" from "the test runtime was merely slow" (a wall-clock timeout alone can't tell them
+/// apart).
+async fn spawn_counting_sink() -> (SocketAddr, Arc<AtomicUsize>) {
+    use tokio::io::AsyncReadExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let count_for_task = count.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            count_for_task.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                while let Ok(n) = sock.read(&mut buf).await {
+                    if n == 0 {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (addr, count)
+}
+
+/// Spawn a piped pair: `(peer_channel, forwarder_channel)`. The forwarder stack has any-IP
+/// acceptance enabled; the peer stack owns `PEER_IP`.
+async fn spawn_pair() -> (Channel, Channel) {
+    let config = netcore::Config::default();
+    let (p1, p2) = WakingPipe::new(None);
+
+    let dev1 = WakingPipeDev {
+        pipe: p1,
+        mtu: 1500,
+        medium: smoltcp::phy::Medium::Ip,
+    };
+    let dev2 = WakingPipeDev {
+        pipe: p2,
+        mtu: 1500,
+        medium: smoltcp::phy::Medium::Ip,
+    };
+
+    let mut peer = Netstack::new(dev1, config.clone());
+    let mut fwd = Netstack::new(dev2, config);
+
+    let peer_ch = peer.command_channel();
+    let fwd_ch = fwd.command_channel();
+
+    tokio::spawn(async move { peer.run_tokio().await });
+    tokio::spawn(async move { fwd.run_tokio().await });
+
+    peer_ch.set_ips([PEER_IP.into()]).await.unwrap();
+    // The forwarder netstack uses any-IP acceptance so it captures flows to destinations it
+    // does not own. This is the dedicated forwarder stack -- never the application stack.
+    fwd_ch.set_any_ip(true).await.unwrap();
+
+    (peer_ch, fwd_ch)
+}
+
+/// A wildcard listener on the any-IP forwarder stack must accept a flow to an arbitrary
+/// destination IP and report that original destination as the accepted stream's local_addr.
+#[tokio::test]
+async fn accept_preserves_original_dst() {
+    let (peer_ch, fwd_ch) = spawn_pair().await;
+
+    let foreign_dst: SocketAddr = "192.0.2.7:80".parse().unwrap();
+
+    let listener = fwd_ch
+        .tcp_listen(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 80))
+        .await
+        .unwrap();
+
+    let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+
+    let peer_local = SocketAddr::new(PEER_IP.into(), PEER_PORT);
+    let _client = peer_ch.tcp_connect(peer_local, foreign_dst).await.unwrap();
+
+    let accepted = tokio::time::timeout(Duration::from_secs(5), accept)
+        .await
+        .expect("accept timed out")
+        .unwrap();
+
+    // The captured original destination, not the wildcard listen address.
+    assert_eq!(accepted.local_addr(), foreign_dst);
+    assert_eq!(accepted.remote_addr(), peer_local);
+}
+
+/// End-to-end: peer dials a subnet-route destination over the overlay; the forwarder accepts,
+/// classifies it as a subnet route, dials the real OS socket via `DirectDialer`, and splices.
+///
+/// Requirement (2): a subnet forward reaches the intended destination.
+#[tokio::test]
+async fn forwarder_splices_subnet_route_to_real_socket() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let echo_addr = spawn_echo().await;
+    let (peer_ch, fwd_ch) = spawn_pair().await;
+
+    // 127.0.0.0/8 is a (narrow) subnet route -> DirectDialer will dial it.
+    let routes = RouteTable::new(["127.0.0.0/8".parse().unwrap()]);
+    let forwarder = Forwarder::new(fwd_ch, routes, DirectDialer, vec![echo_addr.port()], vec![]);
+    tokio::spawn(async move {
+        let _ = forwarder.run().await;
+    });
+
+    // Give the forwarder's per-port listen task time to register its listen socket before the
+    // peer's SYN arrives; otherwise smoltcp RSTs the connection (no matching listener yet).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Peer dials the echo server's address *over the overlay*. The forwarder captures it
+    // (any-IP), classifies 127.0.0.1 as Subnet, and DirectDialer connects to the real echo.
+    let peer_local = SocketAddr::new(PEER_IP.into(), PEER_PORT);
+    let mut client = peer_ch.tcp_connect(peer_local, echo_addr).await.unwrap();
+
+    client.write_all(b"hello forwarder").await.unwrap();
+
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+        .await
+        .expect("read timed out")
+        .unwrap();
+
+    assert_eq!(&buf[..n], b"hello forwarder");
+}
+
+/// Requirement (1): a node may advertise a route yet forward nothing. With no forward ports
+/// configured the forwarder spawns no listeners, so an inbound flow to the advertised
+/// destination is never accepted/spliced — no data is forwarded.
+#[tokio::test]
+async fn advertised_but_no_ports_forwards_nothing() {
+    use tokio::io::AsyncWriteExt;
+
+    let (sink_addr, dial_count) = spawn_counting_sink().await;
+    let (peer_ch, fwd_ch) = spawn_pair().await;
+
+    // Route IS advertised (127.0.0.0/8) but forward ports are empty: forwarding is off.
+    let routes = RouteTable::new(["127.0.0.0/8".parse().unwrap()]);
+    let forwarder = Forwarder::new(fwd_ch, routes, DirectDialer, vec![], vec![]);
+    tokio::spawn(async move {
+        let _ = forwarder.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // No per-port listener exists, so the peer's flow is never accepted/spliced. The connect may
+    // RST or stall; either way the forwarder must never dial the real sink.
+    let peer_local = SocketAddr::new(PEER_IP.into(), PEER_PORT);
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        if let Ok(mut client) = peer_ch.tcp_connect(peer_local, sink_addr).await {
+            client.write_all(b"hello forwarder").await.ok();
+        }
+    })
+    .await;
+
+    // Deterministic proof of "forwarded nothing": the real sink saw zero connections. This
+    // distinguishes a genuine no-op from a merely-slow splice.
+    assert_eq!(
+        dial_count.load(Ordering::SeqCst),
+        0,
+        "forwarder with no ports must never dial the real destination"
+    );
+}
+
+/// Requirement (3), fail-closed half: with the default `DirectDialer`, an exit-node
+/// (`0.0.0.0/0`) flow is **structurally refused** at dial time. The flow is dropped, never
+/// egressed via the raw host IP — so nothing is echoed back to the peer.
+#[tokio::test]
+async fn exit_node_flow_is_dropped_under_direct_dialer() {
+    use tokio::io::AsyncWriteExt;
+
+    let (sink_addr, dial_count) = spawn_counting_sink().await;
+    let (peer_ch, fwd_ch) = spawn_pair().await;
+
+    // Only a default route is advertised, so the sink IP (127.0.0.1) classifies as ExitNode.
+    // DirectDialer refuses exit egress at dial time -> the flow is dropped after accept, the real
+    // socket is never opened. A per-port listener DOES exist, so this proves the refusal happens
+    // at the dialer, not merely from a missing listener.
+    let routes = RouteTable::new(["0.0.0.0/0".parse().unwrap()]);
+    let forwarder = Forwarder::new(fwd_ch, routes, DirectDialer, vec![sink_addr.port()], vec![]);
+    tokio::spawn(async move {
+        let _ = forwarder.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let peer_local = SocketAddr::new(PEER_IP.into(), PEER_PORT);
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        if let Ok(mut client) = peer_ch.tcp_connect(peer_local, sink_addr).await {
+            client.write_all(b"leak attempt").await.ok();
+        }
+    })
+    .await;
+
+    // Deterministic anti-leak proof: the real destination saw zero connections, so the host IP
+    // never egressed the exit-node flow.
+    assert_eq!(
+        dial_count.load(Ordering::SeqCst),
+        0,
+        "DirectDialer must never egress an exit-node flow (anti-leak)"
+    );
+}
+
+/// Requirement (3), opt-in half: the explicit `HostExitDialer` egresses an exit-node
+/// (`0.0.0.0/0`) flow to the intended destination. This is the auditable opt-in a residential
+/// exit node wires deliberately; the splice succeeds and the destination echoes back.
+#[tokio::test]
+async fn exit_node_flow_egresses_under_host_exit_dialer() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let echo_addr = spawn_echo().await;
+    let (peer_ch, fwd_ch) = spawn_pair().await;
+
+    let routes = RouteTable::new(["0.0.0.0/0".parse().unwrap()]);
+    let forwarder = Forwarder::new(
+        fwd_ch,
+        routes,
+        HostExitDialer,
+        vec![echo_addr.port()],
+        vec![],
+    );
+    tokio::spawn(async move {
+        let _ = forwarder.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let peer_local = SocketAddr::new(PEER_IP.into(), PEER_PORT);
+    let mut client = peer_ch.tcp_connect(peer_local, echo_addr).await.unwrap();
+    client.write_all(b"exit egress").await.unwrap();
+
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+        .await
+        .expect("read timed out")
+        .unwrap();
+
+    assert_eq!(&buf[..n], b"exit egress");
+}
+
+/// All-port mode: a flow to a destination port that is **not** in any explicit forward list is
+/// still forwarded for an advertised subnet route. `spawn_echo` binds an OS-assigned random
+/// port; the forwarder is built with `PortSpec::All` (no explicit port list at all), proving the
+/// all-port range covers it.
+#[tokio::test]
+async fn all_ports_forwards_unlisted_port_for_subnet_route() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let echo_addr = spawn_echo().await;
+    let (peer_ch, fwd_ch) = spawn_pair().await;
+
+    // Subnet route; all-port mode, so the random echo port is covered without being enumerated.
+    let routes = RouteTable::new(["127.0.0.0/8".parse().unwrap()]);
+    let forwarder = Forwarder::all_ports(fwd_ch, routes, DirectDialer);
+    tokio::spawn(async move {
+        let _ = forwarder.run().await;
+    });
+
+    // All-port mode registers many listeners; give the actor time to register the one for the
+    // echo port before the peer's SYN arrives.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let peer_local = SocketAddr::new(PEER_IP.into(), PEER_PORT);
+    let mut client = peer_ch.tcp_connect(peer_local, echo_addr).await.unwrap();
+    client.write_all(b"all ports hello").await.unwrap();
+
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(10), client.read(&mut buf))
+        .await
+        .expect("read timed out")
+        .unwrap();
+
+    assert_eq!(&buf[..n], b"all ports hello");
+}
+
+/// All-port + `DirectDialer` + exit-node route: even with every port open, an exit-node
+/// (`0.0.0.0/0`) flow is **still dropped** at dial time. This proves all-port mode did not open
+/// an anti-leak hole: the destination IP is still classified and the dialer still gates egress.
+#[tokio::test]
+async fn all_ports_still_drops_exit_node_flow_under_direct_dialer() {
+    use tokio::io::AsyncWriteExt;
+
+    let (sink_addr, dial_count) = spawn_counting_sink().await;
+    let (peer_ch, fwd_ch) = spawn_pair().await;
+
+    // Only a default route is advertised -> the sink IP classifies as ExitNode. All ports are
+    // open (a listener exists for the sink port), so any drop must come from the dialer, not a
+    // missing listener.
+    let routes = RouteTable::new(["0.0.0.0/0".parse().unwrap()]);
+    let forwarder =
+        Forwarder::new_with_spec(fwd_ch, routes, DirectDialer, PortSpec::All, PortSpec::All);
+    tokio::spawn(async move {
+        let _ = forwarder.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let peer_local = SocketAddr::new(PEER_IP.into(), PEER_PORT);
+    let _ = tokio::time::timeout(Duration::from_secs(3), async {
+        if let Ok(mut client) = peer_ch.tcp_connect(peer_local, sink_addr).await {
+            drop(client.write_all(b"all-ports leak attempt").await);
+        }
+    })
+    .await;
+
+    assert_eq!(
+        dial_count.load(Ordering::SeqCst),
+        0,
+        "all-port mode must still refuse an exit-node flow under DirectDialer (anti-leak)"
+    );
+}
+
+/// Requirement (4): IPv6 inbound is never forwarded. The route table the forwarder consults is
+/// v4-only (IPv6-off posture: `Config::advertised_routes` drops every v6 prefix), so any IPv6
+/// destination classifies as `None` and the per-port loop drops it before any dial. This guards
+/// the forwarder's actual drop gate (`RouteTable::classify`) against an IPv6 destination.
+#[tokio::test]
+async fn ipv6_destination_is_never_forwarded() {
+    // A realistic advertised set: a v4 subnet plus the v4 exit default route. No v6 ever reaches
+    // here because advertised_routes() strips it upstream; we assert the gate drops v6 regardless.
+    let routes = RouteTable::new(["10.0.0.0/8".parse().unwrap(), "0.0.0.0/0".parse().unwrap()]);
+
+    let v6_dsts = [
+        "2001:db8::1".parse().unwrap(),
+        "fd7a:115c:a1e0::1".parse().unwrap(),
+        "::1".parse().unwrap(),
+    ];
+    for dst in v6_dsts {
+        assert_eq!(
+            routes.classify(dst),
+            None,
+            "IPv6 destination {dst} must never be forwarded (IPv6-off posture)"
+        );
+    }
+
+    // Sanity: a v4 destination in the same table still classifies (the table isn't simply empty).
+    assert!(routes.classify("10.1.2.3".parse().unwrap()).is_some());
+}

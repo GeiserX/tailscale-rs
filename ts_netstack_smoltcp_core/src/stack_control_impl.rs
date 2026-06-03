@@ -38,6 +38,29 @@ pub trait NetstackControl: HasChannel {
                 .to_ok()
         }
     }
+
+    /// Enable or disable "any-IP" acceptance on the netstack interface.
+    ///
+    /// See [`stack_control::Command::SetAnyIp`] for the safety constraints: this must only be
+    /// used on a dedicated forwarder netstack.
+    fn set_any_ip_blocking(&self, enabled: bool) -> Result<(), Error> {
+        self.request_blocking(None, stack_control::Command::SetAnyIp { enabled })?
+            .to_ok()
+    }
+
+    /// Enable or disable "any-IP" acceptance on the netstack interface.
+    ///
+    /// See [`stack_control::Command::SetAnyIp`] for the safety constraints: this must only be
+    /// used on a dedicated forwarder netstack.
+    fn set_any_ip(&self, enabled: bool) -> impl Future<Output = Result<(), Error>> + Send {
+        let channel = self.command_channel();
+
+        async move {
+            crate::request(channel, None, stack_control::Command::SetAnyIp { enabled })
+                .await?
+                .to_ok()
+        }
+    }
 }
 
 impl<T> NetstackControl for T where T: HasChannel {}
@@ -56,6 +79,11 @@ impl Netstack {
                     return Error::buffer_full().into();
                 }
 
+                Response::Ok
+            }
+            stack_control::Command::SetAnyIp { enabled } => {
+                self.iface.set_any_ip(enabled);
+                tracing::debug!(enabled, "set any-IP acceptance");
                 Response::Ok
             }
         }

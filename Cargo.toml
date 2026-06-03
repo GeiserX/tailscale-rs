@@ -15,12 +15,15 @@ members = [
     "ts_derp",
     "ts_devtools",
     "ts_disco_protocol",
+    "ts_dns_wire",
     "ts_dynbitset",
     "ts_elixir/native/ts_elixir",
     "ts_ffi",
+    "ts_forwarder",
     "ts_hexdump",
     "ts_http_util",
     "ts_keys",
+    "ts_magicsock",
     "ts_netcheck",
     "ts_netstack_smoltcp",
     "ts_netstack_smoltcp_core",
@@ -117,9 +120,12 @@ ts_control_serde = { path = "ts_control_serde", version = "0.3.3" }
 ts_dataplane = { path = "ts_dataplane", version = "0.3.3" }
 ts_derp = { path = "ts_derp", version = "0.3.3" }
 ts_disco_protocol = { path = "ts_disco_protocol", version = "0.3.3" }
+ts_dns_wire = { path = "ts_dns_wire", version = "0.3.3" }
 ts_dynbitset = { path = "ts_dynbitset", version = "0.3.3" }
+ts_forwarder = { path = "ts_forwarder", version = "0.3.3" }
 ts_hexdump = { path = "ts_hexdump", version = "0.3.3" }
 ts_keys = { path = "ts_keys", version = "0.3.3" }
+ts_magicsock = { path = "ts_magicsock", version = "0.3.3" }
 ts_netcheck = { path = "ts_netcheck", version = "0.3.3" }
 ts_netstack_smoltcp = { path = "ts_netstack_smoltcp", version = "0.3.3" }
 ts_netstack_smoltcp_core = { path = "ts_netstack_smoltcp_core", version = "0.3.3" }
@@ -206,6 +212,7 @@ ts_keys.workspace = true
 
 axum = { version = "0.8", optional = true }
 bytes = { workspace = true, optional = true }
+ipnet.workspace = true
 rand.workspace = true
 ratatui = { version = "0.30", optional = true }
 # exclude rsa to avoid https://rustsec.org/advisories/RUSTSEC-2023-0071

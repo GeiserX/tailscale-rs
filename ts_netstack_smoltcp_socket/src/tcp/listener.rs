@@ -56,14 +56,19 @@ impl TcpListener {
     }
 
     fn _accept(&self, response: Response) -> Result<TcpStream, netcore::Error> {
-        netcore::try_response_as!(response, tcp::listen::Response::Accepted { handle, remote });
+        netcore::try_response_as!(
+            response,
+            tcp::listen::Response::Accepted {
+                handle,
+                remote,
+                local
+            }
+        );
 
-        Ok(TcpStream::new(
-            self.sender.clone(),
-            handle,
-            remote,
-            self.endpoint,
-        ))
+        // Use the per-connection `local` (the original packet destination under any-IP
+        // acceptance), not `self.endpoint` (which may be a wildcard listen address). This is
+        // what lets a forwarder learn the real dial target.
+        Ok(TcpStream::new(self.sender.clone(), handle, remote, local))
     }
 
     /// Report the local endpoint on which this is listening.

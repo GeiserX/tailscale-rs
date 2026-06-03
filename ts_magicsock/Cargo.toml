@@ -1,0 +1,32 @@
+[package]
+name = "ts_magicsock"
+version.workspace = true
+description = "tailscale direct (disco) UDP underlay transport"
+categories = ["network-programming", "asynchronous"]
+keywords = ["tailscale", "disco", "magicsock", "nat", "transport"]
+
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Our crates.
+ts_disco_protocol.workspace = true
+ts_keys.workspace = true
+ts_packet.workspace = true
+ts_transport.workspace = true
+
+# Unconditionally required dependencies.
+rand.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "sync", "rt", "time", "macros"] }
+tracing.workspace = true
+zerocopy = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tracing-test.workspace = true
+
+[lints]
+workspace = true

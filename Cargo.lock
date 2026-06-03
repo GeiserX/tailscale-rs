@@ -3271,6 +3271,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pem"
+version = "3.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
+dependencies = [
+ "base64 0.22.1",
+ "serde_core",
+]
+
+[[package]]
 name = "pem-rfc7468"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4027,6 +4037,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcgen"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
+dependencies = [
+ "pem",
+ "ring",
+ "rustls-pki-types",
+ "time",
+ "yasna",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4370,6 +4393,7 @@ checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -4386,6 +4410,15 @@ dependencies = [
  "rustls-pki-types",
  "schannel",
  "security-framework",
+]
+
+[[package]]
+name = "rustls-pemfile"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]
@@ -5081,6 +5114,7 @@ dependencies = [
  "chrono",
  "clap",
  "include_dir",
+ "ipnet",
  "itertools",
  "mime_guess",
  "rand 0.10.1",
@@ -5739,10 +5773,13 @@ dependencies = [
  "ipnet",
  "lazy_static",
  "pin-project-lite",
+ "rcgen",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tokio-util",
  "tracing",
@@ -5881,6 +5918,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ts_dns_wire"
+version = "0.3.3"
+
+[[package]]
 name = "ts_dynbitset"
 version = "0.3.3"
 dependencies = [
@@ -5909,6 +5950,18 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ts_keys",
+]
+
+[[package]]
+name = "ts_forwarder"
+version = "0.3.3"
+dependencies = [
+ "bytes",
+ "ipnet",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "ts_netstack_smoltcp",
 ]
 
 [[package]]
@@ -5947,6 +6000,22 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "x25519-dalek 3.0.0-pre.6",
+ "zerocopy",
+]
+
+[[package]]
+name = "ts_magicsock"
+version = "0.3.3"
+dependencies = [
+ "rand 0.10.1",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-test",
+ "ts_disco_protocol",
+ "ts_keys",
+ "ts_packet",
+ "ts_transport",
  "zerocopy",
 ]
 
@@ -6119,7 +6188,10 @@ dependencies = [
  "ts_control",
  "ts_dataplane",
  "ts_derp",
+ "ts_dns_wire",
+ "ts_forwarder",
  "ts_keys",
+ "ts_magicsock",
  "ts_netcheck",
  "ts_netstack_smoltcp",
  "ts_overlay_router",
@@ -6145,6 +6217,10 @@ dependencies = [
 name = "ts_tls_util"
 version = "0.3.3"
 dependencies = [
+ "rcgen",
+ "ring",
+ "rustls-pemfile",
+ "subtle",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -7208,6 +7284,15 @@ dependencies = [
  "getrandom 0.4.2",
  "rand_core 0.10.1",
  "zeroize",
+]
+
+[[package]]
+name = "yasna"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
+dependencies = [
+ "time",
 ]
 
 [[package]]

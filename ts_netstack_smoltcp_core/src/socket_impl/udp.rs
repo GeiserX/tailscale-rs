@@ -2,7 +2,11 @@ use alloc::vec;
 use core::net::SocketAddr;
 
 use bytes::Bytes;
-use smoltcp::{iface::SocketHandle, socket::udp, wire::IpVersion};
+use smoltcp::{
+    iface::SocketHandle,
+    socket::udp,
+    wire::{IpListenEndpoint, IpVersion},
+};
 
 use crate::command::{
     Error, Response,
@@ -26,9 +30,22 @@ impl crate::Netstack {
                     return Response::Error(Error::unaddressable());
                 }
 
+                // A wildcard bind (`0.0.0.0` / `::`) must become `addr: None` so smoltcp's
+                // `accepts()` matches datagrams to *any* destination IP (any-IP forwarding).
+                // The blanket `From<SocketAddr>` would yield `addr: Some(0.0.0.0)`, which only
+                // matches a literal `0.0.0.0` destination and silently drops forwarded flows.
+                let listen = if endpoint.ip().is_unspecified() {
+                    IpListenEndpoint {
+                        addr: None,
+                        port: endpoint.port(),
+                    }
+                } else {
+                    endpoint.into()
+                };
+
                 // The two possible failure cases for `bind` are that the port is zero or the socket
                 // was already open. Those are handled, so failure is impossible here.
-                sock.bind(endpoint).unwrap();
+                sock.bind(listen).unwrap();
 
                 let handle = self.socket_set.add(sock);
 
@@ -38,17 +55,24 @@ impl crate::Netstack {
                 }
                 .into()
             }
-            UdpCommand::Send { endpoint, buf } => {
+            UdpCommand::Send {
+                endpoint,
+                local,
+                buf,
+            } => {
                 let handle = handle.unwrap();
 
                 let sock = self.socket_set.get_mut::<udp::Socket>(handle);
-                let sock_is_v4 = sock
-                    .endpoint()
-                    .addr
-                    .is_some_and(|ep| ep.version() == IpVersion::Ipv4);
 
-                if endpoint.is_ipv4() != sock_is_v4 {
-                    return Response::Error(Error::wrong_ip_version());
+                // Enforce IP-version parity only when the socket is bound to a concrete address.
+                // A wildcard bind (`addr: None`, used for any-IP forwarding) carries no version,
+                // so it may legitimately send to either family; smoltcp rejects a genuinely
+                // unaddressable send below.
+                if let Some(bound) = sock.endpoint().addr {
+                    let sock_is_v4 = bound.version() == IpVersion::Ipv4;
+                    if endpoint.is_ipv4() != sock_is_v4 {
+                        return Response::Error(Error::wrong_ip_version());
+                    }
                 }
 
                 if buf.len() > sock.payload_send_capacity() {
@@ -61,13 +85,27 @@ impl crate::Netstack {
                     return Response::Error(Error::big_packet());
                 }
 
-                match sock.send_slice(&buf, endpoint) {
+                // Spoof the source address when requested, so reply datagrams from a forwarder
+                // appear to originate from the original destination the peer expected. smoltcp
+                // honors `local_address` natively when emitting (udp.rs source selection).
+                let meta = udp::UdpMetadata {
+                    endpoint: endpoint.into(),
+                    local_address: local.map(Into::into),
+                    ..udp::UdpMetadata::from(endpoint)
+                };
+
+                match sock.send_slice(&buf, meta) {
                     Ok(_n) => Response::Ok,
                     // This means that the _current_ buffer is too full, but since we checked if we
                     // had send capacity, it should be available in the future, so just punt and
                     // wouldblock until then.
                     Err(udp::SendError::BufferFull) => Response::WouldBlock {
-                        command: UdpCommand::Send { buf, endpoint }.into(),
+                        command: UdpCommand::Send {
+                            buf,
+                            endpoint,
+                            local,
+                        }
+                        .into(),
                         handle: Some(handle),
                     },
                     Err(udp::SendError::Unaddressable) => {
@@ -80,6 +118,10 @@ impl crate::Netstack {
                 let sock = self
                     .socket_set
                     .get_mut::<udp::Socket>(unwrap_handle!(handle));
+
+                // The socket's bound port -- the local address of received datagrams uses the
+                // captured original destination IP but this socket's port.
+                let local_port = sock.endpoint().port;
 
                 match sock.recv() {
                     Ok((b, meta)) => {
@@ -97,8 +139,15 @@ impl crate::Netstack {
                             len = max_len.min(len);
                         }
 
+                        // smoltcp always sets `local_address` on incoming datagrams to the
+                        // original packet destination; this is the forwarder's dial target.
+                        let local_addr = meta
+                            .local_address
+                            .expect("smoltcp sets local_address on every received datagram");
+
                         UdpResponse::RecvFrom {
                             remote: SocketAddr::new(meta.endpoint.addr.into(), meta.endpoint.port),
+                            local: SocketAddr::new(local_addr.into(), local_port),
                             buf: Bytes::copy_from_slice(&b[..len]),
                             truncated,
                         }

@@ -1,0 +1,24 @@
+[package]
+name = "ts_forwarder"
+version.workspace = true
+description = "inbound subnet-router / exit-node forwarding dataplane (overlay accept -> real OS dial)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+categories = ["network-programming"]
+keywords = ["tailscale", "forwarder", "subnet-router", "exit-node", "netstack"]
+
+[lints]
+workspace = true
+
+[dependencies]
+ts_netstack_smoltcp = { workspace = true, features = ["tokio"] }
+ipnet.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }

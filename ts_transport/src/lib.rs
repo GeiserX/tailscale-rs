@@ -98,6 +98,27 @@ pub trait UnderlayTransport {
     ) -> impl Future<Output = impl BatchRecvIter<Self::PeerKey, Error = Self::Error>> + Send;
 }
 
+impl<T> UnderlayTransport for alloc::sync::Arc<T>
+where
+    T: UnderlayTransport + Send + Sync,
+{
+    type PeerKey = T::PeerKey;
+    type Error = T::Error;
+
+    fn send(
+        &self,
+        packet_batch: impl BatchSendIter<Self::PeerKey>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        (**self).send(packet_batch)
+    }
+
+    fn recv(
+        &self,
+    ) -> impl Future<Output = impl BatchRecvIter<Self::PeerKey, Error = Self::Error>> + Send {
+        (**self).recv()
+    }
+}
+
 /// Extension methods on [`UnderlayTransport`].
 pub trait UnderlayTransportExt: UnderlayTransport {
     /// Map the keys used by this transport with the given [`PeerLookup`].

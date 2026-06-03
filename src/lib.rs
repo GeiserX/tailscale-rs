@@ -135,8 +135,18 @@ pub use config::Config;
 #[doc(inline)]
 pub use error::{Error, InternalErrorKind};
 #[doc(inline)]
+pub use ts_control::ExitNodeSelector;
+#[doc(inline)]
 pub use ts_control::Node as NodeInfo;
+#[doc(inline)]
+pub use ts_control::tls::{CertifiedKey, TlsAcceptor, TlsStream};
+#[doc(inline)]
+pub use ts_control::{CertError, MISSING_CERT_RPC, ServeConfig, ServeTarget};
+#[doc(inline)]
+pub use ts_netstack_smoltcp::PingError;
 use ts_netstack_smoltcp::{CreateSocket, netcore::Channel};
+#[doc(inline)]
+pub use ts_runtime::{Status, StatusNode, WhoIs};
 
 #[cfg(feature = "axum")]
 pub mod axum;
@@ -221,6 +231,49 @@ impl Device {
             .map_err(Into::into)
     }
 
+    /// Resolve a tailnet peer (or this node) by MagicDNS name to its tailnet IPv4 address.
+    ///
+    /// This is an in-process lookup against the netmap we already hold — like `tsnet`'s in-memory
+    /// `dnsMap`, it does not query any DNS server (there is no `100.100.100.100` resolver). The
+    /// `name` may be a bare hostname or a fully-qualified MagicDNS name, with or without a trailing
+    /// dot, in any case (matching is case-insensitive). Returns `Ok(None)` if no tailnet node has
+    /// that name.
+    ///
+    /// Only MagicDNS names are resolved; names outside the tailnet are not looked up here, so the
+    /// caller's system resolver remains responsible for them. IPv6 is intentionally not resolved —
+    /// this fork operates IPv4-only on the tailnet.
+    pub async fn resolve(&self, name: &str) -> Result<Option<Ipv4Addr>, Error> {
+        if let Some(peer) = self.peer_by_name(name).await? {
+            return Ok(Some(peer.tailnet_address.ipv4.addr()));
+        }
+
+        // tsnet's dnsMap also resolves our own name; fall back to self when no peer matches.
+        let me = self.self_node().await?;
+        if me.matches_name(name) {
+            return Ok(Some(me.tailnet_address.ipv4.addr()));
+        }
+
+        Ok(None)
+    }
+
+    /// Connect to a tailnet peer by MagicDNS name and port over TCP.
+    ///
+    /// Resolves `name` via [`Device::resolve`] (an in-process netmap lookup, no DNS server), then
+    /// dials the resulting tailnet IPv4 address. Returns [`InternalErrorKind::BadRequest`] if the
+    /// name does not resolve to a tailnet node.
+    pub async fn connect_by_name(
+        &self,
+        name: &str,
+        port: u16,
+    ) -> Result<netstack::TcpStream, Error> {
+        let addr = self
+            .resolve(name)
+            .await?
+            .ok_or(Error::Internal(InternalErrorKind::BadRequest))?;
+
+        self.tcp_connect((addr, port).into()).await
+    }
+
     /// Connect to a TCP socket at the remote address.
     pub async fn tcp_connect(&self, remote: SocketAddr) -> Result<netstack::TcpStream, Error> {
         let ip: IpAddr = match remote.is_ipv4() {
@@ -278,6 +331,11 @@ impl Device {
     }
 
     /// Look up the peer(s) with the most-specific route matches for `ip`.
+    ///
+    /// This reports which peers *advertise* a route covering `ip`, independent of this device's
+    /// `accept_routes` setting — analogous to the Go client's informational `PrimaryRoutes`. It is
+    /// not a reachability oracle: with `accept_routes` off, the dataplane will not actually route
+    /// to (or accept return traffic from) advertised subnet routes even if this returns a peer.
     pub async fn peers_with_route(&self, ip: IpAddr) -> Result<Vec<NodeInfo>, Error> {
         let pt = self
             .runtime
@@ -289,6 +347,69 @@ impl Device {
             .await
             .map_err(ts_runtime::Error::from)
             .map_err(Into::into)
+    }
+
+    /// Snapshot of this device and its tailnet peers (like `tailscale status`).
+    ///
+    /// Combines this node's self info with the current peer set: each [`StatusNode`] reports the
+    /// stable id, display name, tailnet IPs, advertised routes, and exit-node flag. (Per-peer
+    /// `online`/user/capabilities are honestly `None`/empty in this fork — the domain node model
+    /// does not yet carry the wire-level liveness/login fields; see `ts_runtime::status` docs.)
+    pub async fn status(&self) -> Result<Status, Error> {
+        self.runtime.status().await.map_err(Into::into)
+    }
+
+    /// Map a tailnet source `addr` to the node that owns its IP (like `tsnet`'s `WhoIs`).
+    ///
+    /// Only the IP of `addr` is used; the port is ignored. Returns `Ok(None)` if no tailnet node
+    /// owns that address.
+    pub async fn whois(&self, addr: SocketAddr) -> Result<Option<WhoIs>, Error> {
+        self.runtime.whois(addr).await.map_err(Into::into)
+    }
+
+    /// Watch for netmap changes: the returned receiver's value is the current set of peer
+    /// [`StatusNode`]s and updates on every netmap change (like subscribing to `ipn` notifications).
+    pub async fn watch_netmap(
+        &self,
+    ) -> Result<tokio::sync::watch::Receiver<Vec<StatusNode>>, Error> {
+        self.runtime.watch_netmap().await.map_err(Into::into)
+    }
+
+    /// Ping a tailnet peer over the overlay with an ICMPv4 echo, returning the round-trip time
+    /// (like `tailscale ping`).
+    ///
+    /// The echo is sent from this device's own tailnet IPv4 over the overlay netstack — never a
+    /// host socket. IPv6 destinations return [`PingError::Ipv6Unsupported`] (this fork is
+    /// IPv4-only on the tailnet). A peer answers from its own OS stack; this netstack does not
+    /// auto-reply to echo requests.
+    pub async fn ping(&self, dst: IpAddr, timeout: Duration) -> Result<Duration, PingError> {
+        let src = self.ipv4_addr().await.map_err(|_| PingError::Timeout)?;
+        ts_netstack_smoltcp::ping(&self.channel, src, dst, timeout).await
+    }
+
+    /// Obtain a TLS certificate for a node's MagicDNS `name` (like `tsnet`'s `GetCertificate`).
+    ///
+    /// **Fail-closed.** This fork's control plane exposes no ACME-over-control / DNS-01 RPC, so
+    /// this currently always returns [`ts_control::CertError::Unimplemented`] (after a tailnet-name
+    /// check). It NEVER self-signs and NEVER returns a placeholder certificate. When the control
+    /// cert RPC ([`ts_control::MISSING_CERT_RPC`]) lands, this starts returning a real
+    /// [`CertifiedKey`] with no caller change.
+    pub async fn get_certificate(&self, name: &str) -> Result<CertifiedKey, ts_control::CertError> {
+        ts_control::get_certificate(name).await
+    }
+
+    /// Build a [`TlsAcceptor`] terminating TLS for `cfg.name` on the overlay (like `tsnet`'s
+    /// `ListenTLS`).
+    ///
+    /// **Fail-closed.** Delegates to [`Device::get_certificate`]; because no real certificate can
+    /// be issued in this fork, this returns the same [`ts_control::CertError::Unimplemented`]
+    /// rather than ever serving a self-signed cert or downgrading to plaintext. Terminate accepted
+    /// overlay streams with [`ts_control::accept_tls`].
+    pub async fn listen_tls(
+        &self,
+        cfg: &ts_control::ServeConfig,
+    ) -> Result<TlsAcceptor, ts_control::CertError> {
+        ts_control::listen_tls(cfg).await
     }
 
     /// Attempt to gracefully shut down this device's runtime.

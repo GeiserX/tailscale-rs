@@ -12,25 +12,31 @@ use netstack::netcore::Channel;
 use tokio::sync::watch;
 
 use crate::{
-    control_runner::ControlRunner, dataplane::DataplaneActor, multiderp::Multiderp,
-    netstack_actor::NetstackActor,
+    control_runner::ControlRunner, dataplane::DataplaneActor, direct::DirectManager,
+    forwarder_actor::ForwarderActor, multiderp::Multiderp, netstack_actor::NetstackActor,
 };
 
 /// Control runner.
 pub mod control_runner;
 mod dataplane;
 mod derp_latency;
+mod direct;
 mod env;
 mod error;
+mod forwarder_actor;
+mod magic_dns;
 mod multiderp;
 mod netstack_actor;
 mod packetfilter;
 pub mod peer_tracker;
 mod route_updater;
 mod src_filter;
+/// Netmap status snapshot, WhoIs, and watcher types.
+pub mod status;
 
 pub(crate) use env::Env;
 pub use error::{Error, ErrorKind};
+pub use status::{Status, StatusNode, WhoIs};
 
 use crate::peer_tracker::PeerTracker;
 
@@ -54,22 +60,70 @@ impl Runtime {
         keys: ts_keys::NodeState,
     ) -> Result<Self, Error> {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let env = Env::new(keys, shutdown_rx);
+        let env = Env::new(
+            keys,
+            shutdown_rx,
+            config.accept_routes,
+            config.exit_node.clone(),
+            config.advertised_routes(),
+            config.forward_tcp_ports.clone(),
+            config.forward_udp_ports.clone(),
+            config.forward_all_ports,
+            config.forward_exit_egress,
+        );
 
         let dataplane = DataplaneActor::spawn(env.clone());
 
         let (netstack_id, netstack_up, netstack_down) =
             dataplane.ask(dataplane::NewOverlayTransport).await?;
 
+        // A second overlay transport feeds the dedicated any-IP forwarder netstack. Inbound packets
+        // for advertised subnet routes / the exit-node default route are routed here (see
+        // `route_updater`), keeping forwarded flows off the application netstack.
+        let (forwarder_id, forwarder_up, forwarder_down) =
+            dataplane.ask(dataplane::NewOverlayTransport).await?;
+
         let multiderp = Multiderp::spawn((env.clone(), dataplane.clone()));
 
-        route_updater::RouteUpdater::spawn((multiderp.clone(), env.clone(), netstack_id));
+        // Spawn the direct (disco) underlay manager before the route updater. Its `on_start`
+        // binds the UDP socket and registers its transport synchronously, so by the time the
+        // route updater asks it for the direct transport id it is guaranteed to be available.
+        let direct = DirectManager::spawn((env.clone(), dataplane.clone(), multiderp.clone()));
+
+        // Spawn the forwarder before the route updater. Its `on_start` builds the forwarder
+        // netstack, enables any-IP acceptance, and starts the per-port accept loops synchronously,
+        // so by the time the route updater begins delivering advertised prefixes to
+        // `forwarder_id` the netstack is already draining its transport.
+        let forwarder = ForwarderActor::spawn((
+            env.clone(),
+            Default::default(),
+            forwarder_up,
+            forwarder_down,
+        ));
+        // Force `on_start` to finish (any-IP enabled, accept loops live) before the route updater
+        // can route the first inbound flow to `forwarder_id`: an `ask` blocks until the actor has
+        // started.
+        let (_forwarder_channel,) = forwarder.ask(forwarder_actor::GetChannel).await?;
+
+        route_updater::RouteUpdater::spawn((
+            multiderp.clone(),
+            direct.clone(),
+            env.clone(),
+            netstack_id,
+            forwarder_id,
+        ));
         packetfilter::PacketfilterUpdater::spawn(env.clone());
         src_filter::SourceFilterUpdater::spawn(env.clone());
         let peer_tracker = PeerTracker::spawn(env.clone()).downgrade();
 
         let netstack =
             NetstackActor::spawn((env.clone(), Default::default(), netstack_up, netstack_down));
+
+        // Fetch the netstack channel while we still hold the strong ActorRef, then spawn the
+        // MagicDNS responder on it. Fire-and-forget: like src_filter/route_updater, it's owned by
+        // the message bus and isn't stored on `Runtime`.
+        let (channel,) = netstack.ask(netstack_actor::GetChannel).await?;
+        magic_dns::MagicDnsActor::spawn((env.clone(), channel));
 
         let control = ControlRunner::spawn(control_runner::Params {
             config,
@@ -101,6 +155,72 @@ impl Runtime {
             .await?;
 
         Ok(channel)
+    }
+
+    /// A snapshot of the local netmap: this node plus every known peer.
+    ///
+    /// Combines the self node held by the control runner with the peer set held by the peer
+    /// tracker. Mirrors tsnet's `LocalClient::Status`.
+    ///
+    /// `self_node` is `None` until the first netmap update has been received from control. Peer
+    /// entries carry no online/user/capability data (see the [`status`] module docs for that gap).
+    pub async fn status(&self) -> Result<Status, Error> {
+        let self_node = self
+            .control
+            .ask(control_runner::SelfNode)
+            .await?
+            .as_ref()
+            .map(StatusNode::from_node);
+
+        let peers = self
+            .peer_tracker
+            .upgrade()
+            .ok_or(Error {
+                kind: ErrorKind::ActorGone,
+                target_actor: None,
+                message_ty: None,
+            })?
+            .ask(peer_tracker::GetStatus)
+            .await?;
+
+        Ok(Status { self_node, peers })
+    }
+
+    /// Resolve which node owns a tailnet source address.
+    ///
+    /// Maps the source IP of `addr` to its owning node. Mirrors tsnet's `LocalClient::WhoIs`.
+    /// Returns `None` if no peer holds that tailnet IP. The returned [`WhoIs`] carries no
+    /// user/login or capability data in this fork (see the [`status`] module docs).
+    pub async fn whois(&self, addr: core::net::SocketAddr) -> Result<Option<WhoIs>, Error> {
+        self.peer_tracker
+            .upgrade()
+            .ok_or(Error {
+                kind: ErrorKind::ActorGone,
+                target_actor: None,
+                message_ty: None,
+            })?
+            .ask(peer_tracker::Whois { addr })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Subscribe to netmap peer-change events.
+    ///
+    /// Returns a [`watch::Receiver`] whose value is the current set of peer [`StatusNode`]s,
+    /// updated on every netmap state update from control. Mirrors tsnet's `WatchIPNBus`. Await
+    /// [`watch::Receiver::changed`](tokio::sync::watch::Receiver::changed) to react to peers
+    /// joining, leaving, or changing.
+    pub async fn watch_netmap(&self) -> Result<watch::Receiver<Vec<StatusNode>>, Error> {
+        self.peer_tracker
+            .upgrade()
+            .ok_or(Error {
+                kind: ErrorKind::ActorGone,
+                target_actor: None,
+                message_ty: None,
+            })?
+            .ask(peer_tracker::WatchNetmap)
+            .await
+            .map_err(Into::into)
     }
 
     /// Attempt to shut down the runtime gracefully.

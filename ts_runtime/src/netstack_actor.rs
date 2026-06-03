@@ -107,6 +107,8 @@ impl Message<Arc<ts_control::StateUpdate>> for NetstackActor {
             .set_ips([
                 self_node.tailnet_address.ipv4.addr().into(),
                 self_node.tailnet_address.ipv6.addr().into(),
+                // MagicDNS service IP (100.100.100.100) — lets the in-netstack DNS responder bind :53
+                core::net::Ipv4Addr::new(100, 100, 100, 100).into(),
             ])
             .await
         {

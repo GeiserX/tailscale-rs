@@ -37,8 +37,8 @@ impl From<io::Error> for Error {
 ///
 /// Returns `Ok(None)` iff no server could be reached, either due to connectivity errors or
 /// because they were not configured to be reachable (see the note in [`dial_region_tcp`]).
-/// Currently, self-signed server certs are unsupported, so servers with that configuration
-/// are filtered out of the server set.
+/// Self-signed server certs are supported via SHA-256 cert pinning (see
+/// [`TlsValidationConfig::SelfSigned`]).
 pub async fn dial_region_tls<'c>(
     servers: impl IntoIterator<Item = &'c ServerConnInfo>,
 ) -> Result<
@@ -78,9 +78,23 @@ pub async fn dial_region_tls<'c>(
             )
             .await?
         }
-        TlsValidationConfig::SelfSigned { .. } => {
-            // These should be filtered out in `dial_region_tcp`, so we want this to panic.
-            unimplemented!("self-signed derp server certs are currently unsupported");
+        TlsValidationConfig::SelfSigned { sha256 } => {
+            // Self-hosted / self-signed DERP (e.g. a self-hosted control plane-embedded): accept
+            // exactly the cert whose DER matches the configured SHA-256 pin. The
+            // SNI still uses the configured hostname (typically an IP literal),
+            // but trust is the pin, not the public PKI. Fail-closed: a mismatched
+            // cert is a hard handshake error, never a downgrade.
+            ts_tls_util::connect_pinned(
+                ServerName::try_from(server.hostname.clone())
+                    .map_err(|e| {
+                        tracing::error!(error = %e, "derp self-signed hostname");
+                        Error::InvalidParam
+                    })?
+                    .to_owned(),
+                *sha256,
+                conn,
+            )
+            .await?
         }
     };
 
@@ -94,8 +108,6 @@ pub async fn dial_region_tls<'c>(
 ///
 /// Returns `None` if no server could be dialed, whether due to encountered errors or
 /// because they were not configured to be reachable (both ipv4/ipv6 disabled or stun_only).
-/// As a temporary measure, a self-signed TLS certificate configuration also causes server
-/// disablement, as this is unsupported.
 pub async fn dial_region_tcp<'c>(
     servers: impl IntoIterator<Item = &'c ServerConnInfo>,
 ) -> Option<(TcpStream, &'c ServerConnInfo)> {
@@ -105,18 +117,7 @@ pub async fn dial_region_tcp<'c>(
             continue;
         }
 
-        // TODO(npry): self-signed certs
-        if matches!(
-            server.tls_validation_config,
-            TlsValidationConfig::SelfSigned { .. }
-        ) {
-            tracing::warn!(
-                %server.hostname,
-                "self-signed derp server certs are currently unsupported, skipping server",
-            );
-            continue;
-        }
-
+        // SelfSigned is now supported via SHA-256 cert pinning in dial_region_tls.
         // InsecureForTests is allowed through -- TLS verification is skipped in dial_region_tls.
 
         match dial_server(server).await {

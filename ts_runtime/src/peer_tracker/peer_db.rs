@@ -35,6 +35,16 @@ pub trait IndexedField: Debug + private::Sealed {
 type Index<T> = HashMap<T, PeerId>;
 type PeerName = String;
 
+/// Canonicalize a DNS name as a key for [`IndexState::name_idx`].
+///
+/// DNS names are case-insensitive, and an fqdn may be presented with or without the root
+/// (trailing) dot. We store and look names up in a single canonical form — lowercased, with a
+/// single trailing dot stripped — so lookups match regardless of the caller's casing or trailing
+/// dot. This mirrors tsnet's `canonMapKey` (`net/tsdial/dnsmap.go`) for MagicDNS-name parity.
+fn canon_name(name: &str) -> String {
+    name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase()
+}
+
 /// A database that stores a map of peers by [`PeerId`] and multiple indices.
 ///
 /// Assumes that _all indexed fields_ are unique per-node, with a few notable exceptions:
@@ -151,20 +161,21 @@ impl PeerDb {
             |x| (&x.hostname, &x.tailnet),
             &mut self.index_state.name_idx,
             |old, idx| {
-                if idx.get(&old.hostname).is_some_and(|&x| x == id) {
-                    idx.remove(&old.hostname);
+                let old_hostname = canon_name(&old.hostname);
+                if idx.get(&old_hostname).is_some_and(|&x| x == id) {
+                    idx.remove(&old_hostname);
                 }
 
                 if let Some(fqdn) = old.fqdn_opt(false) {
-                    let removed_id = idx.remove(&fqdn);
+                    let removed_id = idx.remove(&canon_name(&fqdn));
                     assert!(removed_id.is_some_and(|removed_id| removed_id == id));
                 }
             },
             |new, idx| {
-                idx.insert(new.hostname.clone(), id);
+                idx.insert(canon_name(&new.hostname), id);
 
                 if let Some(fqdn) = new.fqdn_opt(false) {
-                    idx.insert(fqdn, id);
+                    idx.insert(canon_name(&fqdn), id);
                 }
             },
         );
@@ -278,12 +289,13 @@ impl IndexState {
         self.ip_idx.remove(node.tailnet_address.ipv4.into());
         self.ip_idx.remove(node.tailnet_address.ipv6.into());
 
-        if self.name_idx.get(&node.hostname).is_some_and(|&x| x == id) {
-            self.name_idx.remove(&node.hostname);
+        let hostname = canon_name(&node.hostname);
+        if self.name_idx.get(&hostname).is_some_and(|&x| x == id) {
+            self.name_idx.remove(&hostname);
         }
 
         if let Some(fqdn) = node.fqdn_opt(false) {
-            self.name_idx.remove(&fqdn);
+            self.name_idx.remove(&canon_name(&fqdn));
         }
 
         for route in &node.accepted_routes {
@@ -427,13 +439,13 @@ impl IndexedField for ts_control::NodeId {
 
 impl IndexedField for PeerName {
     fn lookup(&self, db: &PeerDb) -> Option<PeerId> {
-        db.index_state.name_idx.get(self).copied()
+        db.index_state.name_idx.get(&canon_name(self)).copied()
     }
 }
 
 impl IndexedField for &str {
     fn lookup(&self, db: &PeerDb) -> Option<PeerId> {
-        db.index_state.name_idx.get(*self).copied()
+        db.index_state.name_idx.get(&canon_name(self)).copied()
     }
 }
 
@@ -653,6 +665,35 @@ mod test {
         assert_eq!(node, &node2);
     }
 
+    #[test]
+    fn test_name_lookup_is_canonicalized() {
+        // MagicDNS names are case-insensitive and may carry a trailing dot; lookups must match
+        // regardless of the caller's casing or trailing dot (tsnet `canonMapKey` parity).
+        let mut db = PeerDb::default();
+
+        let node = Node {
+            hostname: "MixedCase".to_string(),
+            tailnet: Some("Tail-Scale.ts.net".to_string()),
+            ..rand_node()
+        };
+        let id = db.upsert(&node);
+
+        // bare hostname: any case, no tailnet component
+        assert_eq!(db.get(&"mixedcase").unwrap().0, id);
+        assert_eq!(db.get(&"MIXEDCASE").unwrap().0, id);
+
+        // fqdn: any case, with and without trailing dot
+        assert_eq!(db.get(&"mixedcase.tail-scale.ts.net").unwrap().0, id);
+        assert_eq!(db.get(&"MixedCase.Tail-Scale.TS.NET").unwrap().0, id);
+        assert_eq!(db.get(&"mixedcase.tail-scale.ts.net.").unwrap().0, id);
+
+        // removal must also canonicalize, leaving no dangling index entries
+        db.remove(&id);
+        assert!(db.get(&"mixedcase").is_none());
+        assert!(db.get(&"mixedcase.tail-scale.ts.net").is_none());
+        assert!(db.index_state.is_empty());
+    }
+
     proptest::prop_compose! {
         fn ipv4net()(
             addr: Ipv4Addr,
@@ -679,8 +720,11 @@ mod test {
     }
 
     proptest::prop_compose! {
+        // Lowercase only: names are canonicalized (case-insensitively) by `canon_name`, so the
+        // `hash_set` uniqueness the node generators rely on must hold in canonical form too.
+        // Mixed-case segments could collide after canonicalization and break index assertions.
         fn domain_segment()(
-            seg in "[[:alpha:]][[:alnum:]]*"
+            seg in "[a-z][a-z0-9]*"
         ) -> String {
             seg
         }

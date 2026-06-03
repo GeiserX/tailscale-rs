@@ -92,6 +92,12 @@ mod test {
             .encrypt_in_place(&sender_key, &receiver_key.public_key(), nonce)
             .unwrap();
 
+        // A sealed packet must carry the disco magic so peers can demux it off the wire.
+        assert!(
+            is_disco_message(pkt.as_bytes()),
+            "sealed packet must demux as disco"
+        );
+
         let decrypted = pkt.decrypt_in_place(&receiver_key).unwrap();
         assert_eq!(decrypted.header().nonce, nonce);
         assert_eq!(decrypted.header().sender_pub, sender_key.public_key());

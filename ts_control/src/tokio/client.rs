@@ -73,7 +73,8 @@ impl AsyncControlClient {
         let builder = MapRequestBuilder::new(node_keys)
             .keep_alive(true)
             .omit_peers(false)
-            .stream(true);
+            .stream(true)
+            .routable_ips(config.advertised_routes());
 
         let mut request = if let Some(hostname) = &config.hostname {
             builder.hostname(hostname)
@@ -145,6 +146,22 @@ impl AsyncControlClient {
         }
     }
 
+    /// Advertise this node's magicsock UDP endpoints (ip:port candidates) to the control server
+    /// so peers can learn where to attempt direct connections.
+    #[tracing::instrument(skip_all, fields(map_url = %self.map_url(), n_endpoints), level = "trace")]
+    pub async fn set_endpoints(&mut self, endpoints: Vec<ts_control_serde::Endpoint>) {
+        tracing::Span::current().record("n_endpoints", endpoints.len());
+        tracing::trace!("reporting magicsock endpoints to control server");
+
+        if let Err(e) = self
+            .command_tx
+            .send(Command::SetEndpoints { endpoints })
+            .await
+        {
+            tracing::error!(error = %e, "setting endpoints");
+        }
+    }
+
     /// Construct the URL that should be used to fetch the netmap.
     pub fn map_url(&self) -> Url {
         self.base_url
@@ -163,6 +180,9 @@ pub enum Command {
     SetDerpHomeRegion {
         id: ts_derp::RegionId,
         latencies: BTreeMap<String, f64>,
+    },
+    SetEndpoints {
+        endpoints: Vec<ts_control_serde::Endpoint>,
     },
 }
 
@@ -218,7 +238,8 @@ async fn run_once(
     let builder = MapRequestBuilder::new(node_keys)
         .keep_alive(true)
         .omit_peers(false)
-        .stream(true);
+        .stream(true)
+        .routable_ips(config.advertised_routes());
 
     let request = if let Some(hostname) = &config.hostname {
         builder.hostname(hostname)
@@ -261,8 +282,24 @@ async fn run_once(
                             .keep_alive(false)
                             .omit_peers(true)
                             .stream(false)
+                            .routable_ips(config.advertised_routes())
                             .preferred_derp(id)
                             .derp_latencies(latencies.iter().map(|(k, v)| (k.as_str(), *v)));
+
+                        if let Some(hostname) = &config.hostname {
+                            builder = builder.hostname(hostname);
+                        }
+                        let req = builder.build();
+
+                        drop(send_map_request(req, &map_url, &h2_client).await?);
+                    },
+                    Command::SetEndpoints { endpoints } => {
+                        let mut builder = MapRequestBuilder::new(node_keys)
+                            .keep_alive(false)
+                            .omit_peers(true)
+                            .stream(false)
+                            .routable_ips(config.advertised_routes())
+                            .endpoints(endpoints);
 
                         if let Some(hostname) = &config.hostname {
                             builder = builder.hostname(hostname);

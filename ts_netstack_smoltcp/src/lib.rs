@@ -13,7 +13,9 @@ pub extern crate ts_netstack_smoltcp_socket as netsock;
 
 use netcore::{Channel, smoltcp};
 pub use netcore::{HasChannel, Netstack as CoreStack};
-pub use netsock::CreateSocket;
+#[cfg(feature = "tokio")]
+pub use netsock::ping;
+pub use netsock::{CreateSocket, PingError};
 
 mod pipe;
 mod run;

@@ -19,7 +19,7 @@ tracing.workspace = true
 
 ts_netstack_smoltcp_core = { workspace = true }
 
-tokio = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["time"] }
 futures-io = { version = "0.3", optional = true }
 
 [features]
