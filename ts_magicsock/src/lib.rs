@@ -26,4 +26,4 @@ pub use disco::{Inbound, TxId, looks_like_disco, random_tx_id, seal_call_me_mayb
 pub use endpoint::{SelfEndpoint, SelfEndpointType};
 pub use error::{DiscoError, Error};
 pub use path::{PeerPaths, TRUST_DURATION};
-pub use sock::{DirectTransport, MagicSock, ReceivedData};
+pub use sock::{BindingVerifier, DirectTransport, MagicSock, ReceivedData};

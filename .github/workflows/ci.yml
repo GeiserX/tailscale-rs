@@ -128,6 +128,63 @@ jobs:
       - name: Docs (cargo doc)
         run: cargo doc $COMMON_FLAGS --no-deps
 
+  # Static MUSL build of the root `tailscale` crate with `ssh`/`russh`/`aws-lc-rs` OFF (ring-only),
+  # proving the egress/proxy daemon path is musl-clean for minimal (scratch/distroless) pod images.
+  #
+  # NOTE: this lane deliberately runs on a GitHub-HOSTED runner (`ubuntu-latest`) -- the inherited
+  # upstream matrix targets self-hosted labels (e.g. `linux-arm64-16cpu`) that do not exist on this
+  # fork, so those checks queue forever. This one actually executes.
+  #
+  # We use `cross` (docker-based) because `ring`'s build script needs a matching `*-linux-musl-gcc`
+  # cross C toolchain to assemble its C/asm; the default cross images already ship it. We must NOT
+  # use `--all-features` here: that would enable `ssh`, pulling `russh -> aws-lc-rs`, which fights
+  # static musl and is the entire thing this lane exists to avoid.
+  musl_static:
+    name: musl static (${{ matrix.target.triple }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          # Primary: this project is ARM64-only.
+          - triple: aarch64-unknown-linux-musl
+          # Nice-to-have secondary target.
+          - triple: x86_64-unknown-linux-musl
+    env:
+      # This fork gates compilation behind an explicit acknowledgement env var. It is forwarded into
+      # the `cross` container via the `passthrough` list in `Cross.toml`.
+      TS_RS_EXPERIMENT: this_is_unstable_software
+      # ring-only feature set: `tailscale` has no `default` feature, so `--no-default-features`
+      # leaves `ssh`/`axum` off while keeping the full tailnet/TLS (ring) daemon path.
+      MUSL_FLAGS: -p tailscale --no-default-features
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Setup rust
+        id: setup-rust
+        uses: ./.github/actions/setup-rust
+        with:
+          toolchain-version: *latest_rust
+          builder-triple: x86_64-unknown-linux-gnu
+          targets: ${{ matrix.target.triple }}
+          components: ""
+      - name: Install cross
+        uses: cargo-bins/cargo-binstall@dc19f1e48450eefe5a29b8da6c6b00a87d730b37 #v1.18.1
+      - name: Install cross (binary)
+        run: command -v cross || cargo binstall --no-confirm cross
+      - name: Build static musl (cross build --no-default-features)
+        run: |-
+          cross build \
+            --target ${{ matrix.target.triple }} \
+            $MUSL_FLAGS
+      - name: Verify aws-lc-rs is absent from the musl graph
+        run: |-
+          if cross tree --target ${{ matrix.target.triple }} $MUSL_FLAGS -i aws-lc-rs 2>/dev/null; then
+            echo "::error::aws-lc-rs leaked into the musl build graph (ssh feature on?)"
+            exit 1
+          fi
+          echo "OK: aws-lc-rs is not in the musl dependency graph"
+
   arch_independent:
     name: arch-independent checks
     runs-on: linux-x86_64-16cpu
