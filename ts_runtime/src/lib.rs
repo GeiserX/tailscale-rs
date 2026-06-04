@@ -66,6 +66,16 @@ impl Runtime {
             env::ForwarderConfig::from_control_config(&config),
         );
 
+        // Both userspace netstacks (application + forwarder) share one netstack config. Honor the
+        // per-deployment TCP buffer knob when set, otherwise fall back to the netstack default.
+        let netstack_config = {
+            let mut c = netstack::netcore::Config::default();
+            if let Some(tcp_buffer_size) = config.tcp_buffer_size {
+                c.tcp_buffer_size = tcp_buffer_size;
+            }
+            c
+        };
+
         let dataplane = DataplaneActor::spawn(env.clone());
 
         let (netstack_id, netstack_up, netstack_down) =
@@ -90,7 +100,7 @@ impl Runtime {
         // `forwarder_id` the netstack is already draining its transport.
         let forwarder = ForwarderActor::spawn((
             env.clone(),
-            Default::default(),
+            netstack_config.clone(),
             forwarder_up,
             forwarder_down,
         ));
@@ -111,7 +121,7 @@ impl Runtime {
         let peer_tracker = PeerTracker::spawn(env.clone()).downgrade();
 
         let netstack =
-            NetstackActor::spawn((env.clone(), Default::default(), netstack_up, netstack_down));
+            NetstackActor::spawn((env.clone(), netstack_config, netstack_up, netstack_down));
 
         // Fetch the netstack channel while we still hold the strong ActorRef, then spawn the
         // MagicDNS responder on it. Fire-and-forget: like src_filter/route_updater, it's owned by

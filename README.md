@@ -78,8 +78,10 @@ important considerations:
   or receive could be in the clear on the public Internet.
 - There are no compatibility guarantees at the moment. This is early-days software &mdash; we may
   break dependent code in order to get things right.
-- We currently rely on DERP relays for all communication. Direct connections via NAT holepunching
-  will be a seamless upgrade in the future, but for now, this puts a cap on data throughput.
+- Direct peer-to-peer connections via NAT traversal are implemented (STUN-discovered endpoints and
+  Disco, with `CallMeMaybe` hole-punching over DERP), and traffic falls back to DERP relays when no
+  direct path is available. We have not yet implemented symmetric-NAT birthday-paradox
+  hole-punching, so behind some NATs a flow stays relayed through DERP, which caps its throughput.
 - The `TS_RS_EXPERIMENT` environment variable is required to be set to `this_is_unstable_software`
   for all code linked against `tailscale-rs`; this includes Rust, C, Elixir, and Python code. We'll
   remove this requirement after a third-party code/cryptography audit and any necessary fixes.
@@ -126,8 +128,10 @@ These are features that we currently implement:
     hole-punching over DERP); falls back to DERP when no direct path is available
   - Peer lookups (addressing peers by MagicDNS name, in-process)
   - MagicDNS (an in-netstack resolver on `100.100.100.100:53` answering A/AAAA/PTR for tailnet
-    peers and control-pushed static records (`ExtraRecords`); fail-closed — non-tailnet names get
-    NXDOMAIN, never forwarded to an upstream resolver)
+    peers and control-pushed static records (`ExtraRecords`); by default fail-closed — with no
+    `fallback_resolvers` configured, non-tailnet names get NXDOMAIN and are never forwarded
+    upstream. Configuring `fallback_resolvers` opts in to forwarding non-tailnet query names to
+    those upstream resolvers.)
   - Using a subnet router (accepting peer-advertised subnet routes via `accept_routes`; opt-in,
     fail-closed off by default)
   - Using an exit node (routing internet-bound traffic through a chosen peer via `exit_node`,

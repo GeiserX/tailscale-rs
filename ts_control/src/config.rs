@@ -196,6 +196,18 @@ pub struct Config {
     /// parity — see the repo's `AGENTS.md`/`CLAUDE.md`.
     #[serde(default)]
     pub exit_proxy: Option<ExitProxyConfig>,
+
+    /// Per-direction TCP send/receive buffer size (bytes) for the userspace netstack, or `None` to
+    /// use the netstack default (256 KiB per direction, ~512 KiB per socket).
+    ///
+    /// smoltcp has no window auto-tuning, so this is the hard cap on a single flow's
+    /// bandwidth-delay product; raising it helps large model-API responses on high-RTT links, at
+    /// the cost of more memory per concurrent socket (each socket allocates this size for both rx
+    /// and tx). Like the other dataplane fields, this is a client-side preference not read inside
+    /// `ts_control`; it is carried here only to be threaded into the runtime's netstack
+    /// configuration.
+    #[serde(default)]
+    pub tcp_buffer_size: Option<usize>,
 }
 
 impl Config {
@@ -276,6 +288,7 @@ impl Default for Config {
             forward_all_ports: false,
             forward_exit_egress: false,
             exit_proxy: None,
+            tcp_buffer_size: None,
         }
     }
 }

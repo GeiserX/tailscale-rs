@@ -1,3 +1,4 @@
+use core::net::{SocketAddr, SocketAddrV4};
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
@@ -151,6 +152,25 @@ impl Multiderp {
     #[message]
     pub fn transport_id_for_region(&self, id: RegionId) -> Option<UnderlayTransportId> {
         Some(self.derps.get(&id)?.transport_id)
+    }
+
+    /// v4 STUN server addresses from the current derp map, for leak-safe single-socket STUN.
+    /// Only FixedAddr v4 STUN nodes are returned; UseDns nodes are skipped (resolving them
+    /// would be a second egress / DNS-leak path). May be empty (then we fall back to pong-harvest).
+    #[message]
+    pub fn stun_servers_v4(&self) -> (Vec<SocketAddr>,) {
+        let mut servers = Vec::new();
+        for region in self.regions.values() {
+            for srv in &region.servers {
+                let Some(stun_port) = srv.stun_port else {
+                    continue;
+                };
+                if let ts_derp::IpUsage::FixedAddr(v4) = srv.ipv4 {
+                    servers.push(SocketAddr::V4(SocketAddrV4::new(v4, stun_port)));
+                }
+            }
+        }
+        (servers,)
     }
 
     /// Install the direct underlay socket so disco frames (e.g. a `CallMeMaybe`) relayed to us

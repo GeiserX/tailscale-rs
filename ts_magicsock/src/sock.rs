@@ -7,9 +7,10 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
+use rand::Rng;
 use tokio::{net::UdpSocket, sync::mpsc};
 use ts_keys::{DiscoPrivateKey, DiscoPublicKey, NodePublicKey};
 use ts_packet::PacketMut;
@@ -52,6 +53,22 @@ type Paths = Arc<Mutex<HashMap<DiscoPublicKey, PeerPaths>>>;
 /// cap is reached, further novel addresses are ignored (fail-safe: we keep the ones we already
 /// trust rather than churn).
 const MAX_REFLEXIVE_ADDRS: usize = 16;
+
+/// Cap on the number of outstanding (unanswered) STUN Binding Requests we track at once.
+///
+/// Each in-flight request holds a transaction id we will accept a response for; bounding the set
+/// stops an attacker who can make us probe (or a misbehaving prober loop) from growing the map
+/// without limit. When the cap is reached after pruning expired entries, a new request is dropped
+/// fail-safe (we keep the ones already in flight) rather than evicting a live one.
+///
+/// Sharing the value 16 with [`MAX_REFLEXIVE_ADDRS`] is a coincidence, not a relation — they bound
+/// independent sets (outstanding requests vs. learned reflexive addresses); do not unify them.
+const MAX_STUN_IN_FLIGHT: usize = 16;
+
+/// How long an outstanding STUN transaction id stays valid. A response arriving after this is
+/// treated as stale/spoofed (its txid is pruned before lookup) and learns nothing. Bounds how
+/// long a transaction id is a usable injection target.
+const STUN_TX_TTL: Duration = Duration::from_secs(5);
 
 /// Acquire a [`Mutex`] guard, recovering from poisoning instead of propagating the panic.
 ///
@@ -149,6 +166,14 @@ pub struct MagicSock {
     /// in `CallMeMaybe` so peers behind NAT can reach us. Learned only on this one socket — never
     /// a second egress.
     reflexive: Arc<Mutex<HashSet<SocketAddr>>>,
+    /// Outstanding STUN Binding Requests, keyed by the transaction id we sent. The value records
+    /// the server we sent to and when, so stale transactions can be pruned (see [`STUN_TX_TTL`])
+    /// and a response can be matched to a request we actually made.
+    ///
+    /// Fail-closed is the whole point: a STUN Binding Response whose transaction id is absent from
+    /// this map (never sent, or already expired/consumed) inserts **nothing** into `reflexive`.
+    /// Locked disjointly from `paths`/`addr_to_disco`/`reflexive` — never nested with them.
+    stun_in_flight: Arc<Mutex<HashMap<crate::stun::StunTxId, (SocketAddr, Instant)>>>,
     /// Optional disco<->node-key binding verifier, wired by the netmap-owning route layer.
     ///
     /// When present, every inbound disco frame that would cause us to learn a candidate endpoint
@@ -189,6 +214,7 @@ impl MagicSock {
             paths: Default::default(),
             addr_to_disco: Default::default(),
             reflexive: Default::default(),
+            stun_in_flight: Default::default(),
             binding_verifier: None,
             warned_no_verifier: AtomicBool::new(false),
         })
@@ -463,6 +489,16 @@ impl MagicSock {
             let (n, from) = self.sock.recv_from(&mut buf).await?;
             let datagram = &mut buf[..n];
 
+            // Active-STUN demux: a Binding Success Response to a request we sent on this same
+            // socket. Checked before the disco demux because STUN and disco share this one socket;
+            // only a response matching an in-flight transaction id is consumed here (fail-closed),
+            // anything else falls through to the disco/data demux below.
+            if crate::stun::looks_like_stun_success(datagram)
+                && self.handle_stun_response(from, datagram)
+            {
+                continue;
+            }
+
             if !disco::looks_like_disco(datagram) {
                 // WireGuard data: attribute it to the peer that owns this source address.
                 let from_disco = {
@@ -563,6 +599,114 @@ impl MagicSock {
         }
     }
 
+    /// Record `addr` as a reflexive (STUN-equivalent) endpoint we may advertise, bounded by
+    /// [`MAX_REFLEXIVE_ADDRS`].
+    ///
+    /// This is the single insertion point shared by the disco pong-harvest path (the peer echoes
+    /// the `src` it saw our ping arrive from) and the active-STUN path
+    /// ([`MagicSock::handle_stun_response`]), so both observe the same cap and the same dedup via
+    /// the `HashSet`. When the cap is reached a novel address is ignored fail-safe (we keep the
+    /// addresses already trusted rather than churn). Locked disjointly from every other map.
+    fn note_reflexive(&self, addr: SocketAddr) {
+        let mut reflexive = lock(&self.reflexive);
+        if reflexive.contains(&addr) || reflexive.len() < MAX_REFLEXIVE_ADDRS {
+            reflexive.insert(addr);
+        } else {
+            tracing::debug!(%addr, "reflexive address set full, ignoring new endpoint");
+        }
+    }
+
+    /// Send a STUN Binding Request to `server` from the one bound underlay socket, recording its
+    /// transaction id so the matching response (demuxed on the same socket) can be attributed.
+    ///
+    /// Leak-safe by construction: the request is emitted from the single bound socket — never a
+    /// second socket and never IPv6 — so the reflexive address the response reports is the mapping
+    /// of the only egress path. A non-IPv4 `server` is refused (debug log + `Ok` no-op), mirroring
+    /// the IPv4-only check in [`is_pingable_candidate`]; the underlay is IPv4-only in this
+    /// deployment, so an IPv6 STUN server can only be noise or a leak attempt.
+    ///
+    /// Before recording the transaction we prune transactions older than [`STUN_TX_TTL`]; if the
+    /// in-flight set is still at [`MAX_STUN_IN_FLIGHT`] we drop this request fail-safe (return
+    /// `Ok`) rather than evict a live transaction.
+    pub async fn send_stun_request(&self, server: SocketAddr) -> Result<(), Error> {
+        if !matches!(server.ip(), IpAddr::V4(_)) {
+            // IPv6 underlay is disabled; never open a STUN exchange over IPv6.
+            tracing::debug!(%server, "refusing STUN request to non-IPv4 server");
+            return Ok(());
+        }
+
+        // Random 12-byte transaction id, matching disco's `random_tx_id` pattern.
+        let mut tx_id: crate::stun::StunTxId = [0u8; 12];
+        rand::rng().fill_bytes(&mut tx_id);
+
+        {
+            let now = Instant::now();
+            let mut in_flight = lock(&self.stun_in_flight);
+            // Drop transactions whose responses can no longer be trusted. Note the count cap below
+            // — not this TTL — is the hard memory bound: we only insert on our own sends, so a
+            // bursty caller can fill the map within one TTL window and the cap is what stops it.
+            in_flight.retain(|_, (_, sent)| now.duration_since(*sent) < STUN_TX_TTL);
+            if in_flight.len() >= MAX_STUN_IN_FLIGHT {
+                tracing::debug!(
+                    %server,
+                    "STUN in-flight set full, dropping new request (fail-safe)"
+                );
+                return Ok(());
+            }
+            in_flight.insert(tx_id, (server, now));
+        }
+
+        let req = crate::stun::encode_binding_request(tx_id);
+        self.sock.send_to(&req, server).await?;
+        Ok(())
+    }
+
+    /// Demux a datagram that [`crate::stun::looks_like_stun_success`] flagged as a STUN Binding
+    /// Success Response.
+    ///
+    /// Returns `true` if the datagram was a response to a request we actually sent (so the caller
+    /// must not forward it onward), and `false` if its transaction id is unknown — a stale or
+    /// spoofed response — in which case it falls through to the normal demux (and is dropped there
+    /// as undecodable). Fail-closed: an unknown transaction id inserts **nothing** into the
+    /// reflexive set; only a known transaction whose response parses into a valid IPv4 reflexive
+    /// address is recorded via [`MagicSock::note_reflexive`].
+    ///
+    /// `_src` (the datagram's source address) is intentionally not matched against the request
+    /// target: the 96-bit transaction id is the authoritative anti-spoof check, and a STUN reply
+    /// can legitimately arrive from a different source under some NAT/hairpin configurations, so
+    /// pinning to the server address would reject valid responses without adding real security.
+    fn handle_stun_response(&self, _src: SocketAddr, buf: &[u8]) -> bool {
+        // The transaction id occupies bytes[8..20] of every STUN message.
+        if buf.len() < 20 {
+            return false;
+        }
+        let mut tx_id = [0u8; 12];
+        tx_id.copy_from_slice(&buf[8..20]);
+
+        // Remove the transaction: a response is single-use, and an unknown txid means we never
+        // sent this request (spoof/stale) — let it fall through, learning nothing.
+        let known = {
+            let mut in_flight = lock(&self.stun_in_flight);
+            in_flight.remove(&tx_id).is_some()
+        };
+        if !known {
+            return false;
+        }
+
+        match crate::stun::parse_binding_response(buf, tx_id) {
+            Some(v4) => {
+                // A valid IPv4 reflexive mapping observed on the one bound socket.
+                self.note_reflexive(SocketAddr::V4(v4));
+                true
+            }
+            None => {
+                // It *was* a response to our request, but unusable (e.g. v6 family, malformed
+                // attribute). Consume it (we sent the request) but learn nothing.
+                true
+            }
+        }
+    }
+
     async fn handle_disco(&self, msg: Inbound, from: SocketAddr) -> Result<(), Error> {
         match msg {
             Inbound::Ping {
@@ -614,14 +758,7 @@ impl MagicSock {
                 // (STUN-equivalent) endpoint on this path. Retain it for advertisement, bounded by
                 // `MAX_REFLEXIVE_ADDRS` so a peer ponging many spoofed `src` values can't inflate
                 // the set without bound. Locked disjointly from `paths` above (never nested).
-                {
-                    let mut reflexive = lock(&self.reflexive);
-                    if reflexive.contains(&src) || reflexive.len() < MAX_REFLEXIVE_ADDRS {
-                        reflexive.insert(src);
-                    } else {
-                        tracing::debug!(%src, "reflexive address set full, ignoring new endpoint");
-                    }
-                }
+                self.note_reflexive(src);
             }
             Inbound::CallMeMaybe { sender, endpoints } => {
                 // A CallMeMaybe received directly on the UDP socket. Gate it on netmap membership
@@ -734,6 +871,8 @@ impl UnderlayTransport for DirectTransport {
 
 #[cfg(test)]
 mod tests {
+    use core::net::SocketAddrV4;
+
     use super::*;
 
     fn localhost() -> SocketAddr {
@@ -1390,5 +1529,310 @@ mod tests {
             recv.candidate_addrs(&sender_disco.public_key()).is_empty(),
             "a relayed Ping must not learn a candidate path"
         );
+    }
+
+    /// Build a STUN Binding Success Response carrying an IPv4 XOR-MAPPED-ADDRESS for `addr` and the
+    /// given transaction id, matching `crate::stun`'s wire format.
+    fn stun_success_v4(tx_id: crate::stun::StunTxId, addr: SocketAddrV4) -> Vec<u8> {
+        let cookie = crate::stun::MAGIC_COOKIE;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&crate::stun::BINDING_SUCCESS.to_be_bytes());
+        buf.extend_from_slice(&12u16.to_be_bytes()); // attrs length
+        buf.extend_from_slice(&cookie.to_be_bytes());
+        buf.extend_from_slice(&tx_id);
+        // XOR-MAPPED-ADDRESS attribute (type 0x0020, len 8).
+        buf.extend_from_slice(&0x0020u16.to_be_bytes());
+        buf.extend_from_slice(&8u16.to_be_bytes());
+        buf.push(0x00); // reserved
+        buf.push(0x01); // family IPv4
+        let xor_port = addr.port() ^ ((cookie >> 16) as u16);
+        buf.extend_from_slice(&xor_port.to_be_bytes());
+        let xor_ip = u32::from(*addr.ip()) ^ cookie;
+        buf.extend_from_slice(&xor_ip.to_be_bytes());
+        buf
+    }
+
+    /// Build a STUN Binding Success Response carrying an IPv6-family XOR-MAPPED-ADDRESS.
+    fn stun_success_v6(tx_id: crate::stun::StunTxId) -> Vec<u8> {
+        let cookie = crate::stun::MAGIC_COOKIE;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&crate::stun::BINDING_SUCCESS.to_be_bytes());
+        buf.extend_from_slice(&24u16.to_be_bytes());
+        buf.extend_from_slice(&cookie.to_be_bytes());
+        buf.extend_from_slice(&tx_id);
+        buf.extend_from_slice(&0x0020u16.to_be_bytes());
+        buf.extend_from_slice(&20u16.to_be_bytes());
+        buf.push(0x00);
+        buf.push(0x02); // family IPv6
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&[0u8; 16]);
+        buf
+    }
+
+    /// A STUN response whose transaction id we never sent must insert nothing into the reflexive
+    /// set and report itself unconsumed (so it falls through the demux).
+    #[tokio::test]
+    async fn stun_unknown_txid_inserts_nothing() {
+        let s = MagicSock::bind(
+            localhost(),
+            DiscoPrivateKey::random(),
+            ts_keys::NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap();
+
+        let unknown_tx: crate::stun::StunTxId = [42u8; 12];
+        let mapped = SocketAddrV4::new(core::net::Ipv4Addr::new(203, 0, 113, 9), 41641);
+        let buf = stun_success_v4(unknown_tx, mapped);
+
+        let src: SocketAddr = "203.0.113.9:3478".parse().unwrap();
+        let consumed = s.handle_stun_response(src, &buf);
+        assert!(!consumed, "an unknown txid response must not be consumed");
+        assert!(
+            s.reflexive.lock().unwrap().is_empty(),
+            "an unsolicited STUN response must learn no reflexive address"
+        );
+    }
+
+    /// A STUN response matching an in-flight transaction id with a valid IPv4 mapped address must
+    /// record exactly that reflexive address (and only that one).
+    #[tokio::test]
+    async fn stun_known_txid_inserts_reflexive() {
+        let s = MagicSock::bind(
+            localhost(),
+            DiscoPrivateKey::random(),
+            ts_keys::NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap();
+
+        let tx: crate::stun::StunTxId = [1u8; 12];
+        let server: SocketAddr = "203.0.113.1:3478".parse().unwrap();
+        s.stun_in_flight
+            .lock()
+            .unwrap()
+            .insert(tx, (server, Instant::now()));
+
+        let mapped = SocketAddrV4::new(core::net::Ipv4Addr::new(198, 51, 100, 7), 51820);
+        let buf = stun_success_v4(tx, mapped);
+        let consumed = s.handle_stun_response(server, &buf);
+        assert!(consumed, "a known-txid response must be consumed");
+
+        let reflexive: Vec<SocketAddr> = s.reflexive.lock().unwrap().iter().copied().collect();
+        assert_eq!(
+            reflexive,
+            vec![SocketAddr::V4(mapped)],
+            "exactly the mapped reflexive address must be recorded"
+        );
+
+        // The transaction is single-use: a replay of the same response now finds no in-flight
+        // entry and learns nothing further.
+        assert!(
+            !s.handle_stun_response(server, &buf),
+            "a replayed STUN response must not be consumed again"
+        );
+        assert_eq!(
+            s.reflexive.lock().unwrap().len(),
+            1,
+            "a replay must not add a second reflexive entry"
+        );
+    }
+
+    /// Driving more than `MAX_REFLEXIVE_ADDRS` distinct valid STUN responses must not grow the
+    /// reflexive set past the cap (shared with the pong-harvest path).
+    #[tokio::test]
+    async fn stun_respects_reflexive_cap() {
+        let s = MagicSock::bind(
+            localhost(),
+            DiscoPrivateKey::random(),
+            ts_keys::NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap();
+
+        // Feed more distinct mapped addresses than the cap allows.
+        for i in 0..(MAX_REFLEXIVE_ADDRS as u32 + 8) {
+            let tx: crate::stun::StunTxId = {
+                let mut t = [0u8; 12];
+                t[0..4].copy_from_slice(&i.to_be_bytes());
+                t
+            };
+            let server: SocketAddr = "203.0.113.1:3478".parse().unwrap();
+            s.stun_in_flight
+                .lock()
+                .unwrap()
+                .insert(tx, (server, Instant::now()));
+
+            // Each response maps to a distinct public address.
+            let octets = (i + 1).to_be_bytes();
+            let mapped = SocketAddrV4::new(
+                core::net::Ipv4Addr::new(198, 51, octets[2], octets[3]),
+                41641,
+            );
+            let buf = stun_success_v4(tx, mapped);
+            assert!(s.handle_stun_response(server, &buf));
+        }
+
+        assert_eq!(
+            s.reflexive.lock().unwrap().len(),
+            MAX_REFLEXIVE_ADDRS,
+            "the reflexive set must be capped at MAX_REFLEXIVE_ADDRS"
+        );
+    }
+
+    /// A STUN response to an in-flight transaction whose mapped address is IPv6 is consumed (it was
+    /// our request) but must never enter the reflexive set.
+    #[tokio::test]
+    async fn stun_v6_mapped_never_enters_reflexive() {
+        let s = MagicSock::bind(
+            localhost(),
+            DiscoPrivateKey::random(),
+            ts_keys::NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap();
+
+        let tx: crate::stun::StunTxId = [9u8; 12];
+        let server: SocketAddr = "203.0.113.1:3478".parse().unwrap();
+        s.stun_in_flight
+            .lock()
+            .unwrap()
+            .insert(tx, (server, Instant::now()));
+
+        let buf = stun_success_v6(tx);
+        let consumed = s.handle_stun_response(server, &buf);
+        assert!(consumed, "a v6 response to our request is still consumed");
+        assert!(
+            s.reflexive.lock().unwrap().is_empty(),
+            "a v6-mapped STUN response must never enter the reflexive set"
+        );
+    }
+
+    /// `send_stun_request` refuses a non-IPv4 server (no-op Ok) and records nothing in-flight, so
+    /// no IPv6 STUN exchange is ever opened.
+    #[tokio::test]
+    async fn send_stun_request_refuses_ipv6_server() {
+        let s = MagicSock::bind(
+            localhost(),
+            DiscoPrivateKey::random(),
+            ts_keys::NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap();
+
+        let v6: SocketAddr = "[2001:db8::1]:3478".parse().unwrap();
+        s.send_stun_request(v6).await.unwrap();
+        assert!(
+            s.stun_in_flight.lock().unwrap().is_empty(),
+            "a non-IPv4 STUN server must not create an in-flight transaction"
+        );
+    }
+
+    /// A datagram too short to carry a STUN transaction id (< 20 bytes) must report itself
+    /// unconsumed, so the recv loop falls through to the disco/data demux rather than swallowing
+    /// a non-STUN packet that happened to clear the cheap `looks_like_stun_success` prefix check.
+    #[tokio::test]
+    async fn stun_short_datagram_falls_through() {
+        let s = MagicSock::bind(
+            localhost(),
+            DiscoPrivateKey::random(),
+            ts_keys::NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap();
+
+        // Header-ish bytes but shorter than the 20-byte minimum (no full txid present).
+        let mut short = Vec::new();
+        short.extend_from_slice(&crate::stun::BINDING_SUCCESS.to_be_bytes());
+        short.extend_from_slice(&0u16.to_be_bytes());
+        short.extend_from_slice(&crate::stun::MAGIC_COOKIE.to_be_bytes());
+        // Only 4 of the 12 txid bytes => total len 12 < 20.
+        short.extend_from_slice(&[0u8; 4]);
+
+        let src: SocketAddr = "203.0.113.9:3478".parse().unwrap();
+        assert!(
+            !s.handle_stun_response(src, &short),
+            "a sub-20-byte datagram must not be consumed (must fall through the demux)"
+        );
+        assert!(
+            s.reflexive.lock().unwrap().is_empty(),
+            "a short datagram must learn no reflexive address"
+        );
+    }
+
+    /// Flooding `send_stun_request` (each call records a fresh, unexpired transaction) must never
+    /// grow the in-flight map past `MAX_STUN_IN_FLIGHT`: the cap is enforced fail-safe by dropping
+    /// the new request rather than evicting a live transaction or growing without bound.
+    #[tokio::test]
+    async fn send_stun_request_caps_in_flight() {
+        let s = MagicSock::bind(
+            localhost(),
+            DiscoPrivateKey::random(),
+            ts_keys::NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap();
+
+        // A real local sink so each `send_to` succeeds and the transaction is actually recorded.
+        let sink = UdpSocket::bind(localhost()).await.unwrap();
+        let server = sink.local_addr().unwrap();
+
+        // Drive far more requests than the cap; each is freshly inserted (none expire within the
+        // test) so only the cap can bound the set.
+        for _ in 0..(MAX_STUN_IN_FLIGHT * 4) {
+            s.send_stun_request(server).await.unwrap();
+        }
+
+        assert_eq!(
+            s.stun_in_flight.lock().unwrap().len(),
+            MAX_STUN_IN_FLIGHT,
+            "the in-flight set must be capped at MAX_STUN_IN_FLIGHT under a request flood"
+        );
+    }
+
+    /// An expired in-flight transaction must be pruned by the TTL sweep on the next
+    /// `send_stun_request`, so a stale txid stops being a usable injection target and the new
+    /// (live) transaction takes its place rather than being dropped against the cap.
+    #[tokio::test]
+    async fn send_stun_request_prunes_expired_in_flight() {
+        let s = MagicSock::bind(
+            localhost(),
+            DiscoPrivateKey::random(),
+            ts_keys::NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap();
+
+        let sink = UdpSocket::bind(localhost()).await.unwrap();
+        let server = sink.local_addr().unwrap();
+
+        // Pre-load the map to the cap with transactions sent well past STUN_TX_TTL ago.
+        let stale_when = Instant::now() - (STUN_TX_TTL + Duration::from_secs(1));
+        {
+            let mut in_flight = s.stun_in_flight.lock().unwrap();
+            for i in 0..MAX_STUN_IN_FLIGHT {
+                let mut tx = [0u8; 12];
+                tx[0] = i as u8;
+                in_flight.insert(tx, (server, stale_when));
+            }
+            assert_eq!(in_flight.len(), MAX_STUN_IN_FLIGHT);
+        }
+
+        // The map is at the cap, but every entry is expired: the TTL sweep must clear them and the
+        // fresh request must be admitted (not dropped against the cap).
+        s.send_stun_request(server).await.unwrap();
+
+        let in_flight = s.stun_in_flight.lock().unwrap();
+        assert_eq!(
+            in_flight.len(),
+            1,
+            "expired transactions must be pruned, leaving only the freshly sent one"
+        );
+        for (_, (_, sent)) in in_flight.iter() {
+            assert!(
+                Instant::now().duration_since(*sent) < STUN_TX_TTL,
+                "the surviving transaction must be the live one, not a stale entry"
+            );
+        }
     }
 }

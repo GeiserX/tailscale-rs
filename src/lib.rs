@@ -78,9 +78,10 @@
 //!   anything you send or receive could be in the clear on the public Internet.
 //! - There are no compatibility guarantees at the moment. This is early-days software - we may
 //!   break dependent code in order to get things right.
-//! - We currently rely on DERP relays for all communication. Direct connections via NAT
-//!   holepunching will be a seamless upgrade in the future, but for now, this puts a cap on data
-//!   throughput.
+//! - Direct peer-to-peer connections via NAT traversal are implemented (STUN-discovered endpoints
+//!   and Disco, with `CallMeMaybe` hole-punching over DERP), with DERP relays as the fallback when
+//!   no direct path is available. Symmetric-NAT birthday-paradox hole-punching is not yet
+//!   implemented, so behind some NATs a flow stays relayed through DERP, which caps its throughput.
 //!
 //! ## Feature Flags
 //!

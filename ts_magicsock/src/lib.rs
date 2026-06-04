@@ -21,6 +21,7 @@ mod endpoint;
 mod error;
 mod path;
 mod sock;
+mod stun;
 
 pub use disco::{Inbound, TxId, looks_like_disco, random_tx_id, seal_call_me_maybe, seal_ping};
 pub use endpoint::{SelfEndpoint, SelfEndpointType};

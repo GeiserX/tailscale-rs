@@ -6,6 +6,33 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.3](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.3) - 2026-06-04
+
+Direct-path NAT-traversal completion plus a netstack throughput knob (`docs/PARITY_ROADMAP.md`).
+
+- Added: **leak-safe active STUN** for reflexive-endpoint discovery. A periodic prober sends
+  RFC 5389 Binding Requests over the *single existing bound IPv4 MagicSock socket* (no second
+  socket, no IPv6, no DNS egress) and harvests the reflexive (public) endpoint from the response,
+  feeding the same `note_reflexive` chokepoint as the disco pong-harvest path. The STUN codec is
+  hand-rolled with zero new dependencies, fully bounds-checked, and fail-closed: only `FixedAddr`
+  IPv4 STUN servers from the derp map are probed (`UseDns` servers are skipped to avoid a DNS-leak
+  path), the 96-bit transaction id is the authoritative anti-spoof match, the in-flight set is
+  bounded (16 entries, 5 s TTL), and an unknown/stale/malformed response learns nothing. This
+  completes the direct-path orchestration so a node can discover its public endpoint without
+  relying solely on DERP pong-harvest.
+- Added: `Config::tcp_buffer_size`, a per-deployment knob for the userspace netstack's per-socket
+  TCP send/receive window, threaded `tailscale::Config` → `ts_control::Config` (transport-only) →
+  the runtime's netstack configuration (applies to both the application and forwarder netstacks).
+  The default per-direction buffer is raised from 16 KiB to **256 KiB**: smoltcp has no TCP window
+  auto-tuning, so the old 16 KiB window capped a single flow to ~1.6 Mbps at an 80 ms RTT, visibly
+  throttling large model-API responses. `None` uses the netstack default; lower it on
+  memory-constrained deployments running many concurrent sockets.
+- Docs: corrected the README and crate-level docs that claimed all communication relies on DERP
+  relays — direct peer-to-peer NAT traversal (STUN-discovered endpoints + disco, with `CallMeMaybe`
+  hole-punching over DERP) is implemented, with DERP as the fallback when no direct path exists.
+  Also clarified that MagicDNS only fails closed (NXDOMAIN, never forwarded upstream) *by default*;
+  configuring `fallback_resolvers` opts in to forwarding non-tailnet names upstream.
+
 ## [0.5.2](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.2) - 2026-06-04
 
 Tier 2 of the tsnet full-parity roadmap (`docs/PARITY_ROADMAP.md`).

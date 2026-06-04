@@ -43,6 +43,11 @@ use crate::{
 /// (`TRUST_DURATION`) is re-confirmed.
 const PING_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How often to send active STUN Binding Requests to the derp map's STUN servers, from the one
+/// bound underlay socket, to learn our reflexive (public) address even before any peer pongs.
+/// This complements the pong-harvest path on the same socket without opening a second egress.
+const STUN_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+
 /// How often to re-evaluate our own candidate endpoints and (if changed) advertise them to
 /// control. Reflexive addresses accrue asynchronously as disco pongs arrive, so we poll and
 /// only publish when the set actually differs from what we last advertised.
@@ -264,6 +269,47 @@ async fn run_pinger(sock: Arc<MagicSock>, mut shutdown: tokio::sync::watch::Rece
     }
 }
 
+/// Periodically send active STUN Binding Requests to the derp map's STUN servers, learning our
+/// reflexive (public) address even before any peer pongs.
+///
+/// Leak-safe by construction: every request is emitted from the *one* bound underlay socket (see
+/// [`MagicSock::send_stun_request`]) and only FixedAddr-v4 STUN servers are targeted (UseDns
+/// nodes are skipped by [`Multiderp::stun_servers_v4`] to avoid a DNS-leak / second egress). This
+/// complements — does not replace — the disco pong-harvest reflexive path; if the derp map lists
+/// no v4 STUN servers the request list is empty and we simply fall back to pong-harvest.
+async fn run_stun_prober(
+    sock: Arc<MagicSock>,
+    multiderp: ActorRef<Multiderp>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(STUN_PROBE_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    while !*shutdown.borrow() {
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            _ = interval.tick() => {
+                // Best-effort: if multiderp is unavailable just skip this round (pong-harvest
+                // still runs), matching how the other loops treat multiderp send errors.
+                let servers = match multiderp.ask(multiderp::StunServersV4).await {
+                    Ok((servers,)) => servers,
+                    Err(e) => {
+                        tracing::trace!(error = %e, "querying stun servers from multiderp");
+                        continue;
+                    }
+                };
+                for s in servers {
+                    // send_stun_request fails closed internally (non-v4 refused, in-flight cap);
+                    // a transient io error just means this server is skipped this round.
+                    if let Err(e) = sock.send_stun_request(s).await {
+                        tracing::trace!(error = %e, server = %s, "sending stun binding request");
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Periodically re-evaluate our own candidate endpoints and publish them on the bus when they
 /// change, so control can be told where peers may reach us directly. Only republishes on a real
 /// change to avoid spamming control with redundant side-band map requests.
@@ -453,6 +499,13 @@ impl kameo::Actor for DirectManager {
         tasks.spawn(run_advertiser(
             sock.clone(),
             env.clone(),
+            env.shutdown.clone(),
+        ));
+        // Active STUN probing shares the one bound socket; clone the multiderp ref before it is
+        // moved into run_call_me_maybe below.
+        tasks.spawn(run_stun_prober(
+            sock.clone(),
+            multiderp.clone(),
             env.shutdown.clone(),
         ));
 

@@ -128,6 +128,18 @@ pub struct Config {
     /// When `None` (the default) and exit egress is enabled, egress uses this host's real IP. See
     /// the proxy-egress section of the repo's `AGENTS.md`/`CLAUDE.md`.
     pub exit_proxy: Option<ExitProxyConfig>,
+
+    /// Per-direction TCP send/receive buffer size (bytes) for the userspace netstack, or `None` to
+    /// use the netstack default (256 KiB per direction, ~512 KiB per socket).
+    ///
+    /// The underlying smoltcp stack has no TCP window auto-tuning, so this value is the hard cap on
+    /// a single flow's bandwidth-delay product: at an 80 ms RTT a 16 KiB window throttles a flow to
+    /// ~1.6 Mbps, which visibly slows large model-API responses even at 1x. Each socket allocates
+    /// this size for both its rx and tx buffer, so a socket consumes ~2× this value. The default
+    /// (256 KiB) suits high-RTT links carrying a few large flows; lower it on memory-constrained
+    /// deployments running many concurrent sockets. Applies to both the application and forwarder
+    /// netstacks.
+    pub tcp_buffer_size: Option<usize>,
 }
 
 impl Config {
@@ -267,6 +279,7 @@ impl From<&Config> for ts_control::Config {
             forward_all_ports: value.forward_all_ports,
             forward_exit_egress: value.forward_exit_egress,
             exit_proxy: value.exit_proxy.clone(),
+            tcp_buffer_size: value.tcp_buffer_size,
         }
     }
 }
@@ -289,6 +302,7 @@ impl Default for Config {
             forward_all_ports: false,
             forward_exit_egress: false,
             exit_proxy: None,
+            tcp_buffer_size: None,
         }
     }
 }
@@ -310,6 +324,7 @@ mod tests {
             forward_exit_egress: true,
             forward_tcp_ports: vec![80, 443],
             forward_udp_ports: vec![53],
+            tcp_buffer_size: Some(1024 * 128),
             advertise_routes: vec!["10.0.0.0/24".parse().unwrap()],
             requested_tags: vec!["tag:exit".to_owned()],
             ephemeral: false,
@@ -330,6 +345,7 @@ mod tests {
         assert!(!control.ephemeral);
         assert_eq!(control.forward_tcp_ports, vec![80, 443]);
         assert_eq!(control.forward_udp_ports, vec![53]);
+        assert_eq!(control.tcp_buffer_size, Some(1024 * 128));
         assert_eq!(control.tags, vec!["tag:exit".to_owned()]);
         let proxy = control.exit_proxy.expect("exit_proxy crosses the boundary");
         assert_eq!(proxy.addr, "198.51.100.9:8080".parse().unwrap());
