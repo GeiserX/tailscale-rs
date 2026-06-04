@@ -1,6 +1,6 @@
-use std::ffi;
+use std::ffi::{self, c_char};
 
-use crate::TOKIO_RUNTIME;
+use crate::{TOKIO_RUNTIME, util};
 
 /// A Tailscale TCP listener handle.
 pub struct tcp_listener(tailscale::netstack::TcpListener);
@@ -65,6 +65,33 @@ pub extern "C" fn ts_tcp_connect(
         Ok(sock) => Some(Box::new(tcp_stream(sock))),
         Err(e) => {
             tracing::error!(err = %e, "binding sock");
+            None
+        }
+    }
+}
+
+/// Connect to a tailnet peer by MagicDNS `name` and `port` over TCP.
+///
+/// Resolves `name` via an in-process netmap lookup (no DNS server), then dials the resulting
+/// tailnet IPv4 address. Returns null if the name does not resolve or the connection fails.
+///
+/// # Safety
+///
+/// `name` must be able to be read according to [`std::ffi::CStr`] rules, i.e. it must be
+/// NUL-terminated and valid for reading up to and including the NUL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ts_connect_by_name(
+    dev: &crate::device,
+    name: *const c_char,
+    port: u16,
+) -> Option<Box<tcp_stream>> {
+    // SAFETY: ensured by function precondition
+    let name = unsafe { util::str(name) }?;
+
+    match TOKIO_RUNTIME.block_on(dev.0.connect_by_name(name, port)) {
+        Ok(sock) => Some(Box::new(tcp_stream(sock))),
+        Err(e) => {
+            tracing::error!(err = %e, "connect by name");
             None
         }
     }

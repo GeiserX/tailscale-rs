@@ -6,6 +6,31 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.10](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.10) - 2026-06-04
+
+Foreign-language binding parity: the C FFI (`ts_ffi`), Python (`ts_python`, PyO3), and Elixir
+(`ts_elixir`, Rustler NIF) bindings now expose the same five capability lanes the native `tailscale`
+crate already had, bringing each binding to feature parity with Go `tsnet`'s surface. Pure binding
+plumbing — no change to the native API or its semantics.
+
+- Lane 1 (Status/WhoIs): `status`, `whois`, and a one-shot `netmap` snapshot in all three bindings.
+  Status/StatusNode/WhoIs are marshaled idiomatically (visitor-callback structs in C; `IntoPyObject`
+  in Python; `NifStruct` in Elixir). `online` maps to tri-state (1/0/-1, None/bool, `true/false/nil`);
+  `allowed_routes` to CIDR strings; `capabilities` to `(name, [values])` pairs.
+- Lane 2 (MagicDNS): `resolve(name) -> Option<ipv4>` and `connect_by_name(name, port)` returning the
+  binding's existing TCP-stream handle type.
+- Lane 3 (Forwarding config): the 8 forwarding fields (`accept_routes`, `exit_node`,
+  `advertise_routes`, `advertise_exit_node`, `forward_tcp_ports`, `forward_udp_ports`,
+  `forward_all_ports`, `forward_exit_egress`) are accepted from each binding's config constructor and
+  threaded into `tailscale::Config`.
+- Lane 4 (Ping): `ping(addr, timeout_ms)` returning RTT in milliseconds.
+- Lane 5 (TLS/Serve): full `ServeConfig`/`ServeTarget` marshaling plus `get_certificate` and
+  `listen_tls`. **Fail-closed (sacred):** issuance is `Unimplemented` in this fork, so both surfaces
+  always propagate the native `CertError` (negative return / raised exception / `{:error, reason}`)
+  and never self-sign or fabricate success.
+- C FFI exposes the new types without a doubled prefix (`status_node` → `ts_status_node` via
+  cbindgen); `tailscale.h` is regenerated at build time (gitignored).
+
 ## [0.5.9](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.9) - 2026-06-04
 
 Full exit-node DNS proxy (peerAPI DoH) parity with Go `tsnet`. When this node is selected as a

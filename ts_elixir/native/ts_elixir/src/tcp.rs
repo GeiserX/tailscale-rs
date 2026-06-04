@@ -68,6 +68,27 @@ fn tcp_connect(
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
+fn tcp_connect_by_name(
+    env: rustler::Env<'_>,
+    dev: ResourceArc<crate::Device>,
+    name: &str,
+    port: u16,
+) -> impl Encoder {
+    let dev = dev.inner.clone();
+    let name = name.to_owned();
+
+    let sock = TOKIO_RUNTIME.block_on(async move {
+        let sock = dev.connect_by_name(&name, port).await?;
+
+        ok_arc(TcpStream {
+            inner: Arc::new(sock),
+        })
+    });
+
+    erl_result(env, sock)
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
 fn tcp_accept(env: rustler::Env<'_>, sock: ResourceArc<TcpListener>) -> impl Encoder {
     let inner = sock.inner.clone();
 

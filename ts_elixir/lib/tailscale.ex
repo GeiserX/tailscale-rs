@@ -50,13 +50,36 @@ defmodule Tailscale do
   - `hostname`: the hostname this device will request. If omitted, uses the hostname the OS reports.
   - `tags`: tags the device will request.
   - `control_url`: the url of the control server to use.
+
+  ## Forwarding / routing options (Lane 3)
+
+  All default to a fail-closed value (nothing forwarded, no exit egress) when omitted.
+
+  - `accept_routes`: whether to accept (and route traffic to) subnet routes advertised by peers.
+  - `exit_node`: the peer to route internet-bound traffic through, as a tailnet IP or MagicDNS
+    name string (auto-detected like the Go CLI's `--exit-node`).
+  - `advertise_routes`: subnet routes to advertise as a subnet router, a list of CIDR strings.
+  - `advertise_exit_node`: whether to advertise this node as an exit node.
+  - `forward_tcp_ports`: TCP ports the inbound forwarder splices to real OS sockets.
+  - `forward_udp_ports`: UDP ports the inbound forwarder splices to real OS sockets.
+  - `forward_all_ports`: forward all TCP/UDP ports on every advertised route.
+  - `forward_exit_egress`: whether exit-node flows actually egress via this host's real IP
+    (anti-leak opt-in, separate from `advertise_exit_node`).
   """
   @type options :: [
           auth_key: String.t(),
           keys: Tailscale.Keystate.t(),
           control_url: String.t(),
           hostname: String.t(),
-          tags: [String.t()]
+          tags: [String.t()],
+          accept_routes: boolean(),
+          exit_node: String.t(),
+          advertise_routes: [String.t()],
+          advertise_exit_node: boolean(),
+          forward_tcp_ports: [:inet.port_number()],
+          forward_udp_ports: [:inet.port_number()],
+          forward_all_ports: boolean(),
+          forward_exit_egress: boolean()
         ]
 
   @spec connect(String.t(), options()) :: {:ok, t()} | {:error, any()}
@@ -140,4 +163,63 @@ defmodule Tailscale do
   Retrieve the most narrow set of peers that accept packets for the specified IP.
   """
   defdelegate peers_with_route(dev, ip), to: Tailscale.Native
+
+  @spec status(t()) :: {:ok, Tailscale.Status.t()} | {:error, any()}
+  @doc """
+  Snapshot this device and its tailnet peers (like `tailscale status`).
+  """
+  defdelegate status(dev), to: Tailscale.Native
+
+  @spec whois(t(), {Tailscale.ip_addr(), :inet.port_number()}) ::
+          {:ok, Tailscale.WhoIs.t() | nil} | {:error, any()}
+  @doc """
+  Map a tailnet source `{ip, port}` to the node that owns its IP (like `tsnet`'s `WhoIs`).
+
+  Only the IP is used; the port is ignored. Returns `{:ok, nil}` if no tailnet node owns the
+  address.
+  """
+  defdelegate whois(dev, sockaddr), to: Tailscale.Native
+
+  @spec netmap(t()) :: {:ok, [Tailscale.StatusNode.t()]} | {:error, any()}
+  @doc """
+  Snapshot the current netmap: the current set of peer `t:Tailscale.StatusNode.t/0`s.
+  """
+  defdelegate netmap(dev), to: Tailscale.Native
+
+  @spec resolve(t(), String.t()) :: {:ok, :inet.ip4_address() | nil} | {:error, any()}
+  @doc """
+  Resolve a tailnet peer (or this node) by MagicDNS name to its tailnet IPv4 address.
+
+  Returns `{:ok, ip}` on a match, `{:ok, nil}` if no tailnet node has that name.
+  """
+  defdelegate resolve(dev, name), to: Tailscale.Native
+
+  @spec ping(t(), Tailscale.ip_addr(), non_neg_integer()) :: {:ok, float()} | {:error, any()}
+  @doc """
+  Ping a tailnet peer over the overlay (like `tailscale ping`), returning the round-trip time in
+  milliseconds.
+  """
+  defdelegate ping(dev, addr, timeout_ms), to: Tailscale.Native
+
+  @spec get_certificate(t(), String.t()) :: {:ok, :ok} | {:error, any()}
+  @doc """
+  Obtain a TLS certificate for a node's MagicDNS `name` (like `tsnet`'s `GetCertificate`).
+
+  Fail-closed: this fork has no client-side ACME engine, so this currently always returns
+  `{:error, reason}`. It never self-signs and never returns a placeholder certificate.
+  """
+  defdelegate get_certificate(dev, name), to: Tailscale.Native
+
+  @spec listen_tls(t(), {String.t(), :inet.port_number(), :accept | {:proxy, String.t()}}) ::
+          {:ok, :ok} | {:error, any()}
+  @doc """
+  Build a TLS acceptor terminating TLS for a serve config (like `tsnet`'s `ListenTLS`).
+
+  The serve config is a `{name, port, target}` tuple where `target` is `:accept` or
+  `{:proxy, "host:port"}`.
+
+  Fail-closed: delegates to `get_certificate/2`, so it currently always returns `{:error, reason}`
+  rather than ever serving a self-signed cert or downgrading to plaintext.
+  """
+  defdelegate listen_tls(dev, config), to: Tailscale.Native
 end

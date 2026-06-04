@@ -30,4 +30,16 @@ defmodule Tailscale.Tcp do
   def connect(dev, addr, port) do
     Tailscale.Native.tcp_connect(dev, addr, port)
   end
+
+  @doc """
+  Open a TCP connection to a tailnet peer by MagicDNS name and port.
+
+  Resolves the name via an in-process netmap lookup (no DNS server), then dials the resulting
+  tailnet IPv4 address.
+  """
+  @spec connect_by_name(Tailscale.t(), String.t(), :inet.port_number()) ::
+          {:ok, Tailscale.Tcp.Stream.t()} | {:error, any()}
+  def connect_by_name(dev, name, port) do
+    Tailscale.Native.tcp_connect_by_name(dev, name, port)
+  end
 end

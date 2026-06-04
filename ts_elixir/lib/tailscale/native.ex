@@ -186,4 +186,62 @@ defmodule Tailscale.Native do
   """
   @spec load_key_file(String.t()) :: {:ok, Tailscale.Keystate.t()} | {:error, any()}
   def load_key_file(_path), do: err()
+
+  @doc """
+  Snapshot this device and its tailnet peers (like `tailscale status`).
+  """
+  @spec status(device()) :: {:ok, Tailscale.Status.t()} | {:error, any()}
+  def status(_dev), do: err()
+
+  @doc """
+  Map a tailnet source `{ip, port}` to the node that owns its IP (like `tsnet`'s `WhoIs`).
+  Only the IP is used; the port is ignored.
+  """
+  @spec whois(device(), {Tailscale.ip_addr(), :inet.port_number()}) ::
+          {:ok, Tailscale.WhoIs.t() | nil} | {:error, any()}
+  def whois(_dev, _sockaddr), do: err()
+
+  @doc """
+  Snapshot the current netmap: the current set of peer `t:Tailscale.StatusNode.t/0`s.
+  """
+  @spec netmap(device()) :: {:ok, [Tailscale.StatusNode.t()]} | {:error, any()}
+  def netmap(_dev), do: err()
+
+  @doc """
+  Resolve a tailnet peer (or this node) by MagicDNS name to its tailnet IPv4 address.
+
+  Returns `{:ok, ip}` on a match, `{:ok, nil}` if no tailnet node has that name.
+  """
+  @spec resolve(device(), String.t()) ::
+          {:ok, :inet.ip4_address() | nil} | {:error, any()}
+  def resolve(_dev, _name), do: err()
+
+  @doc """
+  Connect to a tailnet peer by MagicDNS name and port over TCP.
+  """
+  @spec tcp_connect_by_name(device(), String.t(), :inet.port_number()) ::
+          {:ok, tcp_stream()} | {:error, any()}
+  def tcp_connect_by_name(_dev, _name, _port), do: err()
+
+  @doc """
+  Ping a tailnet peer over the overlay, returning the round-trip time in milliseconds.
+  """
+  @spec ping(device(), Tailscale.ip_addr(), non_neg_integer()) ::
+          {:ok, float()} | {:error, any()}
+  def ping(_dev, _addr, _timeout_ms), do: err()
+
+  @doc """
+  Obtain a TLS certificate for a node's MagicDNS `name` (fail-closed until ACME lands).
+  """
+  @spec get_certificate(device(), String.t()) :: {:ok, :ok} | {:error, any()}
+  def get_certificate(_dev, _name), do: err()
+
+  @doc """
+  Build a TLS acceptor terminating TLS for a serve config (fail-closed until ACME lands).
+
+  The config is a `{name, port, target}` tuple where `target` is `:accept` or `{:proxy, "host:port"}`.
+  """
+  @spec listen_tls(device(), {String.t(), :inet.port_number(), :accept | {:proxy, String.t()}}) ::
+          {:ok, :ok} | {:error, any()}
+  def listen_tls(_dev, _config), do: err()
 end

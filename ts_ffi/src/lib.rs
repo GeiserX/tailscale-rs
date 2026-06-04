@@ -19,7 +19,9 @@
 
 use std::{
     ffi::{self, CStr, c_char},
+    net::SocketAddr,
     sync::{LazyLock, Once},
+    time::Duration,
 };
 
 use tracing::level_filters::LevelFilter;
@@ -27,7 +29,9 @@ use tracing::level_filters::LevelFilter;
 mod config;
 mod keys;
 mod net_types;
+mod status;
 mod tcp;
+mod tls;
 mod udp;
 mod util;
 
@@ -35,10 +39,13 @@ pub use net_types::{
     AF_INET, AF_INET6, in_addr_t, in6_addr_t, sa_family_t, sockaddr, sockaddr_data, sockaddr_in,
     sockaddr_in6,
 };
+pub use status::{status_node, status_visitor, ts_status, ts_whois};
 pub use tcp::{
-    tcp_listener, tcp_stream, ts_tcp_close, ts_tcp_close_listener, ts_tcp_connect, ts_tcp_listen,
-    ts_tcp_listener_local_addr, ts_tcp_local_addr, ts_tcp_recv, ts_tcp_remote_addr, ts_tcp_send,
+    tcp_listener, tcp_stream, ts_connect_by_name, ts_tcp_close, ts_tcp_close_listener,
+    ts_tcp_connect, ts_tcp_listen, ts_tcp_listener_local_addr, ts_tcp_local_addr, ts_tcp_recv,
+    ts_tcp_remote_addr, ts_tcp_send,
 };
+pub use tls::{serve_config, serve_target, ts_get_certificate, ts_listen_tls};
 pub use udp::{ts_udp_bind, ts_udp_close, ts_udp_recvfrom, ts_udp_sendto, udp_socket};
 
 static TOKIO_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
@@ -275,6 +282,78 @@ unsafe fn _peer_by_addr(
 
         Err(e) => {
             tracing::error!(error = %e, "looking up peer");
+            -1
+        }
+    }
+}
+
+/// Resolve a tailnet peer (or this node) by MagicDNS `name` to its tailnet IPv4 address.
+///
+/// This is an in-process netmap lookup (no DNS server); only MagicDNS names are resolved. IPv6 is
+/// never resolved (this fork is IPv4-only on the tailnet).
+///
+/// Returns a negative number on error, zero if no tailnet node has that name, and a positive
+/// number if `addr` has been populated with the resolved IPv4 address.
+///
+/// # Safety
+///
+/// `name` must be able to be read according to [`CStr`] rules, i.e. it must be NUL-terminated and
+/// valid for reading up to and including the NUL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ts_resolve(
+    dev: &device,
+    name: *const c_char,
+    addr: &mut in_addr_t,
+) -> ffi::c_int {
+    // SAFETY: ensured by function precondition
+    let Some(name) = (unsafe { util::str(name) }) else {
+        tracing::error!("resolve: name is null or invalid utf-8");
+        return -1;
+    };
+
+    match TOKIO_RUNTIME.block_on(dev.0.resolve(name)) {
+        Ok(Some(ipv4)) => {
+            *addr = ipv4.into();
+            1
+        }
+        Ok(None) => 0,
+        Err(e) => {
+            tracing::error!(error = %e, "resolve");
+            -1
+        }
+    }
+}
+
+/// Ping a tailnet peer over the overlay with an ICMPv4 echo, returning the round-trip time.
+///
+/// `dst` is the destination address (only its IP is used; the port is ignored). `timeout_ms` is
+/// the timeout in milliseconds. On success the round-trip time in milliseconds is written to `rtt_ms`.
+///
+/// Returns 0 on success, a negative number on error (timeout, IPv6 destination — unsupported in
+/// this IPv4-only fork — or a netstack error). `rtt_ms` is only written on success.
+///
+/// # Safety
+///
+/// `dst` must be a valid [`sockaddr`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ts_ping(
+    dev: &device,
+    dst: &sockaddr,
+    timeout_ms: u64,
+    rtt_ms: &mut u64,
+) -> ffi::c_int {
+    let Ok(dst): Result<SocketAddr, _> = dst.try_into() else {
+        tracing::error!("ping: invalid sockaddr");
+        return -1;
+    };
+
+    match TOKIO_RUNTIME.block_on(dev.0.ping(dst.ip(), Duration::from_millis(timeout_ms))) {
+        Ok(rtt) => {
+            *rtt_ms = rtt.as_millis() as u64;
+            0
+        }
+        Err(e) => {
+            tracing::error!(err = %e, "ping");
             -1
         }
     }

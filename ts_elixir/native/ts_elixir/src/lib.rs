@@ -5,11 +5,14 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr,
     sync::{Arc, LazyLock},
+    time::Duration,
 };
 
 use rustler::{Encoder, NifResult, ResourceArc, Term};
 
 mod config;
+mod serve;
+mod status;
 mod tcp;
 mod udp;
 
@@ -208,6 +211,18 @@ fn peers_with_route(env: rustler::Env<'_>, dev: ResourceArc<Device>, ip: Term) -
     }
 }
 
+#[rustler::nif(schedule = "DirtyIo")]
+fn resolve(env: rustler::Env<'_>, dev: ResourceArc<Device>, name: &str) -> impl Encoder {
+    let dev = dev.inner.clone();
+    let name = name.to_owned();
+
+    match TOKIO_RUNTIME.block_on(async move { dev.resolve(&name).await }) {
+        Err(e) => (atoms::error(), e.to_string()).encode(env),
+        Ok(None) => (atoms::ok(), Option::<()>::None).encode(env),
+        Ok(Some(ip)) => (atoms::ok(), ip_to_erl(env, ip)).encode(env),
+    }
+}
+
 fn ip_to_erl(env: rustler::Env, ip: impl Into<IpAddr>) -> Term {
     match ip.into() {
         IpAddr::V4(ip) => {
@@ -289,6 +304,31 @@ fn ip_from_erl(ip: Term) -> Option<IpAddr> {
 
 fn sockaddr_to_erl(env: rustler::Env, addr: SocketAddr) -> impl Encoder {
     (ip_to_erl(env, addr.ip()), addr.port())
+}
+
+/// Decode a `{ip, port}` tuple (the same shape [`sockaddr_to_erl`] produces) into a [`SocketAddr`].
+fn sockaddr_from_erl(term: Term) -> Option<SocketAddr> {
+    let tuple = rustler::types::tuple::get_tuple(term).ok()?;
+    if tuple.len() != 2 {
+        return None;
+    }
+    let ip = ip_from_erl(tuple[0])?;
+    let port: u16 = tuple[1].decode().ok()?;
+    Some(SocketAddr::new(ip, port))
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn ping(env: rustler::Env, dev: ResourceArc<Device>, addr: Term, timeout_ms: u64) -> impl Encoder {
+    let dev = dev.inner.clone();
+    let Some(ip) = ip_from_erl(addr) else {
+        return env.error_tuple("invalid ip");
+    };
+    let timeout = Duration::from_millis(timeout_ms);
+
+    match TOKIO_RUNTIME.block_on(async move { dev.ping(ip, timeout).await }) {
+        Ok(rtt) => (atoms::ok(), rtt.as_secs_f64() * 1000.0).encode(env),
+        Err(e) => (atoms::error(), e.to_string()).encode(env),
+    }
 }
 
 fn load(env: rustler::Env, _term: Term) -> bool {

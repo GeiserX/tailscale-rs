@@ -280,6 +280,7 @@ impl From<&Config> for ts_control::Config {
             forward_exit_egress: value.forward_exit_egress,
             exit_proxy: value.exit_proxy.clone(),
             tcp_buffer_size: value.tcp_buffer_size,
+            peerapi_port: None,
         }
     }
 }

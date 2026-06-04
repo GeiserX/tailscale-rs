@@ -9,6 +9,15 @@ mod atoms {
         hostname,
         tags,
         auth_key,
+
+        accept_routes,
+        exit_node,
+        advertise_routes,
+        advertise_exit_node,
+        forward_tcp_ports,
+        forward_udp_ports,
+        forward_all_ports,
+        forward_exit_egress,
     }
 }
 
@@ -50,6 +59,52 @@ pub fn config_from_erl(
 
     if let Some(value) = erl_config.get(&atoms::auth_key()) {
         auth_key = Some(value.decode()?);
+    }
+
+    // Lane 3: forwarding / routing config. All fields are optional and default to the native
+    // `Config::default` (fail-closed: nothing forwarded, no exit egress) when absent.
+    if let Some(value) = erl_config.get(&atoms::accept_routes()) {
+        config.accept_routes = value.decode()?;
+    }
+
+    if let Some(value) = erl_config.get(&atoms::exit_node()) {
+        // `ExitNodeSelector::from_str` is infallible (a non-IP string becomes a MagicDNS name),
+        // matching the Go CLI's `--exit-node` auto-detection.
+        let selector: &str = value.decode()?;
+        config.exit_node = Some(
+            selector
+                .parse()
+                .map_err(|_| rustler::Error::Atom("bad_exit_node"))?,
+        );
+    }
+
+    if let Some(value) = erl_config.get(&atoms::advertise_routes()) {
+        let routes: Vec<String> = value.decode()?;
+        config.advertise_routes = routes
+            .iter()
+            .map(|s| s.parse())
+            .collect::<Result<_, _>>()
+            .map_err(|_| rustler::Error::Atom("bad_advertise_routes"))?;
+    }
+
+    if let Some(value) = erl_config.get(&atoms::advertise_exit_node()) {
+        config.advertise_exit_node = value.decode()?;
+    }
+
+    if let Some(value) = erl_config.get(&atoms::forward_tcp_ports()) {
+        config.forward_tcp_ports = value.decode()?;
+    }
+
+    if let Some(value) = erl_config.get(&atoms::forward_udp_ports()) {
+        config.forward_udp_ports = value.decode()?;
+    }
+
+    if let Some(value) = erl_config.get(&atoms::forward_all_ports()) {
+        config.forward_all_ports = value.decode()?;
+    }
+
+    if let Some(value) = erl_config.get(&atoms::forward_exit_egress()) {
+        config.forward_exit_egress = value.decode()?;
     }
 
     Ok((config, auth_key))
