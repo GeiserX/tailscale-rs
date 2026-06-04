@@ -29,3 +29,16 @@ through a **residential proxy** — the cloud host's real IP never appears upstr
   rejects forbidden exit destinations (loopback / link-local / unspecified). Proxy credentials
   are redacted from `Debug`. The default `DirectDialer` structurally refuses exit egress, so the
   real origin IP can never leak by accident.
+
+## Exit-node memory: `tcp_buffer_size` at scale
+
+The userspace netstack has **no TCP window auto-tuning**, so `Config::tcp_buffer_size` (default
+**256 KiB per direction**, raised from 16 KiB in v0.5.3 to stop a single flow being throttled to
+~1.6 Mbps at 80 ms RTT) is allocated **eagerly per socket** — one rx buffer and one tx buffer, so
+~512 KiB per TCP socket. The **forwarder** netstack opens one socket per forwarded exit/subnet
+flow, so concurrent-flow count multiplies this directly: a host carrying ~1,000 simultaneous
+forwarded flows pins ~512 MB in TCP buffers alone — a real fraction of a 4 GB a cloud VPS CAX11 exit
+node, the fork's primary deployment. On a small box that forwards many concurrent flows, set
+`Config::tcp_buffer_size` lower (e.g. `Some(64 * 1024)`) and accept the per-flow throughput cap as
+the trade. `None` keeps the throughput-optimized 256 KiB default. Both the application and
+forwarder netstacks share this one value (see `ts_runtime::netstack_config_from`).

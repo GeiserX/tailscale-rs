@@ -159,18 +159,7 @@ impl Multiderp {
     /// would be a second egress / DNS-leak path). May be empty (then we fall back to pong-harvest).
     #[message]
     pub fn stun_servers_v4(&self) -> (Vec<SocketAddr>,) {
-        let mut servers = Vec::new();
-        for region in self.regions.values() {
-            for srv in &region.servers {
-                let Some(stun_port) = srv.stun_port else {
-                    continue;
-                };
-                if let ts_derp::IpUsage::FixedAddr(v4) = srv.ipv4 {
-                    servers.push(SocketAddr::V4(SocketAddrV4::new(v4, stun_port)));
-                }
-            }
-        }
-        (servers,)
+        (stun_servers_from_regions(self.regions.values()),)
     }
 
     /// Install the direct underlay socket so disco frames (e.g. a `CallMeMaybe`) relayed to us
@@ -207,6 +196,32 @@ impl Multiderp {
             tracing::trace!(error = %e, region_id = %region, "disco relay queue full or closed, dropping frame");
         }
     }
+}
+
+/// Collect the v4 STUN server addresses from a set of derp regions, for leak-safe single-socket
+/// STUN.
+///
+/// **Anti-leak gate — do not loosen.** Only [`ts_derp::IpUsage::FixedAddr`] v4 servers with a
+/// `stun_port` are emitted. `UseDns` (and `Disable`) servers are deliberately skipped: resolving a
+/// STUN server hostname would be a DNS query and a second egress path, defeating the whole point of
+/// probing from the one bound underlay socket. A future reader must not "fix" this to include
+/// `UseDns` servers — that would reintroduce the DNS-leak path. Extracted as a free function so the
+/// filtering can be unit-tested directly against `ServerConnInfo` fixtures.
+fn stun_servers_from_regions<'a>(
+    regions: impl IntoIterator<Item = &'a DerpRegion>,
+) -> Vec<SocketAddr> {
+    let mut servers = Vec::new();
+    for region in regions {
+        for srv in &region.servers {
+            let Some(stun_port) = srv.stun_port else {
+                continue;
+            };
+            if let ts_derp::IpUsage::FixedAddr(v4) = srv.ipv4 {
+                servers.push(SocketAddr::V4(SocketAddrV4::new(v4, stun_port)));
+            }
+        }
+    }
+    servers
 }
 
 /// Read a [`RwLock`], recovering from poisoning rather than propagating the panic.
@@ -676,6 +691,80 @@ mod tests {
             sock.candidate_addrs(&peer_disco.public_key()),
             vec![public],
             "only the public candidate survives the pingable-candidate filter"
+        );
+    }
+
+    /// Build a [`ServerConnInfo`] fixture with the given v4 usage and STUN port; other fields are
+    /// fixed placeholders the STUN filter never reads.
+    fn server(
+        ipv4: ts_derp::IpUsage<core::net::Ipv4Addr>,
+        stun_port: Option<u16>,
+    ) -> ts_derp::ServerConnInfo {
+        ts_derp::ServerConnInfo {
+            hostname: "derp.example".to_string(),
+            ipv4,
+            ipv6: ts_derp::IpUsage::Disable,
+            tls_validation_config: ts_derp::TlsValidationConfig::CommonName {
+                common_name: "derp.example".to_string(),
+            },
+            https_port: 443,
+            stun_port,
+            stun_only: false,
+            supports_port_80: false,
+        }
+    }
+
+    fn region(servers: Vec<ts_derp::ServerConnInfo>) -> DerpRegion {
+        DerpRegion {
+            info: ts_derp::RegionInfo {
+                name: "r".to_string(),
+                code: "r".to_string(),
+                no_measure_no_home: false,
+            },
+            servers,
+        }
+    }
+
+    /// The anti-DNS-leak gate: only FixedAddr-v4 servers with a STUN port are returned. A `UseDns`
+    /// server (would require a DNS lookup = second egress) is skipped, a `Disable` server is
+    /// skipped, and a FixedAddr server with no `stun_port` is skipped. A future change that lets
+    /// `UseDns` through would reintroduce the DNS-leak path this test guards.
+    #[test]
+    fn stun_servers_from_regions_returns_only_fixed_v4_with_port() {
+        let fixed = core::net::Ipv4Addr::new(203, 0, 113, 5);
+        let r = region(vec![
+            // Kept: FixedAddr v4 with a STUN port.
+            server(ts_derp::IpUsage::FixedAddr(fixed), Some(3478)),
+            // Skipped: UseDns (resolving it would be a DNS leak / second egress).
+            server(ts_derp::IpUsage::UseDns, Some(3478)),
+            // Skipped: explicitly disabled v4.
+            server(ts_derp::IpUsage::Disable, Some(3478)),
+            // Skipped: FixedAddr but STUN disabled (no stun_port).
+            server(
+                ts_derp::IpUsage::FixedAddr(core::net::Ipv4Addr::new(198, 51, 100, 9)),
+                None,
+            ),
+        ]);
+
+        let got = stun_servers_from_regions([&r]);
+        assert_eq!(
+            got,
+            vec![SocketAddr::V4(SocketAddrV4::new(fixed, 3478))],
+            "only the FixedAddr-v4-with-port server must be probed (UseDns/Disable/no-port skipped)"
+        );
+    }
+
+    /// A derp map with no FixedAddr-v4 STUN servers yields an empty list (the prober then falls back
+    /// to pong-harvest) rather than panicking or fabricating an address.
+    #[test]
+    fn stun_servers_from_regions_empty_when_no_fixed_v4() {
+        let r = region(vec![
+            server(ts_derp::IpUsage::UseDns, Some(3478)),
+            server(ts_derp::IpUsage::Disable, None),
+        ]);
+        assert!(
+            stun_servers_from_regions([&r]).is_empty(),
+            "no FixedAddr-v4 STUN server => empty probe list"
         );
     }
 }

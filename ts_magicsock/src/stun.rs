@@ -21,13 +21,13 @@ use core::net::{Ipv4Addr, SocketAddrV4};
 
 /// The STUN magic cookie (RFC 5389), in host byte order. On the wire it is the big-endian
 /// bytes `bytes[4..8]` of every STUN message.
-pub const MAGIC_COOKIE: u32 = 0x2112_A442;
+pub(crate) const MAGIC_COOKIE: u32 = 0x2112_A442;
 
 /// STUN message type for a Binding Request (the only request we send).
-pub const BINDING_REQUEST: u16 = 0x0001;
+pub(crate) const BINDING_REQUEST: u16 = 0x0001;
 
 /// STUN message type for a Binding Success Response (the only response we accept).
-pub const BINDING_SUCCESS: u16 = 0x0101;
+pub(crate) const BINDING_SUCCESS: u16 = 0x0101;
 
 /// The XOR-MAPPED-ADDRESS attribute type (RFC 5389 §15.2); the reflexive address lives here.
 const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
@@ -42,14 +42,14 @@ const FAMILY_IPV6: u8 = 0x02;
 const HEADER_LEN: usize = 20;
 
 /// A 12-byte STUN transaction id, matching the on-wire layout (`bytes[8..20]`).
-pub type StunTxId = [u8; 12];
+pub(crate) type StunTxId = [u8; 12];
 
 /// Encode a 20-byte STUN Binding Request carrying `tx_id`.
 ///
 /// Layout: type = [`BINDING_REQUEST`] (`0x0001`), message length = `0x0000` (no attributes),
 /// magic cookie = [`MAGIC_COOKIE`] big-endian at `bytes[4..8]`, transaction id at
 /// `bytes[8..20]`.
-pub fn encode_binding_request(tx_id: StunTxId) -> [u8; HEADER_LEN] {
+pub(crate) fn encode_binding_request(tx_id: StunTxId) -> [u8; HEADER_LEN] {
     let mut buf = [0u8; HEADER_LEN];
     buf[0..2].copy_from_slice(&BINDING_REQUEST.to_be_bytes());
     // length stays 0x0000 (no attributes).
@@ -63,7 +63,7 @@ pub fn encode_binding_request(tx_id: StunTxId) -> [u8; HEADER_LEN] {
 /// Only checks the fixed header bytes (type and cookie); it does **not** validate the
 /// transaction id or attributes. Used in the recv loop to decide whether to attempt the full,
 /// transaction-matched [`parse_binding_response`] before falling through to the disco demux.
-pub fn looks_like_stun_success(buf: &[u8]) -> bool {
+pub(crate) fn looks_like_stun_success(buf: &[u8]) -> bool {
     buf.len() >= HEADER_LEN
         && buf[0..2] == BINDING_SUCCESS.to_be_bytes()
         && buf[4..8] == MAGIC_COOKIE.to_be_bytes()
@@ -81,7 +81,7 @@ pub fn looks_like_stun_success(buf: &[u8]) -> bool {
 /// Returns `None` on any mismatch, on an IPv6 family (`0x02`) mapped address, on truncation, or
 /// on a malformed TLV / bad attribute length. Attributes are walked with full bounds checks; a
 /// single malformed attribute aborts the walk (fail closed) rather than guessing.
-pub fn parse_binding_response(buf: &[u8], expected: StunTxId) -> Option<SocketAddrV4> {
+pub(crate) fn parse_binding_response(buf: &[u8], expected: StunTxId) -> Option<SocketAddrV4> {
     if buf.len() < HEADER_LEN {
         return None;
     }
@@ -165,13 +165,16 @@ fn parse_xor_mapped_address(value: &[u8]) -> Option<SocketAddrV4> {
     Some(SocketAddrV4::new(ip, port))
 }
 
+/// Test-only wire-format encoders, shared with the [`crate::sock`] STUN tests so there is a single
+/// canonical Binding-Success encoder (the decoder under test never round-trips against its own
+/// private copy).
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
 
     /// Build a Binding Success Response carrying an IPv4 XOR-MAPPED-ADDRESS for `addr` and the
     /// given transaction id, matching the wire format we parse.
-    fn encode_success_ipv4(tx_id: StunTxId, addr: SocketAddrV4) -> Vec<u8> {
+    pub(crate) fn encode_success_ipv4(tx_id: StunTxId, addr: SocketAddrV4) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
         // attributes length: one XOR-MAPPED-ADDRESS attr (4 header + 8 value = 12 bytes).
@@ -195,7 +198,7 @@ mod tests {
 
     /// Build a Binding Success Response carrying an IPv6-family XOR-MAPPED-ADDRESS (which must
     /// never be accepted).
-    fn encode_success_ipv6(tx_id: StunTxId) -> Vec<u8> {
+    pub(crate) fn encode_success_ipv6(tx_id: StunTxId) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
         // 4 header + 20 value (reserved + family + port + 16-byte v6 addr) = 24 bytes.
@@ -211,6 +214,14 @@ mod tests {
         buf.extend_from_slice(&[0u8; 16]); // xor-ipv6
         buf
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        test_support::{encode_success_ipv4, encode_success_ipv6},
+        *,
+    };
 
     #[test]
     fn encode_binding_request_layout() {
@@ -291,6 +302,114 @@ mod tests {
         // Turn the success response into a request type.
         buf[0..2].copy_from_slice(&BINDING_REQUEST.to_be_bytes());
         assert_eq!(parse_binding_response(&buf, tx_id), None);
+    }
+
+    /// Decode a hand-built wire vector that does NOT come from our own `encode_success_ipv4`,
+    /// pinning the XOR decode against an independently-derived known-good answer.
+    ///
+    /// This is the critical complement to the round-trip tests: a round trip through our own
+    /// encoder would still pass even if the encoder *and* decoder shared a bug (e.g. wrong cookie
+    /// endianness, swapped XOR keys). Here the input bytes and the expected `192.0.2.1:32853`
+    /// answer are written out by hand from the RFC 5769 §2.1 sample-response convention
+    /// (X-Port `0xa147` ^ `0x2112` = 32853; X-Address `0xe112a643` ^ `0x2112a442` = 192.0.2.1),
+    /// so any drift in the magic cookie, the XOR keying, or the byte order is caught.
+    #[test]
+    fn known_good_external_vector_decodes() {
+        // The RFC 5769 §2.1 sample transaction id.
+        let tx_id: StunTxId = [
+            0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae,
+        ];
+        let mut buf = Vec::new();
+        // Header: Binding Success, attrs length = 12 (one XOR-MAPPED-ADDRESS attr), cookie, txid.
+        buf.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
+        buf.extend_from_slice(&12u16.to_be_bytes());
+        buf.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+        buf.extend_from_slice(&tx_id);
+        // XOR-MAPPED-ADDRESS attribute, value length 8.
+        buf.extend_from_slice(&ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
+        buf.extend_from_slice(&8u16.to_be_bytes());
+        buf.push(0x00); // reserved
+        buf.push(FAMILY_IPV4); // family
+        buf.extend_from_slice(&[0xa1, 0x47]); // X-Port (hand-derived, not via our encoder)
+        buf.extend_from_slice(&[0xe1, 0x12, 0xa6, 0x43]); // X-Address (hand-derived)
+
+        assert_eq!(
+            parse_binding_response(&buf, tx_id),
+            Some(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 32853)),
+            "the known-good external vector must decode to 192.0.2.1:32853"
+        );
+    }
+
+    /// An unknown comprehension-optional attribute appearing *before* XOR-MAPPED-ADDRESS must be
+    /// skipped (TLV walk advances past type+len+value, padded to a 4-byte boundary) and the walk
+    /// must continue to find the real address. A bug in the `(len + 3) & !3` padding advance would
+    /// pass every single-attribute round-trip test but desync the offset here and miss the address.
+    #[test]
+    fn unknown_attribute_is_skipped_and_walk_continues() {
+        let tx_id: StunTxId = [8u8; 12];
+        let expected = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 41641);
+
+        // A SOFTWARE-like unknown attribute (type 0x8022) with a 5-byte value => padded to 8.
+        const UNKNOWN_ATTR: u16 = 0x8022;
+        let unknown_value: &[u8] = b"hello"; // 5 bytes => 3 bytes of padding to reach 8.
+
+        let xmapped_len = 4 + 8; // attr header + value
+        let unknown_len = 4 + 8; // attr header + padded value
+        let attrs_len = (xmapped_len + unknown_len) as u16;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
+        buf.extend_from_slice(&attrs_len.to_be_bytes());
+        buf.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+        buf.extend_from_slice(&tx_id);
+
+        // Unknown attribute first (must be skipped including its 3 padding bytes).
+        buf.extend_from_slice(&UNKNOWN_ATTR.to_be_bytes());
+        buf.extend_from_slice(&(unknown_value.len() as u16).to_be_bytes());
+        buf.extend_from_slice(unknown_value);
+        buf.extend_from_slice(&[0u8; 3]); // padding to 4-byte boundary
+
+        // Then the real XOR-MAPPED-ADDRESS.
+        buf.extend_from_slice(&ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
+        buf.extend_from_slice(&8u16.to_be_bytes());
+        buf.push(0x00);
+        buf.push(FAMILY_IPV4);
+        let xor_port = expected.port() ^ ((MAGIC_COOKIE >> 16) as u16);
+        buf.extend_from_slice(&xor_port.to_be_bytes());
+        let xor_ip = u32::from(*expected.ip()) ^ MAGIC_COOKIE;
+        buf.extend_from_slice(&xor_ip.to_be_bytes());
+
+        assert_eq!(
+            parse_binding_response(&buf, tx_id),
+            Some(expected),
+            "an unknown leading attribute must be skipped and the walk must find XOR-MAPPED-ADDRESS"
+        );
+    }
+
+    /// A response carrying no XOR-MAPPED-ADDRESS attribute at all (only an unknown attribute) must
+    /// return `None` (learns nothing) rather than mis-decoding the unknown attribute's bytes.
+    #[test]
+    fn no_xor_mapped_address_returns_none() {
+        let tx_id: StunTxId = [11u8; 12];
+        const UNKNOWN_ATTR: u16 = 0x8022;
+        let value: &[u8] = b"softwarexx"; // 10 bytes => padded to 12
+
+        let attrs_len: u16 = 4 + 12; // attr header + value padded 10 -> 12
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
+        buf.extend_from_slice(&attrs_len.to_be_bytes());
+        buf.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+        buf.extend_from_slice(&tx_id);
+        buf.extend_from_slice(&UNKNOWN_ATTR.to_be_bytes());
+        buf.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        buf.extend_from_slice(value);
+        buf.extend_from_slice(&[0u8; 2]); // pad 10 -> 12
+
+        assert_eq!(
+            parse_binding_response(&buf, tx_id),
+            None,
+            "a response with no XOR-MAPPED-ADDRESS attribute must learn nothing"
+        );
     }
 
     #[test]

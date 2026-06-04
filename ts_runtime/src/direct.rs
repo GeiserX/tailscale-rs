@@ -298,14 +298,23 @@ async fn run_stun_prober(
                         continue;
                     }
                 };
-                for s in servers {
-                    // send_stun_request fails closed internally (non-v4 refused, in-flight cap);
-                    // a transient io error just means this server is skipped this round.
-                    if let Err(e) = sock.send_stun_request(s).await {
-                        tracing::trace!(error = %e, server = %s, "sending stun binding request");
-                    }
-                }
+                probe_stun_servers_once(&sock, &servers).await;
             }
+        }
+    }
+}
+
+/// Send one STUN Binding Request to each server in `servers` from the one bound socket.
+///
+/// Each send fails closed inside [`MagicSock::send_stun_request`] (a non-v4 server is refused, the
+/// in-flight set is capped); a transient io error just skips that server for this round rather than
+/// aborting the sweep. Factored out of [`run_stun_prober`]'s interval loop so the per-tick fan-out
+/// (including the empty-list no-op when the derp map lists no FixedAddr-v4 STUN servers) is
+/// unit-testable without the actor/interval machinery.
+async fn probe_stun_servers_once(sock: &Arc<MagicSock>, servers: &[SocketAddr]) {
+    for &s in servers {
+        if let Err(e) = sock.send_stun_request(s).await {
+            tracing::trace!(error = %e, server = %s, "sending stun binding request");
         }
     }
 }
@@ -655,5 +664,67 @@ mod tests {
             !verify_binding(&db, &stranger, None),
             "a non-member disco key must be rejected for a CallMeMaybe"
         );
+    }
+
+    /// One probe round to a v4 STUN server emits a well-formed STUN Binding Request from the one
+    /// bound underlay socket: 20 bytes, message type `0x0001`, magic cookie `0x2112A442`. This
+    /// pins the per-tick fan-out that `run_stun_prober` drives, independent of the interval/actor
+    /// machinery.
+    #[tokio::test]
+    async fn probe_stun_servers_once_sends_binding_request() {
+        let sock = Arc::new(
+            MagicSock::bind(
+                BIND_ADDR.parse().unwrap(),
+                DiscoPrivateKey::random(),
+                NodePrivateKey::random().public_key(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        // A real local v4 sink so the request is actually delivered and observable.
+        let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server: SocketAddr = sink.local_addr().unwrap();
+
+        probe_stun_servers_once(&sock, &[server]).await;
+
+        let mut buf = [0u8; 64];
+        let (n, _from) = tokio::time::timeout(Duration::from_secs(2), sink.recv_from(&mut buf))
+            .await
+            .expect("a STUN binding request must arrive at the v4 server")
+            .unwrap();
+
+        assert_eq!(
+            n, 20,
+            "a STUN Binding Request is exactly the 20-byte header"
+        );
+        assert_eq!(
+            &buf[0..2],
+            &0x0001u16.to_be_bytes(),
+            "message type must be Binding Request (0x0001)"
+        );
+        assert_eq!(
+            &buf[4..8],
+            &0x2112_A442u32.to_be_bytes(),
+            "the STUN magic cookie must be present at bytes[4..8]"
+        );
+    }
+
+    /// An empty server list (the derp map lists no FixedAddr-v4 STUN servers) is a no-op: nothing is
+    /// sent and we silently fall back to pong-harvest. Probing must not require a STUN server.
+    #[tokio::test]
+    async fn probe_stun_servers_once_empty_list_is_noop() {
+        let sock = Arc::new(
+            MagicSock::bind(
+                BIND_ADDR.parse().unwrap(),
+                DiscoPrivateKey::random(),
+                NodePrivateKey::random().public_key(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        // No servers => no sends, no panic, returns promptly.
+        probe_stun_servers_once(&sock, &[]).await;
     }
 }

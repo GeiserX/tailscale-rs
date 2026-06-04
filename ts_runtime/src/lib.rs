@@ -68,13 +68,7 @@ impl Runtime {
 
         // Both userspace netstacks (application + forwarder) share one netstack config. Honor the
         // per-deployment TCP buffer knob when set, otherwise fall back to the netstack default.
-        let netstack_config = {
-            let mut c = netstack::netcore::Config::default();
-            if let Some(tcp_buffer_size) = config.tcp_buffer_size {
-                c.tcp_buffer_size = tcp_buffer_size;
-            }
-            c
-        };
+        let netstack_config = netstack_config_from(config.tcp_buffer_size);
 
         let dataplane = DataplaneActor::spawn(env.clone());
 
@@ -293,5 +287,49 @@ fn try_shutdown(a: &ActorRef<impl kameo::Actor>) {
     if let Err(e) = a.mailbox_sender().try_send(Signal::Stop) {
         tracing::error!(error = %e, "graceful shutdown failed, killing actor");
         a.kill();
+    }
+}
+
+/// Build the netstack config shared by both userspace netstacks (application + forwarder) from the
+/// per-deployment `tcp_buffer_size` knob.
+///
+/// `None` keeps the netstack default (256 KiB/direction); `Some(n)` overrides it (e.g. a smaller
+/// window on a memory-constrained exit node forwarding many concurrent flows — see
+/// [`netstack::netcore::Config::tcp_buffer_size`]). Factored out of [`Runtime::spawn`] so the
+/// None-default / Some-override mapping is unit-testable without standing up the actor system.
+fn netstack_config_from(tcp_buffer_size: Option<usize>) -> netstack::netcore::Config {
+    let mut c = netstack::netcore::Config::default();
+    if let Some(tcp_buffer_size) = tcp_buffer_size {
+        c.tcp_buffer_size = tcp_buffer_size;
+    }
+    c
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `None` must leave the netstack's own default TCP window in place (the 256 KiB throughput
+    /// default), and must not silently coerce to some other value.
+    #[test]
+    fn netstack_config_none_uses_netstack_default() {
+        let default = netstack::netcore::Config::default();
+        let built = netstack_config_from(None);
+        assert_eq!(
+            built.tcp_buffer_size, default.tcp_buffer_size,
+            "None must inherit the netstack default TCP buffer size"
+        );
+    }
+
+    /// `Some(n)` must override the TCP window (the memory-vs-throughput knob exit-node operators
+    /// reach for), reaching the config that both netstacks are built from.
+    #[test]
+    fn netstack_config_some_overrides_buffer() {
+        let built = netstack_config_from(Some(64 * 1024));
+        assert_eq!(
+            built.tcp_buffer_size,
+            64 * 1024,
+            "Some(n) must override the TCP buffer size that both netstacks use"
+        );
     }
 }

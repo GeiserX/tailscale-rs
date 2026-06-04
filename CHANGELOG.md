@@ -6,6 +6,29 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.4](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.4) - 2026-06-04
+
+Review-driven hardening of the v0.5.3 active-STUN + `tcp_buffer_size` work (no behavior change to
+the shipped feature; tests, docs, and an internal cleanup).
+
+- Cleanup: the STUN in-flight map (`MagicSock`) no longer stores the per-request server address —
+  it was never read for response matching, and storing it falsely implied source-address pinning.
+  The 96-bit transaction id is and remains the sole anti-spoof match (a STUN reply may legitimately
+  arrive from a different source under NAT/hairpin); the map is now keyed `txid → sent-Instant` for
+  TTL pruning only, and the field/TTL docs are corrected to say so.
+- Tests: added coverage for the previously-untested seams — the `stun_servers_v4` anti-DNS-leak
+  filter (FixedAddr-v4-with-port kept; `UseDns`/`Disable`/no-`stun_port` skipped), the per-tick STUN
+  prober fan-out (emits a well-formed 20-byte Binding Request to a v4 server; empty server list is a
+  no-op falling back to pong-harvest), and the `tcp_buffer_size` runtime seam (`None` ⇒ netstack
+  default, `Some(n)` ⇒ override reaching both netstacks). Consolidated the duplicate STUN wire-format
+  test encoders into one canonical `crate::stun::test_support` helper.
+- Docs: documented the `tcp_buffer_size` memory cost at scale — buffers are allocated eagerly per
+  socket (~512 KiB/socket at the 256 KiB default), so ~1,000 concurrent forwarded flows pin ~512 MB,
+  a real fraction of a 4 GB exit node. Operators forwarding many concurrent flows on small boxes
+  should lower the knob (see the new exit-node section of `AGENTS.md` and the
+  `ts_netstack_smoltcp_core` config doc). The `stun_servers_from_regions` helper carries a loud
+  "do not loosen to `UseDns`" anti-leak note.
+
 ## [0.5.3](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.3) - 2026-06-04
 
 Direct-path NAT-traversal completion plus a netstack throughput knob (`docs/PARITY_ROADMAP.md`).
