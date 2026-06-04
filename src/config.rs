@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use serde::Serializer;
+use ts_control::ExitProxyConfig;
 use ts_keys::PersistState;
 
 use crate::keys::NodeState;
@@ -33,6 +34,15 @@ pub struct Config {
 
     /// Tags this node will request.
     pub requested_tags: Vec<String>,
+
+    /// Whether this node registers as *ephemeral*.
+    ///
+    /// This is the equivalent of `tailscale up --ephemeral`. An ephemeral node is
+    /// garbage-collected by the control server shortly after it disconnects, which is the right
+    /// default for short-lived clients. A long-lived node that must survive brief disconnects —
+    /// such as a persistent exit node or subnet router — should set this to `false`, or control
+    /// will GC it out of the tailnet while it is momentarily offline. Defaults to `true`.
+    pub ephemeral: bool,
 
     /// Whether to accept (and route traffic to) subnet routes advertised by peers.
     ///
@@ -105,6 +115,19 @@ pub struct Config {
     /// intended egress (e.g. a residential exit), never on a host whose IP must stay hidden (e.g. a
     /// cloud VPS). Subnet routes are dialed identically regardless of this flag.
     pub forward_exit_egress: bool,
+
+    /// Optional upstream proxy that exit-node egress is routed through, so the node egresses via
+    /// the proxy's IP rather than its own origin IP.
+    ///
+    /// This is a **product capability beyond strict Go `tsnet` parity**: it lets a cloud exit node
+    /// route the traffic it egresses through a residential proxy (currently a residential proxy provider; a residential proxy provider and
+    /// a residential proxy provider are sunset), so the cloud host's real IP never appears upstream. Only consulted when
+    /// [`forward_exit_egress`](Config::forward_exit_egress) is `true`. When `Some`, the forwarder is
+    /// wired with a SOCKS5 / HTTP `CONNECT` proxy dialer that **fails closed** — any proxy connect
+    /// or handshake failure drops the flow rather than dialing direct, so the real IP never leaks.
+    /// When `None` (the default) and exit egress is enabled, egress uses this host's real IP. See
+    /// the proxy-egress section of the repo's `AGENTS.md`/`CLAUDE.md`.
+    pub exit_proxy: Option<ExitProxyConfig>,
 }
 
 impl Config {
@@ -234,6 +257,7 @@ impl From<&Config> for ts_control::Config {
             hostname: value.requested_hostname.clone(),
             server_url: value.control_server_url.clone(),
             tags: value.requested_tags.clone(),
+            ephemeral: value.ephemeral,
             accept_routes: value.accept_routes,
             exit_node: value.exit_node.clone(),
             advertise_routes: value.advertise_routes.clone(),
@@ -242,6 +266,7 @@ impl From<&Config> for ts_control::Config {
             forward_udp_ports: value.forward_udp_ports.clone(),
             forward_all_ports: value.forward_all_ports,
             forward_exit_egress: value.forward_exit_egress,
+            exit_proxy: value.exit_proxy.clone(),
         }
     }
 }
@@ -254,6 +279,7 @@ impl Default for Config {
             control_server_url: ts_control::DEFAULT_CONTROL_SERVER.clone(),
             requested_hostname: None,
             requested_tags: vec![],
+            ephemeral: true,
             accept_routes: false,
             exit_node: None,
             advertise_routes: vec![],
@@ -262,7 +288,60 @@ impl Default for Config {
             forward_udp_ports: vec![],
             forward_all_ports: false,
             forward_exit_egress: false,
+            exit_proxy: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The `From<&Config> for ts_control::Config` impl hand-copies every field, so it silently
+    // drops any field a future edit forgets to add. These tests assert each dataplane field
+    // crosses the boundary, with special attention to the anti-leak ones (`forward_exit_egress`,
+    // `exit_proxy`) whose loss would change egress behavior.
+    #[test]
+    fn from_config_threads_all_dataplane_fields() {
+        let cfg = Config {
+            accept_routes: true,
+            advertise_exit_node: true,
+            forward_all_ports: true,
+            forward_exit_egress: true,
+            forward_tcp_ports: vec![80, 443],
+            forward_udp_ports: vec![53],
+            advertise_routes: vec!["10.0.0.0/24".parse().unwrap()],
+            requested_tags: vec!["tag:exit".to_owned()],
+            ephemeral: false,
+            exit_proxy: Some(ExitProxyConfig {
+                addr: "198.51.100.9:8080".parse().unwrap(),
+                scheme: ts_control::ExitProxyScheme::Socks5,
+                auth: Some(("u".to_owned(), "p".to_owned())),
+            }),
+            ..Default::default()
+        };
+
+        let control: ts_control::Config = (&cfg).into();
+
+        assert!(control.accept_routes);
+        assert!(control.advertise_exit_node);
+        assert!(control.forward_all_ports);
+        assert!(control.forward_exit_egress);
+        assert!(!control.ephemeral);
+        assert_eq!(control.forward_tcp_ports, vec![80, 443]);
+        assert_eq!(control.forward_udp_ports, vec![53]);
+        assert_eq!(control.tags, vec!["tag:exit".to_owned()]);
+        let proxy = control.exit_proxy.expect("exit_proxy crosses the boundary");
+        assert_eq!(proxy.addr, "198.51.100.9:8080".parse().unwrap());
+        assert_eq!(proxy.scheme, ts_control::ExitProxyScheme::Socks5);
+        assert_eq!(proxy.auth, Some(("u".to_owned(), "p".to_owned())));
+    }
+
+    #[test]
+    fn from_config_default_has_no_exit_proxy() {
+        let control: ts_control::Config = (&Config::default()).into();
+        assert!(control.exit_proxy.is_none());
+        assert!(!control.forward_exit_egress);
     }
 }
 

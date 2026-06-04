@@ -70,24 +70,6 @@ impl AsyncControlClient {
 
         tracing::info!("registered, starting netmap stream");
 
-        let builder = MapRequestBuilder::new(node_keys)
-            .keep_alive(true)
-            .omit_peers(false)
-            .stream(true)
-            .routable_ips(config.advertised_routes());
-
-        let mut request = if let Some(hostname) = &config.hostname {
-            builder.hostname(hostname)
-        } else {
-            builder
-        }
-        .build();
-
-        let client_name = config.format_client_name();
-        let host_info = request.host_info.get_or_insert_default();
-        host_info.app = &client_name;
-        host_info.ipn_version = crate::PKG_VERSION;
-
         let (state_tx, state_rx) = broadcast::channel(32);
         let (command_tx, command_rx) = mpsc::channel(32);
 
@@ -186,6 +168,48 @@ pub enum Command {
     },
 }
 
+/// Identifies a map-poll session so a reconnect can resume the delta stream instead of
+/// cold-restarting. Control assigns the `handle` in the first [`MapResponse`] of a session and
+/// stamps each response with a monotonically increasing `seq`; on reconnect we offer the last
+/// `(handle, seq)` we processed and control either resumes after `seq` or ignores it and starts a
+/// fresh session with a full netmap (both are safe — see [`MapRequestBuilder::map_session`]).
+#[derive(Clone, Default)]
+struct MapSession {
+    handle: String,
+    seq: i64,
+}
+
+/// Upper bound on the control-supplied session handle we will store/echo. The handle is an opaque
+/// token; anything beyond this is rejected to avoid unbounded memory growth and log injection.
+const MAX_SESSION_HANDLE_LEN: usize = 256;
+
+/// Advance the resume cursor from a freshly received [`StateUpdate`]. The handle is assigned once
+/// (first response of a session); `seq` advances on substantive responses and is 0 on keep-alives.
+///
+/// If control issues a *new* handle (a fresh session), `seq` is reset to 0 so we never carry a
+/// stale cursor from the prior session into the new one. A control-supplied handle that is empty,
+/// over [`MAX_SESSION_HANDLE_LEN`], or contains non-`ascii_graphic` bytes is rejected (the cursor
+/// is left unchanged) to bound memory and prevent log injection.
+fn advance_session(session: &mut MapSession, update: &StateUpdate) {
+    if let Some(handle) = &update.session_handle {
+        let valid = !handle.is_empty()
+            && handle.len() <= MAX_SESSION_HANDLE_LEN
+            && handle.bytes().all(|b| b.is_ascii_graphic());
+        if valid && *handle != session.handle {
+            session.handle = handle.clone();
+            session.seq = 0;
+        } else if !valid {
+            tracing::warn!(
+                handle_len = handle.len(),
+                "control sent an invalid map-session handle; ignoring it"
+            );
+        }
+    }
+    if update.seq != 0 {
+        session.seq = update.seq;
+    }
+}
+
 pub async fn run(
     state_tx: broadcast::Sender<Arc<StateUpdate>>,
     mut command_rx: mpsc::Receiver<Command>,
@@ -195,6 +219,7 @@ pub async fn run(
     config: crate::Config,
 ) {
     let mut dialer = ControlDialer::default();
+    let mut session = MapSession::default();
 
     loop {
         match run_once(
@@ -205,15 +230,24 @@ pub async fn run(
             auth_key.as_deref(),
             &config,
             &mut dialer,
+            &mut session,
         )
         .await
         {
-            // TODO(npry): netmap stream resumption on reconnect
             Ok(()) => {
-                tracing::warn!("netmap stream ended without error, attempting restart");
+                tracing::warn!(
+                    resume_handle = %session.handle,
+                    resume_seq = session.seq,
+                    "netmap stream ended without error, attempting restart"
+                );
             }
             Err(e) => {
-                tracing::error!(error = %e, "netmap stream failed, attempting restart");
+                tracing::error!(
+                    error = %e,
+                    resume_handle = %session.handle,
+                    resume_seq = session.seq,
+                    "netmap stream failed, attempting restart"
+                );
                 tokio::time::sleep(core::time::Duration::from_millis(500)).await;
             }
         }
@@ -228,6 +262,7 @@ async fn run_once(
     auth_key: Option<&str>,
     config: &crate::Config,
     control_dialer: &mut ControlDialer,
+    session: &mut MapSession,
 ) -> Result<(), Error> {
     let h2_client = control_dialer
         .full_connect_next(control_url, &node_keys.machine_keys)
@@ -235,11 +270,15 @@ async fn run_once(
 
     crate::tokio::register(config, control_url, auth_key, node_keys, &h2_client).await?;
 
+    let client_name = config.format_client_name();
     let builder = MapRequestBuilder::new(node_keys)
         .keep_alive(true)
         .omit_peers(false)
         .stream(true)
-        .routable_ips(config.advertised_routes());
+        .routable_ips(config.advertised_routes())
+        .client_info(&client_name, crate::PKG_VERSION)
+        .request_tags(config.tags.iter().map(String::as_str))
+        .map_session(&session.handle, session.seq);
 
     let request = if let Some(hostname) = &config.hostname {
         builder.hostname(hostname)
@@ -261,6 +300,10 @@ async fn run_once(
                 let Some(state_update) = state_update else {
                     break;
                 };
+
+                // Track the session cursor so a reconnect can resume after the last processed
+                // message instead of cold-restarting.
+                advance_session(session, &state_update);
 
                 let _ = handle_ping(&state_update, control_url, &h2_client).await;
 
@@ -326,4 +369,100 @@ fn netmap_stream(
 
         x.ok()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn update(handle: Option<&str>, seq: i64) -> StateUpdate {
+        StateUpdate {
+            session_handle: handle.map(ToOwned::to_owned),
+            seq,
+            derp: None,
+            node: None,
+            peer_update: None,
+            ping: None,
+            packetfilter: None,
+            pop_browser_url: None,
+            dial_plan: None,
+            dns_config: None,
+        }
+    }
+
+    #[test]
+    fn advance_session_captures_handle_and_seq() {
+        let mut session = MapSession::default();
+
+        advance_session(&mut session, &update(Some("sess-1"), 5));
+
+        assert_eq!(session.handle, "sess-1");
+        assert_eq!(session.seq, 5);
+    }
+
+    #[test]
+    fn advance_session_keepalive_preserves_cursor() {
+        let mut session = MapSession {
+            handle: "sess-1".to_owned(),
+            seq: 7,
+        };
+
+        // Keep-alive: no handle, seq == 0. The cursor must not regress.
+        advance_session(&mut session, &update(None, 0));
+
+        assert_eq!(session.handle, "sess-1");
+        assert_eq!(session.seq, 7);
+    }
+
+    #[test]
+    fn advance_session_resets_seq_on_new_handle() {
+        let mut session = MapSession {
+            handle: "sess-1".to_owned(),
+            seq: 42,
+        };
+
+        // Control started a fresh session: a new handle must reset seq so we never carry a stale
+        // cursor from the prior session.
+        advance_session(&mut session, &update(Some("sess-2"), 0));
+
+        assert_eq!(session.handle, "sess-2");
+        assert_eq!(session.seq, 0);
+    }
+
+    #[test]
+    fn advance_session_same_handle_keeps_seq() {
+        let mut session = MapSession {
+            handle: "sess-1".to_owned(),
+            seq: 10,
+        };
+
+        // Re-issuing the same handle (not a new session) must not reset the cursor.
+        advance_session(&mut session, &update(Some("sess-1"), 0));
+
+        assert_eq!(session.handle, "sess-1");
+        assert_eq!(session.seq, 10);
+    }
+
+    #[test]
+    fn advance_session_rejects_overlong_handle() {
+        let mut session = MapSession::default();
+        let huge = "a".repeat(MAX_SESSION_HANDLE_LEN + 1);
+
+        advance_session(&mut session, &update(Some(&huge), 3));
+
+        // The handle is rejected (cursor handle stays empty); seq still advances.
+        assert_eq!(session.handle, "");
+        assert_eq!(session.seq, 3);
+    }
+
+    #[test]
+    fn advance_session_rejects_non_graphic_handle() {
+        let mut session = MapSession::default();
+
+        // A handle with control/whitespace bytes (log-injection risk) is rejected.
+        advance_session(&mut session, &update(Some("bad\nhandle"), 1));
+
+        assert_eq!(session.handle, "");
+        assert_eq!(session.seq, 1);
+    }
 }

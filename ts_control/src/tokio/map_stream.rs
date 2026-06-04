@@ -81,6 +81,14 @@ pub type FilterUpdate = (Option<pf::Ruleset>, BTreeMap<String, Option<pf::Rulese
 /// An update to the netmap state produced from a mapresponse.
 #[derive(Debug)]
 pub struct StateUpdate {
+    /// The opaque map-session handle, set only when control assigns one (the first
+    /// [`MapResponse`] of a session). Carried so a reconnect can request stream resumption via
+    /// [`MapRequestBuilder::map_session`](crate::MapRequestBuilder::map_session). `None` on
+    /// responses that don't (re)establish a session.
+    pub session_handle: Option<alloc::string::String>,
+    /// The sequence number of this [`MapResponse`] within its session, or `0` when control omits
+    /// it (e.g. keep-alives). The last non-zero value is what a reconnect resumes after.
+    pub seq: i64,
     /// New derp map is available.
     pub derp: Option<crate::DerpMap>,
     /// New self-node.
@@ -156,6 +164,9 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
 
         Some((
             StateUpdate {
+                session_handle: (!map_response.map_session_handle.is_empty())
+                    .then(|| map_response.map_session_handle.to_owned()),
+                seq: map_response.seq,
                 peer_update,
                 node: map_response.node.as_ref().map(Into::into),
                 derp: map_response
@@ -238,4 +249,48 @@ pub async fn send_map_request(
     }
 
     Ok(resp.into_read())
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec::Vec;
+
+    use futures_util::StreamExt;
+
+    use super::*;
+
+    /// Frame each JSON body the way control does: a little-endian u32 length prefix followed by the
+    /// JSON bytes. Returns a single buffer the `map_stream` reader can consume.
+    fn frame(bodies: &[&str]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for body in bodies {
+            buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            buf.extend_from_slice(body.as_bytes());
+        }
+        buf
+    }
+
+    #[tokio::test]
+    async fn map_stream_carries_session_handle_and_seq() {
+        let buf = frame(&[r#"{"MapSessionHandle":"sess-xyz","Seq":12}"#]);
+
+        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let update = stream.next().await.expect("one update");
+
+        assert_eq!(update.session_handle.as_deref(), Some("sess-xyz"));
+        assert_eq!(update.seq, 12);
+    }
+
+    #[tokio::test]
+    async fn map_stream_empty_handle_maps_to_none() {
+        // A keep-alive-style response with no session handle and seq 0 must surface as None/0 so
+        // the resume cursor is left untouched.
+        let buf = frame(&[r#"{"KeepAlive":true}"#]);
+
+        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let update = stream.next().await.expect("one update");
+
+        assert_eq!(update.session_handle, None);
+        assert_eq!(update.seq, 0);
+    }
 }

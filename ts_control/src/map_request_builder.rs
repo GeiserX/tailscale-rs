@@ -96,6 +96,40 @@ impl<'a> MapRequestBuilder<'a> {
         self
     }
 
+    /// Request to reattach to a prior map session (`MapRequest::map_session_handle` +
+    /// `map_session_seq`), so a reconnect resumes the delta stream instead of cold-restarting.
+    ///
+    /// `handle` is the opaque session handle echoed by control in the first `MapResponse` of the
+    /// previous session; `seq` is the last sequence number this client processed in that session.
+    /// Control may honor the request (sending only `seq`-greater deltas) or ignore it and start a
+    /// fresh session with a full netmap — either is safe. Only meaningful when
+    /// [`stream`](Self::stream) is `true`. An empty `handle` leaves both fields at their defaults
+    /// (start a new session).
+    pub fn map_session(mut self, handle: &'a str, seq: i64) -> Self {
+        self.req.map_session_handle = handle;
+        self.req.map_session_seq = if handle.is_empty() { 0 } else { seq };
+        self
+    }
+
+    /// Set the client application name (`HostInfo.App`) and IPN version (`HostInfo.IPNVersion`)
+    /// that this node reports to control, so the tailnet admin can identify the client build.
+    pub fn client_info(mut self, app: &'a str, ipn_version: &'a str) -> Self {
+        let host_info = self.host_info_mut();
+        host_info.app = app;
+        host_info.ipn_version = ipn_version;
+        self
+    }
+
+    /// Advertise the set of ACL tags this node wants to claim (`HostInfo.RequestTags`), so a
+    /// tag-keyed control ACL (e.g. a a self-hosted control plane route auto-approver) can match it. When the
+    /// iterator yields nothing, the field is left as `None` and omitted from the wire request
+    /// (claim no tags).
+    pub fn request_tags(mut self, tags: impl IntoIterator<Item = &'a str>) -> Self {
+        let tags: alloc::vec::Vec<&'a str> = tags.into_iter().collect();
+        self.host_info_mut().request_tags = (!tags.is_empty()).then_some(tags);
+        self
+    }
+
     fn host_info_mut(&mut self) -> &mut HostInfo<'a> {
         self.req.host_info.get_or_insert_default()
     }
@@ -151,5 +185,55 @@ mod tests {
 
         // Empty advertise set: the field stays None and is omitted from the wire request.
         assert_eq!(req.host_info.unwrap().routable_ips, None);
+    }
+
+    #[test]
+    fn request_tags_setter_populates_host_info() {
+        let node_state = ts_keys::NodeState::generate();
+
+        let req = MapRequestBuilder::new(&node_state)
+            .request_tags(["tag:exit", "tag:server"])
+            .build();
+
+        assert_eq!(
+            req.host_info.unwrap().request_tags,
+            Some(alloc::vec!["tag:exit", "tag:server"])
+        );
+    }
+
+    #[test]
+    fn request_tags_setter_empty_leaves_field_none() {
+        let node_state = ts_keys::NodeState::generate();
+
+        let req = MapRequestBuilder::new(&node_state).request_tags([]).build();
+
+        // Empty tag set: the field stays None and is omitted from the wire request.
+        assert_eq!(req.host_info.unwrap().request_tags, None);
+    }
+
+    #[test]
+    fn map_session_setter_populates_resume_fields() {
+        let node_state = ts_keys::NodeState::generate();
+
+        let req = MapRequestBuilder::new(&node_state)
+            .map_session("sess-abc", 42)
+            .build();
+
+        assert_eq!(req.map_session_handle, "sess-abc");
+        assert_eq!(req.map_session_seq, 42);
+    }
+
+    #[test]
+    fn map_session_empty_handle_zeroes_seq() {
+        let node_state = ts_keys::NodeState::generate();
+
+        // No prior session: a stray seq must not be sent without a handle (control would ignore
+        // it, but we keep the wire request clean and unambiguous).
+        let req = MapRequestBuilder::new(&node_state)
+            .map_session("", 99)
+            .build();
+
+        assert_eq!(req.map_session_handle, "");
+        assert_eq!(req.map_session_seq, 0);
     }
 }

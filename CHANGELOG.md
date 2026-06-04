@@ -6,6 +6,42 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.2](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.2) - 2026-06-04
+
+Tier 2 of the tsnet full-parity roadmap (`docs/PARITY_ROADMAP.md`).
+
+- Added: control `MapRequest` now carries requested tags (`HostInfo.RequestTags`), wired from
+  `Config::tags` through the map-request builder on both initial connect and reconnect, so a
+  tag-keyed control ACL (e.g. a a self-hosted control plane route auto-approver) can match this node.
+- Added: ephemeral registration is now config-driven (`Config::ephemeral`, default `true`)
+  instead of hardcoded. A persistent exit node or subnet router can set it to `false` so
+  control will not GC it out of the tailnet during a brief disconnect.
+- Added: netmap stream resumption on reconnect. The client now tracks the control-issued map
+  session handle and per-response sequence number, and offers the last `(handle, seq)` on
+  reconnect so control can resume the netmap stream after a drop instead of always restarting
+  a full netmap (both resume and full-restart paths are handled safely).
+- Added (product capability, beyond strict tsnet parity): upstream **proxy egress** for exit
+  nodes. `ProxyExitDialer` (a `RealDialer`) egresses exit-node flows via a SOCKS5
+  (RFC 1928/1929) or HTTP `CONNECT` upstream — hand-rolled with zero new dependencies — so a
+  cloud exit node can route the traffic it egresses through a residential proxy (a residential proxy provider;
+  configured by the deployer) and never expose its own origin IP. It is now fully wired
+  through the config chain: `Config::exit_proxy` (`ExitProxyConfig` / `ExitProxyScheme`) →
+  `ts_control::Config` (transport-only) → `ForwarderConfig` → the forwarder's dialer selection.
+  Strictly opt-in and **fail-closed**: only consulted when `forward_exit_egress` is set, and any
+  proxy connect/handshake failure drops the flow rather than dialing direct (UDP fails closed
+  with `ProxyUdpUnsupported`, handshake failures with `ProxyHandshake`), so the real origin IP
+  never leaks. Without an `exit_proxy`, exit egress uses `HostExitDialer`; with neither, the
+  default `DirectDialer` structurally refuses exit egress. See the proxy-egress section of
+  `AGENTS.md`.
+- Fixed: `HostInfo.App` / `HostInfo.IPNVersion` (the client build string the tailnet admin sees)
+  were silently dropped on connect because the map-request builder rebuilt the request without
+  them; they are now threaded through via a `client_info` builder setter.
+- Hardened: the resumed map-session handle is bounded (≤256 bytes) and sanitized
+  (ASCII-graphic) before being stored or logged, and `seq` resets to `0` on a handle change —
+  closing a log-injection / unbounded-memory vector on a hostile control response.
+- Security: the proxy dialer rejects forbidden exit destinations (loopback / link-local /
+  unspecified) via an SSRF guard, and `ProxyConfig`'s `Debug` redacts proxy credentials.
+
 ## [0.5.1](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.1) - 2026-06-04
 
 Hardening pass over the Tier 1 direct-path code (review-driven fixes).

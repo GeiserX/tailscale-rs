@@ -70,6 +70,18 @@ pub struct ForwarderConfig {
     /// time rather than leaking out our real IP. See
     /// [`Config::forward_exit_egress`](ts_control::Config::forward_exit_egress).
     pub forward_exit_egress: bool,
+
+    /// Optional upstream proxy that exit-node egress is routed through (product capability beyond
+    /// strict tsnet parity — residential-proxy egress).
+    ///
+    /// Only consulted when [`forward_exit_egress`](ForwarderConfig::forward_exit_egress) is `true`.
+    /// When `Some`, the forwarder is wired with a [`ProxyExitDialer`](ts_forwarder::ProxyExitDialer)
+    /// that tunnels exit-node flows through the proxy and **fails closed** (never falls back to a
+    /// direct host-IP dial). When `None`, exit egress (if enabled) uses this host's real IP. This is
+    /// already the `ts_forwarder` type: the conversion from the transport-only
+    /// [`ts_control::ExitProxyConfig`] happens in [`from_control_config`](ForwarderConfig::from_control_config),
+    /// since `ts_control` must not depend on `ts_forwarder`.
+    pub exit_proxy: Option<ts_forwarder::ProxyConfig>,
 }
 
 impl ForwarderConfig {
@@ -86,7 +98,22 @@ impl ForwarderConfig {
             forward_udp_ports: config.forward_udp_ports.clone(),
             forward_all_ports: config.forward_all_ports,
             forward_exit_egress: config.forward_exit_egress,
+            exit_proxy: config.exit_proxy.as_ref().map(exit_proxy_to_forwarder),
         }
+    }
+}
+
+/// Convert the transport-only [`ts_control::ExitProxyConfig`] into the [`ts_forwarder::ProxyConfig`]
+/// the dialer consumes. This boundary exists because `ts_control` must not depend on `ts_forwarder`
+/// (they are independent crates joined only here in `ts_runtime`).
+fn exit_proxy_to_forwarder(cfg: &ts_control::ExitProxyConfig) -> ts_forwarder::ProxyConfig {
+    ts_forwarder::ProxyConfig {
+        addr: cfg.addr,
+        scheme: match cfg.scheme {
+            ts_control::ExitProxyScheme::Socks5 => ts_forwarder::ProxyScheme::Socks5,
+            ts_control::ExitProxyScheme::HttpConnect => ts_forwarder::ProxyScheme::HttpConnect,
+        },
+        auth: cfg.auth.clone(),
     }
 }
 
@@ -128,6 +155,11 @@ pub struct Env {
     /// See [`ForwarderConfig::forward_exit_egress`].
     pub forward_exit_egress: bool,
 
+    /// Optional upstream proxy that exit-node egress is routed through.
+    ///
+    /// See [`ForwarderConfig::exit_proxy`].
+    pub exit_proxy: Option<ts_forwarder::ProxyConfig>,
+
     /// Whether the runtime is shutdown.
     ///
     /// This is provided so that actors can check whether a message send has failed because
@@ -153,6 +185,7 @@ impl Env {
             forward_udp_ports,
             forward_all_ports,
             forward_exit_egress,
+            exit_proxy,
         } = forwarding;
         Self {
             bus: MessageBus::spawn_default(),
@@ -165,6 +198,7 @@ impl Env {
             forward_udp_ports: Arc::new(forward_udp_ports),
             forward_all_ports,
             forward_exit_egress,
+            exit_proxy,
         }
     }
 

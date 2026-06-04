@@ -59,5 +59,8 @@ mod tcp;
 mod udp;
 
 pub use class::{FlowClass, RouteTable};
-pub use dialer::{DialError, DialedUdp, DirectDialer, HostExitDialer, RealDialer};
+pub use dialer::{
+    DialError, DialedUdp, DirectDialer, HostExitDialer, ProxyConfig, ProxyExitDialer, ProxyScheme,
+    RealDialer,
+};
 pub use forwarder::{Forwarder, PortSpec, RouteUpdater};

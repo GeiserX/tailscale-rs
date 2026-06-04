@@ -125,11 +125,15 @@ pub async fn register(
                 let routes = config.advertised_routes();
                 (!routes.is_empty()).then_some(routes)
             },
+            request_tags: {
+                let tags: Vec<&str> = config.tags.iter().map(String::as_str).collect();
+                (!tags.is_empty()).then_some(tags)
+            },
             ..Default::default()
         },
         nl_key: Some(network_lock_public_key),
         auth: auth_key.map(RegisterAuth::from),
-        ephemeral: true,
+        ephemeral: config.ephemeral,
         ..Default::default()
     };
 

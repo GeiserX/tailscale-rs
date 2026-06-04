@@ -15,7 +15,9 @@ use netstack::{
     netcore::{Channel, NetstackControl},
 };
 use tokio::task::JoinSet;
-use ts_forwarder::{DirectDialer, Forwarder, HostExitDialer, RealDialer, RouteTable};
+use ts_forwarder::{
+    DirectDialer, Forwarder, HostExitDialer, ProxyExitDialer, RealDialer, RouteTable,
+};
 use ts_packet::PacketMut;
 
 use crate::{
@@ -63,16 +65,21 @@ enum DialerChoice {
     Direct,
     /// Explicit opt-in: egresses exit-node flows via this host's real IP.
     HostExit,
+    /// Explicit opt-in: egresses exit-node flows through an upstream proxy (fails closed).
+    Proxy,
 }
 
-/// Pure selection of the forwarder dialer from the `forward_exit_egress` gate, factored out of
-/// `on_start` so it can be unit-tested without a netstack. `HostExitDialer` is chosen iff (and
-/// only iff) exit egress is enabled; otherwise the fail-closed `DirectDialer`.
-fn dialer_choice(forward_exit_egress: bool) -> DialerChoice {
-    if forward_exit_egress {
-        DialerChoice::HostExit
-    } else {
-        DialerChoice::Direct
+/// Pure selection of the forwarder dialer from the `forward_exit_egress` gate and whether an exit
+/// proxy is configured, factored out of `on_start` so it can be unit-tested without a netstack.
+///
+/// - exit egress off => fail-closed `DirectDialer` (a proxy config is ignored unless egress is on).
+/// - exit egress on, proxy configured => `ProxyExitDialer` (egress via the proxy IP, fail-closed).
+/// - exit egress on, no proxy => `HostExitDialer` (egress via this host's real IP).
+fn dialer_choice(forward_exit_egress: bool, has_exit_proxy: bool) -> DialerChoice {
+    match (forward_exit_egress, has_exit_proxy) {
+        (false, _) => DialerChoice::Direct,
+        (true, true) => DialerChoice::Proxy,
+        (true, false) => DialerChoice::HostExit,
     }
 }
 
@@ -161,17 +168,22 @@ impl kameo::Actor for ForwarderActor {
         }
 
         // The forwarder dials precisely the prefixes we advertise (advertise == forward). The dialer
-        // is the single anti-leak chokepoint, selected here by the `forward_exit_egress` gate:
+        // is the single anti-leak chokepoint, selected here by the `forward_exit_egress` gate plus
+        // whether an upstream exit proxy is configured:
         //
         // - `DirectDialer` (default, fail-closed): dials real sockets bound to 0.0.0.0:0 for subnet
         //   routes and *structurally refuses* exit-node egress, so a 0.0.0.0/0 flow routed to this
         //   netstack is dropped at dial time, never leaked out our real IP.
-        // - `HostExitDialer` (explicit opt-in): also egresses exit-node flows via this host's real
-        //   IP. Chosen only when the operator set `forward_exit_egress`, which is an auditable,
-        //   deliberate act (see its config docs).
+        // - `HostExitDialer` (explicit opt-in, no proxy configured): also egresses exit-node flows
+        //   via this host's real IP. Chosen only when the operator set `forward_exit_egress`, which
+        //   is an auditable, deliberate act (see its config docs).
+        // - `ProxyExitDialer` (explicit opt-in, exit proxy configured): egresses exit-node flows
+        //   through the configured upstream proxy (e.g. a residential proxy), so the node's real
+        //   origin IP never leaves. Fails closed — any proxy connect/handshake failure drops the
+        //   flow rather than falling back to a direct host-IP dial.
         //
-        // The two dialers are distinct concrete types (`Forwarder<D>` is generic), so we branch on
-        // the gate to pick the dialer but funnel both through one `spawn_forwarder` helper — the
+        // The dialers are distinct concrete types (`Forwarder<D>` is generic), so we branch on the
+        // gate to pick the dialer but funnel all arms through one `spawn_forwarder` helper — the
         // run-loop body lives in exactly one place so the fail-closed and opt-in arms can't drift.
         let routes = RouteTable::new(env.forward_routes.iter().copied());
         let all_ports = env.forward_all_ports;
@@ -181,7 +193,26 @@ impl kameo::Actor for ForwarderActor {
         let n_tcp_ports = tcp_ports.len();
         let n_udp_ports = udp_ports.len();
 
-        match dialer_choice(env.forward_exit_egress) {
+        let choice = dialer_choice(env.forward_exit_egress, env.exit_proxy.is_some());
+        match choice {
+            DialerChoice::Proxy => {
+                // `dialer_choice` returns `Proxy` only when `exit_proxy.is_some()`, so this clone
+                // is always present; expressed as an expect so a future gate change can't silently
+                // fall through to a direct dial (which would leak the real IP).
+                let proxy_config = env
+                    .exit_proxy
+                    .clone()
+                    .expect("dialer_choice returned Proxy without an exit proxy configured");
+                spawn_forwarder(
+                    &mut joinset,
+                    channel.clone(),
+                    routes,
+                    ProxyExitDialer::new(proxy_config),
+                    all_ports,
+                    tcp_ports,
+                    udp_ports,
+                );
+            }
             DialerChoice::HostExit => spawn_forwarder(
                 &mut joinset,
                 channel.clone(),
@@ -208,6 +239,8 @@ impl kameo::Actor for ForwarderActor {
             n_udp_ports,
             all_ports,
             exit_egress = env.forward_exit_egress,
+            exit_proxy = env.exit_proxy.is_some(),
+            dialer = ?choice,
             "forwarder started"
         );
 
@@ -242,6 +275,15 @@ mod tests {
             forward_udp_ports: vec![],
             forward_all_ports,
             forward_exit_egress,
+            exit_proxy: None,
+        }
+    }
+
+    fn proxy_cfg() -> ts_forwarder::ProxyConfig {
+        ts_forwarder::ProxyConfig {
+            addr: "203.0.113.7:1080".parse().unwrap(),
+            scheme: ts_forwarder::ProxyScheme::Socks5,
+            auth: None,
         }
     }
 
@@ -249,23 +291,79 @@ mod tests {
     fn host_exit_dialer_iff_forward_exit_egress() {
         // Fail-closed default: no exit egress => the direct (refusing) dialer.
         assert_eq!(
-            dialer_choice(cfg(false, false).forward_exit_egress),
+            dialer_choice(cfg(false, false).forward_exit_egress, false),
             DialerChoice::Direct
         );
-        // Opt-in: exit egress => the host-exit dialer that egresses via the real IP.
+        // Opt-in: exit egress, no proxy => the host-exit dialer that egresses via the real IP.
         assert_eq!(
-            dialer_choice(cfg(false, true).forward_exit_egress),
+            dialer_choice(cfg(false, true).forward_exit_egress, false),
             DialerChoice::HostExit
         );
         // The all-ports flag is orthogonal: it must not affect the dialer gate.
         assert_eq!(
-            dialer_choice(cfg(true, false).forward_exit_egress),
+            dialer_choice(cfg(true, false).forward_exit_egress, false),
             DialerChoice::Direct
         );
         assert_eq!(
-            dialer_choice(cfg(true, true).forward_exit_egress),
+            dialer_choice(cfg(true, true).forward_exit_egress, false),
             DialerChoice::HostExit
         );
+    }
+
+    #[test]
+    fn proxy_dialer_iff_exit_egress_and_proxy_configured() {
+        // Exit egress on + proxy configured => proxy dialer (egress via the proxy IP).
+        assert_eq!(
+            dialer_choice(cfg(false, true).forward_exit_egress, true),
+            DialerChoice::Proxy
+        );
+        // A configured proxy with exit egress OFF must NOT enable proxy egress — fail-closed wins,
+        // so the real IP can never leak just because a proxy happens to be configured.
+        assert_eq!(
+            dialer_choice(cfg(false, false).forward_exit_egress, true),
+            DialerChoice::Direct
+        );
+        // Exit egress on, no proxy => host-exit (real IP), proxy dialer only when one is set.
+        assert_eq!(
+            dialer_choice(cfg(false, true).forward_exit_egress, false),
+            DialerChoice::HostExit
+        );
+    }
+
+    #[test]
+    fn exit_proxy_converts_through_control_config() {
+        // The transport-only ts_control type round-trips into the ts_forwarder dialer config via
+        // ForwarderConfig::from_control_config (the only place ts_control<->ts_forwarder cross).
+        let control = ts_control::Config {
+            forward_exit_egress: true,
+            exit_proxy: Some(ts_control::ExitProxyConfig {
+                addr: "198.51.100.9:8080".parse().unwrap(),
+                scheme: ts_control::ExitProxyScheme::HttpConnect,
+                auth: Some(("user".to_owned(), "pass".to_owned())),
+            }),
+            ..Default::default()
+        };
+
+        let fwd = ForwarderConfig::from_control_config(&control);
+        // It selects the proxy dialer.
+        assert_eq!(
+            dialer_choice(fwd.forward_exit_egress, fwd.exit_proxy.is_some()),
+            DialerChoice::Proxy
+        );
+        let proxy = fwd.exit_proxy.expect("proxy threaded through");
+        assert_eq!(proxy.addr, "198.51.100.9:8080".parse().unwrap());
+        assert_eq!(proxy.scheme, ts_forwarder::ProxyScheme::HttpConnect);
+        assert_eq!(proxy.auth, Some(("user".to_owned(), "pass".to_owned())));
+    }
+
+    #[test]
+    fn exit_proxy_absent_when_unconfigured() {
+        let control = ts_control::Config::default();
+        let fwd = ForwarderConfig::from_control_config(&control);
+        assert!(fwd.exit_proxy.is_none());
+        // Touch the helper constructor so it's covered and the unused-fn lint stays quiet.
+        let cfg = proxy_cfg();
+        assert_eq!(cfg.scheme, ts_forwarder::ProxyScheme::Socks5);
     }
 
     #[test]

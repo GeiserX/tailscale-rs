@@ -143,6 +143,8 @@ pub use ts_control::tls::{CertifiedKey, TlsAcceptor, TlsStream};
 #[doc(inline)]
 pub use ts_control::{CertError, MISSING_CERT_RPC, ServeConfig, ServeTarget};
 #[doc(inline)]
+pub use ts_control::{ExitProxyConfig, ExitProxyScheme};
+#[doc(inline)]
 pub use ts_netstack_smoltcp::PingError;
 use ts_netstack_smoltcp::{CreateSocket, netcore::Channel};
 #[doc(inline)]

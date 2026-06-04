@@ -1,10 +1,56 @@
 use core::fmt::Debug;
+use std::net::SocketAddr;
 
 use url::Url;
 
 lazy_static::lazy_static! {
     /// The default [`Url`] of the control plane server (aka "coordination server").
     pub static ref DEFAULT_CONTROL_SERVER: Url = Url::parse("https://controlplane.tailscale.com/").unwrap();
+}
+
+/// Upstream-proxy wire protocol for [`ExitProxyConfig`]. Mirrors `ts_forwarder::ProxyScheme`;
+/// kept as a separate type here because `ts_control` must not depend on `ts_forwarder` (the
+/// runtime converts between them at the boundary).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ExitProxyScheme {
+    /// SOCKS5 (RFC 1928), with optional username/password auth (RFC 1929).
+    Socks5,
+    /// HTTP `CONNECT` tunnelling, with optional `Proxy-Authorization: Basic` auth.
+    HttpConnect,
+}
+
+/// Transport-only description of an upstream proxy that exit-node egress is routed through, so a
+/// cloud exit node egresses via the proxy's (e.g. residential) IP rather than its own origin IP.
+///
+/// This is **not** read inside `ts_control`; like the other dataplane fields on [`Config`] it is
+/// carried for transport only and converted to a `ts_forwarder::ProxyConfig` by the runtime. It is
+/// only consulted when [`Config::forward_exit_egress`] is `true` (the anti-leak opt-in); on its own
+/// it changes nothing. See the proxy-egress docs in the repo's `AGENTS.md`/`CLAUDE.md`.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct ExitProxyConfig {
+    /// Address of the upstream proxy to connect to.
+    pub addr: SocketAddr,
+    /// Wire protocol to speak to the proxy.
+    pub scheme: ExitProxyScheme,
+    /// Optional `(username, password)` credentials for proxy auth.
+    pub auth: Option<(String, String)>,
+}
+
+// Manual Debug that NEVER prints the proxy credentials, mirroring `ts_forwarder::ProxyConfig`. A
+// stray `tracing!(?cfg)` or `{:?}` must not leak the residential-proxy username/password.
+impl Debug for ExitProxyConfig {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ExitProxyConfig")
+            .field("addr", &self.addr)
+            .field("scheme", &self.scheme)
+            .field("auth", &self.auth.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// Default for [`Config::ephemeral`]: `true`, matching the historical behavior of this client.
+fn default_ephemeral() -> bool {
+    true
 }
 
 /// Configuration for the control server.
@@ -21,8 +67,24 @@ pub struct Config {
     /// This will be reported to the control server in the `HostInfo.App` field.
     pub client_name: Option<String>,
 
-    /// Tags to request from the control server.
+    /// Tags to request from the control server (`--advertise-tags` / `AdvertiseTags` in the Go
+    /// client).
+    ///
+    /// Sent as `HostInfo.RequestTags` on registration and on every map request, so a
+    /// tag-keyed control ACL (e.g. a a self-hosted control plane route auto-approver) can match this node. Each
+    /// entry is a full tag string including the `tag:` prefix (e.g. `tag:exit`). Defaults to
+    /// empty (claim no tags); an empty set omits the wire field entirely.
+    #[serde(default)]
     pub tags: Vec<String>,
+
+    /// Whether this node registers as *ephemeral* (`--ephemeral` / `Ephemeral` in the Go client).
+    ///
+    /// An ephemeral node is garbage-collected by the control server shortly after it
+    /// disconnects. That is the right default for short-lived clients, but a persistent exit node
+    /// or subnet router must set this to `false` or it will be GC'd out of the tailnet while
+    /// briefly offline. Defaults to `true` to match the historical behavior of this client.
+    #[serde(default = "default_ephemeral")]
+    pub ephemeral: bool,
 
     /// Whether to accept subnet routes advertised by peers (`--accept-routes` / `RouteAll` in the
     /// Go client).
@@ -118,6 +180,22 @@ pub struct Config {
     /// routes are dialed identically regardless of this flag.
     #[serde(default)]
     pub forward_exit_egress: bool,
+
+    /// Optional upstream proxy that exit-node egress is routed through, so the node egresses via
+    /// the proxy's IP rather than its own origin IP.
+    ///
+    /// Only consulted when [`forward_exit_egress`](Config::forward_exit_egress) is `true`. When
+    /// set, the runtime wires the forwarder with a proxy dialer (SOCKS5 / HTTP `CONNECT`) that
+    /// **fails closed** — any proxy connect or handshake failure drops the flow rather than falling
+    /// back to a direct host-IP dial, so the real origin IP never leaks. When `None` (the default)
+    /// and exit egress is enabled, egress uses this host's real IP (`HostExitDialer`).
+    ///
+    /// Like the other dataplane fields, this is a client-side preference not read inside
+    /// `ts_control`; it is carried here only to be threaded through to the runtime's dialer
+    /// selection. This is a product capability (residential-proxy egress) beyond strict tsnet
+    /// parity — see the repo's `AGENTS.md`/`CLAUDE.md`.
+    #[serde(default)]
+    pub exit_proxy: Option<ExitProxyConfig>,
 }
 
 impl Config {
@@ -188,6 +266,7 @@ impl Default for Config {
             hostname: gethostname::gethostname().into_string().ok(),
             client_name: None,
             tags: Default::default(),
+            ephemeral: default_ephemeral(),
             accept_routes: false,
             exit_node: None,
             advertise_routes: Vec::new(),
@@ -196,6 +275,7 @@ impl Default for Config {
             forward_udp_ports: Vec::new(),
             forward_all_ports: false,
             forward_exit_egress: false,
+            exit_proxy: None,
         }
     }
 }
@@ -258,6 +338,36 @@ mod tests {
         };
         // ::/0 is dropped; only the v4 default route is advertised.
         assert_eq!(cfg.advertised_routes(), vec![v4("0.0.0.0/0")]);
+    }
+
+    #[test]
+    fn default_is_ephemeral() {
+        // Preserves the historical hardcoded behavior; persistent nodes must opt out explicitly.
+        assert!(Config::default().ephemeral);
+    }
+
+    #[test]
+    fn ephemeral_deserializes_default_true_when_absent() {
+        // A config that predates the field still registers ephemeral.
+        let cfg: Config = serde_json::from_str(r#"{"server_url":"https://example.com/"}"#).unwrap();
+        assert!(cfg.ephemeral);
+    }
+
+    #[test]
+    fn ephemeral_can_be_disabled_for_persistent_nodes() {
+        let cfg: Config =
+            serde_json::from_str(r#"{"server_url":"https://example.com/","ephemeral":false}"#)
+                .unwrap();
+        assert!(!cfg.ephemeral);
+    }
+
+    #[test]
+    fn tags_default_empty_and_deserialize() {
+        let cfg: Config =
+            serde_json::from_str(r#"{"server_url":"https://example.com/","tags":["tag:exit"]}"#)
+                .unwrap();
+        assert_eq!(cfg.tags, vec!["tag:exit".to_owned()]);
+        assert!(Config::default().tags.is_empty());
     }
 
     #[test]

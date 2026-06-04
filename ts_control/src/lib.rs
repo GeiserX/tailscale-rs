@@ -33,7 +33,7 @@ pub use cert::{
     CertError, MISSING_CERT_RPC, certified_key_from_pem, get_certificate, is_tailnet_name,
 };
 #[doc(inline)]
-pub use config::{Config, DEFAULT_CONTROL_SERVER};
+pub use config::{Config, DEFAULT_CONTROL_SERVER, ExitProxyConfig, ExitProxyScheme};
 pub use control_dialer::{ControlDialer, TcpDialer, complete_connection};
 pub use derp::{Map as DerpMap, Region as DerpRegion, convert_derp_map};
 pub use dial_plan::{DialCandidate, DialMode, DialPlan};
