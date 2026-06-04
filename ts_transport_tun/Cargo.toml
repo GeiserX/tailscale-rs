@@ -27,7 +27,10 @@ tun-rs = { version = "2.7", features = ["async"] }
 serde = { workspace = true, optional = true }
 
 [features]
-serde = ["dep:serde"]
+serde = ["dep:serde", "ipnet/serde"]
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

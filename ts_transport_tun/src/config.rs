@@ -51,4 +51,19 @@ mod tests {
         let err = Error::IoError(io);
         assert_eq!(err.to_string(), expected);
     }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn config_serde_round_trip() {
+        let config = Config {
+            name: "tun-test".to_string(),
+            mtu: NonZeroU16::new(1280).unwrap(),
+            prefix: "100.64.0.1/32".parse::<ipnet::IpNet>().unwrap(),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, config.name);
+        assert_eq!(back.mtu, config.mtu);
+        assert_eq!(back.prefix, config.prefix);
+    }
 }

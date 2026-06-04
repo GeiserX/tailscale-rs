@@ -6,6 +6,20 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.13](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.13) - 2026-06-05
+
+Cleanup of two known compromises from the v0.5.12 TUN-mode work; no behavior change to the data or
+egress paths.
+
+- **Dedicated error variant** (root `tailscale`): added `InternalErrorKind::UnsupportedInTunMode`.
+  Netstack-only `Device` APIs (and the internal `channel()` accessor) now surface this in TUN mode
+  instead of overloading the generic `InternalErrorKind::Actor` "internal component unavailable"
+  sentinel, so callers can distinguish "wrong transport mode" from a genuine actor failure. The
+  `ts_runtime` `UnsupportedInTunMode` / `TunUnavailable` kinds map to it.
+- **`ts_transport_tun` serde feature fixed**: the `serde` feature now also enables `ipnet/serde`, so
+  the `Config` struct (which holds an `ipnet::IpNet`) actually derives working
+  `Serialize`/`Deserialize`. Added a gated `config_serde_round_trip` test.
+
 ## [0.5.12](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.12) - 2026-06-05
 
 **TUN-mode transport**, gated behind a new default-off `tun` Cargo feature. A node can now run its

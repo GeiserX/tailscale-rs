@@ -63,6 +63,10 @@ pub enum InternalErrorKind {
     BufferFull,
     /// Actor missing or shutdown.
     Actor,
+    /// The operation is not supported while running in TUN transport mode, or
+    /// TUN mode was requested but is unavailable (no device, or the `tun`
+    /// feature is disabled in this build).
+    UnsupportedInTunMode,
 }
 
 impl fmt::Display for InternalErrorKind {
@@ -78,6 +82,9 @@ impl fmt::Display for InternalErrorKind {
             InternalErrorKind::BadRequest => write!(f, "bad request"),
             InternalErrorKind::BufferFull => write!(f, "buffer full"),
             InternalErrorKind::Actor => write!(f, "actor missing or shutdown"),
+            InternalErrorKind::UnsupportedInTunMode => {
+                write!(f, "operation unsupported in TUN transport mode")
+            }
         }
     }
 }
@@ -112,12 +119,12 @@ impl From<ts_runtime::Error> for Error {
             ts_runtime::ErrorKind::Timeout => Error::Timeout,
             ts_runtime::ErrorKind::ActorGone
             | ts_runtime::ErrorKind::MailboxFull
-            | ts_runtime::ErrorKind::ReplyErr
+            | ts_runtime::ErrorKind::ReplyErr => Error::Internal(InternalErrorKind::Actor),
             // TUN transport mode: a netstack-only operation, or TUN requested but unavailable
-            // (no device / `tun` feature off). No dedicated root variant exists, so reuse the
-            // "internal component unavailable" sentinel. See follow-up in the channel field docs.
-            | ts_runtime::ErrorKind::UnsupportedInTunMode
-            | ts_runtime::ErrorKind::TunUnavailable => Error::Internal(InternalErrorKind::Actor),
+            // (no device / `tun` feature off).
+            ts_runtime::ErrorKind::UnsupportedInTunMode | ts_runtime::ErrorKind::TunUnavailable => {
+                Error::Internal(InternalErrorKind::UnsupportedInTunMode)
+            }
         }
     }
 }

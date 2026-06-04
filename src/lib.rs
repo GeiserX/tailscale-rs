@@ -213,12 +213,11 @@ impl Device {
     }
 
     /// The application netstack command channel, or an error in TUN transport mode (no application
-    /// netstack exists). `InternalErrorKind::Actor` is the closest existing "internal component
-    /// unavailable" sentinel; see the channel field docs.
+    /// netstack exists).
     fn channel(&self) -> Result<&Channel, Error> {
         self.channel
             .as_ref()
-            .ok_or(Error::Internal(InternalErrorKind::Actor))
+            .ok_or(Error::Internal(InternalErrorKind::UnsupportedInTunMode))
     }
 
     /// Get this [`Device`]'s IPv4 tailnet address.
