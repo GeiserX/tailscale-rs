@@ -6,10 +6,29 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.0](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.0) - 2026-06-04
+
+Tier 1 of the tsnet full-parity roadmap (`docs/PARITY_ROADMAP.md`).
+
+- Security: enforce the disco↔node-key binding in the netmap-owning layer. Inbound disco
+  pings now cross-check `claimed_node_key` against the control netmap and fail closed on
+  mismatch or unknown disco key (no pong, no learned path). Resolves the `TODO(parity)`.
+- Added: inbound disco-over-DERP demux. DERP-relayed `CallMeMaybe` frames are now decoded
+  and their endpoints learned (through the existing `is_pingable_candidate` sanitizer);
+  relayed Ping/Pong are dropped and non-disco frames still reach the dataplane.
+- Added (CI/build): static musl build lanes (`aarch64`/`x86_64-unknown-linux-musl`) with the
+  `ssh`/`aws-lc-rs` feature off, keeping the ring-only egress path musl-clean; a guard fails
+  the build if `aws-lc-rs` enters the graph.
+
+## [0.4.0](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.4.0) - 2026-06-03
+
+Initial tailscale-rs parity release (fork of tailscale/tailscale-rs).
+
 - Added (Rust API): Experimental support for user-defined tailnet SSH servers using
   [`russh`](https://docs.rs/russh/latest/russh/) and (optionally)
   [`ratatui`](https://docs.rs/ratatui/latest/ratatui/).
   [#178](https://github.com/tailscale/tailscale-rs/pull/178).
+- Hardened the tsnet-parity dataplane (anti-leak, bounds, panic-safety).
 
 ## [0.3.3](https://github.com/tailscale/tailscale-rs/releases/tag/v0.3.3) - 2026-05-20
 
