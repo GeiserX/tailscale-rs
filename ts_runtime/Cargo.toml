@@ -31,7 +31,9 @@ ts_derp.workspace = true
 ts_tunnel.workspace = true
 
 # Unconditionally required dependencies.
+base64.workspace = true
 futures.workspace = true
+httparse.workspace = true
 ipnet.workspace = true
 kameo = "0.19"
 kameo_actors = "0.4"

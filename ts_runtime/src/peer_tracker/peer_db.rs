@@ -538,6 +538,12 @@ mod test {
             tags: (0..rng.random_range(0..8))
                 .map(|_| rand_string(&mut rng, 32))
                 .collect(),
+
+            cap: Default::default(),
+            peerapi_port: None,
+            peerapi_dns_proxy: false,
+            is_wireguard_only: false,
+            exit_node_dns_resolvers: vec![],
         }
     }
 
@@ -816,6 +822,12 @@ mod test {
 
                     accepted_routes: accepted_routes.into_iter().collect(),
                     underlay_addresses: underlay_addrs.into_iter().collect(),
+
+                    cap: Default::default(),
+                    peerapi_port: None,
+                    peerapi_dns_proxy: false,
+                    is_wireguard_only: false,
+                    exit_node_dns_resolvers: vec![],
                 }
             })
             .collect()

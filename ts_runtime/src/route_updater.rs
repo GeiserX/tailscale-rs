@@ -53,6 +53,9 @@ pub struct RouteUpdater {
     /// The underlay map we last published, so a periodic recompute that produces no change can
     /// skip republishing.
     last_underlay: HashMap<PeerId, UnderlayTransportId>,
+    /// The stable id of the exit node we last published via [`ActiveExitNode`], so an unchanged
+    /// recompute doesn't republish it. `None` means we last published "no exit node".
+    last_exit_node_id: Option<ts_control::StableNodeId>,
 }
 
 /// Self-message asking the route updater to recompute routes from cached state.
@@ -113,6 +116,7 @@ impl kameo::Actor for RouteUpdater {
             env,
             last_peer_state: None,
             last_underlay: HashMap::default(),
+            last_exit_node_id: None,
         })
     }
 }
@@ -120,6 +124,23 @@ impl kameo::Actor for RouteUpdater {
 #[derive(Clone)]
 pub struct SelfRouteUpdate {
     pub overlay_in_routes: Arc<ts_bart::Table<InboundRouteAction>>,
+}
+
+/// The peer currently selected and resolved as this node's exit node, republished whenever it
+/// changes.
+///
+/// The route updater is the single place that resolves [`Env::exit_node`](crate::env::Env::exit_node)
+/// against the live peer set (it also installs the matching peer's default route and warns on a
+/// stale/typo'd selector), so it is the authoritative source of "which peer is the exit node right
+/// now". The MagicDNS responder subscribes to this to delegate recursive DNS to the exit node's
+/// peerAPI DoH server ([`Node::peerapi_doh_url`](ts_control::Node::peerapi_doh_url)); resolving the
+/// selector here rather than re-resolving it in the responder keeps a single deterministic answer.
+///
+/// `node` is `None` when no exit node is configured, the selector matches no peer, or the matched
+/// peer advertises no default route (all fail-closed: no DoH delegation, recursion stays local).
+#[derive(Clone)]
+pub struct ActiveExitNode {
+    pub node: Option<Arc<ts_control::Node>>,
 }
 
 #[derive(Clone)]
@@ -232,6 +253,26 @@ impl RouteUpdater {
                 "configured exit node not found among peers (or it advertises no default route); \
                  internet-bound traffic will be dropped"
             );
+        }
+
+        // Republish the active exit node for the MagicDNS responder's DoH delegation. Only an exit
+        // node that was actually satisfied (matched a peer advertising a default route) is eligible;
+        // a stale/typo'd selector publishes `None` so recursion stays local (fail-closed, no leak).
+        let active_exit_id = exit_node_satisfied.then(|| exit_node_id.clone()).flatten();
+        if active_exit_id != self.last_exit_node_id {
+            self.last_exit_node_id = active_exit_id.clone();
+            let node = active_exit_id.and_then(|id| {
+                state
+                    .peers
+                    .peers()
+                    .values()
+                    .find(|peer| peer.stable_id == id)
+                    .cloned()
+                    .map(Arc::new)
+            });
+            if let Err(e) = self.env.publish(ActiveExitNode { node }).await {
+                tracing::error!(error = %e, "publishing active exit node");
+            }
         }
 
         // Query the direct manager for which peers have a live confirmed direct path and the
@@ -420,6 +461,11 @@ mod tests {
             ],
             underlay_addresses: vec![],
             derp_region: None,
+            cap: Default::default(),
+            peerapi_port: None,
+            peerapi_dns_proxy: false,
+            is_wireguard_only: false,
+            exit_node_dns_resolvers: vec![],
         }
     }
 

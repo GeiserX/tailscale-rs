@@ -276,6 +276,7 @@ mod tests {
             forward_all_ports,
             forward_exit_egress,
             exit_proxy: None,
+            peerapi_port: None,
         }
     }
 

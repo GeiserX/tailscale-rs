@@ -57,13 +57,23 @@ const MAGIC_DNS_PORT: u16 = 53;
 /// Updated by the actor's message handlers (from control `StateUpdate` and peer `PeerState`
 /// updates) and read fresh by the answer loop for every packet.
 #[derive(Clone, Default)]
-struct DnsView {
+pub(crate) struct DnsView {
     /// The DNS configuration. `magic_dns == false` (the default) means serve nothing.
-    cfg: DnsConfig,
+    pub(crate) cfg: DnsConfig,
     /// The current peer database, if we've seen a peer update.
-    peers: Option<Arc<PeerDb>>,
+    pub(crate) peers: Option<Arc<PeerDb>>,
     /// This node, if we've seen a self-node update.
-    self_node: Option<Node>,
+    pub(crate) self_node: Option<Node>,
+    /// The peerAPI DoH socket address of the currently-selected exit node, if one is active and can
+    /// proxy DNS ([`Node::peerapi_doh_addr`]). When set, the MagicDNS *client* serve loop delegates
+    /// recursive resolution to this address over the overlay instead of forwarding to the locally
+    /// configured upstream resolvers — so recursive DNS egresses from the exit node, not this host.
+    ///
+    /// Only consumed by the local MagicDNS responder's serve loop (the client side). The peerAPI
+    /// DoH *server* shares this same view but ignores this field: an exit-node DNS proxy resolves
+    /// recursively itself (gated by `forward_exit_egress`), it never re-delegates to its own exit
+    /// node. `None` means no active exit node / no DoH delegation — recursion stays local.
+    pub(crate) exit_doh: Option<SocketAddr>,
 }
 
 impl DnsView {
@@ -159,15 +169,18 @@ impl DnsView {
             return if upstreams.is_empty() {
                 Upstreams::Block
             } else {
-                Upstreams::Use(upstreams)
+                // A deliberately-configured split-DNS route: not eligible for exit-node DoH
+                // delegation — these upstreams (e.g. an internal resolver reachable over a subnet
+                // route) must keep receiving the query directly.
+                Upstreams::Route(upstreams)
             };
         }
 
         if !self.cfg.fallback_resolvers.is_empty() {
-            return Upstreams::Use(&self.cfg.fallback_resolvers);
+            return Upstreams::Recursive(&self.cfg.fallback_resolvers);
         }
         if !self.cfg.resolvers.is_empty() {
-            return Upstreams::Use(&self.cfg.resolvers);
+            return Upstreams::Recursive(&self.cfg.resolvers);
         }
         Upstreams::None
     }
@@ -175,8 +188,11 @@ impl DnsView {
 
 /// The upstreams a non-overlay query should be forwarded to (or why it should not be forwarded).
 enum Upstreams<'a> {
-    /// Forward to one of these upstream resolvers.
-    Use(&'a [DnsResolver]),
+    /// A split-DNS route matched: forward to these route-specific upstreams (never DoH-delegated).
+    Route(&'a [DnsResolver]),
+    /// No route matched: forward to these recursive (fallback/global) resolvers. Eligible for
+    /// exit-node DoH delegation in the client serve loop.
+    Recursive(&'a [DnsResolver]),
     /// A negative split-DNS route matched: do not resolve (NXDOMAIN).
     Block,
     /// No route and no resolver configured: fail closed (NXDOMAIN).
@@ -185,7 +201,7 @@ enum Upstreams<'a> {
 
 /// What the (sync) decision step concluded for a query: either a complete response to send back,
 /// or a request to forward the original query to an upstream resolver.
-enum Decision {
+pub(crate) enum Decision {
     /// A fully-formed response is ready to send.
     Reply(Vec<u8>),
     /// Forward the original query datagram to one of these upstream UDP resolvers; on success
@@ -197,6 +213,12 @@ enum Decision {
         query: Vec<u8>,
         /// Fallback NXDOMAIN response if every upstream fails.
         nxdomain: Vec<u8>,
+        /// Whether this is a *recursive* (catch-all fallback/global resolver) forward, as opposed
+        /// to a deliberately-configured split-DNS route. Only recursive forwards are eligible for
+        /// exit-node DoH delegation in the client serve loop (see [`DnsView::exit_doh`]); split-DNS
+        /// routes always stay on their configured upstreams (typically subnet-reachable internal
+        /// resolvers). The peerAPI DoH *server* ignores this flag entirely.
+        recursive: bool,
     },
 }
 
@@ -247,7 +269,7 @@ fn is_tailnet_cgnat(ip: Ipv4Addr) -> bool {
 /// Pure (no I/O), factored out of the socket loop so it can be unit-tested without a netstack. It
 /// never panics and fails closed: an unknown, unroutable, or tailnet-suffix name resolves to
 /// NXDOMAIN rather than leaking to an upstream resolver.
-fn decide(view: &DnsView, buf: &[u8]) -> Option<Decision> {
+pub(crate) fn decide(view: &DnsView, buf: &[u8]) -> Option<Decision> {
     // Malformed / non-query input is dropped: we never answer something we can't parse.
     let query = decode_query(buf).ok()?;
     let q = &query.question;
@@ -326,26 +348,67 @@ fn forward_or_nxdomain(
         return Decision::Reply(nxdomain);
     }
 
-    match view.route_for(canon) {
-        Upstreams::Use(resolvers) => {
-            let upstreams: Vec<SocketAddr> = resolvers
-                .iter()
-                .map(|DnsResolver::Udp(addr)| *addr)
-                // Anti-leak / IPv6-off: only forward over IPv4 upstreams; never open a v6 socket.
-                .filter(SocketAddr::is_ipv4)
-                .collect();
-            if upstreams.is_empty() {
-                Decision::Reply(nxdomain)
-            } else {
-                Decision::Forward {
-                    upstreams,
-                    query: buf.to_vec(),
-                    nxdomain,
-                }
-            }
-        }
+    let (resolvers, recursive) = match view.route_for(canon) {
+        Upstreams::Route(resolvers) => (resolvers, false),
+        Upstreams::Recursive(resolvers) => (resolvers, true),
         // Negative route or nothing configured: fail closed.
-        Upstreams::Block | Upstreams::None => Decision::Reply(nxdomain),
+        Upstreams::Block | Upstreams::None => return Decision::Reply(nxdomain),
+    };
+
+    let upstreams: Vec<SocketAddr> = resolvers
+        .iter()
+        .map(DnsResolver::udp_addr)
+        // Anti-leak / IPv6-off: only forward over IPv4 upstreams; never open a v6 socket.
+        .filter(SocketAddr::is_ipv4)
+        .collect();
+    if upstreams.is_empty() {
+        Decision::Reply(nxdomain)
+    } else {
+        Decision::Forward {
+            upstreams,
+            query: buf.to_vec(),
+            nxdomain,
+            recursive,
+        }
+    }
+}
+
+/// Client-side plan for a *recursive* forward: keep resolving over local UDP upstreams, or delegate
+/// the query to the active exit node's peerAPI DoH endpoint over the overlay.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RecursivePlan {
+    /// Forward over UDP to these upstreams. Used when no exit node is active, or when the config
+    /// has `use_with_exit_node` resolvers (kept local even with an exit node selected).
+    Udp(Vec<SocketAddr>),
+    /// Delegate the query to the exit node's peerAPI DoH server at this overlay address.
+    Doh(SocketAddr),
+}
+
+/// Decide whether a recursive forward should stay on local UDP upstreams or be delegated to the
+/// active exit node's DoH endpoint. Pure (no I/O) so the delegation rule is unit-testable.
+///
+/// - No active exit node ([`DnsView::exit_doh`] is `None`) => keep `default_upstreams` (UDP).
+/// - Exit node active, but the config has [`use_with_exit_node`][ts_control::DnsResolver::use_with_exit_node]
+///   resolvers => those resolvers stay local (Go keeps `UseWithExitNode` resolvers when an exit node
+///   is selected); forward to them over UDP, do NOT delegate.
+/// - Exit node active, no kept-local resolvers => delegate to the exit node's DoH. Recursive DNS
+///   then egresses from the exit node, not this host (the whole point of routing through an exit
+///   node: this node's real IP is never used to resolve the peer's public names).
+pub(crate) fn recursive_plan(view: &DnsView, default_upstreams: Vec<SocketAddr>) -> RecursivePlan {
+    let Some(doh) = view.exit_doh else {
+        return RecursivePlan::Udp(default_upstreams);
+    };
+    let kept: Vec<SocketAddr> = view
+        .cfg
+        .resolvers_with_exit_node()
+        .map(DnsResolver::udp_addr)
+        // Anti-leak / IPv6-off: only ever resolve over IPv4 upstreams; never open a v6 socket.
+        .filter(SocketAddr::is_ipv4)
+        .collect();
+    if kept.is_empty() {
+        RecursivePlan::Doh(doh)
+    } else {
+        RecursivePlan::Udp(kept)
     }
 }
 
@@ -429,7 +492,7 @@ fn response_matches_query(query: &[u8], resp: &[u8]) -> bool {
 /// UDP socket per query), NEVER a host socket — so the real origin IP can't leak to the resolver,
 /// and split-DNS upstreams reachable only over the tailnet/subnet-router work. Each upstream is
 /// bounded by [`UPSTREAM_TIMEOUT`]; responses are capped at [`MAX_UPSTREAM_RESPONSE`].
-async fn forward_query(
+pub(crate) async fn forward_query(
     channel: &Channel,
     upstreams: &[SocketAddr],
     query: &[u8],
@@ -513,11 +576,28 @@ async fn serve(
                 upstreams,
                 query,
                 nxdomain,
+                recursive,
             }) => {
+                // A recursive forward is eligible for exit-node DoH delegation; a split-DNS route
+                // always stays on its configured upstreams. Decide the plan against the current
+                // view so a query routed while an exit node is active egresses from that exit node.
+                let plan = if recursive {
+                    recursive_plan(&view, upstreams)
+                } else {
+                    RecursivePlan::Udp(upstreams)
+                };
                 let socket = socket.clone();
                 let channel = channel.clone();
                 forwards.spawn(async move {
-                    let resp = forward_query(&channel, &upstreams, &query, nxdomain).await;
+                    let resp = match plan {
+                        RecursivePlan::Udp(upstreams) => {
+                            forward_query(&channel, &upstreams, &query, nxdomain).await
+                        }
+                        RecursivePlan::Doh(doh_addr) => {
+                            crate::peerapi_doh::forward_doh(&channel, doh_addr, &query, nxdomain)
+                                .await
+                        }
+                    };
                     if let Err(e) = socket.send_to(src, &resp).await {
                         tracing::warn!(error = %e, %src, "magic dns forwarded response send failed");
                     }
@@ -551,6 +631,8 @@ impl kameo::Actor for MagicDnsActor {
     ) -> Result<Self, Self::Error> {
         env.subscribe::<Arc<ts_control::StateUpdate>>(&slf).await?;
         env.subscribe::<Arc<PeerState>>(&slf).await?;
+        env.subscribe::<crate::route_updater::ActiveExitNode>(&slf)
+            .await?;
 
         let (view_tx, view_rx) = watch::channel(Arc::new(DnsView::default()));
 
@@ -562,11 +644,26 @@ impl kameo::Actor for MagicDnsActor {
         match channel.udp_bind(addr).await {
             Ok(socket) => {
                 tracing::debug!(%addr, "magic dns responder bound");
-                joinset.spawn(serve(socket, view_rx, channel.clone()));
+                joinset.spawn(serve(socket, view_rx.clone(), channel.clone()));
             }
             Err(e) => {
                 tracing::error!(error = %e, %addr, "magic dns udp bind failed; responder inert");
             }
+        }
+
+        // When this node advertises a peerAPI port, also run the exit-node DoH server on the same
+        // shared view. It answers `/dns-query` for peers that select us as their exit node; its
+        // recursive resolution is gated behind `forward_exit_egress` (see `peerapi_doh`).
+        if let Some(port) = env.peerapi_port {
+            let channel = channel.clone();
+            let view_rx = view_rx.clone();
+            let forward_exit_egress = env.forward_exit_egress;
+            joinset.spawn(crate::peerapi_doh::serve(
+                channel,
+                port,
+                view_rx,
+                forward_exit_egress,
+            ));
         }
 
         Ok(Self {
@@ -600,6 +697,27 @@ impl Message<Arc<PeerState>> for MagicDnsActor {
         self.view_tx.send_modify(|view| {
             let mut next = (**view).clone();
             next.peers = Some(state.peers.clone());
+            *view = Arc::new(next);
+        });
+    }
+}
+
+impl Message<crate::route_updater::ActiveExitNode> for MagicDnsActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        active: crate::route_updater::ActiveExitNode,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) {
+        // Cache the active exit node's DoH endpoint so the serve loop delegates recursive queries
+        // to it. `None` (no exit node, or one that can't proxy DNS) keeps recursion local. Resolving
+        // the address here — once, from the route updater's authoritative selection — means the
+        // serve loop never re-resolves the selector.
+        let exit_doh = active.node.as_ref().and_then(|n| n.peerapi_doh_addr());
+        self.view_tx.send_modify(|view| {
+            let mut next = (**view).clone();
+            next.exit_doh = exit_doh;
             *view = Arc::new(next);
         });
     }
@@ -640,6 +758,11 @@ mod tests {
             accepted_routes: vec![],
             underlay_addresses: vec![],
             derp_region: None,
+            cap: Default::default(),
+            peerapi_port: None,
+            peerapi_dns_proxy: false,
+            is_wireguard_only: false,
+            exit_node_dns_resolvers: vec![],
         }
     }
 
@@ -656,6 +779,7 @@ mod tests {
             },
             peers: Some(Arc::new(db)),
             self_node: None,
+            exit_doh: None,
         }
     }
 
@@ -830,11 +954,15 @@ mod tests {
             cfg: DnsConfig {
                 magic_dns: true,
                 search_domains: vec!["user.ts.net".to_string()],
-                fallback_resolvers: vec![DnsResolver::Udp("9.9.9.9:53".parse().unwrap())],
+                fallback_resolvers: vec![DnsResolver {
+                    transport: ts_control::ResolverTransport::Udp("9.9.9.9:53".parse().unwrap()),
+                    use_with_exit_node: false,
+                }],
                 ..Default::default()
             },
             peers: Some(Arc::new(db)),
             self_node: None,
+            exit_doh: None,
         };
 
         // 100.64.0.9 is in CGNAT range but owned by no peer => NXDOMAIN, never a Forward.
@@ -897,6 +1025,7 @@ mod tests {
             },
             peers: None,
             self_node: Some(test_node()),
+            exit_doh: None,
         };
         let buf = build_query(0x44, &["host", "user", "ts", "net"], 1, 1);
 
@@ -1041,11 +1170,15 @@ mod tests {
             },
             peers: None,
             self_node: None,
+            exit_doh: None,
         }
     }
 
     fn udp(addr: &str) -> DnsResolver {
-        DnsResolver::Udp(addr.parse().unwrap())
+        DnsResolver {
+            transport: ts_control::ResolverTransport::Udp(addr.parse().unwrap()),
+            use_with_exit_node: false,
+        }
     }
 
     #[test]
@@ -1189,6 +1322,7 @@ mod tests {
             },
             peers: Some(Arc::new(db)),
             self_node: None,
+            exit_doh: None,
         };
         let buf = build_query(0x107, &["host", "user", "ts", "net"], 1, 1);
 
@@ -1344,5 +1478,80 @@ mod tests {
             }
             Decision::Reply(_) => panic!("expected forward to global resolver"),
         }
+    }
+
+    fn udp_exit(addr: &str) -> DnsResolver {
+        DnsResolver {
+            transport: ts_control::ResolverTransport::Udp(addr.parse().unwrap()),
+            use_with_exit_node: true,
+        }
+    }
+
+    #[test]
+    fn recursive_forward_is_flagged_route_forward_is_not() {
+        // A recursive (global/fallback) forward sets `recursive = true` (eligible for DoH
+        // delegation); a deliberately-configured split-DNS route sets `recursive = false`.
+        let mut routes = std::collections::BTreeMap::new();
+        routes.insert("corp.example".to_string(), vec![udp("10.0.0.53:53")]);
+        let view = view_with_routes(routes, vec![udp("8.8.8.8:53")], vec![]);
+
+        let routed = build_query(0x500, &["api", "corp", "example"], 1, 1);
+        match decide(&view, &routed).expect("decides") {
+            Decision::Forward { recursive, .. } => {
+                assert!(!recursive, "split-DNS route is not a recursive forward")
+            }
+            Decision::Reply(_) => panic!("expected route forward"),
+        }
+
+        let global = build_query(0x501, &["example", "com"], 1, 1);
+        match decide(&view, &global).expect("decides") {
+            Decision::Forward { recursive, .. } => {
+                assert!(recursive, "unrouted name is a recursive forward")
+            }
+            Decision::Reply(_) => panic!("expected recursive forward"),
+        }
+    }
+
+    #[test]
+    fn recursive_plan_keeps_udp_without_exit_node() {
+        // No active exit node: a recursive forward stays on its default UDP upstreams.
+        let view = view_with_routes(std::collections::BTreeMap::new(), vec![udp("8.8.8.8:53")], vec![]);
+        let default = vec!["8.8.8.8:53".parse().unwrap()];
+        assert_eq!(
+            recursive_plan(&view, default.clone()),
+            RecursivePlan::Udp(default)
+        );
+    }
+
+    #[test]
+    fn recursive_plan_delegates_to_doh_with_exit_node() {
+        // Exit node active, no kept-local resolvers: recursive queries delegate to the exit node's
+        // DoH endpoint so resolution egresses from the exit node, not this host.
+        let mut view =
+            view_with_routes(std::collections::BTreeMap::new(), vec![udp("8.8.8.8:53")], vec![]);
+        let doh: SocketAddr = "100.64.0.5:8080".parse().unwrap();
+        view.exit_doh = Some(doh);
+        assert_eq!(
+            recursive_plan(&view, vec!["8.8.8.8:53".parse().unwrap()]),
+            RecursivePlan::Doh(doh)
+        );
+    }
+
+    #[test]
+    fn recursive_plan_keeps_use_with_exit_node_resolvers_local() {
+        // Even with an exit node active, resolvers flagged `use_with_exit_node` stay local (Go keeps
+        // UseWithExitNode resolvers). The plan forwards to those over UDP, never delegating to DoH.
+        let mut view = view_with_routes(
+            std::collections::BTreeMap::new(),
+            vec![udp_exit("10.0.0.53:53"), udp("8.8.8.8:53")],
+            vec![],
+        );
+        view.exit_doh = Some("100.64.0.5:8080".parse().unwrap());
+        // The default upstreams the caller computed are irrelevant when kept-local resolvers exist;
+        // the plan must use the kept-local ones.
+        assert_eq!(
+            recursive_plan(&view, vec!["8.8.8.8:53".parse().unwrap()]),
+            RecursivePlan::Udp(vec!["10.0.0.53:53".parse().unwrap()])
+        );
     }
 }

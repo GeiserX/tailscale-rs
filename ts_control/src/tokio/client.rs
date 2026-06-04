@@ -278,6 +278,7 @@ async fn run_once(
         .routable_ips(config.advertised_routes())
         .client_info(&client_name, crate::PKG_VERSION)
         .request_tags(config.tags.iter().map(String::as_str))
+        .services(config.advertised_services())
         .map_session(&session.handle, session.seq);
 
     let request = if let Some(hostname) = &config.hostname {

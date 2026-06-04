@@ -129,6 +129,10 @@ pub async fn register(
                 let tags: Vec<&str> = config.tags.iter().map(String::as_str).collect();
                 (!tags.is_empty()).then_some(tags)
             },
+            services: {
+                let services = config.advertised_services();
+                (!services.is_empty()).then_some(services)
+            },
             ..Default::default()
         },
         nl_key: Some(network_lock_public_key),

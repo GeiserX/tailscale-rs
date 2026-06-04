@@ -141,6 +141,11 @@ mod tests {
             accepted_routes: vec![],
             underlay_addresses: vec![],
             derp_region: None,
+            cap: Default::default(),
+            peerapi_port: None,
+            peerapi_dns_proxy: false,
+            is_wireguard_only: false,
+            exit_node_dns_resolvers: vec![],
         }
     }
 

@@ -1,5 +1,5 @@
 use ts_capabilityversion::CapabilityVersion;
-use ts_control_serde::{Endpoint, HostInfo, MapRequest, NetInfo};
+use ts_control_serde::{Endpoint, HostInfo, MapRequest, NetInfo, Service};
 
 /// Builder type for [`MapRequest`]s; smooths over the annoying parts of creating a request.
 #[derive(Debug, Clone)]
@@ -127,6 +127,16 @@ impl<'a> MapRequestBuilder<'a> {
     pub fn request_tags(mut self, tags: impl IntoIterator<Item = &'a str>) -> Self {
         let tags: alloc::vec::Vec<&'a str> = tags.into_iter().collect();
         self.host_info_mut().request_tags = (!tags.is_empty()).then_some(tags);
+        self
+    }
+
+    /// Advertise the services this node runs (`HostInfo.Services`), so peers and control can
+    /// discover this node's peerAPI port and whether it proxies DNS as an exit node. When the
+    /// iterator yields nothing, the field is left as `None` and omitted from the wire request
+    /// (advertise no services).
+    pub fn services(mut self, services: impl IntoIterator<Item = Service<'a>>) -> Self {
+        let services: alloc::vec::Vec<Service<'a>> = services.into_iter().collect();
+        self.host_info_mut().services = (!services.is_empty()).then_some(services);
         self
     }
 

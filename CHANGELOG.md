@@ -6,6 +6,34 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.9](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.9) - 2026-06-04
+
+Full exit-node DNS proxy (peerAPI DoH) parity with Go `tsnet`. When this node is selected as a
+peer's exit node, it now answers that peer's recursive DNS over the overlay; and when this node has
+selected an exit node, its own recursive lookups are delegated to that exit node's DoH endpoint
+instead of leaking to a local resolver.
+
+- Feat (server): a peerAPI DoH server (`/dns-query`, RFC 8484 over HTTP/1.1 on the encrypted overlay)
+  shares the same `decide` path as the local MagicDNS responder, so authoritative MagicDNS records
+  (peer names, control-pushed `ExtraRecords`, PTR) are answered identically. Binds the overlay IPv4
+  at `Config::peerapi_port`. Supports `POST` (body is the raw DNS message) and
+  `GET ?dns=<base64url>`.
+- Feat (client): when an exit node is active, the MagicDNS responder delegates catch-all **recursive**
+  forwards to the exit node's peerAPI DoH endpoint over the overlay (`forward_doh`). Deliberately
+  configured split-DNS routes always stay on their configured upstreams (never delegated). Resolvers
+  marked `use_with_exit_node` are kept local, mirroring Go's `UseWithExitNode`.
+- Feat (control): `Node::peerapi_doh_url` / `peerapi_doh_addr` expose a peer's DoH endpoint
+  (IPv4-only), gated on `peerapi_dns_proxy || cap >= PEER_CAN_PROXY_DNS` (CapabilityVersion 26) and a
+  non-WireGuard-only peer. `route_updater` publishes the active exit node so the responder can
+  resolve its DoH address once.
+- Anti-leak / fail-closed (sacred): server recursion is gated behind `forward_exit_egress` — a node
+  that hasn't opted into exit egress answers a recursive query `REFUSED`, never resolving a peer's
+  public name through its own host resolver (the cloud host's real IP can't leak). Names in control's
+  `ExitNodeFilteredSet` are `REFUSED`. Client delegation is fail-closed: any DoH connect/HTTP/timeout
+  failure resolves to NXDOMAIN — **never a silent fallback to a local resolver**. All sockets are on
+  the overlay netstack (`0.0.0.0:0`), never a host socket; IPv4-only. Requests and responses are
+  size-capped; concurrent in-flight requests are bounded.
+
 ## [0.5.8](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.8) - 2026-06-04
 
 `tsnet.Server.RegisterFallbackTCPHandler` parity: an embedder can now register a callback consulted

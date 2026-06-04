@@ -37,7 +37,7 @@ pub use config::{Config, DEFAULT_CONTROL_SERVER, ExitProxyConfig, ExitProxySchem
 pub use control_dialer::{ControlDialer, TcpDialer, complete_connection};
 pub use derp::{Map as DerpMap, Region as DerpRegion, convert_derp_map};
 pub use dial_plan::{DialCandidate, DialMode, DialPlan};
-pub use dns::{DnsConfig, ExtraRecord, Resolver as DnsResolver};
+pub use dns::{DnsConfig, ExtraRecord, Resolver as DnsResolver, ResolverTransport};
 pub use node::{ExitNodeSelector, Id as NodeId, Node, StableId as StableNodeId, TailnetAddress};
 #[cfg(feature = "async_tokio")]
 pub use serve::{ServeConfig, ServeTarget, accept_tls, listen_tls, tls_acceptor};

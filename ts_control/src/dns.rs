@@ -18,8 +18,23 @@ pub struct ExtraRecord {
 /// transports (DoH/DoT) are parsed off the wire but dropped here as a documented TODO seam —
 /// adding them only requires extending [`from_serde`][DnsConfig::from_serde] and the magic_dns
 /// forwarder, not the wire format.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Resolver {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Resolver {
+    /// The transport/address of this resolver. Only [`ResolverTransport::Udp`] is supported.
+    pub transport: ResolverTransport,
+    /// Continue using this resolver even while an exit node is in use (Go `UseWithExitNode`).
+    ///
+    /// When an exit node is selected, recursive DNS is normally delegated to the exit node's
+    /// peerAPI DoH server; a resolver with this flag set is kept locally instead (e.g. a split-DNS
+    /// server reachable over the tailnet that the exit node can't see). See
+    /// [`DnsConfig::resolvers_with_exit_node`].
+    pub use_with_exit_node: bool,
+}
+
+/// The transport of a [`Resolver`]. Only plaintext UDP is forwarded today; encrypted transports are
+/// dropped at parse time (see [`Resolver::from_serde`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ResolverTransport {
     /// Classic plaintext DNS over UDP at this address.
     Udp(SocketAddr),
 }
@@ -27,12 +42,22 @@ pub enum Resolver {
 impl Resolver {
     /// Build a UDP resolver from the borrowed serde view, or `None` for an encrypted transport
     /// (DoH/DoT/DoH-over-WireGuard) we do not yet forward to.
-    fn from_serde(r: &ts_control_serde::DnsResolver<'_>) -> Option<Self> {
+    pub(crate) fn from_serde(r: &ts_control_serde::DnsResolver<'_>) -> Option<Self> {
         match r.addr {
-            ts_control_serde::DnsResolverAddr::Plaintext(addr) => Some(Resolver::Udp(addr)),
+            ts_control_serde::DnsResolverAddr::Plaintext(addr) => Some(Resolver {
+                transport: ResolverTransport::Udp(addr),
+                use_with_exit_node: r.use_with_exit_node,
+            }),
             // TODO: support DoH/DoT/HttpWireguard upstreams. Until then they are dropped so we
             // never silently treat an encrypted resolver as a plaintext one.
             _ => None,
+        }
+    }
+
+    /// The plaintext UDP socket address of this resolver.
+    pub fn udp_addr(&self) -> SocketAddr {
+        match self.transport {
+            ResolverTransport::Udp(addr) => addr,
         }
     }
 }
@@ -66,6 +91,13 @@ pub struct DnsConfig {
     /// Fallback resolvers (Go `FallbackResolvers`) used for non-overlay names that match no route,
     /// preferred over [`resolvers`][DnsConfig::resolvers].
     pub fallback_resolvers: Vec<Resolver>,
+    /// DNS suffixes this node, **when acting as an exit-node DNS proxy**, must not answer (Go
+    /// `ExitNodeFilteredSet`). Entries are lowercased, no trailing dot. An entry starting with a
+    /// period is a suffix match (but `.a.b` does NOT match `a.b` — a real prefix label is
+    /// required); an entry without a leading period is an exact match. Matching is
+    /// case-insensitive. A filtered name is answered with `REFUSED`. See
+    /// [`DnsConfig::exit_node_filters`].
+    pub exit_node_filtered_set: Vec<String>,
 }
 
 impl DnsConfig {
@@ -115,7 +147,46 @@ impl DnsConfig {
                 .filter(|(suffix, _)| !suffix.is_empty())
                 .collect(),
             fallback_resolvers: resolvers_from_serde(&c.fallback_resolvers),
+            // Canonicalize each filtered-set entry by lowercasing only. We deliberately do NOT
+            // strip a leading period here: a leading period is semantically significant (it marks
+            // a suffix-match entry, per `exit_node_filters`). Trailing dots are stripped so a
+            // wire entry like "Example.com." matches our canonicalized query names.
+            exit_node_filtered_set: c
+                .exit_node_filtered_set
+                .iter()
+                .map(|e| e.strip_suffix('.').unwrap_or(e).to_ascii_lowercase())
+                .filter(|e| !e.is_empty() && e != ".")
+                .collect(),
         }
+    }
+
+    /// Whether `name` (a canonical query name: lowercased, no trailing dot) is in this config's
+    /// [`exit_node_filtered_set`][DnsConfig::exit_node_filtered_set] and so must be `REFUSED` when
+    /// this node answers as an exit-node DNS proxy (Go `dnsConfigForNetmap`'s filtered-set check).
+    ///
+    /// An entry with a leading period is a suffix match requiring a real label before it (`.a.b`
+    /// matches `x.a.b` but not `a.b`); an entry without a leading period is an exact match.
+    /// Matching is case-insensitive (both sides are already lowercased).
+    pub fn exit_node_filters(&self, name: &str) -> bool {
+        self.exit_node_filtered_set.iter().any(|entry| {
+            if let Some(suffix) = entry.strip_prefix('.') {
+                // ".a.b" matches "x.a.b" (ends with ".a.b") but not "a.b" itself.
+                name.len() > suffix.len() + 1 && name.ends_with(suffix) && {
+                    let boundary = name.len() - suffix.len() - 1;
+                    name.as_bytes()[boundary] == b'.'
+                }
+            } else {
+                name == entry
+            }
+        })
+    }
+
+    /// The resolvers to keep when an exit node is active: those flagged
+    /// [`use_with_exit_node`][Resolver::use_with_exit_node]. When an exit node is selected,
+    /// recursive resolution is delegated to it, except for these explicitly-flagged resolvers (Go
+    /// keeps `UseWithExitNode` resolvers in the local config).
+    pub fn resolvers_with_exit_node(&self) -> impl Iterator<Item = &Resolver> {
+        self.resolvers.iter().filter(|r| r.use_with_exit_node)
     }
 }
 
@@ -236,6 +307,96 @@ mod tests {
         assert_eq!(
             config.search_domains,
             alloc::vec!["corp.ts.net".to_string()]
+        );
+    }
+
+    #[test]
+    fn exit_node_filters_leading_period_is_suffix_match_requiring_a_label() {
+        let serde_config = ts_control_serde::DnsConfig {
+            magic_dns: true,
+            // A leading period marks a suffix match: ".a.b" must match "x.a.b" but NOT "a.b".
+            exit_node_filtered_set: alloc::vec![".a.b"],
+            ..Default::default()
+        };
+
+        let config = DnsConfig::from_serde(&serde_config);
+
+        assert!(config.exit_node_filters("x.a.b"));
+        assert!(config.exit_node_filters("deep.x.a.b"));
+        // The suffix itself is NOT matched by a leading-period entry (a real label is required).
+        assert!(!config.exit_node_filters("a.b"));
+        // A name merely ending in the bare letters but without the dot boundary is not matched.
+        assert!(!config.exit_node_filters("xa.b"));
+        assert!(!config.exit_node_filters("other.b"));
+    }
+
+    #[test]
+    fn exit_node_filters_no_leading_period_is_exact_match() {
+        let serde_config = ts_control_serde::DnsConfig {
+            magic_dns: true,
+            exit_node_filtered_set: alloc::vec!["a.b"],
+            ..Default::default()
+        };
+
+        let config = DnsConfig::from_serde(&serde_config);
+
+        assert!(config.exit_node_filters("a.b"));
+        // An exact entry must not match a subdomain.
+        assert!(!config.exit_node_filters("x.a.b"));
+        assert!(!config.exit_node_filters("a.b.c"));
+    }
+
+    #[test]
+    fn exit_node_filters_is_case_insensitive_and_trailing_dot_insensitive() {
+        let serde_config = ts_control_serde::DnsConfig {
+            magic_dns: true,
+            // Wire entries may be mixed-case with a trailing dot; both are canonicalized.
+            exit_node_filtered_set: alloc::vec!["Example.COM.", ".Internal.Corp."],
+            ..Default::default()
+        };
+
+        let config = DnsConfig::from_serde(&serde_config);
+
+        // Query names are already lowercased/no-trailing-dot canonical form.
+        assert!(config.exit_node_filters("example.com"));
+        assert!(config.exit_node_filters("host.internal.corp"));
+        assert!(!config.exit_node_filters("internal.corp"));
+    }
+
+    #[test]
+    fn resolvers_with_exit_node_keeps_only_flagged() {
+        use core::net::Ipv4Addr;
+
+        let kept = ts_control_serde::DnsResolver {
+            addr: ts_control_serde::DnsResolverAddr::Plaintext(SocketAddr::from((
+                Ipv4Addr::new(100, 64, 0, 1),
+                53,
+            ))),
+            bootstrap_resolution: Vec::new(),
+            use_with_exit_node: true,
+        };
+        let dropped = ts_control_serde::DnsResolver {
+            addr: ts_control_serde::DnsResolverAddr::Plaintext(SocketAddr::from((
+                Ipv4Addr::new(8, 8, 8, 8),
+                53,
+            ))),
+            bootstrap_resolution: Vec::new(),
+            use_with_exit_node: false,
+        };
+
+        let serde_config = ts_control_serde::DnsConfig {
+            magic_dns: true,
+            resolvers: alloc::vec![Some(kept), Some(dropped)],
+            ..Default::default()
+        };
+
+        let config = DnsConfig::from_serde(&serde_config);
+
+        let surviving: Vec<_> = config.resolvers_with_exit_node().collect();
+        assert_eq!(surviving.len(), 1);
+        assert_eq!(
+            surviving[0].udp_addr(),
+            SocketAddr::from((Ipv4Addr::new(100, 64, 0, 1), 53))
         );
     }
 }

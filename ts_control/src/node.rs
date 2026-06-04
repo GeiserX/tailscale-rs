@@ -1,7 +1,10 @@
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use chrono::{DateTime, Utc};
+use ts_capabilityversion::CapabilityVersion;
 use ts_keys::{DiscoPublicKey, MachinePublicKey, NodePublicKey};
+
+use crate::dns::Resolver;
 
 /// Whether `addr` falls in a range Tailscale assigns to nodes: the CGNAT range for IPv4
 /// (`100.64.0.0/10`, excluding the ChromeOS VM carve-out `100.115.92.0/23`) and the Tailscale
@@ -132,6 +135,31 @@ pub struct Node {
 
     /// The DERP region for this node, if known.
     pub derp_region: Option<ts_derp::RegionId>,
+
+    /// This node's advertised capability version (`Node.Cap` in Go). Old control servers may not
+    /// send it, in which case it defaults to [`CapabilityVersion::default`]. Used to gate features
+    /// that require a minimum peer capability, e.g. exit-node DNS proxying (`peerCanProxyDNS`).
+    pub cap: CapabilityVersion,
+
+    /// The peerAPI port this node advertises over IPv4 (`peerapi4` service), if any.
+    ///
+    /// Derived from `HostInfo.Services`. `None` means the peer advertises no IPv4 peerAPI, so it
+    /// cannot be reached for peerAPI DoH (DNS-over-HTTPS) exit-node delegation.
+    pub peerapi_port: Option<u16>,
+
+    /// Whether this peer advertises the `peerapi-dns-proxy` service (Go `PeerAPIDNSProxy`),
+    /// indicating it will proxy DNS lookups for other nodes when used as an exit node.
+    pub peerapi_dns_proxy: bool,
+
+    /// Whether this is a non-Tailscale WireGuard-only peer (`IsWireGuardOnly` in Go). Such peers
+    /// cannot run a peerAPI DoH server, so exit-node DNS for them comes from
+    /// [`Node::exit_node_dns_resolvers`] instead.
+    pub is_wireguard_only: bool,
+
+    /// DNS resolvers to use when this WireGuard-only peer is selected as an exit node
+    /// (`ExitNodeDNSResolvers` in Go). Only meaningful when [`Node::is_wireguard_only`] is set.
+    /// Encrypted-transport resolvers are dropped (see [`Resolver::from_serde`]).
+    pub exit_node_dns_resolvers: Vec<Resolver>,
 }
 
 impl Node {
@@ -252,6 +280,67 @@ impl Node {
             accept_routes || !self.is_subnet_route(route)
         })
     }
+
+    /// The capability version at and above which a peer can proxy DNS for nodes using it as an exit
+    /// node (Go `tailcfg.CapabilityVersion` `peerCanProxyDNS`, introduced 2022-01-12 at V26).
+    const PEER_CAN_PROXY_DNS: CapabilityVersion = CapabilityVersion::V26;
+
+    /// The base URL of this peer's IPv4 peerAPI DoH endpoint for exit-node DNS proxying, if it can
+    /// proxy DNS. Returns e.g. `http://100.64.0.5:8080/dns-query`.
+    ///
+    /// Mirrors Go `peerAPIBase(...)+"/dns-query"` gated by `exitNodeCanProxyDNS`: a peer can proxy
+    /// DNS when it advertises an IPv4 peerAPI port **and** either advertises the explicit
+    /// `peerapi-dns-proxy` service or is new enough ([`Node::cap`] ≥ [`PEER_CAN_PROXY_DNS`]). A
+    /// WireGuard-only peer never runs a peerAPI, so it returns `None` here (its exit-node DNS comes
+    /// from [`Node::exit_node_dns_resolvers`] instead).
+    ///
+    /// IPv4-only by deliberate design: the tailnet dataplane in this fork binds IPv4 only, so we
+    /// never form a peerAPI URL on the peer's IPv6 address.
+    pub fn peerapi_doh_url(&self) -> Option<String> {
+        self.peerapi_doh_addr()
+            .map(|addr| format!("http://{addr}/dns-query"))
+    }
+
+    /// The IPv4 socket address (`<tailnet-ipv4>:<peerapi-port>`) of this peer's peerAPI DoH endpoint
+    /// for exit-node DNS proxying, if it can proxy DNS. Same gate as [`Node::peerapi_doh_url`]; this
+    /// is the form the DoH *client* dials (over the overlay netstack) when delegating recursive
+    /// resolution to a selected exit node. `SocketAddr`'s `Display` is `ip:port`, so
+    /// `peerapi_doh_url` formats to `http://<ip>:<port>/dns-query` over this.
+    pub fn peerapi_doh_addr(&self) -> Option<SocketAddr> {
+        if self.is_wireguard_only {
+            return None;
+        }
+        let port = self.peerapi_port?;
+        if !(self.peerapi_dns_proxy || self.cap >= Self::PEER_CAN_PROXY_DNS) {
+            return None;
+        }
+        Some(SocketAddr::new(
+            IpAddr::V4(self.tailnet_address.ipv4.addr()),
+            port,
+        ))
+    }
+}
+
+/// Extract the advertised IPv4 peerAPI port and whether the explicit `peerapi-dns-proxy` service is
+/// advertised, from a peer's `HostInfo.Services` list.
+fn peerapi_from_services(
+    services: Option<&[ts_control_serde::Service<'_>]>,
+) -> (Option<u16>, bool) {
+    use ts_control_serde::ServiceProto;
+
+    let Some(services) = services else {
+        return (None, false);
+    };
+    let mut port = None;
+    let mut dns_proxy = false;
+    for svc in services {
+        match svc.proto {
+            ServiceProto::PeerApi4 => port = Some(svc.port),
+            ServiceProto::PeerApiDnsProxy => dns_proxy = true,
+            _ => {}
+        }
+    }
+    (port, dns_proxy)
 }
 
 /// Addresses for a node within a tailnet.
@@ -281,6 +370,9 @@ impl From<&ts_control_serde::Node<'_>> for Node {
             Some((hostname, tailnet)) => (hostname, Some(tailnet.to_owned())),
             None => (fqdn_without_trailing_dot, None),
         };
+
+        let (peerapi_port, peerapi_dns_proxy) =
+            peerapi_from_services(value.host_info.services.as_deref());
 
         Self {
             id: value.id,
@@ -317,6 +409,16 @@ impl From<&ts_control_serde::Node<'_>> for Node {
                 .or(value.legacy_derp_string)
                 .or_else(|| value.host_info.net_info.as_ref()?.preferred_derp)
                 .map(|x| ts_derp::RegionId(x.into())),
+
+            cap: value.cap,
+            peerapi_port,
+            peerapi_dns_proxy,
+            is_wireguard_only: value.is_wireguard_only,
+            exit_node_dns_resolvers: value
+                .exit_node_dns_resolvers
+                .iter()
+                .filter_map(Resolver::from_serde)
+                .collect(),
         }
     }
 }
@@ -343,6 +445,11 @@ mod tests {
             accepted_routes: vec![],
             underlay_addresses: vec![],
             derp_region: None,
+            cap: CapabilityVersion::default(),
+            peerapi_port: None,
+            peerapi_dns_proxy: false,
+            is_wireguard_only: false,
+            exit_node_dns_resolvers: vec![],
         }
     }
 
@@ -511,6 +618,94 @@ mod tests {
             ExitNodeSelector::Name("dup".into()).resolve(peers.iter().rev()),
             Some(StableId("nA".into()))
         );
+    }
+
+    #[test]
+    fn peerapi_doh_url_requires_port_and_capability() {
+        let mut n = node("exit", Some("ts.net"));
+        n.tailnet_address.ipv4 = "100.64.0.5/32".parse().unwrap();
+
+        // No peerAPI port advertised: cannot proxy DNS.
+        n.peerapi_port = None;
+        n.cap = CapabilityVersion::V130;
+        assert_eq!(n.peerapi_doh_url(), None);
+
+        // Port advertised but capability too old and no explicit service: cannot proxy.
+        n.peerapi_port = Some(8080);
+        n.cap = CapabilityVersion::V25;
+        n.peerapi_dns_proxy = false;
+        assert_eq!(n.peerapi_doh_url(), None);
+
+        // Port + new-enough capability: yields the DoH URL on the IPv4 address.
+        n.cap = CapabilityVersion::V26;
+        assert_eq!(
+            n.peerapi_doh_url().as_deref(),
+            Some("http://100.64.0.5:8080/dns-query")
+        );
+
+        // Port + explicit peerapi-dns-proxy service, even with an old capability.
+        n.cap = CapabilityVersion::V25;
+        n.peerapi_dns_proxy = true;
+        assert_eq!(
+            n.peerapi_doh_url().as_deref(),
+            Some("http://100.64.0.5:8080/dns-query")
+        );
+
+        // WireGuard-only peers never run a peerAPI: no DoH URL even with a port.
+        n.is_wireguard_only = true;
+        assert_eq!(n.peerapi_doh_url(), None);
+    }
+
+    #[test]
+    fn peerapi_doh_addr_matches_url_gate() {
+        let mut n = node("exit", Some("ts.net"));
+        n.tailnet_address.ipv4 = "100.64.0.5/32".parse().unwrap();
+        n.peerapi_port = Some(8080);
+        n.cap = CapabilityVersion::V26;
+
+        // The addr form the DoH client dials is the same gated endpoint as the URL.
+        assert_eq!(
+            n.peerapi_doh_addr(),
+            Some("100.64.0.5:8080".parse().unwrap())
+        );
+        // And it composes into exactly the URL form.
+        assert_eq!(
+            n.peerapi_doh_url().as_deref(),
+            Some("http://100.64.0.5:8080/dns-query")
+        );
+
+        // Gated off the same way: no port => no addr.
+        n.peerapi_port = None;
+        assert_eq!(n.peerapi_doh_addr(), None);
+    }
+
+    #[test]
+    fn peerapi_from_services_extracts_v4_port_and_dns_proxy_flag() {
+        use ts_control_serde::{Service, ServiceProto};
+
+        let services = [
+            Service {
+                proto: ServiceProto::PeerApi4,
+                port: 8080,
+                description: "peerapi",
+            },
+            Service {
+                proto: ServiceProto::PeerApi6,
+                port: 9090,
+                description: "peerapi6",
+            },
+            Service {
+                proto: ServiceProto::PeerApiDnsProxy,
+                port: 1,
+                description: "dns",
+            },
+        ];
+        let (port, dns_proxy) = peerapi_from_services(Some(&services));
+        assert_eq!(port, Some(8080), "only the IPv4 peerAPI port is taken");
+        assert!(dns_proxy);
+
+        // No services at all.
+        assert_eq!(peerapi_from_services(None), (None, false));
     }
 
     #[test]

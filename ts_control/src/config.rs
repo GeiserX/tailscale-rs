@@ -197,6 +197,22 @@ pub struct Config {
     #[serde(default)]
     pub exit_proxy: Option<ExitProxyConfig>,
 
+    /// The IPv4 peerAPI port this node binds to serve exit-node DoH (DNS-over-HTTPS) proxying for
+    /// peers that select it as their exit node (`peerapi4` + `peerapi-dns-proxy` services).
+    ///
+    /// When `Some(port)`, the runtime binds a peerAPI DoH server on this host's overlay IPv4
+    /// address at `port`, and registration / map requests advertise both the `peerapi4` service
+    /// (at `port`) and the `peerapi-dns-proxy` service (Go quirk: its advertised port is always
+    /// `1`) so peers know they can delegate DNS to us. When `None` (the default, fail-closed), no
+    /// peerAPI is run and no services are advertised — this node never offers DNS proxying.
+    ///
+    /// The DoH server always answers authoritative/overlay records (MagicDNS peer names,
+    /// `ExtraRecords`, PTR); *recursive* resolution to real upstream resolvers is gated separately
+    /// behind [`forward_exit_egress`](Config::forward_exit_egress), so a cloud exit node can serve
+    /// overlay DNS without ever exposing its real origin IP via a recursive lookup.
+    #[serde(default)]
+    pub peerapi_port: Option<u16>,
+
     /// Per-direction TCP send/receive buffer size (bytes) for the userspace netstack, or `None` to
     /// use the netstack default (256 KiB per direction, ~512 KiB per socket).
     ///
@@ -259,6 +275,36 @@ impl Config {
 
         routes
     }
+
+    /// The services to advertise in `HostInfo.Services`, derived from
+    /// [`peerapi_port`](Config::peerapi_port).
+    ///
+    /// When a peerAPI port is configured, we advertise the `peerapi4` service at that port plus the
+    /// `peerapi-dns-proxy` service (whose advertised port is always `1`, matching the Go client's
+    /// quirk) so peers learn they can delegate exit-node DNS to us. When `None`, the result is empty
+    /// and callers omit the `HostInfo.Services` wire field entirely (advertise no services). IPv6
+    /// peerAPI (`peerapi6`) is never advertised, per the IPv6-off posture.
+    pub fn advertised_services(&self) -> Vec<ts_control_serde::Service<'static>> {
+        use ts_control_serde::{Service, ServiceProto};
+
+        let Some(port) = self.peerapi_port else {
+            return Vec::new();
+        };
+
+        vec![
+            Service {
+                proto: ServiceProto::PeerApi4,
+                port,
+                description: "tailscale-rs",
+            },
+            Service {
+                // Go quirk: the peerapi-dns-proxy service always advertises port 1.
+                proto: ServiceProto::PeerApiDnsProxy,
+                port: 1,
+                description: "tailscale-rs",
+            },
+        ]
+    }
 }
 
 impl Debug for Config {
@@ -288,6 +334,7 @@ impl Default for Config {
             forward_all_ports: false,
             forward_exit_egress: false,
             exit_proxy: None,
+            peerapi_port: None,
             tcp_buffer_size: None,
         }
     }
@@ -381,6 +428,38 @@ mod tests {
                 .unwrap();
         assert_eq!(cfg.tags, vec!["tag:exit".to_owned()]);
         assert!(Config::default().tags.is_empty());
+    }
+
+    #[test]
+    fn advertises_no_services_without_peerapi_port() {
+        // Fail-closed default: no peerAPI port means no services advertised.
+        assert!(Config::default().advertised_services().is_empty());
+    }
+
+    #[test]
+    fn advertises_peerapi4_and_dns_proxy_when_port_set() {
+        use ts_control_serde::ServiceProto;
+
+        let cfg = Config {
+            peerapi_port: Some(8080),
+            ..Default::default()
+        };
+        let services = cfg.advertised_services();
+        assert_eq!(services.len(), 2);
+
+        // peerapi4 carries the real bind port.
+        assert_eq!(services[0].proto, ServiceProto::PeerApi4);
+        assert_eq!(services[0].port, 8080);
+
+        // peerapi-dns-proxy always advertises port 1 (Go quirk).
+        assert_eq!(services[1].proto, ServiceProto::PeerApiDnsProxy);
+        assert_eq!(services[1].port, 1);
+    }
+
+    #[test]
+    fn peerapi_port_deserializes_default_none() {
+        let cfg: Config = serde_json::from_str(r#"{"server_url":"https://example.com/"}"#).unwrap();
+        assert_eq!(cfg.peerapi_port, None);
     }
 
     #[test]

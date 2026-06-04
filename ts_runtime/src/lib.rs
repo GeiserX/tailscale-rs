@@ -32,6 +32,7 @@ mod multiderp;
 mod netstack_actor;
 mod packetfilter;
 pub mod peer_tracker;
+mod peerapi_doh;
 mod route_updater;
 mod src_filter;
 /// Netmap status snapshot, WhoIs, and watcher types.

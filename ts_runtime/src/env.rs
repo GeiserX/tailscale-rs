@@ -82,6 +82,14 @@ pub struct ForwarderConfig {
     /// [`ts_control::ExitProxyConfig`] happens in [`from_control_config`](ForwarderConfig::from_control_config),
     /// since `ts_control` must not depend on `ts_forwarder`.
     pub exit_proxy: Option<ts_forwarder::ProxyConfig>,
+
+    /// The IPv4 peerAPI port this node binds to serve exit-node DoH (`/dns-query`) to peers, if any.
+    ///
+    /// See [`Config::peerapi_port`](ts_control::Config::peerapi_port). `None` (the default) means
+    /// this node advertises no peerAPI service and runs no DoH server — peers can't use it as a DNS
+    /// proxy. The same value is advertised (`PeerApi4` service) and used to bind the server, so the
+    /// advertised port always matches the actual bind.
+    pub peerapi_port: Option<u16>,
 }
 
 impl ForwarderConfig {
@@ -99,6 +107,7 @@ impl ForwarderConfig {
             forward_all_ports: config.forward_all_ports,
             forward_exit_egress: config.forward_exit_egress,
             exit_proxy: config.exit_proxy.as_ref().map(exit_proxy_to_forwarder),
+            peerapi_port: config.peerapi_port,
         }
     }
 }
@@ -160,6 +169,11 @@ pub struct Env {
     /// See [`ForwarderConfig::exit_proxy`].
     pub exit_proxy: Option<ts_forwarder::ProxyConfig>,
 
+    /// The IPv4 peerAPI port this node binds to serve exit-node DoH to peers, if any.
+    ///
+    /// See [`ForwarderConfig::peerapi_port`].
+    pub peerapi_port: Option<u16>,
+
     /// Whether the runtime is shutdown.
     ///
     /// This is provided so that actors can check whether a message send has failed because
@@ -186,6 +200,7 @@ impl Env {
             forward_all_ports,
             forward_exit_egress,
             exit_proxy,
+            peerapi_port,
         } = forwarding;
         Self {
             bus: MessageBus::spawn_default(),
@@ -199,6 +214,7 @@ impl Env {
             forward_all_ports,
             forward_exit_egress,
             exit_proxy,
+            peerapi_port,
         }
     }
 
