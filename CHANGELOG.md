@@ -6,6 +6,25 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.1](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.1) - 2026-06-04
+
+Hardening pass over the Tier 1 direct-path code (review-driven fixes).
+
+- Security: `CallMeMaybe` over DERP is now gated on a netmap-membership check before its
+  endpoints are learned; relayed Ping fails closed instead of being honored. The
+  `BindingVerifier` signature is now `Fn(&DiscoPublicKey, Option<&NodePublicKey>) -> bool`:
+  `Some(claimed)` demands an exact node-key match (Ping), `None` is membership-only
+  (CallMeMaybe). An absent verifier fails closed (frame dropped), and the absence is warned
+  once.
+- Security: disco `Pong` is now rejected when its UDP source address differs from the address
+  that was pinged, closing a path-confirmation spoofing vector; the learned reflexive-address
+  set is capped (`MAX_REFLEXIVE_ADDRS`).
+- Reliability: shared `RwLock`s recover from poisoning instead of cascading a single task
+  panic into every other flow (kameo actors still isolate per-flow panics); periodic disco
+  intervals use `MissedTickBehavior::Delay`.
+- Tests: added coverage for fail-closed Ping with no verifier, membership-gated CallMeMaybe,
+  relayed-Ping drop, source-address Pong rejection, and forbidden-endpoint filtering.
+
 ## [0.5.0](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.0) - 2026-06-04
 
 Tier 1 of the tsnet full-parity roadmap (`docs/PARITY_ROADMAP.md`).

@@ -160,7 +160,7 @@ impl Multiderp {
     /// live, so this takes effect on regions already running as well as ones spawned later.
     #[message]
     pub fn set_direct_sock(&mut self, sock: Arc<MagicSock>) {
-        *self.direct_sock.write().unwrap() = Some(sock);
+        *poisoned_write(&self.direct_sock) = Some(sock);
     }
 
     /// Relay a raw sealed disco frame (e.g. a CallMeMaybe) to `peer` through DERP region `region`.
@@ -189,11 +189,27 @@ impl Multiderp {
     }
 }
 
+/// Read a [`RwLock`], recovering from poisoning rather than propagating the panic.
+///
+/// These locks guard a wholesale-replaced snapshot (the peer db, or the direct socket handle) with
+/// no cross-field invariant a mid-write panic could leave half-applied. Recovering (rather than
+/// `.unwrap()`) keeps a single panicking task from poisoning the lock and cascade-killing every
+/// region runner that reads it — that would collapse all DERP relaying instead of failing closed.
+fn poisoned_read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Write-lock counterpart of [`poisoned_read`]; same poison-recovery rationale.
+fn poisoned_write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 struct PeerDbLookup<'a>(&'a RwLock<Option<Arc<PeerDb>>>);
 
 impl ts_transport::PeerLookup<PeerId, NodePublicKey> for PeerDbLookup<'_> {
     fn lookup_key(&self, id: PeerId) -> Option<NodePublicKey> {
-        let db = self.0.read().unwrap();
+        let db = poisoned_read(self.0);
         let db = db.as_ref()?;
 
         let (_, node) = db.get(&id)?;
@@ -203,7 +219,7 @@ impl ts_transport::PeerLookup<PeerId, NodePublicKey> for PeerDbLookup<'_> {
 
 impl ts_transport::PeerLookup<NodePublicKey, PeerId> for PeerDbLookup<'_> {
     fn lookup_key(&self, key: NodePublicKey) -> Option<PeerId> {
-        let db = self.0.read().unwrap();
+        let db = poisoned_read(self.0);
         let db = db.as_ref()?;
 
         let (id, _) = db.get(&key)?;
@@ -296,7 +312,10 @@ async fn run_derp_once(
                     // before, where they decode as junk and are dropped. That startup window
                     // self-heals: the peer re-sends CallMeMaybe on its own advertise cadence, so a
                     // dropped frame here is recovered on the next round, not a lost hole-punch.
-                    let sock = direct_sock.read().unwrap().clone();
+                    // Snapshot the direct-sock handle once for the whole batch (it changes at most
+                    // once, when the direct manager installs it). See `demux_relayed_disco` for the
+                    // CallMeMaybe-only filtering this feeds.
+                    let sock = poisoned_read(direct_sock).clone();
                     for ret in from_derp.batch_iter() {
                         let (peer_id, pkts) = ret?;
 
@@ -454,7 +473,7 @@ impl Message<Arc<PeerState>> for Multiderp {
     type Reply = ();
 
     async fn handle(&mut self, msg: Arc<PeerState>, _ctx: &mut Context<Self, Self::Reply>) {
-        let mut db = self.peer_db.write().unwrap();
+        let mut db = poisoned_write(&self.peer_db);
         *db = Some(msg.peers.clone());
     }
 }
@@ -502,6 +521,13 @@ mod tests {
         "127.0.0.1:0".parse().unwrap()
     }
 
+    /// A binding verifier accepting every disco frame. The demux tests are not exercising the
+    /// netmap-membership check (covered in `direct::tests` and `ts_magicsock`), so they install
+    /// this to keep the now-fail-closed relayed-CallMeMaybe handler learning endpoints.
+    fn allow_all() -> ts_magicsock::BindingVerifier {
+        Arc::new(|_: &ts_keys::DiscoPublicKey, _: Option<&NodePublicKey>| true)
+    }
+
     /// A `CallMeMaybe` relayed to us over DERP is routed into the magicsock (its endpoints are
     /// learned via `add_peer_endpoints`) and is *not* returned for the dataplane, while an
     /// interleaved WireGuard data frame still reaches the dataplane unchanged. This is the
@@ -513,7 +539,8 @@ mod tests {
         let our_node = ts_keys::NodePrivateKey::random().public_key();
         let sock = MagicSock::bind(localhost(), our_disco, our_node)
             .await
-            .unwrap();
+            .unwrap()
+            .with_binding_verifier(allow_all());
 
         // A remote peer's CallMeMaybe carrying a public (pingable) candidate endpoint.
         let peer_disco = DiscoPrivateKey::random();
@@ -565,6 +592,70 @@ mod tests {
             out.len(),
             2,
             "no demux without a direct socket; all frames pass through"
+        );
+    }
+
+    /// A disco *Ping* relayed over DERP must be dropped, never ponged: a relayed frame has no real
+    /// UDP source to answer. It is consumed (kept off the dataplane) but learns no candidate path,
+    /// even with an allow-all verifier installed — proving the drop is structural (CallMeMaybe-only
+    /// at the relay), not a verifier rejection.
+    #[tokio::test]
+    async fn relayed_ping_is_dropped_not_ponged() {
+        let our_disco = DiscoPrivateKey::random();
+        let our_node = ts_keys::NodePrivateKey::random().public_key();
+        let sock = MagicSock::bind(localhost(), our_disco, our_node)
+            .await
+            .unwrap()
+            .with_binding_verifier(allow_all());
+
+        let peer_disco = DiscoPrivateKey::random();
+        let peer_node = ts_keys::NodePrivateKey::random().public_key();
+        let tx = ts_magicsock::random_tx_id();
+        let ping =
+            ts_magicsock::seal_ping(&peer_disco, peer_node, &our_disco.public_key(), tx).unwrap();
+
+        let out = demux_relayed_disco(vec![PacketMut::from(&ping[..])], Some(&sock));
+
+        assert!(
+            out.is_empty(),
+            "a relayed disco Ping is consumed (kept off the dataplane)"
+        );
+        assert!(
+            sock.candidate_addrs(&peer_disco.public_key()).is_empty(),
+            "a relayed Ping must not learn a candidate path"
+        );
+    }
+
+    /// A relayed `CallMeMaybe` advertising a forbidden candidate (loopback/private/IPv6) has that
+    /// endpoint filtered by `is_pingable_candidate` before it can become a host-sourced ping
+    /// target; only the public candidate offered alongside it is learned.
+    #[tokio::test]
+    async fn relayed_call_me_maybe_forbidden_endpoints_filtered() {
+        let our_disco = DiscoPrivateKey::random();
+        let our_node = ts_keys::NodePrivateKey::random().public_key();
+        let sock = MagicSock::bind(localhost(), our_disco, our_node)
+            .await
+            .unwrap()
+            .with_binding_verifier(allow_all());
+
+        let peer_disco = DiscoPrivateKey::random();
+        let loopback: std::net::SocketAddr = "127.0.0.1:41641".parse().unwrap();
+        let private: std::net::SocketAddr = "10.1.2.3:41641".parse().unwrap();
+        let public: std::net::SocketAddr = "203.0.113.50:41641".parse().unwrap();
+        let cmm = ts_magicsock::seal_call_me_maybe(
+            &peer_disco,
+            &our_disco.public_key(),
+            &[loopback, private, public],
+        )
+        .unwrap();
+
+        let out = demux_relayed_disco(vec![PacketMut::from(&cmm[..])], Some(&sock));
+        assert!(out.is_empty(), "the CallMeMaybe is consumed, not forwarded");
+
+        assert_eq!(
+            sock.candidate_addrs(&peer_disco.public_key()),
+            vec![public],
+            "only the public candidate survives the pingable-candidate filter"
         );
     }
 }

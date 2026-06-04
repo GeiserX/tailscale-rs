@@ -144,11 +144,21 @@ impl PeerPaths {
         self.in_flight.insert(tx_id, InFlight { to, sent });
     }
 
-    /// Record a pong for `tx_id`. Returns the measured latency if the tx id was in flight.
+    /// Record a pong for `tx_id` received from `from`. Returns the measured latency if the tx id
+    /// was in flight *and* the pong arrived from the address we pinged.
     ///
-    /// Updates the candidate's latency and recomputes the best address.
-    pub fn note_pong(&mut self, tx_id: TxId, now: Instant) -> Option<Duration> {
+    /// The `from == to` check binds the pong to the path it confirms: a pong is only meaningful as
+    /// proof that the address we pinged answered, so a pong arriving from a different source (a
+    /// peer echoing a tx_id from an address we never probed) must not confirm a path. Without this
+    /// a malicious-but-authenticated peer could confirm `best_addr` for an address that never
+    /// actually responded. Updates the candidate's latency and recomputes the best address.
+    pub fn note_pong(&mut self, tx_id: TxId, from: SocketAddr, now: Instant) -> Option<Duration> {
         let InFlight { to, sent } = self.in_flight.remove(&tx_id)?;
+        if to != from {
+            // Pong came from an address other than the one we pinged for this tx_id: drop it. The
+            // in-flight entry is already consumed, so a replayed/forged tx_id can't be reused.
+            return None;
+        }
         let latency = now.saturating_duration_since(sent);
 
         let cand = self.candidates.entry(to).or_default();
@@ -216,7 +226,7 @@ mod tests {
         assert_eq!(p.best_addr(now), None, "no path before any pong");
 
         p.note_ping_sent(tx(1), addr, now);
-        let lat = p.note_pong(tx(1), now + Duration::from_millis(10));
+        let lat = p.note_pong(tx(1), addr, now + Duration::from_millis(10));
         assert_eq!(lat, Some(Duration::from_millis(10)));
 
         let after = now + Duration::from_millis(11);
@@ -233,8 +243,8 @@ mod tests {
         let now = Instant::now();
         p.note_ping_sent(tx(1), slow, now);
         p.note_ping_sent(tx(2), fast, now);
-        p.note_pong(tx(1), now + Duration::from_millis(50));
-        p.note_pong(tx(2), now + Duration::from_millis(5));
+        p.note_pong(tx(1), slow, now + Duration::from_millis(50));
+        p.note_pong(tx(2), fast, now + Duration::from_millis(5));
 
         assert_eq!(p.best_addr(now + Duration::from_millis(51)), Some(fast));
     }
@@ -247,7 +257,7 @@ mod tests {
 
         let now = Instant::now();
         p.note_ping_sent(tx(1), addr, now);
-        p.note_pong(tx(1), now);
+        p.note_pong(tx(1), addr, now);
 
         assert_eq!(p.best_addr(now + Duration::from_secs(1)), Some(addr));
         // Past the trust window the path is dropped — caller must use DERP, not host route.
@@ -268,7 +278,7 @@ mod tests {
         let now = Instant::now();
         // Confirm the path that is about to be revoked.
         p.note_ping_sent(tx(1), revoked, now);
-        p.note_pong(tx(1), now + Duration::from_millis(5));
+        p.note_pong(tx(1), revoked, now + Duration::from_millis(5));
         assert_eq!(
             p.best_addr(now + Duration::from_millis(6)),
             Some(revoked),
@@ -315,9 +325,43 @@ mod tests {
     #[test]
     fn unsolicited_pong_is_ignored() {
         let mut p = PeerPaths::default();
+        let addr: SocketAddr = "203.0.113.1:41641".parse().unwrap();
         let now = Instant::now();
         // No ping was sent for tx(9): the pong must not confirm anything.
-        assert_eq!(p.note_pong(tx(9), now), None);
+        assert_eq!(p.note_pong(tx(9), addr, now), None);
         assert_eq!(p.best_addr(now), None);
+    }
+
+    /// A pong that echoes a tx_id we have in flight but arrives from a *different* source address
+    /// than the one we pinged must not confirm the path (anti-spoofing: the pong only proves the
+    /// pinged address answered). The in-flight entry is still consumed so the tx_id can't be reused.
+    #[test]
+    fn pong_from_wrong_source_is_ignored() {
+        let mut p = PeerPaths::default();
+        let pinged: SocketAddr = "203.0.113.1:41641".parse().unwrap();
+        let attacker: SocketAddr = "203.0.113.99:41641".parse().unwrap();
+        p.add_netmap_candidates([pinged]);
+
+        let now = Instant::now();
+        p.note_ping_sent(tx(1), pinged, now);
+
+        // Pong for our tx_id, but from an address we never pinged: rejected.
+        assert_eq!(
+            p.note_pong(tx(1), attacker, now + Duration::from_millis(5)),
+            None
+        );
+        assert_eq!(
+            p.best_addr(now + Duration::from_millis(6)),
+            None,
+            "a pong from the wrong source must not confirm a path"
+        );
+
+        // The tx_id was consumed by the first (rejected) pong, so the legitimate address can no
+        // longer be confirmed by replaying that tx_id — the peer must ping afresh.
+        assert_eq!(
+            p.note_pong(tx(1), pinged, now + Duration::from_millis(7)),
+            None
+        );
+        assert_eq!(p.best_addr(now + Duration::from_millis(8)), None);
     }
 }

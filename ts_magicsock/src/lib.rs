@@ -22,7 +22,7 @@ mod error;
 mod path;
 mod sock;
 
-pub use disco::{Inbound, TxId, looks_like_disco, random_tx_id, seal_call_me_maybe};
+pub use disco::{Inbound, TxId, looks_like_disco, random_tx_id, seal_call_me_maybe, seal_ping};
 pub use endpoint::{SelfEndpoint, SelfEndpointType};
 pub use error::{DiscoError, Error};
 pub use path::{PeerPaths, TRUST_DURATION};

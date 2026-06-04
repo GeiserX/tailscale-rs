@@ -42,14 +42,43 @@ pub struct ReceivedData {
 /// Shared, per-peer path state keyed by the peer's disco key.
 type Paths = Arc<Mutex<HashMap<DiscoPublicKey, PeerPaths>>>;
 
-/// Verifies that a disco key is bound to a claimed node key by the control netmap.
+/// Cap on the number of distinct reflexive (STUN-equivalent) addresses we retain.
 ///
-/// Returns `true` only when the netmap currently advertises `claimed_node_key` for
-/// `sender_disco` (a live read of the netmap-owning layer). Used by [`MagicSock::handle_disco`]
-/// to fail closed on a disco ping whose `claimed_node_key` does not match the binding control
-/// advertised — a peer must not be able to open a direct path under a node key that isn't its
-/// own. See [`MagicSock::with_binding_verifier`].
-pub type BindingVerifier = Arc<dyn Fn(&DiscoPublicKey, &NodePublicKey) -> bool + Send + Sync>;
+/// Reflexive addresses are learned from the `src` a peer echoes in a disco pong. A
+/// malicious-but-authenticated peer could pong with many spoofed `src` values to inflate this set
+/// without bound (each is advertised to control and in every `CallMeMaybe`). A real node sits
+/// behind a small number of NAT mappings, so a modest cap bounds the memory and the advertised
+/// endpoint set while never dropping a legitimately-needed reflexive address in practice. When the
+/// cap is reached, further novel addresses are ignored (fail-safe: we keep the ones we already
+/// trust rather than churn).
+const MAX_REFLEXIVE_ADDRS: usize = 16;
+
+/// Acquire a [`Mutex`] guard, recovering from poisoning instead of propagating the panic.
+///
+/// These locks guard plain maps/sets with no cross-field invariant that a mid-update panic could
+/// leave half-applied, so recovering the inner data is safe. Recovering (rather than `.unwrap()`)
+/// is the anti-leak-safe choice: a single panic while a guard is held must not poison the lock and
+/// cascade-kill every other task that touches it (the pinger, the DERP relay demux, the route
+/// query) — that would take the whole dataplane down instead of failing closed to DERP.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Verifies a disco key's identity against the control netmap before we act on a disco frame.
+///
+/// Called with the sender's disco key and:
+/// - `Some(claimed_node_key)` for a disco **Ping** — returns `true` only when the netmap currently
+///   binds exactly that node key to the sender's disco key (a peer must not open a direct path
+///   under a node key that isn't its own);
+/// - `None` for a **CallMeMaybe** (which carries no node key) — returns `true` only when the
+///   sender's disco key is a member of the current netmap, so an unknown/spoofed disco key cannot
+///   make us learn (and then host-probe) attacker-chosen candidate endpoints.
+///
+/// A live read of the netmap-owning layer, so revocations take effect immediately. Used by
+/// [`MagicSock::handle_disco`] / [`MagicSock::handle_relayed_call_me_maybe`] to fail closed. See
+/// [`MagicSock::with_binding_verifier`].
+pub type BindingVerifier =
+    Arc<dyn Fn(&DiscoPublicKey, Option<&NodePublicKey>) -> bool + Send + Sync>;
 
 /// Whether a peer-supplied candidate endpoint is safe to probe with a disco ping.
 ///
@@ -122,15 +151,22 @@ pub struct MagicSock {
     reflexive: Arc<Mutex<HashSet<SocketAddr>>>,
     /// Optional disco<->node-key binding verifier, wired by the netmap-owning route layer.
     ///
-    /// When present, an inbound disco ping's `claimed_node_key` is cross-checked against the
-    /// control netmap before we pong or learn the source as a direct-path candidate: if the
-    /// claimed node key is not the one control advertised for the sender's disco key (or the
-    /// disco key is unknown to the netmap), the ping is dropped (fail closed). When absent
-    /// (`None`), pings are answered without the binding check (the pre-binding behavior, used by
-    /// tests and any caller that has no netmap).
+    /// When present, every inbound disco frame that would cause us to learn a candidate endpoint
+    /// (a Ping's source, or a CallMeMaybe's advertised endpoints) is first checked against the
+    /// control netmap: a Ping must present the node key control bound to its disco key, and a
+    /// CallMeMaybe's sender disco key must be a current netmap member. Frames that fail are dropped
+    /// (fail closed) — a peer not bound in our netmap must not be able to open a direct path or
+    /// steer host-sourced probes at attacker-chosen addresses.
+    ///
+    /// When **absent** (`None`) we **fail closed**: disco frames that would learn an endpoint or
+    /// pong are dropped, because answering them without the binding check is the spoofing surface
+    /// this verifier exists to close. The production route layer always installs one via
+    /// [`MagicSock::with_binding_verifier`]; the `None` default exists only so a misconfigured or
+    /// netmap-less construction degrades safely (DERP-only) rather than insecurely. Tests that need
+    /// the pre-binding ping/pong behavior install an explicit allow-all verifier.
     binding_verifier: Option<BindingVerifier>,
     /// One-shot guard so the "no binding verifier installed" warning is emitted at most once
-    /// instead of on every answered ping.
+    /// instead of on every dropped ping.
     warned_no_verifier: AtomicBool,
 }
 
@@ -161,9 +197,10 @@ impl MagicSock {
     /// Install the disco<->node-key binding verifier (see [`BindingVerifier`]).
     ///
     /// Called once at startup by the netmap-owning route layer. With a verifier installed, an
-    /// inbound disco ping must present the node key control bound to its disco key or it is
-    /// dropped (fail closed); without one, pings are answered unconditionally (pre-binding
-    /// behavior). Builder-style so the `bind` call site stays a single expression.
+    /// inbound disco ping must present the node key control bound to its disco key, and a relayed
+    /// CallMeMaybe's sender must be a netmap member, or the frame is dropped (fail closed). Without
+    /// one the socket fails closed entirely (drops such frames). Builder-style so the `bind` call
+    /// site stays a single expression.
     pub fn with_binding_verifier(mut self, verifier: BindingVerifier) -> Self {
         self.binding_verifier = Some(verifier);
         self
@@ -191,7 +228,7 @@ impl MagicSock {
             });
         }
 
-        let reflexive = self.reflexive.lock().unwrap();
+        let reflexive = lock(&self.reflexive);
         for addr in reflexive.iter() {
             eps.push(SelfEndpoint {
                 addr: *addr,
@@ -249,13 +286,28 @@ impl MagicSock {
         }
 
         {
-            let mut a2d = self.addr_to_disco.lock().unwrap();
+            let mut a2d = lock(&self.addr_to_disco);
             for ep in &eps {
-                a2d.insert(*ep, peer);
+                // Don't let a learned (disco-supplied) candidate steal an address already
+                // attributed to a *different* peer: an authenticated-but-malicious peer could
+                // otherwise claim a victim peer's known endpoint and hijack inbound-data
+                // attribution. First writer wins for learned candidates; only the authoritative
+                // netmap path ([`set_netmap_endpoints`]) may reassign an address across peers.
+                match a2d.get(ep) {
+                    Some(existing) if *existing != peer => {
+                        tracing::debug!(
+                            %ep,
+                            "ignoring learned candidate for already-attributed address"
+                        );
+                    }
+                    _ => {
+                        a2d.insert(*ep, peer);
+                    }
+                }
             }
         }
 
-        let mut paths = self.paths.lock().unwrap();
+        let mut paths = lock(&self.paths);
         paths.entry(peer).or_default().add_learned_candidates(eps);
     }
 
@@ -297,14 +349,14 @@ impl MagicSock {
         let eps: Vec<SocketAddr> = endpoints.into_iter().collect();
 
         let removed = {
-            let mut paths = self.paths.lock().unwrap();
+            let mut paths = lock(&self.paths);
             paths
                 .entry(peer)
                 .or_default()
                 .reconcile_netmap_candidates(eps.iter().copied())
         };
 
-        let mut a2d = self.addr_to_disco.lock().unwrap();
+        let mut a2d = lock(&self.addr_to_disco);
         for ep in &eps {
             a2d.insert(*ep, peer);
         }
@@ -322,11 +374,11 @@ impl MagicSock {
     /// Called after a netmap update so peers removed from the tailnet stop being ping targets and
     /// release their `addr -> disco` attributions, bounding the growth of both maps.
     pub fn retain_peers(&self, live: &std::collections::HashSet<DiscoPublicKey>) {
-        let mut paths = self.paths.lock().unwrap();
+        let mut paths = lock(&self.paths);
         paths.retain(|peer, _| live.contains(peer));
         drop(paths);
 
-        let mut a2d = self.addr_to_disco.lock().unwrap();
+        let mut a2d = lock(&self.addr_to_disco);
         a2d.retain(|_, peer| live.contains(peer));
     }
 
@@ -340,7 +392,7 @@ impl MagicSock {
         // Snapshot the work to do without holding the lock across awaits.
         let mut to_ping: Vec<(DiscoPublicKey, SocketAddr, disco::TxId)> = Vec::new();
         {
-            let mut paths = self.paths.lock().unwrap();
+            let mut paths = lock(&self.paths);
             for (peer, pp) in paths.iter_mut() {
                 if !pp.needs_refresh(now) {
                     continue;
@@ -367,10 +419,15 @@ impl MagicSock {
     /// control-advertised), regardless of whether any is confirmed.
     ///
     /// Unlike [`MagicSock::best_addr`] this does not require a pong; it reports what
-    /// [`MagicSock::add_peer_endpoints`]/[`MagicSock::set_netmap_endpoints`] have recorded. Useful
-    /// for observing that a relayed `CallMeMaybe` was learned before any direct path is confirmed.
+    /// [`MagicSock::add_peer_endpoints`]/[`MagicSock::set_netmap_endpoints`] have recorded.
+    ///
+    /// Test-observability only: this exists so cross-crate tests (e.g. the multiderp relayed
+    /// `CallMeMaybe` demux test) can assert an endpoint was learned before any direct path is
+    /// confirmed. It is not used on any production path. It cannot be `#[cfg(test)]` because the
+    /// asserting test lives in another crate, where this crate's test cfg is not active.
+    #[doc(hidden)]
     pub fn candidate_addrs(&self, peer: &DiscoPublicKey) -> Vec<SocketAddr> {
-        let paths = self.paths.lock().unwrap();
+        let paths = lock(&self.paths);
         paths
             .get(peer)
             .map(|pp| pp.candidate_addrs())
@@ -380,7 +437,7 @@ impl MagicSock {
     /// The current best confirmed direct address for a peer, or `None` if there is no
     /// trusted direct path (caller must use DERP — never the host network).
     pub fn best_addr(&self, peer: &DiscoPublicKey) -> Option<SocketAddr> {
-        let paths = self.paths.lock().unwrap();
+        let paths = lock(&self.paths);
         paths.get(peer)?.best_addr(Instant::now())
     }
 
@@ -447,10 +504,19 @@ impl MagicSock {
     /// `frame` is decrypted in place. Returns `true` if the frame was a disco frame we consumed
     /// (whether or not it was actionable), so the caller does not also forward it to the
     /// dataplane as WireGuard data.
+    ///
+    /// The CallMeMaybe's sender disco key is checked for netmap membership via the binding verifier
+    /// before its endpoints are learned: a CallMeMaybe carries no node key, so the check is
+    /// "is this disco key a current netmap peer?". This closes an amplification/poisoning vector —
+    /// without it, anyone who learns a victim disco key could relay a CallMeMaybe over DERP and
+    /// steer the victim's host socket to disco-ping attacker-chosen public addresses every cadence.
+    /// With no verifier installed we fail closed (drop), mirroring [`MagicSock::handle_disco`].
     pub fn handle_relayed_call_me_maybe(&self, frame: &mut [u8]) -> bool {
         match disco::open(&self.our_disco, frame) {
             Ok(Inbound::CallMeMaybe { sender, endpoints }) => {
-                self.add_peer_endpoints(sender, endpoints);
+                if self.call_me_maybe_sender_allowed(&sender) {
+                    self.add_peer_endpoints(sender, endpoints);
+                }
                 true
             }
             Ok(other) => {
@@ -471,6 +537,32 @@ impl MagicSock {
         }
     }
 
+    /// Whether a CallMeMaybe from `sender` may be acted on (its endpoints learned).
+    ///
+    /// A CallMeMaybe carries no node key, so the binding verifier is queried with `None`: it
+    /// returns `true` only if the sender's disco key is a current netmap member. With no verifier
+    /// installed we fail closed (`false`) — see the [`binding_verifier`](Self::binding_verifier)
+    /// field doc. Emits the one-shot no-verifier warning so a misconfiguration is observable.
+    fn call_me_maybe_sender_allowed(&self, sender: &DiscoPublicKey) -> bool {
+        match self.binding_verifier.as_ref() {
+            Some(verify) => verify(sender, None),
+            None => {
+                self.warn_no_verifier_once();
+                false
+            }
+        }
+    }
+
+    /// Emit the "no binding verifier installed" warning at most once.
+    fn warn_no_verifier_once(&self) {
+        if !self.warned_no_verifier.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "disco frames dropped: no binding verifier installed; the route layer must call \
+                 with_binding_verifier or the socket fails closed (DERP-only)"
+            );
+        }
+    }
+
     async fn handle_disco(&self, msg: Inbound, from: SocketAddr) -> Result<(), Error> {
         match msg {
             Inbound::Ping {
@@ -478,19 +570,15 @@ impl MagicSock {
                 tx_id,
                 claimed_node_key,
             } => {
-                // The ping carries a `claimed_node_key`, which disco intends to be cross-checked
-                // against the control netmap (does this disco key really belong to this node
-                // key?). When a binding verifier is installed (by the netmap-owning route layer)
-                // we enforce that binding here, failing closed: if the claimed node key is not the
-                // one control advertised for the sender's disco key — or the disco key is not in
-                // our netmap at all — we drop the ping without ponging and without learning the
-                // source as a candidate path. A peer not bound in our netmap must not be able to
-                // open a direct path. With no verifier (`None`) we keep the pre-binding behavior:
-                // the ping is authenticated (it opened under our disco key), so learning the
-                // source and ponging is sound even without the binding cross-check.
+                // The ping carries a `claimed_node_key` to be cross-checked against the control
+                // netmap (does this disco key really belong to this node key?). We fail closed: if
+                // the claimed node key is not the one control advertised for the sender's disco key
+                // — or the disco key is unknown to the netmap, or no verifier is installed at all —
+                // we drop the ping without ponging and without learning the source as a candidate
+                // path. A peer not bound in our netmap must not be able to open a direct path.
                 match self.binding_verifier.as_ref() {
                     Some(verify) => {
-                        if !verify(&sender, &claimed_node_key) {
+                        if !verify(&sender, Some(&claimed_node_key)) {
                             tracing::debug!(
                                 %from,
                                 "dropping disco ping: claimed node key not bound to sender disco key in netmap"
@@ -499,17 +587,12 @@ impl MagicSock {
                         }
                     }
                     None => {
-                        // Fail-open path: no binding verifier installed, so we answer pings
-                        // without the disco<->node-key cross-check. This is expected for tests and
-                        // netmap-less callers, but a production deployment that forgot to call
-                        // `with_binding_verifier` would silently lose the spoofing protection.
-                        // Warn once so the misconfiguration is observable rather than silent.
-                        if !self.warned_no_verifier.swap(true, Ordering::Relaxed) {
-                            tracing::warn!(
-                                "answering disco pings WITHOUT binding verification (no verifier \
-                                 installed); spoofed-node-key peers can open direct paths"
-                            );
-                        }
+                        // Fail closed: with no verifier we cannot confirm the disco<->node-key
+                        // binding, so we drop the ping rather than answer a potentially spoofed
+                        // peer. Warn once so a deployment that forgot `with_binding_verifier` sees
+                        // why direct paths never open (it stays DERP-only, which is leak-safe).
+                        self.warn_no_verifier_once();
+                        return Ok(());
                     }
                 }
 
@@ -520,18 +603,33 @@ impl MagicSock {
             }
             Inbound::Pong { sender, tx_id, src } => {
                 {
-                    let mut paths = self.paths.lock().unwrap();
+                    let mut paths = lock(&self.paths);
                     if let Some(pp) = paths.get_mut(&sender) {
-                        pp.note_pong(tx_id, Instant::now());
+                        // Bind the pong to the address it arrived from (`from`): a pong only
+                        // confirms a path if it came from the address we pinged for this tx_id.
+                        pp.note_pong(tx_id, from, Instant::now());
                     }
                 }
                 // The peer echoed the address it saw our ping arrive from: that is our reflexive
-                // (STUN-equivalent) endpoint on this path. Retain it for advertisement. Locked
-                // disjointly from `paths` above (never nested).
-                self.reflexive.lock().unwrap().insert(src);
+                // (STUN-equivalent) endpoint on this path. Retain it for advertisement, bounded by
+                // `MAX_REFLEXIVE_ADDRS` so a peer ponging many spoofed `src` values can't inflate
+                // the set without bound. Locked disjointly from `paths` above (never nested).
+                {
+                    let mut reflexive = lock(&self.reflexive);
+                    if reflexive.contains(&src) || reflexive.len() < MAX_REFLEXIVE_ADDRS {
+                        reflexive.insert(src);
+                    } else {
+                        tracing::debug!(%src, "reflexive address set full, ignoring new endpoint");
+                    }
+                }
             }
             Inbound::CallMeMaybe { sender, endpoints } => {
-                self.add_peer_endpoints(sender, endpoints);
+                // A CallMeMaybe received directly on the UDP socket. Gate it on netmap membership
+                // exactly like the relayed path, so an unknown/spoofed disco key cannot make us
+                // learn (and then host-probe) attacker-chosen candidate endpoints.
+                if self.call_me_maybe_sender_allowed(&sender) {
+                    self.add_peer_endpoints(sender, endpoints);
+                }
             }
         }
         Ok(())
@@ -640,6 +738,14 @@ mod tests {
 
     fn localhost() -> SocketAddr {
         "127.0.0.1:0".parse().unwrap()
+    }
+
+    /// A verifier that accepts every disco frame. The loopback ping/pong/data tests are not
+    /// exercising the binding check (they have no netmap), so they install this to keep the
+    /// now-fail-closed Ping/CallMeMaybe handlers answering. Tests that *do* exercise the binding
+    /// check build a discriminating closure instead.
+    fn allow_all() -> BindingVerifier {
+        Arc::new(|_: &DiscoPublicKey, _: Option<&NodePublicKey>| true)
     }
 
     #[test]
@@ -758,7 +864,15 @@ mod tests {
         let b_node = ts_keys::NodePrivateKey::random().public_key();
 
         let a = Arc::new(MagicSock::bind(localhost(), a_disco, a_node).await.unwrap());
-        let b = Arc::new(MagicSock::bind(localhost(), b_disco, b_node).await.unwrap());
+        // B receives A's pings, so it needs a verifier or it now fails closed. The binding check
+        // itself is covered by the dedicated binding_verifier_* tests; here we only want the path
+        // to confirm, so an allow-all verifier is correct.
+        let b = Arc::new(
+            MagicSock::bind(localhost(), b_disco, b_node)
+                .await
+                .unwrap()
+                .with_binding_verifier(allow_all()),
+        );
 
         let a_addr = a.local_addr().unwrap();
         let b_addr = b.local_addr().unwrap();
@@ -837,10 +951,17 @@ mod tests {
         // B's netmap binds A's disco key to A's *real* node key. A pinger that claims a different
         // node key for A's disco key must be rejected.
         let bound_node = a_node;
-        let verifier: BindingVerifier =
-            Arc::new(move |disco: &DiscoPublicKey, claimed: &NodePublicKey| {
-                *disco == a_disco.public_key() && *claimed == bound_node
-            });
+        let bound_disco = a_disco.public_key();
+        let verifier: BindingVerifier = Arc::new(
+            move |disco: &DiscoPublicKey, claimed: Option<&NodePublicKey>| {
+                // Ping: require the exact disco<->node-key binding. CallMeMaybe (None): membership
+                // is satisfied by the same disco key being known.
+                match claimed {
+                    Some(claimed) => *disco == bound_disco && *claimed == bound_node,
+                    None => *disco == bound_disco,
+                }
+            },
+        );
 
         let b_node = ts_keys::NodePrivateKey::random().public_key();
         let b = Arc::new(
@@ -902,10 +1023,12 @@ mod tests {
         // B's netmap correctly binds A's disco key to A's node key.
         let bound_disco = a_disco.public_key();
         let bound_node = a_node;
-        let verifier: BindingVerifier =
-            Arc::new(move |disco: &DiscoPublicKey, claimed: &NodePublicKey| {
-                *disco == bound_disco && *claimed == bound_node
-            });
+        let verifier: BindingVerifier = Arc::new(
+            move |disco: &DiscoPublicKey, claimed: Option<&NodePublicKey>| match claimed {
+                Some(claimed) => *disco == bound_disco && *claimed == bound_node,
+                None => *disco == bound_disco,
+            },
+        );
 
         let a = Arc::new(MagicSock::bind(localhost(), a_disco, a_node).await.unwrap());
         let b = Arc::new(
@@ -962,7 +1085,14 @@ mod tests {
         let b_node = ts_keys::NodePrivateKey::random().public_key();
 
         let a = Arc::new(MagicSock::bind(localhost(), a_disco, a_node).await.unwrap());
-        let b = Arc::new(MagicSock::bind(localhost(), b_disco, b_node).await.unwrap());
+        // B answers A's pings, so it needs a verifier (fail-closed otherwise). Allow-all: the
+        // binding check is covered elsewhere; here we exercise reflexive-address learning.
+        let b = Arc::new(
+            MagicSock::bind(localhost(), b_disco, b_node)
+                .await
+                .unwrap()
+                .with_binding_verifier(allow_all()),
+        );
         let a_addr = a.local_addr().unwrap();
         let b_addr = b.local_addr().unwrap();
 
@@ -1073,7 +1203,14 @@ mod tests {
         let b_node = ts_keys::NodePrivateKey::random().public_key();
 
         let a_sock = Arc::new(MagicSock::bind(localhost(), a_disco, a_node).await.unwrap());
-        let b_sock = Arc::new(MagicSock::bind(localhost(), b_disco, b_node).await.unwrap());
+        // b_sock receives A's pings via its DirectTransport pump; it needs a verifier or it now
+        // fails closed. Allow-all keeps the path opening (binding check covered separately).
+        let b_sock = Arc::new(
+            MagicSock::bind(localhost(), b_disco, b_node)
+                .await
+                .unwrap()
+                .with_binding_verifier(allow_all()),
+        );
         let a_addr = a_sock.local_addr().unwrap();
         let b_addr = b_sock.local_addr().unwrap();
 
@@ -1119,5 +1256,139 @@ mod tests {
         let data: Vec<_> = pkts.into_iter().collect();
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].as_ref(), b"hello-transport");
+    }
+
+    /// With NO binding verifier installed the socket fails closed: an inbound disco ping is
+    /// dropped (no pong, no learned candidate). This is the safe default for a misconfigured or
+    /// netmap-less construction — a peer must not open a direct path we can't authenticate.
+    #[tokio::test]
+    async fn no_verifier_fails_closed_on_ping() {
+        let a_disco = DiscoPrivateKey::random();
+        let b_disco = DiscoPrivateKey::random();
+        let a_node = ts_keys::NodePrivateKey::random().public_key();
+        let b_node = ts_keys::NodePrivateKey::random().public_key();
+
+        // B has no verifier -> must fail closed.
+        let b = Arc::new(MagicSock::bind(localhost(), b_disco, b_node).await.unwrap());
+        let b_addr = b.local_addr().unwrap();
+
+        let a = Arc::new(MagicSock::bind(localhost(), a_disco, a_node).await.unwrap());
+        let tx = disco::random_tx_id();
+        let ping = disco::seal_ping(&a_disco, a_node, &b_disco.public_key(), tx).unwrap();
+
+        let b_pump = b.clone();
+        let pump = tokio::spawn(async move { while let Ok(Some(_)) = b_pump.recv_data().await {} });
+
+        a.sock.send_to(&ping, b_addr).await.unwrap();
+
+        // A must not receive a pong: B fails closed without a verifier.
+        let mut buf = vec![0u8; RECV_BUF];
+        let got = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            a.sock.recv_from(&mut buf),
+        )
+        .await;
+        assert!(
+            got.is_err(),
+            "no-verifier socket must not pong (got {got:?})"
+        );
+
+        let a_addr = a.local_addr().unwrap();
+        assert!(
+            b.paths.lock().unwrap().get(&a_disco.public_key()).is_none(),
+            "no candidate path should be learned without a verifier"
+        );
+        assert!(
+            !b.addr_to_disco.lock().unwrap().contains_key(&a_addr),
+            "no attribution should be learned without a verifier"
+        );
+
+        pump.abort();
+    }
+
+    /// A directly-received CallMeMaybe is gated on netmap membership: a sender disco key the
+    /// verifier rejects has its endpoints dropped; a member's endpoints are learned (after the
+    /// pingable-candidate filter).
+    #[tokio::test]
+    async fn call_me_maybe_gated_on_membership() {
+        let member_disco = DiscoPrivateKey::random();
+        let stranger_disco = DiscoPrivateKey::random();
+        let recv_disco = DiscoPrivateKey::random();
+        let recv_node = ts_keys::NodePrivateKey::random().public_key();
+
+        // Only `member_disco` is a netmap member; CallMeMaybe carries no node key (claimed=None).
+        let member_pub = member_disco.public_key();
+        let verifier: BindingVerifier = Arc::new(
+            move |disco: &DiscoPublicKey, claimed: Option<&NodePublicKey>| {
+                claimed.is_none() && *disco == member_pub
+            },
+        );
+
+        let recv = Arc::new(
+            MagicSock::bind(localhost(), recv_disco, recv_node)
+                .await
+                .unwrap()
+                .with_binding_verifier(verifier),
+        );
+
+        let public_ep: SocketAddr = "203.0.113.40:41641".parse().unwrap();
+
+        // Stranger's CallMeMaybe: rejected, nothing learned.
+        let mut stranger_frame =
+            disco::seal_call_me_maybe(&stranger_disco, &recv_disco.public_key(), &[public_ep])
+                .unwrap();
+        let consumed = recv.handle_relayed_call_me_maybe(&mut stranger_frame);
+        assert!(consumed, "frame is disco, must be consumed");
+        assert!(
+            recv.candidate_addrs(&stranger_disco.public_key())
+                .is_empty(),
+            "stranger CallMeMaybe must not be learned"
+        );
+
+        // Member's CallMeMaybe: accepted, endpoint learned.
+        let mut member_frame =
+            disco::seal_call_me_maybe(&member_disco, &recv_disco.public_key(), &[public_ep])
+                .unwrap();
+        let consumed = recv.handle_relayed_call_me_maybe(&mut member_frame);
+        assert!(consumed, "frame is disco, must be consumed");
+        assert_eq!(
+            recv.candidate_addrs(&member_disco.public_key()),
+            vec![public_ep],
+            "member CallMeMaybe endpoint must be learned"
+        );
+    }
+
+    /// A relayed disco Ping is dropped (never ponged): a DERP-relayed frame has no real UDP source
+    /// to answer, and `handle_relayed_call_me_maybe` only acts on CallMeMaybe. The frame is still
+    /// reported consumed so it stays off the dataplane.
+    #[tokio::test]
+    async fn relayed_ping_is_dropped() {
+        let sender_disco = DiscoPrivateKey::random();
+        let sender_node = ts_keys::NodePrivateKey::random().public_key();
+        let recv_disco = DiscoPrivateKey::random();
+        let recv_node = ts_keys::NodePrivateKey::random().public_key();
+
+        // An allow-all verifier would accept a Ping if it reached the Ping arm — proving the drop
+        // is structural (CallMeMaybe-only), not a verifier rejection.
+        let recv = Arc::new(
+            MagicSock::bind(localhost(), recv_disco, recv_node)
+                .await
+                .unwrap()
+                .with_binding_verifier(allow_all()),
+        );
+
+        let tx = disco::random_tx_id();
+        let mut ping =
+            disco::seal_ping(&sender_disco, sender_node, &recv_disco.public_key(), tx).unwrap();
+
+        let consumed = recv.handle_relayed_call_me_maybe(&mut ping);
+        assert!(
+            consumed,
+            "a relayed disco frame is consumed (kept off dataplane)"
+        );
+        assert!(
+            recv.candidate_addrs(&sender_disco.public_key()).is_empty(),
+            "a relayed Ping must not learn a candidate path"
+        );
     }
 }

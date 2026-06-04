@@ -103,7 +103,7 @@ impl DirectManager {
             return ready;
         };
 
-        let db = self.peer_db.read().unwrap();
+        let db = poisoned_read(&self.peer_db);
         let Some(db) = db.as_ref() else {
             return ready;
         };
@@ -124,34 +124,67 @@ impl DirectManager {
     }
 }
 
+/// The disco<->node-key binding verifier installed on the [`MagicSock`] (see
+/// [`ts_magicsock::BindingVerifier`]). A live read of the peer db (it is replaced as netmaps
+/// arrive), so revocations take effect immediately.
+///
+/// - For a disco **Ping** (`claimed_node_key == Some`): returns `true` only if a peer with this
+///   disco key exists in the netmap *and* its control-advertised node key equals the claimed one.
+///   A peer must not open a direct path under a node key control did not bind to its disco key.
+/// - For a **CallMeMaybe** (`claimed_node_key == None`, no node key on the wire): returns `true`
+///   only if the disco key is a current netmap member. This stops an unknown/spoofed disco key
+///   from steering us into host-probing attacker-chosen endpoints.
+fn verify_binding(
+    peer_db: &RwLock<Option<Arc<PeerDb>>>,
+    disco: &DiscoPublicKey,
+    claimed_node_key: Option<&NodePublicKey>,
+) -> bool {
+    let db = poisoned_read(peer_db);
+    let Some(db) = db.as_ref() else {
+        return false;
+    };
+    let Some((_, node)) = db.get(disco) else {
+        return false;
+    };
+    match claimed_node_key {
+        // Ping: the claimed node key must be exactly the one control bound to this disco key.
+        Some(claimed) => node.node_key == *claimed,
+        // CallMeMaybe: membership is enough — the disco key resolving to a netmap peer above
+        // already proves it.
+        None => true,
+    }
+}
+
+/// Read an [`RwLock`] guarding the peer db, recovering from poisoning rather than propagating the
+/// panic. The peer db is a snapshot replaced wholesale on each netmap update with no cross-field
+/// invariant a mid-write panic could leave half-applied, so reading the inner value is safe. A
+/// single panic while a writer held this lock must not poison it and cascade-kill the pinger, the
+/// binding verifier, and the relayed-disco demux — that would take the dataplane down instead of
+/// failing closed to DERP.
+fn poisoned_read(
+    lock: &RwLock<Option<Arc<PeerDb>>>,
+) -> std::sync::RwLockReadGuard<'_, Option<Arc<PeerDb>>> {
+    lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Write-lock counterpart of [`poisoned_read`]. Same rationale: recover the inner snapshot rather
+/// than let one panicking writer poison the lock and cascade-kill every reader.
+fn poisoned_write(
+    lock: &RwLock<Option<Arc<PeerDb>>>,
+) -> std::sync::RwLockWriteGuard<'_, Option<Arc<PeerDb>>> {
+    lock.write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Bidirectional [`PeerId`] <-> [`DiscoPublicKey`] lookup backed by a snapshot of the peer db.
 ///
 /// Uses the owned (`Arc<RwLock<...>>`) form rather than a borrow, because the direct socket
 /// lives for the whole runtime and the lookup must outlive any single call.
 struct DiscoPeerLookup(Arc<RwLock<Option<Arc<PeerDb>>>>);
 
-impl DiscoPeerLookup {
-    /// Verify that `disco` is bound to `claimed_node_key` by the current netmap.
-    ///
-    /// Returns `true` only if a peer with this disco key exists in the netmap *and* its
-    /// control-advertised node key equals `claimed_node_key`. A live read of the peer db (it is
-    /// replaced as netmaps arrive), so revocations take effect immediately. The
-    /// [`MagicSock`] binding verifier is this method, closed over the same `peer_db` handle.
-    fn verify_binding(&self, disco: &DiscoPublicKey, claimed_node_key: &NodePublicKey) -> bool {
-        let db = self.0.read().unwrap();
-        let Some(db) = db.as_ref() else {
-            return false;
-        };
-        let Some((_, node)) = db.get(disco) else {
-            return false;
-        };
-        node.node_key == *claimed_node_key
-    }
-}
-
 impl PeerLookup<PeerId, DiscoPublicKey> for DiscoPeerLookup {
     fn lookup_key(&self, id: PeerId) -> Option<DiscoPublicKey> {
-        let db = self.0.read().unwrap();
+        let db = poisoned_read(&self.0);
         let db = db.as_ref()?;
         let (_, node) = db.get(&id)?;
         node.disco_key
@@ -160,7 +193,7 @@ impl PeerLookup<PeerId, DiscoPublicKey> for DiscoPeerLookup {
 
 impl PeerLookup<DiscoPublicKey, PeerId> for DiscoPeerLookup {
     fn lookup_key(&self, key: DiscoPublicKey) -> Option<PeerId> {
-        let db = self.0.read().unwrap();
+        let db = poisoned_read(&self.0);
         let db = db.as_ref()?;
         let (id, _) = db.get(&key)?;
         Some(id)
@@ -215,6 +248,9 @@ async fn run_direct(
 /// Periodically (re)ping candidate endpoints to confirm and keep direct paths alive.
 async fn run_pinger(sock: Arc<MagicSock>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(PING_INTERVAL);
+    // If a tick is missed (e.g. send_pings ran long under load), space the next tick a full period
+    // out rather than firing a burst of catch-up ticks back-to-back.
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     while !*shutdown.borrow() {
         tokio::select! {
@@ -244,6 +280,7 @@ async fn run_advertiser(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut interval = tokio::time::interval(ADVERTISE_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last: Vec<SelfEndpoint> = Vec::new();
 
     while !*shutdown.borrow() {
@@ -285,6 +322,7 @@ async fn run_call_me_maybe(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut interval = tokio::time::interval(ADVERTISE_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     while !*shutdown.borrow() {
         tokio::select! {
@@ -294,17 +332,18 @@ async fn run_call_me_maybe(
                 // (STUN-discovered) candidate it can actually reach across the internet; a purely
                 // local LAN address is useless to relay over DERP. Skip the whole cadence until we
                 // have one, so peers that can never go direct don't incur perpetual relay load.
-                if !sock
+                // Snapshot self_endpoints once per tick (it locks the reflexive set internally).
+                let have_reflexive = sock
                     .self_endpoints()
                     .iter()
-                    .any(|e| e.ty == ts_magicsock::SelfEndpointType::Stun)
-                {
+                    .any(|e| e.ty == ts_magicsock::SelfEndpointType::Stun);
+                if !have_reflexive {
                     continue;
                 }
 
                 // Snapshot the targets under the read lock, then release it before any await.
                 let targets: Vec<(ts_keys::NodePublicKey, DiscoPublicKey, ts_derp::RegionId)> = {
-                    let db = peer_db.read().unwrap();
+                    let db = poisoned_read(&peer_db);
                     let Some(db) = db.as_ref() else { continue; };
 
                     db.peers()
@@ -367,7 +406,7 @@ impl kameo::Actor for DirectManager {
         // live handle to `peer_db` so it tracks netmap changes (revocations take effect at once).
         let verifier_db = peer_db.clone();
         let binding_verifier: BindingVerifier = Arc::new(move |disco, claimed_node_key| {
-            DiscoPeerLookup(verifier_db.clone()).verify_binding(disco, claimed_node_key)
+            verify_binding(&verifier_db, disco, claimed_node_key)
         });
 
         // Bind the direct underlay UDP socket. A bind failure is transient/environmental (e.g. no
@@ -469,7 +508,99 @@ impl Message<Arc<PeerState>> for DirectManager {
             sock.retain_peers(&live);
         }
 
-        let mut db = self.peer_db.write().unwrap();
+        let mut db = poisoned_write(&self.peer_db);
         *db = Some(msg.peers.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ts_control::{Node, StableNodeId, TailnetAddress};
+    use ts_keys::{DiscoPrivateKey, NodePrivateKey};
+
+    use super::*;
+    use crate::peer_tracker::PeerDb;
+
+    /// Build a minimal netmap peer with the given disco and node keys.
+    fn node_with_keys(disco: DiscoPublicKey, node_key: NodePublicKey, stable: &str) -> Node {
+        Node {
+            id: 1,
+            stable_id: StableNodeId(stable.to_string()),
+            hostname: "peer".to_string(),
+            tailnet: Some("ts.net".to_string()),
+            tags: vec![],
+            tailnet_address: TailnetAddress {
+                ipv4: "100.64.0.9/32".parse().unwrap(),
+                ipv6: "fd7a::9/128".parse().unwrap(),
+            },
+            node_key,
+            node_key_expiry: None,
+            machine_key: None,
+            disco_key: Some(disco),
+            accepted_routes: vec![],
+            underlay_addresses: vec![],
+            derp_region: None,
+        }
+    }
+
+    fn db_with(node: Node) -> Arc<RwLock<Option<Arc<PeerDb>>>> {
+        let mut db = PeerDb::default();
+        db.upsert(&node);
+        Arc::new(RwLock::new(Some(Arc::new(db))))
+    }
+
+    /// A Ping whose claimed node key matches the netmap binding is accepted; a mismatched node key
+    /// (or unknown disco key, or empty netmap) is rejected. This is the disco<->node-key binding
+    /// check that stops a peer opening a direct path under a node key control did not bind to it.
+    #[test]
+    fn verify_binding_ping_requires_exact_node_key() {
+        let disco = DiscoPrivateKey::random().public_key();
+        let node_key = NodePrivateKey::random().public_key();
+        let other_key = NodePrivateKey::random().public_key();
+
+        let db = db_with(node_with_keys(disco, node_key, "n1"));
+
+        assert!(
+            verify_binding(&db, &disco, Some(&node_key)),
+            "correct disco<->node-key binding must be accepted"
+        );
+        assert!(
+            !verify_binding(&db, &disco, Some(&other_key)),
+            "a claimed node key that is not the bound one must be rejected"
+        );
+
+        let unknown_disco = DiscoPrivateKey::random().public_key();
+        assert!(
+            !verify_binding(&db, &unknown_disco, Some(&node_key)),
+            "a disco key not in the netmap must be rejected"
+        );
+
+        let empty: Arc<RwLock<Option<Arc<PeerDb>>>> = Default::default();
+        assert!(
+            !verify_binding(&empty, &disco, Some(&node_key)),
+            "with no netmap loaded the verifier fails closed"
+        );
+    }
+
+    /// A CallMeMaybe carries no node key (claimed=None): membership is sufficient. A member disco
+    /// key is accepted; a stranger disco key is rejected. This stops a spoofed disco key from
+    /// steering us into host-probing attacker-chosen endpoints.
+    #[test]
+    fn verify_binding_call_me_maybe_is_membership_only() {
+        let disco = DiscoPrivateKey::random().public_key();
+        let node_key = NodePrivateKey::random().public_key();
+
+        let db = db_with(node_with_keys(disco, node_key, "n1"));
+
+        assert!(
+            verify_binding(&db, &disco, None),
+            "a netmap-member disco key must be accepted for a CallMeMaybe"
+        );
+
+        let stranger = DiscoPrivateKey::random().public_key();
+        assert!(
+            !verify_binding(&db, &stranger, None),
+            "a non-member disco key must be rejected for a CallMeMaybe"
+        );
     }
 }
