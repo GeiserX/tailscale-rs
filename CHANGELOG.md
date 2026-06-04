@@ -6,6 +6,28 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.7](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.7) - 2026-06-04
+
+Documentation correction (no code change): the TLS-certificate seam (`ts_control::cert`) described
+a control protocol that **does not exist** in real Tailscale, which would have led a future
+implementer to build the wrong thing.
+
+- Docs: corrected `ts_control/src/cert.rs` (and the matching `serve.rs` / `src/lib.rs` doc
+  references) to describe the **actual** tsnet certificate protocol. There is **no**
+  `POST /machine/<machineKey>/cert/<domain>` "ACME-over-control" endpoint — the node itself is the
+  ACME client and talks **directly to Let's Encrypt**; control's only role is to publish the
+  **DNS-01** challenge TXT (`_acme-challenge.<name>`) via `POST /machine/set-dns` over the Noise
+  (ts2021) channel, with `NodeKey` carried in the request body (`SetDNSRequest`) and an empty
+  `SetDNSResponse{}` on 200. (DNS-01 is for `*.ts.net`; TLS-ALPN-01 is for Funnel/BYO; HTTP-01 is
+  unused.) Updated `MISSING_CERT_RPC` and the `CertError::Unimplemented` detail to name the real
+  missing pieces: a client-side ACME engine plus a `set-dns` Noise RPC.
+- Docs: recorded the **deployment caveat** explaining why issuance stays a fail-closed stub rather
+  than being built now — the fork's control target is **a self-hosted control plane**, which returns **HTTP 501
+  NotImplemented** for `/machine/set-dns`, so a client-side ACME engine could not complete a DNS-01
+  challenge against a self-hosted control plane regardless. The fail-closed contract is unchanged:
+  `get_certificate` / `listen_tls` still return `CertError::Unimplemented` after the tailnet-name
+  check, never self-signing and never downgrading to plaintext.
+
 ## [0.5.6](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.6) - 2026-06-04
 
 Documentation hygiene (no code change): the README's "Unsupported" list contradicted its own

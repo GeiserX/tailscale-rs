@@ -126,10 +126,11 @@ where
 /// Obtain a certificate for `cfg.name` and build a [`TlsAcceptor`] for it.
 ///
 /// **Fail-closed.** Delegates to [`crate::cert::get_certificate`], which in this
-/// fork returns [`CertError::Unimplemented`] (no ACME-over-control RPC exists).
-/// This function therefore returns the same error rather than ever falling back
-/// to plaintext or a self-signed certificate. When the cert RPC lands, this
-/// starts returning a working acceptor with no caller change.
+/// fork returns [`CertError::Unimplemented`] (no client-side ACME engine / no
+/// `set-dns` DNS-01 publish RPC, and a self-hosted control plane 501s on `set-dns`). This function
+/// therefore returns the same error rather than ever falling back to plaintext or
+/// a self-signed certificate. When issuance lands, this starts returning a
+/// working acceptor with no caller change.
 pub async fn listen_tls(cfg: &ServeConfig) -> Result<TlsAcceptor, CertError> {
     cfg.validate()?;
     let cert = cert::get_certificate(&cfg.name).await?;

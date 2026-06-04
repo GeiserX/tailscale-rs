@@ -1,22 +1,32 @@
 //! TLS certificate acquisition for a node's MagicDNS name (`host.tailnet.ts.net`).
 //!
-//! # What tsnet does (and what this fork can / cannot do today)
+//! # What tsnet does (the real protocol — there is NO control `cert/<domain>` RPC)
 //!
 //! In upstream Tailscale, `tsnet`'s `GetCertificate` mints a *real* publicly
-//! trusted certificate for the node's MagicDNS name. It does this by asking the
-//! **control server** to drive an ACME (Let's Encrypt) order on the node's
-//! behalf, satisfying the **DNS-01** challenge by publishing the
-//! `_acme-challenge.<name>` TXT record into the tailnet's DNS *through control*
-//! (the node has no authority over the public `*.ts.net` zone — only the control
-//! plane does). The flow upstream is, roughly:
+//! trusted certificate for the node's MagicDNS name. Contrary to a common
+//! misreading, control does **not** run the ACME order on the node's behalf and
+//! there is **no** `POST /machine/<machineKey>/cert/<domain>` endpoint. Instead
+//! **the node itself is the ACME client** and talks **directly to Let's
+//! Encrypt**; control's *only* role is to publish the DNS-01 challenge TXT record
+//! into the `ts.net` zone it controls (the node has no authority over that zone).
+//! The real flow upstream is:
 //!
-//! 1. node generates an ACME account key + a CSR for `<name>`,
-//! 2. node POSTs to the control server's per-machine cert endpoint
-//!    (`/machine/<machineKey>/cert/<domain>` style RPC),
-//! 3. control answers the ACME DNS-01 challenge by writing the TXT record into
-//!    the `ts.net` zone it controls,
-//! 4. Let's Encrypt validates, control returns the signed leaf + chain,
-//! 5. node assembles a [`rustls::sign::CertifiedKey`] and serves it.
+//! 1. node generates/loads an ACME account key (ECDSA P-256) and a fresh cert
+//!    key, and opens an ACME order for `<name>` directly against Let's Encrypt,
+//! 2. for the **DNS-01** challenge, the node computes the challenge digest and
+//!    asks control to publish it by sending, over the **Noise (ts2021)** channel,
+//!    `POST /machine/set-dns` with body
+//!    `tailcfg.SetDNSRequest{ Version: <current cap>, NodeKey: <node pub>,
+//!    Name: "_acme-challenge.<name>", Type: "TXT", Value: <digest> }`
+//!    (note: `NodeKey` travels in the BODY, not the URL; the response is an empty
+//!    `SetDNSResponse{}` with HTTP 200 on success),
+//! 3. node tells Let's Encrypt the challenge is ready; LE validates the TXT,
+//! 4. node finalizes the order and downloads the signed leaf + chain *from LE*,
+//! 5. node assembles a [`rustls::sign::CertifiedKey`] and serves it, renewing at
+//!    ~2/3 of lifetime (with ARI).
+//!
+//! (DNS-01 is used for `*.ts.net`; TLS-ALPN-01 is used for Funnel/BYO domains;
+//! HTTP-01 is not used.)
 //!
 //! ## Gap verdict for THIS fork (fail-closed seam, no fake cert)
 //!
@@ -26,47 +36,58 @@
 //! - `GET /key`            — control/Noise public key fetch ([`crate::tokio::connect`])
 //! - `POST /ts2021`        — Noise (ts2021) handshake upgrade
 //! - `POST /machine/register` — node registration ([`crate::tokio::register`])
-//! - `POST /machine/map`   — netmap stream + `SetDNS`/endpoint/derp updates
+//! - `POST /machine/map`   — netmap stream + endpoint/derp updates
 //! - ping-response callback (`/machine/.../ping`)
 //!
-//! There is **no** ACME / certificate / DNS-01 RPC. None of `cert/<domain>`,
-//! `set-dns`, ACME order/finalize, or a DNS-01 TXT publish path exists. A node
-//! therefore cannot obtain a publicly trusted cert for its `*.ts.net` name here.
+//! There is **no** `POST /machine/set-dns` client and **no** ACME engine. Neither
+//! the DNS-01 TXT publish RPC nor the LE-facing order/challenge/finalize state
+//! machine exists, so a node cannot obtain a publicly trusted cert for its
+//! `*.ts.net` name here.
 //!
 //! Because issuing a real cert is impossible and self-signing for production is
 //! forbidden (it would not be publicly trusted and would teach callers to expect
 //! a working `ListenTLS`), [`get_certificate`] returns
-//! [`CertError::Unimplemented`] naming the exact missing RPC. This is
+//! [`CertError::Unimplemented`] naming exactly what is missing. This is
 //! **fail-closed**: no self-signed fallback, no plaintext downgrade.
 //!
 //! ## What a future implementation needs (so this seam can be filled in place)
 //!
-//! - A control RPC to drive the per-machine ACME order, e.g.
-//!   `POST /machine/<machineKey>/cert/<domain>` returning the signed leaf+chain
-//!   (mirrors `tailscale.com/ipn/ipnlocal`'s `certStore`/`acme` and the control
-//!   server's `/machine/.../cert/...` handler). Add it alongside the existing
-//!   RPCs in [`crate::tokio`] (`register.rs` / `client.rs` are the templates).
-//! - Control-side DNS-01: control must publish `_acme-challenge.<name>` TXT into
-//!   the `ts.net` zone. The *node* never writes that record — so this is a
-//!   control/server dependency, NOT a local DNS change. (Lane B owns
-//!   `ts_control/src/dns.rs`; even there, DNS-01 TXT publishing is a control-side
-//!   concern, not a `Resolver`/split-DNS change. See the contract addendum.)
-//! - Local ACME account-key persistence + CSR generation for `<name>`.
+//! - A **client-side ACME engine** (talks to Let's Encrypt directly, not to
+//!   control): ACME account key + cert key generation (ECDSA P-256 via `rcgen`,
+//!   ring-only), JWS-signed order/authz/challenge/finalize, and leaf+chain
+//!   download. Renew at ~2/3 lifetime.
+//! - A `POST /machine/set-dns` Noise RPC client to publish the
+//!   `_acme-challenge.<name>` TXT record (body carries `NodeKey`; see step 2
+//!   above). Add it alongside the existing RPCs in [`crate::tokio`]
+//!   (`register.rs` is the template; the Noise transport is `connect.rs`).
+//! - Local ACME account-key persistence keyed to the node identity.
 //!
-//! Once that RPC lands, replace the [`CertError::Unimplemented`] branch in
-//! [`get_certificate`] with: build CSR -> call RPC -> assemble [`CertifiedKey`]
-//! from the returned chain + locally held key via [`certified_key_from_pem`].
+//! **Deployment caveat (why this is currently stubbed, not built):** the fork's
+//! control plane target is **a self-hosted control plane**, which returns **HTTP 501
+//! NotImplemented** for `/machine/set-dns`. A client-side ACME engine therefore
+//! cannot complete a DNS-01 challenge against a self-hosted control plane — the issuance path
+//! is non-functional until a self-hosted control plane grows `set-dns` + a real backing DNS zone
+//! (separate, out-of-repo work). Building the ACME engine here without that would
+//! be dead code against the actual control plane.
+//!
+//! Once both pieces land (and control answers `set-dns`), replace the
+//! [`CertError::Unimplemented`] branch in [`get_certificate`] with: open order ->
+//! publish TXT via `set-dns` -> finalize -> assemble [`CertifiedKey`] from the
+//! LE-returned chain + locally held key via [`certified_key_from_pem`].
 
 use tokio_rustls::rustls::{
     pki_types::{CertificateDer, PrivateKeyDer},
     sign::CertifiedKey,
 };
 
-/// The exact control RPC that upstream Tailscale uses to obtain a cert and that
-/// this fork does not (yet) implement. Surfaced verbatim in
-/// [`CertError::Unimplemented`] so the gap is self-documenting at runtime.
+/// Names exactly what this fork is missing to issue a real cert, surfaced
+/// verbatim in [`CertError::Unimplemented`] so the gap is self-documenting at
+/// runtime. There is no control `cert/<domain>` RPC in real Tailscale — the node
+/// is the ACME client and only needs control to publish the DNS-01 TXT via
+/// `POST /machine/set-dns` (which a self-hosted control plane 501s). See the module docs.
 pub const MISSING_CERT_RPC: &str =
-    "POST /machine/<machineKey>/cert/<domain> (ACME-over-control, DNS-01 published by control)";
+    "client-side ACME engine (direct to Let's Encrypt) + a POST /machine/set-dns \
+     Noise RPC to publish the _acme-challenge TXT (a self-hosted control plane returns 501 for set-dns)";
 
 /// Errors from certificate acquisition / TLS material assembly.
 ///
@@ -163,11 +184,11 @@ pub async fn get_certificate(name: &str) -> Result<CertifiedKey, CertError> {
         return Err(CertError::NotTailnetName(name.to_string()));
     }
 
-    // No ACME-over-control RPC exists in this fork. Do NOT self-sign.
+    // No client-side ACME engine and no set-dns RPC exist in this fork, and the
+    // a self-hosted control plane control target 501s on set-dns. Do NOT self-sign.
     Err(CertError::Unimplemented {
         detail: format!(
-            "control server does not expose an ACME/DNS-01 certificate RPC for {name:?}; \
-             requires: {MISSING_CERT_RPC}"
+            "cannot issue a real certificate for {name:?}; requires: {MISSING_CERT_RPC}"
         ),
     })
 }

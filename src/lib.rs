@@ -392,10 +392,11 @@ impl Device {
 
     /// Obtain a TLS certificate for a node's MagicDNS `name` (like `tsnet`'s `GetCertificate`).
     ///
-    /// **Fail-closed.** This fork's control plane exposes no ACME-over-control / DNS-01 RPC, so
-    /// this currently always returns [`ts_control::CertError::Unimplemented`] (after a tailnet-name
-    /// check). It NEVER self-signs and NEVER returns a placeholder certificate. When the control
-    /// cert RPC ([`ts_control::MISSING_CERT_RPC`]) lands, this starts returning a real
+    /// **Fail-closed.** This fork has no client-side ACME engine and no `set-dns` RPC to publish
+    /// the DNS-01 challenge (and the a self-hosted control plane control target 501s on `set-dns`), so this currently
+    /// always returns [`ts_control::CertError::Unimplemented`] (after a tailnet-name check). It
+    /// NEVER self-signs and NEVER returns a placeholder certificate. When issuance lands
+    /// ([`ts_control::MISSING_CERT_RPC`] names what is missing), this starts returning a real
     /// [`CertifiedKey`] with no caller change.
     pub async fn get_certificate(&self, name: &str) -> Result<CertifiedKey, ts_control::CertError> {
         ts_control::get_certificate(name).await
