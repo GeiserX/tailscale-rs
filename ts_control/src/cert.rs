@@ -85,8 +85,7 @@ use tokio_rustls::rustls::{
 /// runtime. There is no control `cert/<domain>` RPC in real Tailscale — the node
 /// is the ACME client and only needs control to publish the DNS-01 TXT via
 /// `POST /machine/set-dns` (which a self-hosted control plane 501s). See the module docs.
-pub const MISSING_CERT_RPC: &str =
-    "client-side ACME engine (direct to Let's Encrypt) + a POST /machine/set-dns \
+pub const MISSING_CERT_RPC: &str = "client-side ACME engine (direct to Let's Encrypt) + a POST /machine/set-dns \
      Noise RPC to publish the _acme-challenge TXT (a self-hosted control plane returns 501 for set-dns)";
 
 /// Errors from certificate acquisition / TLS material assembly.

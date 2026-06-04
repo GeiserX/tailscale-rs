@@ -97,49 +97,6 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub type BindingVerifier =
     Arc<dyn Fn(&DiscoPublicKey, Option<&NodePublicKey>) -> bool + Send + Sync>;
 
-/// Whether a peer-supplied candidate endpoint is safe to probe with a disco ping.
-///
-/// Disco datagrams are emitted from the node's single real host socket, so a candidate
-/// address advertised by a remote peer (in a `CallMeMaybe`, or as a ping/data source) is an
-/// attacker-controllable target: an authenticated-but-malicious tailnet peer could otherwise
-/// make this node spray host-sourced UDP probes at arbitrary hosts (an SSRF-style internal
-/// scan, or a reachability oracle via pong timing). This filter is the choke point that drops
-/// addresses that must never be probed, fail-closed (drop on any doubt).
-///
-/// Rejected:
-/// - any IPv6 address — the underlay is IPv4-only in this deployment (IPv6 is disabled), so an
-///   IPv6 candidate can only be noise or an attempt to reach a forbidden surface;
-/// - unspecified (`0.0.0.0`);
-/// - loopback (`127.0.0.0/8`) — would let a peer probe this host's own services;
-/// - link-local (`169.254.0.0/16`);
-/// - multicast and broadcast (`255.255.255.255`);
-/// - RFC1918 private ranges (`10/8`, `172.16/12`, `192.168/16`). This fork's topology is
-///   known-public-VPS (see `path.rs`); there is no supported direct-LAN connectivity path, so
-///   private candidates are dropped rather than letting a peer steer host-sourced probes onto
-///   the local network. If LAN connectivity ever becomes a supported path, relax *only* this
-///   clause and keep every other rejection.
-///
-/// Accepted: any other (public, routable) IPv4 address.
-fn is_pingable_candidate(addr: &SocketAddr) -> bool {
-    let ip = match addr.ip() {
-        IpAddr::V4(ip) => ip,
-        // IPv6 underlay is disabled; never probe an IPv6 candidate.
-        IpAddr::V6(_) => return false,
-    };
-
-    if ip.is_unspecified()
-        || ip.is_loopback()
-        || ip.is_link_local()
-        || ip.is_multicast()
-        || ip.is_broadcast()
-        || ip.is_private()
-    {
-        return false;
-    }
-
-    true
-}
-
 /// A direct UDP transport over a single shared socket.
 ///
 /// Construct with [`MagicSock::bind`], then:
@@ -197,6 +154,17 @@ pub struct MagicSock {
     /// One-shot guard so the "no binding verifier installed" warning is emitted at most once
     /// instead of on every dropped ping.
     warned_no_verifier: AtomicBool,
+    /// Gate for accepting IPv6 disco candidates on the tailnet overlay (default `false`).
+    ///
+    /// The primary deployment is an IPv4-only privacy proxy / cloud exit node, so this defaults
+    /// to `false` and the disco-candidate filter ([`is_pingable_candidate`]) then keeps its exact
+    /// historical IPv4-only behavior: every IPv6 candidate is rejected, byte-for-byte as before.
+    /// When wired `true` from `ts_runtime::Env::enable_ipv6` (via
+    /// [`MagicSock::with_enable_ipv6`]), the filter additionally accepts IPv6 candidates that are
+    /// valid global unicast addresses (rejecting loopback, unique-local, link-local, multicast and
+    /// unspecified). This governs *only* which disco candidates are considered pingable — never the
+    /// underlay bind or the exit egress path, both of which stay IPv4-only by their own gates.
+    enable_ipv6: bool,
 }
 
 impl MagicSock {
@@ -221,7 +189,80 @@ impl MagicSock {
             stun_in_flight: Default::default(),
             binding_verifier: None,
             warned_no_verifier: AtomicBool::new(false),
+            enable_ipv6: false,
         })
+    }
+
+    /// Enable accepting IPv6 disco candidates on the tailnet overlay (default `false`).
+    ///
+    /// Wired from `ts_runtime::Env::enable_ipv6`. With the default `false` the disco-candidate
+    /// filter keeps its exact historical IPv4-only behavior; with `true` it additionally accepts
+    /// IPv6 candidates that are valid global unicast addresses (see [`is_pingable_candidate`]).
+    /// Builder-style so the `bind` call site stays a single expression. Governs *only* the disco
+    /// candidate filter — never the underlay bind or the exit egress path.
+    pub fn with_enable_ipv6(mut self, enable_ipv6: bool) -> Self {
+        self.enable_ipv6 = enable_ipv6;
+        self
+    }
+
+    /// Whether a peer-supplied candidate endpoint is safe to probe with a disco ping.
+    ///
+    /// Disco datagrams are emitted from the node's single real host socket, so a candidate
+    /// address advertised by a remote peer (in a `CallMeMaybe`, or as a ping/data source) is an
+    /// attacker-controllable target: an authenticated-but-malicious tailnet peer could otherwise
+    /// make this node spray host-sourced UDP probes at arbitrary hosts (an SSRF-style internal
+    /// scan, or a reachability oracle via pong timing). This filter is the choke point that drops
+    /// addresses that must never be probed, fail-closed (drop on any doubt).
+    ///
+    /// Rejected (IPv4):
+    /// - unspecified (`0.0.0.0`);
+    /// - loopback (`127.0.0.0/8`) — would let a peer probe this host's own services;
+    /// - link-local (`169.254.0.0/16`);
+    /// - multicast and broadcast (`255.255.255.255`);
+    /// - RFC1918 private ranges (`10/8`, `172.16/12`, `192.168/16`). This fork's topology is
+    ///   known-public-VPS (see `path.rs`); there is no supported direct-LAN connectivity path, so
+    ///   private candidates are dropped rather than letting a peer steer host-sourced probes onto
+    ///   the local network. If LAN connectivity ever becomes a supported path, relax *only* this
+    ///   clause and keep every other rejection.
+    ///
+    /// Accepted (IPv4): any other (public, routable) IPv4 address.
+    ///
+    /// IPv6 is gated by [`MagicSock::with_enable_ipv6`] (default `false`):
+    /// - when `false` — every IPv6 candidate is rejected, byte-for-byte the historical IPv4-only
+    ///   behavior. The primary deployment is an IPv4-only privacy proxy / exit node, so an IPv6
+    ///   candidate can only be noise or an attempt to reach a forbidden surface.
+    /// - when `true` — an IPv6 candidate is accepted **only** if it is a valid global unicast
+    ///   address. Rejected: unspecified (`::`), loopback (`::1`), unique-local (`fc00::/7`,
+    ///   `is_unique_local()`), link-local (`fe80::/10`, `is_unicast_link_local()`) and multicast.
+    ///   These mirror the IPv4 rejections (a peer must not steer host-sourced probes at loopback,
+    ///   private/ULA or link-local surfaces); only routable global unicast is probed.
+    fn is_pingable_candidate(&self, addr: &SocketAddr) -> bool {
+        match addr.ip() {
+            IpAddr::V4(ip) => {
+                !(ip.is_unspecified()
+                    || ip.is_loopback()
+                    || ip.is_link_local()
+                    || ip.is_multicast()
+                    || ip.is_broadcast()
+                    || ip.is_private())
+            }
+            IpAddr::V6(ip) => {
+                // IPv6 candidates are gated off by default (IPv4-only deployment). When the gate
+                // is off, preserve the exact historical behavior: every IPv6 candidate is
+                // rejected.
+                if !self.enable_ipv6 {
+                    return false;
+                }
+                // Gate on: accept only a routable global unicast address. `is_unique_local`
+                // (`fc00::/7`) and `is_unicast_link_local` (`fe80::/10`) are stable; `is_global`
+                // is not, so the global-unicast predicate is composed from stable rejections.
+                !(ip.is_unspecified()
+                    || ip.is_loopback()
+                    || ip.is_multicast()
+                    || ip.is_unique_local()
+                    || ip.is_unicast_link_local())
+            }
+        }
     }
 
     /// Install the disco<->node-key binding verifier (see [`BindingVerifier`]).
@@ -303,7 +344,7 @@ impl MagicSock {
         let eps: Vec<SocketAddr> = endpoints
             .into_iter()
             .filter(|ep| {
-                let ok = is_pingable_candidate(ep);
+                let ok = self.is_pingable_candidate(ep);
                 if !ok {
                     tracing::debug!(%ep, "dropping non-pingable peer candidate endpoint");
                 }
@@ -626,8 +667,12 @@ impl MagicSock {
     /// Leak-safe by construction: the request is emitted from the single bound socket — never a
     /// second socket and never IPv6 — so the reflexive address the response reports is the mapping
     /// of the only egress path. A non-IPv4 `server` is refused (debug log + `Ok` no-op), mirroring
-    /// the IPv4-only check in [`is_pingable_candidate`]; the underlay is IPv4-only in this
-    /// deployment, so an IPv6 STUN server can only be noise or a leak attempt.
+    /// the IPv4-only check in [`MagicSock::is_pingable_candidate`]; the underlay is IPv4-only in
+    /// this deployment, so an IPv6 STUN server can only be noise or a leak attempt.
+    ///
+    /// STUN stays IPv4-only even when the IPv6 candidate gate is enabled: IPv6 reflexive discovery
+    /// is out of scope. Globally-routable IPv6 GUA candidates need no STUN — they arrive from
+    /// local-address enumeration and peer `CallMeMaybe` advertisements, not from a STUN exchange.
     ///
     /// Before recording the transaction we prune transactions older than [`STUN_TX_TTL`]; if the
     /// in-flight set is still at [`MAX_STUN_IN_FLIGHT`] we drop this request fail-safe (return
@@ -891,8 +936,21 @@ mod tests {
         Arc::new(|_: &DiscoPublicKey, _: Option<&NodePublicKey>| true)
     }
 
-    #[test]
-    fn is_pingable_candidate_rejects_forbidden_classes() {
+    /// Bind a magicsock with the IPv6 candidate gate `enable`d (or not) for filter tests.
+    async fn sock_with_ipv6(enable: bool) -> MagicSock {
+        MagicSock::bind(
+            localhost(),
+            DiscoPrivateKey::random(),
+            ts_keys::NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap()
+        .with_enable_ipv6(enable)
+    }
+
+    #[tokio::test]
+    async fn is_pingable_candidate_rejects_forbidden_classes() {
+        let sock = sock_with_ipv6(false).await;
         // Each must be dropped before it can become a host-sourced ping target.
         let forbidden: &[&str] = &[
             "0.0.0.0:41641",         // unspecified
@@ -904,28 +962,79 @@ mod tests {
             "10.0.0.5:41641",        // RFC1918 (10/8)
             "172.16.3.4:41641",      // RFC1918 (172.16/12)
             "192.168.1.1:41641",     // RFC1918 (192.168/16)
-            "[::1]:41641",           // IPv6 loopback (underlay is IPv4-only)
-            "[2001:db8::1]:41641",   // IPv6 public (still dropped: no IPv6 underlay)
+            "[::1]:41641",           // IPv6 loopback (gate off: dropped)
+            "[2001:db8::1]:41641",   // IPv6 GUA (gate off: still dropped)
         ];
         for s in forbidden {
             let addr: SocketAddr = s.parse().unwrap();
             assert!(
-                !is_pingable_candidate(&addr),
+                !sock.is_pingable_candidate(&addr),
                 "{s} must be rejected as a ping candidate"
             );
         }
     }
 
-    #[test]
-    fn is_pingable_candidate_accepts_public_ipv4() {
+    #[tokio::test]
+    async fn is_pingable_candidate_accepts_public_ipv4() {
+        let sock = sock_with_ipv6(false).await;
         // Documentation/test ranges (RFC5737) are public/routable from the filter's view.
         for s in ["203.0.113.7:41641", "198.51.100.2:3478"] {
             let addr: SocketAddr = s.parse().unwrap();
             assert!(
-                is_pingable_candidate(&addr),
+                sock.is_pingable_candidate(&addr),
                 "{s} should be accepted as a ping candidate"
             );
         }
+    }
+
+    /// With the IPv6 gate **off** (the default, primary IPv4-only deployment), every IPv6
+    /// candidate is rejected and IPv4 behavior is unchanged — the historical byte-for-byte path.
+    #[tokio::test]
+    async fn is_pingable_candidate_gate_off_rejects_all_ipv6() {
+        let sock = sock_with_ipv6(false).await;
+        for s in ["[2001:db8::1]:41641", "[::1]:41641", "[fe80::1]:41641"] {
+            let addr: SocketAddr = s.parse().unwrap();
+            assert!(
+                !sock.is_pingable_candidate(&addr),
+                "{s} must be rejected when the IPv6 gate is off"
+            );
+        }
+        // IPv4 unchanged regardless of the gate.
+        assert!(sock.is_pingable_candidate(&"203.0.113.7:41641".parse().unwrap()));
+        assert!(!sock.is_pingable_candidate(&"127.0.0.1:41641".parse().unwrap()));
+    }
+
+    /// With the IPv6 gate **on**, only a routable global unicast IPv6 address is accepted; every
+    /// loopback / unique-local / link-local / multicast / unspecified form is still rejected.
+    #[tokio::test]
+    async fn is_pingable_candidate_gate_on_accepts_only_global_unicast_ipv6() {
+        let sock = sock_with_ipv6(true).await;
+
+        // Global unicast — accepted.
+        assert!(
+            sock.is_pingable_candidate(&"[2001:db8::1]:41641".parse().unwrap()),
+            "global unicast IPv6 must be accepted when the gate is on"
+        );
+
+        // Non-global forms — still rejected.
+        let rejected: &[&str] = &[
+            "[::1]:41641",     // loopback
+            "[fe80::1]:41641", // link-local (fe80::/10)
+            "[fc00::1]:41641", // unique-local (fc00::/7)
+            "[::]:41641",      // unspecified
+            "[ff02::1]:41641", // multicast
+        ];
+        for s in rejected {
+            let addr: SocketAddr = s.parse().unwrap();
+            assert!(
+                !sock.is_pingable_candidate(&addr),
+                "{s} must be rejected even with the IPv6 gate on"
+            );
+        }
+
+        // IPv4 behavior is identical whether the gate is on or off.
+        assert!(sock.is_pingable_candidate(&"203.0.113.7:41641".parse().unwrap()));
+        assert!(!sock.is_pingable_candidate(&"10.0.0.5:41641".parse().unwrap()));
     }
 
     /// A peer-supplied candidate that is a forbidden target (e.g. a loopback or private

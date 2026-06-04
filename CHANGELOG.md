@@ -6,6 +6,35 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.11](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.11) - 2026-06-05
+
+IPv6 **on the tailnet overlay**, gated and default-off. A new runtime flag `Config::enable_ipv6`
+(`false` by default — the node stays IPv4-only) opts a node into native IPv6 overlay addressing,
+disco candidates, and MagicDNS AAAA. This brings overlay IPv6 to parity with Go `tsnet`'s
+`--ipv6`-style posture while keeping the fork's IPv4-only default intact.
+
+**The flag governs only the overlay. It has no effect on the exit-node / forwarder egress path,
+which stays hardcoded IPv4 regardless** — the real-origin-IP isolation invariant. This is now
+enforced two ways: a public-API guard test (`ts_forwarder/tests/ipv4_only_guard.rs`) asserts every
+dialer errors on an IPv6 destination, and a CI grep gate (`ipv4_only_forwarder` in the `checks`
+crate, run by `cargo run -p checks`) fails the build if any IPv6 bind/connect/gate token appears in
+`ts_forwarder/src/`.
+
+- **Underlay bind** (`ts_runtime::direct`): with the gate on, binds dual-stack `[::]:0` (single
+  socket serving native v6 and v4-mapped v4); with the gate off, binds `0.0.0.0:0` as before. The v6
+  bind **fails inert** — if the host has IPv6 disabled at the kernel, it warns and falls back to
+  IPv4-only rather than failing to come up.
+- **Disco candidates** (`ts_magicsock`): with the gate on, IPv6 endpoints that are valid global
+  unicast (not loopback / link-local / ULA / multicast / unspecified) become ping candidates; with
+  the gate off, all IPv6 candidates are rejected. STUN stays IPv4-only.
+- **Netstack addressing** (`ts_runtime::netstack_actor`): with the gate on, the node's IPv6 /128
+  overlay address is assigned alongside the IPv4 /32. The `ts_netstack_smoltcp_core` interface
+  address capacity was raised (`iface-max-addr-count-5`) so the v4 + v6 + MagicDNS + dual loopback
+  address set no longer silently overflows.
+- **MagicDNS** (`ts_runtime::magic_dns`): with the gate on, AAAA queries for tailnet names answer the
+  peer's overlay IPv6; with the gate off, AAAA returns NODATA (`NOERROR` + empty answer) and tailnet
+  AAAA is never forwarded upstream.
+
 ## [0.5.10](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.10) - 2026-06-04
 
 Foreign-language binding parity: the C FFI (`ts_ffi`), Python (`ts_python`, PyO3), and Elixir

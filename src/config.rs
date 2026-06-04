@@ -140,6 +140,23 @@ pub struct Config {
     /// deployments running many concurrent sockets. Applies to both the application and forwarder
     /// netstacks.
     pub tcp_buffer_size: Option<usize>,
+
+    /// Whether to enable IPv6 **on the tailnet overlay** (peer-to-peer reachability over the node's
+    /// Tailscale IPv6 address). Defaults to `false`: the node is IPv4-only on the overlay.
+    ///
+    /// This is an opt-in for general embedders that want Go `tsnet`-style dual-stack overlay
+    /// reachability. It is deliberately **off by default** to preserve this fork's sacred anti-leak
+    /// posture: its primary deployment is a privacy proxy / cloud exit node where IPv6 is disabled
+    /// everywhere to prevent tunnel-bypass IP leakage. When `false`, behavior is byte-for-byte the
+    /// historical IPv4-only path: the underlay binds `0.0.0.0:0`, IPv6 candidates/STUN are refused,
+    /// the netstack is handed no IPv6 overlay address, and MagicDNS answers AAAA as NODATA.
+    ///
+    /// **This flag governs only the overlay.** It has NO effect on the exit-node / forwarder egress
+    /// path: exit and subnet egress to the public internet stays hardcoded IPv4 in `ts_forwarder`
+    /// regardless of this flag, so the residential-proxy / real-origin-IP isolation invariant can
+    /// never be weakened by enabling overlay IPv6. On a host with IPv6 disabled at the kernel, the
+    /// dual-stack overlay bind simply fails and the node stays inert on IPv6 rather than panicking.
+    pub enable_ipv6: bool,
 }
 
 impl Config {
@@ -281,6 +298,7 @@ impl From<&Config> for ts_control::Config {
             exit_proxy: value.exit_proxy.clone(),
             tcp_buffer_size: value.tcp_buffer_size,
             peerapi_port: None,
+            enable_ipv6: value.enable_ipv6,
         }
     }
 }
@@ -304,6 +322,7 @@ impl Default for Config {
             forward_exit_egress: false,
             exit_proxy: None,
             tcp_buffer_size: None,
+            enable_ipv6: false,
         }
     }
 }
@@ -326,6 +345,7 @@ mod tests {
             forward_tcp_ports: vec![80, 443],
             forward_udp_ports: vec![53],
             tcp_buffer_size: Some(1024 * 128),
+            enable_ipv6: true,
             advertise_routes: vec!["10.0.0.0/24".parse().unwrap()],
             requested_tags: vec!["tag:exit".to_owned()],
             ephemeral: false,
@@ -352,6 +372,7 @@ mod tests {
         assert_eq!(proxy.addr, "198.51.100.9:8080".parse().unwrap());
         assert_eq!(proxy.scheme, ts_control::ExitProxyScheme::Socks5);
         assert_eq!(proxy.auth, Some(("u".to_owned(), "p".to_owned())));
+        assert!(control.enable_ipv6);
     }
 
     #[test]
@@ -359,6 +380,13 @@ mod tests {
         let control: ts_control::Config = (&Config::default()).into();
         assert!(control.exit_proxy.is_none());
         assert!(!control.forward_exit_egress);
+    }
+
+    #[test]
+    fn from_config_default_is_ipv4_only() {
+        // The IPv6-off posture is the safe default: enabling overlay IPv6 must be an explicit opt-in.
+        let control: ts_control::Config = (&Config::default()).into();
+        assert!(!control.enable_ipv6);
     }
 }
 

@@ -224,6 +224,16 @@ pub struct Config {
     /// configuration.
     #[serde(default)]
     pub tcp_buffer_size: Option<usize>,
+
+    /// Whether IPv6 is enabled on the tailnet overlay. Defaults to `false` (IPv4-only).
+    ///
+    /// Like the other dataplane fields, this is a client-side preference not read inside
+    /// `ts_control`; it is carried here only to be threaded into the runtime's underlay socket,
+    /// disco candidate filter, netstack address assignment, and MagicDNS AAAA handling. It governs
+    /// only the overlay and never the exit-node / forwarder egress path, which stays IPv4-only
+    /// regardless to uphold the real-origin-IP isolation invariant.
+    #[serde(default)]
+    pub enable_ipv6: bool,
 }
 
 impl Config {
@@ -336,6 +346,7 @@ impl Default for Config {
             exit_proxy: None,
             peerapi_port: None,
             tcp_buffer_size: None,
+            enable_ipv6: false,
         }
     }
 }

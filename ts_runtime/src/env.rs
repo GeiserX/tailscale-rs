@@ -90,6 +90,14 @@ pub struct ForwarderConfig {
     /// proxy. The same value is advertised (`PeerApi4` service) and used to bind the server, so the
     /// advertised port always matches the actual bind.
     pub peerapi_port: Option<u16>,
+
+    /// Whether IPv6 is enabled on the tailnet overlay. Defaults to `false` (IPv4-only).
+    ///
+    /// See [`Config::enable_ipv6`](ts_control::Config::enable_ipv6). Governs the underlay socket
+    /// bind, disco candidate filtering, netstack overlay-address assignment, and MagicDNS AAAA
+    /// handling. It NEVER governs the forwarder exit/subnet egress path, which stays IPv4-only
+    /// regardless to uphold the real-origin-IP isolation invariant.
+    pub enable_ipv6: bool,
 }
 
 impl ForwarderConfig {
@@ -108,6 +116,7 @@ impl ForwarderConfig {
             forward_exit_egress: config.forward_exit_egress,
             exit_proxy: config.exit_proxy.as_ref().map(exit_proxy_to_forwarder),
             peerapi_port: config.peerapi_port,
+            enable_ipv6: config.enable_ipv6,
         }
     }
 }
@@ -174,6 +183,12 @@ pub struct Env {
     /// See [`ForwarderConfig::peerapi_port`].
     pub peerapi_port: Option<u16>,
 
+    /// Whether IPv6 is enabled on the tailnet overlay (default `false`, IPv4-only).
+    ///
+    /// See [`ForwarderConfig::enable_ipv6`]. Read by the underlay socket, disco candidate filter,
+    /// netstack address assignment, and MagicDNS; never by the forwarder egress path.
+    pub enable_ipv6: bool,
+
     /// Whether the runtime is shutdown.
     ///
     /// This is provided so that actors can check whether a message send has failed because
@@ -201,6 +216,7 @@ impl Env {
             forward_exit_egress,
             exit_proxy,
             peerapi_port,
+            enable_ipv6,
         } = forwarding;
         Self {
             bus: MessageBus::spawn_default(),
@@ -215,6 +231,7 @@ impl Env {
             forward_exit_egress,
             exit_proxy,
             peerapi_port,
+            enable_ipv6,
         }
     }
 

@@ -14,7 +14,12 @@
 //! - **Fail closed**: if no route and no resolver is configured, an unknown name is `NXDOMAIN`.
 //!
 //! Anti-leak / IPv6-off posture: upstream forwarding binds `0.0.0.0:0` (UDP, IPv4 only) and never
-//! opens an IPv6 socket. AAAA is answered from overlay data but never sourced over a v6 socket.
+//! opens an IPv6 socket. AAAA handling is gated on [`DnsView::enable_ipv6`] (default off): with the
+//! gate OFF an AAAA query for a tailnet/overlay/self name returns NoError with an empty answer
+//! (NODATA) rather than the overlay v6 address — answering a v6 the IPv4-only client can't route
+//! would only create dead connections and a fingerprint. With the gate ON, AAAA is answered from
+//! overlay data (the v6 overlay addr), as historically. AAAA for tailnet names is never forwarded
+//! to a recursive upstream regardless of the gate.
 //!
 //! - MagicDNS disabled (`dns_config == None` or `magic_dns == false`) => `REFUSED` for every query.
 //! - Unsupported qtype => `REFUSED` (never forwarded).
@@ -74,6 +79,13 @@ pub(crate) struct DnsView {
     /// recursively itself (gated by `forward_exit_egress`), it never re-delegates to its own exit
     /// node. `None` means no active exit node / no DoH delegation — recursion stays local.
     pub(crate) exit_doh: Option<SocketAddr>,
+    /// Whether IPv6 is enabled on the tailnet overlay (from [`Env::enable_ipv6`], default `false`).
+    ///
+    /// Governs the AAAA answer path only: with the gate OFF (default) an AAAA query for a
+    /// tailnet/overlay/self name is answered NoError-with-empty-answer (NODATA) instead of the
+    /// overlay v6 address; with it ON, AAAA is answered from overlay data as historically. Set once
+    /// from the runtime `Env` when the actor starts; never changes for the life of the runtime.
+    pub(crate) enable_ipv6: bool,
 }
 
 impl DnsView {
@@ -297,7 +309,18 @@ pub(crate) fn decide(view: &DnsView, buf: &[u8]) -> Option<Decision> {
             _ => forward_or_nxdomain(view, &canon, buf, id, q),
         },
         QType::Aaaa => match view.resolve_addr(&canon, false) {
-            Some(IpAddr::V6(v6)) => reply(Rcode::NoError, &[RData::Aaaa(v6.octets())]),
+            // A tailnet/overlay/self (or extra-record) AAAA match. Gate on IPv6: with IPv6 OFF
+            // (default) the client is IPv4-only, so answering with the overlay v6 address would
+            // only hand out an unroutable address — dead connections plus a fingerprint. Return
+            // NoError with an empty answer (NODATA) instead. With the gate ON, answer from overlay
+            // data as historically. We never forward this name to a recursive upstream either way:
+            // a positive overlay match is authoritative.
+            Some(IpAddr::V6(v6)) if view.enable_ipv6 => {
+                reply(Rcode::NoError, &[RData::Aaaa(v6.octets())])
+            }
+            Some(IpAddr::V6(_)) => reply(Rcode::NoError, &[]),
+            // No overlay/extra-record answer: split-DNS / recursive upstreams (off-tailnet names);
+            // tailnet names fail closed to NXDOMAIN inside `forward_or_nxdomain`.
             _ => forward_or_nxdomain(view, &canon, buf, id, q),
         },
         QType::Ptr => match q.name.ptr_to_ipv4() {
@@ -634,7 +657,13 @@ impl kameo::Actor for MagicDnsActor {
         env.subscribe::<crate::route_updater::ActiveExitNode>(&slf)
             .await?;
 
-        let (view_tx, view_rx) = watch::channel(Arc::new(DnsView::default()));
+        // Seed the view with the runtime's IPv6 gate (default off). Subsequent control/peer updates
+        // clone-and-modify this view, so the flag — set once here from `Env` — is preserved for the
+        // life of the runtime and read by the AAAA answer path in `decide`.
+        let (view_tx, view_rx) = watch::channel(Arc::new(DnsView {
+            enable_ipv6: env.enable_ipv6,
+            ..DnsView::default()
+        }));
 
         let mut joinset = JoinSet::new();
 
@@ -780,6 +809,7 @@ mod tests {
             peers: Some(Arc::new(db)),
             self_node: None,
             exit_doh: None,
+            enable_ipv6: false,
         }
     }
 
@@ -827,8 +857,39 @@ mod tests {
     }
 
     #[test]
-    fn aaaa_query_for_known_peer_answers_v6() {
+    fn aaaa_query_for_known_peer_is_nodata_when_ipv6_off() {
+        // Gate OFF (default): an AAAA query for a known overlay peer must return NoError with an
+        // empty answer (NODATA) — NOT the overlay v6 address, which the IPv4-only client can't
+        // route. This is the anti-fingerprint / no-dead-connections posture.
         let view = view_with_peer();
+        assert!(!view.enable_ipv6, "default gate is off");
+        let buf = build_query(0x5, &["host", "user", "ts", "net"], 28, 1);
+
+        let resp = answer(&view, &buf).expect("answers");
+        let (_, rcode, ancount) = parse_header(&resp);
+        assert_eq!(rcode, 0, "NoError (NODATA)");
+        assert_eq!(ancount, 0, "empty answer: no AAAA handed out with IPv6 off");
+    }
+
+    #[test]
+    fn a_query_still_resolves_when_ipv6_off() {
+        // Gate OFF must not touch the A (v4) path: the v4 answer is byte-for-byte unchanged.
+        let view = view_with_peer();
+        let buf = build_query(0x6, &["host", "user", "ts", "net"], 1, 1);
+
+        let resp = answer(&view, &buf).expect("answers");
+        let (_, rcode, ancount) = parse_header(&resp);
+        assert_eq!(rcode, 0, "NoError");
+        assert_eq!(ancount, 1);
+        let tail = &resp[resp.len() - 4..];
+        assert_eq!(tail, &[100, 64, 0, 1]);
+    }
+
+    #[test]
+    fn aaaa_query_for_known_peer_answers_v6_when_ipv6_on() {
+        // Gate ON: historical behavior — answer AAAA from the overlay v6 address.
+        let mut view = view_with_peer();
+        view.enable_ipv6 = true;
         let buf = build_query(0x5, &["host", "user", "ts", "net"], 28, 1);
 
         let resp = answer(&view, &buf).expect("answers");
@@ -839,6 +900,40 @@ mod tests {
         let expected = "fd7a::1".parse::<std::net::Ipv6Addr>().unwrap().octets();
         let tail = &resp[resp.len() - 16..];
         assert_eq!(tail, expected);
+    }
+
+    #[test]
+    fn aaaa_for_unknown_tailnet_name_is_nxdomain_not_forwarded_with_ipv6_off() {
+        // Anti-leak, unchanged by the gate: an AAAA for a name under the tailnet suffix that has no
+        // overlay match still fails closed to NXDOMAIN — never forwarded to a recursive upstream,
+        // even with resolvers configured. (Gate OFF only changes the *positive* overlay match into
+        // NODATA; a non-match still routes through `forward_or_nxdomain`.)
+        let mut db = PeerDb::default();
+        db.upsert(&test_node());
+        let view = DnsView {
+            cfg: DnsConfig {
+                magic_dns: true,
+                search_domains: vec!["user.ts.net".to_string()],
+                fallback_resolvers: vec![DnsResolver {
+                    transport: ts_control::ResolverTransport::Udp("9.9.9.9:53".parse().unwrap()),
+                    use_with_exit_node: false,
+                }],
+                ..Default::default()
+            },
+            peers: Some(Arc::new(db)),
+            self_node: None,
+            exit_doh: None,
+            enable_ipv6: false,
+        };
+        let buf = build_query(0x5A, &["ghost", "user", "ts", "net"], 28, 1);
+
+        match decide(&view, &buf).expect("decides") {
+            Decision::Reply(resp) => {
+                let (_, rcode, _) = parse_header(&resp);
+                assert_eq!(rcode, 3, "NxDomain: tailnet AAAA not leaked upstream");
+            }
+            Decision::Forward { .. } => panic!("tailnet AAAA must never be forwarded"),
+        }
     }
 
     #[test]
@@ -963,6 +1058,7 @@ mod tests {
             peers: Some(Arc::new(db)),
             self_node: None,
             exit_doh: None,
+            enable_ipv6: false,
         };
 
         // 100.64.0.9 is in CGNAT range but owned by no peer => NXDOMAIN, never a Forward.
@@ -1026,6 +1122,7 @@ mod tests {
             peers: None,
             self_node: Some(test_node()),
             exit_doh: None,
+            enable_ipv6: false,
         };
         let buf = build_query(0x44, &["host", "user", "ts", "net"], 1, 1);
 
@@ -1171,6 +1268,7 @@ mod tests {
             peers: None,
             self_node: None,
             exit_doh: None,
+            enable_ipv6: false,
         }
     }
 
@@ -1323,6 +1421,7 @@ mod tests {
             peers: Some(Arc::new(db)),
             self_node: None,
             exit_doh: None,
+            enable_ipv6: false,
         };
         let buf = build_query(0x107, &["host", "user", "ts", "net"], 1, 1);
 
@@ -1515,7 +1614,11 @@ mod tests {
     #[test]
     fn recursive_plan_keeps_udp_without_exit_node() {
         // No active exit node: a recursive forward stays on its default UDP upstreams.
-        let view = view_with_routes(std::collections::BTreeMap::new(), vec![udp("8.8.8.8:53")], vec![]);
+        let view = view_with_routes(
+            std::collections::BTreeMap::new(),
+            vec![udp("8.8.8.8:53")],
+            vec![],
+        );
         let default = vec!["8.8.8.8:53".parse().unwrap()];
         assert_eq!(
             recursive_plan(&view, default.clone()),
@@ -1527,8 +1630,11 @@ mod tests {
     fn recursive_plan_delegates_to_doh_with_exit_node() {
         // Exit node active, no kept-local resolvers: recursive queries delegate to the exit node's
         // DoH endpoint so resolution egresses from the exit node, not this host.
-        let mut view =
-            view_with_routes(std::collections::BTreeMap::new(), vec![udp("8.8.8.8:53")], vec![]);
+        let mut view = view_with_routes(
+            std::collections::BTreeMap::new(),
+            vec![udp("8.8.8.8:53")],
+            vec![],
+        );
         let doh: SocketAddr = "100.64.0.5:8080".parse().unwrap();
         view.exit_doh = Some(doh);
         assert_eq!(

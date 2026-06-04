@@ -40,7 +40,7 @@ use base64::Engine;
 use netstack::{CreateSocket, netcore::Channel, netsock::TcpStream};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{watch, Semaphore},
+    sync::{Semaphore, watch},
     time::timeout,
 };
 use ts_dns_wire::{Rcode, decode_query, encode_response};
@@ -489,8 +489,8 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<DohReque
     match method {
         "GET" => Ok(Some(parse_get(query_str))),
         "POST" => {
-            let content_length = header_value(&req, "content-length")
-                .and_then(|v| v.trim().parse::<usize>().ok());
+            let content_length =
+                header_value(&req, "content-length").and_then(|v| v.trim().parse::<usize>().ok());
             let Some(len) = content_length else {
                 return Ok(Some(DohRequest::BadRequest));
             };
@@ -563,8 +563,7 @@ async fn write_dns_response(stream: &mut TcpStream, dns_msg: &[u8]) -> std::io::
 
 /// Write a bodyless HTTP error response with the given status line (e.g. `"400 Bad Request"`).
 async fn write_status(stream: &mut TcpStream, status: &str) -> std::io::Result<()> {
-    let head =
-        format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    let head = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     stream.write_all(head.as_bytes()).await?;
     stream.flush().await
 }
@@ -576,7 +575,10 @@ mod tests {
     #[test]
     fn find_header_end_locates_terminator() {
         assert_eq!(find_header_end(b"GET / HTTP/1.1\r\n\r\n"), Some(18));
-        assert_eq!(find_header_end(b"GET / HTTP/1.1\r\nX: 1\r\n\r\nBODY"), Some(24));
+        assert_eq!(
+            find_header_end(b"GET / HTTP/1.1\r\nX: 1\r\n\r\nBODY"),
+            Some(24)
+        );
         assert_eq!(find_header_end(b"GET / HTTP/1.1\r\n"), None);
     }
 

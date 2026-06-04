@@ -62,11 +62,67 @@ pub struct EndpointAdvertisement {
     pub endpoints: Arc<Vec<SelfEndpoint>>,
 }
 
-/// The bind address for the direct underlay socket.
+/// The IPv4 bind address for the direct underlay socket.
 ///
 /// IPv4-only and ephemeral-port: per the anti-leak rules this socket is the only egress path
-/// for the direct underlay, and IPv6 is disabled in our deployment.
+/// for the direct underlay, and IPv6 is disabled in our default deployment. This is the historical
+/// (and `enable_ipv6 == false`) bind — byte-for-byte the original behavior.
 const BIND_ADDR: &str = "0.0.0.0:0";
+
+/// The dual-stack bind address used only when `Env::enable_ipv6` is `true`.
+///
+/// Binding `[::]:0` yields one socket that serves both native IPv6 and IPv4-mapped traffic when
+/// the kernel's `IPV6_V6ONLY` is off (the Linux default on our a cloud VPS deployment, where
+/// `/proc/sys/net/ipv6/bindv6only` is `0`). See [`bind_underlay_addr`] for the inert-fallback
+/// posture when the host has IPv6 disabled at the kernel.
+const BIND_ADDR_V6: &str = "[::]:0";
+
+/// Choose the underlay UDP socket and the address it bound to, honoring the (default-off)
+/// `enable_ipv6` overlay gate.
+///
+/// - `enable_ipv6 == false` (default): bind exactly [`BIND_ADDR`] (`0.0.0.0:0`) — byte-for-byte the
+///   historical IPv4-only path, no new syscalls. This upholds the sacred IPv4-only invariant of the
+///   privacy-proxy deployment.
+/// - `enable_ipv6 == true`: attempt a dual-stack bind on [`BIND_ADDR_V6`] (`[::]:0`) so a single
+///   socket serves both native v6 and v4-mapped traffic. **Fail inert, never panic**: if the v6
+///   bind fails (e.g. a host with `net.ipv6.conf.all.disable_ipv6=1`), warn and fall back to the
+///   IPv4 bind so the node still comes up — protective if the gate is mis-flagged on a hardened box.
+///
+/// NOTE (dep gap reported to the architect): [`MagicSock::bind`] takes only a [`SocketAddr`] and
+/// constructs the `tokio::net::UdpSocket` itself, so this site cannot set `IPV6_V6ONLY` explicitly
+/// (that would require `socket2::Socket`/`libc`, neither of which is a dependency of `ts_runtime`,
+/// or a change to `ts_magicsock`). The dual-stack socket therefore relies on the kernel's
+/// `IPV6_V6ONLY` default, which is dual-stack on Linux (our deployment) but v6-only on macOS. To
+/// force `set_only_v6(false)` portably, either `socket2` must become a dependency or `MagicSock`
+/// must expose a bind that accepts a pre-configured socket.
+async fn bind_underlay_addr(
+    enable_ipv6: bool,
+    our_disco: ts_keys::DiscoPrivateKey,
+    our_node_key: NodePublicKey,
+) -> Result<MagicSock, ts_magicsock::Error> {
+    // IPv4-only default: the historical path, unchanged.
+    if !enable_ipv6 {
+        let v4: SocketAddr = BIND_ADDR.parse().expect("valid bind address");
+        return MagicSock::bind(v4, our_disco, our_node_key).await;
+    }
+
+    // Overlay IPv6 enabled: try the dual-stack bind first.
+    let v6: SocketAddr = BIND_ADDR_V6.parse().expect("valid bind address");
+    match MagicSock::bind(v6, our_disco, our_node_key).await {
+        Ok(sock) => Ok(sock),
+        Err(e) => {
+            // Inert fallback: the host likely has IPv6 disabled at the kernel. Come up IPv4-only
+            // rather than crash — protective on a hardened proxy box even if the gate is set.
+            tracing::warn!(
+                error = %e,
+                %v6,
+                "dual-stack underlay bind failed (host IPv6 disabled?); falling back to IPv4-only",
+            );
+            let v4: SocketAddr = BIND_ADDR.parse().expect("valid bind address");
+            MagicSock::bind(v4, our_disco, our_node_key).await
+        }
+    }
+}
 
 /// Owns the direct (disco) UDP underlay and bridges it to the dataplane.
 ///
@@ -453,9 +509,6 @@ impl kameo::Actor for DirectManager {
         let peer_db: Arc<RwLock<Option<Arc<PeerDb>>>> = Default::default();
         let mut tasks = JoinSet::new();
 
-        // The bind address is a hardcoded, infallible constant; only the parse can't fail.
-        let bind_addr: SocketAddr = BIND_ADDR.parse().expect("valid bind address");
-
         // The disco<->node-key binding verifier: an inbound disco ping must present the node key
         // control bound to its disco key, or `handle_disco` drops it (fail closed). Closed over a
         // live handle to `peer_db` so it tracks netmap changes (revocations take effect at once).
@@ -469,18 +522,25 @@ impl kameo::Actor for DirectManager {
         // and stay inert. DERP-only is the anti-leak-safe fallback (no direct path is ever offered,
         // so the real origin IP can't leak), mirroring the MagicDNS responder's bind-failure
         // posture. The route updater treats a `None` transport id as "stay on DERP" (fail-closed).
-        let sock = match MagicSock::bind(
-            bind_addr,
+        //
+        // `enable_ipv6` (default `false`) gates the bind family: IPv4-only `0.0.0.0:0` historically,
+        // or a dual-stack `[::]:0` with an inert IPv4 fallback when the overlay opts into IPv6. See
+        // [`bind_underlay_addr`].
+        let sock = match bind_underlay_addr(
+            env.enable_ipv6,
             env.keys.disco_keys.private,
             env.keys.node_keys.public,
         )
         .await
         {
-            Ok(sock) => Arc::new(sock.with_binding_verifier(binding_verifier)),
+            Ok(sock) => Arc::new(
+                sock.with_enable_ipv6(env.enable_ipv6)
+                    .with_binding_verifier(binding_verifier),
+            ),
             Err(e) => {
                 tracing::error!(
                     error = %e,
-                    %bind_addr,
+                    enable_ipv6 = env.enable_ipv6,
                     "direct underlay udp bind failed; direct manager inert, staying DERP-only",
                 );
                 return Ok(Self {
@@ -713,6 +773,66 @@ mod tests {
             &0x2112_A442u32.to_be_bytes(),
             "the STUN magic cookie must be present at bytes[4..8]"
         );
+    }
+
+    /// With `enable_ipv6 == false` (the default) the underlay socket binds the historical IPv4
+    /// path: its local address is in the v4 family (`0.0.0.0`). This pins the sacred default — the
+    /// privacy-proxy deployment must stay byte-for-byte IPv4-only when the gate is off.
+    #[tokio::test]
+    async fn bind_underlay_addr_v4_default_is_unchanged() {
+        let sock = bind_underlay_addr(
+            false,
+            DiscoPrivateKey::random(),
+            NodePrivateKey::random().public_key(),
+        )
+        .await
+        .expect("the IPv4 underlay bind must succeed");
+
+        let local = sock.local_addr().expect("a bound socket has a local addr");
+        assert!(
+            local.is_ipv4(),
+            "with enable_ipv6 == false the underlay must bind the v4 family, got {local}"
+        );
+        assert_eq!(
+            local.ip(),
+            "0.0.0.0".parse::<core::net::IpAddr>().unwrap(),
+            "the v4 default binds the unspecified v4 address"
+        );
+    }
+
+    /// With `enable_ipv6 == true` a dual-stack bind on `[::]:0` is attempted. On a normal dev host
+    /// that yields a v6-family socket; if this environment cannot bind v6 at all, the documented
+    /// inert fallback returns a v4 socket instead (never a panic, never an error). Either outcome is
+    /// acceptable here — the non-flaky guarantee is that a usable socket comes back. The positive
+    /// "is v6" assertion is gated on the v6 bind actually succeeding so CI without v6 loopback
+    /// doesn't flake.
+    #[tokio::test]
+    async fn bind_underlay_addr_v6_attempts_dual_stack_or_falls_back() {
+        let sock = bind_underlay_addr(
+            true,
+            DiscoPrivateKey::random(),
+            NodePrivateKey::random().public_key(),
+        )
+        .await
+        .expect("bind must succeed (dual-stack, else inert IPv4 fallback) and never error");
+
+        let local = sock.local_addr().expect("a bound socket has a local addr");
+
+        // Probe whether this host can bind `[::]:0` at all. If it can, the underlay must have taken
+        // the dual-stack (v6-family) path; if it can't, the inert fallback must have produced a v4
+        // socket. This keeps the assertion deterministic on both v6-capable and v6-disabled hosts.
+        match tokio::net::UdpSocket::bind("[::]:0").await {
+            Ok(_) => assert!(
+                local.is_ipv6(),
+                "on a v6-capable host enable_ipv6 == true must bind the v6 (dual-stack) family, \
+                 got {local}"
+            ),
+            Err(_) => assert!(
+                local.is_ipv4(),
+                "on a host that cannot bind v6 the inert fallback must yield a v4 socket, got \
+                 {local}"
+            ),
+        }
     }
 
     /// An empty server list (the derp map lists no FixedAddr-v4 STUN servers) is a no-op: nothing is

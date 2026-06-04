@@ -34,6 +34,10 @@ features = [
     "socket-udp",
     "socket-icmp",
     "socket-raw",
+    # IPv6-on-overlay (gated, default off) assigns up to 3 interface addresses (v4 /32 + v6 /128,
+    # plus headroom). smoltcp defaults to iface-max-addr-count-2, which would silently overflow
+    # (direct_set_ips returns false → netstack gets no addresses) the moment the IPv6 gate is on.
+    "iface-max-addr-count-5",
 ]
 
 [dev-dependencies]
@@ -54,7 +58,7 @@ features = [
     "socket-udp",
     "socket-icmp",
     "socket-raw",
-    "iface-max-addr-count-4",
+    "iface-max-addr-count-5",
     "log",
     "verbose",
 ]
