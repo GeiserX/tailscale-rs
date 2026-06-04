@@ -48,6 +48,47 @@ impl Debug for ExitProxyConfig {
     }
 }
 
+/// How the node's **application** overlay data path is realized.
+///
+/// Defaults to [`Netstack`](TransportMode::Netstack), the userspace smoltcp netstack that needs no
+/// privileges and is the right choice for the fork's primary deployment (a privacy proxy / cloud
+/// exit node running unprivileged in a container). [`Tun`](TransportMode::Tun) instead hands the
+/// node's overlay packets to a real kernel TUN interface, for embedders that want the host OS
+/// networking stack (routes, sockets, DNS) to see the tailnet directly — closer to `tailscaled`'s
+/// model than to Go `tsnet`'s in-process netstack.
+///
+/// Like the other dataplane fields this is **not read inside `ts_control`**: it is carried for
+/// transport only and converted to a `ts_transport_tun` config by the runtime at the `ts_runtime`
+/// boundary (`ts_control` must not depend on `ts_transport_tun`). The mode governs only the
+/// application data path; it never changes the exit-node / forwarder egress path, which stays its
+/// own IPv4-only userspace netstack regardless.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportMode {
+    /// Userspace smoltcp netstack (default). No privileges required.
+    #[default]
+    Netstack,
+    /// Real kernel TUN interface. Requires privileges (root / `CAP_NET_ADMIN` on Linux) and a
+    /// platform that supports TUN (Linux `/dev/net/tun`, macOS `utun`).
+    Tun(TunConfig),
+}
+
+/// Transport-only parameters for [`TransportMode::Tun`].
+///
+/// The node's tailnet *prefix* is deliberately absent: it is assigned by control and only known at
+/// runtime, so the runtime supplies it when it builds the real `ts_transport_tun::Config`. Only the
+/// user-choosable knobs live here.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TunConfig {
+    /// Desired interface name (e.g. `tailscale0`). `None` lets the OS pick (e.g. `utunN` on macOS).
+    #[serde(default)]
+    pub name: Option<String>,
+
+    /// Interface MTU. `None` uses the transport's default. Tailscale's overlay MTU is 1280.
+    #[serde(default)]
+    pub mtu: Option<u16>,
+}
+
 /// Default for [`Config::ephemeral`]: `true`, matching the historical behavior of this client.
 fn default_ephemeral() -> bool {
     true
@@ -234,6 +275,15 @@ pub struct Config {
     /// regardless to uphold the real-origin-IP isolation invariant.
     #[serde(default)]
     pub enable_ipv6: bool,
+
+    /// How the application overlay data path is realized: userspace netstack (default) or a real
+    /// kernel TUN interface. See [`TransportMode`].
+    ///
+    /// Like the other dataplane fields, this is a client-side preference not read inside
+    /// `ts_control`; it is carried here only to be threaded into the runtime, which builds either a
+    /// netstack actor or a TUN transport from it. `ts_control` must not depend on `ts_transport_tun`.
+    #[serde(default)]
+    pub transport_mode: TransportMode,
 }
 
 impl Config {
@@ -347,6 +397,7 @@ impl Default for Config {
             peerapi_port: None,
             tcp_buffer_size: None,
             enable_ipv6: false,
+            transport_mode: TransportMode::default(),
         }
     }
 }

@@ -112,7 +112,12 @@ impl From<ts_runtime::Error> for Error {
             ts_runtime::ErrorKind::Timeout => Error::Timeout,
             ts_runtime::ErrorKind::ActorGone
             | ts_runtime::ErrorKind::MailboxFull
-            | ts_runtime::ErrorKind::ReplyErr => Error::Internal(InternalErrorKind::Actor),
+            | ts_runtime::ErrorKind::ReplyErr
+            // TUN transport mode: a netstack-only operation, or TUN requested but unavailable
+            // (no device / `tun` feature off). No dedicated root variant exists, so reuse the
+            // "internal component unavailable" sentinel. See follow-up in the channel field docs.
+            | ts_runtime::ErrorKind::UnsupportedInTunMode
+            | ts_runtime::ErrorKind::TunUnavailable => Error::Internal(InternalErrorKind::Actor),
         }
     }
 }

@@ -6,6 +6,45 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.12](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.12) - 2026-06-05
+
+**TUN-mode transport**, gated behind a new default-off `tun` Cargo feature. A node can now run its
+application data path over a real kernel TUN interface (`utun` on macOS, `/dev/net/tun` on Linux)
+instead of the userspace smoltcp netstack, selected via a new `Config::transport_mode`
+(`TransportMode::Netstack` — the default — or `TransportMode::Tun(TunConfig { name, mtu })`). This
+brings the fork toward Go `tsnet`'s TUN/`Up`-style data path while leaving the default userspace
+posture byte-for-byte unchanged.
+
+**The forwarder / exit-node egress path is UNCHANGED and stays hardcoded IPv4 in both modes** —
+TUN mode swaps only the *application* data path, never the forwarder. The real-origin-IP isolation
+invariant and its `checks`-crate grep gate are untouched.
+
+- **Feature gate** (`ts_runtime`, root `tailscale`): the `tun` feature is **off by default**. With
+  it off, no TUN code compiles and the default dependency graph is unchanged (`ts_transport_tun`
+  does not enter it). `tun-rs` is off the `ring`-only egress path, so the musl-clean egress
+  invariant holds.
+- **Transport selection** (`ts_runtime::Runtime::spawn`): branches on `Config::transport_mode`.
+  Netstack mode spawns the application netstack + MagicDNS responder + fallback-TCP registry as
+  before; TUN mode spawns a `TunActor` on the same overlay seam instead. **Fail-closed, no silent
+  fallback:** requesting `Tun` in a build without the `tun` feature is a hard error
+  (`ErrorKind::TunUnavailable`), never a silent downgrade to netstack.
+- **`TunActor`** (`ts_runtime::tun_actor`): creates the device lazily on the first netmap update
+  (the tailnet `/32` prefix is assigned by control at runtime), then runs a two-task pump moving
+  packets between the kernel interface and the dataplane. Device-creation failure (e.g. missing
+  root / `CAP_NET_ADMIN`) logs a single error and leaves the actor idle — **no packets flow, no
+  leak** — rather than falling back.
+- **Crate hardening** (`ts_transport_tun`): `AsyncTunTransport::new` now maps a
+  `PermissionDenied` device-open to the typed `Error::RootUserRequired` (previously a dead
+  variant), dead code removed.
+- **In TUN mode there is no application netstack**: netstack-only `Device` APIs (`udp_bind`,
+  `tcp_listen`, `tcp_connect`, `register_fallback_tcp_handler`, …) return an error
+  (`ErrorKind::UnsupportedInTunMode`); control-plane and peer-lookup APIs are unaffected.
+  `register_fallback_tcp_handler` is now fallible (returns `Result`) to reflect this.
+
+Note: true Go-`tsnet` TUN parity also requires host **route and DNS programming** (Go's
+`router`/`dns` engines) so the OS actually sends overlay traffic to the interface; that is tracked
+as a follow-up and is out of scope for this data-path seam.
+
 ## [0.5.11](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.11) - 2026-06-05
 
 IPv6 **on the tailnet overlay**, gated and default-off. A new runtime flag `Config::enable_ipv6`

@@ -29,15 +29,22 @@ impl AsyncTunTransport {
         let mtu = config.mtu.get();
 
         let builder = DeviceBuilder::new()
-            // TODO (dylan): use multi-queue and/or offload
+            // Single-queue, no GRO/GSO offload: correct for the overlay data path; multi-queue is a throughput optimization we have not needed.
             .mtu(mtu)
             .name(&config.name);
 
-        let tun = match config.prefix {
+        let configured = match config.prefix {
             ipnet::IpNet::V4(v4net) => builder.ipv4(v4net.addr(), v4net.prefix_len(), None),
             ipnet::IpNet::V6(v6net) => builder.ipv6(v6net.addr(), v6net.prefix_len()),
-        }
-        .build_async()?;
+        };
+
+        let tun = match configured.build_async() {
+            Ok(d) => d,
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                return Err(Error::RootUserRequired);
+            }
+            Err(e) => return Err(Error::from(e)),
+        };
 
         Ok(Self {
             device: tun,
@@ -50,22 +57,6 @@ impl AsyncTunTransport {
         self.device
             .name()
             .unwrap_or_else(|_| "<unnamed tun device>".to_string())
-    }
-
-    async fn _recv_one(&self) -> Result<PacketMut, Error> {
-        let mut pkt = PacketMut::new(self.mtu);
-
-        let bytes_read = self.device.recv(pkt.as_mut()).await?;
-        pkt.truncate(bytes_read);
-
-        tracing::trace!(
-            transport = self.name(),
-            bytes_read,
-            "read packet:\n{}",
-            pkt.iter().hexdump_string(Case::Lower),
-        );
-
-        Ok(pkt)
     }
 
     async fn recv_many(&self) -> impl Iterator<Item = Result<PacketMut, Error>> {

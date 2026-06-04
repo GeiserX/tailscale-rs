@@ -157,6 +157,17 @@ pub struct Config {
     /// never be weakened by enabling overlay IPv6. On a host with IPv6 disabled at the kernel, the
     /// dual-stack overlay bind simply fails and the node stays inert on IPv6 rather than panicking.
     pub enable_ipv6: bool,
+
+    /// How this node's **application** overlay data path is realized.
+    ///
+    /// Defaults to [`TransportMode::Netstack`](ts_control::TransportMode::Netstack), the userspace
+    /// smoltcp netstack used by the fork's primary unprivileged proxy / exit-node deployment.
+    /// [`TransportMode::Tun`](ts_control::TransportMode::Tun) instead routes the node's overlay
+    /// packets through a real kernel TUN interface (for embedders that want the host OS networking
+    /// stack to see the tailnet directly); it requires privileges (root / `CAP_NET_ADMIN`) and a
+    /// platform with TUN support. This governs only the application data path — never the
+    /// exit-node / forwarder egress path, which keeps its own IPv4-only userspace netstack.
+    pub transport_mode: ts_control::TransportMode,
 }
 
 impl Config {
@@ -299,6 +310,7 @@ impl From<&Config> for ts_control::Config {
             tcp_buffer_size: value.tcp_buffer_size,
             peerapi_port: None,
             enable_ipv6: value.enable_ipv6,
+            transport_mode: value.transport_mode.clone(),
         }
     }
 }
@@ -323,6 +335,7 @@ impl Default for Config {
             exit_proxy: None,
             tcp_buffer_size: None,
             enable_ipv6: false,
+            transport_mode: ts_control::TransportMode::default(),
         }
     }
 }
@@ -346,6 +359,10 @@ mod tests {
             forward_udp_ports: vec![53],
             tcp_buffer_size: Some(1024 * 128),
             enable_ipv6: true,
+            transport_mode: ts_control::TransportMode::Tun(ts_control::TunConfig {
+                name: Some("tailscale0".to_owned()),
+                mtu: Some(1280),
+            }),
             advertise_routes: vec!["10.0.0.0/24".parse().unwrap()],
             requested_tags: vec!["tag:exit".to_owned()],
             ephemeral: false,
@@ -373,6 +390,21 @@ mod tests {
         assert_eq!(proxy.scheme, ts_control::ExitProxyScheme::Socks5);
         assert_eq!(proxy.auth, Some(("u".to_owned(), "p".to_owned())));
         assert!(control.enable_ipv6);
+        assert_eq!(
+            control.transport_mode,
+            ts_control::TransportMode::Tun(ts_control::TunConfig {
+                name: Some("tailscale0".to_owned()),
+                mtu: Some(1280),
+            })
+        );
+    }
+
+    #[test]
+    fn from_config_default_is_netstack_transport() {
+        // The unprivileged userspace netstack is the safe default; opting into a kernel TUN
+        // interface (which needs root) must be explicit.
+        let control: ts_control::Config = (&Config::default()).into();
+        assert_eq!(control.transport_mode, ts_control::TransportMode::Netstack);
     }
 
     #[test]

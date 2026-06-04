@@ -37,6 +37,8 @@ mod route_updater;
 mod src_filter;
 /// Netmap status snapshot, WhoIs, and watcher types.
 pub mod status;
+#[cfg(feature = "tun")]
+mod tun_actor;
 
 pub(crate) use env::Env;
 pub use error::{Error, ErrorKind};
@@ -49,11 +51,14 @@ pub struct Runtime {
     /// Reference to the control actor.
     pub control: ActorRef<ControlRunner>,
     dataplane: ActorRef<DataplaneActor>,
-    netstack: WeakActorRef<NetstackActor>,
+    /// Reference to the application netstack actor. `None` in TUN transport mode, where there is
+    /// no userspace application netstack (the application data path is a real kernel TUN device).
+    netstack: Option<WeakActorRef<NetstackActor>>,
     /// Reference to the peer tracker for peer lookups.
     pub peer_tracker: WeakActorRef<PeerTracker>,
-    /// Fallback TCP handler registry, bound to the application netstack.
-    fallback_tcp: fallback_tcp::FallbackTcpManager,
+    /// Fallback TCP handler registry, bound to the application netstack. `None` in TUN transport
+    /// mode (no application netstack exists to attach it to).
+    fallback_tcp: Option<fallback_tcp::FallbackTcpManager>,
     env: Env,
     shutdown: watch::Sender<bool>,
 }
@@ -120,18 +125,64 @@ impl Runtime {
         src_filter::SourceFilterUpdater::spawn(env.clone());
         let peer_tracker = PeerTracker::spawn(env.clone()).downgrade();
 
-        let netstack =
-            NetstackActor::spawn((env.clone(), netstack_config, netstack_up, netstack_down));
+        // Select the application data path from the transport mode. The forwarder/egress path
+        // above is UNCHANGED in both modes — TUN mode only swaps the application data path, never
+        // the forwarder. `config` is moved into `ControlRunner::spawn` below, so branch on a
+        // borrow and clone the small `TunConfig` where needed before the move.
+        //
+        // - Netstack (the default, and the only reachable arm when the `tun` feature is off):
+        //   spawn the application netstack + MagicDNS responder + fallback-TCP registry, all on
+        //   the `netstack_up`/`netstack_down` overlay seam.
+        // - Tun: spawn `TunActor` on that same overlay seam instead; no application netstack and
+        //   no MagicDNS responder exist, and `netstack`/`fallback_tcp` are `None`.
+        // - Tun requested but built without the `tun` feature: hard-error (a config/build
+        //   mismatch knowable at spawn time). NEVER silently fall back to netstack.
+        let (netstack, fallback_tcp) = match &config.transport_mode {
+            ts_control::TransportMode::Netstack => {
+                let netstack = NetstackActor::spawn((
+                    env.clone(),
+                    netstack_config,
+                    netstack_up,
+                    netstack_down,
+                ));
 
-        // Fetch the netstack channel while we still hold the strong ActorRef, then spawn the
-        // MagicDNS responder on it. Fire-and-forget: like src_filter/route_updater, it's owned by
-        // the message bus and isn't stored on `Runtime`.
-        let (channel,) = netstack.ask(netstack_actor::GetChannel).await?;
-        // The fallback-TCP registry attaches to the application netstack — the same one that
-        // carries the embedder's explicit `Device::tcp_listen` sockets — so a fallback handler
-        // sees exactly the inbound flows no explicit listener matched.
-        let fallback_tcp = fallback_tcp::FallbackTcpManager::new(channel.clone());
-        magic_dns::MagicDnsActor::spawn((env.clone(), channel));
+                // Fetch the netstack channel while we still hold the strong ActorRef, then spawn
+                // the MagicDNS responder on it. Fire-and-forget: like src_filter/route_updater,
+                // it's owned by the message bus and isn't stored on `Runtime`.
+                let (channel,) = netstack.ask(netstack_actor::GetChannel).await?;
+                // The fallback-TCP registry attaches to the application netstack — the same one
+                // that carries the embedder's explicit `Device::tcp_listen` sockets — so a
+                // fallback handler sees exactly the inbound flows no explicit listener matched.
+                let fallback_tcp = fallback_tcp::FallbackTcpManager::new(channel.clone());
+                magic_dns::MagicDnsActor::spawn((env.clone(), channel));
+
+                (Some(netstack.downgrade()), Some(fallback_tcp))
+            }
+
+            #[cfg(feature = "tun")]
+            ts_control::TransportMode::Tun(tun_cfg) => {
+                // Reuse the same `netstack_up`/`netstack_down` overlay-transport pair that would
+                // have fed the netstack — it is just the application-side overlay seam (the name
+                // is historical). No NetstackActor / MagicDnsActor is spawned.
+                tun_actor::TunActor::spawn((
+                    env.clone(),
+                    tun_cfg.clone(),
+                    netstack_up,
+                    netstack_down,
+                ));
+
+                (None, None)
+            }
+
+            #[cfg(not(feature = "tun"))]
+            ts_control::TransportMode::Tun(_) => {
+                return Err(Error {
+                    kind: ErrorKind::TunUnavailable,
+                    target_actor: None,
+                    message_ty: None,
+                });
+            }
+        };
 
         let control = ControlRunner::spawn(control_runner::Params {
             config,
@@ -144,7 +195,7 @@ impl Runtime {
             dataplane,
             peer_tracker,
             fallback_tcp,
-            netstack: netstack.downgrade(),
+            netstack,
             env,
             shutdown: shutdown_tx,
         })
@@ -155,6 +206,9 @@ impl Runtime {
     ///
     /// The returned [`fallback_tcp::FallbackTcpHandle`] deregisters the handler when dropped. See
     /// [`fallback_tcp`] for the dispatch contract and anti-leak guarantees.
+    ///
+    /// Returns [`ErrorKind::UnsupportedInTunMode`] in TUN transport mode, where there is no
+    /// application netstack to attach a fallback handler to.
     pub fn register_fallback_tcp_handler(
         &self,
         cb: Arc<
@@ -162,14 +216,31 @@ impl Runtime {
                 + Send
                 + Sync,
         >,
-    ) -> fallback_tcp::FallbackTcpHandle {
-        self.fallback_tcp.register(cb)
+    ) -> Result<fallback_tcp::FallbackTcpHandle, Error> {
+        Ok(self
+            .fallback_tcp
+            .as_ref()
+            .ok_or(Error {
+                kind: ErrorKind::UnsupportedInTunMode,
+                target_actor: None,
+                message_ty: None,
+            })?
+            .register(cb))
     }
 
     /// Get a channel to send commands to the netstack.
+    ///
+    /// Returns [`ErrorKind::UnsupportedInTunMode`] in TUN transport mode, where there is no
+    /// application netstack.
     pub async fn channel(&self) -> Result<Channel, Error> {
         let (channel,) = self
             .netstack
+            .as_ref()
+            .ok_or(Error {
+                kind: ErrorKind::UnsupportedInTunMode,
+                target_actor: None,
+                message_ty: None,
+            })?
             .upgrade()
             .ok_or(Error {
                 kind: ErrorKind::ActorGone,

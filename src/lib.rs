@@ -169,7 +169,10 @@ pub mod ssh;
 /// construction-time.
 pub struct Device {
     runtime: ts_runtime::Runtime,
-    channel: Channel,
+    /// Command channel to the application netstack. `None` in TUN transport mode, where there is
+    /// no userspace application netstack; the channel-driven socket APIs ([`Device::udp_bind`],
+    /// [`Device::tcp_listen`], [`Device::tcp_connect`], [`Device::ping`]) are unsupported there.
+    channel: Option<Channel>,
 }
 
 impl Device {
@@ -194,12 +197,28 @@ impl Device {
 
         let rt =
             ts_runtime::Runtime::spawn(config.into(), auth_key, (&config.key_state).into()).await?;
-        let channel = rt.channel().await?;
+        // In TUN transport mode there is no application netstack, so the runtime has no command
+        // channel: that surfaces as `UnsupportedInTunMode`, which we map to a `None` channel rather
+        // than an error (the device is still usable for control-plane and peer-lookup APIs).
+        let channel = match rt.channel().await {
+            Ok(c) => Some(c),
+            Err(e) if e.kind == ts_runtime::ErrorKind::UnsupportedInTunMode => None,
+            Err(e) => return Err(e.into()),
+        };
 
         Ok(Self {
             runtime: rt,
             channel,
         })
+    }
+
+    /// The application netstack command channel, or an error in TUN transport mode (no application
+    /// netstack exists). `InternalErrorKind::Actor` is the closest existing "internal component
+    /// unavailable" sentinel; see the channel field docs.
+    fn channel(&self) -> Result<&Channel, Error> {
+        self.channel
+            .as_ref()
+            .ok_or(Error::Internal(InternalErrorKind::Actor))
     }
 
     /// Get this [`Device`]'s IPv4 tailnet address.
@@ -223,16 +242,23 @@ impl Device {
     }
 
     /// Bind a UDP socket to the specified [`SocketAddr`].
+    ///
+    /// Returns an error in TUN transport mode (there is no application netstack to bind on).
     pub async fn udp_bind(&self, socket_addr: SocketAddr) -> Result<netstack::UdpSocket, Error> {
-        self.channel.udp_bind(socket_addr).await.map_err(Into::into)
+        self.channel()?
+            .udp_bind(socket_addr)
+            .await
+            .map_err(Into::into)
     }
 
     /// Bind a TCP listener to the specified [`SocketAddr`].
+    ///
+    /// Returns an error in TUN transport mode (there is no application netstack to listen on).
     pub async fn tcp_listen(
         &self,
         socket_addr: SocketAddr,
     ) -> Result<netstack::TcpListener, Error> {
-        self.channel
+        self.channel()?
             .tcp_listen(socket_addr)
             .await
             .map_err(Into::into)
@@ -252,12 +278,15 @@ impl Device {
     ///
     /// Handlers serve flows over the overlay netstack only — never a host socket — and a flow no
     /// handler claims is closed (fail-closed), never direct-dialed.
-    pub fn register_fallback_tcp_handler<F>(&self, cb: F) -> FallbackTcpHandle
+    ///
+    /// Returns an error in TUN transport mode (there is no application netstack to attach to).
+    pub fn register_fallback_tcp_handler<F>(&self, cb: F) -> Result<FallbackTcpHandle, Error>
     where
         F: Fn(SocketAddr, SocketAddr) -> FallbackDecision + Send + Sync + 'static,
     {
         self.runtime
             .register_fallback_tcp_handler(std::sync::Arc::new(cb))
+            .map_err(Into::into)
     }
 
     /// Resolve a tailnet peer (or this node) by MagicDNS name to its tailnet IPv4 address.
@@ -304,7 +333,11 @@ impl Device {
     }
 
     /// Connect to a TCP socket at the remote address.
+    ///
+    /// Returns an error in TUN transport mode (there is no application netstack to dial from).
     pub async fn tcp_connect(&self, remote: SocketAddr) -> Result<netstack::TcpStream, Error> {
+        let channel = self.channel()?;
+
         let ip: IpAddr = match remote.is_ipv4() {
             true => self.ipv4_addr().await?.into(),
             false => self.ipv6_addr().await?.into(),
@@ -313,7 +346,7 @@ impl Device {
         // TODO(npry): collision checking
         let ephemeral_port = rand::random_range(49152..=u16::MAX);
 
-        self.channel
+        channel
             .tcp_connect((ip, ephemeral_port).into(), remote)
             .await
             .map_err(Into::into)
@@ -411,9 +444,14 @@ impl Device {
     /// host socket. IPv6 destinations return [`PingError::Ipv6Unsupported`] (this fork is
     /// IPv4-only on the tailnet). A peer answers from its own OS stack; this netstack does not
     /// auto-reply to echo requests.
+    ///
+    /// In TUN transport mode there is no application netstack to ping from; this surfaces as
+    /// [`PingError::Timeout`] (the same error this method already uses for an unavailable source
+    /// address — `PingError` carries no dedicated "unsupported" variant).
     pub async fn ping(&self, dst: IpAddr, timeout: Duration) -> Result<Duration, PingError> {
+        let channel = self.channel().map_err(|_| PingError::Timeout)?;
         let src = self.ipv4_addr().await.map_err(|_| PingError::Timeout)?;
-        ts_netstack_smoltcp::ping(&self.channel, src, dst, timeout).await
+        ts_netstack_smoltcp::ping(channel, src, dst, timeout).await
     }
 
     /// Obtain a TLS certificate for a node's MagicDNS `name` (like `tsnet`'s `GetCertificate`).

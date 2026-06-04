@@ -164,6 +164,14 @@ pub enum ErrorKind {
 
     /// An operation timed out.
     Timeout,
+
+    /// A netstack-only operation was attempted on a runtime running in TUN transport mode (no
+    /// userspace application netstack exists in that mode).
+    UnsupportedInTunMode,
+
+    /// TUN transport mode was requested but the TUN device could not be created (e.g. missing
+    /// root/CAP_NET_ADMIN), or the runtime was built without the `tun` feature.
+    TunUnavailable,
 }
 
 impl core::fmt::Display for ErrorKind {
@@ -173,6 +181,10 @@ impl core::fmt::Display for ErrorKind {
             Self::ReplyErr => write!(f, "actor replied with an error"),
             Self::MailboxFull => write!(f, "actor's mailbox was full"),
             Self::Timeout => write!(f, "operation timed out"),
+            Self::UnsupportedInTunMode => {
+                write!(f, "netstack operation unsupported in TUN transport mode")
+            }
+            Self::TunUnavailable => write!(f, "TUN transport unavailable"),
         }
     }
 }
