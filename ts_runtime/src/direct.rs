@@ -25,8 +25,8 @@ use kameo::{
     message::{Context, Message},
 };
 use tokio::task::JoinSet;
-use ts_keys::DiscoPublicKey;
-use ts_magicsock::{DirectTransport, MagicSock, SelfEndpoint};
+use ts_keys::{DiscoPublicKey, NodePublicKey};
+use ts_magicsock::{BindingVerifier, DirectTransport, MagicSock, SelfEndpoint};
 use ts_transport::{
     BatchRecvIter, PeerId, PeerLookup, UnderlayTransport, UnderlayTransportExt, UnderlayTransportId,
 };
@@ -130,6 +130,25 @@ impl DirectManager {
 /// lives for the whole runtime and the lookup must outlive any single call.
 struct DiscoPeerLookup(Arc<RwLock<Option<Arc<PeerDb>>>>);
 
+impl DiscoPeerLookup {
+    /// Verify that `disco` is bound to `claimed_node_key` by the current netmap.
+    ///
+    /// Returns `true` only if a peer with this disco key exists in the netmap *and* its
+    /// control-advertised node key equals `claimed_node_key`. A live read of the peer db (it is
+    /// replaced as netmaps arrive), so revocations take effect immediately. The
+    /// [`MagicSock`] binding verifier is this method, closed over the same `peer_db` handle.
+    fn verify_binding(&self, disco: &DiscoPublicKey, claimed_node_key: &NodePublicKey) -> bool {
+        let db = self.0.read().unwrap();
+        let Some(db) = db.as_ref() else {
+            return false;
+        };
+        let Some((_, node)) = db.get(disco) else {
+            return false;
+        };
+        node.node_key == *claimed_node_key
+    }
+}
+
 impl PeerLookup<PeerId, DiscoPublicKey> for DiscoPeerLookup {
     fn lookup_key(&self, id: PeerId) -> Option<DiscoPublicKey> {
         let db = self.0.read().unwrap();
@@ -212,6 +231,13 @@ async fn run_pinger(sock: Arc<MagicSock>, mut shutdown: tokio::sync::watch::Rece
 /// Periodically re-evaluate our own candidate endpoints and publish them on the bus when they
 /// change, so control can be told where peers may reach us directly. Only republishes on a real
 /// change to avoid spamming control with redundant side-band map requests.
+///
+/// Reflexive (STUN-equivalent) endpoints come solely from the disco pong-harvest path on the one
+/// bound socket (peers echo our public `src`); we deliberately do **not** run an active
+/// [`ts_netcheck::StunProber`] for self-endpoint discovery. That prober binds its own sockets
+/// (including an IPv6 `[::]:0` egress that violates the IPv4-only invariant), so its reflexive
+/// mapping would be both a different NAT path and a potential IPv6 leak. Pong-harvest is the
+/// leak-safe, parity-correct source for Tier 1.
 async fn run_advertiser(
     sock: Arc<MagicSock>,
     env: Env,
@@ -336,6 +362,14 @@ impl kameo::Actor for DirectManager {
         // The bind address is a hardcoded, infallible constant; only the parse can't fail.
         let bind_addr: SocketAddr = BIND_ADDR.parse().expect("valid bind address");
 
+        // The disco<->node-key binding verifier: an inbound disco ping must present the node key
+        // control bound to its disco key, or `handle_disco` drops it (fail closed). Closed over a
+        // live handle to `peer_db` so it tracks netmap changes (revocations take effect at once).
+        let verifier_db = peer_db.clone();
+        let binding_verifier: BindingVerifier = Arc::new(move |disco, claimed_node_key| {
+            DiscoPeerLookup(verifier_db.clone()).verify_binding(disco, claimed_node_key)
+        });
+
         // Bind the direct underlay UDP socket. A bind failure is transient/environmental (e.g. no
         // ephemeral ports available); rather than panicking the actor we degrade to **DERP-only**
         // and stay inert. DERP-only is the anti-leak-safe fallback (no direct path is ever offered,
@@ -348,7 +382,7 @@ impl kameo::Actor for DirectManager {
         )
         .await
         {
-            Ok(sock) => Arc::new(sock),
+            Ok(sock) => Arc::new(sock.with_binding_verifier(binding_verifier)),
             Err(e) => {
                 tracing::error!(
                     error = %e,
@@ -382,6 +416,18 @@ impl kameo::Actor for DirectManager {
             env.clone(),
             env.shutdown.clone(),
         ));
+
+        // Hand the bound socket to multiderp so a peer's `CallMeMaybe` relayed to us over DERP is
+        // demuxed into the magicsock (and can open a direct path) instead of being forwarded to the
+        // dataplane as junk. Best-effort: if multiderp has stopped we stay relay-blind for inbound
+        // CallMeMaybe but everything else is unaffected.
+        if let Err(e) = multiderp
+            .tell(multiderp::SetDirectSock { sock: sock.clone() })
+            .await
+        {
+            tracing::warn!(error = %e, "could not install direct socket on multiderp");
+        }
+
         tasks.spawn(run_call_me_maybe(
             sock.clone(),
             peer_db.clone(),

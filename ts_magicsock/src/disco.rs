@@ -118,11 +118,11 @@ pub enum Inbound {
         /// The node key the sender claims for its disco key.
         ///
         /// Disco intends this to be bound to the disco key via the control netmap (i.e. verify
-        /// control really advertised this node key for this disco key). That binding is NOT
-        /// enforced here: this codec/socket layer has no netmap. The magicsock consumer
-        /// (`handle_disco`) does not have the netmap either, so the cross-check is the
-        /// responsibility of the route layer that owns the netmap.
-        /// TODO(parity): enforce the disco<->node-key binding in the netmap-owning layer.
+        /// control really advertised this node key for this disco key). This codec/socket layer
+        /// has no netmap, so the cross-check is performed by the magicsock consumer
+        /// (`handle_disco`) via the optional [`crate::BindingVerifier`] the netmap-owning route
+        /// layer installs: a ping whose `claimed_node_key` is not bound to its disco key is
+        /// dropped fail-closed.
         claimed_node_key: NodePublicKey,
         /// The ping's transaction id, to be echoed in the pong.
         tx_id: TxId,

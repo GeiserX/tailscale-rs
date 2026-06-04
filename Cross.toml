@@ -1,2 +1,23 @@
-# This is mostly a placeholder to indicate that the workspace is meant to build with cross -- any
-# future platform-specific build customizations go here.
+# `cross` configuration (https://github.com/cross-rs/cross).
+#
+# Used by the `musl_static` CI lane to produce a fully static MUSL build of the root `tailscale`
+# crate on a GitHub-hosted x86 runner. `cross` runs the compile inside a docker image that already
+# ships the matching `*-linux-musl-gcc` cross C toolchain, which `ring`'s build script requires to
+# assemble its C/asm sources. We stay on `ring` (not aws-lc-rs); the `ssh` feature is intentionally
+# OFF so `russh`/`aws-lc-rs` never enter the graph.
+#
+# The `TS_RS_EXPERIMENT` env var must be forwarded into the container so the build is permitted.
+[build.env]
+passthrough = [
+    "TS_RS_EXPERIMENT",
+    "CARGO_TERM_COLOR",
+    "CARGO_TERM_VERBOSE",
+    "RUST_BACKTRACE",
+]
+
+[target.aarch64-unknown-linux-musl]
+# Default cross image already bundles `aarch64-linux-musl-gcc`; pin nothing extra here so we inherit
+# upstream maintenance. Listed explicitly to document the supported (primary) target.
+
+[target.x86_64-unknown-linux-musl]
+# Nice-to-have secondary target; default cross image bundles `x86_64-linux-musl-gcc`.

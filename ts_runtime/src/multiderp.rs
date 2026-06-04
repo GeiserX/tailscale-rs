@@ -16,6 +16,7 @@ use tokio::{
 use ts_control::DerpRegion;
 use ts_derp::RegionId;
 use ts_keys::{NodeKeyPair, NodePublicKey};
+use ts_magicsock::MagicSock;
 use ts_transport::{
     BatchRecvIter, PeerId, UnderlayTransport, UnderlayTransportExt, UnderlayTransportId,
 };
@@ -43,6 +44,16 @@ pub struct Multiderp {
     regions: HashMap<RegionId, DerpRegion>,
     current_home_derp: Option<RegionId>,
     peer_db: Arc<RwLock<Option<Arc<PeerDb>>>>,
+    /// The direct underlay socket, installed by [`crate::direct::DirectManager`] once it binds.
+    ///
+    /// A live handle (shared `RwLock`) so a disco frame (e.g. a `CallMeMaybe`) relayed to us over
+    /// DERP can be demuxed and routed into the magicsock — letting it learn a peer's candidate
+    /// endpoints and open a direct path even when the peer can only reach us over the relay. `None`
+    /// until the direct manager binds (or permanently if its bind failed, in which case relayed
+    /// disco frames are simply forwarded to the dataplane as before — they decode as junk there
+    /// and are dropped). Region tasks read it live, so regions spawned before the sock is set pick
+    /// it up once available.
+    direct_sock: Arc<RwLock<Option<Arc<MagicSock>>>>,
     tasks: JoinSet<()>,
 }
 
@@ -88,6 +99,7 @@ impl Multiderp {
         let (disco_tx, mut disco_rx) = mpsc::channel::<(NodePublicKey, Vec<u8>)>(8);
 
         let peer_db = self.peer_db.clone();
+        let direct_sock = self.direct_sock.clone();
 
         self.tasks.spawn(async move {
             while !*shutdown.borrow() {
@@ -104,6 +116,7 @@ impl Multiderp {
                         &mut home_derp_rx,
                         &mut disco_rx,
                         &peer_db,
+                        &direct_sock,
                     ) => if let Err(e) = ret {
                         tracing::error!(error = %e, region_id = %id, "running derp client");
                         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -138,6 +151,16 @@ impl Multiderp {
     #[message]
     pub fn transport_id_for_region(&self, id: RegionId) -> Option<UnderlayTransportId> {
         Some(self.derps.get(&id)?.transport_id)
+    }
+
+    /// Install the direct underlay socket so disco frames (e.g. a `CallMeMaybe`) relayed to us
+    /// over DERP can be demuxed into the magicsock (see [`Multiderp::direct_sock`]).
+    ///
+    /// Sent once by [`crate::direct::DirectManager`] after it binds. Region tasks read the handle
+    /// live, so this takes effect on regions already running as well as ones spawned later.
+    #[message]
+    pub fn set_direct_sock(&mut self, sock: Arc<MagicSock>) {
+        *self.direct_sock.write().unwrap() = Some(sock);
     }
 
     /// Relay a raw sealed disco frame (e.g. a CallMeMaybe) to `peer` through DERP region `region`.
@@ -199,6 +222,7 @@ async fn run_derp_once(
     home_derp_rx: &mut watch::Receiver<bool>,
     disco_rx: &mut mpsc::Receiver<(NodePublicKey, Vec<u8>)>,
     peer_db: &RwLock<Option<Arc<PeerDb>>>,
+    direct_sock: &RwLock<Option<Arc<MagicSock>>>,
 ) -> Result<(), ts_derp::Error> {
     const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -258,19 +282,32 @@ async fn run_derp_once(
                 from_derp = transport.recv() => {
                     last_activity = Instant::now();
 
-                    // TODO(npts-C2): inbound disco-over-DERP demux. A peer's CallMeMaybe (or any
-                    // disco frame) relayed to us arrives here and is forwarded to the dataplane as
-                    // if it were WireGuard data. Until we demux disco on this path, hole punching
-                    // relies on the peer pinging our direct socket (where `handle_disco` answers).
-                    // This is sufficient for the common NAT case; symmetric-NAT-both-sides still
-                    // stays on DERP until this seam exists.
+                    // Inbound disco-over-DERP demux (npts-C2). A peer that can only reach us over
+                    // the relay (e.g. symmetric NAT on both sides) sends its CallMeMaybe over DERP;
+                    // it arrives here interleaved with WireGuard data. Route disco frames into the
+                    // magicsock so it can learn the peer's candidate endpoints and open a direct
+                    // path; everything else goes to the dataplane unchanged.
+                    //
+                    // Anti-leak: only CallMeMaybe is acted on (see
+                    // `MagicSock::handle_relayed_call_me_maybe`). A relayed frame has no real UDP
+                    // source, so we must never feed a relayed Ping/Pong into a path that would pong
+                    // to a bogus address — that entry point drops them. If the direct socket isn't
+                    // bound yet (or its bind failed), disco frames fall through to the dataplane as
+                    // before, where they decode as junk and are dropped. That startup window
+                    // self-heals: the peer re-sends CallMeMaybe on its own advertise cadence, so a
+                    // dropped frame here is recovered on the next round, not a lost hole-punch.
+                    let sock = direct_sock.read().unwrap().clone();
                     for ret in from_derp.batch_iter() {
                         let (peer_id, pkts) = ret?;
-                        let pkts = pkts.into_iter().collect::<Vec<_>>();
 
-                        tracing::trace!(parent: &span, %peer_id, len = pkts.len(), "packet from derp server");
+                        let data = demux_relayed_disco(pkts, sock.as_deref());
+                        if data.is_empty() {
+                            continue;
+                        }
 
-                        let Ok(()) = to_dataplane.send((peer_id, pkts)) else {
+                        tracing::trace!(parent: &span, %peer_id, len = data.len(), "packet from derp server");
+
+                        let Ok(()) = to_dataplane.send((peer_id, data)) else {
                             tracing::error!(parent: &span, "underlay receive channel closed");
                             break;
                         };
@@ -317,6 +354,37 @@ async fn run_derp_once(
     }
 }
 
+/// Demux a batch of frames received from a DERP server, routing relayed disco frames into the
+/// direct socket and returning the remaining (WireGuard data) frames to forward to the dataplane.
+///
+/// A peer reachable only over the relay (e.g. symmetric NAT on both ends) sends its `CallMeMaybe`
+/// over DERP; it is interleaved with WireGuard data on this path. Each frame that
+/// [`ts_magicsock::looks_like_disco`] and is consumed by
+/// [`MagicSock::handle_relayed_call_me_maybe`] is dropped from the data stream (the magicsock
+/// learns the peer's candidate endpoints from it). Everything else — and *all* frames when no
+/// direct socket is installed — is returned unchanged for the dataplane.
+///
+/// Anti-leak: a relayed frame has no real UDP source, so only `CallMeMaybe` is acted on; relayed
+/// Pings/Pongs are dropped by `handle_relayed_call_me_maybe` rather than producing a pong to a
+/// bogus address.
+fn demux_relayed_disco(
+    pkts: impl IntoIterator<Item = ts_packet::PacketMut>,
+    sock: Option<&MagicSock>,
+) -> Vec<ts_packet::PacketMut> {
+    let mut data = Vec::new();
+    for mut pkt in pkts {
+        if ts_magicsock::looks_like_disco(pkt.as_ref())
+            && let Some(sock) = sock
+            && sock.handle_relayed_call_me_maybe(pkt.as_mut())
+        {
+            // Consumed as a relayed disco frame; keep it off the dataplane.
+            continue;
+        }
+        data.push(pkt);
+    }
+    data
+}
+
 async fn option_timeout(duration: Option<Instant>) {
     match duration {
         Some(dur) => tokio::time::sleep_until(dur.into()).await,
@@ -340,6 +408,7 @@ impl kameo::Actor for Multiderp {
             env,
             dataplane,
             peer_db: Default::default(),
+            direct_sock: Default::default(),
             derps: Default::default(),
             regions: Default::default(),
             tasks: JoinSet::new(),
@@ -419,5 +488,83 @@ impl Message<DerpLatencyMeasurement> for Multiderp {
                 "new home derp region selected"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ts_keys::DiscoPrivateKey;
+    use ts_packet::PacketMut;
+
+    use super::*;
+
+    fn localhost() -> std::net::SocketAddr {
+        "127.0.0.1:0".parse().unwrap()
+    }
+
+    /// A `CallMeMaybe` relayed to us over DERP is routed into the magicsock (its endpoints are
+    /// learned via `add_peer_endpoints`) and is *not* returned for the dataplane, while an
+    /// interleaved WireGuard data frame still reaches the dataplane unchanged. This is the
+    /// npts-C2 inbound disco-over-DERP demux.
+    #[tokio::test]
+    async fn relayed_call_me_maybe_is_demuxed_not_forwarded() {
+        // Our direct socket; the relayed CallMeMaybe is sealed *to* its disco key.
+        let our_disco = DiscoPrivateKey::random();
+        let our_node = ts_keys::NodePrivateKey::random().public_key();
+        let sock = MagicSock::bind(localhost(), our_disco, our_node)
+            .await
+            .unwrap();
+
+        // A remote peer's CallMeMaybe carrying a public (pingable) candidate endpoint.
+        let peer_disco = DiscoPrivateKey::random();
+        let peer_ep: std::net::SocketAddr = "203.0.113.7:41641".parse().unwrap();
+        let cmm =
+            ts_magicsock::seal_call_me_maybe(&peer_disco, &our_disco.public_key(), &[peer_ep])
+                .unwrap();
+
+        // A normal WireGuard data frame (type byte 0x04, never the disco magic prefix).
+        let wg = PacketMut::from(&[0x04u8, 0, 0, 0, 1, 2, 3, 4][..]);
+
+        let batch = vec![PacketMut::from(&cmm[..]), wg];
+        let to_dataplane = demux_relayed_disco(batch, Some(&sock));
+
+        // The CallMeMaybe was consumed; only the data frame is forwarded.
+        assert_eq!(
+            to_dataplane.len(),
+            1,
+            "only the data frame reaches the dataplane"
+        );
+        assert_eq!(to_dataplane[0].as_ref(), &[0x04u8, 0, 0, 0, 1, 2, 3, 4]);
+
+        // The peer's candidate endpoint was learned by the magicsock.
+        assert_eq!(
+            sock.candidate_addrs(&peer_disco.public_key()),
+            vec![peer_ep],
+            "the relayed CallMeMaybe's endpoint should be learned"
+        );
+    }
+
+    /// With no direct socket installed (bind failed, or before the direct manager binds), every
+    /// frame — disco or not — is forwarded to the dataplane unchanged (the prior behavior).
+    #[tokio::test]
+    async fn without_direct_sock_all_frames_forwarded() {
+        let our_disco = DiscoPrivateKey::random();
+        let peer_disco = DiscoPrivateKey::random();
+        let cmm = ts_magicsock::seal_call_me_maybe(
+            &peer_disco,
+            &our_disco.public_key(),
+            &["203.0.113.7:41641".parse().unwrap()],
+        )
+        .unwrap();
+        let wg = PacketMut::from(&[0x04u8, 9, 9][..]);
+
+        let batch = vec![PacketMut::from(&cmm[..]), wg];
+        let out = demux_relayed_disco(batch, None);
+
+        assert_eq!(
+            out.len(),
+            2,
+            "no demux without a direct socket; all frames pass through"
+        );
     }
 }
