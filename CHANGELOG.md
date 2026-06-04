@@ -6,6 +6,30 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.8](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.8) - 2026-06-04
+
+`tsnet.Server.RegisterFallbackTCPHandler` parity: an embedder can now register a callback consulted
+for every **inbound TCP flow that matches no explicit `Device::tcp_listen` listener**, mirroring Go
+`tsnet`'s fallback-handler contract.
+
+- Feat: `Device::register_fallback_tcp_handler(cb)` returns a `#[must_use]` `FallbackTcpHandle` that
+  deregisters on drop (mirrors the `unregister func()` Go returns). The callback receives the
+  `(src, dst)` `SocketAddr` pair and returns a `FallbackDecision` — `(None, false)` declines (the
+  next handler is tried), `(Some(handler), true)` claims the flow, and `(None, true)` claims and
+  rejects it. Multiple handlers dispatch in registration order; the first to intercept wins.
+- Feat: read-only `BoundPorts` query on the netstack listener registry
+  (`CreateSocket::bound_tcp_ports`) so the fallback manager never binds a competing any-IP listener
+  on a port the embedder already serves with an explicit `tcp_listen`.
+- How it works: a raw `(Ipv4, Tcp)` observer socket suppresses smoltcp's unmatched-SYN RST and
+  reveals each SYN's destination port; the manager lazily materializes a per-port any-IP listener
+  and dispatches accepted flows to the registered handlers. The observer runs **only while at least
+  one handler is registered** — started on the first registration, torn down on the last
+  deregistration — so the netstack's default **fail-closed RST** behavior stays pristine when no
+  handler is installed.
+- Anti-leak / DoS bounds: flows no handler claims are **closed (fail-closed), never direct-dialed**;
+  the observer never creates a host socket. Per-port listeners are capped (`MAX_PORTS = 1024`),
+  idle-reaped (120 s), and per-port in-flight flows are bounded (`MAX_INFLIGHT = 512`). IPv4-only.
+
 ## [0.5.7](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.7) - 2026-06-04
 
 Documentation correction (no code change): the TLS-certificate seam (`ts_control::cert`) described

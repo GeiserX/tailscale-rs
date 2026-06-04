@@ -236,6 +236,17 @@ impl Netstack {
 
                 Response::Ok
             }
+            TcpListenCommand::BoundPorts => {
+                // Read-only: snapshot the local ports of every explicit listener. Never touches
+                // the packet ingress / accept path, so it can't perturb the RST behavior the
+                // fallback-handler manager relies on.
+                let ports = self
+                    .tcp_listeners
+                    .values()
+                    .map(|l| l.local_endpoint.port())
+                    .collect();
+                TcpListenResponse::BoundPorts { ports }.into()
+            }
         }
     }
 

@@ -3,6 +3,7 @@
 extern crate ts_netstack_smoltcp as netstack;
 
 use core::time::Duration;
+use std::sync::Arc;
 
 use kameo::{
     actor::{ActorRef, Spawn, WeakActorRef},
@@ -23,6 +24,8 @@ mod derp_latency;
 mod direct;
 mod env;
 mod error;
+/// Fallback TCP handler registry (`tsnet.Server.RegisterFallbackTCPHandler` parity).
+pub mod fallback_tcp;
 mod forwarder_actor;
 mod magic_dns;
 mod multiderp;
@@ -48,6 +51,8 @@ pub struct Runtime {
     netstack: WeakActorRef<NetstackActor>,
     /// Reference to the peer tracker for peer lookups.
     pub peer_tracker: WeakActorRef<PeerTracker>,
+    /// Fallback TCP handler registry, bound to the application netstack.
+    fallback_tcp: fallback_tcp::FallbackTcpManager,
     env: Env,
     shutdown: watch::Sender<bool>,
 }
@@ -121,6 +126,10 @@ impl Runtime {
         // MagicDNS responder on it. Fire-and-forget: like src_filter/route_updater, it's owned by
         // the message bus and isn't stored on `Runtime`.
         let (channel,) = netstack.ask(netstack_actor::GetChannel).await?;
+        // The fallback-TCP registry attaches to the application netstack — the same one that
+        // carries the embedder's explicit `Device::tcp_listen` sockets — so a fallback handler
+        // sees exactly the inbound flows no explicit listener matched.
+        let fallback_tcp = fallback_tcp::FallbackTcpManager::new(channel.clone());
         magic_dns::MagicDnsActor::spawn((env.clone(), channel));
 
         let control = ControlRunner::spawn(control_runner::Params {
@@ -133,10 +142,27 @@ impl Runtime {
             control,
             dataplane,
             peer_tracker,
+            fallback_tcp,
             netstack: netstack.downgrade(),
             env,
             shutdown: shutdown_tx,
         })
+    }
+
+    /// Register a fallback TCP handler consulted for every inbound TCP flow that matches no
+    /// explicit listener (`tsnet.Server.RegisterFallbackTCPHandler` parity).
+    ///
+    /// The returned [`fallback_tcp::FallbackTcpHandle`] deregisters the handler when dropped. See
+    /// [`fallback_tcp`] for the dispatch contract and anti-leak guarantees.
+    pub fn register_fallback_tcp_handler(
+        &self,
+        cb: Arc<
+            dyn Fn(core::net::SocketAddr, core::net::SocketAddr) -> fallback_tcp::FallbackDecision
+                + Send
+                + Sync,
+        >,
+    ) -> fallback_tcp::FallbackTcpHandle {
+        self.fallback_tcp.register(cb)
     }
 
     /// Get a channel to send commands to the netstack.

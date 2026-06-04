@@ -30,6 +30,16 @@ pub enum Command {
         /// The handle of hte listener to close.
         handle: ListenerHandle,
     },
+
+    /// Query the set of local ports that currently have an explicit listener.
+    ///
+    /// Read-only: answered purely from the listener registry without touching the packet
+    /// ingress / accept path. Used by the fallback-TCP-handler manager to learn which ports are
+    /// already owned by an explicit `Listen`er, so it never binds a competing any-IP listener on
+    /// a port the embedder is already serving.
+    ///
+    /// Response: [`Response::BoundPorts`].
+    BoundPorts,
 }
 
 impl From<Command> for command::Command {
@@ -57,6 +67,14 @@ pub enum Response {
         local: SocketAddr,
         /// Handle of the new TCP connection.
         handle: SocketHandle,
+    },
+    /// The set of local ports that currently have an explicit listener.
+    ///
+    /// Answers [`Command::BoundPorts`]. Read-only snapshot of the listener registry.
+    BoundPorts {
+        /// Local ports with an active explicit listener (may contain duplicates if multiple
+        /// listeners share a port; callers that need a set should dedup).
+        ports: alloc::vec::Vec<u16>,
     },
 }
 

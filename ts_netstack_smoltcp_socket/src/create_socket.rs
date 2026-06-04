@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use core::net::SocketAddr;
 
 use netcore::{Command, HasChannel, raw, smoltcp::wire, tcp, udp};
@@ -24,6 +25,16 @@ pub trait CreateSocket {
         &self,
         local_endpoint: SocketAddr,
     ) -> impl Future<Output = Result<TcpListener, netcore::Error>> + Send;
+
+    /// Snapshot the set of local ports that currently have an explicit TCP listener.
+    ///
+    /// Read-only: answered from the listener registry without touching the packet ingress /
+    /// accept path. The fallback-TCP-handler manager uses this to avoid binding a competing
+    /// any-IP listener on a port the embedder is already serving with an explicit `tcp_listen`.
+    fn bound_tcp_ports_blocking(&self) -> Result<Vec<u16>, netcore::Error>;
+    /// Asynchronously snapshot the set of local ports that currently have an explicit TCP
+    /// listener. See [`CreateSocket::bound_tcp_ports_blocking`].
+    fn bound_tcp_ports(&self) -> impl Future<Output = Result<Vec<u16>, netcore::Error>> + Send;
 
     /// Create a new [`TcpStream`] bound to the given `local` address and connected to
     /// the given `remote`.
@@ -117,6 +128,22 @@ where
             handle,
             endpoint: local_endpoint,
         })
+    }
+
+    fn bound_tcp_ports_blocking(&self) -> Result<Vec<u16>, netcore::Error> {
+        let resp = self.request_blocking(None, tcp::listen::Command::BoundPorts)?;
+
+        netcore::try_response_as!(resp, tcp::listen::Response::BoundPorts { ports });
+
+        Ok(ports)
+    }
+
+    async fn bound_tcp_ports(&self) -> Result<Vec<u16>, netcore::Error> {
+        let resp = self.request(None, tcp::listen::Command::BoundPorts).await?;
+
+        netcore::try_response_as!(resp, tcp::listen::Response::BoundPorts { ports });
+
+        Ok(ports)
     }
 
     fn tcp_connect_blocking(

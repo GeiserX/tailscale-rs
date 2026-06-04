@@ -149,6 +149,10 @@ pub use ts_control::{ExitProxyConfig, ExitProxyScheme};
 pub use ts_netstack_smoltcp::PingError;
 use ts_netstack_smoltcp::{CreateSocket, netcore::Channel};
 #[doc(inline)]
+pub use ts_runtime::fallback_tcp::{
+    FallbackConnFuture, FallbackConnHandler, FallbackDecision, FallbackTcpHandle,
+};
+#[doc(inline)]
 pub use ts_runtime::{Status, StatusNode, WhoIs};
 
 #[cfg(feature = "axum")]
@@ -232,6 +236,28 @@ impl Device {
             .tcp_listen(socket_addr)
             .await
             .map_err(Into::into)
+    }
+
+    /// Register a fallback TCP handler (like `tsnet`'s `RegisterFallbackTCPHandler`).
+    ///
+    /// The callback is consulted for every inbound TCP flow that matches **no** explicit
+    /// [`Device::tcp_listen`] listener, with the flow's `(src, dst)` addresses. It returns
+    /// `(handler, intercept)`:
+    /// - `(_, false)` — decline; the next registered callback is tried.
+    /// - `(Some(h), true)` — claim the flow; `h` is handed the accepted [`netstack::TcpStream`].
+    /// - `(None, true)` — claim and reject the flow (the connection is closed).
+    ///
+    /// Multiple handlers may be registered; they are consulted in registration order and the first
+    /// to intercept wins. The returned [`FallbackTcpHandle`] deregisters the handler when dropped.
+    ///
+    /// Handlers serve flows over the overlay netstack only — never a host socket — and a flow no
+    /// handler claims is closed (fail-closed), never direct-dialed.
+    pub fn register_fallback_tcp_handler<F>(&self, cb: F) -> FallbackTcpHandle
+    where
+        F: Fn(SocketAddr, SocketAddr) -> FallbackDecision + Send + Sync + 'static,
+    {
+        self.runtime
+            .register_fallback_tcp_handler(std::sync::Arc::new(cb))
     }
 
     /// Resolve a tailnet peer (or this node) by MagicDNS name to its tailnet IPv4 address.
