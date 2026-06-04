@@ -6,6 +6,21 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.6](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.6) - 2026-06-04
+
+Documentation hygiene (no code change): the README's "Unsupported" list contradicted its own
+"Implemented" section and the actual code.
+
+- Docs: removed **Split DNS** and **upstream/recursive DNS forwarding** from the README's
+  "Unsupported features" list — both are implemented and wired end-to-end (`ts_control::dns`
+  longest-suffix `routes` + `fallback_resolvers`/`resolvers` recursive forwarding, decided in
+  `ts_runtime::magic_dns`). The stale entry claimed "non-tailnet queries are not forwarded ...
+  fail-closed by design", directly contradicting the "Implemented" MagicDNS entry, which correctly
+  states that configuring `fallback_resolvers` opts in to forwarding. Added an explicit Split-DNS
+  bullet to the "Implemented" list (longest-suffix route match; empty route list = negative route =
+  NXDOMAIN; recursive forwarding applies only when no route matches). Fail-closed remains the
+  default (NXDOMAIN, never forwarded) when no route and no resolver is configured.
+
 ## [0.5.5](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.5) - 2026-06-04
 
 Review-driven test hardening of the v0.5.4 STUN cleanup (no behavior change; tests and one

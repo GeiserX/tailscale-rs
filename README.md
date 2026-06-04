@@ -132,6 +132,10 @@ These are features that we currently implement:
     `fallback_resolvers` configured, non-tailnet names get NXDOMAIN and are never forwarded
     upstream. Configuring `fallback_resolvers` opts in to forwarding non-tailnet query names to
     those upstream resolvers.)
+  - Split DNS (per-domain `routes` from control: a query matching a route's suffix is forwarded to
+    that route's resolvers by longest-suffix match; a route with an empty resolver list is a
+    negative route answering NXDOMAIN. Recursive forwarding to `fallback_resolvers`/`resolvers`
+    applies only when no route matches.)
   - Using a subnet router (accepting peer-advertised subnet routes via `accept_routes`; opt-in,
     fail-closed off by default)
   - Using an exit node (routing internet-bound traffic through a chosen peer via `exit_node`,
@@ -165,10 +169,7 @@ Unsupported features
   - Peer relays
   - Exit Nodes (being one — advertising a default route; *using* one is supported)
   - Exit node DNS (`ExitNodeDNSResolvers` — routing DNS through the exit node)
-  - Upstream/recursive DNS forwarding (MagicDNS answers tailnet names only; non-tailnet queries
-    are not forwarded to public/configured resolvers — fail-closed by design)
   - Private DERP relays
-  - Split DNS (per-domain routing to configured resolvers)
   - Subnet Routers (being one — advertising routes; *using* one is supported)
 - Platforms
   - AIX
