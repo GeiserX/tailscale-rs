@@ -28,8 +28,8 @@ pub struct Config {
     /// 256 KiB per direction (~512 KiB per socket); lower it only on memory-constrained deployments
     /// with many concurrent sockets.
     ///
-    /// **Memory at scale (exit-node / subnet-router operators).** Buffers are allocated *eagerly*
-    /// per socket, so concurrent-flow count multiplies this directly: at the 256 KiB default a
+    /// **Memory at scale (exit-node / subnet-router operators).** Because the per-socket buffers
+    /// above are eager, concurrent-flow count multiplies them directly: at the 256 KiB default a
     /// host holding 1,000 simultaneous forwarded TCP flows pins ~512 MB just in TCP buffers, which
     /// is a real fraction of a 4 GB exit node. This matters most on the *forwarder* netstack (it
     /// fans out one socket per forwarded exit/subnet flow); the application netstack only carries

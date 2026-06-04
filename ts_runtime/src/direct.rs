@@ -311,7 +311,7 @@ async fn run_stun_prober(
 /// aborting the sweep. Factored out of [`run_stun_prober`]'s interval loop so the per-tick fan-out
 /// (including the empty-list no-op when the derp map lists no FixedAddr-v4 STUN servers) is
 /// unit-testable without the actor/interval machinery.
-async fn probe_stun_servers_once(sock: &Arc<MagicSock>, servers: &[SocketAddr]) {
+async fn probe_stun_servers_once(sock: &MagicSock, servers: &[SocketAddr]) {
     for &s in servers {
         if let Err(e) = sock.send_stun_request(s).await {
             tracing::trace!(error = %e, server = %s, "sending stun binding request");

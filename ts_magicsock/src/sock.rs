@@ -1798,4 +1798,108 @@ mod tests {
             );
         }
     }
+
+    /// A datagram whose 12-byte transaction id matches an in-flight request but whose body is
+    /// otherwise hostile — wrong message type, wrong magic cookie, or a lying XOR-MAPPED-ADDRESS
+    /// attribute length — must be *consumed* (we did send that txid, so it stops here) yet learn no
+    /// reflexive address. Pins the receive-path contract: matching is txid-only, but a matched
+    /// frame that fails to parse can never inject a forged endpoint.
+    #[tokio::test]
+    async fn stun_malformed_response_to_known_txid_learns_nothing() {
+        let s = MagicSock::bind(
+            localhost(),
+            DiscoPrivateKey::random(),
+            ts_keys::NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap();
+
+        let tx: crate::stun::StunTxId = [7u8; 12];
+        let server: SocketAddr = "203.0.113.1:3478".parse().unwrap();
+
+        // A 20-byte header carrying the in-flight txid, parameterized by message type and cookie.
+        let header = |msg_type: u16, cookie: u32| {
+            let mut b = Vec::new();
+            b.extend_from_slice(&msg_type.to_be_bytes());
+            b.extend_from_slice(&0u16.to_be_bytes()); // attrs length 0
+            b.extend_from_slice(&cookie.to_be_bytes());
+            b.extend_from_slice(&tx);
+            b
+        };
+
+        // A success header that *claims* 12 attribute bytes but provides only the 4-byte attribute
+        // header (value length 8 with no value): the bounds-checked TLV walk fails closed.
+        let lying_attr_len = {
+            let mut b = Vec::new();
+            b.extend_from_slice(&crate::stun::BINDING_SUCCESS.to_be_bytes());
+            b.extend_from_slice(&12u16.to_be_bytes());
+            b.extend_from_slice(&crate::stun::MAGIC_COOKIE.to_be_bytes());
+            b.extend_from_slice(&tx);
+            b.extend_from_slice(&0x0020u16.to_be_bytes()); // XOR-MAPPED-ADDRESS
+            b.extend_from_slice(&8u16.to_be_bytes()); // declares 8 value bytes, supplies none
+            b
+        };
+
+        let variants: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "wrong message type",
+                header(crate::stun::BINDING_REQUEST, crate::stun::MAGIC_COOKIE),
+            ),
+            (
+                "wrong magic cookie",
+                header(crate::stun::BINDING_SUCCESS, 0xDEAD_BEEF),
+            ),
+            ("lying attribute length", lying_attr_len),
+        ];
+
+        for (label, buf) in &variants {
+            s.stun_in_flight.lock().unwrap().insert(tx, Instant::now());
+            assert!(
+                s.handle_stun_response(server, buf),
+                "{label}: a matched-txid response is consumed even when malformed"
+            );
+            assert!(
+                s.reflexive.lock().unwrap().is_empty(),
+                "{label}: a malformed STUN response must learn no reflexive address"
+            );
+            assert!(
+                s.stun_in_flight.lock().unwrap().is_empty(),
+                "{label}: the matched transaction must be removed (single-use)"
+            );
+        }
+    }
+
+    /// The transaction id is the *sole* anti-spoof match: a valid Binding Success for an in-flight
+    /// txid must be accepted even when its UDP source address differs from the server we probed —
+    /// legitimate under NAT/hairpin. Pins the v0.5.4 contract that the server address is
+    /// deliberately neither stored nor matched.
+    #[tokio::test]
+    async fn stun_known_txid_from_different_source_is_consumed() {
+        let s = MagicSock::bind(
+            localhost(),
+            DiscoPrivateKey::random(),
+            ts_keys::NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap();
+
+        let tx: crate::stun::StunTxId = [3u8; 12];
+        s.stun_in_flight.lock().unwrap().insert(tx, Instant::now());
+
+        // The reply arrives from a different source than the server we (notionally) probed.
+        let other_source: SocketAddr = "198.51.100.250:3478".parse().unwrap();
+        let mapped = SocketAddrV4::new(core::net::Ipv4Addr::new(192, 0, 2, 33), 51820);
+        let buf = stun_success_v4(tx, mapped);
+
+        assert!(
+            s.handle_stun_response(other_source, &buf),
+            "a matched-txid response from a different source must still be consumed"
+        );
+        let reflexive: Vec<SocketAddr> = s.reflexive.lock().unwrap().iter().copied().collect();
+        assert_eq!(
+            reflexive,
+            vec![SocketAddr::V4(mapped)],
+            "the reflexive address must be learned regardless of the response's source address"
+        );
+    }
 }

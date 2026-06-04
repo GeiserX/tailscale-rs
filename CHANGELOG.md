@@ -6,6 +6,23 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.5](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.5) - 2026-06-04
+
+Review-driven test hardening of the v0.5.4 STUN cleanup (no behavior change; tests and one
+signature/doc tidy).
+
+- Tests: close the two coverage gaps a review found in the active-STUN receive path. A
+  matched-transaction-id Binding Success whose body is hostile — wrong message type, wrong magic
+  cookie, or a lying XOR-MAPPED-ADDRESS attribute length — is now asserted to be consumed (we did
+  send that txid) yet learn no reflexive address, pinning that a matched-but-malformed frame can
+  never inject a forged endpoint. A second test pins the v0.5.4 contract that the 96-bit
+  transaction id is the *sole* anti-spoof match: a valid Binding Success for an in-flight txid is
+  accepted even when its UDP source differs from the probed server (legitimate under NAT/hairpin),
+  proving the server address is deliberately neither stored nor matched.
+- Cleanup: `probe_stun_servers_once` now takes `&MagicSock` instead of `&Arc<MagicSock>` (the Arc
+  was never cloned), and a redundant opening clause in the `tcp_buffer_size` memory-at-scale doc
+  was tightened.
+
 ## [0.5.4](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.4) - 2026-06-04
 
 Review-driven hardening of the v0.5.3 active-STUN + `tcp_buffer_size` work (no behavior change to
