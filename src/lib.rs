@@ -708,10 +708,12 @@ impl Device {
     /// with Tailscale's `ts-dissector.lua` the direction/path of each packet decodes.
     ///
     /// The hook runs **inline on the single-threaded dataplane step**, so `writer` must not block for
-    /// long — a slow writer back-pressures the datapath. A write error is swallowed per-packet (the
-    /// capture silently drops that record) rather than tearing down the datapath; call
-    /// [`Device::stop_capture`] to end it. Returns an error only if the dataplane actor is unreachable
-    /// or the initial global-header write fails.
+    /// long — a slow writer back-pressures the datapath. Records are **not** flushed per packet (that
+    /// would be a syscall on every packet on the dataplane thread); buffered bytes are flushed when
+    /// the writer is dropped on [`Device::stop_capture`]. Wrap `writer` in a [`std::io::BufWriter`] if
+    /// you want buffering. A write error is swallowed per-packet (the capture silently drops that
+    /// record) rather than tearing down the datapath; call [`Device::stop_capture`] to end it. Returns
+    /// an error only if the dataplane actor is unreachable or the initial global-header write fails.
     pub async fn capture_pcap<W>(&self, writer: W) -> Result<(), Error>
     where
         W: std::io::Write + Send + 'static,

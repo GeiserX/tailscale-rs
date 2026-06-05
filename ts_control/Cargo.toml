@@ -49,7 +49,7 @@ zerocopy.workspace = true
 
 # Required dependencies for the async_tokio feature.
 futures-util = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["fs"] }
 tokio-stream = { version = "0.1", optional = true, default-features = false, features = ["sync"] }
 
 [dev-dependencies]

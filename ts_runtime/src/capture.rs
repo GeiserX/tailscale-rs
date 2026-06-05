@@ -28,6 +28,11 @@ pub const LINKTYPE_USER0: u32 = 147;
 /// A pcap stream framer that writes captured packets to a writer in Go-Tailscale-faithful classic
 /// pcap (USER0 link type + a 4-byte path preamble per record). Construct with [`PcapSink::new`]
 /// (which emits the global header), then call [`PcapSink::log_packet`] per packet.
+///
+/// Records are **not** flushed per packet (that would be a syscall on every packet on the single
+/// dataplane thread). For buffering, wrap `writer` in a [`std::io::BufWriter`]; buffered records are
+/// flushed when the writer is dropped (on capture stop), or call [`PcapSink::flush`] periodically if
+/// a reader needs to tail the stream promptly.
 pub struct PcapSink<W> {
     writer: W,
 }
@@ -71,12 +76,19 @@ impl<W: std::io::Write> PcapSink<W> {
         // Raw IP packet bytes.
         self.writer.write_all(pkt)?;
 
-        // Flush each record so a reader tailing the stream (e.g. `tcpdump -r` on a growing file, or a
-        // live pipe) sees packets promptly, and so a buffered writer needs no final explicit flush on
-        // capture stop. Mirrors Go's periodic capture flush; for a debug tool the per-record cost is
-        // immaterial.
-        self.writer.flush()?;
+        // No per-record flush: flushing on every packet is a syscall per packet on the single
+        // dataplane thread, which collapses throughput under capture. Buffered records are flushed
+        // when the writer is dropped on capture stop (see [`PcapSink::flush`] for an explicit
+        // periodic/tailing flush, and wrap `writer` in a `std::io::BufWriter` if you want buffering).
         Ok(())
+    }
+
+    /// Flush the underlying writer. Optional: callers that need a reader tailing the stream (e.g.
+    /// `tcpdump -r` on a growing file, or a live pipe) to see packets promptly can call this
+    /// periodically — it is *not* called per record, so the hot path stays syscall-free. Buffered
+    /// records are otherwise flushed when the writer is dropped on capture stop.
+    pub fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
     }
 
     /// Consume the sink and return the inner writer (test helper for byte assertions).

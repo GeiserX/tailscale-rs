@@ -6,6 +6,30 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.33](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.33) - 2026-06-06
+
+Hardening + coverage from a multi-reviewer audit of the v0.5.27–v0.5.32 safe-bucket features. No
+happy-path behavior change.
+
+- **Capture hot-path fix** (`ts_runtime::capture`): `PcapSink` no longer flushes per record — a
+  per-packet `flush()` syscall on the single dataplane thread collapsed throughput under capture.
+  Buffered records now flush when the writer is dropped (on `stop_capture`); a new
+  `PcapSink::flush()` lets a caller flush periodically for live tailing. The doc comment, which
+  wrongly claimed "periodic flush", is corrected. Byte-layout unchanged.
+- **WIF blocking I/O fix** (`ts_control::wif`): the AWS web-identity token read now uses
+  `tokio::fs::read_to_string` instead of the blocking `std::fs` call inside the async resolver.
+- **Loopback connection cap** (`Device::loopback`): the SOCKS5 accept loop now bounds concurrent
+  connections with a semaphore (256), so a local client cannot open unbounded overlay sockets
+  (each pins ~512 KiB of netstack buffers); the accept loop back-pressures at the cap.
+- **Regression tests added**: `RegisterRequest.OldNodeKey` wire (de)serialization (present-when-set,
+  omitted-when-`None`); the dataplane capture tee actually firing with `FromLocal` on
+  `process_outbound`; and the Taildrop SSRF guard composition (`is_tailscale_ip ∘ peerapi_addr`
+  rejects a non-CGNAT peer address).
+- **Docs**: `LoopbackHandle` now documents that it is not tied to `Device` shutdown (hold/drop it for
+  the proxy's lifetime); the WIF `?baseURL=` is documented as intentionally inert on the `client_id`
+  path; the `CapturePath::SynthesizedTo{Local,Peer}` variants are documented as retained for Go
+  wire-parity and not yet emitted.
+
 ## [0.5.32](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.32) - 2026-06-05
 
 **Loopback SOCKS5 proxy** (`tsr-am9.6`): `Device::loopback()`, porting the SOCKS5 half of Go

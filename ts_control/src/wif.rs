@@ -392,7 +392,8 @@ async fn obtain_ambient_id_token(audience: &str) -> Result<String, WifError> {
 
     // AWS: read the OIDC JWT from the web-identity token file.
     if let Ok(path) = std::env::var("AWS_WEB_IDENTITY_TOKEN_FILE") {
-        let token = std::fs::read_to_string(&path)
+        let token = tokio::fs::read_to_string(&path)
+            .await
             .map_err(|e| WifError::Http(format!("reading AWS_WEB_IDENTITY_TOKEN_FILE: {e}")))?;
         return Ok(token.trim().to_string());
     }
@@ -496,6 +497,9 @@ pub async fn resolve_auth_key(
     // 3. client_id selects the WIF token-exchange path.
     if let Some(client_id) = cfg.client_id.as_deref() {
         validate_wif(cfg.id_token.as_deref(), cfg.audience.as_deref())?;
+        // `base_url` from the client_id's `?baseURL=` query is intentionally unused on the WIF path:
+        // the WIF token-exchange + CreateKey go to the configured control server (`control_url`).
+        // Only the OAuth-client-secret path honors `?baseURL=`.
         let parsed = OAuthSecret::parse(client_id);
         let key = resolve_wif(
             &parsed,

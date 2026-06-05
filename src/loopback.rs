@@ -22,6 +22,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    sync::Semaphore,
     task::AbortHandle,
 };
 use ts_netstack_smoltcp::{CreateSocket, netcore::Channel};
@@ -185,6 +186,12 @@ impl OverlayDialer {
 /// spliced connections continue until they close on their own, which is acceptable (the proxy is
 /// loopback-only and each connection already egresses over the overlay). Call [`Self::shutdown`] to
 /// stop it explicitly, or just drop it.
+///
+/// Lifecycle: this handle is **not** tied to [`crate::Device`] shutdown. If the caller drops the
+/// `Device` but keeps (or leaks) this handle, the accept loop and the bound `127.0.0.1` port stay
+/// alive until the handle drops. Hold the handle for exactly as long as you want the proxy and drop
+/// it (or call [`Self::shutdown`]) when done; do not let it outlive the `Device` it proxies into
+/// (dialing into a shut-down device's overlay just fails).
 #[must_use = "dropping the handle stops the loopback SOCKS5 proxy"]
 pub struct LoopbackHandle {
     accept_task: AbortHandle,
@@ -253,10 +260,27 @@ fn gen_cred() -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/// Accept loop: one task per connection. Aborting this task (via [`LoopbackHandle`]) stops accepting
-/// new connections; already-spawned connection tasks keep running until they finish.
+/// Cap on simultaneous loopback SOCKS5 connections. This is a `127.0.0.1`-only debug/proxy
+/// listener, but each accepted connection dials INTO the overlay and so pins one netstack TCP socket
+/// (~512 KiB of rx+tx buffers, see `tcp_buffer_size` in AGENTS.md). 256 ≈ a 128 MB ceiling — enough
+/// for any realistic local client, while preventing a misbehaving local process from opening
+/// unbounded overlay sockets and exhausting memory. At the cap the accept loop back-pressures
+/// (stops accepting) until an in-flight connection finishes, which is the desired behavior here.
+const MAX_CONCURRENT_CONNS: usize = 256;
+
+/// Accept loop: one task per connection, capped at [`MAX_CONCURRENT_CONNS`] in flight. Aborting this
+/// task (via [`LoopbackHandle`]) stops accepting new connections; already-spawned connection tasks
+/// keep running until they finish.
 async fn accept_loop(listener: TcpListener, dialer: OverlayDialer, cred: String) {
+    let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNS));
     loop {
+        // Acquire a permit BEFORE accepting so that at the cap the loop stops pulling new
+        // connections off the listener until an in-flight one finishes (back-pressure).
+        let permit = match sem.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            // The semaphore is never closed in this loop; if it somehow is, stop accepting.
+            Err(_) => return,
+        };
         let (sock, _peer) = match listener.accept().await {
             Ok(pair) => pair,
             Err(e) => {
@@ -267,6 +291,9 @@ async fn accept_loop(listener: TcpListener, dialer: OverlayDialer, cred: String)
         let dialer = dialer.clone();
         let cred = cred.clone();
         tokio::spawn(async move {
+            // Hold the permit for the lifetime of the connection; dropping it on task end frees
+            // the slot for the next accept.
+            let _permit = permit;
             if let Err(e) = handle_conn(sock, dialer, cred).await {
                 tracing::debug!(error = %e, "loopback SOCKS5 connection ended");
             }

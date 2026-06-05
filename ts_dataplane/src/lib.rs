@@ -27,9 +27,12 @@ pub enum CapturePath {
     FromLocal = 0,
     /// A packet received from a peer, decrypted, heading to the local device.
     FromPeer = 1,
-    /// A packet synthesized by us toward the local device.
+    /// A packet synthesized by us toward the local device. Retained for Go `capture.Path` on-wire
+    /// code parity (so captured pcap path codes match Go's, and a future synthesized-packet tee
+    /// point can emit it); not currently emitted — the tee only produces `FromLocal`/`FromPeer`.
     SynthesizedToLocal = 2,
-    /// A packet synthesized by us toward a peer.
+    /// A packet synthesized by us toward a peer. Retained for Go `capture.Path` on-wire code parity
+    /// (see [`Self::SynthesizedToLocal`]); not currently emitted.
     SynthesizedToPeer = 3,
 }
 
@@ -314,7 +317,12 @@ pub struct EventResult {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    /// Records `(path, bytes)` for each capture-hook invocation in a test.
+    type CaptureLog = Arc<Mutex<Vec<(CapturePath, Vec<u8>)>>>;
 
     #[test]
     fn capture_path_codes() {
@@ -322,5 +330,33 @@ mod tests {
         assert_eq!(CapturePath::FromPeer.code(), 1);
         assert_eq!(CapturePath::SynthesizedToLocal.code(), 2);
         assert_eq!(CapturePath::SynthesizedToPeer.code(), 3);
+    }
+
+    /// Behavioral guard: an installed capture hook MUST be invoked with `CapturePath::FromLocal`
+    /// and the exact packet bytes for every outbound packet. The tee sits at the top of
+    /// `process_outbound`, before `or_out.route` consumes the packets, so it fires regardless of
+    /// whether a wireguard peer exists (an empty router just drops the routed packets afterward).
+    /// This is the only end-to-end guard that the dataplane capture tee actually fires; a refactor
+    /// that drops the tee would leave every byte-layout test green.
+    #[test]
+    fn capture_hook_fires_on_outbound() {
+        let mut dp = DataPlane::new(NodeKeyPair::new());
+
+        let recorded: CaptureLog = Arc::new(Mutex::new(Vec::new()));
+        let sink = recorded.clone();
+        dp.capture = Some(Arc::new(move |path: CapturePath, bytes: &[u8]| {
+            sink.lock().unwrap().push((path, bytes.to_vec()));
+        }));
+
+        // The outbound tee passes `p.as_ref()` as-given; the bytes need not be a valid IP packet.
+        let payload: Vec<u8> = vec![0xde, 0xad, 0xbe, 0xef];
+        let packet = PacketMut::from(payload.clone());
+
+        drop(dp.process_outbound(vec![packet]));
+
+        let captured = recorded.lock().unwrap();
+        assert_eq!(captured.len(), 1, "hook must fire exactly once per packet");
+        assert_eq!(captured[0].0, CapturePath::FromLocal);
+        assert_eq!(captured[0].1, payload);
     }
 }

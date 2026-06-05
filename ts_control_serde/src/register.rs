@@ -167,3 +167,52 @@ pub struct RegisterResponse<'a> {
     #[serde(borrow)]
     pub error: &'a str,
 }
+
+#[cfg(test)]
+mod tests {
+    use alloc::format;
+
+    use ts_keys::NodePublicKey;
+
+    use super::*;
+
+    /// The `old_node_key` field MUST serialize under the wire name `OldNodeKey` (PascalCase) with
+    /// the `nodekey:`+hex string Display form. If the rename/casing drifts, Go control treats a
+    /// rotated node as brand-new and silently breaks `regen` key-continuity.
+    #[test]
+    fn register_request_serializes_old_node_key() {
+        let key = NodePublicKey::from([7u8; 32]);
+        let req = RegisterRequest {
+            old_node_key: Some(key),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&req).unwrap();
+        let obj = value.as_object().expect("serializes to a JSON object");
+
+        let wire = obj
+            .get("OldNodeKey")
+            .expect("OldNodeKey key present on the wire");
+        assert_eq!(wire.as_str().unwrap(), format!("{key}"));
+        // Sanity-check the wire value matches the `nodekey:`+hex Display form.
+        assert!(wire.as_str().unwrap().starts_with("nodekey:"));
+    }
+
+    /// When `old_node_key` is `None`, the `skip_serializing_if = "Option::is_none"` attribute MUST
+    /// omit the `OldNodeKey` key entirely (not emit `null`).
+    #[test]
+    fn register_request_omits_old_node_key_when_none() {
+        let req = RegisterRequest {
+            old_node_key: None,
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&req).unwrap();
+        let obj = value.as_object().expect("serializes to a JSON object");
+
+        assert!(
+            !obj.contains_key("OldNodeKey"),
+            "OldNodeKey must be omitted when None, got: {obj:?}"
+        );
+    }
+}

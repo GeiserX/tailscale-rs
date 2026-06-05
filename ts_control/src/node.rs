@@ -876,6 +876,38 @@ mod tests {
         assert!(!is_tailscale_ip("fd00::1".parse().unwrap()));
     }
 
+    /// Taildrop SSRF guard (defense-in-depth). `Device::send_file` rejects an upload destination
+    /// unless `is_tailscale_ip(peer.peerapi_addr().ip())` holds. `Device::send_file` itself needs a
+    /// live runtime (it goes through `self.channel()`), so it can't be unit-tested here; instead we
+    /// test the exact composition the guard relies on — `is_tailscale_ip ∘ peerapi_addr` — against a
+    /// `Node` whose `tailnet_address.ipv4` has been corrupted to a non-CGNAT (public) address. A
+    /// well-formed peer always has a CGNAT 100.64.0.0/10 address, but the guard exists to catch a
+    /// malformed/hostile node; this proves it would reject one.
+    #[test]
+    fn taildrop_ssrf_guard_rejects_non_cgnat_peerapi_addr() {
+        let mut n = node("evil", Some("ts.net"));
+        // Corrupt the peer to a public, non-CGNAT address and advertise a peerAPI port so
+        // `peerapi_addr` returns `Some(_)`.
+        n.tailnet_address.ipv4 = "1.2.3.4/32".parse().unwrap();
+        n.peerapi_port = Some(443);
+
+        let addr = n
+            .peerapi_addr()
+            .expect("peerapi_addr yields Some with a port set");
+        assert_eq!(addr.ip(), Ipv4Addr::new(1, 2, 3, 4));
+        // The guard `if !is_tailscale_ip(dst.ip()) { return Err(BadRequest) }` WOULD reject this.
+        assert!(
+            !is_tailscale_ip(addr.ip()),
+            "SSRF guard must reject a peer whose peerAPI addr is not a Tailscale CGNAT IP"
+        );
+
+        // Conversely, a well-formed CGNAT peer passes the guard.
+        let mut good = node("friend", Some("ts.net"));
+        good.peerapi_port = Some(443);
+        let good_addr = good.peerapi_addr().expect("peerapi_addr yields Some");
+        assert!(is_tailscale_ip(good_addr.ip()));
+    }
+
     #[test]
     fn is_subnet_route_distinguishes_self_from_subnet() {
         let n = node("host", Some("ts.net"));
