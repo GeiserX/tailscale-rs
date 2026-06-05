@@ -371,6 +371,7 @@ mod tests {
             peerapi_dns_proxy: false,
             is_wireguard_only: false,
             exit_node_dns_resolvers: vec![],
+            peer_relay: false,
             service_vips: Default::default(),
         }
     }

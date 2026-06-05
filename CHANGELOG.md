@@ -6,6 +6,27 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.24](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.24) - 2026-06-05
+
+**Peer-relay awareness** (`tsr-77q-d`): make the fork wire-aware of Tailscale's peer-relay feature
+(relaying traffic through a peer's UDP relay server, Geneve-encapsulated). This is the bounded,
+client-aware slice; the **active relay data path is intentionally deferred** (see below).
+
+- **Geneve codec** (`ts_packet::geneve`, re-exported as `tailscale::geneve`): parse/encode the
+  RFC 8926 fixed Geneve header Tailscale uses for relayed disco + WireGuard frames (the C bit,
+  protocol type `0x7A11`/`0x7A12`, 24-bit VNI). Rejects non-zero version / variable options so a
+  foreign Geneve packet isn't mis-decoded.
+- **`Hostinfo.PeerRelay`** is parsed into `ts_control::Node::peer_relay` with an
+  `is_peer_relay()` accessor, so a relay-capable peer can be recognized. (The fork is a relay
+  *client* only and never advertises itself as a relay server.)
+
+**Deferred:** actually traversing a relay path — the `relayManager` allocation/handshake state
+machine + magicsock Geneve data path — is a large subsystem (Go ~1700-2000 LOC of stateful client
+code) and is **not implemented**. This release makes the fork recognize the framing and peer
+capability without choking; the disco demux already gracefully ignores relayed control frames it
+can't act on. (The private/custom **DERP map** half of this bead was already satisfied — the fork
+honors control-pushed DERP maps.)
+
 ## [0.5.23](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.23) - 2026-06-05
 
 **Node-key expiry handling** (`tsr-77q-e`): surface this node's key-expiry state so an embedder can

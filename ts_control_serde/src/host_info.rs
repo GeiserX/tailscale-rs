@@ -130,6 +130,12 @@ pub struct HostInfo<'a> {
 
     /// Indicates whether the Tailscale node is running the app-connector service.
     pub app_connector: Option<bool>,
+
+    /// Whether this node is willing to relay traffic for other peers as a **peer relay**
+    /// (`Hostinfo.PeerRelay` in Go; the node runs a UDP relay server other peers can allocate
+    /// endpoints on). This fork is a relay *client* only and never sets this true for itself, but
+    /// parses it off peers so it can recognize which peers offer a relay.
+    pub peer_relay: bool,
     /// Opaque hash of the most recent list of Tailnet services. A change in the hash value
     /// indicates the control server should fetch the new list of services from the Tailscale node
     /// via c2n (control-to-node).

@@ -3,6 +3,9 @@
 
 extern crate alloc;
 
+/// Geneve (RFC 8926) fixed-header codec for Tailscale peer-relay framing.
+pub mod geneve;
+
 use alloc::{borrow::ToOwned, string::String, vec::Vec};
 use core::{
     fmt::{self, LowerHex, UpperHex},

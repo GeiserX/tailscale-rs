@@ -719,6 +719,19 @@ pub mod netstack {
     pub use ts_netstack_smoltcp::netsock::{TcpListener, TcpStream, UdpSocket};
 }
 
+/// Geneve (RFC 8926) framing for Tailscale **peer-relay** traffic. A peer that advertises
+/// [`NodeInfo::is_peer_relay`] runs a UDP relay server; relayed disco + WireGuard frames are
+/// Geneve-encapsulated with a VNI. This module exposes the header codec so the framing is
+/// recognizable. NOTE: the active relay *data path* (the relay-allocation handshake +
+/// magicsock integration) is **not yet implemented** in this fork — this is the wire-aware slice.
+pub mod geneve {
+    #[doc(inline)]
+    pub use ts_packet::geneve::{
+        GENEVE_FIXED_HEADER_LEN, GENEVE_PROTOCOL_DISCO, GENEVE_PROTOCOL_WIREGUARD, GeneveError,
+        GeneveHeader,
+    };
+}
+
 /// Tailnet Lock (TKA) verification: the [`tka::Authority`] checks a peer's node-key signature
 /// against the trusted-key state, mirroring Go's `tka` package. Pair with [`Device::tka_status`]
 /// (the control-pushed head/disablement signal).

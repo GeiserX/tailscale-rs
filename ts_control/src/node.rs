@@ -178,6 +178,13 @@ pub struct Node {
     /// Encrypted-transport resolvers are dropped (see [`Resolver::from_serde`]).
     pub exit_node_dns_resolvers: Vec<Resolver>,
 
+    /// Whether this node advertises itself as a **peer relay** (Go `Hostinfo.PeerRelay`): it runs a
+    /// UDP relay server other peers can allocate relay endpoints on. This fork is a relay client
+    /// only and never sets this for itself; it is parsed off peers so a relay candidate can be
+    /// recognized. Actually *using* a relay path (the Geneve data path + allocation handshake) is
+    /// not yet implemented — see the crate docs.
+    pub peer_relay: bool,
+
     /// Per-service virtual IP addresses of the Tailscale VIP services this node *hosts*, keyed by
     /// `svc:<label>` service name. Parsed from the `service-host`
     /// ([`ts_control_serde::NODE_ATTR_SERVICE_HOST`]) node-capability value
@@ -229,6 +236,13 @@ impl Node {
     /// A caller can schedule a re-evaluation/re-auth at this time.
     pub fn key_expiry(&self) -> Option<DateTime<Utc>> {
         self.node_key_expiry
+    }
+
+    /// Whether this node advertises itself as a peer relay (Go `Hostinfo.PeerRelay`): it runs a UDP
+    /// relay server other peers may allocate relay endpoints on. Recognizing a relay candidate;
+    /// actually traversing a relay path is not yet implemented in this fork.
+    pub fn is_peer_relay(&self) -> bool {
+        self.peer_relay
     }
 
     /// The key-expiry instant as **Unix seconds**, or `None` if the key never expires. Provided for
@@ -683,6 +697,7 @@ impl From<&ts_control_serde::Node<'_>> for Node {
                 .iter()
                 .filter_map(Resolver::from_serde)
                 .collect(),
+            peer_relay: value.host_info.peer_relay,
             service_vips,
         }
     }
@@ -739,6 +754,7 @@ mod tests {
             peerapi_dns_proxy: false,
             is_wireguard_only: false,
             exit_node_dns_resolvers: vec![],
+            peer_relay: false,
             service_vips: Default::default(),
         }
     }
