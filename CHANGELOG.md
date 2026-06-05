@@ -6,6 +6,28 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.25](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.25) - 2026-06-05
+
+**Symmetric-NAT traversal: hard-NAT local-port candidate** (`tsr-bs7`): improve direct-connect
+success behind symmetric (endpoint-dependent-mapping) NATs, mirroring **current** Go Tailscale.
+
+- magicsock now detects a symmetric NAT when the one bound socket is observed at **two or more
+  distinct reflexive IPv4 `addr:port`s** (endpoint-dependent mapping — exactly Go's
+  `MappingVariesByDestIP` determination from multi-STUN-server observations), or when set explicitly
+  via `MagicSock::set_symmetric_nat` (e.g. from control's `NetInfo`).
+- When symmetric NAT is detected, `self_endpoints()` advertises an extra hard-NAT candidate pairing
+  a reflexive IPv4 with the node's **local** bound port (`SelfEndpointType::Stun4LocalPort` →
+  control `EndpointType::Stun4LocalPort`), mirroring Go's `EndpointSTUN4LocalPort`: if the router
+  has a static port-mapping to the fixed local port, this `(reflexive_ip, local_port)` may be
+  reachable where the per-destination reflexive port is not. It rides the existing
+  Pong→`bestAddr` path-selection with no special handling.
+
+**Scope note:** the classic *birthday-paradox port-spray* this bead was named for **no longer exists
+in mainline Tailscale** — it was removed in favor of this single static-port-mapping guess + DERP
+fallback. Porting the spray would reimplement dead upstream code, so this release matches what Go
+actually does today; behind a hard NAT with no static mapping, a flow still falls back to DERP (as
+in upstream).
+
 ## [0.5.24](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.24) - 2026-06-05
 
 **Peer-relay awareness** (`tsr-77q-d`): make the fork wire-aware of Tailscale's peer-relay feature

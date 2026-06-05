@@ -165,6 +165,12 @@ pub struct MagicSock {
     /// unspecified). This governs *only* which disco candidates are considered pingable — never the
     /// underlay bind or the exit egress path, both of which stay IPv4-only by their own gates.
     enable_ipv6: bool,
+    /// Whether this node sits behind a symmetric (endpoint-dependent-mapping) NAT, per netcheck's
+    /// `MappingVariesByDestIP`. When `true`, [`self_endpoints`](Self::self_endpoints) additionally
+    /// advertises a hard-NAT [`SelfEndpointType::Stun4LocalPort`] guess pairing a reflexive IPv4
+    /// with the local bound port. Set via [`set_symmetric_nat`](Self::set_symmetric_nat); defaults
+    /// `false` (no extra candidate — byte-for-byte the prior behavior).
+    symmetric_nat: AtomicBool,
 }
 
 impl MagicSock {
@@ -190,6 +196,7 @@ impl MagicSock {
             binding_verifier: None,
             warned_no_verifier: AtomicBool::new(false),
             enable_ipv6: false,
+            symmetric_nat: AtomicBool::new(false),
         })
     }
 
@@ -292,7 +299,8 @@ impl MagicSock {
     pub fn self_endpoints(&self) -> Vec<SelfEndpoint> {
         let mut eps = Vec::new();
 
-        if let Ok(local) = self.local_addr() {
+        let local = self.local_addr().ok();
+        if let Some(local) = local {
             eps.push(SelfEndpoint {
                 addr: local,
                 ty: SelfEndpointType::Local,
@@ -307,7 +315,48 @@ impl MagicSock {
             });
         }
 
+        // Hard-NAT guess (Go `EndpointSTUN4LocalPort`): behind a symmetric NAT the reflexive port a
+        // peer learns varies per-destination and is useless to a third peer, but the router may have
+        // a static mapping to our fixed *local* port. So advertise `(reflexive_ipv4, local_port)` as
+        // an extra best-effort candidate. Only when symmetric NAT is detected, only for IPv4
+        // reflexive addresses, and only when it differs from an already-listed reflexive endpoint.
+        //
+        // Symmetric NAT is detected when EITHER the `symmetric_nat` flag was set explicitly (e.g.
+        // from control's NetInfo) OR the one bound socket has been observed at two or more DISTINCT
+        // reflexive IPv4 addr:ports — endpoint-dependent mapping, exactly Go's `MappingVariesByDestIP`
+        // determination from multi-STUN-server observations.
+        let v4_reflexive: Vec<SocketAddr> =
+            reflexive.iter().filter(|a| a.is_ipv4()).copied().collect();
+        let detected_symmetric = v4_reflexive.len() >= 2;
+        if (self.symmetric_nat.load(Ordering::Relaxed) || detected_symmetric)
+            && let Some(local) = local
+        {
+            let local_port = local.port();
+            for refl in v4_reflexive {
+                let guess = SocketAddr::new(refl.ip(), local_port);
+                // Skip if the reflexive endpoint already uses the local port (not a symmetric remap)
+                // or if we'd duplicate an existing candidate.
+                if guess.port() == refl.port() {
+                    continue;
+                }
+                if eps.iter().any(|e| e.addr == guess) {
+                    continue;
+                }
+                eps.push(SelfEndpoint {
+                    addr: guess,
+                    ty: SelfEndpointType::Stun4LocalPort,
+                });
+            }
+        }
+
         eps
+    }
+
+    /// Record whether this node is behind a symmetric (endpoint-dependent-mapping) NAT, per
+    /// netcheck's `MappingVariesByDestIP`. When set, [`self_endpoints`](Self::self_endpoints) emits
+    /// the hard-NAT [`SelfEndpointType::Stun4LocalPort`] candidate. Idempotent; cheap atomic store.
+    pub fn set_symmetric_nat(&self, symmetric: bool) {
+        self.symmetric_nat.store(symmetric, Ordering::Relaxed);
     }
 
     /// Seal a disco `CallMeMaybe` addressed to `receiver`, carrying our candidate endpoints so the
@@ -960,6 +1009,87 @@ mod tests {
         .await
         .unwrap()
         .with_enable_ipv6(enable)
+    }
+
+    /// Bind a plain magicsock for self-endpoint tests.
+    async fn plain_sock() -> MagicSock {
+        MagicSock::bind(
+            localhost(),
+            DiscoPrivateKey::random(),
+            ts_keys::NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn no_stun4localport_without_symmetric_nat() {
+        let sock = plain_sock().await;
+        // One reflexive address: not symmetric, no flag → no Stun4LocalPort candidate.
+        sock.reflexive
+            .lock()
+            .unwrap()
+            .insert("203.0.113.5:51000".parse().unwrap());
+        let eps = sock.self_endpoints();
+        assert!(
+            !eps.iter().any(|e| e.ty == SelfEndpointType::Stun4LocalPort),
+            "no hard-NAT guess when not symmetric: {eps:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn detects_symmetric_nat_from_two_reflexive_and_emits_guess() {
+        let sock = plain_sock().await;
+        let local_port = sock.local_addr().unwrap().port();
+        // Two DISTINCT reflexive v4 addr:ports observed on the one socket ⇒ endpoint-dependent
+        // mapping ⇒ symmetric NAT detected.
+        {
+            let mut r = sock.reflexive.lock().unwrap();
+            r.insert("203.0.113.5:51000".parse().unwrap());
+            r.insert("203.0.113.5:52000".parse().unwrap());
+        }
+        let eps = sock.self_endpoints();
+        // The guess pairs the reflexive IP with our LOCAL port.
+        let guesses: Vec<_> = eps
+            .iter()
+            .filter(|e| e.ty == SelfEndpointType::Stun4LocalPort)
+            .collect();
+        assert!(
+            !guesses.is_empty(),
+            "expected a Stun4LocalPort guess: {eps:?}"
+        );
+        assert!(
+            guesses.iter().all(|e| e.addr.port() == local_port),
+            "guess must use the local bound port"
+        );
+        assert!(
+            guesses
+                .iter()
+                .all(|e| e.addr.ip() == "203.0.113.5".parse::<core::net::IpAddr>().unwrap()),
+            "guess must use the reflexive IP"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_symmetric_flag_emits_guess_with_one_reflexive() {
+        let sock = plain_sock().await;
+        let local_port = sock.local_addr().unwrap().port();
+        // A single reflexive whose port differs from our local port; flag set explicitly.
+        sock.reflexive
+            .lock()
+            .unwrap()
+            .insert("198.51.100.9:60000".parse().unwrap());
+        sock.set_symmetric_nat(true);
+        let eps = sock.self_endpoints();
+        let guess = eps
+            .iter()
+            .find(|e| e.ty == SelfEndpointType::Stun4LocalPort)
+            .expect("explicit symmetric flag must emit a guess");
+        assert_eq!(guess.addr.port(), local_port);
+        assert_eq!(
+            guess.addr.ip(),
+            "198.51.100.9".parse::<core::net::IpAddr>().unwrap()
+        );
     }
 
     #[tokio::test]

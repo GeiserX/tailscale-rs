@@ -318,6 +318,7 @@ impl Message<EndpointAdvertisement> for ControlRunner {
                 ty: match ep.ty {
                     SelfEndpointType::Local => EndpointType::Local,
                     SelfEndpointType::Stun => EndpointType::Stun,
+                    SelfEndpointType::Stun4LocalPort => EndpointType::Stun4LocalPort,
                 },
             })
             .collect();

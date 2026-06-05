@@ -16,6 +16,13 @@ pub enum SelfEndpointType {
     Local,
     /// A reflexive address learned from a disco pong's echoed source (STUN-equivalent).
     Stun,
+    /// Hard-NAT guess: a reflexive (STUN) IPv4 paired with our **local** bound port. Under a
+    /// symmetric (endpoint-dependent-mapping) NAT the public port varies per-destination, so the
+    /// reflexive `ip:port` a peer learns is useless to a third peer; but if the router happens to
+    /// have a static port-mapping to our fixed local port, `(reflexive_ip, local_port)` may be
+    /// reachable. Mirrors Go's `EndpointSTUN4LocalPort`. A best-effort candidate, only emitted when
+    /// symmetric NAT is detected.
+    Stun4LocalPort,
 }
 
 /// One candidate address we believe we are reachable on, tagged with how we learned it.
