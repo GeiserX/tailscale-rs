@@ -177,6 +177,62 @@ mod tests {
     }
 
     #[test]
+    fn encode_matches_spec_byte_layout() {
+        // Byte-exact reference vector hand-derived from RFC 8926 §3.4 + Tailscale's usage,
+        // NOT computed by round-tripping through this fork's own encoder (that would be
+        // circular and would mask any byte-order / bit-position bug). The 6 round-trip tests
+        // above only prove encode/parse are mutually consistent, not that either matches the
+        // wire format.
+        //
+        // For GeneveHeader { control: true, protocol: GENEVE_PROTOCOL_DISCO (0x7A11),
+        //                    vni: 0x0ABCDE }:
+        //   byte 0: Ver(2b)=00 | Opt Len(6b)=000000                     => 0x00
+        //   byte 1: O(bit7)=0 | C(bit6)=1 | Rsvd(6b)=0  (0b0100_0000)   => 0x40
+        //   byte 2: Protocol Type high byte (0x7A11 big-endian)          => 0x7A
+        //   byte 3: Protocol Type low  byte                              => 0x11
+        //   byte 4: VNI[23:16] of 0x0ABCDE                               => 0x0A
+        //   byte 5: VNI[15:8]                                            => 0xBC
+        //   byte 6: VNI[7:0]                                             => 0xDE
+        //   byte 7: Reserved                                             => 0x00
+        //
+        // Residual gap: this is a SPEC-derived vector, not one captured from a live Go
+        // `tailscaled` peer-relay packet. Full Go cross-validation would require a captured
+        // on-wire Geneve frame from tailscaled and is left as the remaining verification step.
+        let h = GeneveHeader {
+            control: true,
+            protocol: GENEVE_PROTOCOL_DISCO,
+            vni: 0x0A_BC_DE,
+        };
+        assert_eq!(h.encode(), [0x00, 0x40, 0x7A, 0x11, 0x0A, 0xBC, 0xDE, 0x00]);
+    }
+
+    #[test]
+    fn parse_known_wire_bytes() {
+        // Hand-built wire bytes (NOT produced by this fork's encoder), decoded field-by-field
+        // per RFC 8926 §3.4:
+        //   byte 0 = 0x00: Ver=00 (ok), Opt Len=000000 (no options)
+        //   byte 1 = 0x00: O=0, C(bit6)=0  => control = false
+        //   bytes 2..4 = 0x7A,0x12: Protocol Type big-endian 0x7A12 = GENEVE_PROTOCOL_WIREGUARD
+        //   bytes 4..7 = 0x00,0x00,0x01: 24-bit VNI big-endian = 0x000001 = 1
+        //   byte 7 = 0x00: Reserved
+        // Inner payload therefore begins at offset GENEVE_FIXED_HEADER_LEN (8).
+        //
+        // Residual gap: spec-derived, not captured from Go `tailscaled`; a real captured
+        // peer-relay frame would be needed for full cross-implementation validation.
+        let wire = [0x00, 0x00, 0x7A, 0x12, 0x00, 0x00, 0x01, 0x00];
+        let (parsed, off) = GeneveHeader::parse(&wire).unwrap();
+        assert_eq!(
+            parsed,
+            GeneveHeader {
+                control: false,
+                protocol: GENEVE_PROTOCOL_WIREGUARD,
+                vni: 1,
+            }
+        );
+        assert_eq!(off, GENEVE_FIXED_HEADER_LEN);
+    }
+
+    #[test]
     fn parse_returns_payload_offset() {
         let mut buf = GeneveHeader {
             control: false,

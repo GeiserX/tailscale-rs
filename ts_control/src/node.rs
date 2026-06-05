@@ -730,6 +730,61 @@ mod tests {
         assert!(n.key_expired(now));
     }
 
+    #[test]
+    fn key_expiry_unix_agrees_with_chrono() {
+        // The chrono-free variants (`key_expired_at_unix` / `key_expiry_unix`) must agree with the
+        // chrono variants for the same none/future/past cases (Unix seconds of the same instants).
+        let now: DateTime<Utc> = "2026-06-05T00:00:00Z".parse().unwrap();
+        let past: DateTime<Utc> = "2020-01-01T00:00:00Z".parse().unwrap();
+        let future: DateTime<Utc> = "2099-01-01T00:00:00Z".parse().unwrap();
+        let now_unix = now.timestamp();
+
+        let mut n = node("h", Some("t.ts.net"));
+
+        // No expiry => never expired; the unix accessor reports `None`.
+        n.node_key_expiry = None;
+        assert_eq!(n.key_expired(now), n.key_expired_at_unix(now_unix));
+        assert!(!n.key_expired_at_unix(now_unix));
+        assert_eq!(n.key_expiry_unix(), None);
+
+        // Future expiry => not yet expired; unix accessor matches the chrono timestamp.
+        n.node_key_expiry = Some(future);
+        assert_eq!(n.key_expired(now), n.key_expired_at_unix(now_unix));
+        assert!(!n.key_expired_at_unix(now_unix));
+        assert_eq!(n.key_expiry_unix(), Some(future.timestamp()));
+
+        // Past expiry => expired; unix accessor matches the chrono timestamp.
+        n.node_key_expiry = Some(past);
+        assert_eq!(n.key_expired(now), n.key_expired_at_unix(now_unix));
+        assert!(n.key_expired_at_unix(now_unix));
+        assert_eq!(n.key_expiry_unix(), Some(past.timestamp()));
+    }
+
+    #[test]
+    fn key_expiry_boundary_is_not_expired() {
+        // A key whose expiry exactly equals `now` is NOT expired: the code uses strict `<`, matching
+        // Go's `Before`. Both the chrono and chrono-free variants must agree at the boundary.
+        let now: DateTime<Utc> = "2026-06-05T00:00:00Z".parse().unwrap();
+        let now_unix = now.timestamp();
+
+        let mut n = node("h", Some("t.ts.net"));
+        n.node_key_expiry = Some(now);
+
+        assert!(!n.key_expired(now));
+        assert!(!n.key_expired_at_unix(now_unix));
+    }
+
+    #[test]
+    fn is_peer_relay_returns_field() {
+        let mut n = node("h", Some("t.ts.net"));
+
+        n.peer_relay = true;
+        assert!(n.is_peer_relay());
+
+        n.peer_relay = false;
+        assert!(!n.is_peer_relay());
+    }
+
     fn node(hostname: &str, tailnet: Option<&str>) -> Node {
         Node {
             id: 1,

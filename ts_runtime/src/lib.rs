@@ -312,10 +312,7 @@ impl Runtime {
         self.control
             .ask(control_runner::FetchIdToken { audience })
             .await
-            .map_err(|e| match e {
-                kameo::error::SendError::HandlerError(err) => err,
-                _ => ts_control::IdTokenError::NetworkError,
-            })
+            .map_err(flatten_send_err)
     }
 
     /// Resolve which node owns a tailnet source address.
@@ -439,6 +436,23 @@ fn netstack_config_from(tcp_buffer_size: Option<usize>) -> netstack::netcore::Co
     c
 }
 
+/// Flatten a kameo delegated-reply [`SendError`] for the id-token RPC into the RPC's own
+/// [`ts_control::IdTokenError`].
+///
+/// A [`SendError::HandlerError`](kameo::error::SendError::HandlerError) carries the real
+/// `IdTokenError` produced by the handler and is surfaced verbatim. Any other send failure (actor
+/// not running / stopped, mailbox full, send timeout) is a delivery problem rather than an RPC
+/// result, so it collapses to a transient [`ts_control::IdTokenError::NetworkError`]. Factored out
+/// of [`Runtime::fetch_id_token`] so this mapping is unit-testable without standing up an actor.
+fn flatten_send_err<M>(
+    e: kameo::error::SendError<M, ts_control::IdTokenError>,
+) -> ts_control::IdTokenError {
+    match e {
+        kameo::error::SendError::HandlerError(err) => err,
+        _ => ts_control::IdTokenError::NetworkError,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,5 +479,45 @@ mod tests {
             64 * 1024,
             "Some(n) must override the TCP buffer size that both netstacks use"
         );
+    }
+
+    /// A `HandlerError` carries the real `IdTokenError` from the RPC handler and must pass through
+    /// verbatim, not be flattened to a generic network error. Using an `Internal(_)` payload (not
+    /// `NetworkError`) makes the passthrough observable: a buggy flatten that always returned
+    /// `NetworkError` would fail this assertion.
+    #[test]
+    fn flatten_send_err_handler_error_passes_through() {
+        // Build an `Internal(_)` payload via the public `From<Utf8Error>` conversion (no extra
+        // deps): it is distinct from the `_ => NetworkError` fallback, so a buggy flatten that
+        // always returned `NetworkError` would fail this assertion.
+        // Route the invalid bytes through a runtime Vec so the `invalid_from_utf8` lint (which only
+        // fires on compile-time-known literals) doesn't flag this intentional bad input.
+        let bytes = vec![0xffu8, 0xfe];
+        let utf8_err = core::str::from_utf8(&bytes).unwrap_err();
+        let inner = ts_control::IdTokenError::from(utf8_err);
+        assert!(matches!(inner, ts_control::IdTokenError::Internal(_)));
+        let e: kameo::error::SendError<control_runner::FetchIdToken, ts_control::IdTokenError> =
+            kameo::error::SendError::HandlerError(inner.clone());
+        assert_eq!(flatten_send_err(e), inner);
+    }
+
+    /// A non-handler send failure (actor stopped) is a delivery problem, not an RPC result, so it
+    /// must collapse to a transient `NetworkError`.
+    #[test]
+    fn flatten_send_err_actor_stopped_is_network_error() {
+        let e: kameo::error::SendError<control_runner::FetchIdToken, ts_control::IdTokenError> =
+            kameo::error::SendError::ActorStopped;
+        assert_eq!(flatten_send_err(e), ts_control::IdTokenError::NetworkError);
+    }
+
+    /// `ActorNotRunning` (the message bounces back undelivered) is likewise a delivery failure and
+    /// must map to a transient `NetworkError`.
+    #[test]
+    fn flatten_send_err_actor_not_running_is_network_error() {
+        let e: kameo::error::SendError<control_runner::FetchIdToken, ts_control::IdTokenError> =
+            kameo::error::SendError::ActorNotRunning(control_runner::FetchIdToken {
+                audience: "sts.amazonaws.com".to_string(),
+            });
+        assert_eq!(flatten_send_err(e), ts_control::IdTokenError::NetworkError);
     }
 }

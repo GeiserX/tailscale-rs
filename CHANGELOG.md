@@ -6,6 +6,29 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.26](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.26) - 2026-06-05
+
+Hardening + coverage from a multi-reviewer audit of v0.5.22–v0.5.25. No happy-path behavior change.
+
+- **Security: gate the disco Pong reflexive-harvest** (`ts_magicsock`). `note_reflexive(src)` on an
+  inbound Pong is now performed only when the pong is **both** (1) from a current netmap member
+  (verifier checked, same as CallMeMaybe) and (2) **solicited** — it matched an outstanding ping we
+  actually sent for that `(tx_id, from)`. Previously any party knowing our control-advertised disco
+  pubkey could seal a pong with an arbitrary `src` and pollute our reflexive set (advertised to
+  control + in CallMeMaybe, and amplified into the new `Stun4LocalPort` guess). The legitimate
+  NAT-traversal path is unchanged.
+- **`is_symmetric_nat` predicate extracted** (`ts_magicsock`): symmetric-NAT detection is now a
+  named, documented method separate from endpoint assembly; the `reflexive` lock no longer spans the
+  candidate-build loop.
+- **`IdTokenError` owns its error vocabulary** (`ts_control`): a private `IdTokenInternalErrorKind`
+  replaces the cross-module reuse of registration's error kind. `parse_token_response` and
+  `flatten_send_err` were extracted and a **30s timeout** now bounds the id-token RPC.
+- **Coverage**: added the previously-missing tests for the id-token RPC error mapping + response
+  parsing (15), the kameo send-error flatten (3), `peer_relay` wire (de)serialization (3), the
+  chrono-free key-expiry variants + `expiry==now` boundary + `is_peer_relay` (4), symmetric-NAT edge
+  cases (local-port-skip / dedup / IPv6-ignored / non-member + unsolicited pong, 5), and a byte-exact
+  Geneve reference vector (2) closing the self-roundtrip-only blind spot.
+
 ## [0.5.25](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.25) - 2026-06-05
 
 **Symmetric-NAT traversal: hard-NAT local-port candidate** (`tsr-bs7`): improve direct-connect

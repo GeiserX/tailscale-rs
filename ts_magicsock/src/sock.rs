@@ -307,8 +307,16 @@ impl MagicSock {
             });
         }
 
-        let reflexive = lock(&self.reflexive);
-        for addr in reflexive.iter() {
+        // Collect the reflexive set into owned `Vec`s and drop the guard before the O(n²) dedup/
+        // guess loop below: the critical section is the cheap copy, not the candidate assembly.
+        let (all_reflexive, v4_reflexive): (Vec<SocketAddr>, Vec<SocketAddr>) = {
+            let reflexive = lock(&self.reflexive);
+            let all: Vec<SocketAddr> = reflexive.iter().copied().collect();
+            let v4: Vec<SocketAddr> = all.iter().filter(|a| a.is_ipv4()).copied().collect();
+            (all, v4)
+        };
+
+        for addr in &all_reflexive {
             eps.push(SelfEndpoint {
                 addr: *addr,
                 ty: SelfEndpointType::Stun,
@@ -320,15 +328,7 @@ impl MagicSock {
         // a static mapping to our fixed *local* port. So advertise `(reflexive_ipv4, local_port)` as
         // an extra best-effort candidate. Only when symmetric NAT is detected, only for IPv4
         // reflexive addresses, and only when it differs from an already-listed reflexive endpoint.
-        //
-        // Symmetric NAT is detected when EITHER the `symmetric_nat` flag was set explicitly (e.g.
-        // from control's NetInfo) OR the one bound socket has been observed at two or more DISTINCT
-        // reflexive IPv4 addr:ports — endpoint-dependent mapping, exactly Go's `MappingVariesByDestIP`
-        // determination from multi-STUN-server observations.
-        let v4_reflexive: Vec<SocketAddr> =
-            reflexive.iter().filter(|a| a.is_ipv4()).copied().collect();
-        let detected_symmetric = v4_reflexive.len() >= 2;
-        if (self.symmetric_nat.load(Ordering::Relaxed) || detected_symmetric)
+        if self.is_symmetric_nat(&v4_reflexive)
             && let Some(local) = local
         {
             let local_port = local.port();
@@ -350,6 +350,23 @@ impl MagicSock {
         }
 
         eps
+    }
+
+    /// Whether to treat this node as behind a symmetric (endpoint-dependent-mapping) NAT, which is
+    /// the condition under which [`self_endpoints`](Self::self_endpoints) emits the hard-NAT
+    /// [`SelfEndpointType::Stun4LocalPort`] guess.
+    ///
+    /// True when EITHER the `symmetric_nat` flag was set explicitly (e.g. from control's NetInfo
+    /// via [`set_symmetric_nat`](Self::set_symmetric_nat)) OR the one bound socket has been observed
+    /// at two or more DISTINCT IPv4 reflexive `addr:port`s — endpoint-dependent mapping, exactly
+    /// Go's `MappingVariesByDestIP` determination from multi-STUN-server observations.
+    ///
+    /// Caveat: the `>= 2 distinct SocketAddr` heuristic also fires for two reflexives that differ
+    /// only by IP at the same port (e.g. multi-WAN), which is not truly symmetric NAT. This is
+    /// harmless — it only adds a dead `Stun4LocalPort` candidate (the guess reuses the local port,
+    /// so a same-port reflexive is skipped) — and is accepted rather than refined.
+    fn is_symmetric_nat(&self, v4_reflexive: &[SocketAddr]) -> bool {
+        self.symmetric_nat.load(Ordering::Relaxed) || v4_reflexive.len() >= 2
     }
 
     /// Record whether this node is behind a symmetric (endpoint-dependent-mapping) NAT, per
@@ -683,11 +700,24 @@ impl MagicSock {
 
     /// Whether a CallMeMaybe from `sender` may be acted on (its endpoints learned).
     ///
-    /// A CallMeMaybe carries no node key, so the binding verifier is queried with `None`: it
-    /// returns `true` only if the sender's disco key is a current netmap member. With no verifier
-    /// installed we fail closed (`false`) — see the [`binding_verifier`](Self::binding_verifier)
-    /// field doc. Emits the one-shot no-verifier warning so a misconfiguration is observable.
+    /// A CallMeMaybe carries no node key, so this is exactly a netmap-membership check — see
+    /// [`disco_sender_is_member`](Self::disco_sender_is_member) for the fail-closed semantics.
     fn call_me_maybe_sender_allowed(&self, sender: &DiscoPublicKey) -> bool {
+        self.disco_sender_is_member(sender)
+    }
+
+    /// Whether `sender`'s disco key is a current netmap member.
+    ///
+    /// A disco frame carrying no node key (a CallMeMaybe, or a Pong) cannot be checked for the
+    /// exact disco<->node-key binding, so the verifier is queried with `None`: it returns `true`
+    /// only if the sender's disco key is a current netmap member. With no verifier installed we
+    /// fail closed (`false`) — see the [`binding_verifier`](Self::binding_verifier) field doc.
+    /// Emits the one-shot no-verifier warning so a misconfiguration is observable.
+    ///
+    /// Shared by [`call_me_maybe_sender_allowed`](Self::call_me_maybe_sender_allowed) and the Pong
+    /// reflexive-harvest gate in [`handle_disco`](Self::handle_disco): a non-member must not be
+    /// able to make us learn (and then advertise) a candidate endpoint or a reflexive `src`.
+    fn disco_sender_is_member(&self, sender: &DiscoPublicKey) -> bool {
         match self.binding_verifier.as_ref() {
             Some(verify) => verify(sender, None),
             None => {
@@ -858,19 +888,35 @@ impl MagicSock {
                 self.sock.send_to(&pong, from).await?;
             }
             Inbound::Pong { sender, tx_id, src } => {
-                {
+                let solicited = {
                     let mut paths = lock(&self.paths);
-                    if let Some(pp) = paths.get_mut(&sender) {
+                    match paths.get_mut(&sender) {
                         // Bind the pong to the address it arrived from (`from`): a pong only
-                        // confirms a path if it came from the address we pinged for this tx_id.
-                        pp.note_pong(tx_id, from, Instant::now());
+                        // confirms a path (and only counts as solicited) if it came from the
+                        // address we pinged for this tx_id. `note_pong` returns `Some(_)` exactly
+                        // when the `(tx_id, from)` pair matched an outstanding ping we sent.
+                        Some(pp) => pp.note_pong(tx_id, from, Instant::now()).is_some(),
+                        None => false,
                     }
-                }
+                };
                 // The peer echoed the address it saw our ping arrive from: that is our reflexive
-                // (STUN-equivalent) endpoint on this path. Retain it for advertisement, bounded by
-                // `MAX_REFLEXIVE_ADDRS` so a peer ponging many spoofed `src` values can't inflate
-                // the set without bound. Locked disjointly from `paths` above (never nested).
-                self.note_reflexive(src);
+                // (STUN-equivalent) endpoint on this path. Harvesting it advertises it to control
+                // and offers it in every `CallMeMaybe`, so an attacker who knows our disco pubkey
+                // could otherwise seal a pong with an arbitrary `src` and pollute the reflexive
+                // set (now also amplified into a `Stun4LocalPort` guess). Gate the harvest on BOTH:
+                //   1. netmap membership — the pong's sender disco key must be a current netmap
+                //      member (a Pong carries no node key, so the verifier is queried with `None`,
+                //      exactly like CallMeMaybe). A non-member's `src` is never learned.
+                //   2. solicited — the pong matched an outstanding ping we actually sent for this
+                //      `(tx_id, from)` (`note_pong` returned `Some(_)`). An unsolicited or
+                //      wrong-source pong learns nothing even from a member.
+                // A real peer's solicited pong from a netmap member still harvests its reflexive
+                // `src` — this is how the fork learns its public address; the legitimate
+                // NAT-traversal path is unchanged. Locked disjointly from `paths` above (never
+                // nested).
+                if solicited && self.disco_sender_is_member(&sender) {
+                    self.note_reflexive(src);
+                }
             }
             Inbound::CallMeMaybe { sender, endpoints } => {
                 // A CallMeMaybe received directly on the UDP socket. Gate it on netmap membership
@@ -1089,6 +1135,120 @@ mod tests {
         assert_eq!(
             guess.addr.ip(),
             "198.51.100.9".parse::<core::net::IpAddr>().unwrap()
+        );
+    }
+
+    /// A reflexive whose port already equals our local bound port produces NO Stun4LocalPort guess:
+    /// the guess `(reflexive_ip, local_port)` would be byte-identical to the reflexive endpoint
+    /// already listed as a `Stun` candidate, so the `guess.port() == refl.port()` skip suppresses it.
+    #[tokio::test]
+    async fn stun4localport_skips_reflexive_already_on_local_port() {
+        let sock = plain_sock().await;
+        let local_port = sock.local_addr().unwrap().port();
+        // The reflexive's port IS our local port (not a symmetric remap).
+        let refl = SocketAddr::new("203.0.113.5".parse().unwrap(), local_port);
+        sock.reflexive.lock().unwrap().insert(refl);
+        sock.set_symmetric_nat(true);
+
+        let eps = sock.self_endpoints();
+        assert!(
+            !eps.iter().any(|e| e.ty == SelfEndpointType::Stun4LocalPort),
+            "no degenerate guess when the reflexive already uses the local port: {eps:?}"
+        );
+        // The reflexive is still present as a plain Stun candidate (and not duplicated).
+        assert_eq!(
+            eps.iter()
+                .filter(|e| e.ty == SelfEndpointType::Stun && e.addr == refl)
+                .count(),
+            1,
+            "the reflexive remains exactly once as a Stun candidate"
+        );
+    }
+
+    /// Two reflexives that share an IP but differ only in port both map to the same guess
+    /// `(ip, local_port)`; the dedup must emit that Stun4LocalPort candidate exactly once.
+    #[tokio::test]
+    async fn stun4localport_dedups_identical_guesses() {
+        let sock = plain_sock().await;
+        let local_port = sock.local_addr().unwrap().port();
+        // Two distinct reflexive ports (neither equal to local_port) ⇒ symmetric detected, and both
+        // collapse to the single guess (203.0.113.5, local_port).
+        let other_port = local_port.wrapping_add(1).max(1);
+        let yet_another = local_port.wrapping_add(2).max(2);
+        {
+            let mut r = sock.reflexive.lock().unwrap();
+            r.insert(SocketAddr::new("203.0.113.5".parse().unwrap(), other_port));
+            r.insert(SocketAddr::new("203.0.113.5".parse().unwrap(), yet_another));
+        }
+
+        let eps = sock.self_endpoints();
+        let guesses: Vec<_> = eps
+            .iter()
+            .filter(|e| e.ty == SelfEndpointType::Stun4LocalPort)
+            .collect();
+        assert_eq!(
+            guesses.len(),
+            1,
+            "identical guesses must be de-duplicated to one: {eps:?}"
+        );
+        assert_eq!(guesses[0].addr.port(), local_port);
+        assert_eq!(
+            guesses[0].addr.ip(),
+            "203.0.113.5".parse::<core::net::IpAddr>().unwrap()
+        );
+    }
+
+    /// An IPv6 reflexive address is excluded from BOTH the symmetric-NAT detection count AND the
+    /// hard-NAT guess (the guess is IPv4-only). Two v6 reflexives must not trip detection, and even
+    /// with the flag forced on no v6-derived Stun4LocalPort is emitted.
+    #[tokio::test]
+    async fn stun4localport_ignores_ipv6_reflexive() {
+        // Two v6 reflexives alone must NOT be counted as symmetric NAT (the count is v4-only).
+        let sock = plain_sock().await;
+        {
+            let mut r = sock.reflexive.lock().unwrap();
+            r.insert("[2001:db8::1]:51000".parse().unwrap());
+            r.insert("[2001:db8::2]:52000".parse().unwrap());
+        }
+        let eps = sock.self_endpoints();
+        assert!(
+            !eps.iter().any(|e| e.ty == SelfEndpointType::Stun4LocalPort),
+            "two IPv6 reflexives must not trip symmetric-NAT detection: {eps:?}"
+        );
+
+        // Even with the symmetric flag forced on, a v6 reflexive yields no guess (guess is v4-only),
+        // while a co-present v4 reflexive still does.
+        let sock = plain_sock().await;
+        let local_port = sock.local_addr().unwrap().port();
+        let v4_refl = SocketAddr::new(
+            "203.0.113.5".parse().unwrap(),
+            local_port.wrapping_add(1).max(1),
+        );
+        {
+            let mut r = sock.reflexive.lock().unwrap();
+            r.insert("[2001:db8::1]:60000".parse().unwrap());
+            r.insert(v4_refl);
+        }
+        sock.set_symmetric_nat(true);
+        let eps = sock.self_endpoints();
+        let guesses: Vec<_> = eps
+            .iter()
+            .filter(|e| e.ty == SelfEndpointType::Stun4LocalPort)
+            .collect();
+        assert_eq!(
+            guesses.len(),
+            1,
+            "only the v4 reflexive yields a guess: {eps:?}"
+        );
+        assert!(
+            guesses[0].addr.is_ipv4(),
+            "the guess must be IPv4-only, got {:?}",
+            guesses[0].addr
+        );
+        assert_eq!(
+            guesses[0].addr.ip(),
+            "203.0.113.5".parse::<core::net::IpAddr>().unwrap(),
+            "the guess pairs the v4 reflexive IP with the local port"
         );
     }
 
@@ -1480,7 +1640,16 @@ mod tests {
         let a_node = ts_keys::NodePrivateKey::random().public_key();
         let b_node = ts_keys::NodePrivateKey::random().public_key();
 
-        let a = Arc::new(MagicSock::bind(localhost(), a_disco, a_node).await.unwrap());
+        // A harvests the reflexive `src` from B's pong, which is now gated on B's disco key being a
+        // netmap member (and on the pong being solicited). A therefore needs a verifier too, or it
+        // fails closed and learns no reflexive address. Allow-all: the membership gate is exercised
+        // by the dedicated `pong_*` tests; here we confirm the legitimate harvest path still works.
+        let a = Arc::new(
+            MagicSock::bind(localhost(), a_disco, a_node)
+                .await
+                .unwrap()
+                .with_binding_verifier(allow_all()),
+        );
         // B answers A's pings, so it needs a verifier (fail-closed otherwise). Allow-all: the
         // binding check is covered elsewhere; here we exercise reflexive-address learning.
         let b = Arc::new(
@@ -1541,6 +1710,135 @@ mod tests {
 
         a_pump.abort();
         b_pump.abort();
+    }
+
+    /// The disco-pong reflexive harvest is gated on netmap membership: a pong sealed by a disco key
+    /// the binding verifier rejects must NOT add to the reflexive set, even if it carries a valid
+    /// `src` and matches an in-flight ping. Otherwise an attacker who learns our disco pubkey could
+    /// seal pongs with arbitrary `src` values and pollute the addresses we advertise to control.
+    #[tokio::test]
+    async fn pong_from_non_member_does_not_harvest_reflexive() {
+        let member_disco = DiscoPrivateKey::random();
+        let stranger_disco = DiscoPrivateKey::random();
+        let our_disco = DiscoPrivateKey::random();
+        let our_node = ts_keys::NodePrivateKey::random().public_key();
+
+        // Only `member_disco` is a netmap member; a Pong carries no node key (claimed = None).
+        let member_pub = member_disco.public_key();
+        let verifier: BindingVerifier = Arc::new(
+            move |disco: &DiscoPublicKey, claimed: Option<&NodePublicKey>| {
+                claimed.is_none() && *disco == member_pub
+            },
+        );
+
+        let sock = MagicSock::bind(localhost(), our_disco, our_node)
+            .await
+            .unwrap()
+            .with_binding_verifier(verifier);
+
+        let from: SocketAddr = "203.0.113.50:41641".parse().unwrap();
+        let spoofed_src: SocketAddr = "198.51.100.77:51000".parse().unwrap();
+        let tx = disco::random_tx_id();
+
+        // Make the pong SOLICITED for the stranger's path so only the membership gate can reject it:
+        // register an in-flight ping for `(tx, from)` under the stranger's disco key.
+        {
+            let mut paths = sock.paths.lock().unwrap();
+            paths
+                .entry(stranger_disco.public_key())
+                .or_default()
+                .note_ping_sent(tx, from, Instant::now());
+        }
+
+        sock.handle_disco(
+            Inbound::Pong {
+                sender: stranger_disco.public_key(),
+                tx_id: tx,
+                src: spoofed_src,
+            },
+            from,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            sock.reflexive.lock().unwrap().is_empty(),
+            "a non-member pong must not harvest its reflexive src"
+        );
+        assert!(
+            !sock.self_endpoints().iter().any(|e| e.addr == spoofed_src),
+            "the spoofed reflexive must not appear in self_endpoints"
+        );
+
+        // A SOLICITED pong from the netmap MEMBER still harvests its reflexive src (the legitimate
+        // NAT-traversal path must keep working).
+        let member_src: SocketAddr = "192.0.2.123:60000".parse().unwrap();
+        let member_tx = disco::random_tx_id();
+        {
+            let mut paths = sock.paths.lock().unwrap();
+            paths
+                .entry(member_disco.public_key())
+                .or_default()
+                .note_ping_sent(member_tx, from, Instant::now());
+        }
+        sock.handle_disco(
+            Inbound::Pong {
+                sender: member_disco.public_key(),
+                tx_id: member_tx,
+                src: member_src,
+            },
+            from,
+        )
+        .await
+        .unwrap();
+
+        let reflexive: Vec<SocketAddr> = sock.reflexive.lock().unwrap().iter().copied().collect();
+        assert_eq!(
+            reflexive,
+            vec![member_src],
+            "a member's solicited pong must harvest exactly its reflexive src"
+        );
+    }
+
+    /// The harvest is also gated on the pong being SOLICITED: a pong from a netmap member that does
+    /// NOT match an in-flight ping (`note_pong` returns `None`) must not harvest a reflexive `src`,
+    /// so a member cannot inject arbitrary `src` values via unsolicited pongs either.
+    #[tokio::test]
+    async fn unsolicited_member_pong_does_not_harvest_reflexive() {
+        let member_disco = DiscoPrivateKey::random();
+        let our_disco = DiscoPrivateKey::random();
+        let our_node = ts_keys::NodePrivateKey::random().public_key();
+
+        let member_pub = member_disco.public_key();
+        let verifier: BindingVerifier = Arc::new(
+            move |disco: &DiscoPublicKey, claimed: Option<&NodePublicKey>| {
+                claimed.is_none() && *disco == member_pub
+            },
+        );
+
+        let sock = MagicSock::bind(localhost(), our_disco, our_node)
+            .await
+            .unwrap()
+            .with_binding_verifier(verifier);
+
+        let from: SocketAddr = "203.0.113.50:41641".parse().unwrap();
+        let spoofed_src: SocketAddr = "198.51.100.88:52000".parse().unwrap();
+        // No in-flight ping is registered for this tx/peer: the pong is unsolicited.
+        sock.handle_disco(
+            Inbound::Pong {
+                sender: member_disco.public_key(),
+                tx_id: disco::random_tx_id(),
+                src: spoofed_src,
+            },
+            from,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            sock.reflexive.lock().unwrap().is_empty(),
+            "an unsolicited pong (no matching in-flight ping) must not harvest its src"
+        );
     }
 
     #[tokio::test]

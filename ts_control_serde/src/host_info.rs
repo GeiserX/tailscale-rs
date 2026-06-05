@@ -155,3 +155,47 @@ pub struct HostInfo<'a> {
     /// * Android apps use `EncryptedSharedPreferences`
     pub state_encrypted: Option<bool>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_relay_deserializes_pascalcase_true() {
+        // Go encodes `Hostinfo.PeerRelay` PascalCase on the wire; a `true` must parse to `true`.
+        let json = r#"{"PeerRelay":true}"#;
+        let host_info: HostInfo = serde_json::from_str(json).unwrap();
+        assert!(host_info.peer_relay);
+    }
+
+    #[test]
+    fn peer_relay_defaults_false_when_omitted() {
+        // Omitting the field entirely must default to `false` (the `_ => #[serde(default)]`
+        // apply-rule), not error or parse as anything else.
+        let json = r#"{}"#;
+        let host_info: HostInfo = serde_json::from_str(json).unwrap();
+        assert!(!host_info.peer_relay);
+    }
+
+    #[test]
+    fn peer_relay_round_trips_and_skips_when_false() {
+        // `true` serializes to include `"PeerRelay":true`.
+        let mut host_info = HostInfo {
+            peer_relay: true,
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&host_info).unwrap();
+        assert_eq!(
+            value.get("PeerRelay").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+
+        // `false` is omitted from the output (the crate's `bool => skip_serializing_if =
+        // is_default` rule), matching the other bool fields' behavior.
+        host_info.peer_relay = false;
+        let value = serde_json::to_value(&host_info).unwrap();
+        assert!(value.get("PeerRelay").is_none());
+        // Sanity-check the shared bool behavior on a sibling bool field.
+        assert!(value.get("ShieldsUp").is_none());
+    }
+}
