@@ -15,6 +15,7 @@ use crate::{
     host_info::HostInfo,
     node::{Node, NodeId},
     ping::PingRequest,
+    ssh_policy::SSHPolicy,
     tka_info::TkaInfo,
     user::UserProfile,
 };
@@ -410,10 +411,10 @@ pub struct MapResponse<'a> {
     // As a special case, the map key "*" with a value of nil means to clear all
     // prior display messages before processing the other map entries.
     //DisplayMessages map[DisplayMessageID]*DisplayMessage `json:",omitempty"`
-
-    // SSHPolicy, if non-nil, updates the SSH policy for how incoming
-    // SSH connections should be handled.
-    //SSHPolicy *SSHPolicy `json:",omitempty"`
+    /// If non-`None`, updates the SSH policy for how incoming SSH connections should be handled.
+    /// A `None` value means no change from the previous value.
+    #[serde(default, rename = "SSHPolicy")]
+    pub ssh_policy: Option<SSHPolicy<'a>>,
 
     // --------------------------------------------------------------------------------------------
     /// The current timestamp according to the control server; otherwise, `None`.
@@ -546,5 +547,34 @@ mod test {
 
         let serialized = serde_json::to_string_pretty(&req).unwrap();
         std::println!("{serialized}");
+    }
+
+    #[test]
+    fn ssh_policy_present() {
+        const TEST: &str = r#"{
+            "Seq": 1,
+            "SSHPolicy": {
+                "rules": [
+                    {
+                        "principals": [{ "any": true }],
+                        "sshUsers": { "*": "=" },
+                        "action": { "accept": true }
+                    }
+                ]
+            }
+        }"#;
+
+        let resp = serde_json::from_str::<MapResponse>(TEST).unwrap();
+        let policy = resp.ssh_policy.expect("ssh_policy should be Some");
+        assert_eq!(policy.rules.len(), 1);
+        assert!(policy.rules[0].principals[0].any);
+        assert!(policy.rules[0].action.as_ref().unwrap().accept);
+    }
+
+    #[test]
+    fn ssh_policy_absent() {
+        const TEST: &str = r#"{ "Seq": 1 }"#;
+        let resp = serde_json::from_str::<MapResponse>(TEST).unwrap();
+        assert!(resp.ssh_policy.is_none());
     }
 }

@@ -105,6 +105,9 @@ pub struct StateUpdate {
     pub dial_plan: Option<DialPlan>,
     /// New DNS configuration for the MagicDNS responder. `None` means no change.
     pub dns_config: Option<crate::DnsConfig>,
+    /// New Tailscale SSH policy pushed by control. `None` means no change in this response;
+    /// `Some` replaces the active policy (an empty rule set means "deny all", fail-closed).
+    pub ssh_policy: Option<crate::SshPolicy>,
 }
 
 pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpdate> {
@@ -185,6 +188,10 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
                     .dns_config
                     .as_ref()
                     .map(crate::DnsConfig::from_serde),
+                ssh_policy: map_response
+                    .ssh_policy
+                    .as_ref()
+                    .map(crate::SshPolicy::from_serde),
             },
             reader,
         ))

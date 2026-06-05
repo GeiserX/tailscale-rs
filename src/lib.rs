@@ -145,6 +145,10 @@ pub use ts_control::tls::{CertifiedKey, TlsAcceptor, TlsStream};
 pub use ts_control::{CertError, MISSING_CERT_RPC, ServeConfig, ServeTarget};
 #[doc(inline)]
 pub use ts_control::{ExitProxyConfig, ExitProxyScheme};
+pub use ts_control::{
+    SshAccept, SshAction, SshConnIdentity, SshDecision, SshDenyReason, SshPolicy, SshPrincipal,
+    SshRule,
+};
 #[doc(inline)]
 pub use ts_netstack_smoltcp::PingError;
 use ts_netstack_smoltcp::{CreateSocket, netcore::Channel};
@@ -359,6 +363,21 @@ impl Device {
             .await
             .map_err(ts_runtime::Error::from)?
             .ok_or(Error::Internal(InternalErrorKind::Actor))
+    }
+
+    /// Fetch the current Tailscale SSH policy pushed by control, if any.
+    ///
+    /// Returns `Ok(None)` when control has not sent an SSH policy. The SSH server treats an absent
+    /// or empty policy as **deny-all** (fail-closed). Used by the SSH auth path
+    /// ([`SshPolicy::evaluate`][ts_control::SshPolicy::evaluate]) to authorize incoming
+    /// connections.
+    pub async fn ssh_policy(&self) -> Result<Option<ts_control::SshPolicy>, Error> {
+        self.runtime
+            .control
+            .ask(ts_runtime::control_runner::CurrentSshPolicy)
+            .await
+            .map_err(ts_runtime::Error::from)
+            .map_err(Into::into)
     }
 
     /// Look up a peer by name.

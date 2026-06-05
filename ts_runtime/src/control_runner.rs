@@ -13,7 +13,7 @@ use kameo::{
 };
 use tokio::sync::watch;
 use ts_control::{
-    AsyncControlClient, Endpoint, EndpointType, Error as ControlError, Node, StateUpdate,
+    AsyncControlClient, Endpoint, EndpointType, Error as ControlError, Node, SshPolicy, StateUpdate,
 };
 use ts_magicsock::SelfEndpointType;
 
@@ -30,6 +30,9 @@ pub struct ControlRunner {
     params: Params,
 
     self_node: watch::Sender<Option<Node>>,
+    /// Latest Tailscale SSH policy pushed by control, or `None` until control sends one. The SSH
+    /// server reads this to authorize incoming connections; absent policy means deny-all.
+    ssh_policy: watch::Sender<Option<SshPolicy>>,
 }
 
 /// Control runner args.
@@ -93,6 +96,7 @@ impl kameo::Actor for ControlRunner {
             client,
             params,
             self_node: Default::default(),
+            ssh_policy: Default::default(),
         })
     }
 }
@@ -179,6 +183,16 @@ impl ControlRunner {
 
         deleg
     }
+
+    /// Fetch the current Tailscale SSH policy, if control has pushed one.
+    ///
+    /// Returns `None` when control has not sent an SSH policy (the SSH server treats this as
+    /// deny-all — fail-closed). Unlike [`self_node`](Self::self_node) this does not block waiting
+    /// for a value: an absent policy is a legitimate, immediate answer.
+    #[message]
+    pub fn current_ssh_policy(&self) -> Option<SshPolicy> {
+        self.ssh_policy.borrow().clone()
+    }
 }
 
 impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
@@ -197,6 +211,10 @@ impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
             StreamMessage::Next(msg) => {
                 if let Some(node) = msg.node.as_ref() {
                     self.self_node.send_replace(Some(node.clone()));
+                }
+
+                if let Some(policy) = msg.ssh_policy.as_ref() {
+                    self.ssh_policy.send_replace(Some(policy.clone()));
                 }
 
                 if let Err(e) = self.params.env.publish(msg).await {

@@ -389,6 +389,7 @@ mod tests {
             pop_browser_url: None,
             dial_plan: None,
             dns_config: None,
+            ssh_policy: None,
         }
     }
 

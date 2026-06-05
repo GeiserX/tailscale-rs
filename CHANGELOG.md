@@ -6,6 +6,35 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.16](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.16) - 2026-06-05
+
+**Tailscale SSH server authorization** (`tsr-l24`): the in-process SSH server now enforces the
+control-pushed `SSHPolicy`, brought to Go `tailssh` parity and made **fail-closed**. Previously the
+SSH `ChannelServer` accepted *any* known tailnet peer with no policy evaluation; that gap is closed.
+
+- **Wire types** (`ts_control_serde`): `SSHPolicy` / `SSHRule` / `SSHPrincipal` / `SSHAction` /
+  `SSHRecorderFailureAction`, mirroring `tailcfg` field-for-field (verbatim lowerCamel JSON tags:
+  `ruleExpires`, `sshUsers`, `nodeIP`, `userLogin`, `sessionDuration` (nanoseconds), `notifyURL`,
+  …). `MapResponse.SSHPolicy` is now deserialized off the netmap.
+- **Policy evaluator** (`ts_control::SshPolicy`): an owned domain model + `evaluate` that reproduces
+  Go `evalSSHPolicy` / `matchRule` / `mapLocalUser` — **first-match-wins, default-deny**, with the
+  exact `SSHUsers` map semantics (`"*"` wildcard key, `"="` identity map, empty-string value =
+  rule does not apply). Principal matching by stable node id / node IP / `any`. Rule-expiry is
+  honored and **fails closed**: an unreadable host clock makes time-limited rules look expired
+  (deny) rather than perpetually live.
+- **Server enforcement** (`Device::authorize_ssh`, `ssh` feature): resolves the connection's source
+  IP to a known tailnet peer (unknown ⇒ deny), fetches the current policy (**absent ⇒ deny-all**),
+  and evaluates it; `auth_none` rejects on any deny *or* any lookup error. The policy is threaded
+  netmap → `StateUpdate` → `ControlRunner` (watch channel) → `Device`.
+- **musl-clean isolation guard** (`checks::ssh_isolation`): a new build-gate asserting the `ssh`
+  feature (which pulls `russh` → `aws-lc-rs`) stays OFF by default, `dep:russh`-gated, and that
+  `aws-lc-rs` is never a direct dependency — so the core tailnet/egress path remains `ring`-only and
+  cross-compiles cleanly to musl. The SSH server is meant to run isolated in a separate non-musl
+  binary.
+
+Advanced SSH features (session recording / `OnRecordingFailure`, the interactive `holdAndDelegate`
+control round-trip) are intentionally out of scope for this basic `ListenSSH` parity slice.
+
 ## [0.5.15](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.15) - 2026-06-05
 
 **`ListenFunnel`** (`tsr-jir`): the Tailscale Funnel public-ingress entry point, brought to the same

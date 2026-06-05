@@ -31,6 +31,8 @@ pub extern crate russh;
 use std::{fmt::Debug, net::SocketAddr, sync::Arc};
 
 use russh::server::Handler;
+use ts_control::SshConnIdentity;
+pub use ts_control::{SshAccept, SshDecision, SshDenyReason, SshPolicy};
 
 mod channel_server;
 mod channel_write;
@@ -38,6 +40,64 @@ mod ratatui;
 
 pub use channel_server::{ChannelEvent, ChannelHandler, ChannelServer};
 pub use ratatui::{RatatuiApp, RatatuiEnv, RatatuiTerm};
+
+impl crate::Device {
+    /// Authorize an incoming Tailscale SSH connection from `remote` requesting local user
+    /// `requested_user`, against the control-pushed SSH policy.
+    ///
+    /// **Fail-closed.** This is the Rust analogue of Go `tailssh`'s policy evaluation. It:
+    /// 1. resolves `remote`'s IP to a known tailnet peer — an unknown source is denied;
+    /// 2. fetches the current [`SshPolicy`][ts_control::SshPolicy] — **no policy means deny-all**;
+    /// 3. evaluates the policy (first-match-wins, default-deny) against the peer's identity.
+    ///
+    /// Returns the [`SshDecision`]. Callers MUST reject the connection on any
+    /// [`SshDecision::Deny`]. Any lookup error is surfaced as `Err` and must also be treated as a
+    /// rejection by the caller — the connection is never allowed on the error path.
+    ///
+    /// NOTE: `userLogin`-principal matching requires the connecting peer's owner login, which this
+    /// fork's domain node model does not yet retain (it is reported as `None`); such principals
+    /// therefore never match here. Node-id / node-IP / `any` principals match normally.
+    pub async fn authorize_ssh(
+        &self,
+        remote: SocketAddr,
+        requested_user: &str,
+    ) -> Result<SshDecision, crate::Error> {
+        use ts_control::SshDenyReason;
+
+        let Some(peer) = self.peer_by_tailnet_ip(remote.ip()).await? else {
+            tracing::warn!(remote = %remote, "ssh: source IP does not match a known tailnet peer");
+            return Ok(SshDecision::Deny(SshDenyReason::NoRuleMatched));
+        };
+
+        let Some(policy) = self.ssh_policy().await? else {
+            tracing::warn!(remote = %remote, "ssh: no SSH policy pushed by control; deny-all");
+            return Ok(SshDecision::Deny(SshDenyReason::NoRuleMatched));
+        };
+
+        let id = SshConnIdentity {
+            stable_id: peer.stable_id.0.clone(),
+            src_ip: remote.ip(),
+            // The domain node model does not retain the owner login; see method docs.
+            user_login: None,
+        };
+
+        Ok(policy.evaluate_at_unix(&id, requested_user, now_unix_secs()))
+    }
+}
+
+/// Current wall-clock time as Unix seconds, derived from [`std::time::SystemTime`].
+///
+/// The root crate does not depend on `chrono`, and the workspace pins it without the `clock`
+/// feature anyway, so policy evaluation takes a Unix timestamp instead of a `DateTime`. An
+/// unreadable clock (time before the Unix epoch) is clamped to [`i64::MAX`] so SSH-rule expiry
+/// **fails closed**: a broken clock makes every time-limited rule look already-expired (deny)
+/// rather than perpetually-live.
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(i64::MAX)
+}
 
 /// Trait to construct a new [`Handler`] from a Tailscale [`Device`][crate::Device] and
 /// the address of a connecting client.

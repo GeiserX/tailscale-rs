@@ -23,6 +23,7 @@ mod map_request_builder;
 mod node;
 #[cfg(feature = "async_tokio")]
 mod serve;
+mod ssh_policy;
 #[cfg(feature = "async_tokio")]
 mod tokio;
 
@@ -47,6 +48,10 @@ pub use node::{
 pub use serve::{
     FunnelError, FunnelOptions, MISSING_FUNNEL_RELAY, ServeConfig, ServeTarget, accept_tls,
     funnel_access, listen_funnel, listen_tls, tls_acceptor,
+};
+pub use ssh_policy::{
+    SshAccept, SshAction, SshConnIdentity, SshDecision, SshDenyReason, SshPolicy, SshPrincipal,
+    SshRule,
 };
 pub use ts_control_serde::{Endpoint, EndpointType};
 

@@ -41,9 +41,14 @@ pub trait ChannelHandler: Sized {
 ///
 /// # Authentication and authorization
 ///
-/// **WARNING**: [`ChannelServer`] currently does _no_ authentication or authorization checks
-/// internally. It is still protected by the policy file's network-layer rules, but it does
-/// not currently support the `ssh` policy block or application capabilities.
+/// Incoming connections are gated by the control-pushed Tailscale SSH policy: [`auth_none`]
+/// resolves the source IP to a known tailnet peer and evaluates the policy via
+/// [`Device::authorize_ssh`][crate::Device::authorize_ssh] (fail-closed — an unknown peer, an
+/// absent policy, or a non-matching policy all reject). The `ssh` policy block's accept/reject
+/// rules, principal matching, and SSH-user mapping are honored; advanced features (recording,
+/// `holdAndDelegate`, per-session capability enforcement) are not yet implemented.
+///
+/// [`auth_none`]: russh::server::Handler::auth_none
 pub struct ChannelServer<H> {
     channel_state: HashMap<ChannelId, ChannelState>,
     remote: SocketAddr,
@@ -122,16 +127,27 @@ where
 {
     type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-    #[tracing::instrument(skip_all, fields(user = %_user, remote = ?self.remote))]
-    async fn auth_none(&mut self, _user: &str) -> Result<Auth, Self::Error> {
-        let Some(peer) = self.dev.peer_by_tailnet_ip(self.remote.ip()).await? else {
-            tracing::error!("remote ip does not match a known peer");
-            return Ok(Auth::reject());
-        };
-
-        tracing::debug!(?peer, "accept ssh connection");
-
-        Ok(Auth::Accept)
+    #[tracing::instrument(skip_all, fields(user = %user, remote = ?self.remote))]
+    async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
+        // Enforce the control-pushed Tailscale SSH policy. Fail-closed: an unknown source, an
+        // absent policy, a non-matching policy, or any lookup error all reject the connection.
+        match self.dev.authorize_ssh(self.remote, user).await {
+            Ok(crate::ssh::SshDecision::Accept(accept)) => {
+                tracing::debug!(
+                    local_user = %accept.local_user,
+                    "ssh: policy accepted connection"
+                );
+                Ok(Auth::Accept)
+            }
+            Ok(crate::ssh::SshDecision::Deny(reason)) => {
+                tracing::warn!(?reason, "ssh: policy denied connection");
+                Ok(Auth::reject())
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "ssh: authorization failed; rejecting");
+                Ok(Auth::reject())
+            }
+        }
     }
 
     async fn channel_open_session(
