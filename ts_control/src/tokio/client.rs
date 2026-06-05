@@ -390,6 +390,7 @@ mod tests {
             dial_plan: None,
             dns_config: None,
             ssh_policy: None,
+            tka: None,
         }
     }
 

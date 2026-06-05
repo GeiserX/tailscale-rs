@@ -622,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "checks"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "clap",
  "globwalk",
@@ -1089,6 +1089,7 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
  "curve25519-dalek-derive",
+ "digest 0.10.7",
  "fiat-crypto 0.2.9",
  "rustc_version",
  "subtle",
@@ -1236,6 +1237,17 @@ checksum = "5729f5117e208430e437df2f4843f5e5952997175992d1414f94c57d61e270b4"
 
 [[package]]
 name = "der"
+version = "0.7.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
+dependencies = [
+ "const-oid 0.9.6",
+ "pem-rfc7468 0.7.0",
+ "zeroize",
+]
+
+[[package]]
+name = "der"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71fd89660b2dc699704064e59e9dba0147b903e85319429e131620d022be411b"
@@ -1370,13 +1382,24 @@ version = "0.17.0-rc.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91bbdd377139884fafcad8dc43a760a3e1e681aa26db910257fa6535b70e1829"
 dependencies = [
- "der",
+ "der 0.8.0",
  "digest 0.11.3",
  "elliptic-curve",
  "rfc6979",
- "signature",
- "spki",
+ "signature 3.0.0",
+ "spki 0.8.0-rc.4",
  "zeroize",
+]
+
+[[package]]
+name = "ed25519"
+version = "2.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
+dependencies = [
+ "pkcs8 0.10.2",
+ "serde",
+ "signature 2.2.0",
 ]
 
 [[package]]
@@ -1385,8 +1408,22 @@ version = "3.0.0-rc.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c6e914c7c52decb085cea910552e24c63ac019e3ab8bf001ff736da9a9d9d890"
 dependencies = [
- "pkcs8",
- "signature",
+ "pkcs8 0.11.0-rc.11",
+ "signature 3.0.0",
+]
+
+[[package]]
+name = "ed25519-dalek"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
+dependencies = [
+ "curve25519-dalek 4.1.3",
+ "ed25519 2.2.3",
+ "serde",
+ "sha2 0.10.9",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -1396,11 +1433,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "053618a4c3d3bc24f188aa660ae75a46eeab74ef07fb415c61431e5e7cd4749b"
 dependencies = [
  "curve25519-dalek 5.0.0-pre.6",
- "ed25519",
+ "ed25519 3.0.0-rc.4",
  "rand_core 0.10.1",
  "serde",
  "sha2 0.11.0",
- "signature",
+ "signature 3.0.0",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "ed25519-zebra"
+version = "4.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "775765289f7c6336c18d3d66127527820dd45ffd9eb3b6b8ee4708590e6c20f5"
+dependencies = [
+ "curve25519-dalek 4.1.3",
+ "ed25519 2.2.3",
+ "hashbrown 0.16.1",
+ "pkcs8 0.10.2",
+ "rand_core 0.6.4",
+ "serde",
+ "sha2 0.10.9",
  "subtle",
  "zeroize",
 ]
@@ -1425,7 +1479,7 @@ dependencies = [
  "hybrid-array",
  "once_cell",
  "pem-rfc7468 1.0.0",
- "pkcs8",
+ "pkcs8 0.11.0-rc.11",
  "rand_core 0.10.1",
  "rustcrypto-ff",
  "rustcrypto-group",
@@ -2454,7 +2508,7 @@ dependencies = [
  "bcrypt-pbkdf",
  "crypto-bigint",
  "ecdsa",
- "ed25519-dalek",
+ "ed25519-dalek 3.0.0-pre.6",
  "hex",
  "hmac 0.13.0",
  "p256",
@@ -2465,7 +2519,7 @@ dependencies = [
  "sec1",
  "sha1 0.11.0",
  "sha2 0.11.0",
- "signature",
+ "signature 3.0.0",
  "ssh-cipher",
  "ssh-encoding",
  "subtle",
@@ -3442,8 +3496,8 @@ version = "0.8.0-rc.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "986d2e952779af96ea048f160fd9194e1751b4faea78bcf3ceb456efe008088e"
 dependencies = [
- "der",
- "spki",
+ "der 0.8.0",
+ "spki 0.8.0-rc.4",
 ]
 
 [[package]]
@@ -3455,12 +3509,22 @@ dependencies = [
  "aes 0.9.0",
  "aes-gcm 0.11.0-rc.3",
  "cbc 0.2.0",
- "der",
+ "der 0.8.0",
  "pbkdf2 0.13.0",
  "rand_core 0.10.1",
  "scrypt",
  "sha2 0.11.0",
- "spki",
+ "spki 0.8.0-rc.4",
+]
+
+[[package]]
+name = "pkcs8"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f950b2377845cebe5cf8b5165cb3cc1a5e0fa5cfa3e1f7f55707d8fd82e0a7b7"
+dependencies = [
+ "der 0.7.10",
+ "spki 0.7.3",
 ]
 
 [[package]]
@@ -3469,10 +3533,10 @@ version = "0.11.0-rc.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "12922b6296c06eb741b02d7b5161e3aaa22864af38dfa025a1a3ba3f68c84577"
 dependencies = [
- "der",
+ "der 0.8.0",
  "pkcs5",
  "rand_core 0.10.1",
- "spki",
+ "spki 0.8.0-rc.4",
 ]
 
 [[package]]
@@ -4200,10 +4264,10 @@ dependencies = [
  "crypto-primes",
  "digest 0.11.3",
  "pkcs1",
- "pkcs8",
+ "pkcs8 0.11.0-rc.11",
  "rand_core 0.10.1",
  "sha2 0.11.0",
- "signature",
+ "signature 3.0.0",
  "zeroize",
 ]
 
@@ -4231,10 +4295,10 @@ dependencies = [
  "curve25519-dalek 5.0.0-pre.6",
  "data-encoding",
  "delegate",
- "der",
+ "der 0.8.0",
  "digest 0.10.7",
  "ecdsa",
- "ed25519-dalek",
+ "ed25519-dalek 3.0.0-pre.6",
  "elliptic-curve",
  "enum_dispatch",
  "flate2",
@@ -4262,7 +4326,7 @@ dependencies = [
  "pbkdf2 0.12.2",
  "pbkdf2 0.13.0",
  "pkcs5",
- "pkcs8",
+ "pkcs8 0.11.0-rc.11",
  "polyval 0.7.1",
  "rand 0.10.1",
  "rand_core 0.10.1",
@@ -4276,8 +4340,8 @@ dependencies = [
  "sha2 0.10.9",
  "sha2 0.11.0",
  "sha3",
- "signature",
- "spki",
+ "signature 3.0.0",
+ "spki 0.8.0-rc.4",
  "ssh-encoding",
  "subtle",
  "thiserror 2.0.18",
@@ -4587,7 +4651,7 @@ checksum = "d56d437c2f19203ce5f7122e507831de96f3d2d4d3be5af44a0b0a09d8a80e4d"
 dependencies = [
  "base16ct",
  "ctutils",
- "der",
+ "der 0.8.0",
  "hybrid-array",
  "subtle",
  "zeroize",
@@ -4852,6 +4916,15 @@ dependencies = [
 
 [[package]]
 name = "signature"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
+dependencies = [
+ "rand_core 0.6.4",
+]
+
+[[package]]
+name = "signature"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
@@ -4936,12 +5009,22 @@ dependencies = [
 
 [[package]]
 name = "spki"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
+dependencies = [
+ "base64ct",
+ "der 0.7.10",
+]
+
+[[package]]
+name = "spki"
 version = "0.8.0-rc.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8baeff88f34ed0691978ec34440140e1572b68c7dd4a495fd14a3dc1944daa80"
 dependencies = [
  "base64ct",
- "der",
+ "der 0.8.0",
 ]
 
 [[package]]
@@ -5107,7 +5190,7 @@ dependencies = [
 
 [[package]]
 name = "tailscale"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "axum",
  "bytes",
@@ -5133,6 +5216,7 @@ dependencies = [
  "ts_netstack_smoltcp",
  "ts_runtime",
  "ts_test_util",
+ "ts_tka",
  "url",
 ]
 
@@ -5685,7 +5769,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "ts_array256"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "heapless",
  "lazy_static",
@@ -5697,7 +5781,7 @@ dependencies = [
 
 [[package]]
 name = "ts_bart"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "cfg-if",
  "divan",
@@ -5716,7 +5800,7 @@ dependencies = [
 
 [[package]]
 name = "ts_bart_packetfilter"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "hashbrown 0.17.1",
  "ipnet",
@@ -5731,7 +5815,7 @@ dependencies = [
 
 [[package]]
 name = "ts_bitset"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "cfg-if",
  "divan",
@@ -5741,14 +5825,14 @@ dependencies = [
 
 [[package]]
 name = "ts_capabilityversion"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "ts_cli_util"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "cfg-if",
  "clap",
@@ -5765,7 +5849,7 @@ dependencies = [
 
 [[package]]
 name = "ts_control"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "bytes",
  "chrono",
@@ -5803,7 +5887,7 @@ dependencies = [
 
 [[package]]
 name = "ts_control_noise"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -5828,7 +5912,7 @@ dependencies = [
 
 [[package]]
 name = "ts_control_serde"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -5846,7 +5930,7 @@ dependencies = [
 
 [[package]]
 name = "ts_dataplane"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "etherparse",
  "tokio",
@@ -5863,7 +5947,7 @@ dependencies = [
 
 [[package]]
 name = "ts_derp"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "bytes",
  "crypto_box",
@@ -5891,7 +5975,7 @@ dependencies = [
 
 [[package]]
 name = "ts_devtools"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "bytes",
  "clap",
@@ -5907,7 +5991,7 @@ dependencies = [
 
 [[package]]
 name = "ts_disco_protocol"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "aead 0.5.2",
  "crypto_box",
@@ -5921,11 +6005,11 @@ dependencies = [
 
 [[package]]
 name = "ts_dns_wire"
-version = "0.5.19"
+version = "0.5.20"
 
 [[package]]
 name = "ts_dynbitset"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "proptest",
  "smallvec",
@@ -5934,7 +6018,7 @@ dependencies = [
 
 [[package]]
 name = "ts_elixir"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "rustler",
  "tailscale",
@@ -5944,7 +6028,7 @@ dependencies = [
 
 [[package]]
 name = "ts_ffi"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "cbindgen",
  "tailscale",
@@ -5956,7 +6040,7 @@ dependencies = [
 
 [[package]]
 name = "ts_forwarder"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "bytes",
  "ipnet",
@@ -5968,14 +6052,14 @@ dependencies = [
 
 [[package]]
 name = "ts_hexdump"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "heapless",
 ]
 
 [[package]]
 name = "ts_host_net"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "ipnet",
  "thiserror 2.0.18",
@@ -5984,7 +6068,7 @@ dependencies = [
 
 [[package]]
 name = "ts_http_util"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "bytes",
  "futures",
@@ -6005,7 +6089,7 @@ dependencies = [
 
 [[package]]
 name = "ts_keys"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "crypto_box",
  "serde",
@@ -6016,7 +6100,7 @@ dependencies = [
 
 [[package]]
 name = "ts_magicsock"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "rand 0.10.1",
  "thiserror 2.0.18",
@@ -6033,11 +6117,11 @@ dependencies = [
 
 [[package]]
 name = "ts_metrics"
-version = "0.5.19"
+version = "0.5.20"
 
 [[package]]
 name = "ts_netcheck"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "bytes",
  "dashmap",
@@ -6058,7 +6142,7 @@ dependencies = [
 
 [[package]]
 name = "ts_netstack_smoltcp"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "axum",
  "bytes",
@@ -6079,7 +6163,7 @@ dependencies = [
 
 [[package]]
 name = "ts_netstack_smoltcp_core"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "bytes",
  "flume",
@@ -6093,7 +6177,7 @@ dependencies = [
 
 [[package]]
 name = "ts_netstack_smoltcp_socket"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "bytes",
  "futures-io",
@@ -6104,7 +6188,7 @@ dependencies = [
 
 [[package]]
 name = "ts_nodecapability"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "cfg-if",
  "serde",
@@ -6113,7 +6197,7 @@ dependencies = [
 
 [[package]]
 name = "ts_overlay_router"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "itertools",
  "tracing",
@@ -6124,7 +6208,7 @@ dependencies = [
 
 [[package]]
 name = "ts_packet"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "bytes",
  "crypto_box",
@@ -6133,7 +6217,7 @@ dependencies = [
 
 [[package]]
 name = "ts_packetfilter"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "hashbrown 0.17.1",
  "ipnet",
@@ -6143,7 +6227,7 @@ dependencies = [
 
 [[package]]
 name = "ts_packetfilter_serde"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "ipnet",
  "nom 8.0.0",
@@ -6156,7 +6240,7 @@ dependencies = [
 
 [[package]]
 name = "ts_packetfilter_state"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "divan",
  "serde_json",
@@ -6167,7 +6251,7 @@ dependencies = [
 
 [[package]]
 name = "ts_peercapability"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "serde",
  "url",
@@ -6175,7 +6259,7 @@ dependencies = [
 
 [[package]]
 name = "ts_python"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "hex",
  "pyo3",
@@ -6186,7 +6270,7 @@ dependencies = [
 
 [[package]]
 name = "ts_runtime"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "base64 0.22.1",
  "futures",
@@ -6224,18 +6308,27 @@ dependencies = [
 
 [[package]]
 name = "ts_test_util"
-version = "0.5.19"
+version = "0.5.20"
 
 [[package]]
 name = "ts_time"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
+name = "ts_tka"
+version = "0.5.20"
+dependencies = [
+ "blake2",
+ "ed25519-dalek 2.2.0",
+ "ed25519-zebra",
+]
+
+[[package]]
 name = "ts_tls_util"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "rcgen",
  "ring",
@@ -6250,14 +6343,14 @@ dependencies = [
 
 [[package]]
 name = "ts_transport"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "ts_packet",
 ]
 
 [[package]]
 name = "ts_transport_tun"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "bytes",
  "ipnet",
@@ -6273,7 +6366,7 @@ dependencies = [
 
 [[package]]
 name = "ts_tunnel"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "aead 0.5.2",
  "base64 0.22.1",
@@ -6298,7 +6391,7 @@ dependencies = [
 
 [[package]]
 name = "ts_underlay_router"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "ts_packet",
  "ts_transport",

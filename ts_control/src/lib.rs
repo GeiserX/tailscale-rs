@@ -25,6 +25,7 @@ mod node;
 mod serve;
 mod service;
 mod ssh_policy;
+mod tka;
 #[cfg(feature = "async_tokio")]
 mod tokio;
 
@@ -56,6 +57,7 @@ pub use ssh_policy::{
     SshAccept, SshAction, SshConnIdentity, SshDecision, SshDenyReason, SshPolicy, SshPrincipal,
     SshRule,
 };
+pub use tka::TkaStatus;
 pub use ts_control_serde::{Endpoint, EndpointType};
 
 /// Re-exported TLS types from the `tokio-rustls`/`ring` stack used by [`cert`]/[`serve`], so

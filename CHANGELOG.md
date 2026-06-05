@@ -6,6 +6,32 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.20](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.20) - 2026-06-05
+
+**Tailnet Lock (TKA) verification** (`tsr-77q-c`): the client-side signature-chain verification path
+of Tailscale's Tailnet Lock, mirroring Go's `tka` package. Fail-closed.
+
+- **`ts_tka` crate**: a dependency-light reimplementation of the TKA verification primitives —
+  a CTAP2-canonical CBOR encoder (so a value's signing digest is byte-identical to Go's
+  `fxamacker/cbor` CTAP2 output), `AumHash` (BLAKE2s-256 + RFC4648 base32-nopad, the type
+  `TkaInfo.head` carries), the `Aum`/`Key`/`NodeKeySignature` wire vocabulary, and an `Authority`
+  exposing `node_key_authorized` — the check that a peer's node key is signed by a key trusted under
+  the current tailnet-lock state. Signature verification uses ZIP-215 (cofactored) Ed25519 for
+  direct/credential signatures (matching Go `ed25519consensus`) and standard Ed25519 for the
+  rotation wrap.
+- **Netmap threading**: control's `TKAInfo` (head + disablement) is parsed into a domain `TkaStatus`,
+  threaded `MapResponse` → `StateUpdate` → `ControlRunner`, and exposed via `Device::tka_status()`.
+  The `tailscale::tka` module re-exports the verification engine for embedders.
+- **Fail-closed**: any decode/shape/signature failure denies authorization; a credential-only
+  signature can never authorize a node; an untrusted authorizing key denies.
+
+**Validation caveat:** the CTAP2-CBOR byte-exactness is asserted by construction and exercised by an
+end-to-end Ed25519 sign→verify roundtrip, but has **not** been cross-validated against Go-produced
+TKA test vectors. A *failed* verification is always safe to act on (deny); treat a *successful* one
+as advisory until vectors land. The node's own NL-key signing (admin side) is out of scope — the
+fork's `NetworkLockPublicKey` is modelled as X25519 while Go TKA keys are Ed25519; only client-side
+verification (against peers' Ed25519 keys in the authority state) is implemented here.
+
 ## [0.5.19](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.19) - 2026-06-05
 
 **Client metrics / observability** (`tsr-77q-b`): a `clientmetric`-style in-process metric registry

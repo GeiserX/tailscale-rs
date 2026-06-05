@@ -504,6 +504,22 @@ impl Device {
         self.runtime.status().await.map_err(Into::into)
     }
 
+    /// Fetch the current Tailnet Lock (TKA) status pushed by control, if any.
+    ///
+    /// Returns `Ok(None)` when control has sent no `TKAInfo` (tailnet lock not in use, or no change
+    /// observed yet). The returned [`TkaStatus`][ts_control::TkaStatus] carries the authority head
+    /// (a base32 `AUMHash`, decode with [`tka::AumHash::from_base32`][ts_tka::AumHash::from_base32])
+    /// and the disablement signal. Signature verification of a peer's node-key signature against the
+    /// authority is performed with the [`tka`] module's [`tka::Authority`][ts_tka::Authority].
+    pub async fn tka_status(&self) -> Result<Option<ts_control::TkaStatus>, Error> {
+        self.runtime
+            .control
+            .ask(ts_runtime::control_runner::CurrentTkaStatus)
+            .await
+            .map_err(ts_runtime::Error::from)
+            .map_err(Into::into)
+    }
+
     /// Snapshot this node's client metrics in Prometheus text exposition format.
     ///
     /// Mirrors Go Tailscale's `clientmetric` registry: process-global counters/gauges incremented
@@ -661,6 +677,17 @@ pub mod netstack {
     pub use ts_netstack_smoltcp::netcore::InternalErrorKind;
     #[doc(inline)]
     pub use ts_netstack_smoltcp::netsock::{TcpListener, TcpStream, UdpSocket};
+}
+
+/// Tailnet Lock (TKA) verification: the [`tka::Authority`] checks a peer's node-key signature
+/// against the trusted-key state, mirroring Go's `tka` package. Pair with [`Device::tka_status`]
+/// (the control-pushed head/disablement signal).
+pub mod tka {
+    #[doc(inline)]
+    pub use ts_tka::{
+        AumHash, AumKind, Authority, Key, KeyKind, NodeKeySignature, SigKind, State, TkaError,
+        aum_hash,
+    };
 }
 
 /// Tailscale cryptographic key types.

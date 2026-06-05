@@ -1,0 +1,21 @@
+[package]
+name = "ts_tka"
+version.workspace = true
+description = "Tailnet Lock (TKA — Tailnet Key Authority) signature-chain verification"
+categories = ["cryptography", "network-programming"]
+keywords = ["tailscale", "tailnet-lock", "tka", "ed25519"]
+
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+blake2.workspace = true
+ed25519-dalek = "2"
+ed25519-zebra = "4"
+
+[dev-dependencies]
+
+[lints]
+workspace = true

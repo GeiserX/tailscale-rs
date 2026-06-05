@@ -108,6 +108,9 @@ pub struct StateUpdate {
     /// New Tailscale SSH policy pushed by control. `None` means no change in this response;
     /// `Some` replaces the active policy (an empty rule set means "deny all", fail-closed).
     pub ssh_policy: Option<crate::SshPolicy>,
+    /// New Tailnet Lock (TKA) status from control (`MapResponse.TKAInfo`). `None` means no change in
+    /// this response; `Some` carries the current authority head + disablement signal.
+    pub tka: Option<crate::TkaStatus>,
 }
 
 pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpdate> {
@@ -192,6 +195,10 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
                     .ssh_policy
                     .as_ref()
                     .map(crate::SshPolicy::from_serde),
+                tka: map_response
+                    .tka_info
+                    .as_ref()
+                    .map(crate::TkaStatus::from_serde),
             },
             reader,
         ))

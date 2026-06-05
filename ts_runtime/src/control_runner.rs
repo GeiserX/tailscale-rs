@@ -13,7 +13,8 @@ use kameo::{
 };
 use tokio::sync::watch;
 use ts_control::{
-    AsyncControlClient, Endpoint, EndpointType, Error as ControlError, Node, SshPolicy, StateUpdate,
+    AsyncControlClient, Endpoint, EndpointType, Error as ControlError, Node, SshPolicy,
+    StateUpdate, TkaStatus,
 };
 use ts_magicsock::SelfEndpointType;
 
@@ -33,6 +34,8 @@ pub struct ControlRunner {
     /// Latest Tailscale SSH policy pushed by control, or `None` until control sends one. The SSH
     /// server reads this to authorize incoming connections; absent policy means deny-all.
     ssh_policy: watch::Sender<Option<SshPolicy>>,
+    /// Latest Tailnet Lock status pushed by control, or `None` until control sends one.
+    tka: watch::Sender<Option<TkaStatus>>,
 }
 
 /// Control runner args.
@@ -97,6 +100,7 @@ impl kameo::Actor for ControlRunner {
             params,
             self_node: Default::default(),
             ssh_policy: Default::default(),
+            tka: Default::default(),
         })
     }
 }
@@ -193,6 +197,14 @@ impl ControlRunner {
     pub fn current_ssh_policy(&self) -> Option<SshPolicy> {
         self.ssh_policy.borrow().clone()
     }
+
+    /// Fetch the current Tailnet Lock status, if control has pushed one.
+    ///
+    /// Returns `None` when control has sent no `TKAInfo` (tailnet lock not in use / no change seen).
+    #[message]
+    pub fn current_tka_status(&self) -> Option<TkaStatus> {
+        self.tka.borrow().clone()
+    }
 }
 
 impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
@@ -215,6 +227,10 @@ impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
 
                 if let Some(policy) = msg.ssh_policy.as_ref() {
                     self.ssh_policy.send_replace(Some(policy.clone()));
+                }
+
+                if let Some(tka) = msg.tka.as_ref() {
+                    self.tka.send_replace(Some(tka.clone()));
                 }
 
                 if let Err(e) = self.params.env.publish(msg).await {
