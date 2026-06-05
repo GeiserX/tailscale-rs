@@ -28,6 +28,7 @@ ts_packetfilter = { workspace = true, features = ["checking-filter"] }
 ts_packetfilter_state.workspace = true
 ts_transport.workspace = true
 ts_transport_tun = { workspace = true, optional = true }
+ts_host_net = { workspace = true, optional = true }
 ts_derp.workspace = true
 ts_tunnel.workspace = true
 
@@ -47,7 +48,7 @@ smallvec.workspace = true
 # Off by default. Enables the TUN-mode overlay transport (ts_transport_tun) so the runtime can
 # run the application data path over a real OS TUN interface instead of the userspace netstack.
 # TUN device creation needs root/CAP_NET_ADMIN; off the ring-only egress path.
-tun = ["dep:ts_transport_tun"]
+tun = ["dep:ts_transport_tun", "dep:ts_host_net"]
 
 [dev-dependencies]
 rand = "0.10"

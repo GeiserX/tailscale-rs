@@ -5,6 +5,7 @@ use std::{path::PathBuf, process::Command, str::FromStr};
 use clap::Parser;
 
 mod ipv4_only_forwarder;
+mod ipv4_only_host_net;
 mod lints_enabled;
 
 /// Run CI checks on all crates.
@@ -25,6 +26,7 @@ pub type CheckFn = fn(&Args) -> BoxResult<()>;
 pub const CHECK_FNS: &[(&str, CheckFn)] = &[
     ("lints_enabled", lints_enabled::run),
     ("ipv4_only_forwarder", ipv4_only_forwarder::run),
+    ("ipv4_only_host_net", ipv4_only_host_net::run),
 ];
 
 /// Convenience alias for `Result` with a boxed `std::error::Error`.

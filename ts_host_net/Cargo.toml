@@ -1,0 +1,21 @@
+[package]
+name = "ts_host_net"
+version.workspace = true
+description = "tailscale host route + DNS programming"
+readme = "README.md"
+categories = ["network-programming", "asynchronous"]
+keywords = ["tailscale", "route", "dns", "network", "host"]
+
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Unconditionally required dependencies.
+ipnet.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

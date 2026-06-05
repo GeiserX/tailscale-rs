@@ -169,6 +169,13 @@ impl Runtime {
                     tun_cfg.clone(),
                     netstack_up,
                     netstack_down,
+                    // Host-route gating inputs derived from `Env`: subnet routes are only steered
+                    // into the TUN when `--accept-routes` is set, and the host `/0` only when the
+                    // embedder configured an exit node. See `tun_actor::host_routes_from_node`.
+                    tun_actor::HostRouteGating {
+                        accept_routes: env.accept_routes,
+                        exit_node_configured: env.exit_node.is_some(),
+                    },
                 ));
 
                 (None, None)

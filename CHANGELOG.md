@@ -6,6 +6,35 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.14](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.14) - 2026-06-05
+
+**TUN-mode host integration** (`tsr-248.1`): a new `ts_host_net` crate programs the host routing
+table and system resolver so a TUN-mode node's traffic is actually steered into the kernel TUN
+interface. Without it the TUN device exists but the OS has no FIB entries pointing tailnet / subnet
+/ exit prefixes at it. This is the host-side analogue of `ts_forwarder`'s `RealDialer` anti-leak
+chokepoint, and is **off the default (netstack) path** — it only runs in TUN transport mode.
+
+- **`ts_host_net` crate**: a `HostNet` trait (`apply_routes` / `apply_dns` / `teardown`) with
+  per-OS implementations — macOS (`route(8)` + `scutil(8)`), Linux (`ip(8)` + `resolvectl(1)`),
+  and a typed `Unsupported` error on every other platform (never a silent no-op). Zero new heavy
+  dependencies (`ipnet` / `thiserror` / `tracing` only), keeping the musl-clean posture intact.
+- **IPv4-only by construction**: `HostRoutes` / `HostDns` carry only `Ipv4Net` / `Ipv4Addr`, so a
+  v6 route can never be emitted. A new `ipv4_only_host_net` `checks`-crate grep gate enforces it.
+- **Fail-closed**: a partial `apply_*` rolls back its own state before returning `Err`; `teardown`
+  reverses exactly what was installed. The TUN actor never pumps packets on an unrouted interface
+  and never silently falls back to the netstack.
+- **`/0` split-default**: a literal `0.0.0.0/0` exit route is expanded to the reversible
+  `0.0.0.0/1` + `128.0.0.0/1` pair (longest-prefix-match wins without clobbering the host default;
+  avoids `EEXIST` from `route add default` on macOS). Shared between both platform impls so they
+  cannot drift.
+- **Host-route gating**: subnet routes are steered into the TUN only when `--accept-routes` is set,
+  and the host `/0` only when an exit node is configured (`HostRouteGating`).
+- **Anti-injection input guards**: control-supplied DNS match-domains and the (embedder-influenced)
+  TUN interface name are validated as strict DNS / interface names before reaching a privileged
+  argv or `scutil` stdin script — a domain containing a newline can no longer inject a `scutil`
+  verb. DNS programming is inert this slice (empty nameservers ⇒ no-op) until a TUN-mode MagicDNS
+  responder exists; pointing the resolver at a dead `100.100.100.100` would black-hole.
+
 ## [0.5.13](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.13) - 2026-06-05
 
 Cleanup of two known compromises from the v0.5.12 TUN-mode work; no behavior change to the data or
