@@ -165,8 +165,12 @@ pub use ts_runtime::{Status, StatusNode, WhoIs};
 pub mod axum;
 pub mod config;
 mod error;
+mod loopback;
 #[cfg(feature = "ssh")]
 pub mod ssh;
+
+#[doc(inline)]
+pub use loopback::LoopbackHandle;
 
 /// How a program connects to a tailnet and communicates with peers.
 ///
@@ -443,6 +447,64 @@ impl Device {
             .tcp_connect((ip, ephemeral_port).into(), remote)
             .await
             .map_err(Into::into)
+    }
+
+    /// Start a SOCKS5 proxy on a host loopback address that dials into the tailnet (Go
+    /// `tsnet.Server.Loopback`, SOCKS5 half).
+    ///
+    /// Binds a TCP listener on `127.0.0.1:0` (host loopback only — never an external interface) and
+    /// serves SOCKS5 (RFC 1928) with required username/password auth (RFC 1929): username `tsnet`,
+    /// password = the returned `proxy_cred`. Each `CONNECT` is dialed INTO the overlay via
+    /// [`Device::connect_by_name`] / [`Device::tcp_connect`] and spliced to the accepted host socket, so
+    /// a non-Rust host process can reach tailnet peers through the proxy. Returns the bound address, the
+    /// proxy credential, and a [`LoopbackHandle`] whose drop stops the listener.
+    ///
+    /// Anti-leak: the listener is loopback-only and every connection egresses over the overlay, never a
+    /// host socket — the host's real origin IP is never used to reach the destination. Unlike Go, the
+    /// LocalAPI HTTP surface is not served (this fork exposes status/whois/id-token natively on
+    /// `Device`); only the SOCKS5 proxy is provided.
+    ///
+    /// Returns an error in TUN transport mode (no application netstack to dial from).
+    pub async fn loopback(&self) -> Result<(std::net::SocketAddr, String, LoopbackHandle), Error> {
+        // Capture only cloneable pieces — never `&self` — for the spawned accept loop: a clone of the
+        // netstack command channel, this device's own overlay IPv4 (fetched once), and a boxed
+        // resolver closure over clones of the control + peer-tracker actor refs. The resolver
+        // replicates `Device::resolve` (peer-by-name, falling back to this node's own name).
+        let channel = self.channel()?.clone();
+        let self_ipv4 = self.ipv4_addr().await?;
+
+        let control = self.runtime.control.clone();
+        let peer_tracker = self.runtime.peer_tracker.clone();
+        let resolve: loopback::Resolver = std::sync::Arc::new(move |name: String| {
+            let control = control.clone();
+            let peer_tracker = peer_tracker.clone();
+            Box::pin(async move {
+                let pt = peer_tracker
+                    .upgrade()
+                    .ok_or(Error::Internal(InternalErrorKind::Actor))?;
+                let peer = pt
+                    .ask(ts_runtime::peer_tracker::PeerByName { name: name.clone() })
+                    .await
+                    .map_err(ts_runtime::Error::from)?;
+                if let Some(peer) = peer {
+                    return Ok(Some(peer.tailnet_address.ipv4.addr()));
+                }
+                // tsnet's dnsMap also resolves our own name; fall back to self.
+                let me = control
+                    .ask(ts_runtime::control_runner::SelfNode)
+                    .await
+                    .map_err(ts_runtime::Error::from)?
+                    .ok_or(Error::Internal(InternalErrorKind::Actor))?;
+                if me.matches_name(&name) {
+                    Ok(Some(me.tailnet_address.ipv4.addr()))
+                } else {
+                    Ok(None)
+                }
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
+        });
+
+        let dialer = loopback::OverlayDialer::new(channel, self_ipv4, resolve);
+        loopback::start(dialer).await
     }
 
     /// Get our node info.

@@ -6,6 +6,29 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.32](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.32) - 2026-06-05
+
+**Loopback SOCKS5 proxy** (`tsr-am9.6`): `Device::loopback()`, porting the SOCKS5 half of Go
+`tsnet.Server.Loopback`. Binds a host-loopback TCP listener and proxies SOCKS5 `CONNECT`s into the
+tailnet, so a non-Rust host process can reach tailnet peers through the proxy.
+
+- `Device::loopback() -> (SocketAddr, proxy_cred, LoopbackHandle)`: binds `127.0.0.1:0` (**host
+  loopback only** — never an external interface), serves SOCKS5 (RFC 1928) with required
+  username/password auth (RFC 1929): username `tsnet`, password = a fresh 128-bit random hex
+  `proxy_cred`. Each `CONNECT` is dialed **into the overlay** (`ATYP=IPv4` → `tcp_connect`,
+  `ATYP=DOMAINNAME` → in-process MagicDNS resolve → overlay dial) and spliced to the accepted
+  socket. `ATYP=IPv6` is refused (the fork is IPv4-only on the tailnet); non-`CONNECT` commands are
+  refused. The returned `LoopbackHandle` stops the accept loop on drop (`#[must_use]`).
+- **Anti-leak**: every connection egresses over the overlay netstack — never a host socket to the
+  destination — so the host's real origin IP is never used to reach the target; there is no
+  direct-dial fallback. The listener is loopback-only, and name resolution uses the in-process
+  netmap (never the host resolver, which would leak intent). The SOCKS5 negotiation is bounded by a
+  30s timeout (a stalled local client can't park a task forever); the splice itself is unbounded
+  (proxied connections are long-lived).
+- The LocalAPI HTTP surface Go also serves on the loopback is intentionally **not** ported: the fork
+  exposes status/whois/id-token natively on `Device`, and Go itself recommends the in-process client
+  over the loopback LocalAPI — so there is no SOCKS-vs-HTTP demux, just SOCKS5.
+
 ## [0.5.31](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.31) - 2026-06-05
 
 **Workload-identity federation (WIF) + OAuth-client auth-key bootstrap** (`tsr-am9.5`), behind the
