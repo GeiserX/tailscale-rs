@@ -17,6 +17,8 @@ use crate::{
     forwarder_actor::ForwarderActor, multiderp::Multiderp, netstack_actor::NetstackActor,
 };
 
+/// Pcap stream framer for debug packet capture (`CapturePcap`).
+pub mod capture;
 /// Control runner.
 pub mod control_runner;
 mod dataplane;
@@ -47,6 +49,7 @@ mod tun_actor;
 pub(crate) use env::Env;
 pub use error::{Error, ErrorKind};
 pub use status::{Status, StatusNode, WhoIs};
+pub use ts_dataplane::{CaptureHook, CapturePath};
 
 use crate::peer_tracker::PeerTracker;
 
@@ -269,6 +272,19 @@ impl Runtime {
     /// the embedder's read APIs and the receive path see the same on-disk store.
     pub fn taildrop_store(&self) -> Option<Arc<crate::taildrop::TaildropStore>> {
         self.env.taildrop_store.clone()
+    }
+
+    /// Install (`Some`) or clear (`None`) the debug packet-capture hook on the running dataplane.
+    /// `Some(hook)` tees every plaintext packet crossing the datapath to `hook` until it is cleared;
+    /// `None` stops capture. Mirrors Go `tstun.Wrapper.InstallCaptureHook` / `ClearCaptureSink`.
+    pub async fn install_capture(
+        &self,
+        hook: Option<ts_dataplane::CaptureHook>,
+    ) -> Result<(), Error> {
+        self.dataplane
+            .ask(dataplane::InstallCapture { hook })
+            .await
+            .map_err(Into::into)
     }
 
     /// A snapshot of the local netmap: this node plus every known peer.

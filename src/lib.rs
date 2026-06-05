@@ -585,6 +585,52 @@ impl Device {
             .map_err(taildrop_send_err)
     }
 
+    /// Begin a debug packet capture, streaming a pcap of every packet crossing the dataplane to
+    /// `writer` (Go `tsnet.Server.CapturePcap`).
+    ///
+    /// Installs a capture hook on the running dataplane: from now until [`Device::stop_capture`] is
+    /// called (or another capture replaces this one), a copy of every plaintext IP packet on the
+    /// datapath — outbound (pre-encrypt) and inbound (post-decrypt) — is framed and written to
+    /// `writer`. The 24-byte pcap global header is written immediately on success.
+    ///
+    /// The format is byte-faithful classic pcap with Tailscale's `LINKTYPE_USER0` + 4-byte path
+    /// preamble per record (see [`ts_runtime::capture`]); a resulting file opens in Wireshark, and
+    /// with Tailscale's `ts-dissector.lua` the direction/path of each packet decodes.
+    ///
+    /// The hook runs **inline on the single-threaded dataplane step**, so `writer` must not block for
+    /// long — a slow writer back-pressures the datapath. A write error is swallowed per-packet (the
+    /// capture silently drops that record) rather than tearing down the datapath; call
+    /// [`Device::stop_capture`] to end it. Returns an error only if the dataplane actor is unreachable
+    /// or the initial global-header write fails.
+    pub async fn capture_pcap<W>(&self, writer: W) -> Result<(), Error>
+    where
+        W: std::io::Write + Send + 'static,
+    {
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(
+            ts_runtime::capture::PcapSink::new(writer)
+                .map_err(|_| Error::Internal(InternalErrorKind::Io))?,
+        ));
+        let hook: ts_runtime::CaptureHook = std::sync::Arc::new(move |path, pkt: &[u8]| {
+            if let Ok(mut sink) = sink.lock() {
+                // A per-packet write failure (e.g. a closed pipe) silently drops that record rather
+                // than tearing down the datapath; the caller ends capture via `stop_capture`.
+                drop(sink.log_packet(path.code(), pkt));
+            }
+        });
+        self.runtime.install_capture(Some(hook)).await?;
+        Ok(())
+    }
+
+    /// Stop a debug packet capture started by [`Device::capture_pcap`] (Go `ClearCaptureSink`).
+    ///
+    /// Clears the dataplane capture hook; the writer is dropped (its remaining buffered bytes are
+    /// flushed by its own `Drop`). Idempotent — clearing when no capture is installed is a no-op.
+    /// Returns an error only if the dataplane actor is unreachable.
+    pub async fn stop_capture(&self) -> Result<(), Error> {
+        self.runtime.install_capture(None).await?;
+        Ok(())
+    }
+
     /// Snapshot of this device and its tailnet peers (like `tailscale status`).
     ///
     /// Combines this node's self info with the current peer set: each [`StatusNode`] reports the

@@ -6,6 +6,29 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.28](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.28) - 2026-06-05
+
+**Debug packet capture / `CapturePcap`** (`tsr-am9.2`): tee a pcap of every packet crossing the
+dataplane to a writer, for `tcpdump`/Wireshark debugging — the fork's equivalent of Go Tailscale's
+`tsnet.Server.CapturePcap` (`tstun.Wrapper.InstallCaptureHook` + `feature/capture`).
+
+- **`Device::capture_pcap(writer)` / `Device::stop_capture()`** (root crate): install a capture hook
+  that streams a pcap to any `std::io::Write`, and clear it. The 24-byte global header is written on
+  start; capture is **opt-in** (off by default) and writes **only** to the caller-supplied sink —
+  never to the network.
+- **Byte-faithful classic-pcap framer** (`ts_runtime::capture::PcapSink`): magic `0xA1B2C3D4`, v2.4,
+  snaplen 65535, **`LINKTYPE_USER0` (147)**, with Tailscale's 4-byte per-record path preamble
+  (`[path:u16 LE][snat_len=0][dnat_len=0]` — this fork never does SNAT/DNAT) before each raw IP
+  packet. A produced file opens in Wireshark; with Tailscale's `ts-dissector.lua` the direction/path
+  of each packet decodes. Each record is flushed so a reader tailing the stream sees packets promptly.
+- **Read-only dataplane tee** (`ts_dataplane`): a `CapturePath` (`FromLocal`/`FromPeer`/
+  `SynthesizedTo{Local,Peer}`, on-wire codes 0–3, matching Go) + an `Option<CaptureHook>` on the
+  sync `DataPlane`. Packets are tee'd at two points — outbound pre-encrypt (`FromLocal`) and inbound
+  post-decrypt, pre-filter (`FromPeer`) — strictly read-only (no drop/reorder/mutate). When no
+  capture is installed the datapath is byte- and performance-identical to before (a single `Option`
+  check). The hook is installed/cleared at runtime via the dataplane actor, mirroring the existing
+  packet-filter hot-swap.
+
 ## [0.5.27](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.27) - 2026-06-05
 
 **Taildrop file sender** (`tsr-am9.1`): the sending half of Tailscale's peer-to-peer file transfer,

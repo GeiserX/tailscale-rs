@@ -59,6 +59,15 @@ impl DataplaneActor {
     ) {
         self.dataplane.new_underlay_transport().await
     }
+
+    /// Install (`Some`) or clear (`None`) the debug packet-capture hook on the running dataplane.
+    /// `Some(hook)` begins teeing every plaintext packet crossing the datapath to `hook`; `None`
+    /// stops capture. Mirrors Go `tstun.Wrapper.InstallCaptureHook` / `ClearCaptureSink`.
+    #[message]
+    pub async fn install_capture(&self, hook: Option<ts_dataplane::CaptureHook>) {
+        let dp = &mut *self.dataplane.inner().await;
+        dp.capture = hook;
+    }
 }
 
 impl kameo::Actor for DataplaneActor {

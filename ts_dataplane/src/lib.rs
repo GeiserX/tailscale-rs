@@ -19,6 +19,34 @@ pub enum Subsystem {
     Wireguard,
 }
 
+/// The direction/path of a captured packet, mirroring Go Tailscale's `capture.Path`. The numeric
+/// values are the on-wire path codes written into each pcap record's Tailscale preamble.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapturePath {
+    /// A packet from the local device, heading out to a peer (pre-encrypt).
+    FromLocal = 0,
+    /// A packet received from a peer, decrypted, heading to the local device.
+    FromPeer = 1,
+    /// A packet synthesized by us toward the local device.
+    SynthesizedToLocal = 2,
+    /// A packet synthesized by us toward a peer.
+    SynthesizedToPeer = 3,
+}
+
+impl CapturePath {
+    /// The on-wire path code (the `uint16` written into the pcap record preamble).
+    pub fn code(self) -> u16 {
+        self as u16
+    }
+}
+
+/// A debug packet-capture hook. When installed on a [`DataPlane`], it is invoked with the path and
+/// the raw IP packet bytes for every plaintext packet crossing the datapath. It must be cheap and
+/// non-blocking — it runs inline on the single-threaded dataplane step, so a slow hook backs up the
+/// datapath. Wrapped in `Arc` so it is cheap to clone and `Send + Sync` for the actor that installs
+/// it.
+pub type CaptureHook = std::sync::Arc<dyn Fn(CapturePath, &[u8]) + Send + Sync>;
+
 /// Transforms packets to make tailscale happen.
 pub struct DataPlane {
     /// Wireguard encryption/decryption.
@@ -42,6 +70,11 @@ pub struct DataPlane {
 
     /// Next event for the wireguard subsystem.
     pub wg_next: Option<Handle<Subsystem>>,
+
+    /// Optional debug packet-capture hook (Go `tstun.Wrapper` capture hook). `None` (the default)
+    /// means no capture and zero datapath overhead. Installed/cleared at runtime by the dataplane
+    /// actor; see [`DataPlane::process_outbound`]/[`DataPlane::process_inbound`] for the tee points.
+    pub capture: Option<CaptureHook>,
 }
 
 impl DataPlane {
@@ -56,12 +89,19 @@ impl DataPlane {
             events: Default::default(),
             packet_filter: Arc::new(ts_packetfilter::DropAllFilter),
             wg_next: None,
+            capture: None,
         }
     }
 
     /// Processes packets originating from the local device.
     #[tracing::instrument(skip_all, fields(n_packets = packets.len()))]
     pub fn process_outbound(&mut self, packets: Vec<PacketMut>) -> OutboundResult {
+        if let Some(hook) = &self.capture {
+            for p in &packets {
+                hook(CapturePath::FromLocal, p.as_ref());
+            }
+        }
+
         let or::outbound::Result {
             to_wireguard,
             loopback,
@@ -97,6 +137,14 @@ impl DataPlane {
         packets: impl IntoIterator<Item = PacketMut>,
     ) -> InboundResult {
         let ts_tunnel::RecvResult { to_local, to_peers } = self.wireguard.recv(packets);
+
+        if let Some(hook) = &self.capture {
+            for packets in to_local.values() {
+                for p in packets {
+                    hook(CapturePath::FromPeer, p.as_ref());
+                }
+            }
+        }
 
         let to_local = to_local
             .into_iter()
@@ -262,4 +310,17 @@ pub struct InboundResult {
 pub struct EventResult {
     /// Encrypted packets to be sent to wireguard peers by the underlay.
     pub to_peers: HashMap<(UnderlayTransportId, PeerId), Vec<PacketMut>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_path_codes() {
+        assert_eq!(CapturePath::FromLocal.code(), 0);
+        assert_eq!(CapturePath::FromPeer.code(), 1);
+        assert_eq!(CapturePath::SynthesizedToLocal.code(), 2);
+        assert_eq!(CapturePath::SynthesizedToPeer.code(), 3);
+    }
 }
