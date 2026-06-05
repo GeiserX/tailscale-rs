@@ -6,6 +6,23 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.19](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.19) - 2026-06-05
+
+**Client metrics / observability** (`tsr-77q-b`): a `clientmetric`-style in-process metric registry
+plus a `Device::metrics()` Prometheus-text export. (Go `tsnet` exposes no metrics method of its own,
+so this is the fork's clean public surface.)
+
+- **`ts_metrics` crate**: a small, dependency-free reimplementation of Go's `util/clientmetric` — a
+  process-global registry of named counters/gauges (`Metric::new_counter` / `new_gauge`, `add` /
+  `inc` / `set`, single relaxed-atomic increments on hot paths) with a `write_prometheus` exporter
+  emitting `# TYPE <name> <kind>\n<name> <value>\n` per metric, name-sorted. Metric names are
+  validated to `[A-Za-z0-9_]` (Go `isIllegalMetricRune`).
+- **magicsock counters**: the direct-UDP datapath now increments canonical `magicsock_*` counters
+  (`magicsock_send_udp`, `magicsock_send_udp_bytes`, `magicsock_send_udp_error`,
+  `magicsock_recv_data_udp`, `magicsock_recv_data_bytes_udp`), matching the Go naming convention.
+- **`Device::metrics() -> String`** returns the full Prometheus text exposition for the embedder to
+  scrape or forward.
+
 ## [0.5.18](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.18) - 2026-06-05
 
 **Taildrop file transfer (receive side)** (`tsr-77q-a`): this node can now receive files from

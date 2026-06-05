@@ -19,6 +19,7 @@
 mod disco;
 mod endpoint;
 mod error;
+mod metrics;
 mod path;
 mod sock;
 mod stun;

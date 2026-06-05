@@ -504,6 +504,17 @@ impl Device {
         self.runtime.status().await.map_err(Into::into)
     }
 
+    /// Snapshot this node's client metrics in Prometheus text exposition format.
+    ///
+    /// Mirrors Go Tailscale's `clientmetric` registry: process-global counters/gauges incremented
+    /// on the datapath hot loops (e.g. `magicsock_send_udp`, `magicsock_recv_data_bytes_udp`),
+    /// rendered as `# TYPE <name> <kind>\n<name> <value>\n` per metric, sorted by name. (Go `tsnet`
+    /// exposes no metrics method of its own, so this is the fork's clean public surface.) The
+    /// registry is process-global, so the output covers every `Device` in the process.
+    pub fn metrics(&self) -> String {
+        ts_metrics::write_prometheus()
+    }
+
     /// Map a tailnet source `addr` to the node that owns its IP (like `tsnet`'s `WhoIs`).
     ///
     /// Only the IP of `addr` is used; the port is ignored. Returns `Ok(None)` if no tailnet node

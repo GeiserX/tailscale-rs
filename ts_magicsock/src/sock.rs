@@ -518,8 +518,18 @@ impl MagicSock {
     /// hard error: the caller keeps the peer on DERP rather than leaking via a host dial.
     pub async fn send_wireguard(&self, peer: &DiscoPublicKey, data: &[u8]) -> Result<(), Error> {
         let addr = self.best_addr(peer).ok_or(Error::NoPath)?;
-        self.sock.send_to(data, addr).await?;
-        Ok(())
+        let m = crate::metrics::metrics();
+        match self.sock.send_to(data, addr).await {
+            Ok(_) => {
+                m.send_udp.inc();
+                m.send_udp_bytes.add(data.len() as i64);
+                Ok(())
+            }
+            Err(e) => {
+                m.send_udp_error.inc();
+                Err(e.into())
+            }
+        }
     }
 
     /// Receive the next WireGuard datagram, handling any disco traffic inline.
@@ -555,6 +565,10 @@ impl MagicSock {
                     tracing::trace!(%from, "dropping data from unknown source address");
                     continue;
                 };
+
+                let m = crate::metrics::metrics();
+                m.recv_data_udp.inc();
+                m.recv_data_bytes_udp.add(datagram.len() as i64);
 
                 return Ok(Some(ReceivedData {
                     from_disco,
