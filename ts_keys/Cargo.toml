@@ -25,6 +25,9 @@ ed25519-dalek = { version = "2", default-features = false }
 # (x25519's StaticSecret clamps, which would reduce seed entropy and be wrong for Ed25519).
 getrandom = "0.4"
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [features]
 serde = ["dep:serde"]
 

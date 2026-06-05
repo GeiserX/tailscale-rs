@@ -235,6 +235,20 @@ impl Config {
 
         config
     }
+
+    /// Rotate this config's node key in place for an embedder-driven re-registration, mirroring Go's
+    /// `regen` flow: the current node key is recorded as the old key and a fresh node key is
+    /// generated. Re-create the [`Device`](crate::Device) from this config to perform the rotation;
+    /// the next registration sends the prior key as `OldNodeKey` for key continuity.
+    ///
+    /// Reactive and embedder-driven by design (you decide when to rotate, e.g. after observing
+    /// [`Device::self_key_expired`](crate::Device::self_key_expired) flip, or on a policy of your
+    /// own). This fork does not auto-rotate before expiry — neither does Go, which treats key expiry
+    /// as a deliberate periodic re-authentication checkpoint. Rotation still requires a valid auth
+    /// key, exactly like a fresh registration.
+    pub fn rotate_node_key(&mut self) {
+        self.key_state.rotate_node_key();
+    }
 }
 
 /// Load an auth key from the `TS_AUTH_KEY` environment variable.

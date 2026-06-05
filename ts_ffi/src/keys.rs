@@ -77,6 +77,7 @@ impl From<&persisted_key_state> for ts_keys::PersistState {
             machine_key: (&value.machine_private_key).into(),
             network_lock_key: (&value.network_lock_private_key).into(),
             node_key: (&value.node_private_key).into(),
+            old_node_key: None,
         }
     }
 }

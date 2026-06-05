@@ -76,6 +76,7 @@ impl TryFrom<&Keystate> for tailscale::keys::PersistState {
             machine_key: key(&value.machine)?,
             node_key: key(&value.node)?,
             network_lock_key: key(&value.network_lock)?,
+            old_node_key: None,
         })
     }
 }

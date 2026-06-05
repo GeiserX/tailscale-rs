@@ -2,7 +2,7 @@ use core::fmt::{Debug, Display, Formatter};
 
 use crate::{
     DiscoKeyPair, MachineKeyPair, MachinePrivateKey, NetworkLockKeyPair, NetworkLockPrivateKey,
-    NodeKeyPair, NodePrivateKey,
+    NodeKeyPair, NodePrivateKey, NodePublicKey,
 };
 
 /// The portion of the key state that should be retained between runs of the same device.
@@ -20,6 +20,35 @@ pub struct PersistState {
 
     /// The [`NodePrivateKey`] for this Tailnet peer.
     pub node_key: NodePrivateKey,
+
+    /// The node's PREVIOUS node public key, recorded during a node-key rotation so the next
+    /// registration sends it as `RegisterRequest.OldNodeKey` for key continuity (Go's `regen` flow).
+    /// `None` outside a rotation (the default). Reactive / embedder-driven — matching Go, this fork
+    /// does NOT auto-rotate the node key before expiry (Go deliberately doesn't either; key expiry is
+    /// a human-re-auth control). See [`PersistState::rotate_node_key`].
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub old_node_key: Option<NodePublicKey>,
+}
+
+impl PersistState {
+    /// Rotate the node key for re-registration, mirroring Go's `regen` flow: record the current
+    /// node public key as [`old_node_key`](PersistState::old_node_key) and replace the node key with
+    /// a freshly-generated one. The next registration that uses this state will send the prior key
+    /// as `RegisterRequest.OldNodeKey`, so control links the new node key to the node's existing
+    /// identity instead of treating it as a brand-new node.
+    ///
+    /// This is the embedder-driven rotation primitive (re-create the device with the returned state).
+    /// It is reactive, NOT a pre-expiry auto-rotator: Go has no such timer, because node-key expiry
+    /// is a deliberate periodic human/IdP re-attestation control. Re-registration still requires a
+    /// valid auth credential, exactly as a fresh registration does.
+    ///
+    // TODO(TKA): on a tailnet-lock-enabled tailnet, a node-key rotation must also re-sign the node
+    // key with the network-lock key and send the new `RegisterRequest.NodeKeySignature`. This
+    // primitive covers the non-TKA path; TKA re-sign is a separate follow-up.
+    pub fn rotate_node_key(&mut self) {
+        self.old_node_key = Some(self.node_key.public_key());
+        self.node_key = NodePrivateKey::random();
+    }
 }
 
 impl From<&NodeState> for PersistState {
@@ -28,6 +57,7 @@ impl From<&NodeState> for PersistState {
             node_key: value.node_keys.private,
             machine_key: value.machine_keys.private,
             network_lock_key: value.network_lock_keys.private,
+            old_node_key: value.old_node_key,
         }
     }
 }
@@ -44,6 +74,7 @@ impl Default for PersistState {
             machine_key: MachinePrivateKey::random(),
             network_lock_key: NetworkLockPrivateKey::random(),
             node_key: NodePrivateKey::random(),
+            old_node_key: None,
         }
     }
 }
@@ -65,6 +96,11 @@ pub struct NodeState {
 
     /// The [`NodeKeyPair`] for this Tailnet peer.
     pub node_keys: NodeKeyPair,
+
+    /// The node's previous node public key during a rotation (see
+    /// [`PersistState::old_node_key`]). Threaded to registration as `RegisterRequest.OldNodeKey`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub old_node_key: Option<NodePublicKey>,
 }
 
 impl Debug for NodeState {
@@ -98,6 +134,7 @@ impl From<&PersistState> for NodeState {
             node_keys: value.node_key.into(),
             machine_keys: value.machine_key.into(),
             network_lock_keys: value.network_lock_key.into(),
+            old_node_key: value.old_node_key,
         }
     }
 }
@@ -105,5 +142,60 @@ impl From<&PersistState> for NodeState {
 impl From<PersistState> for NodeState {
     fn from(value: PersistState) -> Self {
         Self::from(&value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rotate_node_key_sets_old_and_fresh() {
+        let mut state = PersistState::default();
+        let before_pub = state.node_key.public_key();
+
+        state.rotate_node_key();
+
+        assert_eq!(state.old_node_key, Some(before_pub));
+        assert_ne!(state.node_key.public_key(), before_pub);
+    }
+
+    #[test]
+    fn node_state_threads_old_node_key() {
+        let mut persist = PersistState::default();
+        let some_pub = NodePrivateKey::random().public_key();
+        persist.old_node_key = Some(some_pub);
+
+        let node_state = NodeState::from(&persist);
+        assert_eq!(node_state.old_node_key, Some(some_pub));
+
+        let round_trip = PersistState::from(&node_state);
+        assert_eq!(round_trip.old_node_key, Some(some_pub));
+    }
+
+    #[test]
+    fn default_persist_state_has_no_old_key() {
+        assert!(PersistState::default().old_node_key.is_none());
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn persist_state_old_node_key_serde_default() {
+        // A default PersistState round-trips with no old key.
+        let json = serde_json::to_string(&PersistState::default()).unwrap();
+        let parsed: PersistState = serde_json::from_str(&json).unwrap();
+        assert!(parsed.old_node_key.is_none());
+
+        // A serialized form that OMITS `old_node_key` still deserializes (serde(default) →
+        // backward-compat with pre-rotation persisted state).
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("old_node_key")
+            .expect("default serializes the field");
+        let parsed: PersistState =
+            serde_json::from_value(value).expect("missing old_node_key deserializes via default");
+        assert!(parsed.old_node_key.is_none());
     }
 }

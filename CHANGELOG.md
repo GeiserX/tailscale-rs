@@ -6,6 +6,35 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.30](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.30) - 2026-06-05
+
+**Node-key rotation: wire `RegisterRequest.OldNodeKey` + add the rotation primitive** (`tsr-am9.4`).
+Fixes a real bug and completes the embedder-driven rotation path.
+
+The bug: `register()` always sent `OldNodeKey = None`, so the fork's documented "re-create the
+Device with a fresh node key + prior `old_node_key`" rotation silently broke key continuity — control
+saw each rotation as a brand-new node. There was also no seam to supply the prior key.
+
+- `register()` now sends `RegisterRequest.OldNodeKey` from the key state (omitted, as before, on a
+  normal first registration — no behavior change for the common path).
+- `PersistState` / `NodeState` carry a new `old_node_key: Option<NodePublicKey>`
+  (`#[serde(default)]`, so existing on-disk key files load unchanged → `None`).
+- New `PersistState::rotate_node_key()` and `Config::rotate_node_key()` mirror Go's `regen` flow:
+  record the current node public key as the old key, generate a fresh node key. Re-create the
+  `Device` from the rotated config to perform the rotation.
+
+**This is deliberately NOT a background pre-expiry auto-rotator.** Research confirmed Go tsnet does
+**not** auto-rotate the node key before expiry — node-key expiry is an intentional periodic
+human/IdP re-authentication control, and the supported posture for unattended servers is to *disable
+key expiry* (or use an auth-key / tag), not to silently rotate. Re-registration still requires a
+valid auth credential. The fork matches Go: it surfaces expiry (`Device::self_key_expired` /
+`self_key_expiry_unix`) and exposes the rotation primitive for the embedder to trigger; it never
+silently re-registers on a timer.
+
+Known follow-up: on a tailnet-lock (TKA) enabled tailnet, a rotation must also re-sign the node key
+with the network-lock key (`RegisterRequest.NodeKeySignature`); this release covers the non-TKA path
+(marked with a `TODO(TKA)`).
+
 ## [0.5.29](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.29) - 2026-06-05
 
 **Fix: Tailnet-Lock (TKA) node key is now Ed25519, not X25519** (`tsr-am9.3`). The node-side

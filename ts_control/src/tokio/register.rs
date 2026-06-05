@@ -114,9 +114,14 @@ pub async fn register(
     let node_public_key = node_keystate.node_keys.public;
     let network_lock_public_key = node_keystate.network_lock_keys.public;
 
+    if node_keystate.old_node_key.is_some() {
+        tracing::debug!("re-registering with OldNodeKey set (node-key rotation)");
+    }
+
     let register_req = RegisterRequest {
         version: CapabilityVersion::CURRENT,
         node_key: node_public_key,
+        old_node_key: node_keystate.old_node_key,
         hostinfo: HostInfo {
             hostname: config.hostname.as_deref(),
             app: &config.format_client_name(),
