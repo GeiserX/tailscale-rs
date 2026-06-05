@@ -40,9 +40,14 @@ pub use control_dialer::{ControlDialer, TcpDialer, complete_connection};
 pub use derp::{Map as DerpMap, Region as DerpRegion, convert_derp_map};
 pub use dial_plan::{DialCandidate, DialMode, DialPlan};
 pub use dns::{DnsConfig, ExtraRecord, Resolver as DnsResolver, ResolverTransport};
-pub use node::{ExitNodeSelector, Id as NodeId, Node, StableId as StableNodeId, TailnetAddress};
+pub use node::{
+    ExitNodeSelector, Id as NodeId, Node, NodeCapMap, StableId as StableNodeId, TailnetAddress,
+};
 #[cfg(feature = "async_tokio")]
-pub use serve::{ServeConfig, ServeTarget, accept_tls, listen_tls, tls_acceptor};
+pub use serve::{
+    FunnelError, FunnelOptions, MISSING_FUNNEL_RELAY, ServeConfig, ServeTarget, accept_tls,
+    funnel_access, listen_funnel, listen_tls, tls_acceptor,
+};
 pub use ts_control_serde::{Endpoint, EndpointType};
 
 /// Re-exported TLS types from the `tokio-rustls`/`ring` stack used by [`cert`]/[`serve`], so

@@ -540,6 +540,7 @@ mod test {
                 .collect(),
 
             cap: Default::default(),
+            cap_map: Default::default(),
             peerapi_port: None,
             peerapi_dns_proxy: false,
             is_wireguard_only: false,
@@ -824,6 +825,7 @@ mod test {
                     underlay_addresses: underlay_addrs.into_iter().collect(),
 
                     cap: Default::default(),
+                    cap_map: Default::default(),
                     peerapi_port: None,
                     peerapi_dns_proxy: false,
                     is_wireguard_only: false,

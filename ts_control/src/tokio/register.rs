@@ -133,6 +133,9 @@ pub async fn register(
                 let services = config.advertised_services();
                 (!services.is_empty()).then_some(services)
             },
+            // capver-113 Funnel "wire me up server-side" signal. IngressEnabled stays false:
+            // listen_funnel is fail-closed in this fork, so no Funnel endpoint ever goes live.
+            wire_ingress: config.wire_ingress,
             ..Default::default()
         },
         nl_key: Some(network_lock_public_key),

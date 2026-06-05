@@ -20,6 +20,7 @@ ts_control_serde.workspace = true
 ts_dynbitset.workspace = true
 ts_http_util.workspace = true
 ts_keys.workspace = true
+ts_nodecapability = { workspace = true, features = ["serde"] }
 ts_packet.workspace = true
 ts_packetfilter.workspace = true
 ts_packetfilter_state.workspace = true

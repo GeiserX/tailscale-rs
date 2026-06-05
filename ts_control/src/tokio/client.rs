@@ -279,6 +279,7 @@ async fn run_once(
         .client_info(&client_name, crate::PKG_VERSION)
         .request_tags(config.tags.iter().map(String::as_str))
         .services(config.advertised_services())
+        .wire_ingress(config.wire_ingress)
         .map_session(&session.handle, session.seq);
 
     let request = if let Some(hostname) = &config.hostname {

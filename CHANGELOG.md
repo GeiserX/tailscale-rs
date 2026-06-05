@@ -6,6 +6,37 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.15](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.15) - 2026-06-05
+
+**`ListenFunnel`** (`tsr-jir`): the Tailscale Funnel public-ingress entry point, brought to the same
+fail-closed posture as `ListenTLS`. `Device::listen_funnel` validates that the self node may funnel
+before doing anything, then attempts to terminate TLS on the overlay netstack — never on a host
+socket, never with a self-signed cert, never with a plaintext downgrade.
+
+- **Capability gating mirrors Go `tsnet` exactly** (`ts_control::Node`): `NodeCanFunnel` requires
+  BOTH `CapabilityHTTPS` (`"https"`) AND `NodeAttrFunnel` (`"funnel"`) in the node's CapMap, and
+  `CheckFunnelPort` reads the allowed ports from the `funnel-ports` cap **key's** `?ports=` query —
+  comma-separated single ports (string equality) plus `first-last` inclusive `uint16` ranges. An
+  empty / unparseable / missing / wrong-URL ports query denies. The node carries an owned
+  `NodeCapMap` populated from the netmap.
+- **`FunnelError`** (`NotAllowed` / `PortNotAllowed` / `Cert` / `Unsupported`) and
+  `FunnelOptions { funnel_only }` in `ts_control::serve`. `listen_funnel` runs the access check →
+  `cert::get_certificate` (which is itself `Unimplemented` in this fork) → and, since a self-hosted
+  control plane provides no Tailscale-operated public ingress relay, surfaces
+  `FunnelError::Unsupported` rather than bringing a non-functional listener up. Fail-closed.
+- **capver-113 ingress signalling**: a new default-`false` `wire_ingress` config knob threads
+  through `tailscale::Config` → `ts_control::Config` → the registration and streaming map-request
+  `HostInfo`. When set, it advertises `HostInfo.WireIngress` ("would like to be wired up for
+  Funnel") to control. `HostInfo.IngressEnabled` is intentionally left `false` — no Funnel endpoint
+  ever goes live in this fork, mirroring how Go suppresses `WireIngress` only once ingress is
+  actually enabled.
+- **`funnel_fail_closed` leak-firewall** (`checks` crate): a new build-gate that scans the
+  production (non-test) portion of both `ts_control/src/serve.rs` and `ts_control/src/cert.rs` for
+  self-signed cert-minting tokens (`rcgen` / `generate_simple_self_signed` / `self_signed`), so a
+  self-signed fallback can never silently regress into the public-TLS termination path. The
+  `#[cfg(test)]` cutoff is matched only at column 0 and the file must contain exactly one such
+  boundary, closing an evasion vector.
+
 ## [0.5.14](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.14) - 2026-06-05
 
 **TUN-mode host integration** (`tsr-248.1`): a new `ts_host_net` crate programs the host routing

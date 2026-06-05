@@ -140,6 +140,17 @@ impl<'a> MapRequestBuilder<'a> {
         self
     }
 
+    /// Ask control to wire this node up server-side for Tailscale Funnel
+    /// (`HostInfo.WireIngress`, capver 113), so the DNS/ingress records a Funnel node needs are
+    /// provisioned even when no Funnel endpoint is currently live. Mirrors Go `tsnet`'s
+    /// "would like to be wired up for Funnel" signal. `HostInfo.IngressEnabled` (endpoints actually
+    /// active) is intentionally left unset: this fork's [`crate::listen_funnel`] is fail-closed, so
+    /// no Funnel endpoint ever goes live.
+    pub fn wire_ingress(mut self, value: bool) -> Self {
+        self.host_info_mut().wire_ingress = value;
+        self
+    }
+
     fn host_info_mut(&mut self) -> &mut HostInfo<'a> {
         self.req.host_info.get_or_insert_default()
     }
@@ -219,6 +230,28 @@ mod tests {
 
         // Empty tag set: the field stays None and is omitted from the wire request.
         assert_eq!(req.host_info.unwrap().request_tags, None);
+    }
+
+    #[test]
+    fn wire_ingress_setter_populates_host_info() {
+        let node_state = ts_keys::NodeState::generate();
+
+        let req = MapRequestBuilder::new(&node_state)
+            .wire_ingress(true)
+            .build();
+        let hi = req.host_info.unwrap();
+        // WireIngress is the capver-113 "wire me up for Funnel" signal; IngressEnabled (endpoints
+        // actually live) must stay false — listen_funnel is fail-closed in this fork.
+        assert!(hi.wire_ingress);
+        assert!(!hi.ingress_enabled);
+    }
+
+    #[test]
+    fn wire_ingress_setter_defaults_false() {
+        let node_state = ts_keys::NodeState::generate();
+
+        let req = MapRequestBuilder::new(&node_state).build();
+        assert!(!req.host_info.unwrap().wire_ingress);
     }
 
     #[test]

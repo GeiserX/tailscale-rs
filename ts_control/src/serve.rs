@@ -32,7 +32,10 @@ use tokio_rustls::{
     server::TlsStream,
 };
 
-use crate::cert::{self, CertError};
+use crate::{
+    cert::{self, CertError},
+    node::Node,
+};
 
 /// What to do with a stream once TLS is terminated.
 ///
@@ -137,6 +140,136 @@ pub async fn listen_tls(cfg: &ServeConfig) -> Result<TlsAcceptor, CertError> {
     tls_acceptor(cert)
 }
 
+/// Options for a Funnel listener (mirrors `tsnet.FunnelOption`).
+///
+/// Funnel exposes a tailnet TLS service to the *public* internet via Tailscale's ingress relays.
+/// These knobs scope down from upstream to what this fork models; the listener itself is
+/// fail-closed in this fork (see [`listen_funnel`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FunnelOptions {
+    /// Reject tailnet-internal connections, serving *only* public Funnel ingress (`tsnet`'s
+    /// `FunnelOnly`). When `false`, the same listener accepts both tailnet and Funnel traffic.
+    pub funnel_only: bool,
+}
+
+/// Why a Funnel listen request was denied or could not be served.
+///
+/// Fail-closed by construction: the access-gate variants ([`FunnelError::NotAllowed`],
+/// [`FunnelError::PortNotAllowed`]) deny before any listener is built, and the terminal
+/// [`FunnelError::Cert`] carries the same fail-closed [`CertError`] as [`listen_tls`] (no
+/// self-signed/plaintext fallback). [`FunnelError::Unsupported`] marks the public-relay leg that
+/// this fork cannot stand up against its control plane.
+#[derive(Debug)]
+pub enum FunnelError {
+    /// The node is not permitted to funnel: it lacks the `https` and/or `funnel` node attributes
+    /// (Go `ipn.NodeCanFunnel`). The tailnet admin must enable HTTPS and grant the `funnel`
+    /// attribute via the ACL policy.
+    NotAllowed,
+    /// The node may funnel, but `port` is not in the set granted by the `funnel-ports` capability
+    /// (Go `ipn.CheckFunnelPort`).
+    PortNotAllowed(u16),
+    /// Certificate acquisition / TLS material assembly failed. In this fork this is always
+    /// [`CertError::Unimplemented`] (no client-side ACME engine, no `set-dns` RPC) — Funnel
+    /// terminates public TLS, which needs a real publicly-trusted cert.
+    Cert(CertError),
+    /// The public ingress relay leg is unavailable in this fork. Funnel traffic arrives over
+    /// Tailscale-operated ingress relays (DERP-based `TCPHandlerForIngress` plumbing) that a
+    /// self-hosted control plane (a self-hosted control plane) does not provide, so there is no public entrypoint to
+    /// attach an overlay listener to. `detail` names what is missing.
+    Unsupported {
+        /// Names exactly what is missing to serve public Funnel ingress.
+        detail: String,
+    },
+}
+
+impl core::fmt::Display for FunnelError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            FunnelError::NotAllowed => write!(
+                f,
+                "Funnel not available: node lacks the \"https\" and/or \"funnel\" attributes"
+            ),
+            FunnelError::PortNotAllowed(port) => {
+                write!(f, "port {port} is not allowed for funnel")
+            }
+            FunnelError::Cert(e) => write!(f, "Funnel certificate error: {e}"),
+            FunnelError::Unsupported { detail } => {
+                write!(f, "Funnel ingress is unsupported in this fork: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for FunnelError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            FunnelError::Cert(e) => Some(e),
+            FunnelError::NotAllowed
+            | FunnelError::PortNotAllowed(_)
+            | FunnelError::Unsupported { .. } => None,
+        }
+    }
+}
+
+impl From<CertError> for FunnelError {
+    fn from(e: CertError) -> Self {
+        FunnelError::Cert(e)
+    }
+}
+
+/// Names exactly what this fork is missing to serve public Funnel ingress, surfaced verbatim in
+/// [`FunnelError::Unsupported`] so the gap is self-documenting at runtime.
+pub const MISSING_FUNNEL_RELAY: &str = "Tailscale-operated public ingress relays (DERP TCPHandlerForIngress) that route funnel.<...> \
+     traffic to this node; a self-hosted a self-hosted control plane control plane provides no such relay, and a \
+     publicly-trusted cert (TLS-ALPN-01 via the client-side ACME engine) is required to terminate";
+
+/// Check whether `node` may funnel on `port`, mirroring Go's `ipn.NodeCanFunnel` +
+/// `ipn.CheckFunnelPort` gate. Pure and fail-closed: a missing attribute or out-of-range port
+/// denies. This is the access decision; it does not build a listener.
+pub fn funnel_access(node: &Node, port: u16) -> Result<(), FunnelError> {
+    if !node.can_funnel() {
+        return Err(FunnelError::NotAllowed);
+    }
+    if !node.check_funnel_port(port) {
+        return Err(FunnelError::PortNotAllowed(port));
+    }
+    Ok(())
+}
+
+/// Build a [`TlsAcceptor`] terminating public Funnel ingress for `cfg.name` on `cfg.port` (like
+/// `tsnet`'s `ListenFunnel`).
+///
+/// **Fail-closed, two gates.** First the node-attribute gate ([`funnel_access`], mirroring Go
+/// `NodeCanFunnel` + `CheckFunnelPort`) must pass — this part is real and fully enforced from the
+/// node's capability map. Then TLS material is obtained via [`cert::get_certificate`], which in
+/// this fork returns [`CertError::Unimplemented`] (no client-side ACME engine / no `set-dns`
+/// publish RPC). Even with a cert, the **public ingress relay** leg does not exist against a
+/// self-hosted control plane, so the call surfaces [`FunnelError::Unsupported`]
+/// ([`MISSING_FUNNEL_RELAY`] names what is missing) rather than ever returning a listener that
+/// silently serves nothing or downgrades to plaintext.
+///
+/// Anti-leak: Funnel TLS would terminate only on the overlay netstack, never a host socket; there
+/// is no self-signed or plaintext fallback. `_opts` is accepted now so the public surface is stable
+/// when the relay leg lands.
+pub async fn listen_funnel(
+    node: &Node,
+    cfg: &ServeConfig,
+    _opts: FunnelOptions,
+) -> Result<TlsAcceptor, FunnelError> {
+    cfg.validate()?;
+    funnel_access(node, cfg.port)?;
+
+    // Access granted. Public Funnel needs a publicly-trusted cert AND a Tailscale ingress relay to
+    // route public traffic to this node. The cert path is fail-closed in this fork...
+    let _cert = cert::get_certificate(&cfg.name).await?;
+
+    // ...and even a real cert can't be served publicly without the relay, which a self-hosted
+    // control plane does not provide. Fail closed rather than hand back a dead listener.
+    Err(FunnelError::Unsupported {
+        detail: MISSING_FUNNEL_RELAY.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,5 +343,154 @@ mod tests {
         let key_pem = cert.key_pair.serialize_pem();
         let ck = cert::certified_key_from_pem(cert_pem.as_bytes(), key_pem.as_bytes()).unwrap();
         assert!(tls_acceptor(ck).is_ok());
+    }
+
+    // ---- Funnel gating ----
+
+    use crate::node::{Node, NodeCapMap, StableId, TailnetAddress};
+
+    /// Build a minimal node with the given cap-map keys, for funnel-gate tests.
+    fn funnel_node(caps: &[&str]) -> Node {
+        let mut cap_map = NodeCapMap::new();
+        for c in caps {
+            cap_map.insert((*c).to_string(), vec![]);
+        }
+        Node {
+            id: 1,
+            stable_id: StableId("n1".to_string()),
+            hostname: "host".to_string(),
+            tailnet: Some("tail1.ts.net".to_string()),
+            tags: vec![],
+            tailnet_address: TailnetAddress {
+                ipv4: "100.64.0.1/32".parse().unwrap(),
+                ipv6: "fd7a::1/128".parse().unwrap(),
+            },
+            node_key: [0u8; 32].into(),
+            node_key_expiry: None,
+            machine_key: None,
+            disco_key: None,
+            accepted_routes: vec![],
+            underlay_addresses: vec![],
+            derp_region: None,
+            cap: Default::default(),
+            cap_map,
+            peerapi_port: None,
+            peerapi_dns_proxy: false,
+            is_wireguard_only: false,
+            exit_node_dns_resolvers: vec![],
+        }
+    }
+
+    const FUNNEL_PORTS_443_8443: &str =
+        "https://tailscale.com/cap/funnel-ports?ports=443,8443,10000-10010";
+
+    #[test]
+    fn funnel_access_denies_without_both_attrs() {
+        // Neither attr.
+        assert!(matches!(
+            funnel_access(&funnel_node(&[]), 443),
+            Err(FunnelError::NotAllowed)
+        ));
+        // Only https.
+        assert!(matches!(
+            funnel_access(&funnel_node(&["https", FUNNEL_PORTS_443_8443]), 443),
+            Err(FunnelError::NotAllowed)
+        ));
+        // Only funnel.
+        assert!(matches!(
+            funnel_access(&funnel_node(&["funnel", FUNNEL_PORTS_443_8443]), 443),
+            Err(FunnelError::NotAllowed)
+        ));
+    }
+
+    #[test]
+    fn funnel_access_denies_disallowed_port() {
+        let node = funnel_node(&["https", "funnel", FUNNEL_PORTS_443_8443]);
+        assert!(matches!(
+            funnel_access(&node, 22),
+            Err(FunnelError::PortNotAllowed(22))
+        ));
+    }
+
+    #[test]
+    fn funnel_access_allows_listed_single_and_range_ports() {
+        let node = funnel_node(&["https", "funnel", FUNNEL_PORTS_443_8443]);
+        // Single ports.
+        assert!(funnel_access(&node, 443).is_ok());
+        assert!(funnel_access(&node, 8443).is_ok());
+        // Range endpoints + interior.
+        assert!(funnel_access(&node, 10000).is_ok());
+        assert!(funnel_access(&node, 10005).is_ok());
+        assert!(funnel_access(&node, 10010).is_ok());
+        // Just outside the range.
+        assert!(funnel_access(&node, 9999).is_err());
+        assert!(funnel_access(&node, 10011).is_err());
+    }
+
+    #[test]
+    fn check_funnel_port_denies_without_ports_cap() {
+        // Can funnel, but no funnel-ports cap at all => every port denied.
+        let node = funnel_node(&["https", "funnel"]);
+        assert!(node.can_funnel());
+        assert!(!node.check_funnel_port(443));
+    }
+
+    #[test]
+    fn check_funnel_port_denies_empty_ports_query() {
+        let node = funnel_node(&[
+            "https",
+            "funnel",
+            "https://tailscale.com/cap/funnel-ports?ports=",
+        ]);
+        assert!(!node.check_funnel_port(443));
+    }
+
+    #[test]
+    fn check_funnel_port_rejects_wrong_url_with_ports_query() {
+        // A look-alike host carrying ?ports= must NOT be honored: after stripping the query the
+        // URL must equal the exact funnel-ports cap. (starts_with the cap prefix is the scan
+        // filter, but parse_attr re-validates the full URL.)
+        let node = funnel_node(&[
+            "https",
+            "funnel",
+            "https://tailscale.com/cap/funnel-ports-evil?ports=443",
+        ]);
+        assert!(!node.check_funnel_port(443));
+    }
+
+    #[tokio::test]
+    async fn listen_funnel_is_fail_closed_unsupported_when_allowed() {
+        // Node is allowed to funnel on 443, but the public relay leg + real cert don't exist in
+        // this fork: must surface Unsupported (or Cert), never a usable acceptor.
+        let node = funnel_node(&["https", "funnel", FUNNEL_PORTS_443_8443]);
+        let cfg = ServeConfig {
+            name: "host.tail1.ts.net".into(),
+            port: 443,
+            target: ServeTarget::Accept,
+        };
+        let err = match listen_funnel(&node, &cfg, FunnelOptions::default()).await {
+            Ok(_) => panic!("must not build a Funnel acceptor without relay + real cert"),
+            Err(e) => e,
+        };
+        assert!(matches!(
+            err,
+            FunnelError::Unsupported { .. } | FunnelError::Cert(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn listen_funnel_denies_before_cert_when_not_allowed() {
+        // Access gate must run first: a node that can't funnel never reaches the cert path.
+        let node = funnel_node(&[]);
+        let cfg = ServeConfig {
+            name: "host.tail1.ts.net".into(),
+            port: 443,
+            target: ServeTarget::Accept,
+        };
+        let err = match listen_funnel(&node, &cfg, FunnelOptions::default()).await {
+            Ok(_) => panic!("must deny a node that cannot funnel"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, FunnelError::NotAllowed));
     }
 }

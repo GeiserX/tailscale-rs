@@ -4,6 +4,7 @@ use std::{path::PathBuf, process::Command, str::FromStr};
 
 use clap::Parser;
 
+mod funnel_fail_closed;
 mod ipv4_only_forwarder;
 mod ipv4_only_host_net;
 mod lints_enabled;
@@ -27,6 +28,7 @@ pub const CHECK_FNS: &[(&str, CheckFn)] = &[
     ("lints_enabled", lints_enabled::run),
     ("ipv4_only_forwarder", ipv4_only_forwarder::run),
     ("ipv4_only_host_net", ipv4_only_host_net::run),
+    ("funnel_fail_closed", funnel_fail_closed::run),
 ];
 
 /// Convenience alias for `Result` with a boxed `std::error::Error`.

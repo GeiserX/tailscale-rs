@@ -284,6 +284,23 @@ pub struct Config {
     /// netstack actor or a TUN transport from it. `ts_control` must not depend on `ts_transport_tun`.
     #[serde(default)]
     pub transport_mode: TransportMode,
+
+    /// Whether to ask control to wire this node up server-side for Tailscale Funnel
+    /// (`HostInfo.WireIngress`, the capver-113 client→control Funnel signal), even when no Funnel
+    /// endpoint is currently active.
+    ///
+    /// Unlike the dataplane fields above, this one *is* read inside `ts_control`: it sets
+    /// `HostInfo.WireIngress` on registration and the streaming map request, asking control to
+    /// provision the DNS / ingress records a Funnel node needs so a later `serve`/funnel session
+    /// works immediately. It mirrors Go `tsnet`'s "would like to be wired up for Funnel" signal.
+    ///
+    /// This fork cannot yet *terminate* public Funnel ingress — [`crate::listen_funnel`] is
+    /// fail-closed (no client-side ACME engine, and a self-hosted control plane provides no public
+    /// ingress relay). So `HostInfo.IngressEnabled` (Funnel endpoints actually live) is never set;
+    /// only `WireIngress` is, and only when this flag is `true`. Defaults to `false` (fail-closed):
+    /// a node requests Funnel wiring only when explicitly opted in.
+    #[serde(default)]
+    pub wire_ingress: bool,
 }
 
 impl Config {
@@ -398,6 +415,7 @@ impl Default for Config {
             tcp_buffer_size: None,
             enable_ipv6: false,
             transport_mode: TransportMode::default(),
+            wire_ingress: false,
         }
     }
 }

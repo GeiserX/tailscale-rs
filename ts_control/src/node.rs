@@ -1,10 +1,21 @@
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use ts_capabilityversion::CapabilityVersion;
 use ts_keys::{DiscoPublicKey, MachinePublicKey, NodePublicKey};
 
 use crate::dns::Resolver;
+
+/// An owned node-capability map (`Node.CapMap` in Go: `map[NodeCapability][]RawMessage`).
+///
+/// Keys are capability names or URLs (e.g. `"funnel"`, `"https"`, or
+/// `"https://tailscale.com/cap/funnel-ports?ports=443,8443"`); values are the raw JSON-encoded
+/// argument blobs for that capability (often empty). Stored *owned* because the wire form
+/// ([`ts_control_serde::Node::cap_map`]) borrows from the decode buffer, whereas the domain
+/// [`Node`] outlives it. Funnel gating only inspects the keys (see [`Node::can_funnel`] and
+/// [`Node::check_funnel_port`]); the values are retained for capabilities that carry argument data.
+pub type NodeCapMap = BTreeMap<String, Vec<String>>;
 
 /// Whether `addr` falls in a range Tailscale assigns to nodes: the CGNAT range for IPv4
 /// (`100.64.0.0/10`, excluding the ChromeOS VM carve-out `100.115.92.0/23`) and the Tailscale
@@ -140,6 +151,12 @@ pub struct Node {
     /// send it, in which case it defaults to [`CapabilityVersion::default`]. Used to gate features
     /// that require a minimum peer capability, e.g. exit-node DNS proxying (`peerCanProxyDNS`).
     pub cap: CapabilityVersion,
+
+    /// This node's capability map (`Node.CapMap` in Go). Keys are capability names/URLs; values are
+    /// the raw JSON argument blobs (often empty). Threaded from the wire
+    /// ([`ts_control_serde::Node::cap_map`]) as an owned copy. Used to gate node-level features such
+    /// as Funnel ingress ([`Node::can_funnel`], [`Node::check_funnel_port`]).
+    pub cap_map: NodeCapMap,
 
     /// The peerAPI port this node advertises over IPv4 (`peerapi4` service), if any.
     ///
@@ -319,6 +336,110 @@ impl Node {
             port,
         ))
     }
+
+    /// The node attribute granting HTTPS (TLS cert provisioning) for this node (Go
+    /// `tailcfg.CapabilityHTTPS`). One of the two caps [`Node::can_funnel`] requires.
+    const CAP_HTTPS: &'static str = "https";
+
+    /// The node attribute granting the ability to host Funnel ingress (Go `tailcfg.NodeAttrFunnel`).
+    /// The other cap [`Node::can_funnel`] requires.
+    const NODE_ATTR_FUNNEL: &'static str = "funnel";
+
+    /// The capability URL whose `?ports=` query enumerates the ports Funnel may listen on (Go
+    /// `tailcfg.CapabilityFunnelPorts`). The allowed ports live entirely in the *key's* query
+    /// string, not the cap value.
+    const CAP_FUNNEL_PORTS: &'static str = "https://tailscale.com/cap/funnel-ports";
+
+    /// Report whether the cap map contains `cap` as a key (Go `NodeCapMap.Contains` / `HasCap`).
+    pub fn has_node_attr(&self, cap: &str) -> bool {
+        self.cap_map.contains_key(cap)
+    }
+
+    /// Report whether this node is permitted to host Tailscale Funnel ingress.
+    ///
+    /// Mirrors Go `ipn.NodeCanFunnel`: the node must advertise BOTH `CapabilityHTTPS` (`"https"`)
+    /// AND `NodeAttrFunnel` (`"funnel"`) in its cap map. Fail-closed: a missing cap denies.
+    pub fn can_funnel(&self) -> bool {
+        self.has_node_attr(Self::CAP_HTTPS) && self.has_node_attr(Self::NODE_ATTR_FUNNEL)
+    }
+
+    /// Report whether `wanted_port` is allowed for Funnel on this node.
+    ///
+    /// Mirrors Go `ipn.CheckFunnelPort`: scan the cap-map keys for one prefixed by
+    /// [`Node::CAP_FUNNEL_PORTS`], URL-parse that key, read its `ports` query parameter, and match
+    /// `wanted_port` against the comma-separated list of single ports and `first-last` ranges. The
+    /// port list lives in the *key*, never the value. Fail-closed: no matching cap, an empty or
+    /// unparseable `ports` query, or a key whose non-query part isn't exactly the funnel-ports URL
+    /// all deny.
+    pub fn check_funnel_port(&self, wanted_port: u16) -> bool {
+        // Extract the `ports=` list from the first cap-map key that is the funnel-ports URL with a
+        // non-empty `ports` query. Returns `None` (deny) if the key is unparseable, the query is
+        // missing/empty, or the URL (sans query) isn't exactly the funnel-ports cap.
+        let parse_attr = |attr: &str| -> Option<String> {
+            let mut url = url::Url::parse(attr).ok()?;
+            let ports = url
+                .query_pairs()
+                .find(|(k, _)| k == "ports")
+                .map(|(_, v)| v.into_owned())?;
+            if ports.is_empty() {
+                return None;
+            }
+            url.set_query(None);
+            // Go compares `u.String()` against the bare cap; `url`'s serializer keeps a trailing
+            // `/` only if present in the input, and the funnel-ports cap has none, so a direct
+            // string compare matches Go's behavior.
+            if url.as_str() != Self::CAP_FUNNEL_PORTS {
+                return None;
+            }
+            Some(ports)
+        };
+
+        let Some(ports_str) = self
+            .cap_map
+            .keys()
+            .filter(|attr| attr.starts_with(Self::CAP_FUNNEL_PORTS))
+            .find_map(|attr| parse_attr(attr))
+        else {
+            return false;
+        };
+
+        let wanted = wanted_port.to_string();
+        for ps in ports_str.split(',') {
+            if ps.is_empty() {
+                continue;
+            }
+            match ps.split_once('-') {
+                None => {
+                    if ps == wanted {
+                        return true;
+                    }
+                }
+                Some((first, last)) => {
+                    let (Ok(fp), Ok(lp)) = (first.parse::<u16>(), last.parse::<u16>()) else {
+                        continue;
+                    };
+                    if fp <= wanted_port && wanted_port <= lp {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Collect a wire ([`ts_control_serde`]) node cap map into an owned [`NodeCapMap`].
+///
+/// Keys are copied as owned strings; each value's raw JSON text is preserved verbatim. The wire map
+/// borrows from the decode buffer, so an owned copy is required to outlive it on the domain
+/// [`Node`].
+fn cap_map_from_serde(wire: &ts_nodecapability::Map<'_>) -> NodeCapMap {
+    wire.iter()
+        .map(|(&key, values)| {
+            let owned_values = values.0.iter().map(|v| v.get().to_owned()).collect();
+            (key.to_owned(), owned_values)
+        })
+        .collect()
 }
 
 /// Extract the advertised IPv4 peerAPI port and whether the explicit `peerapi-dns-proxy` service is
@@ -411,6 +532,7 @@ impl From<&ts_control_serde::Node<'_>> for Node {
                 .map(|x| ts_derp::RegionId(x.into())),
 
             cap: value.cap,
+            cap_map: cap_map_from_serde(&value.cap_map),
             peerapi_port,
             peerapi_dns_proxy,
             is_wireguard_only: value.is_wireguard_only,
@@ -446,6 +568,7 @@ mod tests {
             underlay_addresses: vec![],
             derp_region: None,
             cap: CapabilityVersion::default(),
+            cap_map: NodeCapMap::new(),
             peerapi_port: None,
             peerapi_dns_proxy: false,
             is_wireguard_only: false,

@@ -479,6 +479,38 @@ impl Device {
         ts_control::listen_tls(cfg).await
     }
 
+    /// Expose a tailnet TLS service to the public internet via Tailscale Funnel (like `tsnet`'s
+    /// `ListenFunnel`).
+    ///
+    /// **Two fail-closed gates.** First the node-attribute gate is fully enforced from this node's
+    /// own capability map (mirroring Go `ipn.NodeCanFunnel` + `ipn.CheckFunnelPort`): the tailnet
+    /// admin must have enabled HTTPS and granted the `funnel` node attribute, and `cfg.port` must be
+    /// in the set the `funnel-ports` capability allows — otherwise this returns
+    /// [`ts_control::FunnelError::NotAllowed`] / [`ts_control::FunnelError::PortNotAllowed`] before
+    /// touching any cert or network. Then, because public Funnel ingress requires both a
+    /// publicly-trusted certificate (no client-side ACME engine exists here — see
+    /// [`Device::get_certificate`]) and Tailscale-operated public ingress relays that a self-hosted
+    /// control plane does not provide, an allowed request surfaces
+    /// [`ts_control::FunnelError::Unsupported`] ([`ts_control::MISSING_FUNNEL_RELAY`] names what is
+    /// missing) rather than ever returning a listener that silently serves nothing or downgrades to
+    /// plaintext.
+    ///
+    /// Anti-leak: Funnel TLS would terminate only on the overlay netstack, never a host socket;
+    /// there is no self-signed or plaintext fallback. The access gate is real today, so callers can
+    /// rely on it; when the relay + issuance legs land, this starts returning a working acceptor
+    /// with no caller change.
+    pub async fn listen_funnel(
+        &self,
+        cfg: &ts_control::ServeConfig,
+        opts: ts_control::FunnelOptions,
+    ) -> Result<TlsAcceptor, ts_control::FunnelError> {
+        let me = self
+            .self_node()
+            .await
+            .map_err(|_| ts_control::FunnelError::NotAllowed)?;
+        ts_control::listen_funnel(&me, cfg, opts).await
+    }
+
     /// Attempt to gracefully shut down this device's runtime.
     ///
     /// Reports whether the device was fully shut down before the timeout. It is still shut

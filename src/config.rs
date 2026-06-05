@@ -168,6 +168,21 @@ pub struct Config {
     /// platform with TUN support. This governs only the application data path — never the
     /// exit-node / forwarder egress path, which keeps its own IPv4-only userspace netstack.
     pub transport_mode: ts_control::TransportMode,
+
+    /// Whether to ask control to wire this node up server-side for Tailscale Funnel, even when no
+    /// Funnel endpoint is currently active (Go `tsnet`'s "would like to be wired up for Funnel"
+    /// signal, `HostInfo.WireIngress`, capver 113).
+    ///
+    /// When `true`, registration and map requests set `HostInfo.WireIngress` so control provisions
+    /// the DNS / ingress records a Funnel node needs, making a later [`Device::listen_funnel`] (or
+    /// `serve`) session work immediately. Defaults to `false` (fail-closed): a node requests Funnel
+    /// wiring only when explicitly opted in.
+    ///
+    /// Note this fork cannot yet *terminate* public Funnel ingress — `Device::listen_funnel` is
+    /// fail-closed (no client-side ACME engine, and a self-hosted control plane provides no public
+    /// ingress relay). Setting this flag only requests server-side wiring; it does not by itself
+    /// make Funnel live.
+    pub wire_ingress: bool,
 }
 
 impl Config {
@@ -311,6 +326,7 @@ impl From<&Config> for ts_control::Config {
             peerapi_port: None,
             enable_ipv6: value.enable_ipv6,
             transport_mode: value.transport_mode.clone(),
+            wire_ingress: value.wire_ingress,
         }
     }
 }
@@ -336,6 +352,7 @@ impl Default for Config {
             tcp_buffer_size: None,
             enable_ipv6: false,
             transport_mode: ts_control::TransportMode::default(),
+            wire_ingress: false,
         }
     }
 }
@@ -359,6 +376,7 @@ mod tests {
             forward_udp_ports: vec![53],
             tcp_buffer_size: Some(1024 * 128),
             enable_ipv6: true,
+            wire_ingress: true,
             transport_mode: ts_control::TransportMode::Tun(ts_control::TunConfig {
                 name: Some("tailscale0".to_owned()),
                 mtu: Some(1280),
@@ -390,6 +408,7 @@ mod tests {
         assert_eq!(proxy.scheme, ts_control::ExitProxyScheme::Socks5);
         assert_eq!(proxy.auth, Some(("u".to_owned(), "p".to_owned())));
         assert!(control.enable_ipv6);
+        assert!(control.wire_ingress);
         assert_eq!(
             control.transport_mode,
             ts_control::TransportMode::Tun(ts_control::TunConfig {
