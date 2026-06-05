@@ -6,6 +6,29 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.29](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.29) - 2026-06-05
+
+**Fix: Tailnet-Lock (TKA) node key is now Ed25519, not X25519** (`tsr-am9.3`). The node-side
+network-lock key (`NetworkLockPublicKey`/`NetworkLockPrivateKey`/`NetworkLockKeyPair`) was being
+generated as an **X25519** key, but Go Tailscale's `key.NLPrivate`/`NLPublic` are **Ed25519**
+(RFC 8032). The X25519 public key sent in `RegisterRequest.NLKey` would never have matched what a
+TKA authority expects. Now fixed to standards-conformant Ed25519.
+
+- New `create_ed25519_keypair_types!` macro in `ts_keys`, reusing the existing crypto-agnostic
+  byte/Display/FromStr/serde/zerocopy machinery; only the key derivation differs — the public is
+  derived via the RFC 8032 seed→public path (`ed25519-dalek`), matching Go's
+  `ed25519.PrivateKey.Public()`.
+- The `nlpub:`+lowercase-hex wire encoding of the 32-byte Ed25519 public is **byte-identical** to
+  Go's `key.NLPublic.MarshalText` (proven by an RFC 8032 §7.1 Test-1 known-answer test through the
+  fork's own `NetworkLockPrivateKey`).
+- Seed entropy is sourced from `getrandom` (32 uniformly-random bytes) — deliberately **not** from
+  x25519's bit-clamped `StaticSecret`, which would reduce seed entropy.
+- The persisted node-state key stays 32 bytes with the same `nlpriv:`/`nlpub:` serde form, so the
+  change needs **no migration** (matches Go, which was always Ed25519): a pre-fix persisted key
+  simply loads as a valid Ed25519 seed and the node re-registers its corrected public on next
+  connect. The X25519 key path is unchanged for Disco/Machine/Node keys (those genuinely are
+  X25519).
+
 ## [0.5.28](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.28) - 2026-06-05
 
 **Debug packet capture / `CapturePcap`** (`tsr-am9.2`): tee a pcap of every packet crossing the

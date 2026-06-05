@@ -260,7 +260,113 @@ macro_rules! create_x25519_keypair_types {
     }
 }
 
+/// Generates a struct that implements all the fields/methods needed by Ed25519 (RFC 8032) public
+/// keys. Reuses the crypto-agnostic [`_create_x25519_base_key_type`] for the byte/Display/FromStr/
+/// serde/zerocopy surface. No fallible `From<_> for VerifyingKey` is provided because not every
+/// 32-byte string is a valid Ed25519 point and no downstream caller needs a dalek conversion on the
+/// public key (callers only use Display/serde/`.public`).
+macro_rules! create_ed25519_public_key_type {
+    ($(#[$attr:meta])* $public_name:ident, $key_prefix:literal) => {
+        _create_x25519_base_key_type!($(#[$attr])* #[derive(Default, Hash, PartialOrd, Ord)] $public_name, $key_prefix);
+    }
+}
+
+/// Generates a struct that implements all the fields/methods needed by Ed25519 (RFC 8032) private
+/// keys. The wrapped 32 bytes are the Ed25519 *seed* (matching Go's `ed25519.PrivateKey` seed
+/// semantics and `key.NLPrivate`).
+macro_rules! create_ed25519_private_key_type {
+    ($(#[$attr:meta])* $private_name:ident, $public_name:ident, $key_prefix:literal) => {
+        _create_x25519_base_key_type!($(#[$attr])* $private_name, $key_prefix);
+
+        impl $private_name {
+            /// Generate a new Ed25519 private key.
+            ///
+            /// Sources 32 uniformly-random bytes for the Ed25519 seed directly from `getrandom`.
+            /// We deliberately do NOT reuse `x25519_dalek::StaticSecret`, whose bytes are bit
+            /// clamped (low bits zeroed, bit 254 set); clamping reduces seed entropy and is wrong
+            /// for an Ed25519 seed.
+            pub fn random() -> Self {
+                let mut seed = [0u8; $private_name::KEY_LEN_BYTES];
+                ::getrandom::fill(&mut seed).expect("getrandom failed");
+                $private_name(seed)
+            }
+
+            /// Calculate the corresponding public key for this private key.
+            ///
+            /// This is the standard RFC 8032 seed->public derivation, matching Go's
+            /// `ed25519.PrivateKey.Public()`.
+            pub fn public_key(self) -> $public_name {
+                self.signing_key().verifying_key().to_bytes().into()
+            }
+
+            /// Return this key as an `ed25519_dalek::SigningKey`, treating the wrapped bytes as the
+            /// Ed25519 seed (RFC 8032).
+            pub fn signing_key(&self) -> ::ed25519_dalek::SigningKey {
+                ::ed25519_dalek::SigningKey::from_bytes(&self.0)
+            }
+        }
+    }
+}
+
+/// Generates the public key, private key, and key pair structs with all the fields/methods needed
+/// to work with Ed25519 (RFC 8032) keys. Mirrors [`create_x25519_keypair_types`] but derives the
+/// public key via the Ed25519 seed->public derivation instead of X25519 scalar multiplication.
+macro_rules! create_ed25519_keypair_types {
+    ($(#[$public_attr:meta])* $public_name:ident, $public_prefix:literal, $(#[$private_attr:meta])* $private_name:ident, $private_prefix:literal, $(#[$pair_attr:meta])* $keypair_name:ident) => {
+        create_ed25519_public_key_type! { $(#[$public_attr])* $public_name, $public_prefix }
+        create_ed25519_private_key_type! { $(#[$private_attr])* $private_name, $public_name, $private_prefix }
+
+        impl From<$private_name> for $public_name {
+            fn from(v: $private_name) -> Self {
+                let public = ::ed25519_dalek::SigningKey::from_bytes(&v.0)
+                    .verifying_key()
+                    .to_bytes();
+                $public_name(public)
+            }
+        }
+
+        $(#[$pair_attr])*
+        #[cfg_attr(feature = "serde", derive(::serde::Deserialize, ::serde::Serialize))]
+        #[derive(Clone, Copy, Debug, Eq, PartialEq, ::zerocopy::FromBytes, ::zerocopy::Immutable, ::zerocopy::IntoBytes, ::zerocopy::KnownLayout)]
+        pub struct $keypair_name {
+            /// This keypair's public key.
+            pub public: $public_name,
+            /// This keypair's private key.
+            pub private: $private_name,
+        }
+
+        impl $keypair_name {
+            /// Generate a new Ed25519 public/private key pair.
+            pub fn new() -> Self {
+                let private = $private_name::random();
+                Self {
+                    private,
+                    public: private.into(),
+                }
+            }
+        }
+
+        impl Default for $keypair_name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl From<$private_name> for $keypair_name {
+            fn from(private: $private_name) -> Self {
+                Self {
+                    private,
+                    public: private.into(),
+                }
+            }
+        }
+    }
+}
+
 pub(crate) use _create_x25519_base_key_type;
+pub(crate) use create_ed25519_keypair_types;
+pub(crate) use create_ed25519_private_key_type;
+pub(crate) use create_ed25519_public_key_type;
 pub(crate) use create_x25519_keypair_types;
 pub(crate) use create_x25519_private_key_type;
 pub(crate) use create_x25519_public_key_type;

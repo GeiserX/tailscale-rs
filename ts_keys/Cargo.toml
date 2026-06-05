@@ -16,6 +16,14 @@ zerocopy.workspace = true
 serde = { workspace = true, optional = true }
 x25519-dalek.workspace = true
 crypto_box.workspace = true
+# ed25519-dalek (v2, already in the workspace tree via ts_tka) provides the RFC 8032
+# seed->public derivation for the Tailnet-Lock (TKA) key. Default features off keeps the
+# crate no_std-clean; we only need from_bytes / verifying_key / to_bytes.
+ed25519-dalek = { version = "2", default-features = false }
+# getrandom 0.4 is already pulled transitively (via x25519-dalek 3.0.0-pre.6). We use it as a
+# direct dep to source 32 uniformly-random bytes for the Ed25519 seed WITHOUT any bit clamping
+# (x25519's StaticSecret clamps, which would reduce seed entropy and be wrong for Ed25519).
+getrandom = "0.4"
 
 [features]
 serde = ["dep:serde"]
