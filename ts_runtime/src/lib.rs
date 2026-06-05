@@ -299,6 +299,25 @@ impl Runtime {
         Ok(Status { self_node, peers })
     }
 
+    /// Request an OIDC ID token from control scoped to `audience` (workload-identity federation).
+    ///
+    /// Returns the signed JWT, or the token RPC's own [`ts_control::IdTokenError`]. The kameo
+    /// delegated-reply send error is flattened: a handler error carries the real `IdTokenError`,
+    /// any other send failure (actor shutdown / mailbox closed) is surfaced as
+    /// [`ts_control::IdTokenError::NetworkError`].
+    pub async fn fetch_id_token(
+        &self,
+        audience: String,
+    ) -> Result<String, ts_control::IdTokenError> {
+        self.control
+            .ask(control_runner::FetchIdToken { audience })
+            .await
+            .map_err(|e| match e {
+                kameo::error::SendError::HandlerError(err) => err,
+                _ => ts_control::IdTokenError::NetworkError,
+            })
+    }
+
     /// Resolve which node owns a tailnet source address.
     ///
     /// Maps the source IP of `addr` to its owning node. Mirrors tsnet's `LocalClient::WhoIs`.

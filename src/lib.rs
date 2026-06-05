@@ -146,8 +146,8 @@ pub use ts_control::{CertError, MISSING_CERT_RPC, ServeConfig, ServeTarget};
 #[doc(inline)]
 pub use ts_control::{ExitProxyConfig, ExitProxyScheme};
 pub use ts_control::{
-    ServiceError, ServiceMode, SshAccept, SshAction, SshConnIdentity, SshDecision, SshDenyReason,
-    SshPolicy, SshPrincipal, SshRule,
+    IdTokenError, ServiceError, ServiceMode, SshAccept, SshAction, SshConnIdentity, SshDecision,
+    SshDenyReason, SshPolicy, SshPrincipal, SshRule,
 };
 #[doc(inline)]
 pub use ts_netstack_smoltcp::PingError;
@@ -522,6 +522,18 @@ impl Device {
             .await
             .map_err(ts_runtime::Error::from)
             .map_err(Into::into)
+    }
+
+    /// Request an OIDC **ID token** from control for this node, scoped to `audience` (workload-
+    /// identity federation, like `tailscale`'s `id-token` LocalAPI).
+    ///
+    /// Returns a signed JWT whose `sub` claim is this node's MagicDNS name and whose `aud` claim is
+    /// `audience`, suitable for presenting to a third-party relying party (e.g. AWS/GCP
+    /// workload-identity federation). The node is the token *subject*, not the authenticator — this
+    /// is token issuance over the Noise transport (`POST /machine/id-token`), not a login path.
+    /// Requires the control plane to support capability version ≥ 30.
+    pub async fn fetch_id_token(&self, audience: &str) -> Result<String, ts_control::IdTokenError> {
+        self.runtime.fetch_id_token(audience.to_string()).await
     }
 
     /// Snapshot this node's client metrics in Prometheus text exposition format.

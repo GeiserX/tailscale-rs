@@ -9,12 +9,11 @@ use kameo::{
     actor::{ActorRef, Spawn},
     message::{Context, StreamMessage},
     prelude::Message,
-    reply::DelegatedReply,
 };
 use tokio::sync::watch;
 use ts_control::{
-    AsyncControlClient, Endpoint, EndpointType, Error as ControlError, Node, SshPolicy,
-    StateUpdate, TkaStatus,
+    AsyncControlClient, Endpoint, EndpointType, Error as ControlError, IdTokenError, Node,
+    SshPolicy, StateUpdate, TkaStatus,
 };
 use ts_magicsock::SelfEndpointType;
 
@@ -126,84 +125,122 @@ impl ControlRunner {
     }
 }
 
-#[kameo::messages]
-impl ControlRunner {
-    /// Fetch the IPv4 address for this tailscale device.
-    #[message(ctx)]
-    pub fn ipv4(
-        &self,
-        ctx: &mut Context<Self, DelegatedReply<Option<Ipv4Addr>>>,
-    ) -> DelegatedReply<Option<Ipv4Addr>> {
-        let (deleg, replier) = ctx.reply_sender();
+// The `#[kameo::messages]` macro generates message structs whose fields mirror the method params;
+// those generated fields carry no doc and can't take attributes, so wrap in a module where
+// missing-docs is allowed (same pattern as PeerTracker's `msg_impl`). The generated message structs
+// are re-exported so callers keep referencing them at `control_runner::<Name>`.
+pub use msg_impl::*;
 
-        if let Some(replier) = replier {
-            let fut = self.with_self_node(|node| node.tailnet_address.ipv4.addr());
+#[allow(missing_docs)]
+mod msg_impl {
+    use kameo::{message::Context, reply::DelegatedReply};
 
-            tokio::spawn(async move {
-                let ip = fut.await;
-                replier.send(ip);
-            });
+    use super::*;
+
+    #[kameo::messages]
+    impl ControlRunner {
+        /// Fetch the IPv4 address for this tailscale device.
+        #[message(ctx)]
+        pub fn ipv4(
+            &self,
+            ctx: &mut Context<Self, DelegatedReply<Option<Ipv4Addr>>>,
+        ) -> DelegatedReply<Option<Ipv4Addr>> {
+            let (deleg, replier) = ctx.reply_sender();
+
+            if let Some(replier) = replier {
+                let fut = self.with_self_node(|node| node.tailnet_address.ipv4.addr());
+
+                tokio::spawn(async move {
+                    let ip = fut.await;
+                    replier.send(ip);
+                });
+            }
+
+            deleg
         }
 
-        deleg
-    }
+        /// Fetch the IPv6 address for this tailscale device.
+        #[message(ctx)]
+        pub fn ipv6(
+            &self,
+            ctx: &mut Context<Self, DelegatedReply<Option<Ipv6Addr>>>,
+        ) -> DelegatedReply<Option<Ipv6Addr>> {
+            let (deleg, replier) = ctx.reply_sender();
 
-    /// Fetch the IPv6 address for this tailscale device.
-    #[message(ctx)]
-    pub fn ipv6(
-        &self,
-        ctx: &mut Context<Self, DelegatedReply<Option<Ipv6Addr>>>,
-    ) -> DelegatedReply<Option<Ipv6Addr>> {
-        let (deleg, replier) = ctx.reply_sender();
+            if let Some(replier) = replier {
+                let fut = self.with_self_node(|node| node.tailnet_address.ipv6.addr());
 
-        if let Some(replier) = replier {
-            let fut = self.with_self_node(|node| node.tailnet_address.ipv6.addr());
+                tokio::spawn(async move {
+                    let ip = fut.await;
+                    replier.send(ip);
+                });
+            }
 
-            tokio::spawn(async move {
-                let ip = fut.await;
-                replier.send(ip);
-            });
+            deleg
         }
 
-        deleg
-    }
+        /// Fetch the self node for this tailscale device.
+        #[message(ctx)]
+        pub fn self_node(
+            &self,
+            ctx: &mut Context<Self, DelegatedReply<Option<Node>>>,
+        ) -> DelegatedReply<Option<Node>> {
+            let (deleg, replier) = ctx.reply_sender();
 
-    /// Fetch the self node for this tailscale device.
-    #[message(ctx)]
-    pub fn self_node(
-        &self,
-        ctx: &mut Context<Self, DelegatedReply<Option<Node>>>,
-    ) -> DelegatedReply<Option<Node>> {
-        let (deleg, replier) = ctx.reply_sender();
+            if let Some(replier) = replier {
+                let node = self.with_self_node(|node| node.clone());
 
-        if let Some(replier) = replier {
-            let node = self.with_self_node(|node| node.clone());
+                tokio::spawn(async move {
+                    let node = node.await;
+                    replier.send(node)
+                });
+            }
 
-            tokio::spawn(async move {
-                let node = node.await;
-                replier.send(node)
-            });
+            deleg
         }
 
-        deleg
-    }
+        /// Fetch the current Tailscale SSH policy, if control has pushed one.
+        ///
+        /// Returns `None` when control has not sent an SSH policy (the SSH server treats this as
+        /// deny-all — fail-closed). Unlike [`self_node`](Self::self_node) this does not block waiting
+        /// for a value: an absent policy is a legitimate, immediate answer.
+        #[message]
+        pub fn current_ssh_policy(&self) -> Option<SshPolicy> {
+            self.ssh_policy.borrow().clone()
+        }
 
-    /// Fetch the current Tailscale SSH policy, if control has pushed one.
-    ///
-    /// Returns `None` when control has not sent an SSH policy (the SSH server treats this as
-    /// deny-all — fail-closed). Unlike [`self_node`](Self::self_node) this does not block waiting
-    /// for a value: an absent policy is a legitimate, immediate answer.
-    #[message]
-    pub fn current_ssh_policy(&self) -> Option<SshPolicy> {
-        self.ssh_policy.borrow().clone()
-    }
+        /// Fetch the current Tailnet Lock status, if control has pushed one.
+        ///
+        /// Returns `None` when control has sent no `TKAInfo` (tailnet lock not in use / no change seen).
+        #[message]
+        pub fn current_tka_status(&self) -> Option<TkaStatus> {
+            self.tka.borrow().clone()
+        }
 
-    /// Fetch the current Tailnet Lock status, if control has pushed one.
-    ///
-    /// Returns `None` when control has sent no `TKAInfo` (tailnet lock not in use / no change seen).
-    #[message]
-    pub fn current_tka_status(&self) -> Option<TkaStatus> {
-        self.tka.borrow().clone()
+        /// Request an OIDC ID token from control scoped to `audience` (workload-identity federation).
+        ///
+        /// Opens a fresh Noise channel and POSTs `/machine/id-token`; returns the signed JWT or an
+        /// [`IdTokenError`]. Runs on a spawned task (delegated reply) so the actor mailbox isn't blocked
+        /// for the round-trip.
+        #[message(ctx)]
+        pub fn fetch_id_token(
+            &self,
+            ctx: &mut Context<Self, DelegatedReply<Result<String, IdTokenError>>>,
+            audience: String,
+        ) -> DelegatedReply<Result<String, IdTokenError>> {
+            let (deleg, replier) = ctx.reply_sender();
+
+            if let Some(replier) = replier {
+                let config = self.params.config.clone();
+                let keys = self.params.env.keys.clone();
+                tokio::spawn(async move {
+                    let result = ts_control::fetch_id_token(&config, &keys, &audience).await;
+                    replier.send(result);
+                });
+            }
+
+            deleg
+        }
     }
 }
 

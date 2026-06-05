@@ -13,6 +13,7 @@ mod dial_plan;
 mod dns;
 mod env_type;
 mod host_info;
+mod id_token;
 mod location;
 mod net_info;
 mod netmap;
@@ -37,6 +38,7 @@ pub use dns::{
     ResolverAddr as DnsResolverAddr,
 };
 pub use host_info::HostInfo;
+pub use id_token::{TokenRequest, TokenResponse};
 pub use net_info::{DerpLatencyMap, LinkType, NetInfo};
 pub use netmap::{Endpoint, EndpointType, MapRequest, MapResponse};
 pub use node::{MarshaledSignature, Node, NodeId, StableNodeId};

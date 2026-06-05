@@ -6,6 +6,26 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.22](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.22) - 2026-06-05
+
+**OIDC ID-token issuance / workload-identity federation** (`tsr-cdv`): a node can now ask control
+to mint a short-lived OIDC ID token (JWT) it can present to a third-party relying party (e.g.
+AWS/GCP workload-identity federation), mirroring Go `tailscale`'s `id-token` LocalAPI.
+
+- **Wire types** (`ts_control_serde`): `TokenRequest` (`{CapVersion, NodeKey, Audience}`) and
+  `TokenResponse` (`{id_token}`), mirroring `tailcfg.TokenRequest`/`TokenResponse`.
+- **Noise RPC** (`ts_control::fetch_id_token`): `POST /machine/id-token` over the ts2021 transport,
+  returning the signed JWT whose `aud` claim is the requested audience. Requires control capability
+  version ≥ 30.
+- **API**: `Device::fetch_id_token(audience)` (via a `ControlRunner` delegated-reply message + a
+  `Runtime` wrapper). The node is the token *subject*, not the authenticator — this is token
+  issuance, not a registration/login path; `RegisterRequest` is unchanged.
+
+(Note: Go has no `ClientID` field and no separate federated-registration wire path — the bead's
+"ClientID/Audience" framing maps to this issuance flow, where `Audience` is a per-call runtime input
+and there is no `ClientID`. `tsnet.Sys()` is an unrelated generic subsystem accessor and is not
+modelled.)
+
 ## [0.5.21](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.21) - 2026-06-05
 
 Hardening from a multi-reviewer audit of the v0.5.15–v0.5.20 parity features. No behavior change to
