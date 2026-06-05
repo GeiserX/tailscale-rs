@@ -391,6 +391,30 @@ impl Device {
             .ok_or(Error::Internal(InternalErrorKind::Actor))
     }
 
+    /// This node's key-expiry instant as Unix seconds (`Node.KeyExpiry` in Go), or `Ok(None)` if
+    /// the key never expires.
+    ///
+    /// Like Go, this fork is **reactive** about key expiry — it reports it rather than rotating the
+    /// node key in the background. A caller can schedule re-authentication around this time; on
+    /// expiry, re-create the [`Device`] (which re-registers), supplying a fresh node key + the prior
+    /// `old_node_key` to rotate, or the same key to refresh.
+    pub async fn self_key_expiry_unix(&self) -> Result<Option<i64>, Error> {
+        Ok(self.self_node().await?.key_expiry_unix())
+    }
+
+    /// Whether this node's key has expired as of now (`!KeyExpiry.IsZero() && KeyExpiry.Before(now)`
+    /// in Go). A key with no expiry is never expired. See [`Device::self_key_expiry_unix`] for the
+    /// reactive-rotation note.
+    pub async fn self_key_expired(&self) -> Result<bool, Error> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            // An unreadable clock (pre-epoch) is treated as the far future so a time-limited key
+            // looks expired — fail-safe toward prompting re-auth rather than trusting a stale key.
+            .unwrap_or(i64::MAX);
+        Ok(self.self_node().await?.key_expired_at_unix(now))
+    }
+
     /// Fetch the current Tailscale SSH policy pushed by control, if any.
     ///
     /// Returns `Ok(None)` when control has not sent an SSH policy. The SSH server treats an absent

@@ -208,6 +208,45 @@ impl Node {
         }
     }
 
+    /// Whether this node's key has expired as of `now`, mirroring Go's
+    /// `netmap.NetworkMap.SelfKeyExpiry` + the `!expiry.IsZero() && expiry.Before(now)` check in
+    /// `ipnlocal`. A node with no expiry ([`Node::node_key_expiry`] is `None`, the Go "zero value =
+    /// does not expire") is never expired.
+    ///
+    /// Like Go, this fork is **reactive**: it reports expiry rather than auto-rotating in the
+    /// background (Go transitions to `NeedsLogin` on expiry and re-registers via stored auth-key or
+    /// interactive login). A caller observing `true` should re-register
+    /// ([`crate::tokio::register`]) — supplying `RegisterRequest::old_node_key` (the prior key) and
+    /// a fresh `node_key` when rotating the key, or the same key to merely refresh.
+    pub fn key_expired(&self, now: DateTime<Utc>) -> bool {
+        match self.node_key_expiry {
+            None => false,
+            Some(expiry) => expiry < now,
+        }
+    }
+
+    /// The instant this node's key expires (`Node.KeyExpiry` in Go), or `None` if it never expires.
+    /// A caller can schedule a re-evaluation/re-auth at this time.
+    pub fn key_expiry(&self) -> Option<DateTime<Utc>> {
+        self.node_key_expiry
+    }
+
+    /// The key-expiry instant as **Unix seconds**, or `None` if the key never expires. Provided for
+    /// callers (e.g. the root crate) that don't depend on `chrono`.
+    pub fn key_expiry_unix(&self) -> Option<i64> {
+        self.node_key_expiry.map(|t| t.timestamp())
+    }
+
+    /// Whether the key has expired as of `now_unix_secs` (Unix seconds). Equivalent to
+    /// [`key_expired`](Self::key_expired) for `chrono`-free callers. A key with no expiry is never
+    /// expired.
+    pub fn key_expired_at_unix(&self, now_unix_secs: i64) -> bool {
+        match self.key_expiry_unix() {
+            None => false,
+            Some(expiry) => expiry < now_unix_secs,
+        }
+    }
+
     /// The fully-qualified domain name of the node, only returning `Some` if the tailnet
     /// component is present.
     ///
@@ -652,6 +691,29 @@ impl From<&ts_control_serde::Node<'_>> for Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_expiry_semantics() {
+        let now: DateTime<Utc> = "2026-06-05T00:00:00Z".parse().unwrap();
+        let past: DateTime<Utc> = "2020-01-01T00:00:00Z".parse().unwrap();
+        let future: DateTime<Utc> = "2099-01-01T00:00:00Z".parse().unwrap();
+
+        let mut n = node("h", Some("t.ts.net"));
+
+        // No expiry set => never expired (Go zero-value semantics).
+        n.node_key_expiry = None;
+        assert!(!n.key_expired(now));
+        assert_eq!(n.key_expiry(), None);
+
+        // Future expiry => not yet expired.
+        n.node_key_expiry = Some(future);
+        assert!(!n.key_expired(now));
+        assert_eq!(n.key_expiry(), Some(future));
+
+        // Past expiry => expired.
+        n.node_key_expiry = Some(past);
+        assert!(n.key_expired(now));
+    }
 
     fn node(hostname: &str, tailnet: Option<&str>) -> Node {
         Node {

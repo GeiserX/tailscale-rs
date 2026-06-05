@@ -6,6 +6,23 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.23](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.23) - 2026-06-05
+
+**Node-key expiry handling** (`tsr-77q-e`): surface this node's key-expiry state so an embedder can
+react (re-authenticate / rotate), mirroring Go's **reactive** model.
+
+- `ts_control::Node::key_expired(now)` / `key_expiry()` (and `chrono`-free `key_expired_at_unix` /
+  `key_expiry_unix`): compute expiry from the self-node's `KeyExpiry` exactly as Go does
+  (`!KeyExpiry.IsZero() && KeyExpiry.Before(now)`; a key with no expiry never expires).
+- `Device::self_key_expiry_unix()` / `Device::self_key_expired()`: expose the current node's expiry
+  instant and expired flag.
+
+Per Go, the fork does **not** auto-rotate the node key in the background — Go transitions to
+`NeedsLogin` on expiry and re-registers via a stored auth-key or interactive login. The registration
+wire path already carries `RegisterRequest::old_node_key` + `expiry` for rotation (set a fresh
+`node_key` + the prior `old_node_key` to rotate, or the same key to refresh); this release adds the
+client-side *detection* half.
+
 ## [0.5.22](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.22) - 2026-06-05
 
 **OIDC ID-token issuance / workload-identity federation** (`tsr-cdv`): a node can now ask control
