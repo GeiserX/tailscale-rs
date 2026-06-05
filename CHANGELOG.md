@@ -6,6 +6,36 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.17](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.17) - 2026-06-05
+
+**Tailscale VIP services / `ListenService`** (`tsr-6b5`): a node can now host a Tailscale **VIP
+service** (`svc:<label>`) by binding an overlay listener on the virtual IP address control assigned
+that service, mirroring Go `tsnet.Server.ListenService`. Fail-closed throughout.
+
+- **Wire types** (`ts_control_serde`): `ServiceName` (`svc:<label>`), `VipService`,
+  `ProtoPortRange`, and `ServiceIpMappings` (the value of the `service-host` node-capability —
+  `NODE_ATTR_SERVICE_HOST`), mirroring `tailcfg`. These are the control-assigned service→VIP
+  mappings a host learns from its netmap.
+- **Domain model** (`ts_control::Node`): a new `service_vips` map (svc-name → VIP IPs) parsed from
+  the `service-host` cap, with `service_addresses()` (flattened set) / `service_addresses_for(name)`
+  (per-service) accessors and an `is_service_host()` gate. A `validate_service_name` enforces the
+  `svc:<dns-label>` shape.
+- **Listen gate** (`ts_control::resolve_service_listen` + `Device::listen_service`): binds a
+  listener on the service's control-assigned VIP only when the name is valid, the host is **tagged**
+  (Go `ErrUntaggedServiceHost`), and control assigned that specific service a VIP — otherwise a
+  typed `ServiceError` and the node serves nothing (never a host socket, never an unbound listen).
+  Per-service VIP selection ensures a multi-service co-host binds the correct address for each
+  service.
+- **Netstack acceptance**: control-assigned VIPs are added to the application netstack's
+  accepted-address set (the same mechanism as the MagicDNS `100.100.100.100` service IP) so a
+  hosted-service listener is reachable by tailnet peers. IPv6 VIPs are dropped when IPv6 is disabled
+  on the overlay (the default), consistently in both the accept-set and the listen resolver — the
+  fork stays IPv4-only by default.
+
+The advertise→`c2n`-fetch leg (`Hostinfo.ServicesHash` + control's `GET /vip-services`) and the
+L3/`Tun` service mode (a TODO in upstream tsnet) are out of scope for this slice; VIP hosting works
+from the control-assigned `service-host` mapping a node already receives.
+
 ## [0.5.16](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.16) - 2026-06-05
 
 **Tailscale SSH server authorization** (`tsr-l24`): the in-process SSH server now enforces the

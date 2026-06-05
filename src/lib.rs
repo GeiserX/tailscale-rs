@@ -146,8 +146,8 @@ pub use ts_control::{CertError, MISSING_CERT_RPC, ServeConfig, ServeTarget};
 #[doc(inline)]
 pub use ts_control::{ExitProxyConfig, ExitProxyScheme};
 pub use ts_control::{
-    SshAccept, SshAction, SshConnIdentity, SshDecision, SshDenyReason, SshPolicy, SshPrincipal,
-    SshRule,
+    ServiceError, ServiceMode, SshAccept, SshAction, SshConnIdentity, SshDecision, SshDenyReason,
+    SshPolicy, SshPrincipal, SshRule,
 };
 #[doc(inline)]
 pub use ts_netstack_smoltcp::PingError;
@@ -177,6 +177,11 @@ pub struct Device {
     /// no userspace application netstack; the channel-driven socket APIs ([`Device::udp_bind`],
     /// [`Device::tcp_listen`], [`Device::tcp_connect`], [`Device::ping`]) are unsupported there.
     channel: Option<Channel>,
+    /// Whether IPv6 is enabled on the tailnet overlay (the `Config::enable_ipv6` gate, default
+    /// `false`). Captured at construction; used by [`Device::listen_service`] to decide whether an
+    /// IPv6 VIP-service address is bindable (the netstack only accepts IPv6 overlay addresses when
+    /// this is set).
+    enable_ipv6: bool,
 }
 
 impl Device {
@@ -213,6 +218,7 @@ impl Device {
         Ok(Self {
             runtime: rt,
             channel,
+            enable_ipv6: config.enable_ipv6,
         })
     }
 
@@ -528,6 +534,39 @@ impl Device {
             .await
             .map_err(|_| ts_control::FunnelError::NotAllowed)?;
         ts_control::listen_funnel(&me, cfg, opts).await
+    }
+
+    /// Host a Tailscale **VIP service** (`svc:<label>`) by binding an overlay listener on the
+    /// service's control-assigned virtual IP (like `tsnet`'s `ListenService`).
+    ///
+    /// **Fail-closed.** Mirrors Go `tsnet.Server.ListenService`'s preconditions, enforced from this
+    /// node's own netmap state ([`ts_control::resolve_service_listen`]): the `name` must be a valid
+    /// `svc:<dns-label>`, this node must be **tagged** (Go `ErrUntaggedServiceHost`), and control
+    /// must have assigned the service a VIP address on this node (delivered via the `service-host`
+    /// node-capability — see [`ts_control::Node::service_addresses`]). Any unmet precondition
+    /// returns a typed [`ts_control::ServiceError`] before binding anything.
+    ///
+    /// When all hold, this binds a [`tcp_listen`][Device::tcp_listen] on the service VIP and the
+    /// configured `mode` port over the **overlay netstack** (never a host socket) and returns the
+    /// listener. The netstack already accepts packets for control-assigned VIPs (they are injected
+    /// alongside the node's own tailnet address), so the listener is reachable by tailnet peers.
+    ///
+    /// The `Tun`/L3 service mode is unsupported (a TODO in upstream tsnet); only TCP/HTTP modes
+    /// (which bind the same VIP:port at the listen layer) are offered. Returns an error in TUN
+    /// transport mode (there is no application netstack to bind on).
+    pub async fn listen_service(
+        &self,
+        name: &str,
+        mode: ts_control::ServiceMode,
+    ) -> Result<netstack::TcpListener, ts_control::ServiceError> {
+        let me = self
+            .self_node()
+            .await
+            .map_err(|e| ts_control::ServiceError::Listen(e.to_string()))?;
+        let listen_addr = ts_control::resolve_service_listen(&me, name, mode, self.enable_ipv6)?;
+        self.tcp_listen(listen_addr)
+            .await
+            .map_err(|e| ts_control::ServiceError::Listen(e.to_string()))
     }
 
     /// Attempt to gracefully shut down this device's runtime.

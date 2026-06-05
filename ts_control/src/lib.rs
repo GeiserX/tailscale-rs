@@ -23,6 +23,7 @@ mod map_request_builder;
 mod node;
 #[cfg(feature = "async_tokio")]
 mod serve;
+mod service;
 mod ssh_policy;
 #[cfg(feature = "async_tokio")]
 mod tokio;
@@ -43,12 +44,14 @@ pub use dial_plan::{DialCandidate, DialMode, DialPlan};
 pub use dns::{DnsConfig, ExtraRecord, Resolver as DnsResolver, ResolverTransport};
 pub use node::{
     ExitNodeSelector, Id as NodeId, Node, NodeCapMap, StableId as StableNodeId, TailnetAddress,
+    validate_service_name,
 };
 #[cfg(feature = "async_tokio")]
 pub use serve::{
     FunnelError, FunnelOptions, MISSING_FUNNEL_RELAY, ServeConfig, ServeTarget, accept_tls,
     funnel_access, listen_funnel, listen_tls, tls_acceptor,
 };
+pub use service::{ServiceError, ServiceMode, resolve_service_listen};
 pub use ssh_policy::{
     SshAccept, SshAction, SshConnIdentity, SshDecision, SshDenyReason, SshPolicy, SshPrincipal,
     SshRule,

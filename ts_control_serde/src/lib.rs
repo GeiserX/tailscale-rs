@@ -20,6 +20,7 @@ mod node;
 mod ping;
 mod register;
 mod service;
+mod service_vip;
 mod ssh_policy;
 mod tka_info;
 mod tpm;
@@ -42,6 +43,10 @@ pub use node::{MarshaledSignature, Node, NodeId, StableNodeId};
 pub use ping::{PingRequest, PingResponse, PingType};
 pub use register::{RegisterAuth, RegisterRequest, RegisterResponse, SignatureType};
 pub use service::{Service, ServiceProto};
+pub use service_vip::{
+    NODE_ATTR_SERVICE_HOST, ProtoPortRange, SERVICE_NAME_PREFIX, ServiceIpMappings, ServiceName,
+    VipService,
+};
 pub use ssh_policy::{SSHAction, SSHPolicy, SSHPrincipal, SSHRecorderFailureAction, SSHRule};
 pub use tka_info::TkaInfo;
 pub use tpm::TpmInfo;

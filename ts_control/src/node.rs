@@ -177,6 +177,17 @@ pub struct Node {
     /// (`ExitNodeDNSResolvers` in Go). Only meaningful when [`Node::is_wireguard_only`] is set.
     /// Encrypted-transport resolvers are dropped (see [`Resolver::from_serde`]).
     pub exit_node_dns_resolvers: Vec<Resolver>,
+
+    /// Per-service virtual IP addresses of the Tailscale VIP services this node *hosts*, keyed by
+    /// `svc:<label>` service name. Parsed from the `service-host`
+    /// ([`ts_control_serde::NODE_ATTR_SERVICE_HOST`]) node-capability value
+    /// (`tailcfg.ServiceIPMappings`). These VIPs are control-assigned and also injected into the
+    /// node's `AllowedIPs`; the application netstack must accept packets for them so a
+    /// [`listen_service`][crate::Device::listen_service]-bound listener can answer. Empty when the
+    /// node hosts no VIP services (the common case). Per-service IP lists are deduplicated, source
+    /// order otherwise preserved. Use [`Node::service_addresses`] for the flattened set (netstack
+    /// accept list) and [`Node::service_addresses_for`] for a specific service's VIPs.
+    pub service_vips: alloc::collections::BTreeMap<String, Vec<IpAddr>>,
 }
 
 impl Node {
@@ -426,6 +437,95 @@ impl Node {
         }
         false
     }
+
+    /// Report whether this node is permitted to host Tailscale VIP services.
+    ///
+    /// Mirrors the Go grant model: possession of the `service-host`
+    /// ([`ts_control_serde::NODE_ATTR_SERVICE_HOST`]) node-capability **and** at least one assigned
+    /// VIP address. Go additionally requires the host to be tagged
+    /// (`ErrUntaggedServiceHost`); that tag gate is enforced at
+    /// [`listen_service`][crate::Device::listen_service] using [`Node::tags`]. Fail-closed: no cap
+    /// or no assigned VIP denies.
+    pub fn is_service_host(&self) -> bool {
+        self.has_node_attr(ts_control_serde::NODE_ATTR_SERVICE_HOST)
+            && !self.service_vips.is_empty()
+    }
+
+    /// The control-assigned VIP addresses for one named service (`svc:<label>`), or an empty slice
+    /// if this node does not host that service. This is the exact per-service mapping (so a
+    /// multi-service co-host binds the right VIP for each service).
+    pub fn service_addresses_for(&self, service: &str) -> &[IpAddr] {
+        self.service_vips
+            .get(service)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// The flattened, deduplicated set of every VIP address this node hosts across all services.
+    /// Used to widen the netstack's accepted-address set so any hosted-service listener is
+    /// reachable. Per-service binding uses [`Node::service_addresses_for`] instead.
+    pub fn service_addresses(&self) -> Vec<IpAddr> {
+        let mut seen = alloc::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        for addr in self.service_vips.values().flatten() {
+            if seen.insert(*addr) {
+                out.push(*addr);
+            }
+        }
+        out
+    }
+}
+
+/// Validate a Tailscale VIP service name (`tailcfg.ServiceName.Validate`): it must carry the
+/// `svc:` prefix ([`ts_control_serde::SERVICE_NAME_PREFIX`]) followed by a valid DNS label
+/// (1–63 chars, ASCII alphanumeric or `-`, not starting/ending with `-`). Returns the bare label on
+/// success. Fail-closed: anything malformed is rejected so a listener can never bind for a bogus
+/// service name.
+pub fn validate_service_name(name: &str) -> Option<&str> {
+    let label = name.strip_prefix(ts_control_serde::SERVICE_NAME_PREFIX)?;
+    if label.is_empty() || label.len() > 63 {
+        return None;
+    }
+    if label.starts_with('-') || label.ends_with('-') {
+        return None;
+    }
+    if label
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        Some(label)
+    } else {
+        None
+    }
+}
+
+/// Parse the per-service VIP map this node hosts from the `service-host` node-capability value(s).
+/// Each value is the raw JSON text of a [`ts_control_serde::ServiceIpMappings`] object (svc-name ->
+/// VIP IPs); unparseable values are skipped (fail-closed: a malformed mapping contributes no VIPs).
+/// Per-service IP lists are deduplicated, source order otherwise preserved.
+fn service_vips_from_cap_map(
+    cap_map: &NodeCapMap,
+) -> alloc::collections::BTreeMap<String, Vec<IpAddr>> {
+    let mut out: alloc::collections::BTreeMap<String, Vec<IpAddr>> =
+        alloc::collections::BTreeMap::new();
+    let Some(values) = cap_map.get(ts_control_serde::NODE_ATTR_SERVICE_HOST) else {
+        return out;
+    };
+
+    for raw in values {
+        let Ok(mappings) = serde_json::from_str::<ts_control_serde::ServiceIpMappings>(raw) else {
+            continue;
+        };
+        for (name, addrs) in &mappings.0 {
+            let entry = out.entry((*name).to_string()).or_default();
+            for addr in addrs {
+                if !entry.contains(addr) {
+                    entry.push(*addr);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Collect a wire ([`ts_control_serde`]) node cap map into an owned [`NodeCapMap`].
@@ -495,6 +595,9 @@ impl From<&ts_control_serde::Node<'_>> for Node {
         let (peerapi_port, peerapi_dns_proxy) =
             peerapi_from_services(value.host_info.services.as_deref());
 
+        let cap_map = cap_map_from_serde(&value.cap_map);
+        let service_vips = service_vips_from_cap_map(&cap_map);
+
         Self {
             id: value.id,
             stable_id: StableId(value.stable_id.0.to_string()),
@@ -532,7 +635,7 @@ impl From<&ts_control_serde::Node<'_>> for Node {
                 .map(|x| ts_derp::RegionId(x.into())),
 
             cap: value.cap,
-            cap_map: cap_map_from_serde(&value.cap_map),
+            cap_map,
             peerapi_port,
             peerapi_dns_proxy,
             is_wireguard_only: value.is_wireguard_only,
@@ -541,6 +644,7 @@ impl From<&ts_control_serde::Node<'_>> for Node {
                 .iter()
                 .filter_map(Resolver::from_serde)
                 .collect(),
+            service_vips,
         }
     }
 }
@@ -573,6 +677,7 @@ mod tests {
             peerapi_dns_proxy: false,
             is_wireguard_only: false,
             exit_node_dns_resolvers: vec![],
+            service_vips: Default::default(),
         }
     }
 
