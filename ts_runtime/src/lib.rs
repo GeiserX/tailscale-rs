@@ -32,11 +32,14 @@ mod multiderp;
 mod netstack_actor;
 mod packetfilter;
 pub mod peer_tracker;
+mod peerapi;
 mod peerapi_doh;
 mod route_updater;
 mod src_filter;
 /// Netmap status snapshot, WhoIs, and watcher types.
 pub mod status;
+/// Taildrop peer-to-peer file transfer store.
+pub mod taildrop;
 #[cfg(feature = "tun")]
 mod tun_actor;
 
@@ -258,6 +261,13 @@ impl Runtime {
             .await?;
 
         Ok(channel)
+    }
+
+    /// The Taildrop file store, if Taildrop is enabled (`taildrop_dir` configured and the store
+    /// initialized). `None` when disabled — fail-closed. Shared with the peerAPI Taildrop server so
+    /// the embedder's read APIs and the receive path see the same on-disk store.
+    pub fn taildrop_store(&self) -> Option<Arc<crate::taildrop::TaildropStore>> {
+        self.env.taildrop_store.clone()
     }
 
     /// A snapshot of the local netmap: this node plus every known peer.

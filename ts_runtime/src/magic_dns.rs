@@ -680,18 +680,21 @@ impl kameo::Actor for MagicDnsActor {
             }
         }
 
-        // When this node advertises a peerAPI port, also run the exit-node DoH server on the same
-        // shared view. It answers `/dns-query` for peers that select us as their exit node; its
-        // recursive resolution is gated behind `forward_exit_egress` (see `peerapi_doh`).
+        // When this node advertises a peerAPI port, run the single peerAPI server on the same shared
+        // view. It routes `/dns-query` to the exit-node DoH handler (recursive resolution gated by
+        // `forward_exit_egress`, see `peerapi_doh`) and `/v0/put/<name>` to the Taildrop receive
+        // handler when a store is configured (access-gated, fail-closed, see `peerapi`).
         if let Some(port) = env.peerapi_port {
             let channel = channel.clone();
             let view_rx = view_rx.clone();
             let forward_exit_egress = env.forward_exit_egress;
-            joinset.spawn(crate::peerapi_doh::serve(
+            let taildrop = env.taildrop_store.clone();
+            joinset.spawn(crate::peerapi::serve(
                 channel,
                 port,
                 view_rx,
                 forward_exit_egress,
+                taildrop,
             ));
         }
 

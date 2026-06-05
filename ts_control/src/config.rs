@@ -254,6 +254,23 @@ pub struct Config {
     #[serde(default)]
     pub peerapi_port: Option<u16>,
 
+    /// Filesystem directory that received Taildrop files land in, or `None` to disable Taildrop
+    /// (the default, fail-closed).
+    ///
+    /// When `Some(dir)` **and** [`peerapi_port`](Config::peerapi_port) is also set, the runtime
+    /// serves the Taildrop peerAPI route `PUT /v0/put/<name>` on the shared peerAPI listener, and
+    /// incoming files are written under `dir` (created if absent). When `None`, no Taildrop server
+    /// is run — a peer's `PUT` is refused. This is a pure on-disk destination: like the other
+    /// dataplane fields it is not read inside `ts_control`; it is carried here only to be threaded
+    /// into the runtime, which constructs the file store from it.
+    ///
+    /// Independently of the network server, the embedder consumes received files via the
+    /// `Device::taildrop_*` methods (Go exposes these over LocalAPI; this fork exposes them on the
+    /// device). With no `peerapi_port`, the store still exists for those read APIs but no peer can
+    /// deliver to it.
+    #[serde(default)]
+    pub taildrop_dir: Option<std::path::PathBuf>,
+
     /// Per-direction TCP send/receive buffer size (bytes) for the userspace netstack, or `None` to
     /// use the netstack default (256 KiB per direction, ~512 KiB per socket).
     ///
@@ -412,6 +429,7 @@ impl Default for Config {
             forward_exit_egress: false,
             exit_proxy: None,
             peerapi_port: None,
+            taildrop_dir: None,
             tcp_buffer_size: None,
             enable_ipv6: false,
             transport_mode: TransportMode::default(),

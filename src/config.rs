@@ -183,6 +183,18 @@ pub struct Config {
     /// ingress relay). Setting this flag only requests server-side wiring; it does not by itself
     /// make Funnel live.
     pub wire_ingress: bool,
+
+    /// Filesystem directory that received Taildrop files land in, or `None` to disable Taildrop
+    /// (the default, fail-closed).
+    ///
+    /// When `Some(dir)` **and** a peerAPI port is configured (Taildrop is served on the shared
+    /// peerAPI listener, so it needs the same bind), the runtime serves the Taildrop peerAPI route
+    /// `PUT /v0/put/<name>` and writes incoming files under `dir` (created if absent). When `None`,
+    /// no Taildrop server is run and a peer's `PUT` is refused (`403`). The embedder consumes
+    /// received files via the [`Device::taildrop_waiting_files`](crate::Device::taildrop_waiting_files)
+    /// / [`taildrop_open_file`](crate::Device::taildrop_open_file) /
+    /// [`taildrop_delete_file`](crate::Device::taildrop_delete_file) methods.
+    pub taildrop_dir: Option<std::path::PathBuf>,
 }
 
 impl Config {
@@ -324,6 +336,7 @@ impl From<&Config> for ts_control::Config {
             exit_proxy: value.exit_proxy.clone(),
             tcp_buffer_size: value.tcp_buffer_size,
             peerapi_port: None,
+            taildrop_dir: value.taildrop_dir.clone(),
             enable_ipv6: value.enable_ipv6,
             transport_mode: value.transport_mode.clone(),
             wire_ingress: value.wire_ingress,
@@ -353,6 +366,7 @@ impl Default for Config {
             enable_ipv6: false,
             transport_mode: ts_control::TransportMode::default(),
             wire_ingress: false,
+            taildrop_dir: None,
         }
     }
 }
@@ -389,6 +403,7 @@ mod tests {
                 scheme: ts_control::ExitProxyScheme::Socks5,
                 auth: Some(("u".to_owned(), "p".to_owned())),
             }),
+            taildrop_dir: Some(std::path::PathBuf::from("/var/lib/taildrop")),
             ..Default::default()
         };
 
@@ -409,6 +424,10 @@ mod tests {
         assert_eq!(proxy.auth, Some(("u".to_owned(), "p".to_owned())));
         assert!(control.enable_ipv6);
         assert!(control.wire_ingress);
+        assert_eq!(
+            control.taildrop_dir,
+            Some(std::path::PathBuf::from("/var/lib/taildrop"))
+        );
         assert_eq!(
             control.transport_mode,
             ts_control::TransportMode::Tun(ts_control::TunConfig {

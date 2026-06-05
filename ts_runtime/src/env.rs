@@ -91,6 +91,15 @@ pub struct ForwarderConfig {
     /// advertised port always matches the actual bind.
     pub peerapi_port: Option<u16>,
 
+    /// Filesystem directory received Taildrop files land in, or `None` to disable Taildrop.
+    ///
+    /// See [`Config::taildrop_dir`](ts_control::Config::taildrop_dir). When `Some`, the runtime
+    /// constructs the [`TaildropStore`](crate::taildrop::TaildropStore) from it; the store is then
+    /// served on the shared peerAPI listener (only if [`peerapi_port`](ForwarderConfig::peerapi_port)
+    /// is also set) and exposed to the embedder's read APIs. `None` (the default) is fail-closed:
+    /// no store, no Taildrop server.
+    pub taildrop_dir: Option<std::path::PathBuf>,
+
     /// Whether IPv6 is enabled on the tailnet overlay. Defaults to `false` (IPv4-only).
     ///
     /// See [`Config::enable_ipv6`](ts_control::Config::enable_ipv6). Governs the underlay socket
@@ -116,6 +125,7 @@ impl ForwarderConfig {
             forward_exit_egress: config.forward_exit_egress,
             exit_proxy: config.exit_proxy.as_ref().map(exit_proxy_to_forwarder),
             peerapi_port: config.peerapi_port,
+            taildrop_dir: config.taildrop_dir.clone(),
             enable_ipv6: config.enable_ipv6,
         }
     }
@@ -183,6 +193,12 @@ pub struct Env {
     /// See [`ForwarderConfig::peerapi_port`].
     pub peerapi_port: Option<u16>,
 
+    /// The Taildrop file store, constructed once at startup when
+    /// [`ForwarderConfig::taildrop_dir`] is `Some` (and the on-disk root could be created), else
+    /// `None` (Taildrop disabled — fail-closed). Shared (`Arc`) between the peerAPI Taildrop server
+    /// (which writes received files) and the embedder's read APIs on the device.
+    pub taildrop_store: Option<Arc<crate::taildrop::TaildropStore>>,
+
     /// Whether IPv6 is enabled on the tailnet overlay (default `false`, IPv4-only).
     ///
     /// See [`ForwarderConfig::enable_ipv6`]. Read by the underlay socket, disco candidate filter,
@@ -216,8 +232,24 @@ impl Env {
             forward_exit_egress,
             exit_proxy,
             peerapi_port,
+            taildrop_dir,
             enable_ipv6,
         } = forwarding;
+
+        // Construct the Taildrop store once when a directory is configured. A construction failure
+        // (e.g. the root can't be created) is non-fatal: the store stays `None` (Taildrop disabled,
+        // fail-closed) so the runtime still starts, rather than taking it down for a feature the
+        // node opted into but whose directory is unusable.
+        let taildrop_store = taildrop_dir.and_then(|dir| {
+            match crate::taildrop::TaildropStore::new(&dir) {
+                Ok(store) => Some(Arc::new(store)),
+                Err(e) => {
+                    tracing::error!(error = %e, dir = %dir.display(), "taildrop: store init failed; disabled");
+                    None
+                }
+            }
+        });
+
         Self {
             bus: MessageBus::spawn_default(),
             keys: Arc::new(keys),
@@ -231,6 +263,7 @@ impl Env {
             forward_exit_egress,
             exit_proxy,
             peerapi_port,
+            taildrop_store,
             enable_ipv6,
         }
     }

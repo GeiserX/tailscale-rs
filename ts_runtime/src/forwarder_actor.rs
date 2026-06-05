@@ -277,6 +277,7 @@ mod tests {
             forward_exit_egress,
             exit_proxy: None,
             peerapi_port: None,
+            taildrop_dir: None,
             enable_ipv6: false,
         }
     }

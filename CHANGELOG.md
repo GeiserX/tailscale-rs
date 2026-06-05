@@ -6,6 +6,34 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.18](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.18) - 2026-06-05
+
+**Taildrop file transfer (receive side)** (`tsr-77q-a`): this node can now receive files from
+tailnet peers over the peerAPI, mirroring Go Tailscale's Taildrop. Fail-closed and IPv4-only.
+
+- **Path-safe file store** (`ts_runtime::taildrop`): a `TaildropStore` that writes each incoming
+  transfer to a `<name>.partial` file and **atomically renames** it to the final name on success
+  (non-clobbering ` (n)` suffix on conflict, Go `nextFilename`). `validate_base_name` is the
+  security boundary — it rejects path separators, `..`, NUL/control chars, and the reserved
+  `.partial`/`.deleted` suffixes before any path is constructed, so a malicious file name can never
+  escape the store directory. Supports offset-resume.
+- **peerAPI route + router** (`ts_runtime::peerapi`): the peerAPI listener is now a single
+  path-routing server (mirroring Go's one-server-many-routes model). `PUT /v0/put/<name>` lands a
+  Taildrop file (`200 OK` + `{}\n`; `400` invalid name, `409` in-progress conflict, `405` wrong
+  method); `/dns-query` continues to the existing exit-node DoH handler byte-for-byte.
+- **Fail-closed access gate**: a `PUT` is accepted only when a Taildrop directory is configured
+  (`Config::taildrop_dir`, default `None` = disabled) **and** this node holds the
+  `https://tailscale.com/cap/file-sharing` node capability **and** the source IP resolves to a known
+  tailnet node. (The per-peer `file-send` peer-capability check is deferred until the packet-filter
+  peer-cap map is threaded into the runtime node model — documented in `peerapi.rs`; the surface
+  stays fail-closed without it.)
+- **Embedder API** (`Device`): `taildrop_waiting_files()`, `taildrop_open_file(name)`, and
+  `taildrop_delete_file(name)` let the host application consume received files. `WaitingFile` is
+  re-exported from the crate root.
+
+The sender side (`tailscale file cp` / push) and the LocalAPI long-poll are out of scope for this
+slice; this is the receive half a peer pushes to.
+
 ## [0.5.17](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.17) - 2026-06-05
 
 **Tailscale VIP services / `ListenService`** (`tsr-6b5`): a node can now host a Tailscale **VIP

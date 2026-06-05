@@ -40,26 +40,17 @@ use base64::Engine;
 use netstack::{CreateSocket, netcore::Channel, netsock::TcpStream};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{Semaphore, watch},
+    sync::watch,
     time::timeout,
 };
 use ts_dns_wire::{Rcode, decode_query, encode_response};
 
 use crate::magic_dns::{Decision, DnsView, decide, forward_query};
 
-/// Max concurrent in-flight DoH requests served at once. Bounds per-flow spawn fan-out so a flood
-/// can't grow tasks without limit; saturated => drop the flow (fail-closed). Mirrors the
-/// `fallback_tcp` / forwarder cap.
-const MAX_INFLIGHT: usize = 512;
-
 /// Largest HTTP request (headers + body) we will read for one DoH query. A DNS message is at most
 /// 64 KiB, but a peerAPI DoH query is a single small question; cap well below that to bound memory
 /// and reject abuse. Anything larger is answered `413` and the connection closed.
 const MAX_REQUEST: usize = 8 * 1024;
-
-/// How long one DoH connection may take to deliver its full request before we give up (fail-closed:
-/// a slow-loris peer can't pin a server task indefinitely).
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long the DoH *client* waits for the exit node to answer a delegated query before giving up
 /// and returning the fallback NXDOMAIN. Matches the local UDP upstream timeout.
@@ -225,78 +216,22 @@ fn parse_response_head(buf: &[u8]) -> std::io::Result<usize> {
     Ok(content_length)
 }
 
-/// Run the peerAPI DoH server on `channel`, accepting on `0.0.0.0:port` of the overlay netstack.
-/// Returns on bind/accept failure — fail-closed: no server means peers simply can't use us as a
-/// DNS proxy (they fall back to their own resolution).
-///
-/// Binding the unspecified overlay address (rather than this node's specific tailnet IPv4) avoids a
-/// startup dependency on the self IP, which isn't known until the first netmap; the interface owns
-/// the node's tailnet address, so a peer dialing `<our-tailnet-ipv4>:port` is accepted here. This
-/// mirrors how the fallback-TCP listeners bind. IPv4-only.
-///
-/// `view_rx` is the live [`DnsView`] shared with the MagicDNS responder (same control/peer state).
-/// `forward_exit_egress` gates recursive resolution (see module docs).
-pub(crate) async fn serve(
-    channel: Channel,
-    port: u16,
-    view_rx: watch::Receiver<Arc<DnsView>>,
-    forward_exit_egress: bool,
-) {
-    let addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port);
-    let listener = match channel.tcp_listen(addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(error = %e, %addr, "peerapi doh: tcp listen failed; server inert");
-            return;
-        }
-    };
-    tracing::debug!(%addr, "peerapi doh server accepting");
-
-    let inflight = Arc::new(Semaphore::new(MAX_INFLIGHT));
-
-    loop {
-        let stream = match listener.accept().await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, "peerapi doh: accept failed, stopping server");
-                return;
-            }
-        };
-
-        let Ok(permit) = inflight.clone().try_acquire_owned() else {
-            tracing::warn!(
-                peer = %stream.remote_addr(),
-                "peerapi doh drop: at max in-flight requests ({MAX_INFLIGHT})"
-            );
-            // Dropping `stream` closes the flow; fail-closed.
-            continue;
-        };
-
-        let channel = channel.clone();
-        let view_rx = view_rx.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            if let Err(e) = timeout(
-                REQUEST_TIMEOUT,
-                handle_conn(stream, &channel, &view_rx, forward_exit_egress),
-            )
-            .await
-            {
-                tracing::debug!(error = %e, "peerapi doh: connection timed out");
-            }
-        });
-    }
-}
-
 /// Service one DoH connection: read the HTTP request, resolve the DNS query, write the response.
 /// Closes the connection afterward (one request per connection).
-async fn handle_conn(
+///
+/// `seed` carries the header bytes the shared peerAPI router ([`crate::peerapi`]) already read off
+/// the stream while it determined the route, and `header_end` is the offset just past the
+/// `\r\n\r\n` header terminator within `seed`. The DoH parser resumes from there, so no bytes are
+/// lost when the router hands the connection over.
+pub(crate) async fn handle_conn(
     mut stream: TcpStream,
+    seed: Vec<u8>,
+    header_end: usize,
     channel: &Channel,
     view_rx: &watch::Receiver<Arc<DnsView>>,
     forward_exit_egress: bool,
 ) -> std::io::Result<()> {
-    let request = match read_request(&mut stream).await? {
+    let request = match read_request(&mut stream, seed, header_end).await? {
         Some(r) => r,
         None => return Ok(()),
     };
@@ -437,32 +372,17 @@ enum DohRequest {
     NotFound,
 }
 
-/// Read and parse one DoH HTTP/1.1 request from `stream`. Supports `POST /dns-query` (body is the
-/// raw DNS message, `Content-Type: application/dns-message`) and `GET /dns-query?dns=<base64url>`
-/// (RFC 8484). Returns `Ok(None)` if the peer closed before sending a full request.
-async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<DohRequest>> {
-    let mut buf = Vec::with_capacity(1024);
+/// Parse one DoH HTTP/1.1 request, given the header bytes already read by the shared peerAPI router
+/// in `buf` (with `header_end` the offset just past `\r\n\r\n`). Supports `POST /dns-query` (body is
+/// the raw DNS message, `Content-Type: application/dns-message`) and `GET /dns-query?dns=<base64url>`
+/// (RFC 8484). Reads any remaining body bytes from `stream`. Returns `Ok(None)` if the peer closed
+/// before sending a full request.
+async fn read_request(
+    stream: &mut TcpStream,
+    buf: Vec<u8>,
+    header_end: usize,
+) -> std::io::Result<Option<DohRequest>> {
     let mut tmp = [0u8; 1024];
-
-    // Read until the end of headers (\r\n\r\n) or EOF / size cap.
-    let header_end = loop {
-        if let Some(pos) = find_header_end(&buf) {
-            break pos;
-        }
-        if buf.len() > MAX_REQUEST {
-            return Ok(Some(DohRequest::TooLarge));
-        }
-        let n = stream.read(&mut tmp).await?;
-        if n == 0 {
-            // EOF before headers completed.
-            return Ok(if buf.is_empty() {
-                None
-            } else {
-                Some(DohRequest::BadRequest)
-            });
-        }
-        buf.extend_from_slice(&tmp[..n]);
-    };
 
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut req = httparse::Request::new(&mut headers);
@@ -545,8 +465,9 @@ fn header_value<'a>(req: &'a httparse::Request<'_, '_>, name: &str) -> Option<&'
         .and_then(|h| std::str::from_utf8(h.value).ok())
 }
 
-/// Find the byte offset just past the `\r\n\r\n` header terminator, if present.
-fn find_header_end(buf: &[u8]) -> Option<usize> {
+/// Find the byte offset just past the `\r\n\r\n` header terminator, if present. Shared with the
+/// peerAPI router ([`crate::peerapi`]).
+pub(crate) fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
 }
 
@@ -562,7 +483,8 @@ async fn write_dns_response(stream: &mut TcpStream, dns_msg: &[u8]) -> std::io::
 }
 
 /// Write a bodyless HTTP error response with the given status line (e.g. `"400 Bad Request"`).
-async fn write_status(stream: &mut TcpStream, status: &str) -> std::io::Result<()> {
+/// Shared with the peerAPI router ([`crate::peerapi`]).
+pub(crate) async fn write_status(stream: &mut TcpStream, status: &str) -> std::io::Result<()> {
     let head = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     stream.write_all(head.as_bytes()).await?;
     stream.flush().await

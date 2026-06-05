@@ -157,6 +157,8 @@ pub use ts_runtime::fallback_tcp::{
     FallbackConnFuture, FallbackConnHandler, FallbackDecision, FallbackTcpHandle,
 };
 #[doc(inline)]
+pub use ts_runtime::taildrop::WaitingFile;
+#[doc(inline)]
 pub use ts_runtime::{Status, StatusNode, WhoIs};
 
 #[cfg(feature = "axum")]
@@ -182,6 +184,20 @@ pub struct Device {
     /// IPv6 VIP-service address is bindable (the netstack only accepts IPv6 overlay addresses when
     /// this is set).
     enable_ipv6: bool,
+}
+
+/// Map a [`ts_runtime::taildrop::TaildropError`] to the device-facing [`Error`]. `Error` is a
+/// `Copy` enum with no I/O payload, so this is a lossy projection: an invalid name becomes
+/// [`InternalErrorKind::BadRequest`] and any other failure (in-progress conflict, filesystem I/O
+/// such as a missing file) becomes [`InternalErrorKind::Actor`].
+fn taildrop_err(e: ts_runtime::taildrop::TaildropError) -> Error {
+    match e {
+        ts_runtime::taildrop::TaildropError::InvalidFileName => {
+            Error::Internal(InternalErrorKind::BadRequest)
+        }
+        ts_runtime::taildrop::TaildropError::FileExists
+        | ts_runtime::taildrop::TaildropError::Io(_) => Error::Internal(InternalErrorKind::Actor),
+    }
 }
 
 impl Device {
@@ -433,6 +449,49 @@ impl Device {
             .await
             .map_err(ts_runtime::Error::from)
             .map_err(Into::into)
+    }
+
+    /// List the Taildrop files this device has fully received and not yet consumed (Go LocalAPI
+    /// `WaitingFiles`).
+    ///
+    /// Returns the files waiting under the configured `taildrop_dir`, sorted by name. Returns an
+    /// empty list when Taildrop is disabled (`Config::taildrop_dir` unset) — fail-closed, never an
+    /// error for the disabled case. A filesystem error while listing surfaces as
+    /// [`InternalErrorKind::Actor`].
+    pub fn taildrop_waiting_files(&self) -> Result<Vec<WaitingFile>, Error> {
+        let Some(store) = self.runtime.taildrop_store() else {
+            return Ok(Vec::new());
+        };
+        store
+            .waiting_files()
+            .map_err(|_| Error::Internal(InternalErrorKind::Actor))
+    }
+
+    /// Open a received Taildrop file by name for reading, returning the handle and its size (Go
+    /// LocalAPI `OpenFile`).
+    ///
+    /// The `name` is validated (path-traversal-safe) inside the store before any path is built.
+    /// Returns [`InternalErrorKind::BadRequest`] when Taildrop is disabled or the name is invalid,
+    /// and [`InternalErrorKind::Actor`] for a filesystem error (e.g. the file does not exist).
+    pub fn taildrop_open_file(&self, name: &str) -> Result<(std::fs::File, u64), Error> {
+        let store = self
+            .runtime
+            .taildrop_store()
+            .ok_or(Error::Internal(InternalErrorKind::BadRequest))?;
+        store.open_file(name).map_err(taildrop_err)
+    }
+
+    /// Delete a received Taildrop file by name (Go LocalAPI `DeleteFile`).
+    ///
+    /// The `name` is validated (path-traversal-safe) inside the store before any path is built.
+    /// Returns [`InternalErrorKind::BadRequest`] when Taildrop is disabled or the name is invalid,
+    /// and [`InternalErrorKind::Actor`] for a filesystem error (e.g. the file does not exist).
+    pub fn taildrop_delete_file(&self, name: &str) -> Result<(), Error> {
+        let store = self
+            .runtime
+            .taildrop_store()
+            .ok_or(Error::Internal(InternalErrorKind::BadRequest))?;
+        store.delete_file(name).map_err(taildrop_err)
     }
 
     /// Snapshot of this device and its tailnet peers (like `tailscale status`).
