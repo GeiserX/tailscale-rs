@@ -11,6 +11,10 @@ use crate::keys::NodeState;
 const CONTROL_URL_VAR: &str = "TS_CONTROL_URL";
 const HOSTNAME_VAR: &str = "TS_HOSTNAME";
 const AUTHKEY_VAR: &str = "TS_AUTH_KEY";
+const CLIENT_ID_VAR: &str = "TS_CLIENT_ID";
+const CLIENT_SECRET_VAR: &str = "TS_CLIENT_SECRET";
+const ID_TOKEN_VAR: &str = "TS_ID_TOKEN";
+const AUDIENCE_VAR: &str = "TS_AUDIENCE";
 
 /// Config for connecting to Tailscale.
 pub struct Config {
@@ -195,6 +199,39 @@ pub struct Config {
     /// / [`taildrop_open_file`](crate::Device::taildrop_open_file) /
     /// [`taildrop_delete_file`](crate::Device::taildrop_delete_file) methods.
     pub taildrop_dir: Option<std::path::PathBuf>,
+
+    /// Pre-auth key for non-interactive registration (Go `tsnet.Server.AuthKey`). When set, used as
+    /// the registration auth key. If it is an OAuth client secret (prefix `tskey-client-`) and the
+    /// `identity-federation` feature is enabled, it is exchanged for an auth key before registration.
+    /// Falls back to the `TS_AUTH_KEY` env var (see [`auth_key_from_env`]). Defaults to `None`.
+    pub auth_key: Option<String>,
+
+    /// OAuth client ID for workload-identity federation (Go `tsnet.Server.ClientID`). SaaS-only;
+    /// requires the `identity-federation` feature. With [`id_token`](Config::id_token) or
+    /// [`audience`](Config::audience), the node exchanges an IdP-issued OIDC token for a Tailscale
+    /// auth key. Defaults to `None` (`TS_CLIENT_ID` env fallback).
+    pub client_id: Option<String>,
+
+    /// OAuth client secret used to mint auth keys via OAuth (Go `tsnet.Server.ClientSecret`).
+    /// SaaS-only; requires the `identity-federation` feature. Defaults to `None` (`TS_CLIENT_SECRET`).
+    ///
+    /// Treat as **fully operator-trusted input**: a `tskey-client-…?baseURL=…` secret redirects the
+    /// credential exchange to that host, so a hostile value would exfiltrate the secret and the
+    /// minted auth key. Never source it from a less-trusted origin.
+    pub client_secret: Option<String>,
+
+    /// IdP-issued OIDC ID token to exchange with control for an auth key via workload-identity
+    /// federation (Go `tsnet.Server.IDToken`). SaaS-only; requires the `identity-federation` feature
+    /// and [`client_id`](Config::client_id). Mutually exclusive with [`audience`](Config::audience).
+    /// Defaults to `None` (`TS_ID_TOKEN`).
+    pub id_token: Option<String>,
+
+    /// Audience for requesting an OIDC ID token from the ambient workload identity (GitHub Actions /
+    /// GCP / AWS), to exchange for an auth key via workload-identity federation (Go
+    /// `tsnet.Server.Audience`). SaaS-only; requires the `identity-federation` feature +
+    /// [`client_id`](Config::client_id). Mutually exclusive with [`id_token`](Config::id_token).
+    /// Defaults to `None` (`TS_AUDIENCE`).
+    pub audience: Option<String>,
 }
 
 impl Config {
@@ -219,6 +256,11 @@ impl Config {
     ///
     /// - `control_server_url` from `TS_CONTROL_URL`
     /// - `requested_hostname` from `TS_HOSTNAME`
+    /// - `auth_key` from `TS_AUTH_KEY`
+    /// - `client_id` from `TS_CLIENT_ID`
+    /// - `client_secret` from `TS_CLIENT_SECRET`
+    /// - `id_token` from `TS_ID_TOKEN`
+    /// - `audience` from `TS_AUDIENCE`
     pub fn default_from_env() -> Config {
         let mut config = Config::default();
 
@@ -232,6 +274,22 @@ impl Config {
         };
 
         config.requested_hostname = std::env::var(HOSTNAME_VAR).ok();
+
+        if let Some(auth_key) = auth_key_from_env() {
+            config.auth_key = Some(auth_key);
+        }
+        if let Ok(client_id) = std::env::var(CLIENT_ID_VAR) {
+            config.client_id = Some(client_id);
+        }
+        if let Ok(client_secret) = std::env::var(CLIENT_SECRET_VAR) {
+            config.client_secret = Some(client_secret);
+        }
+        if let Ok(id_token) = std::env::var(ID_TOKEN_VAR) {
+            config.id_token = Some(id_token);
+        }
+        if let Ok(audience) = std::env::var(AUDIENCE_VAR) {
+            config.audience = Some(audience);
+        }
 
         config
     }
@@ -381,6 +439,11 @@ impl Default for Config {
             transport_mode: ts_control::TransportMode::default(),
             wire_ingress: false,
             taildrop_dir: None,
+            auth_key: None,
+            client_id: None,
+            client_secret: None,
+            id_token: None,
+            audience: None,
         }
     }
 }
@@ -464,6 +527,18 @@ mod tests {
         let control: ts_control::Config = (&Config::default()).into();
         assert!(control.exit_proxy.is_none());
         assert!(!control.forward_exit_egress);
+    }
+
+    #[test]
+    fn wif_fields_default_none() {
+        // Workload-identity-federation config is SaaS-only and opt-in: a default config never
+        // carries an auth key or any OAuth/OIDC federation material.
+        let cfg = Config::default();
+        assert!(cfg.auth_key.is_none());
+        assert!(cfg.client_id.is_none());
+        assert!(cfg.client_secret.is_none());
+        assert!(cfg.id_token.is_none());
+        assert!(cfg.audience.is_none());
     }
 
     #[test]

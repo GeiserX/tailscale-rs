@@ -28,6 +28,8 @@ mod ssh_policy;
 mod tka;
 #[cfg(feature = "async_tokio")]
 mod tokio;
+#[cfg(feature = "identity-federation")]
+pub mod wif;
 
 use std::fmt;
 
@@ -59,6 +61,8 @@ pub use ssh_policy::{
 };
 pub use tka::TkaStatus;
 pub use ts_control_serde::{Endpoint, EndpointType};
+#[cfg(feature = "identity-federation")]
+pub use wif::{WifConfig, WifError, resolve_auth_key};
 
 /// Re-exported TLS types from the `tokio-rustls`/`ring` stack used by [`cert`]/[`serve`], so
 /// embedders can name [`get_certificate`]/[`listen_tls`] return types without taking their own

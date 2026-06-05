@@ -66,6 +66,8 @@ async_tokio = ["dep:futures-util", "dep:tokio", "dep:tokio-stream"]
 insecure-derp = ["ts_derp/insecure-for-tests"]
 # Allow control keys to be fetched over plain HTTP1 without TLS. Only for use in tests.
 insecure-keyfetch = []
+# SaaS-only WIF/OAuth-client auth-key bootstrap (off by default; a self-hosted control plane lacks these endpoints).
+identity-federation = []
 
 [lints]
 workspace = true

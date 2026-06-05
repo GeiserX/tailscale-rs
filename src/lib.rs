@@ -220,6 +220,46 @@ fn taildrop_send_err(e: ts_runtime::taildrop_send::TaildropSendError) -> Error {
     }
 }
 
+/// Resolve the effective registration auth key from `auth_key` plus the config's
+/// workload-identity-federation (WIF) / OAuth-client fields.
+///
+/// With the `identity-federation` feature enabled, an OAuth client secret (`tskey-client-…`) or a
+/// `client_id` + (`id_token` | `audience`) is exchanged for a Tailscale auth key against the SaaS
+/// admin API before registration (Go `tsnet.Server`'s `resolveAuthKey`). Without the feature this is
+/// a pure pass-through: `auth_key` is returned unchanged and the WIF config fields are ignored, so
+/// the default build is byte-identical to before.
+#[cfg(feature = "identity-federation")]
+async fn resolve_auth_key(
+    config: &Config,
+    auth_key: Option<String>,
+) -> Result<Option<String>, Error> {
+    let wif = ts_control::WifConfig {
+        auth_key,
+        client_id: config.client_id.clone(),
+        client_secret: config.client_secret.clone(),
+        id_token: config.id_token.clone(),
+        audience: config.audience.clone(),
+        tags: config.requested_tags.clone(),
+    };
+    ts_control::resolve_auth_key(&wif, &config.control_server_url)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "resolving auth key via workload-identity federation");
+            Error::Internal(InternalErrorKind::BadRequest)
+        })
+}
+
+/// Pass-through when the `identity-federation` feature is disabled: the auth key is used as-is and
+/// the WIF config fields have no effect (matching Go, where the federation path is compiled out
+/// unless its optional feature is linked).
+#[cfg(not(feature = "identity-federation"))]
+async fn resolve_auth_key(
+    _config: &Config,
+    auth_key: Option<String>,
+) -> Result<Option<String>, Error> {
+    Ok(auth_key)
+}
+
 impl Device {
     /// Create a device from the given [`Config`] and auth key.
     ///
@@ -239,6 +279,14 @@ impl Device {
     /// ```
     pub async fn new(config: &Config, auth_key: Option<String>) -> Result<Self, Error> {
         check_magic_env()?;
+
+        // Resolve the effective registration auth key. The explicit `auth_key` argument wins; if it
+        // is `None`, fall back to `config.auth_key` (Go `tsnet.Server.AuthKey`). When the
+        // `identity-federation` feature is enabled, the resolved key is further passed through the
+        // WIF / OAuth-client bootstrap, which exchanges an OAuth client secret (`tskey-client-…`) or
+        // an IdP-issued OIDC token for a Tailscale auth key before registration (SaaS-only).
+        let auth_key = auth_key.or_else(|| config.auth_key.clone());
+        let auth_key = resolve_auth_key(config, auth_key).await?;
 
         let rt =
             ts_runtime::Runtime::spawn(config.into(), auth_key, (&config.key_state).into()).await?;

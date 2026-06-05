@@ -6,6 +6,35 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.31](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.31) - 2026-06-05
+
+**Workload-identity federation (WIF) + OAuth-client auth-key bootstrap** (`tsr-am9.5`), behind the
+new off-by-default `identity-federation` cargo feature. Ports Go Tailscale's `feature/oauthkey` +
+`feature/identityfederation`: resolve a Tailscale auth key from OAuth-client credentials or an
+ambient IdP OIDC token *before* registration.
+
+- New `Config` fields mirroring Go `tsnet.Server`: `auth_key`, `client_id`, `client_secret`,
+  `id_token`, `audience` (env fallbacks `TS_AUTH_KEY` / `TS_CLIENT_ID` / `TS_CLIENT_SECRET` /
+  `TS_ID_TOKEN` / `TS_AUDIENCE`). `Device::new` resolves the effective key with Go's precedence
+  (explicit arg → `config.auth_key` → OAuth/WIF exchange).
+- `ts_control::wif` (feature-gated) implements the exact Go wire contract: OAuth client-credentials
+  (`POST /api/v2/oauth/token`), the bespoke WIF token-exchange (`POST /api/v2/oauth/token-exchange`
+  with `client_id`+`jwt`), and CreateKey (`POST /api/v2/tailnet/-/keys`), plus ambient OIDC-token
+  fetch for GitHub Actions / GCP metadata / AWS web-identity-token-file. Validation matches Go
+  (client_id requires exactly one of id_token/audience; each requires client_id).
+- **SaaS-only** and off by default: a self-hosted control plane (the fork's usual control plane) does not implement
+  these admin-API endpoints (a self-hosted control plane issue #3081, closed unimplemented), mirroring Go's optional
+  `feature/` blank-import gating. With the feature off, auth-key resolution is a pure pass-through
+  and the config fields are inert — zero behavior change, zero new dependency.
+- **Anti-leak preserved**: all calls reuse the existing ring-based `ts_http_util`/`ts_tls_util` stack
+  (no new TLS/HTTP/AWS-SDK deps, cert validation intact); credentials/tokens are never logged or
+  embedded in error strings; any failure is **fail-closed** (registration aborts — no silent keyless
+  fallback). The id-token *issuance* side (`Device::fetch_id_token`) was already shipped earlier;
+  this adds the *consumption*/bootstrap half.
+
+The OAuth secret may carry a `?baseURL=` that redirects the exchange host, so the `client_secret` /
+`auth_key` value must be treated as fully operator-trusted input (documented on the fields).
+
 ## [0.5.30](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.30) - 2026-06-05
 
 **Node-key rotation: wire `RegisterRequest.OldNodeKey` + add the rotation primitive** (`tsr-am9.4`).
