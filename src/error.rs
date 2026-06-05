@@ -67,6 +67,12 @@ pub enum InternalErrorKind {
     /// TUN mode was requested but is unavailable (no device, or the `tun`
     /// feature is disabled in this build).
     UnsupportedInTunMode,
+    /// The requested resource (e.g. a Taildrop file) does not exist.
+    NotFound,
+    /// The resource already exists (e.g. a Taildrop transfer for the same file is in progress).
+    AlreadyExists,
+    /// An underlying I/O error (e.g. a Taildrop filesystem operation failed).
+    Io,
 }
 
 impl fmt::Display for InternalErrorKind {
@@ -85,6 +91,9 @@ impl fmt::Display for InternalErrorKind {
             InternalErrorKind::UnsupportedInTunMode => {
                 write!(f, "operation unsupported in TUN transport mode")
             }
+            InternalErrorKind::NotFound => write!(f, "resource not found"),
+            InternalErrorKind::AlreadyExists => write!(f, "resource already exists"),
+            InternalErrorKind::Io => write!(f, "I/O error"),
         }
     }
 }

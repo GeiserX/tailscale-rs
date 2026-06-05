@@ -6,6 +6,31 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.21](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.21) - 2026-06-05
+
+Hardening from a multi-reviewer audit of the v0.5.15–v0.5.20 parity features. No behavior change to
+the happy paths; tightens fail-closed posture, removes DoS levers, and adds coverage.
+
+- **TKA: bound recursion on untrusted input** (`ts_tka`). A peer-supplied `NodeKeySignature` CBOR
+  blob is now depth-capped (`MAX_SIG_NESTING_DEPTH = 16`) at **decode** time — both the
+  signature-chain walk and generic CBOR container nesting — so a deeply-nested blob can no longer
+  overflow the stack (DoS). The CBOR decoder also now rejects duplicate map keys (CTAP2/Go parity).
+- **TKA: bind nested-credential pubkey** (`ts_tka`). A `SigKind::Credential` reached via a rotation
+  wrap must now have its `pubkey` equal the rotation pivot, closing a latent soundness gap vs Go.
+- **TKA tests**: added the previously-missing rotation-chain end-to-end test, the nested-credential
+  bind test, and the depth-cap rejection test; documented the ZIP-215-vs-standard verifier split in
+  `Cargo.toml`. Removed dead `text_string_map`/`Value::TextMap` encoder surface.
+- **Taildrop: move blocking fsync off the async runtime** (`ts_runtime::taildrop`). The terminal
+  `flush`+`sync_all`+atomic `rename` now run in `tokio::task::spawn_blocking`, so up to 512
+  concurrent transfers no longer starve the tokio worker pool. Fail-closed preserved (a finalize
+  failure leaves the partial in place, never publishes).
+- **peerAPI/Taildrop tests**: added request→response coverage driving the production `BodyReader` +
+  `put_file` over real async streams (200/403/400/405, the DoH-route regression guard, and the
+  Content-Length cap), plus the previously-untested offset-resume path.
+- **Device error fidelity**: `taildrop_*` errors now map to distinct `InternalErrorKind`
+  (`BadRequest` / `AlreadyExists` / `NotFound` / `Io`) instead of collapsing every failure into the
+  generic `Actor` kind, so callers can act on the actual cause.
+
 ## [0.5.20](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.20) - 2026-06-05
 
 **Tailnet Lock (TKA) verification** (`tsr-77q-c`): the client-side signature-chain verification path

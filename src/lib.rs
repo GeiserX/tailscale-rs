@@ -187,16 +187,20 @@ pub struct Device {
 }
 
 /// Map a [`ts_runtime::taildrop::TaildropError`] to the device-facing [`Error`]. `Error` is a
-/// `Copy` enum with no I/O payload, so this is a lossy projection: an invalid name becomes
-/// [`InternalErrorKind::BadRequest`] and any other failure (in-progress conflict, filesystem I/O
-/// such as a missing file) becomes [`InternalErrorKind::Actor`].
+/// `Copy` enum with no payload, so the I/O detail string is dropped, but the *kind* is preserved so
+/// a caller can still distinguish the actionable cases: an invalid name →
+/// [`InternalErrorKind::BadRequest`], an in-progress conflict → [`InternalErrorKind::AlreadyExists`],
+/// a missing file → [`InternalErrorKind::NotFound`], and any other filesystem failure →
+/// [`InternalErrorKind::Io`].
 fn taildrop_err(e: ts_runtime::taildrop::TaildropError) -> Error {
+    use ts_runtime::taildrop::TaildropError;
     match e {
-        ts_runtime::taildrop::TaildropError::InvalidFileName => {
-            Error::Internal(InternalErrorKind::BadRequest)
+        TaildropError::InvalidFileName => Error::Internal(InternalErrorKind::BadRequest),
+        TaildropError::FileExists => Error::Internal(InternalErrorKind::AlreadyExists),
+        TaildropError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+            Error::Internal(InternalErrorKind::NotFound)
         }
-        ts_runtime::taildrop::TaildropError::FileExists
-        | ts_runtime::taildrop::TaildropError::Io(_) => Error::Internal(InternalErrorKind::Actor),
+        TaildropError::Io(_) => Error::Internal(InternalErrorKind::Io),
     }
 }
 

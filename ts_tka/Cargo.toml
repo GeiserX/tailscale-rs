@@ -12,6 +12,11 @@ rust-version.workspace = true
 
 [dependencies]
 blake2.workspace = true
+# Two ed25519 verifiers are intentionally carried — they are NOT redundant, do not collapse them:
+#   ed25519-dalek = standard RFC 8032 verification, used ONLY for the outer rotation-wrap signature
+#     (Go signs/verifies the rotation wrap with plain `ed25519.Verify`).
+#   ed25519-zebra = ZIP-215 cofactored verification, used for Direct/Credential signatures to match
+#     Go `ed25519consensus.Verify`. Collapsing to one verifier silently breaks Go wire-compat.
 ed25519-dalek = "2"
 ed25519-zebra = "4"
 

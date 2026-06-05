@@ -36,6 +36,15 @@ use cbor::Value;
 /// Length in bytes of an [`AumHash`] (BLAKE2s-256 output).
 pub const AUM_HASH_LEN: usize = 32;
 
+/// Maximum nesting depth allowed when decoding/verifying a [`NodeKeySignature`] and its CBOR.
+///
+/// A peer-supplied signature CBOR is attacker-controlled and cheap to nest arbitrarily deep (a few
+/// bytes per level). Without a bound, the recursive decoder/verifier overflows the stack and aborts
+/// the process (DoS). Go bounds this. Real TKA rotation chains are short (a handful of links), so a
+/// cap of 16 sits comfortably above any legitimate chain while staying far below stack-overflow.
+/// Enforced at DECODE time (before any crypto), and also bounds generic CBOR container nesting.
+const MAX_SIG_NESTING_DEPTH: usize = 16;
+
 /// A BLAKE2s-256 hash of an AUM's canonical serialization. Identifies an AUM and links the chain
 /// (`PrevAUMHash`). Text form is RFC4648 standard base32, no padding (Go `AUMHash.MarshalText`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -262,6 +271,14 @@ impl NodeKeySignature {
                     return Err(TkaError::Decode("wrapping pubkey wrong length"));
                 }
                 verify_ed25519_std(verify_pub, &sig_hash, &self.signature)?;
+                // The nested signature must cover the rotation pivot (`verify_pub`). For a nested
+                // Direct this is enforced inside its own `verify_signature` (the non-credential
+                // `pubkey != node_key` check). A nested Credential SKIPS that check, so bind it
+                // here: the credential must cover exactly the wrapping pubkey it is rotating, or an
+                // attacker could splice an unrelated valid credential into the chain.
+                if nested.sig_kind == SigKind::Credential && nested.pubkey != *verify_pub {
+                    return Err(TkaError::NodeKeyMismatch);
+                }
                 // Then the nested signature must itself be valid, rooting in the trusted key.
                 nested.verify_signature(verify_pub, verification_key)
             }
@@ -405,14 +422,17 @@ fn verify_ed25519_zip215(public: &[u8], msg: &[u8], sig: &[u8]) -> Result<(), Tk
 /// Decode a [`NodeKeySignature`] from canonical CBOR. This is a minimal decoder for the exact map
 /// shape Go emits (integer keys 1..=6); anything else is rejected (fail-closed).
 fn decode_node_key_signature(buf: &[u8]) -> Result<NodeKeySignature, TkaError> {
-    let (val, rest) = decode_value(buf)?;
+    let (val, rest) = decode_value(buf, 0)?;
     if !rest.is_empty() {
         return Err(TkaError::Decode("trailing bytes after signature"));
     }
-    node_key_signature_from_value(val)
+    node_key_signature_from_value(val, 0)
 }
 
-fn node_key_signature_from_value(val: Value) -> Result<NodeKeySignature, TkaError> {
+fn node_key_signature_from_value(val: Value, depth: usize) -> Result<NodeKeySignature, TkaError> {
+    if depth > MAX_SIG_NESTING_DEPTH {
+        return Err(TkaError::Decode("nested signature too deep"));
+    }
     let Value::IntMap(entries) = val else {
         return Err(TkaError::Decode("signature is not an int-keyed map"));
     };
@@ -439,7 +459,12 @@ fn node_key_signature_from_value(val: Value) -> Result<NodeKeySignature, TkaErro
             2 => pubkey = expect_bytes(v)?,
             3 => key_id = expect_bytes(v)?,
             4 => signature = expect_bytes(v)?,
-            5 => nested = Some(alloc::boxed::Box::new(node_key_signature_from_value(v)?)),
+            5 => {
+                nested = Some(alloc::boxed::Box::new(node_key_signature_from_value(
+                    v,
+                    depth + 1,
+                )?))
+            }
             6 => wrapping_pubkey = expect_bytes(v)?,
             _ => return Err(TkaError::Decode("unknown signature field")),
         }
@@ -464,7 +489,12 @@ fn expect_bytes(v: Value) -> Result<Vec<u8>, TkaError> {
 
 /// Decode one CBOR value (the subset the encoder produces) from `buf`, returning the value and the
 /// remaining bytes. Minimal — only the major types TKA uses.
-fn decode_value(buf: &[u8]) -> Result<(Value, &[u8]), TkaError> {
+fn decode_value(buf: &[u8], depth: usize) -> Result<(Value, &[u8]), TkaError> {
+    // Bound generic CBOR container nesting so a deeply-nested array/map (even a non-signature one)
+    // cannot overflow the recursive decoder before signature-shape validation runs.
+    if depth > MAX_SIG_NESTING_DEPTH {
+        return Err(TkaError::Decode("nested signature too deep"));
+    }
     let (major, arg, rest) = decode_head(buf)?;
     match major {
         0 => Ok((Value::Uint(arg), rest)),
@@ -486,14 +516,14 @@ fn decode_value(buf: &[u8]) -> Result<(Value, &[u8]), TkaError> {
             let mut items = Vec::new();
             let mut cur = rest;
             for _ in 0..arg {
-                let (v, next) = decode_value(cur)?;
+                let (v, next) = decode_value(cur, depth + 1)?;
                 items.push(v);
                 cur = next;
             }
             Ok((Value::Array(items), cur))
         }
         5 => {
-            let mut entries = Vec::new();
+            let mut entries: Vec<(u64, Value)> = Vec::new();
             let mut cur = rest;
             for _ in 0..arg {
                 let (k, next) = decode_head(cur).and_then(|(m, a, r)| {
@@ -503,7 +533,12 @@ fn decode_value(buf: &[u8]) -> Result<(Value, &[u8]), TkaError> {
                         Err(TkaError::Decode("map key not uint"))
                     }
                 })?;
-                let (v, next2) = decode_value(next)?;
+                // CTAP2/Go reject duplicate map keys; do the same (fail-closed) rather than
+                // silently last-wins.
+                if entries.iter().any(|(existing, _)| *existing == k) {
+                    return Err(TkaError::Decode("duplicate map key"));
+                }
+                let (v, next2) = decode_value(next, depth + 1)?;
                 entries.push((k, v));
                 cur = next2;
             }
@@ -746,5 +781,186 @@ mod tests {
         let auth = Authority::from_state(h, State::default());
         assert!(auth.head_matches(&h));
         assert!(!auth.head_matches(&AumHash([6u8; 32])));
+    }
+
+    // ----- Fix 1: depth cap on attacker-controlled nesting -----
+
+    #[test]
+    fn deeply_nested_signature_rejected_without_overflow() {
+        // Wrap a NodeKeySignature inside `nested` far past MAX_SIG_NESTING_DEPTH. This is cheap to
+        // construct (a few bytes per level) and would overflow an unbounded recursive decoder. The
+        // decoder must reject it as a Decode error — never panic / stack-overflow.
+        let mut sig = NodeKeySignature {
+            sig_kind: SigKind::Direct,
+            pubkey: alloc::vec![1u8; 32],
+            key_id: alloc::vec![2u8; 32],
+            signature: alloc::vec![3u8; 64],
+            nested: None,
+            wrapping_pubkey: Vec::new(),
+        };
+        for _ in 0..(MAX_SIG_NESTING_DEPTH + 8) {
+            sig = NodeKeySignature {
+                sig_kind: SigKind::Rotation,
+                pubkey: alloc::vec![1u8; 32],
+                key_id: Vec::new(),
+                signature: alloc::vec![3u8; 64],
+                nested: Some(alloc::boxed::Box::new(sig)),
+                wrapping_pubkey: alloc::vec![1u8; 32],
+            };
+        }
+        let cbor = sig.to_cbor(true).to_vec();
+        let err = decode_node_key_signature(&cbor).unwrap_err();
+        assert_eq!(err, TkaError::Decode("nested signature too deep"));
+    }
+
+    // ----- Fix 5: duplicate CBOR map keys rejected -----
+
+    #[test]
+    fn duplicate_map_key_rejected() {
+        // Hand-craft a CBOR map with key 1 repeated: map(2) { 1:0, 1:1 } => 0xa2 01 00 01 01.
+        let blob = [0xa2u8, 0x01, 0x00, 0x01, 0x01];
+        let err = decode_node_key_signature(&blob).unwrap_err();
+        assert_eq!(err, TkaError::Decode("duplicate map key"));
+    }
+
+    // ----- Fix 3: rotation-chain happy path + ZIP-215/std split -----
+
+    // ZIP-215 vs standard ed25519 in TKA, and why this crate carries BOTH verifiers:
+    //
+    //   * Direct/Credential signatures are verified with `verify_ed25519_zip215` (ed25519-zebra),
+    //     matching Go `ed25519consensus.Verify` — the *cofactored* ZIP-215 rule the TKA leaf
+    //     signatures are produced under. ZIP-215 is a strict superset of RFC 8032: any standard
+    //     (dalek) signature is accepted by it, which is why the tests below can sign leaves with
+    //     dalek and still verify under zebra.
+    //   * The outer rotation WRAP signature is verified with `verify_ed25519_std` (ed25519-dalek),
+    //     matching Go's plain `ed25519.Verify` for the rotation wrap. Collapsing these two
+    //     verifiers into one would silently diverge from Go on the wire — hence both deps are kept
+    //     (see Cargo.toml comment).
+    #[test]
+    fn rotation_chain_verifies_end_to_end() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        // Trusted key signs the inner Direct over the wrapping (pivot) pubkey.
+        let trusted = SigningKey::from_bytes(&[7u8; 32]);
+        let trusted_pub = trusted.verifying_key().to_bytes().to_vec();
+
+        // The rotation pivot: a fresh keypair whose public key the inner Direct authorizes and
+        // whose private key signs the outer rotation wrap.
+        let wrapping = SigningKey::from_bytes(&[9u8; 32]);
+        let wrapping_pub = wrapping.verifying_key().to_bytes().to_vec();
+
+        let node_key = alloc::vec![5u8; 32];
+
+        let auth = Authority::from_state(
+            AumHash([0; 32]),
+            State {
+                keys: alloc::vec![Key {
+                    kind: KeyKind::Ed25519,
+                    votes: 1,
+                    public: trusted_pub.clone(),
+                }],
+            },
+        );
+
+        // Inner Direct: trusted key authorizes the wrapping pubkey. Verified ZIP-215, so a dalek
+        // signature is accepted.
+        let mut inner = NodeKeySignature {
+            sig_kind: SigKind::Direct,
+            pubkey: wrapping_pub.clone(),
+            key_id: trusted_pub.clone(),
+            signature: Vec::new(),
+            nested: None,
+            wrapping_pubkey: wrapping_pub.clone(),
+        };
+        let inner_hash = inner.sig_hash();
+        inner.signature = trusted.sign(&inner_hash).to_bytes().to_vec();
+
+        // Outer Rotation: signs the node key with the wrapping key (verified STANDARD ed25519).
+        let mut outer = NodeKeySignature {
+            sig_kind: SigKind::Rotation,
+            pubkey: node_key.clone(),
+            key_id: Vec::new(),
+            signature: Vec::new(),
+            nested: Some(alloc::boxed::Box::new(inner)),
+            wrapping_pubkey: Vec::new(),
+        };
+        let outer_hash = outer.sig_hash();
+        outer.signature = wrapping.sign(&outer_hash).to_bytes().to_vec();
+
+        let cbor = outer.to_cbor(true).to_vec();
+        assert!(auth.node_key_authorized(&node_key, &cbor).is_ok());
+
+        // A tampered rotation-wrap signature must be rejected by the STANDARD ed25519 verifier.
+        let mut tampered = outer.clone();
+        let mut sb = tampered.signature.clone();
+        sb[0] ^= 0xff;
+        tampered.signature = sb;
+        let cbor_bad = tampered.to_cbor(true).to_vec();
+        assert_eq!(
+            auth.node_key_authorized(&node_key, &cbor_bad).unwrap_err(),
+            TkaError::BadSignature
+        );
+    }
+
+    // ----- Fix 2: nested-Credential pubkey must bind to the rotation pivot -----
+
+    #[test]
+    fn rotation_nested_credential_pubkey_bind() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let trusted = SigningKey::from_bytes(&[11u8; 32]);
+        let trusted_pub = trusted.verifying_key().to_bytes().to_vec();
+        let wrapping = SigningKey::from_bytes(&[13u8; 32]);
+        let wrapping_pub = wrapping.verifying_key().to_bytes().to_vec();
+        let node_key = alloc::vec![6u8; 32];
+
+        let auth = Authority::from_state(
+            AumHash([0; 32]),
+            State {
+                keys: alloc::vec![Key {
+                    kind: KeyKind::Ed25519,
+                    votes: 1,
+                    public: trusted_pub.clone(),
+                }],
+            },
+        );
+
+        // Helper: build a rotation wrapping a nested Credential whose `pubkey` is `cred_pubkey`.
+        let build = |cred_pubkey: Vec<u8>| -> Vec<u8> {
+            let mut inner = NodeKeySignature {
+                sig_kind: SigKind::Credential,
+                pubkey: cred_pubkey,
+                key_id: trusted_pub.clone(),
+                signature: Vec::new(),
+                nested: None,
+                wrapping_pubkey: wrapping_pub.clone(),
+            };
+            let inner_hash = inner.sig_hash();
+            inner.signature = trusted.sign(&inner_hash).to_bytes().to_vec();
+
+            let mut outer = NodeKeySignature {
+                sig_kind: SigKind::Rotation,
+                pubkey: node_key.clone(),
+                key_id: Vec::new(),
+                signature: Vec::new(),
+                nested: Some(alloc::boxed::Box::new(inner)),
+                wrapping_pubkey: Vec::new(),
+            };
+            let outer_hash = outer.sig_hash();
+            outer.signature = wrapping.sign(&outer_hash).to_bytes().to_vec();
+            outer.to_cbor(true).to_vec()
+        };
+
+        // Matching: credential covers exactly the wrapping pivot pubkey -> accepted.
+        let cbor_ok = build(wrapping_pub.clone());
+        assert!(auth.node_key_authorized(&node_key, &cbor_ok).is_ok());
+
+        // Mismatch: credential covers an unrelated pubkey -> rejected (NodeKeyMismatch), even though
+        // the credential is otherwise signed by the trusted key.
+        let cbor_bad = build(alloc::vec![0xaau8; 32]);
+        assert_eq!(
+            auth.node_key_authorized(&node_key, &cbor_bad).unwrap_err(),
+            TkaError::NodeKeyMismatch
+        );
     }
 }

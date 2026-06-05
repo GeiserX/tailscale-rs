@@ -31,8 +31,6 @@ pub enum Value {
     /// Map with unsigned-integer keys (CBOR major type 5, `keyasint`). Encoded in CTAP2 canonical
     /// key order regardless of insertion order.
     IntMap(Vec<(u64, Value)>),
-    /// Map with text-string keys (used for the `Meta map[string]string` fields).
-    TextMap(Vec<(Vec<u8>, Value)>),
 }
 
 impl Value {
@@ -63,23 +61,6 @@ impl Value {
                 encode_head(out, 5, sorted.len() as u64);
                 for (k, v) in sorted {
                     encode_head(out, 0, *k); // key: unsigned int
-                    v.encode(out);
-                }
-            }
-            Value::TextMap(entries) => {
-                // CTAP2 canonical order for text keys: shorter encoded key first, then
-                // byte-lexicographic. The encoded key length is the head length + byte length; for
-                // equal head sizes this reduces to (len, bytes) ordering.
-                let mut sorted: Vec<&(Vec<u8>, Value)> = entries.iter().collect();
-                sorted.sort_by(|(a, _), (b, _)| {
-                    a.len()
-                        .cmp(&b.len())
-                        .then_with(|| a.as_slice().cmp(b.as_slice()))
-                });
-                encode_head(out, 5, sorted.len() as u64);
-                for (k, v) in sorted {
-                    encode_head(out, 3, k.len() as u64);
-                    out.extend_from_slice(k);
                     v.encode(out);
                 }
             }
@@ -124,11 +105,6 @@ fn encode_head(out: &mut Vec<u8>, major: u8, n: u64) {
         out.push(mt | 27);
         out.extend_from_slice(&n.to_be_bytes());
     }
-}
-
-/// Encode a `map[string]string` as a canonical text-keyed CBOR map (used for `Meta`).
-pub fn text_string_map(m: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>) -> Value {
-    Value::TextMap(m.into_iter().map(|(k, v)| (k, Value::Text(v))).collect())
 }
 
 #[cfg(test)]
@@ -178,17 +154,5 @@ mod tests {
         ]);
         // Only keys 1 and 3 present.
         assert_eq!(m.to_vec(), vec![0xa2, 0x01, 0x01, 0x03, 0x03]);
-    }
-
-    #[test]
-    fn text_map_ctap2_order() {
-        // CTAP2: shorter key first, then lexical. "bb" (len2) sorts after "a" (len1).
-        let m = Value::TextMap(vec![
-            (b"bb".to_vec(), Value::Uint(2)),
-            (b"a".to_vec(), Value::Uint(1)),
-        ]);
-        let out = m.to_vec();
-        // map(2) { "a":1, "bb":2 }
-        assert_eq!(out, vec![0xa2, 0x61, b'a', 0x01, 0x62, b'b', b'b', 0x02]);
     }
 }

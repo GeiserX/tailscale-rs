@@ -441,14 +441,18 @@ async fn write_taildrop_ok(stream: &mut TcpStream) -> std::io::Result<()> {
 /// stopping at the declared `Content-Length`. This gives [`TaildropStore::put_file`] a reader that
 /// hits EOF at the body boundary so it never blocks waiting for bytes past the body or over-reads
 /// into a (non-existent here) next request.
-struct BodyReader<'a> {
+/// Generic over the underlying byte source so the production `&mut TcpStream` (the netstack stream)
+/// works by inference while tests can drive it over any `AsyncRead`, e.g. a `tokio::io::duplex`
+/// half — the netstack `TcpStream` is a concrete, privately-constructed type that can't be built in
+/// a test, so this is the only way to exercise the cap against a real async stream.
+struct BodyReader<S> {
     seed: std::io::Cursor<Vec<u8>>,
-    stream: &'a mut TcpStream,
+    stream: S,
     remaining: u64,
 }
 
-impl<'a> BodyReader<'a> {
-    fn new(seed: Vec<u8>, stream: &'a mut TcpStream, content_length: u64) -> Self {
+impl<S> BodyReader<S> {
+    fn new(seed: Vec<u8>, stream: S, content_length: u64) -> Self {
         // The seed may hold more than the body in pathological pipelined cases; cap it.
         let seed = if seed.len() as u64 > content_length {
             seed[..content_length as usize].to_vec()
@@ -464,7 +468,7 @@ impl<'a> BodyReader<'a> {
     }
 }
 
-impl tokio::io::AsyncRead for BodyReader<'_> {
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for BodyReader<S> {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -489,7 +493,7 @@ impl tokio::io::AsyncRead for BodyReader<'_> {
         let want = self.remaining.min(buf.remaining() as u64) as usize;
         let poll = {
             let mut limited = buf.take(want);
-            let stream = std::pin::Pin::new(&mut *self.stream);
+            let stream = std::pin::Pin::new(&mut self.stream);
             match tokio::io::AsyncRead::poll_read(stream, cx, &mut limited) {
                 std::task::Poll::Ready(Ok(())) => {
                     std::task::Poll::Ready(Ok(limited.filled().len()))
@@ -707,5 +711,269 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(text.contains("Content-Length: 3\r\n"));
         assert!(text.ends_with("\r\n\r\n{}\n"));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Request → response path coverage.
+    //
+    // The netstack `netsock::TcpStream` is a concrete struct with a `pub(crate)` constructor that
+    // needs a live `netcore::Channel` + `SocketHandle`; it cannot be built from a
+    // `tokio::io::duplex` half. `route_conn` / `handle_taildrop_put` are hard-typed to it, so a
+    // single end-to-end duplex drive of those two functions is infeasible without changing their
+    // production signatures (which we will not do gratuitously). Instead we exercise the request →
+    // response path at the seams the types allow:
+    //
+    //  * `taildrop_request_path` below reproduces exactly the decision sequence that
+    //    `route_conn` + `handle_taildrop_put` walk (classify → gate → content-length → name
+    //    validation via `put_file`), driving the body over a real `tokio::io::duplex` async stream
+    //    through the production `BodyReader` and the production `TaildropStore::put_file`, and
+    //    emitting the production response bytes. This covers 200/403/400/405 and the file landing in
+    //    the store.
+    //  * `body_reader_caps_at_content_length` drives the production `BodyReader` (now generic) over
+    //    a `tokio::io::duplex` half whose source is LARGER than the declared length, asserting only
+    //    `content_length` bytes are delivered.
+    //  * `dns_query_post_is_not_taildrop_405_or_404` asserts the DoH POST still reaches the DoH path
+    //    (a `DohOrOther` route, never `405`/Taildrop), the regression guard requested for the
+    //    refactor.
+
+    use crate::taildrop::TaildropStore;
+
+    fn tmp_store() -> (std::path::PathBuf, Arc<TaildropStore>) {
+        let mut root = std::env::temp_dir();
+        root.push(format!(
+            "peerapi-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = Arc::new(TaildropStore::new(&root).unwrap());
+        (root, store)
+    }
+
+    /// Drive the exact decision sequence of `route_conn` → `handle_taildrop_put` against a real
+    /// async body stream, returning the production response status line (first line) plus body. This
+    /// mirrors the production control flow seam-for-seam: classify the route, run the gate, require a
+    /// Content-Length, then stream the `BodyReader` into `TaildropStore::put_file` and map the result
+    /// through the same status codes.
+    async fn taildrop_request_path(
+        method: &str,
+        full_path: &str,
+        content_length: Option<u64>,
+        body: &[u8],
+        store: Option<Arc<TaildropStore>>,
+        view: &DnsView,
+        src: SocketAddr,
+    ) -> (String, Vec<u8>) {
+        // Status helper mirroring `peerapi_doh::write_status`'s wire shape closely enough for the
+        // assertions (status line is what we check).
+        fn status(code: &str) -> (String, Vec<u8>) {
+            (format!("HTTP/1.1 {code}"), Vec::new())
+        }
+
+        match classify_route(method, full_path) {
+            Route::TaildropMethodNotAllowed => status("405 Method Not Allowed"),
+            Route::DohOrOther => status("DOH"), // would be handed to the DoH handler
+            Route::TaildropPut { name } => {
+                // Gate (fail-closed): no store → 403; gate Deny → 403.
+                let Some(store) = store else {
+                    return status("403 Forbidden");
+                };
+                if gate_taildrop(view, src, true) == GateDecision::Deny {
+                    return status("403 Forbidden");
+                }
+                let Some(content_length) = content_length else {
+                    return status("400 Bad Request");
+                };
+
+                // Real async stream carrying the body, fed through the production BodyReader.
+                let (mut client, server) = tokio::io::duplex(64 * 1024);
+                let body = body.to_vec();
+                tokio::spawn(async move {
+                    client.write_all(&body).await.ok();
+                    client.shutdown().await.ok();
+                });
+                let reader = BodyReader::new(Vec::new(), server, content_length);
+
+                match store.put_file(&name, reader, 0).await {
+                    Ok(_) => {
+                        let resp = taildrop_ok_response();
+                        // Split off the status line + body for the assertions.
+                        let text = String::from_utf8_lossy(&resp).into_owned();
+                        let line = text.lines().next().unwrap_or("").to_string();
+                        (line, b"{}\n".to_vec())
+                    }
+                    Err(TaildropError::InvalidFileName) => status("400 Bad Request"),
+                    Err(TaildropError::FileExists) => status("409 Conflict"),
+                    Err(TaildropError::Io(_)) => status("500 Internal Server Error"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn put_request_allowed_writes_file_and_200() {
+        let (root, store) = tmp_store();
+        let view = view_with(true, &["100.64.0.9".parse().unwrap()]);
+        let body = b"hello over the wire";
+
+        let (line, resp_body) = taildrop_request_path(
+            "PUT",
+            "/v0/put/wire.txt",
+            Some(body.len() as u64),
+            body,
+            Some(store.clone()),
+            &view,
+            src("100.64.0.9"),
+        )
+        .await;
+
+        assert_eq!(line, "HTTP/1.1 200 OK");
+        assert_eq!(resp_body, b"{}\n");
+        // The file landed in the store with the exact body.
+        assert_eq!(std::fs::read(root.join("wire.txt")).unwrap(), body);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn put_request_denied_by_gate_is_403() {
+        let view = view_with(true, &["100.64.0.9".parse().unwrap()]);
+
+        // No store configured → 403.
+        let (line, _) = taildrop_request_path(
+            "PUT",
+            "/v0/put/x.txt",
+            Some(1),
+            b"x",
+            None,
+            &view,
+            src("100.64.0.9"),
+        )
+        .await;
+        assert_eq!(line, "HTTP/1.1 403 Forbidden");
+
+        // Store present but node lacks the file-sharing cap → gate Deny → 403.
+        let (root, store) = tmp_store();
+        let no_cap = view_with(false, &["100.64.0.9".parse().unwrap()]);
+        let (line, _) = taildrop_request_path(
+            "PUT",
+            "/v0/put/x.txt",
+            Some(1),
+            b"x",
+            Some(store),
+            &no_cap,
+            src("100.64.0.9"),
+        )
+        .await;
+        assert_eq!(line, "HTTP/1.1 403 Forbidden");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn put_request_with_bad_name_is_400() {
+        let (root, store) = tmp_store();
+        let view = view_with(true, &["100.64.0.9".parse().unwrap()]);
+
+        // `../escape` percent-encoded as `%2E%2E%2Fescape`; classify percent-decodes it to
+        // `../escape`, which `put_file` rejects → InvalidFileName → 400.
+        let (line, _) = taildrop_request_path(
+            "PUT",
+            "/v0/put/%2E%2E%2Fescape",
+            Some(1),
+            b"x",
+            Some(store),
+            &view,
+            src("100.64.0.9"),
+        )
+        .await;
+        assert_eq!(line, "HTTP/1.1 400 Bad Request");
+        // Nothing escaped the store root.
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn get_on_taildrop_path_is_405() {
+        let view = view_with(true, &["100.64.0.9".parse().unwrap()]);
+        let (root, store) = tmp_store();
+        let (line, _) = taildrop_request_path(
+            "GET",
+            "/v0/put/x.txt",
+            Some(1),
+            b"x",
+            Some(store),
+            &view,
+            src("100.64.0.9"),
+        )
+        .await;
+        assert_eq!(line, "HTTP/1.1 405 Method Not Allowed");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn dns_query_post_is_not_taildrop_405_or_404() {
+        // Regression guard for the refactor: a DoH POST must not be stolen by the Taildrop router; it
+        // classifies as `DohOrOther` and is handed to the DoH handler (it never short-circuits to
+        // 405 or a Taildrop response in `route_conn`).
+        assert_eq!(classify_route("POST", "/dns-query"), Route::DohOrOther);
+        assert_eq!(classify_route("POST", "/dns-query?x=1"), Route::DohOrOther);
+    }
+
+    #[tokio::test]
+    async fn body_reader_caps_at_content_length() {
+        // Feed a source LARGER than the declared length over a real async duplex stream and assert
+        // the production `BodyReader` delivers exactly `content_length` bytes (the cap holds, so a
+        // peer can't smuggle bytes past the declared body into `put_file`).
+        let declared: u64 = 8;
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            // 20 bytes available, only 8 should be read.
+            client.write_all(b"01234567OVERFLOW1234").await.ok();
+            client.shutdown().await.ok();
+        });
+
+        let mut reader = BodyReader::new(Vec::new(), server, declared);
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 4];
+        loop {
+            let n = tokio::io::AsyncReadExt::read(&mut reader, &mut chunk)
+                .await
+                .unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&chunk[..n]);
+        }
+        assert_eq!(out, b"01234567");
+        assert_eq!(out.len() as u64, declared);
+    }
+
+    #[tokio::test]
+    async fn body_reader_includes_seed_then_caps() {
+        // The seed bytes (already read while parsing headers) count toward the cap: seed=3, declared
+        // total=6, stream supplies more but is capped so total delivered == 6 (seed first, then 3
+        // stream bytes). Drive it with the same fixed-buffer read loop `put_file` uses (production's
+        // actual read pattern) rather than `read_to_end`.
+        let declared: u64 = 6;
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            client.write_all(b"XXXXXXXXXX").await.ok(); // plenty, will be capped
+            client.shutdown().await.ok();
+        });
+        let mut reader = BodyReader::new(b"abc".to_vec(), server, declared);
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 4];
+        loop {
+            let n = tokio::io::AsyncReadExt::read(&mut reader, &mut chunk)
+                .await
+                .unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&chunk[..n]);
+        }
+        assert_eq!(out.len() as u64, declared);
+        assert_eq!(out, b"abcXXX");
     }
 }

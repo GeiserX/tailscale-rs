@@ -214,17 +214,40 @@ impl TaildropStore {
             if n == 0 {
                 break;
             }
+            // Each `write_all` only pushes the chunk into the page cache (microseconds); the
+            // genuinely blocking cost is the terminal `flush`/`sync_all`/`rename` below, which we
+            // hand to a blocking thread so a flood of concurrent transfers can't starve the tokio
+            // worker pool on fsync (see `peerapi::MAX_INFLIGHT`).
             file.write_all(&buf[..n])?;
             copied += n as u64;
         }
-        file.flush()?;
-        file.sync_all()?;
-        drop(file);
 
-        // Atomically publish under a non-clobbering final name.
-        let final_name = next_available_name(&self.root, base);
-        let final_path = self.root.join(&final_name);
-        std::fs::rename(&partial, &final_path)?;
+        // Finalize off the async runtime: `sync_all` (fsync) and `rename` are the dominant blocking
+        // operations, so run them on a blocking thread. The `File` and both paths are owned by the
+        // closure (`Send + 'static`), and `next_available_name` (which `stat`s candidates) goes with
+        // them. Fail-closed: any I/O error — or a join failure — propagates without ever publishing
+        // the final name, leaving the `.partial` in place for a later resume.
+        let root = self.root.clone();
+        let base = base.to_string();
+        tokio::task::spawn_blocking(move || -> io::Result<()> {
+            file.flush()?;
+            file.sync_all()?;
+            drop(file);
+
+            // Atomically publish under a non-clobbering final name.
+            let final_name = next_available_name(&root, &base);
+            let final_path = root.join(&final_name);
+            std::fs::rename(&partial, &final_path)?;
+            Ok(())
+        })
+        .await
+        .map_err(|join_err| {
+            // A panicked/cancelled finalize task: surface as I/O so the caller maps it to a 500 and
+            // the partial is left untouched (never publishes the final name).
+            TaildropError::Io(io::Error::other(format!(
+                "taildrop finalize task failed: {join_err}"
+            )))
+        })??;
 
         Ok(offset + copied)
     }
@@ -350,6 +373,37 @@ mod tests {
         assert_eq!(wf.len(), 1);
         assert_eq!(wf[0].name, "greeting.txt");
         assert_eq!(wf[0].size, data.len() as u64);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn put_file_resumes_from_offset() {
+        let root = tmp_root();
+        let store = TaildropStore::new(&root).unwrap();
+
+        // Pre-write a prefix into the `.partial` directly, simulating bytes already received by an
+        // earlier (interrupted) transfer.
+        let prefix = b"the first half ";
+        let partial = root.join("resume.txt.partial");
+        std::fs::write(&partial, prefix).unwrap();
+
+        // Resume at offset == the prefix length: `put_file` opens the existing partial, seeks past
+        // the prefix, and appends the rest.
+        let rest = b"and the second half";
+        let total = store
+            .put_file("resume.txt", &rest[..], prefix.len() as u64)
+            .await
+            .unwrap();
+
+        // The returned count is offset + freshly-copied bytes, and the final file is the prefix and
+        // the resumed bytes concatenated (the seek positioned the write correctly).
+        assert_eq!(total, (prefix.len() + rest.len()) as u64);
+        let body = std::fs::read(root.join("resume.txt")).unwrap();
+        let mut expected = prefix.to_vec();
+        expected.extend_from_slice(rest);
+        assert_eq!(body, expected);
+        assert!(!partial.exists());
 
         std::fs::remove_dir_all(&root).ok();
     }
