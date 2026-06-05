@@ -401,6 +401,25 @@ impl Node {
         ))
     }
 
+    /// The IPv4 peerAPI socket address (`<tailnet-ipv4>:<peerapi4-port>`) of this node, if it
+    /// advertises an IPv4 peerAPI. Unlike [`Node::peerapi_doh_addr`], this is **not** gated on the
+    /// DNS-proxy capability: it is the general base for any peerAPI request to this node (e.g. a
+    /// Taildrop `PUT /v0/put/<name>` upload), mirroring Go's `peerAPIBase`/`peerAPIPorts`.
+    ///
+    /// IPv4-only by this fork's deliberate design (the tailnet dataplane binds IPv4 only, so we never
+    /// form a peerAPI URL on the peer's IPv6 address). Returns `None` for a WireGuard-only peer (which
+    /// runs no peerAPI) or a peer advertising no IPv4 peerAPI port.
+    pub fn peerapi_addr(&self) -> Option<SocketAddr> {
+        if self.is_wireguard_only {
+            return None;
+        }
+        let port = self.peerapi_port?;
+        Some(SocketAddr::new(
+            IpAddr::V4(self.tailnet_address.ipv4.addr()),
+            port,
+        ))
+    }
+
     /// The node attribute granting HTTPS (TLS cert provisioning) for this node (Go
     /// `tailcfg.CapabilityHTTPS`). One of the two caps [`Node::can_funnel`] requires.
     const CAP_HTTPS: &'static str = "https";
@@ -1038,6 +1057,36 @@ mod tests {
         // Gated off the same way: no port => no addr.
         n.peerapi_port = None;
         assert_eq!(n.peerapi_doh_addr(), None);
+    }
+
+    #[test]
+    fn peerapi_addr_returns_addr_when_advertised() {
+        let mut n = node("peer", Some("ts.net"));
+        n.tailnet_address.ipv4 = "100.64.0.5/32".parse().unwrap();
+        n.peerapi_port = Some(8089);
+
+        // Not gated on the DNS-proxy capability: a plain advertised peerAPI port is enough.
+        assert_eq!(n.peerapi_addr(), Some("100.64.0.5:8089".parse().unwrap()));
+    }
+
+    #[test]
+    fn peerapi_addr_none_when_no_port() {
+        let mut n = node("peer", Some("ts.net"));
+        n.tailnet_address.ipv4 = "100.64.0.5/32".parse().unwrap();
+        n.peerapi_port = None;
+
+        assert_eq!(n.peerapi_addr(), None);
+    }
+
+    #[test]
+    fn peerapi_addr_none_for_wireguard_only() {
+        let mut n = node("peer", Some("ts.net"));
+        n.tailnet_address.ipv4 = "100.64.0.5/32".parse().unwrap();
+        n.peerapi_port = Some(8089);
+        n.is_wireguard_only = true;
+
+        // WireGuard-only peers run no peerAPI, even with a port set.
+        assert_eq!(n.peerapi_addr(), None);
     }
 
     #[test]

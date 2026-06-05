@@ -204,6 +204,22 @@ fn taildrop_err(e: ts_runtime::taildrop::TaildropError) -> Error {
     }
 }
 
+/// Map a [`ts_runtime::taildrop_send::TaildropSendError`] (the Taildrop *sender*) to the
+/// device-facing [`Error`]. The send-side conflict/forbidden/unexpected-status cases all reduce to
+/// `BadRequest` (the peer refused the transfer for a request-level reason), a dial failure or
+/// timeout to `Timeout`, an invalid name to `BadRequest`, and any stream I/O failure to `Io`.
+fn taildrop_send_err(e: ts_runtime::taildrop_send::TaildropSendError) -> Error {
+    use ts_runtime::taildrop_send::TaildropSendError;
+    match e {
+        TaildropSendError::Connect | TaildropSendError::Timeout => Error::Timeout,
+        TaildropSendError::InvalidName
+        | TaildropSendError::Forbidden
+        | TaildropSendError::Conflict
+        | TaildropSendError::UnexpectedStatus(_) => Error::Internal(InternalErrorKind::BadRequest),
+        TaildropSendError::Io => Error::Internal(InternalErrorKind::Io),
+    }
+}
+
 impl Device {
     /// Create a device from the given [`Config`] and auth key.
     ///
@@ -520,6 +536,53 @@ impl Device {
             .taildrop_store()
             .ok_or(Error::Internal(InternalErrorKind::BadRequest))?;
         store.delete_file(name).map_err(taildrop_err)
+    }
+
+    /// Send a local file to a tailnet `peer` via Taildrop (Go `PushFile` / `tailscale file cp`).
+    ///
+    /// Pushes `content_length` bytes from `reader` to the peer's peerAPI as
+    /// `PUT /v0/put/<name>` over the overlay netstack — the sending counterpart to the receive store
+    /// surfaced by [`Device::taildrop_waiting_files`]. The transfer rides the encrypted WireGuard
+    /// overlay, never a host socket. The body is streamed from offset 0 (no resume).
+    ///
+    /// The destination is derived **solely from `peer`'s own node record**
+    /// ([`NodeInfo::peerapi_addr`][ts_control::Node::peerapi_addr]): its advertised tailnet IPv4 and
+    /// `peerapi4` port. The caller obtains `peer` from [`Device::peer_by_name`] /
+    /// [`Device::peer_by_tailnet_ip`], so it is always a current netmap peer — a raw control-supplied
+    /// or attacker-chosen address can never be targeted. As defense in depth, the resolved address is
+    /// additionally asserted to be a Tailscale CGNAT IP before dialing.
+    ///
+    /// Returns [`InternalErrorKind::BadRequest`] when the peer advertises no IPv4 peerAPI (so it
+    /// cannot receive files), when the name is invalid, or when the peer refuses the transfer
+    /// (`403`/`409`/unexpected status); [`Error::Timeout`] on a dial failure or timeout; and
+    /// [`InternalErrorKind::Io`] on a mid-transfer stream error.
+    pub async fn send_file<R>(
+        &self,
+        peer: &NodeInfo,
+        name: &str,
+        content_length: u64,
+        reader: R,
+    ) -> Result<(), Error>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        let channel = self.channel()?;
+
+        // Destination comes only from the peer's own node record — never an arbitrary address.
+        let dst = peer
+            .peerapi_addr()
+            .ok_or(Error::Internal(InternalErrorKind::BadRequest))?;
+        // Defense in depth: refuse to dial anything outside the Tailscale CGNAT range, so a
+        // malformed node record can't steer the PUT at a non-tailnet host.
+        if !ts_control::is_tailscale_ip(dst.ip()) {
+            return Err(Error::Internal(InternalErrorKind::BadRequest));
+        }
+
+        let self_ipv4 = self.ipv4_addr().await?;
+
+        ts_runtime::taildrop_send::send_file(channel, self_ipv4, dst, name, content_length, reader)
+            .await
+            .map_err(taildrop_send_err)
     }
 
     /// Snapshot of this device and its tailnet peers (like `tailscale status`).

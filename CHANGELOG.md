@@ -6,6 +6,33 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.27](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.27) - 2026-06-05
+
+**Taildrop file sender** (`tsr-am9.1`): the sending half of Tailscale's peer-to-peer file transfer,
+mirroring Go's wire sender. The fork already implemented the *receiver* (peerAPI `PUT /v0/put/<name>`
+server + path-safe store); this adds the *client* that pushes a local file to a tailnet peer.
+
+- **`Device::send_file(peer, name, content_length, reader)`** (root crate): push `content_length`
+  bytes from any `AsyncRead` to a peer as `PUT /v0/put/<name>`. The body streams from offset 0 (the
+  Range/resume GET Go uses as an optimization is deliberately omitted — a fresh full PUT is always
+  correct).
+- **Anti-leak**: the transfer dials **exclusively** over the overlay netstack (`channel.tcp_connect`,
+  bound to this node's tailnet IPv4) — never a host socket — reusing the same discipline as the
+  peerAPI DoH client (`ts_runtime::peerapi_doh`).
+- **SSRF-safe by construction**: the destination is derived **only** from the peer's own node record
+  via the new `Node::peerapi_addr()` (`tailnet-ipv4 : peerapi4-port`, mirroring Go
+  `peerAPIBase`/`peerAPIPorts`). The caller passes a `&NodeInfo` obtained from `peer_by_name` /
+  `peer_by_tailnet_ip` (a current netmap peer), not a raw address; as defense in depth the resolved
+  address is additionally asserted to be a Tailscale CGNAT IP before dialing.
+- **Request-smuggling-safe**: the file name is validated by the receiver's `validate_base_name`
+  (rejects `/`, `\`, NUL, control chars, `..`) **and** percent-escaped with a strict whitelist encoder
+  (`path_escape`, the Go `url.PathEscape` counterpart to the receiver's `percent_decode`), so CRLF /
+  header injection / path traversal are structurally impossible.
+- **Bounded against a hostile peer**: 10s dial timeout, 60s per-write idle timeout (caps a stalled
+  `write_all` if a peer accepts the connection but never drains its window), 30s response-head read
+  bounded to 8 KiB. Every non-2xx status (`403`→denied, `409`→conflict, other) returns an error — no
+  failure is ever masked as success.
+
 ## [0.5.26](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.26) - 2026-06-05
 
 Hardening + coverage from a multi-reviewer audit of v0.5.22–v0.5.25. No happy-path behavior change.

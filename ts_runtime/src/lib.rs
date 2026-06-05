@@ -40,6 +40,7 @@ mod src_filter;
 pub mod status;
 /// Taildrop peer-to-peer file transfer store.
 pub mod taildrop;
+pub mod taildrop_send;
 #[cfg(feature = "tun")]
 mod tun_actor;
 
