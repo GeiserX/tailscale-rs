@@ -289,6 +289,8 @@ async fn dispatch_conn(
                         tracing::debug!(%port, "serve: accept receiver dropped; closing conn");
                     }
                 }
+                // Reached DIRECTLY (no request head consumed off `tls`): a plain splice with no
+                // prefix replay — the backend sees the client's bytes verbatim.
                 ServeTarget::Proxy { to } => {
                     proxy_to_backend(port, tls, to).await;
                 }
@@ -319,7 +321,26 @@ async fn dispatch_conn(
 
 /// Reverse-proxy a TLS-terminated stream to a local host backend (Go `Proxy` handler). The backend
 /// dial is a LOCAL host socket to the embedder's own backend — never the forwarder egress path.
-async fn proxy_to_backend<S>(port: u16, mut tls: S, to: &str)
+///
+/// Reached DIRECTLY from [`dispatch_conn`] (no request head has been consumed off `tls`), so no
+/// prefix replay is needed — the backend sees the client's bytes verbatim via the bidirectional
+/// splice. The `Path`-nested case (where a head WAS consumed) uses [`proxy_to_backend_with_prefix`]
+/// instead.
+async fn proxy_to_backend<S>(port: u16, tls: S, to: &str)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    proxy_to_backend_with_prefix(port, tls, to, &[]).await;
+}
+
+/// Reverse-proxy a TLS-terminated stream to a local host backend, writing `prefix` to the backend
+/// FIRST (before the bidirectional splice). This replays an HTTP request head already consumed off
+/// `tls` (e.g. by [`serve_path`]'s [`read_http_head`]) so the backend sees the complete request: the
+/// consumed request line + headers, then the rest of the body/stream via the splice. An empty
+/// `prefix` is equivalent to a plain splice ([`proxy_to_backend`]). The backend dial is a LOCAL host
+/// socket — never the forwarder egress path; any failure (dial or prefix write) drops the conn
+/// fail-closed.
+async fn proxy_to_backend_with_prefix<S>(port: u16, mut tls: S, to: &str, prefix: &[u8])
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -330,6 +351,12 @@ where
             return;
         }
     };
+    if !prefix.is_empty()
+        && let Err(e) = backend.write_all(prefix).await
+    {
+        tracing::debug!(%port, %to, error = %e, "serve proxy: prefix replay failed; dropping conn");
+        return;
+    }
     if let Err(e) = tokio::io::copy_bidirectional(&mut tls, &mut backend).await {
         tracing::debug!(%port, %to, error = %e, "serve proxy: splice ended");
     }
@@ -366,7 +393,8 @@ where
 }
 
 /// Max bytes of an HTTP request head (request line + headers) we will buffer before giving up. A
-/// peer that never sends `\r\n\r\n` within this bound is dropped fail-closed (no unbounded read).
+/// peer that never sends `\r\n\r\n` within this exact bound is dropped fail-closed (no unbounded
+/// read); the buffer is bound-checked AFTER each read, so it never exceeds this cap.
 const MAX_HTTP_HEAD: usize = 8 * 1024;
 
 /// Read the HTTP request head (up to and including `\r\n\r\n`) from a TLS-terminated stream into a
@@ -382,25 +410,25 @@ where
     let mut buf = Vec::with_capacity(1024);
     let mut tmp = [0u8; 1024];
     loop {
-        if let Some(end) = find_header_end(&buf) {
+        if let Some(end) = crate::peerapi_doh::find_header_end(&buf) {
             return Some((buf, end));
-        }
-        if buf.len() >= MAX_HTTP_HEAD {
-            return None;
         }
         match stream.read(&mut tmp).await {
             Ok(0) => return None,
-            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Ok(n) => {
+                buf.extend_from_slice(&tmp[..n]);
+                // Bound-check AFTER extending so the buffer never exceeds MAX_HTTP_HEAD. The
+                // terminator is re-checked at the top of the loop, so a head whose terminator lands
+                // exactly at the bound still succeeds; only a head with no terminator within
+                // MAX_HTTP_HEAD is dropped fail-closed.
+                if crate::peerapi_doh::find_header_end(&buf).is_none() && buf.len() >= MAX_HTTP_HEAD
+                {
+                    return None;
+                }
+            }
             Err(_) => return None,
         }
     }
-}
-
-/// Find the byte offset just past the `\r\n\r\n` header terminator, if present. Local mirror of
-/// `peerapi_doh::find_header_end` — replicated here because that helper takes the peerAPI's concrete
-/// `netsock::TcpStream`, while Serve dispatch operates on a generic TLS-terminated stream.
-fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
 }
 
 /// Parse the request-line path from an HTTP head. Returns the path component (without the query
@@ -469,9 +497,11 @@ where
 /// Serve a [`ServeTarget::Path`] mux on a TLS-terminated stream: read the request head, pick the
 /// longest-matching path prefix in `handlers`, and dispatch the matched nested target on the
 /// already-decrypted stream. Fail-closed: a malformed head, no matching prefix, or an
-/// un-dispatchable nested target ⇒ 404/drop. Backend dial failures inside a nested `Proxy` drop the
-/// conn (via [`proxy_to_backend`]). Nested `Path` is rejected by `ServeState::validate`, so it is
-/// not expected here; it is dropped fail-closed if it ever reaches dispatch.
+/// un-dispatchable nested target ⇒ 404/drop. For a matched nested `Proxy`, the request head consumed
+/// here is replayed to the backend first (via [`proxy_to_backend_with_prefix`]) so the backend sees
+/// the complete request. Backend dial failures inside a nested `Proxy` drop the conn. Nested `Path`
+/// is rejected by `ServeState::validate`, so it is not expected here; it is dropped fail-closed if it
+/// ever reaches dispatch.
 async fn serve_path<S>(port: u16, mut tls: S, handlers: &BTreeMap<String, ServeTarget>)
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -498,7 +528,10 @@ where
     };
 
     match target {
-        ServeTarget::Proxy { to } => proxy_to_backend(port, tls, to).await,
+        // The request head was already consumed off `tls` by `read_http_head`; replay it (`buf`) to
+        // the backend FIRST so the backend sees the complete request (head + remaining body/stream),
+        // not a request with its first request-line+headers missing.
+        ServeTarget::Proxy { to } => proxy_to_backend_with_prefix(port, tls, to, &buf).await,
         ServeTarget::Text { body } => write_text(port, tls, body).await,
         ServeTarget::Redirect { to, status } => serve_redirect(port, tls, to, *status).await,
         // Accept (no hand-back channel here), TcpForward (raw, not on a TLS path), nested Path
@@ -595,9 +628,18 @@ mod tests {
     }
 
     #[test]
-    fn find_header_end_locates_terminator() {
-        assert_eq!(find_header_end(b"GET / HTTP/1.1\r\n\r\n"), Some(18));
-        assert_eq!(find_header_end(b"GET / HTTP/1.1\r\n"), None);
+    fn find_header_end_shared_with_peerapi_doh() {
+        // The local mirror was removed; serve dispatch now uses the shared peerAPI helper. Keep one
+        // assertion that the shared fn behaves as serve dispatch relies on (peerapi_doh owns the
+        // exhaustive coverage).
+        assert_eq!(
+            crate::peerapi_doh::find_header_end(b"GET / HTTP/1.1\r\n\r\n"),
+            Some(18)
+        );
+        assert_eq!(
+            crate::peerapi_doh::find_header_end(b"GET / HTTP/1.1\r\n"),
+            None
+        );
     }
 
     #[test]
@@ -611,6 +653,14 @@ mod tests {
             Some("/")
         );
         assert_eq!(request_path(b"not a request").as_deref(), None);
+    }
+
+    #[test]
+    fn request_path_none_on_malformed_request_line() {
+        // No method/version framing at all => httparse rejects => None.
+        assert_eq!(request_path(b"GARBAGE\r\n\r\n").as_deref(), None);
+        // Empty buffer => incomplete => None.
+        assert_eq!(request_path(b"").as_deref(), None);
     }
 
     #[test]
@@ -641,9 +691,208 @@ mod tests {
         assert_eq!(redirect_reason(399), "Redirect");
     }
 
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Read everything the server side wrote to the `client` half of a duplex until the server task
+    /// closes its end (drop/shutdown), returning it as a `String`.
+    async fn drain_to_string(mut client: tokio::io::DuplexStream) -> String {
+        let mut out = Vec::new();
+        drop(client.read_to_end(&mut out).await);
+        String::from_utf8(out).expect("server emitted valid utf8")
+    }
+
+    #[tokio::test]
+    async fn serve_redirect_emits_exact_response() {
+        let (client, server) = tokio::io::duplex(4096);
+        let t = tokio::spawn(async move {
+            serve_redirect(443, server, "/elsewhere", 302).await;
+        });
+        let got = drain_to_string(client).await;
+        t.await.unwrap();
+        assert_eq!(
+            got,
+            "HTTP/1.1 302 Found\r\nLocation: /elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_http_status_emits_status_line() {
+        let (client, server) = tokio::io::duplex(4096);
+        let t = tokio::spawn(async move {
+            write_http_status(443, server, "404 Not Found").await;
+        });
+        let got = drain_to_string(client).await;
+        t.await.unwrap();
+        assert_eq!(
+            got,
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+
+        let (client, server) = tokio::io::duplex(4096);
+        let t = tokio::spawn(async move {
+            write_http_status(443, server, "400 Bad Request").await;
+        });
+        let got = drain_to_string(client).await;
+        t.await.unwrap();
+        assert_eq!(
+            got,
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_http_head_reads_terminated_head() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        client
+            .write_all(b"GET /api HTTP/1.1\r\nHost: h\r\n\r\nBODY")
+            .await
+            .unwrap();
+        drop(client);
+        let (buf, end) = read_http_head(&mut server).await.expect("complete head");
+        // `end` points just past the terminator; the head + trailing body are both buffered.
+        assert_eq!(&buf[..end], b"GET /api HTTP/1.1\r\nHost: h\r\n\r\n");
+        assert_eq!(&buf[end..], b"BODY");
+    }
+
+    #[tokio::test]
+    async fn read_http_head_none_on_early_eof() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        client.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
+        drop(client); // EOF before the terminator
+        assert!(read_http_head(&mut server).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_http_head_none_on_oversized_head() {
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        // A head that never terminates and exceeds MAX_HTTP_HEAD must be dropped fail-closed.
+        let oversized = vec![b'a'; MAX_HTTP_HEAD + 1024];
+        client.write_all(&oversized).await.unwrap();
+        drop(client);
+        assert!(read_http_head(&mut server).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_http_head_never_exceeds_max_head() {
+        // A terminator landing exactly at the bound still succeeds (the buffer never overshoots).
+        let (mut client, mut server) = tokio::io::duplex(MAX_HTTP_HEAD + 16);
+        let mut head = vec![b'a'; MAX_HTTP_HEAD - 4];
+        head.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(head.len(), MAX_HTTP_HEAD);
+        client.write_all(&head).await.unwrap();
+        drop(client);
+        let (buf, end) = read_http_head(&mut server).await.expect("head at bound");
+        assert_eq!(end, MAX_HTTP_HEAD);
+        assert!(buf.len() <= MAX_HTTP_HEAD);
+    }
+
+    #[tokio::test]
+    async fn proxy_with_prefix_writes_prefix_before_bidi_copy() {
+        // Fix 1 regression guard: the consumed request head MUST hit the backend FIRST, before the
+        // bidirectional splice forwards the rest of the client stream. The backend is a real
+        // loopback TcpListener (the helper dials `to` via tokio TcpStream).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = listener.local_addr().unwrap();
+
+        let prefix = b"GET /api HTTP/1.1\r\nHost: h\r\n\r\n";
+        let body = b"trailing-body-bytes";
+        let backend = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut head = vec![0u8; prefix.len()];
+            sock.read_exact(&mut head).await.unwrap();
+            let mut rest = vec![0u8; body.len()];
+            sock.read_exact(&mut rest).await.unwrap();
+            (head, rest)
+        });
+
+        // Client side of the duplex stands in for the TLS-terminated stream the helper splices.
+        let (mut client, server) = tokio::io::duplex(4096);
+        let to = backend_addr.to_string();
+        let proxy_task = tokio::spawn(async move {
+            proxy_to_backend_with_prefix(443, server, &to, prefix).await;
+        });
+
+        // Feed the rest of the request body through the splice, then close.
+        client.write_all(body).await.unwrap();
+        drop(client);
+
+        let (head, rest) = backend.await.unwrap();
+        proxy_task.await.unwrap();
+        assert_eq!(
+            head, prefix,
+            "prefix (consumed head) replayed to backend first"
+        );
+        assert_eq!(rest, body, "remaining stream spliced after the prefix");
+    }
+
+    #[tokio::test]
+    async fn serve_path_proxy_replays_consumed_head_to_backend() {
+        // End-to-end longest-prefix selection routing to a nested Proxy: the head consumed by
+        // `read_http_head` must reach the backend, proving the request is not dropped (the bug).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = listener.local_addr().unwrap();
+        let request = b"GET /api/v2/x HTTP/1.1\r\nHost: h\r\n\r\n";
+        let backend = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut head = vec![0u8; request.len()];
+            sock.read_exact(&mut head).await.unwrap();
+            head
+        });
+
+        let mut handlers: BTreeMap<String, ServeTarget> = BTreeMap::new();
+        handlers.insert("/".to_string(), proxy("127.0.0.1:1")); // shorter prefix (not selected)
+        handlers.insert("/api/v2".to_string(), proxy(&backend_addr.to_string())); // longest match
+
+        let (mut client, server) = tokio::io::duplex(4096);
+        let path_task = tokio::spawn(async move {
+            serve_path(443, server, &handlers).await;
+        });
+        client.write_all(request).await.unwrap();
+        drop(client);
+
+        let head = backend.await.unwrap();
+        path_task.await.unwrap();
+        assert_eq!(
+            head, request,
+            "serve_path routed to the longest-prefix Proxy and replayed the consumed head"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_path_text_target_emits_body() {
+        // Longest-prefix selection routing to a nested Text target: the body is emitted verbatim.
+        let mut handlers: BTreeMap<String, ServeTarget> = BTreeMap::new();
+        handlers.insert(
+            "/".to_string(),
+            ServeTarget::Text {
+                body: "root".into(),
+            },
+        );
+        handlers.insert(
+            "/hello".to_string(),
+            ServeTarget::Text {
+                body: "hello-body".into(),
+            },
+        );
+
+        let (mut client, server) = tokio::io::duplex(4096);
+        let t = tokio::spawn(async move {
+            serve_path(443, server, &handlers).await;
+        });
+        client
+            .write_all(b"GET /hello/world HTTP/1.1\r\nHost: h\r\n\r\n")
+            .await
+            .unwrap();
+        // Keep the client half open: `read_http_head` already saw the full head, and the Text target
+        // neither reads further nor needs EOF. Drain the body the server writes + shuts down.
+        let got = drain_to_string(client).await;
+        t.await.unwrap();
+        assert_eq!(got, "hello-body");
+    }
+
     // NOTE: a live bind+accept test needs a running netstack channel + overlay; the existing
     // netstack-backed managers (fallback_tcp) likewise unit-test only the pure pieces (port diff,
-    // dispatch decision) and leave the bind/accept path to integration coverage. We mirror that:
-    // `pure_reconcile` + the `terminates_tls` agreement are tested here; the bind/accept/splice path
-    // is exercised via `Device::set_serve_config` against a real device.
+    // dispatch decision) and leave the bind/accept path to integration coverage. The byte-emission
+    // helpers above are exercised directly over `tokio::io::duplex` + loopback `TcpStream` backends;
+    // the bind/accept/splice path is exercised via `Device::set_serve_config` against a real device.
 }

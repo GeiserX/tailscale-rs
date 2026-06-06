@@ -168,3 +168,35 @@ async fn dial_tls(
             Error::Io
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn url(s: &str) -> url::Url {
+        url::Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn host_header_omits_default_https_port() {
+        let (name, value) = host_header(&url("https://h/")).unwrap();
+        assert_eq!(name, HOST);
+        assert_eq!(value, "h");
+        assert!(!value.to_str().unwrap().contains(":443"));
+    }
+
+    #[test]
+    fn host_header_omits_default_http_port() {
+        let (name, value) = host_header(&url("http://h/")).unwrap();
+        assert_eq!(name, HOST);
+        assert_eq!(value, "h");
+        assert!(!value.to_str().unwrap().contains(":80"));
+    }
+
+    #[test]
+    fn host_header_includes_non_default_port() {
+        let (name, value) = host_header(&url("https://localhost:14000/")).unwrap();
+        assert_eq!(name, HOST);
+        assert_eq!(value, "localhost:14000");
+    }
+}

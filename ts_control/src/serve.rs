@@ -147,8 +147,10 @@ const MAX_PATH_NESTING_DEPTH: usize = 1;
 /// Fail-closed validation for one [`ServeTarget`], shared by [`ServeState::validate`] and
 /// [`ServeConfig::validate`]. `depth` is the current `Path` nesting level (0 at the top).
 ///
-/// Rejects: empty `Proxy`/`TcpForward` targets; `Redirect` with an out-of-`300..=399` status or an
-/// empty `to`; `Path` with empty `handlers`, a `Path` nested deeper than [`MAX_PATH_NESTING_DEPTH`]
+/// Rejects: empty `Proxy`/`TcpForward` targets; `Redirect` with an out-of-`300..=399` status, an
+/// empty `to`, or a `to` containing CR/LF (the value is written verbatim into a `Location:` response
+/// header, so embedded CR/LF would allow HTTP response-header injection / response splitting);
+/// `Path` with empty `handlers`, a `Path` nested deeper than [`MAX_PATH_NESTING_DEPTH`]
 /// (no unbounded recursion), or any nested target that itself fails validation.
 fn validate_target(target: &ServeTarget, depth: usize) -> Result<(), CertError> {
     match target {
@@ -159,6 +161,14 @@ fn validate_target(target: &ServeTarget, depth: usize) -> Result<(), CertError> 
             if to.trim().is_empty() {
                 return Err(CertError::Acme(
                     "serve redirect target must not be empty".into(),
+                ));
+            }
+            // The redirect `to` is written verbatim into a `Location:` response header at runtime.
+            // A CR or LF would terminate the header line and allow injection of arbitrary headers
+            // or a response body (response splitting). Reject it fail-closed.
+            if to.contains(['\r', '\n']) {
+                return Err(CertError::Acme(
+                    "serve redirect target must not contain CR/LF".into(),
                 ));
             }
             if !(300..=399).contains(status) {
@@ -517,6 +527,59 @@ mod tests {
             },
         };
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_redirect_with_crlf() {
+        // CR/LF in the `to` would terminate the `Location:` header line and allow response-header
+        // injection / response splitting. Must be rejected (bare CR, bare LF, and CRLF), via the
+        // shared validate_target used by ServeConfig::validate and ServeState::validate.
+        for bad in [
+            "https://host.tail1.ts.net/\r\nSet-Cookie: evil=1",
+            "https://host.tail1.ts.net/\rX",
+            "https://host.tail1.ts.net/\nX",
+        ] {
+            let c = ServeConfig {
+                name: "host.tail1.ts.net".into(),
+                port: 443,
+                target: ServeTarget::Redirect {
+                    to: bad.into(),
+                    status: 302,
+                },
+            };
+            assert!(
+                c.validate().is_err(),
+                "ServeConfig must reject CR/LF redirect target: {bad:?}"
+            );
+
+            let mut ports = alloc::collections::BTreeMap::new();
+            ports.insert(
+                443u16,
+                ServeTarget::Redirect {
+                    to: bad.into(),
+                    status: 302,
+                },
+            );
+            let st = ServeState {
+                name: "host.tail1.ts.net".into(),
+                ports,
+            };
+            assert!(
+                st.validate().is_err(),
+                "ServeState must reject CR/LF redirect target: {bad:?}"
+            );
+        }
+
+        // A normal redirect target (no CR/LF) still passes.
+        let ok = ServeConfig {
+            name: "host.tail1.ts.net".into(),
+            port: 443,
+            target: ServeTarget::Redirect {
+                to: "https://host.tail1.ts.net/app".into(),
+                status: 308,
+            },
+        };
+        assert!(ok.validate().is_ok());
     }
 
     #[test]

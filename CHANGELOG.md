@@ -6,6 +6,35 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.57](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.57) - 2026-06-07
+
+Fixes from a multi-perspective review of the v0.5.56 wave:
+
+- **Fix (Serve `Path` → `Proxy` dropped the client's first request).** `serve_path` reads the HTTP
+  request head to pick a path prefix, then proxied the stream onward — but the already-consumed
+  head bytes were never replayed to the backend, so the backend saw a request with its request
+  line + headers missing. The consumed head is now replayed before the bidirectional splice
+  (`proxy_to_backend_with_prefix`); the direct (non-`Path`) `Proxy` path is unchanged.
+- **Fix (recursive MagicDNS in TUN head-of-line blocking).** A `Decision::Forward` was awaited
+  inline in the TUN uplink pump, so one slow/hung upstream DNS query stalled *all* TUN traffic for
+  up to the 5 s timeout. Forwards now run on a bounded `JoinSet` (≤256 in flight) like the netstack
+  resolver loop; the synchronous fast paths stay inline. IPv4-only egress + NXDOMAIN fail-closed
+  fallback preserved.
+- **Fix (Serve `Redirect` header injection).** The redirect `Location` target is now rejected at
+  validation time if it contains CR/LF, closing an HTTP response-splitting vector.
+- **Fix (Tailnet Lock revocation on re-sync).** A `Full` netmap re-sync now evicts a
+  previously-admitted peer whose signature is no longer authorized under an active TKA `Authority`
+  (the retain set is filtered through the gate); the no-authority path is unchanged.
+- **Tests.** First unit tests for `ts_http_util` (`origin_form_target` incl. an
+  is-never-absolute-form regression guard for the Let's-Encrypt bug fixed in 0.5.52, `host_header`
+  port handling, default User-Agent); Serve dispatch byte-emission + oversized/malformed-head +
+  end-to-end `Path` routing; TKA enforcement driven through the real `PeerUpdate::Full`/`Delta`
+  handlers (handler refactored to a single shared `apply_peer_update` so tests exercise the real
+  path).
+- **Cleanups.** Deduplicated `find_header_end` onto the shared helper; made the `MAX_HTTP_HEAD`
+  bound exact; documented the `ssh`-graph advisory scope in `deny.toml`; refreshed a stale comment
+  in the Pebble test script.
+
 ## [0.5.56](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.56) - 2026-06-07
 
 Hardening + feature wave (security gaps + buildable parity gaps from a feature-surface audit):

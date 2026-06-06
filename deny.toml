@@ -1,3 +1,12 @@
+# NOTE on advisory coverage scope: the fork's `hosted_test` CI lane runs cargo-deny on the
+# ring-only RUNTIME graph (`--no-default-features --exclude-dev`), which excludes the off-by-default
+# `ssh` feature (russh) and dev-only deps. Consequently advisories that live ONLY in the `ssh`
+# dependency tree (e.g. russh RUSTSEC-2026-0153/0154) are NOT scanned on this fork — the
+# `--all-features` audit that would catch them lives in the `arch_independent` job, which is gated
+# to the upstream repo and never runs here. This is an accepted, deliberate gap: `ssh` is
+# off-by-default, never enabled in the shipped exit-node/proxy egress daemon, and outside the
+# product's egress path. Anyone building `--features ssh` for production must run
+# `cargo deny --all-features check advisories` themselves.
 [advisories]
 ignore = [
     { id = "RUSTSEC-2024-0436", reason = "archived crate depended on by netlink-packet-utils. Already fixed upstream, just hasn't bubbled through the dependency stack yet" },

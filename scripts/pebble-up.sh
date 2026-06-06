@@ -35,16 +35,14 @@ if [ -z "${GO_BIN}" ]; then
   exit 1
 fi
 
-# Pebble version is PINNED.
+# Pebble version is PINNED to v2.9.0.
 #
-# Pebble >= v2.10.0 hard-enforces RFC 8555 sec 6.1 ("All requests MUST include a
-# User-Agent header") and 400s every request that omits it. The fork's `acme`
-# engine (ts_control/src/acme.rs) does NOT currently send a User-Agent on its
-# ACME GET/POSTs, so it cannot complete issuance against Pebble >= 2.10.0 (or a
-# strict production CA like Boulder/Let's Encrypt). v2.9.0 is the newest release
-# that still issues for a UA-less client AND builds with current Go. We pin it
-# so this test proves the engine's full RFC 8555 state machine end-to-end today.
-# (Tracked separately: add a User-Agent to the engine for strict-CA parity.)
+# The `acme` engine now sends a User-Agent (ts_http_util), so the RFC 8555 sec 6.1
+# enforcement in Pebble >= v2.10.0 is no longer a blocker. The pin remains for a
+# DIFFERENT reason: the bundled challtestsrv's DNS-01 bind flag is `-dns01` in
+# v2.9.0 and was renamed to `-dnsserver` in v2.10.x (see the challtestsrv launch
+# below), so the flag wiring in this script is version-specific. Bumping the pin
+# requires updating that flag. v2.9.0 also builds cleanly with current Go.
 PEBBLE_VERSION="${PEBBLE_VERSION:-v2.9.0}"
 
 GOPATH="$("${GO_BIN}" env GOPATH)"

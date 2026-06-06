@@ -88,9 +88,9 @@ pub struct TunActor {
     dns_view: watch::Sender<Arc<DnsView>>,
 
     /// The overlay netstack `Channel` (the forwarder netstack's, reused — TUN mode has no
-    /// application netstack of its own) used by [`intercept_magic_dns`] to forward recursive /
-    /// split-DNS queries over the overlay (anti-leak: a fresh `0.0.0.0:0` overlay UDP socket per
-    /// query, never a host socket). Cloned into the UP pump when the device is built.
+    /// application netstack of its own) used by the UP pump's spawned [`run_forward`] to forward
+    /// recursive / split-DNS queries over the overlay (anti-leak: a fresh `0.0.0.0:0` overlay UDP
+    /// socket per query, never a host socket). Cloned into the UP pump when the device is built.
     channel: Channel,
 }
 
@@ -212,7 +212,7 @@ pub(crate) fn host_routes_from_node(
 ///
 /// When MagicDNS is enabled the host resolver is pointed at the MagicDNS service IP
 /// `100.100.100.100` — Go's model: the host sends queries to quad-100, the UP pump intercepts them
-/// in the datapath and answers in-process via the shared responder ([`intercept_magic_dns`]). There
+/// in the datapath and answers in-process via the shared responder ([`plan_intercept`]). There
 /// is NO host loopback socket. When MagicDNS is disabled, `nameservers` stays empty (a documented
 /// no-op in both the macOS and Linux `apply_dns` impls) so we never point the resolver at a dead
 /// address — fail-closed.
@@ -353,44 +353,86 @@ fn build_dns_view(
     }
 }
 
-/// In-datapath MagicDNS intercept for the UP pump (Go's `handleLocalPackets`). Returns `true` if
-/// `pkt` was a MagicDNS query that we handled in-process (the caller must NOT forward it to the
-/// overlay); `false` if it should be forwarded unchanged.
+/// Outcome of classifying an inbound TUN packet against the in-datapath MagicDNS responder.
+/// Produced by the PURE [`plan_intercept`] (no I/O, unit-testable without a TUN device) and acted on
+/// by the UP pump: the slow [`Decision::Forward`] path is handed back as [`Self::Forward`] for the
+/// pump to SPAWN, never awaited inline — so one slow upstream cannot head-of-line-block the uplink.
+enum Intercept {
+    /// Not a MagicDNS query; the pump should forward the original packet to the overlay unchanged.
+    NotIntercepted,
+    /// A malformed MagicDNS query — consumed (it was quad-100/UDP/53) but dropped silently with no
+    /// reply. The pump must NOT forward it to the overlay.
+    Dropped,
+    /// An authoritative [`Decision::Reply`] (cache / in-tailnet name): the synthesized reply bytes
+    /// are carried out for the pump to write back into the TUN INLINE (the fast path — no overlay
+    /// round-trip). The pump must NOT forward the packet to the overlay.
+    Reply {
+        /// The DNS wire response to wrap in an IPv4+UDP packet and write back into the TUN.
+        response: Vec<u8>,
+        /// The reply's destination (the host stub resolver) — the query's source endpoint.
+        src: SocketAddrV4,
+    },
+    /// A [`Decision::Forward`] (recursive / split-DNS). The slow overlay round-trip must be SPAWNED
+    /// by the pump rather than awaited inline (anti-HOL-blocking). Carries the already-resolved
+    /// [`RecursivePlan`] (computed while the view borrow was held), the original query bytes, the
+    /// fail-closed `nxdomain` fallback, and the reply destination `src`. The pump must NOT forward
+    /// the packet to the overlay.
+    Forward {
+        /// The resolved forwarding plan (UDP upstreams vs exit-node DoH over the overlay). The
+        /// upstream `SocketAddr`s come only from `decide`/`recursive_plan`, which already
+        /// `.filter(SocketAddr::is_ipv4)`; this path never constructs an upstream address, so the
+        /// IPv4-only egress invariant is inherited.
+        plan: RecursivePlan,
+        /// The original query bytes to forward verbatim.
+        query: Vec<u8>,
+        /// Fail-closed NXDOMAIN response written back if every upstream fails.
+        nxdomain: Vec<u8>,
+        /// The reply's destination (the host stub resolver) — the query's source endpoint.
+        src: SocketAddrV4,
+    },
+}
+
+/// In-datapath MagicDNS classify+decide for the UP pump (Go's `handleLocalPackets`). PURE: no I/O,
+/// factored out of the pump loop so the branch behavior — crucially, that a [`Decision::Forward`] is
+/// handed back to be SPAWNED rather than awaited inline — is unit-testable without a TUN device
+/// (mirrors `magic_dns::decide`'s "factored out of the socket loop" rationale).
 ///
-/// A matched query is answered via the SHARED [`decide`] responder against the latest [`DnsView`];
-/// the reply IPv4+UDP packet is written straight back into the TUN via `device` — no host loopback
-/// socket and no overlay egress for the DNS itself (anti-leak).
+/// Fast paths resolve synchronously: a non-MagicDNS packet ⇒ [`Intercept::NotIntercepted`]; a
+/// malformed query ⇒ [`Intercept::Dropped`]; an authoritative [`Decision::Reply`] ⇒
+/// [`Intercept::Reply`] carrying the response bytes for the pump to write back into the TUN INLINE
+/// (no overlay round-trip — no host loopback socket, anti-leak).
 ///
-/// [`Decision::Forward`] handling — recursive / split-DNS forwarding — rides the overlay `Channel`
-/// (the forwarder netstack's, threaded in at the spawn site), mirroring the netstack serve loop
-/// (`magic_dns.rs:598-628`): a recursive forward computes [`recursive_plan`] (UDP upstreams, or
-/// delegate to the active exit node's peerAPI DoH over the overlay); a split-DNS route stays on its
-/// configured UDP upstreams. Both forward over the overlay (anti-leak: never a host socket) and fall
-/// back to the pre-built `nxdomain` on failure (fail-closed). The upstream `SocketAddr`s come only
-/// from `decide`/`recursive_plan`, which already `.filter(SocketAddr::is_ipv4)` — this fn never
-/// constructs an upstream address, so the IPv4-only egress invariant is inherited.
-async fn intercept_magic_dns(
-    device: &Arc<AsyncTunTransport>,
-    channel: &Channel,
-    dns_view_rx: &watch::Receiver<Arc<DnsView>>,
-    pkt: &[u8],
-) -> bool {
+/// The SLOW path — [`Decision::Forward`] (recursive / split-DNS forwarding, a full overlay DNS
+/// round-trip bounded only by a ~5s timeout) — is NOT awaited here. It is returned as
+/// [`Intercept::Forward`] carrying the already-resolved [`RecursivePlan`] so the pump can SPAWN it
+/// onto a [`JoinSet`] (see the UP pump in the StateUpdate handler), mirroring the netstack serve
+/// loop (`magic_dns.rs:598-632`): "a slow upstream never blocks other queries". Awaiting the forward
+/// inline (as this did historically) stalls the ENTIRE TUN uplink — all application traffic, not
+/// just DNS — for up to the forward timeout while the pump cannot pull the next packet.
+///
+/// The plan (UDP upstreams vs exit-node DoH) is computed here from the current view; both branches
+/// route through `recursive_plan`/the `decide`-built upstreams, so the IPv4-only filter at
+/// `magic_dns.rs:385,429` is inherited (we never build a `SocketAddr` here). The fail-closed
+/// `nxdomain` fallback is carried into the spawned task and written on forward failure — same as
+/// before, just from the spawned task rather than inline.
+fn plan_intercept(view: &DnsView, pkt: &[u8]) -> Intercept {
     let Some(query) = classify_magic_dns(pkt) else {
-        return false;
+        return Intercept::NotIntercepted;
     };
+    // The reply destination (the query's source endpoint). Bound before the `Decision::Forward`
+    // arm shadows `query` with the forward's own owned query bytes.
+    let src = query.src;
 
-    // Read the freshest view per query (mirrors the netstack serve loop).
-    let view = dns_view_rx.borrow().clone();
-
-    let response = match decide(&view, query.dns_payload) {
+    match decide(view, query.dns_payload) {
         // Malformed query: drop silently. We still consumed it (it was quad-100/UDP/53) so it must
         // NOT be forwarded to the overlay.
-        None => return true,
-        Some(Decision::Reply(resp)) => resp,
-        // Forward over the overlay, mirroring the netstack serve loop (`magic_dns.rs:598-628`). The
+        None => Intercept::Dropped,
+        Some(Decision::Reply(response)) => Intercept::Reply { response, src },
+        // Forward over the overlay, mirroring the netstack serve loop (`magic_dns.rs:598-632`). The
         // plan (UDP upstreams vs exit-node DoH) is computed from the current view; both branches
         // route through `recursive_plan`/the `decide`-built upstreams, so the IPv4-only filter at
-        // `magic_dns.rs:385,429` is inherited (we never build a `SocketAddr` here).
+        // `magic_dns.rs:385,429` is inherited (we never build a `SocketAddr` here). The overlay
+        // round-trip is NOT awaited here — it is handed back for the pump to SPAWN (anti-HOL).
         Some(Decision::Forward {
             upstreams,
             query,
@@ -398,27 +440,61 @@ async fn intercept_magic_dns(
             recursive,
         }) => {
             let plan = if recursive {
-                recursive_plan(&view, upstreams)
+                recursive_plan(view, upstreams)
             } else {
                 RecursivePlan::Udp(upstreams)
             };
-            match plan {
-                RecursivePlan::Udp(ups) => forward_query(channel, &ups, &query, nxdomain).await,
-                RecursivePlan::Doh(addr) => {
-                    crate::peerapi_doh::forward_doh(channel, addr, &query, nxdomain).await
-                }
+            Intercept::Forward {
+                plan,
+                query,
+                nxdomain,
+                src,
             }
         }
-    };
+    }
+}
 
-    let reply_pkt = build_dns_response(query.src, &response);
+/// Write an authoritative MagicDNS reply (the fast path) back into the TUN inline. The synthesized
+/// IPv4+UDP packet goes straight back to the querier via `device` — no host loopback socket and no
+/// overlay egress for the DNS itself (anti-leak).
+async fn send_dns_reply(device: &Arc<AsyncTunTransport>, src: SocketAddrV4, response: &[u8]) {
+    let reply_pkt = build_dns_response(src, response);
     if let Err(e) = device
         .send(core::iter::once(ts_packet::PacketMut::from(reply_pkt)))
         .await
     {
         tracing::warn!(error = %e, "magic dns tun reply send failed");
     }
-    true
+}
+
+/// Run the SLOW [`Decision::Forward`] overlay round-trip and write the synthesized DNS reply back
+/// into the TUN. Spawned onto the pump's `JoinSet` so it never blocks the uplink (see
+/// [`plan_intercept`] / the UP pump). Mirrors the spawned forward in the netstack serve loop
+/// (`magic_dns.rs:614-627`): forward over the overlay (anti-leak: never a host socket), falling back
+/// to the pre-built `nxdomain` on failure (fail-closed), then write the reply packet into the TUN.
+/// The upstreams are carried in `plan` (from `decide`/`recursive_plan`, already v4-only filtered);
+/// this fn never constructs an upstream `SocketAddr`, so the IPv4-only egress invariant is inherited.
+async fn run_forward(
+    device: Arc<AsyncTunTransport>,
+    channel: Channel,
+    plan: RecursivePlan,
+    query: Vec<u8>,
+    nxdomain: Vec<u8>,
+    src: SocketAddrV4,
+) {
+    let response = match plan {
+        RecursivePlan::Udp(ups) => forward_query(&channel, &ups, &query, nxdomain).await,
+        RecursivePlan::Doh(addr) => {
+            crate::peerapi_doh::forward_doh(&channel, addr, &query, nxdomain).await
+        }
+    };
+    let reply_pkt = build_dns_response(src, &response);
+    if let Err(e) = device
+        .send(core::iter::once(ts_packet::PacketMut::from(reply_pkt)))
+        .await
+    {
+        tracing::warn!(error = %e, "magic dns tun forwarded reply send failed");
+    }
 }
 
 impl kameo::Actor for TunActor {
@@ -559,6 +635,21 @@ impl Message<Arc<ts_control::StateUpdate>> for TunActor {
         // queries (the forwarder netstack's; egresses over the overlay — anti-leak).
         let dns_channel = self.channel.clone();
         self._joinset.spawn(async move {
+            // In-flight MagicDNS forward tasks. The slow `Decision::Forward` overlay round-trip
+            // (bounded only by a ~5s timeout) is SPAWNED here rather than awaited inline, so one
+            // slow/hung upstream never head-of-line-blocks the ENTIRE TUN uplink (all application
+            // traffic, not just DNS). Mirrors the netstack serve loop's `JoinSet`
+            // (`magic_dns.rs:577,614-632`): spawn each forward, reap with `try_join_next`.
+            //
+            // CONCURRENCY BOUND: a `JoinSet` reaped with `try_join_next` matches `magic_dns.rs`
+            // for consistency (the pump owns the set across loop iterations, so no separate
+            // semaphore is needed). To avoid trading HOL-blocking for unbounded task growth under a
+            // DNS flood, in-flight forwards are capped at `MAX_INFLIGHT_FORWARDS`: at the cap we
+            // synchronously reap one completed forward (`join_next`) before spawning the next.
+            // Worst case is one forward's latency of back-pressure on *new DNS forwards only* — the
+            // non-DNS uplink and the authoritative/no-intercept fast paths are never blocked.
+            const MAX_INFLIGHT_FORWARDS: usize = 256;
+            let mut forwards: JoinSet<()> = JoinSet::new();
             loop {
                 // Drain the (non-`Send`) recv iterator into an owned batch first, so no part of it
                 // is held across the intercept's `await` (the iterator is not `Send`; `PacketMut`
@@ -569,21 +660,59 @@ impl Message<Arc<ts_control::StateUpdate>> for TunActor {
                         Ok(p) => {
                             // Peel off quad-100/UDP/53 DNS queries and answer them in-process: an
                             // authoritative reply is written straight back into the TUN via `dev_up`
-                            // (no overlay egress, no host socket); a Forward (recursive / split-DNS)
-                            // egresses over the overlay `Channel` (anti-leak), never a host socket.
-                            // Everything else forwards to the overlay unchanged.
-                            if intercept_magic_dns(&dev_up, &dns_channel, &dns_view_rx, p.as_ref())
-                                .await
-                            {
-                                continue;
-                            }
-                            if up.send(vec![p]).is_err() {
-                                return;
+                            // (no overlay egress, no host socket) INLINE; a Forward (recursive /
+                            // split-DNS) is SPAWNED so its overlay round-trip never blocks the pump.
+                            // Everything else forwards to the overlay unchanged. The view is read
+                            // fresh per packet (mirrors the netstack serve loop); the borrow guard
+                            // is dropped at the end of this statement, never held across an `await`.
+                            let plan = plan_intercept(&dns_view_rx.borrow(), p.as_ref());
+                            match plan {
+                                Intercept::NotIntercepted => {
+                                    if up.send(vec![p]).is_err() {
+                                        return;
+                                    }
+                                }
+                                // Malformed query: consumed but dropped silently; never forward to
+                                // the overlay.
+                                Intercept::Dropped => {}
+                                // Authoritative reply (fast path): write it back into the TUN inline.
+                                Intercept::Reply { response, src } => {
+                                    send_dns_reply(&dev_up, src, &response).await;
+                                }
+                                // Spawn the slow overlay round-trip; it writes the reply (or the
+                                // fail-closed nxdomain) back into the TUN when it completes.
+                                Intercept::Forward {
+                                    plan,
+                                    query,
+                                    nxdomain,
+                                    src,
+                                } => {
+                                    // Bound in-flight forwards: reap one completed task at the cap
+                                    // before spawning, so a DNS flood can't grow tasks without
+                                    // limit. This back-pressures *new DNS forwards only*, never the
+                                    // non-DNS uplink or the inline fast paths.
+                                    if forwards.len() >= MAX_INFLIGHT_FORWARDS {
+                                        // Reap exactly one completed forward; the join result is
+                                        // intentionally discarded (the task is `()` and logs its
+                                        // own send failures).
+                                        drop(forwards.join_next().await);
+                                    }
+                                    forwards.spawn(run_forward(
+                                        dev_up.clone(),
+                                        dns_channel.clone(),
+                                        plan,
+                                        query,
+                                        nxdomain,
+                                        src,
+                                    ));
+                                }
                             }
                         }
                         Err(e) => tracing::warn!(error = %e, "tun recv error"),
                     }
                 }
+                // Reap finished forward tasks without blocking (mirrors `magic_dns.rs:632`).
+                while forwards.try_join_next().is_some() {}
             }
         });
 
@@ -642,8 +771,8 @@ mod tests {
     use ts_control::TunConfig;
 
     use super::{
-        HostRouteGating, build_dns_view, host_dns_from_dns_config, host_routes_from_node,
-        tun_config_from_control,
+        HostRouteGating, Intercept, build_dns_view, host_dns_from_dns_config,
+        host_routes_from_node, plan_intercept, tun_config_from_control,
     };
     use crate::{
         env::{Env, ForwarderConfig},
@@ -1168,6 +1297,109 @@ mod tests {
             ),
             RecursivePlan::Udp(_) => panic!("active exit node with no kept-local resolvers ⇒ DoH"),
         }
+    }
+
+    /// Wrap a DNS payload in an IPv4/UDP packet `client -> 100.100.100.100:53` — a packet the UP
+    /// pump's intercept classifies as a MagicDNS query.
+    fn quad100_query_packet(client: SocketAddrV4, payload: &[u8]) -> Vec<u8> {
+        let b = etherparse::PacketBuilder::ipv4(client.ip().octets(), [100, 100, 100, 100], 64)
+            .udp(client.port(), 53);
+        let mut out = Vec::with_capacity(b.size(payload.len()));
+        b.write(&mut out, payload).unwrap();
+        out
+    }
+
+    /// HOL-blocking regression: the UP pump's intercept must hand a `Decision::Forward` back as
+    /// [`Intercept::Forward`] (a plan to SPAWN) rather than awaiting the overlay round-trip inline —
+    /// so one slow/hung upstream can never head-of-line-block the entire TUN uplink. `plan_intercept`
+    /// is the pure, synchronous decision seam (no device, no `await`): if it ever returned only after
+    /// the forward completed, a forward could not be a synchronous return value at all. This also
+    /// pins the fast-path classifications the pump relies on: a non-MagicDNS packet forwards to the
+    /// overlay, an authoritative reply is carried out for an inline write, and a malformed query is
+    /// dropped. The forward's upstreams come only from `decide`/`recursive_plan` (v4-only filtered),
+    /// so this path never constructs an upstream `SocketAddr` (IPv4-only egress invariant inherited).
+    #[tokio::test]
+    async fn intercept_plan_spawns_forward_and_classifies_fast_paths() {
+        let client: SocketAddrV4 = "100.64.0.7:34567".parse().unwrap();
+
+        // A public name with a global UDP resolver and no exit node ⇒ a recursive Forward whose plan
+        // is `RecursivePlan::Udp` of the configured upstream. Crucially this is RETURNED, not awaited
+        // — the pump spawns it (see the UP pump's `forwards.spawn(run_forward(...))`).
+        let update = dns_update(vec![udp_resolver("8.8.8.8:53")]);
+        let env = test_env(None);
+        let peer = exit_peer("exit", "100.64.0.9", 1080);
+        let view = build_dns_view(&env, &update, Some(peer_db_with(&peer)), true);
+
+        let fwd_pkt = quad100_query_packet(client, &build_query(0x4242, &["example", "com"]));
+        match plan_intercept(&view, &fwd_pkt) {
+            Intercept::Forward {
+                plan, src, query, ..
+            } => {
+                assert_eq!(
+                    src, client,
+                    "forward reply is addressed back to the querier"
+                );
+                assert!(
+                    !query.is_empty(),
+                    "the original query bytes are carried verbatim"
+                );
+                match plan {
+                    RecursivePlan::Udp(ups) => assert_eq!(
+                        ups,
+                        vec!["8.8.8.8:53".parse().unwrap()],
+                        "no exit node ⇒ UDP plan of the v4-only-filtered upstream (never built here)"
+                    ),
+                    RecursivePlan::Doh(_) => panic!("no exit node configured ⇒ must not be DoH"),
+                }
+            }
+            _ => panic!("a public name with a global resolver must yield a SPAWNED Forward plan"),
+        }
+
+        // A tailnet self-name `A` query is answered authoritatively from the view (an INLINE Reply
+        // carried out for the pump to write back), or — lacking overlay address data in this
+        // fixture — Forwarded; either way it is consumed, never passed through.
+        let reply_pkt =
+            quad100_query_packet(client, &build_query(0x1, &["self", "user", "ts", "net"]));
+        match plan_intercept(&view, &reply_pkt) {
+            Intercept::Reply { src, response } => {
+                assert_eq!(
+                    src, client,
+                    "the inline reply is addressed back to the querier"
+                );
+                assert!(
+                    !response.is_empty(),
+                    "an authoritative reply carries response bytes"
+                );
+            }
+            other => assert!(
+                matches!(other, Intercept::Forward { .. }),
+                "a tailnet self-name is answered authoritatively (Reply) or, lacking overlay data, \
+                 Forwarded — never NotIntercepted/Dropped"
+            ),
+        }
+
+        // A non-MagicDNS packet (UDP/53 to a real upstream IP) forwards to the overlay unchanged.
+        let passthrough = {
+            let b = etherparse::PacketBuilder::ipv4(client.ip().octets(), [8, 8, 8, 8], 64)
+                .udp(client.port(), 53);
+            let mut out = Vec::new();
+            b.write(&mut out, b"x").unwrap();
+            out
+        };
+        assert!(
+            matches!(
+                plan_intercept(&view, &passthrough),
+                Intercept::NotIntercepted
+            ),
+            "a packet not destined to quad-100:53 must pass through to the overlay"
+        );
+
+        // A malformed query to quad-100:53 is consumed but dropped silently (never forwarded).
+        let malformed = quad100_query_packet(client, &[0xff, 0x00]);
+        assert!(
+            matches!(plan_intercept(&view, &malformed), Intercept::Dropped),
+            "a malformed quad-100/UDP/53 query is dropped, never forwarded to the overlay"
+        );
     }
 
     /// Defaults must apply when control supplies no knobs: name `tailscale0`, MTU `1280`, and the
