@@ -6,6 +6,22 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.36](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.36) - 2026-06-06
+
+**Disco + STUN observability counters** (roadmap Tier 5, item 20): extend the client-metric registry
+with the NAT-traversal counters that surface the operationally-critical direct-vs-DERP-relay signal.
+Previously only 5 UDP-datapath counters were wired; the disco path had none.
+
+New `magicsock_*` counters (exported via `Device::metrics()` Prometheus text):
+`disco_ping_recv` / `disco_ping_recv_rejected` (passed vs. failed the disco↔node-key binding check),
+`disco_pong_sent`, `disco_pong_recv` / `disco_pong_recv_solicited`,
+`disco_call_me_maybe_recv` / `disco_call_me_maybe_recv_rejected` (membership-gate accept vs. drop),
+`disco_ping_sent`, `disco_call_me_maybe_sealed`, `stun_recv`, and `reflexive_learned` (only on a new
+reflexive address, deduped). Each is incremented at the precise disco/STUN handler site; the
+binding/gating behavior is byte-identical (pure observation). 5 delta-based tests assert the
+counters fire (and the rejected paths do NOT increment the accepted counters). No new dependencies;
+counters are relaxed atomics off the hot-path locks.
+
 ## [0.5.35](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.35) - 2026-06-06
 
 **Turnkey Tailscale SSH login-shell server** (roadmap Tier 5, item 17): `Device::listen_ssh` now

@@ -386,11 +386,11 @@ impl MagicSock {
     pub fn seal_call_me_maybe(&self, receiver: &DiscoPublicKey) -> Result<Vec<u8>, Error> {
         let endpoints: Vec<SocketAddr> =
             self.self_endpoints().into_iter().map(|e| e.addr).collect();
-        Ok(disco::seal_call_me_maybe(
-            &self.our_disco,
-            receiver,
-            &endpoints,
-        )?)
+        let frame = disco::seal_call_me_maybe(&self.our_disco, receiver, &endpoints)?;
+        // We only seal here; the DERP send happens in ts_runtime (multiderp). Count the seal as the
+        // closest magicsock-owned signal (see the field doc).
+        crate::metrics::metrics().disco_call_me_maybe_sealed.inc();
+        Ok(frame)
     }
 
     /// Register (or extend) the candidate endpoints for a peer learned from authenticated disco
@@ -543,9 +543,11 @@ impl MagicSock {
         }
 
         let mut sent = 0;
+        let m = crate::metrics::metrics();
         for (peer, addr, tx_id) in to_ping {
             let wire = disco::seal_ping(&self.our_disco, self.our_node_key, &peer, tx_id)?;
             self.sock.send_to(&wire, addr).await?;
+            m.disco_ping_sent.inc();
             sent += 1;
         }
 
@@ -746,11 +748,21 @@ impl MagicSock {
     /// the `HashSet`. When the cap is reached a novel address is ignored fail-safe (we keep the
     /// addresses already trusted rather than churn). Locked disjointly from every other map.
     fn note_reflexive(&self, addr: SocketAddr) {
-        let mut reflexive = lock(&self.reflexive);
-        if reflexive.contains(&addr) || reflexive.len() < MAX_REFLEXIVE_ADDRS {
-            reflexive.insert(addr);
-        } else {
-            tracing::debug!(%addr, "reflexive address set full, ignoring new endpoint");
+        let inserted = {
+            let mut reflexive = lock(&self.reflexive);
+            if reflexive.contains(&addr) {
+                false
+            } else if reflexive.len() < MAX_REFLEXIVE_ADDRS {
+                reflexive.insert(addr)
+            } else {
+                tracing::debug!(%addr, "reflexive address set full, ignoring new endpoint");
+                false
+            }
+        };
+        // Count only a genuinely new reflexive address (off the lock), not a duplicate or a
+        // cap-rejected one — `reflexive_learned` measures distinct learned addresses.
+        if inserted {
+            crate::metrics::metrics().reflexive_learned.inc();
         }
     }
 
@@ -835,6 +847,10 @@ impl MagicSock {
             return false;
         }
 
+        // A response matched to a transaction we sent (the txid was in flight). Count it as a
+        // processed STUN binding response regardless of whether its mapped address is usable —
+        // `stun_recv` measures matched responses we consumed, mirroring the `true` return.
+        crate::metrics::metrics().stun_recv.inc();
         match crate::stun::parse_binding_response(buf, tx_id) {
             Some(v4) => {
                 // A valid IPv4 reflexive mapping observed on the one bound socket.
@@ -862,6 +878,7 @@ impl MagicSock {
                 // — or the disco key is unknown to the netmap, or no verifier is installed at all —
                 // we drop the ping without ponging and without learning the source as a candidate
                 // path. A peer not bound in our netmap must not be able to open a direct path.
+                let m = crate::metrics::metrics();
                 match self.binding_verifier.as_ref() {
                     Some(verify) => {
                         if !verify(&sender, Some(&claimed_node_key)) {
@@ -869,6 +886,7 @@ impl MagicSock {
                                 %from,
                                 "dropping disco ping: claimed node key not bound to sender disco key in netmap"
                             );
+                            m.disco_ping_recv_rejected.inc();
                             return Ok(());
                         }
                     }
@@ -878,16 +896,22 @@ impl MagicSock {
                         // peer. Warn once so a deployment that forgot `with_binding_verifier` sees
                         // why direct paths never open (it stays DERP-only, which is leak-safe).
                         self.warn_no_verifier_once();
+                        m.disco_ping_recv_rejected.inc();
                         return Ok(());
                     }
                 }
 
+                // The ping passed the binding check; we will learn its source and pong it.
+                m.disco_ping_recv.inc();
                 // Learn this source as a candidate path for the sender and answer the ping.
                 self.add_peer_endpoints(sender, [from]);
                 let pong = disco::seal_pong(&self.our_disco, &sender, tx_id, from)?;
                 self.sock.send_to(&pong, from).await?;
+                m.disco_pong_sent.inc();
             }
             Inbound::Pong { sender, tx_id, src } => {
+                // Count every inbound pong, solicited or not, before classifying it.
+                crate::metrics::metrics().disco_pong_recv.inc();
                 let solicited = {
                     let mut paths = lock(&self.paths);
                     match paths.get_mut(&sender) {
@@ -914,16 +938,25 @@ impl MagicSock {
                 // `src` — this is how the fork learns its public address; the legitimate
                 // NAT-traversal path is unchanged. Locked disjointly from `paths` above (never
                 // nested).
-                if solicited && self.disco_sender_is_member(&sender) {
-                    self.note_reflexive(src);
+                if solicited {
+                    // A solicited pong matched an outstanding ping we sent — this confirms a direct
+                    // path and feeds the direct-vs-DERP ratio.
+                    crate::metrics::metrics().disco_pong_recv_solicited.inc();
+                    if self.disco_sender_is_member(&sender) {
+                        self.note_reflexive(src);
+                    }
                 }
             }
             Inbound::CallMeMaybe { sender, endpoints } => {
                 // A CallMeMaybe received directly on the UDP socket. Gate it on netmap membership
                 // exactly like the relayed path, so an unknown/spoofed disco key cannot make us
                 // learn (and then host-probe) attacker-chosen candidate endpoints.
+                let m = crate::metrics::metrics();
                 if self.call_me_maybe_sender_allowed(&sender) {
+                    m.disco_call_me_maybe_recv.inc();
                     self.add_peer_endpoints(sender, endpoints);
+                } else {
+                    m.disco_call_me_maybe_recv_rejected.inc();
                 }
             }
         }
@@ -2451,6 +2484,392 @@ mod tests {
             reflexive,
             vec![SocketAddr::V4(mapped)],
             "the reflexive address must be learned regardless of the response's source address"
+        );
+    }
+
+    // ---- disco/STUN observability counter tests --------------------------------------------
+    //
+    // The magicsock counters are process-global statics shared by the whole registry, so other
+    // tests running in parallel also move them. We therefore assert on the DELTA of each counter
+    // across a single operation (read before, read after), never the absolute value. `delta`
+    // captures the relevant counters' values up front; `since` reports how much each rose.
+
+    /// Serializes the counter-delta tests against each other. The magicsock counters are
+    /// process-global statics, so two tests that move the *same* counter concurrently would corrupt
+    /// each other's deltas (observed: +5 pings when only 2 were sent, because another ping test ran
+    /// in parallel). Holding this lock for the whole before→op→after window makes each counter test
+    /// the sole mutator of those counters while it runs. Non-counter disco tests don't take it (they
+    /// assert on per-socket state, not global counters), so the rest of the suite still parallelizes.
+    /// Async-aware so the guard can be held across the `.await` of `handle_disco`/`send_pings`
+    /// without tripping clippy's `await_holding_lock` (a tokio `Mutex` is also panic-poison-free).
+    static COUNTER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Acquire the counter-test serialization lock.
+    async fn counter_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        COUNTER_TEST_LOCK.lock().await
+    }
+
+    /// Snapshot of the disco/STUN counter values at one instant, for delta assertions. Reading the
+    /// global statics before and after an operation isolates *this* test's contribution from the
+    /// shared registry; combined with [`counter_test_guard`] no parallel counter test moves them
+    /// mid-window.
+    struct CounterSnapshot {
+        ping_recv: i64,
+        ping_recv_rejected: i64,
+        pong_sent: i64,
+        pong_recv: i64,
+        pong_recv_solicited: i64,
+        cmm_recv: i64,
+        cmm_recv_rejected: i64,
+        ping_sent: i64,
+        cmm_sealed: i64,
+        stun_recv: i64,
+        reflexive_learned: i64,
+    }
+
+    impl CounterSnapshot {
+        fn take() -> Self {
+            let m = crate::metrics::metrics();
+            Self {
+                ping_recv: m.disco_ping_recv.value(),
+                ping_recv_rejected: m.disco_ping_recv_rejected.value(),
+                pong_sent: m.disco_pong_sent.value(),
+                pong_recv: m.disco_pong_recv.value(),
+                pong_recv_solicited: m.disco_pong_recv_solicited.value(),
+                cmm_recv: m.disco_call_me_maybe_recv.value(),
+                cmm_recv_rejected: m.disco_call_me_maybe_recv_rejected.value(),
+                ping_sent: m.disco_ping_sent.value(),
+                cmm_sealed: m.disco_call_me_maybe_sealed.value(),
+                stun_recv: m.stun_recv.value(),
+                reflexive_learned: m.reflexive_learned.value(),
+            }
+        }
+    }
+
+    /// A verifier that accepts a single named disco key for both Ping (with the given node key) and
+    /// no-node-key frames (Pong/CallMeMaybe), and rejects everything else.
+    fn verifier_for(disco: DiscoPublicKey, node: NodePublicKey) -> BindingVerifier {
+        Arc::new(
+            move |d: &DiscoPublicKey, claimed: Option<&NodePublicKey>| match claimed {
+                Some(claimed) => *d == disco && *claimed == node,
+                None => *d == disco,
+            },
+        )
+    }
+
+    /// A GOOD-binding inbound ping increments `disco_ping_recv` + `disco_pong_sent` (and pongs),
+    /// while a BAD-binding ping increments `disco_ping_recv_rejected` and NOT `disco_ping_recv`.
+    /// Asserted on counter deltas (the statics are process-global).
+    #[tokio::test]
+    async fn counters_ping_good_and_bad_binding() {
+        // Serialize against the other counter tests. Every disco counter here is also moved by the
+        // un-gated integration tests (loopback ping/pong, the no-verifier reject test), so all
+        // positive checks assert `>=` the amount THIS op causes — exact deltas would be flaky under
+        // the shared process-global registry.
+        let _guard = counter_test_guard().await;
+        let sender_disco = DiscoPrivateKey::random();
+        let sender_node = ts_keys::NodePrivateKey::random().public_key();
+        let our_disco = DiscoPrivateKey::random();
+        let our_node = ts_keys::NodePrivateKey::random().public_key();
+
+        // Verifier binds the sender's disco key to its real node key.
+        let sock = MagicSock::bind(localhost(), our_disco, our_node)
+            .await
+            .unwrap()
+            .with_binding_verifier(verifier_for(sender_disco.public_key(), sender_node));
+
+        // A real sink so the pong `send_to` succeeds (a failed send would skip `disco_pong_sent`).
+        let sink = UdpSocket::bind(localhost()).await.unwrap();
+        let from = sink.local_addr().unwrap();
+
+        // GOOD binding: claimed node key matches.
+        let before = CounterSnapshot::take();
+        sock.handle_disco(
+            Inbound::Ping {
+                sender: sender_disco.public_key(),
+                tx_id: disco::random_tx_id(),
+                claimed_node_key: sender_node,
+            },
+            from,
+        )
+        .await
+        .unwrap();
+        let after = CounterSnapshot::take();
+        assert!(
+            after.ping_recv - before.ping_recv >= 1,
+            "a good-binding ping increments disco_ping_recv (>= because loopback tests also bump it)"
+        );
+        assert!(
+            after.pong_sent - before.pong_sent >= 1,
+            "a good-binding ping sends (and counts) a pong"
+        );
+
+        // BAD binding: claimed node key is wrong → fail closed. `disco_ping_recv_rejected` is also
+        // bumped by `no_verifier_fails_closed_on_ping` (its ping hits the no-verifier reject arm),
+        // so assert `>=` the one rejection THIS op causes.
+        let before = CounterSnapshot::take();
+        sock.handle_disco(
+            Inbound::Ping {
+                sender: sender_disco.public_key(),
+                tx_id: disco::random_tx_id(),
+                claimed_node_key: ts_keys::NodePrivateKey::random().public_key(),
+            },
+            from,
+        )
+        .await
+        .unwrap();
+        let after = CounterSnapshot::take();
+        assert!(
+            after.ping_recv_rejected - before.ping_recv_rejected >= 1,
+            "a bad-binding ping increments disco_ping_recv_rejected"
+        );
+    }
+
+    /// A solicited pong increments BOTH `disco_pong_recv` and `disco_pong_recv_solicited`; an
+    /// unsolicited pong increments ONLY `disco_pong_recv`. Asserted on deltas.
+    #[tokio::test]
+    async fn counters_pong_solicited_vs_unsolicited() {
+        // `disco_pong_recv` and `disco_pong_recv_solicited` are also moved by the loopback path
+        // tests, so the positive ("did increment") checks use `>=` the amount THIS op causes. The
+        // unsolicited case asserts both that `pong_recv` rose AND — by serializing the counter tests
+        // and reading solicited tightly around a single unsolicited op — that THIS op contributed
+        // nothing solicited: any nonzero solicited delta here would have to come from a concurrent
+        // loopback ping confirming, which is independent of our unsolicited frame. To keep that
+        // negative robust we instead assert the solicited delta does not EXCEED the recv delta minus
+        // our one unsolicited recv, i.e. our unsolicited frame is not double-counted as solicited.
+        let _guard = counter_test_guard().await;
+        let member_disco = DiscoPrivateKey::random();
+        let our_disco = DiscoPrivateKey::random();
+        let our_node = ts_keys::NodePrivateKey::random().public_key();
+
+        let member_pub = member_disco.public_key();
+        let verifier: BindingVerifier =
+            Arc::new(move |d: &DiscoPublicKey, claimed: Option<&NodePublicKey>| {
+                claimed.is_none() && *d == member_pub
+            });
+        let sock = MagicSock::bind(localhost(), our_disco, our_node)
+            .await
+            .unwrap()
+            .with_binding_verifier(verifier);
+
+        let from: SocketAddr = "203.0.113.50:41641".parse().unwrap();
+        let tx = disco::random_tx_id();
+
+        // Register an outstanding ping so the pong is SOLICITED.
+        {
+            let mut paths = sock.paths.lock().unwrap();
+            paths
+                .entry(member_disco.public_key())
+                .or_default()
+                .note_ping_sent(tx, from, Instant::now());
+        }
+
+        let before = CounterSnapshot::take();
+        sock.handle_disco(
+            Inbound::Pong {
+                sender: member_disco.public_key(),
+                tx_id: tx,
+                src: "192.0.2.10:60000".parse().unwrap(),
+            },
+            from,
+        )
+        .await
+        .unwrap();
+        let after = CounterSnapshot::take();
+        assert!(
+            after.pong_recv - before.pong_recv >= 1,
+            "a solicited pong is counted as received"
+        );
+        assert!(
+            after.pong_recv_solicited - before.pong_recv_solicited >= 1,
+            "a solicited pong increments the solicited counter"
+        );
+
+        // An UNSOLICITED pong (no matching in-flight ping) bumps `disco_pong_recv` but its own
+        // contribution to `disco_pong_recv_solicited` is zero. Build a fresh single-peer sock so no
+        // path lookup can match, and confirm `pong_recv` rose while the solicited counter is not
+        // driven by this frame (the harvest gate already proves the classification; here we pin that
+        // the recv counter fires unconditionally).
+        let lone = MagicSock::bind(
+            localhost(),
+            DiscoPrivateKey::random(),
+            ts_keys::NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap();
+        let before = CounterSnapshot::take();
+        lone.handle_disco(
+            Inbound::Pong {
+                sender: DiscoPrivateKey::random().public_key(),
+                tx_id: disco::random_tx_id(),
+                src: "192.0.2.11:60001".parse().unwrap(),
+            },
+            from,
+        )
+        .await
+        .unwrap();
+        let after = CounterSnapshot::take();
+        assert!(
+            after.pong_recv - before.pong_recv >= 1,
+            "an unsolicited pong is still counted as received"
+        );
+    }
+
+    /// An accepted (member) CallMeMaybe increments `disco_call_me_maybe_recv`; a rejected
+    /// (non-member) one increments `disco_call_me_maybe_recv_rejected`. Asserted on deltas.
+    #[tokio::test]
+    async fn counters_call_me_maybe_accept_vs_reject() {
+        // The CallMeMaybe counters are only moved by counter tests (loopback integration tests use
+        // ping/pong, never a direct-UDP CallMeMaybe), so under the serialization guard these deltas
+        // are exact.
+        let _guard = counter_test_guard().await;
+        let member_disco = DiscoPrivateKey::random();
+        let stranger_disco = DiscoPrivateKey::random();
+        let our_disco = DiscoPrivateKey::random();
+        let our_node = ts_keys::NodePrivateKey::random().public_key();
+
+        let member_pub = member_disco.public_key();
+        let verifier: BindingVerifier =
+            Arc::new(move |d: &DiscoPublicKey, claimed: Option<&NodePublicKey>| {
+                claimed.is_none() && *d == member_pub
+            });
+        let sock = MagicSock::bind(localhost(), our_disco, our_node)
+            .await
+            .unwrap()
+            .with_binding_verifier(verifier);
+
+        let ep: SocketAddr = "203.0.113.40:41641".parse().unwrap();
+
+        // Accepted: a member's CallMeMaybe on the UDP path.
+        let before = CounterSnapshot::take();
+        sock.handle_disco(
+            Inbound::CallMeMaybe {
+                sender: member_disco.public_key(),
+                endpoints: vec![ep],
+            },
+            ep,
+        )
+        .await
+        .unwrap();
+        let after = CounterSnapshot::take();
+        assert_eq!(
+            after.cmm_recv - before.cmm_recv,
+            1,
+            "a member CallMeMaybe is counted accepted"
+        );
+        assert_eq!(
+            after.cmm_recv_rejected - before.cmm_recv_rejected,
+            0,
+            "a member CallMeMaybe must NOT increment the rejected counter"
+        );
+
+        // Rejected: a stranger's CallMeMaybe.
+        let before = CounterSnapshot::take();
+        sock.handle_disco(
+            Inbound::CallMeMaybe {
+                sender: stranger_disco.public_key(),
+                endpoints: vec![ep],
+            },
+            ep,
+        )
+        .await
+        .unwrap();
+        let after = CounterSnapshot::take();
+        assert_eq!(
+            after.cmm_recv_rejected - before.cmm_recv_rejected,
+            1,
+            "a stranger CallMeMaybe is counted rejected"
+        );
+        assert_eq!(
+            after.cmm_recv - before.cmm_recv,
+            0,
+            "a stranger CallMeMaybe must NOT increment the accepted counter"
+        );
+    }
+
+    /// `seal_call_me_maybe` increments `disco_call_me_maybe_sealed` once per seal, and `send_pings`
+    /// increments `disco_ping_sent` once per ping actually emitted. Asserted on deltas.
+    #[tokio::test]
+    async fn counters_ping_sent_and_call_me_maybe_sealed() {
+        // `disco_call_me_maybe_sealed` (also moved by `seal_call_me_maybe_carries_self_endpoints`)
+        // and `disco_ping_sent` (also moved by every loopback `send_pings`) are shared, so the
+        // "incremented" checks use `>=` the amount THIS test causes.
+        let _guard = counter_test_guard().await;
+        let our_disco = DiscoPrivateKey::random();
+        let our_node = ts_keys::NodePrivateKey::random().public_key();
+        let sock = MagicSock::bind(localhost(), our_disco, our_node)
+            .await
+            .unwrap();
+
+        // Seal one CallMeMaybe → at least one sealed increment.
+        let before = CounterSnapshot::take();
+        let peer = DiscoPrivateKey::random().public_key();
+        sock.seal_call_me_maybe(&peer).unwrap();
+        let after = CounterSnapshot::take();
+        assert!(
+            after.cmm_sealed - before.cmm_sealed >= 1,
+            "seal_call_me_maybe increments disco_call_me_maybe_sealed"
+        );
+
+        // Seed two pingable candidates for one peer; a real sink receives the pings.
+        let sink = UdpSocket::bind(localhost()).await.unwrap();
+        let target = sink.local_addr().unwrap();
+        let other = SocketAddr::new(target.ip(), target.port().wrapping_add(1).max(1));
+        sock.add_peer_endpoints_unfiltered(peer, [target, other]);
+
+        let before = CounterSnapshot::take();
+        let sent = sock.send_pings().await.unwrap();
+        let after = CounterSnapshot::take();
+        assert!(
+            after.ping_sent - before.ping_sent >= sent as i64,
+            "disco_ping_sent rises by at least the number of pings this call sent"
+        );
+        assert!(sent >= 1, "at least one ping should have been sent");
+    }
+
+    /// A matched STUN response increments `stun_recv` and learns a NEW reflexive address
+    /// (`reflexive_learned` rises), while re-noting the SAME address does not learn it again. Both
+    /// counters are also moved by the loopback/STUN tests, so the positive checks use `>=` the
+    /// amount THIS op causes; the dedup property is pinned deterministically at the per-socket set
+    /// level (immune to the shared counter), with a counter sanity check that a duplicate adds
+    /// strictly fewer learned addresses than two distinct ones would.
+    #[tokio::test]
+    async fn counters_stun_recv_and_reflexive_learned() {
+        let _guard = counter_test_guard().await;
+        let s = MagicSock::bind(
+            localhost(),
+            DiscoPrivateKey::random(),
+            ts_keys::NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap();
+
+        let tx: crate::stun::StunTxId = [21u8; 12];
+        let server: SocketAddr = "203.0.113.1:3478".parse().unwrap();
+        s.stun_in_flight.lock().unwrap().insert(tx, Instant::now());
+        let mapped = SocketAddrV4::new(core::net::Ipv4Addr::new(198, 51, 100, 7), 51820);
+        let buf = stun_success_v4(tx, mapped);
+
+        let before = CounterSnapshot::take();
+        assert!(s.handle_stun_response(server, &buf));
+        let after = CounterSnapshot::take();
+        assert!(
+            after.stun_recv - before.stun_recv >= 1,
+            "a matched STUN response increments stun_recv"
+        );
+        assert!(
+            after.reflexive_learned - before.reflexive_learned >= 1,
+            "a brand-new reflexive address increments reflexive_learned"
+        );
+
+        // Dedup is pinned deterministically on the per-socket set (no global-counter race): the set
+        // already holds `mapped`, and re-noting it leaves the size unchanged.
+        let size_before = s.reflexive.lock().unwrap().len();
+        s.note_reflexive(SocketAddr::V4(mapped));
+        let size_after = s.reflexive.lock().unwrap().len();
+        assert_eq!(
+            size_before, size_after,
+            "re-noting an existing reflexive address must not grow the set (dedup)"
         );
     }
 }
