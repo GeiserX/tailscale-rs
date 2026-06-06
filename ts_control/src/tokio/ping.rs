@@ -1,6 +1,6 @@
 use alloc::string::String;
 
-use ts_control_serde::PingType;
+use ts_control_serde::{C2NVIPServicesResponse, PingType};
 use ts_http_util::{BytesBody, ClientExt, Http2, Request};
 use url::Url;
 
@@ -9,11 +9,35 @@ use crate::StateUpdate;
 /// Path requested in HTTP GET via a Control-to-Node (C2N) [`ts_control_serde::PingRequest`] to
 /// invoke the C2N echo handler.
 const C2N_PATH_ECHO: &str = "/echo";
+/// Path requested in HTTP GET via a C2N [`ts_control_serde::PingRequest`] to fetch the VIP services
+/// this node hosts (Go `c2n` `GET /vip-services`). Answered with a JSON
+/// [`C2NVIPServicesResponse`].
+const C2N_PATH_VIP_SERVICES: &str = "/vip-services";
 /// HTTP 400 Bad Request response sent for all unimplemented C2N methods/paths.
 const C2N_PATH_UNKNOWN: &str = "HTTP/1.1 400 Bad Request\r\n\r\nunknown c2n path";
 /// The start of an HTTP/1.1 200 response with no headers, just missing the body. Intended for use
 /// with C2N echo responses, which can append the request body.
 const C2N_RESPONSE_ECHO_PREAMBLE: &str = "HTTP/1.1 200 OK\r\n\r\n";
+
+/// Build the full HTTP/1.1 response to a c2n `GET /vip-services` request from a node's config: a
+/// `200 OK` with a JSON [`C2NVIPServicesResponse`] body listing the validated hosted VIP services
+/// and their hash (which matches the `HostInfo.ServicesHash` the node advertises). Factored out as a
+/// pure function so the response shape is unit-testable without a live control connection.
+fn build_vip_services_response(config: &crate::Config) -> String {
+    let vip_services = config.advertised_vip_services();
+    let services_hash = crate::services_hash(&vip_services);
+    let response = C2NVIPServicesResponse {
+        vip_services,
+        services_hash,
+    };
+    // Serialization of an owned VIP-service list never fails; fall back to an empty list on the
+    // impossible error rather than panicking in the network loop.
+    let body = serde_json::to_string(&response).unwrap_or_else(|_| {
+        tracing::error!("serializing c2n /vip-services response");
+        String::from(r#"{"VIPServices":[],"ServicesHash":""}"#)
+    });
+    format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{body}")
+}
 
 #[derive(Debug, thiserror::Error, Clone, Copy, Eq, PartialEq)]
 pub enum PingError {
@@ -59,9 +83,9 @@ fn parse_c2n_ping(payload: &str) -> Result<Request<String>, PingError> {
 }
 
 /// Handles [`ts_control_serde::PingRequest`]s from the control plane to this Tailscale node.
-/// Currently only handles Control-to-Node (C2N) echo requests; non-C2N requests are skipped with a
-/// warning, while C2N requests for an unhandled path return a "400 Bad Request" to the control
-/// plane.
+/// Handles Control-to-Node (C2N) `GET /echo` (echo back the body) and `GET /vip-services` (report
+/// the VIP services this node hosts, from `config`); non-C2N requests are skipped with a warning,
+/// while C2N requests for an unhandled path return a "400 Bad Request" to the control plane.
 ///
 /// ## C2N Mechanism
 ///
@@ -83,6 +107,7 @@ pub async fn handle_ping(
     state: &StateUpdate,
     control_url: &Url,
     http2_client: &Http2<BytesBody>,
+    config: &crate::Config,
 ) -> Result<(), PingError> {
     let Some(ping_request) = &state.ping else {
         return Ok(());
@@ -116,6 +141,10 @@ pub async fn handle_ping(
                 tracing::trace!(c2n_request_path, "handling c2n echo");
                 format!("{}{}", C2N_RESPONSE_ECHO_PREAMBLE, c2n_request.body())
             }
+            C2N_PATH_VIP_SERVICES => {
+                tracing::trace!(c2n_request_path, "handling c2n vip-services fetch");
+                build_vip_services_response(config)
+            }
             _ => {
                 tracing::debug!(c2n_request_path, "no handler for c2n path");
                 C2N_PATH_UNKNOWN.to_string()
@@ -135,4 +164,73 @@ pub async fn handle_ping(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::string::ToString;
+
+    use super::*;
+
+    /// Split the HTTP/1.1 response built by [`build_vip_services_response`] into its status line and
+    /// JSON body for assertions.
+    fn parse_response(resp: &str) -> (&str, serde_json::Value) {
+        let (head, body) = resp.split_once("\r\n\r\n").expect("response has a body");
+        let status = head.lines().next().unwrap();
+        let json: serde_json::Value = serde_json::from_str(body).expect("body is JSON");
+        (status, json)
+    }
+
+    #[test]
+    fn vip_services_response_lists_configured_services() {
+        let config = crate::Config {
+            advertise_services: alloc::vec!["svc:samba".to_string(), "svc:web".to_string()],
+            ..Default::default()
+        };
+        let resp = build_vip_services_response(&config);
+        let (status, json) = parse_response(&resp);
+
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        let names: alloc::vec::Vec<&str> = json["VIPServices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["Name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"svc:samba"));
+        assert!(names.contains(&"svc:web"));
+        // The response hash must match the standalone hash over the same advertised set.
+        let expected = crate::services_hash(&config.advertised_vip_services());
+        assert_eq!(json["ServicesHash"].as_str().unwrap(), expected);
+        assert!(!expected.is_empty());
+    }
+
+    #[test]
+    fn vip_services_response_empty_when_none_configured() {
+        let config = crate::Config::default();
+        let resp = build_vip_services_response(&config);
+        let (status, json) = parse_response(&resp);
+
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert!(json["VIPServices"].as_array().unwrap().is_empty());
+        // Empty set -> empty hash sentinel.
+        assert_eq!(json["ServicesHash"].as_str().unwrap(), "");
+    }
+
+    #[test]
+    fn vip_services_response_drops_invalid_names() {
+        let config = crate::Config {
+            advertise_services: alloc::vec![
+                "svc:good".to_string(),
+                "not-a-service".to_string(), // missing svc: prefix -> dropped
+            ],
+            ..Default::default()
+        };
+        let resp = build_vip_services_response(&config);
+        let (_, json) = parse_response(&resp);
+
+        let services = json["VIPServices"].as_array().unwrap();
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0]["Name"].as_str().unwrap(), "svc:good");
+    }
 }

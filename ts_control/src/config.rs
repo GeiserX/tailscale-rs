@@ -318,6 +318,20 @@ pub struct Config {
     /// a node requests Funnel wiring only when explicitly opted in.
     #[serde(default)]
     pub wire_ingress: bool,
+
+    /// VIP services this node advertises that it **hosts** (`svc:<dns-label>` names), the
+    /// advertise side of Tailscale VIP services (Go `tsnet`'s `Hostinfo.ServicesHash` +
+    /// c2n `GET /vip-services`).
+    ///
+    /// Each entry is a full `svc:`-prefixed service name. This field *is* read inside `ts_control`:
+    /// the valid names ([`validate_service_name`](crate::validate_service_name) is applied
+    /// fail-closed; malformed names are dropped and logged) are hashed into `HostInfo.ServicesHash`
+    /// on every map request, and answered when control fetches the list via the c2n
+    /// `/vip-services` endpoint. Defaults to empty: with no entries the hash is `""` and behavior is
+    /// byte-for-byte the historical non-advertising path. Hosting a service additionally requires
+    /// control to assign it a VIP and the node to be tagged (the *consume* side, unchanged here).
+    #[serde(default)]
+    pub advertise_services: Vec<String>,
 }
 
 impl Config {
@@ -399,6 +413,74 @@ impl Config {
             },
         ]
     }
+
+    /// The validated set of VIP services this node advertises that it hosts, derived from
+    /// [`advertise_services`](Config::advertise_services).
+    ///
+    /// Each configured name is validated with
+    /// [`validate_service_name`](crate::validate_service_name) (fail-closed: a name that is not a
+    /// well-formed `svc:<dns-label>` is dropped with a warning, never advertised). Each surviving
+    /// service is advertised on **all ports** (a single `0/0..=65535` [`ProtoPortRange`], matching
+    /// Go's default `ServicePortRange()` when no explicit ports are configured) and marked active.
+    /// The result is the canonical input to both [`services_hash`] and the c2n `/vip-services`
+    /// response. An empty config yields an empty `Vec` (advertise nothing — the hash is `""`).
+    pub fn advertised_vip_services(&self) -> Vec<ts_control_serde::VipServiceOwned> {
+        use ts_control_serde::{ProtoPortRange, VipServiceOwned};
+
+        self.advertise_services
+            .iter()
+            .filter_map(|name| {
+                if crate::validate_service_name(name).is_none() {
+                    tracing::warn!(
+                        service = %name,
+                        "dropping invalid advertise_services name (expected svc:<dns-label>)"
+                    );
+                    return None;
+                }
+                Some(VipServiceOwned {
+                    name: name.clone(),
+                    // All ports: proto 0 (all protocols), full 0..=65535 span — Go's default
+                    // ServicePortRange() for a service with no explicit port restriction.
+                    ports: vec![ProtoPortRange {
+                        proto: 0,
+                        first: 0,
+                        last: 65535,
+                    }],
+                    active: true,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Compute the `HostInfo.ServicesHash` for a node's advertised VIP services, mirroring Go's
+/// `vipServiceHash`.
+///
+/// The services are sorted by name, serialized to canonical (whitespace-free) JSON as a
+/// [`ts_control_serde::VipServiceOwned`] list, SHA-256'd, and hex-encoded. An empty list hashes to
+/// the empty string `""` (the "no services advertised" sentinel, which omits/clears the wire
+/// field). The hash is byte-stable and order-independent: the same set in any input order yields the
+/// same value, so control reliably refetches only on a genuine change.
+///
+/// Uses `ring`'s SHA-256 (the same crypto backend the rest of the stack links — no aws-lc-rs /
+/// openssl is introduced).
+pub fn services_hash(services: &[ts_control_serde::VipServiceOwned]) -> String {
+    if services.is_empty() {
+        return String::new();
+    }
+
+    let mut sorted = services.to_vec();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Canonical, whitespace-free JSON so the digest is byte-stable across builds.
+    let json = serde_json::to_vec(&sorted).expect("VipServiceOwned list always serializes");
+    let digest = ring::digest::digest(&ring::digest::SHA256, &json);
+
+    let mut hex = String::with_capacity(digest.as_ref().len() * 2);
+    for byte in digest.as_ref() {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
 }
 
 impl Debug for Config {
@@ -434,6 +516,7 @@ impl Default for Config {
             enable_ipv6: false,
             transport_mode: TransportMode::default(),
             wire_ingress: false,
+            advertise_services: Vec::new(),
         }
     }
 }
@@ -558,6 +641,97 @@ mod tests {
     fn peerapi_port_deserializes_default_none() {
         let cfg: Config = serde_json::from_str(r#"{"server_url":"https://example.com/"}"#).unwrap();
         assert_eq!(cfg.peerapi_port, None);
+    }
+
+    #[test]
+    fn advertise_services_default_empty() {
+        assert!(Config::default().advertise_services.is_empty());
+        assert!(Config::default().advertised_vip_services().is_empty());
+    }
+
+    #[test]
+    fn advertise_services_deserializes() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"server_url":"https://example.com/","advertise_services":["svc:samba"]}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.advertise_services, vec!["svc:samba".to_owned()]);
+    }
+
+    #[test]
+    fn advertised_vip_services_validates_and_drops_bad_names() {
+        let cfg = Config {
+            advertise_services: vec![
+                "svc:good".to_owned(),
+                "bad-no-prefix".to_owned(),
+                "svc:-bad-label".to_owned(),
+            ],
+            ..Default::default()
+        };
+        let svcs = cfg.advertised_vip_services();
+        assert_eq!(svcs.len(), 1);
+        assert_eq!(svcs[0].name, "svc:good");
+        // All-ports default range, active.
+        assert_eq!(svcs[0].ports.len(), 1);
+        assert_eq!(svcs[0].ports[0].first, 0);
+        assert_eq!(svcs[0].ports[0].last, 65535);
+        assert!(svcs[0].active);
+    }
+
+    #[test]
+    fn services_hash_empty_is_empty_string() {
+        assert_eq!(services_hash(&[]), "");
+    }
+
+    #[test]
+    fn services_hash_is_order_independent() {
+        let a = Config {
+            advertise_services: vec!["svc:a".to_owned(), "svc:b".to_owned()],
+            ..Default::default()
+        };
+        let b = Config {
+            advertise_services: vec!["svc:b".to_owned(), "svc:a".to_owned()],
+            ..Default::default()
+        };
+        let ha = services_hash(&a.advertised_vip_services());
+        let hb = services_hash(&b.advertised_vip_services());
+        assert_eq!(ha, hb);
+        assert!(!ha.is_empty());
+    }
+
+    #[test]
+    fn services_hash_changes_with_set() {
+        let one = Config {
+            advertise_services: vec!["svc:a".to_owned()],
+            ..Default::default()
+        };
+        let two = Config {
+            advertise_services: vec!["svc:a".to_owned(), "svc:b".to_owned()],
+            ..Default::default()
+        };
+        assert_ne!(
+            services_hash(&one.advertised_vip_services()),
+            services_hash(&two.advertised_vip_services())
+        );
+    }
+
+    #[test]
+    fn services_hash_known_answer() {
+        // KAT: pin the hash of a single all-ports `svc:samba` so a future serialization change
+        // (field order, whitespace) that would silently break control's change-detection fails
+        // this test. Computed once from this very implementation.
+        let cfg = Config {
+            advertise_services: vec!["svc:samba".to_owned()],
+            ..Default::default()
+        };
+        let hash = services_hash(&cfg.advertised_vip_services());
+        // 64 hex chars = SHA-256.
+        assert_eq!(hash.len(), 64);
+        assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(
+            hash,
+            "f96574bfe9f637164f5d7fff37ea169b3aa86b12e25d98f5c3b7fd049839f4e9"
+        );
     }
 
     #[test]

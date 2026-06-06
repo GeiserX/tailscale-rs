@@ -6,6 +6,30 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.45](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.45) - 2026-06-06
+
+**VIP-service advertise side** (roadmap `tsr-am9.9`): a node can now tell control it hosts a
+`svc:<name>` VIP service, completing Tailscale Services (the consume side — binding a control-assigned
+VIP — already shipped). Mirrors Go's `Hostinfo.ServicesHash` + c2n `GET /vip-services` mechanism (not
+an inline `Hostinfo.Services` entry — that struct can't carry a `svc:` name).
+
+- New `Config::advertise_services: Vec<String>` (the `svc:<dns-label>` names this node hosts;
+  validated with `validate_service_name`, invalid names dropped fail-closed). Threaded root →
+  `ts_control::Config` like `requested_tags`.
+- `ts_control::services_hash(...)` computes Go's `vipServiceHash`: the sorted `VIPService` list
+  serialized to canonical JSON, SHA-256'd (via **ring** — the same provider the rest of the TLS
+  stack uses, now an unconditional `ts_control` dep; **no aws-lc-rs / openssl**, confirmed absent
+  from the default *and* `acme` graphs), hex-encoded; `""` when empty. It's set as
+  `Hostinfo.ServicesHash` on both the register and every map request via a new
+  `MapRequestBuilder::services_hash` setter.
+- The existing inbound c2n dispatcher (`ping.rs`, previously only `/echo`) gains a `GET /vip-services`
+  arm returning `C2NVIPServicesResponse { VIPServices, ServicesHash }` (new serde types;
+  `VipService`/`ProtoPortRange`/`ServiceName` gained `Serialize`). Control fetches the full list on a
+  hash change, validates the node may host it (ACL), and returns the VIP via the existing
+  `service-host` capability the consume side already reads.
+- Empty `advertise_services` ⇒ hash `""` ⇒ the wire field is omitted ⇒ behavior unchanged. The
+  consume side (`service.rs` / `node.rs`) is untouched.
+
 ## [0.5.44](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.44) - 2026-06-06
 
 **TUN-mode MagicDNS** (roadmap `tsr-am9.7`): TUN-transport nodes now get MagicDNS, closing the gap

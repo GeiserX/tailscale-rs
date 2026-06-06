@@ -8,10 +8,10 @@
 //!
 //! Mirrors `tailcfg`'s `ServiceName`, `VIPService`, `ProtoPortRange`, and `ServiceIPMappings`.
 
-use alloc::{collections::BTreeMap, vec::Vec};
+use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use core::net::IpAddr;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// The node-capability key by which control tells a node which VIP service IPs it hosts
 /// (`tailcfg.NodeAttrServiceHost`). Possession of this cap (with a non-empty mapping) is the grant
@@ -26,13 +26,13 @@ pub const SERVICE_NAME_PREFIX: &str = "svc:";
 /// Stored verbatim as it appears on the wire (including the `svc:` prefix). Validation of the
 /// `svc:`-prefix + DNS-label shape is performed by the consumer (see the domain layer), not here —
 /// this is a transparent wire newtype.
-#[derive(Default, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub struct ServiceName<'a>(#[serde(borrow)] pub &'a str);
 
 /// A protocol + inclusive port range (`tailcfg.ProtoPortRange`). `proto == 0` means "all protocols"
 /// in Go (`int(0)`); otherwise it is an IP protocol number (6 = TCP, 17 = UDP). A `first..=last`
 /// span of `0..=65535` means "all ports".
-#[derive(Default, Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ProtoPortRange {
     /// IP protocol number (`Proto` in Go). `0` = all protocols.
@@ -50,7 +50,7 @@ pub struct ProtoPortRange {
 ///
 /// This is the *definition* of a service (name, advertised port ranges, active flag); the
 /// host-assigned VIP IPs come separately via [`ServiceIpMappings`].
-#[derive(Default, Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct VipService<'a> {
     /// The `svc:`-prefixed service name.
@@ -62,6 +62,40 @@ pub struct VipService<'a> {
     /// Whether the service is currently active.
     #[serde(default)]
     pub active: bool,
+}
+
+/// An **owned** VIP service definition, used when *advertising* the services this node hosts back
+/// to control (the borrowed [`VipService`] is for the inbound control→node direction). Field-for-
+/// field the same wire shape as [`VipService`] (`tailcfg.VIPService`), but owning its `name` so it
+/// can be built from a [`crate`]-external `String` config without lifetime entanglement.
+#[derive(Default, Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct VipServiceOwned {
+    /// The `svc:`-prefixed service name (owned).
+    pub name: String,
+    /// The protocol/port ranges this service is advertised on.
+    #[serde(default)]
+    pub ports: Vec<ProtoPortRange>,
+    /// Whether the service is currently active.
+    #[serde(default)]
+    pub active: bool,
+}
+
+/// The body a node returns to control's c2n `GET /vip-services` request, listing the VIP services
+/// this node currently hosts plus the hash that triggered the fetch (`tailcfg.C2NVIPServicesResponse`).
+///
+/// Control fetches this whenever the node's advertised `HostInfo.ServicesHash` changes; the
+/// `services_hash` here echoes the same value (see the services-hash helper in `ts_control`).
+#[derive(Default, Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct C2NVIPServicesResponse {
+    /// The VIP services this node hosts (`VIPServices` on the wire).
+    #[serde(rename = "VIPServices", default)]
+    pub vip_services: Vec<VipServiceOwned>,
+    /// The opaque hash of the advertised service list (`ServicesHash` on the wire), matching the
+    /// `HostInfo.ServicesHash` the node last sent.
+    #[serde(rename = "ServicesHash", default)]
+    pub services_hash: String,
 }
 
 /// The value of the `service-host` ([`NODE_ATTR_SERVICE_HOST`]) node-capability: a map from VIP
@@ -135,5 +169,49 @@ mod tests {
     fn empty_mappings_parse() {
         let m: ServiceIpMappings = serde_json::from_str("{}").unwrap();
         assert_eq!(m.all_addrs().count(), 0);
+    }
+
+    #[test]
+    fn c2n_vip_services_response_serializes_pascalcase() {
+        use alloc::string::ToString;
+
+        let resp = C2NVIPServicesResponse {
+            vip_services: alloc::vec![VipServiceOwned {
+                name: "svc:samba".to_string(),
+                ports: alloc::vec![ProtoPortRange {
+                    proto: 6,
+                    first: 445,
+                    last: 445,
+                }],
+                active: true,
+            }],
+            services_hash: "abc123".to_string(),
+        };
+
+        let value: serde_json::Value = serde_json::to_value(&resp).unwrap();
+        // PascalCase wire names, including the all-caps `VIPServices`.
+        let svc = &value["VIPServices"][0];
+        assert_eq!(svc["Name"], "svc:samba");
+        assert_eq!(svc["Ports"][0]["Proto"], 6);
+        assert_eq!(svc["Ports"][0]["First"], 445);
+        assert_eq!(svc["Ports"][0]["Last"], 445);
+        assert_eq!(svc["Active"], true);
+        assert_eq!(value["ServicesHash"], "abc123");
+    }
+
+    #[test]
+    fn vip_service_round_trips_serialize() {
+        let svc = VipService {
+            name: ServiceName("svc:web"),
+            ports: alloc::vec![ProtoPortRange {
+                proto: 0,
+                first: 0,
+                last: 65535,
+            }],
+            active: true,
+        };
+        let json = serde_json::to_string(&svc).unwrap();
+        let back: VipService = serde_json::from_str(&json).unwrap();
+        assert_eq!(svc, back);
     }
 }

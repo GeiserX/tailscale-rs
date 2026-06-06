@@ -33,6 +33,11 @@ bytes.workspace = true
 # `tokio-rustls`/`ring` provider the rest of the stack (`ts_tls_util`) uses, so
 # no second crypto backend is introduced. Pure-Rust PEM decoder keeps musl-static.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+# SHA-256 over the canonical VIP-services JSON for `HostInfo.ServicesHash` (the c2n
+# `/vip-services` advertise signal). Already in the dep tree via `ts_tls_util` +
+# `tokio-rustls`'s `ring` provider, so this introduces NO new crypto backend
+# (ring-only — never aws-lc-rs / openssl). Used un-gated (not behind `acme`).
+ring = "0.17"
 rustls-pemfile = "2"
 chrono = { workspace = true, features = ["serde"] }
 gethostname.workspace = true
@@ -54,9 +59,9 @@ tokio-stream = { version = "0.1", optional = true, default-features = false, fea
 
 # Required dependencies for the `acme` feature (client-side ACME / Let's Encrypt cert issuance).
 # Hand-rolled on the existing ring-based HTTP/TLS stack (ts_http_util + tokio-rustls/ring), so it
-# pulls NO aws-lc-rs / openssl / second TLS stack. `ring` does the ES256 JWS signing + SHA-256
-# digests; `base64` does the base64url encoding; `rcgen` (ring) builds the finalize CSR.
-ring = { version = "0.17", optional = true }
+# pulls NO aws-lc-rs / openssl / second TLS stack. `ring` (now an unconditional dep, see above) does
+# the ES256 JWS signing + SHA-256 digests; `base64` does the base64url encoding; `rcgen` (ring)
+# builds the finalize CSR.
 base64 = { workspace = true, optional = true }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"], optional = true }
 
@@ -80,7 +85,7 @@ identity-federation = []
 # publishes the DNS-01 challenge TXT. Off by default and SaaS-only: a self-hosted control plane returns HTTP 501
 # for `set-dns`, so issuance is non-functional there (built for full tsnet parity, like WIF). Pulls
 # `ring`/`base64`/`rcgen` (all ring-only — no aws-lc-rs). Requires `async_tokio` for the Noise RPC.
-acme = ["async_tokio", "dep:ring", "dep:base64", "dep:rcgen"]
+acme = ["async_tokio", "dep:base64", "dep:rcgen"]
 
 [lints]
 workspace = true

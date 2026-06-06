@@ -271,6 +271,10 @@ async fn run_once(
     crate::tokio::register(config, control_url, auth_key, node_keys, &h2_client).await?;
 
     let client_name = config.format_client_name();
+    // Advertise-side VIP services: hash the validated hosted-service set into
+    // `HostInfo.ServicesHash`. Empty config -> empty hash -> wire field omitted (unchanged behavior).
+    let advertised_vip_services = config.advertised_vip_services();
+    let services_hash = crate::services_hash(&advertised_vip_services);
     let builder = MapRequestBuilder::new(node_keys)
         .keep_alive(true)
         .omit_peers(false)
@@ -279,6 +283,7 @@ async fn run_once(
         .client_info(&client_name, crate::PKG_VERSION)
         .request_tags(config.tags.iter().map(String::as_str))
         .services(config.advertised_services())
+        .services_hash(&services_hash)
         .wire_ingress(config.wire_ingress)
         .map_session(&session.handle, session.seq);
 
@@ -307,7 +312,7 @@ async fn run_once(
                 // message instead of cold-restarting.
                 advance_session(session, &state_update);
 
-                let _ = handle_ping(&state_update, control_url, &h2_client).await;
+                let _ = handle_ping(&state_update, control_url, &h2_client, config).await;
 
                 if let Some(dial_plan) = &state_update.dial_plan
                     && control_dialer.update_dial_plan(dial_plan)

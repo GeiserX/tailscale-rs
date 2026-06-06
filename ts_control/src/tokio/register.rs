@@ -118,6 +118,12 @@ pub async fn register(
         tracing::debug!("re-registering with OldNodeKey set (node-key rotation)");
     }
 
+    // Advertise-side VIP services: register with the same `HostInfo.ServicesHash` the map request
+    // sends, so control's view is consistent from the first contact. Empty advertise set -> empty
+    // hash -> field omitted (unchanged registration).
+    let advertised_vip_services = config.advertised_vip_services();
+    let services_hash = crate::services_hash(&advertised_vip_services);
+
     let register_req = RegisterRequest {
         version: CapabilityVersion::CURRENT,
         node_key: node_public_key,
@@ -141,6 +147,8 @@ pub async fn register(
             // capver-113 Funnel "wire me up server-side" signal. IngressEnabled stays false:
             // listen_funnel is fail-closed in this fork, so no Funnel endpoint ever goes live.
             wire_ingress: config.wire_ingress,
+            // Advertise-side VIP services hash (empty when no services are advertised).
+            services_hash: &services_hash,
             ..Default::default()
         },
         nl_key: Some(network_lock_public_key),

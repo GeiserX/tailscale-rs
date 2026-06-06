@@ -188,6 +188,18 @@ pub struct Config {
     /// make Funnel live.
     pub wire_ingress: bool,
 
+    /// VIP services this node advertises that it **hosts** (`svc:<dns-label>` names), the advertise
+    /// side of Tailscale VIP services (Go `tsnet`'s `Hostinfo.ServicesHash` + c2n
+    /// `GET /vip-services`).
+    ///
+    /// Each entry is a full `svc:`-prefixed name. The valid names (each validated as a well-formed
+    /// `svc:<dns-label>`; malformed names are dropped and logged) are hashed into
+    /// `HostInfo.ServicesHash` on registration and every map request, and reported when control
+    /// fetches the hosted-service list via the c2n `/vip-services` endpoint. Defaults to empty:
+    /// advertise nothing (the hash is `""`, behavior unchanged). Actually *hosting* a service still
+    /// requires control to assign it a VIP and the node to be tagged.
+    pub advertise_services: Vec<String>,
+
     /// Filesystem directory that received Taildrop files land in, or `None` to disable Taildrop
     /// (the default, fail-closed).
     ///
@@ -412,6 +424,7 @@ impl From<&Config> for ts_control::Config {
             enable_ipv6: value.enable_ipv6,
             transport_mode: value.transport_mode.clone(),
             wire_ingress: value.wire_ingress,
+            advertise_services: value.advertise_services.clone(),
         }
     }
 }
@@ -438,6 +451,7 @@ impl Default for Config {
             enable_ipv6: false,
             transport_mode: ts_control::TransportMode::default(),
             wire_ingress: false,
+            advertise_services: vec![],
             taildrop_dir: None,
             auth_key: None,
             client_id: None,
@@ -474,6 +488,7 @@ mod tests {
             }),
             advertise_routes: vec!["10.0.0.0/24".parse().unwrap()],
             requested_tags: vec!["tag:exit".to_owned()],
+            advertise_services: vec!["svc:samba".to_owned()],
             ephemeral: false,
             exit_proxy: Some(ExitProxyConfig {
                 addr: "198.51.100.9:8080".parse().unwrap(),
@@ -501,6 +516,7 @@ mod tests {
         assert_eq!(proxy.auth, Some(("u".to_owned(), "p".to_owned())));
         assert!(control.enable_ipv6);
         assert!(control.wire_ingress);
+        assert_eq!(control.advertise_services, vec!["svc:samba".to_owned()]);
         assert_eq!(
             control.taildrop_dir,
             Some(std::path::PathBuf::from("/var/lib/taildrop"))

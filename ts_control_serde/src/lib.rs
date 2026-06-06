@@ -47,8 +47,8 @@ pub use ping::{PingRequest, PingResponse, PingType};
 pub use register::{RegisterAuth, RegisterRequest, RegisterResponse, SignatureType};
 pub use service::{Service, ServiceProto};
 pub use service_vip::{
-    NODE_ATTR_SERVICE_HOST, ProtoPortRange, SERVICE_NAME_PREFIX, ServiceIpMappings, ServiceName,
-    VipService,
+    C2NVIPServicesResponse, NODE_ATTR_SERVICE_HOST, ProtoPortRange, SERVICE_NAME_PREFIX,
+    ServiceIpMappings, ServiceName, VipService, VipServiceOwned,
 };
 pub use set_dns::{SetDnsRequest, SetDnsResponse};
 pub use ssh_policy::{SSHAction, SSHPolicy, SSHPrincipal, SSHRecorderFailureAction, SSHRule};

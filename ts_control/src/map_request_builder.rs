@@ -151,6 +151,17 @@ impl<'a> MapRequestBuilder<'a> {
         self
     }
 
+    /// Set the opaque VIP-services hash this node advertises (`HostInfo.ServicesHash`), the
+    /// advertise-side signal that tells control to (re)fetch the node's hosted VIP-service list via
+    /// the c2n `GET /vip-services` endpoint when it changes. Compute it with
+    /// [`crate::services_hash`] over [`Config::advertised_vip_services`](crate::Config::advertised_vip_services).
+    /// An empty string (the default / no-services-advertised case) leaves the wire field omitted, so
+    /// non-advertising nodes are byte-for-byte unchanged.
+    pub fn services_hash(mut self, hash: &'a str) -> Self {
+        self.host_info_mut().services_hash = hash;
+        self
+    }
+
     fn host_info_mut(&mut self) -> &mut HostInfo<'a> {
         self.req.host_info.get_or_insert_default()
     }
@@ -252,6 +263,25 @@ mod tests {
 
         let req = MapRequestBuilder::new(&node_state).build();
         assert!(!req.host_info.unwrap().wire_ingress);
+    }
+
+    #[test]
+    fn services_hash_setter_populates_host_info() {
+        let node_state = ts_keys::NodeState::generate();
+
+        let req = MapRequestBuilder::new(&node_state)
+            .services_hash("deadbeef")
+            .build();
+        assert_eq!(req.host_info.unwrap().services_hash, "deadbeef");
+    }
+
+    #[test]
+    fn services_hash_setter_defaults_empty() {
+        let node_state = ts_keys::NodeState::generate();
+
+        let req = MapRequestBuilder::new(&node_state).build();
+        // Empty hash = no VIP services advertised; the field is omitted from the wire request.
+        assert_eq!(req.host_info.unwrap().services_hash, "");
     }
 
     #[test]
