@@ -55,7 +55,21 @@ jobs:
       # This fork gates compilation behind an explicit acknowledgement env var.
       TS_RS_EXPERIMENT: this_is_unstable_software
       COMMON_FLAGS: --workspace
+      # Incremental artifacts roughly double `target/` size for no benefit in a cold CI build,
+      # and this ~45-crate workspace (clippy + build --all-targets + test) otherwise overflows the
+      # hosted runner's ~14 GB free disk (the first hosted_test run died with ENOSPC).
+      CARGO_INCREMENTAL: 0
     steps:
+      - name: Free disk space
+        # The default ubuntu-latest image ships ~25 GB of SDKs (dotnet, Android, GHC, large Docker
+        # base images) we never use. Removing them gives this large Rust workspace headroom so the
+        # build/test artifacts don't fill the disk. Hand-rolled (no third-party action) to keep the
+        # supply chain minimal for an OSS repo.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h /
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Setup rust

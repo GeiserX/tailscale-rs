@@ -6,6 +6,15 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.50](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.50) - 2026-06-06
+
+**Give the `hosted_test` lane enough disk to build.** With both clippy steps green, the
+`ubuntu-latest` runner died with `ENOSPC` during `cargo build --all-targets`: this ~45-crate
+workspace's clippy + build + test artifacts overflow the hosted runner's ~14 GB free disk. Added
+a `Free disk space` step that removes the unused preinstalled SDKs (dotnet, Android, GHC, CodeQL,
+boost, the agent toolcache) and prunes Docker images — hand-rolled, no third-party action, to
+keep the OSS supply chain minimal — and set `CARGO_INCREMENTAL=0` to roughly halve `target/`.
+
 ## [0.5.49](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.49) - 2026-06-06
 
 **Fix a Linux-only clippy lint the new `hosted_test` lane exposed.** `ts_host_net/src/linux.rs`
