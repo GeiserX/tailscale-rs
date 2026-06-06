@@ -109,6 +109,12 @@ jobs:
         run: cargo run -p checks
 
   build_test:
+    # This matrix targets self-hosted runner labels (linux-x86_64-16cpu, macos-26, windows-8vcpu,
+    # …) that only exist in the upstream tailscale/tailscale-rs org. On this fork they would queue
+    # forever and never report (spamming the Actions tab / notifications), so skip the whole job
+    # off-upstream. The `hosted_test` lane above covers the equivalent verification on a
+    # GitHub-hosted runner. Delete this guard if/when the fork provisions its own runners.
+    if: ${{ github.repository_owner == 'tailscale' }}
     strategy:
       fail-fast: false
       matrix:
@@ -252,6 +258,10 @@ jobs:
 
   arch_independent:
     name: arch-independent checks
+    # Self-hosted runner (linux-x86_64-16cpu) that only exists upstream; skip off-upstream so it
+    # doesn't queue forever on this fork. cargo-deny/machete/fmt/checks are run locally + the
+    # `checks` step is also covered by `hosted_test`. See the note on `build_test`.
+    if: ${{ github.repository_owner == 'tailscale' }}
     runs-on: linux-x86_64-16cpu
     steps:
       - name: Checkout
@@ -289,7 +299,9 @@ jobs:
     name: publish
     runs-on: linux-x86_64-16cpu
 
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    # Upstream-only: self-hosted runner + crates.io publish. This fork releases via git tags, not
+    # crates.io, and `needs` two upstream-only jobs anyway. The owner guard makes the skip explicit.
+    if: ${{ github.repository_owner == 'tailscale' && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch') }}
     needs:
       - build_test
       - arch_independent

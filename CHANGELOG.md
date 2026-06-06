@@ -6,6 +6,16 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.53](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.53) - 2026-06-06
+
+**Stop the perpetually-queued CI jobs (notification spam).** The inherited `build_test` matrix,
+`arch_independent`, and `publish` jobs target self-hosted runner labels (and a crates.io publish)
+that only exist in the upstream `tailscale` org; on this fork they queued forever and never
+reported, spamming the Actions tab. They are now gated `if: github.repository_owner ==
+'tailscale'` so they skip cleanly off-upstream, leaving only the two GitHub-hosted lanes that
+actually run here (`hosted_test` + `musl_static`). The four sibling workflows that can never run
+on the fork (`c`, `elixir`, `nix`, `python`) were disabled at the Actions level.
+
 ## [0.5.52](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.52) - 2026-06-06
 
 **Fix three RFC-compliance bugs in the shared HTTP client (`ts_http_util`), surfaced by a new
