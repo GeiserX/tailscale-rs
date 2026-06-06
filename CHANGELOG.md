@@ -6,6 +6,27 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.44](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.44) - 2026-06-06
+
+**TUN-mode MagicDNS** (roadmap `tsr-am9.7`): TUN-transport nodes now get MagicDNS, closing the gap
+where their host DNS was inert (`nameservers: vec![]`). Mirrors Go's model — an in-process packet
+intercept, not a host socket.
+
+- The TUN packet pump now intercepts outbound UDP queries to `100.100.100.100:53`, answers them
+  in-process via the **same** `decide()` MagicDNS responder the netstack path uses (no second
+  resolver), and writes the reply back into the TUN (parsed/rebuilt with `etherparse`, checksums
+  recomputed). Non-matching packets pass through to the overlay unchanged.
+- `host_dns_from_dns_config` now programs the host resolver with `nameservers = [100.100.100.100]`
+  (when MagicDNS is enabled) via `ts_host_net::apply_dns` (macOS `scutil` / Linux `resolvectl`), and
+  `host_routes_from_node` adds the `100.100.100.100/32` route so the host's queries actually enter
+  the TUN. The `TunActor` builds its own `DnsView` from the control state (peers + DNS config),
+  mirroring the netstack `MagicDnsActor`.
+- **Fail-safe**: a `Decision::Forward` (recursive / exit-node DNS) answers NXDOMAIN in TUN mode — a
+  tailnet name is answered authoritatively, a public name gets NXDOMAIN rather than hanging or
+  leaking to a host resolver. Recursive/exit-node DoH forwarding in TUN mode is a documented
+  follow-up (it needs an overlay `Channel` threaded into the TUN actor). The netstack-mode MagicDNS
+  path is byte-identical. New `etherparse` dep is gated to the off-by-default `tun` feature.
+
 ## [0.5.43](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.43) - 2026-06-06
 
 **Docs: correct the symmetric-NAT caveat** (`tsr-am9.10`). The crate-root README claimed
