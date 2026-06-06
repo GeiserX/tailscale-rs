@@ -248,10 +248,10 @@ mod imp {
             }
             self.installed_routes.clear();
 
-            if let Some(if_name) = self.dns_if.take() {
-                if let Err(e) = run_resolvectl(&resolvectl_revert_argv(&if_name)) {
-                    tracing::debug!(error = %e, "ignoring resolvectl revert failure");
-                }
+            if let Some(if_name) = self.dns_if.take()
+                && let Err(e) = run_resolvectl(&resolvectl_revert_argv(&if_name))
+            {
+                tracing::debug!(error = %e, "ignoring resolvectl revert failure");
             }
         }
     }

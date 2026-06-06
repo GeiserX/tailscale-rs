@@ -6,6 +6,15 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.49](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.49) - 2026-06-06
+
+**Fix a Linux-only clippy lint the new `hosted_test` lane exposed.** `ts_host_net/src/linux.rs`
+is `#[cfg(target_os = "linux")]`, so it never compiled under local macOS clippy — the
+`ubuntu-latest` lane is the first thing to lint it. Collapsed a nested `if let Some(..) { if let
+Err(..) }` into a single let-chain to satisfy `clippy::collapsible_if`. Verified the only two
+crates carrying Linux-gated code (`ts_host_net`, `ts_netstack_smoltcp`) are clippy-clean for the
+`aarch64-unknown-linux-musl` target.
+
 ## [0.5.48](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.48) - 2026-06-06
 
 **Fix the `hosted_test` lane added in 0.5.47.** The shared `setup-rust` composite action bakes
