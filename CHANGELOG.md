@@ -6,6 +6,38 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.38](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.38) - 2026-06-06
+
+**Client-side ACME (Let's Encrypt) certificate issuance + `set-dns` RPC** (roadmap Tier 4 item 10 /
+Tier 5 item 16 keystone): `Device::get_certificate` can now mint a *real* publicly-trusted
+certificate for a node's `*.ts.net` MagicDNS name, completing the long-stubbed Lane E. Behind the
+new off-by-default `acme` feature.
+
+This is faithful to how Go `tsnet` does it — **the node is the ACME client talking directly to
+Let's Encrypt**; control's only role is publishing the DNS-01 challenge TXT:
+
+- **Hand-rolled ACME (RFC 8555) DNS-01 engine** (`ts_control::acme`): full new-account → new-order →
+  authz → finalize → download flow over the existing **ring-based** `ts_http_util` HTTPS stack, with
+  ES256 JWS signing via `ring`, the RFC 7638 JWK thumbprint + RFC 8555 §8.1/§8.4 key-authorization /
+  TXT-value computation (unit-tested byte-exact), and a `rcgen` (ring) CSR. Deliberately **not**
+  `instant-acme` — that bundles a second hyper/aws-lc-rs TLS stack; hand-rolling keeps the
+  **ring-only invariant structural** (confirmed: `aws-lc-rs` absent from the `--features acme`
+  graph). No second TLS stack, no `instant-acme`, no `openssl`.
+- **`POST /machine/set-dns` Noise RPC** (`ts_control::tokio::set_dns` + `ts_control_serde::SetDnsRequest`):
+  publishes the `_acme-challenge.<name>` TXT, mirroring the existing id-token RPC. A `SetDnsPublisher`
+  bridges it to the engine's `PublishTxt` seam.
+- **Wiring**: `Device::get_certificate` → `Runtime::get_certificate` → a ControlRunner message (holds
+  the control URL + node keys) → `issue_certificate_via_setdns`. The ACME **account key** is
+  persisted in the node key state (`PersistState::acme_account_key`, `#[serde(default)]` so existing
+  key files load as `None`) to keep one Let's Encrypt account across renewals; absent, an ephemeral
+  per-call account key is generated.
+- **Off by default + fail-closed**: WITHOUT the `acme` feature, `Device::get_certificate` is
+  byte-identical to before (`CertError::Unimplemented`, no self-signed/plaintext fallback). The
+  issuance path is **SaaS-only / DOA against a self-hosted control plane**, which returns HTTP 501 for `set-dns`
+  (built for full tsnet parity, like the WIF subsystem) — it works against real Let's Encrypt + a
+  control plane that implements `set-dns`. When functional, it transparently unblocks
+  `Device::listen_tls` and `listen_funnel`.
+
 ## [0.5.37](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.37) - 2026-06-06
 
 **IPv6 direct-path candidates** (roadmap Tier 5, item 13): close the last gap to negotiating a direct

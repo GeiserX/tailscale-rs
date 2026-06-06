@@ -28,6 +28,14 @@ pub struct PersistState {
     /// a human-re-auth control). See [`PersistState::rotate_node_key`].
     #[cfg_attr(feature = "serde", serde(default))]
     pub old_node_key: Option<NodePublicKey>,
+
+    /// The persisted ACME account key (PKCS#8 DER of an ECDSA P-256 key), or `None` if no ACME
+    /// account has been provisioned for this node. The `acme` cert-issuance path loads this to keep
+    /// the same Let's Encrypt account identity across renewals; absent, the runtime generates an
+    /// ephemeral per-call key (a new ACME account each issuance). `#[serde(default)]` so key files
+    /// written before this field load as `None` (mirrors [`old_node_key`](PersistState::old_node_key)).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub acme_account_key: Option<alloc::vec::Vec<u8>>,
 }
 
 impl PersistState {
@@ -58,6 +66,7 @@ impl From<&NodeState> for PersistState {
             machine_key: value.machine_keys.private,
             network_lock_key: value.network_lock_keys.private,
             old_node_key: value.old_node_key,
+            acme_account_key: value.acme_account_key.clone(),
         }
     }
 }
@@ -75,6 +84,7 @@ impl Default for PersistState {
             network_lock_key: NetworkLockPrivateKey::random(),
             node_key: NodePrivateKey::random(),
             old_node_key: None,
+            acme_account_key: None,
         }
     }
 }
@@ -101,6 +111,12 @@ pub struct NodeState {
     /// [`PersistState::old_node_key`]). Threaded to registration as `RegisterRequest.OldNodeKey`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub old_node_key: Option<NodePublicKey>,
+
+    /// The persisted ACME account key (PKCS#8 DER), threaded from
+    /// [`PersistState::acme_account_key`]. The `acme` cert-issuance path reads this to reuse the
+    /// same Let's Encrypt account across renewals. `None` when no ACME account is provisioned.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub acme_account_key: Option<alloc::vec::Vec<u8>>,
 }
 
 impl Debug for NodeState {
@@ -135,6 +151,7 @@ impl From<&PersistState> for NodeState {
             machine_keys: value.machine_key.into(),
             network_lock_keys: value.network_lock_key.into(),
             old_node_key: value.old_node_key,
+            acme_account_key: value.acme_account_key.clone(),
         }
     }
 }
@@ -197,5 +214,44 @@ mod tests {
         let parsed: PersistState =
             serde_json::from_value(value).expect("missing old_node_key deserializes via default");
         assert!(parsed.old_node_key.is_none());
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn persist_state_acme_account_key_serde_default_and_round_trip() {
+        use alloc::vec;
+
+        // An old key file that OMITS `acme_account_key` still deserializes (serde(default) → None).
+        let json = serde_json::to_string(&PersistState::default()).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("acme_account_key")
+            .expect("default serializes the field");
+        let parsed: PersistState = serde_json::from_value(value)
+            .expect("missing acme_account_key deserializes via default");
+        assert!(parsed.acme_account_key.is_none());
+
+        // A `Some(der)` value round-trips through serde and across the NodeState conversions.
+        let mut state = PersistState::default();
+        state.acme_account_key = Some(vec![1u8, 2, 3, 4]);
+        let json = serde_json::to_string(&state).unwrap();
+        let parsed: PersistState = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.acme_account_key.as_deref(),
+            Some(&[1u8, 2, 3, 4][..])
+        );
+
+        let node_state = NodeState::from(&state);
+        assert_eq!(
+            node_state.acme_account_key.as_deref(),
+            Some(&[1u8, 2, 3, 4][..])
+        );
+        let round_trip = PersistState::from(&node_state);
+        assert_eq!(
+            round_trip.acme_account_key.as_deref(),
+            Some(&[1u8, 2, 3, 4][..])
+        );
     }
 }

@@ -827,14 +827,25 @@ impl Device {
 
     /// Obtain a TLS certificate for a node's MagicDNS `name` (like `tsnet`'s `GetCertificate`).
     ///
-    /// **Fail-closed.** This fork has no client-side ACME engine and no `set-dns` RPC to publish
-    /// the DNS-01 challenge (and the a self-hosted control plane control target 501s on `set-dns`), so this currently
-    /// always returns [`ts_control::CertError::Unimplemented`] (after a tailnet-name check). It
-    /// NEVER self-signs and NEVER returns a placeholder certificate. When issuance lands
-    /// ([`ts_control::MISSING_CERT_RPC`] names what is missing), this starts returning a real
-    /// [`CertifiedKey`] with no caller change.
+    /// **Fail-closed without the `acme` feature.** By default this fork has no client-side ACME
+    /// engine wired in, so this returns [`ts_control::CertError::Unimplemented`] (after a
+    /// tailnet-name check) — it NEVER self-signs and NEVER returns a placeholder certificate
+    /// ([`ts_control::MISSING_CERT_RPC`] names what is missing).
+    ///
+    /// **With the `acme` feature** this instead drives the client-side ACME DNS-01 engine to issue a
+    /// real Let's Encrypt certificate for `name`, publishing the challenge TXT via the node's
+    /// `POST /machine/set-dns` RPC (routed through the control runner). SaaS-only: a self-hosted control plane
+    /// 501s on set-dns, surfaced as [`ts_control::CertError::Acme`].
+    #[cfg(not(feature = "acme"))]
     pub async fn get_certificate(&self, name: &str) -> Result<CertifiedKey, ts_control::CertError> {
         ts_control::get_certificate(name).await
+    }
+
+    /// See the no-`acme` variant for the contract; with `acme` this issues a real cert via the
+    /// runtime's ACME engine (`Device → Runtime → ControlRunner → issue_certificate_via_setdns`).
+    #[cfg(feature = "acme")]
+    pub async fn get_certificate(&self, name: &str) -> Result<CertifiedKey, ts_control::CertError> {
+        self.runtime.get_certificate(name.to_string()).await
     }
 
     /// Build a [`TlsAcceptor`] terminating TLS for `cfg.name` on the overlay (like `tsnet`'s

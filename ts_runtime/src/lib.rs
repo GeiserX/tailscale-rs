@@ -332,6 +332,25 @@ impl Runtime {
             .map_err(flatten_send_err)
     }
 
+    /// Issue a real Let's Encrypt certificate for this node's MagicDNS `name` (`acme` feature).
+    ///
+    /// Mirrors [`fetch_id_token`](Self::fetch_id_token): forwards to the control runner, which runs
+    /// the client-side ACME DNS-01 flow on a spawned task and publishes the challenge TXT via the
+    /// node's set-dns RPC. The kameo delegated-reply send error is flattened — a handler error
+    /// carries the real [`ts_control::CertError`]; any other send failure (actor shutdown / mailbox
+    /// closed) is surfaced as a [`ts_control::CertError::Io`]. SaaS-only: a self-hosted control plane 501s on
+    /// set-dns.
+    #[cfg(feature = "acme")]
+    pub async fn get_certificate(
+        &self,
+        name: String,
+    ) -> Result<ts_control::tls::CertifiedKey, ts_control::CertError> {
+        self.control
+            .ask(control_runner::GetCertificate { name })
+            .await
+            .map_err(flatten_cert_send_err)
+    }
+
     /// Resolve which node owns a tailnet source address.
     ///
     /// Maps the source IP of `addr` to its owning node. Mirrors tsnet's `LocalClient::WhoIs`.
@@ -467,6 +486,25 @@ fn flatten_send_err<M>(
     match e {
         kameo::error::SendError::HandlerError(err) => err,
         _ => ts_control::IdTokenError::NetworkError,
+    }
+}
+
+/// Flatten a kameo `SendError` from the `GetCertificate` ask into a [`ts_control::CertError`].
+///
+/// A `HandlerError` carries the real `CertError` produced by the ACME issuance and is surfaced
+/// verbatim. `CertError` has no transient-network variant, so any other send failure (actor not
+/// running / stopped, mailbox full, send timeout) — a delivery problem rather than an issuance
+/// result — collapses to a [`ts_control::CertError::Io`]. Factored out of
+/// [`Runtime::get_certificate`] so this mapping is unit-testable without standing up an actor.
+#[cfg(feature = "acme")]
+fn flatten_cert_send_err<M>(
+    e: kameo::error::SendError<M, ts_control::CertError>,
+) -> ts_control::CertError {
+    match e {
+        kameo::error::SendError::HandlerError(err) => err,
+        _ => ts_control::CertError::Io(std::io::Error::other(
+            "control runner unavailable for certificate issuance",
+        )),
     }
 }
 

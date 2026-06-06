@@ -242,6 +242,81 @@ mod msg_impl {
             deleg
         }
     }
+
+    // The `acme`-gated cert-issuance message lives in its own `#[kameo::messages]` impl block so the
+    // proc-macro never sees it in a non-`acme` build (a `#[cfg]` *inside* a single messages-impl
+    // block is not honored by the macro's generated dispatch — it would emit a `GetCertificate`
+    // handler calling a `get_certificate` method that the same `#[cfg]` strips). A separate gated
+    // block keeps the default build clean.
+    #[cfg(feature = "acme")]
+    #[kameo::messages]
+    impl ControlRunner {
+        /// Issue a real Let's Encrypt certificate for this node's MagicDNS `name` via the
+        /// client-side ACME DNS-01 engine (`acme` feature).
+        ///
+        /// Mirrors [`fetch_id_token`](Self::fetch_id_token): clones the control config + node keys
+        /// into a spawned task (delegated reply, so the round-trip doesn't block the mailbox), loads
+        /// or generates the ACME account key, and runs issuance against Let's Encrypt production,
+        /// publishing the DNS-01 challenge TXT through the node's `POST /machine/set-dns` RPC.
+        ///
+        /// The account key is loaded from [`ts_keys::NodeState::acme_account_key`] (PKCS#8 DER) when
+        /// present, so the same ACME account persists across renewals; otherwise an ephemeral key is
+        /// generated for this call only (a fresh ACME account each issuance — acceptable for v1; LE
+        /// allows it). Persisting a generated key back into the key file is the embedder's job (no
+        /// write-back path here). SaaS-only: against a self-hosted control plane the set-dns publish 501s.
+        #[message(ctx)]
+        pub fn get_certificate(
+            &self,
+            ctx: &mut Context<
+                Self,
+                DelegatedReply<Result<ts_control::tls::CertifiedKey, ts_control::CertError>>,
+            >,
+            name: String,
+        ) -> DelegatedReply<Result<ts_control::tls::CertifiedKey, ts_control::CertError>> {
+            let (deleg, replier) = ctx.reply_sender();
+
+            if let Some(replier) = replier {
+                let config = self.params.config.clone();
+                let keys = self.params.env.keys.clone();
+                tokio::spawn(async move {
+                    let result = issue_certificate(&config, &keys, &name).await;
+                    replier.send(result);
+                });
+            }
+
+            deleg
+        }
+    }
+}
+
+/// Load or generate the ACME account key, then issue a cert for `name` via set-dns DNS-01.
+///
+/// Reuses the persisted [`ts_keys::NodeState::acme_account_key`] (PKCS#8 DER) when present so the
+/// same Let's Encrypt account survives renewals; otherwise generates an ephemeral per-call key
+/// (logged at debug — a new ACME account each issuance, with no write-back). Always targets Let's
+/// Encrypt production ([`ts_control::acme::LETS_ENCRYPT_PRODUCTION_DIRECTORY`]).
+#[cfg(feature = "acme")]
+async fn issue_certificate(
+    config: &ts_control::Config,
+    keys: &ts_keys::NodeState,
+    name: &str,
+) -> Result<ts_control::tls::CertifiedKey, ts_control::CertError> {
+    let account_key = match keys.acme_account_key.as_deref() {
+        Some(der) => ts_control::acme::AcmeAccountKey::from_pkcs8(der)?,
+        None => {
+            tracing::debug!(
+                "no persisted ACME account key in key state; generating an ephemeral per-call key \
+                 (a new ACME account this issuance — not persisted back)"
+            );
+            ts_control::acme::AcmeAccountKey::generate()?.0
+        }
+    };
+    let directory = ts_control::acme::LETS_ENCRYPT_PRODUCTION_DIRECTORY
+        .parse()
+        .map_err(|e| {
+            ts_control::CertError::Acme(format!("parsing Let's Encrypt directory URL: {e}"))
+        })?;
+    ts_control::issue_certificate_via_setdns(config, keys, name, &account_key, &directory).await
 }
 
 impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {

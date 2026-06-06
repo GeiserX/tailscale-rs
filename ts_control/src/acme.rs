@@ -1,0 +1,794 @@
+//! Hand-rolled client-side ACME ([RFC 8555]) DNS-01 engine that mints a *real* Let's Encrypt
+//! certificate for a node's `*.ts.net` MagicDNS name, talking **directly** to Let's Encrypt over
+//! this crate's existing ring-based HTTPS stack.
+//!
+//! # Why hand-rolled (ring-only is structural)
+//!
+//! `instant-acme` would bundle a second `hyper`/`hyper-rustls` TLS stack and defaults to
+//! `aws-lc-rs` (a `CryptoProvider`-init race plus the aws-lc supply-chain/musl risk). To keep the
+//! crate **ring-only**, this engine is built directly on:
+//!
+//! - [`ts_http_util`] — ring HTTPS via `ts_tls_util` (the same substrate [`crate::wif`] uses; see
+//!   it for the `connect_tls` / `ClientExt::{get,post}` / `ResponseExt::collect_bytes` idiom — we
+//!   additionally read response headers via [`http::Response::headers`]),
+//! - [`ring`] — ES256 JWS signing (P-256, fixed `r||s`) and SHA-256 digests,
+//! - [`rcgen`] (ring backend) — the finalize CSR.
+//!
+//! No `instant-acme`, no `aws-lc-rs`, no `openssl`, no second TLS stack enter the dependency graph.
+//!
+//! # DNS-01 flow ([RFC 8555] §7) implemented by [`issue_certificate`]
+//!
+//! 1. account key (ECDSA P-256), 2. fetch directory + seed a `Replay-Nonce`, 3. `newAccount`
+//! (`jwk` header) → account URL (the `kid`), 4. `newOrder` → authorization + finalize URLs,
+//! 5. POST-as-GET the authorization → the `dns-01` challenge `token`, 6. compute the key
+//! authorization + TXT digest ([RFC 8555] §8.1/§8.4, [RFC 7638] §3) and publish it via the
+//! [`crate::cert::PublishTxt`] seam (control's `set-dns`), 7. signal the challenge ready, poll the
+//! authorization to `valid`, 8. finalize with a fresh-cert-key CSR, poll the order to `valid`,
+//! 9. download the PEM chain and assemble a [`CertifiedKey`] via
+//! [`crate::cert::certified_key_from_pem`].
+//!
+//! Every ACME POST body is a flattened JWS (`{"protected","payload","signature"}`,
+//! `application/jose+json`); `base64url` is **always unpadded**.
+//!
+//! # Deployment caveat (DOA against a self-hosted control plane)
+//!
+//! The DNS-01 TXT publish goes through [`crate::cert::PublishTxt`], backed by the node's
+//! `POST /machine/set-dns` Noise RPC. **A self-hosted control plane returns HTTP 501** for `set-dns`, so this
+//! engine cannot complete a challenge there — it is built for full `tsnet` parity and works against
+//! real Let's Encrypt / Pebble plus a control plane that implements `set-dns` (and owns the
+//! `ts.net` zone). This mirrors the SaaS-only posture of [`crate::wif`].
+//!
+//! [RFC 8555]: https://www.rfc-editor.org/rfc/rfc8555.txt
+//! [RFC 7638]: https://www.rfc-editor.org/rfc/rfc7638.txt
+
+use std::time::Duration;
+
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use ring::{
+    rand::SystemRandom,
+    signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair as _},
+};
+use serde_json::Value;
+use tokio_rustls::rustls::sign::CertifiedKey;
+use ts_http_util::{BytesBody, ClientExt as _, HeaderMap, Response, ResponseExt, StatusCode};
+use url::Url;
+
+use crate::cert::{CertError, PublishTxt, certified_key_from_pem};
+
+/// The production Let's Encrypt v2 ACME directory URL.
+///
+/// Pass this as `directory_url` to [`issue_certificate`] for real issuance; tests/staging point at
+/// Pebble or the LE staging directory instead.
+pub const LETS_ENCRYPT_PRODUCTION_DIRECTORY: &str =
+    "https://acme-v02.api.letsencrypt.org/directory";
+
+/// Maximum number of polling iterations for an authorization or order to reach `valid`.
+const MAX_POLL_TRIES: usize = 30;
+
+/// Default delay between polls when the server sends no `Retry-After` header.
+const DEFAULT_POLL_DELAY: Duration = Duration::from_secs(2);
+
+/// Base64url-encode `input` with **no** `=` padding (the only encoding ACME/JWS uses).
+///
+/// Uses the URL-safe alphabet (`-`/`_`, never `+`/`/`).
+fn b64u(input: &[u8]) -> String {
+    URL_SAFE_NO_PAD.encode(input)
+}
+
+/// SHA-256 digest of `input` (ring), returned as raw bytes.
+fn sha256(input: &[u8]) -> Vec<u8> {
+    ring::digest::digest(&ring::digest::SHA256, input)
+        .as_ref()
+        .to_vec()
+}
+
+/// An ACME account key: an ECDSA P-256 key pair used to sign every JWS-protected ACME request
+/// (`alg: ES256`). The same account key identifies the ACME account across renewals, so callers
+/// persist its PKCS#8 DER (from [`AcmeAccountKey::generate`]) keyed to the node identity.
+pub struct AcmeAccountKey {
+    /// The ring ECDSA key pair (fixed `r||s` signatures — exactly the 64-byte form ES256 needs).
+    key_pair: EcdsaKeyPair,
+    /// A random source for ECDSA's per-signature nonce.
+    rng: SystemRandom,
+}
+
+impl AcmeAccountKey {
+    /// Generate a fresh account key, returning it plus its PKCS#8 DER encoding to persist.
+    ///
+    /// Reload later with [`AcmeAccountKey::from_pkcs8`].
+    pub fn generate() -> Result<(Self, Vec<u8>), CertError> {
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
+            .map_err(|e| CertError::Acme(format!("generating account key: {e}")))?;
+        let der = pkcs8.as_ref().to_vec();
+        let key = Self::from_pkcs8(&der)?;
+        Ok((key, der))
+    }
+
+    /// Load an account key from its PKCS#8 DER (as returned by [`AcmeAccountKey::generate`]).
+    pub fn from_pkcs8(der: &[u8]) -> Result<Self, CertError> {
+        let rng = SystemRandom::new();
+        let key_pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, der, &rng)
+            .map_err(|e| CertError::Acme(format!("loading account key: {e}")))?;
+        Ok(Self { key_pair, rng })
+    }
+
+    /// The uncompressed SEC1 public point (`0x04 || X || Y`, 65 bytes), split into the JWK `x`/`y`
+    /// base64url-unpadded coordinates.
+    fn public_xy(&self) -> (String, String) {
+        let pubkey = self.key_pair.public_key().as_ref();
+        // SEC1 uncompressed: byte 0 is 0x04, then 32-byte X, then 32-byte Y.
+        let x = b64u(&pubkey[1..33]);
+        let y = b64u(&pubkey[33..65]);
+        (x, y)
+    }
+
+    /// The public JWK JSON object used in the `newAccount` `jwk` protected header.
+    ///
+    /// Members are in canonical (lexical) order so the same value also feeds the thumbprint.
+    fn public_jwk(&self) -> Value {
+        let (x, y) = self.public_xy();
+        serde_json::json!({"crv": "P-256", "kty": "EC", "x": x, "y": y})
+    }
+
+    /// The canonical JWK JSON string for RFC 7638 thumbprinting: members in EXACT lexical order
+    /// (`crv` < `kty` < `x` < `y`) with **zero** whitespace.
+    fn canonical_jwk_json(&self) -> String {
+        let (x, y) = self.public_xy();
+        format!(r#"{{"crv":"P-256","kty":"EC","x":"{x}","y":"{y}"}}"#)
+    }
+
+    /// The RFC 7638 JWK thumbprint: `base64url_nopad(SHA256(canonical_jwk_json))`.
+    fn jwk_thumbprint(&self) -> String {
+        b64u(&sha256(self.canonical_jwk_json().as_bytes()))
+    }
+
+    /// ES256-sign `signing_input`, returning the 64-byte fixed `r||s` signature.
+    fn sign(&self, signing_input: &[u8]) -> Result<Vec<u8>, CertError> {
+        self.key_pair
+            .sign(&self.rng, signing_input)
+            .map(|sig| sig.as_ref().to_vec())
+            .map_err(|e| CertError::Acme(format!("signing JWS: {e}")))
+    }
+}
+
+/// The JWS protected-header key material: either the full public `jwk` (for `newAccount`) or the
+/// account `kid` URL (for every other request).
+enum JwsKey<'a> {
+    /// Embed the public JWK (used only by `newAccount`).
+    Jwk,
+    /// Reference the existing account by its URL (`kid`).
+    Kid(&'a str),
+}
+
+/// Build a flattened JWS JSON string for an ACME request ([RFC 8555] §6.2).
+///
+/// `payload` is the already-serialized request body bytes (empty for POST-as-GET). The signing
+/// input is `b64u(protected) + "." + b64u(payload)`, signed with ES256.
+fn build_jws(
+    account_key: &AcmeAccountKey,
+    url: &str,
+    nonce: &str,
+    key: JwsKey<'_>,
+    payload: &[u8],
+) -> Result<String, CertError> {
+    let mut protected = serde_json::Map::new();
+    protected.insert("alg".into(), Value::from("ES256"));
+    protected.insert("nonce".into(), Value::from(nonce));
+    protected.insert("url".into(), Value::from(url));
+    match key {
+        JwsKey::Jwk => {
+            protected.insert("jwk".into(), account_key.public_jwk());
+        }
+        JwsKey::Kid(kid) => {
+            protected.insert("kid".into(), Value::from(kid));
+        }
+    }
+    let protected_json = Value::Object(protected).to_string();
+    let protected_b64 = b64u(protected_json.as_bytes());
+    let payload_b64 = b64u(payload);
+
+    let signing_input = format!("{protected_b64}.{payload_b64}");
+    let signature = account_key.sign(signing_input.as_bytes())?;
+    let signature_b64 = b64u(&signature);
+
+    Ok(serde_json::json!({
+        "protected": protected_b64,
+        "payload": payload_b64,
+        "signature": signature_b64,
+    })
+    .to_string())
+}
+
+/// The DNS-01 challenge material for one authorization: the full TXT record name and its value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Dns01Challenge {
+    /// The full record name to publish: `_acme-challenge.<name>`.
+    record_name: String,
+    /// The base64url-unpadded TXT value (always 43 chars): `b64u(SHA256(key_authorization))`.
+    txt_value: String,
+}
+
+/// Compute the DNS-01 record name + TXT value for `name` from the challenge `token` and the
+/// account key's thumbprint ([RFC 8555] §8.1/§8.4).
+///
+/// Pure (no I/O), so it is unit-testable without a network. The key authorization is
+/// `"{token}.{thumbprint}"` and the published TXT value is `b64u_nopad(SHA256(key_authorization))`.
+fn prepare_dns01(name: &str, token: &str, account_key: &AcmeAccountKey) -> Dns01Challenge {
+    let thumbprint = account_key.jwk_thumbprint();
+    let key_authorization = format!("{token}.{thumbprint}");
+    let txt_value = b64u(&sha256(key_authorization.as_bytes()));
+    Dns01Challenge {
+        record_name: format!("_acme-challenge.{name}"),
+        txt_value,
+    }
+}
+
+/// A response reduced to the parts the ACME flow needs: status, headers, and the collected body.
+///
+/// `ts_http_util` does not re-export its `hyper::body::Incoming` response-body type, so instead of
+/// naming it, [`consume`] immediately collects each response into this owned struct (using only the
+/// re-exported [`StatusCode`]/[`HeaderMap`] and the [`ResponseExt`] trait). Everything downstream
+/// works on `Parts`, keeping `hyper`/`http` out of this crate's direct dependencies.
+struct Parts {
+    /// The HTTP status line.
+    status: StatusCode,
+    /// The response headers (read for `Replay-Nonce` / `Location` / `Retry-After`).
+    headers: HeaderMap,
+    /// The fully collected response body.
+    body: bytes::Bytes,
+}
+
+impl Parts {
+    /// Read a single header as an owned `String`, if present and valid UTF-8.
+    fn header(&self, name: &str) -> Option<String> {
+        self.headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    }
+}
+
+/// Reduce a client response to its status + headers + collected body ([`Parts`]).
+///
+/// Generic over the response body so this crate never names `ts_http_util`'s `Incoming` type; the
+/// bound is exactly what [`ResponseExt::collect_bytes`] requires.
+async fn consume<B>(resp: Response<B>) -> Result<Parts, CertError>
+where
+    Response<B>: ResponseExt,
+{
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let body = resp.collect_bytes().await.map_err(http_err)?;
+    Ok(Parts {
+        status,
+        headers,
+        body,
+    })
+}
+
+/// Connect, POST `jws` (Content-Type `application/jose+json`) to `url`, and return its [`Parts`].
+async fn acme_post(url: &Url, jws: String) -> Result<Parts, CertError> {
+    let client = ts_http_util::http1::connect_tls::<BytesBody>(url)
+        .await
+        .map_err(http_err)?;
+    let headers = [(
+        ts_http_util::HeaderName::from_static("content-type"),
+        ts_http_util::HeaderValue::from_static("application/jose+json"),
+    )];
+    let resp = client
+        .post(url, headers, bytes::Bytes::from(jws).into())
+        .await
+        .map_err(http_err)?;
+    consume(resp).await
+}
+
+/// Map a `ts_http_util::Error` into [`CertError::Io`].
+fn http_err(error: ts_http_util::Error) -> CertError {
+    CertError::Io(std::io::Error::other(error.to_string()))
+}
+
+/// The directory endpoint URLs we use from `GET <directory>`.
+struct Directory {
+    /// `newNonce` endpoint (seed/refresh the anti-replay nonce).
+    new_nonce: Url,
+    /// `newAccount` endpoint.
+    new_account: Url,
+    /// `newOrder` endpoint.
+    new_order: Url,
+}
+
+/// Parse the three endpoint URLs we need from a directory JSON body.
+fn parse_directory(body: &[u8]) -> Result<Directory, CertError> {
+    let v: Value = serde_json::from_slice(body)
+        .map_err(|e| CertError::Acme(format!("directory JSON: {e}")))?;
+    let field = |k: &str| -> Result<Url, CertError> {
+        let s = v
+            .get(k)
+            .and_then(Value::as_str)
+            .ok_or_else(|| CertError::Acme(format!("directory missing {k}")))?;
+        Url::parse(s).map_err(|e| CertError::Acme(format!("directory {k} URL: {e}")))
+    };
+    Ok(Directory {
+        new_nonce: field("newNonce")?,
+        new_account: field("newAccount")?,
+        new_order: field("newOrder")?,
+    })
+}
+
+/// A live ACME session: the directory, the account `kid`, and the current `Replay-Nonce`.
+struct Session {
+    /// The directory endpoints.
+    directory: Directory,
+    /// The account URL returned by `newAccount`, used as the `kid` for every later request.
+    kid: String,
+    /// The most recent `Replay-Nonce` (each response refreshes it).
+    nonce: String,
+}
+
+impl Session {
+    /// Take the current nonce, leaving an empty placeholder (it must be refreshed per response).
+    fn take_nonce(&mut self) -> String {
+        std::mem::take(&mut self.nonce)
+    }
+}
+
+/// POST `payload` to `url` with a `kid`-keyed JWS, refreshing the session nonce from the response.
+///
+/// `payload` is empty (`&[]`) for POST-as-GET. Returns the collected [`Parts`] (status + headers +
+/// body).
+async fn signed_post(
+    session: &mut Session,
+    account_key: &AcmeAccountKey,
+    url: &Url,
+    payload: &[u8],
+) -> Result<Parts, CertError> {
+    let nonce = session.take_nonce();
+    let jws = build_jws(
+        account_key,
+        url.as_str(),
+        &nonce,
+        JwsKey::Kid(&session.kid),
+        payload,
+    )?;
+    let parts = acme_post(url, jws).await?;
+    if let Some(n) = parts.header("replay-nonce") {
+        session.nonce = n;
+    }
+    Ok(parts)
+}
+
+/// Issue a real certificate for `name` via the full RFC 8555 DNS-01 flow against `directory_url`.
+///
+/// `account_key` is the persisted ACME account key (see [`AcmeAccountKey::generate`]); `publisher`
+/// is the control-plane seam ([`PublishTxt`]) that publishes the `_acme-challenge.<name>` TXT.
+/// Returns the assembled [`CertifiedKey`] (leaf+chain from Let's Encrypt plus a freshly generated
+/// cert key) ready to serve, or [`CertError`] on any ACME/HTTP failure (fail-closed: no cert is
+/// returned unless the order reached `valid` and the chain assembled).
+///
+/// `directory_url` lets tests point at Pebble/staging; production is
+/// [`LETS_ENCRYPT_PRODUCTION_DIRECTORY`].
+pub async fn issue_certificate(
+    name: &str,
+    directory_url: &Url,
+    account_key: &AcmeAccountKey,
+    publisher: &(impl PublishTxt + Sync),
+) -> Result<CertifiedKey, CertError> {
+    // 1. Directory.
+    let dir_client = ts_http_util::http1::connect_tls::<BytesBody>(directory_url)
+        .await
+        .map_err(http_err)?;
+    let dir_resp = dir_client.get(directory_url, []).await.map_err(http_err)?;
+    let dir = consume(dir_resp).await?;
+    let directory = parse_directory(&dir.body)?;
+
+    // 2. Seed a nonce (HEAD-equivalent GET to newNonce; the body is discarded).
+    let nonce_client = ts_http_util::http1::connect_tls::<BytesBody>(&directory.new_nonce)
+        .await
+        .map_err(http_err)?;
+    let nonce_resp = nonce_client
+        .get(&directory.new_nonce, [])
+        .await
+        .map_err(http_err)?;
+    let nonce = consume(nonce_resp)
+        .await?
+        .header("replay-nonce")
+        .ok_or_else(|| CertError::Acme("newNonce response missing Replay-Nonce".into()))?;
+
+    // 3. newAccount (jwk header) → the account URL is the kid for all later requests.
+    let account_payload = serde_json::json!({"termsOfServiceAgreed": true}).to_string();
+    let account_jws = build_jws(
+        account_key,
+        directory.new_account.as_str(),
+        &nonce,
+        JwsKey::Jwk,
+        account_payload.as_bytes(),
+    )?;
+    let account_resp = acme_post(&directory.new_account, account_jws).await?;
+    if !account_resp.status.is_success() {
+        return Err(status_err("newAccount", &account_resp));
+    }
+    let kid = account_resp
+        .header("location")
+        .ok_or_else(|| CertError::Acme("newAccount response missing Location (kid)".into()))?;
+    let nonce = account_resp
+        .header("replay-nonce")
+        .ok_or_else(|| CertError::Acme("newAccount response missing Replay-Nonce".into()))?;
+
+    let mut session = Session {
+        directory,
+        kid,
+        nonce,
+    };
+
+    // 4. newOrder.
+    let order_payload =
+        serde_json::json!({"identifiers": [{"type": "dns", "value": name}]}).to_string();
+    let new_order_url = session.directory.new_order.clone();
+    let order_resp = signed_post(
+        &mut session,
+        account_key,
+        &new_order_url,
+        order_payload.as_bytes(),
+    )
+    .await?;
+    if !order_resp.status.is_success() {
+        return Err(status_err("newOrder", &order_resp));
+    }
+    let order_url = order_resp
+        .header("location")
+        .ok_or_else(|| CertError::Acme("newOrder response missing Location (order URL)".into()))?;
+    let order: Value = serde_json::from_slice(&order_resp.body)
+        .map_err(|e| CertError::Acme(format!("newOrder JSON: {e}")))?;
+    let authorizations = order
+        .get("authorizations")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CertError::Acme("order missing authorizations".into()))?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let finalize_url = order
+        .get("finalize")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CertError::Acme("order missing finalize URL".into()))?
+        .to_string();
+
+    // 5–7. For each authorization: find dns-01, publish TXT, signal ready, poll to valid.
+    for authz_url in &authorizations {
+        let authz_url = Url::parse(authz_url)
+            .map_err(|e| CertError::Acme(format!("authorization URL: {e}")))?;
+        let authz_resp = signed_post(&mut session, account_key, &authz_url, &[]).await?;
+        if !authz_resp.status.is_success() {
+            return Err(status_err("authorization", &authz_resp));
+        }
+        let authz: Value = serde_json::from_slice(&authz_resp.body)
+            .map_err(|e| CertError::Acme(format!("authorization JSON: {e}")))?;
+        let challenge = authz
+            .get("challenges")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|c| c.get("type").and_then(Value::as_str) == Some("dns-01"))
+            .ok_or_else(|| CertError::Acme("authorization has no dns-01 challenge".into()))?;
+        let token = challenge
+            .get("token")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CertError::Acme("dns-01 challenge missing token".into()))?;
+        let challenge_url = challenge
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CertError::Acme("dns-01 challenge missing url".into()))?
+            .to_string();
+
+        // 6. key authorization + TXT digest, published via control's set-dns.
+        let dns01 = prepare_dns01(name, token, account_key);
+        publisher
+            .publish_txt(&dns01.record_name, &dns01.txt_value)
+            .await?;
+
+        // 7. Signal ready: POST the challenge URL with payload `{}`.
+        let challenge_url = Url::parse(&challenge_url)
+            .map_err(|e| CertError::Acme(format!("challenge URL: {e}")))?;
+        let ready_resp = signed_post(&mut session, account_key, &challenge_url, b"{}").await?;
+        if !ready_resp.status.is_success() {
+            return Err(status_err("challenge-ready", &ready_resp));
+        }
+
+        // Poll the authorization to valid.
+        poll_status(&mut session, account_key, &authz_url, "authorization").await?;
+    }
+
+    // 8. Finalize: fresh cert key + CSR for `name`.
+    let cert_params = rcgen::CertificateParams::new(vec![name.to_string()])
+        .map_err(|e| CertError::Acme(format!("building CSR params: {e}")))?;
+    let cert_key = rcgen::KeyPair::generate()
+        .map_err(|e| CertError::Acme(format!("generating cert key: {e}")))?;
+    let csr = cert_params
+        .serialize_request(&cert_key)
+        .map_err(|e| CertError::Acme(format!("serializing CSR: {e}")))?;
+    let csr_b64 = b64u(csr.der());
+    let cert_key_pem = cert_key.serialize_pem();
+
+    let finalize_url =
+        Url::parse(&finalize_url).map_err(|e| CertError::Acme(format!("finalize URL: {e}")))?;
+    let finalize_payload = serde_json::json!({"csr": csr_b64}).to_string();
+    let finalize_resp = signed_post(
+        &mut session,
+        account_key,
+        &finalize_url,
+        finalize_payload.as_bytes(),
+    )
+    .await?;
+    if !finalize_resp.status.is_success() {
+        return Err(status_err("finalize", &finalize_resp));
+    }
+
+    // 9. Poll the order to valid → it then carries the certificate URL.
+    let order_url =
+        Url::parse(&order_url).map_err(|e| CertError::Acme(format!("order URL: {e}")))?;
+    let final_order = poll_status(&mut session, account_key, &order_url, "order").await?;
+    let certificate_url = final_order
+        .get("certificate")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CertError::Acme("valid order missing certificate URL".into()))?
+        .to_string();
+
+    // 10. Download the PEM chain (POST-as-GET) and assemble the CertifiedKey.
+    let certificate_url = Url::parse(&certificate_url)
+        .map_err(|e| CertError::Acme(format!("certificate URL: {e}")))?;
+    let cert_resp = signed_post(&mut session, account_key, &certificate_url, &[]).await?;
+    if !cert_resp.status.is_success() {
+        return Err(status_err("certificate-download", &cert_resp));
+    }
+
+    certified_key_from_pem(&cert_resp.body, cert_key_pem.as_bytes())
+}
+
+/// Poll `url` (POST-as-GET) until its JSON `status` is `valid`, returning the final JSON.
+///
+/// Errors on `status: "invalid"`, on exhausting [`MAX_POLL_TRIES`], or on HTTP failure. Honors a
+/// `Retry-After` header (seconds) when present, else waits [`DEFAULT_POLL_DELAY`]. `what` names the
+/// resource for error messages.
+async fn poll_status(
+    session: &mut Session,
+    account_key: &AcmeAccountKey,
+    url: &Url,
+    what: &str,
+) -> Result<Value, CertError> {
+    for _ in 0..MAX_POLL_TRIES {
+        let resp = signed_post(session, account_key, url, &[]).await?;
+        if !resp.status.is_success() {
+            return Err(status_err(what, &resp));
+        }
+        let retry_after = resp
+            .header("retry-after")
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(Duration::from_secs);
+        let value: Value = serde_json::from_slice(&resp.body)
+            .map_err(|e| CertError::Acme(format!("{what} poll JSON: {e}")))?;
+        match value.get("status").and_then(Value::as_str) {
+            Some("valid") => return Ok(value),
+            Some("invalid") => {
+                return Err(CertError::Acme(format!("{what} became invalid: {value}")));
+            }
+            _ => {
+                tokio::time::sleep(retry_after.unwrap_or(DEFAULT_POLL_DELAY)).await;
+            }
+        }
+    }
+    Err(CertError::Acme(format!(
+        "{what} did not reach valid within {MAX_POLL_TRIES} polls"
+    )))
+}
+
+/// Wrap a non-2xx response's status + truncated body preview in [`CertError::Acme`].
+fn status_err(what: &str, parts: &Parts) -> CertError {
+    let mut preview = parts.body.to_vec();
+    preview.truncate(512);
+    let preview = String::from_utf8_lossy(&preview);
+    CertError::Acme(format!(
+        "{what} returned status {}: {preview}",
+        parts.status
+    ))
+}
+
+#[cfg(all(test, feature = "acme"))]
+mod tests {
+    use std::pin::Pin;
+
+    use super::*;
+
+    /// A `PublishTxt` that records the (name, value) pairs it is asked to publish.
+    struct MockPublisher {
+        records: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl MockPublisher {
+        fn new() -> Self {
+            Self {
+                records: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl PublishTxt for MockPublisher {
+        fn publish_txt(
+            &self,
+            name: &str,
+            value: &str,
+        ) -> Pin<Box<dyn core::future::Future<Output = Result<(), CertError>> + Send + '_>>
+        {
+            self.records
+                .lock()
+                .unwrap()
+                .push((name.to_string(), value.to_string()));
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// A freshly generated account key round-trips through PKCS#8 and yields valid JWK coords.
+    fn fresh_key() -> AcmeAccountKey {
+        let (_key, der) = AcmeAccountKey::generate().expect("generate");
+        AcmeAccountKey::from_pkcs8(&der).expect("reload")
+    }
+
+    #[test]
+    fn base64url_is_unpadded_and_url_safe() {
+        // 0xFB 0xFF 0xFE encodes to "+/+ " in standard base64 → "-_-" region in URL-safe.
+        let encoded = b64u(&[0xfb, 0xff, 0xbf]);
+        assert!(!encoded.contains('='), "must have no padding: {encoded}");
+        assert!(!encoded.contains('+'), "must be URL-safe: {encoded}");
+        assert!(!encoded.contains('/'), "must be URL-safe: {encoded}");
+        // This specific input exercises both URL-safe substitutions.
+        assert_eq!(encoded, "-_-_");
+    }
+
+    #[test]
+    fn canonical_jwk_is_lexical_and_whitespace_free() {
+        let key = fresh_key();
+        let canonical = key.canonical_jwk_json();
+        // Exact member order crv<kty<x<y, no whitespace.
+        assert!(canonical.starts_with(r#"{"crv":"P-256","kty":"EC","x":""#));
+        assert!(canonical.ends_with(r#""}"#));
+        assert!(!canonical.contains(' '));
+        assert!(!canonical.contains('\n'));
+        // Order check: crv index < kty index < x index < y index.
+        let i_crv = canonical.find("crv").unwrap();
+        let i_kty = canonical.find("kty").unwrap();
+        let i_x = canonical.find(r#""x":"#).unwrap();
+        let i_y = canonical.find(r#""y":"#).unwrap();
+        assert!(i_crv < i_kty && i_kty < i_x && i_x < i_y);
+    }
+
+    #[test]
+    fn thumbprint_is_43_char_unpadded_b64url() {
+        let key = fresh_key();
+        let tp = key.jwk_thumbprint();
+        // SHA-256 → 32 bytes → 43 unpadded base64url chars.
+        assert_eq!(tp.len(), 43, "thumbprint: {tp}");
+        assert!(!tp.contains('='));
+        assert!(!tp.contains('+') && !tp.contains('/'));
+    }
+
+    #[test]
+    fn jwk_x_y_are_32_byte_coords() {
+        let key = fresh_key();
+        let (x, y) = key.public_xy();
+        // 32 raw bytes → base64url-unpadded → 43 chars.
+        assert_eq!(x.len(), 43, "x: {x}");
+        assert_eq!(y.len(), 43, "y: {y}");
+        assert!(!x.contains('=') && !y.contains('='));
+    }
+
+    #[test]
+    fn prepare_dns01_key_authorization_and_txt_value() {
+        let key = fresh_key();
+        let dns01 = prepare_dns01("host.tail1234.ts.net", "tok-EN-FACE-123", &key);
+        assert_eq!(dns01.record_name, "_acme-challenge.host.tail1234.ts.net");
+        // txt_value = b64u(SHA256("tok.thumbprint")); always 43 unpadded base64url chars.
+        assert_eq!(dns01.txt_value.len(), 43, "txt: {}", dns01.txt_value);
+        assert!(!dns01.txt_value.contains('='));
+        // Recompute independently to prove the exact key-authorization formula.
+        let key_auth = format!("tok-EN-FACE-123.{}", key.jwk_thumbprint());
+        let expected = b64u(&sha256(key_auth.as_bytes()));
+        assert_eq!(dns01.txt_value, expected);
+    }
+
+    #[test]
+    fn jws_has_three_fields_and_verifiable_signature() {
+        let key = fresh_key();
+        let jws = build_jws(
+            &key,
+            "https://acme.example/new-order",
+            "abc-nonce",
+            JwsKey::Kid("https://acme.example/acct/1"),
+            b"{}",
+        )
+        .expect("build jws");
+        let v: Value = serde_json::from_str(&jws).unwrap();
+        let protected_b64 = v.get("protected").and_then(Value::as_str).unwrap();
+        let payload_b64 = v.get("payload").and_then(Value::as_str).unwrap();
+        let signature_b64 = v.get("signature").and_then(Value::as_str).unwrap();
+
+        // Protected header decodes to the expected JSON with kid (not jwk).
+        let protected_json = URL_SAFE_NO_PAD.decode(protected_b64).unwrap();
+        let header: Value = serde_json::from_slice(&protected_json).unwrap();
+        assert_eq!(header.get("alg").and_then(Value::as_str), Some("ES256"));
+        assert_eq!(
+            header.get("nonce").and_then(Value::as_str),
+            Some("abc-nonce")
+        );
+        assert_eq!(
+            header.get("url").and_then(Value::as_str),
+            Some("https://acme.example/new-order")
+        );
+        assert_eq!(
+            header.get("kid").and_then(Value::as_str),
+            Some("https://acme.example/acct/1")
+        );
+        assert!(header.get("jwk").is_none());
+
+        // Signature is the 64-byte fixed r||s form.
+        let sig = URL_SAFE_NO_PAD.decode(signature_b64).unwrap();
+        assert_eq!(sig.len(), 64, "ES256 fixed signature is 64 bytes");
+
+        // Round-trip verify with ring to prove the signing input is correct.
+        let signing_input = format!("{protected_b64}.{payload_b64}");
+        let peer = ring::signature::UnparsedPublicKey::new(
+            &ring::signature::ECDSA_P256_SHA256_FIXED,
+            key.key_pair.public_key().as_ref(),
+        );
+        peer.verify(signing_input.as_bytes(), &sig)
+            .expect("signature must verify");
+    }
+
+    #[test]
+    fn newaccount_jws_uses_jwk_not_kid() {
+        let key = fresh_key();
+        let jws = build_jws(
+            &key,
+            "https://acme.example/new-acct",
+            "n1",
+            JwsKey::Jwk,
+            br#"{"termsOfServiceAgreed":true}"#,
+        )
+        .expect("build jws");
+        let v: Value = serde_json::from_str(&jws).unwrap();
+        let protected_b64 = v.get("protected").and_then(Value::as_str).unwrap();
+        let header: Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(protected_b64).unwrap()).unwrap();
+        let jwk = header.get("jwk").expect("newAccount uses jwk header");
+        assert_eq!(jwk.get("crv").and_then(Value::as_str), Some("P-256"));
+        assert_eq!(jwk.get("kty").and_then(Value::as_str), Some("EC"));
+        assert!(header.get("kid").is_none());
+    }
+
+    #[tokio::test]
+    async fn mock_publisher_records_the_challenge() {
+        let key = fresh_key();
+        let publisher = MockPublisher::new();
+        let dns01 = prepare_dns01("host.tail1234.ts.net", "the-token", &key);
+        publisher
+            .publish_txt(&dns01.record_name, &dns01.txt_value)
+            .await
+            .unwrap();
+        let records = publisher.records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].0, "_acme-challenge.host.tail1234.ts.net");
+        assert_eq!(records[0].1, dns01.txt_value);
+    }
+
+    #[test]
+    fn generate_then_from_pkcs8_round_trips() {
+        // `generate()` returns the key + its PKCS#8 DER to persist; reloading that exact DER must
+        // succeed and yield identical JWK coordinates and thumbprint (the persistence contract).
+        let (k1, der) = AcmeAccountKey::generate().expect("generate");
+        let k2 = AcmeAccountKey::from_pkcs8(&der).expect("reload persisted DER");
+        assert_eq!(k1.canonical_jwk_json(), k2.canonical_jwk_json());
+        assert_eq!(k1.jwk_thumbprint(), k2.jwk_thumbprint());
+        // Reloading the same DER a second time is also stable.
+        let k3 = AcmeAccountKey::from_pkcs8(&der).expect("reload again");
+        assert_eq!(k2.jwk_thumbprint(), k3.jwk_thumbprint());
+    }
+}

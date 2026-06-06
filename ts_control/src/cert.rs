@@ -80,6 +80,104 @@ use tokio_rustls::rustls::{
     sign::CertifiedKey,
 };
 
+/// The control-plane seam the ACME DNS-01 engine depends on: publish (and later clear) the
+/// `_acme-challenge.<name>` TXT record in the `ts.net` zone control owns, by sending the node's
+/// `POST /machine/set-dns` Noise RPC.
+///
+/// Implemented by the runtime's control-RPC layer (which holds the Noise transport + node keys);
+/// the ACME engine ([`crate::acme`], `acme` feature) calls it without depending on the actor types.
+/// `name` is the FULL record name (`_acme-challenge.<host>.<tailnet>.ts.net`), `value` the
+/// base64url-unpadded DNS-01 digest. Returning `Err` fails the issuance closed (no cert).
+#[cfg(feature = "acme")]
+pub trait PublishTxt {
+    /// Publish the DNS-01 challenge TXT record via `POST /machine/set-dns`. Resolves once control
+    /// has accepted the record (HTTP 200 / empty `SetDnsResponse`).
+    fn publish_txt(
+        &self,
+        name: &str,
+        value: &str,
+    ) -> std::pin::Pin<Box<dyn core::future::Future<Output = Result<(), CertError>> + Send + '_>>;
+}
+
+/// Map a [`crate::tokio::SetDnsError`] into [`CertError::Acme`].
+///
+/// The DNS-01 publish is the one I/O step of issuance the ACME engine reaches through the
+/// [`PublishTxt`] seam; fold the set-dns RPC's own error vocabulary into the cert error surface
+/// (its `Display` carries the coarse cause, e.g. the a self-hosted control plane 501 `Internal(Http)`).
+#[cfg(feature = "acme")]
+impl From<crate::tokio::SetDnsError> for CertError {
+    fn from(error: crate::tokio::SetDnsError) -> Self {
+        CertError::Acme(format!("set-dns publish failed: {error}"))
+    }
+}
+
+/// A [`PublishTxt`] backed by the node's `POST /machine/set-dns` Noise RPC.
+///
+/// Borrows the node's [`crate::Config`] (control URL + transport) and [`ts_keys::NodeState`] (node
+/// keys for the Noise channel) and publishes the `_acme-challenge.<name>` `TXT` record through
+/// [`crate::tokio::set_dns`]. SaaS-only: a self-hosted control plane 501s on `set-dns`, surfaced as
+/// [`CertError::Acme`].
+#[cfg(feature = "acme")]
+pub struct SetDnsPublisher<'a> {
+    /// Control config (server URL + transport) the set-dns RPC dials.
+    config: &'a crate::Config,
+    /// The node's key state, providing the node/machine keys for the Noise channel.
+    node_keystate: &'a ts_keys::NodeState,
+}
+
+#[cfg(feature = "acme")]
+impl<'a> SetDnsPublisher<'a> {
+    /// Build a publisher borrowing the node's control `config` and `node_keystate`.
+    pub fn new(config: &'a crate::Config, node_keystate: &'a ts_keys::NodeState) -> Self {
+        Self {
+            config,
+            node_keystate,
+        }
+    }
+}
+
+#[cfg(feature = "acme")]
+impl PublishTxt for SetDnsPublisher<'_> {
+    fn publish_txt(
+        &self,
+        name: &str,
+        value: &str,
+    ) -> std::pin::Pin<Box<dyn core::future::Future<Output = Result<(), CertError>> + Send + '_>>
+    {
+        let name = name.to_string();
+        let value = value.to_string();
+        Box::pin(async move {
+            crate::tokio::set_dns(self.config, self.node_keystate, &name, "TXT", &value)
+                .await
+                .map_err(CertError::from)
+        })
+    }
+}
+
+/// Issue a real certificate for `name` via the client-side ACME DNS-01 engine, publishing the
+/// challenge TXT through the node's `POST /machine/set-dns` RPC.
+///
+/// `account_key` is the ACME account identity (persist its PKCS#8 DER across renewals — see the
+/// runtime caller); `directory_url` selects the ACME CA (production is
+/// [`crate::acme::LETS_ENCRYPT_PRODUCTION_DIRECTORY`]). Rejects non-tailnet names up front (anti-leak)
+/// before any network I/O. SaaS-only: against a self-hosted control plane the set-dns publish 501s, surfaced as
+/// [`CertError::Acme`]. Fail-closed: returns a [`CertifiedKey`] only when the LE order reached
+/// `valid` and the chain assembled.
+#[cfg(feature = "acme")]
+pub async fn issue_certificate_via_setdns(
+    config: &crate::Config,
+    node_keystate: &ts_keys::NodeState,
+    name: &str,
+    account_key: &crate::acme::AcmeAccountKey,
+    directory_url: &url::Url,
+) -> Result<CertifiedKey, CertError> {
+    if !is_tailnet_name(name) {
+        return Err(CertError::NotTailnetName(name.to_string()));
+    }
+    let publisher = SetDnsPublisher::new(config, node_keystate);
+    crate::acme::issue_certificate(name, directory_url, account_key, &publisher).await
+}
+
 /// Names exactly what this fork is missing to issue a real cert, surfaced
 /// verbatim in [`CertError::Unimplemented`] so the gap is self-documenting at
 /// runtime. There is no control `cert/<domain>` RPC in real Tailscale — the node
@@ -279,5 +377,36 @@ mod tests {
         let e = CertError::Unimplemented { detail: "x".into() };
         let _: &dyn std::error::Error = &e;
         assert!(format!("{e}").contains("unimplemented"));
+    }
+
+    /// `issue_certificate_via_setdns` rejects a non-tailnet name with [`CertError::NotTailnetName`]
+    /// BEFORE any network I/O (the `is_tailnet_name` guard fires first). This is the only path
+    /// reachable without a live control plane / ACME CA, and it proves the anti-leak guard.
+    #[cfg(feature = "acme")]
+    #[tokio::test]
+    async fn issue_via_setdns_rejects_offtailnet_before_network() {
+        let config = crate::Config::default();
+        let keystate = ts_keys::NodeState::generate();
+        let (account_key, _der) = crate::acme::AcmeAccountKey::generate().expect("generate");
+        let directory = url::Url::parse(crate::acme::LETS_ENCRYPT_PRODUCTION_DIRECTORY).unwrap();
+
+        let err = issue_certificate_via_setdns(
+            &config,
+            &keystate,
+            "example.com",
+            &account_key,
+            &directory,
+        )
+        .await
+        .expect_err("must refuse a non-tailnet name without touching the network");
+        assert!(matches!(err, CertError::NotTailnetName(_)));
+    }
+
+    /// `SetDnsPublisher` implements [`PublishTxt`] (compile-level assertion).
+    #[cfg(feature = "acme")]
+    #[test]
+    fn set_dns_publisher_is_publish_txt() {
+        fn assert_publish_txt<T: PublishTxt>() {}
+        assert_publish_txt::<SetDnsPublisher<'_>>();
     }
 }

@@ -49,6 +49,10 @@ smallvec.workspace = true
 # run the application data path over a real OS TUN interface instead of the userspace netstack.
 # TUN device creation needs root/CAP_NET_ADMIN; off the ring-only egress path.
 tun = ["dep:ts_transport_tun", "dep:ts_host_net"]
+# Client-side ACME (Let's Encrypt) cert issuance via the node's set-dns RPC. Off by default and
+# SaaS-only (forwards to `ts_control/acme`). Enables `Runtime::get_certificate` + the ControlRunner
+# `GetCertificate` message; a self-hosted control plane 501s on set-dns so issuance is non-functional there.
+acme = ["ts_control/acme"]
 
 [dev-dependencies]
 rand = "0.10"

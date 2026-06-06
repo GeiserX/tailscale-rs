@@ -11,6 +11,9 @@ const PKG_VERSION: &str = if let Some(version) = option_env!("CARGO_PKG_VERSION"
     ""
 };
 
+/// Client-side ACME (Let's Encrypt) DNS-01 cert issuance engine (`acme` feature, SaaS-only).
+#[cfg(feature = "acme")]
+pub mod acme;
 #[cfg(feature = "async_tokio")]
 mod cert;
 mod config;
@@ -37,6 +40,8 @@ use std::fmt;
 pub use cert::{
     CertError, MISSING_CERT_RPC, certified_key_from_pem, get_certificate, is_tailnet_name,
 };
+#[cfg(feature = "acme")]
+pub use cert::{PublishTxt, SetDnsPublisher, issue_certificate_via_setdns};
 #[doc(inline)]
 pub use config::{
     Config, DEFAULT_CONTROL_SERVER, ExitProxyConfig, ExitProxyScheme, TransportMode, TunConfig,

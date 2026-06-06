@@ -52,6 +52,14 @@ futures-util = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["fs"] }
 tokio-stream = { version = "0.1", optional = true, default-features = false, features = ["sync"] }
 
+# Required dependencies for the `acme` feature (client-side ACME / Let's Encrypt cert issuance).
+# Hand-rolled on the existing ring-based HTTP/TLS stack (ts_http_util + tokio-rustls/ring), so it
+# pulls NO aws-lc-rs / openssl / second TLS stack. `ring` does the ES256 JWS signing + SHA-256
+# digests; `base64` does the base64url encoding; `rcgen` (ring) builds the finalize CSR.
+ring = { version = "0.17", optional = true }
+base64 = { workspace = true, optional = true }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"], optional = true }
+
 [dev-dependencies]
 # TEST-ONLY ephemeral self-signed cert to exercise the rustls acceptor wiring in
 # `serve`/`cert` tests. Never a production issuance path.
@@ -68,6 +76,11 @@ insecure-derp = ["ts_derp/insecure-for-tests"]
 insecure-keyfetch = []
 # SaaS-only WIF/OAuth-client auth-key bootstrap (off by default; a self-hosted control plane lacks these endpoints).
 identity-federation = []
+# Client-side ACME (Let's Encrypt) cert issuance + the POST /machine/set-dns Noise RPC that
+# publishes the DNS-01 challenge TXT. Off by default and SaaS-only: a self-hosted control plane returns HTTP 501
+# for `set-dns`, so issuance is non-functional there (built for full tsnet parity, like WIF). Pulls
+# `ring`/`base64`/`rcgen` (all ring-only — no aws-lc-rs). Requires `async_tokio` for the Noise RPC.
+acme = ["async_tokio", "dep:ring", "dep:base64", "dep:rcgen"]
 
 [lints]
 workspace = true
