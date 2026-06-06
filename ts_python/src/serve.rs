@@ -53,3 +53,28 @@ fn extract_target(ob: Borrowed<'_, '_, PyAny>) -> PyResult<tailscale::ServeTarge
         "serve target must be \"accept\" or {\"proxy\": \"host:port\"}",
     ))
 }
+
+/// A Python-supplied VIP-service mode: `{"mode": "tcp"|"http", "port": int}`.
+///
+/// Maps to [`tailscale::ServiceMode`] (`tcp`/`http`); the L3/`tun` mode is unsupported in this fork
+/// and is rejected.
+pub struct ServiceModeArg(pub tailscale::ServiceMode);
+
+impl<'py> FromPyObject<'_, 'py> for ServiceModeArg {
+    type Error = PyErr;
+
+    fn extract(ob: Borrowed<'_, 'py, PyAny>) -> PyResult<Self> {
+        let port: u16 = ob.get_item("port")?.extract()?;
+        let mode: String = ob.get_item("mode")?.extract()?;
+        let mode = match mode.as_str() {
+            "tcp" => tailscale::ServiceMode::Tcp { port },
+            "http" => tailscale::ServiceMode::Http { port },
+            other => {
+                return Err(py_value_err(format!(
+                    "unknown service mode {other:?}; expected \"tcp\" or \"http\""
+                )));
+            }
+        };
+        Ok(ServiceModeArg(mode))
+    }
+}

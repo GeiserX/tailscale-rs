@@ -2,7 +2,7 @@
 
 use std::{
     net::{IpAddr, SocketAddr},
-    sync::{Arc, Once},
+    sync::{Arc, Mutex, Once},
     time::Duration,
 };
 
@@ -26,7 +26,7 @@ mod udp;
 
 use key_state::Keystate;
 use node_info::NodeInfo;
-use serve::ServeConfigArg;
+use serve::{ServeConfigArg, ServiceModeArg};
 use status::{Status, WhoIs};
 
 /// Tailscale API.
@@ -35,7 +35,7 @@ pub mod _internal {
     use super::*;
     #[pymodule_export]
     use crate::{
-        Device, Keystate,
+        Device, Keystate, LoopbackHandle,
         tcp::{TcpListener, TcpStream},
         udp::UdpSocket,
     };
@@ -443,6 +443,274 @@ impl Device {
             dev.listen_tls(&cfg).await.map_err(py_value_err)?;
             Ok(())
         })
+    }
+
+    // --- Lane: identity / metrics / key-expiry ---
+
+    /// Fetch an OIDC **ID token** from control scoped to `audience` (like `tailscale id-token`).
+    ///
+    /// Returns the signed JWT as a string. The `sub` claim is this node's MagicDNS name and the
+    /// `aud` claim is `audience`, suitable for workload-identity federation (AWS/GCP). Raises if
+    /// control does not support id-token issuance.
+    pub fn fetch_id_token<'p>(&self, py: Python<'p>, audience: String) -> PyFut<'p> {
+        let dev = self.dev.clone();
+
+        future_into_py(py, async move {
+            let token = dev.fetch_id_token(&audience).await.map_err(py_value_err)?;
+            Ok(token)
+        })
+    }
+
+    /// Snapshot this process's client metrics in Prometheus text exposition format.
+    ///
+    /// The metric registry is process-global, so the returned text covers every `Device` in the
+    /// process. Synchronous — no overlay round-trip is involved.
+    pub fn metrics(&self) -> String {
+        self.dev.metrics()
+    }
+
+    /// This node's key-expiry instant as Unix seconds, or `None` if the key never expires.
+    ///
+    /// This fork is reactive about key expiry (it reports rather than rotating in the background);
+    /// schedule re-authentication around this time.
+    pub fn self_key_expiry_unix<'p>(&self, py: Python<'p>) -> PyFut<'p> {
+        let dev = self.dev.clone();
+
+        future_into_py(py, async move {
+            let expiry = dev.self_key_expiry_unix().await.map_err(py_value_err)?;
+            Ok(expiry)
+        })
+    }
+
+    /// Whether this node's key has expired as of now. A key with no expiry is never expired.
+    pub fn self_key_expired<'p>(&self, py: Python<'p>) -> PyFut<'p> {
+        let dev = self.dev.clone();
+
+        future_into_py(py, async move {
+            let expired = dev.self_key_expired().await.map_err(py_value_err)?;
+            Ok(expired)
+        })
+    }
+
+    // --- Lane: Taildrop ---
+
+    /// List the Taildrop files this device has fully received and not yet consumed.
+    ///
+    /// Returns a list of dicts `{"name": str, "size": int}`, sorted by name. Returns an empty list
+    /// when Taildrop is disabled (fail-closed, never an error). Synchronous (a local filesystem
+    /// listing).
+    pub fn taildrop_waiting_files(&self) -> PyResult<Vec<(String, u64)>> {
+        let files = self.dev.taildrop_waiting_files().map_err(py_value_err)?;
+        Ok(files.into_iter().map(|f| (f.name, f.size)).collect())
+    }
+
+    /// Delete a received Taildrop file by `name` (path-traversal-safe; validated in the store).
+    ///
+    /// Raises when Taildrop is disabled, the name is invalid, or the file does not exist.
+    /// Synchronous (a local filesystem delete).
+    pub fn taildrop_delete_file(&self, name: String) -> PyResult<()> {
+        self.dev.taildrop_delete_file(&name).map_err(py_value_err)
+    }
+
+    /// Save a received Taildrop file by `name` to `dst_path` on the local filesystem.
+    ///
+    /// Opens the received file via the store (path-traversal-safe) and copies its bytes to
+    /// `dst_path`, returning the number of bytes written. Pyo3 cannot hand back a raw file handle,
+    /// so this save-to-path shape is the Pythonic equivalent of Go's `OpenFile`. Synchronous (local
+    /// filesystem I/O). Raises when Taildrop is disabled, the name is invalid, the source file does
+    /// not exist, or `dst_path` cannot be written.
+    pub fn taildrop_save_file(&self, name: String, dst_path: String) -> PyResult<u64> {
+        let (mut src, _size) = self.dev.taildrop_open_file(&name).map_err(py_value_err)?;
+        let mut dst = std::fs::File::create(&dst_path).map_err(py_value_err)?;
+        let copied = std::io::copy(&mut src, &mut dst).map_err(py_value_err)?;
+        Ok(copied)
+    }
+
+    /// Send a local file at `src_path` to tailnet peer `peer_name` via Taildrop (Go `PushFile`).
+    ///
+    /// Resolves `peer_name` via [`peer_by_name`][Self::peer_by_name], opens `src_path` as a tokio
+    /// file, and streams it to the peer's peerAPI over the encrypted overlay (never a host socket).
+    /// `file_name` is the base name the receiver sees. Raises when the peer is unknown, the peer
+    /// advertises no IPv4 peerAPI, or the transfer fails.
+    pub fn send_file<'p>(
+        &self,
+        py: Python<'p>,
+        peer_name: String,
+        file_name: String,
+        src_path: String,
+    ) -> PyFut<'p> {
+        let dev = self.dev.clone();
+
+        future_into_py(py, async move {
+            let peer = dev
+                .peer_by_name(&peer_name)
+                .await
+                .map_err(py_value_err)?
+                .ok_or_else(|| py_value_err(format!("no tailnet peer named {peer_name:?}")))?;
+
+            let file = tokio::fs::File::open(&src_path)
+                .await
+                .map_err(py_value_err)?;
+            let len = file.metadata().await.map_err(py_value_err)?.len();
+
+            dev.send_file(&peer, &file_name, len, file)
+                .await
+                .map_err(py_value_err)?;
+            Ok(())
+        })
+    }
+
+    // --- Lane: packet capture ---
+
+    /// Begin a debug packet capture, writing a pcap of every dataplane packet to `dst_path`.
+    ///
+    /// Opens `dst_path` and streams a classic pcap (Tailscale `LINKTYPE_USER0`) of every plaintext
+    /// IP packet — outbound (pre-encrypt) and inbound (post-decrypt) — until
+    /// [`stop_capture`][Self::stop_capture] is called. Records are buffered and flushed on stop.
+    /// Opens in Wireshark with Tailscale's `ts-dissector.lua`.
+    pub fn capture_pcap<'p>(&self, py: Python<'p>, dst_path: String) -> PyFut<'p> {
+        let dev = self.dev.clone();
+
+        future_into_py(py, async move {
+            let file = std::fs::File::create(&dst_path).map_err(py_value_err)?;
+            dev.capture_pcap(std::io::BufWriter::new(file))
+                .await
+                .map_err(py_value_err)?;
+            Ok(())
+        })
+    }
+
+    /// Stop a packet capture started by [`capture_pcap`][Self::capture_pcap].
+    ///
+    /// Clears the dataplane capture hook; the writer is dropped and its buffered bytes flushed.
+    /// Idempotent — stopping when no capture is installed is a no-op.
+    pub fn stop_capture<'p>(&self, py: Python<'p>) -> PyFut<'p> {
+        let dev = self.dev.clone();
+
+        future_into_py(py, async move {
+            dev.stop_capture().await.map_err(py_value_err)?;
+            Ok(())
+        })
+    }
+
+    // --- Lane: loopback SOCKS5 proxy ---
+
+    /// Start a host-loopback SOCKS5 proxy that dials into the tailnet (Go `tsnet.Loopback`).
+    ///
+    /// Returns a tuple `(addr, proxy_cred, handle)` where `addr` is the bound `127.0.0.1:port`
+    /// string, `proxy_cred` is the SOCKS5 password (username is `tsnet`), and `handle` is a
+    /// [`LoopbackHandle`] whose `.stop()` (or garbage collection) stops the proxy. Hold the handle
+    /// for exactly as long as you want the proxy alive. Raises in TUN transport mode.
+    pub fn loopback<'p>(&self, py: Python<'p>) -> PyFut<'p> {
+        let dev = self.dev.clone();
+
+        future_into_py(py, async move {
+            let (addr, cred, handle) = dev.loopback().await.map_err(py_value_err)?;
+            Ok((
+                addr.to_string(),
+                cred,
+                LoopbackHandle {
+                    inner: Mutex::new(Some(handle)),
+                },
+            ))
+        })
+    }
+
+    // --- Lane: Tailnet Lock (TKA) ---
+
+    /// Fetch the current Tailnet Lock (TKA) status pushed by control, if any.
+    ///
+    /// Returns `None` when control has sent no `TKAInfo`, else a dict `{"head": str,
+    /// "disabled": bool}` where `head` is the base32 (no-pad) `AUMHash` of the latest applied
+    /// Authority Update Message.
+    pub fn tka_status<'p>(&self, py: Python<'p>) -> PyFut<'p> {
+        let dev = self.dev.clone();
+
+        future_into_py(py, async move {
+            let status = dev.tka_status().await.map_err(py_value_err)?;
+            Ok(status.map(|s| (s.head, s.disabled)))
+        })
+    }
+
+    // --- Lane: Serve / Funnel / Services ---
+
+    /// Build a Funnel TLS listener config for `serve_config` (like `tsnet`'s `ListenFunnel`).
+    ///
+    /// `serve_config` has the same shape as [`listen_tls`][Self::listen_tls]. `funnel_only` (default
+    /// `False`) rejects tailnet-internal connections, serving only public Funnel ingress.
+    ///
+    /// **Fail-closed.** Enforces the node-attribute / port gates first, then — because this fork has
+    /// no client-side ACME engine and no public ingress relays — always raises the underlying
+    /// `FunnelError` rather than ever serving plaintext or a self-signed cert.
+    #[pyo3(signature = (serve_config, funnel_only=false))]
+    pub fn listen_funnel<'p>(
+        &self,
+        py: Python<'p>,
+        serve_config: ServeConfigArg,
+        funnel_only: bool,
+    ) -> PyFut<'p> {
+        let dev = self.dev.clone();
+        let cfg = serve_config.0;
+        let opts = ts_control::FunnelOptions { funnel_only };
+
+        future_into_py(py, async move {
+            // Gate may pass, but issuance/relay legs always raise in this fork; propagate faithfully.
+            dev.listen_funnel(&cfg, opts).await.map_err(py_value_err)?;
+            Ok(())
+        })
+    }
+
+    /// Host a Tailscale **VIP service** (`svc:<label>`) by `service_name` (like `ListenService`).
+    ///
+    /// `mode` is a dict `{"mode": "tcp"|"http", "port": int}`. Returns a [`TcpListener`] bound on the
+    /// service's control-assigned VIP over the overlay netstack.
+    ///
+    /// **Fail-closed.** The `service_name` must be a valid `svc:<dns-label>`, this node must be
+    /// tagged, and control must have assigned the service a VIP on this node; any unmet precondition
+    /// raises before binding.
+    pub fn listen_service<'p>(
+        &self,
+        py: Python<'p>,
+        service_name: String,
+        mode: ServiceModeArg,
+    ) -> PyFut<'p> {
+        let dev = self.dev.clone();
+        let mode = mode.0;
+
+        future_into_py(py, async move {
+            let listener = dev
+                .listen_service(&service_name, mode)
+                .await
+                .map_err(py_value_err)?;
+
+            Ok(tcp::TcpListener {
+                listener: Arc::new(listener),
+            })
+        })
+    }
+}
+
+/// Handle that keeps a loopback SOCKS5 proxy alive (returned by [`Device::loopback`]).
+///
+/// Dropping this handle — or calling [`stop`][Self::stop] / letting Python garbage-collect it —
+/// stops the accept loop and frees the bound `127.0.0.1` port. Hold it for exactly as long as you
+/// want the proxy.
+#[pyclass(module = "tailscale")]
+pub struct LoopbackHandle {
+    inner: Mutex<Option<ts::LoopbackHandle>>,
+}
+
+#[pymethods]
+impl LoopbackHandle {
+    /// Stop the loopback SOCKS5 proxy now. Idempotent — a second call is a no-op.
+    pub fn stop(&self) {
+        // Take + drop the inner handle; its Drop aborts the accept loop.
+        drop(self.inner.lock().ok().and_then(|mut g| g.take()));
+    }
+
+    /// Stop the proxy when the Python object is garbage-collected. Equivalent to [`stop`][Self::stop].
+    pub fn __del__(&self) {
+        self.stop();
     }
 }
 

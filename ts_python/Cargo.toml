@@ -12,8 +12,10 @@ rust-version.workspace = true
 
 [dependencies]
 tailscale.workspace = true
+ts_control.workspace = true
 
 hex.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util"] }
 pyo3 = { version = "0.28", features = ["bytes", "abi3-py312"] }
 pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime", "attributes"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

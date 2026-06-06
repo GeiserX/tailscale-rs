@@ -18,7 +18,7 @@
 //! synchronization.
 
 use std::{
-    ffi::{self, CStr, c_char},
+    ffi::{self, CStr, CString, c_char},
     net::SocketAddr,
     sync::{LazyLock, Once},
     time::Duration,
@@ -26,26 +26,37 @@ use std::{
 
 use tracing::level_filters::LevelFilter;
 
+mod capture;
 mod config;
 mod keys;
+mod loopback;
 mod net_types;
 mod status;
+mod taildrop;
 mod tcp;
 mod tls;
 mod udp;
 mod util;
 
+pub use capture::{ts_capture_pcap, ts_stop_capture};
+pub use loopback::{loopback_handle, ts_loopback, ts_loopback_stop};
 pub use net_types::{
     AF_INET, AF_INET6, in_addr_t, in6_addr_t, sa_family_t, sockaddr, sockaddr_data, sockaddr_in,
     sockaddr_in6,
 };
 pub use status::{status_node, status_visitor, ts_status, ts_whois};
+pub use taildrop::{
+    ts_taildrop_delete_file, ts_taildrop_file_size, ts_taildrop_save_file,
+    ts_taildrop_waiting_files,
+};
 pub use tcp::{
     tcp_listener, tcp_stream, ts_connect_by_name, ts_tcp_close, ts_tcp_close_listener,
     ts_tcp_connect, ts_tcp_listen, ts_tcp_listener_local_addr, ts_tcp_local_addr, ts_tcp_recv,
     ts_tcp_remote_addr, ts_tcp_send,
 };
-pub use tls::{serve_config, serve_target, ts_get_certificate, ts_listen_tls};
+pub use tls::{
+    serve_config, serve_target, service_mode, ts_get_certificate, ts_listen_service, ts_listen_tls,
+};
 pub use udp::{ts_udp_bind, ts_udp_close, ts_udp_recvfrom, ts_udp_sendto, udp_socket};
 
 static TOKIO_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
@@ -357,4 +368,251 @@ pub unsafe extern "C" fn ts_ping(
             -1
         }
     }
+}
+
+/// Free a C string previously allocated and returned by this library (e.g. by [`ts_metrics`],
+/// [`ts_fetch_id_token`], [`ts_tka_status`], or [`ts_taildrop_waiting_files`](taildrop::ts_taildrop_waiting_files)).
+///
+/// Passing `NULL` is a no-op. Each returned string must be freed at most once, and only with this
+/// function — do not call the C library `free` on it.
+///
+/// # Safety
+///
+/// `s` must be either `NULL` or a pointer obtained from one of this library's string-returning
+/// functions and not yet freed. It must not be used after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ts_string_free(s: *mut c_char) {
+    if s.is_null() {
+        return;
+    }
+    // SAFETY: by precondition, `s` came from `CString::into_raw` in this library and has not been
+    // freed, so reconstituting the `CString` (which frees on drop) is sound.
+    drop(unsafe { CString::from_raw(s) });
+}
+
+/// Helper: allocate a C string from a Rust `String`, returning a pointer that the caller must free
+/// with [`ts_string_free`]. Returns null if the string contains an interior NUL.
+pub(crate) fn into_c_string(s: String) -> *mut c_char {
+    match CString::new(s) {
+        Ok(c) => c.into_raw(),
+        Err(e) => {
+            tracing::error!(err = %e, "string contains interior NUL");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Request an OIDC **ID token** from control for this node, scoped to `audience` (like `tailscale`'s
+/// `id-token` LocalAPI).
+///
+/// On success, writes a newly-allocated, NUL-terminated JWT string to `*out` and returns 0; the
+/// caller must free it with [`ts_string_free`]. On error, writes `NULL` to `*out` and returns a
+/// negative number (the underlying [`IdTokenError`](tailscale::IdTokenError) is logged via
+/// `tracing`).
+///
+/// # Safety
+///
+/// `audience` must be readable per [`CStr`] rules (NUL-terminated, valid up to and including the
+/// NUL). `out` must be a valid, writable pointer to a `char *`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ts_fetch_id_token(
+    dev: &device,
+    audience: *const c_char,
+    out: *mut *mut c_char,
+) -> ffi::c_int {
+    // SAFETY: ensured by function precondition
+    let Some(audience) = (unsafe { util::str(audience) }) else {
+        tracing::error!("fetch_id_token: audience is null or invalid utf-8");
+        return -1;
+    };
+
+    match TOKIO_RUNTIME.block_on(dev.0.fetch_id_token(audience)) {
+        Ok(jwt) => {
+            let ptr = into_c_string(jwt);
+            if ptr.is_null() {
+                return -1;
+            }
+            // SAFETY: `out` is a valid writable pointer by precondition.
+            unsafe { *out = ptr };
+            0
+        }
+        Err(e) => {
+            tracing::error!(err = %e, "fetch_id_token");
+            // SAFETY: `out` is a valid writable pointer by precondition.
+            unsafe { *out = std::ptr::null_mut() };
+            -1
+        }
+    }
+}
+
+/// Snapshot this node's client metrics in Prometheus text exposition format (like Go Tailscale's
+/// `clientmetric` registry).
+///
+/// Returns a newly-allocated, NUL-terminated string the caller must free with [`ts_string_free`].
+/// Returns `NULL` only if the rendered metrics contain an interior NUL (never expected). The
+/// registry is process-global, so the output covers every device in the process.
+#[unsafe(no_mangle)]
+pub extern "C" fn ts_metrics(dev: &device) -> *mut c_char {
+    into_c_string(dev.0.metrics())
+}
+
+/// This node's key-expiry instant as Unix seconds (`Node.KeyExpiry` in Go).
+///
+/// On success returns 0 and sets `*out_has` to 1 with `*out_unix` populated if the key has an
+/// expiry, or `*out_has` to 0 (and leaves `*out_unix` untouched) if the key never expires. Returns
+/// a negative number on error (and writes nothing).
+///
+/// # Safety
+///
+/// `out_unix` and `out_has` must be valid, writable pointers.
+#[unsafe(no_mangle)]
+pub extern "C" fn ts_self_key_expiry_unix(
+    dev: &device,
+    out_unix: &mut i64,
+    out_has: &mut ffi::c_int,
+) -> ffi::c_int {
+    match TOKIO_RUNTIME.block_on(dev.0.self_key_expiry_unix()) {
+        Ok(Some(unix)) => {
+            *out_unix = unix;
+            *out_has = 1;
+            0
+        }
+        Ok(None) => {
+            *out_has = 0;
+            0
+        }
+        Err(e) => {
+            tracing::error!(err = %e, "self_key_expiry_unix");
+            -1
+        }
+    }
+}
+
+/// Whether this node's key has expired as of now (`!KeyExpiry.IsZero() && KeyExpiry.Before(now)` in
+/// Go). A key with no expiry is never expired.
+///
+/// On success returns 0 and sets `*out` to 1 if expired, 0 otherwise. Returns a negative number on
+/// error.
+///
+/// # Safety
+///
+/// `out` must be a valid, writable pointer.
+#[unsafe(no_mangle)]
+pub extern "C" fn ts_self_key_expired(dev: &device, out: &mut ffi::c_int) -> ffi::c_int {
+    match TOKIO_RUNTIME.block_on(dev.0.self_key_expired()) {
+        Ok(expired) => {
+            *out = expired as ffi::c_int;
+            0
+        }
+        Err(e) => {
+            tracing::error!(err = %e, "self_key_expired");
+            -1
+        }
+    }
+}
+
+/// Fetch the current Tailnet Lock (TKA) status pushed by control, if any.
+///
+/// On success returns 0 and writes a newly-allocated JSON object to `*out` of the form
+/// `{"enabled":<bool>,"disabled":<bool>,"head":"<base32>"}` (the caller frees it with
+/// [`ts_string_free`]). When control has sent no TKA status, returns 0 and writes the JSON
+/// `null`. Returns a negative number on error (and writes `NULL` to `*out`).
+///
+/// # Safety
+///
+/// `out` must be a valid, writable pointer to a `char *`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ts_tka_status(dev: &device, out: *mut *mut c_char) -> ffi::c_int {
+    match TOKIO_RUNTIME.block_on(dev.0.tka_status()) {
+        Ok(status) => {
+            let json = match status {
+                Some(s) => format!(
+                    "{{\"enabled\":{},\"disabled\":{},\"head\":{:?}}}",
+                    s.is_enabled(),
+                    s.disabled,
+                    s.head
+                ),
+                None => "null".to_owned(),
+            };
+            let ptr = into_c_string(json);
+            if ptr.is_null() {
+                return -1;
+            }
+            // SAFETY: `out` is a valid writable pointer by precondition.
+            unsafe { *out = ptr };
+            0
+        }
+        Err(e) => {
+            tracing::error!(err = %e, "tka_status");
+            // SAFETY: `out` is a valid writable pointer by precondition.
+            unsafe { *out = std::ptr::null_mut() };
+            -1
+        }
+    }
+}
+
+/// Send a local file to a tailnet peer via Taildrop (Go `PushFile` / `tailscale file cp`).
+///
+/// Looks up `peer_name` (a MagicDNS name) in the netmap, opens `src_path` as a local file, and
+/// streams its full contents to the peer's peerAPI as `file_name` over the encrypted overlay (never
+/// a host socket). The destination is derived solely from the resolved peer's own node record.
+///
+/// Returns 0 on success, a positive number (1) if no peer matched `peer_name`, and a negative
+/// number on error (invalid input, file open failure, or transfer failure — logged via `tracing`).
+///
+/// # Safety
+///
+/// `peer_name`, `file_name`, and `src_path` must each be readable per [`CStr`] rules (NUL-
+/// terminated, valid up to and including the NUL).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ts_send_file(
+    dev: &device,
+    peer_name: *const c_char,
+    file_name: *const c_char,
+    src_path: *const c_char,
+) -> ffi::c_int {
+    // SAFETY: ensured by function precondition
+    let (Some(peer_name), Some(file_name), Some(src_path)) = (unsafe {
+        (
+            util::str(peer_name),
+            util::str(file_name),
+            util::str(src_path),
+        )
+    }) else {
+        tracing::error!("send_file: a string argument is null or invalid utf-8");
+        return -1;
+    };
+
+    let peer = match TOKIO_RUNTIME.block_on(dev.0.peer_by_name(peer_name)) {
+        Ok(Some(peer)) => peer,
+        Ok(None) => return 1,
+        Err(e) => {
+            tracing::error!(err = %e, "send_file: peer lookup");
+            return -1;
+        }
+    };
+
+    TOKIO_RUNTIME.block_on(async {
+        let file = match tokio::fs::File::open(src_path).await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!(err = %e, "send_file: open source");
+                return -1;
+            }
+        };
+        let len = match file.metadata().await {
+            Ok(m) => m.len(),
+            Err(e) => {
+                tracing::error!(err = %e, "send_file: stat source");
+                return -1;
+            }
+        };
+        match dev.0.send_file(&peer, file_name, len, file).await {
+            Ok(()) => 0,
+            Err(e) => {
+                tracing::error!(err = %e, "send_file");
+                -1
+            }
+        }
+    })
 }

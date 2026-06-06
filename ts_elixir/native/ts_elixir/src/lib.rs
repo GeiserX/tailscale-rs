@@ -11,11 +11,13 @@ use std::{
 use rustler::{Encoder, NifResult, ResourceArc, Term};
 
 mod config;
+mod device;
 mod serve;
 mod status;
 mod tcp;
 mod udp;
 
+use device::LoopbackHandleResource;
 use tcp::{TcpListener, TcpStream};
 use udp::UdpSocket;
 
@@ -335,7 +337,8 @@ fn load(env: rustler::Env, _term: Term) -> bool {
     let ret = env.register::<UdpSocket>().is_ok()
         && env.register::<Device>().is_ok()
         && env.register::<TcpStream>().is_ok()
-        && env.register::<TcpListener>().is_ok();
+        && env.register::<TcpListener>().is_ok()
+        && env.register::<LoopbackHandleResource>().is_ok();
     if ret {
         tracing::debug!("loaded tailscale nifs");
     }

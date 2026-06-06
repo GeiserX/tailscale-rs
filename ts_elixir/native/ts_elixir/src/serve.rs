@@ -15,6 +15,9 @@ mod atoms_serve {
     rustler::atoms! {
         accept,
         proxy,
+
+        tcp,
+        http,
     }
 }
 
@@ -76,5 +79,75 @@ fn listen_tls(env: rustler::Env<'_>, dev: ResourceArc<Device>, config: Term) -> 
     match TOKIO_RUNTIME.block_on(async move { dev.listen_tls(&cfg).await }) {
         Ok(_acceptor) => (atoms::ok(), atoms::ok()).encode(env),
         Err(e) => (atoms::error(), e.to_string()).encode(env),
+    }
+}
+
+/// Expose a tailnet TLS service to the public internet via Tailscale Funnel (mirrors `listen_tls`).
+///
+/// `funnel_only` maps to [`tailscale::FunnelOptions::funnel_only`]. Like [`listen_tls`], this is
+/// **fail-closed**: the node-attribute/port gate is enforced first, then an allowed request still
+/// surfaces [`tailscale::FunnelError`] (`Unsupported` / `Cert`) because this fork has neither a
+/// client-side ACME engine nor public-ingress relays. We never serve a self-signed cert or
+/// downgrade to plaintext.
+#[rustler::nif(schedule = "DirtyIo")]
+fn listen_funnel(
+    env: rustler::Env<'_>,
+    dev: ResourceArc<Device>,
+    config: Term,
+    funnel_only: bool,
+) -> impl Encoder {
+    let dev = dev.inner.clone();
+    let Some(cfg) = serve_config_from_erl(config) else {
+        return env.error_tuple("invalid serve config");
+    };
+    let opts = ts_control::FunnelOptions { funnel_only };
+
+    match TOKIO_RUNTIME.block_on(async move { dev.listen_funnel(&cfg, opts).await }) {
+        Ok(_acceptor) => (atoms::ok(), atoms::ok()).encode(env),
+        Err(e) => (atoms::error(), e.to_string()).encode(env),
+    }
+}
+
+/// Host a Tailscale VIP service (`svc:<label>`) on its control-assigned VIP (mirrors `listen_tls`).
+///
+/// `mode` is a `{:tcp, port}` or `{:http, port}` tuple. **Fail-closed**: an invalid name, an
+/// untagged host, or a missing control-assigned VIP all return a typed
+/// [`tailscale::ServiceError`] before any listener is bound. On success the bound overlay listener
+/// is created and immediately dropped — like the other Serve NIFs, the BEAM has no idiomatic place
+/// to hold a Rust listener, so we surface the precondition outcome only.
+#[rustler::nif(schedule = "DirtyIo")]
+fn listen_service(
+    env: rustler::Env<'_>,
+    dev: ResourceArc<Device>,
+    name: &str,
+    mode: Term,
+) -> impl Encoder {
+    let dev = dev.inner.clone();
+    let name = name.to_owned();
+    let Some(mode) = service_mode_from_erl(mode) else {
+        return env.error_tuple("invalid service mode");
+    };
+
+    match TOKIO_RUNTIME.block_on(async move { dev.listen_service(&name, mode).await }) {
+        Ok(_listener) => (atoms::ok(), atoms::ok()).encode(env),
+        Err(e) => (atoms::error(), e.to_string()).encode(env),
+    }
+}
+
+/// Decode a `{:tcp, port}` / `{:http, port}` tuple into a [`tailscale::ServiceMode`].
+fn service_mode_from_erl(term: Term) -> Option<tailscale::ServiceMode> {
+    let tuple = rustler::types::tuple::get_tuple(term).ok()?;
+    if tuple.len() != 2 {
+        return None;
+    }
+    let tag = tuple[0].decode::<rustler::Atom>().ok()?;
+    let port: u16 = tuple[1].decode().ok()?;
+
+    if tag == atoms_serve::tcp() {
+        Some(tailscale::ServiceMode::Tcp { port })
+    } else if tag == atoms_serve::http() {
+        Some(tailscale::ServiceMode::Http { port })
+    } else {
+        None
     }
 }

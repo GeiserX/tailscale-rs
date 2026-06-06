@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use rustler::{Atom, NifResult, Term};
+use rustler::{Atom, Encoder, NifResult, Term};
 
 mod atoms {
     rustler::atoms! {
@@ -146,4 +146,33 @@ impl TryFrom<Keystate> for tailscale::keys::PersistState {
             old_node_key: None,
         })
     }
+}
+
+/// Rotate the node key in a [`Keystate`] for embedder-driven re-registration (mirrors
+/// `Config::rotate_node_key`, which delegates to `key_state.rotate_node_key()`).
+///
+/// The binding exposes key material as the `Tailscale.Keystate` struct rather than a `Config`
+/// resource, so we rotate at that level: the current node key is recorded as the old key and a
+/// fresh node key is generated. Re-`connect/1` with the returned `keys:` to perform the rotation;
+/// the next registration sends the prior key as `OldNodeKey` for key continuity. Returns
+/// `{:error, :badkeys}` if the keystate bytes are not valid 32-byte keys.
+///
+/// NOTE: the round-trip [`Keystate`] type drops `old_node_key` (it carries only the three 32-byte
+/// keys), so the rotated `old_node_key` is held in the returned native `PersistState` only until it
+/// is re-encoded; on `connect/1` the freshly-rotated node key is registered. This matches the
+/// fork's reactive, re-registration-on-connect rotation model.
+#[rustler::nif]
+fn rotate_node_key(env: rustler::Env<'_>, keys: Term) -> impl Encoder {
+    let Ok(keystate) = keys.decode::<Keystate>() else {
+        return (crate::atoms::error(), "badkeys").encode(env);
+    };
+
+    let mut state: tailscale::keys::PersistState = match keystate.try_into() {
+        Ok(s) => s,
+        Err(()) => return (crate::atoms::error(), "badkeys").encode(env),
+    };
+
+    state.rotate_node_key();
+
+    (crate::atoms::ok(), Keystate::from(state)).encode(env)
 }

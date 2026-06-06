@@ -6,6 +6,35 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.34](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.34) - 2026-06-06
+
+**Language-binding parity** (roadmap Tier 4, item 12): propagate the newer `Device` surface into all
+three bindings (`ts_ffi` C ABI, `ts_python` pyo3, `ts_elixir` rustler), bringing them from ~lanes-A–E
+coverage up to the full device API.
+
+Each binding now exposes (mirroring its native idiom): `fetch_id_token`, `metrics` (Prometheus
+text), `self_key_expiry_unix` / `self_key_expired`, Taildrop receive (`waiting_files`,
+`delete_file`, `save_file`-to-path) + Taildrop **send** (`send_file` resolves the peer by name and
+streams a local file over the overlay), `capture_pcap`-to-path + `stop_capture`, `loopback` (returns
+the bound addr + proxy credential + a stop-on-drop handle), and `tka_status`.
+
+- **C FFI** (`ts_ffi`): new `ts_fetch_id_token`, `ts_metrics`, `ts_self_key_expiry_unix`,
+  `ts_self_key_expired`, `ts_tka_status`, `ts_send_file`, `ts_taildrop_{waiting_files,file_size,
+  save_file,delete_file}`, `ts_capture_pcap`/`ts_stop_capture`, `ts_loopback`/`ts_loopback_stop`,
+  `ts_listen_service` (+ `ts_service_mode`), and `ts_string_free` for library-allocated strings; the
+  `tailscale.h` header is regenerated. `listen_funnel` is omitted from the C ABI (its
+  `FunnelOptions` type would require a `ts_control` dependency the C crate deliberately avoids; Funnel
+  is fail-closed regardless).
+- **Python** (`ts_python`): the above as `Device` async methods plus `listen_funnel` /
+  `listen_service`, and a `LoopbackHandle` pyclass whose `stop()`/`__del__` tears down the proxy.
+- **Elixir** (`ts_elixir`): the above as NIFs plus `listen_funnel`/`listen_service` and a
+  `rotate_node_key` on the `Keystate` struct; a `LoopbackHandleResource` is registered for teardown.
+
+`register_fallback_tcp_handler` is intentionally not bridged into Python/Elixir (it takes a native
+Rust closure with no clean cross-language callback seam). No new TLS/crypto dependencies — the
+ring-only invariant is preserved; the two non-C bindings take an internal `ts_control` dependency for
+`FunnelOptions` only.
+
 ## [0.5.33](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.33) - 2026-06-06
 
 Hardening + coverage from a multi-reviewer audit of the v0.5.27–v0.5.32 safe-bucket features. No

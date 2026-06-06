@@ -14,6 +14,7 @@ rust-version.workspace = true
 rustler = "0.37.2"
 
 tailscale = { workspace = true }
+ts_control = { workspace = true }
 
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }

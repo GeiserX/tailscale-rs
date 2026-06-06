@@ -32,6 +32,12 @@ defmodule Tailscale.Native do
   """
   @opaque tcp_stream :: reference()
 
+  @typedoc """
+  A handle to a running SOCKS5 loopback proxy. Dropping it (via `loopback_stop/1` or GC) stops the
+  proxy listener.
+  """
+  @opaque loopback_handle :: reference()
+
   defp err, do: :erlang.nif_error(:nif_not_loaded)
 
   @doc """
@@ -244,4 +250,118 @@ defmodule Tailscale.Native do
   @spec listen_tls(device(), {String.t(), :inet.port_number(), :accept | {:proxy, String.t()}}) ::
           {:ok, :ok} | {:error, any()}
   def listen_tls(_dev, _config), do: err()
+
+  @doc """
+  Expose a tailnet TLS service to the public internet via Tailscale Funnel (fail-closed until
+  public-ingress relays + ACME land).
+
+  The config is the same `{name, port, target}` tuple as `listen_tls/2`. `funnel_only` rejects
+  tailnet-internal connections when `true`.
+  """
+  @spec listen_funnel(
+          device(),
+          {String.t(), :inet.port_number(), :accept | {:proxy, String.t()}},
+          boolean()
+        ) :: {:ok, :ok} | {:error, any()}
+  def listen_funnel(_dev, _config, _funnel_only), do: err()
+
+  @doc """
+  Host a Tailscale VIP service (`svc:<label>`) on its control-assigned VIP.
+
+  `mode` is a `{:tcp, port}` or `{:http, port}` tuple. Fail-closed: an untagged host or a missing
+  control-assigned VIP returns `{:error, reason}` before any listener is bound.
+  """
+  @spec listen_service(device(), String.t(), {:tcp | :http, :inet.port_number()}) ::
+          {:ok, :ok} | {:error, any()}
+  def listen_service(_dev, _name, _mode), do: err()
+
+  @doc """
+  Request an OIDC ID token (a signed JWT) for this node, scoped to `audience`.
+  """
+  @spec fetch_id_token(device(), String.t()) :: {:ok, String.t()} | {:error, any()}
+  def fetch_id_token(_dev, _audience), do: err()
+
+  @doc """
+  Snapshot this process's client metrics in Prometheus text exposition format.
+  """
+  @spec metrics(device()) :: String.t()
+  def metrics(_dev), do: err()
+
+  @doc """
+  This node's key-expiry instant as Unix seconds, or `{:ok, nil}` if the key never expires.
+  """
+  @spec self_key_expiry_unix(device()) :: {:ok, integer() | nil} | {:error, any()}
+  def self_key_expiry_unix(_dev), do: err()
+
+  @doc """
+  Whether this node's key has expired as of now.
+  """
+  @spec self_key_expired(device()) :: {:ok, boolean()} | {:error, any()}
+  def self_key_expired(_dev), do: err()
+
+  @doc """
+  List the Taildrop files this device has fully received and not yet consumed.
+  """
+  @spec taildrop_waiting_files(device()) ::
+          {:ok, [Tailscale.WaitingFile.t()]} | {:error, any()}
+  def taildrop_waiting_files(_dev), do: err()
+
+  @doc """
+  Delete a received Taildrop file by name.
+  """
+  @spec taildrop_delete_file(device(), String.t()) :: {:ok, :ok} | {:error, any()}
+  def taildrop_delete_file(_dev, _name), do: err()
+
+  @doc """
+  Save a received Taildrop file to `dst_path` by copying it there. Returns the bytes copied.
+  """
+  @spec taildrop_save_file(device(), String.t(), String.t()) ::
+          {:ok, non_neg_integer()} | {:error, any()}
+  def taildrop_save_file(_dev, _name, _dst_path), do: err()
+
+  @doc """
+  Send a local file at `src_path` to `peer_name` via Taildrop, naming it `file_name` on the peer.
+  """
+  @spec taildrop_send_file(device(), String.t(), String.t(), String.t()) ::
+          {:ok, :ok} | {:error, any()}
+  def taildrop_send_file(_dev, _peer_name, _file_name, _src_path), do: err()
+
+  @doc """
+  Begin a debug packet capture, writing a pcap of every dataplane packet to `dst_path`.
+  """
+  @spec capture_pcap(device(), String.t()) :: {:ok, :ok} | {:error, any()}
+  def capture_pcap(_dev, _dst_path), do: err()
+
+  @doc """
+  Stop a debug packet capture started by `capture_pcap/2`. Idempotent.
+  """
+  @spec stop_capture(device()) :: {:ok, :ok} | {:error, any()}
+  def stop_capture(_dev), do: err()
+
+  @doc """
+  Start the SOCKS5 loopback proxy, returning `{:ok, {addr, cred, handle}}`.
+  """
+  @spec loopback(device()) ::
+          {:ok, {{:inet.ip_address(), :inet.port_number()}, String.t(), loopback_handle()}}
+          | {:error, any()}
+  def loopback(_dev), do: err()
+
+  @doc """
+  Stop a loopback proxy by dropping its handle. Idempotent.
+  """
+  @spec loopback_stop(loopback_handle()) :: :ok
+  def loopback_stop(_handle), do: err()
+
+  @doc """
+  Fetch the current Tailnet Lock (TKA) status, or `{:ok, nil}` if control has sent none.
+  """
+  @spec tka_status(device()) :: {:ok, Tailscale.TkaStatus.t() | nil} | {:error, any()}
+  def tka_status(_dev), do: err()
+
+  @doc """
+  Rotate the node key in a keystate for embedder-driven re-registration.
+  """
+  @spec rotate_node_key(Tailscale.Keystate.t()) ::
+          {:ok, Tailscale.Keystate.t()} | {:error, any()}
+  def rotate_node_key(_keys), do: err()
 end

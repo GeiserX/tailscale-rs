@@ -14,7 +14,7 @@
 
 use std::ffi::{self, c_char};
 
-use crate::{TOKIO_RUNTIME, device, util};
+use crate::{TOKIO_RUNTIME, device, tcp::tcp_listener, util};
 
 /// What a [`serve_config`] does with each decrypted stream.
 #[repr(C)]
@@ -115,6 +115,63 @@ pub unsafe extern "C" fn ts_listen_tls(dev: &device, cfg: &serve_config) -> ffi:
         Err(e) => {
             tracing::error!(err = %e, "listen_tls (fail-closed in this fork)");
             -1
+        }
+    }
+}
+
+/// How a [`ts_listen_service`] binds the service VIP port.
+///
+/// Both modes bind the same VIP:port at the listen layer (TLS termination / HTTP handling is the
+/// embedder's concern); they differ only in the Go `ServiceMode` they map to.
+#[repr(C)]
+pub enum service_mode {
+    /// Raw TCP on the service port (`tsnet`'s `ServiceModeTCP`).
+    Tcp = 0,
+    /// HTTP(S) on the service port (`tsnet`'s `ServiceModeHTTP`).
+    Http = 1,
+}
+
+/// Host a Tailscale **VIP service** (`svc:<label>`) by binding an overlay listener on the
+/// service's control-assigned virtual IP (like `tsnet`'s `ListenService`).
+///
+/// **Fail-closed.** Mirrors Go `tsnet.Server.ListenService`'s preconditions, enforced from this
+/// node's own netmap state: the `name` must be a valid `svc:<dns-label>`, this node must be tagged,
+/// and control must have assigned the service a VIP on this node. Any unmet precondition returns a
+/// negative number (the typed [`ServiceError`](tailscale::ServiceError) is logged via `tracing`)
+/// rather than binding anything.
+///
+/// On success returns a [`tcp_listener`] handle bound on the service VIP and `port` over the overlay
+/// netstack (never a host socket); accept connections with
+/// [`ts_tcp_accept`](crate::ts_tcp_accept) and free it with
+/// [`ts_tcp_close_listener`](crate::ts_tcp_close_listener). Returns null on error.
+///
+/// # Safety
+///
+/// `name` must be readable per [`std::ffi::CStr`] rules (NUL-terminated, valid up to and including
+/// the NUL).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ts_listen_service(
+    dev: &device,
+    name: *const c_char,
+    mode: service_mode,
+    port: u16,
+) -> Option<Box<tcp_listener>> {
+    // SAFETY: ensured by function precondition
+    let Some(name) = (unsafe { util::str(name) }) else {
+        tracing::error!("listen_service: name is null or invalid utf-8");
+        return None;
+    };
+
+    let svc_mode = match mode {
+        service_mode::Tcp => tailscale::ServiceMode::Tcp { port },
+        service_mode::Http => tailscale::ServiceMode::Http { port },
+    };
+
+    match TOKIO_RUNTIME.block_on(dev.0.listen_service(name, svc_mode)) {
+        Ok(listener) => Some(Box::new(tcp_listener::new(listener))),
+        Err(e) => {
+            tracing::error!(err = %e, "listen_service (fail-closed in this fork)");
+            None
         }
     }
 }

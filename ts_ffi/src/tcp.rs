@@ -5,6 +5,13 @@ use crate::{TOKIO_RUNTIME, util};
 /// A Tailscale TCP listener handle.
 pub struct tcp_listener(tailscale::netstack::TcpListener);
 
+impl tcp_listener {
+    /// Wrap a native [`TcpListener`](tailscale::netstack::TcpListener) in the FFI handle.
+    pub(crate) fn new(inner: tailscale::netstack::TcpListener) -> Self {
+        tcp_listener(inner)
+    }
+}
+
 /// A Tailscale TCP stream handle.
 pub struct tcp_stream(tailscale::netstack::TcpStream);
 
