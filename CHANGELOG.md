@@ -6,6 +6,14 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.48](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.48) - 2026-06-06
+
+**Fix the `hosted_test` lane added in 0.5.47.** The shared `setup-rust` composite action bakes
+the `components` input into an `actions/cache` key, and cache keys reject commas — so passing
+`components: clippy,rustfmt` failed key validation in the `Setup rust` step before any
+verification ran. Pass `components: ""` (as `musl_static` does) and install clippy + rustfmt in a
+dedicated `rustup component add` step after the toolchain override is set.
+
 ## [0.5.47](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.47) - 2026-06-06
 
 **CI now has a real green signal.** The inherited upstream workflow matrix targets self-hosted
