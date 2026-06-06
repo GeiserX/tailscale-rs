@@ -6,6 +6,13 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.54](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.54) - 2026-06-06
+
+**Give the `musl_static` lane disk headroom.** It started failing with `ENOSPC`: the `cross`
+docker images plus build artifacts overflow the hosted runner's ~14 GB free disk. Added the same
+hand-rolled `Free disk space` step the `hosted_test` lane already uses (remove unused
+preinstalled SDKs + prune docker images) so both GitHub-hosted lanes have room to build.
+
 ## [0.5.53](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.53) - 2026-06-06
 
 **Stop the perpetually-queued CI jobs (notification spam).** The inherited `build_test` matrix,

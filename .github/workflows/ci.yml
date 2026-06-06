@@ -229,6 +229,16 @@ jobs:
       # leaves `ssh`/`axum` off while keeping the full tailnet/TLS (ring) daemon path.
       MUSL_FLAGS: -p tailscale --no-default-features
     steps:
+      - name: Free disk space
+        # `cross` pulls a multi-GB docker image per target and the build artifacts otherwise
+        # overflow the hosted runner's ~14 GB free disk (this lane started failing with ENOSPC).
+        # Remove the unused preinstalled SDKs first. Hand-rolled (no third-party action) to keep
+        # the supply chain minimal for an OSS repo. Mirrors the `hosted_test` lane.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h /
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Setup rust
