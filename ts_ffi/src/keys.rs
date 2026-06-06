@@ -6,9 +6,16 @@ use std::{
 use crate::TOKIO_RUNTIME;
 
 /// A Tailscale cryptographic key.
-#[derive(Debug, Default)]
+#[derive(Default)]
 #[repr(transparent)]
 pub struct key(pub [u8; 32]);
+
+// Manual, redacting `Debug` so a stray `{:?}` anywhere can never leak the raw private-key bytes.
+impl core::fmt::Debug for key {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("key([redacted; 32])")
+    }
+}
 
 macro_rules! impl_to_from {
     ($key:ty, $($keys:ty),+) => {
@@ -54,7 +61,7 @@ impl_to_from!(
 );
 
 /// Tailscale key state for running a device.
-#[derive(Debug, Default)]
+#[derive(Default)]
 #[repr(C)]
 pub struct persisted_key_state {
     /// Private key for the node (device) identity.
@@ -63,6 +70,18 @@ pub struct persisted_key_state {
     pub machine_private_key: key,
     /// Private key for tailnet lock.
     pub network_lock_private_key: key,
+}
+
+// Manual, redacting `Debug`: print field names but never the raw private-key bytes. (The per-field
+// `key` Debug above already redacts, but keep this explicit so the struct can't leak via `{:?}`.)
+impl core::fmt::Debug for persisted_key_state {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("persisted_key_state")
+            .field("node_private_key", &"[redacted]")
+            .field("machine_private_key", &"[redacted]")
+            .field("network_lock_private_key", &"[redacted]")
+            .finish()
+    }
 }
 
 impl From<persisted_key_state> for ts_keys::PersistState {
@@ -130,7 +149,7 @@ pub unsafe extern "C" fn ts_load_key_file(
     match TOKIO_RUNTIME.block_on(tailscale::config::load_key_file(s, mode)) {
         Ok(state) => {
             *key_state = state.into();
-            tracing::info!(?key_state, "loaded key state");
+            tracing::info!(path = %s, "loaded key state");
 
             0
         }

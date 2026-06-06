@@ -68,6 +68,19 @@ const MAX_POLL_TRIES: usize = 30;
 /// Default delay between polls when the server sends no `Retry-After` header.
 const DEFAULT_POLL_DELAY: Duration = Duration::from_secs(2);
 
+/// Per-request timeout for a single ACME HTTP round-trip (connect + send + read response).
+///
+/// Mirrors `set_dns`'s `SET_DNS_TIMEOUT`: each individual call to Let's Encrypt is bounded so a
+/// peer that accepts the TCP/TLS connection then stalls cannot hang [`issue_certificate`] forever.
+/// This bounds each HTTP call independently; it does not change the [`MAX_POLL_TRIES`] poll loop.
+const ACME_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum accepted ACME response body size (256 KiB).
+///
+/// ACME responses are small JSON objects or a short PEM chain, so this is generous; the cap exists
+/// only so a hostile or buggy directory cannot stream unbounded bytes into memory.
+const ACME_MAX_RESPONSE: usize = 256 * 1024;
+
 /// Base64url-encode `input` with **no** `=` padding (the only encoding ACME/JWS uses).
 ///
 /// Uses the URL-safe alphabet (`-`/`_`, never `+`/`/`).
@@ -260,6 +273,7 @@ where
     let status = resp.status();
     let headers = resp.headers().clone();
     let body = resp.collect_bytes().await.map_err(http_err)?;
+    check_body_size(body.len())?;
     Ok(Parts {
         status,
         headers,
@@ -267,20 +281,65 @@ where
     })
 }
 
+/// Reject a response body larger than [`ACME_MAX_RESPONSE`].
+///
+/// Pure (no I/O): factored out of [`consume`] so the cap is unit-testable without a server.
+fn check_body_size(len: usize) -> Result<(), CertError> {
+    if len > ACME_MAX_RESPONSE {
+        return Err(CertError::Acme("ACME response body too large".into()));
+    }
+    Ok(())
+}
+
+/// Run a single ACME HTTP round-trip future, bounded by [`ACME_HTTP_TIMEOUT`].
+///
+/// Wraps the whole connect + send + read-response future so a peer that accepts the connection
+/// then stalls is abandoned instead of hanging forever. Hard to unit-test without a stalling
+/// server, so it is exercised only indirectly via the real ACME flow.
+async fn with_timeout<F>(round_trip: F) -> Result<Parts, CertError>
+where
+    F: core::future::Future<Output = Result<Parts, CertError>>,
+{
+    match tokio::time::timeout(ACME_HTTP_TIMEOUT, round_trip).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(CertError::Acme("ACME HTTP request timed out".into())),
+    }
+}
+
 /// Connect, POST `jws` (Content-Type `application/jose+json`) to `url`, and return its [`Parts`].
+///
+/// The whole connect + POST + response read is bounded by [`ACME_HTTP_TIMEOUT`].
 async fn acme_post(url: &Url, jws: String) -> Result<Parts, CertError> {
-    let client = ts_http_util::http1::connect_tls::<BytesBody>(url)
-        .await
-        .map_err(http_err)?;
-    let headers = [(
-        ts_http_util::HeaderName::from_static("content-type"),
-        ts_http_util::HeaderValue::from_static("application/jose+json"),
-    )];
-    let resp = client
-        .post(url, headers, bytes::Bytes::from(jws).into())
-        .await
-        .map_err(http_err)?;
-    consume(resp).await
+    with_timeout(async {
+        let client = ts_http_util::http1::connect_tls::<BytesBody>(url)
+            .await
+            .map_err(http_err)?;
+        let headers = [(
+            ts_http_util::HeaderName::from_static("content-type"),
+            ts_http_util::HeaderValue::from_static("application/jose+json"),
+        )];
+        let resp = client
+            .post(url, headers, bytes::Bytes::from(jws).into())
+            .await
+            .map_err(http_err)?;
+        consume(resp).await
+    })
+    .await
+}
+
+/// Connect and GET `url`, returning its [`Parts`].
+///
+/// The directory fetch and the `newNonce` seed are plain GETs; the whole connect + GET + response
+/// read is bounded by [`ACME_HTTP_TIMEOUT`], same as [`acme_post`].
+async fn acme_get(url: &Url) -> Result<Parts, CertError> {
+    with_timeout(async {
+        let client = ts_http_util::http1::connect_tls::<BytesBody>(url)
+            .await
+            .map_err(http_err)?;
+        let resp = client.get(url, []).await.map_err(http_err)?;
+        consume(resp).await
+    })
+    .await
 }
 
 /// Map a `ts_http_util::Error` into [`CertError::Io`].
@@ -375,22 +434,11 @@ pub async fn issue_certificate(
     publisher: &(impl PublishTxt + Sync),
 ) -> Result<CertifiedKey, CertError> {
     // 1. Directory.
-    let dir_client = ts_http_util::http1::connect_tls::<BytesBody>(directory_url)
-        .await
-        .map_err(http_err)?;
-    let dir_resp = dir_client.get(directory_url, []).await.map_err(http_err)?;
-    let dir = consume(dir_resp).await?;
+    let dir = acme_get(directory_url).await?;
     let directory = parse_directory(&dir.body)?;
 
     // 2. Seed a nonce (HEAD-equivalent GET to newNonce; the body is discarded).
-    let nonce_client = ts_http_util::http1::connect_tls::<BytesBody>(&directory.new_nonce)
-        .await
-        .map_err(http_err)?;
-    let nonce_resp = nonce_client
-        .get(&directory.new_nonce, [])
-        .await
-        .map_err(http_err)?;
-    let nonce = consume(nonce_resp)
+    let nonce = acme_get(&directory.new_nonce)
         .await?
         .header("replay-nonce")
         .ok_or_else(|| CertError::Acme("newNonce response missing Replay-Nonce".into()))?;
@@ -510,6 +558,9 @@ pub async fn issue_certificate(
     let csr_b64 = b64u(csr.der());
     let cert_key_pem = cert_key.serialize_pem();
 
+    // Known simplification: we finalize as soon as the last authorization is `valid` without first
+    // polling the order to `ready` (RFC 8555 §7.4 `pending`→`ready`). Most CAs (LE, Pebble) accept
+    // this; a strict CA that enforces the `ready` state could 403 here — a future hardening.
     let finalize_url =
         Url::parse(&finalize_url).map_err(|e| CertError::Acme(format!("finalize URL: {e}")))?;
     let finalize_payload = serde_json::json!({"csr": csr_b64}).to_string();
@@ -780,6 +831,15 @@ mod tests {
     }
 
     #[test]
+    fn check_body_size_caps_at_max() {
+        // At or below the cap is accepted; one byte over is rejected.
+        check_body_size(0).expect("empty body ok");
+        check_body_size(ACME_MAX_RESPONSE).expect("exactly at cap ok");
+        let err = check_body_size(ACME_MAX_RESPONSE + 1).expect_err("over cap rejected");
+        assert!(matches!(err, CertError::Acme(m) if m.contains("too large")));
+    }
+
+    #[test]
     fn generate_then_from_pkcs8_round_trips() {
         // `generate()` returns the key + its PKCS#8 DER to persist; reloading that exact DER must
         // succeed and yield identical JWK coordinates and thumbprint (the persistence contract).
@@ -790,5 +850,76 @@ mod tests {
         // Reloading the same DER a second time is also stable.
         let k3 = AcmeAccountKey::from_pkcs8(&der).expect("reload again");
         assert_eq!(k2.jwk_thumbprint(), k3.jwk_thumbprint());
+    }
+
+    /// A fixed, committed ECDSA P-256 account key (PKCS#8 DER), so the JWK/thumbprint below are
+    /// reproducible byte-for-byte. Generated once with `AcmeAccountKey::generate()` and pinned.
+    const FIXED_PKCS8_HEX: &str = "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b0201010420ed5474cb46ef01de295207f9f91ae8a8cca0b9d9a3182c9355328442f2ecc55aa144034200041e9b8e358664e3b6a4bb56c2301efcfdca4120fcef7574ed1bf1287882adb32b5a2f5597fd7eb76e3dd8f3744e7f4c1dde4c7384a27acc78d53fbcd16f4bc062";
+
+    fn fixed_key() -> AcmeAccountKey {
+        let der: Vec<u8> = (0..FIXED_PKCS8_HEX.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&FIXED_PKCS8_HEX[i..i + 2], 16).unwrap())
+            .collect();
+        AcmeAccountKey::from_pkcs8(&der).expect("load fixed key")
+    }
+
+    /// RFC 7638 known-answer test (self-pinned-literal variant). The existing thumbprint tests use
+    /// freshly generated keys, so they only check shape/self-consistency — a member-reorder or a
+    /// base64/digest drift in the live `newAccount` JWK would pass them yet break against Let's
+    /// Encrypt. This pins the EXACT canonical bytes and an independently computed thumbprint for a
+    /// FIXED key, so any reorder / whitespace / base64 / digest change breaks the test.
+    ///
+    /// (We pin our own canonical literal rather than the RFC's published RSA example, which is not a
+    /// P-256 vector; the literal is the engine's `canonical_jwk_json()` output captured once and
+    /// hardcoded here. The thumbprint RHS is recomputed via `ring` directly, independent of the
+    /// function under test's internal path.)
+    #[test]
+    fn jwk_thumbprint_known_answer_rfc7638() {
+        let key = fixed_key();
+
+        // 1. The canonical JWK string is byte-for-byte the RFC 7638 §3 form: members in lexical
+        //    order (crv < kty < x < y) with ZERO whitespace. This is the regression guard the
+        //    fresh-key tests lack — a reorder here silently breaks LE.
+        const EXPECTED_CANONICAL: &str = r#"{"crv":"P-256","kty":"EC","x":"HpuONYZk47aku1bCMB78_cpBIPzvdXTtG_EoeIKtsys","y":"Wi9Vl_1-t2492PN0Tn9MHd5Mc4Siesx41T-80W9LwGI"}"#;
+        assert_eq!(
+            key.canonical_jwk_json(),
+            EXPECTED_CANONICAL,
+            "canonical JWK must be byte-identical (member order + no whitespace)"
+        );
+
+        // 2. Independent-path thumbprint: SHA-256 of THAT exact literal, base64url-unpadded, computed
+        //    here with `ring::digest` + `URL_SAFE_NO_PAD` directly (not via `jwk_thumbprint`'s code).
+        let expected_thumbprint = URL_SAFE_NO_PAD.encode(
+            ring::digest::digest(&ring::digest::SHA256, EXPECTED_CANONICAL.as_bytes()).as_ref(),
+        );
+        assert_eq!(
+            key.jwk_thumbprint(),
+            expected_thumbprint,
+            "thumbprint must equal base64url_nopad(SHA256(canonical JWK))"
+        );
+        // Also pin the literal known-answer constant (captured once from the fixed key).
+        assert_eq!(
+            key.jwk_thumbprint(),
+            "8NZV0yNd0fBPk--o9T4HK4Koyyb9cv_I9w5TfuDqiqo"
+        );
+    }
+
+    /// The `jwk` embedded in the `newAccount` JWS header (`public_jwk`) must serialize with the SAME
+    /// member order as `canonical_jwk_json` (the thumbprint input). If the header JWK and the
+    /// thumbprint input disagree on order, Let's Encrypt computes a different thumbprint than we
+    /// publish in the DNS-01 TXT and silently fails — exactly the silent-LE-failure the auditor
+    /// flagged. Pinning byte-equality of the header JWK to the canonical string guards it.
+    #[test]
+    fn public_jwk_header_member_order_matches_canonical() {
+        let key = fixed_key();
+        // `serde_json::Value` (a `BTreeMap`) serializes object keys in sorted order, which for these
+        // members (crv < kty < x < y) is the canonical order — assert it byte-for-byte.
+        let header_jwk = serde_json::to_string(&key.public_jwk()).unwrap();
+        assert_eq!(
+            header_jwk,
+            key.canonical_jwk_json(),
+            "newAccount header JWK must be byte-identical-ordered to the thumbprint input"
+        );
     }
 }

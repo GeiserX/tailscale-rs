@@ -263,6 +263,10 @@ impl MagicSock {
                 // Gate on: accept only a routable global unicast address. `is_unique_local`
                 // (`fc00::/7`) and `is_unicast_link_local` (`fe80::/10`) are stable; `is_global`
                 // is not, so the global-unicast predicate is composed from stable rejections.
+                // Consequently this is intentionally permissive: it also admits documentation
+                // (`2001:db8::/32`), IPv4-mapped (`::ffff:0:0/96`), and Teredo/6to4 ranges that a
+                // stable `is_global` would reject. These are unlikely on a real interface and at
+                // worst yield a dead candidate that falls back to DERP — never a leak or panic.
                 !(ip.is_unspecified()
                     || ip.is_loopback()
                     || ip.is_multicast()
@@ -2771,6 +2775,14 @@ mod tests {
             after.pong_sent - before.pong_sent >= 1,
             "a good-binding ping sends (and counts) a pong"
         );
+        // Drain the good-binding pong from the sink so the post-reject read below sees ONLY traffic
+        // (if any) caused by the rejected ping. This pong is the accepted-path side effect we expect.
+        let mut buf = [0u8; 1500];
+        let good_pong =
+            tokio::time::timeout(std::time::Duration::from_secs(1), sink.recv_from(&mut buf))
+                .await
+                .expect("good-binding pong should arrive at the sink");
+        good_pong.expect("recv good-binding pong");
 
         // BAD binding: claimed node key is wrong → fail closed. `disco_ping_recv_rejected` is also
         // bumped by `no_verifier_fails_closed_on_ping` (its ping hits the no-verifier reject arm),
@@ -2790,6 +2802,23 @@ mod tests {
         assert!(
             after.ping_recv_rejected - before.ping_recv_rejected >= 1,
             "a bad-binding ping increments disco_ping_recv_rejected"
+        );
+        // Symmetric isolation guard: the reject branch must do NO accepted-path work. The
+        // process-global `disco_ping_recv` counter can't carry an exact `==0` here (the un-gated
+        // loopback integration tests bump it concurrently — that is why the good-binding check above
+        // is `>=`). Instead we pin the accepted-path SIDE EFFECT on this sock's own `sink`: an
+        // accepted ping sends a pong to `from` (proven above via `pong_sent`), whereas a rejected
+        // ping must send nothing. `sink` is private to this test, so loopback tests can't write to
+        // it — this delta IS deterministic. A double-count regression that ran the accepted path
+        // (emitting a pong) on the reject branch would deliver a datagram here and fail.
+        let stray = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            sink.recv_from(&mut buf),
+        )
+        .await;
+        assert!(
+            stray.is_err(),
+            "a bad-binding ping must NOT emit a pong (accepted-path side effect) — got {stray:?}"
         );
     }
 

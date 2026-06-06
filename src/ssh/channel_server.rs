@@ -81,6 +81,14 @@ unsafe impl<H> Send for PhantomSend<H> {}
 /// sessions per connection, so this is generous for legitimate use.
 const MAX_CHANNELS_PER_CONN: usize = 16;
 
+/// Whether a connection at `open_channels` currently-open channels has reached the per-connection
+/// channel cap and must refuse the next channel open. Pure boundary predicate extracted from
+/// [`ChannelServer::channel_open_session`] so the fork-bomb guard's edge can be unit-tested without
+/// a live russh [`Session`].
+fn at_channel_cap(open_channels: usize) -> bool {
+    open_channels >= MAX_CHANNELS_PER_CONN
+}
+
 #[derive(thiserror::Error, Debug, Copy, Clone, PartialEq, Eq)]
 #[error("no such channel")]
 struct NoChannel;
@@ -196,7 +204,7 @@ where
         // Bound the number of concurrent channels (each opens a session/handler — e.g. a login
         // shell). Without this an authorized-but-hostile peer could open unbounded channels on one
         // connection and fork-bomb the host with session handlers. Past the cap, refuse new channels.
-        if self.channel_state.len() >= MAX_CHANNELS_PER_CONN {
+        if at_channel_cap(self.channel_state.len()) {
             tracing::warn!(
                 channel = ?channel.id(),
                 cap = MAX_CHANNELS_PER_CONN,
@@ -351,5 +359,27 @@ where
         session.channel_success(channel)?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_CHANNELS_PER_CONN, at_channel_cap};
+
+    /// The per-connection channel cap (fork-bomb guard) refuses at and beyond `MAX_CHANNELS_PER_CONN`
+    /// and allows below it. Pins the exact boundary: a `>=`→`>` flip would let `MAX_CHANNELS_PER_CONN`
+    /// open channels become `MAX_CHANNELS_PER_CONN + 1`, failing the `== cap` assertion below.
+    #[test]
+    fn channel_cap_boundary_is_inclusive() {
+        // Below the cap: still allowed.
+        assert!(!at_channel_cap(MAX_CHANNELS_PER_CONN - 1));
+        assert!(!at_channel_cap(15));
+        // At the cap: refuse the next open (the channel that would make it 17).
+        assert!(at_channel_cap(MAX_CHANNELS_PER_CONN));
+        assert!(at_channel_cap(16));
+        // Above the cap (defensive): still refused.
+        assert!(at_channel_cap(17));
+        // The const itself is the documented value.
+        assert_eq!(MAX_CHANNELS_PER_CONN, 16);
     }
 }

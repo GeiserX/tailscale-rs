@@ -252,7 +252,16 @@ impl ChannelHandler for ShellHandler {
             let status = { pump_child.lock().await.wait().await };
             match status {
                 Ok(status) => {
-                    let code = status.code().unwrap_or(0) as u32;
+                    // A signal-killed shell has `code() == None`; reporting that as `exit-status 0`
+                    // would lie to the client (success). russh's `exit_signal_request` needs a `Sig`
+                    // name mapped from the raw signal number — awkward — so we take the simpler,
+                    // still-correct path: convey signal death as the conventional `128 + signal`
+                    // non-zero status (what a POSIX shell reports), never a bogus 0.
+                    use std::os::unix::process::ExitStatusExt as _;
+                    let code = status
+                        .code()
+                        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+                        as u32;
                     if session.exit_status_request(channel_id, code).await.is_err() {
                         tracing::debug!(%channel_id, "ssh: failed sending exit-status");
                     }

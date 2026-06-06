@@ -108,6 +108,9 @@ pub unsafe extern "C" fn ts_taildrop_file_size(
 ///
 /// `name` and `dst_path` must each be readable per [`std::ffi::CStr`] rules (NUL-terminated, valid
 /// up to and including the NUL).
+///
+/// `dst_path` is written verbatim on the host filesystem; the C embedder is responsible for
+/// ensuring it is a trusted, sanitized path (no path-traversal from untrusted input).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ts_taildrop_save_file(
     dev: &device,

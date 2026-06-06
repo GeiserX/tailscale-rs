@@ -30,6 +30,10 @@ pub extern crate russh;
 
 use std::{fmt::Debug, net::SocketAddr, sync::Arc};
 
+/// Upper bound on concurrent SSH connections served by [`Device::serve_ssh`]. The accept loop
+/// back-pressures past this cap (defense-in-depth beside the per-connection channel cap).
+const MAX_SSH_CONNECTIONS: usize = 64;
+
 use russh::server::Handler;
 use ts_control::SshConnIdentity;
 pub use ts_control::{SshAccept, SshDecision, SshDenyReason, SshPolicy};
@@ -131,13 +135,31 @@ impl crate::Device {
 
         tracing::info!(%listen_addr, "ssh server listening");
 
+        // Bound concurrent connections (back-pressure: acquire a permit *before* accepting so the
+        // loop stops pulling connections off the listener once at the cap). Per-connection sessions
+        // are held in a `JoinSet` owned by this future rather than detached via bare `tokio::spawn`,
+        // so dropping the `serve_ssh` future (the caller's cancellation model) both stops accepting
+        // and aborts in-flight sessions instead of leaking them.
+        let sem = Arc::new(tokio::sync::Semaphore::new(MAX_SSH_CONNECTIONS));
+        let mut sessions = tokio::task::JoinSet::new();
+
         loop {
+            // Reap finished sessions opportunistically so the `JoinSet` does not grow unbounded.
+            while sessions.try_join_next().is_some() {}
+
+            // The semaphore is never closed in this loop; if it somehow is, stop accepting.
+            let Ok(permit) = sem.clone().acquire_owned().await else {
+                return Ok(());
+            };
             let conn = listener.accept().await?;
 
             let handler = H::new_client(self.clone(), conn.remote_addr());
             let config = config.clone();
 
-            tokio::task::spawn(async move {
+            sessions.spawn(async move {
+                // Hold the permit for the connection's lifetime; dropping it on task end frees the
+                // slot for the next accept.
+                let _permit = permit;
                 let sess = match russh::server::run_stream(config, conn, handler).await {
                     Ok(sess) => sess,
                     Err(e) => {

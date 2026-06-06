@@ -6,6 +6,32 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.41](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.41) - 2026-06-06
+
+Hardening + coverage from a multi-reviewer audit of the v0.5.33–v0.5.40 parity sweep. No happy-path
+behavior change.
+
+- **Security (HIGH)**: stop logging private key bytes. `ts_ffi`'s key-state load logged the full
+  `persisted_key_state` (node/machine/network-lock private keys) at INFO via a derived `Debug`. The
+  log line now records only the file path, and the FFI `key` / `persisted_key_state` types get
+  manual **redacting `Debug`** impls so a stray `{:?}` can never leak key bytes.
+- **ACME robustness**: every Let's Encrypt HTTP request is now bounded by a 30s
+  `ACME_HTTP_TIMEOUT` (a stalled CA connection previously hung issuance forever, defeating the
+  bounded poll loop), and responses are capped at 256 KiB (`ACME_MAX_RESPONSE`) against an unbounded
+  body. Added a doc note that finalize is issued once the last authz is `valid` without polling the
+  order to `ready` (accepted by LE/Pebble; a future hardening for strict CAs).
+- **SSH lifecycle**: `serve_ssh` now bounds concurrent connections with a 64-permit semaphore
+  (defense-in-depth beside the per-connection 16-channel cap) and owns its per-connection sessions
+  in a `JoinSet`, so dropping the `serve_ssh` future aborts in-flight sessions instead of leaking
+  them. A signal-killed shell now reports `128 + signal` instead of a bogus `exit-status 0`.
+- **Tests**: an RFC-7638-style **known-answer** JWK-thumbprint test + a `public_jwk` header
+  member-order guard (catch silent ACME wire drift against Let's Encrypt); an inclusive SSH
+  channel-cap boundary test (15→allow / 16→refuse); and a symmetric isolation guard on the
+  bad-binding disco-ping path (a rejected ping delivers no pong / doesn't bump the accepted counter).
+- **Docs**: the FFI `ts_taildrop_save_file` / `ts_capture_pcap` `dst_path` is documented as a
+  trusted-embedder host path (sanitize untrusted input); the permissive IPv6 pingable-candidate
+  predicate is documented as intentional (no stable `is_global`; worst case a dead candidate → DERP).
+
 ## [0.5.40](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.40) - 2026-06-06
 
 **Docs**: refresh `docs/PARITY_ROADMAP.md` to reflect near-complete tsnet parity as of v0.5.39.
