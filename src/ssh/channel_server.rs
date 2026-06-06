@@ -9,7 +9,10 @@ use tokio::{
     task::JoinSet,
 };
 
-use crate::{Device, ssh::TailnetServer};
+use crate::{
+    Device,
+    ssh::{SshAccept, TailnetServer},
+};
 
 type Request = (ChannelId, ChannelEvent);
 
@@ -19,11 +22,18 @@ pub trait ChannelHandler: Sized {
     type Error: Into<std::io::Error> + std::error::Error;
 
     /// Construct a new per-channel handler.
+    ///
+    /// `accept` is the [`SshAccept`] produced by the single fail-closed authorization decision in
+    /// [`auth_none`][russh::server::Handler::auth_none]; in particular its
+    /// [`local_user`][SshAccept::local_user] is the policy-mapped identity the session must run as.
+    /// Handlers MUST NOT re-evaluate policy or substitute a different user — the accepted identity
+    /// is the sole authorization source.
     fn new(
         handle: tokio::runtime::Handle,
         channel_id: ChannelId,
         session: Handle,
         dev: Arc<Device>,
+        accept: &SshAccept,
     ) -> Result<Self, Self::Error>;
 
     /// Handle an event from the channel.
@@ -53,6 +63,10 @@ pub struct ChannelServer<H> {
     channel_state: HashMap<ChannelId, ChannelState>,
     remote: SocketAddr,
     dev: Arc<Device>,
+    /// The accepted identity from the single [`auth_none`][russh::server::Handler::auth_none]
+    /// authorization decision, stashed so per-channel handlers run as the policy-mapped user.
+    /// `None` until a successful `auth_none`; a channel open with `None` here fails closed.
+    accepted: Option<SshAccept>,
     _handler: PhantomSend<H>,
 }
 
@@ -60,6 +74,12 @@ struct PhantomSend<H>(PhantomData<H>);
 
 // SAFETY: H is a phantom type, it's never actually sent
 unsafe impl<H> Send for PhantomSend<H> {}
+
+/// Maximum number of concurrent channels a single SSH connection may open. Each channel spawns a
+/// session handler (e.g. a login shell), so this caps the per-connection resource/process fan-out
+/// an authorized-but-hostile peer can induce. SSH clients realistically open one (or a few)
+/// sessions per connection, so this is generous for legitimate use.
+const MAX_CHANNELS_PER_CONN: usize = 16;
 
 #[derive(thiserror::Error, Debug, Copy, Clone, PartialEq, Eq)]
 #[error("no such channel")]
@@ -95,6 +115,7 @@ impl<H> TailnetServer for ChannelServer<H> {
             channel_state: Default::default(),
             dev,
             remote: addr,
+            accepted: None,
             _handler: PhantomSend(PhantomData),
         }
     }
@@ -137,6 +158,10 @@ where
                     local_user = %accept.local_user,
                     "ssh: policy accepted connection"
                 );
+                // Stash the accepted identity so the per-channel handler runs as the
+                // policy-mapped local user. This is the single fail-closed authorization point;
+                // the handler never re-evaluates policy.
+                self.accepted = Some(accept);
                 Ok(Auth::Accept)
             }
             Ok(crate::ssh::SshDecision::Deny(reason)) => {
@@ -157,6 +182,29 @@ where
     ) -> Result<bool, Self::Error> {
         tracing::debug!(channel = ?channel.id(), "new session");
 
+        // Fail closed: a channel open must be preceded by a successful `auth_none` that stashed
+        // the accepted identity. If it is somehow absent, refuse to open the channel rather than
+        // run a handler with no authorized user.
+        let Some(accept) = self.accepted.clone() else {
+            tracing::error!(
+                channel = ?channel.id(),
+                "ssh: channel open with no accepted identity; refusing"
+            );
+            return Ok(false);
+        };
+
+        // Bound the number of concurrent channels (each opens a session/handler — e.g. a login
+        // shell). Without this an authorized-but-hostile peer could open unbounded channels on one
+        // connection and fork-bomb the host with session handlers. Past the cap, refuse new channels.
+        if self.channel_state.len() >= MAX_CHANNELS_PER_CONN {
+            tracing::warn!(
+                channel = ?channel.id(),
+                cap = MAX_CHANNELS_PER_CONN,
+                "ssh: per-connection channel cap reached; refusing new channel"
+            );
+            return Ok(false);
+        }
+
         let (tx, mut rx) = mpsc::unbounded_channel::<Request>();
         let mut joinset = JoinSet::new();
 
@@ -166,7 +214,7 @@ where
         joinset.spawn(async move {
             let rt = tokio::runtime::Handle::current();
 
-            let mut handler = match H::new(rt, channel_id, session_handle.clone(), dev) {
+            let mut handler = match H::new(rt, channel_id, session_handle.clone(), dev, &accept) {
                 Ok(handler) => handler,
                 Err(e) => {
                     let e = e.into();

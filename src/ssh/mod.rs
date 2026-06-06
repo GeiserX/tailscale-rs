@@ -37,9 +37,11 @@ pub use ts_control::{SshAccept, SshDecision, SshDenyReason, SshPolicy};
 mod channel_server;
 mod channel_write;
 mod ratatui;
+mod shell;
 
 pub use channel_server::{ChannelEvent, ChannelHandler, ChannelServer};
 pub use ratatui::{RatatuiApp, RatatuiEnv, RatatuiTerm};
+pub use shell::ShellHandler;
 
 impl crate::Device {
     /// Authorize an incoming Tailscale SSH connection from `remote` requesting local user
@@ -152,6 +154,28 @@ impl crate::Device {
                 }
             });
         }
+    }
+
+    /// Run a turnkey Tailscale SSH server on `listen_addr` (tailnet overlay) that grants authorized
+    /// connections an interactive login shell as their policy-mapped local user.
+    ///
+    /// Authorization is the control-pushed SSH policy (see [`Device::authorize_ssh`]) — fail-closed:
+    /// unknown source, no policy, no matching rule, or any error rejects. The accepted connection's
+    /// `local_user` is resolved against the local passwd database and the login shell is spawned in
+    /// a PTY **after dropping privileges** to that user's uid/gid (the daemon must run as root to do
+    /// so; if it cannot, the session fails closed). Mirrors Go `tailssh`'s incubator shell path.
+    ///
+    /// Only the interactive login-shell path is implemented: `pty-req` → `<shell> -l`,
+    /// `window-change` → `TIOCSWINSZ`, and an `exit-status` on shell exit. The exec form
+    /// (`<shell> -c <cmd>`) is **not** supported because [`ChannelEvent`] does not surface an SSH
+    /// `exec` request in this fork's channel abstraction.
+    pub async fn listen_ssh(
+        self: Arc<Self>,
+        config: russh::server::Config,
+        listen_addr: SocketAddr,
+    ) -> Result<(), crate::Error> {
+        self.serve_ssh::<ChannelServer<ShellHandler>>(config, listen_addr)
+            .await
     }
 
     /// Serve an SSH TUI service on the given TCP address.

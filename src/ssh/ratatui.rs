@@ -89,6 +89,8 @@ where
         channel_id: ChannelId,
         session: Handle,
         dev: Arc<Device>,
+        // The TUI demo handler ignores the policy-mapped local user; it runs purely in-process.
+        _accept: &crate::ssh::SshAccept,
     ) -> Result<Self, Self::Error> {
         let mut term = Self {
             term: make_term(rt, session.clone(), channel_id)?,

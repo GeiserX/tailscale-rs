@@ -6,6 +6,38 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.35](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.35) - 2026-06-06
+
+**Turnkey Tailscale SSH login-shell server** (roadmap Tier 5, item 17): `Device::listen_ssh` now
+runs a complete SSH server on the tailnet that grants authorized connections an interactive login
+shell as their policy-mapped local user, mirroring Go `tailssh`'s incubator shell path. Behind the
+off-by-default, non-musl `ssh` feature.
+
+Previously the fork had the authorization half (`authorize_ssh`, fail-closed, enforced in
+`ChannelServer::auth_none`) and a generic `serve_ssh::<H>` accept loop, but the only `ChannelHandler`
+was the TUI demo — an embedder had to hand-write a shell handler. This adds the missing piece.
+
+- **`Device::listen_ssh(config, listen_addr)`** = `serve_ssh::<ChannelServer<ShellHandler>>`.
+- **`ShellHandler`** (`src/ssh/shell.rs`): resolves the **policy-mapped** local user (from the single
+  `auth_none` accept decision — never re-evaluated, never defaulted) against the local passwd db via
+  `nix`, spawns the user's login shell (`<shell> -l`) in a PTY (`pty-process`), and pumps the PTY
+  master ↔ the SSH channel; window-change sets `TIOCSWINSZ`; child exit reports `exit-status`.
+- **Privilege drop** in the child `pre_exec`, in the exact order **initgroups → setgid → setuid**
+  (uid last — the order is load-bearing), so the shell runs as the mapped user, never as the
+  (root) daemon. **Fail-closed everywhere**: an unresolved user, a failed privilege-drop step, or a
+  daemon lacking the privilege to setuid aborts the session rather than running a shell with the
+  wrong/elevated identity.
+- **Clean environment**: the shell gets only `HOME/USER/LOGNAME/SHELL/PATH/TERM` (env cleared first),
+  so the daemon's environment (auth keys, proxy credentials) never leaks into a user shell.
+- **Resource bound**: a per-connection cap of 16 concurrent channels prevents an
+  authorized-but-hostile peer from fork-bombing the host with session handlers.
+- The authorized `local_user` is threaded from the single `auth_none` policy decision through to the
+  handler (the `ChannelHandler::new` signature gains the accept identity); the SSH `exec` request
+  form is not yet surfaced (interactive login shell only).
+
+New dependencies (`pty-process`, `nix`) are strictly under the `ssh` feature; the default
+musl/ring-only egress graph is unchanged (confirmed `aws-lc-rs` absent without `ssh`).
+
 ## [0.5.34](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.34) - 2026-06-06
 
 **Language-binding parity** (roadmap Tier 4, item 12): propagate the newer `Device` surface into all
