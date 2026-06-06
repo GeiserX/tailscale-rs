@@ -8,6 +8,9 @@
 //! - `/dns-query` → the exit-node DoH handler ([`crate::peerapi_doh`]), unchanged byte-for-byte.
 //! - `/v0/put/<name>` → the Taildrop receive handler ([`handle_taildrop_put`]), writing the file
 //!   into the configured [`TaildropStore`](crate::taildrop::TaildropStore).
+//! - `POST /v0/ingress` → the client-side Funnel ingress handler ([`handle_ingress`]): a Tailscale
+//!   ingress-relay hand-off, membership-gated then `101`-hijacked into a raw stream and pushed to the
+//!   active funnel listener's sink (see [`crate::funnel`]); `404` when no funnel listener is active.
 //! - anything else → `404`.
 //!
 //! ## Anti-leak / IPv4-only
@@ -45,6 +48,7 @@ use tokio::{
 };
 
 use crate::{
+    funnel::{FunnelIngressSlot, IngressConn},
     magic_dns::DnsView,
     peerapi_doh::{find_header_end, write_status},
     taildrop::{TaildropError, TaildropStore},
@@ -81,12 +85,16 @@ const MAX_HEADERS: usize = 16 * 1024;
 /// the DoH handler resolves queries against it and the Taildrop handler reads the self-node cap and
 /// peer set from it for the access gate. `forward_exit_egress` gates DoH recursive resolution.
 /// `taildrop` is the configured file store, or `None` when Taildrop is disabled (a `PUT` then `403`s).
+/// `funnel_ingress` is the shared slot the client-side Funnel listener installs its ingress sink
+/// into (see [`crate::funnel`]); a `POST /v0/ingress` is membership-gated, hijacked with
+/// `101 Switching Protocols`, and pushed to the sink when one is present, else `404` (fail-closed).
 pub(crate) async fn serve(
     channel: Channel,
     port: u16,
     view_rx: watch::Receiver<Arc<DnsView>>,
     forward_exit_egress: bool,
     taildrop: Option<Arc<TaildropStore>>,
+    funnel_ingress: FunnelIngressSlot,
 ) {
     use std::net::Ipv4Addr;
 
@@ -125,11 +133,19 @@ pub(crate) async fn serve(
         let channel = channel.clone();
         let view_rx = view_rx.clone();
         let taildrop = taildrop.clone();
+        let funnel_ingress = funnel_ingress.clone();
         tokio::spawn(async move {
             let _permit = permit;
             if let Err(e) = timeout(
                 REQUEST_TIMEOUT,
-                route_conn(stream, &channel, &view_rx, forward_exit_egress, taildrop),
+                route_conn(
+                    stream,
+                    &channel,
+                    &view_rx,
+                    forward_exit_egress,
+                    taildrop,
+                    &funnel_ingress,
+                ),
             )
             .await
             {
@@ -148,6 +164,7 @@ async fn route_conn(
     view_rx: &watch::Receiver<Arc<DnsView>>,
     forward_exit_egress: bool,
     taildrop: Option<Arc<TaildropStore>>,
+    funnel_ingress: &FunnelIngressSlot,
 ) -> std::io::Result<()> {
     let (seed, header_end) = match read_headers(&mut stream).await? {
         Some(v) => v,
@@ -195,6 +212,15 @@ async fn route_conn(
         Route::TaildropMethodNotAllowed => {
             write_status(&mut stream, "405 Method Not Allowed").await
         }
+        Route::Ingress => {
+            // Extract the ingress headers into owned values before `req` (which borrows `seed`) is
+            // dropped; `handle_ingress` then owns the stream.
+            let target = header_value(&req, INGRESS_TARGET_HEADER).map(str::to_owned);
+            let src_header = header_value(&req, INGRESS_SRC_HEADER).map(str::to_owned);
+            let src = stream.remote_addr();
+            handle_ingress(stream, target, src_header, src, view_rx, funnel_ingress).await
+        }
+        Route::IngressMethodNotAllowed => write_status(&mut stream, "405 Method Not Allowed").await,
         // Everything else is handed to the DoH handler (which itself returns 404 for a path that
         // is not `/dns-query`).
         Route::DohOrOther => {
@@ -211,6 +237,14 @@ async fn route_conn(
     }
 }
 
+/// The `Tailscale-Ingress-Target` request header: the `host:port` the public Funnel client hit (the
+/// service this node should TLS-terminate + serve). Go `ipnlocal.serve`'s ingress target.
+const INGRESS_TARGET_HEADER: &str = "Tailscale-Ingress-Target";
+
+/// The `Tailscale-Ingress-Src` request header: the public Funnel client's `host:port` (informational
+/// — carried through to the embedder, not used for the access decision). Go's ingress source.
+const INGRESS_SRC_HEADER: &str = "Tailscale-Ingress-Src";
+
 /// The route a peerAPI request maps to, derived purely from its method and path.
 #[derive(Debug, PartialEq, Eq)]
 enum Route {
@@ -218,13 +252,18 @@ enum Route {
     TaildropPut { name: String },
     /// A `/v0/put/` path with a non-`PUT` method → `405`.
     TaildropMethodNotAllowed,
+    /// `POST /v0/ingress` — a Tailscale ingress-relay Funnel hand-off to hijack + TLS-terminate.
+    Ingress,
+    /// A `/v0/ingress` path with a non-`POST` method → `405`.
+    IngressMethodNotAllowed,
     /// Anything else; handed to the DoH handler (`/dns-query`, else `404`).
     DohOrOther,
 }
 
 /// Classify a request by `method` and `full_path` (which may carry a `?query`). Mirrors Go's
-/// `strings.CutPrefix(path, "/v0/put/")` for the Taildrop route, percent-decoding the name. Pure so
-/// the routing decision is unit-testable without a live stream.
+/// `strings.CutPrefix(path, "/v0/put/")` for the Taildrop route (percent-decoding the name) and the
+/// exact `/v0/ingress` match for the Funnel ingress route. Pure so the routing decision is
+/// unit-testable without a live stream.
 fn classify_route(method: &str, full_path: &str) -> Route {
     let raw_path = full_path.split('?').next().unwrap_or(full_path);
     if let Some(encoded_name) = raw_path.strip_prefix("/v0/put/") {
@@ -234,6 +273,12 @@ fn classify_route(method: &str, full_path: &str) -> Route {
         return Route::TaildropPut {
             name: percent_decode(encoded_name),
         };
+    }
+    if raw_path == "/v0/ingress" {
+        if method != "POST" {
+            return Route::IngressMethodNotAllowed;
+        }
+        return Route::Ingress;
     }
     Route::DohOrOther
 }
@@ -322,6 +367,96 @@ fn source_is_known_node(view: &DnsView, ip: std::net::IpAddr) -> bool {
         std::net::IpAddr::from(n.tailnet_address.ipv4.addr()) == ip
             || std::net::IpAddr::from(n.tailnet_address.ipv6.addr()) == ip
     })
+}
+
+/// Decide whether a `POST /v0/ingress` from `src` is authorized, given the live `view`. Fail-closed,
+/// mirroring [`gate_taildrop`]'s membership substitute: the relay is a current tailnet peer, so the
+/// source must resolve to a known tailnet node (peer or self); an ingress POST from a non-member is
+/// rejected. Pure (no I/O) so it is unit-testable without a live stream.
+///
+/// **Documented follow-up:** Go additionally requires the source to be the *specific* Tailscale
+/// ingress-relay node (a relay-specific capability), not merely any tailnet member. That relay-cap
+/// datum is not threaded into the runtime's domain `Node` (same gap as Taildrop's `FILE_SHARING_SEND`
+/// peer-cap — see the module docs), so netmap membership is the v1 gate. The transfer still cannot
+/// happen unless a funnel listener is active (sink installed) AND the `funnel_access` node-attribute
+/// gate passed at `listen_funnel` time, so the surface stays fail-closed.
+fn gate_ingress(view: &DnsView, src: SocketAddr) -> GateDecision {
+    if source_is_known_node(view, src.ip()) {
+        GateDecision::Allow
+    } else {
+        GateDecision::Deny
+    }
+}
+
+/// The exact hijack reply written to a `/v0/ingress` connection before it becomes a raw bidi stream:
+/// `HTTP/1.1 101 Switching Protocols\r\n\r\n` (Go writes the same to upgrade the relay conn). Pure so
+/// the wire bytes are unit-testable.
+fn ingress_101_response() -> &'static [u8] {
+    b"HTTP/1.1 101 Switching Protocols\r\n\r\n"
+}
+
+/// Handle one `POST /v0/ingress` Funnel hand-off from the Tailscale ingress relay.
+///
+/// Fail-closed in order: (1) the `Tailscale-Ingress-Target` header must be present (a malformed
+/// relay POST → `400`); (2) a funnel listener must be active — the shared slot must hold a
+/// [`FunnelIngressSink`](crate::funnel::FunnelIngressSink) — else `404` (no `listen_funnel` was
+/// called, so we must NOT hijack a conn nothing will serve); (3) the source must be a known tailnet
+/// node ([`gate_ingress`]) else `403`. Only then do we write `101 Switching Protocols` to hijack the
+/// connection into a raw stream and push it (with the parsed target/src) to the funnel manager's
+/// sink. If the sink is full/closed at push time, the (already-hijacked) connection is dropped
+/// (fail-closed) — we never fall back to anything.
+///
+/// Anti-leak: the hijacked stream is the overlay peerAPI connection (never a host socket); TLS is
+/// terminated downstream by the funnel manager on that same overlay stream.
+async fn handle_ingress(
+    mut stream: TcpStream,
+    target: Option<String>,
+    src_header: Option<String>,
+    src: SocketAddr,
+    view_rx: &watch::Receiver<Arc<DnsView>>,
+    funnel_ingress: &FunnelIngressSlot,
+) -> std::io::Result<()> {
+    // (1) The target header is mandatory — it names the service this node must serve.
+    let Some(target) = target else {
+        return write_status(&mut stream, "400 Bad Request").await;
+    };
+
+    // (2) A funnel listener must be active (sink installed). Snapshot the sink under the lock, then
+    // release it before any await — never hold a std Mutex across `.await`.
+    let sink = {
+        let guard = funnel_ingress.lock().unwrap_or_else(|e| e.into_inner());
+        guard.clone()
+    };
+    let Some(sink) = sink else {
+        return write_status(&mut stream, "404 Not Found").await;
+    };
+
+    // (3) Membership gate (fail-closed): the relay must be a current tailnet node.
+    {
+        let view = view_rx.borrow().clone();
+        if gate_ingress(&view, src) == GateDecision::Deny {
+            return write_status(&mut stream, "403 Forbidden").await;
+        }
+    }
+
+    // Hijack: switch the connection into a raw bidirectional stream. From here on the bytes are the
+    // public client's TLS, terminated downstream by the funnel manager.
+    stream.write_all(ingress_101_response()).await?;
+    stream.flush().await?;
+
+    let conn = IngressConn {
+        target,
+        src: src_header.unwrap_or_default(),
+        stream,
+    };
+    if sink.send(conn).await.is_err() {
+        // The funnel manager (or its receiver) is gone, or the sink is saturated and the embedder
+        // can't keep up: the connection is already hijacked, so we can only drop it (fail-closed).
+        // `conn.stream` is moved into `send`; on error it is returned and dropped here, closing the
+        // overlay flow.
+        tracing::debug!(%src, "funnel ingress: sink closed/full; dropping hijacked conn");
+    }
+    Ok(())
 }
 
 /// Parse the optional resume `Range: bytes=<start>-` header into a starting offset. Mirrors Go's
@@ -774,7 +909,12 @@ mod tests {
         }
 
         match classify_route(method, full_path) {
-            Route::TaildropMethodNotAllowed => status("405 Method Not Allowed"),
+            Route::TaildropMethodNotAllowed | Route::IngressMethodNotAllowed => {
+                status("405 Method Not Allowed")
+            }
+            // This helper only drives Taildrop request paths; the ingress route is covered by its own
+            // pure tests (classify / gate / 101 bytes), so it is not exercised here.
+            Route::Ingress => status("INGRESS"),
             Route::DohOrOther => status("DOH"), // would be handed to the DoH handler
             Route::TaildropPut { name } => {
                 // Gate (fail-closed): no store → 403; gate Deny → 403.
@@ -910,6 +1050,55 @@ mod tests {
         .await;
         assert_eq!(line, "HTTP/1.1 405 Method Not Allowed");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn classify_route_maps_post_to_ingress() {
+        assert_eq!(classify_route("POST", "/v0/ingress"), Route::Ingress);
+        // A query string after the path is ignored when extracting the route.
+        assert_eq!(classify_route("POST", "/v0/ingress?x=1"), Route::Ingress);
+    }
+
+    #[test]
+    fn classify_route_non_post_on_ingress_is_405() {
+        assert_eq!(
+            classify_route("GET", "/v0/ingress"),
+            Route::IngressMethodNotAllowed
+        );
+        assert_eq!(
+            classify_route("PUT", "/v0/ingress"),
+            Route::IngressMethodNotAllowed
+        );
+    }
+
+    #[test]
+    fn ingress_101_response_is_exact() {
+        // The hijack reply must be exactly the 101 status line + blank line, nothing else — those
+        // bytes are written before the connection becomes the public client's raw TLS stream.
+        assert_eq!(
+            ingress_101_response(),
+            b"HTTP/1.1 101 Switching Protocols\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn gate_ingress_allows_known_node_denies_unknown() {
+        // Mirror the Taildrop membership gate: a source that resolves to a known tailnet node (peer
+        // or self) is allowed; an off-tailnet source is denied (fail-closed).
+        let v = view_with(true, &["100.64.0.9".parse().unwrap()]);
+        assert_eq!(gate_ingress(&v, src("100.64.0.9")), GateDecision::Allow);
+        // Self node is at 100.64.0.1 (see `view_with`).
+        assert_eq!(gate_ingress(&v, src("100.64.0.1")), GateDecision::Allow);
+        // Unknown / off-tailnet source → Deny.
+        assert_eq!(gate_ingress(&v, src("198.51.100.7")), GateDecision::Deny);
+    }
+
+    #[test]
+    fn gate_ingress_denies_when_no_peers_and_no_self() {
+        // An empty view (no self node, no peers) denies every source — fail-closed before any
+        // funnel listener could ever be reached.
+        let v = DnsView::default();
+        assert_eq!(gate_ingress(&v, src("100.64.0.9")), GateDecision::Deny);
     }
 
     #[test]

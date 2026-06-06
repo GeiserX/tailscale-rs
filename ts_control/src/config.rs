@@ -319,6 +319,20 @@ pub struct Config {
     #[serde(default)]
     pub wire_ingress: bool,
 
+    /// Live signal that this node currently has an active Funnel ingress listener
+    /// (`Device::listen_funnel` was called and its listener is up), driving `HostInfo.IngressEnabled`
+    /// on the streaming map request.
+    ///
+    /// Unlike [`wire_ingress`](Self::wire_ingress) (a static "please provision Funnel records" hint),
+    /// this is a *dynamic* flag: the runtime flips it `true` when a funnel listener starts serving and
+    /// back to `false` when it stops, so the next map request advertises `IngressEnabled` accordingly
+    /// (Go sets `HostInfo.IngressEnabled` only while Funnel endpoints are actually live, and
+    /// `IngressEnabled` implies `WireIngress`). Shared (`Arc`) with the runtime so the device can flip
+    /// it without rebuilding the config. Defaults to a fresh `false` (fail-closed: no live endpoint).
+    /// Not serialized — it is process-local runtime state, not persisted configuration.
+    #[serde(skip, default)]
+    pub ingress_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+
     /// VIP services this node advertises that it **hosts** (`svc:<dns-label>` names), the
     /// advertise side of Tailscale VIP services (Go `tsnet`'s `Hostinfo.ServicesHash` +
     /// c2n `GET /vip-services`).
@@ -516,6 +530,7 @@ impl Default for Config {
             enable_ipv6: false,
             transport_mode: TransportMode::default(),
             wire_ingress: false,
+            ingress_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             advertise_services: Vec::new(),
         }
     }

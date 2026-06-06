@@ -85,10 +85,12 @@ fn listen_tls(env: rustler::Env<'_>, dev: ResourceArc<Device>, config: Term) -> 
 /// Expose a tailnet TLS service to the public internet via Tailscale Funnel (mirrors `listen_tls`).
 ///
 /// `funnel_only` maps to [`tailscale::FunnelOptions::funnel_only`]. Like [`listen_tls`], this is
-/// **fail-closed**: the node-attribute/port gate is enforced first, then an allowed request still
-/// surfaces [`tailscale::FunnelError`] (`Unsupported` / `Cert`) because this fork has neither a
-/// client-side ACME engine nor public-ingress relays. We never serve a self-signed cert or
-/// downgrade to plaintext.
+/// **fail-closed**: the node-attribute/port gate is enforced first, then the node's `*.ts.net` cert
+/// is obtained via the ACME-aware path (`Cert` error if unavailable — never a self-signed cert or
+/// plaintext downgrade). On success the funnel ingress listener is registered and its
+/// `FunnelAcceptedReceiver` is dropped here (the BEAM has no idiomatic place to hold it), so this NIF
+/// surfaces only the gate/cert outcome; the public ingress relay that feeds it is Tailscale
+/// infrastructure, present only against real Tailscale SaaS.
 #[rustler::nif(schedule = "DirtyIo")]
 fn listen_funnel(
     env: rustler::Env<'_>,
@@ -102,8 +104,11 @@ fn listen_funnel(
     };
     let opts = ts_control::FunnelOptions { funnel_only };
 
+    // On success `listen_funnel` returns a `FunnelAcceptedReceiver` delivering TLS-terminated public
+    // connections; the BEAM has no idiomatic place to hold a Rust receiver (like the other Serve
+    // NIFs), so we drop it and surface only the gate/cert outcome.
     match TOKIO_RUNTIME.block_on(async move { dev.listen_funnel(&cfg, opts).await }) {
-        Ok(_acceptor) => (atoms::ok(), atoms::ok()).encode(env),
+        Ok(_receiver) => (atoms::ok(), atoms::ok()).encode(env),
         Err(e) => (atoms::error(), e.to_string()).encode(env),
     }
 }

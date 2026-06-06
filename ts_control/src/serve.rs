@@ -235,14 +235,18 @@ pub enum FunnelError {
     /// The node may funnel, but `port` is not in the set granted by the `funnel-ports` capability
     /// (Go `ipn.CheckFunnelPort`).
     PortNotAllowed(u16),
-    /// Certificate acquisition / TLS material assembly failed. In this fork this is always
-    /// [`CertError::Unimplemented`] (no client-side ACME engine, no `set-dns` RPC) — Funnel
-    /// terminates public TLS, which needs a real publicly-trusted cert.
+    /// Certificate acquisition / TLS material assembly failed. Funnel terminates public TLS with the
+    /// node's `*.ts.net` cert (the Funnel hostname *is* the node's MagicDNS name, so the existing
+    /// DNS-01 cert matches — no TLS-ALPN-01 needed). Without the `acme` feature (or before a cert is
+    /// issued) this carries the same fail-closed [`CertError`] as [`listen_tls`] — no self-signed or
+    /// plaintext fallback.
     Cert(CertError),
-    /// The public ingress relay leg is unavailable in this fork. Funnel traffic arrives over
-    /// Tailscale-operated ingress relays (DERP-based `TCPHandlerForIngress` plumbing) that a
-    /// self-hosted control plane (a self-hosted control plane) does not provide, so there is no public entrypoint to
-    /// attach an overlay listener to. `detail` names what is missing.
+    /// The public ingress relay leg is unavailable. Funnel ingress arrives as a tailnet-peer POST to
+    /// this node's peerAPI `/v0/ingress` (the relay is a Tailscale-operated peer that the control
+    /// plane stands up); against a self-hosted control plane (a self-hosted control plane) no such relay exists, so no
+    /// public traffic is ever delivered. This is *not* returned by [`listen_funnel`] anymore (the
+    /// listener is built and works against real SaaS); it remains for callers that want to surface
+    /// the relay gap explicitly. `detail` names what is missing.
     Unsupported {
         /// Names exactly what is missing to serve public Funnel ingress.
         detail: String,
@@ -284,11 +288,18 @@ impl From<CertError> for FunnelError {
     }
 }
 
-/// Names exactly what this fork is missing to serve public Funnel ingress, surfaced verbatim in
-/// [`FunnelError::Unsupported`] so the gap is self-documenting at runtime.
-pub const MISSING_FUNNEL_RELAY: &str = "Tailscale-operated public ingress relays (DERP TCPHandlerForIngress) that route funnel.<...> \
-     traffic to this node; a self-hosted a self-hosted control plane control plane provides no such relay, and a \
-     publicly-trusted cert (TLS-ALPN-01 via the client-side ACME engine) is required to terminate";
+/// Names what is needed to actually receive public Funnel ingress on a node whose client-side
+/// listener is up. This is **Tailscale infrastructure, not buildable in this fork**: the public DNS
+/// `<node>.<tailnet>.ts.net:443` → relay mapping plus the ingress relay itself (a Tailscale-operated
+/// tailnet peer that POSTs the public client's bytes to this node's peerAPI `/v0/ingress`). Against
+/// real Tailscale SaaS (with a Funnel-enabled ACL) control stands these up automatically and
+/// [`listen_funnel`]'s listener serves real public traffic; against a self-hosted control plane
+/// (a self-hosted control plane) no relay exists, so the listener is correct but never fed. Surfaced verbatim in
+/// [`FunnelError::Unsupported`] for callers that want to flag the relay gap.
+pub const MISSING_FUNNEL_RELAY: &str = "the Tailscale-operated public ingress relay + the public DNS \
+     <node>.<tailnet>.ts.net:443 -> relay mapping that POST public client bytes to this node's peerAPI \
+     /v0/ingress; these are Tailscale infrastructure (provisioned automatically against real Tailscale \
+     SaaS with a Funnel-enabled ACL) and a self-hosted a self-hosted control plane control plane provides no such relay";
 
 /// Check whether `node` may funnel on `port`, mirroring Go's `ipn.NodeCanFunnel` +
 /// `ipn.CheckFunnelPort` gate. Pure and fail-closed: a missing attribute or out-of-range port
@@ -306,18 +317,26 @@ pub fn funnel_access(node: &Node, port: u16) -> Result<(), FunnelError> {
 /// Build a [`TlsAcceptor`] terminating public Funnel ingress for `cfg.name` on `cfg.port` (like
 /// `tsnet`'s `ListenFunnel`).
 ///
-/// **Fail-closed, two gates.** First the node-attribute gate ([`funnel_access`], mirroring Go
-/// `NodeCanFunnel` + `CheckFunnelPort`) must pass — this part is real and fully enforced from the
-/// node's capability map. Then TLS material is obtained via [`cert::get_certificate`], which in
-/// this fork returns [`CertError::Unimplemented`] (no client-side ACME engine / no `set-dns`
-/// publish RPC). Even with a cert, the **public ingress relay** leg does not exist against a
-/// self-hosted control plane, so the call surfaces [`FunnelError::Unsupported`]
-/// ([`MISSING_FUNNEL_RELAY`] names what is missing) rather than ever returning a listener that
-/// silently serves nothing or downgrades to plaintext.
+/// **Fail-closed gates, then the working TLS acceptor.** First the node-attribute gate
+/// ([`funnel_access`], mirroring Go `NodeCanFunnel` + `CheckFunnelPort`) must pass — fully enforced
+/// from the node's capability map. Then TLS material is obtained via [`cert::get_certificate`]: the
+/// Funnel hostname *is* the node's MagicDNS `*.ts.net` name, so the node's existing DNS-01 cert
+/// matches and no TLS-ALPN-01 is required. Without the `acme` feature this fork's stub still returns
+/// [`CertError::Unimplemented`] (carried as [`FunnelError::Cert`]); the device-level
+/// `listen_funnel` routes through the ACME-aware cert path instead, so with `acme` (and a control
+/// plane that answers `set-dns`) this yields a real acceptor.
 ///
-/// Anti-leak: Funnel TLS would terminate only on the overlay netstack, never a host socket; there
-/// is no self-signed or plaintext fallback. `_opts` is accepted now so the public surface is stable
-/// when the relay leg lands.
+/// Unlike the previous fail-closed stub, an allowed request with a cert now returns a usable
+/// acceptor (the caller — `Device::listen_funnel` — registers a funnel manager that TLS-terminates
+/// hijacked `/v0/ingress` streams with it and hands the decrypted streams back). The public ingress
+/// **relay + DNS mapping** that feed `/v0/ingress` are Tailscale infrastructure
+/// ([`MISSING_FUNNEL_RELAY`]) provisioned automatically against real Tailscale SaaS; against a
+/// self-hosted control plane no relay exists, so the listener is correct but never fed.
+///
+/// Anti-leak: Funnel TLS terminates only on the overlay netstack (the hijacked ingress stream
+/// arrives on the peerAPI overlay listener), never a host socket; there is no self-signed or
+/// plaintext fallback. `_opts` is accepted now so the public surface is stable as ingress wiring
+/// evolves.
 pub async fn listen_funnel(
     node: &Node,
     cfg: &ServeConfig,
@@ -326,15 +345,12 @@ pub async fn listen_funnel(
     cfg.validate()?;
     funnel_access(node, cfg.port)?;
 
-    // Access granted. Public Funnel needs a publicly-trusted cert AND a Tailscale ingress relay to
-    // route public traffic to this node. The cert path is fail-closed in this fork...
-    let _cert = cert::get_certificate(&cfg.name).await?;
-
-    // ...and even a real cert can't be served publicly without the relay, which a self-hosted
-    // control plane does not provide. Fail closed rather than hand back a dead listener.
-    Err(FunnelError::Unsupported {
-        detail: MISSING_FUNNEL_RELAY.to_string(),
-    })
+    // Access granted. Build the TLS acceptor from the node's `*.ts.net` cert (the Funnel hostname is
+    // the node's MagicDNS name, so the existing DNS-01 cert matches). Fail-closed on CertError — no
+    // self-signed/plaintext fallback. The cert path here is the non-acme stub; the device-level
+    // listen_funnel routes through the acme-aware Device::get_certificate.
+    let cert = cert::get_certificate(&cfg.name).await?;
+    Ok(tls_acceptor(cert)?)
 }
 
 #[cfg(test)]

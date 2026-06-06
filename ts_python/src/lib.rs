@@ -639,9 +639,12 @@ impl Device {
     /// `serve_config` has the same shape as [`listen_tls`][Self::listen_tls]. `funnel_only` (default
     /// `False`) rejects tailnet-internal connections, serving only public Funnel ingress.
     ///
-    /// **Fail-closed.** Enforces the node-attribute / port gates first, then — because this fork has
-    /// no client-side ACME engine and no public ingress relays — always raises the underlying
-    /// `FunnelError` rather than ever serving plaintext or a self-signed cert.
+    /// **Fail-closed.** Enforces the node-attribute / port gates first, then obtains the node's
+    /// `*.ts.net` cert via the ACME-aware path (raising `FunnelError` on cert failure — never
+    /// plaintext or a self-signed cert). On success the funnel ingress listener is registered; the
+    /// returned `FunnelAcceptedReceiver` is dropped here (Python holds no Rust receiver), so this
+    /// surfaces only the gate/cert outcome. The public ingress relay that feeds it is Tailscale
+    /// infrastructure, present only against real Tailscale SaaS.
     #[pyo3(signature = (serve_config, funnel_only=false))]
     pub fn listen_funnel<'p>(
         &self,
@@ -654,7 +657,8 @@ impl Device {
         let opts = ts_control::FunnelOptions { funnel_only };
 
         future_into_py(py, async move {
-            // Gate may pass, but issuance/relay legs always raise in this fork; propagate faithfully.
+            // Drop the returned FunnelAcceptedReceiver (Python holds no Rust receiver); propagate any
+            // gate/cert FunnelError faithfully.
             dev.listen_funnel(&cfg, opts).await.map_err(py_value_err)?;
             Ok(())
         })

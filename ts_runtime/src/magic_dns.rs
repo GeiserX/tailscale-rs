@@ -689,12 +689,14 @@ impl kameo::Actor for MagicDnsActor {
             let view_rx = view_rx.clone();
             let forward_exit_egress = env.forward_exit_egress;
             let taildrop = env.taildrop_store.clone();
+            let funnel_ingress = env.funnel_ingress.clone();
             joinset.spawn(crate::peerapi::serve(
                 channel,
                 port,
                 view_rx,
                 forward_exit_egress,
                 taildrop,
+                funnel_ingress,
             ));
         }
 

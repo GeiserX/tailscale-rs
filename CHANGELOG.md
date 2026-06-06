@@ -6,6 +6,33 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.46](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.46) - 2026-06-06
+
+**Client-side Funnel ingress** (roadmap `tsr-am9.11`): `Device::listen_funnel` now returns a
+**working** ingress listener — the final tsnet-parity item. Investigation corrected the model:
+Funnel ingress is **not** a DERP-layer feature. Tailscale's ingress relay is a tailnet *peer* that
+**POSTs to the node's peerAPI `/v0/ingress`** and the node HTTP-hijacks the connection — so the
+node side is a peerAPI route, fully buildable. (The public DNS + the relay itself remain
+Tailscale-operated infrastructure: this works against real Tailscale SaaS with a Funnel-enabled ACL;
+a self-hosted a self-hosted control plane provides no relay, documented in `MISSING_FUNNEL_RELAY`.)
+
+- New peerAPI `POST /v0/ingress` route (`ts_runtime::peerapi`): fail-closed netmap-membership gate
+  (a non-member ingress POST is rejected `403`; the stricter relay-specific cap is a documented
+  follow-up, same posture as Taildrop), parses `Tailscale-Ingress-Target`/`-Src`, replies
+  `HTTP/1.1 101 Switching Protocols` to hijack the connection into a raw bidi stream, and hands it
+  to the funnel manager. No active funnel listener ⇒ `404` (never hijack what won't be served).
+- New `FunnelManager` (`ts_runtime::funnel`, mirrors the Serve runtime): TLS-terminates each hijacked
+  stream with the node's `*.ts.net` cert (the ACME-issued DNS-01 cert matches the Funnel hostname —
+  no TLS-ALPN-01 needed) and yields `FunnelAccepted { target, src, stream }` over a
+  `FunnelAcceptedReceiver`.
+- **API change**: `Device::listen_funnel` now returns `FunnelAcceptedReceiver` (was `TlsAcceptor`) —
+  the working hand-back shape. The `funnel_access` (NodeCanFunnel + CheckFunnelPort) and cert gates
+  stay fail-closed. While a funnel listener is active the node advertises `HostInfo.IngressEnabled`
+  (new `MapRequestBuilder::ingress_enabled`) so control routes Funnel traffic to it.
+- **Anti-leak**: ingress arrives on the overlay peerAPI listener and is TLS-terminated on the
+  overlay — never a host socket, never routed through `ts_forwarder`; no plaintext/self-signed
+  fallback. The Python/Elixir `listen_funnel` bindings were updated for the new return type.
+
 ## [0.5.45](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.45) - 2026-06-06
 
 **VIP-service advertise side** (roadmap `tsr-am9.9`): a node can now tell control it hosts a

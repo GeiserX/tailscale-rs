@@ -107,6 +107,15 @@ pub struct ForwarderConfig {
     /// handling. It NEVER governs the forwarder exit/subnet egress path, which stays IPv4-only
     /// regardless to uphold the real-origin-IP isolation invariant.
     pub enable_ipv6: bool,
+
+    /// The shared "Funnel ingress listener active" flag, the same `Arc` as
+    /// [`Config::ingress_active`](ts_control::Config::ingress_active).
+    ///
+    /// `Device::listen_funnel` flips this `true` when its listener starts (and the dropped manager
+    /// flips it back `false`); the control session reads it on each map request to set
+    /// `HostInfo.IngressEnabled`. Cloned from the control config at `from_control_config` so the
+    /// runtime and `ts_control` share one flag.
+    pub ingress_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ForwarderConfig {
@@ -127,6 +136,7 @@ impl ForwarderConfig {
             peerapi_port: config.peerapi_port,
             taildrop_dir: config.taildrop_dir.clone(),
             enable_ipv6: config.enable_ipv6,
+            ingress_active: config.ingress_active.clone(),
         }
     }
 }
@@ -205,6 +215,25 @@ pub struct Env {
     /// netstack address assignment, and MagicDNS; never by the forwarder egress path.
     pub enable_ipv6: bool,
 
+    /// The shared "Funnel ingress listener active" flag, the same `Arc` as
+    /// [`Config::ingress_active`](ts_control::Config::ingress_active).
+    ///
+    /// `Device::listen_funnel` flips this `true` when its listener starts; the control session reads
+    /// it on each map request to set `HostInfo.IngressEnabled`. See [`ForwarderConfig::ingress_active`].
+    pub ingress_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+
+    /// The active Funnel ingress sink, shared (runtime-lifetime) between the peerAPI server and
+    /// `Device::listen_funnel`.
+    ///
+    /// The peerAPI server (spawned at startup, before any `listen_funnel`) holds a clone of this
+    /// `Arc` and reads it per connection: when a `FunnelManager` is registered (the embedder called
+    /// `Device::listen_funnel`) the slot holds its [`FunnelIngressSink`](crate::funnel::FunnelIngressSink)
+    /// and a `POST /v0/ingress` is membership-gated, `101`-hijacked, and pushed to the sink; when
+    /// `None` (the default, no funnel listener active) the route fails closed (`404`) without
+    /// hijacking. Installing the sink here at `listen_funnel` time makes the route live without
+    /// restarting the peerAPI server.
+    pub funnel_ingress: crate::funnel::FunnelIngressSlot,
+
     /// Whether the runtime is shutdown.
     ///
     /// This is provided so that actors can check whether a message send has failed because
@@ -234,6 +263,7 @@ impl Env {
             peerapi_port,
             taildrop_dir,
             enable_ipv6,
+            ingress_active,
         } = forwarding;
 
         // Construct the Taildrop store once when a directory is configured. A construction failure
@@ -265,6 +295,8 @@ impl Env {
             peerapi_port,
             taildrop_store,
             enable_ipv6,
+            ingress_active,
+            funnel_ingress: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 

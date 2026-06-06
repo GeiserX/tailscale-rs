@@ -29,6 +29,8 @@ mod error;
 /// Fallback TCP handler registry (`tsnet.Server.RegisterFallbackTCPHandler` parity).
 pub mod fallback_tcp;
 mod forwarder_actor;
+/// Client-side Funnel ingress termination (`tsnet`'s `ListenFunnel` data path).
+pub mod funnel;
 mod magic_dns;
 mod multiderp;
 mod netstack_actor;
@@ -274,6 +276,23 @@ impl Runtime {
     /// the embedder's read APIs and the receive path see the same on-disk store.
     pub fn taildrop_store(&self) -> Option<Arc<crate::taildrop::TaildropStore>> {
         self.env.taildrop_store.clone()
+    }
+
+    /// The shared Funnel ingress slot the peerAPI `/v0/ingress` route reads per connection.
+    ///
+    /// `Device::listen_funnel` installs a [`FunnelManager`](crate::funnel::FunnelManager)'s sink here
+    /// to make the route live (the peerAPI server is already running from startup). Returns a clone of
+    /// the runtime-lifetime `Arc` so the device can write the slot without restarting the server. See
+    /// [`crate::funnel`] for the ingress data path.
+    pub fn funnel_ingress_slot(&self) -> crate::funnel::FunnelIngressSlot {
+        self.env.funnel_ingress.clone()
+    }
+
+    /// The shared "Funnel ingress listener active" flag (the same `Arc` the control session reads to
+    /// set `HostInfo.IngressEnabled`). `Device::listen_funnel` flips it `true` while a funnel listener
+    /// is up so control routes Funnel traffic to this node; clearing it advertises no live endpoint.
+    pub fn ingress_active_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.env.ingress_active.clone()
     }
 
     /// Install (`Some`) or clear (`None`) the debug packet-capture hook on the running dataplane.

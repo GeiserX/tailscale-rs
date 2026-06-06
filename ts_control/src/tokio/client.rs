@@ -285,6 +285,11 @@ async fn run_once(
         .services(config.advertised_services())
         .services_hash(&services_hash)
         .wire_ingress(config.wire_ingress)
+        .ingress_enabled(
+            config
+                .ingress_active
+                .load(core::sync::atomic::Ordering::Relaxed),
+        )
         .map_session(&session.handle, session.seq);
 
     let request = if let Some(hostname) = &config.hostname {

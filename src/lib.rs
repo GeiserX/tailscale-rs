@@ -196,6 +196,11 @@ pub struct Device {
     /// node's overlay IPv4, only known after registration). Held here so its accept loops abort when
     /// the `Device` drops; `None` (empty config) until the first `set`.
     serve: std::sync::Mutex<Option<ts_runtime::serve::ServeManager>>,
+    /// The live Funnel ingress manager (`tsnet`'s `ListenFunnel` data path), built on
+    /// [`Device::listen_funnel`]. Held here so its TLS-termination pump and the installed peerAPI
+    /// ingress sink stay alive for the device's life (and tear down when a new `listen_funnel`
+    /// replaces it, or the `Device` drops). `None` until the first `listen_funnel`.
+    funnel: std::sync::Mutex<Option<ts_runtime::funnel::FunnelManager>>,
 }
 
 /// Map a [`ts_runtime::taildrop::TaildropError`] to the device-facing [`Error`]. `Error` is a
@@ -316,6 +321,7 @@ impl Device {
             channel,
             enable_ipv6: config.enable_ipv6,
             serve: std::sync::Mutex::new(None),
+            funnel: std::sync::Mutex::new(None),
         })
     }
 
@@ -964,35 +970,81 @@ impl Device {
     }
 
     /// Expose a tailnet TLS service to the public internet via Tailscale Funnel (like `tsnet`'s
-    /// `ListenFunnel`).
+    /// `ListenFunnel`), returning a [`FunnelAcceptedReceiver`](ts_runtime::funnel::FunnelAcceptedReceiver)
+    /// that delivers each TLS-terminated public connection.
     ///
-    /// **Two fail-closed gates.** First the node-attribute gate is fully enforced from this node's
-    /// own capability map (mirroring Go `ipn.NodeCanFunnel` + `ipn.CheckFunnelPort`): the tailnet
-    /// admin must have enabled HTTPS and granted the `funnel` node attribute, and `cfg.port` must be
-    /// in the set the `funnel-ports` capability allows — otherwise this returns
-    /// [`ts_control::FunnelError::NotAllowed`] / [`ts_control::FunnelError::PortNotAllowed`] before
-    /// touching any cert or network. Then, because public Funnel ingress requires both a
-    /// publicly-trusted certificate (no client-side ACME engine exists here — see
-    /// [`Device::get_certificate`]) and Tailscale-operated public ingress relays that a self-hosted
-    /// control plane does not provide, an allowed request surfaces
-    /// [`ts_control::FunnelError::Unsupported`] ([`ts_control::MISSING_FUNNEL_RELAY`] names what is
-    /// missing) rather than ever returning a listener that silently serves nothing or downgrades to
-    /// plaintext.
+    /// **Two fail-closed gates, then the live ingress listener.** First the node-attribute gate is
+    /// fully enforced from this node's own capability map (mirroring Go `ipn.NodeCanFunnel` +
+    /// `ipn.CheckFunnelPort`): the tailnet admin must have enabled HTTPS and granted the `funnel`
+    /// node attribute, and `cfg.port` must be in the set the `funnel-ports` capability allows —
+    /// otherwise this returns [`ts_control::FunnelError::NotAllowed`] /
+    /// [`ts_control::FunnelError::PortNotAllowed`] before touching any cert or network. Then the
+    /// node's `*.ts.net` certificate is obtained via the ACME-aware [`Device::get_certificate`] (the
+    /// Funnel hostname *is* the node's MagicDNS name, so its DNS-01 cert matches); fail-closed on
+    /// [`ts_control::FunnelError::Cert`] — no self-signed or plaintext fallback.
     ///
-    /// Anti-leak: Funnel TLS would terminate only on the overlay netstack, never a host socket;
-    /// there is no self-signed or plaintext fallback. The access gate is real today, so callers can
-    /// rely on it; when the relay + issuance legs land, this starts returning a working acceptor
-    /// with no caller change.
+    /// On success a [`FunnelManager`](ts_runtime::funnel::FunnelManager) is registered: its ingress
+    /// sink is installed into the runtime's peerAPI `/v0/ingress` slot (making that route live without
+    /// restarting the peerAPI server), and the `HostInfo.IngressEnabled` map-request signal is set so
+    /// control routes Funnel traffic to this node. Public Funnel bytes arrive as a relay POST to
+    /// `/v0/ingress`, are membership-gated + `101`-hijacked into a raw stream, TLS-terminated by the
+    /// manager, and delivered over the returned receiver.
+    ///
+    /// **Where the relay comes from.** The public ingress **relay + DNS mapping** that feed
+    /// `/v0/ingress` are Tailscale infrastructure ([`ts_control::MISSING_FUNNEL_RELAY`]), provisioned
+    /// automatically against real Tailscale SaaS with a Funnel-enabled ACL; against a self-hosted
+    /// control plane (a self-hosted control plane) no relay exists, so the listener is correct but never fed.
+    ///
+    /// Anti-leak: Funnel TLS terminates only on the overlay netstack (the hijacked ingress stream
+    /// arrives on the overlay peerAPI listener), never a host socket; there is no self-signed or
+    /// plaintext fallback. A new `listen_funnel` replaces the previous manager (its pump + sink tear
+    /// down); dropping the `Device` tears it down too.
     pub async fn listen_funnel(
         &self,
         cfg: &ts_control::ServeConfig,
         opts: ts_control::FunnelOptions,
-    ) -> Result<TlsAcceptor, ts_control::FunnelError> {
+    ) -> Result<ts_runtime::funnel::FunnelAcceptedReceiver, ts_control::FunnelError> {
+        // Gate 1 (fail-closed, no network): node-attribute + funnel-port access from our cap map.
         let me = self
             .self_node()
             .await
             .map_err(|_| ts_control::FunnelError::NotAllowed)?;
-        ts_control::listen_funnel(&me, cfg, opts).await
+        cfg.validate()?;
+        ts_control::funnel_access(&me, cfg.port)?;
+
+        // Gate 2 (fail-closed): obtain the node's `*.ts.net` cert via the ACME-aware path and build
+        // the TLS acceptor. A cert failure surfaces as FunnelError::Cert — never a plaintext listener.
+        let cert = self
+            .get_certificate(&cfg.name)
+            .await
+            .map_err(ts_control::FunnelError::Cert)?;
+        let acceptor = ts_control::tls_acceptor(cert).map_err(ts_control::FunnelError::Cert)?;
+
+        // `opts.funnel_only` (reject tailnet-internal connections) is accepted for surface stability;
+        // the ingress data path only ever carries relay-delivered public traffic, so there is no
+        // tailnet-internal leg on this listener to reject. Documented as a no-op here for now.
+        let _ = opts;
+
+        // Build the funnel manager + its ingress sink + the hand-back receiver, install the sink into
+        // the runtime's shared peerAPI `/v0/ingress` slot (making the route live), and flip the
+        // IngressEnabled map signal. Hold the manager on the device so its pump/sink live as long as
+        // the listener; replacing a prior manager tears the old one down on drop at end of scope.
+        let (manager, sink, receiver) = ts_runtime::funnel::FunnelManager::new(acceptor);
+        {
+            let slot = self.runtime.funnel_ingress_slot();
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink);
+        }
+        self.runtime
+            .ingress_active_flag()
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let old = {
+            let mut held = self.funnel.lock().unwrap_or_else(|e| e.into_inner());
+            held.replace(manager)
+        };
+        drop(old);
+
+        Ok(receiver)
     }
 
     /// Host a Tailscale **VIP service** (`svc:<label>`) by binding an overlay listener on the

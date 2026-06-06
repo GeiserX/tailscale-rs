@@ -151,6 +151,18 @@ impl<'a> MapRequestBuilder<'a> {
         self
     }
 
+    /// Signal that this node currently has at least one live Tailscale Funnel endpoint
+    /// (`HostInfo.IngressEnabled`), set while a [`crate::listen_funnel`] listener is active. Unlike
+    /// [`wire_ingress`](Self::wire_ingress) (the "would like to be wired up" hint), this advertises
+    /// that public ingress is *actually* being served, so control routes Funnel traffic to this node
+    /// via its ingress relay. Per Go's optimization, `IngressEnabled` implies `WireIngress`, so the
+    /// caller sends this *instead of* `WireIngress` when a Funnel listener is up. Defaults unset
+    /// (no live endpoint) — fail-closed: a node only advertises ingress while it can serve it.
+    pub fn ingress_enabled(mut self, value: bool) -> Self {
+        self.host_info_mut().ingress_enabled = value;
+        self
+    }
+
     /// Set the opaque VIP-services hash this node advertises (`HostInfo.ServicesHash`), the
     /// advertise-side signal that tells control to (re)fetch the node's hosted VIP-service list via
     /// the c2n `GET /vip-services` endpoint when it changes. Compute it with

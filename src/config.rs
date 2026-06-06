@@ -424,6 +424,9 @@ impl From<&Config> for ts_control::Config {
             enable_ipv6: value.enable_ipv6,
             transport_mode: value.transport_mode.clone(),
             wire_ingress: value.wire_ingress,
+            // A fresh runtime-local flag (default `false`): the runtime flips it when
+            // `Device::listen_funnel` starts a listener. Not derived from the embedder config.
+            ingress_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             advertise_services: value.advertise_services.clone(),
         }
     }
