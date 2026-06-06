@@ -6,6 +6,19 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.39](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.39) - 2026-06-06
+
+**Route `Device::listen_tls` through the ACME-aware issuance path** (follow-up to v0.5.38). With the
+`acme` feature, `Device::get_certificate` issues a real cert, but `Device::listen_tls` was still
+delegating to `ts_control::listen_tls`, which only knows the non-`acme` fail-closed stub — so a
+`--features acme` build still failed closed on `listen_tls`. `Device::listen_tls` now validates the
+serve config, obtains the certificate via `Device::get_certificate` (the `acme`-routed path), and
+assembles the acceptor with `ts_control::tls_acceptor`. Without `acme` the behavior is unchanged
+(same fail-closed `CertError`); with `acme` (and a `set-dns`-capable control plane) `listen_tls` now
+returns a working acceptor. `listen_funnel` remains fail-closed on `MISSING_FUNNEL_RELAY` — public
+Funnel additionally requires a Tailscale-operated ingress relay that a self-hosted control plane
+cannot provide.
+
 ## [0.5.38](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.38) - 2026-06-06
 
 **Client-side ACME (Let's Encrypt) certificate issuance + `set-dns` RPC** (roadmap Tier 4 item 10 /

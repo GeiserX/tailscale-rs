@@ -851,15 +851,21 @@ impl Device {
     /// Build a [`TlsAcceptor`] terminating TLS for `cfg.name` on the overlay (like `tsnet`'s
     /// `ListenTLS`).
     ///
-    /// **Fail-closed.** Delegates to [`Device::get_certificate`]; because no real certificate can
-    /// be issued in this fork, this returns the same [`ts_control::CertError::Unimplemented`]
-    /// rather than ever serving a self-signed cert or downgrading to plaintext. Terminate accepted
-    /// overlay streams with [`ts_control::accept_tls`].
+    /// Obtains the certificate via [`Device::get_certificate`] — so with the `acme` feature this
+    /// issues a real Let's Encrypt cert (when the control plane answers `set-dns`), and without it
+    /// (or when issuance is unavailable) it surfaces the same fail-closed
+    /// [`ts_control::CertError`] rather than ever serving a self-signed cert or downgrading to
+    /// plaintext. Terminate accepted overlay streams with [`ts_control::accept_tls`].
     pub async fn listen_tls(
         &self,
         cfg: &ts_control::ServeConfig,
     ) -> Result<TlsAcceptor, ts_control::CertError> {
-        ts_control::listen_tls(cfg).await
+        // Route through Device::get_certificate (the acme-aware issuance path) rather than
+        // ts_control::listen_tls, which only knows the non-acme stub. Validate the serve config
+        // first (same fail-closed checks ts_control::listen_tls applies), then assemble the acceptor.
+        cfg.validate()?;
+        let cert = self.get_certificate(&cfg.name).await?;
+        ts_control::tls_acceptor(cert)
     }
 
     /// Expose a tailnet TLS service to the public internet via Tailscale Funnel (like `tsnet`'s
