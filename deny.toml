@@ -1,6 +1,7 @@
 [advisories]
 ignore = [
     { id = "RUSTSEC-2024-0436", reason = "archived crate depended on by netlink-packet-utils. Already fixed upstream, just hasn't bubbled through the dependency stack yet" },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is unmaintained (functionality folded into rustls-pki-types >=1.9); transitive via the TLS stack, no published vulnerability. Pre-existing advisory, unrelated to the supply-chain ban below." },
 ]
 
 [licenses]
@@ -23,11 +24,30 @@ private = { ignore = true }
 [bans]
 multiple-versions = "allow"
 wildcards = "allow"
+# Machine-enforce the ring-only / no-aws-lc supply-chain invariant on the egress graph.
+# aws-lc enters this workspace ONLY via (a) `russh` behind the off-by-default `ssh` feature
+# (runtime, opt-in) and (b) `reqwest` default-tls as a *dev-dependency* of ts_derp/ts_netcheck.
+# The `hosted_test` CI lane runs `cargo deny --no-default-features --exclude-dev check all`, which
+# turns `ssh` off (russh gone) and drops the dev-dep reqwest path, so this ban must hold on the
+# runtime no-ssh graph without breaking the build. Upstream's `arch_independent` job still runs
+# `--all-features` (where aws-lc legitimately appears via ssh+dev) and is unaffected by this ban
+# because that job's invocation excludes neither.
+deny = [
+    { name = "aws-lc-rs" },
+    { name = "aws-lc-sys" },
+]
 
 [graph]
-# Ensure that cargo deny runs with all features enabled, so we check the licenses/advisories/etc
-# for all dependencies, not just the deps enabled by the default features.
-all-features = true
+# Feature selection is driven by each `cargo deny` invocation's CLI flags rather than forced on
+# here. Forcing `all-features = true` in this config would make the `hosted_test` lane's
+# `--no-default-features` a no-op (the `ssh` feature would stay on, pulling `russh -> aws-lc-rs`
+# back into the graph and tripping the ban below). The upstream `arch_independent` job still passes
+# `--all-features` explicitly on its CLI, so license/advisory coverage there is unchanged.
+all-features = false
+# Exclude dev-dependencies from the dependency graph so the aws-lc ban (above) is not tripped by
+# the `reqwest` default-tls dev-dependency of ts_derp/ts_netcheck. Dev deps never ship in the
+# egress/proxy daemon binary, so they are out of scope for the runtime ring-only invariant.
+exclude-dev = true
 
 [sources]
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]

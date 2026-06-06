@@ -6,6 +6,8 @@
 //! RPC. The actual signature verification lives in the `ts_tka` crate; this type just carries the
 //! head/disabled fields off the netmap so the runtime and embedder can react (e.g. detect a head
 //! change and resync, or surface lock state).
+//!
+//! AUM-sync RPC deferred, see SECURITY.md.
 
 use alloc::string::{String, ToString};
 

@@ -123,7 +123,14 @@ impl Runtime {
         // Force `on_start` to finish (any-IP enabled, accept loops live) before the route updater
         // can route the first inbound flow to `forwarder_id`: an `ask` blocks until the actor has
         // started.
-        let (_forwarder_channel,) = forwarder.ask(forwarder_actor::GetChannel).await?;
+        //
+        // The forwarder netstack's overlay `Channel` is reused by the TUN application path for
+        // recursive / exit-node-DoH MagicDNS forwarding (TUN mode has no application netstack of its
+        // own, but the forwarder netstack runs in both modes and egresses over the overlay — the
+        // anti-leak property `forward_query`/`forward_doh` require). Only the `tun` Tun arm consumes
+        // it, so it is unused when the `tun` feature is off — allow that without warn-as-error.
+        #[cfg_attr(not(feature = "tun"), allow(unused_variables))]
+        let (forwarder_channel,) = forwarder.ask(forwarder_actor::GetChannel).await?;
 
         route_updater::RouteUpdater::spawn((
             multiderp.clone(),
@@ -187,6 +194,10 @@ impl Runtime {
                         accept_routes: env.accept_routes,
                         exit_node_configured: env.exit_node.is_some(),
                     },
+                    // Reuse the forwarder netstack's overlay `Channel` for recursive / exit-node-DoH
+                    // MagicDNS forwarding in the TUN datapath (TUN mode has no application netstack
+                    // Channel of its own). Egresses over the overlay — anti-leak preserved.
+                    forwarder_channel.clone(),
                 ));
 
                 (None, None)

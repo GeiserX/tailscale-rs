@@ -34,19 +34,68 @@ SOCKS5 (v0.5.27–v0.5.32); a multi-reviewer hardening pass (v0.5.33); then the 
 (v0.5.39). Tier 1 (direct-path glue, disco↔node-key binding, musl lane) and Tier 2 (tags, ephemeral,
 upstream-proxy dialer, netmap resumption) were verified already-complete in-tree.
 
-### Remaining (deferred / external — beaded under `tsr-am9`)
-- `tsr-am9.7` **TUN-mode MagicDNS** — deep host-DNS + dedicated-netstack change (netstack mode is
-  fully functional; TUN mode's host DNS is inert). Supervised session.
-- `tsr-am9.8` **Serve get/set_serve_config + accept-loop runtime** — awkward Accept-handback seam;
-  needs a serve-state product decision.
-- `tsr-am9.9` **Service advertise-to-control** — consume-side done; advertise-side low value
-  (ACL-preassigned VIPs work), needs a wire-field decision.
-- `tsr-am9.10` **Symmetric-NAT port spray** — deliberately skipped (low value for the DERP-acceptable
-  k8s/proxy deployment; single-port guess already covers easy cases).
-- `tsr-am9.11` **Funnel public ingress relay** — EXTERNAL infra dependency (Tailscale-operated
-  relay); un-buildable against a self-hosted control plane; `listen_funnel` correctly fail-closed.
-- `tsr-4pp` **Netstack sharding** — benchmark-gated; needs a real residential-exit measurement first.
+Most recent wave:
+- **Serve `Path` / `Redirect` handlers** — HTTP path-prefix mux and HTTP 3xx redirect targets added
+  to `ServeTarget`, validated and dispatched on the TLS-terminated stream, fail-closed (unmatched
+  path → 404, backend dial failure → drop). Hand-rolled HTTP head parsing; no axum/hyper added.
+- **Recursive MagicDNS in TUN mode** — the TUN-mode `100.100.100.100:53` resolver now forwards
+  non-tailnet names recursively (previously inert in TUN mode), reusing the forwarder netstack's
+  overlay-backed `Channel` and the same `decide`/`recursive_plan` path as netstack mode, so the
+  IPv4-only egress filter and fail-closed NXDOMAIN default are inherited.
+- **Tailnet Lock peer-key enforcement (partial)** — per-peer node-key signature verification is
+  threaded through the domain `Node` and wired at the `ts_runtime` peer-trust chokepoint, gated
+  behind an optional `ts_tka::Authority` and unit-tested. With no `Authority` (always, today)
+  behavior is unchanged; when one is supplied the chokepoint fails closed on bad/missing signatures.
+  Live `Authority` construction is **deferred** — see the deferred list below and
+  [SECURITY.md](../SECURITY.md).
+
+### Deferred (in-scope eventually, not blocked externally — with reasons)
+- **AUM-sync RPC + live TKA `Authority`** — the `/machine/tka/sync/*` Noise RPC family plus the
+  AUM-chain replayer that folds `AddKey`/`RemoveKey`/`UpdateKey`/`Checkpoint` into a trusted-key
+  `State`. `MapResponse` carries only the AUM head hash and the per-peer signature, never the
+  trusted keys, so the `Authority` cannot be derived from data the client already receives. Until
+  this lands, the wired TKA enforcement is inert (see [SECURITY.md](../SECURITY.md)).
+- **`ts_tka` CTAP2-CBOR cross-validation against Go test vectors** — byte-for-byte wire
+  compatibility is asserted by construction, not proven; a *successful* TKA verification should be
+  treated as advisory until vectors land.
+- **`UnsignedPeerAPIOnly`** — the peerAPI-only network-access carve-out for unsigned peers under
+  tailnet lock; today an active lock rejects unsigned peers outright.
+- **DERP mesh / private DERP server** — running our own DERP relay mesh (consuming public relays as
+  a fallback path is implemented).
+- **TKA signing** — initiating/mutating tailnet-lock state (only client-side *verification* is in
+  scope here).
+- **UPnP / PCP / NAT-PMP portmapper** — gateway port-mapping for better direct connectivity.
+- **App connector** — `4via6`-style application connectors.
+- **`4via6`** subnet-route encoding.
+- **Serve get/set_serve_config + accept-loop runtime** — the handler *types* ship (`Path`/`Redirect`/
+  `Proxy`/`Text`/`TcpForward`); the stored serve-state runtime and the Accept-handback loop remain,
+  pending a serve-state product decision.
+- **Service advertise-to-control** — consume-side done; advertise-side is low value (ACL-preassigned
+  VIPs work) and needs a wire-field decision.
+- **Symmetric-NAT birthday-paradox port spray** — deliberately skipped (low value for the
+  DERP-acceptable k8s/proxy deployment; the single-port guess already covers easy cases).
+- **Netstack sharding** (`tsr-4pp`) — benchmark-gated; needs a real residential-exit measurement
+  first.
 - `Sys()` internals — satisfied via typed accessors (`self_node`/`status`/`watch_netmap`/`whois`).
+
+### Blocked by external dependency
+These cannot be built against a self-hosted control plane and depend on Tailscale-operated infra or
+out-of-band setup:
+- **Funnel public ingress relay** — depends on the Tailscale-operated public relay leg; un-buildable
+  against a self-hosted control plane. `listen_funnel` correctly fail-closed.
+- **ACME on a self-hosted control plane** — a self-hosted control plane returns `501` for the ACME-over-control cert RPC; client-side
+  ACME (DNS-01) is implemented but the a self-hosted control plane leg is not available.
+- **OIDC / SSO** — identity-provider integration is a control-plane/deployment concern.
+- **Network flow logs** — depends on the control-plane log-collection pipeline.
+- **Taildrop relay** — the relayed (non-direct) Taildrop path depends on Tailscale infra (direct
+  send/recv is implemented).
+- **Node sharing** — cross-tailnet sharing is a control-plane feature.
+
+## Upstream tracking
+
+Upstream [`tailscale/tailscale-rs`](https://github.com/tailscale/tailscale-rs) is now active. Going
+forward this fork tracks upstream and aims to upstream or re-base fork-specific work where it makes
+sense, while keeping the product-specific anti-leak/egress posture (see `AGENTS.md`).
 
 ## Consumers and the seams they need
 
@@ -107,11 +156,13 @@ so these are now in scope:
     **observability/metrics**.
 21. **Workload identity federation fields** (`ClientID`/`IDToken`/`Audience`) + `Sys()` internals.
 
-## Cross-cutting doc-hygiene (must-fix — privacy product)
-- Reconcile README: it claims both "DERP for all communication" and "direct NAT traversal
-  implemented." Code says direct is real.
-- Clarify `fallback_resolvers`: "never forwards upstream" is the **default**, not an invariant — a
-  configured resolver *does* forward query names.
+## Cross-cutting doc-hygiene (privacy product)
+- ~~Reconcile README DERP-vs-direct~~ — **done.** The README now states direct NAT traversal is
+  real and DERP is the fallback used only when no direct path is available.
+- ~~Clarify `fallback_resolvers`~~ — **done.** The README states fail-closed NXDOMAIN is the
+  *default* and that configuring a resolver opts in to forwarding query names upstream.
+- Security posture is now documented in full in [SECURITY.md](../SECURITY.md) (unaudited crypto, the
+  inert TKA enforcement, peerAPI capability gap, at-rest key handling, anti-leak posture).
 
 ## Invariants that must never regress
 - Real origin IP must never leak; no silent direct-dial fallback (fail-closed is sacred).

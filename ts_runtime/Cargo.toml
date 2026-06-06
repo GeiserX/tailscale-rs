@@ -26,6 +26,7 @@ ts_overlay_router.workspace = true
 ts_packet.workspace = true
 ts_packetfilter = { workspace = true, features = ["checking-filter"] }
 ts_packetfilter_state.workspace = true
+ts_tka.workspace = true
 ts_transport.workspace = true
 ts_transport_tun = { workspace = true, optional = true }
 ts_host_net = { workspace = true, optional = true }
@@ -61,6 +62,9 @@ acme = ["ts_control/acme"]
 rand = "0.10"
 proptest = "1.11"
 itertools = "0.14"
+# Test-only: sign the TKA node-key-signature fixtures the peer_tracker TKA enforcement tests verify
+# against (mirrors how `ts_tka`'s own unit tests build a valid signature). Not on any egress path.
+ed25519-dalek = "2"
 
 [lints]
 workspace = true

@@ -41,8 +41,8 @@ use crate::{
 /// stream with no TLS).
 ///
 /// Mirrors the handler shapes of upstream `ipn.ServeConfig`'s `HTTPHandler`/`TCPPortHandler`
-/// (`Proxy`/`Text`/`TCPForward`), plus an `Accept` hand-back the in-process Rust embedder uses in
-/// place of Go's `net.Listener`. (`Path`/`Redirect` static-file handlers are not yet implemented.)
+/// (`Proxy`/`Text`/`TCPForward`/`Path`/`Redirect`), plus an `Accept` hand-back the in-process Rust
+/// embedder uses in place of Go's `net.Listener`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 #[non_exhaustive]
@@ -69,13 +69,39 @@ pub enum ServeTarget {
         /// `host:port` to dial for the raw-TCP backend.
         to: String,
     },
+    /// HTTP path-prefix mux (Go `HTTPHandler` path map). Terminates TLS, reads the request line, and
+    /// dispatches the longest-matching path prefix's nested target on the already-decrypted stream.
+    Path {
+        /// Path-prefix → nested target. Longest-prefix wins at dispatch; an unmatched path is a
+        /// fail-closed 404. Nested `Path` is rejected by [`validate`](ServeState::validate) to bound
+        /// recursion (one level of nesting only).
+        handlers: alloc::collections::BTreeMap<String, ServeTarget>,
+    },
+    /// HTTP redirect response (Go `HTTPHandler` redirect). Terminates TLS, then writes a bodyless
+    /// `status`/`Location: to` response and closes.
+    Redirect {
+        /// Absolute or relative `Location` header value.
+        to: String,
+        /// HTTP redirect status; [`validate`](ServeState::validate) rejects anything outside
+        /// `300..=399`.
+        status: u16,
+    },
 }
 
 impl ServeTarget {
-    /// Whether this target requires TLS termination on the serve port (`Accept`/`Proxy`/`Text` ride
-    /// an HTTPS port; `TcpForward` is a raw passthrough with no TLS).
+    /// Whether this target requires TLS termination on the serve port. `Accept`/`Proxy`/`Text`/
+    /// `Path`/`Redirect` ride an HTTPS port and terminate TLS; only `TcpForward` is a raw passthrough
+    /// with no TLS. Explicit arms (not a single `matches!`) so the `#[non_exhaustive]` intent — every
+    /// future variant must declare its TLS posture deliberately — is clear at the call site.
     pub fn terminates_tls(&self) -> bool {
-        !matches!(self, ServeTarget::TcpForward { .. })
+        match self {
+            ServeTarget::Accept
+            | ServeTarget::Proxy { .. }
+            | ServeTarget::Text { .. }
+            | ServeTarget::Path { .. }
+            | ServeTarget::Redirect { .. } => true,
+            ServeTarget::TcpForward { .. } => false,
+        }
     }
 }
 
@@ -107,18 +133,58 @@ impl ServeState {
             if *port == 0 {
                 return Err(CertError::Acme("serve port must be non-zero".into()));
             }
-            match target {
-                ServeTarget::Proxy { to } | ServeTarget::TcpForward { to }
-                    if to.trim().is_empty() =>
-                {
-                    return Err(CertError::Acme(
-                        "serve proxy/forward target must not be empty".into(),
-                    ));
-                }
-                _ => {}
-            }
+            validate_target(target, 0)?;
         }
         Ok(())
+    }
+}
+
+/// Maximum depth of nested [`ServeTarget::Path`] handlers. A top-level `Path` (depth 0) may hold
+/// non-`Path` nested targets; a `Path` nested inside another `Path` is rejected. This bounds
+/// validation (and dispatch) recursion so an attacker-supplied config can't blow the stack.
+const MAX_PATH_NESTING_DEPTH: usize = 1;
+
+/// Fail-closed validation for one [`ServeTarget`], shared by [`ServeState::validate`] and
+/// [`ServeConfig::validate`]. `depth` is the current `Path` nesting level (0 at the top).
+///
+/// Rejects: empty `Proxy`/`TcpForward` targets; `Redirect` with an out-of-`300..=399` status or an
+/// empty `to`; `Path` with empty `handlers`, a `Path` nested deeper than [`MAX_PATH_NESTING_DEPTH`]
+/// (no unbounded recursion), or any nested target that itself fails validation.
+fn validate_target(target: &ServeTarget, depth: usize) -> Result<(), CertError> {
+    match target {
+        ServeTarget::Proxy { to } | ServeTarget::TcpForward { to } if to.trim().is_empty() => Err(
+            CertError::Acme("serve proxy/forward target must not be empty".into()),
+        ),
+        ServeTarget::Redirect { to, status } => {
+            if to.trim().is_empty() {
+                return Err(CertError::Acme(
+                    "serve redirect target must not be empty".into(),
+                ));
+            }
+            if !(300..=399).contains(status) {
+                return Err(CertError::Acme(
+                    "serve redirect status must be in 300..=399".into(),
+                ));
+            }
+            Ok(())
+        }
+        ServeTarget::Path { handlers } => {
+            if depth >= MAX_PATH_NESTING_DEPTH {
+                return Err(CertError::Acme(
+                    "serve path handlers must not nest more than one level".into(),
+                ));
+            }
+            if handlers.is_empty() {
+                return Err(CertError::Acme(
+                    "serve path handlers must not be empty".into(),
+                ));
+            }
+            for nested in handlers.values() {
+                validate_target(nested, depth + 1)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -145,12 +211,7 @@ impl ServeConfig {
         if self.port == 0 {
             return Err(CertError::Acme("serve port must be non-zero".into()));
         }
-        if let ServeTarget::Proxy { to } = &self.target
-            && to.trim().is_empty()
-        {
-            return Err(CertError::Acme("proxy target must not be empty".into()));
-        }
-        Ok(())
+        validate_target(&self.target, 0)
     }
 }
 
@@ -405,6 +466,123 @@ mod tests {
         assert_eq!(c, back);
     }
 
+    #[test]
+    fn serve_target_path_redirect_roundtrips_json() {
+        let mut handlers = alloc::collections::BTreeMap::new();
+        handlers.insert(
+            "/".to_string(),
+            ServeTarget::Redirect {
+                to: "https://host.tail1.ts.net/app".into(),
+                status: 308,
+            },
+        );
+        handlers.insert(
+            "/api".to_string(),
+            ServeTarget::Proxy {
+                to: "127.0.0.1:8080".into(),
+            },
+        );
+        let c = ServeConfig {
+            name: "host.tail1.ts.net".into(),
+            port: 443,
+            target: ServeTarget::Path { handlers },
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        let back: ServeConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(c, back);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_bad_redirect_status() {
+        let c = ServeConfig {
+            name: "host.tail1.ts.net".into(),
+            port: 443,
+            target: ServeTarget::Redirect {
+                to: "/elsewhere".into(),
+                status: 200,
+            },
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_redirect_target() {
+        let c = ServeConfig {
+            name: "host.tail1.ts.net".into(),
+            port: 443,
+            target: ServeTarget::Redirect {
+                to: "  ".into(),
+                status: 302,
+            },
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_path_handlers() {
+        let c = ServeConfig {
+            name: "host.tail1.ts.net".into(),
+            port: 443,
+            target: ServeTarget::Path {
+                handlers: alloc::collections::BTreeMap::new(),
+            },
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_nested_path() {
+        let mut inner = alloc::collections::BTreeMap::new();
+        inner.insert("/deep".to_string(), ServeTarget::Accept);
+        let mut handlers = alloc::collections::BTreeMap::new();
+        handlers.insert("/".to_string(), ServeTarget::Path { handlers: inner });
+        let c = ServeConfig {
+            name: "host.tail1.ts.net".into(),
+            port: 443,
+            target: ServeTarget::Path { handlers },
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_recurses_into_nested_path_target() {
+        // A nested target that is itself invalid (empty proxy) must fail through the recursion.
+        let mut handlers = alloc::collections::BTreeMap::new();
+        handlers.insert("/".to_string(), ServeTarget::Proxy { to: "  ".into() });
+        let c = ServeConfig {
+            name: "host.tail1.ts.net".into(),
+            port: 443,
+            target: ServeTarget::Path { handlers },
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn serve_state_validate_accepts_path_and_redirect() {
+        let mut handlers = alloc::collections::BTreeMap::new();
+        handlers.insert(
+            "/api".to_string(),
+            ServeTarget::Proxy {
+                to: "127.0.0.1:8080".into(),
+            },
+        );
+        let mut ports = alloc::collections::BTreeMap::new();
+        ports.insert(443u16, ServeTarget::Path { handlers });
+        ports.insert(
+            8443u16,
+            ServeTarget::Redirect {
+                to: "/api".into(),
+                status: 307,
+            },
+        );
+        let st = ServeState {
+            name: "host.tail1.ts.net".into(),
+            ports,
+        };
+        assert!(st.validate().is_ok());
+    }
+
     #[tokio::test]
     async fn listen_tls_is_fail_closed() {
         // No ACME RPC in this fork: must surface Unimplemented, never a usable
@@ -463,6 +641,9 @@ mod tests {
             exit_node_dns_resolvers: vec![],
             peer_relay: false,
             service_vips: Default::default(),
+            // Cross-stream coupling (S4): `Node` gains `key_signature: Vec<u8>`. Empty here so this
+            // exhaustive literal compiles once S4's field lands.
+            key_signature: vec![],
         }
     }
 

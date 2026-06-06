@@ -22,3 +22,4 @@ tailscale.h
 *.db
 .beads-credential-key
 .beads/proxieddb/
+.omc/

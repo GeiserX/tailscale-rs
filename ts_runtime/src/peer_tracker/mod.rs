@@ -25,6 +25,15 @@ pub struct PeerTracker {
     /// Latest peer snapshot, published on every netmap update so embedders can watch for peer
     /// changes ([`WatchNetmap`]).
     peer_watch: watch::Sender<Vec<StatusNode>>,
+    /// Tailnet-Lock (TKA) authority used to verify each peer's `key_signature` at the peer-trust
+    /// chokepoint. When `Some`, enforcement is **active**: every upserted peer must present a
+    /// signature this authority authorizes, or it is rejected (fail-closed). When `None` (always,
+    /// this wave) enforcement is **inactive** and every peer is upserted — identical to pre-TKA
+    /// behavior. There is no live `Authority` source yet: building one requires the
+    /// `/machine/tka/sync` Noise RPC + AUM-chain replayer (deferred, see SECURITY.md). The
+    /// enforcement path below is wired and unit-tested, and flips on the instant an authority is
+    /// supplied; it is explicitly gated, not a silent no-op.
+    tka_authority: Option<ts_tka::Authority>,
     env: Env,
 }
 
@@ -53,6 +62,42 @@ impl PeerTracker {
             .cloned()
             .map(crate::status::WhoIs::from_node)
     }
+
+    /// Whether `node` may be admitted to the peer db under the current Tailnet-Lock posture.
+    ///
+    /// Fail-closed and gated:
+    /// - No [`tka_authority`](Self::tka_authority) ⇒ enforcement inactive ⇒ always admit (today's
+    ///   behavior; this is the always-taken branch this wave).
+    /// - Authority present + peer carries a `key_signature` that the authority authorizes for the
+    ///   peer's node key ⇒ admit.
+    /// - Authority present + signature missing or unauthorized/invalid ⇒ **reject** (Go denies
+    ///   network access to unsigned peers under tailnet lock; we do not upsert them).
+    fn tka_admits(&self, node: &Node) -> bool {
+        let Some(auth) = &self.tka_authority else {
+            return true;
+        };
+
+        if node.key_signature.is_empty() {
+            // TKA active but peer presented no signature: reject (Go denies network access to
+            // unsigned peers under tailnet lock, unless UnsignedPeerAPIOnly — out of scope here).
+            tracing::warn!(
+                stable_id = ?node.stable_id,
+                "TKA: rejecting unsigned peer under tailnet lock"
+            );
+            return false;
+        }
+
+        if let Err(e) = auth.node_key_authorized(&node.node_key.to_bytes(), &node.key_signature) {
+            tracing::warn!(
+                stable_id = ?node.stable_id,
+                error = %e,
+                "TKA: rejecting peer with unauthorized node key"
+            );
+            return false;
+        }
+
+        true
+    }
 }
 
 impl kameo::Actor for PeerTracker {
@@ -69,6 +114,9 @@ impl kameo::Actor for PeerTracker {
             pending_requests: Default::default(),
             seen_state_update: false,
             peer_watch,
+            // No live TKA authority source this wave (the `/machine/tka/sync` RPC + AUM replayer are
+            // deferred); enforcement stays inactive until one is supplied. See `tka_authority`.
+            tka_authority: None,
             env,
         })
     }
@@ -305,6 +353,9 @@ impl Message<Arc<ts_control::StateUpdate>> for PeerTracker {
                 });
 
                 for node in new_nodes {
+                    if !self.tka_admits(node) {
+                        continue; // fail-CLOSED: do not upsert a peer rejected by tailnet lock
+                    }
                     let peer_id = self.peer_db.upsert(node);
                     upserts.insert(peer_id);
                 }
@@ -314,6 +365,9 @@ impl Message<Arc<ts_control::StateUpdate>> for PeerTracker {
                 tracing::trace!("delta peer update");
 
                 for peer in upsert {
+                    if !self.tka_admits(peer) {
+                        continue; // fail-CLOSED: do not upsert a peer rejected by tailnet lock
+                    }
                     let id = self.peer_db.upsert(peer);
 
                     upserts.insert(id);
@@ -358,6 +412,22 @@ impl Message<Arc<ts_control::StateUpdate>> for PeerTracker {
 }
 
 impl PeerTracker {
+    /// Test-only constructor: build a [`PeerTracker`] with a chosen [`tka_authority`](Self::tka_authority)
+    /// without going through the actor `on_start` path. Used by the TKA enforcement unit tests to
+    /// exercise the peer-trust chokepoint ([`tka_admits`](Self::tka_admits)) directly.
+    #[cfg(test)]
+    fn for_test(env: Env, tka_authority: Option<ts_tka::Authority>) -> Self {
+        let (peer_watch, _) = watch::channel(Vec::new());
+        Self {
+            peer_db: PeerDb::default(),
+            seen_state_update: false,
+            pending_requests: Vec::new(),
+            peer_watch,
+            tka_authority,
+            env,
+        }
+    }
+
     fn service_pending_requests(&mut self) {
         if self.seen_state_update {
             return;
@@ -396,5 +466,208 @@ impl PeerTracker {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tka_tests {
+    //! Tailnet-Lock (TKA) enforcement tests for the peer-trust chokepoint.
+    //!
+    //! These exercise [`PeerTracker::tka_admits`] and the `tka_admits ⇒ upsert` loop the netmap
+    //! handler runs. The test [`ts_tka::Authority`] is built with [`ts_tka::Authority::from_state`]
+    //! over a known Ed25519 trusted key, and the signed node-key signature CBOR is produced through
+    //! `ts_tka`'s public `cbor` encoder + `aum_hash` (the exact same canonical bytes `ts_tka`'s own
+    //! `direct_signature_verifies_end_to_end` test signs, with no new crypto vectors invented and no
+    //! private `ts_tka` API used).
+
+    use ed25519_dalek::{Signer, SigningKey};
+    use ts_control::{Node, StableNodeId, TailnetAddress};
+    use ts_tka::{
+        AumHash, Authority, Key, KeyKind, State,
+        cbor::{self, Value},
+    };
+
+    use super::*;
+
+    /// `SigKind::Direct` wire value (Go `SigKind`; `ts_tka::SigKind::Direct = 1`).
+    const SIG_KIND_DIRECT: u64 = 1;
+
+    /// The 32-byte node key used across the signed-peer fixtures.
+    const NODE_KEY_BYTES: [u8; 32] = [7u8; 32];
+
+    /// Build a real [`Env`] for the tracker. Only the bus/keys/shutdown plumbing matters here; the
+    /// TKA gate reads neither, so the forwarding preferences are all benign defaults.
+    fn test_env() -> Env {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        Env::new(
+            ts_keys::NodeState::generate(),
+            shutdown_rx,
+            crate::env::ForwarderConfig {
+                accept_routes: false,
+                exit_node: None,
+                forward_routes: Vec::new(),
+                forward_tcp_ports: Vec::new(),
+                forward_udp_ports: Vec::new(),
+                forward_all_ports: false,
+                forward_exit_egress: false,
+                exit_proxy: None,
+                peerapi_port: None,
+                taildrop_dir: None,
+                enable_ipv6: false,
+                ingress_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        )
+    }
+
+    /// A minimal peer [`Node`] carrying `node_key` and the given `key_signature`.
+    fn peer_node(stable_id: &str, node_key: [u8; 32], key_signature: Vec<u8>) -> Node {
+        Node {
+            id: 1,
+            stable_id: StableNodeId(stable_id.to_string()),
+            hostname: stable_id.to_string(),
+            tailnet: Some("ts.net".to_string()),
+            tags: Vec::new(),
+            tailnet_address: TailnetAddress {
+                ipv4: "100.64.0.1/32".parse().unwrap(),
+                ipv6: "fd7a:115c:a1e0::1/128".parse().unwrap(),
+            },
+            node_key: node_key.into(),
+            node_key_expiry: None,
+            key_signature,
+            machine_key: None,
+            disco_key: None,
+            accepted_routes: Vec::new(),
+            underlay_addresses: Vec::new(),
+            derp_region: None,
+            cap: Default::default(),
+            cap_map: Default::default(),
+            peerapi_port: None,
+            peerapi_dns_proxy: false,
+            is_wireguard_only: false,
+            exit_node_dns_resolvers: Vec::new(),
+            peer_relay: false,
+            service_vips: Default::default(),
+        }
+    }
+
+    /// Encode a `Direct` [`ts_tka::NodeKeySignature`] CBOR exactly as `ts_tka`'s private `to_cbor`
+    /// does (int-map keys: 1=kind, 2=pubkey, 3=key_id, 4=signature; empty byte fields omitted),
+    /// using only the crate's *public* `cbor` encoder. `signature` of `None` produces the
+    /// signing-digest preimage (the `SigHash` form).
+    fn direct_sig_cbor(node_key: &[u8], key_id: &[u8], signature: Option<&[u8]>) -> Vec<u8> {
+        let mut pairs = alloc_pairs(node_key, key_id);
+        if let Some(sig) = signature {
+            pairs.push((4, Some(Value::Bytes(sig.to_vec()))));
+        }
+        cbor::int_map(pairs).to_vec()
+    }
+
+    fn alloc_pairs(node_key: &[u8], key_id: &[u8]) -> Vec<(u64, Option<Value>)> {
+        vec![
+            (1, Some(Value::Uint(SIG_KIND_DIRECT))),
+            (2, Some(Value::Bytes(node_key.to_vec()))),
+            (3, Some(Value::Bytes(key_id.to_vec()))),
+        ]
+    }
+
+    /// Build a TKA [`Authority`] that trusts `signing.verifying_key()`, plus a valid `Direct`
+    /// node-key signature CBOR authorizing [`NODE_KEY_BYTES`] under it.
+    fn authority_and_valid_sig() -> (Authority, Vec<u8>) {
+        // A fixed, known Ed25519 trusted key (mirrors ts_tka's own end-to-end test seed).
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let trusted_pub = signing.verifying_key().to_bytes().to_vec();
+
+        let authority = Authority::from_state(
+            AumHash([0; 32]),
+            State {
+                keys: vec![Key {
+                    kind: KeyKind::Ed25519,
+                    votes: 1,
+                    public: trusted_pub.clone(),
+                }],
+            },
+        );
+
+        // SigHash preimage = canonical CBOR with the signature field omitted; sign its blake2s hash.
+        let preimage = direct_sig_cbor(&NODE_KEY_BYTES, &trusted_pub, None);
+        let sig_hash = ts_tka::aum_hash(&preimage).0;
+        let signature = signing.sign(&sig_hash).to_bytes().to_vec();
+
+        let signed_cbor = direct_sig_cbor(&NODE_KEY_BYTES, &trusted_pub, Some(&signature));
+        // Sanity: the authority accepts the signature we just built (same path the gate uses).
+        assert!(
+            authority
+                .node_key_authorized(&NODE_KEY_BYTES, &signed_cbor)
+                .is_ok()
+        );
+
+        (authority, signed_cbor)
+    }
+
+    #[tokio::test]
+    async fn tka_inactive_upserts_all_peers() {
+        // No authority ⇒ enforcement inactive ⇒ both a signed and an unsigned peer are admitted.
+        let mut tracker = PeerTracker::for_test(test_env(), None);
+
+        let signed = peer_node("signed", [1u8; 32], vec![0xde, 0xad, 0xbe, 0xef]);
+        let unsigned = peer_node("unsigned", [2u8; 32], vec![]);
+
+        assert!(tracker.tka_admits(&signed));
+        assert!(tracker.tka_admits(&unsigned));
+
+        tracker.peer_db.upsert(&signed);
+        tracker.peer_db.upsert(&unsigned);
+        assert_eq!(tracker.peer_db.peers().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn tka_active_rejects_unsigned_peer() {
+        // Authority present + peer presents no signature ⇒ rejected (fail-closed), not in peer_db.
+        let (authority, _sig) = authority_and_valid_sig();
+        let mut tracker = PeerTracker::for_test(test_env(), Some(authority));
+
+        let unsigned = peer_node("unsigned", NODE_KEY_BYTES, vec![]);
+        assert!(!tracker.tka_admits(&unsigned));
+
+        // Mirror the handler's `if !tka_admits { continue }` loop.
+        if tracker.tka_admits(&unsigned) {
+            tracker.peer_db.upsert(&unsigned);
+        }
+        assert_eq!(tracker.peer_db.peers().len(), 0);
+        assert!(tracker.peer_db.get(&unsigned.node_key).is_none());
+    }
+
+    #[tokio::test]
+    async fn tka_active_rejects_bad_signature() {
+        // Authority present + a signature that fails to verify ⇒ rejected, not in peer_db.
+        let (authority, mut sig) = authority_and_valid_sig();
+        // Tamper the last byte (the trailing signature byte) so verification fails.
+        let last = sig.len() - 1;
+        sig[last] ^= 0xff;
+
+        let mut tracker = PeerTracker::for_test(test_env(), Some(authority));
+        let bad = peer_node("bad", NODE_KEY_BYTES, sig);
+        assert!(!tracker.tka_admits(&bad));
+
+        if tracker.tka_admits(&bad) {
+            tracker.peer_db.upsert(&bad);
+        }
+        assert_eq!(tracker.peer_db.peers().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn tka_active_admits_authorized_peer() {
+        // Authority present + correctly-signed node key ⇒ admitted and upserted.
+        let (authority, sig) = authority_and_valid_sig();
+        let mut tracker = PeerTracker::for_test(test_env(), Some(authority));
+
+        let good = peer_node("good", NODE_KEY_BYTES, sig);
+        assert!(tracker.tka_admits(&good));
+
+        if tracker.tka_admits(&good) {
+            tracker.peer_db.upsert(&good);
+        }
+        assert_eq!(tracker.peer_db.peers().len(), 1);
+        assert!(tracker.peer_db.get(&good.node_key).is_some());
     }
 }

@@ -111,6 +111,18 @@ jobs:
         run: cargo test $COMMON_FLAGS
       - name: Anti-leak firewall checks (cargo run -p checks)
         run: cargo run -p checks
+      - name: binstall
+        uses: cargo-bins/cargo-binstall@dc19f1e48450eefe5a29b8da6c6b00a87d730b37 #v1.18.1
+      - name: Install cargo-deny
+        run: command -v cargo-deny || cargo binstall --no-confirm cargo-deny
+      # Machine-enforce the ring-only / no-aws-lc supply-chain invariant on every push, on the
+      # ring-only runtime graph this lane builds (default features, no `ssh`). `--no-default-features`
+      # turns `ssh` off so `russh -> aws-lc-rs` is gone, and `--exclude-dev` drops the `reqwest`
+      # default-tls dev-dependency of ts_derp/ts_netcheck. The aws-lc ban in `deny.toml` must hold
+      # here. Do NOT add `--all-features`: that re-introduces aws-lc via russh+reqwest and is the
+      # upstream `arch_independent` job's concern (left intact). `TS_RS_EXPERIMENT` is set at job-level.
+      - name: Supply-chain audit (cargo deny, ring-only graph)
+        run: cargo deny --no-default-features --exclude-dev check all
 
   build_test:
     # This matrix targets self-hosted runner labels (linux-x86_64-16cpu, macos-26, windows-8vcpu,

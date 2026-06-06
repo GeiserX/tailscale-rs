@@ -6,6 +6,40 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.56](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.56) - 2026-06-07
+
+Hardening + feature wave (security gaps + buildable parity gaps from a feature-surface audit):
+
+- **Tailnet Lock (TKA) peer-key enforcement, wired (partial).** The per-peer node-key signature
+  (`tailcfg.Node.KeySignature`) is now threaded through the domain `Node` instead of being dropped
+  in wire→domain conversion, and a fail-closed authorization gate is wired at the peer-trust
+  chokepoint (`ts_runtime` peer tracker): when a TKA `Authority` is present, peers whose node key
+  isn't signed by a trusted key — or that present no signature — are refused (not added to the peer
+  DB). Four unit tests cover active/inactive/unsigned/bad-signature/authorized cases.
+  **Status:** enforcement is currently inert because the `/machine/tka/sync/*` RPC + AUM-chain
+  replayer that supply the trusted-key `Authority` are deferred — so do not yet rely on Tailnet
+  Lock for control-plane-compromise protection. See `SECURITY.md`.
+- **Supply-chain CI gate.** `cargo deny` now runs on every push in the GitHub-hosted `hosted_test`
+  lane against the ring-only runtime graph (`--no-default-features --exclude-dev check all`), with
+  an explicit `aws-lc-rs`/`aws-lc-sys` ban in `deny.toml`, machine-enforcing the ring-only /
+  musl-clean invariant (previously only in the upstream-gated job that never runs on this fork).
+- **Tailscale Serve `Path` and `Redirect` handlers.** `ServeTarget` gains a `Path` (HTTP
+  path-prefix mux, longest-prefix wins) and `Redirect` (configurable 3xx + `Location`) variant,
+  with hand-rolled HTTP request-head parsing on the TLS-terminated stream (no axum/hyper),
+  fail-closed on unmatched paths / backend failures.
+- **Recursive MagicDNS in TUN mode.** TUN-mode `Decision::Forward` no longer dead-ends at NXDOMAIN:
+  it now forwards over the forwarder netstack's overlay channel (UDP or exit-node DoH), reusing the
+  existing resolver path and preserving the IPv4-only egress filter.
+- **`SECURITY.md`** added: unaudited-crypto disclaimer, TKA-enforcement status, peerAPI
+  capability-gap note, at-rest-key-handling note, anti-leak posture, vulnerability-reporting
+  contact, and a not-affiliated-with-Tailscale-Inc. notice. README + parity roadmap updated; the
+  project now tracks the (active) upstream `tailscale/tailscale-rs`.
+
+Deferred (documented in `docs/PARITY_ROADMAP.md`): TKA AUM-sync RPC + live `Authority`, DERP mesh
+server, TKA signing, UPnP/PCP/PMP portmapper, app-connector, 4via6; and the BLOCKED-by-external
+set (Funnel public relay, ACME/set-dns on a self-hosted control plane, OIDC/SSO, network flow logs, Taildrop relay,
+node sharing).
+
 ## [0.5.55](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.55) - 2026-06-06
 
 **Fix the aarch64 `musl_static` `GLIBC_2.XX not found` failure (isolate the CI target cache per

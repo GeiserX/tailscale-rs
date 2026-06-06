@@ -20,6 +20,7 @@ use kameo::{
     actor::ActorRef,
     message::{Context, Message},
 };
+use netstack::netcore::Channel;
 use tokio::{sync::watch, task::JoinSet};
 use ts_transport::OverlayTransport;
 use ts_transport_tun::{AsyncTunTransport, Config as TunDeviceConfig};
@@ -28,7 +29,7 @@ use crate::{
     Error,
     dataplane::{OverlayFromDataplane, OverlayToDataplane},
     env::Env,
-    magic_dns::{Decision, DnsView, decide},
+    magic_dns::{Decision, DnsView, RecursivePlan, decide, forward_query, recursive_plan},
     peer_tracker::PeerState,
 };
 
@@ -54,6 +55,11 @@ pub struct TunActor {
     /// aborts them — the device handle they hold is then dropped, tearing down the interface.
     _joinset: JoinSet<()>,
 
+    /// The runtime [`Env`], retained so the StateUpdate handler can resolve the configured exit
+    /// node against the live peer set when rebuilding the MagicDNS [`DnsView`] (populating
+    /// `exit_doh` for recursive / exit-node-DoH forwarding). See [`build_dns_view`].
+    env: Env,
+
     /// The control-supplied TUN knobs (name/MTU), used to build the device on the first
     /// StateUpdate. The tailnet prefix is supplied at that point from the self-node.
     tun_config: ts_control::TunConfig,
@@ -77,9 +83,15 @@ pub struct TunActor {
     /// The latest MagicDNS view, shared with the UP pump's in-datapath responder. Built here from
     /// the same control `StateUpdate` / peer `PeerState` the actor already subscribes to, mirroring
     /// [`MagicDnsActor`](crate::magic_dns)'s view construction. The UP task holds the receiver and
-    /// reads it fresh for every intercepted query; `exit_doh` stays `None` in TUN mode (recursive /
-    /// exit-node DoH forwarding is a deferred follow-up — see [`intercept_magic_dns`]).
+    /// reads it fresh for every intercepted query; `exit_doh` is populated from the active exit
+    /// peer (see [`build_dns_view`]) so recursive / exit-node-DoH forwarding works in TUN mode.
     dns_view: watch::Sender<Arc<DnsView>>,
+
+    /// The overlay netstack `Channel` (the forwarder netstack's, reused — TUN mode has no
+    /// application netstack of its own) used by [`intercept_magic_dns`] to forward recursive /
+    /// split-DNS queries over the overlay (anti-leak: a fresh `0.0.0.0:0` overlay UDP socket per
+    /// query, never a host socket). Cloned into the UP pump when the device is built.
+    channel: Channel,
 }
 
 /// Gating inputs for host-route programming, derived from [`Env`] at the spawn site. A named
@@ -299,21 +311,44 @@ fn build_dns_response(dst: SocketAddrV4, dns_response: &[u8]) -> Vec<u8> {
 
 /// Build a fresh [`DnsView`] from the latest control `StateUpdate` and (optional) peer database,
 /// mirroring [`MagicDnsActor`](crate::magic_dns)'s view construction
-/// (`magic_dns::MagicDnsActor`'s `StateUpdate`/`PeerState` handlers). `exit_doh` is always `None`
-/// in TUN mode: recursive / exit-node DoH forwarding over the overlay is a deferred follow-up (the
-/// netstack path threads an overlay `Channel`; the TUN path has none yet). `enable_ipv6` comes from
-/// the runtime `Env`.
+/// (`magic_dns::MagicDnsActor`'s `StateUpdate`/`PeerState` handlers). `enable_ipv6` comes from the
+/// runtime `Env`.
+///
+/// `exit_doh` is populated from the active exit peer's peerAPI DoH endpoint so recursive resolution
+/// egresses from the exit node (not this host) — same source as the netstack
+/// `MagicDnsActor`'s `ActiveExitNode` handler (`magic_dns.rs:751`:
+/// `active_exit_peer.and_then(|n| n.peerapi_doh_addr())`). The netstack path receives the
+/// already-resolved peer from the route updater's `ActiveExitNode` publication; the TunActor has no
+/// such subscription, so it resolves the exit peer locally — exactly as the route updater does
+/// (`route_updater.rs:191-272`): resolve [`Env::exit_node`](crate::env::Env::exit_node) against the
+/// live peer set to a [`StableId`](ts_control::StableId), then find that peer in the db. No exit
+/// node configured, an unmatched selector, or a peer that can't proxy DNS ⇒ `None` (recursion stays
+/// local — fail-closed, no leak).
 fn build_dns_view(
+    env: &Env,
     update: &ts_control::StateUpdate,
     peers: Option<Arc<crate::peer_tracker::PeerDb>>,
     enable_ipv6: bool,
 ) -> DnsView {
+    // Resolve the configured exit node to its peerAPI DoH address, mirroring the netstack path's
+    // `active_exit_peer.and_then(|n| n.peerapi_doh_addr())` (`magic_dns.rs:751`). The two-line peer
+    // resolution mirrors `route_updater.rs:191-272` (selector -> stable id -> peer); replicated
+    // locally (no shared-fn extraction) to keep S3 inside `tun_actor.rs`.
+    let exit_doh = env.exit_node.as_ref().and_then(|sel| {
+        let peers = peers.as_ref()?;
+        let id = sel.resolve(peers.peers().values())?;
+        peers
+            .peers()
+            .values()
+            .find(|peer| peer.stable_id == id)
+            .and_then(|n| n.peerapi_doh_addr())
+    });
+
     DnsView {
         cfg: update.dns_config.clone().unwrap_or_default(),
         peers,
         self_node: update.node.clone(),
-        // Deferred: recursive forwarding in TUN mode (needs an overlay Channel). See fn doc.
-        exit_doh: None,
+        exit_doh,
         enable_ipv6,
     }
 }
@@ -326,13 +361,17 @@ fn build_dns_view(
 /// the reply IPv4+UDP packet is written straight back into the TUN via `device` — no host loopback
 /// socket and no overlay egress for the DNS itself (anti-leak).
 ///
-/// [`Decision::Forward`] handling — recursive / split-DNS forwarding — is DEFERRED in TUN mode: the
-/// netstack path forwards over an overlay `Channel` the TunActor does not have. Until that Channel
-/// is threaded in (follow-up), a Forward is answered with the pre-built `nxdomain` fallback bytes
-/// `decide` already carries. This is FAIL-SAFE: a tailnet name is answered authoritatively, while a
-/// public/off-tailnet name gets NXDOMAIN rather than hanging or leaking to a host resolver.
+/// [`Decision::Forward`] handling — recursive / split-DNS forwarding — rides the overlay `Channel`
+/// (the forwarder netstack's, threaded in at the spawn site), mirroring the netstack serve loop
+/// (`magic_dns.rs:598-628`): a recursive forward computes [`recursive_plan`] (UDP upstreams, or
+/// delegate to the active exit node's peerAPI DoH over the overlay); a split-DNS route stays on its
+/// configured UDP upstreams. Both forward over the overlay (anti-leak: never a host socket) and fall
+/// back to the pre-built `nxdomain` on failure (fail-closed). The upstream `SocketAddr`s come only
+/// from `decide`/`recursive_plan`, which already `.filter(SocketAddr::is_ipv4)` — this fn never
+/// constructs an upstream address, so the IPv4-only egress invariant is inherited.
 async fn intercept_magic_dns(
     device: &Arc<AsyncTunTransport>,
+    channel: &Channel,
     dns_view_rx: &watch::Receiver<Arc<DnsView>>,
     pkt: &[u8],
 ) -> bool {
@@ -348,9 +387,28 @@ async fn intercept_magic_dns(
         // NOT be forwarded to the overlay.
         None => return true,
         Some(Decision::Reply(resp)) => resp,
-        // DEFERRED: no overlay Channel for recursive forwarding in TUN mode. Fail-safe to the
-        // pre-built NXDOMAIN the Forward arm carries (see fn doc).
-        Some(Decision::Forward { nxdomain, .. }) => nxdomain,
+        // Forward over the overlay, mirroring the netstack serve loop (`magic_dns.rs:598-628`). The
+        // plan (UDP upstreams vs exit-node DoH) is computed from the current view; both branches
+        // route through `recursive_plan`/the `decide`-built upstreams, so the IPv4-only filter at
+        // `magic_dns.rs:385,429` is inherited (we never build a `SocketAddr` here).
+        Some(Decision::Forward {
+            upstreams,
+            query,
+            nxdomain,
+            recursive,
+        }) => {
+            let plan = if recursive {
+                recursive_plan(&view, upstreams)
+            } else {
+                RecursivePlan::Udp(upstreams)
+            };
+            match plan {
+                RecursivePlan::Udp(ups) => forward_query(channel, &ups, &query, nxdomain).await,
+                RecursivePlan::Doh(addr) => {
+                    crate::peerapi_doh::forward_doh(channel, addr, &query, nxdomain).await
+                }
+            }
+        }
     };
 
     let reply_pkt = build_dns_response(query.src, &response);
@@ -372,11 +430,14 @@ impl kameo::Actor for TunActor {
         // Host-route gating, derived from `Env` at the spawn site. v6 needs no flag:
         // `host_routes_from_node` drops it by construction.
         HostRouteGating,
+        // The overlay netstack `Channel` (the forwarder netstack's, reused) used by
+        // `intercept_magic_dns` to forward recursive / split-DNS queries over the overlay.
+        Channel,
     );
     type Error = Error;
 
     async fn on_start(
-        (env, tun_config, overlay_to_dataplane, overlay_from_dataplane, gating): Self::Args,
+        (env, tun_config, overlay_to_dataplane, overlay_from_dataplane, gating, channel): Self::Args,
         slf: ActorRef<Self>,
     ) -> Result<Self, Self::Error> {
         // We need the tailnet /32 prefix to build the device, which control only assigns at
@@ -395,12 +456,14 @@ impl kameo::Actor for TunActor {
 
         Ok(Self {
             _joinset: JoinSet::new(),
+            env,
             tun_config,
             overlay_to_dataplane: Some(overlay_to_dataplane),
             overlay_from_dataplane: Some(overlay_from_dataplane),
             gating,
             host_guard: None,
             dns_view,
+            channel,
         })
     }
 }
@@ -415,9 +478,16 @@ impl Message<Arc<ts_control::StateUpdate>> for TunActor {
     ) {
         // Refresh the MagicDNS view from this control update (DNS config + self node), preserving
         // the peer db and the IPv6 gate. Read by the UP pump's in-datapath responder. Done on EVERY
-        // update, including ones with no node (so a DNS-config-only update still lands).
+        // update, including ones with no node (so a DNS-config-only update still lands). The exit
+        // node is re-resolved against the (preserved) peer db so `exit_doh` tracks the active exit.
+        let env = &self.env;
         self.dns_view.send_modify(|view| {
-            *view = Arc::new(build_dns_view(&msg, view.peers.clone(), view.enable_ipv6));
+            *view = Arc::new(build_dns_view(
+                env,
+                &msg,
+                view.peers.clone(),
+                view.enable_ipv6,
+            ));
         });
 
         let Some(self_node) = &msg.node else {
@@ -485,6 +555,9 @@ impl Message<Arc<ts_control::StateUpdate>> for TunActor {
         // UP: device -> {in-datapath MagicDNS responder | dataplane}.
         let dev_up = device.clone();
         let dns_view_rx = self.dns_view.subscribe();
+        // The overlay `Channel` used by the MagicDNS responder to forward recursive / split-DNS
+        // queries (the forwarder netstack's; egresses over the overlay — anti-leak).
+        let dns_channel = self.channel.clone();
         self._joinset.spawn(async move {
             loop {
                 // Drain the (non-`Send`) recv iterator into an owned batch first, so no part of it
@@ -494,10 +567,14 @@ impl Message<Arc<ts_control::StateUpdate>> for TunActor {
                 for pkt in batch {
                     match pkt {
                         Ok(p) => {
-                            // Peel off quad-100/UDP/53 DNS queries and answer them in-process; the
-                            // reply is written back into the TUN via `dev_up` (no overlay egress,
-                            // no host socket). Everything else forwards to the overlay unchanged.
-                            if intercept_magic_dns(&dev_up, &dns_view_rx, p.as_ref()).await {
+                            // Peel off quad-100/UDP/53 DNS queries and answer them in-process: an
+                            // authoritative reply is written straight back into the TUN via `dev_up`
+                            // (no overlay egress, no host socket); a Forward (recursive / split-DNS)
+                            // egresses over the overlay `Channel` (anti-leak), never a host socket.
+                            // Everything else forwards to the overlay unchanged.
+                            if intercept_magic_dns(&dev_up, &dns_channel, &dns_view_rx, p.as_ref())
+                                .await
+                            {
                                 continue;
                             }
                             if up.send(vec![p]).is_err() {
@@ -532,10 +609,24 @@ impl Message<Arc<PeerState>> for TunActor {
 
     async fn handle(&mut self, state: Arc<PeerState>, _ctx: &mut Context<Self, Self::Reply>) {
         // Feed the peer database into the MagicDNS view so the in-datapath responder resolves peer
-        // names authoritatively. Mirrors `MagicDnsActor`'s `PeerState` handler.
+        // names authoritatively. Mirrors `MagicDnsActor`'s `PeerState` handler. Also re-resolve
+        // `exit_doh` against the new peer set: the netstack path learns the active exit node from a
+        // separate `ActiveExitNode` message (route-updater-published), but the TunActor has no such
+        // subscription, so it tracks the exit node by resolving the selector against the peer db
+        // here (and on every StateUpdate) — fail-closed `None` if unmatched / can't proxy DNS.
+        let exit_doh = self.env.exit_node.as_ref().and_then(|sel| {
+            let id = sel.resolve(state.peers.peers().values())?;
+            state
+                .peers
+                .peers()
+                .values()
+                .find(|peer| peer.stable_id == id)
+                .and_then(|n| n.peerapi_doh_addr())
+        });
         self.dns_view.send_modify(|view| {
             let mut next = (**view).clone();
             next.peers = Some(state.peers.clone());
+            next.exit_doh = exit_doh;
             *view = Arc::new(next);
         });
     }
@@ -544,13 +635,113 @@ impl Message<Arc<PeerState>> for TunActor {
 #[cfg(test)]
 mod tests {
     use core::net::{Ipv4Addr, SocketAddrV4};
+    use std::sync::Arc;
 
     use ipnet::Ipv4Net;
+    use tokio::sync::watch;
     use ts_control::TunConfig;
 
     use super::{
-        HostRouteGating, host_dns_from_dns_config, host_routes_from_node, tun_config_from_control,
+        HostRouteGating, build_dns_view, host_dns_from_dns_config, host_routes_from_node,
+        tun_config_from_control,
     };
+    use crate::{
+        env::{Env, ForwarderConfig},
+        magic_dns::{Decision, RecursivePlan, decide, recursive_plan},
+        peer_tracker::PeerDb,
+    };
+
+    /// Build a benign [`Env`] for `build_dns_view`. Only `exit_node` matters for these tests; every
+    /// other forwarding preference is a default. `exit_node` is the caller-supplied selector.
+    fn test_env(exit_node: Option<ts_control::ExitNodeSelector>) -> Env {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        Env::new(
+            ts_keys::NodeState::generate(),
+            shutdown_rx,
+            ForwarderConfig {
+                accept_routes: false,
+                exit_node,
+                forward_routes: Vec::new(),
+                forward_tcp_ports: Vec::new(),
+                forward_udp_ports: Vec::new(),
+                forward_all_ports: false,
+                forward_exit_egress: false,
+                exit_proxy: None,
+                peerapi_port: None,
+                taildrop_dir: None,
+                enable_ipv6: false,
+                ingress_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        )
+    }
+
+    /// A peer node that advertises a peerAPI DoH endpoint (so [`Node::peerapi_doh_addr`] is `Some`):
+    /// `peerapi_port` set and `peerapi_dns_proxy` true. Stable id / address are caller-supplied so a
+    /// selector can target it.
+    fn exit_peer(stable_id: &str, ipv4: &str, peerapi_port: u16) -> ts_control::Node {
+        use ts_control::{Node, StableNodeId, TailnetAddress};
+        Node {
+            id: 2,
+            stable_id: StableNodeId(stable_id.to_string()),
+            hostname: stable_id.to_string(),
+            tailnet: Some("ts.net".to_string()),
+            tags: vec![],
+            tailnet_address: TailnetAddress {
+                ipv4: format!("{ipv4}/32").parse().unwrap(),
+                ipv6: "fd7a::2/128".parse().unwrap(),
+            },
+            node_key: [1u8; 32].into(),
+            node_key_expiry: None,
+            key_signature: vec![],
+            machine_key: None,
+            disco_key: None,
+            accepted_routes: vec!["0.0.0.0/0".parse().unwrap()],
+            underlay_addresses: vec![],
+            derp_region: None,
+            cap: Default::default(),
+            cap_map: Default::default(),
+            peerapi_port: Some(peerapi_port),
+            peerapi_dns_proxy: true,
+            is_wireguard_only: false,
+            exit_node_dns_resolvers: vec![],
+            peer_relay: false,
+            service_vips: Default::default(),
+        }
+    }
+
+    /// A `PeerDb` containing exactly the given exit peer.
+    fn peer_db_with(peer: &ts_control::Node) -> Arc<PeerDb> {
+        let mut db = PeerDb::default();
+        db.upsert(peer);
+        Arc::new(db)
+    }
+
+    /// A UDP global resolver, for building a recursive-forward query in [`forward_decision`].
+    fn udp_resolver(addr: &str) -> ts_control::DnsResolver {
+        ts_control::DnsResolver {
+            transport: ts_control::ResolverTransport::Udp(addr.parse().unwrap()),
+            use_with_exit_node: false,
+        }
+    }
+
+    /// Build a DNS A query for `labels` (mirrors `magic_dns::tests::build_query`).
+    fn build_query(id: u16, labels: &[&str]) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&id.to_be_bytes());
+        buf.extend_from_slice(&0u16.to_be_bytes()); // flags: QR=0 (query)
+        buf.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+        buf.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+        buf.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+        buf.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+        for label in labels {
+            buf.push(label.len() as u8);
+            buf.extend_from_slice(label.as_bytes());
+        }
+        buf.push(0); // root label
+        buf.extend_from_slice(&1u16.to_be_bytes()); // QTYPE = A
+        buf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
+        buf
+    }
 
     /// Both gates on — the common exit-node + accept-routes case.
     fn gating_all() -> HostRouteGating {
@@ -581,6 +772,9 @@ mod tests {
             },
             node_key: [0u8; 32].into(),
             node_key_expiry: None,
+            // Cross-stream coupling (S4): `Node` gains `key_signature: Vec<u8>`. Empty here so this
+            // fixture compiles after S4 lands; no TKA enforcement is exercised by tun_actor tests.
+            key_signature: vec![],
             machine_key: None,
             disco_key: None,
             accepted_routes: vec![
@@ -850,13 +1044,10 @@ mod tests {
         );
     }
 
-    /// `build_dns_view` mirrors `MagicDnsActor`'s construction: cfg + self_node from the update,
-    /// `exit_doh` always `None` in TUN mode (recursive forward deferred), `enable_ipv6` threaded.
-    #[test]
-    fn build_dns_view_maps_update() {
-        use super::build_dns_view;
-
-        let update = ts_control::StateUpdate {
+    /// Build a `StateUpdate` carrying the self node + a MagicDNS-on config with the given global
+    /// resolvers (used to drive a recursive forward).
+    fn dns_update(resolvers: Vec<ts_control::DnsResolver>) -> ts_control::StateUpdate {
+        ts_control::StateUpdate {
             session_handle: None,
             seq: 0,
             derp: None,
@@ -869,21 +1060,114 @@ mod tests {
             dns_config: Some(ts_control::DnsConfig {
                 magic_dns: true,
                 search_domains: vec!["user.ts.net".to_owned()],
+                resolvers,
                 ..Default::default()
             }),
             ssh_policy: None,
             tka: None,
-        };
+        }
+    }
 
-        let view = build_dns_view(&update, None, true);
+    /// `build_dns_view` mirrors `MagicDnsActor`'s construction: cfg + self_node from the update,
+    /// `enable_ipv6` threaded. `exit_doh` covers BOTH cases: no exit node configured (or unresolved)
+    /// ⇒ `None`; a configured selector that resolves to an active exit peer with a peerAPI DoH
+    /// endpoint ⇒ `Some(addr)`.
+    #[tokio::test]
+    async fn build_dns_view_maps_update() {
+        let update = dns_update(vec![]);
+
+        // No exit node configured ⇒ exit_doh None (even with a peer db present).
+        let no_exit_env = test_env(None);
+        let peer = exit_peer("exit", "100.64.0.9", 1080);
+        let db = peer_db_with(&peer);
+        let view = build_dns_view(&no_exit_env, &update, Some(db.clone()), true);
         assert!(view.cfg.magic_dns, "dns config carried");
         assert!(view.self_node.is_some(), "self node carried");
-        assert!(view.peers.is_none(), "no peer db passed");
+        assert!(view.peers.is_some(), "peer db passed through");
         assert!(
             view.exit_doh.is_none(),
-            "exit_doh stays None in TUN mode (recursive forward deferred)"
+            "no exit node configured ⇒ exit_doh None"
         );
         assert!(view.enable_ipv6, "ipv6 gate threaded from Env");
+
+        // Active exit node configured + a peer with a peerAPI DoH endpoint ⇒ exit_doh Some(addr),
+        // resolved from the selector against the peer db (mirrors magic_dns.rs:751 + route_updater).
+        let exit_env = test_env(Some(ts_control::ExitNodeSelector::StableId(
+            ts_control::StableNodeId("exit".to_owned()),
+        )));
+        let view = build_dns_view(&exit_env, &update, Some(db), true);
+        assert_eq!(
+            view.exit_doh,
+            peer.peerapi_doh_addr(),
+            "exit_doh resolves to the active exit peer's peerAPI DoH address"
+        );
+        assert_eq!(
+            view.exit_doh,
+            Some("100.64.0.9:1080".parse().unwrap()),
+            "exit_doh is the peer's tailnet IPv4 + peerAPI port"
+        );
+
+        // A configured selector that matches no peer ⇒ exit_doh None (fail-closed, recursion local).
+        let ghost_env = test_env(Some(ts_control::ExitNodeSelector::StableId(
+            ts_control::StableNodeId("ghost".to_owned()),
+        )));
+        let view = build_dns_view(&ghost_env, &update, Some(peer_db_with(&peer)), true);
+        assert!(
+            view.exit_doh.is_none(),
+            "unresolved selector ⇒ exit_doh None (fail-closed)"
+        );
+    }
+
+    /// A `Decision::Forward` for a public name now produces a real forwarded plan (recursive ⇒
+    /// `RecursivePlan::Udp` of the configured upstreams when no exit node is active, or
+    /// `RecursivePlan::Doh` when one is). This asserts the plan branch the UP pump dispatches on, not
+    /// live socket I/O (a full forward needs a netstack) — same convention as the `serve.rs` tests.
+    /// Critically: the upstreams come only from `decide`/`recursive_plan`, both of which already
+    /// `.filter(SocketAddr::is_ipv4)`, so this path never constructs an upstream `SocketAddr`.
+    #[tokio::test]
+    async fn forward_decision_produces_udp_then_doh_plan() {
+        // Public name + a global UDP resolver ⇒ recursive Forward.
+        let update = dns_update(vec![udp_resolver("8.8.8.8:53")]);
+        let env = test_env(None);
+        let peer = exit_peer("exit", "100.64.0.9", 1080);
+        let view = build_dns_view(&env, &update, Some(peer_db_with(&peer)), true);
+        let query = build_query(0x4242, &["example", "com"]);
+
+        let (upstreams, recursive) = match decide(&view, &query).expect("decides") {
+            Decision::Forward {
+                upstreams,
+                recursive,
+                ..
+            } => (upstreams, recursive),
+            Decision::Reply(_) => panic!("a public name with a global resolver must Forward"),
+        };
+        assert!(recursive, "an unrouted public name is a recursive forward");
+        assert_eq!(
+            upstreams,
+            vec!["8.8.8.8:53".parse().unwrap()],
+            "the IPv4 global resolver is the upstream (v4-only filter inherited)"
+        );
+
+        // No exit node active ⇒ the recursive plan keeps the UDP upstreams.
+        match recursive_plan(&view, upstreams.clone()) {
+            RecursivePlan::Udp(ups) => assert_eq!(ups, upstreams, "no exit node ⇒ UDP plan"),
+            RecursivePlan::Doh(_) => panic!("no exit node configured ⇒ must not delegate to DoH"),
+        }
+
+        // With an active exit node (DoH-capable) and no use-with-exit-node resolvers, the recursive
+        // plan delegates to the exit node's DoH endpoint — the overlay-egress branch.
+        let exit_env = test_env(Some(ts_control::ExitNodeSelector::StableId(
+            ts_control::StableNodeId("exit".to_owned()),
+        )));
+        let exit_view = build_dns_view(&exit_env, &update, Some(peer_db_with(&peer)), true);
+        match recursive_plan(&exit_view, upstreams) {
+            RecursivePlan::Doh(addr) => assert_eq!(
+                Some(addr),
+                peer.peerapi_doh_addr(),
+                "active exit node ⇒ delegate recursion to its peerAPI DoH endpoint"
+            ),
+            RecursivePlan::Udp(_) => panic!("active exit node with no kept-local resolvers ⇒ DoH"),
+        }
     }
 
     /// Defaults must apply when control supplies no knobs: name `tailscale0`, MTU `1280`, and the

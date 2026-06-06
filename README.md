@@ -86,6 +86,10 @@ important considerations:
   for all code linked against `tailscale-rs`; this includes Rust, C, Elixir, and Python code. We'll
   remove this requirement after a third-party code/cryptography audit and any necessary fixes.
 
+For the full security posture — unaudited cryptography, the Tailnet Lock enforcement gap, peerAPI
+capability limitations, at-rest key handling, and how to report a vulnerability — see
+[SECURITY.md](SECURITY.md).
+
 ## Versioning, Releases, and Compatability
 
 We follow semver and aim to make a point release roughly monthly. Since we are pre-1.0, we make no
@@ -123,9 +127,9 @@ These are features that we currently implement:
 
 - Basics
   - Create TCP and UDP sockets on the tailnet
-  - Communicate with peers via public DERP relays
   - Direct connections via NAT traversal (STUN-discovered endpoints and Disco, with `CallMeMaybe`
-    hole-punching over DERP); falls back to DERP when no direct path is available
+    hole-punching over DERP); traffic falls back to public DERP relays only when no direct path is
+    available
   - Peer lookups (addressing peers by MagicDNS name, in-process)
   - MagicDNS (an in-netstack resolver on `100.100.100.100:53` answering A/AAAA/PTR for tailnet
     peers and control-pushed static records (`ExtraRecords`); by default fail-closed — with no
@@ -141,6 +145,17 @@ These are features that we currently implement:
   - Using an exit node (routing internet-bound traffic through a chosen peer via `exit_node`,
     selectable by Tailscale stable ID, tailnet IP, or MagicDNS name; opt-in, fail-closed off by
     default)
+  - Recursive MagicDNS forwarding in TUN mode (the `100.100.100.100:53` resolver now forwards
+    non-tailnet names recursively in TUN mode, matching the netstack-mode behavior; the same
+    fail-closed default applies — without `fallback_resolvers`, non-tailnet names get NXDOMAIN)
+  - Tailscale Serve: `Proxy`, `Text`, `TcpForward`, plus HTTP `Path` (path-prefix mux) and
+    `Redirect` (HTTP 3xx) handlers; all TLS-terminating targets are validated and dispatched
+    fail-closed (unmatched path → 404, backend dial failure → drop)
+  - Tailnet Lock (TKA), **partial**: per-peer node-key signature verification is wired and
+    unit-tested at the peer-trust chokepoint and fails closed when a trusted-key `Authority` is
+    supplied. Live enforcement is **currently inert** — the AUM-chain sync RPC that would supply the
+    `Authority` is not yet implemented, so a compromised control plane can still inject peer keys.
+    See [SECURITY.md](SECURITY.md) before relying on it.
   - Communicate with the Tailscale Go client, `tsnet`, and `libtailscale`
 - Language support
   - Rust API
@@ -194,9 +209,12 @@ Unsupported features
   - Node Sharing
   - Taildrive
   - Taildrop
-  - Tailnet Lock
+  - Tailnet Lock — full enforcement (signature verification is wired, but the AUM-sync RPC that
+    supplies the trusted-key `Authority` is not yet built, so enforcement is inert; see
+    [SECURITY.md](SECURITY.md))
   - Tailscale Funnel
-  - Tailscale Serve
+  - Tailscale Serve — the stored serve-config runtime and accept-loop (the `Path`/`Redirect`/`Proxy`/
+    `Text`/`TcpForward` handlers themselves are implemented)
   - Tailscale SSH
   - Tailscale Services
   - Webhooks

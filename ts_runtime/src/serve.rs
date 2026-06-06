@@ -295,6 +295,12 @@ async fn dispatch_conn(
                 ServeTarget::Text { body } => {
                     write_text(port, tls, body).await;
                 }
+                ServeTarget::Redirect { to, status } => {
+                    serve_redirect(port, tls, to, *status).await;
+                }
+                ServeTarget::Path { handlers } => {
+                    serve_path(port, tls, handlers).await;
+                }
                 // `TcpForward` is handled in the non-TLS arm above; nothing else terminates TLS.
                 // The wildcard covers `#[non_exhaustive]` future raw (non-TLS) variants: if one is
                 // added it must NOT silently terminate TLS here — drop it fail-closed until this
@@ -359,6 +365,152 @@ where
     drop(tls.shutdown().await);
 }
 
+/// Max bytes of an HTTP request head (request line + headers) we will buffer before giving up. A
+/// peer that never sends `\r\n\r\n` within this bound is dropped fail-closed (no unbounded read).
+const MAX_HTTP_HEAD: usize = 8 * 1024;
+
+/// Read the HTTP request head (up to and including `\r\n\r\n`) from a TLS-terminated stream into a
+/// buffer. Returns `(buf, header_end)` where `header_end` is the offset just past the terminator, or
+/// `None` if the peer closed early or the head exceeded [`MAX_HTTP_HEAD`]. Hand-rolled (no
+/// axum/hyper); mirrors the peerAPI router's head-read style.
+async fn read_http_head<S>(stream: &mut S) -> Option<(Vec<u8>, usize)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = Vec::with_capacity(1024);
+    let mut tmp = [0u8; 1024];
+    loop {
+        if let Some(end) = find_header_end(&buf) {
+            return Some((buf, end));
+        }
+        if buf.len() >= MAX_HTTP_HEAD {
+            return None;
+        }
+        match stream.read(&mut tmp).await {
+            Ok(0) => return None,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Find the byte offset just past the `\r\n\r\n` header terminator, if present. Local mirror of
+/// `peerapi_doh::find_header_end` — replicated here because that helper takes the peerAPI's concrete
+/// `netsock::TcpStream`, while Serve dispatch operates on a generic TLS-terminated stream.
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+}
+
+/// Parse the request-line path from an HTTP head. Returns the path component (without the query
+/// string), or `None` if the head is malformed. Hand-rolled; no HTTP library framing assumptions
+/// beyond the request line.
+fn request_path(buf: &[u8]) -> Option<String> {
+    let mut headers = [httparse::EMPTY_HEADER; 32];
+    let mut req = httparse::Request::new(&mut headers);
+    match req.parse(buf) {
+        Ok(_) => {}
+        Err(_) => return None,
+    }
+    let path = req.path?;
+    let raw = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
+    Some(raw.to_string())
+}
+
+/// Reason phrase for a redirect status (best-effort; falls back to "Redirect").
+fn redirect_reason(status: u16) -> &'static str {
+    match status {
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        _ => "Redirect",
+    }
+}
+
+/// Write a bodyless HTTP redirect (Go `HTTPHandler` redirect) on a TLS-terminated stream, then close.
+/// Fail-closed: any write error drops the conn. No request parsing is needed — every request on a
+/// `Redirect` target gets the same response.
+async fn serve_redirect<S>(port: u16, mut tls: S, to: &str, status: u16)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        reason = redirect_reason(status),
+    );
+    if let Err(e) = tls.write_all(head.as_bytes()).await {
+        tracing::debug!(%port, error = %e, "serve redirect: write failed");
+        return;
+    }
+    if let Err(e) = tls.flush().await {
+        tracing::debug!(%port, error = %e, "serve redirect: flush failed");
+    }
+    drop(tls.shutdown().await);
+}
+
+/// Write a bodyless HTTP status response (e.g. `404 Not Found`) on a TLS-terminated stream, then
+/// close. Local mirror of `peerapi_doh::write_status` (which takes the concrete peerAPI stream type).
+async fn write_http_status<S>(port: u16, mut tls: S, status: &str)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let head = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    if let Err(e) = tls.write_all(head.as_bytes()).await {
+        tracing::debug!(%port, error = %e, "serve path: status write failed");
+        return;
+    }
+    drop(tls.flush().await);
+    drop(tls.shutdown().await);
+}
+
+/// Serve a [`ServeTarget::Path`] mux on a TLS-terminated stream: read the request head, pick the
+/// longest-matching path prefix in `handlers`, and dispatch the matched nested target on the
+/// already-decrypted stream. Fail-closed: a malformed head, no matching prefix, or an
+/// un-dispatchable nested target ⇒ 404/drop. Backend dial failures inside a nested `Proxy` drop the
+/// conn (via [`proxy_to_backend`]). Nested `Path` is rejected by `ServeState::validate`, so it is
+/// not expected here; it is dropped fail-closed if it ever reaches dispatch.
+async fn serve_path<S>(port: u16, mut tls: S, handlers: &BTreeMap<String, ServeTarget>)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let Some((buf, _end)) = read_http_head(&mut tls).await else {
+        tracing::debug!(%port, "serve path: incomplete/oversized request head; dropping conn");
+        return;
+    };
+    let Some(path) = request_path(&buf) else {
+        write_http_status(port, tls, "400 Bad Request").await;
+        return;
+    };
+
+    // Longest-matching prefix wins.
+    let matched = handlers
+        .iter()
+        .filter(|(prefix, _)| path.starts_with(prefix.as_str()))
+        .max_by_key(|(prefix, _)| prefix.len())
+        .map(|(_, target)| target);
+
+    let Some(target) = matched else {
+        write_http_status(port, tls, "404 Not Found").await;
+        return;
+    };
+
+    match target {
+        ServeTarget::Proxy { to } => proxy_to_backend(port, tls, to).await,
+        ServeTarget::Text { body } => write_text(port, tls, body).await,
+        ServeTarget::Redirect { to, status } => serve_redirect(port, tls, to, *status).await,
+        // Accept (no hand-back channel here), TcpForward (raw, not on a TLS path), nested Path
+        // (rejected by validate), and any future `#[non_exhaustive]` variant are not servable as a
+        // Path leaf: drop fail-closed rather than guess.
+        _ => {
+            tracing::warn!(%port, "serve path: unsupported nested target; dropping conn");
+            write_http_status(port, tls, "404 Not Found").await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,16 +572,73 @@ mod tests {
     #[test]
     fn terminates_tls_matches_dispatch_arm() {
         // The dispatch decision (TLS vs raw) must agree with the type's own `terminates_tls`: only
-        // TcpForward is raw; Accept/Proxy/Text all terminate TLS.
+        // TcpForward is raw; Accept/Proxy/Text/Path/Redirect all terminate TLS.
         assert!(ServeTarget::Accept.terminates_tls());
         assert!(proxy("127.0.0.1:8080").terminates_tls());
         assert!(ServeTarget::Text { body: "ok".into() }.terminates_tls());
+        assert!(
+            ServeTarget::Redirect {
+                to: "/elsewhere".into(),
+                status: 302,
+            }
+            .terminates_tls()
+        );
+        let mut handlers = BTreeMap::new();
+        handlers.insert("/".to_string(), proxy("127.0.0.1:8080"));
+        assert!(ServeTarget::Path { handlers }.terminates_tls());
         assert!(
             !ServeTarget::TcpForward {
                 to: "127.0.0.1:5000".into()
             }
             .terminates_tls()
         );
+    }
+
+    #[test]
+    fn find_header_end_locates_terminator() {
+        assert_eq!(find_header_end(b"GET / HTTP/1.1\r\n\r\n"), Some(18));
+        assert_eq!(find_header_end(b"GET / HTTP/1.1\r\n"), None);
+    }
+
+    #[test]
+    fn request_path_strips_query() {
+        assert_eq!(
+            request_path(b"GET /api/v1?x=1 HTTP/1.1\r\nHost: h\r\n\r\n").as_deref(),
+            Some("/api/v1")
+        );
+        assert_eq!(
+            request_path(b"GET / HTTP/1.1\r\n\r\n").as_deref(),
+            Some("/")
+        );
+        assert_eq!(request_path(b"not a request").as_deref(), None);
+    }
+
+    #[test]
+    fn longest_prefix_wins() {
+        // Mirror the selection serve_path performs: longest matching prefix wins.
+        let mut handlers: BTreeMap<String, ServeTarget> = BTreeMap::new();
+        handlers.insert("/".to_string(), proxy("127.0.0.1:1"));
+        handlers.insert("/api".to_string(), proxy("127.0.0.1:2"));
+        handlers.insert("/api/v2".to_string(), proxy("127.0.0.1:3"));
+
+        let pick = |path: &str| -> Option<&ServeTarget> {
+            handlers
+                .iter()
+                .filter(|(prefix, _)| path.starts_with(prefix.as_str()))
+                .max_by_key(|(prefix, _)| prefix.len())
+                .map(|(_, target)| target)
+        };
+
+        assert_eq!(pick("/api/v2/x"), Some(&proxy("127.0.0.1:3")));
+        assert_eq!(pick("/api/v1"), Some(&proxy("127.0.0.1:2")));
+        assert_eq!(pick("/other"), Some(&proxy("127.0.0.1:1")));
+    }
+
+    #[test]
+    fn redirect_reason_known_statuses() {
+        assert_eq!(redirect_reason(301), "Moved Permanently");
+        assert_eq!(redirect_reason(308), "Permanent Redirect");
+        assert_eq!(redirect_reason(399), "Redirect");
     }
 
     // NOTE: a live bind+accept test needs a running netstack channel + overlay; the existing

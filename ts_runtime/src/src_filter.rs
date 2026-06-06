@@ -88,6 +88,7 @@ mod tests {
             },
             node_key: [0u8; 32].into(),
             node_key_expiry: None,
+            key_signature: vec![],
             machine_key: None,
             disco_key: None,
             // Own tailnet addresses plus an advertised LAN subnet.

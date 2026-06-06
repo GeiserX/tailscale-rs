@@ -515,6 +515,7 @@ mod test {
                 ipv6: rand_ipv6(&mut rng).into(),
             },
             node_key: rng.random::<[u8; 32]>().into(),
+            key_signature: vec![],
             disco_key: rng
                 .random::<bool>()
                 .then_some(rng.random::<[u8; 32]>().into()),
@@ -810,6 +811,7 @@ mod test {
                     tailnet: has_tailnet.then_some(tailnet),
 
                     node_key: node_key.into(),
+                    key_signature: vec![],
                     disco_key: disco_key.map(Into::into),
                     machine_key: machine_key.map(Into::into),
 

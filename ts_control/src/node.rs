@@ -134,6 +134,11 @@ pub struct Node {
     /// The node key's expiration.
     pub node_key_expiry: Option<DateTime<Utc>>,
 
+    /// Marshalled TKA node-key signature (`tailcfg.Node.KeySignature`); empty when control sends
+    /// none. Verified against a TKA `Authority` at the peer-trust chokepoint WHEN tailnet-lock
+    /// enforcement is active.
+    pub key_signature: Vec<u8>,
+
     /// The node's [`MachinePublicKey`], if known.
     pub machine_key: Option<MachinePublicKey>,
     /// The node's [`DiscoPublicKey`], if known.
@@ -689,6 +694,7 @@ impl From<&ts_control_serde::Node<'_>> for Node {
             },
             node_key: value.key,
             node_key_expiry: value.key_expiry,
+            key_signature: value.key_signature.to_vec(),
             machine_key: value.machine,
             disco_key: value.disco_key,
 
@@ -817,6 +823,7 @@ mod tests {
             },
             node_key: [0u8; 32].into(),
             node_key_expiry: None,
+            key_signature: vec![],
             machine_key: None,
             disco_key: None,
             accepted_routes: vec![],

@@ -657,6 +657,7 @@ mod tests {
             },
             node_key,
             node_key_expiry: None,
+            key_signature: vec![],
             machine_key: None,
             disco_key: Some(disco),
             accepted_routes: vec![],
