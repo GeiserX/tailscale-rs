@@ -80,8 +80,11 @@
 //!   break dependent code in order to get things right.
 //! - Direct peer-to-peer connections via NAT traversal are implemented (STUN-discovered endpoints
 //!   and Disco, with `CallMeMaybe` hole-punching over DERP), with DERP relays as the fallback when
-//!   no direct path is available. Symmetric-NAT birthday-paradox hole-punching is not yet
-//!   implemented, so behind some NATs a flow stays relayed through DERP, which caps its throughput.
+//!   no direct path is available. Hard/symmetric NATs get the same single fixed-local-port candidate
+//!   (`EndpointSTUN4LocalPort`) Go Tailscale uses; behind a NAT with no static port mapping a flow
+//!   may still stay relayed through DERP, which caps its throughput. (Upstream Go does **not** do a
+//!   "256-port birthday-paradox spray" — that is a common misconception; the single-candidate guess
+//!   is the actual behavior, and this fork matches it.)
 //!
 //! ## Feature Flags
 //!

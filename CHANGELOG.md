@@ -6,6 +6,19 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.43](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.43) - 2026-06-06
+
+**Docs: correct the symmetric-NAT caveat** (`tsr-am9.10`). The crate-root README claimed
+"symmetric-NAT birthday-paradox hole-punching is not yet implemented." Investigation against
+`tailscale/tailscale` @ main **and** v1.30.0 found that **upstream Go has no 256-port spray** — the
+"birthday-paradox spray" is a common misconception. Go's actual hard/symmetric-NAT tactic is a
+**single `EndpointSTUN4LocalPort` candidate** (the reflexive IPv4 paired with the node's fixed local
+port, gated on `MappingVariesByDestIP && port != 0`), which this fork already emits in
+`self_endpoints` and advertises in every `CallMeMaybe`. So symmetric-NAT handling is at **parity with
+Go**; the README is corrected to say so. Building an actual 256-port spray was rejected: it would
+diverge from Go, be an SSRF-style host-sourced-UDP-spray (which `ts_magicsock` explicitly guards
+against), and leak unbounded in-flight ping state. No behavior change.
+
 ## [0.5.42](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.42) - 2026-06-06
 
 **Stored Serve config + accept-loop runtime** (roadmap `tsr-am9.8`): `Device::set_serve_config` /
