@@ -5,20 +5,48 @@
 > per-session client. This document is the durable plan; live status is tracked in beads
 > (`bd list`, prefix `tsr`).
 
-## Where we are (v0.4.0)
+## Where we are (v0.5.39 — near-complete tsnet parity)
 
-Five dataplane lanes shipped and hardened. Crucially, the fork is **more mature than its own
-stale README suggests**:
+Crucially, the fork is **more mature than its own stale README suggests**:
 
 - **Direct-path P2P is real** — disco Ping/Pong/CallMeMaybe, RTT-based best-addr selection, trust
-  windows, DERP-as-fallback. It is **not** DERP-relay-only.
+  windows, DERP-as-fallback. It is **not** DERP-relay-only. IPv6 direct paths negotiate when
+  `enable_ipv6` is set (v0.5.37).
 - **No `panic=abort`** — kameo actors isolate per-flow panics; crash isolation is intact.
 - **Anti-leak is type-encoded** — `DirectDialer` structurally refuses exit egress; egress
   fail-closes when no `/0` route matches; no host-socket fallback exists in `Device::tcp_connect`.
+- **musl static + ring-only** — CI musl lane + `aws-lc-rs`-absence guard; aws-lc confined to the
+  optional `ssh` feature.
 
-Per-lane parity estimate: A (Status/WhoIs) ~75%, B (MagicDNS) ~80%, C (forwarding) ~85%,
-D (Ping/direct) ~85%, E (TLS/Serve/ACME) ~25% (plumbing built, issuance stubbed),
-FFI/Python/Elixir bindings ~30%.
+Per-lane parity estimate (updated v0.5.39): A (Status/WhoIs) ~85%, B (MagicDNS) ~85% (full netstack
+`100.100.100.100:53` server; host-resolver redirect only missing in TUN mode), C (forwarding) ~85%,
+D (Ping/direct) ~90% (IPv6 direct paths land; only symmetric-NAT spray skipped),
+E (TLS/Serve/ACME) ~80% (client-side ACME DNS-01 issuance shipped behind `acme`; `listen_tls` issues
+real certs against a `set-dns`-capable control plane; only the stored Serve-state runtime + the
+external Funnel relay leg remain), FFI/Python/Elixir bindings ~90% (full Device surface propagated).
+
+### Shipped since v0.4.0 (the parity push)
+Taildrop send/recv, CapturePcap, TKA Ed25519 fix, node-key rotation, WIF/OAuth bootstrap, loopback
+SOCKS5 (v0.5.27–v0.5.32); a multi-reviewer hardening pass (v0.5.33); then the parity sweep:
+**FFI/Python/Elixir lane propagation** (v0.5.34), **turnkey `listen_ssh` login-shell** (v0.5.35),
+**disco/STUN observability counters** (v0.5.36), **IPv6 local disco candidates** (v0.5.37),
+**client-side ACME (RFC 8555 DNS-01) + `set-dns` RPC** (v0.5.38), **`listen_tls`→ACME wiring**
+(v0.5.39). Tier 1 (direct-path glue, disco↔node-key binding, musl lane) and Tier 2 (tags, ephemeral,
+upstream-proxy dialer, netmap resumption) were verified already-complete in-tree.
+
+### Remaining (deferred / external — beaded under `tsr-am9`)
+- `tsr-am9.7` **TUN-mode MagicDNS** — deep host-DNS + dedicated-netstack change (netstack mode is
+  fully functional; TUN mode's host DNS is inert). Supervised session.
+- `tsr-am9.8` **Serve get/set_serve_config + accept-loop runtime** — awkward Accept-handback seam;
+  needs a serve-state product decision.
+- `tsr-am9.9` **Service advertise-to-control** — consume-side done; advertise-side low value
+  (ACL-preassigned VIPs work), needs a wire-field decision.
+- `tsr-am9.10` **Symmetric-NAT port spray** — deliberately skipped (low value for the DERP-acceptable
+  k8s/proxy deployment; single-port guess already covers easy cases).
+- `tsr-am9.11` **Funnel public ingress relay** — EXTERNAL infra dependency (Tailscale-operated
+  relay); un-buildable against a self-hosted control plane; `listen_funnel` correctly fail-closed.
+- `tsr-4pp` **Netstack sharding** — benchmark-gated; needs a real residential-exit measurement first.
+- `Sys()` internals — satisfied via typed accessors (`self_node`/`status`/`watch_netmap`/`whois`).
 
 ## Consumers and the seams they need
 

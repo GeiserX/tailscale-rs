@@ -6,6 +6,14 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.40](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.40) - 2026-06-06
+
+**Docs**: refresh `docs/PARITY_ROADMAP.md` to reflect near-complete tsnet parity as of v0.5.39.
+Updates the per-lane parity estimates (A ~85%, B ~85%, C ~85%, D ~90%, E ~80%, bindings ~90%),
+records the v0.5.27–v0.5.39 parity push, and enumerates the remaining deferred/external items
+(TUN-mode MagicDNS, Serve accept-loop runtime, Service advertise-to-control, symmetric-NAT spray,
+the external Funnel relay leg, netstack sharding) with their bead IDs. No code change.
+
 ## [0.5.39](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.39) - 2026-06-06
 
 **Route `Device::listen_tls` through the ACME-aware issuance path** (follow-up to v0.5.38). With the
