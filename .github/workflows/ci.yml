@@ -93,6 +93,10 @@ jobs:
           # rejects commas. Multiple components (`clippy,rustfmt`) would fail that key validation,
           # so install them in a separate step below and pass none here (like `musl_static`).
           components: ""
+          # Distinct target/ cache from the musl lanes: this lane builds a native host workspace,
+          # they build cross containers with a different glibc. Sharing one cache risks the same
+          # cross-container build-script GLIBC mismatch (see the note on `musl_static`).
+          cache-key: hosted-test
       - name: Install clippy + rustfmt
         run: rustup component add clippy rustfmt
       - name: Check formatting (cargo fmt)
@@ -249,6 +253,15 @@ jobs:
           builder-triple: x86_64-unknown-linux-gnu
           targets: ${{ matrix.target.triple }}
           components: ""
+          # Isolate the target/ cache PER musl target. The action keys its target cache on
+          # `builder-triple` (x86_64 here for both matrix entries) + Cargo.lock only -- NOT on the
+          # cross target -- so without this both musl jobs (and hosted_test) would share one cache.
+          # `cross` runs each target in its own container image (different glibc); a build-script
+          # binary (e.g. libc's) compiled for one image then restored into the other fails with
+          # `GLIBC_2.XX not found` (cargo doesn't invalidate build-script fingerprints across
+          # targets -- cross-rs FAQ "Glibc Version Error"). A per-triple cache-key keeps caching
+          # while preventing the cross-container artifact collision.
+          cache-key: musl-${{ matrix.target.triple }}
       - name: Install cross
         uses: cargo-bins/cargo-binstall@dc19f1e48450eefe5a29b8da6c6b00a87d730b37 #v1.18.1
       - name: Install cross (binary)

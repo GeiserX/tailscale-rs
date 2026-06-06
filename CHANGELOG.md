@@ -6,6 +6,20 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.55](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.55) - 2026-06-06
+
+**Fix the aarch64 `musl_static` `GLIBC_2.XX not found` failure (isolate the CI target cache per
+lane).** The shared `setup-rust` action keys its `target/` cache on `builder-triple`
+(`x86_64-unknown-linux-gnu` for both musl matrix entries) + `Cargo.lock` only — not on the cross
+target — so both musl jobs and `hosted_test` restored one shared cache. `cross` runs each target
+in its own container image (different glibc); a build-script binary (e.g. `libc`'s) compiled for
+one image and restored into another fails with `GLIBC_2.XX not found`, because cargo does not
+invalidate build-script fingerprints across targets (cross-rs FAQ "Glibc Version Error"). Each
+GitHub-hosted lane now passes a distinct `cache-key` (`hosted-test`,
+`musl-<target-triple>`), keeping the cache fully (no per-run loss, no extra runner cost) while
+preventing the cross-container artifact collision. `x86_64` musl and `hosted_test` were already
+green; this fixes the remaining `aarch64` musl lane.
+
 ## [0.5.54](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.54) - 2026-06-06
 
 **Give the `musl_static` lane disk headroom.** It started failing with `ENOSPC`: the `cross`
