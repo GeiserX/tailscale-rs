@@ -24,6 +24,12 @@ on:
           # - staging
           - prod
 
+# Collapse redundant runs of the same ref (e.g. rapid pushes to a PR branch). `cancel-in-progress`
+# is deliberately gated OFF for tag refs so an in-flight publish run is never cancelled mid-release.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_TERM_VERBOSE: true
@@ -51,6 +57,11 @@ jobs:
   hosted_test:
     name: hosted test (ubuntu-latest)
     runs-on: ubuntu-latest
+    # Skip on tag pushes: this lane verifies code, and `publish` (which fires on tags) deliberately
+    # does NOT depend on it, so re-running the full build+test on every release tag gates nothing.
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    # A hung cargo step would otherwise burn the 6h GitHub-hosted default; cap it.
+    timeout-minutes: 60
     env:
       # This fork gates compilation behind an explicit acknowledgement env var.
       TS_RS_EXPERIMENT: this_is_unstable_software

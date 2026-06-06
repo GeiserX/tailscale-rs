@@ -6,6 +6,16 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.51](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.51) - 2026-06-06
+
+**Harden the `hosted_test` CI lane** (from a multi-perspective review of v0.5.47–0.5.50): add a
+workflow-level `concurrency` group so rapid pushes to the same ref collapse, with
+`cancel-in-progress` gated OFF for tag refs so an in-flight `publish` run is never cancelled
+mid-release; add `timeout-minutes: 60` so a hung `cargo` step can't burn the 6h GitHub-hosted
+default; and skip the lane on tag pushes (`if: !startsWith(github.ref, 'refs/tags/')`) since it
+verifies code and `publish` deliberately does not depend on it, so re-running it on every release
+tag gates nothing.
+
 ## [0.5.50](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.50) - 2026-06-06
 
 **Give the `hosted_test` lane enough disk to build.** With both clippy steps green, the
