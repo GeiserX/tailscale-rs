@@ -40,7 +40,7 @@ ipnet.workspace = true
 kameo = "0.19"
 kameo_actors = "0.4"
 thiserror.workspace = true
-tokio = { workspace = true, features = ["net", "time"] }
+tokio = { workspace = true, features = ["net", "time", "io-util", "sync"] }
 tracing.workspace = true
 smallvec.workspace = true
 

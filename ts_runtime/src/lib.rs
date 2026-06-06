@@ -37,6 +37,8 @@ pub mod peer_tracker;
 mod peerapi;
 mod peerapi_doh;
 mod route_updater;
+/// Stored Serve config + accept-loop runtime (`tsnet`'s `Get/SetServeConfig` + serving runtime).
+pub mod serve;
 mod src_filter;
 /// Netmap status snapshot, WhoIs, and watcher types.
 pub mod status;

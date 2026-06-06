@@ -56,8 +56,8 @@ pub use node::{
 };
 #[cfg(feature = "async_tokio")]
 pub use serve::{
-    FunnelError, FunnelOptions, MISSING_FUNNEL_RELAY, ServeConfig, ServeTarget, accept_tls,
-    funnel_access, listen_funnel, listen_tls, tls_acceptor,
+    FunnelError, FunnelOptions, MISSING_FUNNEL_RELAY, ServeConfig, ServeState, ServeTarget,
+    accept_tls, funnel_access, listen_funnel, listen_tls, tls_acceptor,
 };
 pub use service::{ServiceError, ServiceMode, resolve_service_listen};
 pub use ssh_policy::{

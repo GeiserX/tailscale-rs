@@ -6,6 +6,30 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.42](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.42) - 2026-06-06
+
+**Stored Serve config + accept-loop runtime** (roadmap `tsr-am9.8`): `Device::set_serve_config` /
+`get_serve_config`, completing Go `tsnet`'s `Get/SetServeConfig` + serving runtime. Now that ACME
+issuance landed (v0.5.38–39), serve ports terminate TLS with a real Let's Encrypt cert.
+
+- New `ServeState { name, ports: BTreeMap<u16, ServeTarget> }` (multi-port, mirroring upstream
+  `ipn.ServeConfig`'s per-port `TCP` map). `ServeTarget` gains, alongside `Accept`/`Proxy{to}`:
+  `Text{body}` (Go `HTTPHandler.Text`) and `TcpForward{to}` (Go `TCPPortHandler.TCPForward`, raw
+  passthrough, no TLS); the enum is now `#[non_exhaustive]`.
+- `Device::set_serve_config(state)` validates, builds each TLS-terminating port's `TlsAcceptor`
+  up-front via the ACME cert path (any cert failure fails the whole call **closed** — no port is
+  bound, no plaintext downgrade), then binds one overlay accept loop per port and reconciles on
+  re-set (full-replace, Go semantics). It returns a `ServeAcceptedReceiver` — the in-process Rust
+  stand-in for `ListenTLS`'s `net.Listener` — over which `Accept`-target streams arrive.
+- Per-connection dispatch: `Accept` → TLS-terminated stream handed to the receiver; `Proxy{to}` →
+  TLS-terminate then `copy_bidirectional` to a local host backend; `Text{body}` → write + close;
+  `TcpForward{to}` → raw overlay stream spliced to a local host backend (no TLS).
+- **Anti-leak**: serve listeners bind the **overlay** netstack only; the Proxy/TcpForward backend
+  dial is a local host socket to the embedder's own backend (like the loopback proxy / Go's
+  reverse-proxy to `127.0.0.1`), never routed through the `ts_forwarder` egress path. Per-port
+  concurrent-connection cap (256). The legacy single-port `ServeConfig` + `Device::listen_tls`
+  /`listen_funnel` are unchanged.
+
 ## [0.5.41](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.41) - 2026-06-06
 
 Hardening + coverage from a multi-reviewer audit of the v0.5.33–v0.5.40 parity sweep. No happy-path

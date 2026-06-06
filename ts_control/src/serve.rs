@@ -37,12 +37,15 @@ use crate::{
     node::Node,
 };
 
-/// What to do with a stream once TLS is terminated.
+/// What to do with a stream once TLS is terminated (or, for [`ServeTarget::TcpForward`], a raw TCP
+/// stream with no TLS).
 ///
-/// Scoped down from upstream `ipn.ServeConfig` to the two shapes this fork needs:
-/// hand the decrypted bytes to the embedder, or reverse-proxy to a local target.
+/// Mirrors the handler shapes of upstream `ipn.ServeConfig`'s `HTTPHandler`/`TCPPortHandler`
+/// (`Proxy`/`Text`/`TCPForward`), plus an `Accept` hand-back the in-process Rust embedder uses in
+/// place of Go's `net.Listener`. (`Path`/`Redirect` static-file handlers are not yet implemented.)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
+#[non_exhaustive]
 pub enum ServeTarget {
     /// Hand the accepted, decrypted stream back to the embedder (like
     /// `tsnet`'s `ListenTLS` returning a `net.Listener`).
@@ -53,6 +56,70 @@ pub enum ServeTarget {
         /// `host:port` to dial for the proxied backend.
         to: String,
     },
+    /// Serve a fixed plaintext body to every connection, then close (Go `HTTPHandler.Text`). The
+    /// bytes are written as-is after TLS termination — the embedder supplies any HTTP framing.
+    Text {
+        /// The exact bytes to write to each accepted stream.
+        body: String,
+    },
+    /// Forward the **raw** (non-TLS-terminated) TCP stream to a local backend (Go
+    /// `TCPPortHandler.TCPForward`). Unlike [`ServeTarget::Proxy`], no TLS is terminated — bytes are
+    /// spliced through verbatim to `to` (a real OS socket on this host).
+    TcpForward {
+        /// `host:port` to dial for the raw-TCP backend.
+        to: String,
+    },
+}
+
+impl ServeTarget {
+    /// Whether this target requires TLS termination on the serve port (`Accept`/`Proxy`/`Text` ride
+    /// an HTTPS port; `TcpForward` is a raw passthrough with no TLS).
+    pub fn terminates_tls(&self) -> bool {
+        !matches!(self, ServeTarget::TcpForward { .. })
+    }
+}
+
+/// A complete multi-port Serve configuration for one node (mirrors upstream `ipn.ServeConfig`'s
+/// per-port `TCP` map). Stored on the device and reconciled into one accept loop per port by the
+/// Serve runtime; `set_serve_config` REPLACES the whole config (Go semantics).
+///
+/// All TLS-terminating ports share the node's single MagicDNS [`name`](ServeState::name)
+/// certificate (obtained via the ACME path). `TcpForward` ports need no cert.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ServeState {
+    /// The node's MagicDNS name the TLS-terminating ports' certificate is for (e.g.
+    /// `host.tailnet.ts.net`). Must be a tailnet name when any TLS-terminating port is configured.
+    pub name: String,
+    /// Map of tailnet (overlay) port → what to serve on it.
+    pub ports: alloc::collections::BTreeMap<u16, ServeTarget>,
+}
+
+impl ServeState {
+    /// Validate the whole config. Fail-closed: rejects port 0, empty proxy/forward targets, and —
+    /// when any TLS-terminating port is present — a non-tailnet `name` (anti-leak: we never mint a
+    /// cert for an off-tailnet name). An empty config (no ports) is valid (serves nothing).
+    pub fn validate(&self) -> Result<(), CertError> {
+        let any_tls = self.ports.values().any(ServeTarget::terminates_tls);
+        if any_tls && !cert::is_tailnet_name(&self.name) {
+            return Err(CertError::NotTailnetName(self.name.clone()));
+        }
+        for (port, target) in &self.ports {
+            if *port == 0 {
+                return Err(CertError::Acme("serve port must be non-zero".into()));
+            }
+            match target {
+                ServeTarget::Proxy { to } | ServeTarget::TcpForward { to }
+                    if to.trim().is_empty() =>
+                {
+                    return Err(CertError::Acme(
+                        "serve proxy/forward target must not be empty".into(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Configuration for terminating TLS on one tailnet port for one MagicDNS name.

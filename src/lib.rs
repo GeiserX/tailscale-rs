@@ -142,7 +142,7 @@ pub use ts_control::Node as NodeInfo;
 #[doc(inline)]
 pub use ts_control::tls::{CertifiedKey, TlsAcceptor, TlsStream};
 #[doc(inline)]
-pub use ts_control::{CertError, MISSING_CERT_RPC, ServeConfig, ServeTarget};
+pub use ts_control::{CertError, MISSING_CERT_RPC, ServeConfig, ServeState, ServeTarget};
 #[doc(inline)]
 pub use ts_control::{ExitProxyConfig, ExitProxyScheme};
 pub use ts_control::{
@@ -188,6 +188,11 @@ pub struct Device {
     /// IPv6 VIP-service address is bindable (the netstack only accepts IPv6 overlay addresses when
     /// this is set).
     enable_ipv6: bool,
+    /// The stored Serve config + its live per-port accept loops (`tsnet`'s `Get/SetServeConfig` +
+    /// serving runtime). Built lazily on the first [`Device::set_serve_config`] (it needs this
+    /// node's overlay IPv4, only known after registration). Held here so its accept loops abort when
+    /// the `Device` drops; `None` (empty config) until the first `set`.
+    serve: std::sync::Mutex<Option<ts_runtime::serve::ServeManager>>,
 }
 
 /// Map a [`ts_runtime::taildrop::TaildropError`] to the device-facing [`Error`]. `Error` is a
@@ -307,6 +312,7 @@ impl Device {
             runtime: rt,
             channel,
             enable_ipv6: config.enable_ipv6,
+            serve: std::sync::Mutex::new(None),
         })
     }
 
@@ -866,6 +872,92 @@ impl Device {
         cfg.validate()?;
         let cert = self.get_certificate(&cfg.name).await?;
         ts_control::tls_acceptor(cert)
+    }
+
+    /// The currently-stored Serve config (like `tsnet`'s `GetServeConfig`).
+    ///
+    /// Returns the config last passed to [`Device::set_serve_config`], or an empty
+    /// [`ts_control::ServeState`] (no ports) if none was ever set. Pure read — does not touch the
+    /// network.
+    pub fn get_serve_config(&self) -> ts_control::ServeState {
+        match &*self.serve.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some(mgr) => mgr.get(),
+            None => ts_control::ServeState::default(),
+        }
+    }
+
+    /// Replace this node's Serve config and (re)bind its tailnet ports (like `tsnet`'s
+    /// `SetServeConfig`, REPLACE semantics).
+    ///
+    /// `state` becomes the **whole** config (full-replace reconcile: every previously-bound serve
+    /// port's accept loop is torn down and the new config's ports are bound from scratch). For each
+    /// configured port the manager binds an overlay listener on this node's tailnet IPv4 and
+    /// dispatches per [`ts_control::ServeTarget`]:
+    /// - [`Accept`](ts_control::ServeTarget::Accept) — the TLS-terminated stream is handed back over
+    ///   the returned [`ServeAcceptedReceiver`](ts_runtime::serve::ServeAcceptedReceiver) (the
+    ///   in-process stand-in for `ListenTLS`'s `net.Listener`).
+    /// - [`Proxy`](ts_control::ServeTarget::Proxy) — reverse-proxy the decrypted stream to a local
+    ///   host backend.
+    /// - [`Text`](ts_control::ServeTarget::Text) — write a fixed body and close.
+    /// - [`TcpForward`](ts_control::ServeTarget::TcpForward) — forward the **raw** (non-TLS) stream
+    ///   to a local host backend.
+    ///
+    /// **Fail-closed.** `state.validate()` runs first. Every TLS-terminating port's acceptor is
+    /// obtained up-front via [`Device::listen_tls`] (the ACME-aware cert path); if any cert cannot be
+    /// issued the whole call fails with that [`ts_control::CertError`] and **nothing is bound** — a
+    /// TLS port never downgrades to plaintext.
+    ///
+    /// **Anti-leak.** Listeners bind the overlay netstack only (never a host socket). The
+    /// `Proxy`/`TcpForward` backend dial is a local host socket to the embedder's own backend (like
+    /// Go's reverse-proxy to `127.0.0.1`), intentionally NOT routed through the exit-egress
+    /// forwarder. A backend dial failure drops that connection; it never falls back.
+    ///
+    /// Returns an error in TUN transport mode (there is no application netstack to bind on). The
+    /// previous config's accept loops (and any earlier `ServeAcceptedReceiver`) stop when this
+    /// returns; the new receiver delivers every `Accept`-port connection.
+    pub async fn set_serve_config(
+        &self,
+        state: ts_control::ServeState,
+    ) -> Result<ts_runtime::serve::ServeAcceptedReceiver, Error> {
+        state
+            .validate()
+            .map_err(|_| Error::Internal(InternalErrorKind::BadRequest))?;
+
+        // Fail-closed: build every TLS-terminating port's acceptor up-front via the ACME-aware cert
+        // path. If any cert can't be issued, return before binding anything (no plaintext downgrade).
+        let mut resolved = std::collections::BTreeMap::new();
+        for (port, target) in &state.ports {
+            let acceptor = if target.terminates_tls() {
+                let cfg = ts_control::ServeConfig {
+                    name: state.name.clone(),
+                    port: *port,
+                    target: target.clone(),
+                };
+                Some(self.listen_tls(&cfg).await.map_err(|_| {
+                    // Cert issuance is fail-closed in this fork; surface as a request error rather
+                    // than ever binding a plaintext TLS port.
+                    Error::Internal(InternalErrorKind::BadRequest)
+                })?)
+            } else {
+                None
+            };
+            resolved.insert(
+                *port,
+                ts_runtime::serve::ResolvedPort {
+                    target: target.clone(),
+                    acceptor,
+                },
+            );
+        }
+
+        // The manager binds the OVERLAY netstack on this node's own tailnet IPv4.
+        let self_ipv4 = self.ipv4_addr().await?;
+        let channel = self.channel()?.clone();
+
+        let mut slot = self.serve.lock().unwrap_or_else(|e| e.into_inner());
+        let mgr =
+            slot.get_or_insert_with(|| ts_runtime::serve::ServeManager::new(channel, self_ipv4));
+        Ok(mgr.set(state, resolved))
     }
 
     /// Expose a tailnet TLS service to the public internet via Tailscale Funnel (like `tsnet`'s
