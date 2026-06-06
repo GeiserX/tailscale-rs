@@ -1,3 +1,12 @@
+//! DERP relay fan-out: one underlay-transport task per DERP region from the control derp map.
+//!
+//! [`Multiderp`] spawns a connection task per region, keeps the home region always-on, and lets the
+//! others idle out after a grace period. It also demuxes disco frames (e.g. `CallMeMaybe`) relayed
+//! over DERP into the magicsock so a relay-only peer can still open a direct path.
+//!
+//! Anti-leak: STUN server collection ([`stun_servers_from_regions`]) emits only `FixedAddr` v4
+//! servers — never `UseDns` — so probing never triggers a second DNS-resolution egress path.
+
 use core::net::{SocketAddr, SocketAddrV4};
 use std::{
     collections::HashMap,
@@ -94,7 +103,13 @@ impl Multiderp {
 
                 return;
             }
-            Err(e) => unreachable!("{}", e),
+            // A transient mailbox-full / timeout (or handler) error must degrade a single region
+            // rather than abort DERP setup for the whole node. Skip this region; it is re-attempted
+            // on the next derp-map update or send_disco.
+            Err(e) => {
+                tracing::error!(error = %e, "multiderp: failed to set up DERP region; skipping");
+                return;
+            }
         };
         let (home_derp_tx, mut home_derp_rx) = watch::channel(false);
         let (disco_tx, mut disco_rx) = mpsc::channel::<(NodePublicKey, Vec<u8>)>(8);

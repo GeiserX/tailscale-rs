@@ -80,15 +80,17 @@ pub(crate) async fn forward_doh(
     match timeout(CLIENT_TIMEOUT, doh_round_trip(channel, doh_addr, query)).await {
         Ok(Ok(resp)) if !resp.is_empty() => resp,
         Ok(Ok(_)) => {
-            tracing::debug!(%doh_addr, "peerapi doh client: empty response from exit node");
+            // A broken exit-node recursive resolver silently NXDOMAINs every delegated query, so
+            // surface delegation failures at warn (default level) — the operator needs the signal.
+            tracing::warn!(%doh_addr, "peerapi doh client: empty response from exit node");
             nxdomain
         }
         Ok(Err(e)) => {
-            tracing::debug!(error = %e, %doh_addr, "peerapi doh client: delegation failed");
+            tracing::warn!(error = %e, %doh_addr, "peerapi doh client: delegation failed");
             nxdomain
         }
         Err(_) => {
-            tracing::debug!(%doh_addr, "peerapi doh client: delegation timed out");
+            tracing::warn!(%doh_addr, "peerapi doh client: delegation timed out");
             nxdomain
         }
     }

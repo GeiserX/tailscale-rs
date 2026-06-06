@@ -1,3 +1,13 @@
+//! Route reconciliation: turns peer/control state into the overlay+underlay route tables.
+//!
+//! [`RouteUpdater`] resolves the exit-node selector against the live peer set, builds the outbound
+//! cryptokey-routing table and the DERP/direct underlay map, splits inbound self-routes between the
+//! application and forwarder netstacks, and republishes on every peer/control update plus a periodic
+//! recompute that upgrades/downgrades peers as direct paths come and go.
+//!
+//! Fail-closed: a peer is routed direct only while it holds a live confirmed path (else DERP), and
+//! a stale/typo'd exit-node selector grants no `/0` (internet-bound traffic is dropped, not leaked).
+
 use core::time::Duration;
 use std::{
     collections::{HashMap, HashSet},

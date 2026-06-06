@@ -9,6 +9,15 @@ use crate::{
 ///
 /// Disco keys are ephemeral and should be generated anew each time a device runs, so are
 /// excluded from this state.
+///
+/// # At-rest protection is the embedder's responsibility
+///
+/// The secret-bearing fields here are zeroized in memory on drop (the dedicated key types and the
+/// [`Zeroizing`](zeroize::Zeroizing)-wrapped ACME account key), but that is an in-process hygiene
+/// measure only. Protecting this state **at rest** — restrictive file permissions (e.g. `0o600`),
+/// full-disk or filesystem encryption, secure-enclave/keyring storage — is entirely the
+/// responsibility of the embedding application that serializes and writes it to durable storage.
+/// This crate neither reads nor writes files and makes no at-rest guarantee (see `SECURITY.md`).
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PersistState {
@@ -34,8 +43,12 @@ pub struct PersistState {
     /// the same Let's Encrypt account identity across renewals; absent, the runtime generates an
     /// ephemeral per-call key (a new ACME account each issuance). `#[serde(default)]` so key files
     /// written before this field load as `None` (mirrors [`old_node_key`](PersistState::old_node_key)).
+    ///
+    /// Wrapped in [`Zeroizing`](zeroize::Zeroizing) so the DER private-key bytes are wiped from
+    /// memory on drop. `Zeroizing<Vec<u8>>` serializes transparently via its inner `Vec`, so the
+    /// persisted JSON shape is identical to a bare `Vec<u8>` (a byte array).
     #[cfg_attr(feature = "serde", serde(default))]
-    pub acme_account_key: Option<alloc::vec::Vec<u8>>,
+    pub acme_account_key: Option<zeroize::Zeroizing<alloc::vec::Vec<u8>>>,
 }
 
 impl PersistState {
@@ -115,8 +128,11 @@ pub struct NodeState {
     /// The persisted ACME account key (PKCS#8 DER), threaded from
     /// [`PersistState::acme_account_key`]. The `acme` cert-issuance path reads this to reuse the
     /// same Let's Encrypt account across renewals. `None` when no ACME account is provisioned.
+    ///
+    /// Wrapped in [`Zeroizing`](zeroize::Zeroizing) so the DER private-key bytes are wiped from
+    /// memory on drop; serializes transparently via the inner `Vec` (unchanged JSON shape).
     #[cfg_attr(feature = "serde", serde(default))]
-    pub acme_account_key: Option<alloc::vec::Vec<u8>>,
+    pub acme_account_key: Option<zeroize::Zeroizing<alloc::vec::Vec<u8>>>,
 }
 
 impl Debug for NodeState {
@@ -234,25 +250,31 @@ mod tests {
         assert!(parsed.acme_account_key.is_none());
 
         // A `Some(der)` value round-trips through serde and across the NodeState conversions.
+        // The `Zeroizing` wrapper must NOT change the on-wire JSON: it serializes as the inner
+        // byte `Vec`, so the rendered JSON is identical to a bare `Vec<u8>`.
         let state = PersistState {
-            acme_account_key: Some(vec![1u8, 2, 3, 4]),
+            acme_account_key: Some(zeroize::Zeroizing::new(vec![1u8, 2, 3, 4])),
             ..Default::default()
         };
         let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("\"acme_account_key\":[1,2,3,4]"),
+            "Zeroizing must serialize as the bare byte array (unchanged JSON shape): {json}"
+        );
         let parsed: PersistState = serde_json::from_str(&json).unwrap();
         assert_eq!(
-            parsed.acme_account_key.as_deref(),
+            parsed.acme_account_key.as_deref().map(|v| v.as_slice()),
             Some(&[1u8, 2, 3, 4][..])
         );
 
         let node_state = NodeState::from(&state);
         assert_eq!(
-            node_state.acme_account_key.as_deref(),
+            node_state.acme_account_key.as_deref().map(|v| v.as_slice()),
             Some(&[1u8, 2, 3, 4][..])
         );
         let round_trip = PersistState::from(&node_state);
         assert_eq!(
-            round_trip.acme_account_key.as_deref(),
+            round_trip.acme_account_key.as_deref().map(|v| v.as_slice()),
             Some(&[1u8, 2, 3, 4][..])
         );
     }

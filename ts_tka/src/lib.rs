@@ -963,4 +963,116 @@ mod tests {
             TkaError::NodeKeyMismatch
         );
     }
+
+    // ----- CTAP2-CBOR byte-exactness FROZEN regression vector -----
+
+    /// A small hex helper for embedding captured bytes in a failure message.
+    fn hex(bytes: &[u8]) -> String {
+        let mut s = String::new();
+        for b in bytes {
+            s.push_str(&alloc::format!("{b:02x}"));
+        }
+        s
+    }
+
+    /// FROZEN CTAP2-CBOR byte-exactness vector for the wire/signing serialization.
+    ///
+    /// The crate docs (and the `cbor` module) state the CTAP2-canonical CBOR encoding is asserted by
+    /// construction but NOT cross-validated against Go's `fxamacker/cbor` (CTAP2 mode) in this fork.
+    /// The existing TKA tests build a signature, sign it, and verify round-trip — so they would all
+    /// still pass if the canonical encoding silently changed (int-map key ordering, smallest-int
+    /// rule, omitempty), because both sides of the round-trip use the same encoder. That class of
+    /// change would, however, break wire-compat with a live Go TKA.
+    ///
+    /// This pins the EXACT bytes for a fixed `NodeKeySignature` (Direct, deterministic key material):
+    /// the full `to_cbor(true)` serialization, the `to_cbor(false)` SigHash preimage, the resulting
+    /// `sig_hash` (BLAKE2s-256 of the preimage), and the `aum_hash` over the full serialization. ANY
+    /// accidental change to canonical-CBOR encoding or the BLAKE2s digest breaks this test.
+    ///
+    /// NOTE: this is a regression-FREEZE vector captured from the current encoder, NOT a Go-sourced
+    /// cross-vector. It should be replaced with a real `fxamacker/cbor` CTAP2 vector (the same
+    /// `NodeKeySignature` encoded by a live Go `tka`) once one can be captured.
+    #[test]
+    fn node_key_signature_cbor_frozen_vector() {
+        // Deterministic, fixed key material — NOT random. byte i = i, so the bytes are obvious.
+        let pubkey: Vec<u8> = (0u8..32).collect();
+        let key_id: Vec<u8> = (32u8..64).collect();
+        let signature: Vec<u8> = (64u8..128).collect();
+
+        let sig = NodeKeySignature {
+            sig_kind: SigKind::Direct,
+            pubkey,
+            key_id,
+            signature,
+            nested: None,
+            wrapping_pubkey: Vec::new(), // empty -> omitted (omitempty), key 6 must NOT appear
+        };
+
+        // 1. Full serialization (include_signature = true): keys 1,2,3,4 present, 5/6 omitted.
+        let full = sig.to_cbor(true).to_vec();
+        const EXPECTED_FULL: &[u8] = &[
+            0xa4, 0x01, 0x01, 0x02, 0x58, 0x20, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
+            0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x03, 0x58, 0x20, 0x20,
+            0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e,
+            0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c,
+            0x3d, 0x3e, 0x3f, 0x04, 0x58, 0x40, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
+            0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55,
+            0x56, 0x57, 0x58, 0x59, 0x5a, 0x5b, 0x5c, 0x5d, 0x5e, 0x5f, 0x60, 0x61, 0x62, 0x63,
+            0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x70, 0x71,
+            0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x7b, 0x7c, 0x7d, 0x7e, 0x7f,
+        ];
+        assert_eq!(
+            full,
+            EXPECTED_FULL,
+            "full CBOR serialization changed (canonical-CBOR encoding drift). actual: {}",
+            hex(&full)
+        );
+
+        // 2. SigHash preimage (include_signature = false): key 4 (signature) omitted.
+        let preimage = sig.to_cbor(false).to_vec();
+        const EXPECTED_PREIMAGE: &[u8] = &[
+            0xa3, 0x01, 0x01, 0x02, 0x58, 0x20, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
+            0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x03, 0x58, 0x20, 0x20,
+            0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e,
+            0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c,
+            0x3d, 0x3e, 0x3f,
+        ];
+        assert_eq!(
+            preimage,
+            EXPECTED_PREIMAGE,
+            "SigHash preimage CBOR changed. actual: {}",
+            hex(&preimage)
+        );
+
+        // 3. sig_hash = BLAKE2s-256(preimage) — pinned.
+        let sig_hash = sig.sig_hash();
+        const EXPECTED_SIG_HASH: [u8; AUM_HASH_LEN] = [
+            0x22, 0x6f, 0x9c, 0xbc, 0x63, 0x73, 0x92, 0x75, 0x2e, 0x0e, 0xb1, 0x32, 0x9c, 0xc4,
+            0x99, 0x07, 0x01, 0x4a, 0xb6, 0x4f, 0x8e, 0x5d, 0x82, 0x85, 0xc2, 0x91, 0x42, 0x62,
+            0xf6, 0xa6, 0xa8, 0x33,
+        ];
+        assert_eq!(
+            sig_hash,
+            EXPECTED_SIG_HASH,
+            "sig_hash (BLAKE2s-256 of preimage) changed. actual: {}",
+            hex(&sig_hash)
+        );
+
+        // 4. aum_hash over the full serialization — pinned (exercises the public `aum_hash` helper
+        //    + BLAKE2s digest over a frozen input).
+        let aum = aum_hash(&full);
+        const EXPECTED_AUM_HASH: [u8; AUM_HASH_LEN] = [
+            0xa4, 0x40, 0x71, 0xa3, 0x7a, 0xbf, 0x80, 0x92, 0xd6, 0xff, 0x23, 0x84, 0xb2, 0xb0,
+            0xa3, 0x50, 0xc7, 0xcb, 0x48, 0x41, 0xed, 0x68, 0x99, 0x62, 0x41, 0x7c, 0xd4, 0x23,
+            0x68, 0xdc, 0x72, 0x49,
+        ];
+        assert_eq!(
+            aum.0,
+            EXPECTED_AUM_HASH,
+            "aum_hash over full serialization changed. actual: {}",
+            hex(&aum.0)
+        );
+    }
 }

@@ -922,4 +922,197 @@ mod tests {
             "newAccount header JWK must be byte-identical-ordered to the thumbprint input"
         );
     }
+
+    // ----- Offline ACME state-machine coverage -----
+    //
+    // SEAM STATUS: the full order→authz→challenge→poll→finalize flow lives in `issue_certificate`,
+    // which is HARD-WIRED to `ts_http_util` via the free functions `acme_get` / `acme_post`
+    // (`ts_http_util::http1::connect_tls`). There is NO injectable HTTP-client/transport trait — the
+    // flow takes only `(name, directory_url, account_key, publisher)`, so a mock transport cannot be
+    // substituted without refactoring production code to add a seam. Per the task scope, we do NOT
+    // add that seam in this pass. The only network-driving end-to-end coverage remains the env-gated
+    // Pebble integration test elsewhere.
+    //
+    // What IS testable offline without a refactor are the pure helpers the state machine is built
+    // from: directory parsing, the nonce-carry of `Session`, header extraction (the `Replay-Nonce` /
+    // `Location` / `Retry-After` reads), and error formatting. We cover those below. (The JWS/JWK/
+    // DNS-01 builders and the response-size cap are already covered by the tests above.)
+
+    /// `parse_directory` extracts exactly the three endpoint URLs the flow uses, ignoring extras.
+    #[test]
+    fn parse_directory_extracts_three_endpoints() {
+        let body = br#"{
+            "newNonce": "https://acme.example/acme/new-nonce",
+            "newAccount": "https://acme.example/acme/new-acct",
+            "newOrder": "https://acme.example/acme/new-order",
+            "revokeCert": "https://acme.example/acme/revoke-cert",
+            "meta": {"termsOfService": "https://acme.example/tos"}
+        }"#;
+        let dir = match parse_directory(body) {
+            Ok(d) => d,
+            Err(e) => panic!("valid directory must parse: {e:?}"),
+        };
+        assert_eq!(
+            dir.new_nonce.as_str(),
+            "https://acme.example/acme/new-nonce"
+        );
+        assert_eq!(
+            dir.new_account.as_str(),
+            "https://acme.example/acme/new-acct"
+        );
+        assert_eq!(
+            dir.new_order.as_str(),
+            "https://acme.example/acme/new-order"
+        );
+    }
+
+    /// A directory missing a required endpoint is a fail-closed `CertError::Acme`, naming the field.
+    #[test]
+    fn parse_directory_missing_field_errors() {
+        // No `newOrder`.
+        let body = br#"{
+            "newNonce": "https://acme.example/acme/new-nonce",
+            "newAccount": "https://acme.example/acme/new-acct"
+        }"#;
+        let err = match parse_directory(body) {
+            Err(e) => e,
+            Ok(_) => panic!("missing newOrder must error"),
+        };
+        assert!(
+            matches!(err, CertError::Acme(m) if m.contains("newOrder")),
+            "error must name the missing field"
+        );
+    }
+
+    /// A directory whose endpoint is not a valid URL is rejected (fail-closed).
+    #[test]
+    fn parse_directory_bad_url_errors() {
+        let body = br#"{
+            "newNonce": "not a url",
+            "newAccount": "https://acme.example/acme/new-acct",
+            "newOrder": "https://acme.example/acme/new-order"
+        }"#;
+        let err = match parse_directory(body) {
+            Err(e) => e,
+            Ok(_) => panic!("invalid URL must error"),
+        };
+        assert!(matches!(err, CertError::Acme(_)), "got {err:?}");
+    }
+
+    /// Non-JSON directory body is rejected.
+    #[test]
+    fn parse_directory_non_json_errors() {
+        let err = match parse_directory(b"<html>not json</html>") {
+            Err(e) => e,
+            Ok(_) => panic!("non-JSON must error"),
+        };
+        assert!(
+            matches!(err, CertError::Acme(m) if m.contains("directory JSON")),
+            "error must indicate a directory JSON parse failure"
+        );
+    }
+
+    /// `Parts::header` reads a present header case-insensitively (the flow reads `replay-nonce`,
+    /// `location`, `retry-after`) and returns `None` for an absent one — the exact nonce/Location
+    /// extraction the state machine depends on.
+    #[test]
+    fn parts_header_read_and_absent() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ts_http_util::HeaderName::from_static("replay-nonce"),
+            ts_http_util::HeaderValue::from_static("nonce-abc-123"),
+        );
+        headers.insert(
+            ts_http_util::HeaderName::from_static("location"),
+            ts_http_util::HeaderValue::from_static("https://acme.example/acct/42"),
+        );
+        let parts = Parts {
+            status: StatusCode::OK,
+            headers,
+            body: bytes::Bytes::new(),
+        };
+        // `http::HeaderMap` lookup is case-insensitive — assert the flow can read these regardless of
+        // the case the server used.
+        assert_eq!(
+            parts.header("Replay-Nonce").as_deref(),
+            Some("nonce-abc-123")
+        );
+        assert_eq!(
+            parts.header("replay-nonce").as_deref(),
+            Some("nonce-abc-123")
+        );
+        assert_eq!(
+            parts.header("location").as_deref(),
+            Some("https://acme.example/acct/42")
+        );
+        assert_eq!(parts.header("retry-after"), None);
+    }
+
+    /// `Session::take_nonce` returns the current nonce and leaves an empty placeholder, so a request
+    /// can never silently reuse a spent nonce (anti-replay): each `signed_post` takes then a fresh
+    /// response must refill it.
+    #[test]
+    fn session_take_nonce_consumes_then_empties() {
+        let directory = match parse_directory(
+            br#"{
+                "newNonce": "https://acme.example/n",
+                "newAccount": "https://acme.example/a",
+                "newOrder": "https://acme.example/o"
+            }"#,
+        ) {
+            Ok(d) => d,
+            Err(e) => panic!("directory must parse: {e:?}"),
+        };
+        let mut session = Session {
+            directory,
+            kid: "https://acme.example/acct/1".to_string(),
+            nonce: "first-nonce".to_string(),
+        };
+        assert_eq!(session.take_nonce(), "first-nonce");
+        // Now spent — a second take yields empty until a response refills `session.nonce`.
+        assert_eq!(session.take_nonce(), "");
+        session.nonce = "second-nonce".to_string();
+        assert_eq!(session.take_nonce(), "second-nonce");
+    }
+
+    /// `status_err` (the error path used when the server returns a non-2xx, e.g. an order that goes
+    /// `invalid` or any 4xx/5xx) names the failing step, includes the status, and previews the body.
+    #[test]
+    fn status_err_includes_step_status_and_body_preview() {
+        let parts = Parts {
+            status: StatusCode::FORBIDDEN,
+            headers: HeaderMap::new(),
+            body: bytes::Bytes::from_static(
+                br#"{"type":"urn:ietf:params:acme:error:unauthorized"}"#,
+            ),
+        };
+        let err = status_err("newOrder", &parts);
+        let CertError::Acme(msg) = err else {
+            panic!("expected CertError::Acme, got {err:?}");
+        };
+        assert!(msg.contains("newOrder"), "names the step: {msg}");
+        assert!(msg.contains("403"), "includes the status: {msg}");
+        assert!(msg.contains("unauthorized"), "previews the body: {msg}");
+    }
+
+    /// `status_err` truncates a huge body to the 512-byte preview rather than echoing it whole.
+    #[test]
+    fn status_err_truncates_long_body() {
+        let big = vec![b'x'; 4096];
+        let parts = Parts {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            headers: HeaderMap::new(),
+            body: bytes::Bytes::from(big),
+        };
+        let CertError::Acme(msg) = status_err("finalize", &parts) else {
+            panic!("expected CertError::Acme");
+        };
+        // The preview is capped at 512 bytes; the whole message stays bounded well under the body.
+        assert!(
+            msg.len() < 700,
+            "preview must be truncated, got {} chars",
+            msg.len()
+        );
+        assert!(msg.contains("finalize") && msg.contains("500"));
+    }
 }

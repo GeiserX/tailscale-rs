@@ -43,6 +43,9 @@ defaults:
 jobs:
   build_test:
     name: compile, test, static checks (elixir ${{ matrix.elixir.label }}, otp ${{ matrix.otp.label }}, rust ${{ matrix.rust_toolchain.label }}, platform ${{ matrix.platform.name }})
+    # This matrix targets self-hosted runner labels that only exist in the upstream tailscale
+    # org; skip off-upstream to avoid queued-run spam.
+    if: ${{ github.repository_owner == 'tailscale' }}
     runs-on: ${{ matrix.platform.runner }}
 
     strategy:
@@ -146,6 +149,9 @@ jobs:
 
   arch_independent:
     name: arch-independent checks
+    # Targets a self-hosted runner label that only exists in the upstream tailscale org; skip
+    # off-upstream to avoid queued-run spam.
+    if: ${{ github.repository_owner == 'tailscale' }}
     runs-on: linux-x86_64-16cpu
 
     env:
@@ -211,7 +217,9 @@ jobs:
       - build_test
       - arch_independent
 
-    if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
+    # Targets a self-hosted runner label that only exists in the upstream tailscale org; skip
+    # off-upstream to avoid queued-run spam (in addition to the tag/dispatch gate).
+    if: ${{ github.repository_owner == 'tailscale' && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch') }}
 
     environment: *hex_environment
     env:

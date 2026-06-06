@@ -14,6 +14,12 @@ rust-version.workspace = true
 thiserror.workspace = true
 zerocopy.workspace = true
 serde = { workspace = true, optional = true }
+# zeroize (matching the workspace-tree pin in ts_control_noise) wipes secret byte buffers on
+# drop. `alloc` (not `std`, this crate is `no_std`) is required for the `Zeroize`/`ZeroizeOnDrop`
+# impls on `alloc::vec::Vec`, which is what `Zeroizing<Vec<u8>>` relies on for the persisted ACME
+# account key. `Zeroizing<Vec<u8>>` serializes transparently via its inner `Vec`, so the on-wire
+# JSON shape of `PersistState`/`NodeState` is unchanged.
+zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
 x25519-dalek.workspace = true
 crypto_box.workspace = true
 # ed25519-dalek (v2, already in the workspace tree via ts_tka) provides the RFC 8032
@@ -29,7 +35,9 @@ getrandom = "0.4"
 serde_json.workspace = true
 
 [features]
-serde = ["dep:serde"]
+# The `serde` feature must also turn on zeroize's `serde` so `Zeroizing<Vec<u8>>` serializes
+# transparently via its inner `Vec` — keeping the persisted JSON shape byte-identical.
+serde = ["dep:serde", "zeroize/serde"]
 
 [lints]
 workspace = true

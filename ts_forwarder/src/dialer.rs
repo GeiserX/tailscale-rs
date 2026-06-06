@@ -266,10 +266,29 @@ impl ProxyExitDialer {
 /// metadata `169.254.169.254`), or RFC1918 hosts on the proxy's side. Subnet routes legitimately
 /// target private ranges (that *is* the subnet being routed), so this guard applies only to
 /// exit-node flows. IPv6 is rejected wholesale elsewhere (IPv6-off posture).
+///
+/// In addition to loopback/private/link-local/unspecified, this also rejects:
+/// - **CGNAT / shared `100.64.0.0/10` (RFC 6598)** — this is the Tailscale address range itself.
+///   Without this, a malicious peer could aim an exit CONNECT at another tailnet node's `100.x`
+///   address and reach internal tailnet hosts via the residential proxy.
+/// - **Broadcast `255.255.255.255`** — never a legitimate egress target.
+/// - **"This network" `0.0.0.0/8` (RFC 791)** — covers `0.0.0.0/8`, of which `0.0.0.0` (the
+///   unspecified address) is one; the explicit `is_unspecified` check above is kept for clarity.
 fn exit_dst_is_forbidden(dst: SocketAddr) -> bool {
     match dst.ip() {
         IpAddr::V4(v4) => {
-            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+            let o = v4.octets();
+            // CGNAT / shared 100.64.0.0/10 (RFC 6598): the Tailscale range itself.
+            let is_cgnat = o[0] == 100 && (o[1] & 0xc0) == 0x40;
+            // "This network" 0.0.0.0/8 (RFC 791); includes the unspecified address.
+            let is_this_network = o[0] == 0;
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || is_cgnat
+                || is_this_network
         }
         // Exit egress is IPv4-only; any v6 dst is forbidden (and refused again in the handshake).
         IpAddr::V6(_) => true,
@@ -914,6 +933,43 @@ mod tests {
                 "exit dial to {forbidden} must be refused"
             );
         }
+    }
+
+    /// SSRF guard ranges: CGNAT/shared `100.64.0.0/10` (the Tailscale range itself), broadcast
+    /// `255.255.255.255`, and "this network" `0.0.0.0/8` must all be forbidden for an exit-node
+    /// flow, while a normal public IP and a CGNAT-adjacent-but-outside address stay allowed.
+    /// Tests the `exit_dst_is_forbidden` predicate directly (the dialer-level refusal is covered by
+    /// `proxy_dialer_refuses_forbidden_exit_destinations`).
+    #[test]
+    fn exit_ssrf_guard_rejects_cgnat_broadcast_and_this_network() {
+        // 100.64.0.0/10 (RFC 6598) — the Tailscale address range itself.
+        for forbidden in [
+            "100.64.0.1:443",     // bottom of 100.64/10
+            "100.127.255.255:80", // top of 100.64/10
+            "255.255.255.255:80", // broadcast
+            "0.0.0.1:80",         // 0.0.0.0/8 "this network"
+        ] {
+            let dst: SocketAddr = forbidden.parse().unwrap();
+            assert!(
+                exit_dst_is_forbidden(dst),
+                "exit dst {forbidden} must be forbidden (SSRF guard)"
+            );
+        }
+
+        // A normal public IP is still ALLOWED.
+        let public: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        assert!(
+            !exit_dst_is_forbidden(public),
+            "public IP 1.1.1.1 must remain an allowed exit destination"
+        );
+
+        // 100.128.0.1 is OUTSIDE 100.64.0.0/10 (the /10 only covers 100.64–100.127), so it is a
+        // normal public address and must NOT be caught by the CGNAT guard.
+        let cgnat_adjacent: SocketAddr = "100.128.0.1:443".parse().unwrap();
+        assert!(
+            !exit_dst_is_forbidden(cgnat_adjacent),
+            "100.128.0.1 is outside 100.64/10 and must remain allowed"
+        );
     }
 
     /// The SSRF guard applies only to exit-node flows: a subnet route legitimately targets a

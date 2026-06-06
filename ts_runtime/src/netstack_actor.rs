@@ -1,3 +1,13 @@
+//! The application netstack actor: the userspace TCP/IP stack carrying this node's own tailnet
+//! traffic.
+//!
+//! [`NetstackActor`] pumps packets between the dataplane overlay queues and an in-process netstack,
+//! and on each control update assigns the node's overlay addresses ([`overlay_addresses`]): its IPv4
+//! tailnet address, the MagicDNS service IP, and any hosted VIP-service addresses.
+//!
+//! IPv6-off by default: the node's IPv6 overlay address (and any v6 VIP) is assigned only when
+//! [`Env::enable_ipv6`] is set, keeping the default posture byte-for-byte the IPv4-only path.
+
 use core::net::IpAddr;
 use std::sync::Arc;
 

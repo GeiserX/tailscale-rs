@@ -158,7 +158,13 @@ impl Message<Arc<PeerState>> for DataplaneActor {
             let wg = &mut dp.wireguard;
 
             for &upsert in &msg.upserts {
-                let (_, node) = msg.peers.get(&upsert).unwrap();
+                let Some((_, node)) = msg.peers.get(&upsert) else {
+                    tracing::error!(
+                        ?upsert,
+                        "dataplane: upsert id missing from peer snapshot; skipping"
+                    );
+                    continue;
+                };
 
                 wg.upsert_peer(
                     ts_tunnel::PeerId(upsert.0),

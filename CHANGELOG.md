@@ -6,6 +6,33 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.58](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.58) - 2026-06-07
+
+Fixes from a whole-codebase health audit:
+
+- **Fix (exit-node SSRF guard gap).** `ts_forwarder`'s `exit_dst_is_forbidden` now also rejects
+  CGNAT/shared `100.64.0.0/10` (the Tailscale range itself — closing a path where a peer could
+  drive an exit CONNECT at another tailnet node via the residential proxy), broadcast
+  `255.255.255.255`, and `0.0.0.0/8`.
+- **Fix (CI phantom-runner spam).** The `python` and `elixir` workflows' self-hosted-runner jobs
+  are now gated `if: github.repository_owner == 'tailscale'` (mirroring the `rust` workflow), so
+  they no longer queue for hours and auto-cancel on every push to the fork.
+- **Hardening (at-rest key hygiene).** The persisted ACME account-key buffer is wrapped in
+  `Zeroizing` so it is wiped on drop (on-wire JSON unchanged). At-rest protection of the state
+  file remains the embedding application's responsibility (documented).
+- **Robustness.** `dataplane` peer-upsert no longer `unwrap()`s on a maintained invariant (logs +
+  skips instead of panicking the whole update); `multiderp` degrades a single DERP region on a
+  transient actor send error instead of aborting setup; exit-node DoH delegation failures are
+  logged at `warn` (were `debug`, hiding broken recursive DNS from operators).
+- **Tests (crypto known-answer / regression vectors).** Added the first tests for the TS2021
+  big-endian ChaCha20Poly1305 AEAD (round-trip, tamper-rejection, a big-endianness assertion that
+  catches a nonce-order revert, and a frozen self-vector); a frozen CTAP2-CBOR vector for
+  `ts_tka` (catches canonical-CBOR/digest drift that would break wire-compat with Go); and offline
+  unit coverage of the ACME directory/nonce/error-path helpers. No crypto defect was found.
+- **Docs/consistency.** Added module docs to four previously doc-less modules; documented the
+  `ssh`-feature advisory scope; corrected the README install-version example (`0.3`→`0.5`) and the
+  `SECURITY.md` vulnerability-reporting contact.
+
 ## [0.5.57](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.57) - 2026-06-07
 
 Fixes from a multi-perspective review of the v0.5.56 wave:

@@ -1,3 +1,12 @@
+//! The parsed domain [`Node`] model: a tailnet node decoded from the wire (`tailcfg.Node`).
+//!
+//! [`Node`] is the owned, validated form the rest of the fork reasons about (addresses, keys, caps,
+//! accepted routes, peerAPI/VIP services), built from the borrow-bound `ts_control_serde::Node` via
+//! the [`From`] impl. It also carries the route/exit-node/funnel predicates ([`Node::is_subnet_route`],
+//! [`Node::routes_to_install`], [`Node::can_funnel`]) and the [`ExitNodeSelector`] resolution.
+//!
+//! Fail-closed: route, funnel, and service-host gates all deny on a missing/malformed input.
+
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::collections::BTreeMap;
 
