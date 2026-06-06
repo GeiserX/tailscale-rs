@@ -19,6 +19,11 @@ ts_packet.workspace = true
 ts_transport.workspace = true
 
 # Unconditionally required dependencies.
+# `if-addrs` enumerates the host's interface addresses (libc `getifaddrs` on POSIX, the
+# `windows-sys` IP-helper on Windows) so `self_endpoints` can advertise real global-unicast IPv6
+# interface addresses as local disco candidates when IPv6 is enabled. Pure syscall wrapper — pulls
+# only `libc`/`windows-sys`, no TLS stack (verified via `cargo tree`), keeping the egress path clean.
+if-addrs = "0.15"
 rand.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "sync", "rt", "time", "macros"] }

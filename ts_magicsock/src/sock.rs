@@ -296,6 +296,13 @@ impl MagicSock {
     /// the single bound underlay socket — there is no second egress. The local address is always
     /// present (available from bind); reflexive addresses accrue as pongs arrive, so before any
     /// direct path is confirmed this returns just the local address.
+    ///
+    /// When `enable_ipv6` is set, the host's real global-unicast IPv6 interface addresses are also
+    /// enumerated and advertised as [`SelfEndpointType::Local`] candidates (each paired with the
+    /// bound socket's port), filtered through the same [`is_pingable_candidate`] rules a peer
+    /// applies — without this, a dual-stack `[::]:0` bind only ever yields the undialable
+    /// unspecified `[::]:port`. With the default `enable_ipv6 == false` no IPv6 local candidate is
+    /// emitted and the result is byte-for-byte the prior IPv4-only set.
     pub fn self_endpoints(&self) -> Vec<SelfEndpoint> {
         let mut eps = Vec::new();
 
@@ -305,6 +312,57 @@ impl MagicSock {
                 addr: local,
                 ty: SelfEndpointType::Local,
             });
+        }
+
+        // Local IPv6 candidate enumeration (gated on `enable_ipv6`; default `false` ⇒ this whole
+        // block is skipped and the candidate set is byte-for-byte the prior IPv4-only behavior).
+        //
+        // For a dual-stack `[::]:0` underlay bind, `local_addr()` above yields the UNSPECIFIED
+        // address `[::]:port`, which a peer cannot dial — so no usable local v6 candidate would
+        // ever be advertised and a direct v6 path could never form. STUN is v4-only here, so v6
+        // reflexive addresses only ever arrive via peer pongs; this fills the local-candidate gap
+        // by advertising the host's real global-unicast IPv6 interface addresses paired with the
+        // bound socket's port.
+        //
+        // Each enumerated v6 address is filtered through the SAME `is_pingable_candidate` the
+        // peer-accept side uses (built into a `SocketAddr` on the local port), so the set of v6
+        // addresses we advertise as local candidates EXACTLY matches what a peer will accept and
+        // probe — one source of truth for the v6 acceptance rules (rejects `::`, `::1`, ULA
+        // `fc00::/7`, link-local `fe80::/10`, multicast; accepts only global unicast).
+        //
+        // Fail-safe, not fail-closed: if interface enumeration errors we simply add no v6 locals
+        // (a missing v6 candidate only means v6 falls back to DERP relay, which is safe) — it must
+        // never block the v4 candidates already pushed above.
+        if self.enable_ipv6
+            && let Some(local) = local
+        {
+            let local_port = local.port();
+            match if_addrs::get_if_addrs() {
+                Ok(ifaces) => {
+                    for iface in ifaces {
+                        let IpAddr::V6(v6) = iface.ip() else {
+                            continue;
+                        };
+                        let cand = SocketAddr::new(IpAddr::V6(v6), local_port);
+                        if !self.is_pingable_candidate(&cand) {
+                            continue;
+                        }
+                        if eps.iter().any(|e| e.addr == cand) {
+                            continue;
+                        }
+                        eps.push(SelfEndpoint {
+                            addr: cand,
+                            ty: SelfEndpointType::Local,
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "self_endpoints: get_if_addrs failed; advertising no local IPv6 candidates"
+                    );
+                }
+            }
         }
 
         // Collect the reflexive set into owned `Vec`s and drop the guard before the O(n²) dedup/
@@ -1372,6 +1430,116 @@ mod tests {
         // IPv4 behavior is identical whether the gate is on or off.
         assert!(sock.is_pingable_candidate(&"203.0.113.7:41641".parse().unwrap()));
         assert!(!sock.is_pingable_candidate(&"10.0.0.5:41641".parse().unwrap()));
+    }
+
+    /// With the IPv6 gate **off** (the default IPv4-only deployment) `self_endpoints` must emit NO
+    /// IPv6 `Local` candidate regardless of what interface addresses the host actually has — the
+    /// entire local-v6 enumeration block is gated behind `enable_ipv6`, so the candidate set is the
+    /// historical IPv4-only one. We can't control `get_if_addrs`, but we CAN assert the result
+    /// contains zero IPv6 `Local` entries.
+    #[tokio::test]
+    async fn self_endpoints_no_v6_local_when_disabled() {
+        let sock = sock_with_ipv6(false).await;
+        let eps = sock.self_endpoints();
+        assert!(
+            !eps.iter()
+                .any(|e| e.ty == SelfEndpointType::Local && e.addr.is_ipv6()),
+            "gate off must emit no IPv6 Local candidate: {eps:?}"
+        );
+    }
+
+    /// With the IPv6 gate **on**, local IPv6 candidate enumeration runs. This is host-dependent
+    /// (CI may have no global-unicast v6 address), so the assertion is conditional:
+    /// - if the host exposes a GUA v6 interface address, at least one IPv6 `Local` candidate must
+    ///   appear and every emitted IPv6 `Local` must itself pass `is_pingable_candidate` (i.e. be a
+    ///   global unicast on the bound port);
+    /// - otherwise (no GUA v6 available) we only assert the call did not panic and the v4 `Local`
+    ///   candidate(s) are unchanged.
+    ///
+    /// Either way the v4 candidate set is identical to the gate-off path. Bound to `[::]:0` so the
+    /// underlay is dual-stack and the port advertised on v6 candidates is the real listen port.
+    #[tokio::test]
+    async fn self_endpoints_emits_v6_local_when_enabled() {
+        let sock = MagicSock::bind(
+            "[::]:0".parse().unwrap(),
+            DiscoPrivateKey::random(),
+            ts_keys::NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap()
+        .with_enable_ipv6(true);
+        let local_port = sock.local_addr().unwrap().port();
+
+        let eps = sock.self_endpoints();
+
+        // The ENUMERATED v6 local candidates are the IPv6 `Local` entries other than the bound
+        // address itself (a `[::]:0` bind contributes the undialable unspecified `[::]:port` as the
+        // plain local address — that is the exact gap this enumeration fills, so it is excluded).
+        let enumerated_v6: Vec<&SelfEndpoint> = eps
+            .iter()
+            .filter(|e| {
+                e.ty == SelfEndpointType::Local && e.addr.is_ipv6() && !e.addr.ip().is_unspecified()
+            })
+            .collect();
+
+        // Every enumerated IPv6 Local candidate must pass the same pingability filter (global
+        // unicast) and use the bound port — the local set never advertises a v6 a peer would reject.
+        for e in &enumerated_v6 {
+            assert_eq!(
+                e.addr.port(),
+                local_port,
+                "v6 local must use the bound port"
+            );
+            assert!(
+                sock.is_pingable_candidate(&e.addr),
+                "emitted v6 local {:?} must pass the same pingability filter",
+                e.addr
+            );
+        }
+
+        // If the host actually has a routable global-unicast v6 interface address, we must have
+        // advertised at least one; otherwise (common on CI) just confirm no panic + v4 intact.
+        let host_has_gua_v6 = if_addrs::get_if_addrs()
+            .map(|ifaces| {
+                ifaces.into_iter().any(|i| {
+                    matches!(i.ip(), IpAddr::V6(_))
+                        && sock.is_pingable_candidate(&SocketAddr::new(i.ip(), local_port))
+                })
+            })
+            .unwrap_or(false);
+        if host_has_gua_v6 {
+            assert!(
+                !enumerated_v6.is_empty(),
+                "host has a GUA v6 address, so a v6 Local candidate must be advertised: {eps:?}"
+            );
+        }
+    }
+
+    /// The local-v6 candidate filter is exactly `is_pingable_candidate` (single source of truth):
+    /// given a synthetic interface-address set of `::1`, `fe80::1`, a GUA, and `fc00::1`, only the
+    /// global unicast survives the filter that gates which addresses become `Local` candidates.
+    #[tokio::test]
+    async fn local_v6_filter_keeps_only_global_unicast() {
+        let sock = sock_with_ipv6(true).await;
+        let port = 41641u16;
+        let enumerated: &[(&str, bool)] = &[
+            ("::1", false),        // loopback
+            ("fe80::1", false),    // link-local
+            ("2001:db8::1", true), // global unicast — the only survivor
+            ("fc00::1", false),    // unique-local
+        ];
+        let survivors: Vec<core::net::Ipv6Addr> = enumerated
+            .iter()
+            .map(|(s, _)| s.parse().unwrap())
+            .filter(|v6: &core::net::Ipv6Addr| {
+                sock.is_pingable_candidate(&SocketAddr::new(IpAddr::V6(*v6), port))
+            })
+            .collect();
+        assert_eq!(
+            survivors,
+            vec!["2001:db8::1".parse::<core::net::Ipv6Addr>().unwrap()],
+            "only the global unicast v6 address may become a local candidate"
+        );
     }
 
     /// A peer-supplied candidate that is a forbidden target (e.g. a loopback or private

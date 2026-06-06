@@ -6,6 +6,27 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.37](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.37) - 2026-06-06
+
+**IPv6 direct-path candidates** (roadmap Tier 5, item 13): close the last gap to negotiating a direct
+IPv6 underlay path when `Config::enable_ipv6` is set. The disco machinery was already v6-capable
+(reflexive set, peer-candidate accept/ping, IPv6-wins best-addr tiebreak, the dual-stack `[::]:0`
+underlay bind), but `self_endpoints` only ever advertised the bound socket address — which for a
+dual-stack bind is the undialable unspecified `[::]`, so no usable local v6 candidate was offered
+and a direct v6 path never formed.
+
+- `MagicSock::self_endpoints` now enumerates the host's IPv6 interface addresses (via `if-addrs`,
+  which pulls only `libc` — no TLS) and emits each **global-unicast** address as a `Local` candidate
+  paired with the bound port, **only when `enable_ipv6` is set**. The candidates are filtered through
+  the same `is_pingable_candidate` the peer-accept side uses (single source of truth — rejects `::`,
+  `::1`, link-local `fe80::/10`, ULA `fc00::/7`, multicast), so what we advertise exactly matches
+  what we'd accept.
+- **Default unchanged**: with `enable_ipv6 = false` (the proxy / k8s deployment default) zero v6
+  candidates are emitted and the path is byte-identical to before. STUN stays IPv4-only (v6 reflexive
+  arrives only via peer pongs, by design).
+- **Anti-leak intact**: this is the overlay underlay disco path, not the forwarder egress — the
+  `ts_forwarder` IPv4-only egress is untouched and the `ipv4_only_forwarder` guard stays green.
+
 ## [0.5.36](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.36) - 2026-06-06
 
 **Disco + STUN observability counters** (roadmap Tier 5, item 20): extend the client-metric registry
