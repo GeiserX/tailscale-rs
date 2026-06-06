@@ -184,8 +184,10 @@ mod tests {
         assert_eq!(dns.match_domains, vec!["ts.net".to_owned()]);
 
         // Defaults are available for both types.
-        let _ = HostRoutes::default();
-        let _ = HostDns::default();
+        let default_routes = HostRoutes::default();
+        let default_dns = HostDns::default();
+        assert!(default_routes.routed.is_empty());
+        assert!(default_dns.nameservers.is_empty());
     }
 
     /// On macOS the platform implementation is wired (stream S2), so

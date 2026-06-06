@@ -43,6 +43,41 @@ defaults:
     shell: bash
 
 jobs:
+  # GitHub-HOSTED (`ubuntu-latest`) build/test/lint lane. The inherited `build_test` matrix below
+  # targets self-hosted runner labels (`linux-x86_64-16cpu`, etc.) that DO NOT EXIST on this fork, so
+  # those jobs queue forever and never report. This lane runs the same core verification on a runner
+  # that actually exists, so the `rust` workflow has a real green signal. ring-only, default features
+  # (no `ssh`/`acme`/`tun`); the musl + feature-specific paths are covered by `musl_static` + local.
+  hosted_test:
+    name: hosted test (ubuntu-latest)
+    runs-on: ubuntu-latest
+    env:
+      # This fork gates compilation behind an explicit acknowledgement env var.
+      TS_RS_EXPERIMENT: this_is_unstable_software
+      COMMON_FLAGS: --workspace
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Setup rust
+        id: setup-rust
+        uses: ./.github/actions/setup-rust
+        with:
+          toolchain-version: *latest_rust
+          builder-triple: x86_64-unknown-linux-gnu
+          components: clippy,rustfmt
+      - name: Check formatting (cargo fmt)
+        run: cargo fmt --all -- --check
+      - name: Lint lib targets (cargo clippy)
+        run: cargo clippy $COMMON_FLAGS --no-deps --lib -- -D warnings
+      - name: Lint other targets (cargo clippy)
+        run: cargo clippy $COMMON_FLAGS --no-deps --bins --tests --benches --examples -- -D warnings -A missing_docs
+      - name: Build (cargo build)
+        run: cargo build $COMMON_FLAGS --all-targets
+      - name: Test (cargo test)
+        run: cargo test $COMMON_FLAGS
+      - name: Anti-leak firewall checks (cargo run -p checks)
+        run: cargo run -p checks
+
   build_test:
     strategy:
       fail-fast: false

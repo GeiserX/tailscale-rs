@@ -6,6 +6,21 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.47](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.47) - 2026-06-06
+
+**CI now has a real green signal.** The inherited upstream workflow matrix targets self-hosted
+runner labels (`linux-x86_64-16cpu`, `linux-arm64-16cpu`, `macos-26`, …) that do not exist on
+this fork, so every `rust`-workflow job queued forever and never reported. Added a `hosted_test`
+job that runs on GitHub-hosted `ubuntu-latest` and executes the same core verification (fmt,
+clippy `-D warnings` for lib + other targets, `build --all-targets`, `test`, and the `checks`
+anti-leak firewall) with default features (ring-only; no `ssh`/`acme`/`tun`). This is the only
+lane in the `rust` workflow that actually executes; `musl_static` already covered the musl path.
+
+Fixed three latent clippy lints that only surface under the full `--workspace --bins --tests`
+pass the new lane runs (per-crate checks had missed them): a doc-list overindent in
+`checks/src/ipv4_only_host_net.rs`, a `field_reassign_with_default` in a `ts_keys` test, and two
+`let-underscore-drop`s in a `ts_host_net` test (now bound and asserted on).
+
 ## [0.5.46](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.46) - 2026-06-06
 
 **Client-side Funnel ingress** (roadmap `tsr-am9.11`): `Device::listen_funnel` now returns a

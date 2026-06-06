@@ -234,8 +234,10 @@ mod tests {
         assert!(parsed.acme_account_key.is_none());
 
         // A `Some(der)` value round-trips through serde and across the NodeState conversions.
-        let mut state = PersistState::default();
-        state.acme_account_key = Some(vec![1u8, 2, 3, 4]);
+        let state = PersistState {
+            acme_account_key: Some(vec![1u8, 2, 3, 4]),
+            ..Default::default()
+        };
         let json = serde_json::to_string(&state).unwrap();
         let parsed: PersistState = serde_json::from_str(&json).unwrap();
         assert_eq!(

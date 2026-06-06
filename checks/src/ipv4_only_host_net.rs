@@ -13,7 +13,7 @@
 //! fails if any are found:
 //!   - `inet6`        : the macOS `route` IPv6 address family (`-inet6`).
 //!   - `Ipv6`         : an IPv6 type (`Ipv6Addr`/`Ipv6Net`) in the route/DNS path. (Lowercase `p`,
-//!                      so it matches Rust type names, not the prose "IPv6" in doc comments.)
+//!     so it matches Rust type names, not the prose "IPv6" in doc comments.)
 //!   - `enable_ipv6`  : the runtime IPv6 gate must never be read by host programming.
 //!   - `inet6` / `-6` family selectors that would put `ip`/`route` into IPv6 mode.
 //!
