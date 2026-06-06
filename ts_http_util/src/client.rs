@@ -1,9 +1,30 @@
 use std::sync::Arc;
 
-use http::{HeaderName, HeaderValue, Request, Response};
+use http::{HeaderName, HeaderValue, Request, Response, header::USER_AGENT};
 use hyper::body::{Body, Incoming};
 
 use crate::Error;
+
+/// Default `User-Agent` sent on [`ClientExt`] requests.
+///
+/// RFC 8555 §6.1 *requires* ACME clients to send a `User-Agent`, and real ACME servers
+/// (Boulder/Let's Encrypt, Pebble ≥ 2.10) reject requests without one. No current caller passes
+/// its own `User-Agent`; if one ever does, it is appended alongside this default.
+const DEFAULT_USER_AGENT: &str = concat!("tailscale-rs/", env!("CARGO_PKG_VERSION"));
+
+/// Build the RFC 7230 §5.3.1 *origin-form* request target (`/path?query`) for a direct request.
+///
+/// These clients connect straight to the origin server (not through a forward proxy), so the
+/// request line must carry only the absolute path and query — never the absolute-form
+/// `scheme://host/path`. Passing the full URL makes hyper emit `POST https://host/path HTTP/1.1`,
+/// which servers that reconstruct the effective request URI from `Host` + request-target (e.g. an
+/// ACME server validating the JWS `url` field) see as a doubled URL, rejecting every request.
+fn origin_form_target(url: &url::Url) -> String {
+    match url.query() {
+        Some(query) => format!("{}?{}", url.path(), query),
+        None => url.path().to_owned(),
+    }
+}
 
 /// An HTTP client that can asynchronously send requests and receive responses.
 ///
@@ -49,9 +70,10 @@ where
     where
         B: Default,
     {
-        let mut req = Request::get(url.as_str());
+        let mut req = Request::get(origin_form_target(url));
 
         if let Some(hdrs) = req.headers_mut() {
+            hdrs.append(USER_AGENT, HeaderValue::from_static(DEFAULT_USER_AGENT));
             hdrs.extend(crate::host_header(url));
             hdrs.extend(headers);
         }
@@ -77,9 +99,10 @@ where
         headers: impl IntoIterator<Item = (HeaderName, HeaderValue)>,
         body: B,
     ) -> impl Future<Output = Result<Response<Incoming>, Error>> {
-        let mut req = Request::post(url.as_str());
+        let mut req = Request::post(origin_form_target(url));
 
         if let Some(hdrs) = req.headers_mut() {
+            hdrs.append(USER_AGENT, HeaderValue::from_static(DEFAULT_USER_AGENT));
             hdrs.extend(crate::host_header(url));
             hdrs.extend(headers);
         }

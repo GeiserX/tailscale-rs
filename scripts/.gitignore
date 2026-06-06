@@ -1,0 +1,2 @@
+# Runtime state written by pebble-up.sh (logs, PIDs, fetched CA, generated config).
+.pebble/

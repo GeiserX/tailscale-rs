@@ -6,6 +6,38 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.52](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.52) - 2026-06-06
+
+**Fix three RFC-compliance bugs in the shared HTTP client (`ts_http_util`), surfaced by a new
+live-CA ACME integration test.** None were visible at compile time, and all three were
+production-DOA for the `acme` feature against Let's Encrypt (real Tailscale's control plane is
+lenient and runs on the default port, so they did not affect the tailnet path):
+
+1. **Absolute-form request target.** `ClientExt::{get,post}` sent the request line in absolute
+   form (`POST https://host/path HTTP/1.1`) instead of RFC 7230 §5.3.1 origin-form
+   (`POST /path HTTP/1.1`); these clients dial the origin directly, never a forward proxy. A
+   compliant ACME server compares the JWS `url` against `scheme + Host + request-target`, so the
+   absolute-form target doubled the URL and every signed POST was rejected.
+2. **Missing `User-Agent`.** RFC 8555 §6.1 requires one; Boulder/Let's Encrypt and Pebble ≥ 2.10
+   reject requests without it. A default `tailscale-rs/<version>` UA is now sent.
+3. **`host_header` dropped the non-default port.** Servers that reconstruct their own absolute
+   URLs from the `Host` header (e.g. an ACME directory's `newNonce`/`newAccount` endpoints) were
+   handed `localhost` instead of `localhost:14000` and advertised unreachable `:443` URLs. The
+   port is now included whenever the URL carries a non-default one.
+
+**Validation harnesses added (all gated, no-op in CI without their env):**
+- `ts_control/tests/acme_pebble.rs` (`acme` feature + `TS_RS_TEST_PEBBLE`) — drives the full
+  RFC 8555 DNS-01 flow against a real [Pebble](https://github.com/letsencrypt/pebble) CA via
+  `scripts/pebble-up.sh`/`pebble-down.sh` (native Go, no Docker) and asserts a real issued chain.
+- `ts_forwarder/tests/antileak_runtime.rs` — runtime proof of the fail-closed anti-leak
+  invariant: `DirectDialer` structurally refuses exit egress, `ProxyExitDialer` fails closed on a
+  dead proxy with no direct fallback, the SSRF guard rejects loopback/metadata/private/IPv6, and
+  proxy UDP egress is refused. Complements the static `checks` firewall with actual dialer
+  behavior.
+- `tests/tailnet_live.rs` (`TS_RS_TEST_NET` + `TS_RS_TEST_AUTHKEY`) — joins a real Tailscale
+  tailnet end-to-end (registration, CGNAT IP assignment, peer/netmap read, MagicDNS resolve),
+  proving the pure-Rust fork interoperates with `controlplane.tailscale.com`.
+
 ## [0.5.51](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.51) - 2026-06-06
 
 **Harden the `hosted_test` CI lane** (from a multi-perspective review of v0.5.47–0.5.50): add a

@@ -117,9 +117,18 @@ pub fn make_upgrade_req(
 
 /// Produce a `Host` header for the given URL.
 ///
+/// Includes the port when the URL carries a non-default one (`u.port()` is `Some`), per
+/// RFC 7230 §5.4 — e.g. `localhost:14000`. Origin servers that reconstruct their own absolute
+/// URLs from the `Host` header (such as an ACME directory emitting `newNonce`/`newAccount`
+/// endpoints) would otherwise drop the port and advertise unreachable `:443` URLs.
+///
 /// Returns `None` if `u.host_str()` is `None` or includes non-ascii-printable characters.
 pub fn host_header(u: &url::Url) -> Option<(HeaderName, HeaderValue)> {
-    Some((HOST, HeaderValue::from_str(u.host_str()?).ok()?))
+    let host = match u.port() {
+        Some(port) => format!("{}:{port}", u.host_str()?),
+        None => u.host_str()?.to_owned(),
+    };
+    Some((HOST, HeaderValue::from_str(&host).ok()?))
 }
 
 async fn dial_tcp(url: &url::Url) -> Result<TcpStream, Error> {
