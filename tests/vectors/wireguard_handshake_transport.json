@@ -1,0 +1,46 @@
+{
+  "transport_nonce_kat": [
+    {
+      "desc": "counter 0, short pt",
+      "key_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "counter": 0,
+      "nonce_hex": "000000000000000000000000",
+      "pt_hex": "78797a7a79",
+      "ct_hex": "ddc5edec00deab2e13b1c722647aba8e9bd1d6574e"
+    },
+    {
+      "desc": "counter 1, short pt",
+      "key_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "counter": 1,
+      "nonce_hex": "000000000100000000000000",
+      "pt_hex": "706c6f766572",
+      "ct_hex": "a148eec08017563c51a807ab84fa67a6071a0aaf8a91"
+    },
+    {
+      "desc": "high counter, fixed pt",
+      "key_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "counter": 72623859790382856,
+      "nonce_hex": "000000000807060504030201",
+      "pt_hex": "deadbeef",
+      "ct_hex": "6adef61326b21fac9641232622ec6e35c845e0e2"
+    }
+  ],
+  "handshake_transcript": {
+    "desc": "Noise_IKpsk2 transcript, fixed ephemerals/statics",
+    "init_static_priv_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+    "init_static_pub_hex": "a4e09292b651c278b9772c569f5fa9bb13d906b46ab68c9df9dc2b4409f8a209",
+    "resp_static_priv_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+    "resp_static_pub_hex": "ce8d3ad1ccb633ec7b70c17814a5c76ecd029685050d344745ba05870e587d59",
+    "init_ephem_priv_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+    "resp_ephem_priv_hex": "0404040404040404040404040404040404040404040404040404040404040404",
+    "psk_hex": "0505050505050505050505050505050505050505050505050505050505050505",
+    "timestamp_hex": "070707070707070707070707",
+    "init_ephem_pub_hex": "5dfedd3b6bd47f6fa28ee15d969d5bb0ea53774d488bdaf9df1c6e0124b3ef22",
+    "init_static_sealed_hex": "0a26599fb2188bb723276fc173af67616c817fc32fd04d686d87ec152fac10eed2bda3bb3b6f1eded6977684082284d8",
+    "init_ts_sealed_hex": "50fc41b4cbcf9deeba2039d1c21710e7081f158a3f5bb6ceb5c344e3",
+    "resp_ephem_pub_hex": "ac01b2209e86354fb853237b5de0f4fab13c7fcbf433a61c019369617fecf10b",
+    "resp_empty_sealed_hex": "dad1dbbeb72c29c492bd43373a62c58b",
+    "send_key_i2r_hex": "a18cc809fd05b6b5f99644cf506f89dce368c2f54a9dbeb9a384f36c274317ef",
+    "recv_key_r2i_hex": "b1aa1b797d3a45da97552b8084ade493aa767f15af95854bc86557f6dacd851d"
+  }
+}

@@ -1,0 +1,62 @@
+[
+  {
+    "index": 0,
+    "std_accept": true,
+    "zip215_accept": true
+  },
+  {
+    "index": 1,
+    "std_accept": true,
+    "zip215_accept": true
+  },
+  {
+    "index": 2,
+    "std_accept": true,
+    "zip215_accept": true
+  },
+  {
+    "index": 3,
+    "std_accept": true,
+    "zip215_accept": true
+  },
+  {
+    "index": 4,
+    "std_accept": false,
+    "zip215_accept": true
+  },
+  {
+    "index": 5,
+    "std_accept": false,
+    "zip215_accept": true
+  },
+  {
+    "index": 6,
+    "std_accept": false,
+    "zip215_accept": false
+  },
+  {
+    "index": 7,
+    "std_accept": false,
+    "zip215_accept": false
+  },
+  {
+    "index": 8,
+    "std_accept": false,
+    "zip215_accept": false
+  },
+  {
+    "index": 9,
+    "std_accept": false,
+    "zip215_accept": true
+  },
+  {
+    "index": 10,
+    "std_accept": false,
+    "zip215_accept": true
+  },
+  {
+    "index": 11,
+    "std_accept": true,
+    "zip215_accept": true
+  }
+]

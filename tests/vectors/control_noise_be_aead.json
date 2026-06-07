@@ -1,0 +1,35 @@
+[
+  {
+    "desc": "all-0x42 key, counter 7, fixed ad+pt",
+    "key_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+    "counter": 7,
+    "nonce_hex": "000000000000000000000007",
+    "ad_hex": "0102030405060708",
+    "pt_hex": "68656c6c6f20776972654b4154",
+    "ct_hex": "7b0294364fe1db3a5103032cdafb17a16a78348e953af8d63604bc1c13",
+    "tag_hex": "fb17a16a78348e953af8d63604bc1c13",
+    "cipher_only_hex": "7b0294364fe1db3a5103032cda"
+  },
+  {
+    "desc": "counter 0, empty ad, empty pt (tag-only)",
+    "key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "counter": 0,
+    "nonce_hex": "000000000000000000000000",
+    "ad_hex": "",
+    "pt_hex": "",
+    "ct_hex": "10324f800a160bd9a1794255be7ec29d",
+    "tag_hex": "10324f800a160bd9a1794255be7ec29d",
+    "cipher_only_hex": ""
+  },
+  {
+    "desc": "high counter 0xdeadbeefcafe1234, ad, longer pt",
+    "key_hex": "ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00",
+    "counter": 16045690984503054900,
+    "nonce_hex": "00000000deadbeefcafe1234",
+    "ad_hex": "74732d636f6e74726f6c",
+    "pt_hex": "54686520717569636b2062726f776e20666f78206a756d7073206f76657220746865206c617a7920646f672e",
+    "ct_hex": "e900e29d1fef158b66dd67d574e1d2a33f6b4fa944df63796cf805a59773b5f460000021305cf53b6c18ab89f504bb83b8843a277346639e9e6c51ef",
+    "tag_hex": "f504bb83b8843a277346639e9e6c51ef",
+    "cipher_only_hex": "e900e29d1fef158b66dd67d574e1d2a33f6b4fa944df63796cf805a59773b5f460000021305cf53b6c18ab89"
+  }
+]

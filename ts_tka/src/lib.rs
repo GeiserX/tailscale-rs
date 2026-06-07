@@ -1262,4 +1262,190 @@ mod tests {
             );
         }
     }
+
+    // ----- Cross-implementation KATs against real Go `tailscale.com/tka` v1.100.0 -----
+
+    /// Cross-implementation Known-Answer-Test: the CTAP2-CBOR serialization and BLAKE2s-256
+    /// `SigHash` of three `NodeKeySignature` shapes must byte-match the REAL Go
+    /// `tailscale.com/tka` package, version **v1.100.0** (toolchain **go1.26.4**).
+    ///
+    /// Provenance: the golden bytes below were produced by a Go generator that imports the real
+    /// upstream `tailscale.com/tka` and calls `NodeKeySignature.Serialize()` (full CBOR including
+    /// the signature field) and `NodeKeySignature.SigHash()` (BLAKE2s-256 of the CBOR with the
+    /// `Signature` field nil'd). They are authoritative upstream output, NOT this fork's own
+    /// encoder echoed back — this is the cross-validation the `node_key_signature_cbor_frozen_vector`
+    /// freeze-test could not provide. The generator lives alongside the speccheck generator under
+    /// `tests/vectors/gen` (Go module pinned to `tailscale.com v1.100.0`).
+    ///
+    /// Three shapes are covered: a `Direct` leaf, a `Credential` leaf (same fields, different
+    /// `sigKind`), and a `Rotation` wrapping a nested `Direct` (the rotation-chain wire form). The
+    /// int-map keys are 1=sigKind, 2=pubkey, 3=keyID, 4=signature, 5=nested, 6=wrappingPubkey;
+    /// empty byte fields are omitted (`omitempty`).
+    #[test]
+    fn tka_cbor_matches_go_golden() {
+        // Common fixed field material (real Go generator inputs).
+        let pubkey32 = unhex("a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf");
+        let key_id32 = unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+        let sig64 = unhex(
+            "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeffe0e1e2e3e4e5e6e7e8e9eaebecedeeefd0d1d2d3d4d5d6d7d8d9dadbdcdddedfc0c1c2c3c4c5c6c7c8c9cacbcccdcecf",
+        );
+        let wrap32 = unhex("101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f");
+        let rot_sig64 = unhex(
+            "55565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f9091929394",
+        );
+
+        // GOLDEN 1 — Direct.
+        {
+            let sig = NodeKeySignature {
+                sig_kind: SigKind::Direct,
+                pubkey: pubkey32.clone(),
+                key_id: key_id32.clone(),
+                signature: sig64.clone(),
+                nested: None,
+                wrapping_pubkey: Vec::new(),
+            };
+            let full = sig.to_cbor(true).to_vec();
+            let expected_full = unhex(
+                "a40101025820a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf035820000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f045840f0f1f2f3f4f5f6f7f8f9fafbfcfdfeffe0e1e2e3e4e5e6e7e8e9eaebecedeeefd0d1d2d3d4d5d6d7d8d9dadbdcdddedfc0c1c2c3c4c5c6c7c8c9cacbcccdcecf",
+            );
+            assert_eq!(
+                full,
+                expected_full,
+                "GOLDEN 1 (Direct) full CBOR diverged from Go tka v1.100.0. actual: {}",
+                hex(&full)
+            );
+            let expected_hash =
+                unhex("7e9653c97d35485b37b9bf942b1861cd2f3cb0663b5bb154f1178cca72101e74");
+            assert_eq!(
+                sig.sig_hash().as_slice(),
+                expected_hash.as_slice(),
+                "GOLDEN 1 (Direct) sig_hash diverged from Go tka v1.100.0. actual: {}",
+                hex(&sig.sig_hash())
+            );
+        }
+
+        // GOLDEN 2 — Credential (same fields as Direct, sigKind=3).
+        {
+            let sig = NodeKeySignature {
+                sig_kind: SigKind::Credential,
+                pubkey: pubkey32.clone(),
+                key_id: key_id32.clone(),
+                signature: sig64.clone(),
+                nested: None,
+                wrapping_pubkey: Vec::new(),
+            };
+            let full = sig.to_cbor(true).to_vec();
+            let expected_full = unhex(
+                "a40103025820a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf035820000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f045840f0f1f2f3f4f5f6f7f8f9fafbfcfdfeffe0e1e2e3e4e5e6e7e8e9eaebecedeeefd0d1d2d3d4d5d6d7d8d9dadbdcdddedfc0c1c2c3c4c5c6c7c8c9cacbcccdcecf",
+            );
+            assert_eq!(
+                full,
+                expected_full,
+                "GOLDEN 2 (Credential) full CBOR diverged from Go tka v1.100.0. actual: {}",
+                hex(&full)
+            );
+            let expected_hash =
+                unhex("b6070ea8bc7ae8989ef4293f5031bedaa4a499803ade99f9e2f34dc2898ac03f");
+            assert_eq!(
+                sig.sig_hash().as_slice(),
+                expected_hash.as_slice(),
+                "GOLDEN 2 (Credential) sig_hash diverged from Go tka v1.100.0. actual: {}",
+                hex(&sig.sig_hash())
+            );
+        }
+
+        // GOLDEN 3 — Rotation wrapping a nested Direct.
+        //
+        // Decoded from the authoritative Go bytes, the OUTER map is `a4` = 4 entries: keys
+        // 1=sigKind(Rotation), 2=pubkey(wrap32), 4=signature(rotSig64), 5=nested. The outer has NO
+        // key 6 (its `wrapping_pubkey` is EMPTY → omitted) and NO key 3 (its `key_id` is EMPTY →
+        // omitted). The trailing `065820<wrap32>` in the hex belongs to the NESTED Direct map
+        // (`a5` = 5 entries: keys 1,2,3,4,6), whose `wrapping_pubkey` IS set to wrap32. Constructing
+        // the structs this way (outer wrapping_pubkey empty, nested wrapping_pubkey=wrap32)
+        // reproduces the Go bytes exactly.
+        {
+            let nested = NodeKeySignature {
+                sig_kind: SigKind::Direct,
+                pubkey: pubkey32.clone(),
+                key_id: key_id32.clone(),
+                signature: sig64.clone(),
+                nested: None,
+                wrapping_pubkey: wrap32.clone(),
+            };
+            let sig = NodeKeySignature {
+                sig_kind: SigKind::Rotation,
+                pubkey: wrap32.clone(),
+                key_id: Vec::new(),
+                signature: rot_sig64.clone(),
+                nested: Some(alloc::boxed::Box::new(nested)),
+                wrapping_pubkey: Vec::new(),
+            };
+            let full = sig.to_cbor(true).to_vec();
+            let expected_full = unhex(
+                "a40102025820101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f04584055565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939405a50101025820a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf035820000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f045840f0f1f2f3f4f5f6f7f8f9fafbfcfdfeffe0e1e2e3e4e5e6e7e8e9eaebecedeeefd0d1d2d3d4d5d6d7d8d9dadbdcdddedfc0c1c2c3c4c5c6c7c8c9cacbcccdcecf065820101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f",
+            );
+            assert_eq!(
+                full,
+                expected_full,
+                "GOLDEN 3 (Rotation) full CBOR diverged from Go tka v1.100.0. actual: {}",
+                hex(&full)
+            );
+            let expected_hash =
+                unhex("fac0a5a6781bb945369c28a0b3d3eea04e1648b60ec1a990a1ff68a9a566e6a7");
+            assert_eq!(
+                sig.sig_hash().as_slice(),
+                expected_hash.as_slice(),
+                "GOLDEN 3 (Rotation) sig_hash diverged from Go tka v1.100.0. actual: {}",
+                hex(&sig.sig_hash())
+            );
+        }
+    }
+
+    /// Cross-bind the dual Ed25519 verifier accept/reject matrix to the verdicts produced by the
+    /// REAL Go implementations on the adversarial speccheck set (see [`SPECCHECK_VECTORS`]).
+    ///
+    /// Provenance of the Go verdicts: Go `crypto/ed25519.Verify` (standard, cofactorless) and
+    /// `github.com/hdevalence/ed25519consensus v0.2.0` (ZIP-215, cofactored), toolchain
+    /// **go1.26.4**, driven by the generator under `tests/vectors/gen/zip215`. These are the SAME
+    /// verdicts the pinned Rust crates produce — proving `ed25519-dalek 2.x` == Go-std and
+    /// `ed25519-zebra 4.x` == Go-`ed25519consensus` on the adversarial set. The arrays below MUST
+    /// therefore equal `STD_EXPECT` / `ZIP215_EXPECT` asserted in
+    /// `ed25519_speccheck_dual_verifier_kat`; this test additionally pins them to Go's behavior.
+    ///
+    /// NOTE: [`SPECCHECK_VECTORS`] is duplicated (byte-for-byte) in the Go generator at
+    /// `tests/vectors/gen/zip215/main.go`. Both copies derive from the same upstream
+    /// `cases.json` commit; if you edit one you MUST edit the other, or this proof would compare
+    /// inputs the Go verdicts were never computed over.
+    #[test]
+    fn ed25519_dual_verifier_matches_go_verdicts() {
+        //                                  0    1    2    3    4    5    6    7    8    9   10   11
+        const GO_STD_ACCEPT: [bool; 12] = [
+            true, true, true, true, false, false, false, false, false, false, false, true,
+        ];
+        const GO_ZIP215_ACCEPT: [bool; 12] = [
+            true, true, true, true, true, true, false, false, false, true, true, true,
+        ];
+
+        for (i, (msg_hex, pk_hex, sig_hex)) in SPECCHECK_VECTORS.iter().enumerate() {
+            let msg = unhex(msg_hex);
+            let pk = unhex(pk_hex);
+            let sig = unhex(sig_hex);
+
+            let std_ok = verify_ed25519_std(&pk, &msg, &sig).is_ok();
+            let zip_ok = verify_ed25519_zip215(&pk, &msg, &sig).is_ok();
+
+            assert_eq!(
+                std_ok, GO_STD_ACCEPT[i],
+                "vector {i}: Rust verify_ed25519_std accept={std_ok} disagrees with Go \
+                 crypto/ed25519.Verify={}",
+                GO_STD_ACCEPT[i]
+            );
+            assert_eq!(
+                zip_ok, GO_ZIP215_ACCEPT[i],
+                "vector {i}: Rust verify_ed25519_zip215 accept={zip_ok} disagrees with Go \
+                 ed25519consensus.Verify={}",
+                GO_ZIP215_ACCEPT[i]
+            );
+        }
+    }
 }

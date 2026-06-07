@@ -325,6 +325,86 @@ mod tests {
         assert_eq!(&pt, plaintext);
     }
 
+    /// Cross-implementation Known-Answer-Test against real Go ciphertext.
+    ///
+    /// Vectors generated with Go `golang.org/x/crypto/chacha20poly1305` v0.52.0, go1.26.4;
+    /// generator `tests/vectors/gen/aead`. Proves the big-endian transport nonce matches Go
+    /// `control/controlbase` (which does `binary.BigEndian.PutUint64(nonce[4:], counter)`).
+    #[test]
+    fn be_aead_matches_go_kat() {
+        fn unhex(s: &str) -> Vec<u8> {
+            assert!(
+                s.len().is_multiple_of(2),
+                "hex string must have even length"
+            );
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex"))
+                .collect()
+        }
+
+        struct Vector {
+            key: &'static str,
+            counter: u64,
+            ad: &'static str,
+            pt: &'static str,
+            ct: &'static str,
+        }
+
+        let vectors = [
+            Vector {
+                key: "4242424242424242424242424242424242424242424242424242424242424242",
+                counter: 7,
+                ad: "0102030405060708",
+                pt: "68656c6c6f20776972654b4154",
+                ct: "7b0294364fe1db3a5103032cdafb17a16a78348e953af8d63604bc1c13",
+            },
+            Vector {
+                key: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+                counter: 0,
+                ad: "",
+                pt: "",
+                ct: "10324f800a160bd9a1794255be7ec29d",
+            },
+            Vector {
+                key: "ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00",
+                counter: 0xdead_beef_cafe_1234,
+                ad: "74732d636f6e74726f6c",
+                pt: "54686520717569636b2062726f776e20666f78206a756d7073206f76657220746865206c617a7920646f672e",
+                ct: "e900e29d1fef158b66dd67d574e1d2a33f6b4fa944df63796cf805a59773b5f460000021305cf53b6c18ab89f504bb83b8843a277346639e9e6c51ef",
+            },
+        ];
+
+        for (i, v) in vectors.iter().enumerate() {
+            let key_bytes: [u8; 32] = unhex(v.key).try_into().expect("32-byte key");
+            let ad = unhex(v.ad);
+            let pt = unhex(v.pt);
+            let expected_ct = unhex(v.ct);
+
+            // Byte-exact Go-interop assertion: our ciphertext+tag must equal Go's bytes.
+            let mut out = alloc_zeroed(pt.len() + 16);
+            C::encrypt(&key(key_bytes), v.counter, &ad, &pt, &mut out);
+            assert_eq!(
+                out,
+                expected_ct,
+                "vector {i}: ciphertext must match Go output. actual: {}",
+                hex(&out)
+            );
+
+            // Round-trip: decrypt Go's ciphertext back to the plaintext.
+            let mut recovered = alloc_zeroed(pt.len());
+            C::decrypt(
+                &key(key_bytes),
+                v.counter,
+                &ad,
+                &expected_ct,
+                &mut recovered,
+            )
+            .expect("Go ciphertext must decrypt");
+            assert_eq!(recovered, pt, "vector {i}: round-trip plaintext mismatch");
+        }
+    }
+
     fn alloc_zeroed(len: usize) -> Vec<u8> {
         vec![0u8; len]
     }

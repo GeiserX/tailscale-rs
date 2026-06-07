@@ -382,7 +382,77 @@ change; (4) defer hybrid-Noise and ML-DSA-TKA — track, don't build. Pragmatic,
 
 ---
 
-## 9. Open risks (tracked as beads)
+## 8a. Interop test vectors
+
+The proofs of §4 buy the cryptographic theorems **only if the wire bytes match Go exactly** (the
+load-bearing caveat). Self-consistent Rust round-trips cannot catch a divergence from Go — they
+would happily agree with themselves on a wrong byte. **tsr-19k** therefore pins Go-sourced
+known-answer vectors over the three hand-rolled surfaces; a divergence fails closed (denied auth /
+failed handshake / consensus split) but still breaks real interop, so these are the silent-wire-
+incompatibility guard. The vectors live in [`../tests/vectors/`](../tests/vectors/); full provenance
+and regeneration are documented in [`../tests/vectors/VENDOR.md`](../tests/vectors/VENDOR.md).
+
+```mermaid
+flowchart LR
+    REF["Go reference libs<br/>tailscale.com v1.100.0<br/>x/crypto v0.52.0<br/>ed25519consensus v0.2.0"]
+    GEN["Go generator<br/>(go1.26.4)"]
+    JSON["committed JSON vector"]
+    KAT["Rust KAT<br/>byte-for-byte assert"]
+    CI["CI gate (tsr-19k)"]
+    REF --> GEN --> JSON --> KAT --> CI
+```
+
+### 8a.1 The three asserted surfaces
+
+- **Control-plane big-endian-nonce AEAD (TS2021).** The forked `ChaCha20Poly1305BigEndian` (§2.2)
+  must produce Go's ciphertext + Poly1305 tag for fixed `(key, counter, ad, pt)` inputs, including a
+  high counter that exercises the full `to_be_bytes` width. This is the byte-for-byte check that the
+  4-character endianness fork matches `binary.BigEndian.PutUint64` — the difference between a
+  control handshake that completes and one that silently never does.
+- **WireGuard `Noise_IKpsk2` transport + handshake transport keys.** Two checks against `ts_tunnel`
+  (§2.1): a little-endian transport-nonce KAT (matching Go ciphertexts across counters), and a full
+  handshake transcript driven with **fixed** initiator/responder statics, ephemerals, psk, and
+  timestamp through the real `HandshakeState` mix sequence — asserting the derived **send/recv
+  transport keys** from `Split()`. An independent Go reimplementation of wireguard-go's construction
+  agrees on those keys byte-for-byte; two implementations of the same KDF/DH/AEAD schedule converging
+  is the cross-impl proof. Fixing the ephemerals makes the otherwise-randomized handshake
+  reproducible so the derived keys are a stable golden.
+- **TKA CTAP2-CBOR + SigHash + dual Ed25519 verifier split.** Three checks against `ts_tka`
+  (§2.5, §5): the CTAP2-canonical CBOR encoding of each `NodeKeySignature` kind (Direct / Credential
+  / Rotation-nesting-Direct) must byte-match Go's `fxamacker/cbor` CTAP2 output; `BLAKE2s-256` over
+  those bytes must equal Go's SigHash; and the **12 `ed25519-speccheck` vectors** must reproduce both
+  verdict columns — `ed25519-dalek` ≡ Go `crypto/ed25519` (standard) and `ed25519-zebra` ≡ Go
+  `ed25519consensus` (ZIP-215) — proving the dispatch asymmetry of §5.1 matches Go on the
+  discriminating cases.
+
+### 8a.2 Provenance
+
+All vectors derive from **real Go libraries**, not hand-transcribed constants: `tailscale.com`
+**v1.100.0** (the shipping TKA package — source of the CBOR/SigHash golden),
+`golang.org/x/crypto` **v0.52.0** (`chacha20poly1305`, `blake2s`, `curve25519`), and
+`github.com/hdevalence/ed25519consensus` **v0.2.0** (the ZIP-215 verifier TKA uses), built with
+`go1.26.4`. The speccheck inputs are `novifinancial/ed25519-speccheck` at a pinned commit. See
+[`../tests/vectors/VENDOR.md`](../tests/vectors/VENDOR.md) for the exact versions, the speccheck
+commit hash, and the regeneration commands — and for the rule that a non-empty diff after a
+Go-Tailscale rebase must be investigated before the committed vectors are updated.
+
+### 8a.3 The key-confirmation conformance test
+
+The WireGuard transcript vector is not only an interop KAT — it backs the **key-confirmation**
+conformance requirement of §2.1 and §4.
+
+> **Key-confirmation property (Dowling & Paterson, IACR ePrint 2018/080, Thm 1, §3.1).** The bare
+> WireGuard 1-RTT handshake gives the **responder no key confirmation**: completing the two
+> handshake messages alone does not prove the initiator is live, and signaling "established" at that
+> point is exactly the KCI / forward-secrecy key-recovery hole (§5.1). The responder must hold the
+> session **PROVISIONAL after `ResponderHello`** and treat the peer as authenticated — and allow
+> itself to originate data — **only on successfully decrypting the first inbound transport
+> message**. `ts_tunnel` enforces this: the responder keeps a **tentative session** after sending
+> its handshake reply and **promotes it to live only after the first AEAD-verifying inbound
+> transport packet**. The transcript vector's derived transport keys let the conformance test feed
+> exactly that first packet and assert the promotion happens then, and not before (tsr-19k).
+
+
 
 | Bead | Title | Severity | Summary |
 |---|---|---|---|

@@ -248,6 +248,79 @@ mod tests {
     use super::*;
     use crate::messages::Message;
 
+    fn unhex(s: &str) -> Vec<u8> {
+        assert!(s.len().is_multiple_of(2), "odd hex length");
+        (0..s.len() / 2)
+            .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).expect("valid hex"))
+            .collect()
+    }
+
+    /// Cross-implementation KAT: the WireGuard transport-data frame uses ChaCha20Poly1305 with a
+    /// 12-byte nonce of `[0,0,0,0] || counter.to_le_bytes()` (LITTLE-endian — the counterpart of
+    /// the control-plane BIG-endian nonce) and empty AAD. These reference ciphertexts come from
+    /// Go `golang.org/x/crypto/chacha20poly1305` v0.52.0 (go1.26.4); generator
+    /// `tests/vectors/gen/wg`. Proves our zerocopy `Nonce {_zero: U32, counter: U64(LE)}` packing
+    /// is byte-identical to wireguard-go's transport nonce, so a peer running Go can decrypt our
+    /// transport frames (and vice-versa). A divergence here fails closed (AEAD auth failure) but
+    /// silently breaks data-plane interop.
+    #[test]
+    fn transport_nonce_matches_go_kat() {
+        // (key_hex, counter, pt_hex, expected ciphertext||tag hex), empty AAD.
+        const VECTORS: &[(&str, u64, &str, &str)] = &[
+            (
+                "1111111111111111111111111111111111111111111111111111111111111111",
+                0,
+                "78797a7a79",
+                "ddc5edec00deab2e13b1c722647aba8e9bd1d6574e",
+            ),
+            (
+                "1111111111111111111111111111111111111111111111111111111111111111",
+                1,
+                "706c6f766572",
+                "a148eec08017563c51a807ab84fa67a6071a0aaf8a91",
+            ),
+            (
+                "1111111111111111111111111111111111111111111111111111111111111111",
+                0x0102030405060708,
+                "deadbeef",
+                "6adef61326b21fac9641232622ec6e35c845e0e2",
+            ),
+        ];
+
+        for (i, (key_hex, counter, pt_hex, ct_hex)) in VECTORS.iter().enumerate() {
+            let key_bytes: [u8; 32] = unhex(key_hex).try_into().expect("32-byte key");
+            let pt = unhex(pt_hex);
+            let expected = unhex(ct_hex);
+
+            // Build a TransmitSession whose first emitted nonce equals `counter` by pre-advancing
+            // the generator. `batch(n)` consumes n consecutive nonces starting at the current
+            // value, so reserving `counter` of them leaves the next packet on `counter`.
+            let session =
+                TransmitSession::new(key_bytes.into(), SessionId::from(0), Instant::now());
+            let _ = session.nonce.batch(*counter as usize);
+
+            let mut pkt = [PacketMut::from(pt.as_slice())];
+            session.encrypt(&mut pkt);
+
+            // After encrypt: packet = TransportDataHeader(16) || ciphertext || tag(16).
+            let hdr_len = size_of::<TransportDataHeader>();
+            let (header, body) = pkt[0].as_ref().split_at(hdr_len);
+
+            // Sanity: the header carries the LE counter we expect.
+            let parsed = TransportDataHeader::try_ref_from_prefix(header).unwrap().0;
+            assert_eq!(
+                u64::from(parsed.nonce),
+                *counter,
+                "vector {i}: header nonce mismatch"
+            );
+
+            assert_eq!(
+                body, expected,
+                "vector {i}: ciphertext||tag diverges from Go reference"
+            );
+        }
+    }
+
     #[test]
     fn test_session() {
         let k: [u8; 32] = rand::random();

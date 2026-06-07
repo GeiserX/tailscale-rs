@@ -6,6 +6,36 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.60](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.60) - 2026-06-07
+
+Cross-implementation interop proofs from the crypto audit (tsr-19k). The hand-rolled crypto was
+previously validated only by self-consistent round-trips, which cannot catch a wire-incompatibility
+with Go Tailscale. This release pins **Go-sourced known-answer vectors** over every hand-rolled
+surface; a divergence fails closed (denied auth / failed handshake / consensus split) but still
+breaks real interop, so these are the silent-wire-incompatibility guard.
+
+- **Control-plane big-endian-nonce AEAD KAT** (`ts_control_noise`): the `ChaCha20Poly1305BigEndian`
+  fork now has a byte-for-byte KAT against Go `golang.org/x/crypto/chacha20poly1305`, including a
+  high counter that exercises the full `to_be_bytes` width — proving the 4-character endianness edit
+  matches Go's `binary.BigEndian.PutUint64`.
+- **WireGuard transport + handshake KATs** (`ts_tunnel`): a little-endian transport-nonce KAT vs Go
+  ciphertexts, plus a fixed-ephemeral `Noise_IKpsk2` handshake transcript whose derived send/recv
+  transport keys match an independent Go reimplementation of wireguard-go's construction
+  byte-for-byte.
+- **Key-confirmation conformance** (`ts_tunnel`): a test pins the Dowling–Paterson (IACR 2018/080,
+  Thm 1) property — the responder stays **provisional** after `ResponderHello` and is promoted to
+  live **only** after the first AEAD-verifying inbound transport packet, never on handshake
+  completion alone.
+- **TKA CBOR / SigHash golden + dual-verifier cross-bind** (`ts_tka`): the `NodeKeySignature`
+  CTAP2-CBOR encoding and `BLAKE2s-256` SigHash now byte-match the **real `tailscale.com/tka`
+  v1.100.0** package for Direct / Credential / Rotation kinds, and the Ed25519 dual-verifier
+  accept/reject matrix is cross-bound to Go `crypto/ed25519` + `ed25519consensus` verdicts on the
+  12 `ed25519-speccheck` vectors.
+- **Vectors are committed** under [`tests/vectors/`](tests/vectors/) with the Go generators in
+  `tests/vectors/gen/` and full provenance (toolchain + module versions + regen commands) in
+  [`tests/vectors/VENDOR.md`](tests/vectors/VENDOR.md). Documented in
+  [`docs/CRYPTOGRAPHY.md`](docs/CRYPTOGRAPHY.md) §8a.
+
 ## [0.5.59](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.59) - 2026-06-07
 
 Crypto-hardening from the audit beads (tsr-9nu, tsr-quk):
