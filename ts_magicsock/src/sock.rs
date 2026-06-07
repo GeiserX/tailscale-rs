@@ -92,7 +92,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 ///   make us learn (and then host-probe) attacker-chosen candidate endpoints.
 ///
 /// A live read of the netmap-owning layer, so revocations take effect immediately. Used by
-/// [`MagicSock::handle_disco`] / [`MagicSock::handle_relayed_call_me_maybe`] to fail closed. See
+/// `MagicSock::handle_disco` / [`MagicSock::handle_relayed_call_me_maybe`] to fail closed. See
 /// [`MagicSock::with_binding_verifier`].
 pub type BindingVerifier =
     Arc<dyn Fn(&DiscoPublicKey, Option<&NodePublicKey>) -> bool + Send + Sync>;
@@ -204,7 +204,7 @@ impl MagicSock {
     ///
     /// Wired from `ts_runtime::Env::enable_ipv6`. With the default `false` the disco-candidate
     /// filter keeps its exact historical IPv4-only behavior; with `true` it additionally accepts
-    /// IPv6 candidates that are valid global unicast addresses (see [`is_pingable_candidate`]).
+    /// IPv6 candidates that are valid global unicast addresses (see `is_pingable_candidate`).
     /// Builder-style so the `bind` call site stays a single expression. Governs *only* the disco
     /// candidate filter — never the underlay bind or the exit egress path.
     pub fn with_enable_ipv6(mut self, enable_ipv6: bool) -> Self {
@@ -303,7 +303,7 @@ impl MagicSock {
     ///
     /// When `enable_ipv6` is set, the host's real global-unicast IPv6 interface addresses are also
     /// enumerated and advertised as [`SelfEndpointType::Local`] candidates (each paired with the
-    /// bound socket's port), filtered through the same [`is_pingable_candidate`] rules a peer
+    /// bound socket's port), filtered through the same `is_pingable_candidate` rules a peer
     /// applies — without this, a dual-stack `[::]:0` bind only ever yields the undialable
     /// unspecified `[::]:port`. With the default `enable_ipv6 == false` no IPv6 local candidate is
     /// emitted and the result is byte-for-byte the prior IPv4-only set.
@@ -718,11 +718,11 @@ impl MagicSock {
     /// Handle a disco frame relayed to us over DERP (not received on the UDP socket).
     ///
     /// A DERP-relayed frame has **no real UDP source address**, so it must never reach the parts
-    /// of [`MagicSock::handle_disco`] that pong (a Ping reply) or learn a source address from
+    /// of `MagicSock::handle_disco` that pong (a Ping reply) or learn a source address from
     /// `from` — doing so would emit a host-sourced probe to a bogus/unsanitized address. We
     /// therefore decode the frame and act on **only** [`Inbound::CallMeMaybe`], whose handling is
     /// purely `add_peer_endpoints` (peer-supplied candidate endpoints, each sanitized by
-    /// [`is_pingable_candidate`] before it can become a ping target). Relayed Pings and Pongs are
+    /// `is_pingable_candidate` before it can become a ping target). Relayed Pings and Pongs are
     /// dropped: a Ping would require a pong to a non-existent source, and a Pong has no meaning
     /// without a matching ping we sent on this path.
     ///
@@ -735,7 +735,7 @@ impl MagicSock {
     /// "is this disco key a current netmap peer?". This closes an amplification/poisoning vector —
     /// without it, anyone who learns a victim disco key could relay a CallMeMaybe over DERP and
     /// steer the victim's host socket to disco-ping attacker-chosen public addresses every cadence.
-    /// With no verifier installed we fail closed (drop), mirroring [`MagicSock::handle_disco`].
+    /// With no verifier installed we fail closed (drop), mirroring `MagicSock::handle_disco`.
     pub fn handle_relayed_call_me_maybe(&self, frame: &mut [u8]) -> bool {
         match disco::open(&self.our_disco, frame) {
             Ok(Inbound::CallMeMaybe { sender, endpoints }) => {
@@ -834,15 +834,15 @@ impl MagicSock {
     /// Leak-safe by construction: the request is emitted from the single bound socket — never a
     /// second socket and never IPv6 — so the reflexive address the response reports is the mapping
     /// of the only egress path. A non-IPv4 `server` is refused (debug log + `Ok` no-op), mirroring
-    /// the IPv4-only check in [`MagicSock::is_pingable_candidate`]; the underlay is IPv4-only in
+    /// the IPv4-only check in `MagicSock::is_pingable_candidate`; the underlay is IPv4-only in
     /// this deployment, so an IPv6 STUN server can only be noise or a leak attempt.
     ///
     /// STUN stays IPv4-only even when the IPv6 candidate gate is enabled: IPv6 reflexive discovery
     /// is out of scope. Globally-routable IPv6 GUA candidates need no STUN — they arrive from
     /// local-address enumeration and peer `CallMeMaybe` advertisements, not from a STUN exchange.
     ///
-    /// Before recording the transaction we prune transactions older than [`STUN_TX_TTL`]; if the
-    /// in-flight set is still at [`MAX_STUN_IN_FLIGHT`] we drop this request fail-safe (return
+    /// Before recording the transaction we prune transactions older than `STUN_TX_TTL`; if the
+    /// in-flight set is still at `MAX_STUN_IN_FLIGHT` we drop this request fail-safe (return
     /// `Ok`) rather than evict a live transaction.
     pub async fn send_stun_request(&self, server: SocketAddr) -> Result<(), Error> {
         if !matches!(server.ip(), IpAddr::V4(_)) {

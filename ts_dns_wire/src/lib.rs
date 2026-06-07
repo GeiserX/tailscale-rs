@@ -350,7 +350,7 @@ fn encode_answer(out: &mut Vec<u8>, ans: &RData) {
 /// TTL of 600 seconds.
 ///
 /// The encoded datagram is capped at the classic 512-byte UDP limit
-/// ([`MAX_UDP_MSG_LEN`]); this fork does not implement EDNS(0). If the full
+/// (`MAX_UDP_MSG_LEN`); this fork does not implement EDNS(0). If the full
 /// answer set would overflow that limit, the overflowing answers are dropped
 /// and the TC (truncation) bit is set in the header, so the result is always
 /// `<= 512` bytes and never an oversized datagram.

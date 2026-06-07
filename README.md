@@ -1,9 +1,6 @@
 # tailscale-rs
 
-[![docs.rs](https://img.shields.io/docsrs/tailscale)](https://docs.rs/tailscale)
-[![crates.io version](https://img.shields.io/crates/v/tailscale)](https://crates.io/crates/tailscale)
-
-https://tailscale.com
+A fork of [tailscale/tailscale-rs](https://github.com/tailscale/tailscale-rs).
 
 `tailscale-rs` is a work-in-progress Tailscale library written in Rust, with language bindings to
 C, Elixir, and Python.
@@ -118,7 +115,7 @@ We support the following platforms and architectures:
 ## Status
 
 `tailscale-rs` is a work-in-progress - we're still rapidly iterating, fixing bugs, and adding new
-features. We aim to keep this section up-to-date, but our [issue tracker](https://github.com/tailscale/tailscale-rs/issues)
+features. We aim to keep this section up-to-date, but our [issue tracker](https://github.com/GeiserX/tailscale-rs/issues)
 is the best way to see the latest updates.
 
 ### Implemented

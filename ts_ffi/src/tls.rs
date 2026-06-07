@@ -142,7 +142,7 @@ pub enum service_mode {
 ///
 /// On success returns a [`tcp_listener`] handle bound on the service VIP and `port` over the overlay
 /// netstack (never a host socket); accept connections with
-/// [`ts_tcp_accept`](crate::ts_tcp_accept) and free it with
+/// `ts_tcp_accept` and free it with
 /// [`ts_tcp_close_listener`](crate::ts_tcp_close_listener). Returns null on error.
 ///
 /// # Safety

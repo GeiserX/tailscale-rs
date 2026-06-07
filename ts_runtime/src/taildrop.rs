@@ -1,7 +1,7 @@
 //! Taildrop file store — the receiving half of Tailscale's peer-to-peer file transfer.
 //!
 //! A peer sends a file to this node via the peerAPI route `PUT /v0/put/<name>` (handled in
-//! [`crate::peerapi`]). This module owns the on-disk store those puts land in, faithfully mirroring
+//! `peerapi`). This module owns the on-disk store those puts land in, faithfully mirroring
 //! Go's `taildrop.manager`:
 //!
 //! - Incoming bytes are written to a per-transfer **partial** file (`<base>.partial`) so an
@@ -9,14 +9,14 @@
 //!   from an offset.
 //! - On successful completion the partial is **atomically renamed** to the final base name. If the
 //!   final name already exists, a non-clobbering ` (n)` suffix is chosen (Go `nextFilename`).
-//! - File names are strictly validated ([`validate_base_name`]) to defeat path traversal and
+//! - File names are strictly validated ([`validate_base_name`](crate::taildrop::validate_base_name)) to defeat path traversal and
 //!   reserved-suffix abuse before any path is constructed — this is the security boundary.
 //!
 //! # Anti-abuse / safety
 //!
 //! Every name is validated to be a single, local, non-traversing path component before it touches
 //! the filesystem; a name containing `/`, `\`, `..`, a NUL, control chars, or the reserved
-//! `.partial` / `.deleted` suffixes is rejected with [`TaildropError::InvalidFileName`]. The store
+//! `.partial` / `.deleted` suffixes is rejected with [`TaildropError::InvalidFileName`](crate::taildrop::TaildropError::InvalidFileName). The store
 //! root is fixed at construction; all I/O is confined to it by joining only validated base names.
 
 use std::{

@@ -1,6 +1,6 @@
 //! Taildrop file *sender* — the client half of Tailscale's peer-to-peer file transfer.
 //!
-//! Where [`crate::taildrop`] + [`crate::peerapi`] implement the *receiving* half (a peer pushes a
+//! Where [`crate::taildrop`] + `peerapi` implement the *receiving* half (a peer pushes a
 //! file to this node and it lands in the on-disk store), this module implements the *sending* half:
 //! pushing a local file to a peer over the overlay peerAPI as `PUT /v0/put/<name>`, faithfully
 //! mirroring Go's wire sender.
@@ -13,14 +13,14 @@
 //! lacks the file-send capability. We always send **from offset 0** — the Range/resume GET that Go
 //! uses as an optimization to skip already-received bytes is deliberately omitted; a fresh full PUT
 //! is always correct. The name is percent-escaped exactly like Go `url.PathEscape` (see
-//! [`path_escape`]), the encoder counterpart to the receiver's `percent_decode`.
+//! `path_escape`), the encoder counterpart to the receiver's `percent_decode`.
 //!
 //! ## Anti-leak
 //!
 //! ALL traffic rides the overlay netstack `channel` (`channel.tcp_connect`), so it travels the
 //! encrypted WireGuard tunnel to the peer — **never a host socket**. IPv4-only: the local bind and
 //! the destination are tailnet IPv4 addresses. This is the same discipline the DoH client
-//! ([`crate::peerapi_doh`]) follows, mirrored here.
+//! (`peerapi_doh`) follows, mirrored here.
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
@@ -96,7 +96,7 @@ impl std::error::Error for TaildropSendError {}
 /// Percent-escape a path segment exactly like Go `url.PathEscape`: unreserved bytes
 /// (`A-Z a-z 0-9 - _ . ~`) pass through verbatim; every other byte is encoded as `%XX` with
 /// uppercase hex. This is the encoder counterpart to the receiver's `percent_decode` (in
-/// [`crate::peerapi`]), so `percent_decode(path_escape(x)) == x` holds. Hand-rolled, no new deps.
+/// `peerapi`), so `percent_decode(path_escape(x)) == x` holds. Hand-rolled, no new deps.
 pub(crate) fn path_escape(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for &b in name.as_bytes() {
@@ -157,7 +157,7 @@ fn parse_status_line(head: &[u8]) -> Option<u16> {
 /// reject an unsafe name anyway, so we fail fast — then percent-escaped into the request path. The
 /// body is streamed to EOF (we trust the caller's declared `content_length`, like Go's
 /// `DeclaredSize`, and do not enforce that the read byte count matches it). Only the response status
-/// line is inspected ([`classify_status`]); the body is ignored.
+/// line is inspected (`classify_status`); the body is ignored.
 ///
 /// Anti-leak: the connection is dialed over `channel`, so it rides the encrypted overlay — never a
 /// host socket.

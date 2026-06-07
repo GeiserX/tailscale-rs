@@ -13,10 +13,10 @@
 //! that stream with its own `*.ts.net` certificate (the Funnel hostname *is* the node's MagicDNS
 //! name) and serves the decrypted stream.
 //!
-//! This module is the node-side half: the [`FunnelManager`] holds the node's [`TlsAcceptor`] and an
-//! [`mpsc::Sender`] sink ([`FunnelIngressSink`]) the peerAPI `/v0/ingress` handler pushes hijacked
+//! This module is the node-side half: the [`FunnelManager`](crate::funnel::FunnelManager) holds the node's `TlsAcceptor` and an
+//! `mpsc::Sender` sink ([`FunnelIngressSink`](crate::funnel::FunnelIngressSink)) the peerAPI `/v0/ingress` handler pushes hijacked
 //! raw streams to. A spawned pump task TLS-terminates each raw stream and yields the decrypted
-//! [`FunnelAccepted`] over a [`FunnelAcceptedReceiver`] the embedder holds (the in-process stand-in
+//! [`FunnelAccepted`](crate::funnel::FunnelAccepted) over a [`FunnelAcceptedReceiver`](crate::funnel::FunnelAcceptedReceiver) the embedder holds (the in-process stand-in
 //! for Go `tsnet`'s `ListenFunnel`-returned `net.Listener`).
 //!
 //! The relay + DNS legs are **Tailscale infrastructure** — present against real Tailscale SaaS (with
@@ -26,7 +26,7 @@
 //! ## Anti-leak
 //!
 //! The hijacked ingress stream arrives on the **overlay** peerAPI listener (the netstack
-//! [`OverlayStream`], never a host socket). TLS is terminated on that overlay stream and the
+//! `OverlayStream`, never a host socket). TLS is terminated on that overlay stream and the
 //! decrypted stream is handed to the embedder. Nothing here ever dials a host socket and nothing
 //! routes through the `ts_forwarder` exit-egress path — Funnel ingress is purely inbound overlay
 //! traffic, structurally separate from the exit-node anti-leak chokepoint. There is no plaintext
@@ -68,7 +68,7 @@ pub struct IngressConn {
 }
 
 /// The sink the peerAPI `/v0/ingress` handler pushes hijacked [`IngressConn`]s to. Cloneable; an
-/// [`mpsc::Sender`] so the handler back-pressures (and then drops, fail-closed) when the pump can't
+/// `mpsc::Sender` so the handler back-pressures (and then drops, fail-closed) when the pump can't
 /// keep up. Installed into the peerAPI server via the shared slot (see [`FunnelIngressSlot`]) when
 /// the embedder calls `Device::listen_funnel`.
 pub type FunnelIngressSink = mpsc::Sender<IngressConn>;
@@ -97,12 +97,12 @@ pub struct FunnelAccepted {
 }
 
 /// Receiver side of the Funnel ingress hand-back channel (mirrors a `net.Listener`'s accept queue).
-/// [`Device::listen_funnel`] returns one; await [`recv`](mpsc::Receiver::recv) to take the next
+/// `Device::listen_funnel` returns one; await [`recv`](mpsc::Receiver::recv) to take the next
 /// TLS-terminated public connection. Dropping it (or dropping the [`FunnelManager`]) tears the
 /// listener down.
 pub type FunnelAcceptedReceiver = mpsc::Receiver<FunnelAccepted>;
 
-/// Owns the node's Funnel ingress data path: the [`TlsAcceptor`] built from the node's `*.ts.net`
+/// Owns the node's Funnel ingress data path: the `TlsAcceptor` built from the node's `*.ts.net`
 /// cert and the pump task that TLS-terminates each hijacked [`IngressConn`].
 ///
 /// Built by `Device::listen_funnel` after the [`funnel_access`](ts_control::funnel_access) gate and

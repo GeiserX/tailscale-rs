@@ -9,7 +9,7 @@
 //!   Go's `fxamacker/cbor` (CTAP2 mode) output.
 //! - [`AumHash`]: a BLAKE2s-256 hash with RFC4648 base32 (no padding) text encoding — the type
 //!   `TkaInfo.head` carries on the wire.
-//! - [`Aum`] / [`AumKind`] / [`Key`] / [`NodeKeySignature`]: the wire types, with canonical
+//! - [`AumHash`] / [`AumKind`] / [`Key`] / [`NodeKeySignature`]: the wire types, with canonical
 //!   serialization + signing-digest helpers.
 //! - [`Authority`]: holds the current trusted-key [`State`] and exposes
 //!   [`Authority::node_key_authorized`], the check that a peer's node key is signed by a key trusted
@@ -69,7 +69,8 @@ impl AumHash {
     }
 }
 
-/// The kind of an [`Aum`] (Go `AUMKind`; integer values are wire-stable, do not reorder).
+/// The kind of an AUM (Authority Update Message) (Go `AUMKind`; integer values are wire-stable, do
+/// not reorder).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum AumKind {
@@ -112,7 +113,7 @@ pub enum KeyKind {
 }
 
 /// A trusted TKA key (Go `tka.Key`). Its [`Key::id`] (the 32-byte public key for Ed25519) is what an
-/// [`Aum`] / [`NodeKeySignature`] references via `KeyID`.
+/// [`AumHash`] / [`NodeKeySignature`] references via `KeyID`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Key {
     /// Key algorithm.
@@ -175,35 +176,24 @@ pub struct NodeKeySignature {
 }
 
 /// Errors from TKA verification.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum TkaError {
     /// The CBOR blob could not be decoded into the expected shape.
+    #[error("TKA decode error: {0}")]
     Decode(&'static str),
     /// A signature failed to verify cryptographically.
+    #[error("TKA signature verification failed")]
     BadSignature,
     /// The authorizing key is not trusted in the current authority state.
+    #[error("TKA authorizing key is not trusted")]
     UntrustedKey,
     /// A credential signature was presented where a node-authorizing signature was required.
+    #[error("a credential signature cannot authorize a node")]
     CredentialCannotAuthorize,
     /// The presented signature does not cover the given node key.
+    #[error("signature does not cover this node key")]
     NodeKeyMismatch,
 }
-
-impl core::fmt::Display for TkaError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            TkaError::Decode(s) => write!(f, "TKA decode error: {s}"),
-            TkaError::BadSignature => write!(f, "TKA signature verification failed"),
-            TkaError::UntrustedKey => write!(f, "TKA authorizing key is not trusted"),
-            TkaError::CredentialCannotAuthorize => {
-                write!(f, "a credential signature cannot authorize a node")
-            }
-            TkaError::NodeKeyMismatch => write!(f, "signature does not cover this node key"),
-        }
-    }
-}
-
-impl core::error::Error for TkaError {}
 
 impl NodeKeySignature {
     /// The canonical CBOR serialization of this signature with the `Signature` field nil'd, used as
@@ -351,6 +341,14 @@ impl Authority {
     ///
     /// Fail-closed: a credential-only signature, an untrusted authorizing key, a malformed blob, or
     /// a bad signature all return `Err`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TkaError::Decode`] if `signature_cbor` is malformed,
+    /// [`TkaError::CredentialCannotAuthorize`] for a credential-only signature,
+    /// [`TkaError::UntrustedKey`] if the authorizing key is not in the current state,
+    /// [`TkaError::NodeKeyMismatch`] if the signature does not cover `node_key`, or
+    /// [`TkaError::BadSignature`] if cryptographic verification fails.
     pub fn node_key_authorized(
         &self,
         node_key: &[u8],

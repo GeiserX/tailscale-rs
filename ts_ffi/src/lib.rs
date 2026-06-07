@@ -371,7 +371,7 @@ pub unsafe extern "C" fn ts_ping(
 }
 
 /// Free a C string previously allocated and returned by this library (e.g. by [`ts_metrics`],
-/// [`ts_fetch_id_token`], [`ts_tka_status`], or [`ts_taildrop_waiting_files`](taildrop::ts_taildrop_waiting_files)).
+/// [`ts_fetch_id_token`], [`ts_tka_status`], or `ts_taildrop_waiting_files`).
 ///
 /// Passing `NULL` is a no-op. Each returned string must be freed at most once, and only with this
 /// function — do not call the C library `free` on it.

@@ -1,7 +1,7 @@
 //! Fallback TCP handler registry (`tsnet.Server.RegisterFallbackTCPHandler` parity).
 //!
 //! Go `tsnet` lets an embedder register a callback consulted for every inbound TCP flow that
-//! matches **no** explicit [`Listener`]. The callback inspects the `(src, dst)` tuple and either
+//! matches **no** explicit `Listener`. The callback inspects the `(src, dst)` tuple and either
 //! declines (`intercept = false`, try the next handler) or claims the flow (`intercept = true`),
 //! optionally returning a per-connection handler. This module is the faithful equivalent on the
 //! **application** netstack.
@@ -10,7 +10,7 @@
 //!
 //! smoltcp RSTs an inbound SYN to a port with no matching listener *inside* its ingress loop,
 //! before any of our code runs. The single lever it gives us is the same one
-//! [`ts_forwarder::all_port`] uses: a `raw` `(Ipv4, Tcp)` socket whose `accepts()` sets
+//! `ts_forwarder::all_port` uses: a `raw` `(Ipv4, Tcp)` socket whose `accepts()` sets
 //! `handled_by_raw_socket = true`, which **suppresses that RST** and hands us a copy of every
 //! inbound TCP packet. We read each SYN's destination port and lazily materialize a per-port
 //! any-IP listener; the peer's SYN retransmit is then accepted by that listener and dispatched to
@@ -29,7 +29,7 @@
 //! The raw observer never creates a host socket and never dials anything; it only learns ports.
 //! Every accepted flow is handed to the embedder's own handler over the overlay netstack — never a
 //! host socket. Ports already owned by an explicit `tcp_listen`er are skipped (queried read-only
-//! via [`CreateSocket::bound_tcp_ports`]) so a fallback listener never competes with a real one. A
+//! via `CreateSocket::bound_tcp_ports`) so a fallback listener never competes with a real one. A
 //! flow no handler claims is closed (fail-closed), never direct-dialed. IPv4-only.
 
 use std::{
@@ -53,7 +53,7 @@ use tokio::sync::Semaphore;
 
 /// Maximum number of distinct ports that may have a live on-demand fallback listener at once.
 ///
-/// Mirrors [`ts_forwarder::all_port`]'s cap: without it a remote could scan all 65,535 ports and
+/// Mirrors `ts_forwarder::all_port`'s cap: without it a remote could scan all 65,535 ports and
 /// permanently materialize that many tasks + netstack sockets (remote FD/memory-exhaustion DoS).
 /// Over the cap, SYNs to *new* ports are dropped (no listener spawned) until a port is evicted.
 const MAX_PORTS: usize = 1024;

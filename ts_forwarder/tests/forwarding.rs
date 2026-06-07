@@ -270,10 +270,11 @@ async fn advertised_but_no_ports_forwards_nothing() {
         let _ = forwarder.run().await;
     });
 
-    // Let the forwarder finish starting up (it spawns no listeners here). Unlike the splice/drop
-    // tests we deliberately do NOT connect-retry: with zero ports configured no listener will ever
-    // register, so the connect is *expected* to RST or stall — the absence of a listener is the
-    // behavior under test, not a race to wait out.
+    // NOTE: fixed sleep retained on purpose — not convertible to a deadline-poll. The assertion is
+    // a *negative* (the sink saw zero connections), and with zero ports configured the forwarder
+    // exposes no positive readiness signal to poll for (no listener ever registers — that absence
+    // IS the behavior under test). A too-short sleep cannot cause a spurious failure here (the count
+    // can only stay 0 or rise), so this is a settle, not a race to win.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let peer_local = SocketAddr::new(PEER_IP.into(), PEER_PORT);
@@ -320,9 +321,11 @@ async fn exit_node_flow_is_dropped_under_direct_dialer() {
     let mut client = connect_with_retry(&peer_ch, peer_local, sink_addr).await;
     client.write_all(b"leak attempt").await.ok();
 
-    // Give the accepted flow ample time to be classified and (incorrectly) dialed if the dialer
-    // were leaky. The count can only ever increase, so a generous settle keeps the zero-assertion
-    // deterministic rather than timing-lucky.
+    // NOTE: fixed sleep retained on purpose — not convertible to a deadline-poll. `connect_with_retry`
+    // already proves the per-port listener accepted the flow (so classify → dial was reached); the
+    // remaining wait is a settle for a *negative* assertion (a leaky dial would land *after* accept).
+    // There is no positive "flow dropped" signal to poll, and a too-short sleep cannot spuriously
+    // fail (the count can only stay 0 or rise). So this is a settle, not a race.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Deterministic anti-leak proof: the real destination saw zero connections, so the host IP
@@ -430,8 +433,11 @@ async fn all_ports_still_drops_exit_node_flow_under_direct_dialer() {
     let mut client = connect_with_retry(&peer_ch, peer_local, sink_addr).await;
     client.write_all(b"all-ports leak attempt").await.ok();
 
-    // The count can only ever increase, so a generous settle keeps the zero-assertion
-    // deterministic rather than timing-lucky.
+    // NOTE: fixed sleep retained on purpose — not convertible to a deadline-poll. `connect_with_retry`
+    // already proves the on-demand listener accepted the flow (so classify → dial was reached); the
+    // remaining wait is a settle for a *negative* assertion (a leaky dial would land *after* accept).
+    // There is no positive "flow dropped" signal to poll, and a too-short sleep cannot spuriously
+    // fail (the count can only stay 0 or rise). So this is a settle, not a race.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     assert_eq!(
@@ -552,8 +558,12 @@ async fn udp_exit_node_flow_is_dropped_under_direct_dialer() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    // Give any (erroneous) egress ample time to land. The count can only ever increase, so a
-    // generous settle keeps the zero-assertion deterministic rather than timing-lucky.
+    // NOTE: fixed sleep retained on purpose — not convertible to a deadline-poll. The 20 spaced
+    // retransmits above already drive the datagram through the relay's classify → dial path; the
+    // remaining wait is a settle for a *negative* assertion (a leaky egress would land *after*
+    // those sends). UDP exposes no positive "datagram dropped" signal to poll, and a too-short
+    // sleep cannot spuriously fail (the count can only stay 0 or rise). So this is a settle, not a
+    // race.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Deterministic anti-leak proof: the real destination received zero datagrams, so the host IP

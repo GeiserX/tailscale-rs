@@ -11,7 +11,7 @@
 //! `last_seen`, `cap_map`, and the `UserProfiles` table), but this fork's domain
 //! [`Node`](ts_control::Node) — produced by `From<&ts_control_serde::Node>` — currently drops them.
 //! Until the domain `Node` is extended to retain them, [`WhoIs::user`] and [`WhoIs::capabilities`]
-//! are always empty and [`StatusPeer::online`] is always `None`. We surface what the domain model
+//! are always empty and `StatusPeer::online` is always `None`. We surface what the domain model
 //! actually holds rather than inventing values.
 
 use std::net::{IpAddr, SocketAddr};

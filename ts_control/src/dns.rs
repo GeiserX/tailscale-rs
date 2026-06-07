@@ -32,7 +32,7 @@ pub struct Resolver {
 }
 
 /// The transport of a [`Resolver`]. Only plaintext UDP is forwarded today; encrypted transports are
-/// dropped at parse time (see [`Resolver::from_serde`]).
+/// dropped at parse time (see `Resolver::from_serde`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ResolverTransport {
     /// Classic plaintext DNS over UDP at this address.

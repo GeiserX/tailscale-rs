@@ -182,7 +182,7 @@ make ad hoc patch releases as necessary.
 Breaking or significant changes should be recorded in the [changelog](CHANGELOG.md) as part of the
 PR making the change.
 
-Releases must be [tagged](https://github.com/tailscale/tailscale-rs/tags) in `vX.Y.Z` format. Creating a release tag will trigger a GitHub
+Releases must be [tagged](https://github.com/GeiserX/tailscale-rs/tags) in `vX.Y.Z` format. Creating a release tag will trigger a GitHub
 Actions workflow that automatically builds and publishes packages to their respective package
 repositories (crates.io, PyPI, etc.).
 

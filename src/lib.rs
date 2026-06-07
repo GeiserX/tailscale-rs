@@ -88,7 +88,7 @@
 //!
 //! ## Feature Flags
 //!
-//! - `axum`: enables the [`axum`] module, which enables you to run an [`axum` HTTP server] on top
+//! - `axum`: enables the `axum` module, which enables you to run an `axum` HTTP server on top
 //!   of a [`netstack::TcpListener`].
 //!
 //! ## Platform Support
@@ -197,7 +197,7 @@ pub struct Device {
     /// the `Device` drops; `None` (empty config) until the first `set`.
     serve: std::sync::Mutex<Option<ts_runtime::serve::ServeManager>>,
     /// The live Funnel ingress manager (`tsnet`'s `ListenFunnel` data path), built on
-    /// [`Device::listen_funnel`]. Held here so its TLS-termination pump and the installed peerAPI
+    /// [`Device::listen_funnel`](crate::Device::listen_funnel). Held here so its TLS-termination pump and the installed peerAPI
     /// ingress sink stay alive for the device's life (and tear down when a new `listen_funnel`
     /// replaces it, or the `Device` drops). `None` until the first `listen_funnel`.
     funnel: std::sync::Mutex<Option<ts_runtime::funnel::FunnelManager>>,

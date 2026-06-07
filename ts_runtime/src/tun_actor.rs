@@ -474,6 +474,112 @@ async fn send_dns_reply(device: &Arc<AsyncTunTransport>, src: SocketAddrV4, resp
 /// to the pre-built `nxdomain` on failure (fail-closed), then write the reply packet into the TUN.
 /// The upstreams are carried in `plan` (from `decide`/`recursive_plan`, already v4-only filtered);
 /// this fn never constructs an upstream `SocketAddr`, so the IPv4-only egress invariant is inherited.
+/// The TUN uplink pump: the highest-traffic datapath, run as a task spawned onto the actor's
+/// [`JoinSet`] when the device is built (see the StateUpdate handler). It moves application
+/// packets `device -> {in-datapath MagicDNS responder | dataplane}`:
+///
+/// - For every received packet it runs the PURE [`plan_intercept`] against the latest MagicDNS
+///   [`DnsView`] (read fresh per packet; the borrow guard is never held across an `await`):
+///   - [`Intercept::NotIntercepted`] — forward the original packet to the overlay (`up`) unchanged.
+///   - [`Intercept::Dropped`] — a malformed quad-100 query: consumed, never forwarded.
+///   - [`Intercept::Reply`] — an authoritative reply written straight back into the TUN INLINE
+///     (the fast path — no overlay round-trip, no host socket; anti-leak).
+///   - [`Intercept::Forward`] — the SLOW recursive / split-DNS overlay round-trip is SPAWNED onto
+///     a local `JoinSet` ([`run_forward`]) so one slow upstream never head-of-line-blocks the
+///     ENTIRE TUN uplink (all application traffic, not just DNS).
+///
+/// BACKPRESSURE: in-flight forwards are capped at `MAX_INFLIGHT_FORWARDS` to avoid trading
+/// HOL-blocking for unbounded task growth under a DNS flood; at the cap one completed forward is
+/// reaped synchronously (`join_next`) before spawning the next. This back-pressures *new DNS
+/// forwards only* — the non-DNS uplink and the inline fast paths are never blocked. Returns when
+/// the overlay send half (`up`) is closed (the dataplane went away).
+async fn up_pump(
+    dev_up: Arc<AsyncTunTransport>,
+    up: OverlayToDataplane,
+    dns_view_rx: watch::Receiver<Arc<DnsView>>,
+    dns_channel: Channel,
+) {
+    // In-flight MagicDNS forward tasks. The slow `Decision::Forward` overlay round-trip
+    // (bounded only by a ~5s timeout) is SPAWNED here rather than awaited inline, so one
+    // slow/hung upstream never head-of-line-blocks the ENTIRE TUN uplink (all application
+    // traffic, not just DNS). Mirrors the netstack serve loop's `JoinSet`
+    // (`magic_dns.rs:577,614-632`): spawn each forward, reap with `try_join_next`.
+    //
+    // CONCURRENCY BOUND: a `JoinSet` reaped with `try_join_next` matches `magic_dns.rs`
+    // for consistency (the pump owns the set across loop iterations, so no separate
+    // semaphore is needed). To avoid trading HOL-blocking for unbounded task growth under a
+    // DNS flood, in-flight forwards are capped at `MAX_INFLIGHT_FORWARDS`: at the cap we
+    // synchronously reap one completed forward (`join_next`) before spawning the next.
+    // Worst case is one forward's latency of back-pressure on *new DNS forwards only* — the
+    // non-DNS uplink and the authoritative/no-intercept fast paths are never blocked.
+    const MAX_INFLIGHT_FORWARDS: usize = 256;
+    let mut forwards: JoinSet<()> = JoinSet::new();
+    loop {
+        // Drain the (non-`Send`) recv iterator into an owned batch first, so no part of it
+        // is held across the intercept's `await` (the iterator is not `Send`; `PacketMut`
+        // is). Then process the batch, peeling off MagicDNS queries.
+        let batch: Vec<_> = dev_up.recv().await.into_iter().collect();
+        for pkt in batch {
+            match pkt {
+                Ok(p) => {
+                    // Peel off quad-100/UDP/53 DNS queries and answer them in-process: an
+                    // authoritative reply is written straight back into the TUN via `dev_up`
+                    // (no overlay egress, no host socket) INLINE; a Forward (recursive /
+                    // split-DNS) is SPAWNED so its overlay round-trip never blocks the pump.
+                    // Everything else forwards to the overlay unchanged. The view is read
+                    // fresh per packet (mirrors the netstack serve loop); the borrow guard
+                    // is dropped at the end of this statement, never held across an `await`.
+                    let plan = plan_intercept(&dns_view_rx.borrow(), p.as_ref());
+                    match plan {
+                        Intercept::NotIntercepted => {
+                            if up.send(vec![p]).is_err() {
+                                return;
+                            }
+                        }
+                        // Malformed query: consumed but dropped silently; never forward to
+                        // the overlay.
+                        Intercept::Dropped => {}
+                        // Authoritative reply (fast path): write it back into the TUN inline.
+                        Intercept::Reply { response, src } => {
+                            send_dns_reply(&dev_up, src, &response).await;
+                        }
+                        // Spawn the slow overlay round-trip; it writes the reply (or the
+                        // fail-closed nxdomain) back into the TUN when it completes.
+                        Intercept::Forward {
+                            plan,
+                            query,
+                            nxdomain,
+                            src,
+                        } => {
+                            // Bound in-flight forwards: reap one completed task at the cap
+                            // before spawning, so a DNS flood can't grow tasks without
+                            // limit. This back-pressures *new DNS forwards only*, never the
+                            // non-DNS uplink or the inline fast paths.
+                            if forwards.len() >= MAX_INFLIGHT_FORWARDS {
+                                // Reap exactly one completed forward; the join result is
+                                // intentionally discarded (the task is `()` and logs its
+                                // own send failures).
+                                drop(forwards.join_next().await);
+                            }
+                            forwards.spawn(run_forward(
+                                dev_up.clone(),
+                                dns_channel.clone(),
+                                plan,
+                                query,
+                                nxdomain,
+                                src,
+                            ));
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "tun recv error"),
+            }
+        }
+        // Reap finished forward tasks without blocking (mirrors `magic_dns.rs:632`).
+        while forwards.try_join_next().is_some() {}
+    }
+}
+
 async fn run_forward(
     device: Arc<AsyncTunTransport>,
     channel: Channel,
@@ -634,87 +740,8 @@ impl Message<Arc<ts_control::StateUpdate>> for TunActor {
         // The overlay `Channel` used by the MagicDNS responder to forward recursive / split-DNS
         // queries (the forwarder netstack's; egresses over the overlay — anti-leak).
         let dns_channel = self.channel.clone();
-        self._joinset.spawn(async move {
-            // In-flight MagicDNS forward tasks. The slow `Decision::Forward` overlay round-trip
-            // (bounded only by a ~5s timeout) is SPAWNED here rather than awaited inline, so one
-            // slow/hung upstream never head-of-line-blocks the ENTIRE TUN uplink (all application
-            // traffic, not just DNS). Mirrors the netstack serve loop's `JoinSet`
-            // (`magic_dns.rs:577,614-632`): spawn each forward, reap with `try_join_next`.
-            //
-            // CONCURRENCY BOUND: a `JoinSet` reaped with `try_join_next` matches `magic_dns.rs`
-            // for consistency (the pump owns the set across loop iterations, so no separate
-            // semaphore is needed). To avoid trading HOL-blocking for unbounded task growth under a
-            // DNS flood, in-flight forwards are capped at `MAX_INFLIGHT_FORWARDS`: at the cap we
-            // synchronously reap one completed forward (`join_next`) before spawning the next.
-            // Worst case is one forward's latency of back-pressure on *new DNS forwards only* — the
-            // non-DNS uplink and the authoritative/no-intercept fast paths are never blocked.
-            const MAX_INFLIGHT_FORWARDS: usize = 256;
-            let mut forwards: JoinSet<()> = JoinSet::new();
-            loop {
-                // Drain the (non-`Send`) recv iterator into an owned batch first, so no part of it
-                // is held across the intercept's `await` (the iterator is not `Send`; `PacketMut`
-                // is). Then process the batch, peeling off MagicDNS queries.
-                let batch: Vec<_> = dev_up.recv().await.into_iter().collect();
-                for pkt in batch {
-                    match pkt {
-                        Ok(p) => {
-                            // Peel off quad-100/UDP/53 DNS queries and answer them in-process: an
-                            // authoritative reply is written straight back into the TUN via `dev_up`
-                            // (no overlay egress, no host socket) INLINE; a Forward (recursive /
-                            // split-DNS) is SPAWNED so its overlay round-trip never blocks the pump.
-                            // Everything else forwards to the overlay unchanged. The view is read
-                            // fresh per packet (mirrors the netstack serve loop); the borrow guard
-                            // is dropped at the end of this statement, never held across an `await`.
-                            let plan = plan_intercept(&dns_view_rx.borrow(), p.as_ref());
-                            match plan {
-                                Intercept::NotIntercepted => {
-                                    if up.send(vec![p]).is_err() {
-                                        return;
-                                    }
-                                }
-                                // Malformed query: consumed but dropped silently; never forward to
-                                // the overlay.
-                                Intercept::Dropped => {}
-                                // Authoritative reply (fast path): write it back into the TUN inline.
-                                Intercept::Reply { response, src } => {
-                                    send_dns_reply(&dev_up, src, &response).await;
-                                }
-                                // Spawn the slow overlay round-trip; it writes the reply (or the
-                                // fail-closed nxdomain) back into the TUN when it completes.
-                                Intercept::Forward {
-                                    plan,
-                                    query,
-                                    nxdomain,
-                                    src,
-                                } => {
-                                    // Bound in-flight forwards: reap one completed task at the cap
-                                    // before spawning, so a DNS flood can't grow tasks without
-                                    // limit. This back-pressures *new DNS forwards only*, never the
-                                    // non-DNS uplink or the inline fast paths.
-                                    if forwards.len() >= MAX_INFLIGHT_FORWARDS {
-                                        // Reap exactly one completed forward; the join result is
-                                        // intentionally discarded (the task is `()` and logs its
-                                        // own send failures).
-                                        drop(forwards.join_next().await);
-                                    }
-                                    forwards.spawn(run_forward(
-                                        dev_up.clone(),
-                                        dns_channel.clone(),
-                                        plan,
-                                        query,
-                                        nxdomain,
-                                        src,
-                                    ));
-                                }
-                            }
-                        }
-                        Err(e) => tracing::warn!(error = %e, "tun recv error"),
-                    }
-                }
-                // Reap finished forward tasks without blocking (mirrors `magic_dns.rs:632`).
-                while forwards.try_join_next().is_some() {}
-            }
-        });
+        self._joinset
+            .spawn(up_pump(dev_up, up, dns_view_rx, dns_channel));
 
         // DOWN: dataplane -> device.
         let dev_down = device.clone();

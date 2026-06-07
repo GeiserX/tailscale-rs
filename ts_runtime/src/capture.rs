@@ -1,6 +1,6 @@
 //! Pcap stream framer for debug packet capture (`CapturePcap`).
 //!
-//! This is the *format* half of Tailscale's debug packet capture: a [`PcapSink`] that frames
+//! This is the *format* half of Tailscale's debug packet capture: a [`PcapSink`](crate::capture::PcapSink) that frames
 //! captured packets into a byte stream and writes them to any [`std::io::Write`]. A separate seam
 //! tees packets into the sink; this module is only concerned with producing bytes.
 //!
@@ -8,7 +8,7 @@
 //! Tailscale's `feature/capture` (`capture.go`):
 //!
 //! - a 24-byte classic pcap global header, written once on construction, using link type
-//!   [`LINKTYPE_USER0`] (147);
+//!   [`LINKTYPE_USER0`](crate::capture::LINKTYPE_USER0) (147);
 //! - per packet, a 16-byte classic pcap record header, followed by Tailscale's custom 4-byte path
 //!   preamble (a `u16` little-endian path code, then a SNAT length byte and a DNAT length byte),
 //!   followed by the raw IP packet bytes.

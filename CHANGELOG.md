@@ -6,6 +6,29 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.63](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.63) - 2026-06-07
+
+Whole-codebase health review + fixes (open-source readiness). A multi-perspective audit
+(architecture, security, complexity, dead-code, error-handling, test-health, consistency, docs,
+CI/deps) found the core paths sound; this release lands the polish.
+
+- **`cargo doc --workspace` is green again.** 61 broken/`private`-target intra-doc-link errors
+  across `ts_magicsock`, `ts_control`, `ts_runtime`, `ts_ffi`, `ts_dns_wire`, `ts_tka`, and the root
+  crate were fixed (resolved to the real item or de-linked to code spans). These had accumulated
+  undetected because the `cargo doc` CI lane is upstream-owner-gated and never ran on the fork — the
+  gate will pass the moment docs are built.
+- **Dependency advisory cleared:** `russh` bumped `0.60` → `0.60.3`, clearing RUSTSEC-2026-0153 /
+  -0154 (pre-auth allocation DoS). Still confined to the off-by-default `ssh` feature; `aws-lc-rs`
+  stays off the default graph.
+- **Consistency:** `ts_tka`'s `TkaError` now derives `thiserror::Error` like the other fork-own
+  crypto crates (messages byte-identical); added `# Errors` rustdoc where missing.
+- **Complexity:** the TUN uplink datapath (`ts_runtime` `tun_actor`) is extracted from an ~80-line
+  inline nested closure into a named `up_pump` async fn — same behavior, now readable/testable.
+- **Docs/metadata:** fixed stale upstream references (issue-tracker, release-tag links, README
+  badges), closed the `docs/CRYPTOGRAPHY.md` §9 numbering gap, switched `SECURITY.md` disclosure to
+  GitHub private advisories, and set `rust-version` to the CI-verified `1.94.1` (was an untested
+  `1.91.0` claim). Removed a dead `MPL-2.0` allowance from `deny.toml`.
+
 ## [0.5.62](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.62) - 2026-06-07
 
 `unsafe` audit + minimization (tsr-5fu) — open-source readiness. Every `unsafe` block was reviewed

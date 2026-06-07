@@ -202,7 +202,7 @@ mod msg_impl {
         /// Fetch the current Tailscale SSH policy, if control has pushed one.
         ///
         /// Returns `None` when control has not sent an SSH policy (the SSH server treats this as
-        /// deny-all — fail-closed). Unlike [`self_node`](Self::self_node) this does not block waiting
+        /// deny-all — fail-closed). Unlike `self_node` this does not block waiting
         /// for a value: an absent policy is a legitimate, immediate answer.
         #[message]
         pub fn current_ssh_policy(&self) -> Option<SshPolicy> {

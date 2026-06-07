@@ -123,7 +123,7 @@ impl From<ConnectionError> for IdTokenError {
 /// returned JWT). Opens a fresh Noise channel and POSTs to `/machine/id-token`. Returns the signed
 /// JWT string on success.
 ///
-/// The whole connect + POST + response read is bounded by [`ID_TOKEN_TIMEOUT`]: a hung control
+/// The whole connect + POST + response read is bounded by `ID_TOKEN_TIMEOUT`: a hung control
 /// plane is abandoned and reported as [`IdTokenError::NetworkError`] rather than pinning a
 /// half-open connection.
 pub async fn fetch_id_token(

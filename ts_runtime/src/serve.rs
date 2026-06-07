@@ -3,23 +3,23 @@
 //! Go `tsnet` stores an `ipn.ServeConfig` on the node and runs one accept loop per configured
 //! tailnet port, dispatching each accepted connection per its handler (proxy / text / raw TCP
 //! forward / hand-back). This module is the faithful equivalent on the **application** netstack: a
-//! [`ServeManager`] owns the current [`ServeState`](ts_control::ServeState), one accept-loop task
+//! [`ServeManager`](crate::serve::ServeManager) owns the current [`ServeState`](ts_control::ServeState), one accept-loop task
 //! per bound port, and tears every loop down on drop / on the next `set`.
 //!
 //! ## Storage + reconcile (full-replace)
 //!
-//! The manager holds the current [`ServeState`] plus one [`tokio::task::AbortHandle`] per bound
+//! The manager holds the current [`ServeState`](ts_control::ServeState) plus one [`tokio::task::AbortHandle`] per bound
 //! port behind a single `Arc<Mutex<Inner>>` (mirroring [`crate::fallback_tcp::FallbackTcpManager`]).
-//! [`ServeManager::set`] uses **full-replace** semantics: it aborts *every* existing accept loop and
+//! [`ServeManager::set`](crate::serve::ServeManager::set) uses **full-replace** semantics: it aborts *every* existing accept loop and
 //! respawns from the new config. Go reconciles incrementally (leaving unchanged ports running); we
 //! do full-replace because it is simpler and correct, and a `SetServeConfig` is a rare control-plane
-//! operation, not a hot path. The passed [`ServeState`] becomes the whole config (REPLACE, matching
-//! Go). [`pure_reconcile`] computes the add/remove port deltas for testing and documentation, even
+//! operation, not a hot path. The passed [`ServeState`](ts_control::ServeState) becomes the whole config (REPLACE, matching
+//! Go). `pure_reconcile` computes the add/remove port deltas for testing and documentation, even
 //! though the live path replaces wholesale.
 //!
 //! ## TLS termination
 //!
-//! TLS-terminating ports ([`ServeTarget::terminates_tls`]) need a [`TlsAcceptor`]; the caller
+//! TLS-terminating ports (`ServeTarget::terminates_tls`) need a `TlsAcceptor`; the caller
 //! (`Device::set_serve_config`) obtains it **once** via the cert path and hands it in per port. The
 //! manager never builds an acceptor and never touches the cert/ACME machinery — that keeps
 //! `ts_runtime` off the cert path and lets the device fail the whole `set` closed if a cert cannot
@@ -27,9 +27,9 @@
 //!
 //! ## Anti-leak
 //!
-//! Every accept loop binds the **overlay** netstack only (via [`Channel::tcp_listen`] on the
-//! device's own tailnet IPv4) — never a host socket. The [`ServeTarget::Proxy`] /
-//! [`ServeTarget::TcpForward`] backend dial is a **local host socket** to the embedder's own backend
+//! Every accept loop binds the **overlay** netstack only (via `Channel::tcp_listen` on the
+//! device's own tailnet IPv4) — never a host socket. The `ServeTarget::Proxy` /
+//! `ServeTarget::TcpForward` backend dial is a **local host socket** to the embedder's own backend
 //! (exactly like Go's reverse-proxy to `127.0.0.1` and like [`crate::Runtime`]'s loopback proxy) —
 //! it is intentionally NOT routed through the `ts_forwarder` exit-egress path, so the exit-node
 //! anti-leak chokepoint is untouched. A backend dial failure drops the connection (fail-closed,

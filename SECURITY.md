@@ -117,10 +117,9 @@ fail-closed, and egress is IPv4-only** — is enforced both structurally and in 
 If you believe you have found a security vulnerability, please report it privately rather than
 opening a public issue:
 
-- **Preferred:** open a **private GitHub Security Advisory** at
+- Open a **private GitHub Security Advisory** at
   <https://github.com/GeiserX/tailscale-rs/security/advisories/new>
-  (or via the repository's `Security` tab → `Report a vulnerability`), **or**
-- Email the maintainer `(maintainer email — TODO: fill before public release)`.
+  (or via the repository's `Security` tab → `Report a vulnerability`).
 
 Please include a description of the issue, the affected component(s), and steps to reproduce if
 possible. We will acknowledge the report and work with you on a coordinated disclosure timeline.

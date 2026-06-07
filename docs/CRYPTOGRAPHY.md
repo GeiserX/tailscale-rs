@@ -485,6 +485,8 @@ zero shared secret), which dalek computes rather than rejects, so the KAT assert
 
 ---
 
+## 9. Tracked risks (beads)
+
 | Bead | Title | Severity | Summary |
 |---|---|---|---|
 | **tsr-19k** | Prove byte-for-byte interop with Go (cross-impl KAT vectors) | High | All hand-rolled crypto is validated only by self-consistent round-trips, which cannot catch a wire-incompatibility with Go. Add Go-sourced KATs: big-endian AEAD vector, ZIP-215 196-case grid, wireguard-go handshake transcript, TKA CBOR/SigHash golden, Wycheproof primitives. |

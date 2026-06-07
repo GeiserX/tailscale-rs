@@ -53,14 +53,14 @@ members = [
 edition = "2024"
 license = "BSD-3-Clause"
 publish = true
-version = "0.5.62"
+version = "0.5.63"
 repository = "https://github.com/tailscale/tailscale-rs"
 
 # This disagrees with the README's stated MSRV. That's intentional: this field causes cargo to error
 # if the toolchain is too old, unconditionally failing the compile, while our policy is just that we
 # only actively support the last two stables -- older compilers should still work as long as they
 # can still compile the project. This field is the de facto MSRV (the oldest compiler that works).
-rust-version = "1.91.0"
+rust-version = "1.94.1"
 
 [workspace.dependencies]
 aead = { version = "0.5", features = ["std"] }
@@ -230,7 +230,7 @@ pty-process = { version = "0.5", optional = true, features = ["async"] }
 rand.workspace = true
 ratatui = { version = "0.30", optional = true }
 # exclude rsa to avoid https://rustsec.org/advisories/RUSTSEC-2023-0071
-russh = { version = "0.60", optional = true, default-features = false, features = ["flate2", "aws-lc-rs"] }
+russh = { version = "0.60.3", optional = true, default-features = false, features = ["flate2", "aws-lc-rs"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

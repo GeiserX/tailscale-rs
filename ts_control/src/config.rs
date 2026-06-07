@@ -434,7 +434,8 @@ impl Config {
     /// Each configured name is validated with
     /// [`validate_service_name`](crate::validate_service_name) (fail-closed: a name that is not a
     /// well-formed `svc:<dns-label>` is dropped with a warning, never advertised). Each surviving
-    /// service is advertised on **all ports** (a single `0/0..=65535` [`ProtoPortRange`], matching
+    /// service is advertised on **all ports** (a single `0/0..=65535`
+    /// [`ProtoPortRange`](ts_control_serde::ProtoPortRange), matching
     /// Go's default `ServicePortRange()` when no explicit ports are configured) and marked active.
     /// The result is the canonical input to both [`services_hash`] and the c2n `/vip-services`
     /// response. An empty config yields an empty `Vec` (advertise nothing — the hash is `""`).

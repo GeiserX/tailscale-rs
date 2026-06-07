@@ -178,7 +178,8 @@ pub struct Config {
     /// signal, `HostInfo.WireIngress`, capver 113).
     ///
     /// When `true`, registration and map requests set `HostInfo.WireIngress` so control provisions
-    /// the DNS / ingress records a Funnel node needs, making a later [`Device::listen_funnel`] (or
+    /// the DNS / ingress records a Funnel node needs, making a later
+    /// [`Device::listen_funnel`](crate::Device::listen_funnel) (or
     /// `serve`) session work immediately. Defaults to `false` (fail-closed): a node requests Funnel
     /// wiring only when explicitly opted in.
     ///

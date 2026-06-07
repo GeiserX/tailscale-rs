@@ -189,7 +189,7 @@ pub struct Node {
 
     /// DNS resolvers to use when this WireGuard-only peer is selected as an exit node
     /// (`ExitNodeDNSResolvers` in Go). Only meaningful when [`Node::is_wireguard_only`] is set.
-    /// Encrypted-transport resolvers are dropped (see [`Resolver::from_serde`]).
+    /// Encrypted-transport resolvers are dropped (see `Resolver::from_serde`).
     pub exit_node_dns_resolvers: Vec<Resolver>,
 
     /// Whether this node advertises itself as a **peer relay** (Go `Hostinfo.PeerRelay`): it runs a
@@ -204,7 +204,7 @@ pub struct Node {
     /// ([`ts_control_serde::NODE_ATTR_SERVICE_HOST`]) node-capability value
     /// (`tailcfg.ServiceIPMappings`). These VIPs are control-assigned and also injected into the
     /// node's `AllowedIPs`; the application netstack must accept packets for them so a
-    /// [`listen_service`][crate::Device::listen_service]-bound listener can answer. Empty when the
+    /// `Device::listen_service`-bound listener can answer. Empty when the
     /// node hosts no VIP services (the common case). Per-service IP lists are deduplicated, source
     /// order otherwise preserved. Use [`Node::service_addresses`] for the flattened set (netstack
     /// accept list) and [`Node::service_addresses_for`] for a specific service's VIPs.
@@ -237,7 +237,7 @@ impl Node {
     /// Like Go, this fork is **reactive**: it reports expiry rather than auto-rotating in the
     /// background (Go transitions to `NeedsLogin` on expiry and re-registers via stored auth-key or
     /// interactive login). A caller observing `true` should re-register
-    /// ([`crate::tokio::register`]) — supplying `RegisterRequest::old_node_key` (the prior key) and
+    /// (`crate::tokio::register`) — supplying `RegisterRequest::old_node_key` (the prior key) and
     /// a fresh `node_key` when rotating the key, or the same key to merely refresh.
     pub fn key_expired(&self, now: DateTime<Utc>) -> bool {
         match self.node_key_expiry {
@@ -385,7 +385,7 @@ impl Node {
     ///
     /// Mirrors Go `peerAPIBase(...)+"/dns-query"` gated by `exitNodeCanProxyDNS`: a peer can proxy
     /// DNS when it advertises an IPv4 peerAPI port **and** either advertises the explicit
-    /// `peerapi-dns-proxy` service or is new enough ([`Node::cap`] ≥ [`PEER_CAN_PROXY_DNS`]). A
+    /// `peerapi-dns-proxy` service or is new enough ([`Node::cap`] ≥ `PEER_CAN_PROXY_DNS`). A
     /// WireGuard-only peer never runs a peerAPI, so it returns `None` here (its exit-node DNS comes
     /// from [`Node::exit_node_dns_resolvers`] instead).
     ///
@@ -463,7 +463,7 @@ impl Node {
     /// Report whether `wanted_port` is allowed for Funnel on this node.
     ///
     /// Mirrors Go `ipn.CheckFunnelPort`: scan the cap-map keys for one prefixed by
-    /// [`Node::CAP_FUNNEL_PORTS`], URL-parse that key, read its `ports` query parameter, and match
+    /// `Node::CAP_FUNNEL_PORTS`, URL-parse that key, read its `ports` query parameter, and match
     /// `wanted_port` against the comma-separated list of single ports and `first-last` ranges. The
     /// port list lives in the *key*, never the value. Fail-closed: no matching cap, an empty or
     /// unparseable `ports` query, or a key whose non-query part isn't exactly the funnel-ports URL
@@ -530,7 +530,7 @@ impl Node {
     /// ([`ts_control_serde::NODE_ATTR_SERVICE_HOST`]) node-capability **and** at least one assigned
     /// VIP address. Go additionally requires the host to be tagged
     /// (`ErrUntaggedServiceHost`); that tag gate is enforced at
-    /// [`listen_service`][crate::Device::listen_service] using [`Node::tags`]. Fail-closed: no cap
+    /// `Device::listen_service` using [`Node::tags`]. Fail-closed: no cap
     /// or no assigned VIP denies.
     pub fn is_service_host(&self) -> bool {
         self.has_node_attr(ts_control_serde::NODE_ATTR_SERVICE_HOST)

@@ -83,7 +83,7 @@ pub type FilterUpdate = (Option<pf::Ruleset>, BTreeMap<String, Option<pf::Rulese
 pub struct StateUpdate {
     /// The opaque map-session handle, set only when control assigns one (the first
     /// [`MapResponse`] of a session). Carried so a reconnect can request stream resumption via
-    /// [`MapRequestBuilder::map_session`](crate::MapRequestBuilder::map_session). `None` on
+    /// `MapRequestBuilder::map_session`. `None` on
     /// responses that don't (re)establish a session.
     pub session_handle: Option<alloc::string::String>,
     /// The sequence number of this [`MapResponse`] within its session, or `0` when control omits
