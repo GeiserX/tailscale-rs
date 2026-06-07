@@ -198,16 +198,18 @@ impl RouteUpdater {
         // Resolve the exit-node selector against the live peer set once per rebuild. The source
         // filter resolves the same selector the same (deterministic) way, so both agree on the
         // chosen peer — the cryptokey-routing coupling the comment below depends on.
-        let exit_node_id = self
-            .env
-            .exit_node
+        // Snapshot the live exit-node selector once per rebuild (it can change at runtime via
+        // `Device::set_exit_node`); use this single value for resolution + the satisfied check + the
+        // trace below so they can't disagree within one rebuild.
+        let exit_node_selector = self.env.exit_node();
+        let exit_node_id = exit_node_selector
             .as_ref()
             .and_then(|sel| sel.resolve(state.peers.peers().values()));
         // Whether the configured exit node (if any) was matched to a peer that actually advertises
         // a default route. Stays false on a typo'd/stale selector or a peer that dropped its `/0`,
         // which is fail-closed (internet-bound traffic is dropped) but otherwise silent — we warn
         // below so the black-hole is diagnosable in the field.
-        let mut exit_node_satisfied = self.env.exit_node.is_none();
+        let mut exit_node_satisfied = exit_node_selector.is_none();
 
         for (id, peer) in state.peers.peers() {
             peer_ids.push(*id);
@@ -258,7 +260,7 @@ impl RouteUpdater {
             // advertises no default route). Egress is fail-closed (internet-bound traffic dropped),
             // not leaked — surface it so the operator can spot a stale/typo'd exit-node selection.
             tracing::warn!(
-                exit_node = ?self.env.exit_node,
+                exit_node = ?exit_node_selector,
                 resolved = ?exit_node_id,
                 "configured exit node not found among peers (or it advertises no default route); \
                  internet-bound traffic will be dropped"

@@ -401,6 +401,38 @@ impl Runtime {
             .map_err(Into::into)
     }
 
+    /// Change the selected exit node at runtime (the equivalent of Go `tsnet`'s
+    /// `LocalClient.EditPrefs(ExitNodeID/ExitNodeIP)`), without recreating the device.
+    ///
+    /// Updates the live exit-node selector, then asks the peer tracker to re-broadcast the current
+    /// peer set so the route updater and source filter re-resolve the new selector immediately.
+    /// `None` clears the exit node (internet-bound traffic is then dropped, fail-closed, unless this
+    /// node egresses directly). The selection is re-resolved against the live peer set, so passing a
+    /// selector for a peer not yet in the netmap simply takes effect once that peer appears.
+    pub async fn set_exit_node(
+        &self,
+        selector: Option<ts_control::ExitNodeSelector>,
+    ) -> Result<(), Error> {
+        // Update the live cell every reader borrows from. `send_replace` keeps the value current
+        // even with no active receivers (none can have dropped while the runtime is up, but it is
+        // the right non-failing primitive here).
+        self.env.exit_node_tx.send_replace(selector);
+
+        // Trigger an immediate re-resolution: the route updater (outbound routes + DoH delegation)
+        // and the source filter (inbound validation) both recompute on an `Arc<PeerState>`, so a
+        // re-broadcast applies the new exit without waiting for the next netmap update.
+        self.peer_tracker
+            .upgrade()
+            .ok_or(Error {
+                kind: ErrorKind::ActorGone,
+                target_actor: None,
+                message_ty: None,
+            })?
+            .ask(peer_tracker::RepublishState)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Subscribe to netmap peer-change events.
     ///
     /// Returns a [`watch::Receiver`] whose value is the current set of peer [`StatusNode`]s,

@@ -167,8 +167,17 @@ pub struct Env {
 
     /// Which peer (if any) is selected as this node's exit node (`ExitNodeID`).
     ///
-    /// See [`ForwarderConfig::exit_node`].
-    pub exit_node: Option<ts_control::ExitNodeSelector>,
+    /// A live cell rather than a snapshot: `Device::set_exit_node` updates the backing
+    /// [`watch::Sender`] at runtime, and both readers (the route updater and the source filter)
+    /// re-read it via [`Env::exit_node`](Env::exit_node) on their next recompute, so the selected
+    /// exit can change without recreating the device. See [`ForwarderConfig::exit_node`].
+    pub exit_node_rx: watch::Receiver<Option<ts_control::ExitNodeSelector>>,
+
+    /// Sender side of [`exit_node_rx`](Env::exit_node_rx). `Device::set_exit_node` sends through
+    /// this to change the selected exit node at runtime; the route updater and source filter then
+    /// re-resolve on their next recompute. Retained here (cheaply clonable) so the runtime's setter
+    /// can reach it.
+    pub exit_node_tx: watch::Sender<Option<ts_control::ExitNodeSelector>>,
 
     /// The set of prefixes the inbound forwarder accepts and dials to real OS sockets.
     ///
@@ -246,6 +255,12 @@ pub struct Env {
 }
 
 impl Env {
+    /// The currently-selected exit-node selector, re-read live (it can change at runtime via
+    /// `Device::set_exit_node`). Callers resolve it against the live peer set each time.
+    pub fn exit_node(&self) -> Option<ts_control::ExitNodeSelector> {
+        self.exit_node_rx.borrow().clone()
+    }
+
     pub fn new(
         keys: ts_keys::NodeState,
         shutdown: watch::Receiver<bool>,
@@ -280,12 +295,18 @@ impl Env {
             }
         });
 
+        // The exit-node selector is a live `watch` cell so `Device::set_exit_node` can change it at
+        // runtime; the `Sender` is retained here in `Env` (cheap to clone) so the setter path can
+        // update it, while every reader subscribes via the `Receiver`.
+        let (exit_node_tx, exit_node_rx) = watch::channel(exit_node);
+
         Self {
             bus: MessageBus::spawn_default(),
             keys: Arc::new(keys),
             shutdown,
             accept_routes,
-            exit_node,
+            exit_node_tx,
+            exit_node_rx,
             forward_routes: Arc::new(forward_routes),
             forward_tcp_ports: Arc::new(forward_tcp_ports),
             forward_udp_ports: Arc::new(forward_udp_ports),

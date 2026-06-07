@@ -182,7 +182,9 @@ These are features that are currently implemented:
     fail-closed off by default)
   - Using an exit node (routing internet-bound traffic through a chosen peer via `exit_node`,
     selectable by Tailscale stable ID, tailnet IP, or MagicDNS name; opt-in, fail-closed off by
-    default)
+    default). The exit node can also be changed at runtime with `Device::set_exit_node` — the
+    equivalent of Go `tsnet`'s `LocalClient.EditPrefs(ExitNodeID/ExitNodeIP)` — without recreating
+    the device.
   - Recursive MagicDNS forwarding in TUN mode (the `100.100.100.100:53` resolver now forwards
     non-tailnet names recursively in TUN mode, matching the netstack-mode behavior; the same
     fail-closed default applies — without `fallback_resolvers`, non-tailnet names get NXDOMAIN)

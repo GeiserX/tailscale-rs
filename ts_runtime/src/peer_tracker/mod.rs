@@ -359,6 +359,34 @@ impl Message<Arc<ts_control::StateUpdate>> for PeerTracker {
     }
 }
 
+/// Ask the peer tracker to re-broadcast its current peer snapshot on the bus, without any peer
+/// change. `Device::set_exit_node` sends this after changing the exit-node selector so the route
+/// updater and source filter (both `Arc<PeerState>` subscribers) re-resolve the new selector
+/// immediately, rather than waiting for the next netmap update.
+#[derive(Debug, Clone, Copy)]
+pub struct RepublishState;
+
+impl Message<RepublishState> for PeerTracker {
+    type Reply = ();
+
+    async fn handle(&mut self, _msg: RepublishState, _ctx: &mut Context<Self, Self::Reply>) {
+        // An empty upsert/deletion set: this is a re-broadcast of the unchanged peer set, not a
+        // delta. Subscribers recompute their routes/filters against the current peers and the
+        // (just-updated) exit-node selector.
+        if let Err(e) = self
+            .env
+            .publish(Arc::new(PeerState {
+                upserts: HashSet::default(),
+                deletions: HashSet::default(),
+                peers: Arc::new(self.peer_db.clone()),
+            }))
+            .await
+        {
+            tracing::error!(error = %e, "re-publishing peer state after exit-node change");
+        }
+    }
+}
+
 impl PeerTracker {
     /// Apply a single [`PeerUpdate`](ts_control::PeerUpdate) to the peer db, enforcing the
     /// Tailnet-Lock peer-trust chokepoint ([`tka_admits`](Self::tka_admits)) at every upsert site.

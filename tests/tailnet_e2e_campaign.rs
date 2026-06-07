@@ -270,3 +270,61 @@ async fn s6_ipv4_only_config() {
         "IPv6 ping must return an error on the IPv4-only fork"
     );
 }
+
+/// Scenario 7: RUNTIME EXIT-NODE SWITCH. `Device::set_exit_node` changes the selected exit at
+/// runtime (the Go `tsnet` `EditPrefs(ExitNodeID/IP)` equivalent) without recreating the device.
+/// Joins with no exit, then sets an exit selector (a standing peer's IP), then clears it — each
+/// call must re-resolve against the live peer set and return without error or netstack panic. This
+/// is the capability the NVC bridge needs (user picks an exit mid-session).
+#[tokio::test]
+async fn s7_runtime_exit_node_switch() {
+    if gated().is_none() {
+        return;
+    }
+    let dev = join("exitswitch").await;
+    tokio::time::sleep(Duration::from_secs(5)).await; // let the netmap settle
+    let status = dev.status().await.expect("status");
+    eprintln!("[s7] netmap has {} peers", status.peers.len());
+
+    // Pick any standing peer's IP as an exit selector. We're proving the runtime SWITCH mechanism
+    // (re-resolve + recompute) doesn't error/panic — not that this particular peer is a working
+    // exit (most won't advertise a default route, which is fine: resolution is fail-closed).
+    if let Some(peer) = status.peers.first() {
+        let selector: tailscale::ExitNodeSelector = peer
+            .ipv4
+            .to_string()
+            .parse()
+            .expect("peer IP parses as an exit selector");
+        eprintln!(
+            "[s7] setting exit node = {} ({})",
+            peer.display_name, peer.ipv4
+        );
+        dev.set_exit_node(Some(selector))
+            .await
+            .expect("set_exit_node(Some) must apply without error");
+    } else {
+        eprintln!("[s7] no peers to select; exercising set/clear with a literal IP");
+        let selector: tailscale::ExitNodeSelector =
+            "100.64.0.1".parse().expect("literal IP parses");
+        dev.set_exit_node(Some(selector))
+            .await
+            .expect("set_exit_node(Some) must apply without error");
+    }
+
+    // Switching again (clear) must also apply cleanly.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    dev.set_exit_node(None)
+        .await
+        .expect("set_exit_node(None) must clear without error");
+    eprintln!("[s7] exit-node set + cleared at runtime, no panic");
+
+    // The device is still alive and usable after the switches (netstack didn't die).
+    let ip_after = dev
+        .ipv4_addr()
+        .await
+        .expect("device still serves its IP after exit switches");
+    assert!(
+        is_cgnat(ip_after),
+        "device healthy after runtime exit switches: {ip_after}"
+    );
+}

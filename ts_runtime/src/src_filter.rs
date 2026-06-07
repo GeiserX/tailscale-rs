@@ -42,7 +42,7 @@ impl Message<Arc<PeerState>> for SourceFilterUpdater {
         // cryptokey-routing coupling the comment below depends on.
         let exit_node_id = self
             .env
-            .exit_node
+            .exit_node()
             .as_ref()
             .and_then(|sel| sel.resolve(state_update.peers.peers().values()));
 

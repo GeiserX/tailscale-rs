@@ -334,7 +334,7 @@ fn build_dns_view(
     // `active_exit_peer.and_then(|n| n.peerapi_doh_addr())` (`magic_dns.rs:751`). The two-line peer
     // resolution mirrors `route_updater.rs:191-272` (selector -> stable id -> peer); replicated
     // locally (no shared-fn extraction) to keep S3 inside `tun_actor.rs`.
-    let exit_doh = env.exit_node.as_ref().and_then(|sel| {
+    let exit_doh = env.exit_node().as_ref().and_then(|sel| {
         let peers = peers.as_ref()?;
         let id = sel.resolve(peers.peers().values())?;
         peers
@@ -770,7 +770,7 @@ impl Message<Arc<PeerState>> for TunActor {
         // separate `ActiveExitNode` message (route-updater-published), but the TunActor has no such
         // subscription, so it tracks the exit node by resolving the selector against the peer db
         // here (and on every StateUpdate) — fail-closed `None` if unmatched / can't proxy DNS.
-        let exit_doh = self.env.exit_node.as_ref().and_then(|sel| {
+        let exit_doh = self.env.exit_node().as_ref().and_then(|sel| {
             let id = sel.resolve(state.peers.peers().values())?;
             state
                 .peers
