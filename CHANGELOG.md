@@ -6,7 +6,19 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
-## [0.6.0](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.6.0) - 2026-06-07
+## [0.6.1](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.6.1) - 2026-06-07
+
+### Added
+- **Extensive live-tailnet e2e campaign** (`tests/tailnet_e2e_campaign.rs`): a gated, CI-safe test
+  binary with six independent scenarios against real Tailscale — concurrent multi-node join,
+  overlay ICMP ping to real peers, deep MagicDNS resolution, ephemeral re-join churn, overlay TCP
+  connect, and an IPv4-only config permutation. Skips cleanly unless `TS_RS_TEST_NET=1` +
+  `TS_RS_TEST_AUTHKEY` are set.
+
+A run against a live tailnet validated registration, CGNAT addressing, MagicDNS (self + 24/24
+peers), ephemeral churn, and overlay TCP to real peers — and surfaced two pre-existing panics now
+tracked as bugs: a `PeerDb::upsert` disco-key index assertion under concurrent/churning netmaps,
+and an overlay-`ping` netstack panic on a stale raw-socket handle.
 
 Minor-version bump marking the open-source-readiness milestone: a session of crypto-interop
 proofs, an `unsafe` audit, a whole-codebase review, and now an FFI panic boundary leave the fork
