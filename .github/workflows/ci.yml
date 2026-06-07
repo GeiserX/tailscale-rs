@@ -4,12 +4,13 @@ on:
   push:
     branches:
       - main
-    tags:
-      - 'v*'
+    # NOTE: tag pushes (`v*`) deliberately do NOT trigger this workflow. Releases push the commit
+    # (which runs the real lanes) immediately followed by the tag; triggering on BOTH produced two
+    # runs per release and was the dominant source of CI notification spam on this fork. The commit
+    # push already verifies the exact tree the tag points at, so the tag run added nothing.
   pull_request:
-  schedule:
-    # Nightly run; execute daily at 06:37 AM UTC on main (default branch).
-    - cron: '37 6 * * *'
+  # No nightly `schedule` cron: on a fork with no self-hosted runners it was pure notification noise
+  # (a daily green run that verifies nothing new). Re-add if a scheduled audit is ever wanted.
 
   workflow_dispatch:
     inputs:
