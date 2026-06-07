@@ -244,7 +244,7 @@ jobs:
       TS_RS_EXPERIMENT: this_is_unstable_software
       # ring-only feature set: `tailscale` has no `default` feature, so `--no-default-features`
       # leaves `ssh`/`axum` off while keeping the full tailnet/TLS (ring) daemon path.
-      MUSL_FLAGS: -p tailscale --no-default-features
+      MUSL_FLAGS: -p tailscale-rs --no-default-features
     steps:
       - name: Free disk space
         # `cross` pulls a multi-GB docker image per target and the build artifacts otherwise

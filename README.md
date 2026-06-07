@@ -20,8 +20,8 @@ C, Elixir, and Python.
 > [!CAUTION]
 > This software is unstable and insecure.
 >
-> We welcome enthusiasm and interest, but please **do not** build production software using these
-> libraries or rely on it for data privacy until we have a chance to batten down some hatches
+> I welcome enthusiasm and interest, but please **do not** build production software using these
+> libraries or rely on it for data privacy until I've had a chance to batten down some hatches
 > and complete a third-party audit.
 >
 > See [Caveats](#caveats) for more details.
@@ -107,21 +107,21 @@ For the full module layout and design notes, see [ARCHITECTURE.md](ARCHITECTURE.
 
 ## Caveats
 
-This software is still a work-in-progress! We are providing it in the open at this stage out of a
+This software is still a work-in-progress! I'm providing it in the open at this stage out of a
 belief in open-source and to see where the community runs with it, but please be aware of a few
 important considerations:
 
 - This implementation contains unaudited cryptography and hasn't undergone a comprehensive security
   analysis. Conservatively, assume there could be a critical security hole meaning anything you send
   or receive could be in the clear on the public Internet.
-- There are no compatibility guarantees at the moment. This is early-days software &mdash; we may
+- There are no compatibility guarantees at the moment. This is early-days software &mdash; I may
   break dependent code in order to get things right.
 - Direct peer-to-peer connections via NAT traversal are implemented (STUN-discovered endpoints and
   Disco, with `CallMeMaybe` hole-punching over DERP), and traffic falls back to DERP relays when no
-  direct path is available. We have not yet implemented symmetric-NAT birthday-paradox
-  hole-punching, so behind some NATs a flow stays relayed through DERP, which caps its throughput.
+  direct path is available. Symmetric-NAT birthday-paradox hole-punching is not yet implemented,
+  so behind some NATs a flow stays relayed through DERP, which caps its throughput.
 - The `TS_RS_EXPERIMENT` environment variable is required to be set to `this_is_unstable_software`
-  for all code linked against `tailscale-rs`; this includes Rust, C, Elixir, and Python code. We'll
+  for all code linked against `tailscale-rs`; this includes Rust, C, Elixir, and Python code. I'll
   remove this requirement after a third-party code/cryptography audit and any necessary fixes.
 
 For the full security posture — unaudited cryptography, the Tailnet Lock enforcement gap, peerAPI
@@ -130,9 +130,9 @@ capability limitations, at-rest key handling, and how to report a vulnerability 
 
 ## Versioning, Releases, and Compatability
 
-We follow semver and aim to make a point release roughly monthly. Since we are pre-1.0, we make no
-backwards-compatability guarantees. We are aiming to have a stable 1.0 release as soon as we can, but
-we currently don't have a timeline.
+I follow semver and aim to make a point release roughly monthly. Since this is pre-1.0, there are no
+backwards-compatability guarantees. I'm aiming for a stable 1.0 release as soon as I can, but there's
+currently no timeline.
 
 ## MSRV and Edition
 
@@ -142,12 +142,12 @@ The current MSRV is 1.94.1. The current edition is Rust 2024.
 and previous Rust compiler versions, and the latest
 [edition of Rust](https://doc.rust-lang.org/edition-guide/editions/index.html).
 
-We may lag the latest version/edition in rare cases for our dependencies to catch up and for us to
+I may lag the latest version/edition in rare cases to let dependencies catch up and to
 perform any necessary fixes.
 
 ## Platform Support
 
-We support the following platforms and architectures:
+The following platforms and architectures are supported:
 
 - Linux (`x86_64`/`ARM64`)
 - macOS (`ARM64`)
@@ -155,13 +155,13 @@ We support the following platforms and architectures:
 
 ## Status
 
-`tailscale-rs` is a work-in-progress - we're still rapidly iterating, fixing bugs, and adding new
-features. We aim to keep this section up-to-date, but our [issue tracker](https://github.com/GeiserX/tailscale-rs/issues)
+`tailscale-rs` is a work-in-progress - I'm still rapidly iterating, fixing bugs, and adding new
+features. I aim to keep this section up-to-date, but the [issue tracker](https://github.com/GeiserX/tailscale-rs/issues)
 is the best way to see the latest updates.
 
 ### Implemented
 
-These are features that we currently implement:
+These are features that are currently implemented:
 
 - Basics
   - Create TCP and UDP sockets on the tailnet
@@ -201,7 +201,7 @@ These are features that we currently implement:
 
 ### Coming Soon
 
-These are features or efforts we have in the pipeline and are actively working towards, but provide
+These are features or efforts I have in the pipeline and am actively working towards, but with
 no guarantees on timeline or completion:
 
 - Third-party code and cryptography audit
@@ -209,7 +209,7 @@ no guarantees on timeline or completion:
 ### Unsupported
 
 This is an incomplete list of features in the Tailscale Go client, `tsnet`, and/or `libtailscale`
-that we currently *do not* support. We'd like to add all of these eventually! If there's something
+that are *not* currently supported. I'd like to add all of these eventually! If there's something
 on this list you'd like to see supported, or something _not_ on this list you're not sure about,
 please open an issue!
 
