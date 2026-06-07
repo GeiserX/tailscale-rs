@@ -33,9 +33,7 @@ impl Netstack {
                 RawSocketResponse::Opened { handle }.into()
             }
             RawSocketCommand::Send { buf } => {
-                let sock = self
-                    .socket_set
-                    .get_mut::<raw::Socket>(unwrap_handle!(handle));
+                let sock = get_socket_mut!(self, raw::Socket, handle);
 
                 if buf.len() > sock.payload_send_capacity() {
                     tracing::error!(
@@ -56,9 +54,7 @@ impl Netstack {
                 }
             }
             RawSocketCommand::Recv { max_len } => {
-                let sock = self
-                    .socket_set
-                    .get_mut::<raw::Socket>(unwrap_handle!(handle));
+                let sock = get_socket_mut!(self, raw::Socket, handle);
 
                 match sock.recv() {
                     Ok(mut buf) => {
@@ -92,7 +88,13 @@ impl Netstack {
                 }
             }
             RawSocketCommand::Close => {
-                self.socket_set.remove(unwrap_handle!(handle));
+                // `remove` also panics on a stale handle. A `Close` is never re-queued (it returns
+                // `Response::Ok`, never `WouldBlock`), but a caller could send it twice, so guard
+                // the double-close rather than panic the netstack actor.
+                let handle = unwrap_handle!(handle);
+                if self.socket_set.iter().any(|(h, _)| h == handle) {
+                    self.socket_set.remove(handle);
+                }
                 Response::Ok
             }
         }
@@ -103,5 +105,68 @@ impl Netstack {
             vec![raw::PacketMetadata::EMPTY; self.config.raw_message_count],
             vec![0; self.config.raw_buffer_size],
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use smoltcp::{
+        time::Instant,
+        wire::{IpProtocol, IpVersion},
+    };
+
+    use crate::{
+        Config, Netstack, Response,
+        command::{Error, InternalErrorKind},
+        raw::{Command as RawSocketCommand, Response as RawSocketResponse},
+    };
+
+    /// Regression test for tsr-02e: a blocked raw `Recv` can be re-run after its socket is closed
+    /// (e.g. ping's raw ICMP socket dropped while a `Recv` is still queued). The re-run must NOT
+    /// panic the netstack actor — it must return a clean missing-socket error response.
+    #[test]
+    fn recv_on_closed_raw_socket_returns_error_not_panic() {
+        let mut stack = Netstack::new(Config::default(), Instant::ZERO);
+
+        // Open a raw ICMP socket and capture its handle.
+        let handle = match stack.process_raw(
+            RawSocketCommand::Open {
+                ip_version: IpVersion::Ipv4,
+                protocol: IpProtocol::Icmp,
+            },
+            None,
+        ) {
+            Response::Raw(RawSocketResponse::Opened { handle }) => handle,
+            other => panic!("expected Opened, got {other:?}"),
+        };
+
+        // A `Recv` on the empty socket should block (the live, pre-close behavior).
+        assert!(matches!(
+            stack.process_raw(RawSocketCommand::Recv { max_len: None }, Some(handle)),
+            Response::WouldBlock { .. }
+        ));
+
+        // Close the socket, removing the handle from the socket set.
+        assert!(matches!(
+            stack.process_raw(RawSocketCommand::Close, Some(handle)),
+            Response::Ok
+        ));
+
+        // Re-running the blocked `Recv` against the now-stale handle must not panic; it must
+        // return a clean missing-socket error response.
+        let resp = stack.process_raw(RawSocketCommand::Recv { max_len: None }, Some(handle));
+        assert!(
+            matches!(
+                resp,
+                Response::Error(Error::Internal(InternalErrorKind::BadSocketHandle))
+            ),
+            "expected missing-socket error, got {resp:?}"
+        );
+
+        // A double-close against the stale handle must also not panic.
+        assert!(matches!(
+            stack.process_raw(RawSocketCommand::Close, Some(handle)),
+            Response::Ok
+        ));
     }
 }

@@ -77,7 +77,18 @@ impl kameo::Actor for ControlRunner {
                     tracing::info!(auth_url = %u, "please authorize this machine or pass an auth key");
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => {
+                    // A hard registration failure (bad/expired/unknown auth key, etc.). Log the
+                    // specific reason control gave — the actor will stop, but the cause must be
+                    // visible, not an opaque "Panicked" with no detail (tsr-kqj).
+                    //
+                    // TODO(tsr-kqj): surface this as a typed error out of `Device::new` (rather
+                    // than the later opaque `Internal(Actor)` the caller sees) — that requires
+                    // awaiting the actor's startup, since `ControlRunner` is spawned
+                    // fire-and-forget today. Out of scope for this bead; logging here is the fix.
+                    tracing::error!(error = %e, "registration failed; control runner stopping");
+                    return Err(e.into());
+                }
             }
         }
 

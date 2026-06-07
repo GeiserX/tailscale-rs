@@ -13,6 +13,11 @@ pub enum RegistrationError {
     #[error("machine was not authorized by control to join tailnet")]
     MachineNotAuthorized(Option<Url>),
 
+    /// Control rejected registration with a specific reason (the RegisterResponse `Error` field),
+    /// e.g. "invalid key: API key does not exist". No interactive auth URL was offered.
+    #[error("control rejected registration: {0}")]
+    Rejected(String),
+
     #[error("Network error")]
     NetworkError,
 
@@ -82,6 +87,7 @@ impl From<RegistrationError> for crate::Error {
                 crate::InternalErrorKind::MachineAuthorization,
                 crate::Operation::Registration,
             ),
+            RegistrationError::Rejected(msg) => crate::Error::Registration(msg),
             RegistrationError::Internal(k) => {
                 crate::Error::Internal(k.into(), crate::Operation::Registration)
             }
@@ -101,6 +107,31 @@ impl From<InternalErrorKind> for crate::InternalErrorKind {
             InternalErrorKind::Http => crate::InternalErrorKind::Http,
         }
     }
+}
+
+/// Classify a parsed [`RegisterResponse`] into success or a typed [`RegistrationError`].
+///
+/// Pure and side-effect-free so it can be unit-tested directly (the network round-trip in
+/// [`register`] is not). When the machine is not authorized:
+/// - a non-empty `auth_url` means interactive auth is pending -> `MachineNotAuthorized(Some(url))`;
+/// - otherwise control gave a hard rejection. Surface its `error` reason verbatim if present
+///   (e.g. "invalid key: API key does not exist") instead of a generic error (tsr-kqj);
+/// - an empty `error` with no auth URL falls back to `MachineNotAuthorized(None)`.
+fn classify_register_response(resp: &RegisterResponse) -> Result<(), RegistrationError> {
+    if !resp.machine_authorized {
+        if !resp.auth_url.is_empty() {
+            return Err(RegistrationError::MachineNotAuthorized(Some(
+                resp.auth_url.parse()?,
+            )));
+        }
+        // No interactive auth URL — control gave a hard rejection. Surface its reason verbatim if
+        // present (e.g. "invalid key: API key does not exist") instead of a generic error.
+        if !resp.error.is_empty() {
+            return Err(RegistrationError::Rejected(resp.error.to_string()));
+        }
+        return Err(RegistrationError::MachineNotAuthorized(None));
+    }
+    Ok(())
 }
 
 #[tracing::instrument(skip_all, fields(%control_url))]
@@ -202,15 +233,75 @@ pub async fn register(
 
     let register_resp: RegisterResponse = serde_json::from_str(body)?;
 
-    if !register_resp.machine_authorized {
-        if !register_resp.auth_url.is_empty() {
-            Err(RegistrationError::MachineNotAuthorized(Some(
-                register_resp.auth_url.parse()?,
-            )))
-        } else {
-            Err(RegistrationError::MachineNotAuthorized(None))
-        }
-    } else {
-        Ok(())
+    classify_register_response(&register_resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal-but-valid `RegisterResponse` wire body. The `MachineAuthorized`/`AuthURL`/`Error`
+    /// fields are interpolated so each test can mirror a real control response shape.
+    fn register_response_json(machine_authorized: bool, auth_url: &str, error: &str) -> String {
+        format!(
+            r#"{{
+                "User": {{ "ID": 1 }},
+                "Login": {{ "ID": 2, "Provider": "", "LoginName": "" }},
+                "NodeKeyExpired": false,
+                "MachineAuthorized": {machine_authorized},
+                "AuthURL": "{auth_url}",
+                "Error": "{error}"
+            }}"#
+        )
+    }
+
+    /// A hard rejection (no auth URL) with a populated `Error` must surface control's verbatim
+    /// reason as `RegistrationError::Rejected`, not a generic error (tsr-kqj).
+    #[test]
+    fn rejection_with_error_surfaces_reason() {
+        let body = register_response_json(false, "", "invalid key: API key does not exist");
+        let resp: RegisterResponse = serde_json::from_str(&body).unwrap();
+
+        let err = classify_register_response(&resp).unwrap_err();
+        assert_eq!(
+            err,
+            RegistrationError::Rejected("invalid key: API key does not exist".to_string())
+        );
+    }
+
+    /// A not-authorized response with neither an auth URL nor an `Error` falls back to
+    /// `MachineNotAuthorized(None)`.
+    #[test]
+    fn rejection_without_error_yields_machine_not_authorized_none() {
+        let body = register_response_json(false, "", "");
+        let resp: RegisterResponse = serde_json::from_str(&body).unwrap();
+
+        let err = classify_register_response(&resp).unwrap_err();
+        assert_eq!(err, RegistrationError::MachineNotAuthorized(None));
+    }
+
+    /// A not-authorized response with a non-empty `AuthURL` means interactive auth is pending and
+    /// yields `MachineNotAuthorized(Some(url))` (the auth URL takes precedence).
+    #[test]
+    fn rejection_with_auth_url_yields_machine_not_authorized_some() {
+        let body = register_response_json(false, "https://login.example.com/a/abc123", "");
+        let resp: RegisterResponse = serde_json::from_str(&body).unwrap();
+
+        let err = classify_register_response(&resp).unwrap_err();
+        assert_eq!(
+            err,
+            RegistrationError::MachineNotAuthorized(Some(
+                "https://login.example.com/a/abc123".parse().unwrap()
+            ))
+        );
+    }
+
+    /// An authorized response classifies as success.
+    #[test]
+    fn authorized_response_is_ok() {
+        let body = register_response_json(true, "", "");
+        let resp: RegisterResponse = serde_json::from_str(&body).unwrap();
+
+        assert!(classify_register_response(&resp).is_ok());
     }
 }

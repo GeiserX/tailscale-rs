@@ -60,9 +60,9 @@ impl crate::Netstack {
                 local,
                 buf,
             } => {
-                let handle = handle.unwrap();
+                let handle = unwrap_handle!(handle);
 
-                let sock = self.socket_set.get_mut::<udp::Socket>(handle);
+                let sock = get_socket_mut!(self, udp::Socket, Some(handle));
 
                 // Enforce IP-version parity only when the socket is bound to a concrete address.
                 // A wildcard bind (`addr: None`, used for any-IP forwarding) carries no version,
@@ -115,9 +115,7 @@ impl crate::Netstack {
                 }
             }
             UdpCommand::Recv { max_len } => {
-                let sock = self
-                    .socket_set
-                    .get_mut::<udp::Socket>(unwrap_handle!(handle));
+                let sock = get_socket_mut!(self, udp::Socket, handle);
 
                 // The socket's bound port -- the local address of received datagrams uses the
                 // captured original destination IP but this socket's port.
@@ -168,7 +166,13 @@ impl crate::Netstack {
                 // NOTE(npry): smoltcp supports socket reuse via `socket.close()`, which puts the
                 // socket in a valid state to re-bound. We don't support that for API simplicity,
                 // but we could in principle if there was a motivating reason.
-                self.socket_set.remove(unwrap_handle!(handle));
+                //
+                // `remove` panics on a stale handle. A `Close` is never re-queued, but a caller
+                // could send it twice, so guard the double-close rather than panic the netstack.
+                let handle = unwrap_handle!(handle);
+                if self.socket_set.iter().any(|(h, _)| h == handle) {
+                    self.socket_set.remove(handle);
+                }
 
                 Response::Ok
             }

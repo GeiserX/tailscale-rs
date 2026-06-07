@@ -6,6 +6,30 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.6.2](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.6.2) - 2026-06-07
+
+Three panics surfaced by the v0.6.1 live e2e campaign against real Tailscale, all fixed and
+re-verified live (the full 6-scenario campaign now passes; it was 4/6).
+
+### Fixed
+- **`PeerDb` no longer panics under concurrent/churning netmaps (tsr-gxq).** `PeerDb::upsert` had
+  four `assert!(removed_index_entry == id)` checks (disco-key, fqdn, tailnet-IP v4/v6, and the
+  generic node-key/stable-id/control index helper) that fired when a peer's indexed value was
+  transiently reassigned across peers — killing the `PeerTracker` actor and freezing the netmap.
+  They now use a guarded remove (retract only our own mapping, tolerate an absent/different one),
+  matching the idiom the hostname index already used. Joining many nodes concurrently is now safe.
+- **Overlay `ping` (and any raw/UDP socket op) no longer panics the netstack on a stale handle
+  (tsr-02e).** A blocked `Recv`/`Send` whose socket was closed before it re-ran called smoltcp's
+  `SocketSet::get_mut` on a freed handle, which panics — taking down the whole netstack actor (every
+  later op then failed with `InternalChannelClosed`). A new `get_socket_mut!` checks the handle is
+  live first and returns a clean "socket closed" error otherwise; the `Close` path is guarded too.
+  `Device::ping` to real peers now works.
+- **Registration failures are diagnosable (tsr-kqj).** Control's `RegisterResponse.Error` message
+  (e.g. `"invalid key: API key does not exist"`) was discarded, leaving a bad auth key to surface as
+  an opaque `Internal(Actor)`. The reason is now carried through a new `Error::Registration(String)`
+  and logged at the failure point. (Surfacing it as a typed error out of `Device::new` rather than a
+  later call remains a documented follow-up.)
+
 ## [0.6.1](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.6.1) - 2026-06-07
 
 ### Added

@@ -132,8 +132,13 @@ impl PeerDb {
             &mut self.index_state.disco_idx,
             |old, idx| {
                 if let Some(key) = &old.disco_key {
-                    let old_id = idx.remove(key);
-                    assert!(old_id.is_some_and(|old_id| old_id == id));
+                    // Guarded remove: under netmap churn this entry may already belong to another
+                    // peer (or be gone); only retract our own mapping — never clobber another
+                    // peer's. (was an assert!, which panicked the actor under concurrent joins;
+                    // tsr-gxq)
+                    if idx.get(key).is_some_and(|&x| x == id) {
+                        idx.remove(key);
+                    }
                 }
             },
             |new, idx| {
@@ -167,8 +172,14 @@ impl PeerDb {
                 }
 
                 if let Some(fqdn) = old.fqdn_opt(false) {
-                    let removed_id = idx.remove(&canon_name(&fqdn));
-                    assert!(removed_id.is_some_and(|removed_id| removed_id == id));
+                    // Guarded remove: under netmap churn this entry may already belong to another
+                    // peer (or be gone); only retract our own mapping — never clobber another
+                    // peer's. (was an assert!, which panicked the actor under concurrent joins;
+                    // tsr-gxq)
+                    let k = canon_name(&fqdn);
+                    if idx.get(&k).is_some_and(|&x| x == id) {
+                        idx.remove(&k);
+                    }
                 }
             },
             |new, idx| {
@@ -186,11 +197,18 @@ impl PeerDb {
             |x| &x.tailnet_address,
             &mut self.index_state.ip_idx,
             |old, idx| {
-                let id4 = idx.remove(old.tailnet_address.ipv4.into());
-                let id6 = idx.remove(old.tailnet_address.ipv6.into());
+                // Guarded remove: under netmap churn these entries may already belong to another
+                // peer (or be gone); only retract our own mapping — never clobber another peer's.
+                // (was an assert!, which panicked the actor under concurrent joins; tsr-gxq)
+                let ipv4: ipnet::IpNet = old.tailnet_address.ipv4.into();
+                let ipv6: ipnet::IpNet = old.tailnet_address.ipv6.into();
 
-                assert!(id4.is_some_and(|old_id| old_id == id));
-                assert!(id6.is_some_and(|old_id| old_id == id));
+                if idx.lookup_prefix_exact(ipv4).is_some_and(|&x| x == id) {
+                    idx.remove(ipv4);
+                }
+                if idx.lookup_prefix_exact(ipv6).is_some_and(|&x| x == id) {
+                    idx.remove(ipv6);
+                }
             },
             |new, idx| {
                 idx.insert(new.tailnet_address.ipv4.into(), id);
@@ -394,8 +412,12 @@ fn maybe_update_idx<T>(
         &accessor,
         idx,
         |old, idx| {
-            let old_id = idx.remove(accessor(old));
-            assert!(old_id.is_some_and(|old_id| old_id == new_id));
+            // Guarded remove: under netmap churn this entry may already belong to another peer
+            // (or be gone); only retract our own mapping — never clobber another peer's. (was an
+            // assert!, which panicked the actor under concurrent joins; tsr-gxq)
+            if idx.get(accessor(old)).is_some_and(|&x| x == new_id) {
+                idx.remove(accessor(old));
+            }
         },
         |new, idx| {
             idx.insert(accessor(new).clone(), new_id);
@@ -702,6 +724,128 @@ mod test {
         assert!(db.get(&"mixedcase").is_none());
         assert!(db.get(&"mixedcase.tail-scale.ts.net").is_none());
         assert!(db.index_state.is_empty());
+    }
+
+    #[test]
+    fn disco_key_reassigned_across_peers_no_panic() {
+        // Under netmap churn, control can transiently move a disco_key from one peer to another
+        // and then update the original peer. Before the fix, the old-value removal asserted the
+        // disco entry still mapped back to the original peer and panicked the actor (tsr-gxq).
+        let mut db = PeerDb::default();
+
+        let disco: DiscoPublicKey = [7u8; 32].into();
+
+        let node_a = Node {
+            disco_key: Some(disco),
+            ..rand_node()
+        };
+        let id_a = db.upsert(&node_a);
+
+        // B claims the same disco_key (churn / transient reuse). The disco index now points at B.
+        let node_b = Node {
+            disco_key: Some(disco),
+            ..rand_node()
+        };
+        let id_b = db.upsert(&node_b);
+        assert_ne!(id_a, id_b);
+
+        // Re-upsert A with no disco_key. The old-value removal must not panic even though the
+        // disco entry now belongs to B.
+        let node_a2 = Node {
+            disco_key: None,
+            ..node_a.clone()
+        };
+        let id_a2 = db.upsert(&node_a2);
+        assert_eq!(id_a, id_a2);
+
+        // The disco index should still resolve to the last writer (B), unharmed.
+        assert_eq!(disco.lookup(&db), Some(id_b));
+    }
+
+    #[test]
+    fn ip_reassigned_across_peers_no_panic() {
+        // Two peers transiently share a tailnet IP during churn, then the original changes IPs.
+        // Before the fix, the ip_idx old-value removal asserted ownership and panicked (tsr-gxq).
+        let mut db = PeerDb::default();
+
+        let shared = TailnetAddress {
+            ipv4: Ipv4Addr::new(100, 64, 0, 1).into(),
+            ipv6: Ipv6Addr::new(0xfd7a, 0, 0, 0, 0, 0, 0, 1).into(),
+        };
+
+        let node_a = Node {
+            tailnet_address: shared.clone(),
+            ..rand_node()
+        };
+        let id_a = db.upsert(&node_a);
+
+        // B claims the same tailnet IPs (churn). The ip index now points at B.
+        let node_b = Node {
+            tailnet_address: shared.clone(),
+            ..rand_node()
+        };
+        let id_b = db.upsert(&node_b);
+        assert_ne!(id_a, id_b);
+
+        // Re-upsert A with different IPs. The old-value removal must not panic even though the
+        // shared IP entries now belong to B.
+        let node_a2 = Node {
+            tailnet_address: TailnetAddress {
+                ipv4: Ipv4Addr::new(100, 64, 0, 2).into(),
+                ipv6: Ipv6Addr::new(0xfd7a, 0, 0, 0, 0, 0, 0, 2).into(),
+            },
+            ..node_a.clone()
+        };
+        let id_a2 = db.upsert(&node_a2);
+        assert_eq!(id_a, id_a2);
+
+        // The shared IPs still resolve to the last writer (B), unharmed.
+        assert_eq!(
+            IpAddr::from(Ipv4Addr::new(100, 64, 0, 1)).lookup(&db),
+            Some(id_b)
+        );
+        // A's new IP resolves to A.
+        assert_eq!(
+            IpAddr::from(Ipv4Addr::new(100, 64, 0, 2)).lookup(&db),
+            Some(id_a)
+        );
+    }
+
+    #[test]
+    fn node_key_or_stableid_churn_no_panic() {
+        // Exercises the generic `maybe_update_idx` path (node_key / stable_id / control_idx). A
+        // peer re-registering with a node_key that another peer transiently claimed must not panic
+        // the actor on the old-value removal (tsr-gxq).
+        let mut db = PeerDb::default();
+
+        let key: NodePublicKey = [9u8; 32].into();
+
+        let node_a = Node {
+            node_key: key,
+            ..rand_node()
+        };
+        let id_a = db.upsert(&node_a);
+
+        // B claims the same node_key (churn). The nk index now points at B.
+        let node_b = Node {
+            node_key: key,
+            ..rand_node()
+        };
+        let id_b = db.upsert(&node_b);
+        assert_ne!(id_a, id_b);
+
+        // Re-upsert A with a fresh node_key. The old-value removal must not panic even though the
+        // old node_key entry now belongs to B.
+        let node_a2 = Node {
+            node_key: [10u8; 32].into(),
+            ..node_a.clone()
+        };
+        let id_a2 = db.upsert(&node_a2);
+        assert_eq!(id_a, id_a2);
+
+        // The churned node_key still resolves to B; A's fresh key resolves to A.
+        assert_eq!(key.lookup(&db), Some(id_b));
+        assert_eq!(NodePublicKey::from([10u8; 32]).lookup(&db), Some(id_a));
     }
 
     proptest::prop_compose! {

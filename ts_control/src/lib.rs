@@ -94,6 +94,11 @@ pub enum Error {
     #[error("invalid URL: {0}")]
     InvalidUrl(url::Url),
 
+    /// Control rejected registration with a specific reason (e.g. a bad/expired/unknown auth key).
+    /// The string is control's verbatim `RegisterResponse.Error` message.
+    #[error("control rejected registration: {0}")]
+    Registration(String),
+
     /// Some kind of networking error.
     ///
     /// These might be addressed by retrying, or might be an unresolvable error.
