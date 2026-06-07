@@ -6,7 +6,7 @@
 
 use std::ffi::{self, c_char};
 
-use crate::{TOKIO_RUNTIME, device, into_c_string, net_types::sockaddr};
+use crate::{TOKIO_RUNTIME, device, ffi_guard, into_c_string, net_types::sockaddr};
 
 /// An opaque handle to a running loopback SOCKS5 proxy.
 ///
@@ -37,25 +37,27 @@ pub unsafe extern "C" fn ts_loopback(
     out_cred: *mut *mut c_char,
     out_handle: *mut *mut loopback_handle,
 ) -> ffi::c_int {
-    match TOKIO_RUNTIME.block_on(dev.0.loopback()) {
-        Ok((addr, cred, handle)) => {
-            let cred_ptr = into_c_string(cred);
-            if cred_ptr.is_null() {
-                return -1;
+    ffi_guard(move || {
+        match TOKIO_RUNTIME.block_on(dev.0.loopback()) {
+            Ok((addr, cred, handle)) => {
+                let cred_ptr = into_c_string(cred);
+                if cred_ptr.is_null() {
+                    return -1;
+                }
+                *out_addr = addr.into();
+                // SAFETY: `out_cred` and `out_handle` are valid writable pointers by precondition.
+                unsafe {
+                    *out_cred = cred_ptr;
+                    *out_handle = Box::into_raw(Box::new(loopback_handle(handle)));
+                }
+                0
             }
-            *out_addr = addr.into();
-            // SAFETY: `out_cred` and `out_handle` are valid writable pointers by precondition.
-            unsafe {
-                *out_cred = cred_ptr;
-                *out_handle = Box::into_raw(Box::new(loopback_handle(handle)));
+            Err(e) => {
+                tracing::error!(err = %e, "loopback");
+                -1
             }
-            0
         }
-        Err(e) => {
-            tracing::error!(err = %e, "loopback");
-            -1
-        }
-    }
+    })
 }
 
 /// Stop the loopback SOCKS5 proxy and free its handle (the counterpart to the handle returned by
@@ -65,5 +67,5 @@ pub unsafe extern "C" fn ts_loopback(
 /// `NULL` is a no-op.
 #[unsafe(no_mangle)]
 pub extern "C" fn ts_loopback_stop(handle: Option<Box<loopback_handle>>) {
-    drop(handle)
+    ffi_guard(move || drop(handle))
 }

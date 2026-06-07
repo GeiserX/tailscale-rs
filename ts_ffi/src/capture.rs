@@ -6,7 +6,7 @@
 
 use std::ffi::{self, c_char};
 
-use crate::{TOKIO_RUNTIME, device, util};
+use crate::{TOKIO_RUNTIME, device, ffi_guard, util};
 
 /// Begin a debug packet capture, writing a pcap of every packet crossing the dataplane to the file
 /// at `dst_path` (like Go `tsnet.Server.CapturePcap`).
@@ -29,27 +29,29 @@ use crate::{TOKIO_RUNTIME, device, util};
 /// ensuring it is a trusted, sanitized path (no path-traversal from untrusted input).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ts_capture_pcap(dev: &device, dst_path: *const c_char) -> ffi::c_int {
-    // SAFETY: ensured by function precondition
-    let Some(dst_path) = (unsafe { util::str(dst_path) }) else {
-        tracing::error!("capture_pcap: dst_path is null or invalid utf-8");
-        return -1;
-    };
-
-    let file = match std::fs::File::create(dst_path) {
-        Ok(f) => std::io::BufWriter::new(f),
-        Err(e) => {
-            tracing::error!(err = %e, "capture_pcap: create destination");
+    ffi_guard(move || {
+        // SAFETY: ensured by function precondition
+        let Some(dst_path) = (unsafe { util::str(dst_path) }) else {
+            tracing::error!("capture_pcap: dst_path is null or invalid utf-8");
             return -1;
-        }
-    };
+        };
 
-    match TOKIO_RUNTIME.block_on(dev.0.capture_pcap(file)) {
-        Ok(()) => 0,
-        Err(e) => {
-            tracing::error!(err = %e, "capture_pcap");
-            -1
+        let file = match std::fs::File::create(dst_path) {
+            Ok(f) => std::io::BufWriter::new(f),
+            Err(e) => {
+                tracing::error!(err = %e, "capture_pcap: create destination");
+                return -1;
+            }
+        };
+
+        match TOKIO_RUNTIME.block_on(dev.0.capture_pcap(file)) {
+            Ok(()) => 0,
+            Err(e) => {
+                tracing::error!(err = %e, "capture_pcap");
+                -1
+            }
         }
-    }
+    })
 }
 
 /// Stop a debug packet capture started by [`ts_capture_pcap`] (Go `ClearCaptureSink`).
@@ -59,11 +61,11 @@ pub unsafe extern "C" fn ts_capture_pcap(dev: &device, dst_path: *const c_char) 
 /// a negative number on error (the dataplane actor being unreachable — logged via `tracing`).
 #[unsafe(no_mangle)]
 pub extern "C" fn ts_stop_capture(dev: &device) -> ffi::c_int {
-    match TOKIO_RUNTIME.block_on(dev.0.stop_capture()) {
+    ffi_guard(move || match TOKIO_RUNTIME.block_on(dev.0.stop_capture()) {
         Ok(()) => 0,
         Err(e) => {
             tracing::error!(err = %e, "stop_capture");
             -1
         }
-    }
+    })
 }

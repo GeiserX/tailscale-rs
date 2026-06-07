@@ -8,7 +8,7 @@
 
 use std::ffi::{self, c_char};
 
-use crate::{device, into_c_string, util};
+use crate::{device, ffi_guard, into_c_string, util};
 
 /// List the Taildrop files this device has fully received and not yet consumed (Go LocalAPI
 /// `WaitingFiles`).
@@ -30,36 +30,38 @@ pub unsafe extern "C" fn ts_taildrop_waiting_files(
     dev: &device,
     out: *mut *mut c_char,
 ) -> ffi::c_int {
-    let files = match dev.0.taildrop_waiting_files() {
-        Ok(files) => files,
-        Err(e) => {
-            tracing::error!(err = %e, "taildrop_waiting_files");
+    ffi_guard(move || {
+        let files = match dev.0.taildrop_waiting_files() {
+            Ok(files) => files,
+            Err(e) => {
+                tracing::error!(err = %e, "taildrop_waiting_files");
+                // SAFETY: `out` is a valid writable pointer by precondition.
+                unsafe { *out = std::ptr::null_mut() };
+                return -1;
+            }
+        };
+
+        if files.is_empty() {
             // SAFETY: `out` is a valid writable pointer by precondition.
             unsafe { *out = std::ptr::null_mut() };
+            return 0;
+        }
+
+        let count = files.len() as ffi::c_int;
+        let joined = files
+            .into_iter()
+            .map(|f| f.name)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let ptr = into_c_string(joined);
+        if ptr.is_null() {
             return -1;
         }
-    };
-
-    if files.is_empty() {
         // SAFETY: `out` is a valid writable pointer by precondition.
-        unsafe { *out = std::ptr::null_mut() };
-        return 0;
-    }
-
-    let count = files.len() as ffi::c_int;
-    let joined = files
-        .into_iter()
-        .map(|f| f.name)
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let ptr = into_c_string(joined);
-    if ptr.is_null() {
-        return -1;
-    }
-    // SAFETY: `out` is a valid writable pointer by precondition.
-    unsafe { *out = ptr };
-    count
+        unsafe { *out = ptr };
+        count
+    })
 }
 
 /// Get the size in bytes of a received Taildrop file by name (Go LocalAPI `OpenFile`, size only).
@@ -77,22 +79,24 @@ pub unsafe extern "C" fn ts_taildrop_file_size(
     name: *const c_char,
     out_size: &mut u64,
 ) -> ffi::c_int {
-    // SAFETY: ensured by function precondition
-    let Some(name) = (unsafe { util::str(name) }) else {
-        tracing::error!("taildrop_file_size: name is null or invalid utf-8");
-        return -1;
-    };
+    ffi_guard(move || {
+        // SAFETY: ensured by function precondition
+        let Some(name) = (unsafe { util::str(name) }) else {
+            tracing::error!("taildrop_file_size: name is null or invalid utf-8");
+            return -1;
+        };
 
-    match dev.0.taildrop_open_file(name) {
-        Ok((_file, size)) => {
-            *out_size = size;
-            0
+        match dev.0.taildrop_open_file(name) {
+            Ok((_file, size)) => {
+                *out_size = size;
+                0
+            }
+            Err(e) => {
+                tracing::error!(err = %e, "taildrop_file_size");
+                -1
+            }
         }
-        Err(e) => {
-            tracing::error!(err = %e, "taildrop_file_size");
-            -1
-        }
-    }
+    })
 }
 
 /// Save a received Taildrop file by name to the caller's destination path (the C-faithful form of
@@ -117,35 +121,38 @@ pub unsafe extern "C" fn ts_taildrop_save_file(
     name: *const c_char,
     dst_path: *const c_char,
 ) -> ffi::c_int {
-    // SAFETY: ensured by function precondition
-    let (Some(name), Some(dst_path)) = (unsafe { (util::str(name), util::str(dst_path)) }) else {
-        tracing::error!("taildrop_save_file: a string argument is null or invalid utf-8");
-        return -1;
-    };
-
-    let (mut src, _size) = match dev.0.taildrop_open_file(name) {
-        Ok(opened) => opened,
-        Err(e) => {
-            tracing::error!(err = %e, "taildrop_save_file: open source");
+    ffi_guard(move || {
+        // SAFETY: ensured by function precondition
+        let (Some(name), Some(dst_path)) = (unsafe { (util::str(name), util::str(dst_path)) })
+        else {
+            tracing::error!("taildrop_save_file: a string argument is null or invalid utf-8");
             return -1;
-        }
-    };
+        };
 
-    let mut dst = match std::fs::File::create(dst_path) {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::error!(err = %e, "taildrop_save_file: create destination");
-            return -1;
-        }
-    };
+        let (mut src, _size) = match dev.0.taildrop_open_file(name) {
+            Ok(opened) => opened,
+            Err(e) => {
+                tracing::error!(err = %e, "taildrop_save_file: open source");
+                return -1;
+            }
+        };
 
-    match std::io::copy(&mut src, &mut dst) {
-        Ok(_) => 0,
-        Err(e) => {
-            tracing::error!(err = %e, "taildrop_save_file: copy");
-            -1
+        let mut dst = match std::fs::File::create(dst_path) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!(err = %e, "taildrop_save_file: create destination");
+                return -1;
+            }
+        };
+
+        match std::io::copy(&mut src, &mut dst) {
+            Ok(_) => 0,
+            Err(e) => {
+                tracing::error!(err = %e, "taildrop_save_file: copy");
+                -1
+            }
         }
-    }
+    })
 }
 
 /// Delete a received Taildrop file by name (Go LocalAPI `DeleteFile`).
@@ -160,17 +167,19 @@ pub unsafe extern "C" fn ts_taildrop_save_file(
 /// the NUL).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ts_taildrop_delete_file(dev: &device, name: *const c_char) -> ffi::c_int {
-    // SAFETY: ensured by function precondition
-    let Some(name) = (unsafe { util::str(name) }) else {
-        tracing::error!("taildrop_delete_file: name is null or invalid utf-8");
-        return -1;
-    };
+    ffi_guard(move || {
+        // SAFETY: ensured by function precondition
+        let Some(name) = (unsafe { util::str(name) }) else {
+            tracing::error!("taildrop_delete_file: name is null or invalid utf-8");
+            return -1;
+        };
 
-    match dev.0.taildrop_delete_file(name) {
-        Ok(()) => 0,
-        Err(e) => {
-            tracing::error!(err = %e, "taildrop_delete_file");
-            -1
+        match dev.0.taildrop_delete_file(name) {
+            Ok(()) => 0,
+            Err(e) => {
+                tracing::error!(err = %e, "taildrop_delete_file");
+                -1
+            }
         }
-    }
+    })
 }

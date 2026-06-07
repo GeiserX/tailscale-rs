@@ -31,6 +31,7 @@ mod config;
 mod keys;
 mod loopback;
 mod net_types;
+mod panic_guard;
 mod status;
 mod taildrop;
 mod tcp;
@@ -44,6 +45,7 @@ pub use net_types::{
     AF_INET, AF_INET6, in_addr_t, in6_addr_t, sa_family_t, sockaddr, sockaddr_data, sockaddr_in,
     sockaddr_in6,
 };
+pub(crate) use panic_guard::ffi_guard;
 pub use status::{status_node, status_visitor, ts_status, ts_whois};
 pub use taildrop::{
     ts_taildrop_delete_file, ts_taildrop_file_size, ts_taildrop_save_file,
@@ -84,15 +86,17 @@ static TRACING_ONCE: Once = Once::new();
 /// errors if initialization needs to be done before `ts_init`.
 #[unsafe(no_mangle)]
 pub extern "C" fn ts_init_tracing() {
-    TRACING_ONCE.call_once(|| {
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::builder()
-                    .with_default_directive(LevelFilter::INFO.into())
-                    .from_env_lossy(),
-            )
-            .init();
-    });
+    ffi_guard(move || {
+        TRACING_ONCE.call_once(|| {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::builder()
+                        .with_default_directive(LevelFilter::INFO.into())
+                        .from_env_lossy(),
+                )
+                .init();
+        });
+    })
 }
 
 /// Initialize a new Tailscale device.
@@ -115,26 +119,28 @@ pub unsafe extern "C" fn ts_init(
     config: Option<&config::config>,
     auth_token: *const c_char,
 ) -> Option<Box<device>> {
-    ts_init_tracing();
+    ffi_guard(move || {
+        ts_init_tracing();
 
-    let config = match config {
-        Some(cfg) => unsafe { cfg.to_ts_config() },
-        None => Default::default(),
-    };
+        let config = match config {
+            Some(cfg) => unsafe { cfg.to_ts_config() },
+            None => Default::default(),
+        };
 
-    let auth_token = if auth_token.is_null() {
-        None
-    } else {
-        unsafe { util::str(auth_token).map(ToOwned::to_owned) }
-    };
-
-    match TOKIO_RUNTIME.block_on(tailscale::Device::new(&config, auth_token)) {
-        Ok(dev) => Some(Box::new(device(dev))),
-        Err(e) => {
-            tracing::error!(err = %e, "ts_init failed");
+        let auth_token = if auth_token.is_null() {
             None
+        } else {
+            unsafe { util::str(auth_token).map(ToOwned::to_owned) }
+        };
+
+        match TOKIO_RUNTIME.block_on(tailscale::Device::new(&config, auth_token)) {
+            Ok(dev) => Some(Box::new(device(dev))),
+            Err(e) => {
+                tracing::error!(err = %e, "ts_init failed");
+                None
+            }
         }
-    }
+    })
 }
 
 /// Initialize a new Tailscale device with a default configuration using the given key file for the
@@ -153,27 +159,29 @@ pub unsafe extern "C" fn ts_init_from_key_file(
     key_file: *const c_char,
     auth_token: *const c_char,
 ) -> Option<Box<device>> {
-    let mut state = keys::persisted_key_state::default();
+    ffi_guard(move || {
+        let mut state = keys::persisted_key_state::default();
 
-    // SAFETY: CStr invariants maintained by function precondition
-    if unsafe { keys::ts_load_key_file(key_file, false, &mut state) } < 0 {
-        return None;
-    }
+        // SAFETY: CStr invariants maintained by function precondition
+        if unsafe { keys::ts_load_key_file(key_file, false, &mut state) } < 0 {
+            return None;
+        }
 
-    let config = config::config {
-        key_state: Some(&mut state),
-        ..Default::default()
-    };
+        let config = config::config {
+            key_state: Some(&mut state),
+            ..Default::default()
+        };
 
-    // SAFETY: `auth_token` meets the CStr invariants by this function precondition. `config` is
-    // safely default-initialized, except for key state, which has no safety requirements.
-    unsafe { ts_init(Some(&config), auth_token) }
+        // SAFETY: `auth_token` meets the CStr invariants by this function precondition. `config` is
+        // safely default-initialized, except for key state, which has no safety requirements.
+        unsafe { ts_init(Some(&config), auth_token) }
+    })
 }
 
 /// Deinitialize and shut down a Tailscale device.
 #[unsafe(no_mangle)]
 pub extern "C" fn ts_deinit(dev: Box<device>) {
-    drop(dev)
+    ffi_guard(move || drop(dev))
 }
 
 /// Get the IPv4 address of the Tailscale node, blocking until it's available.
@@ -181,17 +189,19 @@ pub extern "C" fn ts_deinit(dev: Box<device>) {
 /// Returns a negative number on error.
 #[unsafe(no_mangle)]
 pub extern "C" fn ts_ipv4_addr(dev: &device, dst: &mut in_addr_t) -> ffi::c_int {
-    let addr = match TOKIO_RUNTIME.block_on(dev.0.ipv4_addr()) {
-        Ok(addr) => addr,
-        Err(e) => {
-            tracing::error!(error = %e, "getting ipv4");
-            return -1;
-        }
-    };
+    ffi_guard(move || {
+        let addr = match TOKIO_RUNTIME.block_on(dev.0.ipv4_addr()) {
+            Ok(addr) => addr,
+            Err(e) => {
+                tracing::error!(error = %e, "getting ipv4");
+                return -1;
+            }
+        };
 
-    dst.0 = addr.octets();
+        dst.0 = addr.octets();
 
-    0
+        0
+    })
 }
 
 /// Get the IPv6 address of the Tailscale node, blocking until it's available.
@@ -199,17 +209,19 @@ pub extern "C" fn ts_ipv4_addr(dev: &device, dst: &mut in_addr_t) -> ffi::c_int 
 /// Returns a negative number on error.
 #[unsafe(no_mangle)]
 pub extern "C" fn ts_ipv6_addr(dev: &device, dst: &mut in6_addr_t) -> ffi::c_int {
-    let addr = match TOKIO_RUNTIME.block_on(dev.0.ipv6_addr()) {
-        Ok(addr) => addr,
-        Err(e) => {
-            tracing::error!(error = %e, "getting ipv6");
-            return -1;
-        }
-    };
+    ffi_guard(move || {
+        let addr = match TOKIO_RUNTIME.block_on(dev.0.ipv6_addr()) {
+            Ok(addr) => addr,
+            Err(e) => {
+                tracing::error!(error = %e, "getting ipv6");
+                return -1;
+            }
+        };
 
-    dst.0 = addr.segments();
+        dst.0 = addr.segments();
 
-    0
+        0
+    })
 }
 
 /// Get the IPv4 address of a specified peer by name.
@@ -231,12 +243,14 @@ pub unsafe extern "C" fn ts_peer_ipv4_addr(
     peer_name: *const c_char,
     addr: &mut in_addr_t,
 ) -> ffi::c_int {
-    // SAFETY: ensured by function precondition
-    unsafe {
-        _peer_by_addr(dev, peer_name, |n| {
-            *addr = n.tailnet_address.ipv4.addr().into();
-        })
-    }
+    ffi_guard(move || {
+        // SAFETY: ensured by function precondition
+        unsafe {
+            _peer_by_addr(dev, peer_name, |n| {
+                *addr = n.tailnet_address.ipv4.addr().into();
+            })
+        }
+    })
 }
 
 /// Get the IPv6 address of a specified peer by name.
@@ -258,12 +272,14 @@ pub unsafe extern "C" fn ts_peer_ipv6_addr(
     peer_name: *const c_char,
     addr: &mut in6_addr_t,
 ) -> ffi::c_int {
-    // SAFETY: ensured by function precondition
-    unsafe {
-        _peer_by_addr(dev, peer_name, |n| {
-            *addr = n.tailnet_address.ipv6.addr().into();
-        })
-    }
+    ffi_guard(move || {
+        // SAFETY: ensured by function precondition
+        unsafe {
+            _peer_by_addr(dev, peer_name, |n| {
+                *addr = n.tailnet_address.ipv6.addr().into();
+            })
+        }
+    })
 }
 
 /// # Safety
@@ -316,23 +332,25 @@ pub unsafe extern "C" fn ts_resolve(
     name: *const c_char,
     addr: &mut in_addr_t,
 ) -> ffi::c_int {
-    // SAFETY: ensured by function precondition
-    let Some(name) = (unsafe { util::str(name) }) else {
-        tracing::error!("resolve: name is null or invalid utf-8");
-        return -1;
-    };
+    ffi_guard(move || {
+        // SAFETY: ensured by function precondition
+        let Some(name) = (unsafe { util::str(name) }) else {
+            tracing::error!("resolve: name is null or invalid utf-8");
+            return -1;
+        };
 
-    match TOKIO_RUNTIME.block_on(dev.0.resolve(name)) {
-        Ok(Some(ipv4)) => {
-            *addr = ipv4.into();
-            1
+        match TOKIO_RUNTIME.block_on(dev.0.resolve(name)) {
+            Ok(Some(ipv4)) => {
+                *addr = ipv4.into();
+                1
+            }
+            Ok(None) => 0,
+            Err(e) => {
+                tracing::error!(error = %e, "resolve");
+                -1
+            }
         }
-        Ok(None) => 0,
-        Err(e) => {
-            tracing::error!(error = %e, "resolve");
-            -1
-        }
-    }
+    })
 }
 
 /// Ping a tailnet peer over the overlay with an ICMPv4 echo, returning the round-trip time.
@@ -353,21 +371,23 @@ pub unsafe extern "C" fn ts_ping(
     timeout_ms: u64,
     rtt_ms: &mut u64,
 ) -> ffi::c_int {
-    let Ok(dst): Result<SocketAddr, _> = dst.try_into() else {
-        tracing::error!("ping: invalid sockaddr");
-        return -1;
-    };
+    ffi_guard(move || {
+        let Ok(dst): Result<SocketAddr, _> = dst.try_into() else {
+            tracing::error!("ping: invalid sockaddr");
+            return -1;
+        };
 
-    match TOKIO_RUNTIME.block_on(dev.0.ping(dst.ip(), Duration::from_millis(timeout_ms))) {
-        Ok(rtt) => {
-            *rtt_ms = rtt.as_millis() as u64;
-            0
+        match TOKIO_RUNTIME.block_on(dev.0.ping(dst.ip(), Duration::from_millis(timeout_ms))) {
+            Ok(rtt) => {
+                *rtt_ms = rtt.as_millis() as u64;
+                0
+            }
+            Err(e) => {
+                tracing::error!(err = %e, "ping");
+                -1
+            }
         }
-        Err(e) => {
-            tracing::error!(err = %e, "ping");
-            -1
-        }
-    }
+    })
 }
 
 /// Free a C string previously allocated and returned by this library (e.g. by [`ts_metrics`],
@@ -382,12 +402,14 @@ pub unsafe extern "C" fn ts_ping(
 /// functions and not yet freed. It must not be used after this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ts_string_free(s: *mut c_char) {
-    if s.is_null() {
-        return;
-    }
-    // SAFETY: by precondition, `s` came from `CString::into_raw` in this library and has not been
-    // freed, so reconstituting the `CString` (which frees on drop) is sound.
-    drop(unsafe { CString::from_raw(s) });
+    ffi_guard(move || {
+        if s.is_null() {
+            return;
+        }
+        // SAFETY: by precondition, `s` came from `CString::into_raw` in this library and has not been
+        // freed, so reconstituting the `CString` (which frees on drop) is sound.
+        drop(unsafe { CString::from_raw(s) });
+    })
 }
 
 /// Helper: allocate a C string from a Rust `String`, returning a pointer that the caller must free
@@ -420,29 +442,31 @@ pub unsafe extern "C" fn ts_fetch_id_token(
     audience: *const c_char,
     out: *mut *mut c_char,
 ) -> ffi::c_int {
-    // SAFETY: ensured by function precondition
-    let Some(audience) = (unsafe { util::str(audience) }) else {
-        tracing::error!("fetch_id_token: audience is null or invalid utf-8");
-        return -1;
-    };
+    ffi_guard(move || {
+        // SAFETY: ensured by function precondition
+        let Some(audience) = (unsafe { util::str(audience) }) else {
+            tracing::error!("fetch_id_token: audience is null or invalid utf-8");
+            return -1;
+        };
 
-    match TOKIO_RUNTIME.block_on(dev.0.fetch_id_token(audience)) {
-        Ok(jwt) => {
-            let ptr = into_c_string(jwt);
-            if ptr.is_null() {
-                return -1;
+        match TOKIO_RUNTIME.block_on(dev.0.fetch_id_token(audience)) {
+            Ok(jwt) => {
+                let ptr = into_c_string(jwt);
+                if ptr.is_null() {
+                    return -1;
+                }
+                // SAFETY: `out` is a valid writable pointer by precondition.
+                unsafe { *out = ptr };
+                0
             }
-            // SAFETY: `out` is a valid writable pointer by precondition.
-            unsafe { *out = ptr };
-            0
+            Err(e) => {
+                tracing::error!(err = %e, "fetch_id_token");
+                // SAFETY: `out` is a valid writable pointer by precondition.
+                unsafe { *out = std::ptr::null_mut() };
+                -1
+            }
         }
-        Err(e) => {
-            tracing::error!(err = %e, "fetch_id_token");
-            // SAFETY: `out` is a valid writable pointer by precondition.
-            unsafe { *out = std::ptr::null_mut() };
-            -1
-        }
-    }
+    })
 }
 
 /// Snapshot this node's client metrics in Prometheus text exposition format (like Go Tailscale's
@@ -453,7 +477,7 @@ pub unsafe extern "C" fn ts_fetch_id_token(
 /// registry is process-global, so the output covers every device in the process.
 #[unsafe(no_mangle)]
 pub extern "C" fn ts_metrics(dev: &device) -> *mut c_char {
-    into_c_string(dev.0.metrics())
+    ffi_guard(move || into_c_string(dev.0.metrics()))
 }
 
 /// This node's key-expiry instant as Unix seconds (`Node.KeyExpiry` in Go).
@@ -471,21 +495,23 @@ pub extern "C" fn ts_self_key_expiry_unix(
     out_unix: &mut i64,
     out_has: &mut ffi::c_int,
 ) -> ffi::c_int {
-    match TOKIO_RUNTIME.block_on(dev.0.self_key_expiry_unix()) {
-        Ok(Some(unix)) => {
-            *out_unix = unix;
-            *out_has = 1;
-            0
-        }
-        Ok(None) => {
-            *out_has = 0;
-            0
-        }
-        Err(e) => {
-            tracing::error!(err = %e, "self_key_expiry_unix");
-            -1
-        }
-    }
+    ffi_guard(
+        move || match TOKIO_RUNTIME.block_on(dev.0.self_key_expiry_unix()) {
+            Ok(Some(unix)) => {
+                *out_unix = unix;
+                *out_has = 1;
+                0
+            }
+            Ok(None) => {
+                *out_has = 0;
+                0
+            }
+            Err(e) => {
+                tracing::error!(err = %e, "self_key_expiry_unix");
+                -1
+            }
+        },
+    )
 }
 
 /// Whether this node's key has expired as of now (`!KeyExpiry.IsZero() && KeyExpiry.Before(now)` in
@@ -499,16 +525,18 @@ pub extern "C" fn ts_self_key_expiry_unix(
 /// `out` must be a valid, writable pointer.
 #[unsafe(no_mangle)]
 pub extern "C" fn ts_self_key_expired(dev: &device, out: &mut ffi::c_int) -> ffi::c_int {
-    match TOKIO_RUNTIME.block_on(dev.0.self_key_expired()) {
-        Ok(expired) => {
-            *out = expired as ffi::c_int;
-            0
-        }
-        Err(e) => {
-            tracing::error!(err = %e, "self_key_expired");
-            -1
-        }
-    }
+    ffi_guard(
+        move || match TOKIO_RUNTIME.block_on(dev.0.self_key_expired()) {
+            Ok(expired) => {
+                *out = expired as ffi::c_int;
+                0
+            }
+            Err(e) => {
+                tracing::error!(err = %e, "self_key_expired");
+                -1
+            }
+        },
+    )
 }
 
 /// Fetch the current Tailnet Lock (TKA) status pushed by control, if any.
@@ -523,32 +551,34 @@ pub extern "C" fn ts_self_key_expired(dev: &device, out: &mut ffi::c_int) -> ffi
 /// `out` must be a valid, writable pointer to a `char *`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ts_tka_status(dev: &device, out: *mut *mut c_char) -> ffi::c_int {
-    match TOKIO_RUNTIME.block_on(dev.0.tka_status()) {
-        Ok(status) => {
-            let json = match status {
-                Some(s) => format!(
-                    "{{\"enabled\":{},\"disabled\":{},\"head\":{:?}}}",
-                    s.is_enabled(),
-                    s.disabled,
-                    s.head
-                ),
-                None => "null".to_owned(),
-            };
-            let ptr = into_c_string(json);
-            if ptr.is_null() {
-                return -1;
+    ffi_guard(move || {
+        match TOKIO_RUNTIME.block_on(dev.0.tka_status()) {
+            Ok(status) => {
+                let json = match status {
+                    Some(s) => format!(
+                        "{{\"enabled\":{},\"disabled\":{},\"head\":{:?}}}",
+                        s.is_enabled(),
+                        s.disabled,
+                        s.head
+                    ),
+                    None => "null".to_owned(),
+                };
+                let ptr = into_c_string(json);
+                if ptr.is_null() {
+                    return -1;
+                }
+                // SAFETY: `out` is a valid writable pointer by precondition.
+                unsafe { *out = ptr };
+                0
             }
-            // SAFETY: `out` is a valid writable pointer by precondition.
-            unsafe { *out = ptr };
-            0
+            Err(e) => {
+                tracing::error!(err = %e, "tka_status");
+                // SAFETY: `out` is a valid writable pointer by precondition.
+                unsafe { *out = std::ptr::null_mut() };
+                -1
+            }
         }
-        Err(e) => {
-            tracing::error!(err = %e, "tka_status");
-            // SAFETY: `out` is a valid writable pointer by precondition.
-            unsafe { *out = std::ptr::null_mut() };
-            -1
-        }
-    }
+    })
 }
 
 /// Send a local file to a tailnet peer via Taildrop (Go `PushFile` / `tailscale file cp`).
@@ -571,48 +601,50 @@ pub unsafe extern "C" fn ts_send_file(
     file_name: *const c_char,
     src_path: *const c_char,
 ) -> ffi::c_int {
-    // SAFETY: ensured by function precondition
-    let (Some(peer_name), Some(file_name), Some(src_path)) = (unsafe {
-        (
-            util::str(peer_name),
-            util::str(file_name),
-            util::str(src_path),
-        )
-    }) else {
-        tracing::error!("send_file: a string argument is null or invalid utf-8");
-        return -1;
-    };
-
-    let peer = match TOKIO_RUNTIME.block_on(dev.0.peer_by_name(peer_name)) {
-        Ok(Some(peer)) => peer,
-        Ok(None) => return 1,
-        Err(e) => {
-            tracing::error!(err = %e, "send_file: peer lookup");
+    ffi_guard(move || {
+        // SAFETY: ensured by function precondition
+        let (Some(peer_name), Some(file_name), Some(src_path)) = (unsafe {
+            (
+                util::str(peer_name),
+                util::str(file_name),
+                util::str(src_path),
+            )
+        }) else {
+            tracing::error!("send_file: a string argument is null or invalid utf-8");
             return -1;
-        }
-    };
+        };
 
-    TOKIO_RUNTIME.block_on(async {
-        let file = match tokio::fs::File::open(src_path).await {
-            Ok(f) => f,
+        let peer = match TOKIO_RUNTIME.block_on(dev.0.peer_by_name(peer_name)) {
+            Ok(Some(peer)) => peer,
+            Ok(None) => return 1,
             Err(e) => {
-                tracing::error!(err = %e, "send_file: open source");
+                tracing::error!(err = %e, "send_file: peer lookup");
                 return -1;
             }
         };
-        let len = match file.metadata().await {
-            Ok(m) => m.len(),
-            Err(e) => {
-                tracing::error!(err = %e, "send_file: stat source");
-                return -1;
+
+        TOKIO_RUNTIME.block_on(async {
+            let file = match tokio::fs::File::open(src_path).await {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::error!(err = %e, "send_file: open source");
+                    return -1;
+                }
+            };
+            let len = match file.metadata().await {
+                Ok(m) => m.len(),
+                Err(e) => {
+                    tracing::error!(err = %e, "send_file: stat source");
+                    return -1;
+                }
+            };
+            match dev.0.send_file(&peer, file_name, len, file).await {
+                Ok(()) => 0,
+                Err(e) => {
+                    tracing::error!(err = %e, "send_file");
+                    -1
+                }
             }
-        };
-        match dev.0.send_file(&peer, file_name, len, file).await {
-            Ok(()) => 0,
-            Err(e) => {
-                tracing::error!(err = %e, "send_file");
-                -1
-            }
-        }
+        })
     })
 }

@@ -14,7 +14,7 @@
 
 use std::ffi::{self, c_char};
 
-use crate::{TOKIO_RUNTIME, device, tcp::tcp_listener, util};
+use crate::{TOKIO_RUNTIME, device, ffi_guard, tcp::tcp_listener, util};
 
 /// What a [`serve_config`] does with each decrypted stream.
 #[repr(C)]
@@ -57,19 +57,21 @@ pub struct serve_config {
 /// NUL-terminated and valid for reading up to and including the NUL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ts_get_certificate(dev: &device, name: *const c_char) -> ffi::c_int {
-    // SAFETY: ensured by function precondition
-    let Some(name) = (unsafe { util::str(name) }) else {
-        tracing::error!("get_certificate: name is null or invalid utf-8");
-        return -1;
-    };
+    ffi_guard(move || {
+        // SAFETY: ensured by function precondition
+        let Some(name) = (unsafe { util::str(name) }) else {
+            tracing::error!("get_certificate: name is null or invalid utf-8");
+            return -1;
+        };
 
-    match TOKIO_RUNTIME.block_on(dev.0.get_certificate(name)) {
-        Ok(_key) => 0,
-        Err(e) => {
-            tracing::error!(err = %e, "get_certificate (fail-closed in this fork)");
-            -1
+        match TOKIO_RUNTIME.block_on(dev.0.get_certificate(name)) {
+            Ok(_key) => 0,
+            Err(e) => {
+                tracing::error!(err = %e, "get_certificate (fail-closed in this fork)");
+                -1
+            }
         }
-    }
+    })
 }
 
 /// Build a TLS acceptor terminating TLS for `cfg.name` on the overlay (like `tsnet`'s `ListenTLS`).
@@ -86,37 +88,39 @@ pub unsafe extern "C" fn ts_get_certificate(dev: &device, name: *const c_char) -
 /// [`std::ffi::CStr`] rules.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ts_listen_tls(dev: &device, cfg: &serve_config) -> ffi::c_int {
-    // SAFETY: ensured by function precondition
-    let Some(name) = (unsafe { util::str(cfg.name) }) else {
-        tracing::error!("listen_tls: name is null or invalid utf-8");
-        return -1;
-    };
+    ffi_guard(move || {
+        // SAFETY: ensured by function precondition
+        let Some(name) = (unsafe { util::str(cfg.name) }) else {
+            tracing::error!("listen_tls: name is null or invalid utf-8");
+            return -1;
+        };
 
-    let target = match cfg.kind {
-        serve_target::Accept => tailscale::ServeTarget::Accept,
-        serve_target::Proxy => {
-            // SAFETY: ensured by function precondition
-            let Some(to) = (unsafe { util::str(cfg.to) }) else {
-                tracing::error!("listen_tls: proxy target is null or invalid utf-8");
-                return -1;
-            };
-            tailscale::ServeTarget::Proxy { to: to.to_owned() }
+        let target = match cfg.kind {
+            serve_target::Accept => tailscale::ServeTarget::Accept,
+            serve_target::Proxy => {
+                // SAFETY: ensured by function precondition
+                let Some(to) = (unsafe { util::str(cfg.to) }) else {
+                    tracing::error!("listen_tls: proxy target is null or invalid utf-8");
+                    return -1;
+                };
+                tailscale::ServeTarget::Proxy { to: to.to_owned() }
+            }
+        };
+
+        let serve_cfg = tailscale::ServeConfig {
+            name: name.to_owned(),
+            port: cfg.port,
+            target,
+        };
+
+        match TOKIO_RUNTIME.block_on(dev.0.listen_tls(&serve_cfg)) {
+            Ok(_acceptor) => 0,
+            Err(e) => {
+                tracing::error!(err = %e, "listen_tls (fail-closed in this fork)");
+                -1
+            }
         }
-    };
-
-    let serve_cfg = tailscale::ServeConfig {
-        name: name.to_owned(),
-        port: cfg.port,
-        target,
-    };
-
-    match TOKIO_RUNTIME.block_on(dev.0.listen_tls(&serve_cfg)) {
-        Ok(_acceptor) => 0,
-        Err(e) => {
-            tracing::error!(err = %e, "listen_tls (fail-closed in this fork)");
-            -1
-        }
-    }
+    })
 }
 
 /// How a [`ts_listen_service`] binds the service VIP port.
@@ -156,22 +160,24 @@ pub unsafe extern "C" fn ts_listen_service(
     mode: service_mode,
     port: u16,
 ) -> Option<Box<tcp_listener>> {
-    // SAFETY: ensured by function precondition
-    let Some(name) = (unsafe { util::str(name) }) else {
-        tracing::error!("listen_service: name is null or invalid utf-8");
-        return None;
-    };
+    ffi_guard(move || {
+        // SAFETY: ensured by function precondition
+        let Some(name) = (unsafe { util::str(name) }) else {
+            tracing::error!("listen_service: name is null or invalid utf-8");
+            return None;
+        };
 
-    let svc_mode = match mode {
-        service_mode::Tcp => tailscale::ServiceMode::Tcp { port },
-        service_mode::Http => tailscale::ServiceMode::Http { port },
-    };
+        let svc_mode = match mode {
+            service_mode::Tcp => tailscale::ServiceMode::Tcp { port },
+            service_mode::Http => tailscale::ServiceMode::Http { port },
+        };
 
-    match TOKIO_RUNTIME.block_on(dev.0.listen_service(name, svc_mode)) {
-        Ok(listener) => Some(Box::new(tcp_listener::new(listener))),
-        Err(e) => {
-            tracing::error!(err = %e, "listen_service (fail-closed in this fork)");
-            None
+        match TOKIO_RUNTIME.block_on(dev.0.listen_service(name, svc_mode)) {
+            Ok(listener) => Some(Box::new(tcp_listener::new(listener))),
+            Err(e) => {
+                tracing::error!(err = %e, "listen_service (fail-closed in this fork)");
+                None
+            }
         }
-    }
+    })
 }

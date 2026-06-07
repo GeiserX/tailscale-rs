@@ -116,6 +116,77 @@ fn build_env(user: &ResolvedUser) -> Vec<(String, String)> {
 /// Go `tailssh`'s interactive path.
 const LOGIN_SHELL_ARG: &str = "-l";
 
+/// One privilege-drop operation, in the order it must be applied.
+///
+/// This is a pure, comparable representation of the security-critical drop sequence so the
+/// ordering invariant (uid **last**) can be unit-tested without root or a real fork. The plan is
+/// built before the fork (allocates) and applied step-by-step inside the `pre_exec` closure (no
+/// alloc, async-signal-safe).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrivDropStep {
+    /// Set supplementary groups from the user's group membership (Linux; absent on Apple).
+    /// Carries the primary `gid` because `initgroups` needs it; storing it here keeps the
+    /// executor free of any pre-fork lookups.
+    InitGroups(Gid),
+    /// Set the real/effective/saved group id.
+    SetGid(Gid),
+    /// Set the real/effective/saved user id. MUST be last.
+    SetUid(Uid),
+}
+
+/// Build the privilege-drop plan in the sacred order: supplementary groups, then setgid, then
+/// setuid LAST (uid-last so the process cannot re-raise its gid after dropping uid). This is a
+/// pure function so the ordering invariant can be unit-tested without root or a real fork.
+///
+/// `with_initgroups` is `false` on Apple targets (where `nix` has no `initgroups`), matching the
+/// `#[cfg(not(target_vendor = "apple"))]` gating of the real call; on Apple the plan is just
+/// `[SetGid, SetUid]`.
+fn priv_drop_plan(uid: Uid, gid: Gid, with_initgroups: bool) -> Vec<PrivDropStep> {
+    let mut plan = Vec::with_capacity(3);
+    if with_initgroups {
+        plan.push(PrivDropStep::InitGroups(gid));
+    }
+    plan.push(PrivDropStep::SetGid(gid));
+    plan.push(PrivDropStep::SetUid(uid));
+    plan
+}
+
+/// Apply a single privilege-drop step via the corresponding `nix`/libc wrapper.
+///
+/// Runs post-fork inside `pre_exec`, so it must stay async-signal-safe: it only calls the libc
+/// wrappers and allocates nothing. `user_cname` is the login name needed by `initgroups`; it is
+/// `Some` only on platforms where an [`PrivDropStep::InitGroups`] step is present.
+fn apply_priv_drop_step(
+    step: &PrivDropStep,
+    user_cname: Option<&std::ffi::CStr>,
+) -> std::io::Result<()> {
+    match step {
+        PrivDropStep::InitGroups(gid) => {
+            // `initgroups` is configured out of `nix` on Apple targets, and `priv_drop_plan`
+            // never emits this step there, so the call is gated to match.
+            #[cfg(not(target_vendor = "apple"))]
+            {
+                let cname = user_cname.ok_or_else(|| {
+                    std::io::Error::other("ssh: initgroups step without user name")
+                })?;
+                nix::unistd::initgroups(cname, *gid)
+                    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+            }
+            #[cfg(target_vendor = "apple")]
+            {
+                let _ = (gid, user_cname);
+            }
+        }
+        PrivDropStep::SetGid(gid) => {
+            nix::unistd::setgid(*gid).map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+        }
+        PrivDropStep::SetUid(uid) => {
+            nix::unistd::setuid(*uid).map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+        }
+    }
+    Ok(())
+}
+
 /// A turnkey [`ChannelHandler`] that runs the authorized user's login shell in a PTY.
 ///
 /// Construct one indirectly via [`Device::listen_ssh`][crate::Device::listen_ssh]; it is not meant
@@ -186,12 +257,18 @@ impl ChannelHandler for ShellHandler {
         // Allocate the PTY master/subordinate pair.
         let (pty, pts) = pty_process::open().map_err(std::io::Error::other)?;
 
-        // Capture privdrop values for the pre_exec closure.
-        let uid = user.uid;
-        let gid = user.gid;
-        // The supplementary-groups call (`initgroups`) is unavailable on Apple targets in `nix`;
-        // it is the production (Linux) path. macOS dev builds still compile and drop the primary
-        // gid + uid.
+        // Build the privilege-drop plan BEFORE the fork (this allocates a Vec). Inside the
+        // `pre_exec` closure we only iterate + call the syscalls (no alloc, async-signal-safe).
+        //
+        // `initgroups` is unavailable on Apple targets in `nix`; it is the production (Linux)
+        // path. macOS dev builds still compile and drop the primary gid + uid (no InitGroups step,
+        // so `user_cname` is not needed there).
+        #[cfg(not(target_vendor = "apple"))]
+        let with_initgroups = true;
+        #[cfg(target_vendor = "apple")]
+        let with_initgroups = false;
+        let plan = priv_drop_plan(user.uid, user.gid, with_initgroups);
+        // The login name needed by `initgroups`; only present on the platforms that have that step.
         #[cfg(not(target_vendor = "apple"))]
         let user_cname = std::ffi::CString::new(user.name.clone())
             .map_err(|e| std::io::Error::other(format!("ssh: user name has NUL byte: {e}")))?;
@@ -205,19 +282,21 @@ impl ChannelHandler for ShellHandler {
         // SECURITY: privilege drop runs in the child between fork and exec. Order is sacred:
         // (1) supplementary groups, (2) setgid, (3) setuid LAST. setuid is last because once the
         // uid is dropped the process can no longer change its gid. Any failure aborts the exec, so
-        // the shell never runs with the wrong or elevated identity.
+        // the shell never runs with the wrong or elevated identity. The ordered `plan` was built
+        // pre-fork (see `priv_drop_plan`); here we only iterate it and apply each step in order —
+        // behavior is identical to the previous inline initgroups→setgid→setuid sequence.
         //
         // Safety: the closure only calls async-signal-safe libc wrappers (initgroups/setgid/
-        // setuid) and allocates nothing; it is sound to run post-fork.
+        // setuid) via `apply_priv_drop_step` and allocates nothing; it is sound to run post-fork.
         cmd = unsafe {
             cmd.pre_exec(move || {
                 #[cfg(not(target_vendor = "apple"))]
-                nix::unistd::initgroups(&user_cname, gid)
-                    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-                nix::unistd::setgid(gid)
-                    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-                nix::unistd::setuid(uid)
-                    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+                let user_cname = Some(user_cname.as_c_str());
+                #[cfg(target_vendor = "apple")]
+                let user_cname: Option<&std::ffi::CStr> = None;
+                for step in &plan {
+                    apply_priv_drop_step(step, user_cname)?;
+                }
                 Ok(())
             })
         };
@@ -361,6 +440,61 @@ mod tests {
         // (`<shell> -c <cmd>`) is documented as unsupported because `ChannelEvent` carries no
         // exec request; see the module note in `Device::listen_ssh`.
         assert_eq!(LOGIN_SHELL_ARG, "-l");
+    }
+
+    #[test]
+    fn priv_drop_plan_orders_uid_last() {
+        let uid = Uid::from_raw(1000);
+        let gid = Gid::from_raw(1000);
+        // Linux production path includes the supplementary-groups step first.
+        let plan = priv_drop_plan(uid, gid, true);
+        assert_eq!(
+            plan,
+            vec![
+                PrivDropStep::InitGroups(gid),
+                PrivDropStep::SetGid(gid),
+                PrivDropStep::SetUid(uid),
+            ],
+            "drop sequence must be initgroups → setgid → setuid"
+        );
+        // setuid MUST be last — fails loudly if anyone reorders.
+        assert_eq!(plan.last(), Some(&PrivDropStep::SetUid(uid)));
+    }
+
+    #[test]
+    fn priv_drop_plan_apple_skips_initgroups() {
+        let uid = Uid::from_raw(1000);
+        let gid = Gid::from_raw(1000);
+        // Apple path: `initgroups` is unavailable, so no InitGroups step — but still uid-last.
+        let plan = priv_drop_plan(uid, gid, false);
+        assert_eq!(
+            plan,
+            vec![PrivDropStep::SetGid(gid), PrivDropStep::SetUid(uid)],
+        );
+        assert!(!plan.contains(&PrivDropStep::InitGroups(gid)));
+        assert_eq!(plan.last(), Some(&PrivDropStep::SetUid(uid)));
+    }
+
+    #[test]
+    fn priv_drop_setgid_before_setuid() {
+        let uid = Uid::from_raw(1000);
+        let gid = Gid::from_raw(1000);
+        // The sacred invariant expressed directly: gid is dropped before uid, on every platform.
+        for with_initgroups in [true, false] {
+            let plan = priv_drop_plan(uid, gid, with_initgroups);
+            let setgid_idx = plan
+                .iter()
+                .position(|s| *s == PrivDropStep::SetGid(gid))
+                .expect("plan must set gid");
+            let setuid_idx = plan
+                .iter()
+                .position(|s| *s == PrivDropStep::SetUid(uid))
+                .expect("plan must set uid");
+            assert!(
+                setgid_idx < setuid_idx,
+                "setgid must precede setuid (with_initgroups={with_initgroups})"
+            );
+        }
     }
 
     #[test]

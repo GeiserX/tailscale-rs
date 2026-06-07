@@ -3,7 +3,7 @@ use std::{
     ffi::{CStr, c_char},
 };
 
-use crate::TOKIO_RUNTIME;
+use crate::{TOKIO_RUNTIME, ffi_guard};
 
 /// A Tailscale cryptographic key.
 #[derive(Default)]
@@ -129,36 +129,38 @@ pub unsafe extern "C" fn ts_load_key_file(
     overwrite_if_invalid: bool,
     key_state: &mut persisted_key_state,
 ) -> ffi::c_int {
-    // SAFETY: `path` upholds the `CStr` invariants (NUL-terminated, valid for reads up to and
-    // including the NUL) by this function's documented `# Safety` precondition.
-    let s = unsafe { CStr::from_ptr(path) };
-    let s = match s.to_str() {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error = %e, "converting path to str");
-            return -1;
+    ffi_guard(move || {
+        // SAFETY: `path` upholds the `CStr` invariants (NUL-terminated, valid for reads up to and
+        // including the NUL) by this function's documented `# Safety` precondition.
+        let s = unsafe { CStr::from_ptr(path) };
+        let s = match s.to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "converting path to str");
+                return -1;
+            }
+        };
+
+        let mode = if overwrite_if_invalid {
+            tailscale::config::BadFormatBehavior::Overwrite
+        } else {
+            tailscale::config::BadFormatBehavior::Error
+        };
+
+        let _span = tracing::trace_span!("ts_load_key_file", ?mode, path = %s).entered();
+
+        match TOKIO_RUNTIME.block_on(tailscale::config::load_key_file(s, mode)) {
+            Ok(state) => {
+                *key_state = state.into();
+                tracing::info!(path = %s, "loaded key state");
+
+                0
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "loading key file");
+
+                -1
+            }
         }
-    };
-
-    let mode = if overwrite_if_invalid {
-        tailscale::config::BadFormatBehavior::Overwrite
-    } else {
-        tailscale::config::BadFormatBehavior::Error
-    };
-
-    let _span = tracing::trace_span!("ts_load_key_file", ?mode, path = %s).entered();
-
-    match TOKIO_RUNTIME.block_on(tailscale::config::load_key_file(s, mode)) {
-        Ok(state) => {
-            *key_state = state.into();
-            tracing::info!(path = %s, "loaded key state");
-
-            0
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "loading key file");
-
-            -1
-        }
-    }
+    })
 }

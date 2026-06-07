@@ -305,16 +305,14 @@ mod tests {
     use super::*;
 
     fn tmp_root() -> PathBuf {
+        // A per-call atomic counter guarantees uniqueness across tests that run concurrently in the
+        // same binary. A timestamp alone is NOT enough: `SystemTime` resolution is coarse on some
+        // platforms, so two tests starting in the same tick would collide on one dir and stomp each
+        // other's files (the cause of intermittent taildrop-test flakiness under parallel runs).
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut p = std::env::temp_dir();
-        p.push(format!(
-            "taildrop-test-{}-{}",
-            std::process::id(),
-            // monotonic-ish unique suffix
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        p.push(format!("taildrop-test-{}-{n}", std::process::id()));
         p
     }
 

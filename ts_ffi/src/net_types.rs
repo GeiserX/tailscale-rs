@@ -14,6 +14,8 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
 };
 
+use crate::ffi_guard;
+
 /// Socket address family.
 #[derive(Copy, Clone, PartialEq, Eq)]
 #[repr(transparent)]
@@ -301,23 +303,25 @@ impl From<sockaddr_in6> for SocketAddrV6 {
 /// it must be NUL-terminated and valid for reading up to and including the NUL.
 #[unsafe(no_mangle)]
 pub extern "C" fn ts_parse_sockaddr(s: *const c_char, addr: &mut sockaddr) -> ffi::c_int {
-    // SAFETY: ensured by function precondition
-    let Ok(s) = (unsafe { CStr::from_ptr(s) }).to_str() else {
-        tracing::error!("bad utf8");
-        return -1;
-    };
-
-    let parsed = match s.parse::<SocketAddr>() {
-        Ok(parsed) => parsed,
-        Err(e) => {
-            tracing::error!(error = %e, "invalid addr");
+    ffi_guard(move || {
+        // SAFETY: ensured by function precondition
+        let Ok(s) = (unsafe { CStr::from_ptr(s) }).to_str() else {
+            tracing::error!("bad utf8");
             return -1;
-        }
-    };
+        };
 
-    *addr = parsed.into();
+        let parsed = match s.parse::<SocketAddr>() {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                tracing::error!(error = %e, "invalid addr");
+                return -1;
+            }
+        };
 
-    0
+        *addr = parsed.into();
+
+        0
+    })
 }
 
 /// Parse an IP address from a string into a [`sockaddr`], setting `sa_family` and the
@@ -332,23 +336,25 @@ pub extern "C" fn ts_parse_sockaddr(s: *const c_char, addr: &mut sockaddr) -> ff
 /// it must be NUL-terminated and valid for reading up to and including the NUL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ts_parse_ip(s: *const c_char, addr: &mut sockaddr) -> ffi::c_int {
-    // SAFETY: ensured by function precondition
-    let Ok(s) = (unsafe { CStr::from_ptr(s) }).to_str() else {
-        tracing::error!("bad utf8");
-        return -1;
-    };
-
-    let parsed = match s.parse::<IpAddr>() {
-        Ok(parsed) => parsed,
-        Err(e) => {
-            tracing::error!(error = %e, "invalid addr");
+    ffi_guard(move || {
+        // SAFETY: ensured by function precondition
+        let Ok(s) = (unsafe { CStr::from_ptr(s) }).to_str() else {
+            tracing::error!("bad utf8");
             return -1;
-        }
-    };
+        };
 
-    *addr = SocketAddr::from((parsed, 0)).into();
+        let parsed = match s.parse::<IpAddr>() {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                tracing::error!(error = %e, "invalid addr");
+                return -1;
+            }
+        };
 
-    0
+        *addr = SocketAddr::from((parsed, 0)).into();
+
+        0
+    })
 }
 
 /// Convenience to set a port on a [`sockaddr`] regardless of its `sa_family`.
@@ -356,21 +362,23 @@ pub unsafe extern "C" fn ts_parse_ip(s: *const c_char, addr: &mut sockaddr) -> f
 /// Returns a negative number if `sa_family` is invalid.
 #[unsafe(no_mangle)]
 pub extern "C" fn ts_sockaddr_set_port(addr: &mut sockaddr, port: u16) -> ffi::c_int {
-    match addr.sa_family {
-        // `sa_family == AF_INET` means the active union variant is `sockaddr_in`. The assignment
-        // writes the port field in place through the union place (no `unsafe` needed: assigning to
-        // a union field is safe, only reading one is unsafe), so it mutates `addr` rather than a
-        // copied-out temporary.
-        AF_INET => {
-            addr.sa_data.sockaddr_in.sin_port = port;
-            0
+    ffi_guard(move || {
+        match addr.sa_family {
+            // `sa_family == AF_INET` means the active union variant is `sockaddr_in`. The assignment
+            // writes the port field in place through the union place (no `unsafe` needed: assigning to
+            // a union field is safe, only reading one is unsafe), so it mutates `addr` rather than a
+            // copied-out temporary.
+            AF_INET => {
+                addr.sa_data.sockaddr_in.sin_port = port;
+                0
+            }
+            // `sa_family == AF_INET6` means the active union variant is `sockaddr_in6`; the port is
+            // written in place through the union place.
+            AF_INET6 => {
+                addr.sa_data.sockaddr_in6.sin6_port = port;
+                0
+            }
+            _ => -1,
         }
-        // `sa_family == AF_INET6` means the active union variant is `sockaddr_in6`; the port is
-        // written in place through the union place.
-        AF_INET6 => {
-            addr.sa_data.sockaddr_in6.sin6_port = port;
-            0
-        }
-        _ => -1,
-    }
+    })
 }

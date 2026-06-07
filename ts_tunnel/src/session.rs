@@ -30,7 +30,15 @@ impl NonceGenerator {
     ///
     /// The reserved range is fully consumed even if the returned NonceIter isn't.
     fn batch(&self, num: usize) -> NonceIter {
-        let mut nonce = self.nonce.lock().unwrap();
+        // Recover from poisoning rather than propagating the panic: the guarded value is a single u64
+        // counter with no cross-field invariant, so a poisoned lock only means a prior holder panicked
+        // (e.g. the unreachable exhaustion guard) — the counter itself is always valid to read/advance.
+        // Propagating the poison would permanently brick this session's nonce path (and a panic here can
+        // become UB across the FFI boundary).
+        let mut nonce = self
+            .nonce
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let end = match nonce.checked_add(num as u64) {
             Some(end) => end,
             // NonceGenerator is used to produce nonces for a wireguard session.

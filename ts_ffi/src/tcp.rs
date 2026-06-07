@@ -1,6 +1,6 @@
 use std::ffi::{self, c_char};
 
-use crate::{TOKIO_RUNTIME, util};
+use crate::{TOKIO_RUNTIME, ffi_guard, util};
 
 /// A Tailscale TCP listener handle.
 pub struct tcp_listener(tailscale::netstack::TcpListener);
@@ -23,15 +23,17 @@ pub extern "C" fn ts_tcp_listen(
     dev: &crate::device,
     addr: &crate::sockaddr,
 ) -> Option<Box<tcp_listener>> {
-    let addr = addr.try_into().ok()?;
+    ffi_guard(move || {
+        let addr = addr.try_into().ok()?;
 
-    match TOKIO_RUNTIME.block_on(dev.0.tcp_listen(addr)) {
-        Ok(sock) => Some(Box::new(tcp_listener(sock))),
-        Err(e) => {
-            tracing::error!(err = %e, "tcp listen");
-            None
+        match TOKIO_RUNTIME.block_on(dev.0.tcp_listen(addr)) {
+            Ok(sock) => Some(Box::new(tcp_listener(sock))),
+            Err(e) => {
+                tracing::error!(err = %e, "tcp listen");
+                None
+            }
         }
-    }
+    })
 }
 
 /// Accept an incoming connection on the given listener.
@@ -39,25 +41,25 @@ pub extern "C" fn ts_tcp_listen(
 /// Returns null if there was an error.
 #[unsafe(no_mangle)]
 pub extern "C" fn ts_tcp_accept(listener: &tcp_listener) -> Option<Box<tcp_stream>> {
-    match listener.0.accept_blocking() {
+    ffi_guard(move || match listener.0.accept_blocking() {
         Ok(sock) => Some(Box::new(tcp_stream(sock))),
         Err(e) => {
             tracing::error!(err = %e, "tcp accept");
             None
         }
-    }
+    })
 }
 
 /// Get the local endpoint `listener` is listening on.
 #[unsafe(no_mangle)]
 pub extern "C" fn ts_tcp_listener_local_addr(listener: &tcp_listener) -> crate::sockaddr {
-    listener.0.local_addr().into()
+    ffi_guard(move || listener.0.local_addr().into())
 }
 
 /// Close the specified socket.
 #[unsafe(no_mangle)]
 pub extern "C" fn ts_tcp_close_listener(sock: Box<tcp_listener>) {
-    drop(sock)
+    ffi_guard(move || drop(sock))
 }
 
 /// Open a TCP connection to the specified `remote`.
@@ -66,15 +68,17 @@ pub extern "C" fn ts_tcp_connect(
     dev: &crate::device,
     remote: &crate::sockaddr,
 ) -> Option<Box<tcp_stream>> {
-    let addr = remote.try_into().ok()?;
+    ffi_guard(move || {
+        let addr = remote.try_into().ok()?;
 
-    match TOKIO_RUNTIME.block_on(dev.0.tcp_connect(addr)) {
-        Ok(sock) => Some(Box::new(tcp_stream(sock))),
-        Err(e) => {
-            tracing::error!(err = %e, "binding sock");
-            None
+        match TOKIO_RUNTIME.block_on(dev.0.tcp_connect(addr)) {
+            Ok(sock) => Some(Box::new(tcp_stream(sock))),
+            Err(e) => {
+                tracing::error!(err = %e, "binding sock");
+                None
+            }
         }
-    }
+    })
 }
 
 /// Connect to a tailnet peer by MagicDNS `name` and `port` over TCP.
@@ -92,16 +96,18 @@ pub unsafe extern "C" fn ts_connect_by_name(
     name: *const c_char,
     port: u16,
 ) -> Option<Box<tcp_stream>> {
-    // SAFETY: ensured by function precondition
-    let name = unsafe { util::str(name) }?;
+    ffi_guard(move || {
+        // SAFETY: ensured by function precondition
+        let name = unsafe { util::str(name) }?;
 
-    match TOKIO_RUNTIME.block_on(dev.0.connect_by_name(name, port)) {
-        Ok(sock) => Some(Box::new(tcp_stream(sock))),
-        Err(e) => {
-            tracing::error!(err = %e, "connect by name");
-            None
+        match TOKIO_RUNTIME.block_on(dev.0.connect_by_name(name, port)) {
+            Ok(sock) => Some(Box::new(tcp_stream(sock))),
+            Err(e) => {
+                tracing::error!(err = %e, "connect by name");
+                None
+            }
         }
-    }
+    })
 }
 
 /// Send bytes to the specified socket, blocking until at least one byte is sent.
@@ -119,16 +125,18 @@ pub unsafe extern "C" fn ts_tcp_send(
     buf: *const u8,
     len: usize,
 ) -> ffi::c_int {
-    // SAFETY: ensured by function precondition
-    let b = unsafe { core::slice::from_raw_parts(buf, len) };
+    ffi_guard(move || {
+        // SAFETY: ensured by function precondition
+        let b = unsafe { core::slice::from_raw_parts(buf, len) };
 
-    match stream.0.send_blocking(b) {
-        Err(e) => {
-            tracing::error!(err = %e, "tcp accept");
-            -1
+        match stream.0.send_blocking(b) {
+            Err(e) => {
+                tracing::error!(err = %e, "tcp accept");
+                -1
+            }
+            Ok(n) => n as _,
         }
-        Ok(n) => n as _,
-    }
+    })
 }
 
 /// Receive bytes from the specified socket, blocking until at least one byte is received.
@@ -142,32 +150,36 @@ pub unsafe extern "C" fn ts_tcp_send(
 /// [`core::slice::from_raw_parts_mut`]).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ts_tcp_recv(stream: &tcp_stream, buf: *mut u8, len: usize) -> ffi::c_int {
-    // SAFETY: ensured by function precondition
-    let b = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+    ffi_guard(move || {
+        // SAFETY: ensured by function precondition
+        let b = unsafe { core::slice::from_raw_parts_mut(buf, len) };
 
-    match stream.0.recv_blocking(b) {
-        Err(e) => {
-            tracing::error!(err = %e, "tcp accept");
-            -1
+        match stream.0.recv_blocking(b) {
+            Err(e) => {
+                tracing::error!(err = %e, "tcp accept");
+                -1
+            }
+            Ok(read) => read as _,
         }
-        Ok(read) => read as _,
-    }
+    })
 }
 
 /// Get the local endpoint for this TCP stream.
 #[unsafe(no_mangle)]
 pub extern "C" fn ts_tcp_local_addr(stream: &tcp_stream) -> crate::sockaddr {
-    stream.0.local_addr().into()
+    ffi_guard(move || stream.0.local_addr().into())
 }
 
 /// Get the remote endpoint this TCP stream is connected to.
 #[unsafe(no_mangle)]
 pub extern "C" fn ts_tcp_remote_addr(stream: &tcp_stream) -> crate::sockaddr {
-    stream.0.remote_addr().into()
+    ffi_guard(move || stream.0.remote_addr().into())
 }
 
 /// Close the specified socket.
 #[unsafe(no_mangle)]
 pub extern "C" fn ts_tcp_close(sock: Box<tcp_stream>) {
-    drop(sock);
+    ffi_guard(move || {
+        drop(sock);
+    })
 }

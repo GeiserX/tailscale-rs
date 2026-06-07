@@ -6,6 +6,32 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.6.0](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.6.0) - 2026-06-07
+
+Minor-version bump marking the open-source-readiness milestone: a session of crypto-interop
+proofs, an `unsafe` audit, a whole-codebase review, and now an FFI panic boundary leave the fork
+substantially hardened. No breaking API changes, but the safety posture is materially stronger.
+
+### Added
+- **Panic boundary across the entire C FFI (tsr-vmy).** A Rust panic unwinding across an
+  `extern "C"` frame is undefined behavior; previously a malformed-packet panic in the datapath
+  could corrupt the host (Go/C) process silently. All ~41 `extern "C"` entry points now run inside
+  a `ffi_guard` that catches any unwind at the boundary and returns the type's documented failure
+  sentinel (negative `c_int`, `NULL`, `None`, or an `AF_UNSPEC` `sockaddr`), logging the panic via
+  `tracing`. Implemented with `catch_unwind` (not `panic = "abort"`) so the crate stays an
+  embeddable `staticlib`/`cdylib`.
+- **Behavioral test for the SSH privilege-drop ordering (tsr-h45).** The sacred
+  supplementary-groups → setgid → setuid-last sequence is extracted into a pure `priv_drop_plan`
+  function (the post-fork closure just executes the plan), with unit tests asserting uid-is-last
+  and the Apple/Linux step difference — so a reordering can no longer ship undetected.
+
+### Fixed
+- **Mutex-poisoning hazard on the WireGuard nonce path** (`ts_tunnel`): the per-session nonce lock
+  now recovers a poisoned guard instead of propagating the panic, so one transient panic can't
+  permanently brick a session's encrypt path (and can't escalate to FFI UB).
+- **Flaky taildrop tests** (`ts_runtime`): the test temp-dir helper now uses an atomic counter, not
+  a coarse timestamp, so concurrent tests no longer collide on a shared directory.
+
 ## [0.5.63](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.63) - 2026-06-07
 
 Whole-codebase health review + fixes (open-source readiness). A multi-perspective audit

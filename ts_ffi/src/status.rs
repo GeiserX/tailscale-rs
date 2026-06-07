@@ -20,7 +20,7 @@ use std::{
     net::SocketAddr,
 };
 
-use crate::{TOKIO_RUNTIME, device, net_types::sockaddr};
+use crate::{TOKIO_RUNTIME, device, ffi_guard, net_types::sockaddr};
 
 /// A single node in a [`ts_status`] / [`ts_whois`] result.
 ///
@@ -112,53 +112,55 @@ pub unsafe extern "C" fn ts_status(
     visit: status_visitor,
     user: *mut c_void,
 ) -> ffi::c_int {
-    let Some(visit) = visit else {
-        return 0;
-    };
+    ffi_guard(move || {
+        let Some(visit) = visit else {
+            return 0;
+        };
 
-    let status = match TOKIO_RUNTIME.block_on(dev.0.status()) {
-        Ok(status) => status,
-        Err(e) => {
-            tracing::error!(err = %e, "status");
-            return -1;
+        let status = match TOKIO_RUNTIME.block_on(dev.0.status()) {
+            Ok(status) => status,
+            Err(e) => {
+                tracing::error!(err = %e, "status");
+                return -1;
+            }
+        };
+
+        let mut count = 0;
+
+        if let Some(n) = &status.self_node {
+            let routes: Vec<String> = n.allowed_routes.iter().map(ToString::to_string).collect();
+            visit_node(
+                &n.stable_id.0,
+                &n.display_name,
+                n.ipv4,
+                n.ipv6,
+                n.online,
+                &routes,
+                n.is_exit_node,
+                visit,
+                user,
+            );
+            count += 1;
         }
-    };
 
-    let mut count = 0;
+        for n in &status.peers {
+            let routes: Vec<String> = n.allowed_routes.iter().map(ToString::to_string).collect();
+            visit_node(
+                &n.stable_id.0,
+                &n.display_name,
+                n.ipv4,
+                n.ipv6,
+                n.online,
+                &routes,
+                n.is_exit_node,
+                visit,
+                user,
+            );
+            count += 1;
+        }
 
-    if let Some(n) = &status.self_node {
-        let routes: Vec<String> = n.allowed_routes.iter().map(ToString::to_string).collect();
-        visit_node(
-            &n.stable_id.0,
-            &n.display_name,
-            n.ipv4,
-            n.ipv6,
-            n.online,
-            &routes,
-            n.is_exit_node,
-            visit,
-            user,
-        );
-        count += 1;
-    }
-
-    for n in &status.peers {
-        let routes: Vec<String> = n.allowed_routes.iter().map(ToString::to_string).collect();
-        visit_node(
-            &n.stable_id.0,
-            &n.display_name,
-            n.ipv4,
-            n.ipv6,
-            n.online,
-            &routes,
-            n.is_exit_node,
-            visit,
-            user,
-        );
-        count += 1;
-    }
-
-    count
+        count
+    })
 }
 
 /// Look up the tailnet node that owns the IP of `addr` (like `tsnet`'s `WhoIs`).
@@ -181,38 +183,40 @@ pub unsafe extern "C" fn ts_whois(
     visit: status_visitor,
     user: *mut c_void,
 ) -> ffi::c_int {
-    let Ok(addr): Result<SocketAddr, _> = addr.try_into() else {
-        tracing::error!("whois: invalid sockaddr");
-        return -1;
-    };
+    ffi_guard(move || {
+        let Ok(addr): Result<SocketAddr, _> = addr.try_into() else {
+            tracing::error!("whois: invalid sockaddr");
+            return -1;
+        };
 
-    match TOKIO_RUNTIME.block_on(dev.0.whois(addr)) {
-        Ok(Some(whois)) => {
-            if let Some(visit) = visit {
-                let node = tailscale::StatusNode::from_node(&whois.node);
-                let routes = node
-                    .allowed_routes
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>();
-                visit_node(
-                    &node.stable_id.0,
-                    &node.display_name,
-                    node.ipv4,
-                    node.ipv6,
-                    node.online,
-                    &routes,
-                    node.is_exit_node,
-                    visit,
-                    user,
-                );
+        match TOKIO_RUNTIME.block_on(dev.0.whois(addr)) {
+            Ok(Some(whois)) => {
+                if let Some(visit) = visit {
+                    let node = tailscale::StatusNode::from_node(&whois.node);
+                    let routes = node
+                        .allowed_routes
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>();
+                    visit_node(
+                        &node.stable_id.0,
+                        &node.display_name,
+                        node.ipv4,
+                        node.ipv6,
+                        node.online,
+                        &routes,
+                        node.is_exit_node,
+                        visit,
+                        user,
+                    );
+                }
+                1
             }
-            1
+            Ok(None) => 0,
+            Err(e) => {
+                tracing::error!(err = %e, "whois");
+                -1
+            }
         }
-        Ok(None) => 0,
-        Err(e) => {
-            tracing::error!(err = %e, "whois");
-            -1
-        }
-    }
+    })
 }
