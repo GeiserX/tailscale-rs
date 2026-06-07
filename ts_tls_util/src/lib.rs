@@ -22,7 +22,7 @@ pub use pinned::connect_pinned;
 
 /// Env var naming a PEM file of additional trust-anchor certificate(s) to add to
 /// the root store, on top of the public webpki roots. This is how a self-hosted
-/// control server with a private/self-signed CA (e.g. a self-hosted control plane) is trusted
+/// control server with a private/self-signed CA is trusted
 /// without disabling verification. Unset ⇒ public roots only (unchanged default).
 const EXTRA_CA_PEM_VAR: &str = "TS_RS_EXTRA_CA_PEM";
 

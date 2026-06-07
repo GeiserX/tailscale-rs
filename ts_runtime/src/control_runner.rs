@@ -274,7 +274,8 @@ mod msg_impl {
         /// present, so the same ACME account persists across renewals; otherwise an ephemeral key is
         /// generated for this call only (a fresh ACME account each issuance — acceptable for v1; LE
         /// allows it). Persisting a generated key back into the key file is the embedder's job (no
-        /// write-back path here). SaaS-only: against a self-hosted control plane the set-dns publish 501s.
+        /// write-back path here). SaaS-only: against a self-hosted control plane the set-dns
+        /// publish 501s.
         #[message(ctx)]
         pub fn get_certificate(
             &self,

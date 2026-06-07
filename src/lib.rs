@@ -849,8 +849,8 @@ impl Device {
     ///
     /// **With the `acme` feature** this instead drives the client-side ACME DNS-01 engine to issue a
     /// real Let's Encrypt certificate for `name`, publishing the challenge TXT via the node's
-    /// `POST /machine/set-dns` RPC (routed through the control runner). SaaS-only: a self-hosted control plane
-    /// 501s on set-dns, surfaced as [`ts_control::CertError::Acme`].
+    /// `POST /machine/set-dns` RPC (routed through the control runner). SaaS-only: a self-hosted
+    /// control plane may 501 on set-dns, surfaced as [`ts_control::CertError::Acme`].
     #[cfg(not(feature = "acme"))]
     pub async fn get_certificate(&self, name: &str) -> Result<CertifiedKey, ts_control::CertError> {
         ts_control::get_certificate(name).await
@@ -993,7 +993,7 @@ impl Device {
     /// **Where the relay comes from.** The public ingress **relay + DNS mapping** that feed
     /// `/v0/ingress` are Tailscale infrastructure ([`ts_control::MISSING_FUNNEL_RELAY`]), provisioned
     /// automatically against real Tailscale SaaS with a Funnel-enabled ACL; against a self-hosted
-    /// control plane (a self-hosted control plane) no relay exists, so the listener is correct but never fed.
+    /// control plane no relay exists, so the listener is correct but never fed.
     ///
     /// Anti-leak: Funnel TLS terminates only on the overlay netstack (the hijacked ingress stream
     /// arrives on the overlay peerAPI listener), never a host socket; there is no self-signed or

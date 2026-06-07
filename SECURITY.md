@@ -27,7 +27,7 @@ flowchart LR
         Dialer["RealDialer chokepoint<br/>fail-closed, IPv4-only"]
     end
 
-    Control["Control plane<br/>(a self-hosted control plane / Tailscale)"]
+    Control["Control plane<br/>(Tailscale or self-hosted)"]
     Peers["Tailnet peers"]
     Upstream["Upstream proxy / Internet"]
 
@@ -98,7 +98,7 @@ access to the running user) is the **embedding application's** responsibility.
 
 ## Anti-leak posture (the strong part)
 
-The product invariant this fork is built around — **the origin IP never leaks, egress is
+The design invariant this fork is built around — **the origin IP never leaks, egress is
 fail-closed, and egress is IPv4-only** — is enforced both structurally and in CI:
 
 - The `RealDialer` trait in `ts_forwarder` is the single anti-leak chokepoint. The default

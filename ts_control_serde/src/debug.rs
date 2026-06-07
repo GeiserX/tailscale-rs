@@ -20,7 +20,7 @@ pub struct Debug {
     pub sleep_seconds: Duration,
 
     /// Disables the `logtail` package in the Go client; ignored by the Rust client. Primarily
-    /// used by a self-hosted control plane.
+    /// used by self-hosted control planes.
     pub disable_log_tail: bool,
 
     /// If populated, indicates that this Tailscale node's process should exit with the given

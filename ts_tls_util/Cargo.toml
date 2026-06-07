@@ -18,7 +18,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 tracing.workspace = true
 url.workspace = true
 webpki-roots = { version = "1.0" }
-# Pure-Rust PEM decoder for loading a private control-plane CA (a self-hosted control plane) into
+# Pure-Rust PEM decoder for loading a private control-plane CA into
 # the root store via TS_RS_EXTRA_CA_PEM. No C toolchain dep (keeps musl-static).
 rustls-pemfile = "2"
 # SHA-256 over the leaf cert DER for self-signed DERP cert pinning. Same `ring`

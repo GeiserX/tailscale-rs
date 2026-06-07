@@ -185,7 +185,7 @@ pub struct ProxyConfig {
 
 // Manual Debug that NEVER prints the proxy credentials. `ProxyConfig` is `pub` (re-exported from
 // the crate root), so a stray `tracing!(?cfg)`, `{:?}`, panic message, or test assertion must not
-// be able to leak the residential-proxy username/password into logs or Convex traces. The derived
+// be able to leak the residential-proxy username/password into logs or traces. The derived
 // Debug would print `auth: Some(("user", "pass"))` verbatim; this elides it to `<redacted>`.
 impl core::fmt::Debug for ProxyConfig {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

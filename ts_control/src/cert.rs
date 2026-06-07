@@ -62,11 +62,11 @@
 //!   (`register.rs` is the template; the Noise transport is `connect.rs`).
 //! - Local ACME account-key persistence keyed to the node identity.
 //!
-//! **Deployment caveat (why this is currently stubbed, not built):** the fork's
-//! control plane target is **a self-hosted control plane**, which returns **HTTP 501
+//! **Deployment caveat (why this is currently stubbed, not built):** a
+//! self-hosted control plane target may return **HTTP 501
 //! NotImplemented** for `/machine/set-dns`. A client-side ACME engine therefore
-//! cannot complete a DNS-01 challenge against a self-hosted control plane — the issuance path
-//! is non-functional until a self-hosted control plane grows `set-dns` + a real backing DNS zone
+//! cannot complete a DNS-01 challenge against such a control plane — the issuance path
+//! is non-functional until the control plane grows `set-dns` + a real backing DNS zone
 //! (separate, out-of-repo work). Building the ACME engine here without that would
 //! be dead code against the actual control plane.
 //!
@@ -103,7 +103,7 @@ pub trait PublishTxt {
 ///
 /// The DNS-01 publish is the one I/O step of issuance the ACME engine reaches through the
 /// [`PublishTxt`] seam; fold the set-dns RPC's own error vocabulary into the cert error surface
-/// (its `Display` carries the coarse cause, e.g. the a self-hosted control plane 501 `Internal(Http)`).
+/// (its `Display` carries the coarse cause, e.g. the self-hosted control plane 501 `Internal(Http)`).
 #[cfg(feature = "acme")]
 impl From<crate::tokio::SetDnsError> for CertError {
     fn from(error: crate::tokio::SetDnsError) -> Self {
@@ -115,7 +115,7 @@ impl From<crate::tokio::SetDnsError> for CertError {
 ///
 /// Borrows the node's [`crate::Config`] (control URL + transport) and [`ts_keys::NodeState`] (node
 /// keys for the Noise channel) and publishes the `_acme-challenge.<name>` `TXT` record through
-/// [`crate::tokio::set_dns`]. SaaS-only: a self-hosted control plane 501s on `set-dns`, surfaced as
+/// [`crate::tokio::set_dns`]. SaaS-only: a self-hosted control plane typically 501s on `set-dns`, surfaced as
 /// [`CertError::Acme`].
 #[cfg(feature = "acme")]
 pub struct SetDnsPublisher<'a> {
@@ -160,7 +160,7 @@ impl PublishTxt for SetDnsPublisher<'_> {
 /// `account_key` is the ACME account identity (persist its PKCS#8 DER across renewals — see the
 /// runtime caller); `directory_url` selects the ACME CA (production is
 /// [`crate::acme::LETS_ENCRYPT_PRODUCTION_DIRECTORY`]). Rejects non-tailnet names up front (anti-leak)
-/// before any network I/O. SaaS-only: against a self-hosted control plane the set-dns publish 501s, surfaced as
+/// before any network I/O. SaaS-only: against a self-hosted control plane the set-dns publish typically 501s, surfaced as
 /// [`CertError::Acme`]. Fail-closed: returns a [`CertifiedKey`] only when the LE order reached
 /// `valid` and the chain assembled.
 #[cfg(feature = "acme")]
@@ -182,7 +182,7 @@ pub async fn issue_certificate_via_setdns(
 /// verbatim in [`CertError::Unimplemented`] so the gap is self-documenting at
 /// runtime. There is no control `cert/<domain>` RPC in real Tailscale — the node
 /// is the ACME client and only needs control to publish the DNS-01 TXT via
-/// `POST /machine/set-dns` (which a self-hosted control plane 501s). See the module docs.
+/// `POST /machine/set-dns` (which a self-hosted control plane typically 501s). See the module docs.
 pub const MISSING_CERT_RPC: &str = "client-side ACME engine (direct to Let's Encrypt) + a POST /machine/set-dns \
      Noise RPC to publish the _acme-challenge TXT (a self-hosted control plane returns 501 for set-dns)";
 
@@ -281,8 +281,8 @@ pub async fn get_certificate(name: &str) -> Result<CertifiedKey, CertError> {
         return Err(CertError::NotTailnetName(name.to_string()));
     }
 
-    // No client-side ACME engine and no set-dns RPC exist in this fork, and the
-    // a self-hosted control plane control target 501s on set-dns. Do NOT self-sign.
+    // No client-side ACME engine and no set-dns RPC exist in this fork, and a
+    // self-hosted control target typically 501s on set-dns. Do NOT self-sign.
     Err(CertError::Unimplemented {
         detail: format!(
             "cannot issue a real certificate for {name:?}; requires: {MISSING_CERT_RPC}"

@@ -274,7 +274,7 @@ tun = ["ts_runtime/tun"]
 identity-federation = ["ts_control/identity-federation"]
 # Client-side ACME (Let's Encrypt) cert issuance (SaaS-only, off by default): makes
 # `Device::get_certificate` issue a real cert for the node's `*.ts.net` name via the node's set-dns
-# RPC, instead of the fail-closed `CertError::Unimplemented` stub. A self-hosted control plane 501s on set-dns,
+# RPC, instead of the fail-closed `CertError::Unimplemented` stub. A self-hosted control plane may 501 on set-dns,
 # so issuance is non-functional there (built for full tsnet parity, like identity-federation).
 acme = ["ts_control/acme", "ts_runtime/acme"]
 

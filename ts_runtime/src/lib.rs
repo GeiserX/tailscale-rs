@@ -370,8 +370,8 @@ impl Runtime {
     /// the client-side ACME DNS-01 flow on a spawned task and publishes the challenge TXT via the
     /// node's set-dns RPC. The kameo delegated-reply send error is flattened — a handler error
     /// carries the real [`ts_control::CertError`]; any other send failure (actor shutdown / mailbox
-    /// closed) is surfaced as a [`ts_control::CertError::Io`]. SaaS-only: a self-hosted control plane 501s on
-    /// set-dns.
+    /// closed) is surfaced as a [`ts_control::CertError::Io`]. SaaS-only: a self-hosted control
+    /// plane 501s on set-dns.
     #[cfg(feature = "acme")]
     pub async fn get_certificate(
         &self,

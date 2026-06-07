@@ -112,7 +112,7 @@ pub struct Config {
     /// client).
     ///
     /// Sent as `HostInfo.RequestTags` on registration and on every map request, so a
-    /// tag-keyed control ACL (e.g. a a self-hosted control plane route auto-approver) can match this node. Each
+    /// tag-keyed control ACL (e.g. a self-hosted control plane's route auto-approver) can match this node. Each
     /// entry is a full tag string including the `tag:` prefix (e.g. `tag:exit`). Defaults to
     /// empty (claim no tags); an empty set omits the wire field entirely.
     #[serde(default)]

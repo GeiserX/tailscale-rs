@@ -234,7 +234,7 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          # Primary: this project is ARM64-only.
+          # Primary: ARM64 is the main deployment target.
           - triple: aarch64-unknown-linux-musl
           # Nice-to-have secondary target.
           - triple: x86_64-unknown-linux-musl

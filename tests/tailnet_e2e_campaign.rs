@@ -105,9 +105,9 @@ async fn s1_concurrent_multinode_join() {
     }
 }
 
-/// Scenario 2: REAL PEER CONNECTIVITY. A fresh fork node pings standing tailnet peers (macmini,
-/// watchtower) over the overlay with ICMP echo — proving the WireGuard data plane actually
-/// carries traffic to real peers, not just that registration succeeded.
+/// Scenario 2: REAL PEER CONNECTIVITY. A fresh fork node pings standing tailnet peers over the
+/// overlay with ICMP echo — proving the WireGuard data plane actually carries traffic to real
+/// peers, not just that registration succeeded.
 #[tokio::test]
 async fn s2_overlay_ping_real_peers() {
     if gated().is_none() {

@@ -324,8 +324,8 @@ mod tests {
     }
 
     #[test]
-    fn check_set_dns_status_a self-hosted control plane_501_is_error() {
-        // a self-hosted control plane does not implement `/machine/set-dns` and returns 501 Not Implemented; document
+    fn check_set_dns_status_self_hosted_501_is_error() {
+        // a self-hosted control plane may not implement `/machine/set-dns` and returns 501 Not Implemented; document
         // that DOA reality — it must surface as an error, never a silent success.
         let err =
             check_set_dns_status(StatusCode::NOT_IMPLEMENTED, b"not implemented").unwrap_err();

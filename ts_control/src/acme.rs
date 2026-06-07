@@ -33,7 +33,7 @@
 //! # Deployment caveat (DOA against a self-hosted control plane)
 //!
 //! The DNS-01 TXT publish goes through [`crate::cert::PublishTxt`], backed by the node's
-//! `POST /machine/set-dns` Noise RPC. **A self-hosted control plane returns HTTP 501** for `set-dns`, so this
+//! `POST /machine/set-dns` Noise RPC. **A self-hosted control plane typically returns HTTP 501** for `set-dns`, so this
 //! engine cannot complete a challenge there — it is built for full `tsnet` parity and works against
 //! real Let's Encrypt / Pebble plus a control plane that implements `set-dns` (and owns the
 //! `ts.net` zone). This mirrors the SaaS-only posture of [`crate::wif`].

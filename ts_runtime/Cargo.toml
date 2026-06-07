@@ -55,7 +55,8 @@ smallvec.workspace = true
 tun = ["dep:ts_transport_tun", "dep:ts_host_net", "dep:etherparse"]
 # Client-side ACME (Let's Encrypt) cert issuance via the node's set-dns RPC. Off by default and
 # SaaS-only (forwards to `ts_control/acme`). Enables `Runtime::get_certificate` + the ControlRunner
-# `GetCertificate` message; a self-hosted control plane 501s on set-dns so issuance is non-functional there.
+# `GetCertificate` message; a self-hosted control plane 501s on set-dns so issuance is
+# non-functional there.
 acme = ["ts_control/acme"]
 
 [dev-dependencies]

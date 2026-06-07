@@ -72,7 +72,7 @@ const BIND_ADDR: &str = "0.0.0.0:0";
 /// The dual-stack bind address used only when `Env::enable_ipv6` is `true`.
 ///
 /// Binding `[::]:0` yields one socket that serves both native IPv6 and IPv4-mapped traffic when
-/// the kernel's `IPV6_V6ONLY` is off (the Linux default on our a cloud VPS deployment, where
+/// the kernel's `IPV6_V6ONLY` is off (the Linux default on a typical cloud VPS, where
 /// `/proc/sys/net/ipv6/bindv6only` is `0`). See [`bind_underlay_addr`] for the inert-fallback
 /// posture when the host has IPv6 disabled at the kernel.
 const BIND_ADDR_V6: &str = "[::]:0";

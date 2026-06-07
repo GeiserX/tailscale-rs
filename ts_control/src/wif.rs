@@ -7,9 +7,9 @@
 //! short-lived API access token and then mints a fresh tailnet auth key via the public Tailscale
 //! API.
 //!
-//! This is **SaaS-only**: the fork's a self-hosted control plane control plane does not implement the
+//! This is **SaaS-only**: a self-hosted control plane does not implement the
 //! `/api/v2/oauth/token`, `/api/v2/oauth/token-exchange`, or `/api/v2/tailnet/-/keys` endpoints
-//! (a self-hosted control plane issue #3081, closed unimplemented). The whole subsystem therefore lives behind the
+//! (tracked upstream as a closed-unimplemented issue). The whole subsystem therefore lives behind the
 //! off-by-default `identity-federation` cargo feature, mirroring Go's optional `feature/`
 //! blank-import gating.
 //!

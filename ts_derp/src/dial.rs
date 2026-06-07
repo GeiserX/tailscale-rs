@@ -79,7 +79,7 @@ pub async fn dial_region_tls<'c>(
             .await?
         }
         TlsValidationConfig::SelfSigned { sha256 } => {
-            // Self-hosted / self-signed DERP (e.g. a self-hosted control plane-embedded): accept
+            // Self-hosted / self-signed DERP (e.g. embedded in a self-hosted control plane): accept
             // exactly the cert whose DER matches the configured SHA-256 pin. The
             // SNI still uses the configured hostname (typically an IP literal),
             // but trust is the pin, not the public PKI. Fail-closed: a mismatched

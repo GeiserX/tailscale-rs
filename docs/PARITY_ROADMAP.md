@@ -1,9 +1,7 @@
 # tsnet Parity Roadmap
 
-> **Goal:** rewrite Go `tsnet` completely into Rust. `tailscale-rs` is the committed
-> pure-Rust Tailscale node that backs this project's the exit node egress path and the this project
-> per-session client. This document is the durable plan; live status is tracked in beads
-> (`bd list`, prefix `tsr`).
+> **Goal:** a complete pure-Rust port of Go `tsnet`. This document is the durable plan; live
+> status is tracked in beads (`bd list`, prefix `tsr`).
 
 ## Where we are (v0.5.39 — near-complete tsnet parity)
 
@@ -69,12 +67,12 @@ Most recent wave:
 - **`4via6`** subnet-route encoding.
 - **Serve get/set_serve_config + accept-loop runtime** — the handler *types* ship (`Path`/`Redirect`/
   `Proxy`/`Text`/`TcpForward`); the stored serve-state runtime and the Accept-handback loop remain,
-  pending a serve-state product decision.
+  pending a serve-state design decision.
 - **Service advertise-to-control** — consume-side done; advertise-side is low value (ACL-preassigned
   VIPs work) and needs a wire-field decision.
 - **Symmetric-NAT birthday-paradox port spray** — deliberately skipped (low value for the
-  DERP-acceptable k8s/proxy deployment; the single-port guess already covers easy cases).
-- **Netstack sharding** (`tsr-4pp`) — benchmark-gated; needs a real residential-exit measurement
+  DERP-acceptable userspace-netstack deployment; the single-port guess already covers easy cases).
+- **Netstack sharding** (`tsr-4pp`) — benchmark-gated; needs a real exit-egress measurement
   first.
 - `Sys()` internals — satisfied via typed accessors (`self_node`/`status`/`watch_netmap`/`whois`).
 
@@ -83,8 +81,9 @@ These cannot be built against a self-hosted control plane and depend on Tailscal
 out-of-band setup:
 - **Funnel public ingress relay** — depends on the Tailscale-operated public relay leg; un-buildable
   against a self-hosted control plane. `listen_funnel` correctly fail-closed.
-- **ACME on a self-hosted control plane** — a self-hosted control plane returns `501` for the ACME-over-control cert RPC; client-side
-  ACME (DNS-01) is implemented but the a self-hosted control plane leg is not available.
+- **ACME on a self-hosted control plane** — a self-hosted control plane may return `501` for the
+  ACME-over-control cert RPC; client-side ACME (DNS-01) is implemented but the control-plane leg is
+  not available there.
 - **OIDC / SSO** — identity-provider integration is a control-plane/deployment concern.
 - **Network flow logs** — depends on the control-plane log-collection pipeline.
 - **Taildrop relay** — the relayed (non-direct) Taildrop path depends on Tailscale infra (direct
@@ -95,17 +94,17 @@ out-of-band setup:
 
 Upstream [`tailscale/tailscale-rs`](https://github.com/tailscale/tailscale-rs) is now active. Going
 forward this fork tracks upstream and aims to upstream or re-base fork-specific work where it makes
-sense, while keeping the product-specific anti-leak/egress posture (see `AGENTS.md`).
+sense, while keeping the anti-leak/egress posture (see `AGENTS.md`).
 
 ## Consumers and the seams they need
 
-- **this project egress** — holds a `Device` handle and obtains per-flow `AsyncRead+AsyncWrite`
+- **Userspace egress client** — holds a `Device` handle and obtains per-flow `AsyncRead+AsyncWrite`
   streams from `Device::tcp_connect`, gated by `Config::exit_node`. This **is** the dialer; do not
   reach for `ts_forwarder::RealDialer` (that is the *inbound* exit-node-server chokepoint, the wrong
   direction). Fail-closed composes because there is no host-socket fallback in the egress path.
-- **this project per-pod client** — pure userspace netstack (no TUN/root), ephemeral auth-key join to
-  a self-hosted control plane, exit-node selection, graceful teardown. Most of this exists; gaps are tags, ephemeral
-  config, and the upstream residential-proxy hop.
+- **Per-pod userspace client** — pure userspace netstack (no TUN/root), ephemeral auth-key join to
+  the control plane, exit-node selection, graceful teardown. Most of this exists; gaps are tags,
+  ephemeral config, and the upstream residential-proxy hop.
 
 ## Roadmap (ranked by leverage)
 
@@ -121,18 +120,18 @@ sense, while keeping the product-specific anti-leak/egress posture (see `AGENTS.
 
 ### Tier 2 — Deployment-critical correctness
 4. **Wire `config.tags` → `HostInfo.request_tags`** at registration (`ts_control/.../register.rs`).
-   Currently dropped; silently breaks a self-hosted control plane tag-keyed route auto-approvers.
+   Currently dropped; silently breaks a self-hosted control plane's tag-keyed route auto-approvers.
 5. **Make `ephemeral` config-driven** (`register.rs` hardcodes `true`) — persistent exit nodes get
    GC'd otherwise.
-6. **Upstream SOCKS/HTTP proxy dialer seam** for the exit hop — residential a residential proxy provider egress sits
+6. **Upstream SOCKS/HTTP proxy dialer seam** for the exit hop — residential proxy egress sits
    *behind* the exit node; `HostExitDialer` must dial via an upstream proxy.
 7. **Netmap stream resumption on reconnect** (`ts_control/src/tokio/client.rs:211`).
 
-### Tier 3 — Performance hardening (before production bulk traffic)
+### Tier 3 — Performance hardening (before bulk traffic)
 8. **`tcp_buffer_size` 16KiB → 256KiB** as a per-deployment knob — the 16KiB window caps a flow at
    ~1.6 Mbps@80ms RTT, throttling large model responses *at 1x*. Highest-ROI perf change.
-9. **Shard the netstack** per ~50-100 sessions in k8s instead of one shared smoltcp poll loop.
-   smoltcp has no SACK/auto-tune — **benchmark over a real residential exit before committing the
+9. **Shard the netstack** per ~50-100 sessions instead of one shared smoltcp poll loop.
+   smoltcp has no SACK/auto-tune — **benchmark over a real exit before committing the
    dataplane**.
 
 ### Tier 4 — True tsnet API-surface gaps
@@ -144,7 +143,7 @@ sense, while keeping the product-specific anti-leak/egress posture (see `AGENTS.
 Previously a "don't-build for egress" list; per direction we are pursuing **complete** tsnet parity,
 so these are now in scope:
 13. **IPv6 on the tailnet** — gated behind a build/runtime flag; default stays IPv4-only to preserve
-    the IPv6-off leak invariant for the proxy/k8s deployments. Parity for general embedders.
+    the IPv6-off leak invariant. Parity for general embedders.
 14. **TUN-mode transport** (`ts_transport_tun`) to full parity — for embedders that want a real
     kernel interface.
 15. **Full MagicDNS server** (`100.100.100.100` resolver) + exit-node DNS.
@@ -156,7 +155,7 @@ so these are now in scope:
     **observability/metrics**.
 21. **Workload identity federation fields** (`ClientID`/`IDToken`/`Audience`) + `Sys()` internals.
 
-## Cross-cutting doc-hygiene (privacy product)
+## Cross-cutting doc-hygiene
 - ~~Reconcile README DERP-vs-direct~~ — **done.** The README now states direct NAT traversal is
   real and DERP is the fallback used only when no direct path is available.
 - ~~Clarify `fallback_resolvers`~~ — **done.** The README states fail-closed NXDOMAIN is the
@@ -167,8 +166,8 @@ so these are now in scope:
 ## Invariants that must never regress
 - Real origin IP must never leak; no silent direct-dial fallback (fail-closed is sacred).
 - IPv4-only on the tailnet by default (bind `0.0.0.0`, never `::`); any IPv6 work is opt-in and must
-  not weaken the proxy/k8s deployment posture.
+  not weaken the deployment posture.
 - Stay on `ring` for the tailnet/TLS path; confine `aws-lc-rs` to the optional `ssh` feature.
 - Keep `panic=unwind` (actor model isolates per-flow panics; `panic=abort` would weaken isolation).
-- Unaudited crypto is acceptable *only* because we own both ends (our a self-hosted control plane + our exits) and pin
-  the capability version.
+- Unaudited crypto is acceptable *only* because the deployer owns both ends (their control plane +
+  their exits) and pins the capability version.

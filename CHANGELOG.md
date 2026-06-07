@@ -16,7 +16,7 @@ Open-source-readiness polish ahead of the public move to `github.com/GeiserX/tai
   on crates.io). The **library name stays `tailscale`** via `[lib] name = "tailscale"`, so
   `use tailscale::…` is unchanged for all consumers; downstream `Cargo.toml` uses
   `tailscale = { package = "tailscale-rs", … }`.
-- `repository` now points at `github.com/GeiserX/tailscale-rs`; all in-repo `GeiserX` references
+- `repository` now points at `github.com/GeiserX/tailscale-rs`; all in-repo repository references
   (CHANGELOG release links, VENDOR origin, SECURITY advisory URL, README issue tracker) repointed.
 - `LICENSE` retains the upstream Tailscale BSD-3-Clause copyright and adds a fork-modifications
   copyright line (license unchanged — BSD-3, matching upstream).
@@ -432,7 +432,7 @@ Funnel ingress is **not** a DERP-layer feature. Tailscale's ingress relay is a t
 **POSTs to the node's peerAPI `/v0/ingress`** and the node HTTP-hijacks the connection — so the
 node side is a peerAPI route, fully buildable. (The public DNS + the relay itself remain
 Tailscale-operated infrastructure: this works against real Tailscale SaaS with a Funnel-enabled ACL;
-a self-hosted a self-hosted control plane provides no relay, documented in `MISSING_FUNNEL_RELAY`.)
+a self-hosted control plane provides no relay, documented in `MISSING_FUNNEL_RELAY`.)
 
 - New peerAPI `POST /v0/ingress` route (`ts_runtime::peerapi`): fail-closed netmap-membership gate
   (a non-member ingress POST is rejected `403`; the stricter relay-specific cap is a documented
@@ -773,8 +773,8 @@ ambient IdP OIDC token *before* registration.
   with `client_id`+`jwt`), and CreateKey (`POST /api/v2/tailnet/-/keys`), plus ambient OIDC-token
   fetch for GitHub Actions / GCP metadata / AWS web-identity-token-file. Validation matches Go
   (client_id requires exactly one of id_token/audience; each requires client_id).
-- **SaaS-only** and off by default: a self-hosted control plane (the fork's usual control plane) does not implement
-  these admin-API endpoints (a self-hosted control plane issue #3081, closed unimplemented), mirroring Go's optional
+- **SaaS-only** and off by default: a self-hosted control plane does not implement
+  these admin-API endpoints (they are not part of the self-hosted control-plane API), mirroring Go's optional
   `feature/` blank-import gating. With the feature off, auth-key resolution is a pure pass-through
   and the config fields are inert — zero behavior change, zero new dependency.
 - **Anti-leak preserved**: all calls reuse the existing ring-based `ts_http_util`/`ts_tls_util` stack
@@ -1486,8 +1486,8 @@ Tier 2 of the tsnet full-parity roadmap (`docs/PARITY_ROADMAP.md`).
 - Added (product capability, beyond strict tsnet parity): upstream **proxy egress** for exit
   nodes. `ProxyExitDialer` (a `RealDialer`) egresses exit-node flows via a SOCKS5
   (RFC 1928/1929) or HTTP `CONNECT` upstream — hand-rolled with zero new dependencies — so a
-  cloud exit node can route the traffic it egresses through a residential proxy (a residential proxy provider;
-  configured by the deployer) and never expose its own origin IP. It is now fully wired
+  cloud exit node can route the traffic it egresses through a residential proxy
+  and never expose its own origin IP. It is now fully wired
   through the config chain: `Config::exit_proxy` (`ExitProxyConfig` / `ExitProxyScheme`) →
   `ts_control::Config` (transport-only) → `ForwarderConfig` → the forwarder's dialer selection.
   Strictly opt-in and **fail-closed**: only consulted when `forward_exit_egress` is set, and any

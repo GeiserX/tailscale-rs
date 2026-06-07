@@ -1,8 +1,8 @@
 //! TLS connections to a server whose leaf certificate is pinned by SHA-256 of
 //! its DER encoding.
 //!
-//! This is how a self-hosted / self-signed DERP server (e.g. a a self-hosted control plane-embedded
-//! DERP) is trusted without a public CA: the control plane distributes a
+//! This is how a self-hosted / self-signed DERP server (e.g. one embedded in a
+//! self-hosted control plane) is trusted without a public CA: the control plane distributes a
 //! `sha256-raw:<hex>` pin in the DERP map, and we accept exactly the cert whose
 //! DER hashes to that pin. Unlike [`crate::connect_insecure`], this still proves
 //! the peer holds the certificate's private key (the handshake signature is

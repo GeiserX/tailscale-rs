@@ -215,7 +215,7 @@ flowchart LR
   WireGuard/Noise + audited primitive crates** can clear a professional audit (Defguard has a
   published isec pentest). The fork stays on this path.
 - **`ring` + RustCrypto + dalek, not aws-lc/BoringSSL, on the default path.** Pure-Rust, no C
-  toolchain, memory-safe, cross-compile-friendly (the ARM64/a cloud VPS deployment posture). `aws-lc-rs`
+  toolchain, memory-safe, cross-compile-friendly (the ARM64 deployment posture). `aws-lc-rs`
   (FIPS-capable) is reachable only behind the off-by-default `ssh` feature, so a FIPS pivot would be
   incremental rather than a rewrite. `ring` is **not** FIPS-validated — a deliberate tradeoff.
 - **TKA uses ZIP-215 for consensus signatures.** Standard Ed25519 verification is ambiguous (RFC

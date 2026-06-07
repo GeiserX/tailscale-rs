@@ -20,7 +20,7 @@
 //! for Go `tsnet`'s `ListenFunnel`-returned `net.Listener`).
 //!
 //! The relay + DNS legs are **Tailscale infrastructure** — present against real Tailscale SaaS (with
-//! a Funnel-enabled ACL), absent against a self-hosted control plane (a self-hosted control plane). So this code is
+//! a Funnel-enabled ACL), absent against a self-hosted control plane. So this code is
 //! correct and fully wired, but only ever fed when the node talks to real Tailscale.
 //!
 //! ## Anti-leak

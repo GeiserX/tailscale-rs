@@ -121,7 +121,7 @@ impl<'a> MapRequestBuilder<'a> {
     }
 
     /// Advertise the set of ACL tags this node wants to claim (`HostInfo.RequestTags`), so a
-    /// tag-keyed control ACL (e.g. a a self-hosted control plane route auto-approver) can match it. When the
+    /// tag-keyed control ACL (e.g. a self-hosted control plane's route auto-approver) can match it. When the
     /// iterator yields nothing, the field is left as `None` and omitted from the wire request
     /// (claim no tags).
     pub fn request_tags(mut self, tags: impl IntoIterator<Item = &'a str>) -> Self {

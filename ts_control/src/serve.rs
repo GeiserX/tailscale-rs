@@ -268,7 +268,7 @@ where
 ///
 /// **Fail-closed.** Delegates to [`crate::cert::get_certificate`], which in this
 /// fork returns [`CertError::Unimplemented`] (no client-side ACME engine / no
-/// `set-dns` DNS-01 publish RPC, and a self-hosted control plane 501s on `set-dns`). This function
+/// `set-dns` DNS-01 publish RPC, and a self-hosted control plane typically 501s on `set-dns`). This function
 /// therefore returns the same error rather than ever falling back to plaintext or
 /// a self-signed certificate. When issuance lands, this starts returning a
 /// working acceptor with no caller change.
@@ -314,7 +314,7 @@ pub enum FunnelError {
     Cert(CertError),
     /// The public ingress relay leg is unavailable. Funnel ingress arrives as a tailnet-peer POST to
     /// this node's peerAPI `/v0/ingress` (the relay is a Tailscale-operated peer that the control
-    /// plane stands up); against a self-hosted control plane (a self-hosted control plane) no such relay exists, so no
+    /// plane stands up); against a self-hosted control plane no such relay exists, so no
     /// public traffic is ever delivered. This is *not* returned by [`listen_funnel`] anymore (the
     /// listener is built and works against real SaaS); it remains for callers that want to surface
     /// the relay gap explicitly. `detail` names what is missing.
@@ -365,12 +365,12 @@ impl From<CertError> for FunnelError {
 /// tailnet peer that POSTs the public client's bytes to this node's peerAPI `/v0/ingress`). Against
 /// real Tailscale SaaS (with a Funnel-enabled ACL) control stands these up automatically and
 /// [`listen_funnel`]'s listener serves real public traffic; against a self-hosted control plane
-/// (a self-hosted control plane) no relay exists, so the listener is correct but never fed. Surfaced verbatim in
+/// no relay exists, so the listener is correct but never fed. Surfaced verbatim in
 /// [`FunnelError::Unsupported`] for callers that want to flag the relay gap.
 pub const MISSING_FUNNEL_RELAY: &str = "the Tailscale-operated public ingress relay + the public DNS \
      <node>.<tailnet>.ts.net:443 -> relay mapping that POST public client bytes to this node's peerAPI \
      /v0/ingress; these are Tailscale infrastructure (provisioned automatically against real Tailscale \
-     SaaS with a Funnel-enabled ACL) and a self-hosted a self-hosted control plane control plane provides no such relay";
+     SaaS with a Funnel-enabled ACL) and a self-hosted control plane provides no such relay";
 
 /// Check whether `node` may funnel on `port`, mirroring Go's `ipn.NodeCanFunnel` +
 /// `ipn.CheckFunnelPort` gate. Pure and fail-closed: a missing attribute or out-of-range port

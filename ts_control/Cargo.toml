@@ -82,7 +82,7 @@ insecure-keyfetch = []
 # SaaS-only WIF/OAuth-client auth-key bootstrap (off by default; a self-hosted control plane lacks these endpoints).
 identity-federation = []
 # Client-side ACME (Let's Encrypt) cert issuance + the POST /machine/set-dns Noise RPC that
-# publishes the DNS-01 challenge TXT. Off by default and SaaS-only: a self-hosted control plane returns HTTP 501
+# publishes the DNS-01 challenge TXT. Off by default and SaaS-only: a self-hosted control plane typically returns HTTP 501
 # for `set-dns`, so issuance is non-functional there (built for full tsnet parity, like WIF). Pulls
 # `ring`/`base64`/`rcgen` (all ring-only — no aws-lc-rs). Requires `async_tokio` for the Noise RPC.
 acme = ["async_tokio", "dep:base64", "dep:rcgen"]

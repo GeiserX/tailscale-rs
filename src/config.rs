@@ -124,8 +124,8 @@ pub struct Config {
     /// the proxy's IP rather than its own origin IP.
     ///
     /// This is a **product capability beyond strict Go `tsnet` parity**: it lets a cloud exit node
-    /// route the traffic it egresses through a residential proxy (currently a residential proxy provider; a residential proxy provider and
-    /// a residential proxy provider are sunset), so the cloud host's real IP never appears upstream. Only consulted when
+    /// route the traffic it egresses through a residential proxy provider configured by the
+    /// deployer, so the cloud host's real IP never appears upstream. Only consulted when
     /// [`forward_exit_egress`](Config::forward_exit_egress) is `true`. When `Some`, the forwarder is
     /// wired with a SOCKS5 / HTTP `CONNECT` proxy dialer that **fails closed** — any proxy connect
     /// or handshake failure drops the flow rather than dialing direct, so the real IP never leaks.
