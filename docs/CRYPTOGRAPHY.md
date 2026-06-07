@@ -1,0 +1,371 @@
+# Cryptography
+
+> **Scope.** This document describes every cryptographic operation in `tailscale-rs`,
+> the protocol principles it inherits from WireGuard, Tailscale, and the Noise framework, why each
+> design choice is what it is, the trust posture of the dependencies, and the known risks tracked as
+> beads. It is written to be followed top-to-bottom by a new engineer **and** to hold up to a
+> security auditor's scrutiny.
+>
+> **Status.** The cryptography here is **unaudited**. Compilation is deliberately gated behind
+> `TS_RS_EXPERIMENT=this_is_unstable_software`. See [`../SECURITY.md`](../SECURITY.md) for the
+> disclosure posture. Open risks: **tsr-19k** (interop proof), **tsr-9nu** (key hygiene),
+> **tsr-quk** (TKA consensus correctness).
+
+---
+
+## 1. The big picture
+
+The fork carries three Noise-family secure channels plus several auxiliary boxes. The single most
+important fact for an auditor: **most of the crypto is thin wrappers over audited crates, but three
+surfaces are hand-rolled and carry essentially all the risk.**
+
+```mermaid
+flowchart TB
+    subgraph Identity["Key hierarchy (ts_keys)"]
+        MK["machine key<br/>(mkey:, Curve25519)<br/>control-plane identity, persists"]
+        NK["node key<br/>(nodekey:, Curve25519)<br/>= WireGuard static, rotates ~180d"]
+        DK["disco key<br/>(discokey:, Curve25519)<br/>NAT-traversal"]
+        NLK["network-lock key<br/>(Ed25519)<br/>Tailnet Lock signing"]
+    end
+
+    subgraph Channels["Secure channels"]
+        TS2021["Control TS2021<br/>Noise_IK over HTTP<br/>(ts_control_noise)"]
+        WG["Data plane<br/>Noise_IKpsk2 WireGuard<br/>(ts_tunnel)"]
+        DERP["DERP relay framing<br/>NaCl box (ts_derp)"]
+        DISCO["disco ping/pong<br/>NaCl box (ts_magicsock)"]
+    end
+
+    subgraph Trust["Trust overlay"]
+        TKA["Tailnet Lock / TKA<br/>Ed25519 sig-chain + CTAP2-CBOR<br/>(ts_tka)"]
+    end
+
+    MK --> TS2021
+    NK --> WG
+    NK --> DERP
+    DK --> DISCO
+    NLK --> TKA
+    TKA -. "co-signs" .-> NK
+
+    classDef handrolled fill:#7a1f1f,stroke:#ff6b6b,color:#fff;
+    class WG,TKA handrolled;
+```
+
+**Legend.** Red = hand-rolled protocol logic (highest audit weight). `ts_control_noise` is mostly a
+library state machine but contains one hand-forked cipher (the big-endian AEAD), so it is a third
+hand-rolled surface even though it is not drawn red.
+
+### 1.1 Operation inventory
+
+| Surface | Crate | Protocol / construction | Primitive library | Hand-rolled? |
+|---|---|---|---|---|
+| WireGuard data plane | `ts_tunnel` | `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s` | `chacha20poly1305`, `x25519-dalek`, `blake2`, `hkdf` | **YES** — full Noise state machine, key schedule, mac1/mac2, transport nonce |
+| Control plane (TS2021) | `ts_control_noise` | `Noise_IK_25519_ChaChaPoly_BLAKE2s` over HTTP Upgrade | `noise-protocol` + `noise-rust-crypto`; **forked** `ChaCha20Poly1305BigEndian` | State machine = library; **transport cipher = 4-char fork (`to_be_bytes`)** |
+| Tailnet Lock | `ts_tka` | Ed25519 AUM sig-chain, CTAP2-canonical CBOR | `ed25519-dalek` (standard) + `ed25519-zebra` (ZIP-215); `blake2` | **YES** — CBOR encode/decode + dual-verifier dispatch |
+| ACME (cert issuance) | `ts_control/acme.rs` | RFC 8555 DNS-01, ES256 JWS, RFC 7638 thumbprint | `ring` (P-256, SHA-256), `rcgen` | JWS framing hand-rolled; primitives = `ring` |
+| disco (NAT traversal) | `ts_disco_protocol`, `ts_magicsock` | NaCl `crypto_box` | `crypto_box` **SalsaBox** (XSalsa20-Poly1305) | library |
+| DERP framing | `ts_derp` | NaCl `crypto_box` ClientInfo/ServerInfo | `crypto_box` SalsaBox | library |
+| TLS (cert fetch, pins) | `ts_tls_util` | rustls + **ring** provider; SHA-256 cert pin | `rustls`/`ring`; `subtle` for constant-time pin compare | library |
+| Keys | `ts_keys` | X25519 (machine/node/disco/derp/challenge) + Ed25519 (network-lock) | `x25519-dalek`, `crypto_box`, `ed25519-dalek` | typed newtype wrappers |
+
+---
+
+## 2. Protocol principles
+
+### 2.1 WireGuard data plane (`Noise_IKpsk2`)
+
+WireGuard is a 1-RTT, 2-message mutual handshake built on the Noise **IK** pattern with the **psk2**
+modifier. The fork implements it by hand in `ts_tunnel` from RustCrypto primitives.
+
+```mermaid
+sequenceDiagram
+    participant I as Initiator
+    participant R as Responder
+    Note over I,R: Responder static pubkey known to initiator (pre-message)
+    I->>R: msg1: e, es, s, ss  (encrypts initiator static + TAI64N timestamp)
+    R->>I: msg2: e, ee, se, psk (key confirmation pending)
+    Note over I,R: Split() -> two transport keys (send/recv)
+    I->>R: first transport message  ⟵ provides responder key confirmation
+    Note over I,R: transport: ChaCha20Poly1305, 64-bit LE counter nonce
+```
+
+**Primitives and their roles.** Curve25519 ECDH (4 DH ops: `es`, `ss` in msg1; `ee`, `se` in msg2);
+ChaCha20Poly1305 (handshake field encryption + transport); BLAKE2s (transcript hash `h`, keyed MAC
+for mac1/mac2, and HMAC inside HKDF); HKDF-BLAKE2s (all chaining-key/transport-key derivation). The
+preshared key enters via `MixKeyAndHash` at the end of msg2.
+
+**The correctness-critical invariants** (each one fails silently/catastrophically if wrong — this is
+the implementation's burden, *not* covered by any protocol proof; see §4):
+
+- **Transport nonce** = `4 zero bytes ‖ 64-bit LITTLE-endian counter`. A `(key, counter)` pair
+  **must never repeat** — reuse recovers the Poly1305 one-time key (→ forgery) and reuses the
+  ChaCha keystream (→ plaintext XOR leak). The counter must be `u64`, **never `usize`** (the
+  boringtun 32-bit-overflow hazard, §6).
+- **Anti-replay** = RFC 6479 sliding window. The window is **8192 bits (8128 usable)** — *not* the
+  "roughly 2000" the WireGuard protocol page mentions; the kernel and wireguard-go both use 8192.
+  The replay check runs **after** AEAD authentication succeeds, never before.
+- **Rekey limits (§6.1 of the whitepaper):** `REKEY_AFTER_MESSAGES = 2^60`;
+  `REJECT_AFTER_MESSAGES = 2^64 − 2^13 − 1` (the `2^13 = 8192` slack reserves a full replay window
+  so the counter can never reach `2^64`); `REKEY_AFTER_TIME = 120s`, `REJECT_AFTER_TIME = 180s`.
+  **Only the initiator** initiates rekey.
+- **TAI64N timestamp** replay defense (store greatest-per-peer), hardened against NTP rollback
+  (the class of CVE-2021-46873).
+- **mac1** (proves knowledge of the responder's public key, gates cheap DoS) and **mac2/cookie**
+  (load-based return-routability). *Known gap:* the fork's mac2/cookie path is unimplemented
+  (`verify_macs` requires `mac2 == 0`) — a DoS limitation for an internet-facing responder, not an
+  auth bypass.
+
+### 2.2 Control plane (TS2021, `Noise_IK`)
+
+Tailscale's client↔control channel is a separate `Noise_IK_25519_ChaChaPoly_BLAKE2s` handshake,
+tunneled inside an HTTP `Upgrade` (cleartext-with-inner-Noise on the happy path, or over HTTPS as a
+compatibility fallback). The prologue `"Tailscale Control Protocol v" + version` binds the handshake
+against downgrade.
+
+**The one detail that justifies a hand-forked cipher:** the TS2021 *transport* nonce is
+`4 zero bytes ‖ 64-bit BIG-endian counter` (Go: `binary.BigEndian.PutUint64(n[4:], counter)`).
+This is the opposite endianness from WireGuard's little-endian transport counter. The fork therefore
+ships `ChaCha20Poly1305BigEndian` — a 4-character edit (`to_le_bytes` → `to_be_bytes`) of
+`noise-rust-crypto`'s cipher. **If this endianness does not match Go byte-for-byte, the control
+handshake silently never completes** (it fails closed, not open). The Noise *state machine* itself is
+the vetted `noise-protocol` library, not hand-rolled; transport ciphers are only taken after the
+handshake completes, so premature-transport-use is structurally prevented.
+
+### 2.3 Noise IK security grades
+
+From the Noise spec and Noise Explorer's ProVerif analysis:
+
+| Message | Authentication | Confidentiality | Notes |
+|---|---|---|---|
+| msg1 `-> e,es,s,ss` | grade 1 | grade 2 | **KCI-vulnerable**, no forward secrecy, replayable — inherent to IK |
+| msg2 `<- e,ee,se` | grade 2 | grade 4 | KCI-resistant |
+| transport | grade 2 | grade 5 | strong forward secrecy |
+
+Initiator identity hiding = grade 4 (static encrypted to the responder's static, no FS); responder =
+grade 3. WireGuard's psk2 + mandatory pre-shared responder static harden the weak first message. The
+KCI-vulnerable msg1 is **not a bug to fix** — it is the documented cost of IK's 0-RTT property.
+
+### 2.4 disco and DERP (NaCl `crypto_box`)
+
+Both use NaCl `crypto_box` = Curve25519 ECDH → HSalsa20 → **XSalsa20-Poly1305** with a 24-byte
+nonce. The 24-byte ("extended") nonce is what makes **random per-message nonces safe** (192-bit
+effective space, vs the 96-bit fragility of RFC-8439 ChaCha20Poly1305).
+
+- **Interop pin:** the RustCrypto `crypto_box` crate offers `SalsaBox` (XSalsa20, NaCl/Go-compatible)
+  **and** `ChaChaBox` (XChaCha20, *not* NaCl). The fork **must use `SalsaBox`** — `ChaChaBox` would
+  silently fail to interop with Go's `nacl/box`. (`crypto_box` was Cure53-audited at v0.7.1.)
+- **disco** wraps `{messageType, version, payload}` in a SalsaBox keyed by the disco key. Identity
+  binding is *indirect*: the control plane vouches for the disco↔node-key mapping over the
+  authenticated TS2021 channel, so `Ping.NodeKey` is never trusted on its own. No general anti-replay
+  counter; ping/pong correlate via a 12-byte TxID.
+- **DERP** relays already-WireGuard-sealed payloads and **cannot decrypt** them; its NaCl box only
+  authenticates the client↔server framing (ClientInfo/ServerInfo). (Note: a `ts_derp` doc-comment
+  currently misnames SalsaBox as ChaCha20Poly1305 — see **tsr-9nu**.)
+
+### 2.5 Tailnet Lock (TKA)
+
+Tailnet Lock protects against a malicious/coerced *control plane* injecting rogue node keys. A set
+of customer-held Ed25519 signing keys co-sign trusted node keys; peers reject any node key not
+chaining to a trusted signer.
+
+```mermaid
+flowchart LR
+    G["genesis AUM"] --> A1["AddKey AUM"] --> A2["AddKey/Checkpoint AUM"] --> H["head (AUMHash)"]
+    H --> S["State: trusted keys + vote weights"]
+    NKS["NodeKeySignature<br/>(Direct / Credential / Rotation)"] -->|verified against| S
+    S -->|admit/reject| Peer["peer node key"]
+```
+
+- **AUM chain:** append-only, hash-linked (`PrevAUMHash` = parent's `BLAKE2s-256(Serialize())`).
+  Clients replay the chain into a `State` (trusted keys + vote thresholds). Fork resolution is
+  deterministic (highest signature weight, then RemoveKey child, then lowest hash) so all nodes
+  converge.
+- **Signature kinds:** `Direct` (signs a node key), `Credential` (a TKA key signs a delegated
+  wrapping pubkey — cannot authorize a node alone), `Rotation` (signs a new node key, nesting the
+  prior signature; bounded to ≤16 levels).
+- **The dual-verifier split (must mirror Go exactly):** AUM signatures and terminal
+  Direct/Credential checks use **ZIP-215** (`ed25519-zebra` ≡ Go `ed25519consensus`); the
+  `Rotation` **wrapping** signature uses **standard** Ed25519 (`ed25519-dalek` ≡ Go
+  `crypto/ed25519`). See §5.
+- **Serialization:** CTAP2-canonical CBOR (must byte-match Go's `fxamacker/cbor` CTAP2 mode). See §5.
+- **Disablement:** ten Argon2id-hashed disablement secrets; any one disables the lock.
+
+---
+
+## 3. Why these choices (design rationale)
+
+- **Standard Noise/WireGuard, not custom crypto.** The landscape is unanimous: Tailscale, NetBird,
+  Innernet (Rust), and Defguard (Rust) all ride standard WireGuard/Noise; Nebula uses Noise with
+  named primitives. The lone outlier that hand-rolled a protocol, **ZeroTier**, shipped with *no
+  forward secrecy* and drew perennial criticism. Innernet and Defguard prove that **Rust + standard
+  WireGuard/Noise + audited primitive crates** can clear a professional audit (Defguard has a
+  published isec pentest). The fork stays on this path.
+- **`ring` + RustCrypto + dalek, not aws-lc/BoringSSL, on the default path.** Pure-Rust, no C
+  toolchain, memory-safe, cross-compile-friendly (the ARM64/a cloud VPS deployment posture). `aws-lc-rs`
+  (FIPS-capable) is reachable only behind the off-by-default `ssh` feature, so a FIPS pivot would be
+  incremental rather than a rewrite. `ring` is **not** FIPS-validated — a deliberate tradeoff.
+- **TKA uses ZIP-215 for consensus signatures.** Standard Ed25519 verification is ambiguous (RFC
+  8032 permits cofactored *or* cofactorless), so two conformant verifiers can disagree on the same
+  signature. A trust-consensus control like TKA cannot tolerate disagreement (split-brain on which
+  keys are trusted), so the consensus-critical signatures use ZIP-215's exactly-specified accept set.
+  Standard verification is reserved for the locally-checked rotation wrapping signature.
+
+---
+
+## 4. Formal verification — what is proven, and what is not
+
+The WireGuard protocol and the Noise IK pattern are among the most heavily analyzed AKE designs:
+
+- **Donenfeld & Milner (2018, Tamarin, symbolic):** key agreement, secrecy, forward secrecy, KCI
+  resistance, unknown-key-share / identity-misbinding resistance, session uniqueness.
+- **Lipp, Blanchet & Bhargavan (2019, CryptoVerif, computational):** the same, plus transport-data
+  message secrecy and replay protection, under standard hardness assumptions.
+- **Dowling & Paterson:** identified that the bare handshake lacks explicit key confirmation; the
+  **first transport message** supplies it.
+- **Noise Explorer (ProVerif):** the per-message IK grades in §2.3.
+
+> **The load-bearing caveat.** These proofs cover the *abstract protocol* with primitives modeled as
+> ideal. A reimplementation inherits the theorems **only if it matches the protocol exactly.** The
+> following are **not** covered by any protocol proof and are 100% the implementation's
+> responsibility:
+>
+> - constant-time scalar multiplication and AEAD tag comparison (§7),
+> - **nonce/counter uniqueness** (catastrophic, and invisible to the symbolic models),
+> - exact transcript hashing and KDF chaining,
+> - the state machine that enforces rekey **and the first-transport-message key confirmation**
+>   (signaling "established" before that exchange weakens the modeled guarantee),
+> - replay-window handling.
+>
+> Formally-verified *primitive* implementations exist (HACL\*/EverCrypt; fiat-crypto field
+> arithmetic underpins `curve25519-dalek`) — these give functional correctness and constant-time at
+> the primitive level, **not** protocol or state-machine correctness.
+
+**Conclusion:** matching the wire protocol byte-for-byte buys the cryptographic theorems; everything
+that makes those theorems true in practice is implementation assurance that only testing, fuzzing,
+constant-time analysis, and audit provide. This is precisely why **tsr-19k** (interop vectors) and
+the fuzzing backlog exist.
+
+---
+
+## 5. ZIP-215 and CTAP2-CBOR — the TKA correctness cruxes (→ tsr-quk)
+
+### 5.1 ZIP-215 Ed25519
+
+RFC 8032 §5.1.7 explicitly allows either the cofactored equation `[8][S]B = [8]R + [8][k]A` or the
+cofactorless `[S]B = R + [k]A`. With a torsion-tainted public key, the two disagree ~1/8 of the
+time. **ZIP-215** pins the exact accept set (cofactored equation; non-canonical `A`/`R` encodings
+allowed; `S < L` still enforced) so *all* conforming verifiers agree bit-for-bit — required for a
+consensus control.
+
+| Signature | Verifier (Go) | Verifier (Rust fork) | Rule |
+|---|---|---|---|
+| AUM signatures | `ed25519consensus` | `ed25519-zebra` | ZIP-215 (consensus) |
+| `SigDirect`, `SigCredential` | `ed25519consensus` | `ed25519-zebra` | ZIP-215 (consensus) |
+| `SigRotation` wrapping sig | `crypto/ed25519` | `ed25519-dalek` | standard (local check) |
+
+**Two open verification items (tsr-quk):**
+
+1. **`ed25519-zebra` must be pinned `>= 2.x`.** Version 1.x is *pre-ZIP-215* (libsodium-1.0.15
+   bug-for-bug) and would silently diverge from Go. Rust-zebra ≡ Go-consensus byte agreement is
+   transitive through the spec, **not directly proven** — close it with the 196-case ZIP-215 vector
+   grid (embedded in `ed25519consensus/zip215_test.go`, mirrored in `ed25519-zebra`).
+2. The dispatch asymmetry (ZIP-215 for Direct/Credential, standard for Rotation-wrap) must be
+   covered by a test matrix including a torsion/cofactor edge case.
+
+### 5.2 CTAP2-canonical CBOR
+
+TKA signs `BLAKE2s-256(canonical_cbor(value))`, so byte-exactness with Go's `fxamacker/cbor` CTAP2
+mode is load-bearing. Rules: shortest-form integers/lengths, definite-length only, no floats/tags,
+no duplicate keys, and a specific map-key ordering.
+
+> **Key-ordering finding.** `fxamacker`'s `SortCTAP2` resolves to *bytewise-lexicographic on the
+> encoded key* (identical to RFC 8949 §4.2.1), **not** the "length-first" rule. For TKA's all-uint
+> keys, bytewise == length-first == ascending numeric, so the fork's `sort_by_key` is **correct** —
+> but `ts_tka/src/cbor.rs`'s doc-comment misstates the general rule and should be corrected, and
+> `Value::IntMap` should add a duplicate-key guard.
+
+> **Malleability.** For signature safety the verifier must hash the **received bytes** (or
+> strict-decode rejecting non-minimal integer heads) rather than re-encoding decoded values. The
+> fork's decoder accepts non-minimal integer heads but rejects duplicate keys; signature safety holds
+> because `sig_hash` re-canonicalizes — **tsr-quk** confirms and documents this contract.
+
+---
+
+## 6. Dependency trust posture
+
+The pinned versions are deliberately at or above every relevant advisory's patched floor.
+
+| Crate | Pin | Maintainer | Audit / status | Notes |
+|---|---|---|---|---|
+| `ring` | 0.17.14 | Brian Smith | BoringSSL pedigree; **not FIPS** | ≥ 0.17.12 clears RUSTSEC-2025-0009 (AES panic) |
+| `curve25519-dalek` | 4.1.3 | dalek | fiat-crypto field arith | **exact** patched floor for RUSTSEC-2024-0344 (timing) |
+| `x25519-dalek` | 2.x | dalek | via curve25519-dalek | — |
+| `ed25519-dalek` | 2.2.0 | dalek | — | ≥ 2.0 clears RUSTSEC-2022-0093 (double-pubkey oracle) |
+| `ed25519-zebra` | 4.2.0 | Zcash Fdn | Zebra ecosystem | ZIP-215; **must stay ≥ 2.x** |
+| `chacha20poly1305` | 0.10.1 | RustCrypto | **NCC Group (2022)** | — |
+| `crypto_box` | — | RustCrypto | **Cure53 (v0.7.1)** | use `SalsaBox`, never `ChaChaBox` |
+| `rustls` | 0.23 | ISRG | **Cure53** | ring provider |
+| `blake2`, `sha2`, `hkdf`, `subtle`, `zeroize` | — | RustCrypto/dalek | de-facto standard | `subtle` underpins constant-time |
+| `noise-protocol`, `noise-rust-crypto` | 0.2.1 / 0.6.2 | individual | **UNAUDITED** | thin wrappers; risk = state-machine, not algorithm |
+| `aws-lc-rs` | 1.17.0 | AWS | SAW-verified, FIPS-capable | **only via off-by-default `ssh` feature** |
+
+The **weakest links are the glue**, not the primitives: `noise-protocol`/`noise-rust-crypto` are
+single-maintainer and unaudited (they delegate the actual crypto to dalek/RustCrypto, so the residual
+risk is protocol-state-machine correctness). A `cargo deny` gate holds these floors in CI.
+
+---
+
+## 7. Constant-time and side-channels
+
+The compiler is an adversary: Rust/LLVM provide no formal constant-time guarantee, and
+`curve25519-dalek`'s RUSTSEC-2024-0344 was a real case of LLVM re-inserting a secret-dependent
+branch (fixed with a volatile barrier). Where the fork **must** be constant-time:
+
+- **AEAD/Poly1305 tag comparison** — never `==` on a `Tag`; use the AEAD `decrypt`/`verify` path
+  (RustCrypto compares in constant time).
+- **Key / key-id comparison** — use `subtle::ConstantTimeEq` (already done in the `ts_tls_util` cert
+  pin compare).
+- **Ed25519 / X25519 scalar operations** — delegated to dalek (fiat-crypto backend).
+
+Pin `curve25519-dalek ≥ 4.1.3`; build constant-time code release-mode only; the recommended verifier
+is `dudect-bencher` (`max_t > 5` ⇒ likely leak — it can detect, never *prove*, constant-timeness).
+
+---
+
+## 8. Post-quantum posture
+
+WireGuard is not PQ-secure (Curve25519 ECDH falls to Shor); the symmetric primitives
+(ChaCha20-Poly1305, BLAKE2s) only lose a quadratic factor (Grover) and stay safe at 256-bit. The
+WireGuard **preshared key (psk2)** is the standards-blessed harvest-now-decrypt-later hedge **if**
+distributed out of band. The reference PQ add-on is **Rosenpass** (itself written in Rust): a
+KEM-based handshake (Classic McEliece + Kyber/ML-KEM) that feeds the WireGuard PSK, refreshed ~2 min.
+NIST finalized ML-KEM (FIPS 203), ML-DSA (204), SLH-DSA (205); the emerging transport hybrid is
+X25519MLKEM768. Rust crates `ml-kem` and `x-wing` exist (unaudited).
+
+**Recommendation for this fork** (a tsnet substitute carrying short-lived sessions): (1) ship
+classical X25519 to match Tailscale; (2) expose the WireGuard PSK as a documented, pluggable config
+seam; (3) architect PSK provisioning to accept a future Rosenpass-style daemon **without** a protocol
+change; (4) defer hybrid-Noise and ML-DSA-TKA — track, don't build. Pragmatic, not over-engineered.
+
+---
+
+## 9. Open risks (tracked as beads)
+
+| Bead | Title | Severity | Summary |
+|---|---|---|---|
+| **tsr-19k** | Prove byte-for-byte interop with Go (cross-impl KAT vectors) | High | All hand-rolled crypto is validated only by self-consistent round-trips, which cannot catch a wire-incompatibility with Go. Add Go-sourced KATs: big-endian AEAD vector, ZIP-215 196-case grid, wireguard-go handshake transcript, TKA CBOR/SigHash golden, Wycheproof primitives. |
+| **tsr-9nu** | Private-key `Debug` leaks secret hex + no key zeroization | High | `ts_keys` private-key newtypes' `Debug` forwards to `Display` (prints the secret seed → log leak); newtypes + handshake key material lack `Zeroize`. Redact `Debug`, add `ZeroizeOnDrop`, fix the `ts_derp` SalsaBox doc-comment. |
+| **tsr-quk** | Verify TKA ZIP-215/CBOR consensus correctness | Medium | Pin `ed25519-zebra ≥ 2.x` with a CI guard; prove the ZIP-215-vs-standard dispatch matches Go; document/enforce the canonical-bytes verification contract; add the `IntMap` dup-key guard; correct the `cbor.rs` key-ordering comment. |
+
+The full 19-researcher synthesis (with per-claim confidence, source citations, and the complete
+hardening + fuzzing backlog) lives at [`../.omc/research/cryptography-deep-dive.md`](../.omc/research/cryptography-deep-dive.md).
+
+---
+
+## 10. Audit-readiness summary
+
+The architecture is **sound and conservative**: standard Noise/WireGuard on both planes, audited
+primitive crates at safe pins, the ZIP-215 consensus split correct in principle, and fail-closed
+behavior on every path traced by the security review. No auth-bypass or confidentiality-leak bug was
+found in traced paths. The residual risk class **fails closed** (denied auth / failed handshake /
+consensus split), not open. The path to a clean audit is: close the interop oracles (tsr-19k), fix
+the two key-hygiene items (tsr-9nu), and lock down the TKA consensus details (tsr-quk).
