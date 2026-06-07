@@ -100,19 +100,34 @@ the implementation's burden, *not* covered by any protocol proof; see §4):
   **must never repeat** — reuse recovers the Poly1305 one-time key (→ forgery) and reuses the
   ChaCha keystream (→ plaintext XOR leak). The counter must be `u64`, **never `usize`** (the
   boringtun 32-bit-overflow hazard, §6).
-- **Anti-replay** = RFC 6479 sliding window. The window is **8192 bits (8128 usable)** — *not* the
-  "roughly 2000" the WireGuard protocol page mentions; the kernel and wireguard-go both use 8192.
-  The replay check runs **after** AEAD authentication succeeds, never before.
+- **Anti-replay** = sliding window. The WireGuard **whitepaper §5.4.6 specifies NO window size** — it
+  defers to RFC 6479 (or RFC 2401 App. C) for the algorithm. The "roughly 2000" on the protocol page
+  and the **8192-bit (8128 usable)** value are *implementation* facts (kernel + wireguard-go), not
+  spec. A reimplementation should use the RFC 6479 8192-bit bitmap to match deployed peers' reordering
+  tolerance. The replay check runs **after** AEAD authentication succeeds, never before.
 - **Rekey limits (§6.1 of the whitepaper):** `REKEY_AFTER_MESSAGES = 2^60`;
   `REJECT_AFTER_MESSAGES = 2^64 − 2^13 − 1` (the `2^13 = 8192` slack reserves a full replay window
   so the counter can never reach `2^64`); `REKEY_AFTER_TIME = 120s`, `REJECT_AFTER_TIME = 180s`.
   **Only the initiator** initiates rekey.
-- **TAI64N timestamp** replay defense (store greatest-per-peer), hardened against NTP rollback
-  (the class of CVE-2021-46873).
+- **TAI64N timestamp** replay defense (12-byte: 8-byte BE seconds-since-1970-TAI + 4-byte BE
+  nanoseconds; store greatest-per-peer, big-endian so `memcmp` orders correctly), hardened against
+  NTP rollback (the class of CVE-2021-46873).
 - **mac1** (proves knowledge of the responder's public key, gates cheap DoS) and **mac2/cookie**
-  (load-based return-routability). *Known gap:* the fork's mac2/cookie path is unimplemented
-  (`verify_macs` requires `mac2 == 0`) — a DoS limitation for an internet-facing responder, not an
-  auth bypass.
+  (load-based return-routability; `mac2 = 0^16` until a cookie is held). *Known gap:* the fork's
+  mac2/cookie path is unimplemented (`verify_macs` requires `mac2 == 0`) — a DoS limitation for an
+  internet-facing responder, not an auth bypass.
+
+> **Key-confirmation rule (Dowling & Paterson 2018, IACR 2018/080, §3.1, Thm 1).** WireGuard's bare
+> 1-RTT handshake provides **no explicit key confirmation** — it is KCI-vulnerable until the
+> initiator proves liveness. Their proof (model **eCK-PFS-PSK**, under PRF-ODH + DDH + AEAD-integrity)
+> covers a variant **mWG** with a dedicated confirmation message; in deployed WireGuard the **first
+> inbound transport message** that AEAD-verifies is what confirms. **Implementation requirement:** a
+> responder must keep a session **provisional** after `ResponderHello` and only treat the peer as
+> authenticated / allow itself to originate data upon successfully decrypting the first inbound
+> transport packet. Do **not** mark the session live on completing the two handshake messages alone —
+> that is exactly the KCI / forward-secrecy key-recovery hole (§3.1, §5.1). The fork's `ts_tunnel`
+> (and, by the same logic, `ts_control_noise`) state machine must preserve this — see tsr-19k for the
+> conformance test.
 
 ### 2.2 Control plane (TS2021, `Noise_IK`)
 
@@ -251,25 +266,38 @@ the fuzzing backlog exist.
 ### 5.1 ZIP-215 Ed25519
 
 RFC 8032 §5.1.7 explicitly allows either the cofactored equation `[8][S]B = [8]R + [8][k]A` or the
-cofactorless `[S]B = R + [k]A`. With a torsion-tainted public key, the two disagree ~1/8 of the
-time. **ZIP-215** pins the exact accept set (cofactored equation; non-canonical `A`/`R` encodings
-allowed; `S < L` still enforced) so *all* conforming verifiers agree bit-for-bit — required for a
-consensus control.
+cofactorless `[S]B = R + [k]A`. With a mixed-order public key `A = bB + tT₈` (`t ≠ 0`), the two
+disagree with probability ~7/8 (Taming-EdDSA §3.1, p.11). **ZIP-215** pins the exact accept set
+(cofactored equation; non-canonical `A`/`R` encodings allowed; `S < L` enforced) so *all* conforming
+verifiers agree bit-for-bit — required for a consensus control.
 
-| Signature | Verifier (Go) | Verifier (Rust fork) | Rule |
-|---|---|---|---|
-| AUM signatures | `ed25519consensus` | `ed25519-zebra` | ZIP-215 (consensus) |
-| `SigDirect`, `SigCredential` | `ed25519consensus` | `ed25519-zebra` | ZIP-215 (consensus) |
-| `SigRotation` wrapping sig | `crypto/ed25519` | `ed25519-dalek` | standard (local check) |
+| Signature | Verifier (Go) | Verifier (Rust fork) | Equation | Non-canon A | Non-canon R | `S < L` |
+|---|---|---|---|---|---|---|
+| AUM signatures | `ed25519consensus` | `ed25519-zebra` (≥2.x) | **cofactored** | accept | accept | enforce |
+| `SigDirect`, `SigCredential` | `ed25519consensus` | `ed25519-zebra` (≥2.x) | **cofactored** | accept | accept | enforce |
+| `SigRotation` wrapping sig | `crypto/ed25519` | `ed25519-dalek` | cofactorless | **accept** | reject | enforce |
 
-**Two open verification items (tsr-quk):**
+> **Correction (Taming-EdDSA, Table 5, p.18 — verified from the primary PDF).** The standard Go /
+> `ed25519-dalek` verifier is **not** "canonical-only on A": it *accepts* a non-canonical `A` encoding
+> (speccheck vectors 10–11) and only *rejects* a non-canonical `R` (vectors 8–9). Both standard and
+> ZIP-215 enforce `S < L` (rejecting vectors 6–7) — this is the malleability guard that protects TKA
+> from S-malleability. The behavior on vectors 8–11 is **version-sensitive**, which is why the pins
+> matter.
 
-1. **`ed25519-zebra` must be pinned `>= 2.x`.** Version 1.x is *pre-ZIP-215* (libsodium-1.0.15
-   bug-for-bug) and would silently diverge from Go. Rust-zebra ≡ Go-consensus byte agreement is
-   transitive through the spec, **not directly proven** — close it with the 196-case ZIP-215 vector
-   grid (embedded in `ed25519consensus/zip215_test.go`, mirrored in `ed25519-zebra`).
-2. The dispatch asymmetry (ZIP-215 for Direct/Credential, standard for Rotation-wrap) must be
-   covered by a test matrix including a torsion/cofactor edge case.
+**Open verification items (tsr-quk):**
+
+1. **`ed25519-zebra` must be pinned `>= 2.x`** (1.x is pre-ZIP-215, libsodium-1.0.15 bug-for-bug, and
+   silently diverges from Go). Rust-zebra ≡ Go-consensus byte agreement is transitive through the
+   spec, **not directly proven**.
+2. **Use the `ed25519-speccheck` 12-vector set as the KAT** (Chalkias/Garillot/Nikolaenko,
+   `github.com/novifinancial/ed25519-speccheck`; full LE hex in Taming-EdDSA Table 6c, p.24). The 196
+   "grid" from `ed25519consensus`/`ed25519-zebra` is the broader ZIP-215 cross-check; the speccheck 12
+   are the *discriminating* cases. Assert: `ed25519-zebra` accepts vectors **0–11** (cofactored, incl.
+   non-canonical 8–11); `ed25519-dalek` **rejects 6–7 (S ≥ L) and 8–9 (non-canonical R)**, accepts
+   10–11. Add an explicit regression that the standard verifier rejects vector 6/7 (the
+   S-malleability guard).
+3. The dispatch asymmetry (ZIP-215 for Direct/Credential, standard for Rotation-wrap) must be covered
+   by a test including vector 4 (the cofactored-vs-cofactorless discriminator).
 
 ### 5.2 CTAP2-canonical CBOR
 
@@ -337,9 +365,15 @@ WireGuard is not PQ-secure (Curve25519 ECDH falls to Shor); the symmetric primit
 (ChaCha20-Poly1305, BLAKE2s) only lose a quadratic factor (Grover) and stay safe at 256-bit. The
 WireGuard **preshared key (psk2)** is the standards-blessed harvest-now-decrypt-later hedge **if**
 distributed out of band. The reference PQ add-on is **Rosenpass** (itself written in Rust): a
-KEM-based handshake (Classic McEliece + Kyber/ML-KEM) that feeds the WireGuard PSK, refreshed ~2 min.
-NIST finalized ML-KEM (FIPS 203), ML-DSA (204), SLH-DSA (205); the emerging transport hybrid is
-X25519MLKEM768. Rust crates `ml-kem` and `x-wing` exist (unaudited).
+**post-quantum variant of Noise IK** with a stateless responder (state held in an encrypted "biscuit"
+cookie). Per its whitepaper it uses a **hybrid of Classic McEliece 460896** (static keys, authenticity)
+**+ Kyber-512** (ephemeral keys, forward secrecy) — note this is the **NIST round-3 Kyber-512, NOT
+ML-KEM/FIPS-203**; backend is **liboqs** (libsodium for hash/AEAD). It feeds the derived key into the
+WireGuard PSK, refreshed ~120s. (Errata worth knowing for any reimplementer: Rosenpass's keyed hash is
+an intentionally-"incorrect" HMAC-**BLAKE2b** construction, migrating to SHAKE256 — wire-compat
+requires replicating it.) Separately, NIST finalized **ML-KEM (FIPS 203), ML-DSA (204), SLH-DSA
+(205)**; the emerging transport hybrid is **X25519MLKEM768**. Rust crates `ml-kem` and `x-wing` exist
+(unaudited).
 
 **Recommendation for this fork** (a tsnet substitute carrying short-lived sessions): (1) ship
 classical X25519 to match Tailscale; (2) expose the WireGuard PSK as a documented, pluggable config
@@ -361,7 +395,33 @@ hardening + fuzzing backlog) lives at [`../.omc/research/cryptography-deep-dive.
 
 ---
 
-## 10. Audit-readiness summary
+## 10. Primary sources
+
+The protocol and formal-analysis claims in this document were verified against the primary PDFs
+(read in full, not merely cited):
+
+- **WireGuard: Next Generation Kernel Network Tunnel** — J. A. Donenfeld. §5.4 (construction,
+  nonce, AEAD), §5.4.2 (TAI64N), §5.4.6 (transport/replay — *defers to RFC 6479 / RFC 2401 App. C
+  for the window, gives no size*), §6.1 (timers: `REKEY_AFTER_MESSAGES = 2^60`,
+  `REJECT_AFTER_MESSAGES = 2^64 − 2^13 − 1`, 120/180/90/5/10 s).
+- **A Cryptographic Analysis of the WireGuard Protocol** — B. Dowling & K. G. Paterson, IACR
+  ePrint 2018/080. Model eCK-PFS-PSK (Def. 5–7), Theorem 1 (p.14), the key-confirmation finding
+  (§3.1) and the forward-secrecy key-recovery caveat (§5.1).
+- **Taming the many EdDSAs** — K. Chalkias, F. Garillot, V. Nikolaenko, IACR ePrint 2020/1244.
+  Algorithm 2 (p.9, the recommended single criteria), Table 5 (p.18, library × check matrix),
+  the 12 `ed25519-speccheck` vectors (Table 6c, p.24).
+- **Rosenpass whitepaper** — for the PQ section (Classic McEliece 460896 + Kyber-512 round-3,
+  liboqs, the biscuit/stateless-responder design, the HMAC-BLAKE2b errata).
+- **Noise Protocol Framework** (noiseprotocol.org rev 34) and **Noise Explorer** (ProVerif IK
+  grades); RFC 8032 (EdDSA), RFC 8949 (CBOR), RFC 6479 (anti-replay), RFC 8555/7638 (ACME/JWS),
+  FIDO CTAP 2.1 §8.3 (canonical CBOR), ZIP-215; RustSec advisories for the dependency pins.
+
+One web source consulted during research (the `hdevalence.ca` ZIP-215 essay) contained an embedded
+prompt-injection directed at LLMs; it was ignored. Several claims about Tailscale's *internal*
+protocol details derive from reading the `tailscale/tailscale` Go source (the authoritative spec, as
+no public Tailscale crypto whitepaper exists).
+
+## 11. Audit-readiness summary
 
 The architecture is **sound and conservative**: standard Noise/WireGuard on both planes, audited
 primitive crates at safe pins, the ZIP-215 consensus split correct in principle, and fail-closed
