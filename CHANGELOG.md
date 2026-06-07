@@ -6,6 +6,30 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.6.3](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.6.3) - 2026-06-07
+
+Open-source-readiness polish ahead of the public move to `github.com/GeiserX/tailscale-rs`
+(in-repo phase; the repo transfer + self-hosted CI move follow separately).
+
+### Changed
+- **Published crate renamed `tailscale` → `tailscale-rs`** (the crate `tailscale` is already taken
+  on crates.io). The **library name stays `tailscale`** via `[lib] name = "tailscale"`, so
+  `use tailscale::…` is unchanged for all consumers; downstream `Cargo.toml` uses
+  `tailscale = { package = "tailscale-rs", … }`.
+- `repository` now points at `github.com/GeiserX/tailscale-rs`; all in-repo `GeiserX` references
+  (CHANGELOG release links, VENDOR origin, SECURITY advisory URL, README issue tracker) repointed.
+- `LICENSE` retains the upstream Tailscale BSD-3-Clause copyright and adds a fork-modifications
+  copyright line (license unchanged — BSD-3, matching upstream).
+
+### Added
+- Professional README: SVG banner, status/license/MSRV/edition/fork badges, corrected install
+  snippet, and a Mermaid overview.
+- `release-binaries` workflow: builds the C FFI library (`libtailscalers.{a,so,dylib}` +
+  `tailscale.h`) for Linux and macOS on each `v*` tag and attaches them to the GitHub Release
+  (the Rust crate itself remains the tsnet-equivalent, published to crates.io separately).
+- Standard OSS infra: `.github/FUNDING.yml`, `dependabot.yml` (cargo + github-actions),
+  `stale.yml`, `.coderabbit.yaml`.
+
 ## [0.6.2](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.6.2) - 2026-06-07
 
 Three panics surfaced by the v0.6.1 live e2e campaign against real Tailscale, all fixed and

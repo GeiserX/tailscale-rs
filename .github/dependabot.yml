@@ -1,0 +1,44 @@
+version: 2
+updates:
+- package-ecosystem: cargo
+  directory: /
+  schedule:
+    interval: weekly
+    day: monday
+  open-pull-requests-limit: 10
+  commit-message:
+    prefix: deps
+  labels:
+  - deps
+  groups:
+    minor-and-patch:
+      patterns:
+      - '*'
+      update-types:
+      - minor
+      - patch
+    cargo_security:
+      applies-to: security-updates
+      patterns:
+      - '*'
+  ignore:
+  - dependency-name: '*'
+    update-types:
+    - version-update:semver-major
+- package-ecosystem: github-actions
+  directory: /
+  schedule:
+    interval: monthly
+  commit-message:
+    prefix: ci
+  labels:
+  - ci
+  - automated
+  groups:
+    github-actions:
+      patterns:
+      - '*'
+    github_actions_security:
+      applies-to: security-updates
+      patterns:
+      - '*'

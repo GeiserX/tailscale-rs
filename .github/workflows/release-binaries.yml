@@ -1,0 +1,103 @@
+name: release-binaries
+
+# Build the C FFI library (`libtailscalers.{a,so,dylib}` + the cbindgen-generated `tailscale.h`)
+# for each supported platform and attach them to the GitHub Release for the pushed `v*` tag.
+#
+# tsnet (Go) ships as a library, so the Rust equivalent is the `tailscale-rs` crate on crates.io
+# (handled separately). THIS workflow serves the fork's *additional* C-binding consumers, who need
+# downloadable native binaries rather than a registry artifact. Python (wheels) and Elixir (Hex)
+# bindings are released by their own workflows (`python.yml` / `elixir.yml`).
+#
+# Hosted runners for now; can move to the Mac-mini self-hosted runner alongside the rest of CI.
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Allow re-attaching artifacts to an existing release without re-tagging.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build + attach artifacts to (e.g. v0.6.2)"
+        required: true
+
+permissions:
+  contents: write # upload assets to the release
+
+env:
+  TS_RS_EXPERIMENT: this_is_unstable_software
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  c-library:
+    name: C library (${{ matrix.target.triple }})
+    runs-on: ${{ matrix.target.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - triple: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - triple: aarch64-apple-darwin
+            runner: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # On workflow_dispatch, build the tag the user named; on tag push, the ref is the tag.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Setup rust
+        uses: ./.github/actions/setup-rust
+        with:
+          toolchain-version: 1.95.0
+          builder-triple: ${{ matrix.target.triple }}
+          components: ""
+          cache-key: release-cdylib-${{ matrix.target.triple }}
+
+      - name: Build ts_ffi (cdylib + staticlib + tailscale.h)
+        env:
+          # Fail the build (rather than silently skipping) if the header can't be generated.
+          TS_FFI_BUILDRS_STRICT: 1
+        run: cargo build --release -p ts_ffi
+
+      - name: Stage artifacts
+        id: stage
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          triple="${{ matrix.target.triple }}"
+          outdir="dist/tailscale-rs-${tag}-${triple}"
+          mkdir -p "$outdir"
+          # The library name is `tailscalers` (see ts_ffi/Cargo.toml [lib]); cdylib+staticlib.
+          for f in libtailscalers.a libtailscalers.so libtailscalers.dylib; do
+            if [ -f "target/release/$f" ]; then cp "target/release/$f" "$outdir/"; fi
+          done
+          # cbindgen writes tailscale.h into the crate dir in release builds (build.rs), with a
+          # fallback under OUT_DIR; copy whichever exists.
+          if [ -f ts_ffi/tailscale.h ]; then
+            cp ts_ffi/tailscale.h "$outdir/"
+          else
+            hdr=$(find target -name tailscale.h -path '*ts_ffi*' 2>/dev/null | head -1)
+            [ -n "$hdr" ] && cp "$hdr" "$outdir/"
+          fi
+          cp LICENSE "$outdir/" 2>/dev/null || true
+          ls -l "$outdir"
+          tarball="tailscale-rs-${tag}-${triple}.tar.gz"
+          tar -czf "$tarball" -C dist "tailscale-rs-${tag}-${triple}"
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+
+      - name: Attach to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          # Create the release if it doesn't exist yet (tag push may precede the release), else reuse.
+          gh release view "$tag" >/dev/null 2>&1 || \
+            gh release create "$tag" --title "$tag" --notes "Automated C-library binaries for $tag. See CHANGELOG.md."
+          gh release upload "$tag" "${{ steps.stage.outputs.tarball }}" --clobber

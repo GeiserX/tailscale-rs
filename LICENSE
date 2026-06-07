@@ -1,6 +1,9 @@
+Fork of github.com/tailscale/tailscale-rs; original Tailscale copyright retained below per BSD-3-Clause.
+
 BSD 3-Clause License
 
 Copyright (c) 2026 Tailscale Inc & contributors.
+Copyright (c) 2026 Sergio (GeiserX) & contributors (fork modifications).
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:

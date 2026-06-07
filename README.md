@@ -1,4 +1,16 @@
-# tailscale-rs
+<p align="center">
+  <img src="docs/assets/banner.svg" alt="tailscale-rs" width="100%">
+</p>
+
+<h1 align="center">tailscale-rs</h1>
+
+<p align="center">
+  <a href="https://github.com/GeiserX/tailscale-rs/actions/workflows/ci.yml"><img src="https://github.com/GeiserX/tailscale-rs/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSD--3--Clause-blue.svg" alt="License: BSD-3-Clause"></a>
+  <img src="https://img.shields.io/badge/MSRV-1.94.1-orange.svg" alt="MSRV 1.94.1">
+  <img src="https://img.shields.io/badge/edition-2024-blue.svg" alt="Rust edition 2024">
+  <a href="https://github.com/tailscale/tailscale-rs"><img src="https://img.shields.io/badge/fork%20of-tailscale%2Ftailscale--rs-purple" alt="fork of tailscale/tailscale-rs"></a>
+</p>
 
 A fork of [tailscale/tailscale-rs](https://github.com/tailscale/tailscale-rs).
 
@@ -25,8 +37,19 @@ Add this dependency line to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tailscale = { version = "0.5" }
+# Published as `tailscale-rs`; imported as `tailscale`.
+tailscale = { package = "tailscale-rs", version = "0.6" }
 ```
+
+> **Not yet published to crates.io;** for now depend on it via git:
+>
+> ```toml
+> [dependencies]
+> tailscale = { package = "tailscale-rs", git = "https://github.com/GeiserX/tailscale-rs" }
+> ```
+
+Either way, you import it as `tailscale` (e.g. `use tailscale::Device;`) — the crate name on
+crates.io is `tailscale-rs`, but the library name is `tailscale`.
 
 Examples of using the `tailscale` crate can be found in [`examples/`](examples/README.md).
 
@@ -63,6 +86,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 ```
+
+## How it works
+
+A `Device` joins the tailnet by authenticating to the **control plane** over Tailscale's
+TS2021 (Noise) channel, then moves data over an in-process **WireGuard** data plane — connecting
+peer-to-peer where NAT traversal allows, and relaying through **DERP** otherwise.
+
+```mermaid
+flowchart LR
+    App["Your app<br/>(Rust / C / Elixir / Python)"] --> Device["tailscale::Device"]
+    Device -->|"TS2021 / Noise"| Control["Control plane<br/>(login, MapResponse)"]
+    Device --> WG["WireGuard data plane<br/>(userspace netstack)"]
+    WG -->|"direct (STUN + Disco)"| Peer["Tailnet peer"]
+    WG -.->|"fallback relay"| DERP["DERP relay"]
+    DERP -.-> Peer
+```
+
+For the full module layout and design notes, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Caveats
 
