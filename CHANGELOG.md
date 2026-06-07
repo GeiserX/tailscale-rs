@@ -6,6 +6,32 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.59](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.59) - 2026-06-07
+
+Crypto-hardening from the audit beads (tsr-9nu, tsr-quk):
+
+- **Private keys no longer leak via `Debug`** (was: `Debug` forwarded to `Display`, printing the
+  full secret hex — a log-leak risk). All private-key newtypes (`Machine`/`Node`/`Disco`/
+  `NetworkLock`) and their keypairs now render `<Type>(<redacted>)`; public keys still show
+  `prefix:hex`. Regression tests added (`ts_keys` `debug_redaction_tests`). The raw bytes remain
+  reachable only via the explicit `to_bytes()`/`Display`/serde paths.
+- **Tailnet Lock Ed25519 verifiers proven correct** against the `ed25519-speccheck` adversarial
+  vectors: a new KAT pins the accept/reject matrix of both verifiers (`verify_ed25519_std` /
+  `verify_ed25519_zip215`), hard-asserts that the standard verifier **rejects `S ≥ L` malleability
+  signatures**, and demonstrates the cofactored-vs-cofactorless **disagreement** (ZIP-215 accepts,
+  standard rejects the same triple) — confirming the dual-verifier split is intentional, not
+  accidental. `ed25519-zebra` is documented as MUST-stay ≥ 2.x (1.x is pre-ZIP-215 and would split
+  consensus with Go).
+- **CBOR canonicalization correctness**: corrected the `ts_tka` CTAP2 key-ordering doc-comment
+  (fxamacker `SortCTAP2` is bytewise-lexicographic, not length-first; coincides with numeric order
+  for TKA's uint-only keys) and added a duplicate-key `debug_assert` guard to the `IntMap` encoder.
+- **Doc fix**: the DERP `Nonce` doc-comment named the wrong cipher (was "ChaCha20Poly1305"; it is
+  NaCl `SalsaBox` / XSalsa20-Poly1305).
+
+Deferred (documented in the beads): key-material zeroization is blocked by the `Copy` + `zerocopy`
+design of the key newtypes — tracked in tsr-9nu with a recommended posture; interop cross-vectors
+vs Go and the key-confirmation conformance test remain in tsr-19k.
+
 ## [0.5.58](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.58) - 2026-06-07
 
 Fixes from a whole-codebase health audit:

@@ -8,8 +8,14 @@
 //! - **Definite lengths only** (no indefinite-length items).
 //! - **Smallest-integer encoding**: a value is encoded in the shortest of the 1/2/4/8-byte forms.
 //! - **Maps keyed by unsigned integers** (`keyasint`), with keys sorted by the **CTAP2 canonical
-//!   key ordering**: shorter encoded key first; ties broken by byte-lexicographic order. For the
-//!   small integer keys TKA uses (all ≤ 23, single-byte), this is simply ascending numeric order.
+//!   key ordering**. NOTE: `fxamacker/cbor`'s `SortCTAP2` is **bytewise-lexicographic on the encoded
+//!   key** (the same comparator as RFC 8949 §4.2.1 deterministic encoding), *not* the
+//!   "shorter-key-first / length-then-lexical" rule (that is `SortCanonical` / RFC 7049 §3.9). The
+//!   two rules diverge only for keys whose encoded forms differ in length; for the small integer
+//!   keys TKA uses (all ≤ 23, single-byte heads) bytewise == numeric == length-first, so ascending
+//!   numeric order is byte-equivalent. If `IntMap` ever carries keys ≥ 24 (multi-byte heads),
+//!   revisit this to ensure pure-bytewise ordering on the encoded key.
+//! - **No duplicate map keys** (CTAP2 forbids them; a duplicate would be a malformed map).
 //! - **`omitempty`**: a field whose value is absent/empty is not emitted at all.
 //!
 //! The encoder is a tiny value model ([`Value`]) plus [`Value::encode`]. It is deliberately not a
@@ -53,11 +59,20 @@ impl Value {
                 }
             }
             Value::IntMap(entries) => {
-                // CTAP2 canonical key order: integer keys, smallest first. All TKA keys are small
-                // (<= 23) single-byte heads, so a numeric sort is byte-equivalent to the
-                // length-then-lexical rule.
+                // CTAP2 canonical key order. fxamacker `SortCTAP2` = bytewise-lexicographic on the
+                // encoded key; for TKA's uint-only keys (all <= 23, single-byte heads) that is
+                // byte-equivalent to ascending numeric order. (See the module doc for the caveat if
+                // keys >= 24 are ever introduced.)
                 let mut sorted: Vec<&(u64, Value)> = entries.iter().collect();
                 sorted.sort_by_key(|(k, _)| *k);
+                // CTAP2 forbids duplicate map keys: a duplicate would emit a malformed map and,
+                // worse, change the signing digest in a way that diverges from Go. Catch it in
+                // debug builds (callers build IntMaps from fixed `keyasint` field sets, so a
+                // duplicate is a construction bug, not attacker input).
+                debug_assert!(
+                    sorted.windows(2).all(|w| w[0].0 != w[1].0),
+                    "IntMap has duplicate keys; CTAP2 canonical CBOR forbids duplicate map keys"
+                );
                 encode_head(out, 5, sorted.len() as u64);
                 for (k, v) in sorted {
                     encode_head(out, 0, *k); // key: unsigned int

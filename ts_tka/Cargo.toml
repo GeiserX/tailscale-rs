@@ -18,6 +18,10 @@ blake2.workspace = true
 #   ed25519-zebra = ZIP-215 cofactored verification, used for Direct/Credential signatures to match
 #     Go `ed25519consensus.Verify`. Collapsing to one verifier silently breaks Go wire-compat.
 ed25519-dalek = "2"
+# MUST stay >= 2.x: ed25519-zebra 1.x is PRE-ZIP-215 (libsodium-1.0.15 bug-for-bug) and would
+# silently diverge from Go `ed25519consensus`, splitting tailnet-lock consensus. "4" floors at the
+# current ZIP-215-correct major; the speccheck dual-verifier KAT (ts_tka/src/lib.rs) is the
+# regression guard that catches any verification-criteria drift on a future bump.
 ed25519-zebra = "4"
 
 [dev-dependencies]

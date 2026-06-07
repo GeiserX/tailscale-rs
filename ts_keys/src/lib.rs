@@ -92,6 +92,61 @@ create_x25519_keypair_types!(
     NodeKeyPair
 );
 
+#[cfg(test)]
+mod debug_redaction_tests {
+    use alloc::format;
+
+    use super::{
+        DiscoPrivateKey, MachinePrivateKey, NetworkLockPrivateKey, NodePrivateKey, NodePublicKey,
+    };
+
+    /// A private key's `Debug` MUST NOT contain the secret bytes (regression guard for the
+    /// log-leak fixed in tsr-9nu). We use an all-`0xAB` key so the hex `"ab"` is unmistakable.
+    #[test]
+    fn private_key_debug_is_redacted() {
+        let secret = [0xABu8; 32];
+
+        let m = MachinePrivateKey::from(secret);
+        let n = NodePrivateKey::from(secret);
+        let d = DiscoPrivateKey::from(secret);
+        let nl = NetworkLockPrivateKey::from(secret);
+
+        for (label, dbg) in [
+            ("MachinePrivateKey", format!("{m:?}")),
+            ("NodePrivateKey", format!("{n:?}")),
+            ("DiscoPrivateKey", format!("{d:?}")),
+            ("NetworkLockPrivateKey", format!("{nl:?}")),
+        ] {
+            assert!(
+                dbg.contains("<redacted>"),
+                "{label} Debug should be redacted, got {dbg:?}"
+            );
+            assert!(
+                !dbg.contains("abab"),
+                "{label} Debug leaked secret bytes: {dbg:?}"
+            );
+            // The secret is also reachable via Display/to_bytes — confirm those still expose it,
+            // so the redaction is Debug-only and didn't break the explicit serialization paths.
+            assert!(
+                format!("{m}").contains("abab"),
+                "Display must still expose the key bytes"
+            );
+        }
+    }
+
+    /// A public key's `Debug` SHOULD still print the full `prefix:hex` (public keys are not secret).
+    #[test]
+    fn public_key_debug_shows_hex() {
+        let pubk = NodePublicKey::from([0xABu8; 32]);
+        let dbg = format!("{pubk:?}");
+        assert!(
+            dbg.contains("abab"),
+            "public key Debug should show hex: {dbg:?}"
+        );
+        assert_eq!(dbg, format!("{pubk}"), "public Debug == Display");
+    }
+}
+
 #[cfg(all(test, feature = "serde"))]
 mod nl_tests {
     use core::str::FromStr;

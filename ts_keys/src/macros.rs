@@ -28,12 +28,6 @@ macro_rules! _create_x25519_base_key_type {
             }
         }
 
-        impl ::core::fmt::Debug for $key_name {
-            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-                ::core::write!(f, "{self}")
-            }
-        }
-
         impl ::core::fmt::Display for $key_name {
             fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
                 ::core::write!(f, "{}:", $key_name::KEY_PREFIX)?;
@@ -138,6 +132,13 @@ macro_rules! create_x25519_public_key_type {
     ($(#[$attr:meta])* $public_name:ident, $key_prefix:literal) => {
         _create_x25519_base_key_type!($(#[$attr])* #[derive(Default, Hash, PartialOrd, Ord)] $public_name, $key_prefix);
 
+        // Public keys are not secret: `Debug` prints the full `prefix:hex` form (== `Display`).
+        impl ::core::fmt::Debug for $public_name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                ::core::write!(f, "{self}")
+            }
+        }
+
         impl From<$public_name> for ::x25519_dalek::PublicKey {
             fn from(v: $public_name) -> Self {
                 v.0.into()
@@ -168,6 +169,15 @@ macro_rules! create_x25519_public_key_type {
 macro_rules! create_x25519_private_key_type {
     ($(#[$attr:meta])* $private_name:ident, $public_name:ident, $key_prefix:literal) => {
         _create_x25519_base_key_type!($(#[$attr])* $private_name, $key_prefix);
+
+        // SECURITY: private keys must NEVER print their bytes. `Debug` is redacted so a stray
+        // `{:?}`/`tracing` of a key (or any struct containing one) cannot leak the secret to logs.
+        // The raw bytes remain reachable only via the explicit `to_bytes()`/`Display` paths.
+        impl ::core::fmt::Debug for $private_name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                ::core::write!(f, "{}(<redacted>)", ::core::stringify!($private_name))
+            }
+        }
 
         impl $private_name {
             /// Generate a new X25519 private key.
@@ -268,6 +278,13 @@ macro_rules! create_x25519_keypair_types {
 macro_rules! create_ed25519_public_key_type {
     ($(#[$attr:meta])* $public_name:ident, $key_prefix:literal) => {
         _create_x25519_base_key_type!($(#[$attr])* #[derive(Default, Hash, PartialOrd, Ord)] $public_name, $key_prefix);
+
+        // Public keys are not secret: `Debug` prints the full `prefix:hex` form (== `Display`).
+        impl ::core::fmt::Debug for $public_name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                ::core::write!(f, "{self}")
+            }
+        }
     }
 }
 
@@ -277,6 +294,14 @@ macro_rules! create_ed25519_public_key_type {
 macro_rules! create_ed25519_private_key_type {
     ($(#[$attr:meta])* $private_name:ident, $public_name:ident, $key_prefix:literal) => {
         _create_x25519_base_key_type!($(#[$attr])* $private_name, $key_prefix);
+
+        // SECURITY: redacted `Debug` (the wrapped bytes are an Ed25519 seed). See the X25519
+        // private-key macro for rationale — never leak secret key material via `{:?}`/logs.
+        impl ::core::fmt::Debug for $private_name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                ::core::write!(f, "{}(<redacted>)", ::core::stringify!($private_name))
+            }
+        }
 
         impl $private_name {
             /// Generate a new Ed25519 private key.

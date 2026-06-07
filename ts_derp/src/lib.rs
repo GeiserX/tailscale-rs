@@ -16,7 +16,9 @@ pub mod frame;
 pub use client::{Client, DefaultClient};
 pub use error::Error;
 
-/// A 24-byte nonce for symmetric encryption with ChaCha20Poly1305.
+/// A 24-byte nonce for the NaCl `crypto_box` (`SalsaBox` = X25519 + XSalsa20-Poly1305) used to
+/// authenticate the DERP client/server handshake framing. The 24-byte width is XSalsa20's extended
+/// nonce, which makes random per-message nonces safe.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, PartialEq, KnownLayout, Immutable, IntoBytes, FromBytes)]
 pub struct Nonce(pub [u8; 24]);
