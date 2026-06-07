@@ -83,7 +83,7 @@ jobs:
           sudo docker image prune --all --force || true
           df -h /
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: Setup rust
         id: setup-rust
         uses: ./.github/actions/setup-rust
@@ -113,7 +113,7 @@ jobs:
       - name: Anti-leak firewall checks (cargo run -p checks)
         run: cargo run -p checks
       - name: binstall
-        uses: cargo-bins/cargo-binstall@dc19f1e48450eefe5a29b8da6c6b00a87d730b37 #v1.18.1
+        uses: cargo-bins/cargo-binstall@aaa84a43aec4955a42c5ffc65d258961e39f276e #v1.19.1
       - name: Install cargo-deny
         run: command -v cargo-deny || cargo binstall --no-confirm cargo-deny
       # Machine-enforce the ring-only / no-aws-lc supply-chain invariant on every push, on the
@@ -171,7 +171,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: Setup rust
         id: setup-rust
         uses: ./.github/actions/setup-rust
@@ -257,7 +257,7 @@ jobs:
           sudo docker image prune --all --force || true
           df -h /
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: Setup rust
         id: setup-rust
         uses: ./.github/actions/setup-rust
@@ -276,7 +276,7 @@ jobs:
           # while preventing the cross-container artifact collision.
           cache-key: musl-${{ matrix.target.triple }}
       - name: Install cross
-        uses: cargo-bins/cargo-binstall@dc19f1e48450eefe5a29b8da6c6b00a87d730b37 #v1.18.1
+        uses: cargo-bins/cargo-binstall@aaa84a43aec4955a42c5ffc65d258961e39f276e #v1.19.1
       - name: Install cross (binary)
         run: command -v cross || cargo binstall --no-confirm cross
       - name: Build static musl (cross build --no-default-features)
@@ -301,7 +301,7 @@ jobs:
     runs-on: linux-x86_64-16cpu
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: Setup rust
         id: setup-rust
         uses: ./.github/actions/setup-rust
@@ -311,7 +311,7 @@ jobs:
           components: rustfmt
       - &binstall
         name: binstall
-        uses: cargo-bins/cargo-binstall@dc19f1e48450eefe5a29b8da6c6b00a87d730b37 #v1.18.1
+        uses: cargo-bins/cargo-binstall@aaa84a43aec4955a42c5ffc65d258961e39f276e #v1.19.1
       - name: Install cargo-deny
         run: command -v cargo-deny || cargo binstall --no-confirm cargo-deny
       - &cargo_ws
@@ -350,7 +350,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
         id: auth
