@@ -541,12 +541,18 @@ impl Buf for PacketMut {
     }
 }
 
+// SAFETY: `bytes::BufMut` is an `unsafe trait`, so `unsafe impl` is required by the language
+// regardless of body. Every method forwards verbatim to `self.contents: BytesMut`, whose own
+// `unsafe impl BufMut` upholds all trait invariants; we add no behavior, so those guarantees
+// carry through unchanged.
 unsafe impl BufMut for PacketMut {
     fn remaining_mut(&self) -> usize {
         self.contents.remaining_mut()
     }
 
     unsafe fn advance_mut(&mut self, cnt: usize) {
+        // SAFETY: the caller guarantees `cnt` bytes returned by `chunk_mut` were initialized; we forward
+        // that identical precondition to `BytesMut::advance_mut`, which requires exactly the same thing.
         unsafe {
             self.contents.advance_mut(cnt);
         }

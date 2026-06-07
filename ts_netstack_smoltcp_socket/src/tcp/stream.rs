@@ -7,7 +7,7 @@ use bytes::Bytes;
 use netcore::{DisplayExt, HasChannel, Response, smoltcp::iface::SocketHandle, tcp};
 
 #[cfg(any(feature = "tokio", feature = "futures-io"))]
-type PinBoxFut<T> = core::pin::Pin<alloc::boxed::Box<dyn Future<Output = T> + Send>>;
+type PinBoxFut<T> = core::pin::Pin<alloc::boxed::Box<dyn Future<Output = T> + Send + Sync>>;
 
 /// A TCP stream.
 pub struct TcpStream {
@@ -44,12 +44,6 @@ impl TcpStream {
         }
     }
 }
-
-// SAFETY: unsafe because of the contained futures which are not necessarily Sync. We know
-// however that they're guaranteed to only be accessed or mutated via a &mut ref
-// (in the Async{Read,Write} impls), implying no simultaneous cross-thread access is possible.
-#[cfg(any(feature = "tokio", feature = "futures-io"))]
-unsafe impl Sync for TcpStream {}
 
 impl Debug for TcpStream {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {

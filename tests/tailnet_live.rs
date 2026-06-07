@@ -58,6 +58,11 @@ async fn live_tailnet_join() {
     // The crate requires this env var to be set to acknowledge the experimental status. The run
     // incantation sets it, but mirror tests/basic.rs's `make_ts_device` and set it defensively so
     // the test self-documents the requirement.
+    // SAFETY: set at the very start of the test, before this test spawns any threads that read
+    // the environment; `std::env::set_var` is `unsafe` in edition 2024 only because concurrent
+    // env access is unsound, which does not occur here. The var gates the experimental build at
+    // runtime (read in `Device::new`); a global `.cargo/config.toml [env]` was rejected because
+    // it would defeat the deliberate `TS_RS_EXPERIMENT` opt-in for ordinary builds.
     unsafe { std::env::set_var("TS_RS_EXPERIMENT", "this_is_unstable_software") };
 
     // Build a default config: control defaults to `https://controlplane.tailscale.com/` — real

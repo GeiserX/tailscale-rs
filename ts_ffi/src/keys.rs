@@ -129,6 +129,8 @@ pub unsafe extern "C" fn ts_load_key_file(
     overwrite_if_invalid: bool,
     key_state: &mut persisted_key_state,
 ) -> ffi::c_int {
+    // SAFETY: `path` upholds the `CStr` invariants (NUL-terminated, valid for reads up to and
+    // including the NUL) by this function's documented `# Safety` precondition.
     let s = unsafe { CStr::from_ptr(path) };
     let s = match s.to_str() {
         Ok(s) => s,

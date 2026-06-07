@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 #![no_std]
+#![deny(unsafe_code)]
 
 #[cfg(any(feature = "alloc", test))]
 extern crate alloc;
@@ -82,7 +83,7 @@ mod test {
         let pkt = Packet::init_from_bytes::<Msg>(&mut buf, init).unwrap();
 
         let init = pkt.as_bytes().to_vec();
-        let init = unsafe { Packet::from_bytes_unchecked(&init) }.unwrap();
+        let init = Packet::from_bytes_unvalidated(&init).unwrap();
 
         let sender_key = DiscoPrivateKey::random();
         let receiver_key = DiscoPrivateKey::random();

@@ -357,12 +357,18 @@ pub unsafe extern "C" fn ts_parse_ip(s: *const c_char, addr: &mut sockaddr) -> f
 #[unsafe(no_mangle)]
 pub extern "C" fn ts_sockaddr_set_port(addr: &mut sockaddr, port: u16) -> ffi::c_int {
     match addr.sa_family {
+        // `sa_family == AF_INET` means the active union variant is `sockaddr_in`. The assignment
+        // writes the port field in place through the union place (no `unsafe` needed: assigning to
+        // a union field is safe, only reading one is unsafe), so it mutates `addr` rather than a
+        // copied-out temporary.
         AF_INET => {
-            unsafe { addr.sa_data.sockaddr_in }.sin_port = port;
+            addr.sa_data.sockaddr_in.sin_port = port;
             0
         }
+        // `sa_family == AF_INET6` means the active union variant is `sockaddr_in6`; the port is
+        // written in place through the union place.
         AF_INET6 => {
-            unsafe { addr.sa_data.sockaddr_in6 }.sin6_port = port;
+            addr.sa_data.sockaddr_in6.sin6_port = port;
             0
         }
         _ => -1,

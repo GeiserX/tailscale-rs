@@ -197,6 +197,11 @@ async fn test_udp_unidir(tx: &UdpSocket, rx: &UdpSocket) {
 }
 
 async fn make_ts_device() -> Result<Device, Error> {
+    // SAFETY: set at the very start of the test, before this test spawns any threads that read
+    // the environment; `std::env::set_var` is `unsafe` in edition 2024 only because concurrent
+    // env access is unsound, which does not occur here. The var gates the experimental build at
+    // runtime (read in `Device::new`); a global `.cargo/config.toml [env]` was rejected because
+    // it would defeat the deliberate `TS_RS_EXPERIMENT` opt-in for ordinary builds.
     unsafe { std::env::set_var("TS_RS_EXPERIMENT", "this_is_unstable_software") };
 
     Device::new(&Config::default(), Some(ts_test_util::auth_key().unwrap())).await

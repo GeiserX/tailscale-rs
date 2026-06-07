@@ -6,6 +6,33 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.62](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.62) - 2026-06-07
+
+`unsafe` audit + minimization (tsr-5fu) — open-source readiness. Every `unsafe` block was reviewed
+for whether it is actually needed, whether a safe alternative exists (even if it means rewriting),
+and whether the irreducible remainder is minimal and justified. Net result: the avoidable `unsafe`
+is gone, three more crates are now statically `unsafe`-free, and a latent bug was fixed.
+
+- **Two hand-written `unsafe` marker impls eliminated via safe idioms.** `TcpStream`'s
+  `unsafe impl Sync` is replaced by adding `+ Sync` to its boxed-future type alias, so `Sync`
+  now **auto-derives** (compiler-enforced — the futures only capture `Sync` data). `ChannelServer`'s
+  `unsafe impl Send for PhantomSend<H>` becomes the safe `PhantomData<fn() -> H>` idiom (the same
+  covariant variance, unconditionally `Send`/`Sync`, no `unsafe`).
+- **Two misused-`unsafe` APIs de-`unsafe`d.** `ts_disco_protocol`'s `from_bytes_unchecked[_mut]`
+  (whose bodies were already safe validating zerocopy calls — `unsafe` was flagging a *semantic*
+  footgun, not a memory-safety contract) are renamed to `from_bytes_unvalidated[_mut]` and made
+  safe. A test-only hand-rolled `Waker` (`ts_http_util`) is replaced by stable `Waker::noop()`.
+- **Bug fix:** `ts_ffi`'s `ts_sockaddr_set_port` read the `sockaddr` union field *by value* and wrote
+  the port to the discarded temporary — so the port was never stored. It now writes through the
+  union place.
+- **`#![deny(unsafe_code)]` added** to `ts_disco_protocol`, `ts_http_util`, and
+  `ts_netstack_smoltcp_socket` (now 9 workspace crates forbid/deny `unsafe`).
+- **Irreducible `unsafe` documented, not removed:** `ts_packet`'s `BufMut` impl (`bytes::BufMut` is
+  an `unsafe trait`, so `unsafe impl` is mandatory), the SSH `pre_exec` privilege-drop, edition-2024
+  `env::set_var` in tests, the inherited perf-critical `ts_bart` IP-octet cast, and the `ts_ffi` C
+  boundary all carry `// SAFETY:` justifications. `ts_ffi/README.md` gains a reader-facing note
+  explaining why the FFI layer concentrates the workspace's `unsafe`.
+
 ## [0.5.61](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.61) - 2026-06-07
 
 Adversarial primitive test vectors (tsr-46h, follow-up to tsr-19k). Where tsr-19k proved

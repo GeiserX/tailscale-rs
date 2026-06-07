@@ -113,21 +113,20 @@ impl Packet<Plaintext> {
 
     /// Cast the slice to a plaintext packet.
     ///
-    /// # Safety
+    /// # Note
     ///
-    /// This operation is safe but may be semantically unsound. Specifically, the type
-    /// and version fields are not set and may disagree with the payload.
-    pub unsafe fn from_bytes_unchecked(b: &[u8]) -> Result<&Self, Error> {
+    /// This is memory-safe, but may be semantically unsound: the type and version fields are not
+    /// set and may disagree with the payload.
+    pub fn from_bytes_unvalidated(b: &[u8]) -> Result<&Self, Error> {
         Self::try_ref_from_bytes(b).map_err(From::from)
     }
 
     /// Cast the slice to a mutable plaintext packet.
     ///
-    /// # Safety
+    /// # Note
     ///
-    /// Like [`Packet::from_bytes_unchecked`], this operation is safe but may be
-    /// semantically unsound.
-    pub unsafe fn from_bytes_unchecked_mut(b: &mut [u8]) -> Result<&mut Self, Error> {
+    /// Like [`Packet::from_bytes_unvalidated`], this is memory-safe but may be semantically unsound.
+    pub fn from_bytes_unvalidated_mut(b: &mut [u8]) -> Result<&mut Self, Error> {
         Self::try_mut_from_bytes(b).map_err(From::from)
     }
 

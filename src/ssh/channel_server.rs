@@ -70,10 +70,7 @@ pub struct ChannelServer<H> {
     _handler: PhantomSend<H>,
 }
 
-struct PhantomSend<H>(PhantomData<H>);
-
-// SAFETY: H is a phantom type, it's never actually sent
-unsafe impl<H> Send for PhantomSend<H> {}
+struct PhantomSend<H>(PhantomData<fn() -> H>);
 
 /// Maximum number of concurrent channels a single SSH connection may open. Each channel spawns a
 /// session handler (e.g. a login shell), so this caps the per-connection resource/process fan-out

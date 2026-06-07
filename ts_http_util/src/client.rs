@@ -178,7 +178,7 @@ mod tests {
         cell::RefCell,
         pin::pin,
         rc::Rc,
-        task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+        task::{Context, Poll, Waker},
     };
 
     use bytes::Bytes;
@@ -280,13 +280,7 @@ mod tests {
     /// `.await` a `send` that returns an already-ready future here). Avoids pulling in a tokio
     /// runtime / executor dependency just to drive a synchronous-completing future.
     fn drive_ready<F: Future>(fut: F) -> F::Output {
-        fn noop(_: *const ()) {}
-        fn clone(_: *const ()) -> RawWaker {
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(Waker::noop());
         let mut fut = pin!(fut);
         match fut.as_mut().poll(&mut cx) {
             Poll::Ready(out) => out,
