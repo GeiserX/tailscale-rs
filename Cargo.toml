@@ -53,7 +53,7 @@ members = [
 edition = "2024"
 license = "BSD-3-Clause"
 publish = true
-version = "0.5.60"
+version = "0.5.61"
 repository = "https://github.com/tailscale/tailscale-rs"
 
 # This disagrees with the README's stated MSRV. That's intentional: this field causes cargo to error
@@ -106,6 +106,9 @@ tracing = { version = "0.1", default-features = false, features = ["attributes"]
 tracing-test = "0.2"
 url = { version = "2", default-features = false }
 x25519-dalek = { version = "3.0.0-pre.6", features = ["getrandom", "reusable_secrets", "static_secrets"] }
+# Project Wycheproof adversarial primitive test vectors (dev-only). Ring-clean: pulls only
+# serde / serde_json / data-encoding, NO aws-lc/openssl/ring — safe for the ring-only invariant.
+wycheproof = "0.6"
 yoke = { version = "0.8", default-features = false }
 zerocopy = { version = "0.8", features = ["derive"] }
 

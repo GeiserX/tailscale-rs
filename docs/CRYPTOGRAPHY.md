@@ -454,6 +454,37 @@ conformance requirement of §2.1 and §4.
 
 
 
+## 8b. Adversarial primitive vectors (Wycheproof)
+
+§8a's Go vectors prove **wire interop** — that the hand-rolled surfaces agree byte-for-byte with
+Go. This complementary suite (**tsr-46h**) proves **adversarial primitive robustness**: that the
+underlying crates reject malleability, low-order points, non-canonical encodings, and forged tags.
+Different guarantee, so it adds to §8a rather than replacing it. Vectors come from the
+[`wycheproof`](https://crates.io/crates/wycheproof) crate **v0.6.0** (a `dev-dependency` that
+bundles Google's Project Wycheproof vectors as typed Rust — nothing to vendor); it is
+**ring-clean** (deps: `serde`, `serde_json`, `data-encoding` — no `aws-lc`/`openssl`/`ring`),
+consistent with the ring-only invariant (§6).
+
+| Primitive | Crate (version) | Headline counts | Assertion |
+|---|---|---|---|
+| ChaCha20Poly1305 (WireGuard transport AEAD, `ts_tunnel`) | `chacha20poly1305` 0.10.1 | 316 ran / 9 skipped | Valid ct+tag matches and round-trips; Invalid must fail (forgery/tamper). |
+| X25519 ECDH (WireGuard/Noise DH, `ts_keys`) | `x25519-dalek` 3.0.0-pre.6 | 518 (265 Valid + 253 Acceptable) | dalek is non-contributory (RFC 7748): computed shared secret must equal expected bytes; 0 mismatches. |
+| Ed25519 verify, **standard** (rotation-wrap, `ts_tka`) | `ed25519-dalek` 2.2.0 | 150 (88 Valid + 62 Invalid) | Valid verifies; Invalid rejected. |
+
+The 9 skipped ChaCha20Poly1305 groups are the non-96-bit-nonce (XChaCha) API this fork does not
+use — RustCrypto's `ChaCha20Poly1305` is fixed 12-byte nonce. X25519 has no Invalid vectors; the
+**Acceptable** set is the adversarial battery (low-order/twist points, non-canonical encodings,
+zero shared secret), which dalek computes rather than rejects, so the KAT asserts byte-equality.
+
+> **HKDF-SHA256 excluded, deliberately.** Wycheproof's `hkdf_sha256` set does not apply: this
+> fork's HKDF is computed over **BLAKE2s** (`SimpleHkdf::<Blake2s256>` in `ts_tunnel`), never
+> SHA-256, on any code path. **Ed25519 standard-only scope:** this KAT covers only the standard
+> RFC-8032 verifier; the **ZIP-215** cofactored verifier (`ed25519-zebra`, Direct/Credential
+> sigs) is out of scope here because Wycheproof's Ed25519 set assumes standard verification — it
+> is already covered by the `ed25519-speccheck` dual-verifier KAT (§5.1 / §8a).
+
+---
+
 | Bead | Title | Severity | Summary |
 |---|---|---|---|
 | **tsr-19k** | Prove byte-for-byte interop with Go (cross-impl KAT vectors) | High | All hand-rolled crypto is validated only by self-consistent round-trips, which cannot catch a wire-incompatibility with Go. Add Go-sourced KATs: big-endian AEAD vector, ZIP-215 196-case grid, wireguard-go handshake transcript, TKA CBOR/SigHash golden, Wycheproof primitives. |

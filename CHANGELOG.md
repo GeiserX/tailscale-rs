@@ -6,6 +6,28 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.5.61](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.61) - 2026-06-07
+
+Adversarial primitive test vectors (tsr-46h, follow-up to tsr-19k). Where tsr-19k proved
+byte-for-byte **wire interop** with Go, this proves the underlying **primitive crates** survive
+Google's Project Wycheproof adversarial battery (malleability, low-order points, non-canonical
+encodings, forged tags). Sourced from the `wycheproof` crate v0.6.0 — **ring-clean** (serde /
+serde_json / data-encoding only; no aws-lc/openssl/ring), so the ring-only invariant holds.
+
+- **ChaCha20Poly1305** (`chacha20poly1305` v0.10.1, WireGuard transport AEAD): 316 of the
+  96-bit-nonce vectors — Valid ciphertext+tag must match and round-trip, Invalid must fail to
+  decrypt. The 9 non-96-bit-nonce groups are skipped (XChaCha API this fork does not use).
+- **X25519** (`x25519-dalek` v3.0.0-pre.6, WireGuard/Noise DH): all 518 vectors (265 Valid + 253
+  Acceptable adversarial), computed shared secret matches Wycheproof's expected bytes — confirms
+  dalek's RFC 7748 non-contributory behavior on low-order/non-canonical/twist/zero inputs.
+- **Ed25519 standard verify** (`ed25519-dalek` v2.2.0, TKA rotation-wrap sig): all 150 vectors
+  (88 Valid + 62 Invalid) — Valid verify, Invalid rejected, zero exceptions. The ZIP-215
+  (`ed25519-zebra`) verifier is intentionally out of scope (Wycheproof assumes standard
+  verification; the cofactored verifier is covered by the speccheck dual-verifier KAT).
+- **HKDF-SHA256 deliberately excluded**: this fork's HKDF is over BLAKE2s, never SHA-256, so the
+  `hkdf_sha256` Wycheproof set does not apply. Documented in
+  [`tests/vectors/VENDOR.md`](tests/vectors/VENDOR.md) and [`docs/CRYPTOGRAPHY.md`](docs/CRYPTOGRAPHY.md) §8b.
+
 ## [0.5.60](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.5.60) - 2026-06-07
 
 Cross-implementation interop proofs from the crypto audit (tsr-19k). The hand-rolled crypto was

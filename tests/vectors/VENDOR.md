@@ -65,3 +65,47 @@ flowchart LR
 
     REF --> GEN --> JSON --> KAT --> CI
 ```
+
+## Project Wycheproof primitive vectors (tsr-46h)
+
+The vectors above prove **wire interop** with Go Tailscale. This second suite (issue **tsr-46h**,
+a follow-up to tsr-19k) proves something different: that the underlying **primitive crates** are
+robust against **adversarial inputs** — malleability, low-order points, non-canonical encodings,
+forged/tampered tags. These two guarantees are complementary, not interchangeable: Wycheproof
+proves the primitives are sound; the Go vectors prove byte-for-byte wire interop with Tailscale.
+
+**Source.** These vectors are **not committed JSON.** They come from the
+[`wycheproof`](https://crates.io/crates/wycheproof) crate **v0.6.0** (a `dev-dependency`), which
+bundles Google's Project Wycheproof test vectors as typed Rust data — there is nothing to vendor.
+The crate is **ring-clean**: its only transitive dependencies are `serde`, `serde_json`, and
+`data-encoding` — **no `aws-lc` / `openssl` / `ring`** — so it does not violate this fork's
+ring-only crypto invariant.
+
+| Primitive | Crate under test | Test file | Tests (ran / skipped) | What's asserted |
+|---|---|---|---|---|
+| ChaCha20Poly1305 AEAD | `chacha20poly1305` v0.10.1 (WireGuard transport AEAD, `ts_tunnel`) | `ts_tunnel/tests/wycheproof_chacha20poly1305.rs` | 316 ran / 9 skipped (316 of the 96-bit-nonce groups; the 9 non-96-bit-nonce groups skipped) | Valid: produced ciphertext+tag must match Go's and decrypt round-trips. Invalid: decryption must fail (forgery/tamper rejection). |
+| X25519 ECDH | `x25519-dalek` v3.0.0-pre.6 (WireGuard/Noise DH, `ts_keys`) | `ts_keys/tests/wycheproof_x25519.rs` | 518 ran (265 Valid + 253 Acceptable) | dalek is non-contributory (RFC 7748) — it computes rather than rejects, so the test asserts the computed shared secret equals Wycheproof's expected bytes. 0 mismatches. |
+| Ed25519 verify (standard) | `ed25519-dalek` v2.2.0 (rotation-wrap sig, `ts_tka`, via `verify_ed25519_std`) | `ts_tka/tests/wycheproof_ed25519.rs` | 150 ran (88 Valid + 62 Invalid) | Valid must verify; Invalid must be rejected. 0 exceptions needed. |
+
+**Why the nonce-group skip (ChaCha20Poly1305).** RustCrypto's `ChaCha20Poly1305` is a fixed
+**12-byte (96-bit) nonce** AEAD — the construction `ts_tunnel` uses for WireGuard transport. The
+9 skipped groups exercise the XChaCha / variable-nonce API this fork does not use, so they are
+out of scope by construction.
+
+**Why X25519 asserts equality, not rejection.** X25519 has **no Invalid vectors**; the
+**Acceptable** set *is* the adversarial battery (low-order points, non-canonical encodings, twist
+points, zero shared secret). Per RFC 7748 the dalek implementation is non-contributory — it
+*computes* a shared secret rather than rejecting these inputs — so the KAT asserts the computed
+secret matches Wycheproof's expected bytes for every case.
+
+> **HKDF-SHA256 exclusion (deliberate, not an oversight).** Wycheproof's `hkdf_sha256` set is
+> **intentionally not used.** This fork's HKDF is computed over **BLAKE2s**
+> (`SimpleHkdf::<Blake2s256>` in `ts_tunnel`'s WireGuard handshake), never SHA-256 — there is no
+> SHA-256 HKDF on any code path, so that Wycheproof set does not apply.
+
+> **Ed25519 standard-vs-ZIP-215 scope.** This KAT covers only the **standard** RFC-8032 verifier
+> (`ed25519-dalek`, the rotation-wrap path, plain non-strict `verify`). Project Wycheproof's
+> Ed25519 set assumes standard verification, so the **ZIP-215 cofactored** verifier
+> (`ed25519-zebra`, used for Direct/Credential sigs) is **out of scope here** — it is already
+> covered by `ts_tka`'s `ed25519_speccheck_dual_verifier_kat`, which cross-binds it to Go
+> `ed25519consensus`.

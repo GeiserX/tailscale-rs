@@ -25,6 +25,8 @@ ed25519-dalek = "2"
 ed25519-zebra = "4"
 
 [dev-dependencies]
+# Project Wycheproof Ed25519 adversarial vectors (dev-only KAT). See VENDOR.md.
+wycheproof.workspace = true
 
 [lints]
 workspace = true

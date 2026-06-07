@@ -36,6 +36,8 @@ hex = "0.4"
 tokio = { workspace = true, features = ["full", "macros"] }
 ts_cli_util.workspace = true
 proptest.workspace = true
+# Project Wycheproof ChaCha20Poly1305 adversarial vectors (dev-only KAT). See VENDOR.md.
+wycheproof.workspace = true
 
 [lints]
 workspace = true

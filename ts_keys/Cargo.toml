@@ -33,6 +33,8 @@ getrandom = "0.4"
 
 [dev-dependencies]
 serde_json.workspace = true
+# Project Wycheproof X25519 adversarial vectors (dev-only KAT). See VENDOR.md.
+wycheproof.workspace = true
 
 [features]
 # The `serde` feature must also turn on zeroize's `serde` so `Zeroizing<Vec<u8>>` serializes
