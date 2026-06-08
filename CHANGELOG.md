@@ -4,6 +4,10 @@ Record breaking or significant changes here. All dates are UTC.
 
 ## Unreleased - June 2026
 
+Put changes for the upcoming release here!
+
+## [0.6.7](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.6.7) - 2026-06-09
+
 ### Added
 - **Re-export `TransportMode` and `TunConfig` from the crate facade**, and a chainable
   **`Config::use_tun(name, mtu)`** builder. `Config::transport_mode` was already public, but the
