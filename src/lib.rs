@@ -152,6 +152,12 @@ pub use ts_control::{
     IdTokenError, LogoutError, ServiceError, ServiceMode, SshAccept, SshAction, SshConnIdentity,
     SshDecision, SshDenyReason, SshPolicy, SshPrincipal, SshRule, StableNodeId,
 };
+// Re-exported so the application data-path transport can be selected through the `tailscale`
+// facade alone: `Config::transport_mode` is `TransportMode` (default `Netstack`; `Tun(TunConfig {
+// name, mtu })` for a real kernel TUN interface). Both are `pub` in `ts_control` but were not
+// reachable through this facade, forcing downstream crates to depend on `ts_control` directly just
+// to name them.
+pub use ts_control::{TransportMode, TunConfig};
 #[doc(inline)]
 pub use ts_netstack_smoltcp::PingError;
 use ts_netstack_smoltcp::{CreateSocket, netcore::Channel};
