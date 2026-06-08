@@ -1,5 +1,5 @@
 [package]
-name = "ts_dns_wire"
+name = "geiserx_ts_dns_wire"
 version.workspace = true
 description = "minimal RFC 1035 DNS query parser and response encoder for MagicDNS"
 categories = ["network-programming", "parser-implementations", "no-std"]
@@ -10,6 +10,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+
+[lib]
+name = "ts_dns_wire"
 [dependencies]
 
 [lints]

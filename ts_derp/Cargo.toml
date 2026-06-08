@@ -1,5 +1,5 @@
 [package]
-name = "ts_derp"
+name = "geiserx_ts_derp"
 version.workspace = true
 description = "tailscale derp client"
 categories = ["network-programming", "encoding", "asynchronous"]
@@ -10,6 +10,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+
+[lib]
+name = "ts_derp"
 [dependencies]
 # Our crates.
 ts_hexdump.workspace = true

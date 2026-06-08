@@ -1809,6 +1809,652 @@ dependencies = [
 ]
 
 [[package]]
+name = "geiserx_tailscale"
+version = "0.6.5"
+dependencies = [
+ "axum",
+ "bytes",
+ "chrono",
+ "clap",
+ "geiserx_ts_control",
+ "geiserx_ts_keys",
+ "geiserx_ts_metrics",
+ "geiserx_ts_netstack_smoltcp",
+ "geiserx_ts_packet",
+ "geiserx_ts_runtime",
+ "geiserx_ts_tka",
+ "include_dir",
+ "ipnet",
+ "itertools",
+ "mime_guess",
+ "nix 0.30.1",
+ "pty-process",
+ "rand 0.10.1",
+ "ratatui",
+ "russh",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "tracing-test",
+ "ts_test_util",
+ "url",
+]
+
+[[package]]
+name = "geiserx_ts_array256"
+version = "0.6.5"
+dependencies = [
+ "geiserx_ts_bitset",
+ "heapless",
+ "lazy_static",
+ "proptest",
+ "smallvec",
+ "static_assertions",
+]
+
+[[package]]
+name = "geiserx_ts_bart"
+version = "0.6.5"
+dependencies = [
+ "cfg-if",
+ "divan",
+ "flate2",
+ "geiserx_ts_array256",
+ "geiserx_ts_bitset",
+ "heapless",
+ "ipnet",
+ "itertools",
+ "lazy_static",
+ "proptest",
+ "rand 0.10.1",
+ "smallvec",
+ "static_assertions",
+]
+
+[[package]]
+name = "geiserx_ts_bart_packetfilter"
+version = "0.6.5"
+dependencies = [
+ "geiserx_ts_array256",
+ "geiserx_ts_bart",
+ "geiserx_ts_bitset",
+ "geiserx_ts_dynbitset",
+ "geiserx_ts_packetfilter",
+ "hashbrown 0.17.1",
+ "ipnet",
+ "proptest",
+ "smallvec",
+]
+
+[[package]]
+name = "geiserx_ts_bitset"
+version = "0.6.5"
+dependencies = [
+ "cfg-if",
+ "divan",
+ "proptest",
+ "static_assertions",
+]
+
+[[package]]
+name = "geiserx_ts_capabilityversion"
+version = "0.6.5"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "geiserx_ts_control"
+version = "0.6.5"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "futures-util",
+ "geiserx_ts_bitset",
+ "geiserx_ts_capabilityversion",
+ "geiserx_ts_control_noise",
+ "geiserx_ts_control_serde",
+ "geiserx_ts_derp",
+ "geiserx_ts_dynbitset",
+ "geiserx_ts_http_util",
+ "geiserx_ts_keys",
+ "geiserx_ts_nodecapability",
+ "geiserx_ts_packet",
+ "geiserx_ts_packetfilter",
+ "geiserx_ts_packetfilter_state",
+ "geiserx_ts_tls_util",
+ "gethostname",
+ "ipnet",
+ "lazy_static",
+ "pin-project-lite",
+ "rcgen",
+ "ring",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "url",
+ "zerocopy",
+]
+
+[[package]]
+name = "geiserx_ts_control_noise"
+version = "0.6.5"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "chacha20poly1305",
+ "futures-util",
+ "geiserx_ts_capabilityversion",
+ "geiserx_ts_hexdump",
+ "geiserx_ts_keys",
+ "noise-protocol",
+ "noise-rust-crypto",
+ "pin-project-lite",
+ "proptest",
+ "rand 0.10.1",
+ "static_assertions",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "zerocopy",
+ "zeroize",
+]
+
+[[package]]
+name = "geiserx_ts_control_serde"
+version = "0.6.5"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "geiserx_ts_capabilityversion",
+ "geiserx_ts_keys",
+ "geiserx_ts_nodecapability",
+ "geiserx_ts_packetfilter_serde",
+ "ipnet",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "serde_with",
+ "url",
+]
+
+[[package]]
+name = "geiserx_ts_dataplane"
+version = "0.6.5"
+dependencies = [
+ "etherparse",
+ "geiserx_ts_bart",
+ "geiserx_ts_overlay_router",
+ "geiserx_ts_packet",
+ "geiserx_ts_packetfilter",
+ "geiserx_ts_time",
+ "geiserx_ts_transport",
+ "geiserx_ts_tunnel",
+ "geiserx_ts_underlay_router",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "geiserx_ts_derp"
+version = "0.6.5"
+dependencies = [
+ "bytes",
+ "crypto_box",
+ "futures",
+ "geiserx_ts_control_serde",
+ "geiserx_ts_hexdump",
+ "geiserx_ts_http_util",
+ "geiserx_ts_keys",
+ "geiserx_ts_packet",
+ "geiserx_ts_tls_util",
+ "geiserx_ts_transport",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "ts_cli_util",
+ "url",
+ "yoke",
+ "zerocopy",
+]
+
+[[package]]
+name = "geiserx_ts_disco_protocol"
+version = "0.6.5"
+dependencies = [
+ "aead 0.5.2",
+ "crypto_box",
+ "geiserx_ts_keys",
+ "num-derive",
+ "num-traits",
+ "rand 0.10.1",
+ "thiserror 2.0.18",
+ "zerocopy",
+]
+
+[[package]]
+name = "geiserx_ts_dns_wire"
+version = "0.6.5"
+
+[[package]]
+name = "geiserx_ts_dynbitset"
+version = "0.6.5"
+dependencies = [
+ "geiserx_ts_bitset",
+ "proptest",
+ "smallvec",
+]
+
+[[package]]
+name = "geiserx_ts_elixir"
+version = "0.6.5"
+dependencies = [
+ "geiserx_tailscale",
+ "geiserx_ts_control",
+ "rustler",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "geiserx_ts_ffi"
+version = "0.6.5"
+dependencies = [
+ "cbindgen",
+ "geiserx_tailscale",
+ "geiserx_ts_keys",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "geiserx_ts_forwarder"
+version = "0.6.5"
+dependencies = [
+ "bytes",
+ "geiserx_ts_netstack_smoltcp",
+ "ipnet",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "geiserx_ts_hexdump"
+version = "0.6.5"
+dependencies = [
+ "heapless",
+]
+
+[[package]]
+name = "geiserx_ts_host_net"
+version = "0.6.5"
+dependencies = [
+ "ipnet",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "geiserx_ts_http_util"
+version = "0.6.5"
+dependencies = [
+ "bytes",
+ "futures",
+ "geiserx_ts_tls_util",
+ "http",
+ "http-body-util",
+ "httparse",
+ "hyper",
+ "hyper-util",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-test",
+ "ts_test_util",
+ "url",
+]
+
+[[package]]
+name = "geiserx_ts_keys"
+version = "0.6.5"
+dependencies = [
+ "crypto_box",
+ "ed25519-dalek 2.2.0",
+ "getrandom 0.4.2",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "wycheproof",
+ "x25519-dalek 3.0.0-rc.0",
+ "zerocopy",
+ "zeroize",
+]
+
+[[package]]
+name = "geiserx_ts_magicsock"
+version = "0.6.5"
+dependencies = [
+ "geiserx_ts_disco_protocol",
+ "geiserx_ts_keys",
+ "geiserx_ts_metrics",
+ "geiserx_ts_packet",
+ "geiserx_ts_transport",
+ "if-addrs",
+ "rand 0.10.1",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-test",
+ "zerocopy",
+]
+
+[[package]]
+name = "geiserx_ts_metrics"
+version = "0.6.5"
+
+[[package]]
+name = "geiserx_ts_netcheck"
+version = "0.6.5"
+dependencies = [
+ "bytes",
+ "dashmap",
+ "geiserx_ts_control",
+ "geiserx_ts_control_serde",
+ "geiserx_ts_derp",
+ "geiserx_ts_http_util",
+ "reqwest",
+ "serde_json",
+ "stun-rs",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-test",
+ "ts_test_util",
+ "url",
+]
+
+[[package]]
+name = "geiserx_ts_netstack_smoltcp"
+version = "0.6.5"
+dependencies = [
+ "axum",
+ "bytes",
+ "clap",
+ "console-subscriber",
+ "futures-util",
+ "geiserx_ts_netstack_smoltcp_core",
+ "geiserx_ts_netstack_smoltcp_socket",
+ "include_dir",
+ "mime_guess",
+ "rand 0.10.1",
+ "tokio",
+ "tracing",
+ "tracing-panic",
+ "ts_cli_util",
+ "tun-rs",
+]
+
+[[package]]
+name = "geiserx_ts_netstack_smoltcp_core"
+version = "0.6.5"
+dependencies = [
+ "bytes",
+ "flume",
+ "heapless",
+ "smoltcp",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-panic",
+ "ts_cli_util",
+]
+
+[[package]]
+name = "geiserx_ts_netstack_smoltcp_socket"
+version = "0.6.5"
+dependencies = [
+ "bytes",
+ "futures-io",
+ "geiserx_ts_netstack_smoltcp_core",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "geiserx_ts_nodecapability"
+version = "0.6.5"
+dependencies = [
+ "cfg-if",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "geiserx_ts_overlay_router"
+version = "0.6.5"
+dependencies = [
+ "geiserx_ts_bart",
+ "geiserx_ts_packet",
+ "geiserx_ts_transport",
+ "itertools",
+ "tracing",
+]
+
+[[package]]
+name = "geiserx_ts_packet"
+version = "0.6.5"
+dependencies = [
+ "bytes",
+ "crypto_box",
+ "geiserx_ts_hexdump",
+]
+
+[[package]]
+name = "geiserx_ts_packetfilter"
+version = "0.6.5"
+dependencies = [
+ "hashbrown 0.17.1",
+ "ipnet",
+ "static_assertions",
+ "tracing",
+]
+
+[[package]]
+name = "geiserx_ts_packetfilter_serde"
+version = "0.6.5"
+dependencies = [
+ "geiserx_ts_nodecapability",
+ "geiserx_ts_peercapability",
+ "ipnet",
+ "nom 8.0.0",
+ "proptest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "geiserx_ts_packetfilter_state"
+version = "0.6.5"
+dependencies = [
+ "divan",
+ "geiserx_ts_bart_packetfilter",
+ "geiserx_ts_packetfilter",
+ "geiserx_ts_packetfilter_serde",
+ "serde_json",
+]
+
+[[package]]
+name = "geiserx_ts_peercapability"
+version = "0.6.5"
+dependencies = [
+ "serde",
+ "url",
+]
+
+[[package]]
+name = "geiserx_ts_python"
+version = "0.6.5"
+dependencies = [
+ "geiserx_tailscale",
+ "geiserx_ts_control",
+ "hex",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "geiserx_ts_runtime"
+version = "0.6.5"
+dependencies = [
+ "base64 0.22.1",
+ "ed25519-dalek 2.2.0",
+ "etherparse",
+ "futures",
+ "geiserx_ts_bart",
+ "geiserx_ts_bart_packetfilter",
+ "geiserx_ts_control",
+ "geiserx_ts_dataplane",
+ "geiserx_ts_derp",
+ "geiserx_ts_dns_wire",
+ "geiserx_ts_forwarder",
+ "geiserx_ts_host_net",
+ "geiserx_ts_keys",
+ "geiserx_ts_magicsock",
+ "geiserx_ts_netcheck",
+ "geiserx_ts_netstack_smoltcp",
+ "geiserx_ts_overlay_router",
+ "geiserx_ts_packet",
+ "geiserx_ts_packetfilter",
+ "geiserx_ts_packetfilter_state",
+ "geiserx_ts_tka",
+ "geiserx_ts_transport",
+ "geiserx_ts_transport_tun",
+ "geiserx_ts_tunnel",
+ "httparse",
+ "ipnet",
+ "itertools",
+ "kameo",
+ "kameo_actors",
+ "proptest",
+ "rand 0.10.1",
+ "smallvec",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "geiserx_ts_time"
+version = "0.6.5"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
+name = "geiserx_ts_tka"
+version = "0.6.5"
+dependencies = [
+ "blake2 0.10.6",
+ "ed25519-dalek 2.2.0",
+ "ed25519-zebra",
+ "thiserror 2.0.18",
+ "wycheproof",
+]
+
+[[package]]
+name = "geiserx_ts_tls_util"
+version = "0.6.5"
+dependencies = [
+ "rcgen",
+ "ring",
+ "rustls-pemfile",
+ "subtle",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "url",
+ "webpki-roots",
+]
+
+[[package]]
+name = "geiserx_ts_transport"
+version = "0.6.5"
+dependencies = [
+ "geiserx_ts_packet",
+]
+
+[[package]]
+name = "geiserx_ts_transport_tun"
+version = "0.6.5"
+dependencies = [
+ "bytes",
+ "geiserx_ts_hexdump",
+ "geiserx_ts_packet",
+ "geiserx_ts_transport",
+ "ipnet",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+ "tun-rs",
+]
+
+[[package]]
+name = "geiserx_ts_tunnel"
+version = "0.6.5"
+dependencies = [
+ "aead 0.5.2",
+ "base64 0.22.1",
+ "blake2 0.10.6",
+ "bytes",
+ "chacha20poly1305",
+ "clap",
+ "geiserx_ts_keys",
+ "geiserx_ts_packet",
+ "geiserx_ts_time",
+ "hex",
+ "hkdf 0.12.4",
+ "itertools",
+ "proptest",
+ "rand 0.10.1",
+ "tokio",
+ "tracing",
+ "ts_cli_util",
+ "wycheproof",
+ "x25519-dalek 3.0.0-rc.0",
+ "zerocopy",
+]
+
+[[package]]
+name = "geiserx_ts_underlay_router"
+version = "0.6.5"
+dependencies = [
+ "geiserx_ts_packet",
+ "geiserx_ts_transport",
+]
+
+[[package]]
 name = "generator"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5178,41 +5824,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tailscale-rs"
-version = "0.6.5"
-dependencies = [
- "axum",
- "bytes",
- "chrono",
- "clap",
- "include_dir",
- "ipnet",
- "itertools",
- "mime_guess",
- "nix 0.30.1",
- "pty-process",
- "rand 0.10.1",
- "ratatui",
- "russh",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "tracing-test",
- "ts_control",
- "ts_keys",
- "ts_metrics",
- "ts_netstack_smoltcp",
- "ts_packet",
- "ts_runtime",
- "ts_test_util",
- "ts_tka",
- "url",
-]
-
-[[package]]
 name = "target-lexicon"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5760,211 +6371,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
-name = "ts_array256"
-version = "0.6.5"
-dependencies = [
- "heapless",
- "lazy_static",
- "proptest",
- "smallvec",
- "static_assertions",
- "ts_bitset",
-]
-
-[[package]]
-name = "ts_bart"
-version = "0.6.5"
-dependencies = [
- "cfg-if",
- "divan",
- "flate2",
- "heapless",
- "ipnet",
- "itertools",
- "lazy_static",
- "proptest",
- "rand 0.10.1",
- "smallvec",
- "static_assertions",
- "ts_array256",
- "ts_bitset",
-]
-
-[[package]]
-name = "ts_bart_packetfilter"
-version = "0.6.5"
-dependencies = [
- "hashbrown 0.17.1",
- "ipnet",
- "proptest",
- "smallvec",
- "ts_array256",
- "ts_bart",
- "ts_bitset",
- "ts_dynbitset",
- "ts_packetfilter",
-]
-
-[[package]]
-name = "ts_bitset"
-version = "0.6.5"
-dependencies = [
- "cfg-if",
- "divan",
- "proptest",
- "static_assertions",
-]
-
-[[package]]
-name = "ts_capabilityversion"
-version = "0.6.5"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "ts_cli_util"
 version = "0.6.5"
 dependencies = [
  "cfg-if",
  "clap",
  "futures-util",
- "tailscale-rs",
+ "geiserx_tailscale",
+ "geiserx_ts_control",
+ "geiserx_ts_derp",
+ "geiserx_ts_netcheck",
  "tracing",
  "tracing-subscriber",
  "tracing-tracy",
  "tracy-client",
- "ts_control",
- "ts_derp",
- "ts_netcheck",
-]
-
-[[package]]
-name = "ts_control"
-version = "0.6.5"
-dependencies = [
- "base64 0.22.1",
- "bytes",
- "chrono",
- "futures-util",
- "gethostname",
- "ipnet",
- "lazy_static",
- "pin-project-lite",
- "rcgen",
- "ring",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-rustls",
- "tokio-stream",
- "tokio-util",
- "tracing",
- "ts_bitset",
- "ts_capabilityversion",
- "ts_control_noise",
- "ts_control_serde",
- "ts_derp",
- "ts_dynbitset",
- "ts_http_util",
- "ts_keys",
- "ts_nodecapability",
- "ts_packet",
- "ts_packetfilter",
- "ts_packetfilter_state",
- "ts_tls_util",
- "url",
- "zerocopy",
-]
-
-[[package]]
-name = "ts_control_noise"
-version = "0.6.5"
-dependencies = [
- "base64 0.22.1",
- "bytes",
- "chacha20poly1305",
- "futures-util",
- "noise-protocol",
- "noise-rust-crypto",
- "pin-project-lite",
- "proptest",
- "rand 0.10.1",
- "static_assertions",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "ts_capabilityversion",
- "ts_hexdump",
- "ts_keys",
- "zerocopy",
- "zeroize",
-]
-
-[[package]]
-name = "ts_control_serde"
-version = "0.6.5"
-dependencies = [
- "base64 0.22.1",
- "chrono",
- "ipnet",
- "serde",
- "serde_json",
- "serde_repr",
- "serde_with",
- "ts_capabilityversion",
- "ts_keys",
- "ts_nodecapability",
- "ts_packetfilter_serde",
- "url",
-]
-
-[[package]]
-name = "ts_dataplane"
-version = "0.6.5"
-dependencies = [
- "etherparse",
- "tokio",
- "tracing",
- "ts_bart",
- "ts_overlay_router",
- "ts_packet",
- "ts_packetfilter",
- "ts_time",
- "ts_transport",
- "ts_tunnel",
- "ts_underlay_router",
-]
-
-[[package]]
-name = "ts_derp"
-version = "0.6.5"
-dependencies = [
- "bytes",
- "crypto_box",
- "futures",
- "hex",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "ts_cli_util",
- "ts_control_serde",
- "ts_hexdump",
- "ts_http_util",
- "ts_keys",
- "ts_packet",
- "ts_tls_util",
- "ts_transport",
- "url",
- "yoke",
- "zerocopy",
 ]
 
 [[package]]
@@ -5974,438 +6394,18 @@ dependencies = [
  "bytes",
  "clap",
  "futures",
+ "geiserx_ts_derp",
+ "geiserx_ts_keys",
+ "geiserx_ts_packetfilter",
+ "geiserx_ts_packetfilter_state",
  "tokio",
  "tracing",
  "ts_cli_util",
- "ts_derp",
- "ts_keys",
- "ts_packetfilter",
- "ts_packetfilter_state",
-]
-
-[[package]]
-name = "ts_disco_protocol"
-version = "0.6.5"
-dependencies = [
- "aead 0.5.2",
- "crypto_box",
- "num-derive",
- "num-traits",
- "rand 0.10.1",
- "thiserror 2.0.18",
- "ts_keys",
- "zerocopy",
-]
-
-[[package]]
-name = "ts_dns_wire"
-version = "0.6.5"
-
-[[package]]
-name = "ts_dynbitset"
-version = "0.6.5"
-dependencies = [
- "proptest",
- "smallvec",
- "ts_bitset",
-]
-
-[[package]]
-name = "ts_elixir"
-version = "0.6.5"
-dependencies = [
- "rustler",
- "tailscale-rs",
- "tokio",
- "tracing",
- "ts_control",
-]
-
-[[package]]
-name = "ts_ffi"
-version = "0.6.5"
-dependencies = [
- "cbindgen",
- "tailscale-rs",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "ts_keys",
-]
-
-[[package]]
-name = "ts_forwarder"
-version = "0.6.5"
-dependencies = [
- "bytes",
- "ipnet",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "ts_netstack_smoltcp",
-]
-
-[[package]]
-name = "ts_hexdump"
-version = "0.6.5"
-dependencies = [
- "heapless",
-]
-
-[[package]]
-name = "ts_host_net"
-version = "0.6.5"
-dependencies = [
- "ipnet",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
-name = "ts_http_util"
-version = "0.6.5"
-dependencies = [
- "bytes",
- "futures",
- "http",
- "http-body-util",
- "httparse",
- "hyper",
- "hyper-util",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-test",
- "ts_test_util",
- "ts_tls_util",
- "url",
-]
-
-[[package]]
-name = "ts_keys"
-version = "0.6.5"
-dependencies = [
- "crypto_box",
- "ed25519-dalek 2.2.0",
- "getrandom 0.4.2",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "wycheproof",
- "x25519-dalek 3.0.0-rc.0",
- "zerocopy",
- "zeroize",
-]
-
-[[package]]
-name = "ts_magicsock"
-version = "0.6.5"
-dependencies = [
- "if-addrs",
- "rand 0.10.1",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-test",
- "ts_disco_protocol",
- "ts_keys",
- "ts_metrics",
- "ts_packet",
- "ts_transport",
- "zerocopy",
-]
-
-[[package]]
-name = "ts_metrics"
-version = "0.6.5"
-
-[[package]]
-name = "ts_netcheck"
-version = "0.6.5"
-dependencies = [
- "bytes",
- "dashmap",
- "reqwest",
- "serde_json",
- "stun-rs",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-test",
- "ts_control",
- "ts_control_serde",
- "ts_derp",
- "ts_http_util",
- "ts_test_util",
- "url",
-]
-
-[[package]]
-name = "ts_netstack_smoltcp"
-version = "0.6.5"
-dependencies = [
- "axum",
- "bytes",
- "clap",
- "console-subscriber",
- "futures-util",
- "include_dir",
- "mime_guess",
- "rand 0.10.1",
- "tokio",
- "tracing",
- "tracing-panic",
- "ts_cli_util",
- "ts_netstack_smoltcp_core",
- "ts_netstack_smoltcp_socket",
- "tun-rs",
-]
-
-[[package]]
-name = "ts_netstack_smoltcp_core"
-version = "0.6.5"
-dependencies = [
- "bytes",
- "flume",
- "heapless",
- "smoltcp",
- "thiserror 2.0.18",
- "tracing",
- "tracing-panic",
- "ts_cli_util",
-]
-
-[[package]]
-name = "ts_netstack_smoltcp_socket"
-version = "0.6.5"
-dependencies = [
- "bytes",
- "futures-io",
- "tokio",
- "tracing",
- "ts_netstack_smoltcp_core",
-]
-
-[[package]]
-name = "ts_nodecapability"
-version = "0.6.5"
-dependencies = [
- "cfg-if",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "ts_overlay_router"
-version = "0.6.5"
-dependencies = [
- "itertools",
- "tracing",
- "ts_bart",
- "ts_packet",
- "ts_transport",
-]
-
-[[package]]
-name = "ts_packet"
-version = "0.6.5"
-dependencies = [
- "bytes",
- "crypto_box",
- "ts_hexdump",
-]
-
-[[package]]
-name = "ts_packetfilter"
-version = "0.6.5"
-dependencies = [
- "hashbrown 0.17.1",
- "ipnet",
- "static_assertions",
- "tracing",
-]
-
-[[package]]
-name = "ts_packetfilter_serde"
-version = "0.6.5"
-dependencies = [
- "ipnet",
- "nom 8.0.0",
- "proptest",
- "serde",
- "serde_json",
- "ts_nodecapability",
- "ts_peercapability",
-]
-
-[[package]]
-name = "ts_packetfilter_state"
-version = "0.6.5"
-dependencies = [
- "divan",
- "serde_json",
- "ts_bart_packetfilter",
- "ts_packetfilter",
- "ts_packetfilter_serde",
-]
-
-[[package]]
-name = "ts_peercapability"
-version = "0.6.5"
-dependencies = [
- "serde",
- "url",
-]
-
-[[package]]
-name = "ts_python"
-version = "0.6.5"
-dependencies = [
- "hex",
- "pyo3",
- "pyo3-async-runtimes",
- "tailscale-rs",
- "tokio",
- "tracing-subscriber",
- "ts_control",
-]
-
-[[package]]
-name = "ts_runtime"
-version = "0.6.5"
-dependencies = [
- "base64 0.22.1",
- "ed25519-dalek 2.2.0",
- "etherparse",
- "futures",
- "httparse",
- "ipnet",
- "itertools",
- "kameo",
- "kameo_actors",
- "proptest",
- "rand 0.10.1",
- "smallvec",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "ts_bart",
- "ts_bart_packetfilter",
- "ts_control",
- "ts_dataplane",
- "ts_derp",
- "ts_dns_wire",
- "ts_forwarder",
- "ts_host_net",
- "ts_keys",
- "ts_magicsock",
- "ts_netcheck",
- "ts_netstack_smoltcp",
- "ts_overlay_router",
- "ts_packet",
- "ts_packetfilter",
- "ts_packetfilter_state",
- "ts_tka",
- "ts_transport",
- "ts_transport_tun",
- "ts_tunnel",
- "url",
 ]
 
 [[package]]
 name = "ts_test_util"
 version = "0.6.5"
-
-[[package]]
-name = "ts_time"
-version = "0.6.5"
-dependencies = [
- "proptest",
-]
-
-[[package]]
-name = "ts_tka"
-version = "0.6.5"
-dependencies = [
- "blake2 0.10.6",
- "ed25519-dalek 2.2.0",
- "ed25519-zebra",
- "thiserror 2.0.18",
- "wycheproof",
-]
-
-[[package]]
-name = "ts_tls_util"
-version = "0.6.5"
-dependencies = [
- "rcgen",
- "ring",
- "rustls-pemfile",
- "subtle",
- "tokio",
- "tokio-rustls",
- "tracing",
- "url",
- "webpki-roots",
-]
-
-[[package]]
-name = "ts_transport"
-version = "0.6.5"
-dependencies = [
- "ts_packet",
-]
-
-[[package]]
-name = "ts_transport_tun"
-version = "0.6.5"
-dependencies = [
- "bytes",
- "ipnet",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tracing",
- "ts_hexdump",
- "ts_packet",
- "ts_transport",
- "tun-rs",
-]
-
-[[package]]
-name = "ts_tunnel"
-version = "0.6.5"
-dependencies = [
- "aead 0.5.2",
- "base64 0.22.1",
- "blake2 0.10.6",
- "bytes",
- "chacha20poly1305",
- "clap",
- "hex",
- "hkdf 0.12.4",
- "itertools",
- "proptest",
- "rand 0.10.1",
- "tokio",
- "tracing",
- "ts_cli_util",
- "ts_keys",
- "ts_packet",
- "ts_time",
- "wycheproof",
- "x25519-dalek 3.0.0-rc.0",
- "zerocopy",
-]
-
-[[package]]
-name = "ts_underlay_router"
-version = "0.6.5"
-dependencies = [
- "ts_packet",
- "ts_transport",
-]
 
 [[package]]
 name = "tun-rs"

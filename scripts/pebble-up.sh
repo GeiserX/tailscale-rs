@@ -203,7 +203,7 @@ Pebble is UP. Export these, then run the integration test:
   export TS_RS_CHALLTESTSRV_URL="${CHALLTESTSRV_MGMT_URL}"
 
   TS_RS_EXPERIMENT=this_is_unstable_software \\
-    cargo test -p ts_control --features acme --test acme_pebble -- --nocapture
+    cargo test -p geiserx_ts_control --features acme --test acme_pebble -- --nocapture
 
 Details:
   ACME directory URL : ${DIRECTORY_URL}

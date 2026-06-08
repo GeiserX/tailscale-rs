@@ -1,5 +1,5 @@
 [package]
-name = "ts_bart_packetfilter"
+name = "geiserx_ts_bart_packetfilter"
 version.workspace = true
 description = "fast tailscale packet filter implemented using ts_bart"
 categories = ["data-structures", "no-std", "network-programming"]
@@ -10,6 +10,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+
+[lib]
+name = "ts_bart_packetfilter"
 [dependencies]
 # Our crates.
 ts_array256 = { workspace = true, features = ["smallvec"] }

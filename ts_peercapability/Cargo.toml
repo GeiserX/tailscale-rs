@@ -1,5 +1,5 @@
 [package]
-name = "ts_peercapability"
+name = "geiserx_ts_peercapability"
 version.workspace = true
 description = "tailscale peer capability definitions"
 categories = ["no-std::no-alloc"]
@@ -11,6 +11,9 @@ license.workspace = true
 rust-version.workspace = true
 
 
+
+[lib]
+name = "ts_peercapability"
 [dependencies]
 serde = { workspace = true, optional = true }
 url.workspace = true

@@ -1,5 +1,5 @@
 [package]
-name = "ts_ffi"
+name = "geiserx_ts_ffi"
 version.workspace = true
 description = "c ffi bindings for tailscale-rs"
 categories = ["api-bindings", "network-programming"]

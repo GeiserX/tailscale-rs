@@ -1,5 +1,5 @@
 [package]
-name = "ts_time"
+name = "geiserx_ts_time"
 version.workspace = true
 description = "time- and scheduling-oriented utilities for tailscale"
 categories = ["date-and-time", "data-structures"]
@@ -10,6 +10,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+
+[lib]
+name = "ts_time"
 [dev-dependencies]
 proptest.workspace = true
 

@@ -1,5 +1,5 @@
 [package]
-name = "ts_underlay_router"
+name = "geiserx_ts_underlay_router"
 version.workspace = true
 description = "underlay router for tailscale dataplane"
 categories = ["network-programming", "data-structures"]
@@ -10,6 +10,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+
+[lib]
+name = "ts_underlay_router"
 [dependencies]
 ts_packet.workspace = true
 ts_transport.workspace = true

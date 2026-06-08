@@ -1,5 +1,5 @@
 [package]
-name = "ts_dataplane"
+name = "geiserx_ts_dataplane"
 version.workspace = true
 description = "tailscale packet processing data plane"
 categories = ["network-programming"]
@@ -10,6 +10,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+
+[lib]
+name = "ts_dataplane"
 [features]
 default = ["async_tokio"]
 async_tokio = ["dep:tokio"]

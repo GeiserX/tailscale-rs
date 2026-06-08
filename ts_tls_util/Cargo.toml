@@ -1,5 +1,5 @@
 [package]
-name = "ts_tls_util"
+name = "geiserx_ts_tls_util"
 version.workspace = true
 description = "tailscale-specific tls utilities"
 categories = ["network-programming", "asynchronous", "cryptography"]
@@ -11,6 +11,9 @@ license.workspace = true
 
 rust-version.workspace = true
 
+
+[lib]
+name = "ts_tls_util"
 [dependencies]
 # Unconditionally required dependencies.
 tokio.workspace = true

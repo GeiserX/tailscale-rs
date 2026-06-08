@@ -18,7 +18,7 @@
 //! export TS_RS_CHALLTESTSRV_URL="http://localhost:8055"
 //!
 //! TS_RS_EXPERIMENT=this_is_unstable_software \
-//!   cargo test -p ts_control --features acme --test acme_pebble -- --nocapture
+//!   cargo test -p geiserx_ts_control --features acme --test acme_pebble -- --nocapture
 //!
 //! ./scripts/pebble-down.sh
 //! ```

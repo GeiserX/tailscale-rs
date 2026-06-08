@@ -1,5 +1,5 @@
 [package]
-name = "ts_keys"
+name = "geiserx_ts_keys"
 version.workspace = true
 description = "tailscale cryptographic key types"
 categories = ["cryptography"]
@@ -10,6 +10,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+
+[lib]
+name = "ts_keys"
 [dependencies]
 thiserror.workspace = true
 zerocopy.workspace = true

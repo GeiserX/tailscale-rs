@@ -255,7 +255,7 @@ jobs:
       TS_RS_EXPERIMENT: this_is_unstable_software
       # ring-only feature set: `tailscale` has no `default` feature, so `--no-default-features`
       # leaves `ssh`/`axum` off while keeping the full tailnet/TLS (ring) daemon path.
-      MUSL_FLAGS: -p tailscale-rs --no-default-features
+      MUSL_FLAGS: -p geiserx_tailscale --no-default-features
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
