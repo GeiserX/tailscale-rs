@@ -65,7 +65,7 @@ jobs:
         env:
           # Fail the build (rather than silently skipping) if the header can't be generated.
           TS_FFI_BUILDRS_STRICT: 1
-        run: cargo build --release -p ts_ffi
+        run: cargo build --release -p geiserx_ts_ffi
 
       - name: Stage artifacts
         id: stage

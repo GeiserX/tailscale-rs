@@ -41,19 +41,19 @@ Add this dependency line to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-# Published as `tailscale-rs`; imported as `tailscale`.
-tailscale = { package = "tailscale-rs", version = "0.6" }
+# Published as `geiserx_tailscale`; imported as `tailscale`.
+tailscale = { package = "geiserx_tailscale", version = "0.6" }
 ```
 
-> **Not yet published to crates.io;** for now depend on it via git:
+> Or depend on the latest from git:
 >
 > ```toml
 > [dependencies]
-> tailscale = { package = "tailscale-rs", git = "https://github.com/GeiserX/tailscale-rs" }
+> tailscale = { package = "geiserx_tailscale", git = "https://github.com/GeiserX/tailscale-rs" }
 > ```
 
 Either way, you import it as `tailscale` (e.g. `use tailscale::Device;`) — the crate name on
-crates.io is `tailscale-rs`, but the library name is `tailscale`.
+crates.io is `geiserx_tailscale`, but the library name is `tailscale`.
 
 Examples of using the `tailscale` crate can be found in [`examples/`](examples/README.md).
 
