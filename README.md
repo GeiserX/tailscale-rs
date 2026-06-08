@@ -17,6 +17,10 @@ A fork of [tailscale/tailscale-rs](https://github.com/tailscale/tailscale-rs).
 `tailscale-rs` is a work-in-progress Tailscale library written in Rust, with language bindings to
 C, Elixir, and Python.
 
+> [!NOTE]
+> This project is **not associated with Tailscale Inc.** — it is an independent, unofficial fork.
+> See [Legal](#legal).
+
 > [!CAUTION]
 > This software is unstable and insecure.
 >
@@ -263,5 +267,9 @@ Unsupported features
 </details>
 
 ## Legal
+
+**This project is not associated with Tailscale Inc.** It is an independent, unofficial fork.
+"Tailscale" is a trademark of Tailscale Inc.; it is used here only to describe interoperability and
+the upstream project this is forked from.
 
 WireGuard is a registered trademark of Jason A. Donenfeld.
