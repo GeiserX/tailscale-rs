@@ -4,6 +4,10 @@ Record breaking or significant changes here. All dates are UTC.
 
 ## Unreleased - June 2026
 
+Put changes for the upcoming release here!
+
+## [0.6.6](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.6.6) - 2026-06-08
+
 ### Added
 - **`Config::allow_http_key_fetch`** (default `false`) — opt into fetching the control server's
   machine public key (`GET /key`) over plain **http** when the control URL is `http://`. The `/key`
