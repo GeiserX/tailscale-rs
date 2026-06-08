@@ -42,7 +42,7 @@ impl Message<Arc<PeerState>> for SourceFilterUpdater {
         // cryptokey-routing coupling the comment below depends on.
         let exit_node_id = self
             .env
-            .exit_node
+            .exit_node()
             .as_ref()
             .and_then(|sel| sel.resolve(state_update.peers.peers().values()));
 
@@ -194,6 +194,89 @@ mod tests {
             t.insert(route.to_owned(), PeerId(node.id as u32));
         }
         t
+    }
+
+    /// A second exit-advertising peer with a distinct stable id / IP, so we can prove that
+    /// *changing* the selector re-resolves to a *different* peer against a fixed peer set.
+    fn exit_router_node_2() -> Node {
+        let mut n = exit_router_node();
+        n.id = 2;
+        n.stable_id = StableNodeId("exit2".to_string());
+        n.hostname = "router2".to_string();
+        n.tailnet_address = TailnetAddress {
+            ipv4: "100.64.0.8/32".parse().unwrap(),
+            ipv6: "fd7a::8/128".parse().unwrap(),
+        };
+        n.accepted_routes = vec![
+            "100.64.0.8/32".parse().unwrap(),
+            "fd7a::8/128".parse().unwrap(),
+            "0.0.0.0/0".parse().unwrap(),
+            "::/0".parse().unwrap(),
+        ];
+        n
+    }
+
+    /// Build the whole-tailnet source-filter table exactly as the `Arc<PeerState>` handler does:
+    /// resolve the selector ONCE against the full peer set, then attribute each peer's
+    /// `routes_to_install` (under that one resolved exit) into the table. This is the path the
+    /// runtime re-runs whenever the `env.exit_node` watch cell changes — so calling it twice with
+    /// two different selectors is the network-free equivalent of `set_exit_node` flipping the cell.
+    fn build_table_resolved_multi(
+        peers: &[Node],
+        accept_routes: bool,
+        selector: Option<&ts_control::ExitNodeSelector>,
+    ) -> Table<PeerId> {
+        let resolved = selector.and_then(|s| s.resolve(peers.iter()));
+        let mut t = Table::default();
+        for node in peers {
+            for route in node.routes_to_install(accept_routes, resolved.as_ref()) {
+                t.insert(route.to_owned(), PeerId(node.id as u32));
+            }
+        }
+        t
+    }
+
+    /// Guards runtime exit-node switching (`Device::set_exit_node` -> `Env::exit_node` watch cell).
+    /// Against a FIXED two-exit peer set, re-resolving with a CHANGED selector must attribute the
+    /// internet source to the newly-selected peer and no longer to the old one. A regression that
+    /// caches a resolved snapshot instead of re-reading the cell would keep returning the first
+    /// peer here and fail. Pure: no Env, no network, no tokio.
+    #[test]
+    fn exit_node_selector_change_reresolves_to_different_peer() {
+        use ts_control::ExitNodeSelector;
+
+        let exit1 = exit_router_node(); // id 1, "exit1", 100.64.0.7
+        let exit2 = exit_router_node_2(); // id 2, "exit2", 100.64.0.8
+        let peers = [exit1.clone(), exit2.clone()];
+        let peer1 = PeerId(exit1.id as u32);
+        let peer2 = PeerId(exit2.id as u32);
+        let arbitrary_internet_ip = "8.8.8.8".parse().unwrap();
+
+        // Selector A -> exit1: internet source attributed to exit1, NOT exit2.
+        let a = build_table_resolved_multi(
+            &peers,
+            false,
+            Some(&ExitNodeSelector::Ip("100.64.0.7".parse().unwrap())),
+        );
+        assert_eq!(a.lookup(arbitrary_internet_ip), Some(&peer1));
+        assert_eq!(a.lookup("100.64.0.8".parse().unwrap()), Some(&peer2)); // exit2 still sources only its own tailnet addr
+        assert_ne!(a.lookup(arbitrary_internet_ip), Some(&peer2));
+
+        // Selector B -> exit2 (same fixed peer set): internet source now exit2, NOT exit1.
+        let b = build_table_resolved_multi(
+            &peers,
+            false,
+            Some(&ExitNodeSelector::StableId(StableNodeId("exit2".into()))),
+        );
+        assert_eq!(b.lookup(arbitrary_internet_ip), Some(&peer2));
+        assert_ne!(b.lookup(arbitrary_internet_ip), Some(&peer1));
+
+        // None -> fail-closed: NEITHER peer is the internet source (no `/0` source admitted).
+        let none = build_table_resolved_multi(&peers, false, None);
+        assert_eq!(none.lookup(arbitrary_internet_ip), None);
+        // Each peer still sources only its own tailnet address.
+        assert_eq!(none.lookup("100.64.0.7".parse().unwrap()), Some(&peer1));
+        assert_eq!(none.lookup("100.64.0.8".parse().unwrap()), Some(&peer2));
     }
 
     #[test]

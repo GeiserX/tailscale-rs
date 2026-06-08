@@ -167,8 +167,13 @@ pub struct Env {
 
     /// Which peer (if any) is selected as this node's exit node (`ExitNodeID`).
     ///
-    /// See [`ForwarderConfig::exit_node`].
-    pub exit_node: Option<ts_control::ExitNodeSelector>,
+    /// A live cell rather than a snapshot: `Device::set_exit_node` updates the backing
+    /// [`watch::Sender`] (held privately on the runtime, not here) at runtime, and both readers
+    /// (the route updater and the source filter) re-read it via [`Env::exit_node`](Env::exit_node)
+    /// on their next recompute, so the selected exit can change without recreating the device. This
+    /// is the readers' contract: `Env` is cloned into many actors, so only the read side lives here
+    /// while the mutation capability stays narrowed to the runtime. See [`ForwarderConfig::exit_node`].
+    pub exit_node_rx: watch::Receiver<Option<ts_control::ExitNodeSelector>>,
 
     /// The set of prefixes the inbound forwarder accepts and dials to real OS sockets.
     ///
@@ -246,14 +251,29 @@ pub struct Env {
 }
 
 impl Env {
-    pub fn new(
+    /// The currently-selected exit-node selector, re-read live (it can change at runtime via
+    /// `Device::set_exit_node`). Callers resolve it against the live peer set each time.
+    pub fn exit_node(&self) -> Option<ts_control::ExitNodeSelector> {
+        self.exit_node_rx.borrow().clone()
+    }
+
+    /// Build an [`Env`] and the exit-node [`watch::Sender`] separately, so the `Sender` (the
+    /// mutation capability) can be retained privately by the runtime while only the read side
+    /// (`exit_node_rx`) is cloned into the many actors that subscribe to `Env`. The `Sender` is
+    /// seeded with [`ForwarderConfig::exit_node`]. The runtime uses this; callers that never mutate
+    /// the exit node (e.g. tests) use [`Env::new`], which discards the `Sender`.
+    pub fn new_with_exit_tx(
         keys: ts_keys::NodeState,
         shutdown: watch::Receiver<bool>,
         forwarding: ForwarderConfig,
-    ) -> Self {
+    ) -> (Self, watch::Sender<Option<ts_control::ExitNodeSelector>>) {
+        let (exit_node_tx, exit_node_rx) = watch::channel(forwarding.exit_node.clone());
+
         let ForwarderConfig {
             accept_routes,
-            exit_node,
+            // Already consumed above to seed the `watch` channel; the `Sender` is returned so the
+            // runtime can hold it privately, narrowing mutation away from the cloned `Env`.
+            exit_node: _,
             forward_routes,
             forward_tcp_ports,
             forward_udp_ports,
@@ -280,12 +300,12 @@ impl Env {
             }
         });
 
-        Self {
+        let env = Self {
             bus: MessageBus::spawn_default(),
             keys: Arc::new(keys),
             shutdown,
             accept_routes,
-            exit_node,
+            exit_node_rx,
             forward_routes: Arc::new(forward_routes),
             forward_tcp_ports: Arc::new(forward_tcp_ports),
             forward_udp_ports: Arc::new(forward_udp_ports),
@@ -297,7 +317,20 @@ impl Env {
             enable_ipv6,
             ingress_active,
             funnel_ingress: Arc::new(std::sync::Mutex::new(None)),
-        }
+        };
+
+        (env, exit_node_tx)
+    }
+
+    /// Build an [`Env`] without retaining the exit-node [`watch::Sender`] — for callers that only
+    /// read the exit node and never mutate it (e.g. tests). The selector is still seeded from
+    /// [`ForwarderConfig::exit_node`] but becomes immutable since the `Sender` is dropped.
+    pub fn new(
+        keys: ts_keys::NodeState,
+        shutdown: watch::Receiver<bool>,
+        forwarding: ForwarderConfig,
+    ) -> Self {
+        Self::new_with_exit_tx(keys, shutdown, forwarding).0
     }
 
     pub async fn subscribe<M>(&self, slf: &ActorRef<impl Message<M>>) -> Result<(), Error>

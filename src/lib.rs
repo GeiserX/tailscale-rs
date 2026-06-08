@@ -815,6 +815,33 @@ impl Device {
         self.runtime.whois(addr).await.map_err(Into::into)
     }
 
+    /// Change the selected exit node at runtime, without recreating the [`Device`] — the equivalent
+    /// of Go `tsnet`'s `LocalClient.EditPrefs(ExitNodeID/ExitNodeIP)`.
+    ///
+    /// The peer may be named by stable node ID, tailnet IP, or MagicDNS name via
+    /// [`ExitNodeSelector`] (a bare IP or name parses with `selector.parse()`); this is the same
+    /// selector type as [`Config::exit_node`](crate::Config::exit_node), so the construction-time
+    /// and runtime paths are identical. Passing `None` clears the exit node — internet-bound traffic
+    /// is then dropped (fail-closed) unless this node egresses directly.
+    ///
+    /// The change is applied immediately: the new selector is re-resolved against the live peer set
+    /// and the outbound route + inbound source filter are recomputed at once. A selector for a peer
+    /// not yet in the netmap simply takes effect once that peer appears.
+    ///
+    /// Only NEW flows use the changed exit; in-flight connections are not torn down and continue
+    /// egressing via the previously-selected exit until they close.
+    pub async fn set_exit_node(&self, exit_node: Option<ExitNodeSelector>) -> Result<(), Error> {
+        self.runtime
+            .set_exit_node(exit_node)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// The currently-selected exit node, or `None` if none is selected.
+    pub fn exit_node(&self) -> Option<ExitNodeSelector> {
+        self.runtime.exit_node()
+    }
+
     /// Watch for netmap changes: the returned receiver's value is the current set of peer
     /// [`StatusNode`]s and updates on every netmap change (like subscribing to `ipn` notifications).
     pub async fn watch_netmap(

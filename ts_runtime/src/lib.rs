@@ -72,6 +72,10 @@ pub struct Runtime {
     fallback_tcp: Option<fallback_tcp::FallbackTcpManager>,
     env: Env,
     shutdown: watch::Sender<bool>,
+    /// Sender side of the exit-node selector `watch` cell. Held privately here (not on the cloned
+    /// `Env`, which keeps only the read side) so that only `Runtime::set_exit_node` can mutate the
+    /// selection; the route updater and source filter re-read it via [`Env::exit_node`].
+    exit_node_tx: watch::Sender<Option<ts_control::ExitNodeSelector>>,
 }
 
 impl Runtime {
@@ -82,7 +86,12 @@ impl Runtime {
         keys: ts_keys::NodeState,
     ) -> Result<Self, Error> {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let env = Env::new(
+
+        // The exit-node selector is a live `watch` cell so `Device::set_exit_node` can change it at
+        // runtime. `new_with_exit_tx` returns the `Sender` (mutation capability) separately so it is
+        // retained privately on the `Runtime`, while only the `Receiver` (the readers' contract)
+        // lives on the cloned `Env`. The initial value comes from `ForwarderConfig.exit_node`.
+        let (env, exit_node_tx) = Env::new_with_exit_tx(
             keys,
             shutdown_rx,
             env::ForwarderConfig::from_control_config(&config),
@@ -192,7 +201,7 @@ impl Runtime {
                     // embedder configured an exit node. See `tun_actor::host_routes_from_node`.
                     tun_actor::HostRouteGating {
                         accept_routes: env.accept_routes,
-                        exit_node_configured: env.exit_node.is_some(),
+                        exit_node_configured: env.exit_node().is_some(),
                     },
                     // Reuse the forwarder netstack's overlay `Channel` for recursive / exit-node-DoH
                     // MagicDNS forwarding in the TUN datapath (TUN mode has no application netstack
@@ -227,6 +236,7 @@ impl Runtime {
             netstack,
             env,
             shutdown: shutdown_tx,
+            exit_node_tx,
         })
     }
 
@@ -399,6 +409,43 @@ impl Runtime {
             .ask(peer_tracker::Whois { addr })
             .await
             .map_err(Into::into)
+    }
+
+    /// Change the selected exit node at runtime (the equivalent of Go `tsnet`'s
+    /// `LocalClient.EditPrefs(ExitNodeID/ExitNodeIP)`), without recreating the device.
+    ///
+    /// Updates the live exit-node selector, then asks the peer tracker to re-broadcast the current
+    /// peer set so the route updater and source filter re-resolve the new selector immediately.
+    /// `None` clears the exit node (internet-bound traffic is then dropped, fail-closed, unless this
+    /// node egresses directly). The selection is re-resolved against the live peer set, so passing a
+    /// selector for a peer not yet in the netmap simply takes effect once that peer appears.
+    pub async fn set_exit_node(
+        &self,
+        selector: Option<ts_control::ExitNodeSelector>,
+    ) -> Result<(), Error> {
+        // Update the live cell every reader borrows from. `send_replace` keeps the value current
+        // even with no active receivers (none can have dropped while the runtime is up, but it is
+        // the right non-failing primitive here).
+        self.exit_node_tx.send_replace(selector);
+
+        // Trigger an immediate re-resolution: the route updater (outbound routes + DoH delegation)
+        // and the source filter (inbound validation) both recompute on an `Arc<PeerState>`, so a
+        // re-broadcast applies the new exit without waiting for the next netmap update.
+        self.peer_tracker
+            .upgrade()
+            .ok_or(Error {
+                kind: ErrorKind::ActorGone,
+                target_actor: None,
+                message_ty: None,
+            })?
+            .ask(peer_tracker::RepublishState)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// The currently-selected exit node, or `None` if none is selected.
+    pub fn exit_node(&self) -> Option<ts_control::ExitNodeSelector> {
+        self.env.exit_node()
     }
 
     /// Subscribe to netmap peer-change events.

@@ -6,6 +6,17 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.6.4](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.6.4) - 2026-06-08
+
+### Added
+- **`Device::set_exit_node(Option<ExitNodeSelector>)` — change the exit node at runtime** without
+  recreating the device (the equivalent of Go `tsnet`'s `LocalClient.EditPrefs(ExitNodeID/ExitNodeIP)`).
+  The selector (stable ID / tailnet IP / MagicDNS name) is the same type as `Config::exit_node`, is
+  re-resolved against the live peer set, and the outbound route + inbound source filter recompute
+  immediately; `None` clears the exit (fail-closed). Internally, `Env::exit_node` became a live
+  `watch` cell that both the route updater and source filter read each recompute, and the peer
+  tracker re-broadcasts its snapshot on a switch. Verified live (campaign scenario `s7`).
+
 ## [0.6.3](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.6.3) - 2026-06-07
 
 Open-source-readiness polish ahead of the public move to `github.com/GeiserX/tailscale-rs`
