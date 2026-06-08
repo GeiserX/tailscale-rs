@@ -155,7 +155,12 @@ pub async fn logout(
 ) -> Result<(), LogoutError> {
     let control_url = &config.server_url;
     let rpc = async {
-        let http2_conn = crate::tokio::connect(control_url, &node_keystate.machine_keys).await?;
+        let http2_conn = crate::tokio::connect(
+            control_url,
+            &node_keystate.machine_keys,
+            config.allow_http_key_fetch,
+        )
+        .await?;
         logout_with(config, control_url, node_keystate, &http2_conn).await
     };
 

@@ -133,7 +133,12 @@ pub async fn fetch_id_token(
 ) -> Result<String, IdTokenError> {
     let control_url = &config.server_url;
     let rpc = async {
-        let http2_conn = crate::tokio::connect(control_url, &node_keystate.machine_keys).await?;
+        let http2_conn = crate::tokio::connect(
+            control_url,
+            &node_keystate.machine_keys,
+            config.allow_http_key_fetch,
+        )
+        .await?;
         fetch_id_token_with(control_url, node_keystate, audience, &http2_conn).await
     };
 

@@ -138,7 +138,12 @@ pub async fn set_dns(
 ) -> Result<(), SetDnsError> {
     let control_url = &config.server_url;
     let rpc = async {
-        let http2_conn = crate::tokio::connect(control_url, &node_keystate.machine_keys).await?;
+        let http2_conn = crate::tokio::connect(
+            control_url,
+            &node_keystate.machine_keys,
+            config.allow_http_key_fetch,
+        )
+        .await?;
         set_dns_with(
             control_url,
             node_keystate,

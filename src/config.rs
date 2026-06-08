@@ -31,6 +31,16 @@ pub struct Config {
     /// The URL of the control server to connect to.
     pub control_server_url: url::Url,
 
+    /// Allow fetching the control server's machine public key (`GET /key`) over plain **http** when
+    /// [`control_server_url`](Config::control_server_url) is `http://`.
+    ///
+    /// By default (`false`) the key bootstrap is always upgraded to `https`, even for an `http://`
+    /// control URL — so registration **fails** against a control plane that only serves plain http
+    /// (e.g. a self-hosted Headscale on a `http://host:port` LAN endpoint / NodePort with no TLS).
+    /// Set `true` for such a deployment. Only safe when you control both ends over a trusted network
+    /// path; no effect when the control URL is `https://`. Fail-closed default is `false`.
+    pub allow_http_key_fetch: bool,
+
     /// The hostname this node will request.
     ///
     /// If left blank, uses the hostname reported by the OS.
@@ -429,6 +439,7 @@ impl From<&Config> for ts_control::Config {
             // `Device::listen_funnel` starts a listener. Not derived from the embedder config.
             ingress_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             advertise_services: value.advertise_services.clone(),
+            allow_http_key_fetch: value.allow_http_key_fetch,
         }
     }
 }
@@ -439,6 +450,7 @@ impl Default for Config {
             key_state: Default::default(),
             client_name: None,
             control_server_url: ts_control::DEFAULT_CONTROL_SERVER.clone(),
+            allow_http_key_fetch: false,
             requested_hostname: None,
             requested_tags: vec![],
             ephemeral: true,
