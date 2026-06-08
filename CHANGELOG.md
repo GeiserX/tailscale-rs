@@ -53,7 +53,14 @@ Put changes for the upcoming release here!
   The self-hosted lanes are gated to **never run code from fork PRs** (the runner has Docker-socket
   access) and check out with `persist-credentials: false`. No effect on consumers — build/test parity
   is unchanged.
-- Dependency bumps: `russh` 0.60.3 → 0.61.1 (security group) and a minor-and-patch group update.
+### Deferred
+- The `russh` 0.61.1 security bump (GHSA-wwx6-x28x-8259) is **not** in this release: russh 0.61.x
+  only resolves against a pre-release crypto subtree (`p256`/`p384`/`p521` 0.14.0-rc,
+  `curve25519-dalek` 5.0.0-rc) that conflicts with this workspace's core
+  `x25519-dalek`/`curve25519-dalek` pins and fails to compile the `ssh` feature. `russh` stays at
+  0.60.3. This affects only the optional, off-by-default `ssh` feature — the ring-only egress path
+  never pulls russh — so the advisory does not reach any shipping consumer. Tracked for a follow-up
+  that bumps the core crypto deps once the RC churn settles.
 
 ## [0.6.4](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.6.4) - 2026-06-08
 
