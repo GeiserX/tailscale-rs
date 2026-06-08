@@ -1,0 +1,66 @@
+name: provision self-hosted runner
+description: >-
+  Idempotently install the host build prerequisites this fork's self-hosted Linux/X64 runner
+  needs. The maintainer's runner is a stock `myoung34/github-runner` container (bare Ubuntu, no
+  Rust, no linker, no Python dev headers), so without this step a freshly (re)created runner fails:
+  `rustup: command not found` (Setup rust), `cc failed`/missing `-lpython3.12` (the ts_python
+  cdylib link), and `cargo: not found` inside `cross`. Running this first means any recreated
+  runner self-heals with no manual `docker exec` surgery. No-op on GitHub-hosted runners (those
+  ship all of this already), and every action below is idempotent so reruns are cheap.
+
+runs:
+  using: composite
+  steps:
+    - name: Provision build prerequisites (self-hosted only)
+      shell: bash
+      run: |
+        set -euo pipefail
+        # GitHub-hosted runners already have rustup + lld + python dev; skip there.
+        if [ "${RUNNER_ENVIRONMENT:-}" = "github-hosted" ]; then
+          echo "github-hosted runner: prerequisites already present, skipping provision"
+          exit 0
+        fi
+
+        SUDO=""
+        if [ "$(id -u)" -ne 0 ]; then SUDO="sudo"; fi
+
+        # System deps: lld (rustc links with -fuse-ld=lld), libpython3.12-dev (the ts_python
+        # pyo3 cdylib links -lpython3.12), plus the usual C toolchain / pkg-config / openssl
+        # headers. apt-get is idempotent; only runs when something is actually missing.
+        need_apt=0
+        command -v ld.lld >/dev/null 2>&1 || need_apt=1
+        command -v cc >/dev/null 2>&1 || need_apt=1
+        command -v pkg-config >/dev/null 2>&1 || need_apt=1
+        ldconfig -p 2>/dev/null | grep -q 'libpython3\.12' || need_apt=1
+        if [ "$need_apt" -eq 1 ]; then
+          export DEBIAN_FRONTEND=noninteractive
+          $SUDO apt-get update -qq
+          $SUDO apt-get install -y -qq \
+            lld python3.12-dev libpython3.12-dev pkg-config libssl-dev build-essential curl ca-certificates
+        else
+          echo "system build deps already present"
+        fi
+
+        # rustup: dtolnay/rust-toolchain (used by ./.github/actions/setup-rust) assumes rustup is
+        # already on PATH. Install it persistently to /opt/rust (shared, not per-job) if absent.
+        export RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo
+        if ! command -v rustup >/dev/null 2>&1 && [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+          $SUDO mkdir -p /opt/rust
+          $SUDO chown -R "$(id -u):$(id -g)" /opt/rust 2>/dev/null || true
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --no-modify-path --default-toolchain none --profile minimal
+        else
+          echo "rustup already installed"
+        fi
+
+        # Make the toolchain + anything `cargo binstall` drops (e.g. `cross`) visible to every
+        # later step's shell — including the minimal shell `cross` itself spawns.
+        echo "RUSTUP_HOME=/opt/rust/rustup" >> "$GITHUB_ENV"
+        echo "CARGO_HOME=/opt/rust/cargo" >> "$GITHUB_ENV"
+        echo "/opt/rust/cargo/bin" >> "$GITHUB_PATH"
+        # Also expose it to non-login /bin/sh invocations (cross shells out to `cargo` via sh).
+        $SUDO ln -sf /opt/rust/cargo/bin/* /usr/local/bin/ 2>/dev/null || true
+
+        echo "provision complete:"
+        /opt/rust/cargo/bin/rustup --version 2>/dev/null || true
+        ld.lld --version | head -1

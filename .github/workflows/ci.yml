@@ -75,6 +75,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      # The self-hosted runner is a stock bare-Ubuntu container; self-heal its build prereqs
+      # (rustup, lld, libpython3.12-dev) so a freshly (re)created runner Just Works.
+      - name: Provision self-hosted runner
+        uses: ./.github/actions/provision-self-hosted
       - name: Setup rust
         id: setup-rust
         uses: ./.github/actions/setup-rust
@@ -239,6 +243,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      # Self-heal the bare-Ubuntu self-hosted runner's build prereqs (see hosted_test).
+      - name: Provision self-hosted runner
+        uses: ./.github/actions/provision-self-hosted
       - name: Setup rust
         id: setup-rust
         uses: ./.github/actions/setup-rust
