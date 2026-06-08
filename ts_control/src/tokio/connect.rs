@@ -154,10 +154,11 @@ impl fmt::Display for ControlPublicKeys {
 pub async fn connect(
     control_url: &Url,
     machine_keys: &MachineKeyPair,
+    allow_http_key_fetch: bool,
 ) -> Result<Http2<BytesBody>, ConnectionError> {
     let h1_client = connect_h1(control_url).await?;
 
-    let control_public_key = fetch_control_key(control_url).await?;
+    let control_public_key = fetch_control_key(control_url, allow_http_key_fetch).await?;
 
     let (handshake, init_msg) = ts_control_noise::Handshake::initialize(
         &CONTROL_PROTOCOL_VERSION,
@@ -188,12 +189,37 @@ async fn connect_h1(url: &Url) -> Result<ts_http_util::Http1<EmptyBody>, Connect
     }
 }
 
-#[tracing::instrument(skip_all, fields(%control_url), ret, err, level = "trace")]
-pub async fn fetch_control_key(control_url: &Url) -> Result<MachinePublicKey, ConnectionError> {
+/// Build the `/key` fetch URL, applying the http→https upgrade policy.
+///
+/// Pure (no I/O) so the scheme decision is unit-testable. By default the unauthenticated key
+/// bootstrap is upgraded to `https` even for an `http://` control URL; the upgrade is skipped when
+/// the caller opts into http (`allow_http_key_fetch`) or the `insecure-keyfetch` build feature is
+/// on. An `https://` control URL is unaffected (already https). `set_scheme` only fails as a no-op
+/// when the scheme is unchanged, so its result is intentionally ignored.
+fn key_fetch_url(control_url: &Url, allow_http_key_fetch: bool) -> Result<Url, url::ParseError> {
     let mut key_url = control_url.join("/key")?;
+    let force_https = !allow_http_key_fetch && !cfg!(feature = "insecure-keyfetch");
+    if force_https {
+        let _ = key_url.set_scheme("https");
+    }
+    Ok(key_url)
+}
 
-    #[cfg(not(feature = "insecure-keyfetch"))]
-    key_url.set_scheme("https").unwrap();
+/// Fetch the control server's machine public key from `GET /key`.
+///
+/// The `/key` bootstrap is unauthenticated, so by default it is forced over `https` even when the
+/// control URL is `http://`. Pass `allow_http_key_fetch = true` (from
+/// [`Config::allow_http_key_fetch`](crate::Config::allow_http_key_fetch)) to fetch it over the same
+/// `http` scheme as the control URL — required for a plain-http control plane (e.g. a self-hosted
+/// Headscale on a `http://host:port` LAN endpoint), and only safe over a trusted network path. The
+/// compile-time `insecure-keyfetch` feature forces http unconditionally (build-time escape hatch);
+/// the runtime flag is the per-deployment knob and supersedes the need for that feature.
+#[tracing::instrument(skip_all, fields(%control_url, allow_http_key_fetch), ret, err, level = "trace")]
+pub async fn fetch_control_key(
+    control_url: &Url,
+    allow_http_key_fetch: bool,
+) -> Result<MachinePublicKey, ConnectionError> {
+    let mut key_url = key_fetch_url(control_url, allow_http_key_fetch)?;
 
     if key_url.scheme() == "http" {
         tracing::warn!("fetching control key over insecure http");
@@ -320,6 +346,43 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
     use super::*;
+
+    // The `insecure-keyfetch` build feature forces http unconditionally; these scheme-policy tests
+    // assert the DEFAULT (feature-off) behavior, so skip them when it's on.
+    #[cfg(not(feature = "insecure-keyfetch"))]
+    mod key_fetch_scheme {
+        use url::Url;
+
+        use super::super::key_fetch_url;
+
+        /// An `http://` control URL upgrades the key fetch to `https` by default (fail-closed).
+        #[test]
+        fn http_control_upgrades_to_https_by_default() {
+            let u = Url::parse("http://192.168.10.11:30443/").unwrap();
+            let key = key_fetch_url(&u, false).unwrap();
+            assert_eq!(key.scheme(), "https");
+            assert_eq!(key.path(), "/key");
+        }
+
+        /// With `allow_http_key_fetch = true`, an `http://` control URL fetches `/key` over http —
+        /// the fix that lets a plain-http LAN/NodePort control plane (e.g. Headscale) register.
+        #[test]
+        fn http_control_stays_http_when_allowed() {
+            let u = Url::parse("http://192.168.10.11:30443/").unwrap();
+            let key = key_fetch_url(&u, true).unwrap();
+            assert_eq!(key.scheme(), "http");
+            assert_eq!(key.host_str(), Some("192.168.10.11"));
+            assert_eq!(key.port(), Some(30443));
+        }
+
+        /// An `https://` control URL is unaffected by the flag — it stays https either way.
+        #[test]
+        fn https_control_stays_https_regardless() {
+            let u = Url::parse("https://controlplane.tailscale.com/").unwrap();
+            assert_eq!(key_fetch_url(&u, false).unwrap().scheme(), "https");
+            assert_eq!(key_fetch_url(&u, true).unwrap().scheme(), "https");
+        }
+    }
 
     /// Build a challenge packet: magic + big-endian length + JSON body.
     fn make_challenge(json: &[u8]) -> Vec<u8> {

@@ -189,6 +189,7 @@ impl ControlDialer {
         &mut self,
         url: &Url,
         machine_keys: &ts_keys::MachineKeyPair,
+        allow_http_key_fetch: bool,
     ) -> Result<Http2<BytesBody>, Error> {
         let next = self.next_dialer();
         tracing::trace!(selected_control_dialer = ?next);
@@ -208,7 +209,7 @@ impl ControlDialer {
             "tcp connection to control"
         );
 
-        let client = complete_connection(url, machine_keys, conn).await?;
+        let client = complete_connection(url, machine_keys, conn, allow_http_key_fetch).await?;
 
         Ok(client)
     }
@@ -223,6 +224,7 @@ pub async fn complete_connection<Io>(
     url: &Url,
     machine_keys: &ts_keys::MachineKeyPair,
     stream: Io,
+    allow_http_key_fetch: bool,
 ) -> Result<Http2<BytesBody>, Error>
 where
     Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -246,7 +248,7 @@ where
             return Err(Error::InvalidUrl(url.clone()));
         }
     };
-    let control_public_key = crate::tokio::fetch_control_key(url).await?;
+    let control_public_key = crate::tokio::fetch_control_key(url, allow_http_key_fetch).await?;
 
     let (handshake, init_msg) = ts_control_noise::Handshake::initialize(
         &crate::tokio::CONTROL_PROTOCOL_VERSION,

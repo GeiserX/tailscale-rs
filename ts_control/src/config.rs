@@ -346,6 +346,24 @@ pub struct Config {
     /// control to assign it a VIP and the node to be tagged (the *consume* side, unchanged here).
     #[serde(default)]
     pub advertise_services: Vec<String>,
+
+    /// Allow fetching the control server's machine public key (`GET /key`) over plain **http** when
+    /// the [`server_url`](Config::server_url) is itself `http://`.
+    ///
+    /// By default (`false`) the `/key` fetch is always upgraded to `https`, even when the control
+    /// URL is `http://` — matching Tailscale's posture that the unauthenticated key bootstrap must
+    /// be TLS-protected. That upgrade makes registration **fail** against a control plane that only
+    /// serves plain http (e.g. a self-hosted Headscale exposed over a `http://host:port` LAN
+    /// endpoint / NodePort with no TLS), even though the rest of the control connection already
+    /// honors the `http` scheme. Set this to `true` for such a deployment to fetch `/key` over the
+    /// same `http` scheme as the control URL.
+    ///
+    /// Security: only enable this when you control both ends and the control plane is reachable
+    /// over a trusted network path — an on-path attacker could otherwise substitute the control
+    /// key. It has no effect when `server_url` is `https://` (the fetch stays https regardless).
+    /// Fail-closed default is `false`.
+    #[serde(default)]
+    pub allow_http_key_fetch: bool,
 }
 
 impl Config {
@@ -533,6 +551,7 @@ impl Default for Config {
             wire_ingress: false,
             ingress_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             advertise_services: Vec::new(),
+            allow_http_key_fetch: false,
         }
     }
 }

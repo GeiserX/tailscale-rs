@@ -4,6 +4,17 @@ Record breaking or significant changes here. All dates are UTC.
 
 ## Unreleased - June 2026
 
+### Added
+- **`Config::allow_http_key_fetch`** (default `false`) — opt into fetching the control server's
+  machine public key (`GET /key`) over plain **http** when the control URL is `http://`. The `/key`
+  bootstrap was previously always upgraded to `https`, so a node could not register against a
+  control plane that only serves plain http (e.g. a self-hosted Headscale on an `http://host:port`
+  LAN endpoint / NodePort with no TLS) even though the rest of the control connection already honors
+  the `http` scheme — registration failed at the key fetch with a `ConnectToControlServer` network
+  error. Set this `true` for such a deployment (safe only over a trusted network path; no effect on
+  `https://` control URLs). Replaces the build-time-only `insecure-keyfetch` feature with a runtime
+  per-deployment knob; the feature still works as an unconditional build override.
+
 ### Changed
 - **Crate package names renamed to a `geiserx_` namespace for crates.io publication.** The bare
   `ts_*` package names collide with unrelated crates already on crates.io (names are global +

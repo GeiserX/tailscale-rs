@@ -36,7 +36,12 @@ impl AsyncControlClient {
     ) -> Result<(), Error> {
         let control_url = &config.server_url;
 
-        let h2_client = crate::tokio::connect(control_url, &node_keys.machine_keys).await?;
+        let h2_client = crate::tokio::connect(
+            control_url,
+            &node_keys.machine_keys,
+            config.allow_http_key_fetch,
+        )
+        .await?;
 
         crate::tokio::register(config, control_url, auth_key, node_keys, &h2_client).await?;
 
@@ -63,7 +68,12 @@ impl AsyncControlClient {
         let control_url = &config.server_url;
         let mut tasks = JoinSet::new();
 
-        let h2_client = crate::tokio::connect(control_url, &node_keys.machine_keys).await?;
+        let h2_client = crate::tokio::connect(
+            control_url,
+            &node_keys.machine_keys,
+            config.allow_http_key_fetch,
+        )
+        .await?;
         tracing::info!("connected to control, registering");
 
         crate::tokio::register(config, control_url, auth_key, node_keys, &h2_client).await?;
@@ -265,7 +275,11 @@ async fn run_once(
     session: &mut MapSession,
 ) -> Result<(), Error> {
     let h2_client = control_dialer
-        .full_connect_next(control_url, &node_keys.machine_keys)
+        .full_connect_next(
+            control_url,
+            &node_keys.machine_keys,
+            config.allow_http_key_fetch,
+        )
         .await?;
 
     crate::tokio::register(config, control_url, auth_key, node_keys, &h2_client).await?;
