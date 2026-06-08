@@ -13,12 +13,21 @@ The consumer-facing tsnet gaps the embedders actually hit are now closed and liv
   expiry. v0.6.5.
 - **Typed registration outcome** — `Device::wait_until_running(timeout) -> Result<(), RegistrationError>`
   + `Device::watch_state()` (`DeviceState` stream). Replaces poll-`ipv4_addr` loops; distinguishes
-  permanent (`AuthRejected`/`KeyExpired`/`NeedsLogin`) from transient (`NetworkUnreachable`). v0.6.5.
+  permanent (`AuthRejected`/`KeyExpired`) from recoverable (`NeedsLogin` — keeps retrying) and
+  transient (`NetworkUnreachable`). v0.6.5.
 - **Active exit node** — `Device::active_exit_node()` / `Status.active_exit_node` (Go
   `Status.ExitNodeStatus.ID`): the resolved, fail-closed engaged exit, not the configured selector.
   v0.6.5.
 - **WhoIs user + capabilities** — `WhoIs.capabilities` from the node `CapMap`; `WhoIs.user` from the
   netmap `UserProfiles` join. v0.6.5. *(Per-node `online`/`last_seen` still not retained.)*
+- **`russh` 0.61.2 security bump** (GHSA-wwx6-x28x-8259), ssh-feature-only; ring-only invariant
+  preserved. v0.6.5.
+
+Still open (tracked): **live Tailnet-Lock (TKA) enforcement** — verification is wired but the
+AUM-sync RPC + chain replayer aren't, so enforcement stays inert. The next step is **verify-and-log**
+(observe-only), not fail-closed enforcement, because the current both-ends-owned deployments treat
+control as trusted and the `ts_tka` crypto is unaudited — fail-closed on unaudited verification would
+risk a self-inflicted outage guarding an out-of-model threat. See issue #7.
 
 ## Where we are (v0.5.39 — near-complete tsnet parity)
 
