@@ -72,6 +72,10 @@ pub struct Runtime {
     fallback_tcp: Option<fallback_tcp::FallbackTcpManager>,
     env: Env,
     shutdown: watch::Sender<bool>,
+    /// Sender side of the exit-node selector `watch` cell. Held privately here (not on the cloned
+    /// `Env`, which keeps only the read side) so that only `Runtime::set_exit_node` can mutate the
+    /// selection; the route updater and source filter re-read it via [`Env::exit_node`].
+    exit_node_tx: watch::Sender<Option<ts_control::ExitNodeSelector>>,
 }
 
 impl Runtime {
@@ -82,7 +86,12 @@ impl Runtime {
         keys: ts_keys::NodeState,
     ) -> Result<Self, Error> {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let env = Env::new(
+
+        // The exit-node selector is a live `watch` cell so `Device::set_exit_node` can change it at
+        // runtime. `new_with_exit_tx` returns the `Sender` (mutation capability) separately so it is
+        // retained privately on the `Runtime`, while only the `Receiver` (the readers' contract)
+        // lives on the cloned `Env`. The initial value comes from `ForwarderConfig.exit_node`.
+        let (env, exit_node_tx) = Env::new_with_exit_tx(
             keys,
             shutdown_rx,
             env::ForwarderConfig::from_control_config(&config),
@@ -192,7 +201,7 @@ impl Runtime {
                     // embedder configured an exit node. See `tun_actor::host_routes_from_node`.
                     tun_actor::HostRouteGating {
                         accept_routes: env.accept_routes,
-                        exit_node_configured: env.exit_node.is_some(),
+                        exit_node_configured: env.exit_node().is_some(),
                     },
                     // Reuse the forwarder netstack's overlay `Channel` for recursive / exit-node-DoH
                     // MagicDNS forwarding in the TUN datapath (TUN mode has no application netstack
@@ -227,6 +236,7 @@ impl Runtime {
             netstack,
             env,
             shutdown: shutdown_tx,
+            exit_node_tx,
         })
     }
 
@@ -416,7 +426,7 @@ impl Runtime {
         // Update the live cell every reader borrows from. `send_replace` keeps the value current
         // even with no active receivers (none can have dropped while the runtime is up, but it is
         // the right non-failing primitive here).
-        self.env.exit_node_tx.send_replace(selector);
+        self.exit_node_tx.send_replace(selector);
 
         // Trigger an immediate re-resolution: the route updater (outbound routes + DoH delegation)
         // and the source filter (inbound validation) both recompute on an `Arc<PeerState>`, so a
@@ -431,6 +441,11 @@ impl Runtime {
             .ask(peer_tracker::RepublishState)
             .await
             .map_err(Into::into)
+    }
+
+    /// The currently-selected exit node, or `None` if none is selected.
+    pub fn exit_node(&self) -> Option<ts_control::ExitNodeSelector> {
+        self.env.exit_node()
     }
 
     /// Subscribe to netmap peer-change events.

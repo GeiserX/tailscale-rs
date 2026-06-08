@@ -200,7 +200,11 @@ impl RouteUpdater {
         // chosen peer — the cryptokey-routing coupling the comment below depends on.
         // Snapshot the live exit-node selector once per rebuild (it can change at runtime via
         // `Device::set_exit_node`); use this single value for resolution + the satisfied check + the
-        // trace below so they can't disagree within one rebuild.
+        // trace below so they can't disagree within one rebuild. Across a back-to-back runtime
+        // switch this actor and the source filter may briefly read different selector values (each
+        // reads the cell when it processes the re-broadcast `PeerState`), but both converge on the
+        // next queued message and both only ever resolve to a validly-selected exit — the anti-leak
+        // coupling never admits a non-exit peer.
         let exit_node_selector = self.env.exit_node();
         let exit_node_id = exit_node_selector
             .as_ref()
