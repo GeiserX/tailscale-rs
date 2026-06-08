@@ -4,15 +4,20 @@
 //! [`PeerTracker`](crate::peer_tracker::PeerTracker)) to embedders, mirroring tsnet's
 //! `LocalClient::Status`, `WhoIs`, and `WatchIPNBus`.
 //!
-//! ## Capability / user gap (do not fabricate)
+//! ## Capability / user / online surfacing (do not fabricate)
 //!
 //! tsnet's `Status`/`WhoIs` also carry per-node *online* state, the owning *user* (login/profile),
-//! and a *capability map*. The wire format does carry these (`ts_control_serde::Node::online`,
-//! `last_seen`, `cap_map`, and the `UserProfiles` table), but this fork's domain
-//! [`Node`](ts_control::Node) — produced by `From<&ts_control_serde::Node>` — currently drops them.
-//! Until the domain `Node` is extended to retain them, [`WhoIs::user`] and [`WhoIs::capabilities`]
-//! are always empty and `StatusPeer::online` is always `None`. We surface what the domain model
-//! actually holds rather than inventing values.
+//! and a *capability map*. Status of each in this fork:
+//! - **Capabilities** — surfaced: [`WhoIs::capabilities`] is populated from the domain
+//!   [`Node`](ts_control::Node)'s `cap_map` (the control-pushed `CapMap`), which the domain model
+//!   retains.
+//! - **User (login/profile)** — surfaced when the netmap provided it: [`WhoIs::user`] is the owning
+//!   user's login/display name, resolved by joining the node's owning user id against the netmap's
+//!   `UserProfiles` table (accumulated by the [`PeerTracker`](crate::peer_tracker::PeerTracker)
+//!   across delta updates). `None` when control sent no profile for that user.
+//! - **Online state** — still a gap: the domain `Node` does not retain the wire-level `online` /
+//!   `last_seen` fields, so `StatusNode::online` is always `None`. We surface what the domain model
+//!   actually holds rather than inventing a value.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -28,6 +33,13 @@ pub struct Status {
     pub self_node: Option<StatusNode>,
     /// Every peer currently known in the netmap.
     pub peers: Vec<StatusNode>,
+    /// The stable id of the exit node traffic is **currently** egressing through, if any (Go's
+    /// `Status.ExitNodeStatus.ID`). This is the *resolved + fail-closed* answer from the route
+    /// updater — `None` when no exit node is configured, the configured selector matches no peer, or
+    /// the matched peer no longer advertises a default route — so it reflects what is actually
+    /// engaged, not merely what [`Config::exit_node`](ts_control::Config) requested. Find the peer's
+    /// details by matching this id against [`peers`](Status::peers).
+    pub active_exit_node: Option<StableNodeId>,
 }
 
 /// A single node entry in a [`Status`] snapshot.
@@ -95,19 +107,28 @@ pub struct WhoIs {
     pub user: Option<String>,
     /// The node's capability map, as `(capability, args)` pairs.
     ///
-    /// Always empty in this fork: the domain [`Node`](ts_control::Node) does not retain the
-    /// wire-level `cap_map` (see the module-level capability/user gap note).
+    /// Populated from the domain [`Node`](ts_control::Node)'s `cap_map` (the control-pushed
+    /// `CapMap`), sorted by capability name (the underlying map is a `BTreeMap`). Empty when control
+    /// granted the node no capabilities. Mirrors tsnet's `WhoIsResponse.CapMap`.
     pub capabilities: Vec<(String, Vec<String>)>,
 }
 
 impl WhoIs {
-    /// Build a [`WhoIs`] from the owning node. User and capabilities are left empty because the
-    /// domain `Node` does not carry them (see the module-level gap note).
-    pub(crate) fn from_node(node: Node) -> Self {
+    /// Build a [`WhoIs`] from the owning node and its resolved owner login/display name (if the
+    /// netmap's `UserProfiles` table mapped the node's owning user id to a profile; `None` when
+    /// control sent no profile — e.g. a tagged node with no human owner).
+    ///
+    /// `capabilities` is always populated from the node's `cap_map`.
+    pub(crate) fn from_node_with_user(node: Node, user: Option<String>) -> Self {
+        let capabilities = node
+            .cap_map
+            .iter()
+            .map(|(cap, args)| (cap.clone(), args.clone()))
+            .collect();
         Self {
             node,
-            user: None,
-            capabilities: Vec::new(),
+            user,
+            capabilities,
         }
     }
 }
@@ -128,6 +149,7 @@ mod tests {
             id: 1,
             stable_id: StableNodeId(stable.to_string()),
             hostname: hostname.to_string(),
+            user_id: 0,
             tailnet: tailnet.map(str::to_string),
             tags: vec![],
             tailnet_address: TailnetAddress {
@@ -196,14 +218,52 @@ mod tests {
     }
 
     #[test]
-    fn whois_user_and_caps_gap() {
-        // WhoIs surfaces the owning node but cannot surface user/caps in this fork; assert we
-        // expose the gap rather than fabricating data.
+    fn whois_caps_empty_when_node_has_none() {
+        // A node with no cap_map surfaces empty capabilities (not fabricated), and no user unless a
+        // profile was joined in.
         let n = node("n1", "host", Some("ts.net"), "100.64.0.9");
-        let whois = WhoIs::from_node(n.clone());
+        let whois = WhoIs::from_node_with_user(n.clone(), None);
 
         assert_eq!(whois.node, n);
         assert_eq!(whois.user, None);
         assert!(whois.capabilities.is_empty());
+    }
+
+    #[test]
+    fn whois_populates_capabilities_from_cap_map() {
+        // WhoIs surfaces the domain Node's cap_map verbatim, sorted by capability name (BTreeMap).
+        let mut n = node("n1", "host", Some("ts.net"), "100.64.0.9");
+        n.cap_map
+            .insert("https://tailscale.com/cap/is-admin".to_string(), vec![]);
+        n.cap_map.insert(
+            "cap/ssh".to_string(),
+            vec!["root".to_string(), "ubuntu".to_string()],
+        );
+        let whois = WhoIs::from_node_with_user(n, None);
+
+        // BTreeMap iteration is sorted: "cap/ssh" < "https://…".
+        assert_eq!(
+            whois.capabilities,
+            vec![
+                (
+                    "cap/ssh".to_string(),
+                    vec!["root".to_string(), "ubuntu".to_string()]
+                ),
+                ("https://tailscale.com/cap/is-admin".to_string(), vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn whois_from_node_with_user_sets_user_and_caps() {
+        let mut n = node("n1", "host", Some("ts.net"), "100.64.0.9");
+        n.cap_map.insert("cap/x".to_string(), vec!["y".to_string()]);
+        let whois = WhoIs::from_node_with_user(n, Some("alice@example.com".to_string()));
+
+        assert_eq!(whois.user, Some("alice@example.com".to_string()));
+        assert_eq!(
+            whois.capabilities,
+            vec![("cap/x".to_string(), vec!["y".to_string()])]
+        );
     }
 }

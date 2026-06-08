@@ -95,6 +95,11 @@ pub struct StateUpdate {
     pub node: Option<crate::Node>,
     /// Updates to the set of peers in the netmap.
     pub peer_update: Option<PeerUpdate>,
+    /// User profiles (`MapResponse.UserProfiles`) carried by this response: the owner identity for
+    /// nodes, keyed by user id. Control sends these incrementally — only new or changed profiles
+    /// per response — so the consumer (the runtime's peer tracker) must **accumulate** them across
+    /// updates, not replace. Empty when this response carried none.
+    pub user_profiles: Vec<crate::UserProfile>,
     /// Send a ping request.
     pub ping: Option<PingRequest>,
     /// Update to the packet filter.
@@ -174,6 +179,11 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
                     .then(|| map_response.map_session_handle.to_owned()),
                 seq: map_response.seq,
                 peer_update,
+                user_profiles: map_response
+                    .user_profiles
+                    .iter()
+                    .map(crate::UserProfile::from)
+                    .collect(),
                 node: map_response.node.as_ref().map(Into::into),
                 derp: map_response
                     .derp_map

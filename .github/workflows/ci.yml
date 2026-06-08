@@ -63,7 +63,14 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     # Skip on tag pushes: this lane verifies code, and `publish` (which fires on tags) deliberately
     # does NOT depend on it, so re-running the full build+test on every release tag gates nothing.
-    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    # SECURITY: this runs on a self-hosted runner with Docker-socket access. Never let a PR from a
+    # FORK execute here (arbitrary code on the maintainer's infra = host-compromise path) — only same
+    # -repo branches (which a maintainer already controls) and direct pushes run on the self-hosted
+    # box. Fork PRs simply skip this lane.
+    if: >-
+      ${{ !startsWith(github.ref, 'refs/tags/')
+        && (github.event_name != 'pull_request'
+            || github.event.pull_request.head.repo.full_name == github.repository) }}
     # A hung cargo step shouldn't pin the self-hosted runner indefinitely; cap it.
     timeout-minutes: 60
     env:
@@ -75,6 +82,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # Don't leave the GITHUB_TOKEN persisted in .git/config on the persistent self-hosted
+          # runner (the checkout default) — these jobs never push, so the token is pure exposure.
+          persist-credentials: false
       # The self-hosted runner is a stock bare-Ubuntu container; self-heal its build prereqs
       # (rustup, lld, libpython3.12-dev) so a freshly (re)created runner Just Works.
       - name: Provision self-hosted runner
@@ -225,6 +236,11 @@ jobs:
   musl_static:
     name: musl static (${{ matrix.target.triple }})
     runs-on: [self-hosted, Linux, X64]
+    # SECURITY: same as `hosted_test` — never run a FORK PR's code on the self-hosted (Docker-socket)
+    # runner. Same-repo branches and direct pushes only; fork PRs skip this lane.
+    if: >-
+      ${{ github.event_name != 'pull_request'
+        || github.event.pull_request.head.repo.full_name == github.repository }}
     strategy:
       fail-fast: false
       matrix:
@@ -243,6 +259,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # See hosted_test: don't persist the token on the self-hosted runner (this lane won't push).
+          persist-credentials: false
       # Self-heal the bare-Ubuntu self-hosted runner's build prereqs (see hosted_test).
       - name: Provision self-hosted runner
         uses: ./.github/actions/provision-self-hosted

@@ -779,6 +779,7 @@ mod tests {
             id: 1,
             stable_id: StableNodeId("n1".to_string()),
             hostname: "host".to_string(),
+            user_id: 0,
             tailnet: Some("user.ts.net".to_string()),
             tags: vec![],
             tailnet_address: TailnetAddress {

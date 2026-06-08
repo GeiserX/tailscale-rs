@@ -1,6 +1,10 @@
 //! Peer delta update tracking.
 
-use std::{collections::HashSet, net::IpAddr, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    net::IpAddr,
+    sync::Arc,
+};
 
 use kameo::{
     actor::ActorRef,
@@ -8,7 +12,7 @@ use kameo::{
     reply::ReplySender,
 };
 use tokio::sync::watch;
-use ts_control::Node;
+use ts_control::{Node, UserId, UserProfile};
 use ts_transport::PeerId;
 
 use crate::{Error, env::Env, status::StatusNode};
@@ -25,6 +29,13 @@ pub struct PeerTracker {
     /// Latest peer snapshot, published on every netmap update so embedders can watch for peer
     /// changes ([`WatchNetmap`]).
     peer_watch: watch::Sender<Vec<StatusNode>>,
+    /// Accumulated netmap user profiles (`MapResponse.UserProfiles`), keyed by user id, joined
+    /// against a node's [`Node::user_id`](ts_control::Node::user_id) to resolve the owning user's
+    /// login/display name for a [`WhoIs`](crate::status::WhoIs). Control sends these incrementally
+    /// (only new/changed profiles per response), so this map **accumulates** across updates rather
+    /// than being replaced — a peer upserted in one response may reference a profile delivered in an
+    /// earlier one.
+    user_profiles: HashMap<UserId, UserProfile>,
     /// Tailnet-Lock (TKA) authority used to verify each peer's `key_signature` at the peer-trust
     /// chokepoint. When `Some`, enforcement is **active**: every upserted peer must present a
     /// signature this authority authorizes, or it is rejected (fail-closed). When `None` (always,
@@ -58,9 +69,19 @@ impl PeerTracker {
 
     fn whois_opt(&self, addr: std::net::SocketAddr) -> Option<crate::status::WhoIs> {
         let ip = crate::status::whois_addr(addr);
-        self.peer_by_tailnet_ip_opt(ip)
-            .cloned()
-            .map(crate::status::WhoIs::from_node)
+        let node = self.peer_by_tailnet_ip_opt(ip).cloned()?;
+        // Join the node's owning user id against the accumulated UserProfiles table to resolve a
+        // login/display name. `None` when control sent no profile for that user (e.g. tagged nodes
+        // with no human owner, or a profile not yet delivered).
+        let user = self.resolve_user(node.user_id);
+        Some(crate::status::WhoIs::from_node_with_user(node, user))
+    }
+
+    /// Resolve a user id to its best display label from the accumulated profile table.
+    fn resolve_user(&self, user_id: UserId) -> Option<String> {
+        self.user_profiles
+            .get(&user_id)
+            .and_then(UserProfile::best_label)
     }
 
     /// Whether `node` may be admitted to the peer db under the current Tailnet-Lock posture.
@@ -114,6 +135,7 @@ impl kameo::Actor for PeerTracker {
             pending_requests: Default::default(),
             seen_state_update: false,
             peer_watch,
+            user_profiles: HashMap::new(),
             // No live TKA authority source this wave (the `/machine/tka/sync` RPC + AUM replayer are
             // deferred); enforcement stays inactive until one is supplied. See `tka_authority`.
             tka_authority: None,
@@ -326,6 +348,13 @@ impl Message<Arc<ts_control::StateUpdate>> for PeerTracker {
         msg: Arc<ts_control::StateUpdate>,
         _ctx: &mut Context<Self, Self::Reply>,
     ) {
+        // Accumulate user profiles first — control sends them incrementally and a response may
+        // carry profiles with no peer delta (or peers that reference a profile from an earlier
+        // response), so this must happen before the no-peer-update early return below.
+        for profile in &msg.user_profiles {
+            self.user_profiles.insert(profile.id, profile.clone());
+        }
+
         let Some(peer_update) = &msg.peer_update else {
             return;
         };
@@ -476,6 +505,7 @@ impl PeerTracker {
             seen_state_update: false,
             pending_requests: Vec::new(),
             peer_watch,
+            user_profiles: HashMap::new(),
             tka_authority,
             env,
         }
@@ -578,6 +608,7 @@ mod tka_tests {
             id: 1,
             stable_id: StableNodeId(stable_id.to_string()),
             hostname: stable_id.to_string(),
+            user_id: 0,
             tailnet: Some("ts.net".to_string()),
             tags: Vec::new(),
             tailnet_address: TailnetAddress {
@@ -847,5 +878,69 @@ mod tka_tests {
         tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![resynced.clone()]));
         assert_eq!(tracker.peer_db.peers().len(), 1);
         assert!(tracker.peer_db.get(&resynced.node_key).is_some());
+    }
+
+    /// A node's `user_id` joins against the accumulated UserProfiles table to resolve the owning
+    /// user's login name in `WhoIs.user`. With no matching profile, `user` is `None` (the
+    /// pre-existing behavior); once a profile arrives, the same node resolves to its login. This
+    /// proves the accumulate-then-join path the netmap handler builds.
+    fn profile(id: ts_control::UserId, login: &str) -> ts_control::UserProfile {
+        ts_control::UserProfile {
+            id,
+            login_name: login.to_string(),
+            display_name: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn whois_resolves_user_from_accumulated_profiles() {
+        let mut tracker = PeerTracker::for_test(test_env(), None);
+
+        // A peer owned by user id 42 at 100.64.0.1 (the peer_node fixture's address).
+        let mut peer = peer_node("p", NODE_KEY_BYTES, Vec::new());
+        peer.user_id = 42;
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer]));
+        let addr = "100.64.0.1:0".parse().unwrap();
+
+        // No profile yet: the node resolves but its owner is unknown.
+        let who = tracker.whois_opt(addr).expect("peer is known");
+        assert_eq!(who.user, None);
+
+        // Profile for a DIFFERENT user must not match.
+        tracker
+            .user_profiles
+            .insert(7, profile(7, "someone-else@example.com"));
+        assert_eq!(tracker.whois_opt(addr).unwrap().user, None);
+
+        // The owning user's profile arrives (as the netmap handler would accumulate it): now the
+        // login resolves.
+        tracker
+            .user_profiles
+            .insert(42, profile(42, "alice@example.com"));
+        assert_eq!(
+            tracker.whois_opt(addr).unwrap().user,
+            Some("alice@example.com".to_string())
+        );
+    }
+
+    /// `UserProfile::best_label` prefers the login name, falling back to display name, else `None`.
+    #[test]
+    fn user_profile_best_label_prefers_login() {
+        assert_eq!(
+            profile(1, "alice@example.com").best_label(),
+            Some("alice@example.com".to_string())
+        );
+        let display_only = ts_control::UserProfile {
+            id: 2,
+            login_name: String::new(),
+            display_name: Some("Bob".to_string()),
+        };
+        assert_eq!(display_only.best_label(), Some("Bob".to_string()));
+        let empty = ts_control::UserProfile {
+            id: 3,
+            login_name: String::new(),
+            display_name: None,
+        };
+        assert_eq!(empty.best_label(), None);
     }
 }

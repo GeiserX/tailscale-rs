@@ -550,6 +550,7 @@ mod test {
                 .collect(),
 
             hostname: rand_string(&mut rng, 32),
+            user_id: rng.random(),
             tailnet: rng.random::<bool>().then_some(rand_string(&mut rng, 32)),
 
             node_key_expiry: None,
@@ -952,6 +953,7 @@ mod test {
                     stable_id: StableNodeId(stable_id),
 
                     hostname: name,
+                    user_id: 0,
                     tailnet: has_tailnet.then_some(tailnet),
 
                     node_key: node_key.into(),

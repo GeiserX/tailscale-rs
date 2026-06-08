@@ -80,6 +80,7 @@ mod tests {
             id: 1,
             stable_id: StableNodeId("n1".to_string()),
             hostname: "router".to_string(),
+            user_id: 0,
             tailnet: Some("ts.net".to_string()),
             tags: vec![],
             tailnet_address: TailnetAddress {

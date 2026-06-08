@@ -318,6 +318,18 @@ async fn s7_runtime_exit_node_switch() {
         .expect("set_exit_node(None) must clear without error");
     eprintln!("[s7] exit-node set + cleared at runtime, no panic");
 
+    // After clearing, the *active* (resolved, fail-closed) exit node must be None — there is no
+    // configured selector to resolve. (While set above, the active exit stays None too unless the
+    // chosen peer actually advertises a default route, which standing test peers generally don't —
+    // active_exit_node reports the engaged exit, not merely the configured one.)
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let active = dev.active_exit_node();
+    eprintln!("[s7] active_exit_node after clear = {active:?}");
+    assert_eq!(
+        active, None,
+        "active exit node must be None after clearing the selector"
+    );
+
     // The device is still alive and usable after the switches (netstack didn't die).
     let ip_after = dev
         .ipv4_addr()
@@ -327,4 +339,83 @@ async fn s7_runtime_exit_node_switch() {
         is_cgnat(ip_after),
         "device healthy after runtime exit switches: {ip_after}"
     );
+}
+
+/// Scenario 8: LOGOUT (control-plane deregister). `Device::logout` re-POSTs `/machine/register`
+/// with a past expiry (the Go `tsnet` `LocalClient.Logout` equivalent), expiring the node at
+/// control. Joins, confirms an assigned IP, logs out, and asserts the RPC succeeds against real
+/// Tailscale — then a second logout must also succeed (idempotent: an already-expired node still
+/// answers 2xx). The local datapath is untouched by logout, so the device still serves its IP
+/// until it is dropped/shut down.
+#[tokio::test]
+async fn s8_logout_deregisters_node() {
+    if gated().is_none() {
+        return;
+    }
+    let dev = join("logout").await;
+    let ip = dev.ipv4_addr().await.expect("ip before logout");
+    eprintln!("[s8] joined as {ip}, logging out");
+
+    timeout(Duration::from_secs(30), dev.logout())
+        .await
+        .expect("logout within timeout")
+        .expect("logout must succeed against real control");
+    eprintln!("[s8] logout #1 OK (node expired at control)");
+
+    // Idempotent: logging out an already-expired node still returns Ok (control accepts the
+    // re-register-with-past-expiry; the node is simply already gone).
+    timeout(Duration::from_secs(30), dev.logout())
+        .await
+        .expect("second logout within timeout")
+        .expect("logout is idempotent");
+    eprintln!("[s8] logout #2 OK (idempotent)");
+
+    // Logout is a control-plane state change only: the local datapath is still up, so the device
+    // continues to serve its assigned IP until it is dropped.
+    let ip_after = dev
+        .ipv4_addr()
+        .await
+        .expect("device still serves its IP after logout (datapath untouched)");
+    assert!(
+        is_cgnat(ip_after),
+        "device healthy after logout: {ip_after}"
+    );
+    eprintln!("[s8] datapath intact after logout; tearing down");
+}
+
+/// Scenario 9: REGISTRATION OUTCOME (`wait_until_running` + `watch_state`). With a valid auth key,
+/// `Device::wait_until_running` must resolve `Ok(())` against real control (the typed equivalent of
+/// Go `tsnet`'s "wait until Running"), and the device-state watcher must report
+/// [`DeviceState::Running`]. Proves the registration-outcome signal the NVC bridge needs to replace
+/// its poll-`ipv4_addr` loop.
+#[tokio::test]
+async fn s9_wait_until_running_reports_running() {
+    let Some(auth) = gated() else { return };
+    let suffix: u32 = rand::random();
+    let config = Config {
+        requested_hostname: Some(format!("tsrs-e2e-waitrun-{suffix:08x}")),
+        ..Config::default()
+    };
+    let dev = timeout(JOIN_TIMEOUT, Device::new(&config, Some(auth)))
+        .await
+        .expect("Device::new within timeout")
+        .expect("device construction");
+
+    // The clean replacement for polling ipv4_addr(): a valid auth key resolves Ok(()) once the
+    // node is registered + running.
+    timeout(JOIN_TIMEOUT, dev.wait_until_running(Some(JOIN_TIMEOUT)))
+        .await
+        .expect("wait_until_running within outer timeout")
+        .expect("a valid auth key must reach Running, not a typed RegistrationError");
+    eprintln!("[s9] wait_until_running -> Ok(Running)");
+
+    // The state watcher reflects Running, and an IP is assigned (registration really completed).
+    assert_eq!(
+        dev.device_state(),
+        tailscale::DeviceState::Running,
+        "device must report Running after wait_until_running succeeds"
+    );
+    let ip = dev.ipv4_addr().await.expect("assigned ipv4 once Running");
+    assert!(is_cgnat(ip), "Running node has a CGNAT IP: {ip}");
+    eprintln!("[s9] device_state=Running, ip={ip}");
 }

@@ -3,6 +3,23 @@
 > **Goal:** a complete pure-Rust port of Go `tsnet`. This document is the durable plan; live
 > status is tracked in beads (`bd list`, prefix `tsr`).
 
+## Recently closed (v0.6.4–v0.6.5)
+
+The consumer-facing tsnet gaps the embedders actually hit are now closed and live-verified against
+`controlplane.tailscale.com`:
+
+- **Runtime exit-node switch** — `Device::set_exit_node` (Go `EditPrefs(ExitNodeID/IP)`). v0.6.4.
+- **Logout / deregister** — `Device::logout` (Go `LocalClient.Logout`): re-register with a past
+  expiry. v0.6.5.
+- **Typed registration outcome** — `Device::wait_until_running(timeout) -> Result<(), RegistrationError>`
+  + `Device::watch_state()` (`DeviceState` stream). Replaces poll-`ipv4_addr` loops; distinguishes
+  permanent (`AuthRejected`/`KeyExpired`/`NeedsLogin`) from transient (`NetworkUnreachable`). v0.6.5.
+- **Active exit node** — `Device::active_exit_node()` / `Status.active_exit_node` (Go
+  `Status.ExitNodeStatus.ID`): the resolved, fail-closed engaged exit, not the configured selector.
+  v0.6.5.
+- **WhoIs user + capabilities** — `WhoIs.capabilities` from the node `CapMap`; `WhoIs.user` from the
+  netmap `UserProfiles` join. v0.6.5. *(Per-node `online`/`last_seen` still not retained.)*
+
 ## Where we are (v0.5.39 — near-complete tsnet parity)
 
 Crucially, the fork is **more mature than its own stale README suggests**:
