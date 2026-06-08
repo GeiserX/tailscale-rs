@@ -105,7 +105,7 @@ tokio-util = { version = "0.7", default-features = false }
 tracing = { version = "0.1", default-features = false, features = ["attributes"] }
 tracing-test = "0.2"
 url = { version = "2", default-features = false }
-x25519-dalek = { version = "3.0.0-pre.6", features = ["getrandom", "reusable_secrets", "static_secrets"] }
+x25519-dalek = { version = "3.0.0-rc.0", features = ["getrandom", "reusable_secrets", "static_secrets"] }
 # Project Wycheproof adversarial primitive test vectors (dev-only). Ring-clean: pulls only
 # serde / serde_json / data-encoding, NO aws-lc/openssl/ring — safe for the ring-only invariant.
 wycheproof = "0.6"
@@ -237,7 +237,7 @@ pty-process = { version = "0.5", optional = true, features = ["async"] }
 rand.workspace = true
 ratatui = { version = "0.30", optional = true }
 # exclude rsa to avoid https://rustsec.org/advisories/RUSTSEC-2023-0071
-russh = { version = "0.60.3", optional = true, default-features = false, features = ["flate2", "aws-lc-rs"] }
+russh = { version = "0.61.2", optional = true, default-features = false, features = ["flate2", "aws-lc-rs"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

@@ -53,14 +53,18 @@ Put changes for the upcoming release here!
   The self-hosted lanes are gated to **never run code from fork PRs** (the runner has Docker-socket
   access) and check out with `persist-credentials: false`. No effect on consumers — build/test parity
   is unchanged.
-### Deferred
-- The `russh` 0.61.1 security bump (GHSA-wwx6-x28x-8259) is **not** in this release: russh 0.61.x
-  only resolves against a pre-release crypto subtree (`p256`/`p384`/`p521` 0.14.0-rc,
-  `curve25519-dalek` 5.0.0-rc) that conflicts with this workspace's core
-  `x25519-dalek`/`curve25519-dalek` pins and fails to compile the `ssh` feature. `russh` stays at
-  0.60.3. This affects only the optional, off-by-default `ssh` feature — the ring-only egress path
-  never pulls russh — so the advisory does not reach any shipping consumer. Tracked for a follow-up
-  that bumps the core crypto deps once the RC churn settles.
+### Security
+- **`russh` 0.60.3 → 0.61.2**, clearing GHSA-wwx6-x28x-8259 (a negotiated-compression "ZIP bomb"
+  that bypassed the max-packet-size check → OOM/DoS). russh `0.61.1` itself does not build (its
+  `p256` rc pin resolves against an incompatible `primefield` rc — upstream russh#720); `0.61.2`
+  bumps the whole RustCrypto subtree to the coherent rc generation and compiles. This required moving
+  the workspace's `x25519-dalek` pin `3.0.0-pre.6 → 3.0.0-rc.0` (russh 0.61.2 hard-pins
+  `curve25519-dalek = 5.0.0-rc.0`, and the two release in lockstep) — a forward step on the same
+  pre-release line the core WireGuard handshake already used, not a new pre-release dependency. The
+  ring-only egress invariant is preserved (aws-lc-rs remains absent from the default graph; `cargo
+  deny --no-default-features` passes), and the WireGuard handshake + Wycheproof x25519 vectors
+  (`ts_keys`/`ts_tunnel`) pass unchanged on the new pin. `russh` remains optional / off-by-default
+  (`ssh` feature only).
 
 ## [0.6.4](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.6.4) - 2026-06-08
 
