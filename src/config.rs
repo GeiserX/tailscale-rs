@@ -270,6 +270,21 @@ impl Config {
         })
     }
 
+    /// Run the application overlay over a real kernel **TUN** interface instead of the default
+    /// userspace netstack — a builder shortcut for setting
+    /// [`transport_mode`](Config::transport_mode) to
+    /// [`TransportMode::Tun`](ts_control::TransportMode::Tun).
+    ///
+    /// `name` is the desired interface name (`None` lets the OS pick, e.g. `utunN` on macOS); `mtu`
+    /// is the interface MTU (`None` uses the transport default; Tailscale's overlay MTU is 1280).
+    /// TUN mode requires root / `CAP_NET_ADMIN` and the engine's `tun` feature to be enabled.
+    /// Chainable: `Config::default().use_tun(Some("tailscale0".into()), None)`.
+    #[must_use]
+    pub fn use_tun(mut self, name: Option<String>, mtu: Option<u16>) -> Self {
+        self.transport_mode = ts_control::TransportMode::Tun(ts_control::TunConfig { name, mtu });
+        self
+    }
+
     /// Construct a default config, setting certain fields from environment variables.
     ///
     /// The fields are only set if the corresponding environment variable is present, using
@@ -578,6 +593,37 @@ mod tests {
         // The IPv6-off posture is the safe default: enabling overlay IPv6 must be an explicit opt-in.
         let control: ts_control::Config = (&Config::default()).into();
         assert!(!control.enable_ipv6);
+    }
+
+    /// `use_tun` is a chainable builder that sets `transport_mode` to `Tun(TunConfig { name, mtu })`,
+    /// and the selection threads through to the control config. Also exercises the facade re-exports
+    /// `tailscale::TransportMode` / `tailscale::TunConfig` by naming them without the `ts_control::`
+    /// path (the whole point of the re-export — a downstream crate can use only the facade).
+    #[test]
+    fn use_tun_builder_sets_transport_mode() {
+        use crate::{TransportMode, TunConfig};
+
+        // Default is netstack.
+        assert_eq!(Config::default().transport_mode, TransportMode::Netstack);
+
+        let cfg = Config::default().use_tun(Some("tailscale0".to_string()), Some(1280));
+        assert_eq!(
+            cfg.transport_mode,
+            TransportMode::Tun(TunConfig {
+                name: Some("tailscale0".to_string()),
+                mtu: Some(1280),
+            })
+        );
+
+        // The selection crosses the From<&Config> boundary into the control config.
+        let control: ts_control::Config = (&cfg).into();
+        assert_eq!(
+            control.transport_mode,
+            TransportMode::Tun(TunConfig {
+                name: Some("tailscale0".to_string()),
+                mtu: Some(1280),
+            })
+        );
     }
 }
 

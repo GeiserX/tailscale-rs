@@ -4,7 +4,15 @@ Record breaking or significant changes here. All dates are UTC.
 
 ## Unreleased - June 2026
 
-Put changes for the upcoming release here!
+### Added
+- **Re-export `TransportMode` and `TunConfig` from the crate facade**, and a chainable
+  **`Config::use_tun(name, mtu)`** builder. `Config::transport_mode` was already public, but the
+  `TransportMode`/`TunConfig` types were only reachable via `ts_control::`, forcing a downstream
+  crate that uses only the `tailscale` facade to add a direct `ts_control` dependency just to select
+  TUN mode. Now `tailscale::TransportMode` / `tailscale::TunConfig` are exported, and
+  `Config::default().use_tun(Some("tailscale0".into()), None)` sets `transport_mode` to
+  `Tun(TunConfig { name, mtu })` in one call. Additive and backward-compatible; TUN mode still
+  requires root/`CAP_NET_ADMIN` and the engine `tun` feature.
 
 ## [0.6.6](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.6.6) - 2026-06-08
 
