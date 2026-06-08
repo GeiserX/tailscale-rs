@@ -50,38 +50,29 @@ defaults:
     shell: bash
 
 jobs:
-  # GitHub-HOSTED (`ubuntu-latest`) build/test/lint lane. The inherited `build_test` matrix below
-  # targets self-hosted runner labels (`linux-x86_64-16cpu`, etc.) that DO NOT EXIST on this fork, so
-  # those jobs queue forever and never report. This lane runs the same core verification on a runner
-  # that actually exists, so the `rust` workflow has a real green signal. ring-only, default features
+  # Self-hosted Linux/X64 build/test/lint lane (runs on the maintainer's own runner, not paid
+  # GitHub-hosted minutes). The inherited `build_test`/`arch_independent` matrices target OTHER
+  # self-hosted labels (`linux-x86_64-16cpu`, etc.) that don't exist here and stay owner-gated, so
+  # this lane is the real green signal for the `rust` workflow. ring-only, default features
   # (no `ssh`/`acme`/`tun`); the musl + feature-specific paths are covered by `musl_static` + local.
   hosted_test:
-    name: hosted test (ubuntu-latest)
-    runs-on: ubuntu-latest
+    name: hosted test (self-hosted Linux)
+    # Self-hosted Linux/X64 runner (Docker container on the maintainer's infra) — keeps CI off paid
+    # GitHub-hosted minutes. The inherited `build_test`/`arch_independent` matrices target other
+    # self-hosted labels (`linux-x86_64-16cpu`, …) that don't exist here and stay owner-gated.
+    runs-on: [self-hosted, Linux, X64]
     # Skip on tag pushes: this lane verifies code, and `publish` (which fires on tags) deliberately
     # does NOT depend on it, so re-running the full build+test on every release tag gates nothing.
     if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-    # A hung cargo step would otherwise burn the 6h GitHub-hosted default; cap it.
+    # A hung cargo step shouldn't pin the self-hosted runner indefinitely; cap it.
     timeout-minutes: 60
     env:
       # This fork gates compilation behind an explicit acknowledgement env var.
       TS_RS_EXPERIMENT: this_is_unstable_software
       COMMON_FLAGS: --workspace
-      # Incremental artifacts roughly double `target/` size for no benefit in a cold CI build,
-      # and this ~45-crate workspace (clippy + build --all-targets + test) otherwise overflows the
-      # hosted runner's ~14 GB free disk (the first hosted_test run died with ENOSPC).
+      # Incremental artifacts roughly double `target/` size for no benefit in a cold CI build.
       CARGO_INCREMENTAL: 0
     steps:
-      - name: Free disk space
-        # The default ubuntu-latest image ships ~25 GB of SDKs (dotnet, Android, GHC, large Docker
-        # base images) we never use. Removing them gives this large Rust workspace headroom so the
-        # build/test artifacts don't fill the disk. Hand-rolled (no third-party action) to keep the
-        # supply chain minimal for an OSS repo.
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
-          sudo docker image prune --all --force || true
-          df -h /
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: Setup rust
@@ -219,9 +210,9 @@ jobs:
   # Static MUSL build of the root `tailscale` crate with `ssh`/`russh`/`aws-lc-rs` OFF (ring-only),
   # proving the egress/proxy daemon path is musl-clean for minimal (scratch/distroless) pod images.
   #
-  # NOTE: this lane deliberately runs on a GitHub-HOSTED runner (`ubuntu-latest`) -- the inherited
-  # upstream matrix targets self-hosted labels (e.g. `linux-arm64-16cpu`) that do not exist on this
-  # fork, so those checks queue forever. This one actually executes.
+  # NOTE: this lane runs on the maintainer's self-hosted Linux/X64 runner (Docker container with the
+  # host docker socket, so `cross`'s container-based builds work). The inherited upstream matrix
+  # targets other self-hosted labels (e.g. `linux-arm64-16cpu`) that do not exist here.
   #
   # We use `cross` (docker-based) because `ring`'s build script needs a matching `*-linux-musl-gcc`
   # cross C toolchain to assemble its C/asm; the default cross images already ship it. We must NOT
@@ -229,7 +220,7 @@ jobs:
   # static musl and is the entire thing this lane exists to avoid.
   musl_static:
     name: musl static (${{ matrix.target.triple }})
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     strategy:
       fail-fast: false
       matrix:
@@ -246,16 +237,6 @@ jobs:
       # leaves `ssh`/`axum` off while keeping the full tailnet/TLS (ring) daemon path.
       MUSL_FLAGS: -p tailscale-rs --no-default-features
     steps:
-      - name: Free disk space
-        # `cross` pulls a multi-GB docker image per target and the build artifacts otherwise
-        # overflow the hosted runner's ~14 GB free disk (this lane started failing with ENOSPC).
-        # Remove the unused preinstalled SDKs first. Hand-rolled (no third-party action) to keep
-        # the supply chain minimal for an OSS repo. Mirrors the `hosted_test` lane.
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
-          sudo docker image prune --all --force || true
-          df -h /
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: Setup rust
