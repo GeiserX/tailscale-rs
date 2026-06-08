@@ -4,6 +4,10 @@ Record breaking or significant changes here. All dates are UTC.
 
 ## Unreleased - June 2026
 
+Put changes for the upcoming release here!
+
+## [0.6.8](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.6.8) - 2026-06-09
+
 ### Fixed
 - **Netmap deserialization against IPv4-only control planes.** `Node.Addresses` was modeled as a
   fixed 2-tuple `(Ipv4Net, Ipv6Net)`, but the wire field (Go `tailcfg.Node.Addresses`) is a
