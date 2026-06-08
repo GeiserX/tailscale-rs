@@ -690,6 +690,30 @@ impl From<&ts_control_serde::Node<'_>> for Node {
         let cap_map = cap_map_from_serde(&value.cap_map);
         let service_vips = service_vips_from_cap_map(&cap_map);
 
+        // `addresses` is a variable-length `Vec<IpNet>` on the wire (Go `[]netip.Prefix`), not a
+        // fixed (v4, v6) pair: an IPv6-off tailnet assigns only a v4 prefix. Pick the first of each
+        // family. The v4 prefix is the node's tailnet identity (always present on a normal node);
+        // if somehow absent we fall back to the unspecified `0.0.0.0/32` rather than panicking.
+        // The v6 prefix is optional — when the tailnet is IPv4-only there is none, and the overlay
+        // never reads `ipv6` in that mode (gated on `enable_ipv6`); we synthesize the unspecified
+        // `::/128` placeholder so the domain `TailnetAddress` stays infallible.
+        let ipv4 = value
+            .addresses
+            .iter()
+            .find_map(|p| match p {
+                ipnet::IpNet::V4(n) => Some(*n),
+                ipnet::IpNet::V6(_) => None,
+            })
+            .unwrap_or_else(|| ipnet::Ipv4Net::new(core::net::Ipv4Addr::UNSPECIFIED, 32).unwrap());
+        let ipv6 = value
+            .addresses
+            .iter()
+            .find_map(|p| match p {
+                ipnet::IpNet::V6(n) => Some(*n),
+                ipnet::IpNet::V4(_) => None,
+            })
+            .unwrap_or_else(|| ipnet::Ipv6Net::new(core::net::Ipv6Addr::UNSPECIFIED, 128).unwrap());
+
         Self {
             id: value.id,
             stable_id: StableId(value.stable_id.0.to_string()),
@@ -704,20 +728,20 @@ impl From<&ts_control_serde::Node<'_>> for Node {
                 .map(|x| x.iter().map(|x| x.to_string()).collect())
                 .unwrap_or_default(),
 
-            tailnet_address: TailnetAddress {
-                ipv4: value.addresses.0,
-                ipv6: value.addresses.1,
-            },
+            tailnet_address: TailnetAddress { ipv4, ipv6 },
             node_key: value.key,
             node_key_expiry: value.key_expiry,
             key_signature: value.key_signature.to_vec(),
             machine_key: value.machine,
             disco_key: value.disco_key,
 
+            // Per capver-112, `AllowedIPs` null/absent means "same as `addresses`". Fall back to the
+            // node's own assigned prefixes verbatim (whatever families the wire carried), not a
+            // synthesized v4+v6 pair.
             accepted_routes: value
                 .allowed_ips
                 .clone()
-                .unwrap_or_else(|| vec![value.addresses.0.into(), value.addresses.1.into()]),
+                .unwrap_or_else(|| value.addresses.clone()),
             underlay_addresses: value.endpoints.clone(),
 
             // legacy_derp_string is still in practical use as of 3/2026
@@ -800,6 +824,79 @@ mod tests {
         // Default (no owner / tagged node) stays 0.
         let tagged = ts_control_serde::Node::default();
         assert_eq!(Node::from(&tagged).user_id, 0);
+    }
+
+    /// A node from an **IPv4-only** tailnet (IPv6-off control plane / Headscale) carries a
+    /// single-element `addresses` list. This used to fail deserialization ("invalid length 1,
+    /// expected a tuple of size 2") when `addresses` was a fixed 2-tuple; it must now parse and
+    /// derive the v4 identity, with the unused v6 a synthesized placeholder.
+    #[test]
+    fn from_wire_node_ipv4_only_addresses() {
+        let wire = ts_control_serde::Node {
+            addresses: vec!["100.64.0.5/32".parse().unwrap()],
+            ..Default::default()
+        };
+        let domain: Node = (&wire).into();
+        assert_eq!(
+            domain.tailnet_address.ipv4,
+            "100.64.0.5/32".parse().unwrap()
+        );
+        // No v6 on the wire → unspecified placeholder (never read in IPv4-only mode).
+        assert_eq!(
+            domain.tailnet_address.ipv6,
+            ipnet::Ipv6Net::new(core::net::Ipv6Addr::UNSPECIFIED, 128).unwrap()
+        );
+        // AllowedIPs absent → falls back to the node's own assigned prefixes (just the v4 here).
+        assert_eq!(
+            domain.accepted_routes,
+            vec!["100.64.0.5/32".parse::<ipnet::IpNet>().unwrap()]
+        );
+    }
+
+    /// A dual-stack node carries both families (any order); the domain picks the first of each.
+    #[test]
+    fn from_wire_node_dual_stack_addresses() {
+        let wire = ts_control_serde::Node {
+            addresses: vec![
+                "100.64.0.7/32".parse().unwrap(),
+                "fd7a:115c:a1e0::7/128".parse().unwrap(),
+            ],
+            ..Default::default()
+        };
+        let domain: Node = (&wire).into();
+        assert_eq!(
+            domain.tailnet_address.ipv4,
+            "100.64.0.7/32".parse().unwrap()
+        );
+        assert_eq!(
+            domain.tailnet_address.ipv6,
+            "fd7a:115c:a1e0::7/128".parse().unwrap()
+        );
+    }
+
+    /// The deserialization regression itself: a MapResponse-style Node JSON with a 1-element
+    /// `Addresses` array must parse (this is the exact shape the dev-Headscale sends).
+    #[test]
+    fn deserialize_node_with_single_address() {
+        let json = r#"{
+            "ID": 1,
+            "StableID": "n1",
+            "Name": "host.tail.ts.net.",
+            "User": 1,
+            "Addresses": ["100.64.0.9/32"],
+            "Key": "nodekey:0000000000000000000000000000000000000000000000000000000000000000",
+            "Machine": null,
+            "DiscoKey": null,
+            "AllowedIPs": null,
+            "Endpoints": []
+        }"#;
+        let wire: ts_control_serde::Node = serde_json::from_str(json).expect("1-addr node parses");
+        assert_eq!(wire.addresses.len(), 1);
+        let domain: Node = (&wire).into();
+        assert_eq!(
+            domain.tailnet_address.ipv4,
+            "100.64.0.9/32".parse().unwrap()
+        );
     }
 
     #[test]

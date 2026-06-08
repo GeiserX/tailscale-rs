@@ -4,7 +4,16 @@ Record breaking or significant changes here. All dates are UTC.
 
 ## Unreleased - June 2026
 
-Put changes for the upcoming release here!
+### Fixed
+- **Netmap deserialization against IPv4-only control planes.** `Node.Addresses` was modeled as a
+  fixed 2-tuple `(Ipv4Net, Ipv6Net)`, but the wire field (Go `tailcfg.Node.Addresses`) is a
+  variable-length `[]Prefix`. A node on an **IPv6-off** tailnet (e.g. a self-hosted Headscale with
+  IPv6 disabled) is assigned only an IPv4 prefix, so the netmap stream failed to parse with
+  `invalid length 1, expected a tuple of size 2`, looping forever and never bringing the device up.
+  `addresses` is now a `Vec<ipnet::IpNet>`; the domain `Node` derives its v4 identity from the first
+  IPv4 prefix and an optional v6 from the first IPv6 prefix (a synthesized `::/128` placeholder when
+  the tailnet is IPv4-only — never read in that mode). Dual-stack tailnets are unaffected. Regression
+  tests cover v4-only, dual-stack, and the raw single-address JSON decode.
 
 ## [0.6.7](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.6.7) - 2026-06-09
 

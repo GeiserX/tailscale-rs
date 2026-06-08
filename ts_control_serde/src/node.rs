@@ -76,10 +76,16 @@ pub struct Node<'a> {
     /// If populated, the public key of the Tailscale node's [`DiscoKeyPair`][ts_keys::DiscoKeyPair].
     pub disco_key: Option<DiscoPublicKey>,
 
-    /// The IP addresses of the Tailscale node in the Tailnet. There are exactly 2 addresses, and
-    /// they are always in the same order: the first is the IPv4 address, the second is the IPv6
-    /// address.
-    pub addresses: (ipnet::Ipv4Net, ipnet::Ipv6Net),
+    /// The IP addresses (CIDR prefixes) assigned to this node in the tailnet (Go `tailcfg.Node`'s
+    /// `Addresses []netip.Prefix`).
+    ///
+    /// A **variable-length** list, NOT a fixed `(v4, v6)` pair: a node on an IPv4-only tailnet
+    /// (e.g. an IPv6-off control plane / Headscale) is assigned **only** an IPv4 prefix, so this
+    /// has length 1. Modeling it as a 2-tuple broke deserialization against such control planes
+    /// ("invalid length 1, expected a tuple of size 2"). The domain [`Node`] picks the first IPv4
+    /// and (optionally) the first IPv6 prefix out of this list.
+    #[serde(default)]
+    pub addresses: Vec<ipnet::IpNet>,
     /// IP ranges to route to this node.
     ///
     /// As of [`CapabilityVersion::V112`], this may be null/undefined on the wire to indicate the
