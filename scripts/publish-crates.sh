@@ -24,6 +24,12 @@ if [ -z "$DRY" ] && [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
   exit 1
 fi
 
+# geiserx_ts_ffi's build.rs writes the generated `tailscale.h` into the SOURCE dir as a dev
+# convenience; cargo's publish-verify rejects a build script modifying anything outside OUT_DIR.
+# This var turns the source-dir write off (the header still goes to OUT_DIR) so the ffi crate
+# packages cleanly. Harmless for the other crates.
+export TS_FFI_BUILDRS_STRICT=1
+
 # Leaf-first publish order (topologically sorted; facade at #40, bindings last).
 CRATES=(
   geiserx_ts_bitset
@@ -73,31 +79,44 @@ CRATES=(
 
 total=${#CRATES[@]}
 i=0
+# crates.io heavily rate-limits NEW crate names (~1 new crate per 10 min after a small burst).
+# On a 429 we parse its "try again after <RFC2822>" and sleep until then, so a 43-new-crate split
+# publishes unattended (it just takes hours). Publishing new *versions* of existing crates is not
+# limited, so a resume after the burst flies through already-published ones via SKIP_PUBLISHED.
 for crate in "${CRATES[@]}"; do
   i=$((i+1))
   echo ""
   echo "==== [$i/$total] $crate ===="
-  if cargo publish -p "$crate" $DRY; then
-    [ -n "$DRY" ] && continue
-    # Wait for the new version to appear in the sparse index before publishing dependents.
-    echo "   waiting for crates.io to index $crate ..."
-    for _ in $(seq 1 60); do
-      sleep 5
-      if curl -fsS "https://crates.io/api/v1/crates/$crate" >/dev/null 2>&1; then
-        echo "   indexed."
-        break
+  while :; do
+    # Capture the single publish attempt's combined output so we can branch on the failure reason.
+    out=$(cargo publish -p "$crate" $DRY 2>&1) && rc=0 || rc=$?
+    printf '%s\n' "$out"
+    if [ "$rc" -eq 0 ]; then
+      [ -n "$DRY" ] && break
+      echo "   published; settling before next crate ..."
+      sleep 15
+      break
+    elif [ "${SKIP_PUBLISHED:-}" = "1" ] && printf '%s' "$out" | grep -qiE "already (exists|uploaded)"; then
+      echo "   already on crates.io, skipping."
+      break
+    elif printf '%s' "$out" | grep -qiE "429 Too Many Requests|published too many"; then
+      # Parse "Please try again after <Day, DD Mon YYYY HH:MM:SS GMT>" and wait until then (+30s).
+      after=$(printf '%s' "$out" | grep -oE "try again after [A-Za-z]{3}, [0-9]{2} [A-Za-z]{3} [0-9]{4} [0-9:]{8} GMT" | sed 's/try again after //')
+      target=$(date -j -u -f "%a, %d %b %Y %H:%M:%S GMT" "$after" "+%s" 2>/dev/null || echo "")
+      now=$(date -u "+%s")
+      if [ -n "$target" ] && [ "$target" -gt "$now" ]; then
+        wait_s=$(( target - now + 30 ))
+      else
+        wait_s=610   # fallback: ~10 min + margin
       fi
-    done
-    sleep 5
-  else
-    rc=$?
-    if [ "${SKIP_PUBLISHED:-}" = "1" ] && cargo publish -p "$crate" $DRY 2>&1 | grep -q "already exists"; then
-      echo "   already published, skipping."
-      continue
+      echo "   rate-limited (429). Waiting ${wait_s}s (until ${after:-~10min}) then retrying $crate ..."
+      sleep "$wait_s"
+      # loop retries the same crate
+    else
+      echo "ERROR: publishing $crate failed (rc=$rc). Stopping. Fix and re-run." >&2
+      exit "$rc"
     fi
-    echo "ERROR: publishing $crate failed (rc=$rc). Stopping. Fix and re-run." >&2
-    exit "$rc"
-  fi
+  done
 done
 
 echo ""
