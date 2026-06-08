@@ -18,6 +18,7 @@ use kameo::{
     actor::ActorRef,
     message::{Context, Message},
 };
+use tokio::sync::watch;
 use ts_bart::RoutingTable;
 use ts_overlay_router::{
     inbound::RouteAction as InboundRouteAction, outbound::RouteAction as OutboundRouteAction,
@@ -66,6 +67,14 @@ pub struct RouteUpdater {
     /// The stable id of the exit node we last published via [`ActiveExitNode`], so an unchanged
     /// recompute doesn't republish it. `None` means we last published "no exit node".
     last_exit_node_id: Option<ts_control::StableNodeId>,
+    /// Live cell mirroring the *active* (resolved + fail-closed) exit node's stable id for
+    /// [`Runtime::status`](crate::Runtime::status). The route updater is the single authoritative
+    /// resolver of [`Env::exit_node`](crate::env::Env::exit_node) against the live peer set, so it is
+    /// the only correct source of "which exit node is engaged right now"; `Status` reads this rather
+    /// than re-resolving (which would miss the `/0`-advertised fail-closed gate). `None` whenever no
+    /// exit node is configured, the selector matches no peer, or the matched peer advertises no
+    /// default route.
+    active_exit_tx: watch::Sender<Option<ts_control::StableNodeId>>,
 }
 
 /// Self-message asking the route updater to recompute routes from cached state.
@@ -79,11 +88,12 @@ impl kameo::Actor for RouteUpdater {
         Env,
         OverlayTransportId,
         OverlayTransportId,
+        watch::Sender<Option<ts_control::StableNodeId>>,
     );
     type Error = Error;
 
     async fn on_start(
-        (multiderp, direct, env, default_transport, forwarder_transport): Self::Args,
+        (multiderp, direct, env, default_transport, forwarder_transport, active_exit_tx): Self::Args,
         actor_ref: ActorRef<Self>,
     ) -> Result<Self, Self::Error> {
         env.subscribe::<Arc<PeerState>>(&actor_ref).await?;
@@ -127,6 +137,7 @@ impl kameo::Actor for RouteUpdater {
             last_peer_state: None,
             last_underlay: HashMap::default(),
             last_exit_node_id: None,
+            active_exit_tx,
         })
     }
 }
@@ -277,6 +288,10 @@ impl RouteUpdater {
         let active_exit_id = exit_node_satisfied.then(|| exit_node_id.clone()).flatten();
         if active_exit_id != self.last_exit_node_id {
             self.last_exit_node_id = active_exit_id.clone();
+            // Mirror the resolved id into the watch cell `Runtime::status` reads. `send_replace`
+            // keeps the value current even with no active borrowers (the receiver lives on the
+            // Runtime for the whole session).
+            self.active_exit_tx.send_replace(active_exit_id.clone());
             let node = active_exit_id.and_then(|id| {
                 state
                     .peers
@@ -459,6 +474,7 @@ mod tests {
             id: 1,
             stable_id: StableNodeId("n1".to_string()),
             hostname: "router".to_string(),
+            user_id: 0,
             tailnet: Some("ts.net".to_string()),
             tags: vec![],
             tailnet_address: TailnetAddress {

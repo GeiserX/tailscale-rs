@@ -129,6 +129,12 @@ pub struct Node {
     /// This node's hostname.
     pub hostname: String,
 
+    /// The integer id of the user that owns this node (`Node.User` in Go). `0` when control sends
+    /// no owner (e.g. tagged/ACL nodes have no human owner). Join against the netmap's
+    /// `UserProfiles` table (accumulated by the runtime's peer tracker) to resolve a login/display
+    /// name — see the runtime `WhoIs` lookup.
+    pub user_id: ts_control_serde::UserId,
+
     /// The tailnet this node belongs to.
     pub tailnet: Option<String>,
 
@@ -689,6 +695,7 @@ impl From<&ts_control_serde::Node<'_>> for Node {
             stable_id: StableId(value.stable_id.0.to_string()),
 
             hostname: hostname.to_owned(),
+            user_id: value.user,
             tailnet,
 
             tags: value
@@ -737,9 +744,63 @@ impl From<&ts_control_serde::Node<'_>> for Node {
     }
 }
 
+/// Display-friendly identity for the user that owns a [`Node`], resolved from the netmap's
+/// `UserProfiles` table (Go `tailcfg.UserProfile`). Owned counterpart of the borrow-bound
+/// [`ts_control_serde::UserProfile`]. Keyed by [`UserProfile::id`] (== [`Node::user_id`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserProfile {
+    /// The integer id of the Tailscale user this profile describes (matches [`Node::user_id`]).
+    pub id: ts_control_serde::UserId,
+    /// An email-ish login name for display (e.g. `alice@example.com` / `alice@github`). May be
+    /// empty if control sent none.
+    pub login_name: String,
+    /// The user's display name (e.g. `Alice Smith`), if the IdP provided one.
+    pub display_name: Option<String>,
+}
+
+impl From<&ts_control_serde::UserProfile<'_>> for UserProfile {
+    fn from(value: &ts_control_serde::UserProfile) -> Self {
+        Self {
+            id: value.id,
+            login_name: value.login_name.to_string(),
+            display_name: value.display_name.map(str::to_string),
+        }
+    }
+}
+
+impl UserProfile {
+    /// The best human-facing label for this user: the login name when present, else the display
+    /// name, else `None`. This is what a `WhoIs` surfaces as the owning user.
+    pub fn best_label(&self) -> Option<String> {
+        if !self.login_name.is_empty() {
+            Some(self.login_name.clone())
+        } else {
+            self.display_name.clone()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wire `Node.User` id must be carried onto the domain `Node.user_id` by the `From` impl
+    /// (the field the runtime joins against the netmap `UserProfiles` table for `WhoIs.user`).
+    /// Guards against the `From` impl wiring the wrong serde field or dropping it.
+    #[test]
+    fn from_wire_node_carries_user_id() {
+        let mut wire = ts_control_serde::Node {
+            user: 4242,
+            ..Default::default()
+        };
+        wire.name = "host.tail.ts.net.";
+        let domain: Node = (&wire).into();
+        assert_eq!(domain.user_id, 4242);
+
+        // Default (no owner / tagged node) stays 0.
+        let tagged = ts_control_serde::Node::default();
+        assert_eq!(Node::from(&tagged).user_id, 0);
+    }
 
     #[test]
     fn key_expiry_semantics() {
@@ -824,6 +885,7 @@ mod tests {
             id: 1,
             stable_id: StableId("n1".to_string()),
             hostname: hostname.to_string(),
+            user_id: 0,
             tailnet: tailnet.map(str::to_string),
             tags: vec![],
             tailnet_address: TailnetAddress {

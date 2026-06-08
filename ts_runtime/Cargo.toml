@@ -47,6 +47,9 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "time", "io-util", "sync"] }
 tracing.workspace = true
 smallvec.workspace = true
+# For `DeviceState::NeedsLogin(url::Url)` / `RegistrationError::NeedsLogin` — the interactive-auth
+# URL control hands back, surfaced through the device-state machine.
+url.workspace = true
 
 [features]
 # Off by default. Enables the TUN-mode overlay transport (ts_transport_tun) so the runtime can

@@ -6,6 +6,66 @@ Record breaking or significant changes here. All dates are UTC.
 
 Put changes for the upcoming release here!
 
+## [0.6.5](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.6.5) - 2026-06-08
+
+### Added
+- **`Device::logout()` — deregister this node from the control plane** (the equivalent of Go
+  `tsnet`'s `LocalClient.Logout`). Re-`POST`s `/machine/register` with the node's current node key
+  and a backdated `expiry`, which control honors by expiring the node now: it drops out of every
+  peer's netmap and must re-register to rejoin. This matters for **non-ephemeral** nodes, which
+  otherwise linger in the tailnet (visible to peers, counting against the machine limit) for ~24h
+  after the process exits. It is a control-plane state change only — the local datapath is untouched
+  (tear down via `Device::shutdown`), the on-disk node key is not deleted (re-registering with it is
+  the re-login path), and it is idempotent (logging out an already-expired node still returns `Ok`).
+  New `ts_control::logout` RPC (fresh Noise channel, 30s-bounded) + `Runtime::logout`. The logout
+  request mirrors the normal registration request shape (node key, NL key, host identity) — control
+  rejects a skeleton request — and only adds the past expiry. Verified live against
+  `controlplane.tailscale.com` (campaign scenario `s8`).
+- **`Device::wait_until_running(timeout)` + `Device::watch_state()` — typed registration outcome /
+  connection-state stream.** `wait_until_running` resolves `Ok(())` once the node is registered and
+  running, or returns a typed `RegistrationError` distinguishing a **permanent** failure
+  (`AuthRejected` — bad/expired/unknown auth key; `KeyExpired`; `NeedsLogin` — interactive auth) from
+  a **transient** one (`NetworkUnreachable`), or `Timeout`. `watch_state()` exposes a
+  `watch::Receiver<DeviceState>` (`Connecting` → `Running` / `NeedsLogin` / `Expired` / `Failed`) so
+  an embedder reacts to control-connection transitions push-style instead of polling. This replaces
+  the consumer workaround of polling `ipv4_addr()` until a deadline and reporting a generic timeout.
+  The control runner publishes transitions into a `watch` cell created in `Runtime::spawn` (so a
+  hard registration failure surfaces its reason even though it stops the actor). Verified live
+  (campaign scenario `s9`). *(Per-reconnect `Connecting` dips are not yet emitted — control
+  reconnects transparently below this layer; the state reflects registration outcome + key expiry.)*
+- **`Device::active_exit_node()` + `Status.active_exit_node` — the exit node actually engaged.** The
+  route updater (the single authoritative resolver of the exit-node selector against the live peer
+  set) publishes the resolved, **fail-closed** stable id; `Status`/`active_exit_node` report it. This
+  differs from the configured `exit_node()` selector — it is `None` when the selector matches no
+  peer or the matched peer no longer advertises a default route (egress is then dropped). Mirrors Go
+  `tsnet`'s `Status.ExitNodeStatus.ID`.
+- **`WhoIs` now surfaces node capabilities and the owning user.** `WhoIs.capabilities` is populated
+  from the node's control-pushed `CapMap`, and `WhoIs.user` resolves the owning user's login/display
+  name by joining the node's user id against the netmap's `UserProfiles` table (accumulated across
+  delta updates by the peer tracker). Previously both were always empty. (Per-node `online` state
+  remains a gap — the domain `Node` still does not retain the wire `online`/`last_seen` fields.)
+
+### Changed
+- **CI now runs on a self-hosted Linux/X64 runner** instead of paid GitHub-hosted minutes. A new
+  idempotent `provision-self-hosted` composite action self-heals the bare-Ubuntu runner's build
+  prerequisites (rustup, `lld`, `libpython3.12-dev`) so a freshly (re)created runner Just Works, and
+  the `musl_static` `cross` lanes get the toolchain identity-mount they need under docker-in-docker.
+  The self-hosted lanes are gated to **never run code from fork PRs** (the runner has Docker-socket
+  access) and check out with `persist-credentials: false`. No effect on consumers — build/test parity
+  is unchanged.
+### Security
+- **`russh` 0.60.3 → 0.61.2**, clearing GHSA-wwx6-x28x-8259 (a negotiated-compression "ZIP bomb"
+  that bypassed the max-packet-size check → OOM/DoS). russh `0.61.1` itself does not build (its
+  `p256` rc pin resolves against an incompatible `primefield` rc — upstream russh#720); `0.61.2`
+  bumps the whole RustCrypto subtree to the coherent rc generation and compiles. This required moving
+  the workspace's `x25519-dalek` pin `3.0.0-pre.6 → 3.0.0-rc.0` (russh 0.61.2 hard-pins
+  `curve25519-dalek = 5.0.0-rc.0`, and the two release in lockstep) — a forward step on the same
+  pre-release line the core WireGuard handshake already used, not a new pre-release dependency. The
+  ring-only egress invariant is preserved (aws-lc-rs remains absent from the default graph; `cargo
+  deny --no-default-features` passes), and the WireGuard handshake + Wycheproof x25519 vectors
+  (`ts_keys`/`ts_tunnel`) pass unchanged on the new pin. `russh` remains optional / off-by-default
+  (`ssh` feature only).
+
 ## [0.6.4](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.6.4) - 2026-06-08
 
 ### Added

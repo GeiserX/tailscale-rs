@@ -41,9 +41,9 @@ dependencies = [
 
 [[package]]
 name = "aes"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66bd29a732b644c0431c6140f370d097879203d79b80c94a6747ba0872adaef8"
+checksum = "f1fc76eaeac4c9164506c466d4ffdd8ec9d0c5bf57ee97177c4d8eceb3a0e138"
 dependencies = [
  "cipher 0.5.1",
  "cpubits",
@@ -72,7 +72,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e22c0c90bbe8d4f77c3ca9ddabe41a1f8382d6fc1f7cea89459d0f320371f972"
 dependencies = [
  "aead 0.6.0-rc.10",
- "aes 0.9.0",
+ "aes 0.9.1",
  "cipher 0.5.1",
  "ctr 0.10.0",
  "ghash 0.6.0",
@@ -419,15 +419,6 @@ dependencies = [
 
 [[package]]
 name = "block-padding"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8894febbff9f758034a5b8e12d87918f56dfc64a8e1fe757d65e29041538d93"
-dependencies = [
- "generic-array 0.14.7",
-]
-
-[[package]]
-name = "block-padding"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "710f1dd022ef4e93f8a438b4ba958de7f64308434fa6a87104481645cc30068b"
@@ -627,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "checks"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "clap",
  "globwalk",
@@ -1093,12 +1084,12 @@ dependencies = [
 
 [[package]]
 name = "curve25519-dalek"
-version = "5.0.0-pre.6"
+version = "5.0.0-rc.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "335f1947f241137a14106b6f5acc5918a5ede29c9d71d3f2cb1678d5075d9fc3"
+checksum = "4f359e08ca85e7bd759e1fd933ff2bccd81864c60a8fba0e259c7f822b0924bf"
 dependencies = [
  "cfg-if",
- "cpufeatures 0.2.17",
+ "cpufeatures 0.3.0",
  "curve25519-dalek-derive",
  "digest 0.11.3",
  "fiat-crypto 0.3.0",
@@ -1432,11 +1423,11 @@ dependencies = [
 
 [[package]]
 name = "ed25519-dalek"
-version = "3.0.0-pre.7"
+version = "3.0.0-rc.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20449acd54b660981ae5caa2bcb56d1fe7f25f2e37a38ec507400fab034d4bb6"
+checksum = "b011170fe4f04665565b4110afef66774fe9ffff278f3eb5b81cc73d26e27d60"
 dependencies = [
- "curve25519-dalek 5.0.0-pre.6",
+ "curve25519-dalek 5.0.0-rc.0",
  "ed25519 3.0.0",
  "rand_core 0.10.1",
  "serde",
@@ -1471,22 +1462,22 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
 name = "elliptic-curve"
-version = "0.14.0-rc.32"
+version = "0.14.0-rc.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cda94f31325c4275e9706adecbb6f0650dee2f904c915a98e3d81adaaaa757aa"
+checksum = "102d3643d30dd8b559613c5cced68317199597fffb278cdc88daa2ef7fafc935"
 dependencies = [
  "base16ct",
  "crypto-bigint",
  "crypto-common 0.2.1",
  "digest 0.11.3",
+ "ff",
+ "group",
  "hkdf 0.13.0",
  "hybrid-array",
  "once_cell",
  "pem-rfc7468 1.0.0",
  "pkcs8 0.11.0",
  "rand_core 0.10.1",
- "rustcrypto-ff",
- "rustcrypto-group",
  "sec1",
  "subtle",
  "zeroize",
@@ -1909,11 +1900,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0de51e6874e94e7bf76d726fc5d13ba782deca734ff60d5bb2fb2607c7406555"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 6.0.0",
  "rand_core 0.10.1",
  "wasip2",
  "wasip3",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1963,6 +1956,17 @@ dependencies = [
  "bitflags 2.11.1",
  "ignore",
  "walkdir",
+]
+
+[[package]]
+name = "group"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7fd1a1c7a5206c5b7a3f5a0d7ccd3ff85d0c8f5133d62a02680255b0004af5f4"
+dependencies = [
+ "ff",
+ "rand_core 0.10.1",
+ "subtle",
 ]
 
 [[package]]
@@ -2495,7 +2499,6 @@ version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
 dependencies = [
- "block-padding 0.3.3",
  "generic-array 0.14.7",
 ]
 
@@ -2505,7 +2508,7 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4250ce6452e92010fdf7268ccc5d14faa80bb12fc741938534c58f16804e03c7"
 dependencies = [
- "block-padding 0.4.2",
+ "block-padding",
  "hybrid-array",
 ]
 
@@ -2857,6 +2860,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
 
 [[package]]
+name = "md5"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae960838283323069879657ca3de837e9f7bbb4c7bf6ea7f1b290d5e9476d2e0"
+
+[[package]]
 name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3191,9 +3200,9 @@ dependencies = [
 
 [[package]]
 name = "p256"
-version = "0.14.0-rc.9"
+version = "0.14.0-rc.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b97e3bf0465157ae90975ff52dbeb1362ba618924878c9f74c25baa27a65f9a"
+checksum = "41adc63effe99d48837a8cc0e6d7a77e32ae6a07f6000df466178dbc2193093e"
 dependencies = [
  "ecdsa",
  "elliptic-curve",
@@ -3204,9 +3213,9 @@ dependencies = [
 
 [[package]]
 name = "p384"
-version = "0.14.0-rc.9"
+version = "0.14.0-rc.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "437f30ebcb1e16ff48acead5f08bd69fbcdbc82421687bb48af5c315a0bfab03"
+checksum = "9bd5333afa5ae0347f39e6a0f2c9c155da431583fd71fe5555bd0521b4ccaf02"
 dependencies = [
  "ecdsa",
  "elliptic-curve",
@@ -3218,9 +3227,9 @@ dependencies = [
 
 [[package]]
 name = "p521"
-version = "0.14.0-rc.9"
+version = "0.14.0-rc.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e9fd792bab86ecf6249561752fb5a413511f999887107dd054bbda5143743d7"
+checksum = "a3a5297f53dc16d35909060ba3032cff7867e8809f01e273ff325579d5f0ceae"
 dependencies = [
  "base16ct",
  "ecdsa",
@@ -3485,7 +3494,7 @@ version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "279a91971a1d8eb1260a30938eae3be9cb67b472dffecb222fbbbe2fd2dc1453"
 dependencies = [
- "aes 0.9.0",
+ "aes 0.9.1",
  "cbc",
  "der 0.8.0",
  "pbkdf2",
@@ -3652,9 +3661,9 @@ dependencies = [
 
 [[package]]
 name = "primeorder"
-version = "0.14.0-rc.9"
+version = "0.14.0-rc.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0556580e42c19833f5d232aca11a7687a503ee41f937b54f5ae1d50fc2a6a36a"
+checksum = "7d2793f22b9b6fd11ef3ac1d59bf003c2573593e4968702341605c2748fd90bf"
 dependencies = [
  "elliptic-curve",
 ]
@@ -4254,42 +4263,41 @@ dependencies = [
 
 [[package]]
 name = "russh"
-version = "0.61.1"
+version = "0.61.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f67013f080c226e5a34db1c71f2567f44d95a6300005bb6cd4e2c8fe3c326d1b"
+checksum = "bbf893f64684e58da8a68d56a5e84d1cf0440226274c515770fe267707a7d0b0"
 dependencies = [
- "aes 0.9.0",
+ "aes 0.9.1",
  "aws-lc-rs",
  "bitflags 2.11.1",
- "block-padding 0.4.2",
+ "block-padding",
  "byteorder",
  "bytes",
  "cbc",
  "cipher 0.5.1",
  "crypto-bigint",
  "ctr 0.10.0",
- "curve25519-dalek 5.0.0-pre.6",
+ "curve25519-dalek 5.0.0-rc.0",
  "data-encoding",
  "delegate",
  "der 0.8.0",
  "digest 0.11.3",
  "ecdsa",
- "ed25519-dalek 3.0.0-pre.7",
+ "ed25519-dalek 3.0.0-rc.0",
  "elliptic-curve",
  "enum_dispatch",
  "flate2",
  "futures",
  "generic-array 1.4.1",
- "getrandom 0.2.17",
+ "getrandom 0.4.2",
  "ghash 0.6.0",
  "hex-literal",
- "hkdf 0.13.0",
  "hmac 0.13.0",
- "inout 0.1.4",
+ "inout 0.2.2",
  "internal-russh-num-bigint",
  "keccak",
  "log",
- "md5",
+ "md5 0.8.0",
  "ml-kem",
  "module-lattice",
  "num-bigint",
@@ -4360,27 +4368,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
-]
-
-[[package]]
-name = "rustcrypto-ff"
-version = "0.14.0-rc.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd2a8adb347447693cd2ba0d218c4b66c62da9b0a5672b17b981e4291ec65ff6"
-dependencies = [
- "rand_core 0.10.1",
- "subtle",
-]
-
-[[package]]
-name = "rustcrypto-group"
-version = "0.14.0-rc.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "369f9b61aa45933c062c9f6b5c3c50ab710687eca83dd3802653b140b43f85ed"
-dependencies = [
- "rand_core 0.10.1",
- "rustcrypto-ff",
- "subtle",
 ]
 
 [[package]]
@@ -5006,7 +4993,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "10db6f219196a8528f9ec904d9d45cdad692d65b0e57e72be4dedd1c5fddce36"
 dependencies = [
  "aead 0.6.0-rc.10",
- "aes 0.9.0",
+ "aes 0.9.1",
  "aes-gcm 0.11.0-rc.3",
  "cbc",
  "chacha20 0.10.0",
@@ -5042,7 +5029,7 @@ dependencies = [
  "argon2",
  "bcrypt-pbkdf",
  "ctutils",
- "ed25519-dalek 3.0.0-pre.7",
+ "ed25519-dalek 3.0.0-rc.0",
  "hex",
  "hmac 0.13.0",
  "p256",
@@ -5113,7 +5100,7 @@ dependencies = [
  "hmac-sha256",
  "hostname-validator",
  "lazy_static",
- "md5",
+ "md5 0.7.0",
  "paste",
  "precis-core",
  "precis-profiles",
@@ -5192,7 +5179,7 @@ dependencies = [
 
 [[package]]
 name = "tailscale-rs"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "axum",
  "bytes",
@@ -5238,7 +5225,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.2",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -5774,7 +5761,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "ts_array256"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "heapless",
  "lazy_static",
@@ -5786,7 +5773,7 @@ dependencies = [
 
 [[package]]
 name = "ts_bart"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "cfg-if",
  "divan",
@@ -5805,7 +5792,7 @@ dependencies = [
 
 [[package]]
 name = "ts_bart_packetfilter"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "hashbrown 0.17.1",
  "ipnet",
@@ -5820,7 +5807,7 @@ dependencies = [
 
 [[package]]
 name = "ts_bitset"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "cfg-if",
  "divan",
@@ -5830,14 +5817,14 @@ dependencies = [
 
 [[package]]
 name = "ts_capabilityversion"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "ts_cli_util"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "cfg-if",
  "clap",
@@ -5854,7 +5841,7 @@ dependencies = [
 
 [[package]]
 name = "ts_control"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -5894,7 +5881,7 @@ dependencies = [
 
 [[package]]
 name = "ts_control_noise"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -5919,7 +5906,7 @@ dependencies = [
 
 [[package]]
 name = "ts_control_serde"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -5937,7 +5924,7 @@ dependencies = [
 
 [[package]]
 name = "ts_dataplane"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "etherparse",
  "tokio",
@@ -5954,7 +5941,7 @@ dependencies = [
 
 [[package]]
 name = "ts_derp"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "bytes",
  "crypto_box",
@@ -5982,7 +5969,7 @@ dependencies = [
 
 [[package]]
 name = "ts_devtools"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "bytes",
  "clap",
@@ -5998,7 +5985,7 @@ dependencies = [
 
 [[package]]
 name = "ts_disco_protocol"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "aead 0.5.2",
  "crypto_box",
@@ -6012,11 +5999,11 @@ dependencies = [
 
 [[package]]
 name = "ts_dns_wire"
-version = "0.6.4"
+version = "0.6.5"
 
 [[package]]
 name = "ts_dynbitset"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "proptest",
  "smallvec",
@@ -6025,7 +6012,7 @@ dependencies = [
 
 [[package]]
 name = "ts_elixir"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "rustler",
  "tailscale-rs",
@@ -6036,7 +6023,7 @@ dependencies = [
 
 [[package]]
 name = "ts_ffi"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "cbindgen",
  "tailscale-rs",
@@ -6048,7 +6035,7 @@ dependencies = [
 
 [[package]]
 name = "ts_forwarder"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "bytes",
  "ipnet",
@@ -6060,14 +6047,14 @@ dependencies = [
 
 [[package]]
 name = "ts_hexdump"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "heapless",
 ]
 
 [[package]]
 name = "ts_host_net"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "ipnet",
  "thiserror 2.0.18",
@@ -6076,7 +6063,7 @@ dependencies = [
 
 [[package]]
 name = "ts_http_util"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "bytes",
  "futures",
@@ -6097,7 +6084,7 @@ dependencies = [
 
 [[package]]
 name = "ts_keys"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "crypto_box",
  "ed25519-dalek 2.2.0",
@@ -6106,14 +6093,14 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "wycheproof",
- "x25519-dalek 3.0.0-pre.6",
+ "x25519-dalek 3.0.0-rc.0",
  "zerocopy",
  "zeroize",
 ]
 
 [[package]]
 name = "ts_magicsock"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "if-addrs",
  "rand 0.10.1",
@@ -6131,11 +6118,11 @@ dependencies = [
 
 [[package]]
 name = "ts_metrics"
-version = "0.6.4"
+version = "0.6.5"
 
 [[package]]
 name = "ts_netcheck"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "bytes",
  "dashmap",
@@ -6156,7 +6143,7 @@ dependencies = [
 
 [[package]]
 name = "ts_netstack_smoltcp"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "axum",
  "bytes",
@@ -6177,7 +6164,7 @@ dependencies = [
 
 [[package]]
 name = "ts_netstack_smoltcp_core"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "bytes",
  "flume",
@@ -6191,7 +6178,7 @@ dependencies = [
 
 [[package]]
 name = "ts_netstack_smoltcp_socket"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "bytes",
  "futures-io",
@@ -6202,7 +6189,7 @@ dependencies = [
 
 [[package]]
 name = "ts_nodecapability"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "cfg-if",
  "serde",
@@ -6211,7 +6198,7 @@ dependencies = [
 
 [[package]]
 name = "ts_overlay_router"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "itertools",
  "tracing",
@@ -6222,7 +6209,7 @@ dependencies = [
 
 [[package]]
 name = "ts_packet"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "bytes",
  "crypto_box",
@@ -6231,7 +6218,7 @@ dependencies = [
 
 [[package]]
 name = "ts_packetfilter"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "hashbrown 0.17.1",
  "ipnet",
@@ -6241,7 +6228,7 @@ dependencies = [
 
 [[package]]
 name = "ts_packetfilter_serde"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "ipnet",
  "nom 8.0.0",
@@ -6254,7 +6241,7 @@ dependencies = [
 
 [[package]]
 name = "ts_packetfilter_state"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "divan",
  "serde_json",
@@ -6265,7 +6252,7 @@ dependencies = [
 
 [[package]]
 name = "ts_peercapability"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "serde",
  "url",
@@ -6273,7 +6260,7 @@ dependencies = [
 
 [[package]]
 name = "ts_python"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "hex",
  "pyo3",
@@ -6286,7 +6273,7 @@ dependencies = [
 
 [[package]]
 name = "ts_runtime"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 2.2.0",
@@ -6323,22 +6310,23 @@ dependencies = [
  "ts_transport",
  "ts_transport_tun",
  "ts_tunnel",
+ "url",
 ]
 
 [[package]]
 name = "ts_test_util"
-version = "0.6.4"
+version = "0.6.5"
 
 [[package]]
 name = "ts_time"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "ts_tka"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "blake2 0.10.6",
  "ed25519-dalek 2.2.0",
@@ -6349,7 +6337,7 @@ dependencies = [
 
 [[package]]
 name = "ts_tls_util"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "rcgen",
  "ring",
@@ -6364,14 +6352,14 @@ dependencies = [
 
 [[package]]
 name = "ts_transport"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "ts_packet",
 ]
 
 [[package]]
 name = "ts_transport_tun"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "bytes",
  "ipnet",
@@ -6387,7 +6375,7 @@ dependencies = [
 
 [[package]]
 name = "ts_tunnel"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "aead 0.5.2",
  "base64 0.22.1",
@@ -6407,13 +6395,13 @@ dependencies = [
  "ts_packet",
  "ts_time",
  "wycheproof",
- "x25519-dalek 3.0.0-pre.6",
+ "x25519-dalek 3.0.0-rc.0",
  "zerocopy",
 ]
 
 [[package]]
 name = "ts_underlay_router"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "ts_packet",
  "ts_transport",
@@ -7423,11 +7411,11 @@ dependencies = [
 
 [[package]]
 name = "x25519-dalek"
-version = "3.0.0-pre.6"
+version = "3.0.0-rc.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b3d5d6ff67acd3945b933e592bfa7143db4fcbb2f871754b6b9fbd7847fc5aea"
+checksum = "f17b575e04fcdb37e5509a85a14ff08116678a1c9724befb8b571db742dbdbb0"
 dependencies = [
- "curve25519-dalek 5.0.0-pre.6",
+ "curve25519-dalek 5.0.0-rc.0",
  "getrandom 0.4.2",
  "rand_core 0.10.1",
  "zeroize",

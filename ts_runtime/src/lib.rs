@@ -23,6 +23,9 @@ pub mod capture;
 pub mod control_runner;
 mod dataplane;
 mod derp_latency;
+/// Device connection-state tracking ([`DeviceState`]) and typed registration outcome
+/// ([`RegistrationError`]).
+pub mod device_state;
 mod direct;
 mod env;
 mod error;
@@ -50,6 +53,7 @@ pub mod taildrop_send;
 #[cfg(feature = "tun")]
 mod tun_actor;
 
+pub use device_state::{DeviceState, RegistrationError};
 pub(crate) use env::Env;
 pub use error::{Error, ErrorKind};
 pub use status::{Status, StatusNode, WhoIs};
@@ -76,6 +80,13 @@ pub struct Runtime {
     /// `Env`, which keeps only the read side) so that only `Runtime::set_exit_node` can mutate the
     /// selection; the route updater and source filter re-read it via [`Env::exit_node`].
     exit_node_tx: watch::Sender<Option<ts_control::ExitNodeSelector>>,
+    /// Receiver mirroring the *active* (resolved + fail-closed) exit node's stable id, fed by the
+    /// route updater. Read by [`Runtime::status`] / [`Runtime::active_exit_node`] to report which
+    /// exit node traffic is actually egressing through (vs. the merely-configured selector).
+    active_exit_rx: watch::Receiver<Option<ts_control::StableNodeId>>,
+    /// Receiver for the device connection-state cell, fed by the control runner. Read by
+    /// [`Runtime::watch_state`] and [`Runtime::wait_until_running`].
+    state_rx: watch::Receiver<DeviceState>,
 }
 
 impl Runtime {
@@ -141,12 +152,17 @@ impl Runtime {
         #[cfg_attr(not(feature = "tun"), allow(unused_variables))]
         let (forwarder_channel,) = forwarder.ask(forwarder_actor::GetChannel).await?;
 
+        // The route updater is the single authoritative resolver of the active (resolved,
+        // fail-closed) exit node; it publishes the resolved stable id into this watch cell so
+        // `Runtime::status` can report which exit is actually engaged (not just configured).
+        let (active_exit_tx, active_exit_rx) = watch::channel(None);
         route_updater::RouteUpdater::spawn((
             multiderp.clone(),
             direct.clone(),
             env.clone(),
             netstack_id,
             forwarder_id,
+            active_exit_tx,
         ));
         packetfilter::PacketfilterUpdater::spawn(env.clone());
         src_filter::SourceFilterUpdater::spawn(env.clone());
@@ -222,10 +238,16 @@ impl Runtime {
             }
         };
 
+        // Device connection-state cell. Created here (not inside the actor) so the control runner's
+        // `on_start` can publish `Failed`/`NeedsLogin` and still return `Err` without the sender
+        // being tied to a `Self` that never gets constructed on a hard registration failure.
+        let (state_tx, state_rx) = watch::channel(DeviceState::Connecting);
+
         let control = ControlRunner::spawn(control_runner::Params {
             config,
             auth_key,
             env: env.clone(),
+            state_tx,
         });
 
         Ok(Self {
@@ -237,6 +259,8 @@ impl Runtime {
             env,
             shutdown: shutdown_tx,
             exit_node_tx,
+            active_exit_rx,
+            state_rx,
         })
     }
 
@@ -355,7 +379,21 @@ impl Runtime {
             .ask(peer_tracker::GetStatus)
             .await?;
 
-        Ok(Status { self_node, peers })
+        Ok(Status {
+            self_node,
+            peers,
+            active_exit_node: self.active_exit_node(),
+        })
+    }
+
+    /// The stable id of the exit node traffic is currently egressing through, or `None` if none is
+    /// engaged. This is the route updater's resolved + fail-closed answer (see
+    /// [`Status::active_exit_node`](crate::status::Status::active_exit_node)): it differs from the
+    /// configured [`exit_node`](Self::exit_node) selector, which may name a peer that is absent or
+    /// no longer advertising a default route (in which case egress is dropped and this returns
+    /// `None`).
+    pub fn active_exit_node(&self) -> Option<ts_control::StableNodeId> {
+        self.active_exit_rx.borrow().clone()
     }
 
     /// Request an OIDC ID token from control scoped to `audience` (workload-identity federation).
@@ -372,6 +410,22 @@ impl Runtime {
             .ask(control_runner::FetchIdToken { audience })
             .await
             .map_err(flatten_send_err)
+    }
+
+    /// Log this node out of the tailnet: deregister it by expiring its current node key.
+    ///
+    /// Forwards to the control runner, which re-POSTs `/machine/register` with a past expiry over a
+    /// fresh Noise channel. This is a control-plane state change only — it does NOT shut the runtime
+    /// down (the caller follows with [`graceful_shutdown`](Self::graceful_shutdown)) and does not
+    /// touch the on-disk node key. The kameo delegated-reply send error is flattened the same way as
+    /// [`fetch_id_token`](Self::fetch_id_token): a handler error carries the real
+    /// [`ts_control::LogoutError`]; any other send failure (actor shutdown / mailbox closed) is
+    /// surfaced as [`ts_control::LogoutError::NetworkError`].
+    pub async fn logout(&self) -> Result<(), ts_control::LogoutError> {
+        self.control
+            .ask(control_runner::Logout)
+            .await
+            .map_err(flatten_logout_send_err)
     }
 
     /// Issue a real Let's Encrypt certificate for this node's MagicDNS `name` (`acme` feature).
@@ -465,6 +519,48 @@ impl Runtime {
             .ask(peer_tracker::WatchNetmap)
             .await
             .map_err(Into::into)
+    }
+
+    /// The current device connection-[`DeviceState`].
+    pub fn device_state(&self) -> DeviceState {
+        self.state_rx.borrow().clone()
+    }
+
+    /// Watch the device connection-[`DeviceState`] (`Connecting` → `Running` / `NeedsLogin` /
+    /// `Expired` / `Failed`).
+    ///
+    /// Returns a [`watch::Receiver`]; await
+    /// [`changed`](tokio::sync::watch::Receiver::changed) to react push-style to control connection
+    /// transitions instead of polling [`status`](Self::status). The initial value is the current
+    /// state. Note: a transient per-reconnect dip back to `Connecting` is **not** currently
+    /// emitted (control transparently reconnects below this layer); the state reflects registration
+    /// outcome and node-key expiry.
+    pub fn watch_state(&self) -> watch::Receiver<DeviceState> {
+        self.state_rx.clone()
+    }
+
+    /// Wait until the device finishes registering, returning a typed outcome.
+    ///
+    /// Resolves `Ok(())` once the device reaches [`DeviceState::Running`]. Returns a typed
+    /// [`RegistrationError`] otherwise — the actionable distinction between "retry", "re-pair", and
+    /// "drive interactive login" that replaces polling [`ipv4_addr`](Self::ipv4_addr) in a loop:
+    /// - `AuthRejected` — bad/expired/unknown auth key. **Permanent** (re-pair).
+    /// - `NeedsLogin(url)` — interactive authorization required (no usable auth key). **Not
+    ///   permanent**: the runtime keeps retrying and will reach `Running` once the user authorizes
+    ///   the URL. An **auth-key** caller should treat this as a failure; an **interactive** caller
+    ///   should ignore this return and instead drive the flow via [`watch_state`](Self::watch_state)
+    ///   (this method returns the URL eagerly rather than blocking for the whole login).
+    /// - `NetworkUnreachable` — control unreachable. **Transient** (retry).
+    /// - `Timeout` — no settled state within `timeout`.
+    ///
+    /// `KeyExpired` is not produced by this initial wait (a node key expires only *after* it has
+    /// come up); observe post-registration expiry via [`watch_state`](Self::watch_state).
+    /// `timeout` of `None` waits indefinitely for a settled state.
+    pub async fn wait_until_running(
+        &self,
+        timeout: Option<Duration>,
+    ) -> Result<(), RegistrationError> {
+        device_state::wait_for_running(self.state_rx.clone(), timeout).await
     }
 
     /// Attempt to shut down the runtime gracefully.
@@ -568,6 +664,22 @@ fn flatten_send_err<M>(
     }
 }
 
+/// Flatten a kameo `SendError` from the `Logout` ask into a [`ts_control::LogoutError`].
+///
+/// A `HandlerError` carries the real `LogoutError` from the control RPC and is surfaced verbatim;
+/// any other send failure (actor not running / stopped, mailbox full, send timeout) — a delivery
+/// problem, not a logout result — collapses to the transient [`ts_control::LogoutError::NetworkError`]
+/// (logout is idempotent, so a retry after a delivery failure is safe). Factored out of
+/// [`Runtime::logout`] so the mapping is unit-testable without standing up an actor.
+fn flatten_logout_send_err<M>(
+    e: kameo::error::SendError<M, ts_control::LogoutError>,
+) -> ts_control::LogoutError {
+    match e {
+        kameo::error::SendError::HandlerError(err) => err,
+        _ => ts_control::LogoutError::NetworkError,
+    }
+}
+
 /// Flatten a kameo `SendError` from the `GetCertificate` ask into a [`ts_control::CertError`].
 ///
 /// A `HandlerError` carries the real `CertError` produced by the ACME issuance and is surfaced
@@ -653,5 +765,29 @@ mod tests {
                 audience: "sts.amazonaws.com".to_string(),
             });
         assert_eq!(flatten_send_err(e), ts_control::IdTokenError::NetworkError);
+    }
+
+    /// A `HandlerError` from the logout RPC carries the real `LogoutError` and must pass through
+    /// verbatim. An `Internal(_)` payload (distinct from the `_ => NetworkError` fallback) makes the
+    /// passthrough observable.
+    #[test]
+    fn flatten_logout_send_err_handler_error_passes_through() {
+        let inner = ts_control::LogoutError::Internal(ts_control::LogoutInternalErrorKind::Http);
+        assert!(matches!(inner, ts_control::LogoutError::Internal(_)));
+        let e: kameo::error::SendError<control_runner::Logout, ts_control::LogoutError> =
+            kameo::error::SendError::HandlerError(inner.clone());
+        assert_eq!(flatten_logout_send_err(e), inner);
+    }
+
+    /// A non-handler send failure (actor stopped) is a delivery problem, not a logout result, and
+    /// collapses to a transient `NetworkError` (logout is idempotent, so a retry is safe).
+    #[test]
+    fn flatten_logout_send_err_actor_stopped_is_network_error() {
+        let e: kameo::error::SendError<control_runner::Logout, ts_control::LogoutError> =
+            kameo::error::SendError::ActorStopped;
+        assert_eq!(
+            flatten_logout_send_err(e),
+            ts_control::LogoutError::NetworkError
+        );
     }
 }

@@ -12,8 +12,8 @@ use kameo::{
 };
 use tokio::sync::watch;
 use ts_control::{
-    AsyncControlClient, Endpoint, EndpointType, Error as ControlError, IdTokenError, Node,
-    SshPolicy, StateUpdate, TkaStatus,
+    AsyncControlClient, Endpoint, EndpointType, Error as ControlError, IdTokenError, LogoutError,
+    Node, SshPolicy, StateUpdate, TkaStatus,
 };
 use ts_magicsock::SelfEndpointType;
 
@@ -47,6 +47,12 @@ pub struct Params {
 
     /// The [`crate::Env`] for this actor.
     pub(crate) env: crate::Env,
+
+    /// Sender for the device connection-state cell. Created in [`Runtime::spawn`](crate::Runtime)
+    /// so it outlives the actor's `on_start` (which may publish [`DeviceState::Failed`] and then
+    /// return `Err`, before `Self` exists). The runtime keeps the matching `Receiver` for
+    /// [`watch_state`](crate::Runtime::watch_state) / [`wait_until_running`](crate::Runtime::wait_until_running).
+    pub(crate) state_tx: watch::Sender<crate::DeviceState>,
 }
 
 #[doc(hidden)]
@@ -75,35 +81,68 @@ impl kameo::Actor for ControlRunner {
                 Ok(()) => break,
                 Err(ControlError::MachineNotAuthorized(u)) => {
                     tracing::info!(auth_url = %u, "please authorize this machine or pass an auth key");
+                    // Surface "interactive login required" so a watcher / `wait_until_running` can
+                    // tell the user to authorize, instead of seeing an opaque timeout. Registration
+                    // keeps retrying (transient), so this is not a terminal `Failed`.
+                    params
+                        .state_tx
+                        .send_replace(crate::DeviceState::NeedsLogin(u.clone()));
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
                 Err(e) => {
                     // A hard registration failure (bad/expired/unknown auth key, etc.). Log the
-                    // specific reason control gave — the actor will stop, but the cause must be
-                    // visible, not an opaque "Panicked" with no detail (tsr-kqj).
-                    //
-                    // TODO(tsr-kqj): surface this as a typed error out of `Device::new` (rather
-                    // than the later opaque `Internal(Actor)` the caller sees) — that requires
-                    // awaiting the actor's startup, since `ControlRunner` is spawned
-                    // fire-and-forget today. Out of scope for this bead; logging here is the fix.
+                    // specific reason control gave AND publish it as a typed `Failed` state so
+                    // `Device::wait_until_running` returns the actionable reason (tsr-kqj) instead
+                    // of the opaque `Internal(Actor)` the caller would otherwise see once the
+                    // stopped actor is next asked. Publishing before `return Err` is why the state
+                    // sender lives on `Runtime`, not on `Self` (which never gets constructed here).
+                    let reason = crate::RegistrationError::from(&e);
                     tracing::error!(error = %e, "registration failed; control runner stopping");
+                    params
+                        .state_tx
+                        .send_replace(crate::DeviceState::Failed(reason));
                     return Err(e.into());
                 }
             }
         }
+        // check_auth succeeded, but the node is not "up" until the netmap stream is actually
+        // attached below. Publish `Running` only AFTER `attach_stream` so `wait_until_running` never
+        // resolves `Ok` for a device whose stream connect failed (which would leave a stopped actor
+        // behind). If the connect/subscribe steps fail, publish a transient `Failed` first so the
+        // waiter sees an actionable reason instead of the opaque post-mortem `Internal(Actor)`.
+        let bring_up = async {
+            let (client, stream) = AsyncControlClient::connect(
+                &params.config,
+                &params.env.keys,
+                params.auth_key.as_deref(),
+            )
+            .await?;
 
-        let (client, stream) = AsyncControlClient::connect(
-            &params.config,
-            &params.env.keys,
-            params.auth_key.as_deref(),
-        )
-        .await?;
+            DerpLatencyMeasurer::spawn_link(&slf, params.env.clone()).await;
 
-        DerpLatencyMeasurer::spawn_link(&slf, params.env.clone()).await;
+            params.env.subscribe::<DerpLatencyMeasurement>(&slf).await?;
+            params.env.subscribe::<EndpointAdvertisement>(&slf).await?;
+            slf.attach_stream(stream.boxed(), (), ());
+            Ok::<_, ControlRunnerError>(client)
+        };
 
-        params.env.subscribe::<DerpLatencyMeasurement>(&slf).await?;
-        params.env.subscribe::<EndpointAdvertisement>(&slf).await?;
-        slf.attach_stream(stream.boxed(), (), ());
+        let client = match bring_up.await {
+            Ok(client) => client,
+            Err(e) => {
+                tracing::error!(error = %e, "bringing up the control session failed");
+                // The control session never came up; surface it as a transient registration
+                // failure (a retry / fresh `Device::new` may succeed) rather than leaving the state
+                // stuck at `Connecting`.
+                params.state_tx.send_replace(crate::DeviceState::Failed(
+                    crate::RegistrationError::NetworkUnreachable,
+                ));
+                return Err(e);
+            }
+        };
+
+        // The netmap stream is attached: the node is up. The stream `Next` handler keeps this
+        // current (and flips to `Expired` if the self-node's key lapses).
+        params.state_tx.send_replace(crate::DeviceState::Running);
 
         Ok(Self {
             client,
@@ -252,6 +291,33 @@ mod msg_impl {
 
             deleg
         }
+
+        /// Log this node out of the tailnet: deregister it by expiring its current node key.
+        ///
+        /// Mirrors [`fetch_id_token`](Self::fetch_id_token): clones the control config + node keys
+        /// into a spawned task (delegated reply, so the round-trip doesn't block the mailbox) and
+        /// re-POSTs `/machine/register` with a past expiry over a fresh Noise channel. This is a
+        /// control-plane state change only — it does NOT stop this actor or tear down the datapath
+        /// (the caller follows up with the normal runtime shutdown), and it does not touch the
+        /// on-disk node key, so re-registering with the same key is the re-login path.
+        #[message(ctx)]
+        pub fn logout(
+            &self,
+            ctx: &mut Context<Self, DelegatedReply<Result<(), LogoutError>>>,
+        ) -> DelegatedReply<Result<(), LogoutError>> {
+            let (deleg, replier) = ctx.reply_sender();
+
+            if let Some(replier) = replier {
+                let config = self.params.config.clone();
+                let keys = self.params.env.keys.clone();
+                tokio::spawn(async move {
+                    let result = ts_control::logout(&config, &keys).await;
+                    replier.send(result);
+                });
+            }
+
+            deleg
+        }
     }
 
     // The `acme`-gated cert-issuance message lives in its own `#[kameo::messages]` impl block so the
@@ -346,6 +412,30 @@ impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
 
             StreamMessage::Next(msg) => {
                 if let Some(node) = msg.node.as_ref() {
+                    // Reflect node-key expiry into the device state: control delivering a self-node
+                    // whose key is in the past means the node must re-authenticate. Otherwise the
+                    // arrival of a fresh self-node confirms we are Running (recovers the state if a
+                    // prior update had flipped it to Expired).
+                    let now_unix = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    let next = if node.key_expired_at_unix(now_unix) {
+                        crate::DeviceState::Expired
+                    } else {
+                        crate::DeviceState::Running
+                    };
+                    // `send_if_modified` avoids waking watchers when the state is unchanged (a fresh
+                    // self-node arrives on every netmap update).
+                    self.params.state_tx.send_if_modified(|s| {
+                        if *s != next {
+                            *s = next.clone();
+                            true
+                        } else {
+                            false
+                        }
+                    });
+
                     self.self_node.send_replace(Some(node.clone()));
                 }
 

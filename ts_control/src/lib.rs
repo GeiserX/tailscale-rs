@@ -53,7 +53,7 @@ pub use dial_plan::{DialCandidate, DialMode, DialPlan};
 pub use dns::{DnsConfig, ExtraRecord, Resolver as DnsResolver, ResolverTransport};
 pub use node::{
     ExitNodeSelector, Id as NodeId, Node, NodeCapMap, StableId as StableNodeId, TailnetAddress,
-    is_tailscale_ip, validate_service_name,
+    UserProfile, is_tailscale_ip, validate_service_name,
 };
 #[cfg(feature = "async_tokio")]
 pub use serve::{
@@ -66,7 +66,7 @@ pub use ssh_policy::{
     SshRule,
 };
 pub use tka::TkaStatus;
-pub use ts_control_serde::{Endpoint, EndpointType};
+pub use ts_control_serde::{Endpoint, EndpointType, UserId};
 #[cfg(feature = "identity-federation")]
 pub use wif::{WifConfig, WifError, resolve_auth_key};
 
@@ -80,7 +80,8 @@ pub mod tls {
 
 #[cfg(feature = "async_tokio")]
 pub use crate::tokio::{
-    AsyncControlClient, FilterUpdate, IdTokenError, PeerUpdate, StateUpdate, fetch_id_token,
+    AsyncControlClient, FilterUpdate, IdTokenError, LogoutError, LogoutInternalErrorKind,
+    PeerUpdate, StateUpdate, fetch_id_token, logout,
 };
 
 /// An error which occurred while connecting to the control server or control plane.

@@ -149,8 +149,8 @@ pub use ts_control::{CertError, MISSING_CERT_RPC, ServeConfig, ServeState, Serve
 #[doc(inline)]
 pub use ts_control::{ExitProxyConfig, ExitProxyScheme};
 pub use ts_control::{
-    IdTokenError, ServiceError, ServiceMode, SshAccept, SshAction, SshConnIdentity, SshDecision,
-    SshDenyReason, SshPolicy, SshPrincipal, SshRule,
+    IdTokenError, LogoutError, ServiceError, ServiceMode, SshAccept, SshAction, SshConnIdentity,
+    SshDecision, SshDenyReason, SshPolicy, SshPrincipal, SshRule, StableNodeId,
 };
 #[doc(inline)]
 pub use ts_netstack_smoltcp::PingError;
@@ -162,7 +162,7 @@ pub use ts_runtime::fallback_tcp::{
 #[doc(inline)]
 pub use ts_runtime::taildrop::WaitingFile;
 #[doc(inline)]
-pub use ts_runtime::{Status, StatusNode, WhoIs};
+pub use ts_runtime::{DeviceState, RegistrationError, Status, StatusNode, WhoIs};
 
 #[cfg(feature = "axum")]
 pub mod axum;
@@ -796,6 +796,27 @@ impl Device {
         self.runtime.fetch_id_token(audience.to_string()).await
     }
 
+    /// Log this node out of the tailnet — deregister it from the control plane (the equivalent of
+    /// Go `tsnet`'s `LocalClient.Logout`).
+    ///
+    /// Re-`POST`s `/machine/register` with this node's current node key and a past expiry, which the
+    /// control plane honors by **expiring the node now**: it drops out of every peer's netmap and
+    /// must re-register (re-authenticate) to rejoin.
+    ///
+    /// This is primarily for **non-ephemeral** nodes. An ephemeral node is garbage-collected by
+    /// control shortly after it disconnects, but a persistent node lingers in the tailnet
+    /// (visible to peers, counting against the machine limit) for up to ~24h after the process exits
+    /// unless explicitly logged out. Call this before [`shutdown`](Self::shutdown) to deregister
+    /// immediately. Calling it on an ephemeral node simply brings the GC forward; it is idempotent,
+    /// so logging out an already-gone node is not an error.
+    ///
+    /// This is a **control-plane state change only**: it does not tear down the local datapath (do
+    /// that via [`shutdown`](Self::shutdown)), and it does not delete or rotate the on-disk node key
+    /// — re-registering with the same key (a fresh [`Device::new`]) is the re-login path.
+    pub async fn logout(&self) -> Result<(), ts_control::LogoutError> {
+        self.runtime.logout().await
+    }
+
     /// Snapshot this node's client metrics in Prometheus text exposition format.
     ///
     /// Mirrors Go Tailscale's `clientmetric` registry: process-global counters/gauges incremented
@@ -842,12 +863,65 @@ impl Device {
         self.runtime.exit_node()
     }
 
+    /// The stable id of the exit node traffic is **currently** egressing through, or `None` if none
+    /// is engaged (the equivalent of Go `tsnet`'s `Status.ExitNodeStatus.ID`).
+    ///
+    /// This differs from [`exit_node`](Self::exit_node), which returns the *configured* selector:
+    /// the active exit node is the route updater's resolved, fail-closed answer. It is `None` when
+    /// no exit node is configured, the configured selector matches no current peer, or the matched
+    /// peer no longer advertises a default route (egress is then dropped, fail-closed). Match the id
+    /// against [`Status::peers`](crate::Status::peers) (via [`status`](Self::status)) for details.
+    pub fn active_exit_node(&self) -> Option<ts_control::StableNodeId> {
+        self.runtime.active_exit_node()
+    }
+
     /// Watch for netmap changes: the returned receiver's value is the current set of peer
     /// [`StatusNode`]s and updates on every netmap change (like subscribing to `ipn` notifications).
     pub async fn watch_netmap(
         &self,
     ) -> Result<tokio::sync::watch::Receiver<Vec<StatusNode>>, Error> {
         self.runtime.watch_netmap().await.map_err(Into::into)
+    }
+
+    /// The current device connection-[`DeviceState`] (`Connecting` / `Running` / `NeedsLogin` /
+    /// `Expired` / `Failed`).
+    pub fn device_state(&self) -> DeviceState {
+        self.runtime.device_state()
+    }
+
+    /// Watch the device connection-[`DeviceState`], reacting push-style to control connection
+    /// transitions instead of polling [`status`](Self::status).
+    ///
+    /// Returns a [`tokio::sync::watch::Receiver`]; await its
+    /// [`changed`](tokio::sync::watch::Receiver::changed) to be woken on each transition. The
+    /// initial value is the current state.
+    pub fn watch_state(&self) -> tokio::sync::watch::Receiver<DeviceState> {
+        self.runtime.watch_state()
+    }
+
+    /// Wait until the device finishes registering, returning a typed outcome — the clean
+    /// replacement for polling [`ipv4_addr`](Self::ipv4_addr) in a loop.
+    ///
+    /// Resolves `Ok(())` once the device is [`DeviceState::Running`]. On a non-running outcome it
+    /// returns a typed [`RegistrationError`]:
+    /// - [`AuthRejected`](RegistrationError::AuthRejected) — bad/expired/unknown auth key;
+    ///   **permanent** (re-pair).
+    /// - [`NeedsLogin`](RegistrationError::NeedsLogin) — interactive authorization required;
+    ///   **not permanent** (the runtime keeps retrying and reaches `Running` once the user
+    ///   authorizes). Auth-key callers treat this as failure; interactive callers should ignore it
+    ///   and drive the flow via [`watch_state`](Self::watch_state).
+    /// - [`NetworkUnreachable`](RegistrationError::NetworkUnreachable) — **transient** (retry).
+    /// - [`Timeout`](RegistrationError::Timeout) — no settled state within `timeout` (`None` waits
+    ///   indefinitely).
+    ///
+    /// [`KeyExpired`](RegistrationError::KeyExpired) is not produced here (a key expires only after
+    /// the node is up); observe it via [`watch_state`](Self::watch_state). Use
+    /// [`RegistrationError::is_permanent`] to branch "re-pair" vs. "retry / drive login".
+    pub async fn wait_until_running(
+        &self,
+        timeout: Option<Duration>,
+    ) -> Result<(), RegistrationError> {
+        self.runtime.wait_until_running(timeout).await
     }
 
     /// Ping a tailnet peer over the overlay with an ICMPv4 echo, returning the round-trip time

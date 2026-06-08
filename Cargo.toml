@@ -53,7 +53,7 @@ members = [
 edition = "2024"
 license = "BSD-3-Clause"
 publish = true
-version = "0.6.4"
+version = "0.6.5"
 repository = "https://github.com/GeiserX/tailscale-rs"
 
 # This disagrees with the README's stated MSRV. That's intentional: this field causes cargo to error
@@ -105,7 +105,7 @@ tokio-util = { version = "0.7", default-features = false }
 tracing = { version = "0.1", default-features = false, features = ["attributes"] }
 tracing-test = "0.2"
 url = { version = "2", default-features = false }
-x25519-dalek = { version = "3.0.0-pre.6", features = ["getrandom", "reusable_secrets", "static_secrets"] }
+x25519-dalek = { version = "3.0.0-rc.0", features = ["getrandom", "reusable_secrets", "static_secrets"] }
 # Project Wycheproof adversarial primitive test vectors (dev-only). Ring-clean: pulls only
 # serde / serde_json / data-encoding, NO aws-lc/openssl/ring — safe for the ring-only invariant.
 wycheproof = "0.6"
@@ -113,48 +113,48 @@ yoke = { version = "0.8", default-features = false }
 zerocopy = { version = "0.8", features = ["derive"] }
 
 # local workspace deps
-tailscale = { path = ".", package = "tailscale-rs", version = "0.6.4" }
-ts_array256 = { path = "ts_array256", version = "0.6.4" }
-ts_bart = { path = "ts_bart", version = "0.6.4" }
-ts_bart_packetfilter = { path = "ts_bart_packetfilter", version = "0.6.4" }
-ts_bitset = { path = "ts_bitset", default-features = false, version = "0.6.4" }
-ts_capabilityversion = { path = "ts_capabilityversion", version = "0.6.4" }
+tailscale = { path = ".", package = "tailscale-rs", version = "0.6.5" }
+ts_array256 = { path = "ts_array256", version = "0.6.5" }
+ts_bart = { path = "ts_bart", version = "0.6.5" }
+ts_bart_packetfilter = { path = "ts_bart_packetfilter", version = "0.6.5" }
+ts_bitset = { path = "ts_bitset", default-features = false, version = "0.6.5" }
+ts_capabilityversion = { path = "ts_capabilityversion", version = "0.6.5" }
 ts_cli_util = { path = "ts_cli_util" }
-ts_control = { path = "ts_control", version = "0.6.4" }
-ts_control_noise = { path = "ts_control_noise", version = "0.6.4" }
-ts_control_serde = { path = "ts_control_serde", version = "0.6.4" }
-ts_dataplane = { path = "ts_dataplane", version = "0.6.4" }
-ts_derp = { path = "ts_derp", version = "0.6.4" }
-ts_disco_protocol = { path = "ts_disco_protocol", version = "0.6.4" }
-ts_dns_wire = { path = "ts_dns_wire", version = "0.6.4" }
-ts_dynbitset = { path = "ts_dynbitset", version = "0.6.4" }
-ts_forwarder = { path = "ts_forwarder", version = "0.6.4" }
-ts_hexdump = { path = "ts_hexdump", version = "0.6.4" }
-ts_host_net = { path = "ts_host_net", version = "0.6.4" }
-ts_keys = { path = "ts_keys", version = "0.6.4" }
-ts_magicsock = { path = "ts_magicsock", version = "0.6.4" }
-ts_metrics = { path = "ts_metrics", version = "0.6.4" }
-ts_netcheck = { path = "ts_netcheck", version = "0.6.4" }
-ts_netstack_smoltcp = { path = "ts_netstack_smoltcp", version = "0.6.4" }
-ts_netstack_smoltcp_core = { path = "ts_netstack_smoltcp_core", version = "0.6.4" }
-ts_netstack_smoltcp_socket = { path = "ts_netstack_smoltcp_socket", version = "0.6.4" }
-ts_nodecapability = { path = "ts_nodecapability", version = "0.6.4" }
-ts_overlay_router = { path = "ts_overlay_router", version = "0.6.4" }
-ts_packet = { path = "ts_packet", version = "0.6.4" }
-ts_packetfilter = { path = "ts_packetfilter", version = "0.6.4" }
-ts_packetfilter_serde = { path = "ts_packetfilter_serde", version = "0.6.4" }
-ts_packetfilter_state = { path = "ts_packetfilter_state", version = "0.6.4" }
-ts_peercapability = { path = "ts_peercapability", version = "0.6.4" }
-ts_http_util = { path = "ts_http_util", version = "0.6.4" }
-ts_tka = { path = "ts_tka", version = "0.6.4" }
-ts_tls_util = { path = "ts_tls_util", version = "0.6.4" }
-ts_runtime = { path = "ts_runtime", version = "0.6.4" }
+ts_control = { path = "ts_control", version = "0.6.5" }
+ts_control_noise = { path = "ts_control_noise", version = "0.6.5" }
+ts_control_serde = { path = "ts_control_serde", version = "0.6.5" }
+ts_dataplane = { path = "ts_dataplane", version = "0.6.5" }
+ts_derp = { path = "ts_derp", version = "0.6.5" }
+ts_disco_protocol = { path = "ts_disco_protocol", version = "0.6.5" }
+ts_dns_wire = { path = "ts_dns_wire", version = "0.6.5" }
+ts_dynbitset = { path = "ts_dynbitset", version = "0.6.5" }
+ts_forwarder = { path = "ts_forwarder", version = "0.6.5" }
+ts_hexdump = { path = "ts_hexdump", version = "0.6.5" }
+ts_host_net = { path = "ts_host_net", version = "0.6.5" }
+ts_keys = { path = "ts_keys", version = "0.6.5" }
+ts_magicsock = { path = "ts_magicsock", version = "0.6.5" }
+ts_metrics = { path = "ts_metrics", version = "0.6.5" }
+ts_netcheck = { path = "ts_netcheck", version = "0.6.5" }
+ts_netstack_smoltcp = { path = "ts_netstack_smoltcp", version = "0.6.5" }
+ts_netstack_smoltcp_core = { path = "ts_netstack_smoltcp_core", version = "0.6.5" }
+ts_netstack_smoltcp_socket = { path = "ts_netstack_smoltcp_socket", version = "0.6.5" }
+ts_nodecapability = { path = "ts_nodecapability", version = "0.6.5" }
+ts_overlay_router = { path = "ts_overlay_router", version = "0.6.5" }
+ts_packet = { path = "ts_packet", version = "0.6.5" }
+ts_packetfilter = { path = "ts_packetfilter", version = "0.6.5" }
+ts_packetfilter_serde = { path = "ts_packetfilter_serde", version = "0.6.5" }
+ts_packetfilter_state = { path = "ts_packetfilter_state", version = "0.6.5" }
+ts_peercapability = { path = "ts_peercapability", version = "0.6.5" }
+ts_http_util = { path = "ts_http_util", version = "0.6.5" }
+ts_tka = { path = "ts_tka", version = "0.6.5" }
+ts_tls_util = { path = "ts_tls_util", version = "0.6.5" }
+ts_runtime = { path = "ts_runtime", version = "0.6.5" }
 ts_test_util = { path = "ts_test_util" }
-ts_time = { path = "ts_time", version = "0.6.4" }
-ts_transport = { path = "ts_transport", version = "0.6.4" }
-ts_transport_tun = { path = "ts_transport_tun", version = "0.6.4" }
-ts_underlay_router = { path = "ts_underlay_router", version = "0.6.4" }
-ts_tunnel = { path = "ts_tunnel", version = "0.6.4" }
+ts_time = { path = "ts_time", version = "0.6.5" }
+ts_transport = { path = "ts_transport", version = "0.6.5" }
+ts_transport_tun = { path = "ts_transport_tun", version = "0.6.5" }
+ts_underlay_router = { path = "ts_underlay_router", version = "0.6.5" }
+ts_tunnel = { path = "ts_tunnel", version = "0.6.5" }
 
 [workspace.lints.rust]
 closure_returning_async_block = "warn"
@@ -237,7 +237,7 @@ pty-process = { version = "0.5", optional = true, features = ["async"] }
 rand.workspace = true
 ratatui = { version = "0.30", optional = true }
 # exclude rsa to avoid https://rustsec.org/advisories/RUSTSEC-2023-0071
-russh = { version = "0.60.3", optional = true, default-features = false, features = ["flate2", "aws-lc-rs"] }
+russh = { version = "0.61.2", optional = true, default-features = false, features = ["flate2", "aws-lc-rs"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
