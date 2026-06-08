@@ -542,48 +542,25 @@ impl Runtime {
     /// Wait until the device finishes registering, returning a typed outcome.
     ///
     /// Resolves `Ok(())` once the device reaches [`DeviceState::Running`]. Returns a typed
-    /// [`RegistrationError`] for a settled non-running outcome — `AuthRejected` (bad/expired/unknown
-    /// auth key — permanent), `KeyExpired`, `NeedsLogin` (interactive auth required), or
-    /// `NetworkUnreachable` — or [`RegistrationError::Timeout`] if no settled state is reached within
-    /// `timeout`. This replaces polling [`ipv4_addr`](Self::ipv4_addr) in a loop with an actionable
-    /// distinction between "retry" and "tell the user to re-pair".
+    /// [`RegistrationError`] otherwise — the actionable distinction between "retry", "re-pair", and
+    /// "drive interactive login" that replaces polling [`ipv4_addr`](Self::ipv4_addr) in a loop:
+    /// - `AuthRejected` — bad/expired/unknown auth key. **Permanent** (re-pair).
+    /// - `NeedsLogin(url)` — interactive authorization required (no usable auth key). **Not
+    ///   permanent**: the runtime keeps retrying and will reach `Running` once the user authorizes
+    ///   the URL. An **auth-key** caller should treat this as a failure; an **interactive** caller
+    ///   should ignore this return and instead drive the flow via [`watch_state`](Self::watch_state)
+    ///   (this method returns the URL eagerly rather than blocking for the whole login).
+    /// - `NetworkUnreachable` — control unreachable. **Transient** (retry).
+    /// - `Timeout` — no settled state within `timeout`.
     ///
+    /// `KeyExpired` is not produced by this initial wait (a node key expires only *after* it has
+    /// come up); observe post-registration expiry via [`watch_state`](Self::watch_state).
     /// `timeout` of `None` waits indefinitely for a settled state.
     pub async fn wait_until_running(
         &self,
         timeout: Option<Duration>,
     ) -> Result<(), RegistrationError> {
-        let mut rx = self.state_rx.clone();
-        let wait = async {
-            loop {
-                // Evaluate the current value, then await a change. `borrow_and_update` marks the
-                // current value seen so the subsequent `changed()` only returns on the NEXT update.
-                let settled = match &*rx.borrow_and_update() {
-                    DeviceState::Running => Some(Ok(())),
-                    DeviceState::Failed(e) => Some(Err(e.clone())),
-                    DeviceState::Expired => Some(Err(RegistrationError::KeyExpired)),
-                    DeviceState::NeedsLogin(u) => {
-                        Some(Err(RegistrationError::NeedsLogin(u.clone())))
-                    }
-                    DeviceState::Connecting => None,
-                };
-                if let Some(result) = settled {
-                    return result;
-                }
-                // Not settled yet — wait for the next transition. If the sender is dropped (runtime
-                // tearing down), treat it as unreachable rather than hanging forever.
-                if rx.changed().await.is_err() {
-                    return Err(RegistrationError::NetworkUnreachable);
-                }
-            }
-        };
-
-        match timeout {
-            Some(timeout) => tokio::time::timeout(timeout, wait)
-                .await
-                .unwrap_or(Err(RegistrationError::Timeout)),
-            None => wait.await,
-        }
+        device_state::wait_for_running(self.state_rx.clone(), timeout).await
     }
 
     /// Attempt to shut down the runtime gracefully.

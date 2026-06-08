@@ -784,6 +784,24 @@ impl UserProfile {
 mod tests {
     use super::*;
 
+    /// The wire `Node.User` id must be carried onto the domain `Node.user_id` by the `From` impl
+    /// (the field the runtime joins against the netmap `UserProfiles` table for `WhoIs.user`).
+    /// Guards against the `From` impl wiring the wrong serde field or dropping it.
+    #[test]
+    fn from_wire_node_carries_user_id() {
+        let mut wire = ts_control_serde::Node {
+            user: 4242,
+            ..Default::default()
+        };
+        wire.name = "host.tail.ts.net.";
+        let domain: Node = (&wire).into();
+        assert_eq!(domain.user_id, 4242);
+
+        // Default (no owner / tagged node) stays 0.
+        let tagged = ts_control_serde::Node::default();
+        assert_eq!(Node::from(&tagged).user_id, 0);
+    }
+
     #[test]
     fn key_expiry_semantics() {
         let now: DateTime<Utc> = "2026-06-05T00:00:00Z".parse().unwrap();

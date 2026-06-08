@@ -149,8 +149,8 @@ pub use ts_control::{CertError, MISSING_CERT_RPC, ServeConfig, ServeState, Serve
 #[doc(inline)]
 pub use ts_control::{ExitProxyConfig, ExitProxyScheme};
 pub use ts_control::{
-    IdTokenError, ServiceError, ServiceMode, SshAccept, SshAction, SshConnIdentity, SshDecision,
-    SshDenyReason, SshPolicy, SshPrincipal, SshRule,
+    IdTokenError, LogoutError, ServiceError, ServiceMode, SshAccept, SshAction, SshConnIdentity,
+    SshDecision, SshDenyReason, SshPolicy, SshPrincipal, SshRule, StableNodeId,
 };
 #[doc(inline)]
 pub use ts_netstack_smoltcp::PingError;
@@ -902,14 +902,21 @@ impl Device {
     /// Wait until the device finishes registering, returning a typed outcome — the clean
     /// replacement for polling [`ipv4_addr`](Self::ipv4_addr) in a loop.
     ///
-    /// Resolves `Ok(())` once the device is [`DeviceState::Running`]. On a settled non-running
-    /// outcome it returns a typed [`RegistrationError`] that distinguishes a permanent failure
-    /// ([`AuthRejected`](RegistrationError::AuthRejected) — re-pair required;
-    /// [`KeyExpired`](RegistrationError::KeyExpired); [`NeedsLogin`](RegistrationError::NeedsLogin) —
-    /// interactive auth) from a transient one ([`NetworkUnreachable`](RegistrationError::NetworkUnreachable)),
-    /// or [`Timeout`](RegistrationError::Timeout) if no settled state is reached within `timeout`
-    /// (`None` waits indefinitely). Use [`RegistrationError::is_permanent`] to branch retry vs.
-    /// surface-to-user.
+    /// Resolves `Ok(())` once the device is [`DeviceState::Running`]. On a non-running outcome it
+    /// returns a typed [`RegistrationError`]:
+    /// - [`AuthRejected`](RegistrationError::AuthRejected) — bad/expired/unknown auth key;
+    ///   **permanent** (re-pair).
+    /// - [`NeedsLogin`](RegistrationError::NeedsLogin) — interactive authorization required;
+    ///   **not permanent** (the runtime keeps retrying and reaches `Running` once the user
+    ///   authorizes). Auth-key callers treat this as failure; interactive callers should ignore it
+    ///   and drive the flow via [`watch_state`](Self::watch_state).
+    /// - [`NetworkUnreachable`](RegistrationError::NetworkUnreachable) — **transient** (retry).
+    /// - [`Timeout`](RegistrationError::Timeout) — no settled state within `timeout` (`None` waits
+    ///   indefinitely).
+    ///
+    /// [`KeyExpired`](RegistrationError::KeyExpired) is not produced here (a key expires only after
+    /// the node is up); observe it via [`watch_state`](Self::watch_state). Use
+    /// [`RegistrationError::is_permanent`] to branch "re-pair" vs. "retry / drive login".
     pub async fn wait_until_running(
         &self,
         timeout: Option<Duration>,

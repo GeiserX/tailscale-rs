@@ -105,23 +105,44 @@ impl kameo::Actor for ControlRunner {
                 }
             }
         }
-        // check_auth succeeded: the node is registered. The map stream is started just below; mark
-        // Running now so `wait_until_running` resolves as soon as registration completes (the
-        // stream `Started`/`Next` handlers keep it current, and flip to Expired if the key lapses).
+        // check_auth succeeded, but the node is not "up" until the netmap stream is actually
+        // attached below. Publish `Running` only AFTER `attach_stream` so `wait_until_running` never
+        // resolves `Ok` for a device whose stream connect failed (which would leave a stopped actor
+        // behind). If the connect/subscribe steps fail, publish a transient `Failed` first so the
+        // waiter sees an actionable reason instead of the opaque post-mortem `Internal(Actor)`.
+        let bring_up = async {
+            let (client, stream) = AsyncControlClient::connect(
+                &params.config,
+                &params.env.keys,
+                params.auth_key.as_deref(),
+            )
+            .await?;
+
+            DerpLatencyMeasurer::spawn_link(&slf, params.env.clone()).await;
+
+            params.env.subscribe::<DerpLatencyMeasurement>(&slf).await?;
+            params.env.subscribe::<EndpointAdvertisement>(&slf).await?;
+            slf.attach_stream(stream.boxed(), (), ());
+            Ok::<_, ControlRunnerError>(client)
+        };
+
+        let client = match bring_up.await {
+            Ok(client) => client,
+            Err(e) => {
+                tracing::error!(error = %e, "bringing up the control session failed");
+                // The control session never came up; surface it as a transient registration
+                // failure (a retry / fresh `Device::new` may succeed) rather than leaving the state
+                // stuck at `Connecting`.
+                params.state_tx.send_replace(crate::DeviceState::Failed(
+                    crate::RegistrationError::NetworkUnreachable,
+                ));
+                return Err(e);
+            }
+        };
+
+        // The netmap stream is attached: the node is up. The stream `Next` handler keeps this
+        // current (and flips to `Expired` if the self-node's key lapses).
         params.state_tx.send_replace(crate::DeviceState::Running);
-
-        let (client, stream) = AsyncControlClient::connect(
-            &params.config,
-            &params.env.keys,
-            params.auth_key.as_deref(),
-        )
-        .await?;
-
-        DerpLatencyMeasurer::spawn_link(&slf, params.env.clone()).await;
-
-        params.env.subscribe::<DerpLatencyMeasurement>(&slf).await?;
-        params.env.subscribe::<EndpointAdvertisement>(&slf).await?;
-        slf.attach_stream(stream.boxed(), (), ());
 
         Ok(Self {
             client,

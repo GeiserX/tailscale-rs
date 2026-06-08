@@ -42,15 +42,24 @@ runs:
         fi
 
         # rustup: dtolnay/rust-toolchain (used by ./.github/actions/setup-rust) assumes rustup is
-        # already on PATH. Install it persistently to /opt/rust (shared, not per-job) if absent.
+        # already on PATH. Install it persistently to the SHARED /opt/rust homes (not per-job) if
+        # absent. Force RUSTUP_HOME/CARGO_HOME and create+own /opt/rust BEFORE the install check so a
+        # rustup found elsewhere on PATH doesn't skip provisioning the declared homes (CodeRabbit).
         export RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo
-        if ! command -v rustup >/dev/null 2>&1 && [ ! -x "$CARGO_HOME/bin/rustup" ]; then
-          $SUDO mkdir -p /opt/rust
-          $SUDO chown -R "$(id -u):$(id -g)" /opt/rust 2>/dev/null || true
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --no-modify-path --default-toolchain none --profile minimal
+        $SUDO mkdir -p /opt/rust
+        $SUDO chown -R "$(id -u):$(id -g)" /opt/rust 2>/dev/null || true
+        if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+          # Supply-chain note: this bootstraps over TLS from the canonical rustup host. The
+          # rustup-init.sh wrapper is unversioned (no stable SHA to pin), but it only fetches the
+          # rustup binary, which then verifies its OWN downloads against signed channel manifests.
+          # The stronger mitigation is to pre-bake rustup into the runner image; this self-heal path
+          # exists for a freshly (re)created bare runner and runs only on same-repo refs (fork PRs
+          # skip these self-hosted lanes — see ci.yml).
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+          sh /tmp/rustup-init.sh -y --no-modify-path --default-toolchain none --profile minimal
+          rm -f /tmp/rustup-init.sh
         else
-          echo "rustup already installed"
+          echo "rustup already installed in $CARGO_HOME"
         fi
 
         # Make the toolchain + anything `cargo binstall` drops (e.g. `cross`) visible to every

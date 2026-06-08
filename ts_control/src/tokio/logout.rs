@@ -230,10 +230,14 @@ pub(crate) async fn logout_with(
 /// expiring a node needs no authorization decision, and an already-gone node still answers 2xx.
 fn classify_logout_response(status: StatusCode, body: &[u8]) -> Result<(), LogoutError> {
     if !status.is_success() {
+        tracing::error!(%status, "logout request failed");
+        // The response body is logged only at debug to keep any control-side diagnostic text out of
+        // default-level logs (defense-in-depth; control's /machine/register error bodies are
+        // status text, not credentials, but we don't surface them by default).
         let mut truncated = body.to_vec();
         truncated.truncate(512);
         let preview = core::str::from_utf8(&truncated).unwrap_or("<invalid utf8>");
-        tracing::error!(body = %preview, %status, "logout request failed");
+        tracing::debug!(body = %preview, %status, "logout failure response body");
         return Err(LogoutError::Internal(LogoutInternalErrorKind::Http));
     }
     Ok(())
