@@ -1,5 +1,5 @@
 [package]
-name = "ts_control_noise"
+name = "geiserx_ts_control_noise"
 version.workspace = true
 description = "noise protocol implementation for tailscale control comms"
 categories = ["encoding"]
@@ -10,6 +10,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+
+[lib]
+name = "ts_control_noise"
 [dependencies]
 # Our crates.
 ts_capabilityversion.workspace = true

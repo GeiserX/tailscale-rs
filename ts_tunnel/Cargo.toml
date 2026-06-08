@@ -1,5 +1,5 @@
 [package]
-name = "ts_tunnel"
+name = "geiserx_ts_tunnel"
 version.workspace = true
 description = "secure packet tunnel over udp"
 categories = ["cryptography", "network-programming", "encoding"]
@@ -10,6 +10,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+
+[lib]
+name = "ts_tunnel"
 [dependencies]
 # Our crates.
 ts_keys.workspace = true

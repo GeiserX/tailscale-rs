@@ -4,7 +4,15 @@ Record breaking or significant changes here. All dates are UTC.
 
 ## Unreleased - June 2026
 
-Put changes for the upcoming release here!
+### Changed
+- **Crate package names renamed to a `geiserx_` namespace for crates.io publication.** The bare
+  `ts_*` package names collide with unrelated crates already on crates.io (names are global +
+  permanent there), so every publishable workspace crate is renamed: the facade `tailscale-rs` →
+  `geiserx_tailscale`, and each `ts_*` → `geiserx_ts_*` (e.g. `ts_control` → `geiserx_ts_control`).
+  **Library (import) names are unchanged** — each crate keeps `[lib] name = "ts_control"` etc., so
+  `use tailscale::…` / `use ts_control::…` and all source code are unaffected; only the published
+  package names and the `package = "…"` keys in `[workspace.dependencies]` change. The four internal
+  `publish = false` crates (`checks`, `ts_cli_util`, `ts_devtools`, `ts_test_util`) are untouched.
 
 ## [0.6.5](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.6.5) - 2026-06-08
 

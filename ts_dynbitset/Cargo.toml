@@ -1,5 +1,5 @@
 [package]
-name = "ts_dynbitset"
+name = "geiserx_ts_dynbitset"
 version.workspace = true
 description = "dynamically-growable bitset based on ts_bitset"
 categories = ["data-structures", "no-std"]
@@ -10,6 +10,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+
+[lib]
+name = "ts_dynbitset"
 [dependencies]
 # Our crates.
 ts_bitset.workspace = true

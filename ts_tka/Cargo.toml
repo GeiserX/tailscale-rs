@@ -1,5 +1,5 @@
 [package]
-name = "ts_tka"
+name = "geiserx_ts_tka"
 version.workspace = true
 description = "Tailnet Lock (TKA — Tailnet Key Authority) signature-chain verification"
 categories = ["cryptography", "network-programming"]
@@ -10,6 +10,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+
+[lib]
+name = "ts_tka"
 [dependencies]
 blake2.workspace = true
 # Two ed25519 verifiers are intentionally carried — they are NOT redundant, do not collapse them:

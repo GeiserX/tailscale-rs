@@ -1,5 +1,5 @@
 [package]
-name = "ts_metrics"
+name = "geiserx_ts_metrics"
 version.workspace = true
 description = "in-process client metrics registry (clientmetric parity) with Prometheus text export"
 categories = ["network-programming"]
@@ -10,6 +10,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+
+[lib]
+name = "ts_metrics"
 [dependencies]
 
 [lints]

@@ -1,5 +1,5 @@
 [package]
-name = "ts_python"
+name = "geiserx_ts_python"
 version.workspace = true
 description = "pyo3-based python bindings for tailscale"
 categories = ["api-bindings", "network-programming"]

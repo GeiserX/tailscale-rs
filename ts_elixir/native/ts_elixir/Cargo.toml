@@ -1,5 +1,5 @@
 [package]
-name = "ts_elixir"
+name = "geiserx_ts_elixir"
 version.workspace = true
 description = "rustler-based elixir bindings for tailscale"
 categories = ["api-bindings", "network-programming"]
@@ -20,6 +20,7 @@ tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
 
 [lib]
+name = "ts_elixir"
 crate-type = ["cdylib"]
 
 [lints]

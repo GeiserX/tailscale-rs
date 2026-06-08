@@ -1,5 +1,5 @@
 [package]
-name = "ts_control_serde"
+name = "geiserx_ts_control_serde"
 version.workspace = true
 description = "serde data types for tailscale control comms"
 categories = ["encoding", "api-bindings"]
@@ -10,6 +10,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+
+[lib]
+name = "ts_control_serde"
 [dependencies]
 # Our crates.
 ts_capabilityversion = { workspace = true, features = ["serde"] }

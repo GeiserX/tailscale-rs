@@ -1,5 +1,5 @@
 [package]
-name = "ts_array256"
+name = "geiserx_ts_array256"
 version.workspace = true
 description = "fast sparse 256-element array with configurable backing storage"
 categories = ["data-structures", "no-std"]
@@ -10,6 +10,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+
+[lib]
+name = "ts_array256"
 [dependencies]
 # Our crates.
 ts_bitset.workspace = true

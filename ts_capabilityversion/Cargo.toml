@@ -1,5 +1,5 @@
 [package]
-name = "ts_capabilityversion"
+name = "geiserx_ts_capabilityversion"
 version.workspace = true
 description = "tailscale capability version definition"
 categories = ["no-std::no-alloc"]
@@ -10,6 +10,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+
+[lib]
+name = "ts_capabilityversion"
 [dependencies]
 serde = { workspace = true, optional = true }
 

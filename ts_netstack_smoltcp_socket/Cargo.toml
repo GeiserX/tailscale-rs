@@ -1,5 +1,5 @@
 [package]
-name = "ts_netstack_smoltcp_socket"
+name = "geiserx_ts_netstack_smoltcp_socket"
 version.workspace = true
 description = "userspace netstack built on smoltcp (socket wrappers)"
 categories = ["no-std", "network-programming"]
@@ -10,6 +10,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+
+[lib]
+name = "ts_netstack_smoltcp_socket"
 [lints]
 workspace = true
 

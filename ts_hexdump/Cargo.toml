@@ -1,5 +1,5 @@
 [package]
-name = "ts_hexdump"
+name = "geiserx_ts_hexdump"
 version.workspace = true
 description = "hexdumps for byte iterators"
 categories = ["encoding"]
@@ -10,6 +10,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+
+[lib]
+name = "ts_hexdump"
 [features]
 default = ["alloc"]
 alloc = []

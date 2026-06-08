@@ -1,5 +1,5 @@
 [package]
-name = "ts_runtime"
+name = "geiserx_ts_runtime"
 version.workspace = true
 description = "tailscale runtime"
 categories = ["network-programming"]
@@ -10,6 +10,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+
+[lib]
+name = "ts_runtime"
 [dependencies]
 # Our crates.
 ts_bart.workspace = true

@@ -1,5 +1,5 @@
 [package]
-name = "ts_http_util"
+name = "geiserx_ts_http_util"
 version.workspace = true
 description = "tailscale-specific http utilities"
 categories = ["network-programming"]
@@ -10,6 +10,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+
+[lib]
+name = "ts_http_util"
 [dependencies]
 # Our crates.
 ts_tls_util.workspace = true

@@ -1,5 +1,5 @@
 [package]
-name = "ts_control"
+name = "geiserx_ts_control"
 version.workspace = true
 description = "tailscale control client"
 categories = ["api-bindings", "network-programming"]
@@ -11,6 +11,9 @@ license.workspace = true
 
 rust-version.workspace = true
 
+
+[lib]
+name = "ts_control"
 [dependencies]
 # Our crates.
 ts_bitset.workspace = true
