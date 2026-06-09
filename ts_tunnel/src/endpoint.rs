@@ -260,8 +260,14 @@ impl IdMap {
         self.sessions.remove(&id).unwrap();
     }
 
+    /// Free both session ids a handshake may own: the in-flight initiator's allocated recv id and
+    /// the tentative responder's recv id. A handshake can hold either, both (simultaneous
+    /// initiation), or neither, so each slot is freed independently.
     fn remove_handshake_session(&mut self, handshake: &Handshake) {
-        if let Some(id) = handshake.session_id() {
+        if let Some(id) = handshake.initiated_session_id() {
+            self.remove_session(id);
+        }
+        if let Some(id) = handshake.responded_session_id() {
             self.remove_session(id);
         }
     }
@@ -297,7 +303,7 @@ impl Peer {
             id,
             config,
             session: SessionState::None(Queue::default()),
-            handshake: Handshake::None,
+            handshake: Handshake::none(),
             last_seen_timestamp: None,
             cookie_sender: macs,
             keepalive: None,
@@ -424,7 +430,7 @@ impl Peer {
     }
 
     fn recv_cookie_reply(&mut self, packet: &CookieReply) {
-        let Handshake::Initiated(_, _, handshake_mac1) = &mut self.handshake else {
+        let Some(handshake_mac1) = self.handshake.mac1() else {
             tracing::trace!("dropping cookie reply received outside of handshake");
             return;
         };
@@ -516,13 +522,18 @@ impl Peer {
 
         let session_id = endpoint.ids.allocate_session(self.id);
 
-        let packet = self.handshake.respond(
+        let (packet, displaced) = self.handshake.respond(
             session_id,
             handshake,
             &self.config.psk,
             &self.cookie_sender,
             Instant::now(),
         );
+        // A previous tentative responder session was replaced (e.g. the peer retransmitted its
+        // initiation, or rekeyed): free its now-orphaned receive id so it doesn't leak.
+        if let Some(old_id) = displaced {
+            endpoint.ids.remove_session(old_id);
+        }
         out.queue_to_peer(self.id).push(packet);
     }
 
@@ -533,7 +544,7 @@ impl Peer {
         }
 
         endpoint.ids.remove_handshake_session(&self.handshake);
-        self.handshake = Handshake::None;
+        self.handshake = Handshake::none();
 
         self.start_handshake(endpoint, out);
     }
@@ -588,7 +599,7 @@ impl Peer {
         self.session.deactivate(endpoint);
 
         endpoint.ids.remove_handshake_session(&self.handshake);
-        self.handshake = Handshake::None;
+        self.handshake = Handshake::none();
 
         // Stop keeping a removed peer's path warm.
         if let Some(handle) = self.persistent_keepalive.take() {
@@ -620,7 +631,9 @@ impl Peer {
         );
 
         let timeout = endpoint.scheduler.add(tr, Event::HandshakeTimeout(self.id));
-        self.handshake = Handshake::Initiated(handshake, timeout, mac);
+        // Set (not replace) the initiator slot: a tentative responder session from a simultaneous
+        // initiation may coexist and must be preserved (it owns an allocated id).
+        self.handshake.set_initiated(handshake, timeout, mac);
     }
 }
 
@@ -860,6 +873,13 @@ impl Endpoint {
     /// Return the peer id that has the selected node key.
     pub fn peer_id(&self, key: NodePublicKey) -> Option<PeerId> {
         self.state.ids.get_by_nodekey(&key)
+    }
+
+    /// Number of session ids currently allocated in the id map. Used by tests to assert there are
+    /// no leaked or double-counted session ids after a handshake settles or a peer is torn down.
+    #[cfg(test)]
+    fn session_id_count(&self) -> usize {
+        self.state.ids.sessions.len()
     }
 }
 
@@ -1453,6 +1473,162 @@ mod tests {
             pkts[0].len() > KEEPALIVE_LEN,
             "real data must be a full (non-empty) data frame, not an empty keepalive — \
              proving keepalives didn't tear down or rotate the live session"
+        );
+    }
+
+    /// Pull the (single peer's) packets out of a result's `to_peers`, asserting exactly one peer
+    /// was addressed. Keeps the simultaneous-initiation test below readable.
+    fn only_to_peer(
+        map: &HashMap<PeerId, Vec<PacketMut>>,
+        peer: PeerId,
+        what: &str,
+    ) -> Vec<PacketMut> {
+        assert_eq!(
+            map.len(),
+            1,
+            "expected packets for exactly one peer ({what})"
+        );
+        map.get(&peer).expect(what).clone()
+    }
+
+    /// Regression test for issue #20: WireGuard *simultaneous initiation*.
+    ///
+    /// Both peers initiate a handshake before either has seen the other's initiation. With the old
+    /// single-slot `Handshake`, each peer's `respond()` clobbered its own in-flight `Initiated`
+    /// state, so its later `finish()` failed ("handshake failed to complete") and every transport
+    /// packet thereafter hit "session not found" — a permanent wedge. The two-slot `Handshake`
+    /// retains BOTH roles (initiator + responder) simultaneously; both handshakes complete and the
+    /// `SessionState` rotation converges them. This drives two real `Endpoint`s through that race
+    /// and asserts: (a) data flows BOTH ways afterwards, (b) no wedge, and (c) no session ids leak
+    /// (the id map returns to its baseline after both peers are torn down).
+    #[test]
+    fn simultaneous_initiation_converges_without_wedge() {
+        let (a_static, b_static) = (NodeKeyPair::new(), NodeKeyPair::new());
+        let psk = rand::random();
+        let (mut a_ep, mut b_ep) = (Endpoint::new(a_static), Endpoint::new(b_static));
+        let (a_peer, b_peer) = (PeerId(1), PeerId(1));
+
+        a_ep.upsert_peer(
+            a_peer,
+            PeerConfig {
+                key: b_static.public,
+                psk,
+                persistent_keepalive_interval: None,
+            },
+        );
+        b_ep.upsert_peer(
+            b_peer,
+            PeerConfig {
+                key: a_static.public,
+                psk,
+                persistent_keepalive_interval: None,
+            },
+        );
+
+        // Baseline: no sessions allocated on either endpoint before any handshake.
+        assert_eq!(a_ep.session_id_count(), 0);
+        assert_eq!(b_ep.session_id_count(), 0);
+
+        // (1) BOTH peers send first — each produces its own initiation while still ignorant of the
+        // other's. Each endpoint now holds an in-flight initiator (and one allocated session id).
+        let init_a = a_ep.send(HashMap::from([(
+            a_peer,
+            vec![PacketMut::from(&b"a-first"[..])],
+        )]));
+        let init_a = only_to_peer(&init_a.to_peers, a_peer, "A's handshake init");
+        let init_b = b_ep.send(HashMap::from([(
+            b_peer,
+            vec![PacketMut::from(&b"b-first"[..])],
+        )]));
+        let init_b = only_to_peer(&init_b.to_peers, b_peer, "B's handshake init");
+        assert_eq!(a_ep.session_id_count(), 1, "A allocated its initiator id");
+        assert_eq!(b_ep.session_id_count(), 1, "B allocated its initiator id");
+
+        // (2) Each initiation is delivered to the OPPOSITE endpoint. Each peer responds to the
+        // peer's msg1 (the interop-mandatory behavior) WITHOUT discarding its own in-flight
+        // initiation: it now holds both roles, and a second (responder) session id.
+        let resp_to_a = b_ep.recv(init_a);
+        assert!(resp_to_a.to_local.is_empty(), "no payload delivered yet");
+        let resp_to_a = only_to_peer(&resp_to_a.to_peers, b_peer, "B's response to A");
+        let resp_to_b = a_ep.recv(init_b);
+        assert!(resp_to_b.to_local.is_empty(), "no payload delivered yet");
+        let resp_to_b = only_to_peer(&resp_to_b.to_peers, a_peer, "A's response to B");
+        assert_eq!(
+            a_ep.session_id_count(),
+            2,
+            "A holds both an initiator and a responder session id"
+        );
+        assert_eq!(
+            b_ep.session_id_count(),
+            2,
+            "B holds both an initiator and a responder session id"
+        );
+
+        // (3) Each peer receives the response to ITS OWN initiation. Under the old code this
+        // `finish()` would fail (the initiation was clobbered by step 2); here it completes,
+        // activates the initiator session, and flushes the queued first-packet to confirm.
+        let data_from_a = a_ep.recv(resp_to_a);
+        let data_from_a = only_to_peer(&data_from_a.to_peers, a_peer, "A's first transport packet");
+        let data_from_b = b_ep.recv(resp_to_b);
+        let data_from_b = only_to_peer(&data_from_b.to_peers, b_peer, "B's first transport packet");
+
+        // (4) The confirming transport packets cross. Each side decrypts the peer's first packet,
+        // delivering the primed payload locally — proving the session converged (no wedge).
+        let delivered_to_b = b_ep.recv(data_from_a);
+        assert_eq!(
+            delivered_to_b.to_local.get(&b_peer).map(|p| p.as_slice()),
+            Some([PacketMut::from(&b"a-first"[..])].as_slice()),
+            "A's primed payload must reach B (no 'session not found' wedge)"
+        );
+        let delivered_to_a = a_ep.recv(data_from_b);
+        assert_eq!(
+            delivered_to_a.to_local.get(&a_peer).map(|p| p.as_slice()),
+            Some([PacketMut::from(&b"b-first"[..])].as_slice()),
+            "B's primed payload must reach A (no 'session not found' wedge)"
+        );
+
+        // (5) The tunnel is fully bidirectional on fresh data, not just the handshake-priming
+        // packets: send new data each way and confirm it decrypts on the other end.
+        let a_payload = b"a->b-after-converge";
+        let to_b = a_ep.send(HashMap::from([(
+            a_peer,
+            vec![PacketMut::from(&a_payload[..])],
+        )]));
+        let to_b = only_to_peer(&to_b.to_peers, a_peer, "A's post-converge data");
+        let got_b = b_ep.recv(to_b);
+        assert_eq!(
+            got_b.to_local.get(&b_peer).map(|p| p.as_slice()),
+            Some([PacketMut::from(&a_payload[..])].as_slice()),
+            "fresh A->B data must flow on the converged session"
+        );
+
+        let b_payload = b"b->a-after-converge";
+        let to_a = b_ep.send(HashMap::from([(
+            b_peer,
+            vec![PacketMut::from(&b_payload[..])],
+        )]));
+        let to_a = only_to_peer(&to_a.to_peers, b_peer, "B's post-converge data");
+        let got_a = a_ep.recv(to_a);
+        assert_eq!(
+            got_a.to_local.get(&a_peer).map(|p| p.as_slice()),
+            Some([PacketMut::from(&b_payload[..])].as_slice()),
+            "fresh B->A data must flow on the converged session"
+        );
+
+        // (6) No leaked session ids: tearing each peer down must free everything it holds (both the
+        // active recv and the rotated recv_prev that the second completion produced). A leak or a
+        // double-free (the id map `remove_session` unwraps) would surface right here.
+        assert!(a_ep.remove_peer(a_peer), "A's peer should exist");
+        assert!(b_ep.remove_peer(b_peer), "B's peer should exist");
+        assert_eq!(
+            a_ep.session_id_count(),
+            0,
+            "A must free every session id on teardown — no leak"
+        );
+        assert_eq!(
+            b_ep.session_id_count(),
+            0,
+            "B must free every session id on teardown — no leak"
         );
     }
 }

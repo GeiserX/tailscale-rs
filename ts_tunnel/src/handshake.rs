@@ -349,36 +349,88 @@ pub struct SessionPair {
 }
 
 /// A handshake with a peer.
-pub(crate) enum Handshake {
-    /// No handshake in progress.
-    None,
-    /// We are the initiator, awaiting a response.
-    ///
-    /// Second field is the timeout for the handshake.
-    Initiated(SentHandshake, Handle<Event>, Mac),
-    /// We are the responder, awaiting an initial transport
-    /// message to confirm the new session.
-    Responded(Box<SessionPair>),
+///
+/// Both roles are tracked simultaneously. WireGuard handshakes are symmetric: either peer may
+/// initiate, and a peer that has sent its own initiation must still respond to the other peer's
+/// initiation (real wireguard-go / Tailscale / kernel peers expect a response and will not
+/// converge otherwise). When both peers initiate at the same time (a "simultaneous initiation"
+/// race, common on an idle relay-only path where both ends rekey in lockstep), each peer ends up
+/// holding *both* an in-flight initiator state (awaiting the peer's response) and a responder
+/// state (awaiting a confirming transport packet). Both handshakes are driven to completion and
+/// the session converges on whichever pair's first transport packet arrives — the existing
+/// `SessionState` rotation absorbs the second completion as an ordinary rekey overlap. Retaining
+/// both roles (rather than a pubkey tie-break, which would be interop-unsafe) is the canonical fix
+/// used by boringtun, wireguard-go, and the Linux kernel.
+pub(crate) struct Handshake {
+    /// Initiator role: we sent a [`HandshakeInitiation`] and are awaiting a [`HandshakeResponse`]
+    /// (msg2). Holds the in-progress [`SentHandshake`], the `HANDSHAKE_TIMEOUT` retry handle, and
+    /// our mac1 (needed to authenticate a cookie reply).
+    initiated: Option<(SentHandshake, Handle<Event>, Mac)>,
+    /// Responder role: we responded to the peer's [`HandshakeInitiation`] and are awaiting an
+    /// initial transport message to confirm the new session.
+    responded: Option<Box<SessionPair>>,
 }
 
 impl Handshake {
-    pub(crate) fn is_active(&self) -> bool {
-        !matches!(self, Handshake::None)
-    }
-
-    /// Return the session id of the handshake, if any.
-    pub(crate) fn session_id(&self) -> Option<SessionId> {
-        match self {
-            Handshake::Initiated(handshake, ..) => Some(handshake.id),
-            Handshake::Responded(tentative) => Some(tentative.recv.id()),
-            Handshake::None => None,
+    /// An idle handshake: neither an initiation in flight nor a tentative responder session.
+    pub(crate) const fn none() -> Handshake {
+        Handshake {
+            initiated: None,
+            responded: None,
         }
     }
 
-    /// Respond to a peer's handshake initiation, and switch to the responder state to await
-    /// session confirmation.
+    /// Record a freshly-sent initiation as the initiator role, leaving the responder role
+    /// untouched.
     ///
-    /// Responding replaces any other handshake state unconditionally.
+    /// Setting (not replacing) the slot is load-bearing: a tentative responder session
+    /// (`responded`) may already exist (simultaneous initiation), and it owns an allocated receive
+    /// id — clobbering it here would both drop a convergeable session and leak that id. The
+    /// caller (`start_handshake`) guarantees no initiator is already in flight, so this never
+    /// overwrites a live initiation (which would orphan its timeout handle).
+    pub(crate) fn set_initiated(&mut self, sent: SentHandshake, timeout: Handle<Event>, mac1: Mac) {
+        debug_assert!(
+            self.initiated.is_none(),
+            "start_handshake should only run with no initiation already in flight"
+        );
+        self.initiated = Some((sent, timeout, mac1));
+    }
+
+    /// Whether an *initiation* of ours is in flight (awaiting a response).
+    ///
+    /// Deliberately gates ONLY on the initiator role: callers use this to decide whether to start
+    /// a fresh handshake, and a tentative responder session (`responded`) does not represent an
+    /// outgoing handshake we're driving — it's the peer's, awaiting confirmation. Suppressing a
+    /// fresh initiation because we happen to be a tentative responder would stall rekey.
+    pub(crate) fn is_active(&self) -> bool {
+        self.initiated.is_some()
+    }
+
+    /// The session id we allocated for the in-flight initiation, if any (i.e. the recv id of the
+    /// session that completing as initiator will produce).
+    pub(crate) fn initiated_session_id(&self) -> Option<SessionId> {
+        self.initiated.as_ref().map(|(handshake, ..)| handshake.id)
+    }
+
+    /// The receive session id of the tentative responder session, if any.
+    pub(crate) fn responded_session_id(&self) -> Option<SessionId> {
+        self.responded.as_ref().map(|tentative| tentative.recv.id())
+    }
+
+    /// Our mac1 from the in-flight initiation, needed to authenticate a cookie reply.
+    pub(crate) fn mac1(&self) -> Option<&Mac> {
+        self.initiated.as_ref().map(|(_, _, mac1)| mac1)
+    }
+
+    /// Respond to a peer's handshake initiation, storing the tentative responder session to await
+    /// confirmation.
+    ///
+    /// This NEVER touches the initiator role: a simultaneous initiation of ours stays in flight so
+    /// both handshakes can complete. Responding always happens, matching wireguard-go / the kernel
+    /// (a real peer expects a response to its msg1 regardless of our own pending initiation).
+    ///
+    /// If a previous tentative responder session was displaced, its receive session id is returned
+    /// so the caller can free it from the [`crate::endpoint`] id map.
     pub(crate) fn respond(
         &mut self,
         session_id: SessionId,
@@ -386,30 +438,21 @@ impl Handshake {
         psk: &Psk,
         cookie_sender: &MACSender,
         now: Instant,
-    ) -> PacketMut {
-        // TODO: tie-breaker for simultaneous initiation.
-        // When both peers initiate simultaneously, it's possible to get into a sticky situation
-        // where each peer completes their own initiation based on the other's response, and in
-        // so doing end up on completely different session keys that will never be confirmed.
-        // We need to resolve the conflict one way or another to avoid this race.
-        //
-        // However, in practice the race is vanishingly rare unless you somehow externally
-        // synchronize the peers to start handshaking at exactly the same time. So, the code is
-        // usable without this race avoidance logic.
-        //
-        // We may also be able to resolve this race with a 4th handshake state wherein we are
-        // simultaneously initiator and responder, and temporarily exist in quantum superposition
-        // until confirmation packets collapse the state again.
+    ) -> (PacketMut, Option<SessionId>) {
         let (session, packet) = handshake.respond(session_id, psk, cookie_sender, now);
-        *self = Handshake::Responded(Box::new(session));
-        packet
+        let displaced = self
+            .responded
+            .replace(Box::new(session))
+            .map(|old| old.recv.id());
+        (packet, displaced)
     }
 
     /// Finish a handshake as the initiator, returning the newly established sessions.
     ///
-    /// The handshake state is unchanged if the handshake cannot complete, either because
-    /// it's not in an appropriate state or because the handshake response isn't a valid
-    /// completion of the handshake.
+    /// Consumes ONLY the initiator role on success (the responder role, if any, is left intact so a
+    /// simultaneously-initiated handshake can still confirm). The handshake state is unchanged if
+    /// the handshake cannot complete, either because there's no initiation in flight or because the
+    /// handshake response isn't a valid completion of it.
     pub(crate) fn finish(
         &mut self,
         packet: &HandshakeResponse,
@@ -417,9 +460,7 @@ impl Handshake {
         cookies: &MACReceiver,
         now: Instant,
     ) -> Option<SessionPair> {
-        let Handshake::Initiated(sent_handshake, ..) = self else {
-            return None;
-        };
+        let (sent_handshake, ..) = self.initiated.as_ref()?;
 
         if !cookies.verify_macs(packet.as_bytes()) {
             return None;
@@ -448,9 +489,9 @@ impl Handshake {
         let send = TransmitSession::new(session_keys.initiator_to_responder, packet.sender_id, now);
         let recv = ReceiveSession::new(session_keys.responder_to_initiator, sent_handshake.id, now);
 
-        let Handshake::Initiated(_, timeout, _) = std::mem::replace(self, Handshake::None) else {
-            unreachable!();
-        };
+        // Crypto succeeded: consume the initiator role and cancel its retry timeout. The responder
+        // role (if any) is intentionally left untouched.
+        let (_, timeout, _) = self.initiated.take().unwrap();
         timeout.cancel();
 
         Some(SessionPair { send, recv })
@@ -460,8 +501,9 @@ impl Handshake {
     ///
     /// A tentative session becomes confirmed when it successfully decrypts its first packet.
     ///
-    /// The handshake state is unchanged if the handshake cannot be confirmed, either because it's
-    /// not in an appropriate state or because no packet successfully decrypted.
+    /// Consumes ONLY the responder role on success (the initiator role, if any, is left intact).
+    /// The handshake state is unchanged if the handshake cannot be confirmed, either because
+    /// there's no tentative responder session, its id doesn't match, or no packet decrypted.
     ///
     /// Upon successful confirmation, returns the newly established sessions as well as the one
     /// or more packets that decrypted successfully
@@ -470,9 +512,7 @@ impl Handshake {
         session_id: SessionId,
         mut packets: Vec<PacketMut>,
     ) -> Option<(SessionPair, Vec<PacketMut>)> {
-        let Handshake::Responded(tentative) = self else {
-            return None;
-        };
+        let tentative = self.responded.as_mut()?;
 
         if tentative.recv.id() != session_id {
             return None;
@@ -483,9 +523,7 @@ impl Handshake {
             return None;
         }
 
-        let Handshake::Responded(tentative) = std::mem::replace(self, Handshake::None) else {
-            unreachable!();
-        };
+        let tentative = self.responded.take().unwrap();
 
         Some((*tentative, packets))
     }
@@ -644,24 +682,28 @@ mod tests {
             ts_time::TimeRange::new_around(Instant::now(), std::time::Duration::from_secs(1000)),
             crate::Event::HandshakeTimeout(crate::config::PeerId(0)),
         );
-        let mut a_handshake = Handshake::Initiated(a_handshake, timeout, handshake_mac);
+        let mut a_handshake = Handshake {
+            initiated: Some((a_handshake, timeout, handshake_mac)),
+            responded: None,
+        };
 
-        // B responds, entering the tentative `Responded` state.
+        // B responds, entering the tentative responder state.
         let init_ref = HandshakeInitiation::try_ref_from_bytes(init_pkt.as_ref()).unwrap();
         let b_mac_send = MACSender::new(&a_static.public);
         let b_mac_recv = MACReceiver::new(&b_static.public);
         let b_received = ReceivedHandshake::new(init_ref, &b_static, &b_mac_recv).unwrap();
         let b_session = SessionId::random();
-        let mut b_handshake = Handshake::None;
-        let response_pkt =
+        let mut b_handshake = Handshake::none();
+        let (response_pkt, displaced) =
             b_handshake.respond(b_session, b_received, &psk, &b_mac_send, Instant::now());
 
-        // ASSERT: the responder is provisional, NOT live.
+        // ASSERT: the responder is provisional, NOT live, and nothing was displaced.
+        assert!(displaced.is_none(), "first respond() displaces nothing");
         assert!(
-            matches!(b_handshake, Handshake::Responded(_)),
-            "responder must be tentative (Responded) after respond(), not live"
+            b_handshake.responded.is_some() && b_handshake.initiated.is_none(),
+            "responder must be tentative (responded set) after respond(), not live"
         );
-        assert_eq!(b_handshake.session_id(), Some(b_session));
+        assert_eq!(b_handshake.responded_session_id(), Some(b_session));
 
         // A finishes and gets live sessions (the initiator DOES confirm at finish() — it has the
         // responder's authenticated empty payload). This is the initiator side; the responder is
@@ -684,7 +726,7 @@ mod tests {
             "a packet that fails to decrypt must NOT confirm the responder session"
         );
         assert!(
-            matches!(b_handshake, Handshake::Responded(_)),
+            b_handshake.responded.is_some(),
             "responder must remain provisional after a non-decrypting packet"
         );
 
@@ -702,7 +744,7 @@ mod tests {
 
         // ASSERT: confirmation consumed the tentative state — the handshake is now idle/live.
         assert!(
-            matches!(b_handshake, Handshake::None),
+            b_handshake.responded.is_none() && b_handshake.initiated.is_none(),
             "confirm() must consume the tentative state once the session is live"
         );
 
@@ -734,7 +776,10 @@ mod tests {
             ts_time::TimeRange::new_around(Instant::now(), std::time::Duration::from_secs(1000)),
             crate::Event::HandshakeTimeout(crate::config::PeerId(0)),
         );
-        let mut a_handshake = Handshake::Initiated(a_handshake, timeout, handshake_mac);
+        let mut a_handshake = Handshake {
+            initiated: Some((a_handshake, timeout, handshake_mac)),
+            responded: None,
+        };
 
         // Peer B receives it and responds
         let init_pkt = HandshakeInitiation::try_ref_from_bytes(init_pkt.as_ref())
