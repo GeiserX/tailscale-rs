@@ -2,7 +2,7 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
-## Unreleased - June 2026
+## [0.6.9](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.6.9) - 2026-06-09
 
 ### Fixed
 - **Netmap decode now tolerates `null` for every sequence/map field (Go `omitempty` ↔ Rust).** Go
@@ -12,13 +12,13 @@ Record breaking or significant changes here. All dates are UTC.
   forever. v0.6.8 fixed only `Node.addresses`; this is the systematic pass. Rather than annotate
   each field (the per-field approach is what let the gap recur), `null` tolerance is now applied at
   the **struct level** via `#[serde_with::apply]` on every type on the deserialized netmap path —
-  `Node`, `MapResponse`, `DNSConfig`, `DerpMap`/`Region`/`HomeParams`, `SSHPolicy` and its nested
-  rules, `ControlDialPlan`, and the `ts_packetfilter_serde` filter/cap-grant types — so any
-  `Vec`/map field added later is covered automatically. `null`, `[]`/`{}`, and a populated container
-  are accepted interchangeably; `Option<…>` fields (whose `null`/absence means *unchanged from the
-  prior poll*, e.g. `peers`, `packet_filter` singular) are deliberately left untouched. Regression
-  tests decode a full `MapResponse` + peer `Node` + `DNSConfig`, a DERP map, an SSH policy, a packet
-  filter, and a dial plan with `null` everywhere a sequence/map is expected.
+  `Node`, `MapResponse`, `DNSConfig`/`Resolver`, `DerpMap`/`Region`/`HomeParams`, `SSHPolicy` and
+  its nested rules, `ControlDialPlan`, and the `ts_packetfilter_serde` filter/cap-grant types — so
+  any `Vec`/map field added later is covered automatically. `null`, `[]`/`{}`, and a populated
+  container are accepted interchangeably; `Option<…>` fields (whose `null`/absence means *unchanged
+  from the prior poll*, e.g. `peers`, `packet_filter` singular) are deliberately left untouched.
+  Regression tests decode a full `MapResponse` + peer `Node` + `DNSConfig`, a DERP map, an SSH
+  policy, a packet filter, and a dial plan with `null` everywhere a sequence/map is expected.
 
 ## [0.6.8](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.6.8) - 2026-06-09
 
