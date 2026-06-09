@@ -19,6 +19,28 @@ use crate::{
 
 type SessionKey = chacha20poly1305::Key;
 
+/// Session age past which the transmit side is considered stale and a key rotation
+/// (rehandshake) should be initiated. This is `REKEY-AFTER-TIME` from the WireGuard
+/// whitepaper §6.1 ("Transport Message Limits"), 120 seconds.
+pub(crate) const REKEY_AFTER_TIME: Duration = Duration::from_secs(120);
+
+/// Session age past which a session must no longer be used to send any transport data. This is
+/// `REJECT-AFTER-TIME` from the WireGuard whitepaper §6.1, 180 seconds. Applied to the **transmit**
+/// side, where it is self-correcting: a `Peer::send` past this age finds the send session expired
+/// and triggers a fresh handshake, so an actively-sending peer rekeys well before it (rekey is
+/// driven at `REKEY_AFTER_TIME` = 120s).
+pub(crate) const REJECT_AFTER_TIME: Duration = Duration::from_secs(180);
+
+/// Age past which a **receive** session is dropped. Deliberately MORE LENIENT than the canonical
+/// `REJECT_AFTER_TIME` (180s): rekey in this fork is triggered ONLY by outbound `Peer::send`, with
+/// no receive-triggered or timer-driven rekey (the trigger real WireGuard has). A mostly-*inbound*
+/// session (a download / event stream) that goes idle on the send side past 120s would, at a strict
+/// 180s receive bound, have its receive keys hard-expire and silently drop inbound traffic until the
+/// next outbound packet forces a new handshake. Keeping the receive bound at 240s preserves the
+/// cushion that makes that invisible. Tightening this to `REJECT_AFTER_TIME` is correct ONLY once a
+/// receive-triggered rekey exists (tracked separately); until then this is the safe value.
+pub(crate) const REJECT_AFTER_TIME_RECV: Duration = Duration::from_secs(240);
+
 /// A generator of monotonically increasing 64-bit nonces.
 #[derive(Default)]
 struct NonceGenerator {
@@ -149,11 +171,11 @@ impl TransmitSession {
     }
 
     pub fn stale(&self, now: Instant) -> bool {
-        now.duration_since(self.created) > Duration::from_secs(120) // TODO: constants
+        now.duration_since(self.created) > REKEY_AFTER_TIME
     }
 
     pub fn expired(&self, now: Instant) -> bool {
-        now.duration_since(self.created) > Duration::from_secs(240) // TODO: constants
+        now.duration_since(self.created) > REJECT_AFTER_TIME
     }
 }
 
@@ -246,8 +268,12 @@ impl ReceiveSession {
         self.id
     }
 
+    /// Whether this receive session is too old to accept inbound transport data. Uses the lenient
+    /// [`REJECT_AFTER_TIME_RECV`] (240s), NOT `REJECT_AFTER_TIME` (180s): without a receive-triggered
+    /// rekey, tightening the receive bound would silently drop inbound traffic on a send-idle,
+    /// mostly-inbound session. See [`REJECT_AFTER_TIME_RECV`].
     pub fn expired(&self, now: Instant) -> bool {
-        now.duration_since(self.created) > Duration::from_secs(240) // TODO: constants
+        now.duration_since(self.created) > REJECT_AFTER_TIME_RECV
     }
 }
 
@@ -371,19 +397,29 @@ mod tests {
         let send = TransmitSession::new(k.into(), session, now);
         let recv = ReceiveSession::new(k.into(), session, now);
 
+        // stale() is keyed on REKEY_AFTER_TIME (120s): not stale before, stale after.
         assert!(!send.stale(now));
         assert!(!send.stale(now + Duration::from_secs(100)));
         assert!(send.stale(now + Duration::from_secs(130)));
         assert!(send.stale(now + Duration::from_secs(250)));
 
+        // expired() is keyed on REJECT_AFTER_TIME (180s): not expired well below the line,
+        // expired well above it. 130s sits below 180s (so still live — rekey, driven by
+        // stale() at 120s, has fired by now but the session is not yet dead); 250s is above.
         assert!(!send.expired(now));
         assert!(!send.expired(now + Duration::from_secs(100)));
         assert!(!send.expired(now + Duration::from_secs(130)));
         assert!(send.expired(now + Duration::from_secs(250)));
 
+        // ReceiveSession::expired() uses the LENIENT REJECT_AFTER_TIME_RECV (240s), deliberately
+        // more generous than the transmit side's 180s — see REJECT_AFTER_TIME_RECV. The 200s point
+        // pins this difference: the send side is already expired at 200s (200 > 180) but the receive
+        // side is still live (200 < 240), so a send-idle inbound session keeps accepting traffic.
         assert!(!recv.expired(now));
         assert!(!recv.expired(now + Duration::from_secs(100)));
         assert!(!recv.expired(now + Duration::from_secs(130)));
+        assert!(send.expired(now + Duration::from_secs(200)));
+        assert!(!recv.expired(now + Duration::from_secs(200)));
         assert!(recv.expired(now + Duration::from_secs(250)));
     }
 

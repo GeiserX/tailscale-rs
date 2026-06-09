@@ -505,7 +505,17 @@ impl Handshake {
     ///
     /// Consumes ONLY the responder role on success (the initiator role, if any, is left intact).
     /// The handshake state is unchanged if the handshake cannot be confirmed, either because
-    /// there's no tentative responder session, its id doesn't match, or no packet decrypted.
+    /// there's no tentative responder session, its id doesn't match, the tentative session has
+    /// aged past `REJECT_AFTER_TIME`, or no packet decrypted.
+    ///
+    /// A not-yet-confirmed responder keypair is bounded by `REJECT_AFTER_TIME` on the receive
+    /// path, matching canonical WireGuard (wireguard-go `ReceivedWithKeypair`/`counter_validate`
+    /// and the kernel's `wg_noise_received_with_keypair`): a delayed-but-valid (or replayed)
+    /// transport packet must NOT promote a stale tentative session arbitrarily later. When the
+    /// tentative session is expired we leave the `responded` slot in place (rather than clearing
+    /// it): the slot is a single `Option`, so the orphan stays bounded and its receive id is
+    /// reclaimed on the existing paths (teardown / displacement by a fresh `respond` /
+    /// handshake-timeout) — clearing it here would instead orphan that id in the endpoint id map.
     ///
     /// Upon successful confirmation, returns the newly established sessions as well as the one
     /// or more packets that decrypted successfully
@@ -513,12 +523,19 @@ impl Handshake {
         &mut self,
         session_id: SessionId,
         mut packets: Vec<PacketMut>,
+        now: Instant,
     ) -> Option<(SessionPair, Vec<PacketMut>)> {
         let tentative = self.responded.as_mut()?;
 
         if tentative.recv.id() != session_id {
             return None;
         };
+
+        if tentative.recv.expired(now) {
+            // Stale tentative responder session: do not promote. Leave the slot intact so the id
+            // is reclaimed on teardown/displacement/timeout rather than leaked.
+            return None;
+        }
 
         packets = tentative.recv.decrypt(packets);
         if packets.is_empty() {
@@ -538,6 +555,7 @@ mod tests {
     use zerocopy::TryFromBytes;
 
     use super::*;
+    use crate::session::REJECT_AFTER_TIME_RECV;
 
     fn fixed_static(b: u8) -> x25519_dalek::StaticSecret {
         x25519_dalek::StaticSecret::from([b; 32])
@@ -724,7 +742,9 @@ mod tests {
         };
         bogus_hdr.write_to_prefix(bogus.as_mut()).unwrap();
         assert!(
-            b_handshake.confirm(b_session, vec![bogus]).is_none(),
+            b_handshake
+                .confirm(b_session, vec![bogus], Instant::now())
+                .is_none(),
             "a packet that fails to decrypt must NOT confirm the responder session"
         );
         assert!(
@@ -737,7 +757,7 @@ mod tests {
         let mut first = plaintext.clone();
         a_sessions.send.encrypt(first.iter_mut());
         let (b_sessions, decrypted) = b_handshake
-            .confirm(b_session, first)
+            .confirm(b_session, first, Instant::now())
             .expect("first AEAD-verifying transport packet confirms the responder");
         assert_eq!(
             decrypted, plaintext,
@@ -755,6 +775,111 @@ mod tests {
         let mut reply_pkt = reply.clone();
         b_sessions.send.encrypt(&mut reply_pkt);
         assert_eq!(a_sessions.recv.decrypt(reply_pkt), reply);
+    }
+
+    /// Build a tentative responder `Handshake` and the initiator's live [`SessionPair`] from one
+    /// real handshake, stamping the responder's receive session with `responder_now` as its
+    /// creation instant. Returns `(b_responder_handshake, b_session_id, a_sessions)` where
+    /// `a_sessions.send` produces transport packets the responder's recv session decrypts. Passing
+    /// a `responder_now` far in the past yields an already-expired tentative responder; passing the
+    /// real `now` yields a fresh one.
+    fn tentative_responder_with_recv_age(
+        a_static: &NodeKeyPair,
+        b_static: &NodeKeyPair,
+        psk: &Psk,
+        responder_now: Instant,
+        scheduler: &mut Scheduler<crate::Event>,
+    ) -> (Handshake, SessionId, SessionPair) {
+        let a_mac_send = MACSender::new(&b_static.public);
+        let a_session = SessionId::random();
+        let (a_handshake, init_pkt) =
+            initiate_handshake(a_static.private, b_static.public, a_session, TAI64N::now());
+        let mut init_pkt = PacketMut::from(init_pkt.as_bytes());
+        let handshake_mac = a_mac_send.write_macs(init_pkt.as_mut());
+        let timeout = scheduler.add(
+            ts_time::TimeRange::new_around(Instant::now(), std::time::Duration::from_secs(1000)),
+            crate::Event::HandshakeTimeout(crate::config::PeerId(0)),
+        );
+        let mut a_handshake = Handshake {
+            initiated: Some((a_handshake, timeout, handshake_mac)),
+            responded: None,
+        };
+
+        let init_ref = HandshakeInitiation::try_ref_from_bytes(init_pkt.as_ref()).unwrap();
+        let b_mac_send = MACSender::new(&a_static.public);
+        let b_mac_recv = MACReceiver::new(&b_static.public);
+        let b_received = ReceivedHandshake::new(init_ref, b_static, &b_mac_recv).unwrap();
+        let b_session = SessionId::random();
+        let mut b_handshake = Handshake::none();
+        // `respond`'s `now` becomes the responder recv session's `created` — this is the knob that
+        // makes the tentative session fresh or expired.
+        let (response_pkt, _) =
+            b_handshake.respond(b_session, b_received, psk, &b_mac_send, responder_now);
+
+        let a_mac_recv = MACReceiver::new(&a_static.public);
+        let response_ref = HandshakeResponse::try_ref_from_bytes(response_pkt.as_ref()).unwrap();
+        let a_sessions = a_handshake
+            .finish(response_ref, psk, &a_mac_recv, Instant::now())
+            .expect("initiator finishes");
+
+        (b_handshake, b_session, a_sessions)
+    }
+
+    /// FIX #2: a not-yet-confirmed responder session is bounded by `REJECT_AFTER_TIME` on the
+    /// receive path. `confirm()` must NOT promote a tentative `responded` session whose receive
+    /// session has aged past expiry, even when handed an otherwise AEAD-verifying transport packet
+    /// (a delayed/replayed-but-valid frame). This mirrors wireguard-go
+    /// `ReceivedWithKeypair`/`counter_validate` and the kernel's `wg_noise_received_with_keypair`,
+    /// which reject transport packets against a keypair older than `REJECT_AFTER_TIME`.
+    ///
+    /// Two real handshakes give two valid tentative responders that differ ONLY in recv age: the
+    /// fresh one confirms on a valid packet; the expired one rejects the same kind of valid packet
+    /// and leaves its `responded` slot intact (so the id is reclaimed later, never leaked).
+    #[test]
+    fn confirm_rejects_expired_tentative_responder() {
+        let (a_static, b_static) = (NodeKeyPair::new(), NodeKeyPair::new());
+        let psk: Psk = rand::random();
+        let mut scheduler = Scheduler::default();
+
+        let now = Instant::now();
+        // Safely past the RECEIVE expiry bound (REJECT_AFTER_TIME_RECV = 240s — confirm() gates on
+        // the tentative recv session's expiry, which is the lenient receive bound, not the 180s
+        // transmit bound). Saturating fallback keeps this robust on platforms whose monotonic clock
+        // starts near zero.
+        let long_ago = now
+            .checked_sub(REJECT_AFTER_TIME_RECV + std::time::Duration::from_secs(60))
+            .unwrap_or(now);
+
+        // (1) FRESH tentative responder (recv.created == now): a valid first packet confirms it,
+        // and confirmation consumes the slot.
+        let (mut fresh, fresh_id, fresh_a) =
+            tentative_responder_with_recv_age(&a_static, &b_static, &psk, now, &mut scheduler);
+        let plaintext = vec![PacketMut::from("confirm-me".as_bytes())];
+        let mut first = plaintext.clone();
+        fresh_a.send.encrypt(first.iter_mut());
+        assert!(
+            fresh.confirm(fresh_id, first, now).is_some(),
+            "a fresh (non-expired) tentative responder must confirm on a valid packet"
+        );
+        assert!(
+            fresh.responded.is_none(),
+            "confirm() consumes the tentative slot on success"
+        );
+
+        // (2) EXPIRED tentative responder (recv.created == long_ago): the SAME kind of valid packet
+        // must NOT confirm, and the slot is left intact (no id leak).
+        let (mut expired, expired_id, expired_a) =
+            tentative_responder_with_recv_age(&a_static, &b_static, &psk, long_ago, &mut scheduler);
+        let mut late = vec![PacketMut::from("too-late".as_bytes())];
+        expired_a.send.encrypt(late.iter_mut());
+        assert!(
+            expired.confirm(expired_id, late, now).is_none(),
+            "an expired tentative responder must NOT confirm, even on a valid packet"
+        );
+        assert!(
+            expired.responded.is_some(),
+            "confirm() must leave the expired tentative slot intact (no id leak)"
+        );
     }
 
     #[test]
