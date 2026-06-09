@@ -2,6 +2,24 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.7.1](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.7.1) - 2026-06-10
+
+### Fixed
+- **Simultaneous-initiation handshake race no longer wedges relay-only peers (closes #20).** Two
+  peers reachable only via a DERP relay (no direct path) that initiated at the same cadence
+  deterministically failed to ever complete a handshake: `Handshake::respond` unconditionally
+  overwrote an in-flight `Initiated` with `Responded`, so the peer's later `HandshakeResponse` failed
+  `finish()`'s state guard → `handshake failed to complete` + `session not found` looped every ~5.5s
+  forever. A direct path's timing jitter masks this; a relay-only idle path removes the jitter and the
+  race becomes the steady state. Fixed by mirroring canonical WireGuard (wireguard-go / boringtun /
+  kernel — none of which use a deterministic public-key tie-break, which would be interop-unsafe):
+  the per-peer handshake now retains **both** an in-flight initiator slot **and** a responder slot at
+  once, so an inbound initiation no longer destroys our pending one. Both handshakes complete; the
+  responder session stays provisional (send-disabled) until a confirming transport packet; the
+  existing receive-session rotation converges them. We always respond to a peer's `msg1`, so interop
+  with real wireguard-go/Tailscale/kernel peers is unchanged (the Go transport-key KAT still passes
+  byte-for-byte). Internal change only — no public API change.
+
 ## [0.7.0](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.7.0) - 2026-06-09
 
 ### Added
