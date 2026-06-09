@@ -30,6 +30,11 @@ pub fn run(_args: &Args) -> BoxResult<()> {
             "!.github",
             "!.direnv",
             "!result",
+            // `ts_tka/fuzz` is its OWN isolated cargo workspace (empty `[workspace]` table, the
+            // cargo-fuzz convention) so it cannot inherit this repo's `[workspace.lints]`; it is
+            // nightly-only dev tooling excluded from the normal build/test graph. Skip it here
+            // rather than force a redundant `[workspace.lints]` into the fuzz manifest.
+            "!ts_tka/fuzz",
         ],
     )
     .build()?;

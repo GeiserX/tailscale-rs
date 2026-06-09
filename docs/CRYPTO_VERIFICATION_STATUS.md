@@ -17,7 +17,8 @@ secret-dependent timing leak?). Today this fork has strong, real coverage on **B
 KATs + byte-for-byte Go cross-vectors across all three hand-rolled surfaces) and **inherits C**
 from existing academic proofs of WireGuard/Noise **conditional on B holding**. **A is the
 largest open gap** (publishing still uses a long-lived registry token; no cosign/SLSA/attestation
-on the Rust crates or the C library). **D is detection-only and not yet exercised.** None of
+on the Rust crates or the C library). **D is detection-only**: the dudect harness source is now
+in-tree and runs, but no `max_t` result has been recorded on a quiet machine yet. None of
 this substitutes for an independent audit of the hand-rolled crypto — the whole codebase stays
 behind `TS_RS_EXPERIMENT=this_is_unstable_software` for exactly that reason.
 
@@ -33,7 +34,7 @@ become *"it is cryptographically verified."* Those are different axes. We track 
 | **A. Artifact authenticity** | Are the installed bytes the bytes we built, from the source we claim? | Whether the source is *correct* or *safe* | crates.io Trusted Publishing, cosign, SLSA / build provenance, signed tags, checksums | **Partial** — Cargo.lock per-crate SHA256; cargo-deny in CI. Trusted Publishing code present but owner-gated; **no** cosign/SLSA on Rust crates or C lib |
 | **B. Implementation correctness / interop** | Does our Rust match the spec, reject what the spec rejects, and emit Go's exact bytes? | Whether the *protocol* built from those primitives is sound | RFC KATs, Wycheproof, Go cross-vectors, fuzzing | **Strong** — Wycheproof (X25519/ChaCha20-Poly1305/Ed25519), Go byte-for-byte vectors on all 3 hand-rolled surfaces |
 | **C. Protocol security** | Is the WireGuard / Noise handshake itself sound (KCI, forward secrecy, identity hiding)? | Nonce uniqueness, the concrete state machine, replay handling — those are B/D | Tamarin, CryptoVerif, Noise Explorer (ProVerif) | **Inherited** — we re-prove nothing; we inherit the proofs **iff** our wire bytes match Go (axis B) |
-| **D. Side-channel resistance** | Any secret-dependent timing / branch / memory-access leak? | Functional correctness; everything in A/B/C | `subtle`, dudect (**detect**, never prove), cargo-checkct, fiat-crypto | **Partial** — `subtle` constant-time compares, `Zeroizing` key material, RFC-6479 replay window; dudect harness **declared but not yet run** |
+| **D. Side-channel resistance** | Any secret-dependent timing / branch / memory-access leak? | Functional correctness; everything in A/B/C | `subtle`, dudect (**detect**, never prove), cargo-checkct, fiat-crypto | **Partial** — `subtle` constant-time compares, `Zeroizing` key material, RFC-6479 replay window; dudect harness present (`ts_tunnel/benches/constant_time.rs`); no `max_t` result recorded yet |
 
 ```mermaid
 flowchart TD
@@ -115,6 +116,29 @@ Plus the **12-vector `ed25519-speccheck` dual-verifier KAT**
 the standard (cofactorless, `ed25519-dalek`) vs ZIP-215 (cofactored, `ed25519-zebra`) dispatch
 agrees with Go's accept/reject behavior on the 12 adversarial Ed25519 edge cases.
 
+**BLAKE2s-256 reference KAT.** BLAKE2s was previously the only hand-rolled primitive exercised
+*only* transitively (through the WireGuard handshake vectors). It now has a direct KAT
+([`ts_tunnel/tests/blake2s_kat.rs`](../ts_tunnel/tests/blake2s_kat.rs),
+`blake2s256_reference_kat`): **15 vectors (8 unkeyed + 7 keyed)** from the canonical BLAKE2
+reference set (`github.com/BLAKE2/BLAKE2`, `testvectors/blake2-kat.json`), covering both the
+unkeyed hash (`Blake2s256` — transcript hash, mac1, HKDF chaining-key expansion) and the keyed
+MAC (`Blake2sMac256` — mac2/cookie MAC). Vectors are embedded inline and committed as JSON
+provenance at [`tests/vectors/blake2s_kat.json`](../tests/vectors/blake2s_kat.json). Runs in the
+normal `cargo test` gate.
+
+**CBOR differential fuzz target (Tailnet Lock).** A `libfuzzer` target
+([`ts_tka/fuzz/fuzz_targets/cbor_decode.rs`](../ts_tka/fuzz/fuzz_targets/cbor_decode.rs)) drives
+`Authority::node_key_authorized` with arbitrary bytes, exercising the hand-written
+`NodeKeySignature` CBOR decoder the way a hostile peer would and asserting it is panic-free /
+DoS-safe and fails closed. It pairs with a Go oracle
+([`tests/vectors/gen/cbor_diff/`](../tests/vectors/gen/cbor_diff/)) that decodes the same bytes
+with Tailscale's `github.com/fxamacker/cbor` for accept/reject comparison. **Scope:** the fuzz
+target needs **nightly + `cargo-fuzz`**, so it does **not** run in normal CI — but a stable-CI smoke
+test ([`ts_tka/tests/cbor_decode_smoke.rs`](../ts_tka/tests/cbor_decode_smoke.rs)) feeds hand-crafted
+malformed/over-nested CBOR to the same `node_key_authorized` entry on every `cargo test` run,
+asserting the panic-free / fail-closed invariant in stable CI. The automated Rust↔Go differential
+loop (wiring the fuzzer to the Go oracle) is tracked as follow-on work.
+
 ### C — Protocol security (inherited, not re-proven)
 
 The data-plane handshake is **`Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s`** — the exact WireGuard
@@ -149,10 +173,15 @@ reference**. It is not a free-standing claim about our code.
 - **Primitive-level CT** is delegated to `curve25519-dalek` (fiat-crypto backend) and RustCrypto —
   see `docs/CRYPTOGRAPHY.md` §“Constant-time” for the per-operation breakdown.
 
-> ⚠️ **dudect is declared but has not run.** [`ts_tunnel/Cargo.toml`](../ts_tunnel/Cargo.toml)
-> declares a `dudect-bencher` dependency and a `[[bench]]` target (`harness = false`), but there is
-> **no `benches/` source for it yet**. So today there is **no executed timing-leak measurement** —
-> the harness is scaffolding, not a result.
+> ⚠️ **dudect harness is present, but no clean-machine `max_t` is committed yet.**
+> [`ts_tunnel/Cargo.toml`](../ts_tunnel/Cargo.toml) declares the `dudect-bencher` dependency and a
+> `[[bench]]` target (`harness = false`), and the harness source now exists at
+> [`ts_tunnel/benches/constant_time.rs`](../ts_tunnel/benches/constant_time.rs) — it builds and
+> runs (a Welch t-test over the ChaCha20-Poly1305 AEAD tag-verify path). It is **informational and
+> deliberately not CI-gated**: the t-statistic is flaky on shared runners (a noisy box empirically
+> emits `max_t ≈ 20`, which would red-flag essentially every build if gated). The one true residual
+> gap is therefore narrow: **no `max_t` measurement from a quiet machine has been committed yet** —
+> the harness exists and is runnable, but no recorded result is in the tree.
 
 ---
 
@@ -164,12 +193,8 @@ flowchart LR
         A1["Long-lived CARGO_REGISTRY_TOKEN<br/>→ adopt Trusted Publishing"]
         A2["No cosign / SLSA / attestation<br/>on Rust crates + C library"]
     end
-    subgraph B["B. Correctness"]
-        B1["BLAKE2s has no direct KAT<br/>(only uncovered primitive)"]
-        B2["No CBOR differential fuzzer"]
-    end
     subgraph D["D. Side-channel"]
-        D1["dudect harness never executed"]
+        D1["dudect max_t result not yet recorded<br/>(harness present)"]
         D2["No CT codegen proof"]
     end
     subgraph X["Doc/reality drift"]
@@ -178,7 +203,7 @@ flowchart LR
     end
 
     classDef gap fill:#7f1d1d,color:#fff,stroke:#b91c1c;
-    class A1,A2,B1,B2,D1,D2,X1,X2 gap;
+    class A1,A2,D1,D2,X1,X2 gap;
 ```
 
 **A — authenticity (the largest real gap, actively being closed):**
@@ -192,15 +217,23 @@ flowchart LR
   [`.github/workflows/release-binaries.yml`](../.github/workflows/release-binaries.yml) is uploaded
   with a plain `gh release upload` and **no attestation**.
 
-**B — correctness (small, in progress):**
-- **BLAKE2s** is the one hand-rolled primitive with **no direct KAT** — it is only exercised
-  transitively through the WireGuard handshake vectors. A dedicated BLAKE2s KAT is being added.
-- No **CBOR differential fuzzer** for the Tailnet Lock encode/decode path yet (being added).
+**B — correctness:** no open gap. The two previously-listed items both landed in this change and
+are documented under *Current coverage → B* above: the direct **BLAKE2s-256 KAT**
+([`ts_tunnel/tests/blake2s_kat.rs`](../ts_tunnel/tests/blake2s_kat.rs)) and the **CBOR differential
+fuzz target** for Tailnet Lock ([`ts_tka/fuzz/fuzz_targets/cbor_decode.rs`](../ts_tka/fuzz/fuzz_targets/cbor_decode.rs)
++ Go oracle [`tests/vectors/gen/cbor_diff/`](../tests/vectors/gen/cbor_diff/)). What remains is
+*follow-on* hardening, not a correctness gap: wiring the fuzzer's Rust↔Go accept/reject comparison
+into an automated differential loop (it needs nightly + `cargo-fuzz`, so it stays out of normal CI —
+the decoder's panic-free invariant is already covered in stable CI by
+[`ts_tka/tests/cbor_decode_smoke.rs`](../ts_tka/tests/cbor_decode_smoke.rs)).
 
 **D — side-channel (in progress):**
-- Actually **run the dudect harness** (write the missing `benches/` source, record `max_t`).
+- **Record a `max_t` result on a quiet machine.** The dudect harness source now exists
+  ([`ts_tunnel/benches/constant_time.rs`](../ts_tunnel/benches/constant_time.rs)) and runs; the
+  remaining gap is that no clean-machine measurement is committed (it is informational and
+  intentionally not CI-gated — see the axis-D note above).
 - No **constant-time codegen proof** (e.g. `cargo-checkct`); detection ≠ proof, and we have neither
-  the detection result nor the proof today.
+  a recorded detection result nor the proof today.
 
 **Doc / reality drift (being corrected):**
 - `docs/CRYPTOGRAPHY.md` §6 documents the dalek floor as `curve25519-dalek 4.1.3` /

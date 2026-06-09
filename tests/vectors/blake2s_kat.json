@@ -1,19 +1,22 @@
 {
   "_provenance": {
-    "primitive": "BLAKE2s-256",
-    "why": "BLAKE2s-256 is the one crypto primitive ts_tunnel uses that has no direct KAT elsewhere. It backs the WireGuard Noise_IKpsk2 transcript hash, the mac1/mac2 cookie MACs, and the HKDF chaining-key expansion (ts_tunnel/src/handshake.rs imports blake2::{Blake2s256, Digest}; ts_tunnel/src/macs.rs; ts_tka SigHash). The Wycheproof project ships no BLAKE2 set, so this is sourced from the canonical BLAKE2 reference KAT instead.",
+    "primitive": "BLAKE2s (256-bit hash + 128-bit keyed cookie MAC)",
+    "why": "BLAKE2s is the one crypto primitive ts_tunnel uses that has no direct KAT elsewhere. ts_tunnel uses it in two widths/forms: (1) 32-byte output (blake2::Blake2s256) backs the WireGuard Noise_IKpsk2 transcript hash, the mac1/mac2 MAC-KEY derivations, and the HKDF chaining-key expansion (ts_tunnel/src/handshake.rs imports blake2::{Blake2s256, Digest}; ts_tunnel/src/macs.rs; ts_tka SigHash); (2) a 16-byte-output keyed MAC (type CookieMac = Blake2sMac<U16>, ts_tunnel/src/macs.rs:18) is the actual mac1/mac2 cookie MAC written to the packet trailer, keyed via new_from_slice (src/macs.rs:91) so a <32-byte key (the live 16-byte cookie key) is padded correctly. The Wycheproof project ships no BLAKE2 set, so the 32-byte vectors are sourced from the canonical BLAKE2 reference KAT; the 16-byte cookie-MAC vectors are produced by the same blake2 crate (the dep ts_tunnel ships) and cross-checked against Python hashlib.",
     "source_repo": "github.com/BLAKE2/BLAKE2",
     "source_file": "testvectors/blake2-kat.json",
-    "convention": "Canonical BLAKE2 KAT: an input of length n is the bytes 00 01 02 ... (n-1). Keyed vectors use the fixed 32-byte key 00 01 02 ... 1f. Keyed BLAKE2s is a MAC construction parameterized by the key (blake2::Blake2sMac256 via KeyInit), NOT a hash over key||input.",
+    "convention": "Canonical BLAKE2 KAT: an input of length n is the bytes 00 01 02 ... (n-1). Keyed vectors use a fixed key 00 01 02 ... (keylen-1): KEY32 = 00..1f (32 bytes), KEY16 = 00..0f (16 bytes). Keyed BLAKE2s is a MAC construction parameterized by the key (blake2::Blake2sMac256 / Blake2sMac<U16> via KeyInit / new_from_slice), NOT a hash over key||input.",
     "anchors": [
       "unkeyed BLAKE2s-256(\"\")    = 69217a3079908094e11121d042354a7c1f55b6482ca1a51e1b250dfd1ed0eef9",
       "unkeyed BLAKE2s-256(\"abc\") = 508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982 (input 0x616263)",
-      "keyed   BLAKE2s-256(\"\", key=00..1f) = 48a8997da407876b3d79c0d92325ad3b89cbb754d86ab71aee047ad345fd2c49"
+      "keyed   BLAKE2s-256(\"\", key=00..1f) = 48a8997da407876b3d79c0d92325ad3b89cbb754d86ab71aee047ad345fd2c49",
+      "cookie  Blake2sMac<U16>(\"\", key=00..0f short) = af4e5d3bb230e9ff9096ca6f7c501f76 (exercises new_from_slice short-key padding)"
     ],
-    "verification": "Every out value was produced by RustCrypto's blake2 crate v0.10.6 (the proven dependency ts_tunnel ships) over the canonical inputs, and independently cross-checked against testvectors/blake2-kat.json and against an unrelated implementation (Python hashlib.blake2s). The Rust assertions live in ts_tunnel/tests/blake2s_kat.rs (vectors embedded there as an array to avoid a JSON-parsing dev-dependency; this file is the committed provenance copy).",
-    "count": 15,
+    "coverage": "Both BLAKE2s flavors ts_tunnel uses are covered: the 32-byte hash/transcript path (unkeyed Blake2s256 + 32-byte-keyed Blake2sMac256), AND the 16-byte cookie-MAC path (Blake2sMac<U16>) including a SHORT (<32-byte) key that drives the new_from_slice padding the live cookie MAC relies on (src/macs.rs:91). The 32-byte vectors are in `vectors`; the 16-byte cookie-MAC vectors are in `mac16_vectors`.",
+    "verification": "Every 32-byte out value was produced by RustCrypto's blake2 crate v0.10.6 (the proven dependency ts_tunnel ships) over the canonical inputs, and independently cross-checked against testvectors/blake2-kat.json and against an unrelated implementation (Python hashlib.blake2s). The 16-byte Blake2sMac<U16> out values (not present in the canonical 32-byte-only KAT file) were produced by the same blake2 crate (keyed via new_from_slice + finalize_fixed, mirroring src/macs.rs) and independently cross-checked against Python hashlib.blake2s(digest_size=16, key=..), matching byte-for-byte. The Rust assertions live in ts_tunnel/tests/blake2s_kat.rs (blake2s256_reference_kat for the 32-byte path, blake2s_mac16_kat for the 16-byte cookie-MAC path; vectors embedded there as arrays to avoid a JSON-parsing dev-dependency; this file is the committed provenance copy).",
+    "count": 21,
     "unkeyed": 8,
-    "keyed": 7
+    "keyed_256": 7,
+    "keyed_mac16": 6
   },
   "vectors": [
     { "hash": "blake2s", "in": "", "key": "", "out": "69217a3079908094e11121d042354a7c1f55b6482ca1a51e1b250dfd1ed0eef9" },
@@ -31,5 +34,13 @@
     { "hash": "blake2s", "in": "000102030405060708090a0b0c0d0e0f", "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "out": "19ba234f0a4f38637d1839f9d9f76ad91c8522307143c97d5f93f69274cec9a7" },
     { "hash": "blake2s", "in": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "out": "c03bc642b20959cbe133a0303e0c1abff3e31ec8e1a328ec8565c36decff5265" },
     { "hash": "blake2s", "in": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f", "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "out": "8975b0577fd35566d750b362b0897a26c399136df07bababbde6203ff2954ed4" }
+  ],
+  "mac16_vectors": [
+    { "mac": "blake2s-mac16", "in": "", "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "out": "9536f9b267655743dee97b8a670f9f53", "note": "32-byte key (KEY32), empty input" },
+    { "mac": "blake2s-mac16", "in": "616263", "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "out": "61ba5f165c194692e09d12520cc4c74a", "note": "32-byte key (KEY32), input 0x616263 (\"abc\")" },
+    { "mac": "blake2s-mac16", "in": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f", "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "out": "f1efa90d2547036841ecd3627fafbc36", "note": "32-byte key (KEY32), 64-byte input" },
+    { "mac": "blake2s-mac16", "in": "", "key": "000102030405060708090a0b0c0d0e0f", "out": "af4e5d3bb230e9ff9096ca6f7c501f76", "note": "SHORT 16-byte key (KEY16), empty input — exercises new_from_slice short-key padding (the cookie-MAC path, src/macs.rs:91)" },
+    { "mac": "blake2s-mac16", "in": "616263", "key": "000102030405060708090a0b0c0d0e0f", "out": "75296c2d2c0f51210b383f386bc8b1ff", "note": "SHORT 16-byte key (KEY16), input 0x616263 (\"abc\") — short-key padding path" },
+    { "mac": "blake2s-mac16", "in": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "key": "000102030405060708090a0b0c0d0e0f", "out": "6b363e9519590c23cda5d0e30b29e1f1", "note": "SHORT 16-byte key (KEY16), 32-byte input — short-key padding path" }
   ]
 }
