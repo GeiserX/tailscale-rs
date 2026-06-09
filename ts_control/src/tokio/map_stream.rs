@@ -1,4 +1,5 @@
 use alloc::collections::BTreeMap;
+use core::net::SocketAddr;
 
 use bytes::Bytes;
 use futures_util::Stream;
@@ -71,6 +72,72 @@ pub enum PeerUpdate {
         /// Peer [`NodeId`]s removed from the state.
         remove: Vec<NodeId>,
     },
+
+    /// Field-level patch updates to already-known peers (`MapResponse.PeersChangedPatch`).
+    ///
+    /// Each [`PeerPatch`] mutates only the fields it carries on the peer identified by
+    /// [`PeerPatch::node_id`], leaving the rest untouched. Per the Go semantics
+    /// (`tailcfg.PeerChange`), a patch for a node **not** in the current netmap is **ignored**, not
+    /// inserted (the consumer enforces this). This is the lightweight sibling of [`Self::Delta`]:
+    /// control normally sends patches on their own, without the `peers*` fields also set.
+    Patch(Vec<PeerPatch>),
+}
+
+/// A field-level patch to a single already-known peer, decoded from a
+/// [`ts_control_serde::PeerChange`] (`MapResponse.PeersChangedPatch`).
+///
+/// Only the fields the domain [`Node`](crate::Node) actually stores **and** that affect peer
+/// reachability/trust are carried; each is `Some` exactly when control sent a new value for it. The
+/// consumer ([`PeerUpdate::Patch`] handling in the peer tracker) looks the peer up by
+/// [`node_id`](Self::node_id) and overwrites only the present (`Some`) fields.
+///
+/// Wire fields deliberately **not** carried:
+/// - `online` and `last_seen` — the domain [`Node`](crate::Node) has no field for either (online
+///   status lives on the runtime's status snapshot, not the tracked node), so there is nothing to
+///   merge.
+#[derive(Debug, Clone)]
+pub struct PeerPatch {
+    /// The control-assigned id of the node being patched (`PeerChange.NodeID`). Used to look up the
+    /// existing peer; if no peer with this id is known, the patch is ignored.
+    pub node_id: NodeId,
+    /// New home DERP region, when changed (`PeerChange.DERPRegion`). Governs reachability — an idle
+    /// peer that moved DERP regions can only be re-reached once this is applied.
+    pub derp_region: Option<ts_derp::RegionId>,
+    /// New UDP underlay endpoints, when changed (`PeerChange.Endpoints`). Governs reachability —
+    /// maps onto [`Node::underlay_addresses`](crate::Node::underlay_addresses).
+    pub endpoints: Option<Vec<SocketAddr>>,
+    /// New WireGuard node key, when changed (`PeerChange.Key`). A key change must be re-validated
+    /// against tailnet lock exactly like a `Delta`/`Full` upsert, so it is paired with
+    /// [`key_signature`](Self::key_signature) below.
+    pub key: Option<ts_keys::NodePublicKey>,
+    /// New marshalled TKA node-key signature, when changed (`PeerChange.KeySignature`). Owned copy
+    /// of the borrow-bound wire signature; maps onto [`Node::key_signature`](crate::Node).
+    pub key_signature: Option<alloc::vec::Vec<u8>>,
+    /// New disco key, when changed (`PeerChange.DiscoKey`). Needed for direct-path (magicsock)
+    /// endpoint reconciliation, which keys netmap endpoints by disco key.
+    pub disco_key: Option<ts_keys::DiscoPublicKey>,
+    /// New node-key expiry, when changed (`PeerChange.KeyExpiry`).
+    pub key_expiry: Option<chrono::DateTime<chrono::Utc>>,
+    /// New advertised capability version, when changed (`PeerChange.Cap`).
+    pub cap: Option<ts_capabilityversion::CapabilityVersion>,
+}
+
+impl From<&ts_control_serde::PeerChange<'_>> for PeerPatch {
+    fn from(change: &ts_control_serde::PeerChange<'_>) -> Self {
+        Self {
+            node_id: change.node_id,
+            // Wire `DerpRegionId` (NonZeroU32 newtype) -> domain `ts_derp::RegionId`, exactly as the
+            // `Node` `From` impl converts `home_derp`.
+            derp_region: change.derp_region.map(|x| ts_derp::RegionId(x.into())),
+            endpoints: change.endpoints.clone(),
+            key: change.key,
+            // `MarshaledSignature<'a>` is `&[u8]`; the domain node stores it owned.
+            key_signature: change.key_signature.map(<[u8]>::to_vec),
+            disco_key: change.disco_key,
+            key_expiry: change.key_expiry,
+            cap: change.cap,
+        }
+    }
 }
 
 /// The components of a packet filter update.
@@ -153,9 +220,32 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
             x.as_ref().is_some_and(|x| !x.is_empty())
         }
 
+        // A patch list with all-`None` entries carries no actual changes.
+        let has_patch = map_response.peers_changed_patch.iter().any(Option::is_some);
+
         let peer_update = if let Some(full_map) = map_response.peers {
+            // A full map replaces the entire peer set, so any patch in the same response is moot
+            // (the new peers already carry the latest fields). Mirror the wire contract: `peers`
+            // takes precedence over `peers_changed`/`peers_removed`, and likewise over a patch.
+            if has_patch {
+                tracing::debug!(
+                    "MapResponse carried both a full peer map and a patch; \
+                     the full map supersedes the patch"
+                );
+            }
             Some(PeerUpdate::Full(full_map.iter().map(Into::into).collect()))
         } else if nonempty(&map_response.peers_removed) || nonempty(&map_response.peers_changed) {
+            // Control should send patches on their own, not alongside `peers_changed`/`peers_removed`
+            // (the wire docs note the patch "should only [be sent] on their own"). If a response
+            // somehow carries both, prefer the heavier delta (it can add/remove whole peers, which a
+            // patch cannot) and skip the patch rather than apply two updates with ambiguous ordering.
+            if has_patch {
+                tracing::warn!(
+                    peers_changed_patch = ?map_response.peers_changed_patch,
+                    "MapResponse carried both a peer delta and a patch; applying the delta and \
+                     skipping the patch (control should not send both)"
+                );
+            }
             Some(PeerUpdate::Delta {
                 remove: map_response.peers_removed.unwrap_or_default(),
                 upsert: map_response
@@ -165,13 +255,20 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
                     .map(Into::into)
                     .collect(),
             })
+        } else if has_patch {
+            // The common case for a patch: it arrives on its own. Apply each `PeerChange` as a
+            // field-level merge onto the already-known peer (unknown nodes are ignored downstream).
+            Some(PeerUpdate::Patch(
+                map_response
+                    .peers_changed_patch
+                    .iter()
+                    .flatten()
+                    .map(PeerPatch::from)
+                    .collect(),
+            ))
         } else {
             None
         };
-
-        if !map_response.peers_changed_patch.is_empty() {
-            tracing::warn!(peers_changed_patch = ?map_response.peers_changed_patch, "ignored peer patch changes");
-        }
 
         Some((
             StateUpdate {
@@ -316,5 +413,76 @@ mod tests {
 
         assert_eq!(update.session_handle, None);
         assert_eq!(update.seq, 0);
+    }
+
+    #[tokio::test]
+    async fn map_stream_decodes_peers_changed_patch() {
+        // A MapResponse carrying `PeersChangedPatch` (and no full map / delta) must decode into a
+        // `PeerUpdate::Patch`, not be dropped. This is the regression guard for the bug where the
+        // patch was logged-and-discarded, wedging idle sessions whose endpoints/DERP changed.
+        let buf = frame(&[r#"{
+            "PeersChangedPatch": [
+                {
+                    "NodeID": 42,
+                    "DERPRegion": 7,
+                    "Endpoints": ["84.54.25.89:5175", "10.0.0.2:41641"]
+                }
+            ]
+        }"#]);
+
+        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let update = stream.next().await.expect("one update");
+
+        let Some(PeerUpdate::Patch(patches)) = update.peer_update else {
+            panic!("expected PeerUpdate::Patch, got {:?}", update.peer_update);
+        };
+        assert_eq!(patches.len(), 1);
+        let p = &patches[0];
+        assert_eq!(p.node_id, 42);
+        assert_eq!(
+            p.derp_region,
+            Some(ts_derp::RegionId(core::num::NonZeroU32::new(7).unwrap()))
+        );
+        assert_eq!(
+            p.endpoints.as_deref(),
+            Some(
+                [
+                    "84.54.25.89:5175".parse().unwrap(),
+                    "10.0.0.2:41641".parse().unwrap()
+                ]
+                .as_slice()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn map_stream_full_map_supersedes_patch() {
+        // When a response carries BOTH a full peer map and a patch, the full map wins (it already
+        // reflects the latest state); the patch is not separately surfaced.
+        let buf = frame(&[r#"{
+            "Peers": [],
+            "PeersChangedPatch": [{"NodeID": 42, "DERPRegion": 7}]
+        }"#]);
+
+        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let update = stream.next().await.expect("one update");
+
+        assert!(
+            matches!(update.peer_update, Some(PeerUpdate::Full(_))),
+            "full map must win over a patch, got {:?}",
+            update.peer_update
+        );
+    }
+
+    #[tokio::test]
+    async fn map_stream_all_none_patch_is_no_update() {
+        // A `PeersChangedPatch` array of only `null`s carries no real change and must produce no
+        // peer update (rather than an empty `Patch`).
+        let buf = frame(&[r#"{"PeersChangedPatch": [null, null]}"#]);
+
+        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let update = stream.next().await.expect("one update");
+
+        assert!(update.peer_update.is_none());
     }
 }

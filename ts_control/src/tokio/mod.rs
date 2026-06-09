@@ -5,7 +5,7 @@ pub use connect::{
 };
 pub use id_token::{IdTokenError, fetch_id_token};
 pub use logout::{LogoutError, LogoutInternalErrorKind, logout};
-pub use map_stream::{FilterUpdate, PeerUpdate, StateUpdate};
+pub use map_stream::{FilterUpdate, PeerPatch, PeerUpdate, StateUpdate};
 use register::register;
 // `set_dns` is a generic control RPC, but in this fork only the (feature-gated) ACME engine calls
 // it; gate the `mod`/`pub use` on `acme` so the default build stays dead-code-warning-clean.
