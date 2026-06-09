@@ -386,4 +386,33 @@ mod tests {
         assert!(!recv.expired(now + Duration::from_secs(130)));
         assert!(recv.expired(now + Duration::from_secs(250)));
     }
+
+    /// A persistent keepalive is an *empty* authenticated packet. Emitting one must NOT push the
+    /// session's rotation/expiry clock forward — those track session age from the handshake
+    /// (`created`), not the time of the last send (the boringtun `if !src.is_empty()` invariant).
+    /// If a keepalive reset the clock it would mask a genuinely dead peer and starve rekey. The
+    /// session's staleness/expiry is keyed on `created`, which encryption never touches, so any
+    /// number of keepalive sends leaves the `stale`/`expired` schedule byte-for-byte unchanged.
+    #[test]
+    fn keepalive_does_not_advance_rotation_timers() {
+        let k: [u8; 32] = rand::random();
+        let session = SessionId::random();
+        let now = Instant::now();
+        let send = TransmitSession::new(k.into(), session, now);
+
+        // Emit several empty keepalives (the `encapsulate(&[])` path the endpoint uses).
+        for _ in 0..5 {
+            let mut keepalive = [PacketMut::new(0)];
+            send.encrypt(&mut keepalive);
+            // It really is an (encrypted) empty payload: header(16) + tag(16), no plaintext body.
+            assert_eq!(keepalive[0].len(), size_of::<TransportDataHeader>() + 16);
+        }
+
+        // Rotation/expiry are still measured from `created`, exactly as in `session_timers`.
+        assert!(!send.stale(now));
+        assert!(!send.stale(now + Duration::from_secs(100)));
+        assert!(send.stale(now + Duration::from_secs(130)));
+        assert!(!send.expired(now + Duration::from_secs(130)));
+        assert!(send.expired(now + Duration::from_secs(250)));
+    }
 }

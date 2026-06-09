@@ -155,6 +155,25 @@ pub struct Config {
     /// netstacks.
     pub tcp_buffer_size: Option<usize>,
 
+    /// WireGuard persistent-keepalive interval applied to every peer, or `None` to disable
+    /// (`PersistentKeepalive`; this is the equivalent of Tailscale setting `PersistentKeepalive=25`
+    /// on a peer when control marks it `KeepAlive=true`).
+    ///
+    /// When `Some(interval)` (the default, `Some(25s)`), each peer emits an empty authenticated
+    /// keepalive after `interval` of outbound silence, holding the path/NAT mapping warm. This is the
+    /// load-bearing fix for **idle DERP-relayed sessions wedging**: on a userspace-netstack node whose
+    /// only path to a peer is the relay, an idle session otherwise ages past expiry with no traffic to
+    /// keep it warm and no timer to refresh it, so the next dial rehandshakes over a cold path and
+    /// loops forever. The persistent keepalive re-arms unconditionally (unlike the reactive WireGuard
+    /// §6.5 keepalive, which is armed only by inbound traffic and dies ~10s after the last inbound
+    /// packet) and the empty packet deliberately does **not** advance the session's rotation/expiry
+    /// timers, so a genuinely dead peer is still detected and rekey still fires on schedule.
+    ///
+    /// Set to `None` to opt out (e.g. an embedder that has its own keepalive strategy or only ever
+    /// runs over a direct, always-warm path). The default is on because this fork's primary
+    /// deployment is the relayed case the wedge bites.
+    pub persistent_keepalive_interval: Option<std::time::Duration>,
+
     /// Whether to enable IPv6 **on the tailnet overlay** (peer-to-peer reachability over the node's
     /// Tailscale IPv6 address). Defaults to `false`: the node is IPv4-only on the overlay.
     ///
@@ -445,6 +464,7 @@ impl From<&Config> for ts_control::Config {
             forward_exit_egress: value.forward_exit_egress,
             exit_proxy: value.exit_proxy.clone(),
             tcp_buffer_size: value.tcp_buffer_size,
+            persistent_keepalive_interval: value.persistent_keepalive_interval,
             peerapi_port: None,
             taildrop_dir: value.taildrop_dir.clone(),
             enable_ipv6: value.enable_ipv6,
@@ -479,6 +499,7 @@ impl Default for Config {
             forward_exit_egress: false,
             exit_proxy: None,
             tcp_buffer_size: None,
+            persistent_keepalive_interval: Some(ts_control::DEFAULT_PERSISTENT_KEEPALIVE),
             enable_ipv6: false,
             transport_mode: ts_control::TransportMode::default(),
             wire_ingress: false,
@@ -511,6 +532,7 @@ mod tests {
             forward_tcp_ports: vec![80, 443],
             forward_udp_ports: vec![53],
             tcp_buffer_size: Some(1024 * 128),
+            persistent_keepalive_interval: Some(std::time::Duration::from_secs(17)),
             enable_ipv6: true,
             wire_ingress: true,
             transport_mode: ts_control::TransportMode::Tun(ts_control::TunConfig {
@@ -540,6 +562,10 @@ mod tests {
         assert_eq!(control.forward_tcp_ports, vec![80, 443]);
         assert_eq!(control.forward_udp_ports, vec![53]);
         assert_eq!(control.tcp_buffer_size, Some(1024 * 128));
+        assert_eq!(
+            control.persistent_keepalive_interval,
+            Some(std::time::Duration::from_secs(17))
+        );
         assert_eq!(control.tags, vec!["tag:exit".to_owned()]);
         let proxy = control.exit_proxy.expect("exit_proxy crosses the boundary");
         assert_eq!(proxy.addr, "198.51.100.9:8080".parse().unwrap());
@@ -574,6 +600,23 @@ mod tests {
         let control: ts_control::Config = (&Config::default()).into();
         assert!(control.exit_proxy.is_none());
         assert!(!control.forward_exit_egress);
+    }
+
+    /// Persistent keepalive is **on by default at 25s** — this is the idle-wedge fix's safe default
+    /// for the relayed case (an idle DERP-relayed session would otherwise age out and wedge). The
+    /// default mirrors `ts_control::DEFAULT_PERSISTENT_KEEPALIVE` and crosses the control boundary.
+    #[test]
+    fn from_config_default_enables_persistent_keepalive_25s() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.persistent_keepalive_interval,
+            Some(std::time::Duration::from_secs(25))
+        );
+        let control: ts_control::Config = (&cfg).into();
+        assert_eq!(
+            control.persistent_keepalive_interval,
+            Some(ts_control::DEFAULT_PERSISTENT_KEEPALIVE)
+        );
     }
 
     #[test]

@@ -92,6 +92,7 @@ async fn main() -> BoxResult<()> {
             ts_tunnel::PeerConfig {
                 key: peer_key,
                 psk: [0; 32].into(),
+                persistent_keepalive_interval: None,
             }
         )
         .is_none()

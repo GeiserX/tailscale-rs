@@ -279,6 +279,7 @@ mod tests {
             peerapi_port: None,
             taildrop_dir: None,
             enable_ipv6: false,
+            persistent_keepalive_interval: None,
             ingress_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }

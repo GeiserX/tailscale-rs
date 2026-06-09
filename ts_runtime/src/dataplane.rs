@@ -32,6 +32,9 @@ pub type UnderlayFromDataplane = mpsc::UnboundedReceiver<(PeerId, Vec<PacketMut>
 pub struct DataplaneActor {
     dataplane: Arc<ts_dataplane::async_tokio::DataPlane>,
     task: tokio::task::JoinHandle<()>,
+    /// Persistent-keepalive interval applied to every upserted peer (or `None` to disable). Snapshot
+    /// of [`Env::persistent_keepalive_interval`] taken at actor start. See the peer-upsert handler.
+    persistent_keepalive_interval: Option<std::time::Duration>,
 }
 
 impl Drop for DataplaneActor {
@@ -79,6 +82,8 @@ impl kameo::Actor for DataplaneActor {
             env.keys.node_keys,
         ));
 
+        let persistent_keepalive_interval = env.persistent_keepalive_interval;
+
         env.subscribe::<PeerRouteUpdate>(&slf).await?;
         env.subscribe::<SelfRouteUpdate>(&slf).await?;
         env.subscribe::<PacketFilterState>(&slf).await?;
@@ -93,7 +98,11 @@ impl kameo::Actor for DataplaneActor {
 
         tracing::trace!("dataplane running");
 
-        Ok(Self { dataplane, task })
+        Ok(Self {
+            dataplane,
+            task,
+            persistent_keepalive_interval,
+        })
     }
 }
 
@@ -171,6 +180,12 @@ impl Message<Arc<PeerState>> for DataplaneActor {
                     ts_tunnel::PeerConfig {
                         key: node.node_key,
                         psk: [0u8; 32].into(),
+                        // Persistent keepalive holds the (often DERP-relayed) path to every peer
+                        // warm so an idle session doesn't age out and wedge the next dial. Applied
+                        // to all peers because this fork's primary deployment is a userspace-netstack
+                        // node whose only path to peers is via the relay. `None` (embedder opt-out)
+                        // disables it. See `Env::persistent_keepalive_interval`.
+                        persistent_keepalive_interval: self.persistent_keepalive_interval,
                     },
                 );
             }

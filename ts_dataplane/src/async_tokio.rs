@@ -197,7 +197,7 @@ impl DataPlane {
                     SelectResult::TransportsChanged
                 }
 
-                _ = option_sleep_until(next_event.map(Into::into)) => {
+                _ = sleep_until_event(next_event.map(Into::into)) => {
                     tracing::trace!("event");
 
                     SelectResult::Event
@@ -268,9 +268,86 @@ async fn write_to_underlay(
     }
 }
 
-async fn option_sleep_until(deadline: Option<tokio::time::Instant>) {
+/// The longest the dataplane will ever sleep waiting for a timer before re-checking the wireguard
+/// state machine, even when no event is scheduled.
+///
+/// The primary driver of timer progress is a real scheduled event: an endpoint with persistent
+/// keepalive enabled (the default) always reports a next-event deadline via
+/// [`crate::DataPlane::next_event`], so `step` wakes on it and the keepalive / rekey / expiry timers
+/// fire on schedule even on an otherwise idle, fully-relayed tunnel. This floor is a defensive safety
+/// net: it guarantees the dataplane can never block *forever* on I/O with timers due — the bug where
+/// `next_event() == None` turned the sleep into `future::pending()`, so an idle session aged past
+/// expiry with nothing to refresh it. A spurious wakeup with no due event is harmless (the dispatch
+/// finds nothing and writes nothing); 1s keeps idle-wakeup overhead negligible.
+const MAX_TIMER_SLEEP: core::time::Duration = core::time::Duration::from_secs(1);
+
+/// Sleep until the next scheduled event deadline, but never longer than [`MAX_TIMER_SLEEP`].
+///
+/// When `deadline` is `None` (no event scheduled) this sleeps for [`MAX_TIMER_SLEEP`] rather than
+/// blocking forever, so the dataplane periodically re-services the wireguard state machine even with
+/// zero traffic and zero scheduled events.
+async fn sleep_until_event(deadline: Option<tokio::time::Instant>) {
+    let until = next_wakeup(deadline, tokio::time::Instant::now(), MAX_TIMER_SLEEP);
+    tokio::time::sleep_until(until).await;
+}
+
+/// Compute the next wakeup instant: the earlier of the next scheduled event `deadline` and the
+/// bounded floor `now + max_sleep`. A `None` deadline (nothing scheduled) collapses to the floor, so
+/// the result is *always* a finite instant — the dataplane can never sleep forever. Pure so the
+/// "never block forever" decision is unit-testable without a runtime.
+fn next_wakeup<I: Ord + core::ops::Add<core::time::Duration, Output = I> + Copy>(
+    deadline: Option<I>,
+    now: I,
+    max_sleep: core::time::Duration,
+) -> I {
+    let floor = now + max_sleep;
     match deadline {
-        Some(deadline) => tokio::time::sleep_until(deadline).await,
-        None => core::future::pending().await,
+        Some(deadline) => deadline.min(floor),
+        None => floor,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wedge fix, distilled: with no event scheduled, the dataplane must still wake within the
+    /// bounded floor instead of `future::pending()` (block forever). This is what guarantees an idle
+    /// endpoint's timers (persistent keepalive / rekey / expiry) keep getting serviced.
+    #[test]
+    fn no_scheduled_event_still_wakes_within_floor() {
+        let now = std::time::Instant::now();
+        let woke = next_wakeup(None, now, MAX_TIMER_SLEEP);
+        assert_eq!(
+            woke,
+            now + MAX_TIMER_SLEEP,
+            "a None deadline must collapse to the bounded floor, never block forever"
+        );
+    }
+
+    /// A soon scheduled event is honored exactly (the floor only caps far-off / absent deadlines, it
+    /// never delays a due event).
+    #[test]
+    fn near_event_is_honored_exactly() {
+        let now = std::time::Instant::now();
+        let soon = now + core::time::Duration::from_millis(50);
+        assert_eq!(
+            next_wakeup(Some(soon), now, MAX_TIMER_SLEEP),
+            soon,
+            "an event sooner than the floor must wake exactly on its deadline"
+        );
+    }
+
+    /// A far-future scheduled event is clamped to the floor, so we re-service the state machine at
+    /// least once per [`MAX_TIMER_SLEEP`] even when the only scheduled event is distant.
+    #[test]
+    fn far_event_is_clamped_to_floor() {
+        let now = std::time::Instant::now();
+        let far = now + core::time::Duration::from_secs(3600);
+        assert_eq!(
+            next_wakeup(Some(far), now, MAX_TIMER_SLEEP),
+            now + MAX_TIMER_SLEEP,
+            "a far-off event must be clamped to the floor"
+        );
     }
 }
