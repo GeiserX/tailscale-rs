@@ -24,6 +24,17 @@ Record breaking or significant changes here. All dates are UTC.
   a tunnel kept alive *solely* by keepalives with zero application traffic past `REKEY_AFTER_TIME`
   is a separate, not-yet-addressed case (see `docs/IDLE-WEDGE-RESEARCH.md`).
 
+### Verification / hardening (no runtime behavior change)
+- **Cryptographic-verification tooling.** Added a direct **BLAKE2s-256 known-answer test** (the one
+  primitive previously lacking a direct KAT — 8 unkeyed + 7 keyed vectors incl. the 16-byte
+  `Blake2sMac<U16>` cookie-MAC short-key path), a **dudect constant-time leakage-detection bench**
+  over the AEAD tag-verify path (informational, not CI-gated), a **`cargo-fuzz` target for the
+  Tailnet-Lock CBOR decoder** plus a stable-CI smoke test asserting the panic-free / fail-closed
+  invariant and a Go `fxamacker/cbor` differential oracle, and **`docs/CRYPTO_VERIFICATION_STATUS.md`**
+  (a four-axis framing: artifact authenticity / implementation correctness / protocol security /
+  side-channel). Reconciled `docs/CRYPTOGRAPHY.md` §6 with the lockfile (the data plane rides
+  `x25519-dalek 3.0.0-rc.0` → `curve25519-dalek 5.0.0-rc.0`, not the previously-documented 4.1.3).
+
 ## [0.6.10](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.6.10) - 2026-06-09
 
 ### Fixed
