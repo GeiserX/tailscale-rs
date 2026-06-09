@@ -156,7 +156,11 @@ impl SessionState {
     ///
     /// Returns the encrypted packets if a session is available, otherwise queues the packets and
     /// returns None to signal that the caller needs to establish a session.
-    fn encrypt_or_queue(&mut self, mut packets: Vec<PacketMut>) -> Option<Vec<PacketMut>> {
+    fn encrypt_or_queue(
+        &mut self,
+        endpoint: &mut EndpointState,
+        mut packets: Vec<PacketMut>,
+    ) -> Option<Vec<PacketMut>> {
         match self {
             SessionState::None(queue) => {
                 queue.append(packets);
@@ -164,9 +168,13 @@ impl SessionState {
             }
             SessionState::Active { send, .. } => {
                 if send.expired(Instant::now()) {
-                    // Note, this also deletes both receive sessions. This is okay: due to the
-                    // semantics of session rotation, if the transmit session has expired, all
-                    // receive sessions have also expired.
+                    // The transmit session has expired. Due to the semantics of session rotation,
+                    // if the transmit session has expired, both receive sessions have also expired,
+                    // so this tears the whole session down. Route the teardown through
+                    // `deactivate()` so the receive session ids are freed from the id map — a plain
+                    // `*self = None(..)` would drop the `ReceiveSession`s without reclaiming their
+                    // ids, leaking them for the lifetime of the endpoint.
+                    self.deactivate(endpoint);
                     *self = SessionState::None(Queue::new_with(packets));
                     return None;
                 }
@@ -187,7 +195,7 @@ impl SessionState {
                     Some(recv)
                 } else if let Some(recv_prev) = recv_prev.as_mut()
                     && recv_prev.id() == id
-                    && !recv.expired(Instant::now())
+                    && !recv_prev.expired(Instant::now())
                 {
                     Some(recv_prev)
                 } else {
@@ -363,7 +371,7 @@ impl Peer {
         packets: Vec<PacketMut>,
         out: &mut SendResult,
     ) {
-        if let Some(mut packets) = self.session.encrypt_or_queue(packets) {
+        if let Some(mut packets) = self.session.encrypt_or_queue(endpoint, packets) {
             tracing::trace!("enqueueing packets to peer");
             // Outgoing authenticated traffic resets the persistent-keepalive timer: we only need to
             // emit a persistent keepalive once the tunnel has gone silent for a full interval.
@@ -460,7 +468,7 @@ impl Peer {
             // handshake with no queued packets available, we have to send an empty packet explicitly.
             packets.push(PacketMut::new(0));
             // Session was just activated, therefore it can encrypt.
-            packets = self.session.encrypt_or_queue(packets).unwrap();
+            packets = self.session.encrypt_or_queue(endpoint, packets).unwrap();
         }
         // A fresh send session is live: start the persistent-keepalive clock so an idle tunnel keeps
         // the path warm. The confirmation packet just emitted counts as the most recent outbound
@@ -485,7 +493,9 @@ impl Peer {
             return;
         }
 
-        let Some((session, mut packets)) = self.handshake.confirm(session_id, packets) else {
+        let Some((session, mut packets)) =
+            self.handshake.confirm(session_id, packets, Instant::now())
+        else {
             // TODO: log
             return;
         };
@@ -950,10 +960,138 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration as StdDuration;
+
     use zerocopy::TryFromBytes;
 
     use super::*;
-    use crate::config::PeerConfig;
+    use crate::{config::PeerConfig, session::ReceiveSession};
+
+    /// A bare [`EndpointState`] with an empty [`IdMap`] for unit-testing the session-state helpers
+    /// (`get_recv`, `encrypt_or_queue`) directly, without standing up a full handshake.
+    fn bare_endpoint_state() -> EndpointState {
+        let my_key = NodeKeyPair::new();
+        EndpointState {
+            my_cookie: MACReceiver::new(&my_key.public),
+            my_key,
+            ids: IdMap::default(),
+            timestamps: Default::default(),
+            scheduler: Default::default(),
+        }
+    }
+
+    /// A random ChaCha20Poly1305 session key for building bare send/recv sessions in tests.
+    fn random_session_key() -> chacha20poly1305::Key {
+        rand::random::<[u8; 32]>().into()
+    }
+
+    /// An instant safely older than `REJECT_AFTER_TIME` (so `expired()` is true), with a saturating
+    /// fallback for platforms whose monotonic clock starts near zero.
+    fn expired_instant(now: Instant) -> Instant {
+        now.checked_sub(StdDuration::from_secs(300)).unwrap_or(now)
+    }
+
+    /// FIX #3: `get_recv` must validate the EXPIRY of the session it is about to return. The
+    /// `recv_prev` arm previously checked the *current* `recv`'s expiry (a copy-paste bug), so an
+    /// expired `recv_prev` could be returned (and a fresh `recv_prev` wrongly rejected whenever the
+    /// current `recv` happened to be expired). This pins the corrected behavior on all four
+    /// combinations.
+    #[test]
+    fn get_recv_validates_the_returned_sessions_own_expiry() {
+        let now = Instant::now();
+        let old = expired_instant(now);
+        let recv_id = SessionId::from(0xAAAA);
+        let prev_id = SessionId::from(0xBBBB);
+
+        // Case A: fresh recv + EXPIRED recv_prev. The fresh recv is returnable by its id; the
+        // expired recv_prev must be rejected (the bug returned it because it checked recv's expiry).
+        let mut state = SessionState::Active {
+            send: TransmitSession::new(random_session_key(), recv_id, now),
+            recv: Box::new(ReceiveSession::new(random_session_key(), recv_id, now)),
+            recv_prev: Some(Box::new(ReceiveSession::new(
+                random_session_key(),
+                prev_id,
+                old,
+            ))),
+        };
+        assert!(
+            state.get_recv(recv_id).is_some(),
+            "fresh current recv must be returnable by its id"
+        );
+        assert!(
+            state.get_recv(prev_id).is_none(),
+            "an EXPIRED recv_prev must be rejected (regression: the arm checked recv's expiry)"
+        );
+
+        // Case B: EXPIRED recv + FRESH recv_prev. The fresh recv_prev must be returnable — the bug
+        // wrongly rejected it because the *current* recv (which it checked) was expired.
+        let mut state = SessionState::Active {
+            send: TransmitSession::new(random_session_key(), recv_id, now),
+            recv: Box::new(ReceiveSession::new(random_session_key(), recv_id, old)),
+            recv_prev: Some(Box::new(ReceiveSession::new(
+                random_session_key(),
+                prev_id,
+                now,
+            ))),
+        };
+        assert!(
+            state.get_recv(recv_id).is_none(),
+            "an expired current recv must be rejected"
+        );
+        assert!(
+            state.get_recv(prev_id).is_some(),
+            "a FRESH recv_prev must be returnable even when the current recv is expired \
+             (this is the case the bug broke)"
+        );
+    }
+
+    /// FIX #4: when a session's transmit side has expired, `encrypt_or_queue` tears the session
+    /// down — but it must FREE the receive session ids from the id map, not just drop the
+    /// `ReceiveSession`s. Dropping them without freeing the ids leaks them for the endpoint's whole
+    /// lifetime (a real concern for a long-lived NVC tunnel that rekeys repeatedly). This asserts
+    /// the id-map session count returns to its baseline after the expiry-driven reset.
+    #[test]
+    fn encrypt_or_queue_frees_recv_ids_when_send_expired() {
+        let mut endpoint = bare_endpoint_state();
+        let now = Instant::now();
+        let old = expired_instant(now);
+        let peer = PeerId(1);
+
+        // Allocate two ids in the id map, exactly as a rotated active session would own (recv +
+        // recv_prev). Baseline is two live ids.
+        let recv_id = endpoint.ids.allocate_session(peer);
+        let prev_id = endpoint.ids.allocate_session(peer);
+        assert_eq!(endpoint.ids.sessions.len(), 2, "two ids allocated");
+
+        // An active session whose SEND side is expired (created `old`), holding both receive
+        // sessions under the allocated ids.
+        let mut state = SessionState::Active {
+            send: TransmitSession::new(random_session_key(), recv_id, old),
+            recv: Box::new(ReceiveSession::new(random_session_key(), recv_id, old)),
+            recv_prev: Some(Box::new(ReceiveSession::new(
+                random_session_key(),
+                prev_id,
+                old,
+            ))),
+        };
+
+        // encrypt_or_queue on the expired send must queue the packet (returns None) AND reclaim
+        // both receive ids — not leak them.
+        let queued = state.encrypt_or_queue(&mut endpoint, vec![PacketMut::from(&b"data"[..])]);
+        assert!(
+            queued.is_none(),
+            "an expired send session must queue (not encrypt) and signal a rehandshake is needed"
+        );
+        assert!(
+            matches!(state, SessionState::None(_)),
+            "the expired session must be reset to None (packets queued)"
+        );
+        assert_eq!(
+            endpoint.ids.sessions.len(),
+            0,
+            "both receive ids must be freed on the expiry-driven teardown — no leak"
+        );
+    }
 
     #[test]
     fn test_one_peer() {
