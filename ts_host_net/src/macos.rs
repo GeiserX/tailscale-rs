@@ -22,8 +22,11 @@ use crate::{
     HostDns, HostNet, HostNetError, HostRoutes, expand_routes, valid_dns_name, valid_if_name,
 };
 
-/// `route(8)` binary path.
-const ROUTE_BIN: &str = "/usr/sbin/route";
+/// `route(8)` binary path. On macOS `route(8)` lives in `/sbin` (NOT `/usr/sbin`, which is the
+/// Linux/iproute2 location and does not exist here) — a wrong path makes `Command::new` fail with
+/// ENOENT ("No such file or directory (os error 2)"), which `TunActor` treats as fatal and
+/// fail-closes the interface. `scutil(8)` below genuinely is in `/usr/sbin`.
+const ROUTE_BIN: &str = "/sbin/route";
 /// `scutil(8)` binary path.
 const SCUTIL_BIN: &str = "/usr/sbin/scutil";
 /// SCDynamicStore DNS key owned by this fork.
