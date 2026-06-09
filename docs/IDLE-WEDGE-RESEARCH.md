@@ -76,6 +76,26 @@ art) + wireguard-go `device/timers.go` `timersAnyAuthenticatedPacketTraversal` /
 `expiredPersistentKeepalive`. Tailscale `wgengine/wgcfg/nmcfg`: `if peer.KeepAlive {
 cpeer.PersistentKeepalive = 25 }`.
 
+### Scope / what this does NOT fix
+
+This PR ships **part 1 + part 2** (persistent-keepalive + periodic tick), which warms the
+path/NAT/relay mapping on an idle tunnel. It does **not** make rekey timer-driven:
+
+- The persistent keepalive holds the **path/NAT mapping** warm, not the **session keys**. It is
+  an empty data packet on the *existing* session; it does not (and must not) advance the
+  data-sent timers that gate rekey.
+- Rekey remains **reactive** — driven by outbound application data / `Peer::send`'s
+  `needs_rotation()` check (`endpoint.rs:330-335`), not by a timer. The keepalive deliberately
+  does not trigger it (see "Invariants": an empty packet masking a dead peer is the failure mode
+  we guard against).
+- The scenario this fixes is **idle → dial**: a tunnel that went quiet and is then woken by a new
+  outbound dial, where the cold NAT/relay mapping was the wedge.
+- A tunnel kept alive **solely by keepalives** with **zero application traffic** past
+  `REKEY_AFTER_TIME` / `REJECT_AFTER_TIME` (>~240s in this fork, `session.rs:152,156`) is a
+  **separate, known case NOT addressed here**: the session keys still age out reactively. The
+  follow-up for that is **timer-driven rekey** (proactive initiator rekey at `REKEY_AFTER_TIME`),
+  which this PR does not add.
+
 ### Insertion points in this fork
 
 - `ts_tunnel/src/endpoint.rs` — a persistent-keepalive timer that re-arms

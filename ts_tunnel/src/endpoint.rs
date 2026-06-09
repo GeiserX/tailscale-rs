@@ -324,7 +324,11 @@ impl Peer {
     /// has no persistent keepalive configured. Note this is independent of the reactive `keepalive`
     /// timer (WireGuard §6.5), which is armed only by *inbound* traffic.
     fn arm_persistent_keepalive(&mut self, scheduler: &mut Scheduler<Event>) {
-        let Some(interval) = self.config.persistent_keepalive_interval else {
+        // `effective_persistent_keepalive` normalizes a `Some(ZERO)` / sub-minimum interval to
+        // `None` (WireGuard treats `PersistentKeepalive = 0` as "off"; a near-zero interval would
+        // otherwise re-arm every tick — a send-flood). Reading it here is the single chokepoint that
+        // arms the timer, so the guard applies everywhere the keepalive is (re)armed.
+        let Some(interval) = self.config.effective_persistent_keepalive() else {
             return;
         };
         // Fire *at* the interval, never after it. The scheduler dispatches at the END of a
@@ -667,14 +671,17 @@ impl Endpoint {
                     self.state.ids.add_peer(id, &cfg.key);
                 }
 
-                let prev_interval = peer.config.persistent_keepalive_interval;
+                // Capture the OLD effective interval BEFORE swapping in the new config.
+                let prev_interval = peer.config.effective_persistent_keepalive();
                 core::mem::swap(&mut peer.config, &mut cfg);
 
-                // Reconcile the persistent-keepalive timer if the configured interval changed. Only
-                // (re)arm when a session is actually live — otherwise the timer is armed at the next
-                // session activation. Disabling (`None`) cancels any pending keepalive.
-                if peer.config.persistent_keepalive_interval != prev_interval {
-                    match peer.config.persistent_keepalive_interval {
+                // Reconcile the persistent-keepalive timer if the *effective* interval changed (so a
+                // `None` ↔ `Some(ZERO)` flip is correctly a no-op — both normalize to "off" — and a
+                // zero/sub-minimum value cancels rather than arms). Only (re)arm when a session is
+                // actually live; otherwise the timer is armed at the next session activation.
+                let new_interval = peer.config.effective_persistent_keepalive();
+                if new_interval != prev_interval {
+                    match new_interval {
                         Some(_) if !matches!(peer.session, SessionState::None(_)) => {
                             peer.arm_persistent_keepalive(&mut self.state.scheduler);
                         }
@@ -1119,8 +1126,10 @@ mod tests {
             "an idle endpoint with persistent keepalive must schedule a wakeup"
         );
 
-        // Jitter is ±interval/3, so the deadline is within [arm+2/3i, arm+4/3i]. Dispatching at
-        // arm+2i is safely past the window; use `now` captured here (>= arm time).
+        // The persistent keepalive has no *upward* jitter: it fires within [deadline-lead, deadline]
+        // (lead = min(1s, interval/4)), i.e. at or before `arm+interval`, never after — staying under
+        // the NAT/relay floor. So the deadline is within [arm+3/4i, arm+i]. Dispatching at arm+2i is
+        // safely past the window; use `now` captured here (>= arm time).
         let now = Instant::now();
         let out = a_ep.dispatch_events(now + interval * 2);
         let pkts = out
@@ -1201,6 +1210,249 @@ mod tests {
         assert!(
             out.to_peers.get(&a_peer).is_none_or(|p| p.is_empty()),
             "no keepalive should fire when persistent keepalive is disabled"
+        );
+    }
+
+    /// An empty (encrypted) persistent keepalive on the wire: header(16) + auth tag(16), no body.
+    const KEEPALIVE_LEN: usize = 16 + 16;
+
+    /// Stand up one local endpoint `A` peered with two *independent* remotes (`B` and `C`), driving a
+    /// full handshake with each so `A` holds a live, distinct send session per peer. Each peer can be
+    /// given its own persistent-keepalive interval. Returns `A` plus the local [`PeerId`] of each peer
+    /// (both timers, if configured, are armed on return).
+    ///
+    /// Distinct from [`establish_session`] (single peer): this exists specifically to prove the
+    /// keepalive timers are *per-peer*, not a single global one.
+    fn establish_two_peers(
+        b_keepalive: Option<Duration>,
+        c_keepalive: Option<Duration>,
+    ) -> (Endpoint, PeerId, PeerId) {
+        let a_static = NodeKeyPair::new();
+        let mut a_ep = Endpoint::new(a_static);
+        // A's two peers carry distinct PeerIds *and* distinct node keys (the id map rejects a key
+        // collision), so their sessions and timers can never alias.
+        let (a_b_peer, a_c_peer) = (PeerId(1), PeerId(2));
+
+        // Drive a full handshake between A and one fresh remote, priming a live A->peer session and
+        // arming A's persistent keepalive for that peer (if configured). `payload` distinguishes the
+        // two peers' delivered data.
+        let bring_up = |a_ep: &mut Endpoint, a_peer: PeerId, keepalive, payload: &[u8]| {
+            let remote_static = NodeKeyPair::new();
+            let mut remote = Endpoint::new(remote_static);
+            let remote_peer = PeerId(1);
+            let psk = rand::random();
+
+            a_ep.upsert_peer(
+                a_peer,
+                PeerConfig {
+                    key: remote_static.public,
+                    psk,
+                    persistent_keepalive_interval: keepalive,
+                },
+            );
+            remote.upsert_peer(
+                remote_peer,
+                PeerConfig {
+                    key: a_static.public,
+                    psk,
+                    persistent_keepalive_interval: None,
+                },
+            );
+
+            let init = a_ep.send(HashMap::from([(a_peer, vec![PacketMut::from(payload)])]));
+            let init = init.to_peers.get(&a_peer).expect("handshake init").clone();
+            let resp = remote.recv(init);
+            let resp = resp
+                .to_peers
+                .get(&remote_peer)
+                .expect("handshake resp")
+                .clone();
+            let data = a_ep.recv(resp);
+            let data = data.to_peers.get(&a_peer).expect("data to peer").clone();
+            let delivered = remote.recv(data);
+            assert_eq!(
+                delivered.to_local.get(&remote_peer).map(|p| p.as_slice()),
+                Some([PacketMut::from(payload)].as_slice()),
+                "payload should be delivered after handshake"
+            );
+        };
+
+        bring_up(&mut a_ep, a_b_peer, b_keepalive, b"to-b");
+        bring_up(&mut a_ep, a_c_peer, c_keepalive, b"to-c");
+
+        (a_ep, a_b_peer, a_c_peer)
+    }
+
+    /// Persistent-keepalive timers are **per-peer**, not a single global timer: each peer fires on its
+    /// own configured cadence, and traffic on (or a firing of) one peer never resets or suppresses
+    /// another peer's timer.
+    ///
+    /// Two peers are deliberately given *different* intervals (B short, C long) so the independence is
+    /// observable with a wide, deterministic margin. The timers are armed against the real monotonic
+    /// clock (`Instant::now()` inside `arm_persistent_keepalive`) and dispatched by passing a synthetic
+    /// future instant to `dispatch_events`; equal intervals would put both deadlines within microseconds
+    /// of each other, leaving no robust window to distinguish them. With B=100ms and C=10s we can
+    /// dispatch in `[B's deadline, C's deadline)` and see B alone fire while C stays silent — a single
+    /// global timer (or a per-peer timer that B's activity wrongly reset) could not produce this.
+    #[test]
+    fn persistent_keepalive_is_per_peer_independent() {
+        let b_interval = Duration::from_millis(100);
+        let c_interval = Duration::from_secs(10);
+        let (mut a_ep, b_peer, c_peer) = establish_two_peers(Some(b_interval), Some(c_interval));
+
+        // Dispatch past B's interval but far short of C's: only B's keepalive may fire.
+        let now = Instant::now();
+        let out = a_ep.dispatch_events(now + b_interval * 2);
+        assert_eq!(
+            out.to_peers.get(&b_peer).map(|p| p.len()),
+            Some(1),
+            "B (short interval) must fire its own keepalive"
+        );
+        assert!(
+            out.to_peers.get(&c_peer).is_none_or(|p| p.is_empty()),
+            "C (long interval) must NOT fire — its timer is independent of B's"
+        );
+
+        // Send real data to B only (re-arming *B's* timer). C must be wholly unaffected: it neither
+        // fires early nor has its long timer reset by anything happening on B.
+        let sent = a_ep.send(HashMap::from([(b_peer, vec![PacketMut::from(&b"x"[..])])]));
+        assert_eq!(
+            sent.to_peers.get(&b_peer).map(|p| p.len()),
+            Some(1),
+            "data to B should encrypt and send on B's live session"
+        );
+        let now = Instant::now();
+        let out = a_ep.dispatch_events(now + b_interval * 2);
+        assert_eq!(
+            out.to_peers.get(&b_peer).map(|p| p.len()),
+            Some(1),
+            "B fires again on its re-armed timer"
+        );
+        assert!(
+            out.to_peers.get(&c_peer).is_none_or(|p| p.is_empty()),
+            "C still silent: repeated activity on B never touched C's timer"
+        );
+
+        // Finally advance past C's own interval: C fires on its own schedule, proving its timer was
+        // armed and tracked independently the whole time (never reset or starved by B).
+        let now = Instant::now();
+        let out = a_ep.dispatch_events(now + c_interval * 2);
+        assert_eq!(
+            out.to_peers.get(&c_peer).map(|p| p.len()),
+            Some(1),
+            "C must fire on its own long interval, independent of B"
+        );
+    }
+
+    /// `upsert_peer` reconciles the persistent-keepalive timer on a *live* session when the configured
+    /// interval changes: `Some(..) -> None` cancels the timer (no further keepalives), and
+    /// `None -> Some(..)` (re)arms it (keepalives resume). This is the runtime reconfiguration path
+    /// (e.g. control toggling a peer's `KeepAlive`), and getting it wrong either leaks a stale timer or
+    /// lets an idle relayed path go cold.
+    #[test]
+    fn upsert_peer_reconciles_persistent_keepalive() {
+        let interval = Duration::from_millis(100);
+        // Start with a live session that has a persistent keepalive armed.
+        let (mut a_ep, _b_ep, a_peer, _b_peer) = establish_session(Some(interval), b"hello");
+        let peer_key = a_ep.peer_key(a_peer).expect("peer key");
+        let psk = rand::random();
+
+        // Some -> None on the live peer must CANCEL the timer.
+        a_ep.upsert_peer(
+            a_peer,
+            PeerConfig {
+                key: peer_key,
+                psk,
+                persistent_keepalive_interval: None,
+            },
+        );
+        let now = Instant::now();
+        let out = a_ep.dispatch_events(now + interval * 2);
+        assert!(
+            out.to_peers.get(&a_peer).is_none_or(|p| p.is_empty()),
+            "disabling the interval (Some->None) must cancel the keepalive timer"
+        );
+        // No timer should remain scheduled for this otherwise-idle endpoint.
+        assert!(
+            a_ep.next_event().is_none(),
+            "no persistent keepalive should remain scheduled after Some->None"
+        );
+
+        // None -> Some on the (still live) peer must ARM the timer again.
+        a_ep.upsert_peer(
+            a_peer,
+            PeerConfig {
+                key: peer_key,
+                psk,
+                persistent_keepalive_interval: Some(interval),
+            },
+        );
+        assert!(
+            a_ep.next_event().is_some(),
+            "re-enabling the interval (None->Some) on a live session must arm a timer"
+        );
+        let now = Instant::now();
+        let out = a_ep.dispatch_events(now + interval * 2);
+        assert_eq!(
+            out.to_peers.get(&a_peer).map(|p| p.len()),
+            Some(1),
+            "re-arming (None->Some) must make keepalives fire again"
+        );
+    }
+
+    /// Safety boundary (the load-bearing direction): persistent keepalives must keep a live session
+    /// *usable* without masking it — emitting keepalives must neither tear the session down nor stop
+    /// real data from flowing on that same session. After several idle keepalives fire, a real
+    /// outbound packet must still encrypt and send as a full (non-empty) data frame on the unchanged
+    /// session.
+    ///
+    /// Note on scope: the complementary "session aged past `REKEY_AFTER_TIME` triggers a rehandshake"
+    /// assertion cannot be driven deterministically from the `Endpoint` API, because session staleness
+    /// is evaluated against the real monotonic clock read *internally* (`send`/`encrypt_or_queue` call
+    /// `Instant::now()`; there is no injectable `now`), so forcing a >120s-old session would require a
+    /// real ~120s sleep (flaky/slow). That age-based rotation is owned and unit-tested at the
+    /// `TransmitSession::stale`/`expired` level (see `session.rs`: `session_timers` and
+    /// `keepalive_does_not_advance_rotation_timers`, which together prove the rotation clock is keyed on
+    /// `created` and is untouched by keepalive sends). This test covers the part that *is*
+    /// deterministic here: keepalives don't disturb the live session.
+    #[test]
+    fn keepalives_do_not_mask_a_live_session() {
+        let interval = Duration::from_millis(100);
+        let (mut a_ep, _b_ep, a_peer, _b_peer) = establish_session(Some(interval), b"hello");
+
+        // Let several idle keepalives fire on the live session.
+        for _ in 0..3 {
+            let now = Instant::now();
+            let out = a_ep.dispatch_events(now + interval * 2);
+            assert_eq!(
+                out.to_peers.get(&a_peer).map(|p| p.len()),
+                Some(1),
+                "an idle keepalive must fire each interval"
+            );
+            assert_eq!(
+                out.to_peers.get(&a_peer).map(|p| p[0].len()),
+                Some(KEEPALIVE_LEN),
+                "each keepalive must be an empty data frame"
+            );
+        }
+
+        // The session is still fully usable: real data encrypts and sends as a *non-empty* frame on
+        // the same session (it was not torn down, expired, or wedged by the keepalives), and no
+        // handshake is forced (a fresh handshake would be a handshake-message packet, not data).
+        let payload = b"real-data-after-keepalives";
+        let sent = a_ep.send(HashMap::from([(
+            a_peer,
+            vec![PacketMut::from(&payload[..])],
+        )]));
+        let pkts = sent
+            .to_peers
+            .get(&a_peer)
+            .expect("real data must still be sent on the live session");
+        assert_eq!(pkts.len(), 1, "exactly one data frame for the one packet");
+        assert!(
+            pkts[0].len() > KEEPALIVE_LEN,
+            "real data must be a full (non-empty) data frame, not an empty keepalive — \
+             proving keepalives didn't tear down or rotate the live session"
         );
     }
 }
