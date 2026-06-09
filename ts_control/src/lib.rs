@@ -52,8 +52,8 @@ pub use derp::{Map as DerpMap, Region as DerpRegion, convert_derp_map};
 pub use dial_plan::{DialCandidate, DialMode, DialPlan};
 pub use dns::{DnsConfig, ExtraRecord, Resolver as DnsResolver, ResolverTransport};
 pub use node::{
-    ExitNodeSelector, Id as NodeId, Node, NodeCapMap, StableId as StableNodeId, TailnetAddress,
-    UserProfile, is_tailscale_ip, validate_service_name,
+    ExitNodeSelector, Id as NodeId, Node, NodeCapMap, PeerChange, StableId as StableNodeId,
+    TailnetAddress, UserProfile, is_tailscale_ip, validate_service_name,
 };
 #[cfg(feature = "async_tokio")]
 pub use serve::{

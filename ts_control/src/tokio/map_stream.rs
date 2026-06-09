@@ -71,6 +71,15 @@ pub enum PeerUpdate {
         /// Peer [`NodeId`]s removed from the state.
         remove: Vec<NodeId>,
     },
+
+    /// Incremental field-level patches to peers already in the netmap
+    /// ([`MapResponse::peers_changed_patch`][crate::MapResponse::peers_changed_patch]). Unlike
+    /// [`Delta`][PeerUpdate::Delta] (which carries whole nodes), each [`PeerChange`] sets only the
+    /// fields it carries on the matching node, leaving the rest untouched; a patch whose node id is
+    /// unknown to the current netmap is ignored. Control uses these for mid-session reachability
+    /// changes — chiefly a peer's UDP endpoints / home DERP when it re-establishes connectivity —
+    /// so they MUST be applied or the netmap keeps stale endpoints and the peer can't re-handshake.
+    Patch(Vec<crate::PeerChange>),
 }
 
 /// The components of a packet filter update.
@@ -153,6 +162,20 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
             x.as_ref().is_some_and(|x| !x.is_empty())
         }
 
+        // `peers_changed_patch` carries field-level patches to already-known peers (Go applies them
+        // *after* the `peers*` fields). In practice control sends patches on their own, and our
+        // single `peer_update` slot carries one update per response — so a full/delta resync takes
+        // precedence (it already conveys the freshest whole nodes) and patches are surfaced only
+        // when no full/delta is present. If both ever arrive together we keep the resync and warn,
+        // rather than silently dropping the patches (the pre-fix behavior dropped them always).
+        let patches: Vec<crate::PeerChange> = map_response
+            .peers_changed_patch
+            .iter()
+            .flatten()
+            .map(crate::PeerChange::from)
+            .collect();
+        let n_patches = patches.len();
+
         let peer_update = if let Some(full_map) = map_response.peers {
             Some(PeerUpdate::Full(full_map.iter().map(Into::into).collect()))
         } else if nonempty(&map_response.peers_removed) || nonempty(&map_response.peers_changed) {
@@ -165,12 +188,20 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
                     .map(Into::into)
                     .collect(),
             })
+        } else if n_patches > 0 {
+            Some(PeerUpdate::Patch(patches))
         } else {
             None
         };
 
-        if !map_response.peers_changed_patch.is_empty() {
-            tracing::warn!(peers_changed_patch = ?map_response.peers_changed_patch, "ignored peer patch changes");
+        // If patches arrived *alongside* a full/delta resync (control normally doesn't do this),
+        // the resync wins and the patches are not separately applied — warn rather than drop
+        // silently, since the pre-fix behavior dropped patches unconditionally.
+        if n_patches > 0 && !matches!(peer_update, Some(PeerUpdate::Patch(_))) {
+            tracing::warn!(
+                n_patches,
+                "peer patches arrived alongside a full/delta peer update; resync takes precedence"
+            );
         }
 
         Some((
@@ -316,5 +347,57 @@ mod tests {
 
         assert_eq!(update.session_handle, None);
         assert_eq!(update.seq, 0);
+    }
+
+    #[tokio::test]
+    async fn map_stream_surfaces_peers_changed_patch() {
+        // A response carrying only `PeersChangedPatch` (control's mid-session reachability update)
+        // must surface as `PeerUpdate::Patch`, not be dropped. Regression for the pre-fix code that
+        // logged + discarded these, wedging idle peers that moved (stale endpoints → no re-handshake).
+        let buf = frame(&[r#"{
+            "Seq": 7,
+            "PeersChangedPatch": [
+                { "NodeID": 42, "Endpoints": ["203.0.113.7:41641"], "DERPRegion": 5 }
+            ]
+        }"#]);
+
+        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let update = stream.next().await.expect("one update");
+
+        match update.peer_update {
+            Some(PeerUpdate::Patch(patches)) => {
+                assert_eq!(patches.len(), 1);
+                assert_eq!(patches[0].id, 42);
+                assert_eq!(
+                    patches[0].underlay_addresses.as_deref(),
+                    Some(&["203.0.113.7:41641".parse().unwrap()][..])
+                );
+                assert_eq!(
+                    patches[0].derp_region,
+                    Some(ts_derp::RegionId(core::num::NonZeroU32::new(5).unwrap()))
+                );
+            }
+            other => panic!("expected PeerUpdate::Patch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn map_stream_resync_takes_precedence_over_patch() {
+        // If a full/delta resync and patches arrive together, the resync wins (it conveys the
+        // freshest whole nodes); the patch is not separately surfaced. `peers_changed` (a Delta)
+        // alongside a patch ⇒ the update is the Delta.
+        let buf = frame(&[r#"{
+            "Seq": 8,
+            "PeersChanged": [
+                { "ID": 1, "StableID": "n1", "Name": "a.ts.net.", "User": 1,
+                  "Key": "nodekey:0000000000000000000000000000000000000000000000000000000000000000" }
+            ],
+            "PeersChangedPatch": [ { "NodeID": 1, "DERPRegion": 9 } ]
+        }"#]);
+
+        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let update = stream.next().await.expect("one update");
+
+        assert!(matches!(update.peer_update, Some(PeerUpdate::Delta { .. })));
     }
 }

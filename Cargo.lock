@@ -2327,6 +2327,7 @@ name = "geiserx_ts_runtime"
 version = "0.6.9"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "ed25519-dalek 2.2.0",
  "etherparse",
  "futures",

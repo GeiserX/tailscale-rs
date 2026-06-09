@@ -489,6 +489,71 @@ impl PeerTracker {
                     deletions.insert(id);
                 }
             }
+
+            ts_control::PeerUpdate::Patch(patches) => {
+                tracing::trace!(n = patches.len(), "peer patch update");
+
+                for patch in patches {
+                    // A patch only mutates a peer already in the netmap; an unknown node id is
+                    // ignored (the wire contract — a patch never creates a node). Clone the current
+                    // node, apply the present fields, and re-upsert through the same path as a
+                    // delta so indexes/routes stay consistent.
+                    let Some((_id, existing)) = self.peer_db.get(&patch.id) else {
+                        tracing::debug!(
+                            control_node_id = patch.id,
+                            "peer patch for unknown node; ignoring"
+                        );
+                        continue;
+                    };
+
+                    let mut node = existing.clone();
+                    if let Some(endpoints) = &patch.underlay_addresses {
+                        node.underlay_addresses = endpoints.clone();
+                    }
+                    if let Some(derp) = patch.derp_region {
+                        node.derp_region = Some(derp);
+                    }
+                    if let Some(cap) = patch.cap {
+                        node.cap = cap;
+                    }
+                    if let Some(cap_map) = &patch.cap_map {
+                        node.cap_map = cap_map.clone();
+                    }
+                    if let Some(disco_key) = patch.disco_key {
+                        node.disco_key = Some(disco_key);
+                    }
+                    if let Some(expiry) = patch.node_key_expiry {
+                        node.node_key_expiry = Some(expiry);
+                    }
+                    // Key rotation: a patch may swap the node key (and its TKA signature). Apply
+                    // both together so the trust gate below verifies the new signature against the
+                    // new key, never a mismatched pair.
+                    if let Some(node_key) = patch.node_key {
+                        node.node_key = node_key;
+                    }
+                    if let Some(sig) = &patch.key_signature {
+                        node.key_signature = sig.clone();
+                    }
+
+                    // Re-run the tailnet-lock gate on the patched node: a patch that rotates the key
+                    // must satisfy the active authority, exactly like a `Delta` upsert, or it would
+                    // be a trust-enforcement bypass. fail-CLOSED — if the patched node is no longer
+                    // admitted, evict it rather than keep the stale (now-unverified) entry.
+                    if !self.tka_admits(&node) {
+                        if let Some((id, _)) = self.peer_db.remove(&patch.id) {
+                            tracing::warn!(
+                                control_node_id = patch.id,
+                                "peer patch rejected by tailnet lock; evicting peer"
+                            );
+                            deletions.insert(id);
+                        }
+                        continue;
+                    }
+
+                    let id = self.peer_db.upsert(&node);
+                    upserts.insert(id);
+                }
+            }
         }
 
         (upserts, deletions)
@@ -878,6 +943,140 @@ mod tka_tests {
         tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![resynced.clone()]));
         assert_eq!(tracker.peer_db.peers().len(), 1);
         assert!(tracker.peer_db.get(&resynced.node_key).is_some());
+    }
+
+    /// A `Patch` for a peer already in the netmap merges only the fields it carries — here new UDP
+    /// endpoints and a new home DERP — leaving the rest of the node intact. This is the fix for
+    /// dropped `peers_changed_patch`: without it the netmap keeps stale endpoints and the peer can
+    /// never re-handshake after it moves.
+    #[tokio::test]
+    async fn patch_merges_endpoints_and_derp_into_existing_peer() {
+        let mut tracker = PeerTracker::for_test(test_env(), None);
+
+        // Seed a peer (id == 1, per `peer_node`) with no endpoints / no DERP.
+        let peer = peer_node("mover", [1u8; 32], vec![]);
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer.clone()]));
+        let (_pid, before) = tracker.peer_db.get(&(1 as ts_control::NodeId)).unwrap();
+        assert!(before.underlay_addresses.is_empty());
+        assert!(before.derp_region.is_none());
+
+        // Patch in fresh reachability (the idle-peer-reconnect case).
+        let new_ep: std::net::SocketAddr = "203.0.113.7:41641".parse().unwrap();
+        let patch = ts_control::PeerChange {
+            id: 1,
+            derp_region: Some(ts_derp::RegionId(core::num::NonZeroU32::new(5).unwrap())),
+            cap: None,
+            cap_map: None,
+            underlay_addresses: Some(vec![new_ep]),
+            node_key: None,
+            key_signature: None,
+            disco_key: None,
+            node_key_expiry: None,
+        };
+        let (upserts, deletions) =
+            tracker.apply_peer_update(&ts_control::PeerUpdate::Patch(vec![patch]));
+
+        assert_eq!(upserts.len(), 1);
+        assert_eq!(deletions.len(), 0);
+        // Same peer, now carrying the patched endpoint + DERP; node key untouched.
+        assert_eq!(tracker.peer_db.peers().len(), 1);
+        let (_pid, after) = tracker.peer_db.get(&(1 as ts_control::NodeId)).unwrap();
+        assert_eq!(after.underlay_addresses, vec![new_ep]);
+        assert_eq!(
+            after.derp_region,
+            Some(ts_derp::RegionId(core::num::NonZeroU32::new(5).unwrap()))
+        );
+        assert_eq!(after.node_key, peer.node_key);
+    }
+
+    /// A `Patch` whose node id is not in the current netmap is ignored (the wire contract: a patch
+    /// never creates a node). No upsert, no deletion, peer set unchanged.
+    #[tokio::test]
+    async fn patch_for_unknown_node_is_ignored() {
+        let mut tracker = PeerTracker::for_test(test_env(), None);
+        let known = peer_node("known", [1u8; 32], vec![]); // id == 1
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![known]));
+
+        let patch = ts_control::PeerChange {
+            id: 999, // not in the netmap
+            derp_region: None,
+            cap: None,
+            cap_map: None,
+            underlay_addresses: Some(vec!["198.51.100.9:1".parse().unwrap()]),
+            node_key: None,
+            key_signature: None,
+            disco_key: None,
+            node_key_expiry: None,
+        };
+        let (upserts, deletions) =
+            tracker.apply_peer_update(&ts_control::PeerUpdate::Patch(vec![patch]));
+
+        assert_eq!(upserts.len(), 0);
+        assert_eq!(deletions.len(), 0);
+        assert_eq!(tracker.peer_db.peers().len(), 1);
+        assert!(tracker.peer_db.get(&(999 as ts_control::NodeId)).is_none());
+    }
+
+    /// An expiry-only `Patch` updates `node_key_expiry` on the matching peer (Go
+    /// `PeerChange.KeyExpiry`), rather than being silently dropped until the next full resync.
+    #[tokio::test]
+    async fn patch_updates_node_key_expiry() {
+        let mut tracker = PeerTracker::for_test(test_env(), None);
+        let peer = peer_node("expiring", [1u8; 32], vec![]); // id == 1, node_key_expiry: None
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer]));
+
+        let expiry = "2027-01-01T00:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let patch = ts_control::PeerChange {
+            id: 1,
+            derp_region: None,
+            cap: None,
+            cap_map: None,
+            underlay_addresses: None,
+            node_key: None,
+            key_signature: None,
+            disco_key: None,
+            node_key_expiry: Some(expiry),
+        };
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Patch(vec![patch]));
+
+        let (_pid, after) = tracker.peer_db.get(&(1 as ts_control::NodeId)).unwrap();
+        assert_eq!(after.node_key_expiry, Some(expiry));
+    }
+
+    /// Security: a `Patch` that rotates the node key must re-satisfy the tailnet-lock authority,
+    /// exactly like a `Delta` upsert. A key-rotation patch whose new signature does NOT verify
+    /// evicts the peer (fail-closed) rather than leaving a now-unverified entry — closing what would
+    /// otherwise be a trust-enforcement bypass via the patch path.
+    #[tokio::test]
+    async fn patch_key_rotation_failing_tka_evicts_peer() {
+        let (authority, sig) = authority_and_valid_sig();
+        let mut tracker = PeerTracker::for_test(test_env(), Some(authority));
+
+        // Admit a correctly-signed peer (id == 1).
+        let good = peer_node("rotator", NODE_KEY_BYTES, sig.clone());
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![good.clone()]));
+        assert_eq!(tracker.peer_db.peers().len(), 1);
+
+        // Patch a new node key whose signature is garbage under the active authority.
+        let patch = ts_control::PeerChange {
+            id: 1,
+            derp_region: None,
+            cap: None,
+            cap_map: None,
+            underlay_addresses: None,
+            node_key: Some([0x33u8; 32].into()),
+            key_signature: Some(vec![0x00, 0x01, 0x02]),
+            disco_key: None,
+            node_key_expiry: None,
+        };
+        let (upserts, deletions) =
+            tracker.apply_peer_update(&ts_control::PeerUpdate::Patch(vec![patch]));
+
+        assert_eq!(upserts.len(), 0);
+        assert_eq!(deletions.len(), 1);
+        assert_eq!(tracker.peer_db.peers().len(), 0);
     }
 
     /// A node's `user_id` joins against the accumulated UserProfiles table to resolve the owning

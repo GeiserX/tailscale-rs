@@ -768,6 +768,60 @@ impl From<&ts_control_serde::Node<'_>> for Node {
     }
 }
 
+/// An incremental update to a single already-known peer [`Node`], carried in
+/// [`MapResponse::peers_changed_patch`][ts_control_serde::MapResponse::peers_changed_patch].
+///
+/// Control sends a patch (rather than a full node in `peers_changed`) when only a peer's
+/// reachability changes mid-session — most importantly its UDP [`endpoints`][PeerChange::endpoints]
+/// and home [`derp_region`][PeerChange::derp_region] when an idle peer re-establishes connectivity.
+/// Every field is `Option`: a patch sets only the fields it carries and leaves the rest of the
+/// target node unchanged (see [`PeerTracker::apply_peer_update`] for the merge). Owned counterpart
+/// of the borrow-bound [`ts_control_serde::PeerChange`]; only the fields that map onto a domain
+/// [`Node`] field are retained (control's `last_seen`/`online` are presence/liveness metadata with
+/// no domain `Node` field and are dropped in conversion).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerChange {
+    /// The [`Node::id`] of the peer being mutated. If no peer with this id is in the current
+    /// netmap, the patch is ignored (the wire contract — a patch never creates a node).
+    pub id: Id,
+    /// If `Some`, the peer's new home DERP region.
+    pub derp_region: Option<ts_derp::RegionId>,
+    /// If `Some`, the peer's new advertised capability version.
+    pub cap: Option<CapabilityVersion>,
+    /// If `Some`, the peer's new capability map (replaces the prior map wholesale).
+    pub cap_map: Option<NodeCapMap>,
+    /// If `Some`, the peer's new UDP underlay endpoints (`Endpoints` in Go; replaces the prior
+    /// set). This is the field that lets magicsock re-handshake a peer that moved.
+    pub underlay_addresses: Option<Vec<SocketAddr>>,
+    /// If `Some`, the peer's new WireGuard public key (key rotation).
+    pub node_key: Option<NodePublicKey>,
+    /// If `Some`, the marshalled TKA signature over the new node key. Re-verified at the
+    /// peer-trust chokepoint when tailnet-lock enforcement is active.
+    pub key_signature: Option<Vec<u8>>,
+    /// If `Some`, the peer's new disco public key.
+    pub disco_key: Option<DiscoPublicKey>,
+    /// If `Some`, the peer's new node-key expiry (`KeyExpiry` in Go). Maps to
+    /// [`Node::node_key_expiry`]; carried so an expiry-only patch isn't lost until the next full
+    /// resync.
+    pub node_key_expiry: Option<DateTime<Utc>>,
+}
+
+impl From<&ts_control_serde::PeerChange<'_>> for PeerChange {
+    fn from(value: &ts_control_serde::PeerChange) -> Self {
+        Self {
+            id: value.node_id,
+            derp_region: value.derp_region.map(|x| ts_derp::RegionId(x.into())),
+            cap: value.cap,
+            cap_map: value.cap_map.as_ref().map(cap_map_from_serde),
+            underlay_addresses: value.endpoints.clone(),
+            node_key: value.key,
+            key_signature: value.key_signature.map(|s| s.to_vec()),
+            disco_key: value.disco_key,
+            node_key_expiry: value.key_expiry,
+        }
+    }
+}
+
 /// Display-friendly identity for the user that owns a [`Node`], resolved from the netmap's
 /// `UserProfiles` table (Go `tailcfg.UserProfile`). Owned counterpart of the borrow-bound
 /// [`ts_control_serde::UserProfile`]. Keyed by [`UserProfile::id`] (== [`Node::user_id`]).
