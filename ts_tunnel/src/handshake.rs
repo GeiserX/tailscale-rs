@@ -363,8 +363,9 @@ pub struct SessionPair {
 /// used by boringtun, wireguard-go, and the Linux kernel.
 pub(crate) struct Handshake {
     /// Initiator role: we sent a [`HandshakeInitiation`] and are awaiting a [`HandshakeResponse`]
-    /// (msg2). Holds the in-progress [`SentHandshake`], the `HANDSHAKE_TIMEOUT` retry handle, and
-    /// our mac1 (needed to authenticate a cookie reply).
+    /// (msg2). Holds the in-progress [`SentHandshake`], the `HANDSHAKE_TIMEOUT` handle (on expiry the
+    /// stale initiation is abandoned and a *fresh* handshake is started — not a retransmit of this
+    /// one), and our mac1 (needed to authenticate a cookie reply).
     initiated: Option<(SentHandshake, Handle<Event>, Mac)>,
     /// Responder role: we responded to the peer's [`HandshakeInitiation`] and are awaiting an
     /// initial transport message to confirm the new session.
@@ -489,8 +490,9 @@ impl Handshake {
         let send = TransmitSession::new(session_keys.initiator_to_responder, packet.sender_id, now);
         let recv = ReceiveSession::new(session_keys.responder_to_initiator, sent_handshake.id, now);
 
-        // Crypto succeeded: consume the initiator role and cancel its retry timeout. The responder
-        // role (if any) is intentionally left untouched.
+        // Crypto succeeded: consume the initiator role and cancel its handshake-timeout handle (it
+        // would otherwise fire and start a fresh handshake). The responder role (if any) is
+        // intentionally left untouched.
         let (_, timeout, _) = self.initiated.take().unwrap();
         timeout.cancel();
 

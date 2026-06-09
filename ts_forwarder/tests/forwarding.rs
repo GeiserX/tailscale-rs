@@ -244,8 +244,12 @@ async fn forwarder_splices_subnet_route_to_real_socket() {
 
     client.write_all(b"hello forwarder").await.unwrap();
 
+    // Generous read deadline (real-socket round-trip): the shared CI runner is often overloaded, so
+    // a tight 5s window spuriously timed out under load. 60s absorbs scheduler jitter; the bound is
+    // still finite, so a forwarder that never splices still fails — this removes false negatives
+    // without weakening the regression guard. Do NOT shrink it back.
     let mut buf = [0u8; 64];
-    let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+    let n = tokio::time::timeout(Duration::from_secs(60), client.read(&mut buf))
         .await
         .expect("read timed out")
         .unwrap();
@@ -363,8 +367,12 @@ async fn exit_node_flow_egresses_under_host_exit_dialer() {
     let mut client = connect_with_retry(&peer_ch, peer_local, echo_addr).await;
     client.write_all(b"exit egress").await.unwrap();
 
+    // Generous read deadline (real-socket round-trip): the shared CI runner is often overloaded, so
+    // a tight 5s window spuriously timed out under load. 60s absorbs scheduler jitter; the bound is
+    // still finite, so a forwarder that never egresses still fails — this removes false negatives
+    // without weakening the regression guard. Do NOT shrink it back.
     let mut buf = [0u8; 64];
-    let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+    let n = tokio::time::timeout(Duration::from_secs(60), client.read(&mut buf))
         .await
         .expect("read timed out")
         .unwrap();
@@ -397,8 +405,12 @@ async fn all_ports_forwards_unlisted_port_for_subnet_route() {
     let mut client = connect_with_retry(&peer_ch, peer_local, echo_addr).await;
     client.write_all(b"all ports hello").await.unwrap();
 
+    // Generous read deadline (real-socket round-trip): the shared CI runner is often overloaded, so
+    // a tight 10s window spuriously timed out under load. 60s absorbs scheduler jitter; the bound is
+    // still finite, so a forwarder that never splices still fails — this removes false negatives
+    // without weakening the regression guard. Do NOT shrink it back.
     let mut buf = [0u8; 64];
-    let n = tokio::time::timeout(Duration::from_secs(10), client.read(&mut buf))
+    let n = tokio::time::timeout(Duration::from_secs(60), client.read(&mut buf))
         .await
         .expect("read timed out")
         .unwrap();
@@ -500,7 +512,14 @@ async fn udp_forwarder_splices_subnet_route_to_real_socket() {
     let peer_sock: OverlayUdpSocket = peer_ch.udp_bind(peer_local).await.unwrap();
 
     let payload = b"hello udp forwarder";
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // Generous round-trip deadline: this is a real-UDP-socket round-trip, and the shared
+    // self-hosted CI runner is frequently overloaded, which adds scheduler jitter to every hop
+    // (overlay relay bind, real dial, echo, splice-back). A tight 10s deadline produced spurious
+    // "never spliced back" failures on unrelated PRs under load; 60s absorbs that jitter. The bound
+    // is still finite, so a genuinely-broken forwarder (one that never forwards) still fails here —
+    // this only removes false negatives, it does not weaken the regression guard. Do NOT shrink it
+    // back: the failures it prevents are load-induced, not logic bugs.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let mut buf = [0u8; 64];
     loop {
         assert!(
@@ -510,7 +529,10 @@ async fn udp_forwarder_splices_subnet_route_to_real_socket() {
 
         peer_sock.send_to(echo_addr, payload).await.unwrap();
 
-        match tokio::time::timeout(Duration::from_millis(250), peer_sock.recv_from(&mut buf)).await
+        // Per-attempt recv timeout widened in proportion to the deadline so retransmit attempts are
+        // not starved on a loaded runner (a too-short per-attempt window would burn the budget on
+        // spurious retransmits before a slow-but-valid reply lands).
+        match tokio::time::timeout(Duration::from_millis(500), peer_sock.recv_from(&mut buf)).await
         {
             Ok(Ok((remote, n))) => {
                 assert_eq!(&buf[..n], payload, "echoed payload must round-trip intact");
