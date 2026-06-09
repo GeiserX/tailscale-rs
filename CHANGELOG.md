@@ -8,15 +8,17 @@ Record breaking or significant changes here. All dates are UTC.
 - **Netmap decode now tolerates `null` for every sequence/map field (Go `omitempty` ↔ Rust).** Go
   marshals empty slices/maps as JSON `null`, so a control plane (notably an IPv6-off Headscale)
   sends `null` for array fields the client modeled as required sequences — failing the netmap decode
-  with `invalid type: null, expected a sequence`. v0.6.8 fixed only `Node.addresses`; this is the
-  systematic pass: a `null_to_default` deserializer is applied to every non-optional `Vec`/map field
-  across the deserialized netmap path — the peer `Node` (`endpoints`, `primary_routes`,
-  `capabilities`, `cap_map`, `exit_node_dns_resolvers`, `addresses`), `MapResponse`
-  (`peers_changed_patch`, `peer_seen_change`, `online_change`, `packet_filters`, `user_profiles`),
-  and `DNSConfig` (`resolvers`, `routes`, `fallback_resolvers`, `domains`, `nameservers`,
-  `cert_domains`, `extra_records`, `exit_node_filtered_set`). `null`, `[]`/`{}`, and a populated
-  container are now accepted interchangeably. Regression test decodes a full `MapResponse` + peer
-  `Node` + `DNSConfig` with `null` everywhere a sequence is expected.
+  with `invalid type: null, expected a sequence`/`expected a map` and looping the map-poll stream
+  forever. v0.6.8 fixed only `Node.addresses`; this is the systematic pass. Rather than annotate
+  each field (the per-field approach is what let the gap recur), `null` tolerance is now applied at
+  the **struct level** via `#[serde_with::apply]` on every type on the deserialized netmap path —
+  `Node`, `MapResponse`, `DNSConfig`, `DerpMap`/`Region`/`HomeParams`, `SSHPolicy` and its nested
+  rules, `ControlDialPlan`, and the `ts_packetfilter_serde` filter/cap-grant types — so any
+  `Vec`/map field added later is covered automatically. `null`, `[]`/`{}`, and a populated container
+  are accepted interchangeably; `Option<…>` fields (whose `null`/absence means *unchanged from the
+  prior poll*, e.g. `peers`, `packet_filter` singular) are deliberately left untouched. Regression
+  tests decode a full `MapResponse` + peer `Node` + `DNSConfig`, a DERP map, an SSH policy, a packet
+  filter, and a dial plan with `null` everywhere a sequence/map is expected.
 
 ## [0.6.8](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.6.8) - 2026-06-09
 

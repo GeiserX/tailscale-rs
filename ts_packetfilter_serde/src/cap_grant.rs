@@ -27,6 +27,7 @@ impl<'a, 'de: 'a> serde::Deserialize<'de> for CapGrant<'a> {
         #[derive(serde::Deserialize)]
         #[serde(rename_all = "PascalCase")]
         struct DeserCapGrant<'a> {
+            #[serde(default, deserialize_with = "crate::null_to_default")]
             dsts: Vec<IpNet>,
 
             #[serde(borrow, default)]

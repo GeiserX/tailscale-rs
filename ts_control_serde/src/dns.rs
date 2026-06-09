@@ -4,11 +4,21 @@ use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use serde::{Deserializer, Serializer};
 
 /// DNS configuration.
+///
+/// The struct-level `#[serde_with::apply]` block makes every `Vec`/map field tolerate a wire `null`
+/// (Go marshals empty `omitempty` slices/maps as `null`; see [`crate::util::null_to_default`]) and
+/// auto-covers any such field added later. This whole struct is only reached when the parent
+/// `MapResponse::dns_config` is `Some`, i.e. a present DNS snapshot; a `null` inner slice means "no
+/// resolvers / no domains / …" (empty), never "unchanged" (that is the parent `Option` being `None`).
+#[serde_with::apply(
+    Vec      => #[serde(default, deserialize_with = "crate::util::null_to_default")],
+    Map      => #[serde(default, deserialize_with = "crate::util::null_to_default")],
+    BTreeMap => #[serde(default, deserialize_with = "crate::util::null_to_default")],
+)]
 #[derive(serde::Deserialize, Debug, Clone, Default)]
 #[serde(default, rename_all = "PascalCase")]
 pub struct Config<'a> {
     /// DNS resolvers to use, in order of preference.
-    #[serde(deserialize_with = "crate::util::null_to_default")]
     pub resolvers: Vec<Option<Resolver<'a>>>,
 
     /// Map of DNS name suffixes to a set of resolvers to use.
@@ -21,24 +31,18 @@ pub struct Config<'a> {
     /// If the value is `None` or empty, the suffix should still be handled by Tailscale's
     /// built-in resolver `100.100.100.100`, such as for the purpose of handling
     /// `extra_records`.
-    #[serde(deserialize_with = "crate::util::null_to_default")]
     pub routes: BTreeMap<&'a str, Option<Vec<Option<Resolver<'a>>>>>,
 
     /// Like [`resolvers`][Config::resolvers], but only used if split DNS is requested
     /// in a configuration that doesn't work yet without explicit default resolvers.
     ///
     /// See: <https://github.com/tailscale/tailscale/issues/1743>
-    #[serde(deserialize_with = "crate::util::null_to_default")]
     pub fallback_resolvers: Vec<Option<Resolver<'a>>>,
 
     /// Search domains to use.
     ///
     /// Must be FQDNs _without_ the trailing dot.
-    #[serde(
-        borrow,
-        rename = "Domains",
-        deserialize_with = "crate::util::null_to_default"
-    )]
+    #[serde(borrow, rename = "Domains")]
     pub search_domains: Vec<&'a str>,
 
     /// Turns on MagicDNS, i.e. automatic resolution of hostnames for devices in the netmap.
@@ -49,18 +53,16 @@ pub struct Config<'a> {
 
     /// The IP addresses of the global nameservers to use.
     #[deprecated = "only used when MapRequest.version ∈ [9, 14]"]
-    #[serde(deserialize_with = "crate::util::null_to_default")]
     pub nameservers: Vec<IpAddr>,
 
     /// The set of DNS names for which control will assist with provisioning TLS certs.
     ///
     /// These names are FQDNs without trailing periods, and without any `_acme-challenge.`
     /// prefix.
-    #[serde(borrow, deserialize_with = "crate::util::null_to_default")]
+    #[serde(borrow)]
     pub cert_domains: Vec<&'a str>,
 
     /// Extra DNS records to add to the MagicDNS config.
-    #[serde(deserialize_with = "crate::util::null_to_default")]
     pub extra_records: Vec<Record<'a>>,
 
     /// The DNS suffixes that the node, when being an exit node DNS proxy, should not
@@ -74,11 +76,18 @@ pub struct Config<'a> {
     /// If an entry does not start with a period, it's an exact match.
     ///
     /// Matches are case-insensitive.
-    #[serde(borrow, deserialize_with = "crate::util::null_to_default")]
+    #[serde(borrow)]
     pub exit_node_filtered_set: Vec<&'a str>,
 }
 
 /// Configuration for one DNS resolver.
+///
+/// The struct-level `#[serde_with::apply]` block makes the `bootstrap_resolution` list tolerate a
+/// wire `null` (Go marshals an empty `omitempty` slice as `null`; see
+/// [`crate::util::null_to_default`]) and auto-covers any `Vec` field added later.
+#[serde_with::apply(
+    Vec => #[serde(default, deserialize_with = "crate::util::null_to_default")],
+)]
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
 #[serde(rename_all = "PascalCase")]
 pub struct Resolver<'a> {
@@ -91,7 +100,6 @@ pub struct Resolver<'a> {
     ///
     /// If empty, clients should use their local "classic" DNS resolver to look up the
     /// server IP.
-    #[serde(default)]
     pub bootstrap_resolution: Vec<IpAddr>,
 
     /// Continue using this resolver while an exit node is in use.

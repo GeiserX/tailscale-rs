@@ -10,11 +10,14 @@ use crate::node::StableNodeId;
 /// node from the control plane (see [`MapResponse::ssh_policy`][crate::MapResponse::ssh_policy]).
 ///
 /// Mirrors `tailcfg.SSHPolicy` in the Go client.
+#[serde_with::apply(
+    Vec => #[serde(default, deserialize_with = "crate::util::null_to_default")],
+)]
 #[derive(Default, Debug, Clone, PartialEq, Deserialize)]
 pub struct SSHPolicy<'a> {
     /// The set of rules that apply to this node, evaluated in order. The first matching rule
     /// determines the outcome of an incoming SSH connection.
-    #[serde(default, borrow, rename = "rules")]
+    #[serde(borrow, rename = "rules")]
     pub rules: Vec<SSHRule<'a>>,
 }
 
@@ -22,6 +25,10 @@ pub struct SSHPolicy<'a> {
 /// [`SSHRule::principals`] match the incoming connection determines its [`SSHRule::action`].
 ///
 /// Mirrors `tailcfg.SSHRule` in the Go client.
+#[serde_with::apply(
+    Vec      => #[serde(default, deserialize_with = "crate::util::null_to_default")],
+    BTreeMap => #[serde(default, deserialize_with = "crate::util::null_to_default")],
+)]
 #[derive(Default, Debug, Clone, PartialEq, Deserialize)]
 pub struct SSHRule<'a> {
     /// An optional time at which this rule expires. After this time, the rule no longer matches.
@@ -30,13 +37,13 @@ pub struct SSHRule<'a> {
 
     /// The set of principals that this rule applies to. A connection matches this rule if it
     /// matches any of these principals.
-    #[serde(default, borrow, rename = "principals")]
+    #[serde(borrow, rename = "principals")]
     pub principals: Vec<SSHPrincipal<'a>>,
 
     /// A map from incoming SSH usernames to the local Unix usernames they may run as. The special
     /// key `"*"` matches any incoming username (and the value is then used verbatim as the local
     /// username, unless it is itself `"="` meaning "use the incoming username as-is").
-    #[serde(default, borrow, rename = "sshUsers")]
+    #[serde(borrow, rename = "sshUsers")]
     pub ssh_users: BTreeMap<&'a str, &'a str>,
 
     /// The action to take when this rule matches. A `None` value means this rule does nothing.
@@ -45,7 +52,7 @@ pub struct SSHRule<'a> {
 
     /// An optional allowlist of environment variable names that may be forwarded from the SSH
     /// client to the session.
-    #[serde(default, borrow, rename = "acceptEnv")]
+    #[serde(borrow, rename = "acceptEnv")]
     pub accept_env: Vec<&'a str>,
 }
 
@@ -53,6 +60,9 @@ pub struct SSHRule<'a> {
 /// fields match the incoming connection.
 ///
 /// Mirrors `tailcfg.SSHPrincipal` in the Go client.
+#[serde_with::apply(
+    Vec => #[serde(default, deserialize_with = "crate::util::null_to_default")],
+)]
 #[derive(Default, Debug, Clone, PartialEq, Deserialize)]
 pub struct SSHPrincipal<'a> {
     /// If populated, matches a specific node by its [`StableNodeId`].
@@ -73,7 +83,7 @@ pub struct SSHPrincipal<'a> {
 
     /// Deprecated. Does nothing. Mirrors the Go field `UnusedPubKeys` (JSON tag `pubKeys`), kept
     /// only so the field round-trips on the wire.
-    #[serde(default, borrow, rename = "pubKeys")]
+    #[serde(borrow, rename = "pubKeys")]
     #[deprecated = "does nothing; kept for wire compatibility"]
     pub unused_pub_keys: Vec<&'a str>,
 }
@@ -81,6 +91,9 @@ pub struct SSHPrincipal<'a> {
 /// The action to take when an [`SSHRule`] matches.
 ///
 /// Mirrors `tailcfg.SSHAction` in the Go client.
+#[serde_with::apply(
+    Vec => #[serde(default, deserialize_with = "crate::util::null_to_default")],
+)]
 #[derive(Default, Debug, Clone, PartialEq, Deserialize)]
 pub struct SSHAction<'a> {
     /// An optional message to show to the user when this action is applied.
@@ -119,7 +132,7 @@ pub struct SSHAction<'a> {
 
     /// The list of session recorders (as `ip:port` socket addresses) that the session should be
     /// recorded to.
-    #[serde(default, rename = "recorders")]
+    #[serde(rename = "recorders")]
     pub recorders: Vec<SocketAddr>,
 
     /// What to do if session recording fails. A `None` value means recording failures are ignored
@@ -222,5 +235,34 @@ mod test {
     fn ssh_policy_empty_rules() {
         let policy = serde_json::from_str::<SSHPolicy>(r#"{}"#).unwrap();
         assert!(policy.rules.is_empty());
+    }
+
+    /// Go marshals empty `omitempty` slices/maps as `null`, so an SSH policy from such a control
+    /// plane can carry `null` for `rules`, `principals`, `sshUsers`, `acceptEnv`, `recorders`, and
+    /// `pubKeys` — each of which previously failed the decode and looped the map-poll stream.
+    #[test]
+    #[allow(deprecated)]
+    fn null_collections_decode_as_empty() {
+        let policy = serde_json::from_str::<SSHPolicy>(r#"{ "rules": null }"#)
+            .expect("SSHPolicy with null rules must decode");
+        assert!(policy.rules.is_empty());
+
+        let rule = serde_json::from_str::<SSHRule>(
+            r#"{
+                "principals": null,
+                "sshUsers": null,
+                "acceptEnv": null,
+                "action": { "accept": true, "recorders": null }
+            }"#,
+        )
+        .expect("SSHRule with null collections must decode");
+        assert!(rule.principals.is_empty());
+        assert!(rule.ssh_users.is_empty());
+        assert!(rule.accept_env.is_empty());
+        assert!(rule.action.unwrap().recorders.is_empty());
+
+        let principal = serde_json::from_str::<SSHPrincipal>(r#"{ "any": true, "pubKeys": null }"#)
+            .expect("SSHPrincipal with null pubKeys must decode");
+        assert!(principal.unused_pub_keys.is_empty());
     }
 }
