@@ -325,9 +325,9 @@ The pinned versions are deliberately at or above every relevant advisory's patch
 | Crate | Pin | Maintainer | Audit / status | Notes |
 |---|---|---|---|---|
 | `ring` | 0.17.14 | Brian Smith | BoringSSL pedigree; **not FIPS** | ≥ 0.17.12 clears RUSTSEC-2025-0009 (AES panic) |
-| `curve25519-dalek` | 4.1.3 | dalek | fiat-crypto field arith | **exact** patched floor for RUSTSEC-2024-0344 (timing) |
-| `x25519-dalek` | 2.x | dalek | via curve25519-dalek | — |
-| `ed25519-dalek` | 2.2.0 | dalek | — | ≥ 2.0 clears RUSTSEC-2022-0093 (double-pubkey oracle) |
+| `x25519-dalek` | **2.0.1 _and_ 3.0.0-rc.0** | dalek | two versions resolved in one tree | **Data plane** (`ts_keys`, `ts_tunnel`) rides **3.0.0-rc.0**; **control-plane TS2021 Noise** (`noise-rust-crypto`) rides **2.0.1**. See rc note below. |
+| `curve25519-dalek` | **4.1.3 _and_ 5.0.0-rc.0** | dalek | fiat-crypto field arith | Follows x25519-dalek: data plane → **5.0.0-rc.0** (via x25519-dalek 3.0.0-rc.0); control-plane Noise + `crypto_box` → **4.1.3** (the exact patched floor for RUSTSEC-2024-0344 timing — see rc note for the rc-line caveat). |
+| `ed25519-dalek` | **2.2.0** (runtime) | dalek | — | ≥ 2.0 clears RUSTSEC-2022-0093 (double-pubkey oracle). Runtime path = `ts_keys` / `ts_tka`; **3.0.0-rc.0 exists only behind the off-by-default `ssh` feature** (via `russh`/`ssh-key`), not on the default graph. |
 | `ed25519-zebra` | 4.2.0 | Zcash Fdn | Zebra ecosystem | ZIP-215; **must stay ≥ 2.x** |
 | `chacha20poly1305` | 0.10.1 | RustCrypto | **NCC Group (2022)** | — |
 | `crypto_box` | — | RustCrypto | **Cure53 (v0.7.1)** | use `SalsaBox`, never `ChaChaBox` |
@@ -335,6 +335,16 @@ The pinned versions are deliberately at or above every relevant advisory's patch
 | `blake2`, `sha2`, `hkdf`, `subtle`, `zeroize` | — | RustCrypto/dalek | de-facto standard | `subtle` underpins constant-time |
 | `noise-protocol`, `noise-rust-crypto` | 0.2.1 / 0.6.2 | individual | **UNAUDITED** | thin wrappers; risk = state-machine, not algorithm |
 | `aws-lc-rs` | 1.17.0 | AWS | SAW-verified, FIPS-capable | **only via off-by-default `ssh` feature** |
+
+> **Release-candidate crypto on the data plane (flagged).** The WireGuard data plane depends on
+> **rc-grade** crates — `x25519-dalek 3.0.0-rc.0` → `curve25519-dalek 5.0.0-rc.0` — a deliberate but
+> flagged choice for an experiment-gated (`TS_RS_EXPERIMENT`) fork. RC crates carry API-churn, yank,
+> and unaudited-change risk, so any "verified" claim must explicitly account for them rather than
+> treating them as released. In particular, RUSTSEC-2024-0344's timing fix landed in the **4.1.x**
+> line; its presence and equivalence in the **5.0-rc** line must be re-validated, not assumed.
+> Note also that **two X25519 implementations now coexist in one tree** — `x25519-dalek 3.0.0-rc.0`
+> (data plane) and `2.0.1` (control-plane Noise) — which doubles the constant-time / audit surface
+> for the same primitive.
 
 The **weakest links are the glue**, not the primitives: `noise-protocol`/`noise-rust-crypto` are
 single-maintainer and unaudited (they delegate the actual crypto to dalek/RustCrypto, so the residual
@@ -354,8 +364,12 @@ branch (fixed with a volatile barrier). Where the fork **must** be constant-time
   pin compare).
 - **Ed25519 / X25519 scalar operations** — delegated to dalek (fiat-crypto backend).
 
-Pin `curve25519-dalek ≥ 4.1.3`; build constant-time code release-mode only; the recommended verifier
-is `dudect-bencher` (`max_t > 5` ⇒ likely leak — it can detect, never *prove*, constant-timeness).
+Hold the `curve25519-dalek` timing floor on **both** lines in the tree: the `4.1.3` control-plane/`crypto_box`
+line is the exact RUSTSEC-2024-0344 patched floor, but the **data plane now rides `5.0.0-rc.0`** (via
+`x25519-dalek 3.0.0-rc.0`), so the load-bearing pin/validation is that the **rc line carries the
+RUSTSEC-2024-0344 timing fix forward** — re-validate it on 5.0-rc rather than assuming the 4.1.x fix
+transferred. Build constant-time code release-mode only; the recommended verifier is `dudect-bencher`
+(`max_t > 5` ⇒ likely leak — it can detect, never *prove*, constant-timeness).
 
 ---
 
@@ -468,7 +482,7 @@ consistent with the ring-only invariant (§6).
 | Primitive | Crate (version) | Headline counts | Assertion |
 |---|---|---|---|
 | ChaCha20Poly1305 (WireGuard transport AEAD, `ts_tunnel`) | `chacha20poly1305` 0.10.1 | 316 ran / 9 skipped | Valid ct+tag matches and round-trips; Invalid must fail (forgery/tamper). |
-| X25519 ECDH (WireGuard/Noise DH, `ts_keys`) | `x25519-dalek` 3.0.0-pre.6 | 518 (265 Valid + 253 Acceptable) | dalek is non-contributory (RFC 7748): computed shared secret must equal expected bytes; 0 mismatches. |
+| X25519 ECDH (WireGuard/Noise DH, `ts_keys`) | `x25519-dalek` 3.0.0-rc.0 | 518 (265 Valid + 253 Acceptable) | dalek is non-contributory (RFC 7748): computed shared secret must equal expected bytes; 0 mismatches. |
 | Ed25519 verify, **standard** (rotation-wrap, `ts_tka`) | `ed25519-dalek` 2.2.0 | 150 (88 Valid + 62 Invalid) | Valid verifies; Invalid rejected. |
 
 The 9 skipped ChaCha20Poly1305 groups are the non-96-bit-nonce (XChaCha) API this fork does not

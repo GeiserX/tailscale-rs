@@ -1,0 +1,35 @@
+{
+  "_provenance": {
+    "primitive": "BLAKE2s-256",
+    "why": "BLAKE2s-256 is the one crypto primitive ts_tunnel uses that has no direct KAT elsewhere. It backs the WireGuard Noise_IKpsk2 transcript hash, the mac1/mac2 cookie MACs, and the HKDF chaining-key expansion (ts_tunnel/src/handshake.rs imports blake2::{Blake2s256, Digest}; ts_tunnel/src/macs.rs; ts_tka SigHash). The Wycheproof project ships no BLAKE2 set, so this is sourced from the canonical BLAKE2 reference KAT instead.",
+    "source_repo": "github.com/BLAKE2/BLAKE2",
+    "source_file": "testvectors/blake2-kat.json",
+    "convention": "Canonical BLAKE2 KAT: an input of length n is the bytes 00 01 02 ... (n-1). Keyed vectors use the fixed 32-byte key 00 01 02 ... 1f. Keyed BLAKE2s is a MAC construction parameterized by the key (blake2::Blake2sMac256 via KeyInit), NOT a hash over key||input.",
+    "anchors": [
+      "unkeyed BLAKE2s-256(\"\")    = 69217a3079908094e11121d042354a7c1f55b6482ca1a51e1b250dfd1ed0eef9",
+      "unkeyed BLAKE2s-256(\"abc\") = 508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982 (input 0x616263)",
+      "keyed   BLAKE2s-256(\"\", key=00..1f) = 48a8997da407876b3d79c0d92325ad3b89cbb754d86ab71aee047ad345fd2c49"
+    ],
+    "verification": "Every out value was produced by RustCrypto's blake2 crate v0.10.6 (the proven dependency ts_tunnel ships) over the canonical inputs, and independently cross-checked against testvectors/blake2-kat.json and against an unrelated implementation (Python hashlib.blake2s). The Rust assertions live in ts_tunnel/tests/blake2s_kat.rs (vectors embedded there as an array to avoid a JSON-parsing dev-dependency; this file is the committed provenance copy).",
+    "count": 15,
+    "unkeyed": 8,
+    "keyed": 7
+  },
+  "vectors": [
+    { "hash": "blake2s", "in": "", "key": "", "out": "69217a3079908094e11121d042354a7c1f55b6482ca1a51e1b250dfd1ed0eef9" },
+    { "hash": "blake2s", "in": "616263", "key": "", "out": "508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982" },
+    { "hash": "blake2s", "in": "00", "key": "", "out": "e34d74dbaf4ff4c6abd871cc220451d2ea2648846c7757fbaac82fe51ad64bea" },
+    { "hash": "blake2s", "in": "0001", "key": "", "out": "ddad9ab15dac4549ba42f49d262496bef6c0bae1dd342a8808f8ea267c6e210c" },
+    { "hash": "blake2s", "in": "000102", "key": "", "out": "e8f91c6ef232a041452ab0e149070cdd7dd1769e75b3a5921be37876c45c9900" },
+    { "hash": "blake2s", "in": "000102030405060708090a0b0c0d0e0f", "key": "", "out": "efc04cdc391c7e9119bd38668a534e65fe31036d6a62112e44ebeb11f9c57080" },
+    { "hash": "blake2s", "in": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "key": "", "out": "05825607d7fdf2d82ef4c3c8c2aea961ad98d60edff7d018983e21204c0d93d1" },
+    { "hash": "blake2s", "in": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f", "key": "", "out": "56f34e8b96557e90c1f24b52d0c89d51086acf1b00f634cf1dde9233b8eaaa3e" },
+    { "hash": "blake2s", "in": "", "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "out": "48a8997da407876b3d79c0d92325ad3b89cbb754d86ab71aee047ad345fd2c49" },
+    { "hash": "blake2s", "in": "00", "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "out": "40d15fee7c328830166ac3f918650f807e7e01e177258cdc0a39b11f598066f1" },
+    { "hash": "blake2s", "in": "0001", "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "out": "6bb71300644cd3991b26ccd4d274acd1adeab8b1d7914546c1198bbe9fc9d803" },
+    { "hash": "blake2s", "in": "000102", "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "out": "1d220dbe2ee134661fdf6d9e74b41704710556f2f6e5a091b227697445dbea6b" },
+    { "hash": "blake2s", "in": "000102030405060708090a0b0c0d0e0f", "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "out": "19ba234f0a4f38637d1839f9d9f76ad91c8522307143c97d5f93f69274cec9a7" },
+    { "hash": "blake2s", "in": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "out": "c03bc642b20959cbe133a0303e0c1abff3e31ec8e1a328ec8565c36decff5265" },
+    { "hash": "blake2s", "in": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f", "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "out": "8975b0577fd35566d750b362b0897a26c399136df07bababbde6203ff2954ed4" }
+  ]
+}

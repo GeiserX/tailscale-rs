@@ -41,6 +41,17 @@ ts_cli_util.workspace = true
 proptest.workspace = true
 # Project Wycheproof ChaCha20Poly1305 adversarial vectors (dev-only KAT). See VENDOR.md.
 wycheproof.workspace = true
+# Statistical constant-time leakage *detection* (Reparaz dudect t-test) for the AEAD-decrypt /
+# tag-compare path. Detects leaks (max_t > 5), never *proves* constant-timeness — see
+# docs/CRYPTOGRAPHY.md §7. Bench-only; not wired into the default CI gate (run on demand).
+dudect-bencher = "0.7"
+
+# Constant-time leakage-detection harness (dudect t-test). Run with:
+#   cargo bench -p geiserx_ts_tunnel --bench constant_time
+# Not part of the default test gate; informational (detect, never prove).
+[[bench]]
+name = "constant_time"
+harness = false
 
 [lints]
 workspace = true
