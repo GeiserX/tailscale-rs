@@ -1,0 +1,29 @@
+# cargo-fuzz crate for the Tailnet-Lock (TKA) CBOR decoder.
+#
+# This is its OWN workspace (the empty `[workspace]` table below) by cargo-fuzz convention: it is
+# deliberately NOT a member of the parent 43-crate tailscale-rs workspace, so the libfuzzer-sys /
+# nightly-only fuzz machinery never pollutes the normal `cargo build`/`cargo test` of the workspace.
+# Run it explicitly from this directory: `cargo +nightly fuzz run cbor_decode`.
+[package]
+name = "ts_tka-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# Depend on the TKA crate by its PUBLISHED package name (`geiserx_ts_tka`); its lib name is `ts_tka`,
+# which is what the fuzz target's `use ts_tka::...` resolves to.
+geiserx_ts_tka = { path = ".." }
+
+# Keep this its own workspace — do not let it be absorbed into the parent workspace.
+[workspace]
+
+[[bin]]
+name = "cbor_decode"
+path = "fuzz_targets/cbor_decode.rs"
+test = false
+doc = false

@@ -1,5 +1,9 @@
 /result
 /target
+# cargo-fuzz crate (ts_tka/fuzz is its own workspace) — its nested build dir + generated corpus/crashes
+ts_tka/fuzz/target/
+ts_tka/fuzz/corpus/
+ts_tka/fuzz/artifacts/
 # produced by cargo-bisect-rustc
 target-bisector-*/
 .idea/

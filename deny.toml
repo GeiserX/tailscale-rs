@@ -12,6 +12,11 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "archived crate depended on by netlink-packet-utils. Already fixed upstream, just hasn't bubbled through the dependency stack yet" },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is unmaintained (functionality folded into rustls-pki-types >=1.9); transitive via the TLS stack, no published vulnerability. Pre-existing advisory, unrelated to the supply-chain ban below." },
 ]
+# NOTE: the `dudect-bencher` dev-dependency (constant-time leakage bench, ts_tunnel) was reviewed for
+# the old atty/ansi_term advisory chain (RUSTSEC-2021-0145/2024-0375/2021-0139). dudect-bencher 0.7
+# does NOT pull those crates into this tree — verified with `cargo deny --all-features check
+# advisories` (advisories ok, none encountered) — so no ignore entries are needed for it. If a future
+# dudect-bencher bump reintroduces them, add dev-only ignores here with that justification.
 
 [licenses]
 allow = [
