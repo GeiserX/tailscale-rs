@@ -4,7 +4,19 @@ Record breaking or significant changes here. All dates are UTC.
 
 ## Unreleased - June 2026
 
-Put changes for the upcoming release here!
+### Fixed
+- **Netmap decode now tolerates `null` for every sequence/map field (Go `omitempty` ↔ Rust).** Go
+  marshals empty slices/maps as JSON `null`, so a control plane (notably an IPv6-off Headscale)
+  sends `null` for array fields the client modeled as required sequences — failing the netmap decode
+  with `invalid type: null, expected a sequence`. v0.6.8 fixed only `Node.addresses`; this is the
+  systematic pass: a `null_to_default` deserializer is applied to every non-optional `Vec`/map field
+  across the deserialized netmap path — the peer `Node` (`endpoints`, `primary_routes`,
+  `capabilities`, `cap_map`, `exit_node_dns_resolvers`, `addresses`), `MapResponse`
+  (`peers_changed_patch`, `peer_seen_change`, `online_change`, `packet_filters`, `user_profiles`),
+  and `DNSConfig` (`resolvers`, `routes`, `fallback_resolvers`, `domains`, `nameservers`,
+  `cert_domains`, `extra_records`, `exit_node_filtered_set`). `null`, `[]`/`{}`, and a populated
+  container are now accepted interchangeably. Regression test decodes a full `MapResponse` + peer
+  `Node` + `DNSConfig` with `null` everywhere a sequence is expected.
 
 ## [0.6.8](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.6.8) - 2026-06-09
 

@@ -8,6 +8,7 @@ use serde::{Deserializer, Serializer};
 #[serde(default, rename_all = "PascalCase")]
 pub struct Config<'a> {
     /// DNS resolvers to use, in order of preference.
+    #[serde(deserialize_with = "crate::util::null_to_default")]
     pub resolvers: Vec<Option<Resolver<'a>>>,
 
     /// Map of DNS name suffixes to a set of resolvers to use.
@@ -20,18 +21,24 @@ pub struct Config<'a> {
     /// If the value is `None` or empty, the suffix should still be handled by Tailscale's
     /// built-in resolver `100.100.100.100`, such as for the purpose of handling
     /// `extra_records`.
+    #[serde(deserialize_with = "crate::util::null_to_default")]
     pub routes: BTreeMap<&'a str, Option<Vec<Option<Resolver<'a>>>>>,
 
     /// Like [`resolvers`][Config::resolvers], but only used if split DNS is requested
     /// in a configuration that doesn't work yet without explicit default resolvers.
     ///
     /// See: <https://github.com/tailscale/tailscale/issues/1743>
+    #[serde(deserialize_with = "crate::util::null_to_default")]
     pub fallback_resolvers: Vec<Option<Resolver<'a>>>,
 
     /// Search domains to use.
     ///
     /// Must be FQDNs _without_ the trailing dot.
-    #[serde(borrow, rename = "Domains")]
+    #[serde(
+        borrow,
+        rename = "Domains",
+        deserialize_with = "crate::util::null_to_default"
+    )]
     pub search_domains: Vec<&'a str>,
 
     /// Turns on MagicDNS, i.e. automatic resolution of hostnames for devices in the netmap.
@@ -42,16 +49,18 @@ pub struct Config<'a> {
 
     /// The IP addresses of the global nameservers to use.
     #[deprecated = "only used when MapRequest.version ∈ [9, 14]"]
+    #[serde(deserialize_with = "crate::util::null_to_default")]
     pub nameservers: Vec<IpAddr>,
 
     /// The set of DNS names for which control will assist with provisioning TLS certs.
     ///
     /// These names are FQDNs without trailing periods, and without any `_acme-challenge.`
     /// prefix.
-    #[serde(borrow)]
+    #[serde(borrow, deserialize_with = "crate::util::null_to_default")]
     pub cert_domains: Vec<&'a str>,
 
     /// Extra DNS records to add to the MagicDNS config.
+    #[serde(deserialize_with = "crate::util::null_to_default")]
     pub extra_records: Vec<Record<'a>>,
 
     /// The DNS suffixes that the node, when being an exit node DNS proxy, should not
@@ -65,6 +74,7 @@ pub struct Config<'a> {
     /// If an entry does not start with a period, it's an exact match.
     ///
     /// Matches are case-insensitive.
+    #[serde(borrow, deserialize_with = "crate::util::null_to_default")]
     pub exit_node_filtered_set: Vec<&'a str>,
 }
 

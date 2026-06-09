@@ -313,16 +313,18 @@ pub struct MapResponse<'a> {
     ///
     /// These are applied after `peers*`, but in practice, the control server should only
     /// send these on their own, without the `peers*` fields also set.
-    #[serde(borrow)]
+    #[serde(borrow, default, deserialize_with = "crate::util::null_to_default")]
     pub peers_changed_patch: Vec<Option<PeerChange<'a>>>,
 
     /// How to update peers' [`last_seen`][crate::Node::last_seen] times.
     ///
     /// If the value for a peer is false, the peer is gone. If true, update `last_seen` to
     /// now.
+    #[serde(default, deserialize_with = "crate::util::null_to_default")]
     pub peer_seen_change: BTreeMap<NodeId, bool>,
 
     /// Updates to peers' [`online`][crate::Node::online] states.
+    #[serde(default, deserialize_with = "crate::util::null_to_default")]
     pub online_change: BTreeMap<NodeId, bool>,
 
     /// The DNS settings for the client to use.
@@ -374,12 +376,13 @@ pub struct MapResponse<'a> {
     /// As a special case, the map key "*" with a value of `None` means to clear all
     /// prior named packet filters (including any implicit "base") before
     /// processing the other map entries.
-    #[serde(borrow)]
+    #[serde(borrow, default, deserialize_with = "crate::util::null_to_default")]
     pub packet_filters: ts_packetfilter_serde::Map<'a>,
 
     // --------------------------------------------------------------------------------------------
     /// The [`UserProfile`]s associated with Tailscale nodes in the Tailnet. As of
     /// [`CapabilityVersion::V5`], contains only new or updated profiles.
+    #[serde(default, deserialize_with = "crate::util::null_to_default")]
     pub user_profiles: Vec<UserProfile<'a>>,
 
     // --------------------------------------------------------------------------------------------
@@ -576,5 +579,69 @@ mod test {
         const TEST: &str = r#"{ "Seq": 1 }"#;
         let resp = serde_json::from_str::<MapResponse>(TEST).unwrap();
         assert!(resp.ssh_policy.is_none());
+    }
+
+    /// Go marshals empty slices/maps as JSON `null` for omitempty fields, so a control plane (esp.
+    /// an IPv6-off Headscale) sends `null` for array/map fields the client modeled as required
+    /// sequences. This used to fail the netmap decode with `invalid type: null, expected a
+    /// sequence`. A `MapResponse` (and its nested peer `Node` + `DNSConfig`) with `null` everywhere
+    /// a sequence/map is expected must now deserialize, treating `null` as the empty container.
+    #[test]
+    fn null_sequences_decode_as_empty() {
+        const TEST: &str = r#"{
+            "Seq": 1,
+            "PeersChangedPatch": null,
+            "PeerSeenChange": null,
+            "OnlineChange": null,
+            "PacketFilters": null,
+            "UserProfiles": null,
+            "Peers": [
+                {
+                    "ID": 2,
+                    "StableID": "n2",
+                    "Name": "peer.tail.ts.net.",
+                    "User": 1,
+                    "Addresses": ["100.64.0.2/32"],
+                    "AllowedIPs": null,
+                    "Endpoints": null,
+                    "PrimaryRoutes": null,
+                    "Capabilities": null,
+                    "CapMap": null,
+                    "Tags": null,
+                    "ExitNodeDNSResolvers": null,
+                    "Key": "nodekey:0000000000000000000000000000000000000000000000000000000000000000"
+                }
+            ],
+            "DNSConfig": {
+                "Resolvers": null,
+                "Routes": null,
+                "FallbackResolvers": null,
+                "Domains": null,
+                "Nameservers": null,
+                "CertDomains": null,
+                "ExtraRecords": null,
+                "ExitNodeFilteredSet": null
+            }
+        }"#;
+
+        let resp = serde_json::from_str::<MapResponse>(TEST)
+            .expect("MapResponse with null sequences must decode");
+        let peers = resp.peers.expect("peers present");
+        assert_eq!(peers.len(), 1);
+        let peer = &peers[0];
+        // Every null array on the peer Node decoded as empty (not a parse error).
+        assert!(peer.endpoints.is_empty());
+        assert!(peer.primary_routes.is_empty());
+        assert!(peer.exit_node_dns_resolvers.is_empty());
+        assert_eq!(peer.addresses.len(), 1);
+        // MapResponse-level null containers are empty too.
+        assert!(resp.peers_changed_patch.is_empty());
+        assert!(resp.peer_seen_change.is_empty());
+        assert!(resp.user_profiles.is_empty());
+        // DNSConfig null arrays decoded as empty.
+        let dns = resp.dns_config.expect("dns_config present");
+        assert!(dns.resolvers.is_empty());
+        assert!(dns.search_domains.is_empty());
+        assert!(dns.extra_records.is_empty());
     }
 }
