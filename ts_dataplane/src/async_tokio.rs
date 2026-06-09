@@ -197,7 +197,7 @@ impl DataPlane {
                     SelectResult::TransportsChanged
                 }
 
-                _ = option_sleep_until(next_event.map(Into::into)) => {
+                _ = sleep_until_event(next_event.map(Into::into)) => {
                     tracing::trace!("event");
 
                     SelectResult::Event
@@ -268,9 +268,162 @@ async fn write_to_underlay(
     }
 }
 
-async fn option_sleep_until(deadline: Option<tokio::time::Instant>) {
+/// The longest the dataplane will sleep waiting for a timer when *no* event is scheduled, before
+/// re-checking the wireguard state machine.
+///
+/// The primary driver of timer progress is a real scheduled event: an endpoint with persistent
+/// keepalive enabled (the default) always reports a next-event deadline via
+/// [`crate::DataPlane::next_event`], so `step` wakes exactly on it and the keepalive / rekey / expiry
+/// timers fire on schedule even on an otherwise idle, fully-relayed tunnel. When such a deadline
+/// exists we sleep all the way to it (it is itself the coalesced *soonest* timer), so an idle tunnel
+/// with a keepalive due in ~25s sleeps ~25s and wakes *once* — not once per second.
+///
+/// This bound is purely a defensive safety net for the *no-event* case: it guarantees the dataplane
+/// can never block *forever* on I/O with nothing scheduled — the wedge where `next_event() == None`
+/// turned the sleep into `future::pending()`, so an idle session aged past expiry with nothing to
+/// refresh it. A spurious wakeup with no due event is harmless (the dispatch finds nothing and writes
+/// nothing); a few-second bound keeps that idle-wakeup overhead negligible (≈17k wakeups/day vs the
+/// old unconditional 1 Hz floor's ≈86k) while still bounding the wedge window.
+const MAX_IDLE_SLEEP: core::time::Duration = core::time::Duration::from_secs(5);
+
+/// Sleep until the next scheduled event deadline; if none is scheduled, sleep at most
+/// [`MAX_IDLE_SLEEP`] rather than blocking forever.
+///
+/// When `deadline` is `Some`, this wakes exactly on it (a finite instant, so it can never block
+/// forever and never wakes later than the deadline). When `deadline` is `None` (no event scheduled)
+/// it sleeps for [`MAX_IDLE_SLEEP`] so the dataplane periodically re-services the wireguard state
+/// machine even with zero traffic and zero scheduled events.
+async fn sleep_until_event(deadline: Option<tokio::time::Instant>) {
+    let until = next_wakeup(deadline, tokio::time::Instant::now(), MAX_IDLE_SLEEP);
+    tokio::time::sleep_until(until).await;
+}
+
+/// Compute the next wakeup instant.
+///
+/// - `Some(deadline)`: wake exactly on the next scheduled event. Real timers (persistent keepalive /
+///   rekey / expiry) are always reported as events, and `next_event` already returns the *soonest*
+///   one, so honoring it directly means an idle tunnel with a keepalive due in 25s sleeps ~25s and
+///   wakes *once*. We deliberately do **not** clamp the deadline down to an idle floor — that would
+///   wake ~25× more often for no benefit, since nothing is due before the deadline. The deadline is
+///   itself a finite instant, so this can never block forever, and we never wake *later* than it.
+/// - `None` (nothing scheduled): collapse to the bounded floor `now + max_idle_sleep` so the result
+///   is *always* a finite instant — the dataplane can never sleep forever even with no events.
+///
+/// Pure so the cadence (and the "never block forever" guarantee) is unit-testable without a runtime.
+fn next_wakeup<I: core::ops::Add<core::time::Duration, Output = I> + Copy>(
+    deadline: Option<I>,
+    now: I,
+    max_idle_sleep: core::time::Duration,
+) -> I {
     match deadline {
-        Some(deadline) => tokio::time::sleep_until(deadline).await,
-        None => core::future::pending().await,
+        Some(deadline) => deadline,
+        None => now + max_idle_sleep,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wedge fix, distilled: with no event scheduled, the dataplane must still wake within the
+    /// bounded floor instead of `future::pending()` (block forever). This is what guarantees an idle
+    /// endpoint's timers (persistent keepalive / rekey / expiry) keep getting serviced.
+    #[test]
+    fn no_scheduled_event_still_wakes_within_floor() {
+        let now = std::time::Instant::now();
+        let woke = next_wakeup(None, now, MAX_IDLE_SLEEP);
+        assert_eq!(
+            woke,
+            now + MAX_IDLE_SLEEP,
+            "a None deadline must collapse to the bounded floor, never block forever"
+        );
+    }
+
+    /// A soon scheduled event is honored exactly: the idle floor only applies when *no* event is
+    /// scheduled, it never delays (or hurries) a due event.
+    #[test]
+    fn near_event_is_honored_exactly() {
+        let now = std::time::Instant::now();
+        let soon = now + core::time::Duration::from_millis(50);
+        assert_eq!(
+            next_wakeup(Some(soon), now, MAX_IDLE_SLEEP),
+            soon,
+            "an event sooner than the floor must wake exactly on its deadline"
+        );
+    }
+
+    /// A far-future scheduled event is honored exactly, *not* clamped down to the idle floor: the
+    /// floor exists only to bound the no-event wedge. `next_event` already reports the soonest timer,
+    /// so nothing is due before the deadline — clamping it would just burn ~floor-cadence wakeups on
+    /// an idle tunnel (the battery regression this fix removes). Sleeping to a far real deadline is
+    /// safe precisely because it is finite (never `pending()`).
+    #[test]
+    fn far_event_is_honored_not_clamped() {
+        let now = std::time::Instant::now();
+        let far = now + core::time::Duration::from_secs(3600);
+        assert_eq!(
+            next_wakeup(Some(far), now, MAX_IDLE_SLEEP),
+            far,
+            "a far-off scheduled event must be honored exactly, not clamped to the idle floor"
+        );
+    }
+
+    /// An idle tunnel with a persistent keepalive due in ~25s must sleep ~25s and wake *once*, not
+    /// once per [`MAX_IDLE_SLEEP`] — this is the battery/wakeup regression the fix targets.
+    #[test]
+    fn keepalive_in_25s_sleeps_to_the_deadline_not_the_floor() {
+        let now = std::time::Instant::now();
+        let keepalive_due = now + core::time::Duration::from_secs(25);
+        let woke = next_wakeup(Some(keepalive_due), now, MAX_IDLE_SLEEP);
+        assert_eq!(
+            woke, keepalive_due,
+            "a 25s keepalive deadline must be slept to directly (one wakeup), not capped at the idle floor"
+        );
+        assert!(
+            woke > now + MAX_IDLE_SLEEP,
+            "the wakeup must be well past the idle floor: the floor must not shorten a real deadline"
+        );
+    }
+
+    /// The anti-busy-spin invariant of the wedge fix, stated as a bound: a fully-idle dataplane (no
+    /// scheduled event) must always wake **strictly in the future**, on the coarse floor — never at
+    /// `now` or earlier (which would make `sleep_until` return instantly and turn `step()` into a
+    /// tight, CPU-burning sub-millisecond loop) and never `future::pending()` (the original
+    /// block-forever wedge). Swept over several base instants against the *real* `MAX_IDLE_SLEEP` so
+    /// the production idle cadence itself is what's pinned, not a toy value.
+    ///
+    /// Scope note: this is the deepest layer testable without a runtime. A full `#[tokio::test]`
+    /// driving [`DataPlane::step`] under `tokio::time::pause()` / `advance()` would require tokio's
+    /// `test-util` feature, which `ts_dataplane` does not enable (turning it on is a non-test
+    /// dependency change, out of scope here). [`sleep_until_event`] is a thin wrapper that feeds this
+    /// exact instant straight to `tokio::time::sleep_until`, so the integration-level idle cadence —
+    /// wake every `MAX_IDLE_SLEEP`, never sooner, never never — is fully determined by (and thus
+    /// covered through) this helper's boundedness.
+    #[test]
+    fn idle_wakeup_is_coarse_and_never_busy_spins() {
+        // A zero floor would let an idle step() spin; the production cadence must be positive.
+        assert!(
+            MAX_IDLE_SLEEP > core::time::Duration::ZERO,
+            "the idle floor must be a positive cadence, else step() would busy-spin"
+        );
+
+        let base = std::time::Instant::now();
+        for offset_ms in [0u64, 1, 250, 5_000, 60_000] {
+            let now = base + core::time::Duration::from_millis(offset_ms);
+            let woke = next_wakeup(None, now, MAX_IDLE_SLEEP);
+
+            // Strictly after `now`: an idle wakeup at or before `now` would busy-spin step().
+            assert!(
+                woke > now,
+                "idle wakeup must be strictly after now (no busy-spin); got {woke:?} <= {now:?}"
+            );
+            // Bounded to exactly the coarse floor: never sooner (tight loop), always finite
+            // (never the old `future::pending()` block-forever).
+            assert_eq!(
+                woke,
+                now + MAX_IDLE_SLEEP,
+                "idle wakeup must land on the bounded coarse floor, never sooner and never never"
+            );
+        }
     }
 }

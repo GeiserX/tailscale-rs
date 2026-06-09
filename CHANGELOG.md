@@ -2,6 +2,28 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.7.0](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.7.0) - 2026-06-09
+
+### Added
+- **Persistent-keepalive (per-peer, default 25s, opt-in) + a periodic dataplane tick, so an idle
+  DERP-relayed session no longer wedges.** A purely event-driven WG endpoint advances its timers
+  only on packet send/recv, so an idle tunnel went silent ~10s after the last packet and the
+  dataplane then blocked forever on I/O with no timer wakeup; the NAT/relay mapping went cold and
+  the next dial could never re-handshake (504 until process restart). Two parts, both required:
+  (1) a per-peer persistent keepalive that re-arms **unconditionally** (not gated on inbound
+  traffic) and, after a full interval of *outbound* silence, emits one empty authenticated data
+  packet to hold the path/NAT/relay mapping warm — it fires at or before the interval (no upward
+  jitter) to stay under the ~30s UDP NAT floor, and does **not** advance the data-sent timers; and
+  (2) a clock-driven periodic tick that services the endpoint even with zero traffic, so the
+  keepalive timer actually fires on a truly idle tunnel. Opt-in via the new
+  **`PeerConfig::persistent_keepalive_interval: Option<Duration>`** (mirroring Tailscale's per-peer
+  `KeepAlive=true` → 25s for relayed/exit peers); `None` preserves the prior purely-reactive
+  behavior. **API note:** this **adds a public field to `PeerConfig`** (and threads through
+  `Config`) — a source-visible, non-breaking API addition, hence the **minor** version bump
+  (0.6.10 → 0.7.0). Scope: this fixes the idle→dial case; it does **not** make rekey timer-driven, so
+  a tunnel kept alive *solely* by keepalives with zero application traffic past `REKEY_AFTER_TIME`
+  is a separate, not-yet-addressed case (see `docs/IDLE-WEDGE-RESEARCH.md`).
+
 ## [0.6.10](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.6.10) - 2026-06-09
 
 ### Fixed

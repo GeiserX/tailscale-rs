@@ -108,6 +108,14 @@ pub struct ForwarderConfig {
     /// regardless to uphold the real-origin-IP isolation invariant.
     pub enable_ipv6: bool,
 
+    /// The WireGuard persistent-keepalive interval applied to every peer, or `None` to disable.
+    ///
+    /// See [`Config::persistent_keepalive_interval`](ts_control::Config::persistent_keepalive_interval).
+    /// Threaded into the dataplane actor, which sets it on every upserted
+    /// [`ts_tunnel::PeerConfig`] so an idle (typically DERP-relayed) session keeps its path warm and
+    /// doesn't age out and wedge the next dial.
+    pub persistent_keepalive_interval: Option<std::time::Duration>,
+
     /// The shared "Funnel ingress listener active" flag, the same `Arc` as
     /// [`Config::ingress_active`](ts_control::Config::ingress_active).
     ///
@@ -136,6 +144,7 @@ impl ForwarderConfig {
             peerapi_port: config.peerapi_port,
             taildrop_dir: config.taildrop_dir.clone(),
             enable_ipv6: config.enable_ipv6,
+            persistent_keepalive_interval: config.persistent_keepalive_interval,
             ingress_active: config.ingress_active.clone(),
         }
     }
@@ -220,6 +229,12 @@ pub struct Env {
     /// netstack address assignment, and MagicDNS; never by the forwarder egress path.
     pub enable_ipv6: bool,
 
+    /// The WireGuard persistent-keepalive interval applied to every peer, or `None` to disable.
+    ///
+    /// See [`ForwarderConfig::persistent_keepalive_interval`]. Read by the dataplane actor when it
+    /// upserts peers.
+    pub persistent_keepalive_interval: Option<std::time::Duration>,
+
     /// The shared "Funnel ingress listener active" flag, the same `Arc` as
     /// [`Config::ingress_active`](ts_control::Config::ingress_active).
     ///
@@ -283,6 +298,7 @@ impl Env {
             peerapi_port,
             taildrop_dir,
             enable_ipv6,
+            persistent_keepalive_interval,
             ingress_active,
         } = forwarding;
 
@@ -315,6 +331,7 @@ impl Env {
             peerapi_port,
             taildrop_store,
             enable_ipv6,
+            persistent_keepalive_interval,
             ingress_active,
             funnel_ingress: Arc::new(std::sync::Mutex::new(None)),
         };

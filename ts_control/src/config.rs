@@ -94,6 +94,20 @@ fn default_ephemeral() -> bool {
     true
 }
 
+/// Default WireGuard persistent-keepalive interval: 25s.
+///
+/// Matches Tailscale, which sets `PersistentKeepalive = 25` on a peer when control marks it
+/// `KeepAlive=true`. 25s sits just under the ~30s lower bound for UDP NAT/firewall mapping
+/// timeouts, so the mapping (and any DERP relay path) is refreshed before it can expire.
+pub const DEFAULT_PERSISTENT_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(25);
+
+/// Default for [`Config::persistent_keepalive_interval`]: `Some(25s)`
+/// ([`DEFAULT_PERSISTENT_KEEPALIVE`]). On by default so a relayed, idle session keeps its path warm
+/// and doesn't wedge the next dial.
+fn default_persistent_keepalive() -> Option<std::time::Duration> {
+    Some(DEFAULT_PERSISTENT_KEEPALIVE)
+}
+
 /// Configuration for the control server.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Config {
@@ -292,6 +306,21 @@ pub struct Config {
     /// regardless to uphold the real-origin-IP isolation invariant.
     #[serde(default)]
     pub enable_ipv6: bool,
+
+    /// WireGuard persistent-keepalive interval applied to every peer, or `None` to disable persistent
+    /// keepalives (`PersistentKeepalive`; Tailscale uses 25s).
+    ///
+    /// When `Some(interval)`, each peer emits an empty authenticated keepalive every `interval` of
+    /// outbound silence, holding the (typically DERP-relayed) path/NAT mapping warm so an idle
+    /// session doesn't age past expiry and wedge the next dial — the failure this fork's primary
+    /// userspace-netstack deployment hits, where the relay is the only path to a peer. Unlike the
+    /// reactive WireGuard §6.5 keepalive (armed only by inbound traffic), this re-arms unconditionally
+    /// and fires on a fully idle tunnel; the empty packet does not advance the session's
+    /// rotation/expiry timers, so a genuinely dead peer is still detected. Defaults to `Some(25s)`
+    /// ([`DEFAULT_PERSISTENT_KEEPALIVE`]). Like the other dataplane fields it is not read inside
+    /// `ts_control`; it is carried here only to be threaded into the runtime's dataplane actor.
+    #[serde(default = "default_persistent_keepalive")]
+    pub persistent_keepalive_interval: Option<std::time::Duration>,
 
     /// How the application overlay data path is realized: userspace netstack (default) or a real
     /// kernel TUN interface. See [`TransportMode`].
@@ -547,6 +576,7 @@ impl Default for Config {
             taildrop_dir: None,
             tcp_buffer_size: None,
             enable_ipv6: false,
+            persistent_keepalive_interval: default_persistent_keepalive(),
             transport_mode: TransportMode::default(),
             wire_ingress: false,
             ingress_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

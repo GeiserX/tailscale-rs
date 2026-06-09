@@ -826,6 +826,7 @@ mod tests {
                 peerapi_port: None,
                 taildrop_dir: None,
                 enable_ipv6: false,
+                persistent_keepalive_interval: None,
                 ingress_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         )
@@ -838,6 +839,7 @@ mod tests {
         use ts_control::{Node, StableNodeId, TailnetAddress};
         Node {
             id: 2,
+            user_id: 0,
             stable_id: StableNodeId(stable_id.to_string()),
             hostname: stable_id.to_string(),
             tailnet: Some("ts.net".to_string()),
@@ -918,6 +920,7 @@ mod tests {
         use ts_control::{Node, StableNodeId, TailnetAddress};
         Node {
             id: 1,
+            user_id: 0,
             stable_id: StableNodeId("n1".to_string()),
             hostname: "self".to_string(),
             tailnet: Some("ts.net".to_string()),
