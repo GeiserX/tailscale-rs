@@ -194,9 +194,8 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
             None
         };
 
-        // If patches arrived *alongside* a full/delta resync (control normally doesn't do this),
-        // the resync wins and the patches are not separately applied — warn rather than drop
-        // silently, since the pre-fix behavior dropped patches unconditionally.
+        // Surface the rare both-present case (a resync chosen above while patches were also sent)
+        // so it's observable rather than silent.
         if n_patches > 0 && !matches!(peer_update, Some(PeerUpdate::Patch(_))) {
             tracing::warn!(
                 n_patches,

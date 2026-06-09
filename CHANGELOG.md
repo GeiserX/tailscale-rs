@@ -2,6 +2,25 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.6.10](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.6.10) - 2026-06-09
+
+### Fixed
+- **Incremental peer patches (`MapResponse.peers_changed_patch`) are now applied instead of
+  dropped.** The map-stream decoder logged and discarded these patches, so the per-peer updates
+  control sends mid-session — chiefly a peer's UDP endpoints and home DERP region when an idle peer
+  re-establishes connectivity — never reached the netmap. magicsock kept stale endpoints and could
+  not re-handshake the moved peer, wedging idle sessions. Patches now surface as a new
+  `PeerUpdate::Patch` and are merged in the peer tracker: each patch is looked up by node id (an
+  unknown id is ignored — a patch never creates a node), only the fields it carries are merged onto
+  the existing node, and the tailnet-lock gate is re-run before upsert so a key-rotation patch
+  cannot bypass TKA (a patch whose new signature fails verification evicts the peer, fail-closed). A
+  full/delta resync in the same response still takes precedence.
+- **macOS TUN bring-up no longer fails with "No such file or directory (os error 2)".** The host
+  networking layer invoked `route(8)` at `/usr/sbin/route`, which is the Linux/iproute2 location and
+  does not exist on macOS (macOS ships `route(8)` in `/sbin`). The missing binary made every route
+  installation fail with `ENOENT`, which the TUN actor treats as fatal and fail-closes — so the TUN
+  interface never came up. Corrected to `/sbin/route`. (`scutil(8)` was already correct.)
+
 ## [0.6.9](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.6.9) - 2026-06-09
 
 ### Fixed
