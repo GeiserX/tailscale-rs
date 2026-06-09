@@ -247,6 +247,22 @@ mod endpoint_serde {
 /// relevant fields. For background, see the [doc comment for `MapResponse`] in the Go client.
 ///
 /// [doc comment for MapResponse]: <https://github.com/tailscale/tailscale/blob/e2233b794247bf20d022d0ebefa99ad39bbad591/tailcfg/tailcfg.go#L1927-L1936>
+///
+/// The struct-level `#[serde_with::apply]` block makes every bare `Vec`/map field tolerate a wire
+/// `null` (Go marshals empty `omitempty` slices/maps as `null`; see [`crate::util::null_to_default`])
+/// and auto-covers any such field added later. This is deliberately scoped to **non-`Option`**
+/// `Vec`/map fields: the delta-encoded fields whose `null`/absence means "unchanged from the prior
+/// poll" (`peers`, `peers_changed`, `peers_removed`, `packet_filter` singular, etc.) are all
+/// `Option<…>` — matched by none of the rules below (the `apply` macro matches the type **exactly
+/// as written**, path qualifier and all), so they are left completely untouched and keep their
+/// "unchanged" semantics. Note the path-qualified `ts_packetfilter_serde::Map` rule: a bare `Map`
+/// token would NOT match it (the field is written with its full path), which is why each alias
+/// spelling that appears on the struct needs its own rule.
+#[serde_with::apply(
+    Vec      => #[serde(default, deserialize_with = "crate::util::null_to_default")],
+    BTreeMap => #[serde(default, deserialize_with = "crate::util::null_to_default")],
+    ts_packetfilter_serde::Map => #[serde(default, deserialize_with = "crate::util::null_to_default")],
+)]
 #[derive(Default, Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct MapResponse<'a> {
@@ -576,5 +592,75 @@ mod test {
         const TEST: &str = r#"{ "Seq": 1 }"#;
         let resp = serde_json::from_str::<MapResponse>(TEST).unwrap();
         assert!(resp.ssh_policy.is_none());
+    }
+
+    /// Go marshals empty slices/maps as JSON `null` for omitempty fields, so a control plane (esp.
+    /// an IPv6-off Headscale) sends `null` for array/map fields the client modeled as required
+    /// sequences. This used to fail the netmap decode with `invalid type: null, expected a
+    /// sequence`. A `MapResponse` (and its nested peer `Node` + `DNSConfig`) with `null` everywhere
+    /// a sequence/map is expected must now deserialize, treating `null` as the empty container.
+    #[test]
+    fn null_sequences_decode_as_empty() {
+        const TEST: &str = r#"{
+            "Seq": 1,
+            "PeersChangedPatch": null,
+            "PeerSeenChange": null,
+            "OnlineChange": null,
+            "PacketFilters": null,
+            "UserProfiles": null,
+            "Peers": [
+                {
+                    "ID": 2,
+                    "StableID": "n2",
+                    "Name": "peer.tail.ts.net.",
+                    "User": 1,
+                    "Addresses": ["100.64.0.2/32"],
+                    "AllowedIPs": null,
+                    "Endpoints": null,
+                    "PrimaryRoutes": null,
+                    "Capabilities": null,
+                    "CapMap": null,
+                    "Tags": null,
+                    "ExitNodeDNSResolvers": null,
+                    "Key": "nodekey:0000000000000000000000000000000000000000000000000000000000000000"
+                }
+            ],
+            "DNSConfig": {
+                "Resolvers": [
+                    { "Addr": "1.1.1.1", "BootstrapResolution": null }
+                ],
+                "Routes": null,
+                "FallbackResolvers": null,
+                "Domains": null,
+                "Nameservers": null,
+                "CertDomains": null,
+                "ExtraRecords": null,
+                "ExitNodeFilteredSet": null
+            }
+        }"#;
+
+        let resp = serde_json::from_str::<MapResponse>(TEST)
+            .expect("MapResponse with null sequences must decode");
+        let peers = resp.peers.expect("peers present");
+        assert_eq!(peers.len(), 1);
+        let peer = &peers[0];
+        // Every null array on the peer Node decoded as empty (not a parse error).
+        assert!(peer.endpoints.is_empty());
+        assert!(peer.primary_routes.is_empty());
+        assert!(peer.exit_node_dns_resolvers.is_empty());
+        assert_eq!(peer.addresses.len(), 1);
+        // MapResponse-level null containers are empty too.
+        assert!(resp.peers_changed_patch.is_empty());
+        assert!(resp.peer_seen_change.is_empty());
+        assert!(resp.user_profiles.is_empty());
+        // DNSConfig null arrays decoded as empty.
+        let dns = resp.dns_config.expect("dns_config present");
+        assert!(dns.search_domains.is_empty());
+        assert!(dns.extra_records.is_empty());
+        // A present resolver whose `BootstrapResolution` is `null` decodes with an empty list
+        // (Resolver carries its own apply block) rather than failing the whole netmap decode.
+        assert_eq!(dns.resolvers.len(), 1);
+        let resolver = dns.resolvers[0].as_ref().expect("resolver present");
+        assert!(resolver.bootstrap_resolution.is_empty());
     }
 }

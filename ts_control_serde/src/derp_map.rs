@@ -1,4 +1,4 @@
-use alloc::collections::BTreeMap;
+use alloc::{collections::BTreeMap, vec::Vec};
 use core::{
     fmt,
     fmt::Display,
@@ -227,6 +227,9 @@ where
 
 /// Contains parameters from the control server related to selecting a DERP home region (sometimes
 /// referred to as the "preferred DERP").
+#[serde_with::apply(
+    BTreeMap => #[serde(default, deserialize_with = "crate::util::null_to_default")],
+)]
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct HomeParams {
@@ -248,6 +251,9 @@ pub struct HomeParams {
 ///
 /// Tailscale nodes will further connect to other regions as necessary to communicate with peer
 /// nodes advertising other regions as their homes.
+#[serde_with::apply(
+    Vec => #[serde(default, deserialize_with = "crate::util::null_to_default")],
+)]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct Region<'a> {
@@ -315,12 +321,14 @@ pub struct Region<'a> {
     /// get the same preferred node order, so if all Tailscale nodes in a Tailnet pick the first
     /// server (as they should, when things are healthy), the inter-cluster routing is minimal to
     /// zero.
-    #[serde(default)]
-    pub nodes: alloc::vec::Vec<DerpServer<'a>>,
+    pub nodes: Vec<DerpServer<'a>>,
 }
 
 /// Describes the set of DERP packet relay servers that are available, sent from the control server
 /// to a Tailscale node.
+#[serde_with::apply(
+    BTreeMap => #[serde(default, deserialize_with = "crate::util::null_to_default")],
+)]
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct DerpMap<'a> {
@@ -361,5 +369,25 @@ mod test {
             d::<Ipv4Addr>(r#""1.2.3.4""#),
             IpUsage::FixedAddr(Ipv4Addr::new(1, 2, 3, 4))
         );
+    }
+
+    /// A DERP map ships in the first `MapResponse`. Go marshals empty `omitempty` slices/maps as
+    /// `null`, so an IPv6-off control plane can send `null` for `Regions`, `Nodes`, or
+    /// `RegionScore` — which previously failed the decode with `invalid type: null, expected a
+    /// map`/`sequence` and looped the map-poll stream forever.
+    #[test]
+    fn null_collections_decode_as_empty() {
+        let dm = serde_json::from_str::<DerpMap>(
+            r#"{ "HomeParams": { "RegionScore": null }, "Regions": null }"#,
+        )
+        .expect("DerpMap with null Regions/RegionScore must decode");
+        assert!(dm.regions.is_empty());
+        assert!(dm.home_params.unwrap().region_score.is_empty());
+
+        let region = serde_json::from_str::<Region>(
+            r#"{ "RegionID": 1, "RegionCode": "sf", "RegionName": "San Francisco", "Nodes": null }"#,
+        )
+        .expect("Region with null Nodes must decode");
+        assert!(region.nodes.is_empty());
     }
 }

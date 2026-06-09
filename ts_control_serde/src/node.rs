@@ -40,6 +40,20 @@ pub type NodeId = i64;
 pub struct StableNodeId<'a>(#[serde(borrow)] pub &'a str);
 
 /// A Tailscale device in a Tailnet.
+///
+/// The struct-level `#[serde_with::apply]` block makes **every** `Vec`/map field tolerate a wire
+/// `null` (Go marshals empty `omitempty` slices/maps as `null`; see
+/// [`crate::util::null_to_default`]). Applying it at the struct level — rather than annotating each
+/// field — means any `Vec`/map field added later is covered automatically, closing the recurring
+/// "forgot a field" gap that broke decoding against IPv6-off control planes. `Option<Vec<…>>` fields
+/// (e.g. `allowed_ips`, `tags`) are written as `Option<Vec<…>>`, matched by none of the rules below
+/// (the `apply` macro matches the type **exactly as written**), so they keep their `null` → `None`
+/// semantics untouched. The path-qualified `ts_nodecapability::Map` rule is required because the
+/// `cap_map` field is written with that full path — a bare `Map` token would not match it.
+#[serde_with::apply(
+    Vec      => #[serde(default, deserialize_with = "crate::util::null_to_default")],
+    ts_nodecapability::Map => #[serde(default, deserialize_with = "crate::util::null_to_default")],
+)]
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct Node<'a> {
@@ -84,7 +98,8 @@ pub struct Node<'a> {
     /// has length 1. Modeling it as a 2-tuple broke deserialization against such control planes
     /// ("invalid length 1, expected a tuple of size 2"). The domain [`Node`] picks the first IPv4
     /// and (optionally) the first IPv6 prefix out of this list.
-    #[serde(default)]
+    ///
+    /// `null` tolerance is supplied by the struct-level `#[serde_with::apply]` block.
     pub addresses: Vec<ipnet::IpNet>,
     /// IP ranges to route to this node.
     ///

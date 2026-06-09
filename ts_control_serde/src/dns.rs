@@ -4,6 +4,17 @@ use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use serde::{Deserializer, Serializer};
 
 /// DNS configuration.
+///
+/// The struct-level `#[serde_with::apply]` block makes every `Vec`/map field tolerate a wire `null`
+/// (Go marshals empty `omitempty` slices/maps as `null`; see [`crate::util::null_to_default`]) and
+/// auto-covers any such field added later. This whole struct is only reached when the parent
+/// `MapResponse::dns_config` is `Some`, i.e. a present DNS snapshot; a `null` inner slice means "no
+/// resolvers / no domains / …" (empty), never "unchanged" (that is the parent `Option` being `None`).
+#[serde_with::apply(
+    Vec      => #[serde(default, deserialize_with = "crate::util::null_to_default")],
+    Map      => #[serde(default, deserialize_with = "crate::util::null_to_default")],
+    BTreeMap => #[serde(default, deserialize_with = "crate::util::null_to_default")],
+)]
 #[derive(serde::Deserialize, Debug, Clone, Default)]
 #[serde(default, rename_all = "PascalCase")]
 pub struct Config<'a> {
@@ -65,10 +76,18 @@ pub struct Config<'a> {
     /// If an entry does not start with a period, it's an exact match.
     ///
     /// Matches are case-insensitive.
+    #[serde(borrow)]
     pub exit_node_filtered_set: Vec<&'a str>,
 }
 
 /// Configuration for one DNS resolver.
+///
+/// The struct-level `#[serde_with::apply]` block makes the `bootstrap_resolution` list tolerate a
+/// wire `null` (Go marshals an empty `omitempty` slice as `null`; see
+/// [`crate::util::null_to_default`]) and auto-covers any `Vec` field added later.
+#[serde_with::apply(
+    Vec => #[serde(default, deserialize_with = "crate::util::null_to_default")],
+)]
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
 #[serde(rename_all = "PascalCase")]
 pub struct Resolver<'a> {
@@ -81,7 +100,6 @@ pub struct Resolver<'a> {
     ///
     /// If empty, clients should use their local "classic" DNS resolver to look up the
     /// server IP.
-    #[serde(default)]
     pub bootstrap_resolution: Vec<IpAddr>,
 
     /// Continue using this resolver while an exit node is in use.

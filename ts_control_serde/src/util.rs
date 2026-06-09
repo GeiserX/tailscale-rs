@@ -120,3 +120,24 @@ where
 {
     t == &T::default()
 }
+
+/// Deserialize a field as `T`, treating a wire `null` as `T::default()`.
+///
+/// Go marshals empty slices/maps as JSON `null` (not `[]`/`{}`) for `omitempty`-tagged fields, and
+/// control planes vary in whether they send `null`, `[]`, or omit the field entirely. A plain
+/// `#[serde(default)]` covers an *omitted* field but NOT an explicit `null` — serde still tries to
+/// deserialize `null` as a sequence/map and fails (`invalid type: null, expected a sequence`). This
+/// helper deserializes through `Option<T>` (so `null` → `None`) and unwraps to the default,
+/// accepting `null`, the empty container, or a populated one interchangeably.
+///
+/// Generic over `Deserialize<'de>` (not `DeserializeOwned`) so it works for borrow-bound fields
+/// (e.g. `Vec<NodeCap<'a>>`, `ts_nodecapability::Map<'a>`) as well as owned ones. Pair with
+/// `#[serde(default, deserialize_with = "crate::util::null_to_default")]` so an omitted field also
+/// defaults.
+pub fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}

@@ -7,6 +7,9 @@ use serde::Deserialize;
 /// server. Used to maintain connection if the node's network state changes after the initial
 /// connection, or if the control server pushes other changes to the node (such as DNS config
 /// updates) that break connectivity.
+#[serde_with::apply(
+    Vec => #[serde(default, deserialize_with = "crate::util::null_to_default")],
+)]
 #[derive(Default, Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ControlDialPlan<'a> {
@@ -137,5 +140,15 @@ mod test {
         for candidate in dial_plan.candidates {
             assert!(candidate.ip.is_some() || candidate.ace_host.is_some());
         }
+    }
+
+    /// Go marshals an empty `omitempty` slice as `null`, so a control plane can send
+    /// `"Candidates": null` — which previously failed the decode with `invalid type: null,
+    /// expected a sequence`.
+    #[test]
+    fn null_candidates_decode_as_empty() {
+        let dial_plan = serde_json::from_str::<ControlDialPlan>(r#"{ "Candidates": null }"#)
+            .expect("ControlDialPlan with null Candidates must decode");
+        assert!(dial_plan.candidates.is_empty());
     }
 }

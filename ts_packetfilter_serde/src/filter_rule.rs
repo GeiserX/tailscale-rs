@@ -37,7 +37,12 @@ impl<'a, 'de: 'a> serde::Deserialize<'de> for FilterRule<'a> {
         #[serde(rename_all = "PascalCase")]
         struct DeserFilterRule<'a> {
             // shared field:
-            #[serde(rename = "SrcIPs", borrow)]
+            #[serde(
+                rename = "SrcIPs",
+                borrow,
+                default,
+                deserialize_with = "crate::null_to_default"
+            )]
             src_ips: Vec<SrcIp<'a>>,
 
             // network fields:
@@ -100,7 +105,12 @@ impl<'a> From<NetworkRule<'a>> for FilterRule<'a> {
 #[serde(rename_all = "PascalCase")]
 pub struct NetworkRule<'a> {
     /// The traffic sources which match for this rule.
-    #[serde(rename = "SrcIPs", borrow)]
+    #[serde(
+        rename = "SrcIPs",
+        borrow,
+        default,
+        deserialize_with = "crate::null_to_default"
+    )]
     pub src_ips: Vec<SrcIp<'a>>,
 
     /// The [`IpProto`]s that match for this rule.
@@ -135,11 +145,16 @@ impl Default for NetworkRule<'_> {
 #[serde(rename_all = "PascalCase")]
 pub struct AppRule<'a> {
     /// Principals to which to grant the caps in `cap_grant`.
-    #[serde(rename = "SrcIPs", borrow)]
+    #[serde(
+        rename = "SrcIPs",
+        borrow,
+        default,
+        deserialize_with = "crate::null_to_default"
+    )]
     pub src_ips: Vec<SrcIp<'a>>,
 
     /// Capability names and values
-    #[serde(borrow)]
+    #[serde(borrow, default, deserialize_with = "crate::null_to_default")]
     pub cap_grant: Vec<CapGrant<'a>>,
 }
 
@@ -318,6 +333,28 @@ mod test {
             TEST_EMPTY_DST_PORTS,
             FilterRule::Network(NetworkRule::default()),
         )
+    }
+
+    /// `packet_filter`/`packet_filters` ship on essentially every full `MapResponse`. Go marshals
+    /// an empty `omitempty` slice as `null`, so a control plane can send `"SrcIPs": null` (and
+    /// `"Dsts": null` inside a cap grant) — which previously failed the decode with `invalid type:
+    /// null, expected a sequence`, the highest-probability re-trigger of the map-poll loop.
+    #[test]
+    fn null_src_ips_and_dsts_decode_as_empty() {
+        // Network rule: null SrcIPs.
+        let rule = serde_json::from_str::<FilterRule>(r#"{ "SrcIPs": null, "DstPorts": [] }"#)
+            .expect("network FilterRule with null SrcIPs must decode");
+        assert!(rule.as_network().unwrap().src_ips.is_empty());
+
+        // App rule: null SrcIPs + a cap grant with null Dsts.
+        let app = serde_json::from_str::<FilterRule>(
+            r#"{ "SrcIPs": null, "CapGrant": [{ "Dsts": null, "CapMap": {} }] }"#,
+        )
+        .expect("app FilterRule with null SrcIPs and null Dsts must decode");
+        let app = app.as_app().unwrap();
+        assert!(app.src_ips.is_empty());
+        assert_eq!(app.cap_grant.len(), 1);
+        assert!(app.cap_grant[0].dsts.is_empty());
     }
 
     #[test]
