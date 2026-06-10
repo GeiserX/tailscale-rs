@@ -2,6 +2,21 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.12.0](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.12.0) - 2026-06-10
+
+### Added
+- **`Device::rebind()`** — re-bind the underlay UDP socket after a network/link change (Wi-Fi
+  switch, sleep/wake), the Rust analog of Go magicsock's `Conn.Rebind()` + `resetEndpointStates`
+  (daemon ask #4 / tsr-9cs). The embedder owns *when* to call it (it watches the OS for link
+  changes — there is no built-in monitor); the engine re-binds the socket (same-port-preferred →
+  ephemeral fallback, IPv4-only invariant preserved) and invalidates the stale local NAT mapping:
+  learned reflexive (STUN) addresses and every peer's *confirmed* direct path are cleared while
+  candidate endpoints are kept, so peers re-probe over the new socket and relay over DERP (never a
+  direct host dial) until a path re-confirms. Peers, control, the netmap, disco keys, and DERP are
+  untouched; WireGuard sessions survive. No-op when the underlay is inert (DERP-only). Internally
+  `MagicSock`'s socket moved behind a `Mutex<Arc<UdpSocket>>` (the `RebindingUDPConn` pattern) so the
+  swap is atomic; no new dependency. New public API → minor bump.
+
 ## [0.11.0](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.11.0) - 2026-06-10
 
 ### Fixed
