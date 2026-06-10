@@ -554,6 +554,8 @@ mod test {
             tailnet: rng.random::<bool>().then_some(rand_string(&mut rng, 32)),
 
             node_key_expiry: None,
+            online: None,
+            last_seen: None,
             underlay_addresses: vec![],
             derp_region: rng
                 .random::<bool>()
@@ -962,6 +964,8 @@ mod test {
                     machine_key: machine_key.map(Into::into),
 
                     node_key_expiry: None,
+            online: None,
+            last_seen: None,
 
                     tailnet_address: TailnetAddress {
                         ipv4: ipv4.into(),

@@ -416,6 +416,8 @@ mod tests {
             dns_config: None,
             ssh_policy: None,
             tka: None,
+            online_change: Default::default(),
+            peer_seen_change: Default::default(),
         }
     }
 

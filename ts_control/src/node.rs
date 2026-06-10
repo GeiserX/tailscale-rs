@@ -149,6 +149,17 @@ pub struct Node {
     /// The node key's expiration.
     pub node_key_expiry: Option<DateTime<Utc>>,
 
+    /// Whether control reports this node currently connected to the coordination server
+    /// (`tailcfg.Node.Online`, a tri-state `*bool`). `None` = unknown / no permission to know /
+    /// never been online — **do not collapse to `false`** (that would fabricate an offline status
+    /// control never asserted). Updated by full nodes AND by the delta channels (a
+    /// [`PeerChange::online`], or the `MapResponse.online_change` map).
+    pub online: Option<bool>,
+    /// When control last saw this node online (`tailcfg.Node.LastSeen`). Per Go, only meaningful
+    /// while `online` is not `Some(true)` ("not updated when Online is true"). `None` = unknown /
+    /// never online.
+    pub last_seen: Option<DateTime<Utc>>,
+
     /// Marshalled TKA node-key signature (`tailcfg.Node.KeySignature`); empty when control sends
     /// none. Verified against a TKA `Authority` at the peer-trust chokepoint WHEN tailnet-lock
     /// enforcement is active.
@@ -731,6 +742,8 @@ impl From<&ts_control_serde::Node<'_>> for Node {
             tailnet_address: TailnetAddress { ipv4, ipv6 },
             node_key: value.key,
             node_key_expiry: value.key_expiry,
+            online: value.online,
+            last_seen: value.last_seen,
             key_signature: value.key_signature.to_vec(),
             machine_key: value.machine,
             disco_key: value.disco_key,
@@ -776,9 +789,9 @@ impl From<&ts_control_serde::Node<'_>> for Node {
 /// and home [`derp_region`][PeerChange::derp_region] when an idle peer re-establishes connectivity.
 /// Every field is `Option`: a patch sets only the fields it carries and leaves the rest of the
 /// target node unchanged (see [`PeerTracker::apply_peer_update`] for the merge). Owned counterpart
-/// of the borrow-bound [`ts_control_serde::PeerChange`]; only the fields that map onto a domain
-/// [`Node`] field are retained (control's `last_seen`/`online` are presence/liveness metadata with
-/// no domain `Node` field and are dropped in conversion).
+/// of the borrow-bound [`ts_control_serde::PeerChange`]; the fields that map onto a domain
+/// [`Node`] field are retained, including control's `online`/`last_seen` liveness deltas — the
+/// dominant channel by which peer online transitions are delivered (see [`Node::online`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerChange {
     /// The [`Node::id`] of the peer being mutated. If no peer with this id is in the current
@@ -804,6 +817,11 @@ pub struct PeerChange {
     /// [`Node::node_key_expiry`]; carried so an expiry-only patch isn't lost until the next full
     /// resync.
     pub node_key_expiry: Option<DateTime<Utc>>,
+    /// If `Some`, the peer's new online status (`PeerChange.Online`). `None` here means "this patch
+    /// did not touch online", **not** "offline" — the merge sets [`Node::online`] only when present.
+    pub online: Option<bool>,
+    /// If `Some`, the peer's new last-seen time (`PeerChange.LastSeen`). Maps to [`Node::last_seen`].
+    pub last_seen: Option<DateTime<Utc>>,
 }
 
 impl From<&ts_control_serde::PeerChange<'_>> for PeerChange {
@@ -818,6 +836,8 @@ impl From<&ts_control_serde::PeerChange<'_>> for PeerChange {
             key_signature: value.key_signature.map(|s| s.to_vec()),
             disco_key: value.disco_key,
             node_key_expiry: value.key_expiry,
+            online: value.online,
+            last_seen: value.last_seen,
         }
     }
 }
@@ -1045,6 +1065,8 @@ mod tests {
             },
             node_key: [0u8; 32].into(),
             node_key_expiry: None,
+            online: None,
+            last_seen: None,
             key_signature: vec![],
             machine_key: None,
             disco_key: None,

@@ -355,7 +355,32 @@ impl Message<Arc<ts_control::StateUpdate>> for PeerTracker {
             self.user_profiles.insert(profile.id, profile.clone());
         }
 
+        // Apply the standalone online/last-seen delta maps (channels C/D, `MapResponse.OnlineChange`
+        // / `PeerSeenChange`). These arrive keyed by control node id and may ride a response that
+        // carries NO `peer_update` (a bare online flip is the common case), so they must be applied
+        // *before* the no-peer-update early return — otherwise online status freezes at the last
+        // full-node/patch value. Each entry only ever *sets* a value (never back to unknown).
+        let liveness_changed =
+            self.apply_liveness_changes(&msg.online_change, &msg.peer_seen_change);
+
         let Some(peer_update) = &msg.peer_update else {
+            // No peer set/patch this response. If a liveness delta still mutated the netmap, publish
+            // the refreshed snapshot so watchers (and `GetStatus`) see the new online state.
+            if liveness_changed {
+                self.service_pending_requests();
+                self.peer_watch.send_replace(self.status_peers());
+                if let Err(e) = self
+                    .env
+                    .publish(Arc::new(PeerState {
+                        upserts: HashSet::default(),
+                        deletions: HashSet::default(),
+                        peers: Arc::new(self.peer_db.clone()),
+                    }))
+                    .await
+                {
+                    tracing::error!(error = %e, "publishing liveness-only peer state update");
+                }
+            }
             return;
         };
 
@@ -525,6 +550,15 @@ impl PeerTracker {
                     if let Some(expiry) = patch.node_key_expiry {
                         node.node_key_expiry = Some(expiry);
                     }
+                    // Online/last-seen liveness deltas (`PeerChange.Online`/`LastSeen`) — the
+                    // dominant channel by which peer online transitions arrive mid-session. A patch
+                    // only ever *sets* a value (never patches back to unknown), so apply when present.
+                    if let Some(online) = patch.online {
+                        node.online = Some(online);
+                    }
+                    if let Some(last_seen) = patch.last_seen {
+                        node.last_seen = Some(last_seen);
+                    }
                     // Key rotation: a patch may swap the node key (and its TKA signature). Apply
                     // both together so the trust gate below verifies the new signature against the
                     // new key, never a mismatched pair.
@@ -557,6 +591,56 @@ impl PeerTracker {
         }
 
         (upserts, deletions)
+    }
+
+    /// Apply the standalone online/last-seen delta maps (`MapResponse.OnlineChange` /
+    /// `PeerSeenChange`, channels C/D) onto the retained netmap. Returns `true` if any node was
+    /// actually mutated (so the caller knows whether to re-publish).
+    ///
+    /// Mirrors Go's post-`peers*` application of these maps. Each entry is keyed by control node id
+    /// and only ever *sets* a value (never back to unknown). An entry for an unknown node id is
+    /// ignored (like a patch — these maps never create a node). `peer_seen_change`'s `false` ("the
+    /// peer is gone") is applied as `online = Some(false)` — the node stays in the netmap, it is
+    /// merely marked offline; the `last_seen = now` update for the `true` case is intentionally not
+    /// performed here (it needs a wall clock this actor does not hold, and `last_seen` is the
+    /// low-value half — `online` is the `tailscale status` column that matters; see the iter-5
+    /// research note §5.5).
+    fn apply_liveness_changes(
+        &mut self,
+        online_change: &std::collections::BTreeMap<ts_control::NodeId, bool>,
+        peer_seen_change: &std::collections::BTreeMap<ts_control::NodeId, bool>,
+    ) -> bool {
+        let mut changed = false;
+
+        // Channel C — direct online flips.
+        for (&node_id, &online) in online_change {
+            if let Some((_pid, existing)) = self.peer_db.get(&node_id)
+                && existing.online != Some(online)
+            {
+                let mut node = existing.clone();
+                node.online = Some(online);
+                self.peer_db.upsert(&node);
+                changed = true;
+            }
+        }
+
+        // Channel D — peer-seen flips. `false` ⇒ "the peer is gone" ⇒ mark offline (the node is
+        // retained, not removed). `true` ⇒ "seen just now"; the online half is unknown from this
+        // signal alone, so we leave `online` untouched (a `true` here does not assert connectivity to
+        // control, only recent contact) and defer the `last_seen = now` timestamp (no clock here).
+        for (&node_id, &seen) in peer_seen_change {
+            if !seen
+                && let Some((_pid, existing)) = self.peer_db.get(&node_id)
+                && existing.online != Some(false)
+            {
+                let mut node = existing.clone();
+                node.online = Some(false);
+                self.peer_db.upsert(&node);
+                changed = true;
+            }
+        }
+
+        changed
     }
 
     /// Test-only constructor: build a [`PeerTracker`] with a chosen [`tka_authority`](Self::tka_authority)
@@ -683,6 +767,8 @@ mod tka_tests {
             },
             node_key: node_key.into(),
             node_key_expiry: None,
+            online: None,
+            last_seen: None,
             key_signature,
             machine_key: None,
             disco_key: None,
@@ -973,6 +1059,8 @@ mod tka_tests {
             key_signature: None,
             disco_key: None,
             node_key_expiry: None,
+            online: None,
+            last_seen: None,
         };
         let (upserts, deletions) =
             tracker.apply_peer_update(&ts_control::PeerUpdate::Patch(vec![patch]));
@@ -1008,6 +1096,8 @@ mod tka_tests {
             key_signature: None,
             disco_key: None,
             node_key_expiry: None,
+            online: None,
+            last_seen: None,
         };
         let (upserts, deletions) =
             tracker.apply_peer_update(&ts_control::PeerUpdate::Patch(vec![patch]));
@@ -1039,11 +1129,118 @@ mod tka_tests {
             key_signature: None,
             disco_key: None,
             node_key_expiry: Some(expiry),
+            online: None,
+            last_seen: None,
         };
         tracker.apply_peer_update(&ts_control::PeerUpdate::Patch(vec![patch]));
 
         let (_pid, after) = tracker.peer_db.get(&(1 as ts_control::NodeId)).unwrap();
         assert_eq!(after.node_key_expiry, Some(expiry));
+    }
+
+    /// Channel B: a `PeerChange.online` patch flips a peer's online state without a full node.
+    #[tokio::test]
+    async fn patch_updates_online() {
+        let mut tracker = PeerTracker::for_test(test_env(), None);
+        let peer = peer_node("p", [1u8; 32], vec![]); // id == 1, online: None
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer]));
+        assert_eq!(
+            tracker
+                .peer_db
+                .get(&(1 as ts_control::NodeId))
+                .unwrap()
+                .1
+                .online,
+            None
+        );
+
+        let mut patch = ts_control::PeerChange {
+            id: 1,
+            derp_region: None,
+            cap: None,
+            cap_map: None,
+            underlay_addresses: None,
+            node_key: None,
+            key_signature: None,
+            disco_key: None,
+            node_key_expiry: None,
+            online: Some(true),
+            last_seen: None,
+        };
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Patch(vec![patch.clone()]));
+        assert_eq!(
+            tracker
+                .peer_db
+                .get(&(1 as ts_control::NodeId))
+                .unwrap()
+                .1
+                .online,
+            Some(true),
+            "PeerChange.online=Some(true) marks the peer online"
+        );
+
+        // A subsequent patch flips it offline.
+        patch.online = Some(false);
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Patch(vec![patch]));
+        assert_eq!(
+            tracker
+                .peer_db
+                .get(&(1 as ts_control::NodeId))
+                .unwrap()
+                .1
+                .online,
+            Some(false)
+        );
+    }
+
+    /// Channel C/D: the `online_change` map flips online directly; `peer_seen_change: false`
+    /// ("the peer is gone") marks the peer offline. Both apply to a peer already in the netmap and
+    /// ignore unknown ids.
+    #[tokio::test]
+    async fn liveness_change_maps_apply_online() {
+        let mut tracker = PeerTracker::for_test(test_env(), None);
+        let peer = peer_node("p", [1u8; 32], vec![]); // id == 1
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer]));
+
+        // Channel C: online_change sets online=true.
+        let mut online_change = std::collections::BTreeMap::new();
+        online_change.insert(1 as ts_control::NodeId, true);
+        online_change.insert(999 as ts_control::NodeId, true); // unknown id — ignored
+        let changed = tracker.apply_liveness_changes(&online_change, &Default::default());
+        assert!(changed);
+        assert_eq!(
+            tracker
+                .peer_db
+                .get(&(1 as ts_control::NodeId))
+                .unwrap()
+                .1
+                .online,
+            Some(true)
+        );
+
+        // Channel D: peer_seen_change=false marks the peer offline (gone), node retained.
+        let mut peer_seen_change = std::collections::BTreeMap::new();
+        peer_seen_change.insert(1 as ts_control::NodeId, false);
+        let changed = tracker.apply_liveness_changes(&Default::default(), &peer_seen_change);
+        assert!(changed);
+        assert_eq!(
+            tracker
+                .peer_db
+                .get(&(1 as ts_control::NodeId))
+                .unwrap()
+                .1
+                .online,
+            Some(false),
+            "peer_seen_change=false marks offline (the node stays in the netmap)"
+        );
+        assert_eq!(
+            tracker.peer_db.peers().len(),
+            1,
+            "the node is retained, not removed"
+        );
+
+        // No-op when nothing matches / changes.
+        assert!(!tracker.apply_liveness_changes(&Default::default(), &Default::default()));
     }
 
     /// Security: a `Patch` that rotates the node key must re-satisfy the tailnet-lock authority,
@@ -1071,6 +1268,8 @@ mod tka_tests {
             key_signature: Some(vec![0x00, 0x01, 0x02]),
             disco_key: None,
             node_key_expiry: None,
+            online: None,
+            last_seen: None,
         };
         let (upserts, deletions) =
             tracker.apply_peer_update(&ts_control::PeerUpdate::Patch(vec![patch]));

@@ -14,6 +14,9 @@ rust-version.workspace = true
 [lib]
 name = "ts_runtime"
 [dependencies]
+# `StatusNode.last_seen` exposes a `chrono::DateTime<Utc>` on a public field (mirrors
+# `ts_control::Node.last_seen` / Go `PeerStatus.LastSeen`). Already a transitive dep via `ts_control`.
+chrono = { workspace = true }
 # Our crates.
 ts_bart.workspace = true
 ts_bart_packetfilter.workspace = true
@@ -72,9 +75,6 @@ itertools = "0.14"
 # Test-only: sign the TKA node-key-signature fixtures the peer_tracker TKA enforcement tests verify
 # against (mirrors how `ts_tka`'s own unit tests build a valid signature). Not on any egress path.
 ed25519-dalek = "2"
-# Test-only: build a `node_key_expiry` timestamp for the peer-patch merge test. Already a transitive
-# dep via `ts_control`; named here only so the test can spell `chrono::DateTime`. Not on any path.
-chrono = { workspace = true }
 
 [lints]
 workspace = true

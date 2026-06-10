@@ -21,8 +21,9 @@ pub struct StatusNode {
     pub ipv4: String,
     /// The node's tailnet IPv6 address, as a string.
     pub ipv6: String,
-    /// Whether the node is online, if known (always `None` in this fork — see
-    /// `ts_runtime::status` docs).
+    /// Whether the node is online, if known (`ipnstate.PeerStatus.Online`). Tri-state: `Some(true)`
+    /// online, `Some(false)` offline, `None` unknown (control sent no status). Reflects control's
+    /// liveness state; `None` is never fabricated to `false`.
     pub online: Option<bool>,
     /// The routes this node accepts traffic for, as a list of CIDR strings.
     pub allowed_routes: Vec<String>,
