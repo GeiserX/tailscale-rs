@@ -142,10 +142,83 @@ impl MACReceiver {
             return false;
         }
 
-        // TODO: verify non-zero mac2
-        if trailer.mac2 != Mac::default() {
-            return false;
-        }
+        // mac1 (verified above) is the authenticator. mac2 is the cookie MAC: a peer sets it to a
+        // non-zero value only when replying to a CookieReply we issued under load (the WireGuard
+        // DoS mitigation). This implementation never issues CookieReplies as the responder — it
+        // holds no cookie secret and has no under-load/rate-limit path — so there is nothing to
+        // verify mac2 against, and a correct peer's non-zero mac2 must NOT be rejected. We
+        // therefore intentionally ignore mac2, matching wireguard-go (which only checks mac2 when
+        // `UnderLoad`, i.e. after issuing cookies) and boringtun (which only enforces mac2 while a
+        // cookie is active). Net effect: a packet is accepted iff mac1 verifies.
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ts_keys::NodeKeyPair;
+
+    use super::*;
+
+    /// Build a packet whose final 32 bytes hold a valid mac1 for `receiver_key`, plus the given
+    /// `mac2` bytes. `write_macs` (sender side) computes mac1 over the data preceding the trailer
+    /// and writes a zero mac2 (no cookie); we then overwrite mac2 to model a peer that received a
+    /// CookieReply and now carries a non-zero cookie MAC.
+    fn packet_with_mac1(receiver_key: &NodeKeyPair, mac2: Mac) -> Vec<u8> {
+        let sender = MACSender::new(&receiver_key.public);
+        // 16 bytes of payload + 32-byte (mac1 || mac2) trailer.
+        let mut pkt = vec![0u8; 16 + 32];
+        sender.write_macs(&mut pkt);
+        let (_data, trailer) = Mac1Trailer::try_mut_from_suffix(&mut pkt).unwrap();
+        trailer.mac2 = mac2;
+        pkt
+    }
+
+    #[test]
+    fn verify_macs_accepts_valid_mac1_with_zero_mac2() {
+        let receiver = NodeKeyPair::new();
+        let recv = MACReceiver::new(&receiver.public);
+        let pkt = packet_with_mac1(&receiver, Mac::default());
+        assert!(recv.verify_macs(&pkt), "valid mac1 + zero mac2 must verify");
+    }
+
+    /// Regression: a peer replying to a CookieReply sends a NON-ZERO mac2. Previously
+    /// `verify_macs` rejected any non-zero mac2 (the `// TODO` reject), so such handshakes failed
+    /// deterministically. Since this implementation never issues cookies, mac2 must be ignored.
+    #[test]
+    fn verify_macs_accepts_valid_mac1_with_nonzero_mac2() {
+        let receiver = NodeKeyPair::new();
+        let recv = MACReceiver::new(&receiver.public);
+        let pkt = packet_with_mac1(&receiver, [0xAB; 16]);
+        assert!(
+            recv.verify_macs(&pkt),
+            "valid mac1 with a non-zero (cookie) mac2 must still verify"
+        );
+    }
+
+    #[test]
+    fn verify_macs_rejects_bad_mac1() {
+        // Compute a valid mac1 for one key, but verify against a different key.
+        let signer = NodeKeyPair::new();
+        let other = NodeKeyPair::new();
+        let recv = MACReceiver::new(&other.public);
+        let pkt = packet_with_mac1(&signer, Mac::default());
+        assert!(
+            !recv.verify_macs(&pkt),
+            "a mac1 computed under a different key must be rejected"
+        );
+    }
+
+    #[test]
+    fn verify_macs_rejects_bad_mac1_even_with_nonzero_mac2() {
+        // A forged mac1 must stay rejected regardless of mac2 (ignoring mac2 must not weaken mac1).
+        let signer = NodeKeyPair::new();
+        let other = NodeKeyPair::new();
+        let recv = MACReceiver::new(&other.public);
+        let pkt = packet_with_mac1(&signer, [0xCD; 16]);
+        assert!(
+            !recv.verify_macs(&pkt),
+            "bad mac1 must be rejected even with a non-zero mac2"
+        );
     }
 }
