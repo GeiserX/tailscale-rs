@@ -51,9 +51,10 @@
 //! (`blake2::Blake2sMac256` / `Blake2sMac<U16>` via `KeyInit` / `new_from_slice`),
 //! *not* a hash with a prefixed key.
 
-use blake2::digest::consts::U16;
-use blake2::digest::{FixedOutput, KeyInit, Mac, Update};
-use blake2::{Blake2s256, Blake2sMac, Blake2sMac256, Digest};
+use blake2::{
+    Blake2s256, Blake2sMac, Blake2sMac256, Digest,
+    digest::{FixedOutput, KeyInit, Mac, Update, consts::U16},
+};
 
 /// The 32-byte canonical keyed-vector key, `00 01 02 ... 1f`.
 const KEY32: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";

@@ -678,7 +678,10 @@ impl Peer {
         // TODO most of this logic might be better in the `handshake` module.
         let session_id = endpoint.ids.allocate_session(self.id);
         let (handshake, packet) = initiate_handshake(
-            endpoint.my_key.private,
+            // `.clone()`: `initiate_handshake` takes the private key by value (it stores it in the
+            // returned `SentHandshake`), and the key is no longer `Copy`. The endpoint keeps its
+            // own long-lived copy in `endpoint.my_key.private`; this clones it for the new session.
+            endpoint.my_key.private.clone(),
             self.config.key,
             session_id,
             endpoint.timestamps.now(),
@@ -720,10 +723,15 @@ struct EndpointState {
 impl Endpoint {
     /// Construct a new endpoint with the given keypair.
     pub fn new(my_key: NodeKeyPair) -> Self {
+        // Derive the cookie receiver from the public key BEFORE moving `my_key` into the state:
+        // `NodeKeyPair` is no longer `Copy` (it holds a zeroize-on-drop private key), so the
+        // field move would otherwise invalidate the `&my_key.public` borrow. The public key IS
+        // `Copy`, so this just copies the 32 public bytes out.
+        let my_cookie = MACReceiver::new(&my_key.public);
         Self {
             state: EndpointState {
                 my_key,
-                my_cookie: MACReceiver::new(&my_key.public),
+                my_cookie,
                 ids: Default::default(),
                 timestamps: Default::default(),
                 scheduler: Default::default(),
@@ -1206,7 +1214,10 @@ mod tests {
         let (a_static, b_static) = (NodeKeyPair::new(), NodeKeyPair::new());
         let psk = rand::random();
 
-        let (mut a_ep, mut b_ep) = (Endpoint::new(a_static), Endpoint::new(b_static));
+        let (mut a_ep, mut b_ep) = (
+            Endpoint::new(a_static.clone()),
+            Endpoint::new(b_static.clone()),
+        );
 
         let a_peer = PeerId(1);
         let b_peer = PeerId(1);
@@ -1338,7 +1349,10 @@ mod tests {
     ) -> (Endpoint, Endpoint, PeerId, PeerId) {
         let (a_static, b_static) = (NodeKeyPair::new(), NodeKeyPair::new());
         let psk = rand::random();
-        let (mut a_ep, mut b_ep) = (Endpoint::new(a_static), Endpoint::new(b_static));
+        let (mut a_ep, mut b_ep) = (
+            Endpoint::new(a_static.clone()),
+            Endpoint::new(b_static.clone()),
+        );
         let (a_peer, b_peer) = (PeerId(1), PeerId(1));
 
         a_ep.upsert_peer(
@@ -1496,7 +1510,7 @@ mod tests {
         c_keepalive: Option<Duration>,
     ) -> (Endpoint, PeerId, PeerId) {
         let a_static = NodeKeyPair::new();
-        let mut a_ep = Endpoint::new(a_static);
+        let mut a_ep = Endpoint::new(a_static.clone());
         // A's two peers carry distinct PeerIds *and* distinct node keys (the id map rejects a key
         // collision), so their sessions and timers can never alias.
         let (a_b_peer, a_c_peer) = (PeerId(1), PeerId(2));
@@ -1506,7 +1520,7 @@ mod tests {
         // two peers' delivered data.
         let bring_up = |a_ep: &mut Endpoint, a_peer: PeerId, keepalive, payload: &[u8]| {
             let remote_static = NodeKeyPair::new();
-            let mut remote = Endpoint::new(remote_static);
+            let mut remote = Endpoint::new(remote_static.clone());
             let remote_peer = PeerId(1);
             let psk = rand::random();
 
@@ -1753,7 +1767,10 @@ mod tests {
     fn simultaneous_initiation_converges_without_wedge() {
         let (a_static, b_static) = (NodeKeyPair::new(), NodeKeyPair::new());
         let psk = rand::random();
-        let (mut a_ep, mut b_ep) = (Endpoint::new(a_static), Endpoint::new(b_static));
+        let (mut a_ep, mut b_ep) = (
+            Endpoint::new(a_static.clone()),
+            Endpoint::new(b_static.clone()),
+        );
         let (a_peer, b_peer) = (PeerId(1), PeerId(1));
 
         a_ep.upsert_peer(
@@ -1894,7 +1911,8 @@ mod tests {
         timestamp: TAI64N,
         scheduler: &mut Scheduler<Event>,
     ) -> (Handshake, PacketMut) {
-        let (sent, init) = initiate_handshake(from.private, to.public, session_id, timestamp);
+        let (sent, init) =
+            initiate_handshake(from.private.clone(), to.public, session_id, timestamp);
         let mut pkt = PacketMut::from(init.as_bytes());
         // The initiation's mac1 must verify against the *recipient's* key (responder); the returned
         // mac1 is what an initiator keeps to authenticate a cookie reply.
@@ -1945,7 +1963,7 @@ mod tests {
     fn fresh_initiation_frees_displaced_responder_id() {
         let (a_static, c_static) = (NodeKeyPair::new(), NodeKeyPair::new());
         let psk = rand::random();
-        let mut a_ep = Endpoint::new(a_static);
+        let mut a_ep = Endpoint::new(a_static.clone());
         let a_peer = PeerId(1);
 
         // A knows C as a peer (so A will respond to C's initiations rather than dropping them).
@@ -2076,7 +2094,10 @@ mod tests {
     fn asymmetric_simultaneous_initiation_orphans_responder_without_wedge() {
         let (a_static, b_static) = (NodeKeyPair::new(), NodeKeyPair::new());
         let psk = rand::random();
-        let (mut a_ep, mut b_ep) = (Endpoint::new(a_static), Endpoint::new(b_static));
+        let (mut a_ep, mut b_ep) = (
+            Endpoint::new(a_static.clone()),
+            Endpoint::new(b_static.clone()),
+        );
         let (a_peer, b_peer) = (PeerId(1), PeerId(1));
 
         a_ep.upsert_peer(

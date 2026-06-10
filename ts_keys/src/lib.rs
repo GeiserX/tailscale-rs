@@ -145,6 +145,42 @@ mod debug_redaction_tests {
         );
         assert_eq!(dbg, format!("{pubk}"), "public Debug == Display");
     }
+
+    /// Private keys wipe their secret bytes on drop (`ZeroizeOnDrop`, tsr-9nu). We can't observe a
+    /// value after it drops in safe Rust, so this drives `Zeroize::zeroize` explicitly (the same
+    /// code the drop glue runs) and confirms the buffer is zeroed — a behavioral guard that the
+    /// derive is wired up, not merely that it compiles.
+    #[test]
+    fn private_key_zeroize_wipes_bytes() {
+        use zeroize::Zeroize;
+
+        let mut k = NodePrivateKey::from([0xABu8; 32]);
+        assert_eq!(
+            k.to_bytes(),
+            [0xABu8; 32],
+            "precondition: key holds its bytes"
+        );
+        k.zeroize();
+        assert_eq!(
+            k.to_bytes(),
+            [0u8; 32],
+            "zeroize must wipe the secret bytes to zero"
+        );
+    }
+
+    /// `public_key()` borrows (`&self`) — deriving the public key must not consume the private key,
+    /// so it stays usable afterwards. This is the API shape that lets callers hold a private key
+    /// without it being moved/dropped on every derivation (mirrors Go's `key.NodePrivate.Public()`).
+    #[test]
+    fn public_key_derivation_borrows_private() {
+        let k = NodePrivateKey::from([0x11u8; 32]);
+        let p1 = k.public_key();
+        // `k` is still alive here precisely because `public_key` took `&self`.
+        let p2 = k.public_key();
+        assert_eq!(p1, p2, "repeated derivation from the same key agrees");
+        // And a clone derives the same public key (clone copies the secret faithfully).
+        assert_eq!(k.clone().public_key(), p1);
+    }
 }
 
 #[cfg(all(test, feature = "serde"))]
@@ -223,7 +259,9 @@ mod nl_tests {
     fn nl_keypair_derivation_is_consistent() {
         let kp = NetworkLockKeyPair::new();
         assert_eq!(kp.public, kp.private.public_key());
-        let from_priv = NetworkLockKeyPair::from(kp.private);
+        // `.clone()`: `From<private>` consumes the key (no longer `Copy`); keep `kp.private` for
+        // the equality check below.
+        let from_priv = NetworkLockKeyPair::from(kp.private.clone());
         assert_eq!(from_priv.public, kp.public);
         assert_eq!(from_priv.private, kp.private);
     }

@@ -3,8 +3,15 @@
 /// intended to be used by itself.
 macro_rules! _create_x25519_base_key_type {
     ($(#[$attr:meta])* $key_name:ident, $key_prefix:literal) => {
+        // NOTE: this base macro derives ONLY the traits common to both public and private keys
+        // (`Clone`, `Eq`, `PartialEq`). Everything that DIFFERS between them is supplied by the
+        // caller via `$attr`: public keys add `Copy` + the `zerocopy` wire traits (they are not
+        // secret), while private keys add `Zeroize` + `ZeroizeOnDrop` and deliberately drop `Copy`.
+        // `Copy` and `Drop` are mutually exclusive in Rust (E0184) and `ZeroizeOnDrop` *is* a `Drop`
+        // impl, so a private key cannot be both freely bit-copied and wiped on drop — we choose
+        // wipe-on-drop. `Clone` is fine alongside `ZeroizeOnDrop` (it is not `Drop`).
         $(#[$attr])*
-        #[derive(Clone, Copy, Eq, PartialEq, ::zerocopy::FromBytes, ::zerocopy::Immutable, ::zerocopy::IntoBytes, ::zerocopy::KnownLayout)]
+        #[derive(Clone, Eq, PartialEq)]
         pub struct $key_name(
             [u8; $key_name::KEY_LEN_BYTES]
         );
@@ -130,7 +137,14 @@ macro_rules! _create_x25519_base_key_type {
 /// Generates a struct that implements all the fields/methods needed by X25519 public keys.
 macro_rules! create_x25519_public_key_type {
     ($(#[$attr:meta])* $public_name:ident, $key_prefix:literal) => {
-        _create_x25519_base_key_type!($(#[$attr])* #[derive(Default, Hash, PartialOrd, Ord)] $public_name, $key_prefix);
+        // Public keys are not secret, so they keep `Copy` and the full `zerocopy` wire surface
+        // (`FromBytes`/`IntoBytes`/`Immutable`/`KnownLayout`) for cheap, allocation-free wire
+        // (de)serialization — unchanged from before the private/public derive split.
+        _create_x25519_base_key_type!(
+            $(#[$attr])*
+            #[derive(Copy, Default, Hash, PartialOrd, Ord, ::zerocopy::FromBytes, ::zerocopy::Immutable, ::zerocopy::IntoBytes, ::zerocopy::KnownLayout)]
+            $public_name, $key_prefix
+        );
 
         // Public keys are not secret: `Debug` prints the full `prefix:hex` form (== `Display`).
         impl ::core::fmt::Debug for $public_name {
@@ -168,7 +182,16 @@ macro_rules! create_x25519_public_key_type {
 /// Generates a struct that implements all the fields/methods needed by X25519 private keys.
 macro_rules! create_x25519_private_key_type {
     ($(#[$attr:meta])* $private_name:ident, $public_name:ident, $key_prefix:literal) => {
-        _create_x25519_base_key_type!($(#[$attr])* $private_name, $key_prefix);
+        // SECURITY: private keys are `Copy`-free and zeroize their 32-byte secret on drop.
+        // Dropping `Copy` stops the secret being silently bit-copied to scattered stack/heap
+        // locations the zeroizer can never reach; `ZeroizeOnDrop` wipes the in-place `[u8; 32]`
+        // buffer when the last owner drops. They are intentionally NOT `zerocopy` wire types — a
+        // private key is never (de)serialized straight off the wire (only public keys are).
+        _create_x25519_base_key_type!(
+            $(#[$attr])*
+            #[derive(::zeroize::Zeroize, ::zeroize::ZeroizeOnDrop)]
+            $private_name, $key_prefix
+        );
 
         // SECURITY: private keys must NEVER print their bytes. `Debug` is redacted so a stray
         // `{:?}`/`tracing` of a key (or any struct containing one) cannot leak the secret to logs.
@@ -186,7 +209,11 @@ macro_rules! create_x25519_private_key_type {
             }
 
             /// Calculate the corresponding public key for this private key.
-            pub fn public_key(self) -> $public_name {
+            ///
+            /// Takes `&self` (not `self`): deriving the public key must not consume — and thus
+            /// drop/zeroize — the private key now that it is not `Copy`. Mirrors Go's
+            /// `key.NodePrivate.Public()` pointer receiver.
+            pub fn public_key(&self) -> $public_name {
                 ::crypto_box::SecretKey::from(self).public_key().to_bytes().into()
             }
         }
@@ -224,17 +251,33 @@ macro_rules! create_x25519_keypair_types {
         create_x25519_public_key_type! { $(#[$public_attr])* $public_name, $public_prefix }
         create_x25519_private_key_type! { $(#[$private_attr])* $private_name, $public_name, $private_prefix }
 
-        impl From<$private_name> for $public_name {
-            fn from(v: $private_name) -> Self {
+        // Derive the public key from a BORROW of the private key. The owned `From<$private_name>`
+        // below delegates here. Taking `&self` matters now that the private key is not `Copy`:
+        // callers (and the keypair constructors) can derive the public key without consuming —
+        // and thus dropping/zeroizing — the private key (mirrors Go's `key.NodePrivate.Public()`
+        // pointer receiver). Reading the `[u8; 32]` field through the reference is a copy of those
+        // bytes (the array is `Copy`), not a move out of the secret.
+        impl From<&$private_name> for $public_name {
+            fn from(v: &$private_name) -> Self {
                 let private = ::x25519_dalek::StaticSecret::from(v.0);
                 let public = ::x25519_dalek::PublicKey::from(&private);
                 $public_name(public.to_bytes())
             }
         }
 
+        impl From<$private_name> for $public_name {
+            fn from(v: $private_name) -> Self {
+                $public_name::from(&v)
+            }
+        }
+
+        // The keypair holds a secret (the private key), so it is deliberately NOT `Copy` and NOT a
+        // `zerocopy` wire type. It needs no explicit `ZeroizeOnDrop`: when the keypair drops, its
+        // `private` field — a `ZeroizeOnDrop` type — wipes itself by drop-glue composition. `Debug`
+        // is safe to derive because the private field's own `Debug` is redacted.
         $(#[$pair_attr])*
         #[cfg_attr(feature = "serde", derive(::serde::Deserialize, ::serde::Serialize))]
-        #[derive(Clone, Copy, Debug, Eq, PartialEq, ::zerocopy::FromBytes, ::zerocopy::Immutable, ::zerocopy::IntoBytes, ::zerocopy::KnownLayout)]
+        #[derive(Clone, Debug, Eq, PartialEq)]
         pub struct $keypair_name {
             /// This keypair's public key.
             pub public: $public_name,
@@ -246,10 +289,8 @@ macro_rules! create_x25519_keypair_types {
             /// Generate a new X25519 public/private key pair.
             pub fn new() -> Self {
                 let private = $private_name::random();
-                Self {
-                    private,
-                    public: private.into(),
-                }
+                let public = $public_name::from(&private);
+                Self { private, public }
             }
         }
 
@@ -261,10 +302,8 @@ macro_rules! create_x25519_keypair_types {
 
         impl From<$private_name> for $keypair_name {
             fn from(private: $private_name) -> Self {
-                Self {
-                    private,
-                    public: private.into(),
-                }
+                let public = $public_name::from(&private);
+                Self { private, public }
             }
         }
     }
@@ -277,7 +316,13 @@ macro_rules! create_x25519_keypair_types {
 /// public key (callers only use Display/serde/`.public`).
 macro_rules! create_ed25519_public_key_type {
     ($(#[$attr:meta])* $public_name:ident, $key_prefix:literal) => {
-        _create_x25519_base_key_type!($(#[$attr])* #[derive(Default, Hash, PartialOrd, Ord)] $public_name, $key_prefix);
+        // Public keys are not secret: keep `Copy` + the full `zerocopy` wire surface (same as the
+        // X25519 public key). Only the PRIVATE key types drop `Copy`/zerocopy and gain zeroize.
+        _create_x25519_base_key_type!(
+            $(#[$attr])*
+            #[derive(Copy, Default, Hash, PartialOrd, Ord, ::zerocopy::FromBytes, ::zerocopy::Immutable, ::zerocopy::IntoBytes, ::zerocopy::KnownLayout)]
+            $public_name, $key_prefix
+        );
 
         // Public keys are not secret: `Debug` prints the full `prefix:hex` form (== `Display`).
         impl ::core::fmt::Debug for $public_name {
@@ -293,7 +338,14 @@ macro_rules! create_ed25519_public_key_type {
 /// semantics and `key.NLPrivate`).
 macro_rules! create_ed25519_private_key_type {
     ($(#[$attr:meta])* $private_name:ident, $public_name:ident, $key_prefix:literal) => {
-        _create_x25519_base_key_type!($(#[$attr])* $private_name, $key_prefix);
+        // SECURITY: like the X25519 private key — `Copy`-free, zeroize-on-drop, not a `zerocopy`
+        // wire type. The wrapped 32 bytes are the Ed25519 *seed*; wiping them on drop keeps the
+        // TKA/network-lock signing secret from lingering in freed memory.
+        _create_x25519_base_key_type!(
+            $(#[$attr])*
+            #[derive(::zeroize::Zeroize, ::zeroize::ZeroizeOnDrop)]
+            $private_name, $key_prefix
+        );
 
         // SECURITY: redacted `Debug` (the wrapped bytes are an Ed25519 seed). See the X25519
         // private-key macro for rationale — never leak secret key material via `{:?}`/logs.
@@ -319,8 +371,9 @@ macro_rules! create_ed25519_private_key_type {
             /// Calculate the corresponding public key for this private key.
             ///
             /// This is the standard RFC 8032 seed->public derivation, matching Go's
-            /// `ed25519.PrivateKey.Public()`.
-            pub fn public_key(self) -> $public_name {
+            /// `ed25519.PrivateKey.Public()`. Takes `&self` (not `self`) so deriving the public key
+            /// does not consume/zeroize the private seed now that it is not `Copy`.
+            pub fn public_key(&self) -> $public_name {
                 self.signing_key().verifying_key().to_bytes().into()
             }
 
@@ -341,8 +394,10 @@ macro_rules! create_ed25519_keypair_types {
         create_ed25519_public_key_type! { $(#[$public_attr])* $public_name, $public_prefix }
         create_ed25519_private_key_type! { $(#[$private_attr])* $private_name, $public_name, $private_prefix }
 
-        impl From<$private_name> for $public_name {
-            fn from(v: $private_name) -> Self {
+        // Derive the public key from a BORROW of the private seed (see the X25519 keypair macro for
+        // why `&self` matters now the private key is not `Copy`). The owned `From` delegates here.
+        impl From<&$private_name> for $public_name {
+            fn from(v: &$private_name) -> Self {
                 let public = ::ed25519_dalek::SigningKey::from_bytes(&v.0)
                     .verifying_key()
                     .to_bytes();
@@ -350,9 +405,18 @@ macro_rules! create_ed25519_keypair_types {
             }
         }
 
+        impl From<$private_name> for $public_name {
+            fn from(v: $private_name) -> Self {
+                $public_name::from(&v)
+            }
+        }
+
+        // Holds a secret seed → NOT `Copy`, NOT a `zerocopy` wire type. The `private` field's
+        // `ZeroizeOnDrop` wipes the seed when the keypair drops (drop-glue composition); `Debug`
+        // is safe because the private field's own `Debug` is redacted.
         $(#[$pair_attr])*
         #[cfg_attr(feature = "serde", derive(::serde::Deserialize, ::serde::Serialize))]
-        #[derive(Clone, Copy, Debug, Eq, PartialEq, ::zerocopy::FromBytes, ::zerocopy::Immutable, ::zerocopy::IntoBytes, ::zerocopy::KnownLayout)]
+        #[derive(Clone, Debug, Eq, PartialEq)]
         pub struct $keypair_name {
             /// This keypair's public key.
             pub public: $public_name,
@@ -364,10 +428,8 @@ macro_rules! create_ed25519_keypair_types {
             /// Generate a new Ed25519 public/private key pair.
             pub fn new() -> Self {
                 let private = $private_name::random();
-                Self {
-                    private,
-                    public: private.into(),
-                }
+                let public = $public_name::from(&private);
+                Self { private, public }
             }
         }
 
@@ -379,10 +441,8 @@ macro_rules! create_ed25519_keypair_types {
 
         impl From<$private_name> for $keypair_name {
             fn from(private: $private_name) -> Self {
-                Self {
-                    private,
-                    public: private.into(),
-                }
+                let public = $public_name::from(&private);
+                Self { private, public }
             }
         }
     }

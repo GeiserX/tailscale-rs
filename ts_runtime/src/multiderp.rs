@@ -102,7 +102,9 @@ impl Multiderp {
         }
 
         let region = region.clone();
-        let keys = self.env.keys.node_keys;
+        // `.clone()`: `node_keys` is no longer `Copy`, so own a clone for the spawned task (the
+        // shared `self.env` keypair stays put and zeroizes on its own drop).
+        let keys = self.env.keys.node_keys.clone();
 
         let (transport_id, mut up, down) = match self.dataplane.ask(NewUnderlayTransport).await {
             Ok(val) => val,
@@ -137,7 +139,9 @@ impl Multiderp {
                     ret = run_derp_once(
                         id,
                         &region,
-                        keys,
+                        // `run_derp_once` consumes the keypair and this is a reconnect loop, so
+                        // clone per attempt (the key is no longer `Copy`).
+                        keys.clone(),
                         &down,
                         &mut up,
                         &mut home_derp_rx,
@@ -688,7 +692,7 @@ mod tests {
         // Our direct socket; the relayed CallMeMaybe is sealed *to* its disco key.
         let our_disco = DiscoPrivateKey::random();
         let our_node = ts_keys::NodePrivateKey::random().public_key();
-        let sock = MagicSock::bind(localhost(), our_disco, our_node)
+        let sock = MagicSock::bind(localhost(), our_disco.clone(), our_node)
             .await
             .unwrap()
             .with_binding_verifier(allow_all());
@@ -754,7 +758,7 @@ mod tests {
     async fn relayed_ping_is_dropped_not_ponged() {
         let our_disco = DiscoPrivateKey::random();
         let our_node = ts_keys::NodePrivateKey::random().public_key();
-        let sock = MagicSock::bind(localhost(), our_disco, our_node)
+        let sock = MagicSock::bind(localhost(), our_disco.clone(), our_node)
             .await
             .unwrap()
             .with_binding_verifier(allow_all());
@@ -784,7 +788,7 @@ mod tests {
     async fn relayed_call_me_maybe_forbidden_endpoints_filtered() {
         let our_disco = DiscoPrivateKey::random();
         let our_node = ts_keys::NodePrivateKey::random().public_key();
-        let sock = MagicSock::bind(localhost(), our_disco, our_node)
+        let sock = MagicSock::bind(localhost(), our_disco.clone(), our_node)
             .await
             .unwrap()
             .with_binding_verifier(allow_all());

@@ -79,7 +79,8 @@ impl kameo::Actor for DataplaneActor {
 
     async fn on_start(env: Self::Args, slf: ActorRef<Self>) -> Result<Self, Self::Error> {
         let dataplane = Arc::new(ts_dataplane::async_tokio::DataPlane::new(
-            env.keys.node_keys,
+            // `.clone()`: `node_keys` is no longer `Copy` and `env` is a shared `Arc`.
+            env.keys.node_keys.clone(),
         ));
 
         let persistent_keepalive_interval = env.persistent_keepalive_interval;

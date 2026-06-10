@@ -1727,12 +1727,16 @@ mod tests {
         let a_node = ts_keys::NodePrivateKey::random().public_key();
         let b_node = ts_keys::NodePrivateKey::random().public_key();
 
-        let a = Arc::new(MagicSock::bind(localhost(), a_disco, a_node).await.unwrap());
+        let a = Arc::new(
+            MagicSock::bind(localhost(), a_disco.clone(), a_node)
+                .await
+                .unwrap(),
+        );
         // B receives A's pings, so it needs a verifier or it now fails closed. The binding check
         // itself is covered by the dedicated binding_verifier_* tests; here we only want the path
         // to confirm, so an allow-all verifier is correct.
         let b = Arc::new(
-            MagicSock::bind(localhost(), b_disco, b_node)
+            MagicSock::bind(localhost(), b_disco.clone(), b_node)
                 .await
                 .unwrap()
                 .with_binding_verifier(allow_all()),
@@ -1829,7 +1833,7 @@ mod tests {
 
         let b_node = ts_keys::NodePrivateKey::random().public_key();
         let b = Arc::new(
-            MagicSock::bind(localhost(), b_disco, b_node)
+            MagicSock::bind(localhost(), b_disco.clone(), b_node)
                 .await
                 .unwrap()
                 .with_binding_verifier(verifier),
@@ -1837,7 +1841,11 @@ mod tests {
         let b_addr = b.local_addr().unwrap();
 
         // A sends a ping to B claiming the WRONG node key for its disco key.
-        let a = Arc::new(MagicSock::bind(localhost(), a_disco, a_node).await.unwrap());
+        let a = Arc::new(
+            MagicSock::bind(localhost(), a_disco.clone(), a_node)
+                .await
+                .unwrap(),
+        );
         let wrong_node = ts_keys::NodePrivateKey::random().public_key();
         let tx = disco::random_tx_id();
         let ping = disco::seal_ping(&a_disco, wrong_node, &b_disco.public_key(), tx).unwrap();
@@ -1894,9 +1902,13 @@ mod tests {
             },
         );
 
-        let a = Arc::new(MagicSock::bind(localhost(), a_disco, a_node).await.unwrap());
+        let a = Arc::new(
+            MagicSock::bind(localhost(), a_disco.clone(), a_node)
+                .await
+                .unwrap(),
+        );
         let b = Arc::new(
-            MagicSock::bind(localhost(), b_disco, b_node)
+            MagicSock::bind(localhost(), b_disco.clone(), b_node)
                 .await
                 .unwrap()
                 .with_binding_verifier(verifier),
@@ -1953,7 +1965,7 @@ mod tests {
         // fails closed and learns no reflexive address. Allow-all: the membership gate is exercised
         // by the dedicated `pong_*` tests; here we confirm the legitimate harvest path still works.
         let a = Arc::new(
-            MagicSock::bind(localhost(), a_disco, a_node)
+            MagicSock::bind(localhost(), a_disco.clone(), a_node)
                 .await
                 .unwrap()
                 .with_binding_verifier(allow_all()),
@@ -1961,7 +1973,7 @@ mod tests {
         // B answers A's pings, so it needs a verifier (fail-closed otherwise). Allow-all: the
         // binding check is covered elsewhere; here we exercise reflexive-address learning.
         let b = Arc::new(
-            MagicSock::bind(localhost(), b_disco, b_node)
+            MagicSock::bind(localhost(), b_disco.clone(), b_node)
                 .await
                 .unwrap()
                 .with_binding_verifier(allow_all()),
@@ -2155,7 +2167,9 @@ mod tests {
         let b_disco = DiscoPrivateKey::random();
         let a_node = ts_keys::NodePrivateKey::random().public_key();
 
-        let a = MagicSock::bind(localhost(), a_disco, a_node).await.unwrap();
+        let a = MagicSock::bind(localhost(), a_disco.clone(), a_node)
+            .await
+            .unwrap();
         let a_addr = a.local_addr().unwrap();
 
         // Seal a CallMeMaybe addressed to B and confirm B can open it and sees A's local endpoint.
@@ -2204,11 +2218,15 @@ mod tests {
         let a_node = ts_keys::NodePrivateKey::random().public_key();
         let b_node = ts_keys::NodePrivateKey::random().public_key();
 
-        let a_sock = Arc::new(MagicSock::bind(localhost(), a_disco, a_node).await.unwrap());
+        let a_sock = Arc::new(
+            MagicSock::bind(localhost(), a_disco.clone(), a_node)
+                .await
+                .unwrap(),
+        );
         // b_sock receives A's pings via its DirectTransport pump; it needs a verifier or it now
         // fails closed. Allow-all keeps the path opening (binding check covered separately).
         let b_sock = Arc::new(
-            MagicSock::bind(localhost(), b_disco, b_node)
+            MagicSock::bind(localhost(), b_disco.clone(), b_node)
                 .await
                 .unwrap()
                 .with_binding_verifier(allow_all()),
@@ -2271,10 +2289,18 @@ mod tests {
         let b_node = ts_keys::NodePrivateKey::random().public_key();
 
         // B has no verifier -> must fail closed.
-        let b = Arc::new(MagicSock::bind(localhost(), b_disco, b_node).await.unwrap());
+        let b = Arc::new(
+            MagicSock::bind(localhost(), b_disco.clone(), b_node)
+                .await
+                .unwrap(),
+        );
         let b_addr = b.local_addr().unwrap();
 
-        let a = Arc::new(MagicSock::bind(localhost(), a_disco, a_node).await.unwrap());
+        let a = Arc::new(
+            MagicSock::bind(localhost(), a_disco.clone(), a_node)
+                .await
+                .unwrap(),
+        );
         let tx = disco::random_tx_id();
         let ping = disco::seal_ping(&a_disco, a_node, &b_disco.public_key(), tx).unwrap();
 
@@ -2327,7 +2353,7 @@ mod tests {
         );
 
         let recv = Arc::new(
-            MagicSock::bind(localhost(), recv_disco, recv_node)
+            MagicSock::bind(localhost(), recv_disco.clone(), recv_node)
                 .await
                 .unwrap()
                 .with_binding_verifier(verifier),
@@ -2373,7 +2399,7 @@ mod tests {
         // An allow-all verifier would accept a Ping if it reached the Ping arm — proving the drop
         // is structural (CallMeMaybe-only), not a verifier rejection.
         let recv = Arc::new(
-            MagicSock::bind(localhost(), recv_disco, recv_node)
+            MagicSock::bind(localhost(), recv_disco.clone(), recv_node)
                 .await
                 .unwrap()
                 .with_binding_verifier(allow_all()),

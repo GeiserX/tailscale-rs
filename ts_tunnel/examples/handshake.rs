@@ -17,7 +17,7 @@ use ts_keys::{NodePrivateKey, NodePublicKey};
 use ts_packet::PacketMut;
 use ts_time::TimeRange;
 use ts_tunnel::Endpoint;
-use zerocopy::{FromBytes, IntoBytes, TryFromBytes};
+use zerocopy::{IntoBytes, TryFromBytes};
 // Minimal example config:
 //
 //     [Interface]
@@ -72,8 +72,11 @@ async fn main() -> BoxResult<()> {
 
     let args = Args::parse();
 
-    let privkey = NodePrivateKey::read_from_bytes(args.private_key.as_bytes())
-        .map_err(|_| "failed reading private key")?;
+    // Private keys are no longer `zerocopy::FromBytes` (they zeroize on drop and are not `Copy`),
+    // so build from a fixed `[u8; 32]` via `From<[u8; 32]>` rather than `read_from_bytes`.
+    let privkey: NodePrivateKey = <[u8; 32]>::try_from(args.private_key.as_bytes())
+        .map_err(|_| "private key must be exactly 32 bytes")?
+        .into();
     eprintln!(
         "my pubkey: {}",
         base64::engine::general_purpose::STANDARD.encode(privkey.public_key().as_bytes())
