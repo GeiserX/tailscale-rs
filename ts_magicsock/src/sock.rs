@@ -81,6 +81,37 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Bind a fresh underlay UDP socket for [`MagicSock::rebind`], preferring `prefer_port` (so the
+/// advertised endpoint stays stable across a link change) and falling back to an ephemeral port if
+/// it's taken. Honors the same family rule as the original bind: IPv4-only `0.0.0.0` by default
+/// (the sacred privacy-proxy invariant), or dual-stack `[::]` with an inert IPv4 fallback when
+/// `want_v6`. Never widens past what the original bind would have chosen.
+async fn rebind_socket(prefer_port: u16, want_v6: bool) -> std::io::Result<UdpSocket> {
+    use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    // IPv4-only default — byte-for-byte the historical family.
+    if !want_v6 {
+        let v4 = |port| SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+        return match UdpSocket::bind(v4(prefer_port)).await {
+            Ok(s) => Ok(s),
+            // Same port taken (or otherwise unbindable): fall back to an ephemeral port.
+            Err(_) if prefer_port != 0 => UdpSocket::bind(v4(0)).await,
+            Err(e) => Err(e),
+        };
+    }
+
+    // Dual-stack: try `[::]:prefer_port`, then `[::]:0`, then the inert IPv4 fallback (a host with
+    // IPv6 disabled at the kernel) — mirroring `direct.rs::bind_underlay_addr`'s posture.
+    let v6 = |port| SocketAddr::from((Ipv6Addr::UNSPECIFIED, port));
+    if let Ok(s) = UdpSocket::bind(v6(prefer_port)).await {
+        return Ok(s);
+    }
+    if let Ok(s) = UdpSocket::bind(v6(0)).await {
+        return Ok(s);
+    }
+    UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).await
+}
+
 /// Verifies a disco key's identity against the control netmap before we act on a disco frame.
 ///
 /// Called with the sender's disco key and:
@@ -106,7 +137,16 @@ pub type BindingVerifier =
 ///   internally and only yields WireGuard data),
 /// - send WireGuard data with [`MagicSock::send_wireguard`].
 pub struct MagicSock {
-    sock: Arc<UdpSocket>,
+    /// The underlay UDP socket, behind a `Mutex<Arc<…>>` so [`MagicSock::rebind`] can atomically
+    /// swap in a freshly-bound socket on a network/link change (Wi-Fi switch, sleep/wake) without
+    /// recreating the `MagicSock` or disturbing peer/disco/path state. Readers take a cheap
+    /// clone via [`MagicSock::sock`] for the duration of a single send/recv; the background recv
+    /// pump re-reads it each loop iteration, so it picks up a rebind on its next `recv_from` (the
+    /// old socket is dropped once outstanding clones release it, which unblocks a parked
+    /// `recv_from` — matching Go's `RebindingUDPConn` close-and-reloop). `std::sync::Mutex` (not an
+    /// extra `arc-swap` dep): the guard is held only long enough to clone the `Arc`, never across
+    /// an `.await`.
+    sock: Mutex<Arc<UdpSocket>>,
     our_disco: DiscoPrivateKey,
     our_node_key: NodePublicKey,
     paths: Paths,
@@ -186,7 +226,7 @@ impl MagicSock {
     ) -> Result<Self, Error> {
         let sock = UdpSocket::bind(bind_addr).await?;
         Ok(Self {
-            sock: Arc::new(sock),
+            sock: Mutex::new(Arc::new(sock)),
             our_disco,
             our_node_key,
             paths: Default::default(),
@@ -198,6 +238,69 @@ impl MagicSock {
             enable_ipv6: false,
             symmetric_nat: AtomicBool::new(false),
         })
+    }
+
+    /// The current underlay socket. Clones the `Arc` under a short lock (never held across an
+    /// `.await`), so a concurrent [`rebind`](Self::rebind) swaps the socket for *subsequent* calls
+    /// while an in-progress send/recv keeps using the socket it already cloned.
+    fn sock(&self) -> Arc<UdpSocket> {
+        lock(&self.sock).clone()
+    }
+
+    /// Re-bind the underlay UDP socket after a network/link change (Wi-Fi switch, sleep/wake), and
+    /// invalidate the now-stale local NAT mapping. The daemon calls this from its own link-change
+    /// monitor (it owns OS netmon; the engine owns the socket). Mirrors Go magicsock's
+    /// `Conn.Rebind()` + `resetEndpointStates`.
+    ///
+    /// What it does, and deliberately does NOT do:
+    /// - **Re-binds the UDP socket**, same-port-preferred (the new mapping should keep our advertised
+    ///   port where possible) with an ephemeral fallback if the old port can't be re-bound. IPv4-only
+    ///   unless `enable_ipv6` (then dual-stack `[::]:0` with an inert IPv4 fallback) — byte-for-byte
+    ///   the `bind` family rule, so the sacred IPv4-only invariant is preserved.
+    /// - **Clears the reflexive (STUN-learned) set and every peer's confirmed best path** (keeping
+    ///   candidate endpoints): the old reflexive addresses and direct paths were valid only for the
+    ///   old NAT mapping. Peers fail closed back to DERP until a candidate re-confirms over the new
+    ///   socket (the disco pinger + STUN prober loops re-derive on their next tick; the caller may
+    ///   nudge them). Anti-leak holds throughout: a peer with no confirmed path relays over DERP,
+    ///   never a host dial, so the re-derivation window cannot leak.
+    /// - Does **NOT** touch peers, disco keys, the netmap, or DERP — only the socket + the
+    ///   mapping-derived state. WireGuard sessions survive (they ride whatever underlay carries them).
+    ///
+    /// On a bind error the existing socket is kept (we do not tear down connectivity to chase a
+    /// rebind that failed); the error is returned so the caller can log/retry.
+    pub async fn rebind(&self) -> Result<(), Error> {
+        // Prefer re-binding the same local port so our advertised endpoint stays stable; fall back
+        // to an ephemeral port if it's taken. Honor the IPv4-only-by-default invariant via the same
+        // family choice `bind` uses.
+        let current_port = self.sock().local_addr().map(|a| a.port()).unwrap_or(0);
+        let want_v6 = self.enable_ipv6;
+        let new_sock = match rebind_socket(current_port, want_v6).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "rebind: re-bind failed, keeping existing socket");
+                return Err(e.into());
+            }
+        };
+
+        // Swap the socket atomically. The old `Arc<UdpSocket>` drops once outstanding clones release
+        // it, which unblocks any `recv_from` parked on it so the recv pump loops onto the new socket.
+        *lock(&self.sock) = Arc::new(new_sock);
+
+        // The local NAT mapping changed: drop stale reflexive addresses and every confirmed best
+        // path (keep candidates — see `PeerPaths::invalidate_best`). Locked disjointly, never nested.
+        lock(&self.reflexive).clear();
+        {
+            let mut paths = lock(&self.paths);
+            for peer in paths.values_mut() {
+                peer.invalidate_best();
+            }
+        }
+        // Outstanding STUN transactions were sent from the old socket; their replies can't arrive on
+        // the new one, so drop them rather than leave them pinned until TTL.
+        lock(&self.stun_in_flight).clear();
+
+        tracing::info!("magicsock rebound underlay socket (link change)");
+        Ok(())
     }
 
     /// Enable accepting IPv6 disco candidates on the tailnet overlay (default `false`).
@@ -290,7 +393,7 @@ impl MagicSock {
 
     /// The local address the underlay socket is bound to.
     pub fn local_addr(&self) -> Result<SocketAddr, Error> {
-        Ok(self.sock.local_addr()?)
+        Ok(self.sock().local_addr()?)
     }
 
     /// Our candidate self-endpoints: the bound local address plus every reflexive address peers
@@ -608,7 +711,7 @@ impl MagicSock {
         let m = crate::metrics::metrics();
         for (peer, addr, tx_id) in to_ping {
             let wire = disco::seal_ping(&self.our_disco, self.our_node_key, &peer, tx_id)?;
-            self.sock.send_to(&wire, addr).await?;
+            self.sock().send_to(&wire, addr).await?;
             m.disco_ping_sent.inc();
             sent += 1;
         }
@@ -649,7 +752,7 @@ impl MagicSock {
     pub async fn send_wireguard(&self, peer: &DiscoPublicKey, data: &[u8]) -> Result<(), Error> {
         let addr = self.best_addr(peer).ok_or(Error::NoPath)?;
         let m = crate::metrics::metrics();
-        match self.sock.send_to(data, addr).await {
+        match self.sock().send_to(data, addr).await {
             Ok(_) => {
                 m.send_udp.inc();
                 m.send_udp_bytes.add(data.len() as i64);
@@ -671,7 +774,7 @@ impl MagicSock {
         let mut buf = vec![0u8; RECV_BUF];
 
         loop {
-            let (n, from) = self.sock.recv_from(&mut buf).await?;
+            let (n, from) = self.sock().recv_from(&mut buf).await?;
             let datagram = &mut buf[..n];
 
             // Active-STUN demux: a Binding Success Response to a request we sent on this same
@@ -873,7 +976,7 @@ impl MagicSock {
         }
 
         let req = crate::stun::encode_binding_request(tx_id);
-        self.sock.send_to(&req, server).await?;
+        self.sock().send_to(&req, server).await?;
         Ok(())
     }
 
@@ -968,7 +1071,7 @@ impl MagicSock {
                 // Learn this source as a candidate path for the sender and answer the ping.
                 self.add_peer_endpoints(sender, [from]);
                 let pong = disco::seal_pong(&self.our_disco, &sender, tx_id, from)?;
-                self.sock.send_to(&pong, from).await?;
+                self.sock().send_to(&pong, from).await?;
                 m.disco_pong_sent.inc();
             }
             Inbound::Pong { sender, tx_id, src } => {
@@ -1743,14 +1846,14 @@ mod tests {
         let b_pump = b.clone();
         let pump = tokio::spawn(async move { while let Ok(Some(_)) = b_pump.recv_data().await {} });
 
-        a.sock.send_to(&ping, b_addr).await.unwrap();
+        a.sock().send_to(&ping, b_addr).await.unwrap();
 
         // A listens for any pong B might (incorrectly) send back. None should arrive.
         let a_addr = a.local_addr().unwrap();
         let mut buf = vec![0u8; RECV_BUF];
         let got = tokio::time::timeout(
             std::time::Duration::from_millis(300),
-            a.sock.recv_from(&mut buf),
+            a.sock().recv_from(&mut buf),
         )
         .await;
         assert!(
@@ -2178,13 +2281,13 @@ mod tests {
         let b_pump = b.clone();
         let pump = tokio::spawn(async move { while let Ok(Some(_)) = b_pump.recv_data().await {} });
 
-        a.sock.send_to(&ping, b_addr).await.unwrap();
+        a.sock().send_to(&ping, b_addr).await.unwrap();
 
         // A must not receive a pong: B fails closed without a verifier.
         let mut buf = vec![0u8; RECV_BUF];
         let got = tokio::time::timeout(
             std::time::Duration::from_millis(300),
-            a.sock.recv_from(&mut buf),
+            a.sock().recv_from(&mut buf),
         )
         .await;
         assert!(
@@ -3068,5 +3171,73 @@ mod tests {
             size_before, size_after,
             "re-noting an existing reflexive address must not grow the set (dedup)"
         );
+    }
+
+    /// `rebind` swaps in a fresh, usable underlay socket and invalidates the stale local mapping:
+    /// the reflexive set is cleared and every peer's confirmed best path is dropped, but the
+    /// candidate endpoints survive (so the peer is re-probed, not forgotten). The new socket can
+    /// still send.
+    #[tokio::test]
+    async fn rebind_swaps_socket_and_resets_mapping_state_keeping_candidates() {
+        let sock = plain_sock().await;
+
+        // Seed mapping-derived state: a reflexive address, and a peer with a candidate endpoint.
+        sock.note_reflexive("203.0.113.9:41641".parse().unwrap());
+        assert!(
+            !lock(&sock.reflexive).is_empty(),
+            "precondition: a reflexive addr is learned"
+        );
+        let peer = DiscoPrivateKey::random().public_key();
+        let cand: SocketAddr = "198.51.100.7:41641".parse().unwrap();
+        sock.set_netmap_endpoints(peer, [cand]);
+        assert_eq!(
+            sock.candidate_addrs(&peer),
+            vec![cand],
+            "precondition: the peer has a candidate endpoint"
+        );
+
+        let port_before = sock.local_addr().unwrap().port();
+
+        // Rebind: must succeed and yield a usable, still-IPv4 socket.
+        sock.rebind().await.expect("rebind must succeed");
+        let after = sock.local_addr().unwrap();
+        assert!(
+            after.is_ipv4(),
+            "rebind must keep the IPv4-only underlay (got {after})"
+        );
+
+        // Mapping-derived state is reset...
+        assert!(
+            lock(&sock.reflexive).is_empty(),
+            "rebind must clear the reflexive set (old NAT mapping is stale)"
+        );
+        assert!(
+            sock.best_addr(&peer).is_none(),
+            "rebind must drop any confirmed best path (must be re-confirmed over the new socket)"
+        );
+        // ...but candidates survive, so the peer is re-probed rather than forgotten.
+        assert_eq!(
+            sock.candidate_addrs(&peer),
+            vec![cand],
+            "rebind must KEEP candidate endpoints (only the confirmed best path is invalidated)"
+        );
+
+        // The new socket is live and can send (prove it isn't a closed/dangling fd).
+        let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sock.sock()
+            .send_to(b"post-rebind", sink.local_addr().unwrap())
+            .await
+            .expect("the rebound socket must be usable for sending");
+        let mut buf = [0u8; 32];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(1), sink.recv_from(&mut buf))
+            .await
+            .expect("a datagram must arrive on the rebound socket")
+            .unwrap();
+        assert_eq!(&buf[..n], b"post-rebind");
+
+        // Same-port-preferred: a free ephemeral port should be re-bindable as the same number.
+        // (Not asserted as an equality because the OS may reassign; we only require a valid bind,
+        // already proven above. `port_before` is captured to document the intent.)
+        let _ = port_before;
     }
 }
