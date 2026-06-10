@@ -48,6 +48,24 @@ pub const AUM_HASH_LEN: usize = 32;
 /// Enforced at DECODE time (before any crypto), and also bounds generic CBOR container nesting.
 const MAX_SIG_NESTING_DEPTH: usize = 16;
 
+// ---------------------------------------------------------------------------------------------
+// Static-validation limits — mirror Go `tka/limits.go` (v1.100.0) byte-for-byte. These bound the
+// accept/reject boundary so a Rust node and a Go node agree on which AUMs/keys/checkpoints are
+// well-formed; a mismatch here is a tailnet-lock CONSENSUS SPLIT (the two derive different trusted
+// states), not merely a robustness nicety. Do not change without changing Go.
+// ---------------------------------------------------------------------------------------------
+
+/// Max trusted keys in a checkpoint state (Go `maxKeys`).
+const MAX_KEYS: usize = 512;
+/// Max disablement values in a checkpoint state (Go `maxDisablementValues`).
+const MAX_DISABLEMENT_VALUES: usize = 32;
+/// Required byte length of each disablement value — a BLAKE2s-256 digest (Go `disablementLength`).
+const DISABLEMENT_LENGTH: usize = 32;
+/// Max total bytes of a key's metadata map, summed over keys+values (Go `maxMetaBytes`).
+const MAX_META_BYTES: usize = 512;
+/// Max key voting weight (Go `Key.StaticValidate`: `Votes > 4096` is "excessive key weight").
+const MAX_KEY_VOTES: u32 = 4096;
+
 /// A BLAKE2s-256 hash of an AUM's canonical serialization. Identifies an AUM and links the chain
 /// (`PrevAUMHash`). Text form is RFC4648 standard base32, no padding (Go `AUMHash.MarshalText`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -413,6 +431,33 @@ impl AumKey {
         &self.public
     }
 
+    /// Validate this key's well-formedness, mirroring Go `Key.StaticValidate` (`tka/key.go`,
+    /// v1.100.0). A trusted key folded into the state with an out-of-range `votes` would contribute
+    /// the wrong weight to [`pick_next_aum`] fork resolution, so a node that accepts it diverges from
+    /// one that rejects it — a consensus split. Checked at decode/fold time.
+    ///
+    /// Rules (exact Go parity): `votes` must be `1..=4096` (`0` → "key votes must be non-zero",
+    /// `>4096` → "excessive key weight"); the metadata byte total (Σ key+value lengths) must be
+    /// `≤ MAX_META_BYTES`; the kind must be a recognized key kind (`Key25519`).
+    pub fn static_validate(&self) -> Result<(), TkaError> {
+        if self.votes > MAX_KEY_VOTES {
+            return Err(TkaError::BadKeyState);
+        }
+        if self.votes == 0 {
+            return Err(TkaError::BadKeyState);
+        }
+        let meta_bytes: usize = self.meta.iter().map(|(k, v)| k.len() + v.len()).sum();
+        if meta_bytes > MAX_META_BYTES {
+            return Err(TkaError::BadKeyState);
+        }
+        // `kind` is the `KeyKind` enum (only `Ed25519`), so an unrecognized kind is unrepresentable
+        // here — Go's `default → "unrecognized key kind"` arm can't be hit by a decoded `AumKey`.
+        match self.kind {
+            KeyKind::Ed25519 => {}
+        }
+        Ok(())
+    }
+
     /// The leaner verify-path [`Key`] view of this key (drops `meta`, which the node-key-signature
     /// verification path never reads). Used by the replayer to populate the trusted-key [`State`].
     pub fn to_key(&self) -> Key {
@@ -500,6 +545,53 @@ impl AumState {
                 (self.state_id2 != 0).then_some(Value::Uint(self.state_id2)),
             ),
         ])
+    }
+
+    /// Validate this state for inclusion in a `Checkpoint` AUM, mirroring Go
+    /// `State.staticValidateCheckpoint` (`tka/state.go`, v1.100.0). A checkpoint replaces the entire
+    /// trusted-key set, so a malformed one a Rust node accepts but a Go node rejects (or vice versa)
+    /// is a consensus split; a zero-key checkpoint would silently disable the authority.
+    ///
+    /// Rules (exact Go parity):
+    /// - `last_aum_hash` must be `None` ("cannot specify a parent AUM" — a checkpoint roots a state).
+    /// - disablement values: **≥1**, **≤ MAX_DISABLEMENT_VALUES**, each exactly `DISABLEMENT_LENGTH`
+    ///   bytes, **no duplicates**.
+    /// - keys: **≥1**, **≤ MAX_KEYS**, each [`AumKey::static_validate`]s, **no duplicate key ids**.
+    ///
+    /// Treats `None` (Go nil) the same as an empty slice for the count checks (a nil `keys`/
+    /// `disablement_values` fails the "≥1" requirement, exactly as Go's `len(nil) == 0`).
+    pub fn static_validate_checkpoint(&self) -> Result<(), TkaError> {
+        if self.last_aum_hash.is_some() {
+            return Err(TkaError::BadKeyState);
+        }
+
+        let disablements = self.disablement_values.as_deref().unwrap_or(&[]);
+        if disablements.is_empty() || disablements.len() > MAX_DISABLEMENT_VALUES {
+            return Err(TkaError::BadKeyState);
+        }
+        for (i, ds) in disablements.iter().enumerate() {
+            if ds.len() != DISABLEMENT_LENGTH {
+                return Err(TkaError::BadKeyState);
+            }
+            // O(n²) dedup — bounded by MAX_DISABLEMENT_VALUES (32), so trivially small. Mirrors Go's
+            // nested-loop `bytes.Equal` check.
+            if disablements[..i].iter().any(|other| other == ds) {
+                return Err(TkaError::BadKeyState);
+            }
+        }
+
+        let keys = self.keys.as_deref().unwrap_or(&[]);
+        if keys.is_empty() || keys.len() > MAX_KEYS {
+            return Err(TkaError::BadKeyState);
+        }
+        for (i, k) in keys.iter().enumerate() {
+            k.static_validate()?;
+            // Duplicate key-id check (Go compares `Key.ID()` pairwise). Bounded by MAX_KEYS (512).
+            if keys[..i].iter().any(|other| other.id() == k.id()) {
+                return Err(TkaError::BadKeyState);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -603,6 +695,92 @@ impl Aum {
     /// `AUM.SigHash`).
     pub fn sig_hash(&self) -> [u8; AUM_HASH_LEN] {
         blake2s_256(&self.to_cbor(/* include_signatures = */ false).to_vec())
+    }
+
+    /// Validate this AUM's structural well-formedness, mirroring Go `AUM.StaticValidate`
+    /// (`tka/aum.go`, v1.100.0). Run **before** folding (and at decode time). Because the chain-link
+    /// [`Aum::hash`] covers *every present field*, an AUM carrying fields foreign to its kind hashes
+    /// differently than the canonical/stripped form — so if one node folds it (no static-validate)
+    /// while another rejects it, they derive different heads = a consensus split. This is the gate
+    /// that keeps both sides byte-identical on what counts as a well-formed AUM.
+    ///
+    /// Rules (exact Go parity):
+    /// - if `key` is present, it must [`AumKey::static_validate`];
+    /// - every signature must have `key_id` of length 32 **and** `signature` of length 64;
+    /// - if `state` is present, it must [`AumState::static_validate_checkpoint`];
+    /// - per-kind field allow-lists:
+    ///   - `AddKey`: must have `key`; must NOT set `key_id`/`state`/`votes`/`meta`;
+    ///   - `RemoveKey`: must have `key_id`; must NOT set `key`/`state`/`votes`/`meta`;
+    ///   - `UpdateKey`: must have `key_id` **and** (`votes` or `meta`); must NOT set `key`/`state`;
+    ///   - `Checkpoint`: must have `state`; must NOT set `key_id`/`key`/`votes`/`meta`;
+    ///   - `NoOp`/`Invalid`/unknown: no field constraints (Go's forward-compat `default`).
+    pub fn static_validate(&self) -> Result<(), TkaError> {
+        if let Some(key) = &self.key {
+            key.static_validate()?;
+        }
+        for sig in &self.signatures {
+            if sig.key_id.len() != 32 || sig.signature.len() != 64 {
+                return Err(TkaError::Decode(
+                    "AUM signature has missing keyID or malformed signature",
+                ));
+            }
+        }
+        if let Some(state) = &self.state {
+            state.static_validate_checkpoint()?;
+        }
+
+        // Field-presence shorthands for the per-kind allow-lists.
+        let has_key = self.key.is_some();
+        let has_key_id = !self.key_id.is_empty();
+        let has_state = self.state.is_some();
+        let has_votes = self.votes.is_some();
+        let has_meta = !self.meta.is_empty();
+
+        match self.message_kind {
+            AumKind::AddKey => {
+                if !has_key {
+                    return Err(TkaError::Decode("AddKey AUMs must contain a key"));
+                }
+                if has_key_id || has_state || has_votes || has_meta {
+                    return Err(TkaError::Decode("AddKey AUMs may only specify a Key"));
+                }
+            }
+            AumKind::RemoveKey => {
+                if !has_key_id {
+                    return Err(TkaError::Decode("RemoveKey AUMs must specify a key ID"));
+                }
+                if has_key || has_state || has_votes || has_meta {
+                    return Err(TkaError::Decode("RemoveKey AUMs may only specify a KeyID"));
+                }
+            }
+            AumKind::UpdateKey => {
+                if !has_key_id {
+                    return Err(TkaError::Decode("UpdateKey AUMs must specify a key ID"));
+                }
+                if !has_votes && !has_meta {
+                    return Err(TkaError::Decode(
+                        "UpdateKey AUMs must contain an update to votes or key metadata",
+                    ));
+                }
+                if has_key || has_state {
+                    return Err(TkaError::Decode(
+                        "UpdateKey AUMs may only specify KeyID, Votes, and Meta",
+                    ));
+                }
+            }
+            AumKind::Checkpoint => {
+                if !has_state {
+                    return Err(TkaError::Decode("Checkpoint AUMs must specify the state"));
+                }
+                if has_key_id || has_key || has_votes || has_meta {
+                    return Err(TkaError::Decode("Checkpoint AUMs may only specify State"));
+                }
+            }
+            // NoOp + Invalid (and, once an AUM decoder exists, any unknown forward-compat kind):
+            // no field constraints, matching Go's `AUMNoOp` empty case + tolerant `default`.
+            AumKind::NoOp | AumKind::Invalid => {}
+        }
+        Ok(())
     }
 }
 
@@ -780,8 +958,19 @@ impl ReplayState {
                 if !aum.meta.is_empty() {
                     self.keys[idx].meta = aum.meta.clone();
                 }
+                // Go `applyVerifiedAUM` re-runs `k.StaticValidate()` after the mutation and errors
+                // "updated key fails validation" if the *result* is invalid (e.g. votes set to 0 or
+                // > 4096). Without this, an out-of-range UpdateKey one node accepts and another
+                // rejects flips fork weight → consensus split.
+                self.keys[idx].static_validate()?;
             }
             AumKind::RemoveKey => {
+                // Last-key guard (Go `aumVerify`): refuse to remove the final trusted key — that
+                // would leave the authority with an empty key set and effectively disable tailnet
+                // lock. Checked against the key id, before the removal.
+                if self.keys.len() == 1 && self.keys[0].id() == aum.key_id.as_slice() {
+                    return Err(TkaError::BadKeyState);
+                }
                 let idx = self
                     .find_key_index(&aum.key_id)
                     .ok_or(TkaError::BadKeyState)?;
@@ -879,11 +1068,16 @@ impl VerifiedAumChain {
         let mut state = ReplayState::default();
         for (i, aum) in aums.iter().enumerate() {
             let is_genesis = i == 0;
-            // Apply the structural fold FIRST so a genesis `Checkpoint`/`AddKey` seeds the trusted
-            // keys, then verify signatures against the resulting state — this is what lets a genesis
-            // self-certify (Go verifies a bootstrap Checkpoint against its own embedded `*State`).
-            // For a non-genesis AUM, `apply_verified_aum` only mutates *after* its parent-link check
-            // passes; we verify signatures against the state-at-parent by checking BEFORE the fold.
+            // Go `aumVerify` runs `aum.StaticValidate()` FIRST (before parent/signature checks). It
+            // is state-independent (per-kind field allow-lists, per-sig 32/64-byte lengths, embedded
+            // Key/Checkpoint validity), so it gates every AUM the same way regardless of position.
+            aum.static_validate()?;
+            // Then the structural fold + signature verify. Apply the fold FIRST for the genesis so a
+            // genesis `Checkpoint`/`AddKey` seeds the trusted keys, then verify signatures against
+            // the resulting state — this is what lets a genesis self-certify (Go verifies a bootstrap
+            // Checkpoint against its own embedded `*State`). For a non-genesis AUM,
+            // `apply_verified_aum` only mutates *after* its parent-link check passes; we verify
+            // signatures against the state-at-parent by checking BEFORE the fold.
             if is_genesis {
                 state.apply_verified_aum(aum)?;
                 state.verify_aum_signatures(aum, true)?;
@@ -3444,7 +3638,8 @@ mod tests {
 
     /// A genesis `Checkpoint` self-certifies against the keys it embeds (Go
     /// `aumVerify(bootstrap, *bootstrap.State, true)`): the checkpoint's signature must verify
-    /// against a key inside its own `State`.
+    /// against a key inside its own `State`. The embedded `State` must itself be Go-valid (≥1
+    /// disablement value of 32 bytes, ≥1 key) — `static_validate_checkpoint` enforces that.
     #[test]
     fn verified_chain_genesis_checkpoint_self_certifies() {
         let trusted = test_aum_key(1, 1);
@@ -3455,7 +3650,8 @@ mod tests {
             key_id: Vec::new(),
             state: Some(AumState {
                 last_aum_hash: None,
-                disablement_values: None,
+                // A valid checkpoint needs ≥1 disablement value, each exactly 32 bytes.
+                disablement_values: Some(alloc::vec![alloc::vec![0xD5u8; DISABLEMENT_LENGTH]]),
                 keys: Some(alloc::vec![trusted.clone()]),
                 state_id1: 0,
                 state_id2: 0,
@@ -3476,6 +3672,78 @@ mod tests {
         let auth = Authority::from_verified_chain(verified);
         assert_eq!(auth.state().keys.len(), 1);
         assert_eq!(auth.head(), g.hash());
+    }
+
+    /// A genesis `Checkpoint` whose embedded `State` is malformed is rejected by
+    /// `static_validate_checkpoint` (Go `staticValidateCheckpoint`), before any signature check.
+    #[test]
+    fn verified_chain_rejects_malformed_checkpoint_state() {
+        let trusted = test_aum_key(1, 1);
+        let mk = |state: AumState| {
+            let mut g = Aum {
+                message_kind: AumKind::Checkpoint,
+                prev_aum_hash: None,
+                key: None,
+                key_id: Vec::new(),
+                state: Some(state),
+                votes: None,
+                meta: Vec::new(),
+                signatures: Vec::new(),
+            };
+            sign_aum(&mut g, &[1]);
+            g
+        };
+        let base = AumState {
+            last_aum_hash: None,
+            disablement_values: Some(alloc::vec![alloc::vec![0xD5u8; DISABLEMENT_LENGTH]]),
+            keys: Some(alloc::vec![trusted.clone()]),
+            state_id1: 0,
+            state_id2: 0,
+        };
+
+        // No disablement values → rejected.
+        let no_disable = AumState {
+            disablement_values: None,
+            ..base.clone()
+        };
+        assert_eq!(
+            VerifiedAumChain::verify(&[mk(no_disable)]).unwrap_err(),
+            TkaError::BadKeyState,
+            "a checkpoint with no disablement value is rejected"
+        );
+
+        // Disablement value of the wrong length → rejected.
+        let bad_len = AumState {
+            disablement_values: Some(alloc::vec![alloc::vec![0u8; 16]]),
+            ..base.clone()
+        };
+        assert_eq!(
+            VerifiedAumChain::verify(&[mk(bad_len)]).unwrap_err(),
+            TkaError::BadKeyState,
+            "a disablement value of the wrong length is rejected"
+        );
+
+        // No keys → rejected.
+        let no_keys = AumState {
+            keys: Some(Vec::new()),
+            ..base.clone()
+        };
+        assert_eq!(
+            VerifiedAumChain::verify(&[mk(no_keys)]).unwrap_err(),
+            TkaError::BadKeyState,
+            "a checkpoint with no keys is rejected"
+        );
+
+        // Duplicate keys → rejected.
+        let dup_keys = AumState {
+            keys: Some(alloc::vec![trusted.clone(), trusted.clone()]),
+            ..base
+        };
+        assert_eq!(
+            VerifiedAumChain::verify(&[mk(dup_keys)]).unwrap_err(),
+            TkaError::BadKeyState,
+            "a checkpoint with duplicate key ids is rejected"
+        );
     }
 
     /// A broken parent link is still caught on the verified path (the structural fold runs after the
@@ -4020,5 +4288,184 @@ mod tests {
                 "non-canonical ({label}) must re-serialize to the canonical form"
             );
         }
+    }
+    // ---- StaticValidate cluster (tsr-uvg): Go `AUM/Key/State.StaticValidate` parity ----
+
+    /// `Key::static_validate` — votes must be 1..=4096 (Go `Key.StaticValidate`).
+    #[test]
+    fn key_static_validate_votes_range() {
+        let mut k = test_aum_key(1, 1);
+        assert!(k.static_validate().is_ok(), "votes=1 ok");
+        k.votes = 4096;
+        assert!(k.static_validate().is_ok(), "votes=4096 ok (boundary)");
+        k.votes = 0;
+        assert_eq!(
+            k.static_validate().unwrap_err(),
+            TkaError::BadKeyState,
+            "votes=0 rejected"
+        );
+        k.votes = 4097;
+        assert_eq!(
+            k.static_validate().unwrap_err(),
+            TkaError::BadKeyState,
+            "votes>4096 rejected"
+        );
+    }
+
+    /// `Key::static_validate` — metadata byte total must be ≤ MAX_META_BYTES.
+    #[test]
+    fn key_static_validate_meta_size() {
+        let mut k = test_aum_key(2, 1);
+        // 256-byte key + 256-byte value = 512 total = exactly MAX_META_BYTES → ok.
+        k.meta = alloc::vec![(
+            String::from_utf8(alloc::vec![b'k'; 256]).unwrap(),
+            String::from_utf8(alloc::vec![b'v'; 256]).unwrap(),
+        )];
+        assert!(k.static_validate().is_ok(), "512 meta bytes ok (boundary)");
+        // One more byte → rejected.
+        k.meta[0].1.push('x');
+        assert_eq!(
+            k.static_validate().unwrap_err(),
+            TkaError::BadKeyState,
+            "meta>512 rejected"
+        );
+    }
+
+    /// `Aum::static_validate` — per-kind field allow-lists (Go `AUM.StaticValidate`).
+    #[test]
+    fn aum_static_validate_per_kind_field_allow_lists() {
+        // AddKey must have a key and nothing else.
+        let mut a = genesis_add(test_aum_key(1, 1));
+        assert!(a.static_validate().is_ok());
+        a.key_id = alloc::vec![1, 2, 3]; // foreign field
+        assert!(
+            a.static_validate().is_err(),
+            "AddKey with a stray KeyID rejected"
+        );
+
+        // RemoveKey must have a key_id and nothing else.
+        let g = signed_genesis_add(1, 1);
+        let mut rm = child(
+            &g,
+            AumKind::RemoveKey,
+            None,
+            test_aum_key(2, 1).public.clone(),
+        );
+        assert!(rm.static_validate().is_ok());
+        rm.votes = Some(3); // foreign field
+        assert!(
+            rm.static_validate().is_err(),
+            "RemoveKey with stray Votes rejected"
+        );
+
+        // UpdateKey must have key_id AND (votes or meta).
+        let mut up = child(
+            &g,
+            AumKind::UpdateKey,
+            None,
+            test_aum_key(2, 1).public.clone(),
+        );
+        assert!(
+            up.static_validate().is_err(),
+            "UpdateKey with neither votes nor meta rejected"
+        );
+        up.votes = Some(2);
+        assert!(up.static_validate().is_ok(), "UpdateKey with votes ok");
+        up.key = Some(test_aum_key(3, 1)); // foreign field
+        assert!(
+            up.static_validate().is_err(),
+            "UpdateKey with a stray Key rejected"
+        );
+
+        // Checkpoint must have state and nothing else.
+        let mut cp = child(&g, AumKind::Checkpoint, None, Vec::new());
+        cp.state = Some(AumState {
+            last_aum_hash: None,
+            disablement_values: Some(alloc::vec![alloc::vec![0xD5u8; DISABLEMENT_LENGTH]]),
+            keys: Some(alloc::vec![test_aum_key(1, 1)]),
+            state_id1: 0,
+            state_id2: 0,
+        });
+        assert!(cp.static_validate().is_ok());
+        cp.votes = Some(1); // foreign field
+        assert!(
+            cp.static_validate().is_err(),
+            "Checkpoint with stray Votes rejected"
+        );
+    }
+
+    /// `Aum::static_validate` — every signature must have a 32-byte key_id and 64-byte signature.
+    #[test]
+    fn aum_static_validate_signature_lengths() {
+        let mut a = genesis_add(test_aum_key(1, 1));
+        a.signatures = alloc::vec![AumSignature {
+            key_id: alloc::vec![0u8; 31], // wrong length (should be 32)
+            signature: alloc::vec![0u8; 64],
+        }];
+        assert!(a.static_validate().is_err(), "31-byte keyID rejected");
+        a.signatures[0].key_id = alloc::vec![0u8; 32];
+        a.signatures[0].signature = alloc::vec![0u8; 63]; // wrong length (should be 64)
+        assert!(a.static_validate().is_err(), "63-byte signature rejected");
+    }
+
+    /// The last-key guard (Go `aumVerify`): a `RemoveKey` removing the only remaining trusted key is
+    /// rejected — otherwise the authority would be left with an empty key set (lock disabled).
+    #[test]
+    fn verified_chain_rejects_removing_last_key() {
+        let g = signed_genesis_add(1, 1); // exactly one trusted key (seed 1)
+        let mut rm = child(
+            &g,
+            AumKind::RemoveKey,
+            None,
+            test_aum_key(1, 1).public.clone(),
+        );
+        sign_aum(&mut rm, &[1]); // validly signed by the trusted key
+        assert_eq!(
+            VerifiedAumChain::verify(&[g, rm]).unwrap_err(),
+            TkaError::BadKeyState,
+            "removing the last trusted key must be refused"
+        );
+    }
+
+    /// Removing a non-last key is fine: with two trusted keys, one can be removed.
+    #[test]
+    fn verified_chain_allows_removing_non_last_key() {
+        let g = signed_genesis_add(1, 1);
+        let mut add = child(&g, AumKind::AddKey, Some(test_aum_key(2, 1)), Vec::new());
+        sign_aum(&mut add, &[1]);
+        let mut rm = child(
+            &add,
+            AumKind::RemoveKey,
+            None,
+            test_aum_key(2, 1).public.clone(),
+        );
+        sign_aum(&mut rm, &[1]);
+        let verified = VerifiedAumChain::verify(&[g, add, rm]).expect("removing a non-last key ok");
+        let auth = Authority::from_verified_chain(verified);
+        assert_eq!(
+            auth.state().keys.len(),
+            1,
+            "back to one key after the remove"
+        );
+    }
+
+    /// `UpdateKey` is re-validated after mutation (Go re-runs `Key.StaticValidate`): an update that
+    /// sets votes out of range is rejected.
+    #[test]
+    fn verified_chain_rejects_updatekey_to_invalid_votes() {
+        let g = signed_genesis_add(1, 1);
+        let mut up = child(
+            &g,
+            AumKind::UpdateKey,
+            None,
+            test_aum_key(1, 1).public.clone(),
+        );
+        up.votes = Some(5000); // > 4096 → invalid after mutation
+        sign_aum(&mut up, &[1]);
+        assert_eq!(
+            VerifiedAumChain::verify(&[g, up]).unwrap_err(),
+            TkaError::BadKeyState,
+            "an UpdateKey that sets votes > 4096 is rejected (post-mutation re-validate)"
+        );
     }
 }
