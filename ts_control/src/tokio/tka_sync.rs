@@ -18,7 +18,8 @@ use std::fmt;
 use bytes::Bytes;
 use ts_capabilityversion::CapabilityVersion;
 use ts_control_serde::{
-    TkaSyncOfferRequest, TkaSyncOfferResponse, TkaSyncSendRequest, TkaSyncSendResponse,
+    TkaBootstrapRequest, TkaBootstrapResponse, TkaSyncOfferRequest, TkaSyncOfferResponse,
+    TkaSyncSendRequest, TkaSyncSendResponse,
 };
 use ts_http_util::{BytesBody, ClientExt, Http2, ResponseExt, StatusCode};
 use ts_keys::NodePublicKey;
@@ -240,6 +241,63 @@ pub(crate) async fn tka_sync_send_with(
     parse_send_response(status, &body)
 }
 
+/// Fetch the TKA bootstrap (genesis AUM) from control: the entry point that gives a node with no
+/// chain yet the initial AUM to build its `Authority` from, before the offer/send catch-up
+/// (Go `tkaFetchBootstrap`). `head` is the node's current known head (empty when it has none).
+/// Fresh Noise channel, bounded by [`TKA_SYNC_TIMEOUT`].
+pub async fn tka_bootstrap(
+    control_url: &Url,
+    node_keystate: &ts_keys::NodeState,
+    head: alloc::string::String,
+    allow_http_key_fetch: bool,
+) -> Result<TkaBootstrapResponse, TkaSyncError> {
+    let run = async {
+        let http2_conn = crate::tokio::connect(
+            control_url,
+            &node_keystate.machine_keys,
+            allow_http_key_fetch,
+        )
+        .await?;
+        tka_bootstrap_with(control_url, node_keystate, head, &http2_conn).await
+    };
+    match tokio::time::timeout(TKA_SYNC_TIMEOUT, run).await {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            tracing::error!(timeout = ?TKA_SYNC_TIMEOUT, "TKA bootstrap timed out");
+            Err(TkaSyncError::NetworkError)
+        }
+    }
+}
+
+/// The bootstrap RPC over an already-established Noise channel.
+pub(crate) async fn tka_bootstrap_with(
+    control_url: &Url,
+    node_keystate: &ts_keys::NodeState,
+    head: alloc::string::String,
+    http2_conn: &Http2<BytesBody>,
+) -> Result<TkaBootstrapResponse, TkaSyncError> {
+    let node_public_key = node_keystate.node_keys.public;
+    let req = TkaBootstrapRequest {
+        version: CapabilityVersion::CURRENT,
+        node_key: node_public_key,
+        head,
+    };
+    let body = serde_json::to_string(&req)?;
+    let url = control_url.join("machine/tka/bootstrap")?;
+    tracing::debug!(url = %url.as_str(), "TKA bootstrap to control");
+
+    let response = http2_conn
+        .get_with_body(
+            &url,
+            [lb_header(&node_public_key)],
+            Bytes::from(body).into(),
+        )
+        .await?;
+    let status = response.status();
+    let body = response.collect_bytes().await?;
+    parse_bootstrap_response(status, &body)
+}
+
 /// The `Ts-Lb` load-balancer header (the node public key), as every other `/machine/*` RPC sets.
 fn lb_header(
     node_public_key: &NodePublicKey,
@@ -286,6 +344,20 @@ fn parse_send_response(
     status: StatusCode,
     body: &[u8],
 ) -> Result<TkaSyncSendResponse, TkaSyncError> {
+    if let Some(err) = classify_status(status, body) {
+        return Err(err);
+    }
+    if body.len() > MAX_TKA_SYNC_RESPONSE {
+        return Err(TkaSyncError::Internal(TkaSyncInternalErrorKind::TooLarge));
+    }
+    let body = core::str::from_utf8(body)?;
+    Ok(serde_json::from_str(body)?)
+}
+
+fn parse_bootstrap_response(
+    status: StatusCode,
+    body: &[u8],
+) -> Result<TkaBootstrapResponse, TkaSyncError> {
     if let Some(err) = classify_status(status, body) {
         return Err(err);
     }
@@ -346,5 +418,31 @@ mod tests {
     fn parse_send_response_ok() {
         let resp = parse_send_response(StatusCode::OK, br#"{"Head":"MFRGGZDF"}"#).expect("parse");
         assert_eq!(resp.head, "MFRGGZDF");
+    }
+
+    #[test]
+    fn parse_bootstrap_response_ok() {
+        // GenesisAUM "AQID" = bytes {1,2,3}.
+        let json = br#"{"GenesisAUM":"AQID","DisablementSecret":"/w=="}"#;
+        let resp = parse_bootstrap_response(StatusCode::OK, json).expect("parse");
+        assert_eq!(resp.genesis_aum, alloc::vec![1u8, 2, 3]);
+        assert_eq!(resp.disablement_secret, alloc::vec![0xffu8]);
+    }
+
+    #[test]
+    fn parse_bootstrap_response_empty_when_no_genesis() {
+        let resp = parse_bootstrap_response(StatusCode::OK, b"{}").expect("parse");
+        assert!(
+            resp.genesis_aum.is_empty(),
+            "no genesis ⇒ empty (TKA not enabled)"
+        );
+    }
+
+    #[test]
+    fn parse_bootstrap_unsupported_status() {
+        assert_eq!(
+            parse_bootstrap_response(StatusCode::NOT_FOUND, b"").unwrap_err(),
+            TkaSyncError::Unsupported
+        );
     }
 }
