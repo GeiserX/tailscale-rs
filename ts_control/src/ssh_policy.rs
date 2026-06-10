@@ -33,7 +33,7 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
-use core::net::IpAddr;
+use core::net::{IpAddr, SocketAddr};
 
 use chrono::{DateTime, Utc};
 
@@ -78,9 +78,13 @@ pub struct SshPrincipal {
     pub any: bool,
 }
 
-/// The action taken when a rule matches. Mirrors `tailcfg.SSHAction`. Only the fields this fork
-/// acts on are retained; recording (`Recorders`/`OnRecordingFailure`) and the interactive
-/// `HoldAndDelegate` control round-trip are out of scope for basic `ListenSSH` parity.
+/// The action taken when a rule matches. Mirrors `tailcfg.SSHAction`.
+///
+/// Recording (`recorders` / `on_recording_failure`) and the interactive `hold_and_delegate`
+/// control round-trip are carried through from the wire so the server can enforce them
+/// fail-closed. This fork has **no recorder transport and no delegate round-trip yet**, so a rule
+/// that *demands* either (non-empty `recorders`, or a non-empty `hold_and_delegate`) cannot be
+/// honored and the session is refused rather than silently downgraded to a plain accept.
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct SshAction {
     /// Optional message shown to the user.
@@ -97,6 +101,34 @@ pub struct SshAction {
     pub allow_local_port_forwarding: bool,
     /// Allow remote port forwarding.
     pub allow_remote_port_forwarding: bool,
+    /// Session recorders (`ip:port`) this session must be streamed to. A **non-empty** list means
+    /// the policy *demands* recording; mirrors `tailcfg.SSHAction.Recorders`.
+    pub recorders: Vec<SocketAddr>,
+    /// What to do when recording cannot be performed; mirrors `tailcfg.SSHAction.OnRecordingFailure`.
+    /// `None` is Go's "ignore recording failures" (fail-open). The interim server still refuses
+    /// when it has no recorder transport at all — see [`SshAccept::recording_required`].
+    pub on_recording_failure: Option<SshRecorderFailureAction>,
+    /// If non-empty, the rule wants the final decision delegated to this URL over a control
+    /// round-trip (Go `HoldAndDelegate`). Carried for fidelity; this fork does **not** perform the
+    /// delegate fetch, so a rule bearing it is treated as not-yet-supported and denied (fail-closed)
+    /// rather than silently accepted. Mirrors `tailcfg.SSHAction.HoldAndDelegate`.
+    // TODO(tsr-0h2 follow-up): implement the HoldAndDelegate check-mode round-trip (needs a live
+    // Noise control channel the turnkey `listen_ssh` server does not currently have); until then a
+    // `hold_and_delegate`-bearing rule is denied with a clear message instead of accepted.
+    pub hold_and_delegate: String,
+}
+
+/// What to do when session recording fails for an [`SshAction`] that has recorders configured.
+/// Mirrors `tailcfg.SSHRecorderFailureAction`.
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+pub struct SshRecorderFailureAction {
+    /// If non-empty, refuse the session with this message when recording cannot start. This is
+    /// Go's explicit **fail-closed** signal (`RejectSessionWithMessage`).
+    pub reject_session_with_message: String,
+    /// If non-empty, terminate an in-progress session with this message when recording fails.
+    pub terminate_session_with_message: String,
+    /// If non-empty, a URL to notify out-of-band when recording fails.
+    pub notify_url: String,
 }
 
 /// The identity of an incoming SSH connection, resolved from the connecting peer.
@@ -135,6 +167,21 @@ pub struct SshAccept {
     pub allow_local_port_forwarding: bool,
     /// Whether remote port forwarding is permitted.
     pub allow_remote_port_forwarding: bool,
+    /// The session recorders (`ip:port`) the matched rule demands this session be streamed to.
+    /// Empty for the common no-recording case.
+    pub recorders: Vec<SocketAddr>,
+    /// `true` when the matched rule **demands** a capability this fork cannot yet provide, so the
+    /// server MUST refuse the session rather than accept it un-recorded/un-delegated (the tsr-0h2
+    /// fail-closed gate). Set when `recorders` is non-empty (recording demanded but there is no
+    /// recorder transport) or `hold_and_delegate` is set (delegate round-trip unimplemented).
+    ///
+    /// The common case — no recorders, no delegate — leaves this `false`, so those sessions accept
+    /// normally and the gate is a no-op for them.
+    pub recording_required: bool,
+    /// The message to surface when refusing a `recording_required` session: the policy's
+    /// `on_recording_failure.reject_session_with_message` when set (Go's explicit fail-closed
+    /// message), else the action `message`, else empty (the caller substitutes a default).
+    pub recording_refusal_message: String,
 }
 
 /// Why a connection was denied. Mirrors Go's `rejected` / `rejectedUser` results plus an explicit
@@ -266,6 +313,16 @@ impl SshRule {
         let local_user =
             map_local_user(&self.ssh_users, requested_user).ok_or(RuleSkip::UserMatch)?;
 
+        // SECURITY (tsr-0h2): a matched accept rule that DEMANDS a capability this fork cannot
+        // provide must not be silently downgraded to a plain accept. Recording is demanded when the
+        // rule carries recorders; HoldAndDelegate is demanded when its URL is set. Neither has a
+        // transport here yet, so flag the accept as `recording_required` and let the server refuse
+        // it (fail-closed). The empty-recorders / no-delegate path leaves the flag false → normal
+        // accept, so the common case is untouched.
+        let recording_required =
+            !action.recorders.is_empty() || !action.hold_and_delegate.is_empty();
+        let recording_refusal_message = action.recording_refusal_message();
+
         Ok(SshDecision::Accept(SshAccept {
             local_user,
             accept_env: self.accept_env.clone(),
@@ -273,6 +330,9 @@ impl SshRule {
             allow_agent_forwarding: action.allow_agent_forwarding,
             allow_local_port_forwarding: action.allow_local_port_forwarding,
             allow_remote_port_forwarding: action.allow_remote_port_forwarding,
+            recorders: action.recorders.clone(),
+            recording_required,
+            recording_refusal_message,
         }))
     }
 
@@ -335,6 +395,39 @@ impl SshAction {
             allow_agent_forwarding: a.allow_agent_forwarding,
             allow_local_port_forwarding: a.allow_local_port_forwarding,
             allow_remote_port_forwarding: a.allow_remote_port_forwarding,
+            // SECURITY: carry the recording/delegate intent into the domain. Previously these were
+            // parsed off the wire but DROPPED here, silently downgrading a "record-or-refuse" rule
+            // to a plain accept (the tsr-0h2 bypass). The server gate now refuses such sessions.
+            recorders: a.recorders.clone(),
+            on_recording_failure: a
+                .on_recording_failure
+                .as_ref()
+                .map(SshRecorderFailureAction::from_serde),
+            hold_and_delegate: a.hold_and_delegate.to_string(),
+        }
+    }
+
+    /// The message to surface when a session this action describes must be refused for lack of a
+    /// recorder/delegate transport. Prefers the policy's explicit fail-closed message
+    /// (`on_recording_failure.reject_session_with_message`), then the action `message`, else empty
+    /// (the server substitutes a sensible default). Empty strings are skipped so a present-but-blank
+    /// field does not mask a useful fallback.
+    fn recording_refusal_message(&self) -> String {
+        if let Some(orf) = &self.on_recording_failure
+            && !orf.reject_session_with_message.is_empty()
+        {
+            return orf.reject_session_with_message.clone();
+        }
+        self.message.clone()
+    }
+}
+
+impl SshRecorderFailureAction {
+    fn from_serde(f: &ts_control_serde::SSHRecorderFailureAction<'_>) -> Self {
+        SshRecorderFailureAction {
+            reject_session_with_message: f.reject_session_with_message.to_string(),
+            terminate_session_with_message: f.terminate_session_with_message.to_string(),
+            notify_url: f.notify_url.to_string(),
         }
     }
 }
@@ -672,5 +765,147 @@ mod tests {
             }
             other => panic!("expected accept, got {other:?}"),
         }
+    }
+
+    // ---- tsr-0h2: recording / hold-and-delegate are carried, not dropped ----
+
+    /// A rule that demands recording (non-empty `recorders`) yields an accept flagged
+    /// `recording_required` — the signal the server uses to refuse (close the bypass). Without
+    /// recorders the same rule must accept normally (`recording_required == false`).
+    #[test]
+    fn recorders_set_marks_accept_recording_required() {
+        let recorder: SocketAddr = "1.2.3.4:5678".parse().unwrap();
+        let pol = SshPolicy {
+            rules: vec![SshRule {
+                action: Some(SshAction {
+                    accept: true,
+                    recorders: vec![recorder],
+                    ..Default::default()
+                }),
+                ..accept_rule(vec![any_principal()], &[("*", "=")])
+            }],
+        };
+        match pol.evaluate(&id("n1", "100.64.0.1", None), "root", now()) {
+            SshDecision::Accept(a) => {
+                assert!(a.recording_required, "recorders set must demand recording");
+                assert_eq!(a.recorders, vec![recorder]);
+            }
+            other => panic!("expected accept, got {other:?}"),
+        }
+    }
+
+    /// Regression guard for the common case: a normal accept rule with NO recorders must NOT be
+    /// flagged `recording_required`, so the fail-closed gate never touches it.
+    #[test]
+    fn no_recorders_accept_is_not_recording_required() {
+        let pol = SshPolicy {
+            rules: vec![accept_rule(vec![any_principal()], &[("*", "=")])],
+        };
+        match pol.evaluate(&id("n1", "100.64.0.1", None), "root", now()) {
+            SshDecision::Accept(a) => {
+                assert!(
+                    !a.recording_required,
+                    "no recorders must not demand recording"
+                );
+                assert!(a.recorders.is_empty());
+                assert!(a.recording_refusal_message.is_empty());
+            }
+            other => panic!("expected accept, got {other:?}"),
+        }
+    }
+
+    /// A `holdAndDelegate`-bearing rule is treated as not-yet-supported: carried through and flagged
+    /// `recording_required` (the fail-closed signal) rather than silently accepted.
+    #[test]
+    fn hold_and_delegate_marks_accept_recording_required() {
+        let pol = SshPolicy {
+            rules: vec![SshRule {
+                action: Some(SshAction {
+                    accept: true,
+                    hold_and_delegate: "https://control.example/ssh/action/xyz".to_string(),
+                    ..Default::default()
+                }),
+                ..accept_rule(vec![any_principal()], &[("*", "=")])
+            }],
+        };
+        match pol.evaluate(&id("n1", "100.64.0.1", None), "root", now()) {
+            SshDecision::Accept(a) => {
+                assert!(
+                    a.recording_required,
+                    "holdAndDelegate must be enforced fail-closed (not silently accepted)"
+                );
+            }
+            other => panic!("expected accept, got {other:?}"),
+        }
+    }
+
+    /// `from_serde` must carry `recorders` and `onRecordingFailure` into the domain (the fields
+    /// were previously parsed off the wire but DROPPED — the tsr-0h2 bypass). The refusal message
+    /// prefers `rejectSessionWithMessage`.
+    #[test]
+    fn from_serde_carries_recorders_and_on_recording_failure() {
+        let wire = r#"{
+            "rules": [
+                {
+                    "principals": [{ "any": true }],
+                    "sshUsers": { "*": "=" },
+                    "action": {
+                        "accept": true,
+                        "recorders": ["1.2.3.4:5678", "5.6.7.8:9000"],
+                        "onRecordingFailure": {
+                            "rejectSessionWithMessage": "recording required by policy",
+                            "notifyURL": "https://example.com/notify"
+                        }
+                    }
+                }
+            ]
+        }"#;
+        let serde_pol: ts_control_serde::SSHPolicy = serde_json::from_str(wire).unwrap();
+        let pol = SshPolicy::from_serde(&serde_pol);
+
+        // The domain action retained the recording fields.
+        let action = pol.rules[0].action.as_ref().unwrap();
+        assert_eq!(
+            action.recorders,
+            vec![
+                "1.2.3.4:5678".parse::<SocketAddr>().unwrap(),
+                "5.6.7.8:9000".parse::<SocketAddr>().unwrap(),
+            ]
+        );
+        let orf = action.on_recording_failure.as_ref().unwrap();
+        assert_eq!(
+            orf.reject_session_with_message,
+            "recording required by policy"
+        );
+        assert_eq!(orf.notify_url, "https://example.com/notify");
+
+        // And evaluation surfaces the fail-closed signal + the explicit refusal message.
+        match pol.evaluate(&id("n1", "100.64.0.1", None), "root", now()) {
+            SshDecision::Accept(a) => {
+                assert!(a.recording_required);
+                assert_eq!(a.recording_refusal_message, "recording required by policy");
+            }
+            other => panic!("expected accept, got {other:?}"),
+        }
+    }
+
+    /// Refusal-message precedence: with no `rejectSessionWithMessage`, fall back to the action
+    /// `message`.
+    #[test]
+    fn recording_refusal_message_falls_back_to_action_message() {
+        let action = SshAction {
+            accept: true,
+            message: "see your admin".to_string(),
+            recorders: vec!["1.2.3.4:5678".parse().unwrap()],
+            ..Default::default()
+        };
+        assert_eq!(action.recording_refusal_message(), "see your admin");
+
+        // An empty rejectSessionWithMessage must NOT mask the action message fallback.
+        let action = SshAction {
+            on_recording_failure: Some(SshRecorderFailureAction::default()),
+            ..action
+        };
+        assert_eq!(action.recording_refusal_message(), "see your admin");
     }
 }
