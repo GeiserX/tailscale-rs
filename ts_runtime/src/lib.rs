@@ -377,12 +377,12 @@ impl Runtime {
     /// `self_node` is `None` until the first netmap update has been received from control. Peer
     /// entries carry no online/user/capability data (see the [`status`] module docs for that gap).
     pub async fn status(&self) -> Result<Status, Error> {
-        let self_node = self
-            .control
-            .ask(control_runner::SelfNode)
-            .await?
-            .as_ref()
-            .map(StatusNode::from_node);
+        let self_node_domain = self.control.ask(control_runner::SelfNode).await?;
+        // The MagicDNS suffix is the self node's FQDN minus its host label — already split into
+        // `Node.tailnet` at decode time (Go derives it the same way in `NetworkMap.MagicDNSSuffix`).
+        // Capture it before the domain `Node` is mapped away into a `StatusNode`.
+        let magic_dns_suffix = self_node_domain.as_ref().and_then(|n| n.tailnet.clone());
+        let self_node = self_node_domain.as_ref().map(StatusNode::from_node);
 
         let peers = self
             .peer_tracker
@@ -399,6 +399,7 @@ impl Runtime {
             self_node,
             peers,
             active_exit_node: self.active_exit_node(),
+            magic_dns_suffix,
         })
     }
 

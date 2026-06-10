@@ -98,6 +98,10 @@ pub struct DnsConfig {
     /// case-insensitive. A filtered name is answered with `REFUSED`. See
     /// [`DnsConfig::exit_node_filters`].
     pub exit_node_filtered_set: Vec<String>,
+    /// DNS names control will assist provisioning TLS certs for (Go `tailcfg.DNSConfig.CertDomains`):
+    /// the cert-eligible FQDNs for this node, without trailing dots or `_acme-challenge.` prefix.
+    /// Surfaced verbatim (Go returns `slices.Clone(nm.DNS.CertDomains)`); empty when control sent none.
+    pub cert_domains: Vec<String>,
 }
 
 impl DnsConfig {
@@ -157,6 +161,10 @@ impl DnsConfig {
                 .map(|e| e.strip_suffix('.').unwrap_or(e).to_ascii_lowercase())
                 .filter(|e| !e.is_empty() && e != ".")
                 .collect(),
+            // Carried verbatim (Go `slices.Clone(nm.DNS.CertDomains)` — no canonicalization). These
+            // are the names a `ListenTLS`/cert-issuance consumer requests, so they must match what
+            // control issued exactly.
+            cert_domains: c.cert_domains.iter().map(|d| d.to_string()).collect(),
         }
     }
 
@@ -229,6 +237,31 @@ mod tests {
         assert!(!config.magic_dns);
         assert!(config.search_domains.is_empty());
         assert!(config.extra_records.is_empty());
+    }
+
+    #[test]
+    fn from_serde_carries_cert_domains_verbatim() {
+        // Go returns `slices.Clone(nm.DNS.CertDomains)` — verbatim, no canonicalization.
+        let serde_config = ts_control_serde::DnsConfig {
+            cert_domains: alloc::vec!["host.tail0123.ts.net", "other.tail0123.ts.net"],
+            ..Default::default()
+        };
+
+        let config = DnsConfig::from_serde(&serde_config);
+
+        assert_eq!(
+            config.cert_domains,
+            alloc::vec![
+                "host.tail0123.ts.net".to_string(),
+                "other.tail0123.ts.net".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn from_serde_cert_domains_empty_when_absent() {
+        let config = DnsConfig::from_serde(&ts_control_serde::DnsConfig::default());
+        assert!(config.cert_domains.is_empty());
     }
 
     #[test]

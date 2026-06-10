@@ -54,6 +54,8 @@ pub struct Status {
     pub self_node: Option<StatusNode>,
     /// Every peer currently known in the netmap.
     pub peers: Vec<StatusNode>,
+    /// The tailnet's MagicDNS suffix (e.g. `"tail0123.ts.net"`), or `None` before the first netmap.
+    pub magic_dns_suffix: Option<String>,
 }
 
 impl From<&tailscale::Status> for Status {
@@ -61,6 +63,7 @@ impl From<&tailscale::Status> for Status {
         Self {
             self_node: value.self_node.as_ref().map(StatusNode::from),
             peers: value.peers.iter().map(StatusNode::from).collect(),
+            magic_dns_suffix: value.magic_dns_suffix.clone(),
         }
     }
 }
