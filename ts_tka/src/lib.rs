@@ -196,6 +196,18 @@ pub enum TkaError {
     /// The presented signature does not cover the given node key.
     #[error("signature does not cover this node key")]
     NodeKeyMismatch,
+    /// An AUM's `PrevAUMHash` does not match the hash of the state it was applied to (Go
+    /// "parent AUMHash mismatch") — the chain link is broken.
+    #[error("AUM parent hash does not match the current chain head")]
+    BadParent,
+    /// An `AUMAddKey` named a key id that is already trusted, or an `AUMRemoveKey`/`AUMUpdateKey`
+    /// named a key id that is not (Go "key already exists" / `ErrNoSuchKey`).
+    #[error("AUM key-state update is invalid (key already exists, or no such key)")]
+    BadKeyState,
+    /// An AUM chain was empty, did not begin at a genesis (`AUMCheckpoint`/`AUMAddKey` with no
+    /// parent), or otherwise could not be replayed into a state.
+    #[error("AUM chain is empty or has no valid genesis")]
+    BadChain,
 }
 
 impl NodeKeySignature {
@@ -395,6 +407,16 @@ impl AumKey {
     /// The key id (for `Key25519`, the public key verbatim — Go `Key.ID`).
     pub fn id(&self) -> &[u8] {
         &self.public
+    }
+
+    /// The leaner verify-path [`Key`] view of this key (drops `meta`, which the node-key-signature
+    /// verification path never reads). Used by the replayer to populate the trusted-key [`State`].
+    pub fn to_key(&self) -> Key {
+        Key {
+            kind: self.kind,
+            votes: self.votes,
+            public: self.public.clone(),
+        }
     }
 
     fn kind_u8(&self) -> u8 {
@@ -611,6 +633,265 @@ fn bytes_or_null(b: &[u8]) -> Value {
         Value::Null
     } else {
         Value::Bytes(b.to_vec())
+    }
+}
+
+// ===========================================================================================
+// AUM-chain replay (issue #7, chunk 1B) — the acquisition-side derivation of a trusted-key
+// `State`/`Authority` from a chain of `Aum`s, mirroring Go `tka/state.go` + `tka/tka.go`.
+// ===========================================================================================
+
+/// The mutable trusted-key state a replay folds AUMs into. Carries the keys plus the hash of the
+/// last AUM applied (Go `State.LastAUMHash`), which the next AUM's `prev_aum_hash` must match.
+/// Distinct from the public [`State`] (which is the verify-only snapshot the [`Authority`] exposes);
+/// this one tracks the chain cursor needed during replay.
+#[derive(Debug, Clone, Default)]
+struct ReplayState {
+    keys: Vec<AumKey>,
+    last_aum_hash: Option<AumHash>,
+    /// The `(StateID1, StateID2)` seeded by the genesis checkpoint, if any. A *subsequent*
+    /// checkpoint must carry the same pair (Go state.go: "checkpointed state has an incorrect
+    /// stateID"); `None` until a checkpoint is applied.
+    state_id: Option<(u64, u64)>,
+}
+
+impl ReplayState {
+    fn get_key(&self, key_id: &[u8]) -> Option<&AumKey> {
+        self.keys.iter().find(|k| k.id() == key_id)
+    }
+
+    fn find_key_index(&self, key_id: &[u8]) -> Option<usize> {
+        self.keys.iter().position(|k| k.id() == key_id)
+    }
+
+    /// The total signing weight of `aum` under this state (Go `AUM.Weight`): the sum of `votes` over
+    /// the **distinct** keys (deduped by key id) that both signed the AUM *and* are trusted here.
+    /// An unknown signing key contributes 0; a key that signed twice counts once.
+    fn weight(&self, aum: &Aum) -> u64 {
+        let mut seen: Vec<&[u8]> = Vec::new();
+        let mut weight: u64 = 0;
+        for sig in &aum.signatures {
+            let id = sig.key_id.as_slice();
+            if seen.contains(&id) {
+                continue;
+            }
+            if let Some(key) = self.get_key(id) {
+                weight += key.votes as u64;
+                seen.push(id);
+            }
+        }
+        weight
+    }
+
+    /// Fold one already-signature-verified AUM into the state (Go `State.applyVerifiedAUM`).
+    ///
+    /// Checks the parent-hash chain link first (a brand-new state with no `last_aum_hash` matches any
+    /// parent — the genesis case), then applies the per-kind mutation. Advances `last_aum_hash` to
+    /// the applied AUM's own hash so the next link can be verified.
+    ///
+    /// When this is the genesis (the state has no `last_aum_hash` yet), Go restricts the kind to
+    /// `NoOp`/`AddKey`/`Checkpoint` (Go `computeStateAt` rejects anything else as
+    /// "invalid genesis update") and a genesis AUM must carry no parent — both are enforced here so a
+    /// non-genesis-rooted slice can't be silently accepted as if it were a genesis.
+    fn apply_verified_aum(&mut self, aum: &Aum) -> Result<(), TkaError> {
+        match &self.last_aum_hash {
+            // Once the chain is rolling, the AUM must name the current head as its parent.
+            Some(head) => match &aum.prev_aum_hash {
+                Some(prev) if prev == head => {}
+                _ => return Err(TkaError::BadParent),
+            },
+            // Genesis: must have no parent, and only certain kinds may start a chain.
+            None => {
+                if aum.prev_aum_hash.is_some() {
+                    return Err(TkaError::BadParent);
+                }
+                if !matches!(
+                    aum.message_kind,
+                    AumKind::NoOp | AumKind::AddKey | AumKind::Checkpoint
+                ) {
+                    return Err(TkaError::BadChain);
+                }
+            }
+        }
+
+        match aum.message_kind {
+            AumKind::NoOp | AumKind::Invalid => {
+                // No state change (unknown/forward-compat kinds are tolerated as no-ops, matching
+                // Go's `default` arm). The chain cursor still advances (below).
+            }
+            AumKind::Checkpoint => {
+                // A checkpoint replaces the whole key set with its embedded snapshot. A genesis
+                // checkpoint seeds the authority's StateID; a later checkpoint must match it (Go
+                // rejects "checkpointed state has an incorrect stateID") — otherwise it belongs to a
+                // different authority and replaying it would silently fork the trusted-key set.
+                let state = aum
+                    .state
+                    .as_ref()
+                    .ok_or(TkaError::Decode("checkpoint AUM missing state"))?;
+                let incoming = (state.state_id1, state.state_id2);
+                match self.state_id {
+                    Some(existing) if existing != incoming => {
+                        return Err(TkaError::BadKeyState);
+                    }
+                    _ => self.state_id = Some(incoming),
+                }
+                self.keys = state.keys.clone();
+            }
+            AumKind::AddKey => {
+                let key = aum
+                    .key
+                    .as_ref()
+                    .ok_or(TkaError::Decode("AddKey AUM missing key"))?;
+                if self.get_key(key.id()).is_some() {
+                    return Err(TkaError::BadKeyState);
+                }
+                self.keys.push(key.clone());
+            }
+            AumKind::UpdateKey => {
+                let idx = self
+                    .find_key_index(&aum.key_id)
+                    .ok_or(TkaError::BadKeyState)?;
+                if let Some(votes) = aum.votes {
+                    self.keys[idx].votes = votes;
+                }
+                if !aum.meta.is_empty() {
+                    self.keys[idx].meta = aum.meta.clone();
+                }
+            }
+            AumKind::RemoveKey => {
+                let idx = self
+                    .find_key_index(&aum.key_id)
+                    .ok_or(TkaError::BadKeyState)?;
+                self.keys.remove(idx);
+            }
+        }
+
+        self.last_aum_hash = Some(aum.hash());
+        Ok(())
+    }
+
+    /// The verify-path [`State`] snapshot (just the trusted keys).
+    fn to_state(&self) -> State {
+        State {
+            keys: self.keys.iter().map(AumKey::to_key).collect(),
+        }
+    }
+}
+
+/// Choose the next AUM to apply when more than one child extends the current head (Go
+/// `tka.pickNextAUM`). The three rules, in order:
+///
+/// 1. **Highest signature weight** wins (computed against `state`).
+/// 2. If tied, prefer the **`RemoveKey`** AUM (a revocation should not be out-voted by a no-op fork).
+/// 3. If still tied, the **lowest `AUM.Hash()`** (bytewise) wins — a deterministic, content-derived
+///    tiebreak both peers compute identically.
+///
+/// `candidates` must be non-empty. The comparison is total and deterministic, so every node
+/// replaying the same chain selects the same active branch (the property tailnet-lock relies on).
+fn pick_next_aum<'a>(state: &ReplayState, candidates: &'a [Aum]) -> &'a Aum {
+    debug_assert!(!candidates.is_empty(), "pick_next_aum needs candidates");
+    let mut best = &candidates[0];
+    let mut best_weight = state.weight(best);
+    let mut best_hash = best.hash();
+    for cand in &candidates[1..] {
+        let w = state.weight(cand);
+        let h = cand.hash();
+        // Rule 1: strictly higher weight wins.
+        let better = if w != best_weight {
+            w > best_weight
+        } else if (cand.message_kind == AumKind::RemoveKey)
+            != (best.message_kind == AumKind::RemoveKey)
+        {
+            // Rule 2: exactly one is a RemoveKey → that one wins.
+            cand.message_kind == AumKind::RemoveKey
+        } else {
+            // Rule 3: lowest hash wins.
+            h.0 < best_hash.0
+        };
+        if better {
+            best = cand;
+            best_weight = w;
+            best_hash = h;
+        }
+    }
+    best
+}
+
+impl Authority {
+    /// Build an [`Authority`] by replaying a **linear** chain of AUMs from genesis to head (Go
+    /// `tka.Authority.Head` after `computeActiveChain` on a single confirmed branch).
+    ///
+    /// `aums` must be ordered parent→child: the first is the genesis — a `NoOp`, `AddKey`, or
+    /// `Checkpoint` with **no** parent (Go `computeStateAt` rejects any other kind as an invalid
+    /// genesis) — and each subsequent AUM's `prev_aum_hash` must equal the prior AUM's [`Aum::hash`].
+    /// A slice that is actually a *suffix* of a chain (its first AUM names a parent not in the slice)
+    /// is rejected rather than mis-rooted. Signature verification of the AUMs themselves is the
+    /// caller's responsibility for now (the sync RPC, chunk 3, verifies before handing a confirmed
+    /// chain here); this folds an already-trusted chain into the trusted-key state.
+    ///
+    /// For the **forked** case (competing children of one parent), use [`Authority::from_forked_chain`].
+    ///
+    /// # Errors
+    /// [`TkaError::BadChain`] if `aums` is empty or its genesis is an invalid kind;
+    /// [`TkaError::BadParent`] if a link doesn't chain (incl. a genesis that carries a parent);
+    /// [`TkaError::BadKeyState`] for an invalid add/remove/update or a mismatched checkpoint StateID;
+    /// [`TkaError::Decode`] for a malformed checkpoint/add.
+    pub fn from_chain(aums: &[Aum]) -> Result<Authority, TkaError> {
+        let last = aums.last().ok_or(TkaError::BadChain)?;
+        let head = last.hash();
+        let mut state = ReplayState::default();
+        for aum in aums {
+            state.apply_verified_aum(aum)?;
+        }
+        Ok(Authority {
+            head,
+            state: state.to_state(),
+        })
+    }
+
+    /// Resolve a **single fork point**: a shared linear `prefix` (genesis→fork point, parent-ordered)
+    /// followed by `branches`, the competing children of the fork point. The active child is chosen by
+    /// [`pick_next_aum`]'s deterministic rules (weight → `RemoveKey` preference → lowest hash),
+    /// evaluated against the state at the fork point, and applied. This is the consensus-critical
+    /// selection every node must make identically; the linear [`Authority::from_chain`] is the common
+    /// (no-fork) case.
+    ///
+    /// **Each branch must be exactly one AUM.** In this single-AUM-per-branch shape the choice is
+    /// provably identical to Go's `pickNextAUM` over the fork point's children. A *multi-step* branch
+    /// is **rejected** ([`TkaError::BadChain`]) rather than mis-resolved: Go re-runs `pickNextAUM` at
+    /// *every* link (`advanceByPrimary`), re-evaluating weight against the evolving state, so judging a
+    /// whole multi-AUM branch by its first AUM alone could pick a different active head than Go and
+    /// silently fork the trusted-key set. Implementing the per-step loop (and a general multi-fork DAG
+    /// walk) is deferred to when the sync layer can actually surface such a chain; until then this
+    /// guard keeps the model honest. (The common re-bootstrap case — competing single-AUM heads — is
+    /// fully covered.)
+    ///
+    /// # Errors
+    /// As [`Authority::from_chain`], plus [`TkaError::BadChain`] if `branches` is empty, or any branch
+    /// is not exactly one AUM.
+    pub fn from_forked_chain(prefix: &[Aum], branches: &[&[Aum]]) -> Result<Authority, TkaError> {
+        // Each branch must be exactly one AUM — see the doc: a multi-step branch judged by its first
+        // AUM could diverge from Go's per-step resolution. Reject rather than silently mis-resolve.
+        if branches.is_empty() || branches.iter().any(|b| b.len() != 1) {
+            return Err(TkaError::BadChain);
+        }
+        let mut state = ReplayState::default();
+        for aum in prefix {
+            state.apply_verified_aum(aum)?;
+        }
+        // Choose the winning child, judged against the state at the fork point — exactly Go's
+        // `pickNextAUM` over the children.
+        let heads: Vec<Aum> = branches.iter().map(|b| b[0].clone()).collect();
+        let winner_head = pick_next_aum(&state, &heads).hash();
+        let winner = branches
+            .iter()
+            .find(|b| b[0].hash() == winner_head)
+            .ok_or(TkaError::BadChain)?;
+        state.apply_verified_aum(&winner[0])?;
+        Ok(Authority {
+            head: winner[0].hash(),
+            state: state.to_state(),
+        })
     }
 }
 
@@ -1838,5 +2119,448 @@ mod tests {
         );
         // Round-trips deterministically (hash is stable).
         assert_eq!(checkpoint.hash(), checkpoint.hash());
+    }
+
+    // ---- AUM-chain replay (chunk 1B) -----------------------------------------------------------
+
+    /// A test trusted key from a seed byte (deterministic public key + given votes).
+    fn test_aum_key(seed: u8, votes: u32) -> AumKey {
+        use ed25519_dalek::SigningKey;
+        let pubk = SigningKey::from_bytes(&[seed; 32])
+            .verifying_key()
+            .to_bytes()
+            .to_vec();
+        AumKey {
+            kind: KeyKind::Ed25519,
+            votes,
+            public: pubk,
+            meta: Vec::new(),
+        }
+    }
+
+    /// A genesis `AUMAddKey` (no parent) adding `key`.
+    fn genesis_add(key: AumKey) -> Aum {
+        Aum {
+            message_kind: AumKind::AddKey,
+            prev_aum_hash: None,
+            key: Some(key),
+            key_id: Vec::new(),
+            state: None,
+            votes: None,
+            meta: Vec::new(),
+            signatures: Vec::new(),
+        }
+    }
+
+    /// A child AUM of `parent` of the given kind, optionally carrying a key / key_id.
+    fn child(parent: &Aum, kind: AumKind, key: Option<AumKey>, key_id: Vec<u8>) -> Aum {
+        Aum {
+            message_kind: kind,
+            prev_aum_hash: Some(parent.hash()),
+            key,
+            key_id,
+            state: None,
+            votes: None,
+            meta: Vec::new(),
+            signatures: Vec::new(),
+        }
+    }
+
+    /// Linear replay applies each kind: genesis AddKey(k0), AddKey(k1), UpdateKey(k1 votes), then
+    /// RemoveKey(k0). The final state has only k1 with its updated votes, and head = last AUM hash.
+    #[test]
+    fn replay_linear_chain_folds_all_kinds() {
+        let k0 = test_aum_key(1, 1);
+        let k1 = test_aum_key(2, 1);
+
+        let a0 = genesis_add(k0.clone());
+        let a1 = child(&a0, AumKind::AddKey, Some(k1.clone()), Vec::new());
+        let mut a2 = child(&a1, AumKind::UpdateKey, None, k1.public.clone());
+        a2.votes = Some(5);
+        let a3 = child(&a2, AumKind::RemoveKey, None, k0.public.clone());
+
+        let auth = Authority::from_chain(&[a0, a1, a2, a3.clone()]).unwrap();
+
+        // Only k1 remains, with the updated vote weight.
+        assert_eq!(auth.state().keys.len(), 1, "k0 removed, k1 remains");
+        let remaining = &auth.state().keys[0];
+        assert_eq!(remaining.public, k1.public, "k1 is the surviving key");
+        assert_eq!(remaining.votes, 5, "UpdateKey raised k1's votes to 5");
+        // Head is the hash of the last applied AUM.
+        assert_eq!(auth.head(), a3.hash(), "head = last AUM hash");
+    }
+
+    /// A broken chain link (wrong `prev_aum_hash`) is rejected with `BadParent`.
+    #[test]
+    fn replay_rejects_broken_parent_link() {
+        let k0 = test_aum_key(1, 1);
+        let k1 = test_aum_key(2, 1);
+        let a0 = genesis_add(k0);
+        // a1 claims a bogus parent, not a0's hash.
+        let mut a1 = child(&a0, AumKind::AddKey, Some(k1), Vec::new());
+        a1.prev_aum_hash = Some(AumHash([0xab; 32]));
+        assert_eq!(
+            Authority::from_chain(&[a0, a1]).unwrap_err(),
+            TkaError::BadParent
+        );
+    }
+
+    /// AddKey of an already-trusted key, and Remove/Update of an absent key, are rejected.
+    #[test]
+    fn replay_rejects_bad_key_state() {
+        let k0 = test_aum_key(1, 1);
+        let a0 = genesis_add(k0.clone());
+        // Duplicate add of k0.
+        let dup = child(&a0, AumKind::AddKey, Some(k0.clone()), Vec::new());
+        assert_eq!(
+            Authority::from_chain(&[a0.clone(), dup]).unwrap_err(),
+            TkaError::BadKeyState
+        );
+        // Remove of a key that was never added.
+        let absent = test_aum_key(9, 1);
+        let rm = child(&a0, AumKind::RemoveKey, None, absent.public.clone());
+        assert_eq!(
+            Authority::from_chain(&[a0, rm]).unwrap_err(),
+            TkaError::BadKeyState
+        );
+    }
+
+    /// An empty chain is rejected.
+    #[test]
+    fn replay_empty_chain_is_bad_chain() {
+        assert_eq!(Authority::from_chain(&[]).unwrap_err(), TkaError::BadChain);
+    }
+
+    /// `weight` sums the votes of distinct trusted signing keys: an unknown signer contributes 0, and
+    /// a key that signs twice counts once (Go `TestAUMWeight` "Double use" → its votes, not double).
+    #[test]
+    fn replay_weight_dedups_and_ignores_unknown() {
+        let k0 = test_aum_key(1, 2);
+        let k1 = test_aum_key(2, 3);
+        let state = ReplayState {
+            keys: alloc::vec![k0.clone(), k1.clone()],
+            last_aum_hash: None,
+            state_id: None,
+        };
+
+        // Empty signatures → 0.
+        let mut aum = genesis_add(test_aum_key(5, 1));
+        assert_eq!(state.weight(&aum), 0);
+
+        // One known signer (k0, votes 2).
+        aum.signatures = alloc::vec![AumSignature {
+            key_id: k0.public.clone(),
+            signature: Vec::new()
+        }];
+        assert_eq!(state.weight(&aum), 2);
+
+        // Two distinct known signers → 2 + 3 = 5.
+        aum.signatures = alloc::vec![
+            AumSignature {
+                key_id: k0.public.clone(),
+                signature: Vec::new()
+            },
+            AumSignature {
+                key_id: k1.public.clone(),
+                signature: Vec::new()
+            },
+        ];
+        assert_eq!(state.weight(&aum), 5);
+
+        // Double-use of k0 → counted once (2), not 4.
+        aum.signatures = alloc::vec![
+            AumSignature {
+                key_id: k0.public.clone(),
+                signature: Vec::new()
+            },
+            AumSignature {
+                key_id: k0.public.clone(),
+                signature: Vec::new()
+            },
+        ];
+        assert_eq!(state.weight(&aum), 2, "a key signing twice counts once");
+
+        // Unknown signer → 0.
+        aum.signatures = alloc::vec![AumSignature {
+            key_id: alloc::vec![0xff; 32],
+            signature: Vec::new()
+        }];
+        assert_eq!(
+            state.weight(&aum),
+            0,
+            "an untrusted signing key contributes no weight"
+        );
+    }
+
+    /// `pick_next_aum` rule 3 (the deterministic tiebreak): with equal weight (0, no signatures) and
+    /// neither a RemoveKey, the candidate with the lexicographically-lowest `Hash()` wins —
+    /// regardless of input order, so two nodes select the same branch.
+    #[test]
+    fn pick_next_aum_lowest_hash_tiebreak_is_order_independent() {
+        let k = test_aum_key(1, 1);
+        let a0 = genesis_add(k);
+        // Two distinct NoOp children of a0 (differ by key_id so their hashes differ).
+        let c1 = child(&a0, AumKind::NoOp, None, alloc::vec![1]);
+        let c2 = child(&a0, AumKind::NoOp, None, alloc::vec![2]);
+        let state = ReplayState::default();
+
+        let lower = if c1.hash().0 < c2.hash().0 {
+            c1.hash()
+        } else {
+            c2.hash()
+        };
+        let ab = [c1.clone(), c2.clone()];
+        let ba = [c2, c1];
+        let pick_ab = pick_next_aum(&state, &ab).hash();
+        let pick_ba = pick_next_aum(&state, &ba).hash();
+        assert_eq!(pick_ab, lower, "lowest hash wins");
+        assert_eq!(
+            pick_ab, pick_ba,
+            "selection is independent of candidate order"
+        );
+    }
+
+    /// `pick_next_aum` rule 1 (weight) dominates rule 3 (hash): a signed child with real weight beats
+    /// an unsigned child even if the unsigned one has a lower hash.
+    #[test]
+    fn pick_next_aum_weight_beats_hash() {
+        use ed25519_dalek::SigningKey;
+        let signer_seed = 3u8;
+        let signer_pub = SigningKey::from_bytes(&[signer_seed; 32])
+            .verifying_key()
+            .to_bytes()
+            .to_vec();
+        let state = ReplayState {
+            keys: alloc::vec![AumKey {
+                kind: KeyKind::Ed25519,
+                votes: 4,
+                public: signer_pub.clone(),
+                meta: Vec::new(),
+            }],
+            last_aum_hash: None,
+            state_id: None,
+        };
+
+        let a0 = genesis_add(test_aum_key(1, 1));
+        let unsigned = child(&a0, AumKind::NoOp, None, alloc::vec![1]);
+        let mut signed = child(&a0, AumKind::NoOp, None, alloc::vec![2]);
+        signed.signatures = alloc::vec![AumSignature {
+            key_id: signer_pub,
+            signature: Vec::new(),
+        }];
+
+        // The signed child wins on weight (4 > 0) no matter the hash order.
+        let candidates = [unsigned.clone(), signed.clone()];
+        let winner = pick_next_aum(&state, &candidates);
+        assert_eq!(
+            winner.hash(),
+            signed.hash(),
+            "higher weight wins over lower hash"
+        );
+    }
+
+    /// `from_forked_chain`: a shared genesis, then two competing RemoveKey vs NoOp branches at equal
+    /// weight — rule 2 prefers the RemoveKey branch. The resulting state reflects the chosen branch.
+    #[test]
+    fn forked_chain_prefers_removekey_branch() {
+        let k0 = test_aum_key(1, 1);
+        let k1 = test_aum_key(2, 1);
+        // Genesis adds both keys (two AUMs).
+        let a0 = genesis_add(k0.clone());
+        let a1 = child(&a0, AumKind::AddKey, Some(k1.clone()), Vec::new());
+        // Fork at a1: branch A removes k0; branch B is a NoOp. Equal weight (0 sigs).
+        let branch_remove = child(&a1, AumKind::RemoveKey, None, k0.public.clone());
+        let branch_noop = child(&a1, AumKind::NoOp, None, alloc::vec![9]);
+
+        let noop_branch = [branch_noop.clone()];
+        let remove_branch = [branch_remove.clone()];
+        let auth = Authority::from_forked_chain(&[a0, a1], &[&noop_branch[..], &remove_branch[..]])
+            .unwrap();
+
+        // RemoveKey branch wins → k0 gone, only k1 remains; head = the RemoveKey AUM.
+        assert_eq!(auth.state().keys.len(), 1);
+        assert_eq!(auth.state().keys[0].public, k1.public);
+        assert_eq!(
+            auth.head(),
+            branch_remove.hash(),
+            "active head = RemoveKey branch"
+        );
+    }
+
+    /// End-to-end: replay a chain to an `Authority`, then verify it authorizes a node key signed by a
+    /// trusted key — proving the replayed state drives `node_key_authorized` identically to
+    /// `from_state`. A key removed by the chain no longer authorizes.
+    #[test]
+    fn replayed_authority_authorizes_node_end_to_end() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let signing = SigningKey::from_bytes(&[77u8; 32]);
+        let trusted_pub = signing.verifying_key().to_bytes().to_vec();
+        let trusted = AumKey {
+            kind: KeyKind::Ed25519,
+            votes: 1,
+            public: trusted_pub.clone(),
+            meta: Vec::new(),
+        };
+        // A second key we'll add then remove, to show a removed key can't authorize.
+        let revoked_signing = SigningKey::from_bytes(&[88u8; 32]);
+        let revoked_pub = revoked_signing.verifying_key().to_bytes().to_vec();
+        let revoked = AumKey {
+            kind: KeyKind::Ed25519,
+            votes: 1,
+            public: revoked_pub.clone(),
+            meta: Vec::new(),
+        };
+
+        let a0 = genesis_add(trusted);
+        let a1 = child(&a0, AumKind::AddKey, Some(revoked), Vec::new());
+        let a2 = child(&a1, AumKind::RemoveKey, None, revoked_pub.clone());
+        let auth = Authority::from_chain(&[a0, a1, a2]).unwrap();
+
+        let node_key = alloc::vec![7u8; 32];
+        // Signature from the still-trusted key authorizes.
+        let mut sig = NodeKeySignature {
+            sig_kind: SigKind::Direct,
+            pubkey: node_key.clone(),
+            key_id: trusted_pub.clone(),
+            signature: Vec::new(),
+            nested: None,
+            wrapping_pubkey: Vec::new(),
+        };
+        sig.signature = signing.sign(&sig.sig_hash()).to_bytes().to_vec();
+        assert!(
+            auth.node_key_authorized(&node_key, &sig.to_cbor(true).to_vec())
+                .is_ok(),
+            "the replayed authority must authorize a node signed by a still-trusted key"
+        );
+
+        // The same node key signed by the REVOKED key must be rejected (key no longer in state).
+        let mut bad = NodeKeySignature {
+            sig_kind: SigKind::Direct,
+            pubkey: node_key.clone(),
+            key_id: revoked_pub.clone(),
+            signature: Vec::new(),
+            nested: None,
+            wrapping_pubkey: Vec::new(),
+        };
+        bad.signature = revoked_signing.sign(&bad.sig_hash()).to_bytes().to_vec();
+        assert_eq!(
+            auth.node_key_authorized(&node_key, &bad.to_cbor(true).to_vec())
+                .unwrap_err(),
+            TkaError::UntrustedKey,
+            "a key the chain removed must not authorize"
+        );
+    }
+
+    /// Genesis-kind guard (Go `computeStateAt` "invalid genesis update"): a chain whose first AUM is
+    /// a `RemoveKey`/`UpdateKey` is rejected. (A genesis `NoOp`/`AddKey`/`Checkpoint` is allowed.)
+    #[test]
+    fn replay_rejects_invalid_genesis_kind() {
+        // A bare RemoveKey as genesis: no key to remove → today this is BadKeyState, but the genesis
+        // guard catches an UpdateKey before the key lookup. Use UpdateKey to exercise the guard arm.
+        let mut g = genesis_add(test_aum_key(1, 1));
+        g.message_kind = AumKind::UpdateKey;
+        g.key = None;
+        g.key_id = test_aum_key(1, 1).public.clone();
+        assert_eq!(
+            Authority::from_chain(&[g]).unwrap_err(),
+            TkaError::BadChain,
+            "an UpdateKey cannot be a genesis AUM"
+        );
+    }
+
+    /// Genesis must carry no parent: a first AUM with a non-None `prev_aum_hash` (i.e. a chain
+    /// *suffix* mis-supplied as a whole chain) is rejected as `BadParent`, not silently re-rooted.
+    #[test]
+    fn replay_rejects_genesis_with_parent() {
+        let mut g = genesis_add(test_aum_key(1, 1));
+        g.prev_aum_hash = Some(AumHash([0x11; 32])); // names a parent not in the slice
+        assert_eq!(
+            Authority::from_chain(&[g]).unwrap_err(),
+            TkaError::BadParent,
+            "a genesis AUM that names a parent must be rejected (not treated as genesis)"
+        );
+    }
+
+    /// Checkpoint StateID guard (Go "checkpointed state has an incorrect stateID"): a genesis
+    /// checkpoint seeds the StateID; a later checkpoint with a different StateID is rejected.
+    #[test]
+    fn replay_rejects_checkpoint_stateid_mismatch() {
+        let k = test_aum_key(1, 1);
+        // Genesis checkpoint seeds StateID (7, 0).
+        let genesis = Aum {
+            message_kind: AumKind::Checkpoint,
+            prev_aum_hash: None,
+            key: None,
+            key_id: Vec::new(),
+            state: Some(AumState {
+                last_aum_hash: None,
+                disablement_values: Vec::new(),
+                keys: alloc::vec![k.clone()],
+                state_id1: 7,
+                state_id2: 0,
+            }),
+            votes: None,
+            meta: Vec::new(),
+            signatures: Vec::new(),
+        };
+        // A second checkpoint, correctly chained, but with a FOREIGN StateID (8, 0).
+        let bad = Aum {
+            message_kind: AumKind::Checkpoint,
+            prev_aum_hash: Some(genesis.hash()),
+            key: None,
+            key_id: Vec::new(),
+            state: Some(AumState {
+                last_aum_hash: Some(genesis.hash()),
+                disablement_values: Vec::new(),
+                keys: alloc::vec![k.clone()],
+                state_id1: 8, // ← mismatch
+                state_id2: 0,
+            }),
+            votes: None,
+            meta: Vec::new(),
+            signatures: Vec::new(),
+        };
+        assert_eq!(
+            Authority::from_chain(&[genesis.clone(), bad]).unwrap_err(),
+            TkaError::BadKeyState,
+            "a checkpoint with a foreign StateID belongs to another authority and must be rejected"
+        );
+        // A matching-StateID second checkpoint is accepted.
+        let ok = Aum {
+            message_kind: AumKind::Checkpoint,
+            prev_aum_hash: Some(genesis.hash()),
+            key: None,
+            key_id: Vec::new(),
+            state: Some(AumState {
+                last_aum_hash: Some(genesis.hash()),
+                disablement_values: Vec::new(),
+                keys: alloc::vec![k],
+                state_id1: 7,
+                state_id2: 0,
+            }),
+            votes: None,
+            meta: Vec::new(),
+            signatures: Vec::new(),
+        };
+        assert!(Authority::from_chain(&[genesis, ok]).is_ok());
+    }
+
+    /// `from_forked_chain` rejects a multi-step branch rather than mis-resolving it (Go re-runs
+    /// pickNextAUM per link; judging a whole branch by its first AUM could diverge).
+    #[test]
+    fn forked_chain_rejects_multistep_branch() {
+        let k0 = test_aum_key(1, 1);
+        let a0 = genesis_add(k0.clone());
+        let b1 = child(&a0, AumKind::NoOp, None, alloc::vec![1]);
+        // A two-AUM branch (b1 → b2): must be rejected as BadChain.
+        let b2 = child(&b1, AumKind::NoOp, None, alloc::vec![2]);
+        let single = [child(&a0, AumKind::NoOp, None, alloc::vec![3])];
+        let multi = [b1, b2];
+        assert_eq!(
+            Authority::from_forked_chain(&[a0], &[&single[..], &multi[..]]).unwrap_err(),
+            TkaError::BadChain,
+            "a multi-step branch must be rejected, not judged by its first AUM"
+        );
     }
 }
