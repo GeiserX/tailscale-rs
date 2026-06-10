@@ -176,7 +176,10 @@ pub use ts_runtime::fallback_tcp::{
 #[doc(inline)]
 pub use ts_runtime::taildrop::WaitingFile;
 #[doc(inline)]
-pub use ts_runtime::{DeviceState, FileTarget, RegistrationError, Status, StatusNode, WhoIs};
+pub use ts_runtime::{
+    DeviceState, FileTarget, NetcheckReport, RegionLatency, RegistrationError, Status, StatusNode,
+    WhoIs,
+};
 
 #[cfg(feature = "axum")]
 pub mod axum;
@@ -781,6 +784,22 @@ impl Device {
         self.runtime
             .control
             .ask(ts_runtime::control_runner::DnsConfig)
+            .await
+            .map_err(ts_runtime::Error::from)
+            .map_err(Into::into)
+    }
+
+    /// This node's latest network-conditions report — the Rust analog of Go's `netcheck.Report` as
+    /// `tailscale netcheck` surfaces it.
+    ///
+    /// Returns the [`NetcheckReport`]: the preferred (lowest-latency) DERP region and the per-region
+    /// latency map this node last measured. Empty (default) before the first measurement. This fork's
+    /// net-report path measures only DERP-region latency, so the report carries that subset rather
+    /// than fabricating the UDP/port-mapping fields Go also reports (see [`NetcheckReport`]).
+    pub async fn netcheck(&self) -> Result<NetcheckReport, Error> {
+        self.runtime
+            .control
+            .ask(ts_runtime::control_runner::Netcheck)
             .await
             .map_err(ts_runtime::Error::from)
             .map_err(Into::into)

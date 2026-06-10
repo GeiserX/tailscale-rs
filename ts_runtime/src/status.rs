@@ -147,6 +147,58 @@ pub(crate) fn whois_addr(addr: SocketAddr) -> IpAddr {
     addr.ip()
 }
 
+/// A measured-latency entry for one DERP region in a [`NetcheckReport`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionLatency {
+    /// The DERP region id (Go `tailcfg.DERPRegionID`).
+    pub region_id: u32,
+    /// The measured round-trip latency to the region's closest DERP node.
+    pub latency: std::time::Duration,
+}
+
+/// A snapshot of this node's latest network conditions report — the Rust analog of Go's
+/// `netcheck.Report` as `tailscale netcheck` surfaces it.
+///
+/// ## Surfaced subset (do not fabricate)
+/// Go's `netcheck.Report` also carries UDP/IPv4/IPv6 reachability, port-mapping support
+/// (UPnP/PMP/PCP), `MappingVariesByDestIP`, global-address discovery, etc. This fork's net-report
+/// path measures only **DERP-region latency** (the data that drives home-region selection), so the
+/// report carries exactly that — the preferred (lowest-latency) region and the per-region latency
+/// map — rather than inventing fields we never probe. Empty before the first measurement.
+#[derive(Debug, Clone, PartialEq, Eq, Default, kameo::Reply)]
+pub struct NetcheckReport {
+    /// The id of the preferred DERP region — the lowest-latency region this node measured, the one it
+    /// homes to (Go `Report.PreferredDERP`). `None` before the first measurement / when no region
+    /// was reachable.
+    pub preferred_derp: Option<u32>,
+    /// Per-region measured latencies, sorted by latency ascending (Go `Report.RegionLatency`, here as
+    /// an ordered list). The first entry, when present, is the [`preferred_derp`](Self::preferred_derp)
+    /// region.
+    pub region_latencies: Vec<RegionLatency>,
+}
+
+impl NetcheckReport {
+    /// Build a report from the latest DERP-region measurements (the `RegionResult` set the latency
+    /// measurer produces). `results` is expected sorted by latency ascending (the measurer's
+    /// `RegionResult` `Ord` sorts on latency first), so the first entry is the preferred region; we
+    /// do not re-sort beyond trusting that contract for `preferred_derp`, but the list is emitted in
+    /// the order given. An empty `results` yields the default (no preferred region, empty list).
+    pub(crate) fn from_region_results(results: &[ts_netcheck::RegionResult]) -> NetcheckReport {
+        let region_latencies: Vec<RegionLatency> = results
+            .iter()
+            .map(|r| RegionLatency {
+                // `ts_derp::RegionId` is a `NonZeroU32` newtype (its `.0` is the public inner).
+                region_id: r.id.0.get(),
+                latency: r.latency,
+            })
+            .collect();
+        NetcheckReport {
+            preferred_derp: region_latencies.first().map(|r| r.region_id),
+            region_latencies,
+        }
+    }
+}
+
 /// A tailnet peer this node can send a Taildrop file *to*, plus the peerAPI base URL to reach it.
 ///
 /// Analogous to tsnet's `apitype.FileTarget`. The set is produced by
@@ -407,5 +459,54 @@ mod tests {
 
         let names: Vec<_> = targets.iter().map(|t| t.node.hostname.clone()).collect();
         assert_eq!(names, vec!["alpha", "zeta"]);
+    }
+
+    fn region_result(id: u32, latency_ms: u64) -> ts_netcheck::RegionResult {
+        ts_netcheck::RegionResult {
+            latency: std::time::Duration::from_millis(latency_ms),
+            id: ts_derp::RegionId(std::num::NonZeroU32::new(id).unwrap()),
+            latency_map_key: format!("{id}-v4"),
+            connected_remote: "1.2.3.4:443".parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn netcheck_report_preferred_is_first_region() {
+        // The measurer hands results sorted by latency ascending, so the first is the preferred
+        // (home) region and every region is surfaced.
+        let results = [
+            region_result(5, 12),
+            region_result(9, 40),
+            region_result(2, 88),
+        ];
+        let report = NetcheckReport::from_region_results(&results);
+        assert_eq!(
+            report.preferred_derp,
+            Some(5),
+            "lowest-latency region is preferred"
+        );
+        assert_eq!(report.region_latencies.len(), 3);
+        assert_eq!(report.region_latencies[0].region_id, 5);
+        assert_eq!(
+            report.region_latencies[0].latency,
+            std::time::Duration::from_millis(12)
+        );
+        // Order is preserved as given (latency-ascending from the measurer).
+        let ids: Vec<u32> = report
+            .region_latencies
+            .iter()
+            .map(|r| r.region_id)
+            .collect();
+        assert_eq!(ids, vec![5, 9, 2]);
+    }
+
+    #[test]
+    fn netcheck_report_empty_when_no_measurements() {
+        // Before any measurement (or when none was reachable): no preferred region, empty list — not
+        // a fabricated value.
+        let report = NetcheckReport::from_region_results(&[]);
+        assert_eq!(report, NetcheckReport::default());
+        assert_eq!(report.preferred_derp, None);
+        assert!(report.region_latencies.is_empty());
     }
 }

@@ -59,7 +59,7 @@ mod tun_actor;
 pub use device_state::{DeviceState, RegistrationError};
 pub(crate) use env::Env;
 pub use error::{Error, ErrorKind};
-pub use status::{FileTarget, Status, StatusNode, WhoIs};
+pub use status::{FileTarget, NetcheckReport, RegionLatency, Status, StatusNode, WhoIs};
 pub use ts_dataplane::{CaptureHook, CapturePath};
 
 use crate::peer_tracker::PeerTracker;
