@@ -208,6 +208,10 @@ pub enum TkaError {
     /// parent), or otherwise could not be replayed into a state.
     #[error("AUM chain is empty or has no valid genesis")]
     BadChain,
+    /// An AUM carried no signatures (Go `aumVerify` "unsigned AUM"). Every AUM — including the
+    /// genesis — must be signed by at least one trusted key before it can advance the chain.
+    #[error("AUM is unsigned")]
+    UnsignedAum,
 }
 
 impl NodeKeySignature {
@@ -795,6 +799,101 @@ impl ReplayState {
             keys: self.keys.iter().map(AumKey::to_key).collect(),
         }
     }
+
+    /// Verify an AUM's signatures against the trusted keys in **this** state — the authenticity
+    /// gate Go runs in `aumVerify` (`tka/tka.go`) before `applyVerifiedAUM`. This is MUST-1: a
+    /// control-supplied chain must not advance the trusted-key state on an AUM that isn't signed by
+    /// keys already trusted at its parent.
+    ///
+    /// Mirrors Go exactly (verified against `tailscale/tailscale` v1.100.0):
+    /// - **`len(signatures) == 0` ⇒ "unsigned AUM"** ([`TkaError::UnsignedAum`]). Every AUM,
+    ///   including the genesis, must be signed.
+    /// - For **every** signature (not "at least one"): its `key_id` must resolve to a key trusted in
+    ///   this state ([`TkaError::UntrustedKey`] otherwise), and the signature must verify
+    ///   cryptographically over [`Aum::sig_hash`] with that key — cofactored Ed25519
+    ///   (`ed25519consensus.Verify` / ZIP-215), the same primitive the node-key-signature Direct
+    ///   path uses. Any failure rejects the whole AUM ([`TkaError::BadSignature`]).
+    /// - **No weight/threshold gate here.** Go's `aumVerify` does *not* compare `Weight` against any
+    ///   quorum; weight is used only by [`pick_next_aum`] for fork resolution. "Authentic" means
+    ///   all signatures valid against trusted keys.
+    /// - `is_genesis` only documents intent; unlike Go it changes nothing in *this* function (Go's
+    ///   `isGenesisAUM` flag gates `checkParent`, which the replayer performs separately in
+    ///   [`ReplayState::apply_verified_aum`]). The signature checks run identically for genesis and
+    ///   non-genesis AUMs.
+    fn verify_aum_signatures(&self, aum: &Aum, _is_genesis: bool) -> Result<(), TkaError> {
+        if aum.signatures.is_empty() {
+            return Err(TkaError::UnsignedAum);
+        }
+        let sig_hash = aum.sig_hash();
+        for sig in &aum.signatures {
+            let key = self.get_key(&sig.key_id).ok_or(TkaError::UntrustedKey)?;
+            if key.kind != KeyKind::Ed25519 || key.public.len() != 32 {
+                return Err(TkaError::Decode("AUM signing key is not ed25519"));
+            }
+            // AUM `tkatype.Signature` verifies cofactored (ZIP-215), matching Go's
+            // `signatureVerify` → `ed25519consensus.Verify`.
+            verify_ed25519_zip215(&key.public, &sig_hash, &sig.signature)?;
+        }
+        Ok(())
+    }
+}
+
+/// A chain of AUMs whose signatures have been verified as it was folded from genesis to head — the
+/// only input [`Authority::from_verified_chain`] accepts. This is MUST-1 made un-skippable in the
+/// type system: a `VerifiedAumChain` can be obtained **only** via [`VerifiedAumChain::verify`],
+/// which runs Go's `aumVerify` on every AUM against the trusted-key state as it stood at that AUM's
+/// parent. A control-supplied `&[Aum]` therefore cannot reach a live `Authority`'s trusted-key set
+/// without each link being signed by keys already trusted at the point it is applied.
+///
+/// Mirrors Go `tka.Authority.Inform` (`InformIdempotent` → `aumVerify(update, state, false)` →
+/// `CommitVerifiedAUMs`), which verifies as it folds rather than trusting a precomputed chain.
+#[derive(Debug, Clone)]
+pub struct VerifiedAumChain {
+    /// The replayed trusted-key state at the head (already folded + verified).
+    state: ReplayState,
+    /// The head AUM hash (the chain link the resulting authority advertises).
+    head: AumHash,
+}
+
+impl VerifiedAumChain {
+    /// Verify and replay a **linear** chain of AUMs from genesis to head, checking each AUM's
+    /// signatures against the trusted-key state at its parent (MUST-1). On success the returned
+    /// value witnesses that every link is authentic and the chain folds cleanly.
+    ///
+    /// `aums` must be ordered parent→child (the first is the genesis). The genesis is verified
+    /// against the trusted-key set it establishes: a genesis **`Checkpoint`** self-certifies (its
+    /// signatures must verify against the keys it embeds, exactly Go's
+    /// `aumVerify(bootstrap, *bootstrap.State, true)`); a genesis `AddKey`/`NoOp` is verified
+    /// against the keys present *after* it seeds them, so a bootstrapping `AddKey` must be
+    /// self-signed by the key it introduces. Each subsequent AUM is verified against the state at
+    /// its parent, then folded.
+    ///
+    /// # Errors
+    /// [`TkaError::UnsignedAum`] for an AUM with no signatures; [`TkaError::UntrustedKey`] if a
+    /// signature names a key not trusted at that point; [`TkaError::BadSignature`] on a failed
+    /// cryptographic check; plus every structural error of [`ReplayState::apply_verified_aum`]
+    /// ([`TkaError::BadChain`]/[`BadParent`](TkaError::BadParent)/[`BadKeyState`](TkaError::BadKeyState)/[`Decode`](TkaError::Decode)).
+    pub fn verify(aums: &[Aum]) -> Result<VerifiedAumChain, TkaError> {
+        let last = aums.last().ok_or(TkaError::BadChain)?;
+        let head = last.hash();
+        let mut state = ReplayState::default();
+        for (i, aum) in aums.iter().enumerate() {
+            let is_genesis = i == 0;
+            // Apply the structural fold FIRST so a genesis `Checkpoint`/`AddKey` seeds the trusted
+            // keys, then verify signatures against the resulting state — this is what lets a genesis
+            // self-certify (Go verifies a bootstrap Checkpoint against its own embedded `*State`).
+            // For a non-genesis AUM, `apply_verified_aum` only mutates *after* its parent-link check
+            // passes; we verify signatures against the state-at-parent by checking BEFORE the fold.
+            if is_genesis {
+                state.apply_verified_aum(aum)?;
+                state.verify_aum_signatures(aum, true)?;
+            } else {
+                state.verify_aum_signatures(aum, false)?;
+                state.apply_verified_aum(aum)?;
+            }
+        }
+        Ok(VerifiedAumChain { state, head })
+    }
 }
 
 /// Choose the next AUM to apply when more than one child extends the current head (Go
@@ -837,16 +936,39 @@ fn pick_next_aum<'a>(state: &ReplayState, candidates: &'a [Aum]) -> &'a Aum {
 }
 
 impl Authority {
+    /// Build an [`Authority`] from a [`VerifiedAumChain`] — the **trust-boundary** constructor.
+    ///
+    /// Because a `VerifiedAumChain` can only be produced by [`VerifiedAumChain::verify`] (which runs
+    /// Go's `aumVerify` on every link), this is the constructor a live client must use when the chain
+    /// originates from an untrusted source (the control plane / `/machine/tka/*` sync RPC). The type
+    /// system makes the signature check un-skippable: there is no way to reach this function with an
+    /// unverified chain. Mirrors Go `tka.Open`, which folds only AUMs already verified by `Inform`.
+    pub fn from_verified_chain(chain: VerifiedAumChain) -> Authority {
+        Authority {
+            head: chain.head,
+            state: chain.state.to_state(),
+        }
+    }
+
     /// Build an [`Authority`] by replaying a **linear** chain of AUMs from genesis to head (Go
-    /// `tka.Authority.Head` after `computeActiveChain` on a single confirmed branch).
+    /// `tka.Authority.Head` after `computeActiveChain` on a single confirmed branch), checking only
+    /// the chain's **structure** (genesis kind, parent links, key-state transitions, checkpoint
+    /// StateID) — **NOT** AUM signatures.
+    ///
+    /// # This is NOT a trust boundary
+    /// `from_chain` does not verify that each AUM is signed by keys trusted at its parent. It is safe
+    /// only for chains whose authenticity is already established by other means — the existing unit
+    /// tests, and a chain the caller has *itself* fed through [`VerifiedAumChain::verify`]. For any
+    /// chain that comes from an untrusted source (the control plane), use
+    /// [`VerifiedAumChain::verify`] + [`Authority::from_verified_chain`], which the type system makes
+    /// impossible to bypass. (A malicious control plane could otherwise forge an `AddKey`/`RemoveKey`
+    /// here and silently defeat tailnet lock — the exact threat TKA exists to stop.)
     ///
     /// `aums` must be ordered parent→child: the first is the genesis — a `NoOp`, `AddKey`, or
     /// `Checkpoint` with **no** parent (Go `computeStateAt` rejects any other kind as an invalid
     /// genesis) — and each subsequent AUM's `prev_aum_hash` must equal the prior AUM's [`Aum::hash`].
     /// A slice that is actually a *suffix* of a chain (its first AUM names a parent not in the slice)
-    /// is rejected rather than mis-rooted. Signature verification of the AUMs themselves is the
-    /// caller's responsibility for now (the sync RPC, chunk 3, verifies before handing a confirmed
-    /// chain here); this folds an already-trusted chain into the trusted-key state.
+    /// is rejected rather than mis-rooted.
     ///
     /// For the **forked** case (competing children of one parent), use [`Authority::from_forked_chain`].
     ///
@@ -2852,6 +2974,199 @@ mod tests {
             hex(&checkpoint.hash().0),
             GO_HASH,
             "with the nil-vs-empty fix, the checkpoint chain-link Hash matches Go"
+        );
+    }
+
+    // =======================================================================================
+    // MUST-1: AUM signature verification (`VerifiedAumChain` / Go `aumVerify`). The trust
+    // boundary for a control-supplied chain — an AUM may advance the trusted-key state only if
+    // every signature on it verifies against a key already trusted at its parent.
+    // =======================================================================================
+
+    /// The signing key whose public key `test_aum_key(seed, _)` derives — so a key trusted via
+    /// `test_aum_key(seed, v)` can be made to actually sign an AUM.
+    fn signer_for(seed: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+    }
+
+    /// Sign `aum` with each `(seed)` signer, appending a real `AumSignature` over `aum.sig_hash()`.
+    /// The signer's public key is `test_aum_key(seed, _).public`, so signing with `seed` produces a
+    /// signature that a state trusting `test_aum_key(seed, _)` will accept.
+    fn sign_aum(aum: &mut Aum, seeds: &[u8]) {
+        use ed25519_dalek::Signer;
+        let sig_hash = aum.sig_hash();
+        for &seed in seeds {
+            let signer = signer_for(seed);
+            aum.signatures.push(AumSignature {
+                key_id: signer.verifying_key().to_bytes().to_vec(),
+                signature: signer.sign(&sig_hash).to_bytes().to_vec(),
+            });
+        }
+    }
+
+    /// A genesis `AddKey` that adds `test_aum_key(seed, votes)` and is self-signed by that very key
+    /// — the bootstrapping shape (Go verifies a genesis against the keys it itself establishes).
+    fn signed_genesis_add(seed: u8, votes: u32) -> Aum {
+        let mut g = genesis_add(test_aum_key(seed, votes));
+        sign_aum(&mut g, &[seed]);
+        g
+    }
+
+    /// Happy path: a self-signed genesis followed by a child signed by the trusted genesis key
+    /// verifies, and `from_verified_chain` yields the same state as the structural `from_chain`.
+    #[test]
+    fn verified_chain_accepts_properly_signed_chain() {
+        let g = signed_genesis_add(1, 1);
+        // Child adds a second key, signed by the trusted key from the genesis (seed 1).
+        let mut a1 = child(&g, AumKind::AddKey, Some(test_aum_key(2, 1)), Vec::new());
+        sign_aum(&mut a1, &[1]);
+
+        let chain = [g.clone(), a1.clone()];
+        let verified = VerifiedAumChain::verify(&chain).expect("a properly signed chain verifies");
+        let auth = Authority::from_verified_chain(verified);
+
+        assert_eq!(auth.head(), a1.hash(), "head = last AUM");
+        assert_eq!(auth.state().keys.len(), 2, "both keys trusted");
+        // The verified-path state must equal the structural-path state for an authentic chain.
+        let structural = Authority::from_chain(&chain).unwrap();
+        assert_eq!(auth.state(), structural.state());
+        assert_eq!(auth.head(), structural.head());
+    }
+
+    /// An unsigned AUM (no signatures at all) is rejected — Go `aumVerify` "unsigned AUM". This
+    /// holds even for the genesis.
+    #[test]
+    fn verified_chain_rejects_unsigned_aum() {
+        // Unsigned genesis.
+        let g = genesis_add(test_aum_key(1, 1));
+        assert_eq!(
+            VerifiedAumChain::verify(core::slice::from_ref(&g)).unwrap_err(),
+            TkaError::UnsignedAum,
+            "an unsigned genesis must be rejected"
+        );
+
+        // Signed genesis, but an unsigned child.
+        let sg = signed_genesis_add(1, 1);
+        let a1 = child(&sg, AumKind::AddKey, Some(test_aum_key(2, 1)), Vec::new());
+        assert_eq!(
+            VerifiedAumChain::verify(&[sg, a1]).unwrap_err(),
+            TkaError::UnsignedAum,
+            "an unsigned non-genesis AUM must be rejected"
+        );
+    }
+
+    /// THE headline security property: a malicious control plane inserts an `AddKey` that adds the
+    /// attacker's own key, signed by the attacker (a key NOT trusted in the current state). MUST-1
+    /// rejects it as `UntrustedKey` — so the forged key never reaches a live `Authority`. Without
+    /// the signature gate, `from_chain` would happily fold it (demonstrated) — which is exactly the
+    /// tailnet-lock-defeating forgery the type-enforced `VerifiedAumChain` prevents.
+    #[test]
+    fn verified_chain_rejects_forged_addkey_from_untrusted_signer() {
+        let g = signed_genesis_add(1, 1); // only key seed=1 is trusted
+        // Attacker forges an AddKey inserting their own key (seed 9), signed by seed 9 (untrusted).
+        let mut forged = child(&g, AumKind::AddKey, Some(test_aum_key(9, 99)), Vec::new());
+        sign_aum(&mut forged, &[9]);
+
+        assert_eq!(
+            VerifiedAumChain::verify(&[g.clone(), forged.clone()]).unwrap_err(),
+            TkaError::UntrustedKey,
+            "an AddKey signed only by an untrusted key must be rejected"
+        );
+        // Contrast: the structural-only `from_chain` (NOT a trust boundary) DOES fold the forgery,
+        // proving why the type-enforced verified path is necessary.
+        let structural = Authority::from_chain(&[g, forged]).unwrap();
+        assert_eq!(
+            structural.state().keys.len(),
+            2,
+            "structural from_chain folds the forged key — exactly why it is not a trust boundary"
+        );
+    }
+
+    /// A signature whose `key_id` IS trusted but whose bytes were produced over different content
+    /// (here: signed by the wrong private key but labelled with the trusted key's id) fails the
+    /// cryptographic check → `BadSignature`.
+    #[test]
+    fn verified_chain_rejects_tampered_signature() {
+        let g = signed_genesis_add(1, 1);
+        let mut a1 = child(&g, AumKind::AddKey, Some(test_aum_key(2, 1)), Vec::new());
+        // Label the signature with the trusted key's id (seed 1) but sign with the WRONG key.
+        use ed25519_dalek::Signer;
+        let wrong = signer_for(42);
+        a1.signatures.push(AumSignature {
+            key_id: signer_for(1).verifying_key().to_bytes().to_vec(),
+            signature: wrong.sign(&a1.sig_hash()).to_bytes().to_vec(),
+        });
+        assert_eq!(
+            VerifiedAumChain::verify(&[g, a1]).unwrap_err(),
+            TkaError::BadSignature,
+            "a signature that doesn't verify under the named trusted key is rejected"
+        );
+    }
+
+    /// Every signature must verify (Go loops over all, failing on the first bad one): a child with
+    /// one valid trusted signature AND one bad/untrusted signature is still rejected.
+    #[test]
+    fn verified_chain_requires_all_signatures_valid() {
+        let g = signed_genesis_add(1, 1);
+        let mut a1 = child(&g, AumKind::AddKey, Some(test_aum_key(2, 1)), Vec::new());
+        // First a valid signature by the trusted key, then a second by an untrusted key.
+        sign_aum(&mut a1, &[1]); // valid (seed 1 trusted)
+        sign_aum(&mut a1, &[7]); // untrusted (seed 7 not in state)
+        assert_eq!(
+            VerifiedAumChain::verify(&[g, a1]).unwrap_err(),
+            TkaError::UntrustedKey,
+            "a single untrusted signature rejects the AUM even alongside a valid one"
+        );
+    }
+
+    /// A genesis `Checkpoint` self-certifies against the keys it embeds (Go
+    /// `aumVerify(bootstrap, *bootstrap.State, true)`): the checkpoint's signature must verify
+    /// against a key inside its own `State`.
+    #[test]
+    fn verified_chain_genesis_checkpoint_self_certifies() {
+        let trusted = test_aum_key(1, 1);
+        let mut g = Aum {
+            message_kind: AumKind::Checkpoint,
+            prev_aum_hash: None,
+            key: None,
+            key_id: Vec::new(),
+            state: Some(AumState {
+                last_aum_hash: None,
+                disablement_values: None,
+                keys: Some(alloc::vec![trusted.clone()]),
+                state_id1: 0,
+                state_id2: 0,
+            }),
+            votes: None,
+            meta: Vec::new(),
+            signatures: Vec::new(),
+        };
+        // Unsigned → rejected.
+        assert_eq!(
+            VerifiedAumChain::verify(&[g.clone()]).unwrap_err(),
+            TkaError::UnsignedAum
+        );
+        // Signed by the key embedded in its own State → accepted.
+        sign_aum(&mut g, &[1]);
+        let verified = VerifiedAumChain::verify(&[g.clone()])
+            .expect("a checkpoint signed by an embedded key self-certifies");
+        let auth = Authority::from_verified_chain(verified);
+        assert_eq!(auth.state().keys.len(), 1);
+        assert_eq!(auth.head(), g.hash());
+    }
+
+    /// A broken parent link is still caught on the verified path (the structural fold runs after the
+    /// signature check for non-genesis AUMs).
+    #[test]
+    fn verified_chain_rejects_broken_parent_link() {
+        let g = signed_genesis_add(1, 1);
+        let mut orphan = child(&g, AumKind::NoOp, None, alloc::vec![9]);
+        orphan.prev_aum_hash = Some(AumHash([0xAB; 32])); // wrong parent
+        sign_aum(&mut orphan, &[1]); // validly signed, but mis-linked
+        assert_eq!(
+            VerifiedAumChain::verify(&[g, orphan]).unwrap_err(),
+            TkaError::BadParent,
+            "a validly-signed but mis-linked AUM is still rejected"
         );
     }
 }
