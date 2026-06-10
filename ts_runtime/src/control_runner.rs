@@ -56,6 +56,10 @@ pub struct ControlRunner {
     /// `tnet dns status`). A superset of [`cert_domains`](Self::cert_domains), which is kept as its
     /// own cell for the narrower TLS-cert use.
     dns_config: watch::Sender<Option<ts_control::DnsConfig>>,
+    /// Latest network-conditions report (preferred DERP region + per-region latencies), updated each
+    /// time the DERP-latency measurer reports in. The facade reads this for `Device::netcheck` (the
+    /// daemon's `tnet netcheck`). Empty until the first measurement.
+    netcheck: watch::Sender<crate::status::NetcheckReport>,
 }
 
 /// Control runner args.
@@ -176,6 +180,7 @@ impl kameo::Actor for ControlRunner {
             tka_syncing: false,
             cert_domains: Default::default(),
             dns_config: Default::default(),
+            netcheck: Default::default(),
         })
     }
 }
@@ -387,6 +392,14 @@ mod msg_impl {
         #[message]
         pub fn dns_config(&self) -> Option<ts_control::DnsConfig> {
             self.dns_config.borrow().clone()
+        }
+
+        /// The latest network-conditions report (preferred DERP region + per-region latencies). An
+        /// immediate answer (does not block); empty before the first DERP-latency measurement. The
+        /// facade surfaces this for `Device::netcheck` (the daemon's `tnet netcheck`).
+        #[message]
+        pub fn netcheck(&self) -> crate::status::NetcheckReport {
+            self.netcheck.borrow().clone()
         }
 
         /// Request an OIDC ID token from control scoped to `audience` (workload-identity federation).
@@ -620,6 +633,14 @@ impl Message<DerpLatencyMeasurement> for ControlRunner {
 
     async fn handle(&mut self, msg: DerpLatencyMeasurement, _ctx: &mut Context<Self, Self::Reply>) {
         let measurements = msg.measurement.as_ref().clone();
+
+        // Publish the net-report snapshot for `Device::netcheck` (the daemon's `tnet netcheck`) from
+        // the same measurements, before the home-region short-circuit below — an empty set still
+        // yields a (default/empty) report rather than a stale one.
+        self.netcheck
+            .send_replace(crate::status::NetcheckReport::from_region_results(
+                &measurements,
+            ));
 
         let Some(result) = measurements.first() else {
             tracing::debug!("derp latency measurements empty");
