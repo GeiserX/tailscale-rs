@@ -2,6 +2,27 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.9.0](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.9.0) - 2026-06-10
+
+### Added
+- **`tka::Aum` + `AumKey`/`AumState`/`AumSignature`** — the acquisition-side AUM (Authority Update
+  Message) type and its canonical CBOR serialization, mirroring Go `tka.AUM`/`tka.Key`/`tka.State`/
+  `tkatype.Signature`. `Aum::serialize`/`hash`/`sig_hash` match Go `AUM.Serialize`/`Hash`/`SigHash`
+  byte-for-byte (BLAKE2s-256 over CTAP2 CBOR; `sig_hash` omits the signatures field). This is the
+  first chunk of Tailnet-Lock verify-and-log (#7) — the prerequisite for the chain replayer that
+  will derive a trusted-key `Authority` from a control-synced chain. The client verify path
+  (`Authority::node_key_authorized`) is unchanged.
+- Byte-exactness is **proven, not assumed**: new tests reproduce the literal `[]byte` vectors from Go
+  `tka/aum_test.go` `TestSerialization` and assert identical canonical bytes. (This caught a real
+  encoding subtlety — a non-`omitempty` nil `[]byte` field encodes as CBOR null `0xf6`, not an empty
+  byte string.) Both the `NodeKeySignature` and `Aum` CBOR paths are now cross-validated against Go.
+
+### Changed (source-breaking → minor bump)
+- **`tka::cbor::Value` gains `Null` and `TextMap` variants.** The enum is public and not
+  `#[non_exhaustive]`, so an external exhaustive `match` on it must add arms — hence a minor bump.
+  `Null` encodes CBOR null (`0xf6`) for nil non-`omitempty` fields; `TextMap` encodes
+  `map[string]string` with CTAP2 bytewise-lexical key ordering.
+
 ## [0.8.1](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.8.1) - 2026-06-10
 
 ### Fixed
