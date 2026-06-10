@@ -2,6 +2,14 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.14.0](https://github.com/GeiserX/tailscale-rs/compare/v0.13.0...v0.14.0) (2026-06-10)
+
+
+### Features
+
+* **ts_control:** /machine/tka/bootstrap Noise RPC (genesis AUM fetch) ([#55](https://github.com/GeiserX/tailscale-rs/issues/55)) ([2e51d5e](https://github.com/GeiserX/tailscale-rs/commit/2e51d5e6cfe61cd7ed3d4b73554e7f47fc9b4806))
+* **ts_runtime:** wire TKA bootstrap+sync into ControlRunner (observe-only) ([#56](https://github.com/GeiserX/tailscale-rs/issues/56)) ([5f42811](https://github.com/GeiserX/tailscale-rs/commit/5f42811ae08e459de67ff716f6418542e76289ea))
+
 ## [0.13.0](https://github.com/GeiserX/tailscale-rs/compare/v0.12.0...v0.13.0) (2026-06-10)
 
 
