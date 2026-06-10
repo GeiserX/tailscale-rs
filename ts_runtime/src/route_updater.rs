@@ -293,15 +293,31 @@ impl RouteUpdater {
         }
 
         if !exit_node_satisfied {
-            // An exit node is configured but no peer matched the selector (or the matched peer
-            // advertises no default route). Egress is fail-closed (internet-bound traffic dropped),
-            // not leaked — surface it so the operator can spot a stale/typo'd exit-node selection.
-            tracing::warn!(
-                exit_node = ?exit_node_selector,
-                resolved = ?exit_node_id,
-                "configured exit node not found among peers (or it advertises no default route); \
-                 internet-bound traffic will be dropped"
-            );
+            // An exit node is configured but either no peer matched the selector, or the matched peer
+            // advertises no default route. Egress is fail-closed (internet-bound traffic dropped), not
+            // leaked — surface it so the operator can spot the cause. Distinguish the two cases,
+            // because they have different fixes and the second is a common false alarm:
+            //   - resolved == None  → stale/typo'd selector (no peer matched). Fix the selector.
+            //   - resolved == Some  → the peer exists but advertises no `0.0.0.0/0`. This is EXPECTED
+            //     if you only want to *reach a peer's port* over the tailnet (e.g. dial its `:1080`),
+            //     not route all internet traffic through it — in that case `exit_node` should be
+            //     unset; setting it asks for full-tunnel egress the peer isn't offering.
+            if exit_node_id.is_some() {
+                tracing::warn!(
+                    exit_node = ?exit_node_selector,
+                    resolved = ?exit_node_id,
+                    "configured exit node resolved to a peer that advertises no default route \
+                     (0.0.0.0/0); internet-bound traffic will be dropped (fail-closed). If you only \
+                     need to reach this peer's ports over the tailnet (not full-tunnel egress), \
+                     leave `exit_node` unset — direct peer dials don't require it."
+                );
+            } else {
+                tracing::warn!(
+                    exit_node = ?exit_node_selector,
+                    "configured exit node not found among peers (stale or typo'd selector); \
+                     internet-bound traffic will be dropped (fail-closed)"
+                );
+            }
         }
 
         // Republish the active exit node for the MagicDNS responder's DoH delegation. Only an exit
