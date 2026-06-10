@@ -53,7 +53,7 @@ members = [
 edition = "2024"
 license = "BSD-3-Clause"
 publish = true
-version = "0.13.0"
+version = "0.14.0"
 repository = "https://github.com/GeiserX/tailscale-rs"
 
 # This disagrees with the README's stated MSRV. That's intentional: this field causes cargo to error
