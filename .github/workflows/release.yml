@@ -1,0 +1,64 @@
+# Release publishing — the *publishing* half. `release-please.yml` is the *versioning* half.
+#
+# Publishes all 43 `geiserx_*` workspace crates to crates.io for a `v{version}` tag, using
+# crates.io **trusted publishing** (OIDC — no stored token). Driven by `scripts/publish-crates.sh`
+# (leaf-first dependency order, `SKIP_PUBLISHED=1` so a re-run resumes past already-published
+# crates, and self-healing through crates.io's sliding-window 429 rate limit — which a 43-crate
+# release reliably trips).
+#
+# Triggers:
+#   - workflow_dispatch: how `release-please.yml` invokes this after it pushes the tag (a tag pushed
+#     with GITHUB_TOKEN does NOT fire `on: push: tags` — GitHub's recursion guard — so the release
+#     flow reaches this job only via that explicit dispatch).
+#   - push: tags 'v*': for a manually/CLI-pushed tag (a human cutting a release outside release-please).
+#
+# This is intentionally SEPARATE from ci.yml's upstream-only publish job (which is gated
+# `owner == 'tailscale'` and `needs:` self-hosted-runner jobs this fork lacks). This workflow runs on
+# a GitHub-hosted runner and stands alone, so it has no dependency on the inherited upstream CI.
+
+name: Release
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - "v*"
+
+# `id-token: write` is required for crates.io OIDC trusted publishing (rust-lang/crates-io-auth-action).
+# `contents: read` is all the publish needs (the tag/release already exist).
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  # One publish per tag; never two racing the same crates.io version.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish-crates:
+    name: publish 43 crates to crates.io (trusted publishing)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Setup rust
+        uses: ./.github/actions/setup-rust
+        with:
+          toolchain-version: "1.95.0"
+          builder-triple: x86_64-unknown-linux-gnu
+
+      # Mint a short-lived crates.io token via OIDC trusted publishing — no long-lived secret.
+      - uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
+        id: auth
+
+      - name: Publish workspace to crates.io
+        env:
+          # The publish script reads CARGO_REGISTRY_TOKEN; feed it the OIDC-minted token.
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          # The script gates real publishes behind this explicit opt-in (guards against accidental runs).
+          TS_RS_EXPERIMENT: this_is_unstable_software
+          # Tolerate already-published crates so a re-dispatch after a partial/rate-limited run resumes.
+          SKIP_PUBLISHED: "1"
+        run: ./scripts/publish-crates.sh

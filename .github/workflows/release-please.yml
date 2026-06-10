@@ -1,0 +1,57 @@
+# Release automation — the *versioning* half. `release.yml` is the *publishing* half.
+# They chain through the `v{version}` tag this workflow pushes.
+#
+#   1. Commits land on `main` as Conventional Commits (feat:, fix:, …).
+#   2. release-please maintains a standing "release PR" that bumps the single
+#      workspace version (`[workspace.package].version` in Cargo.toml, which all 43
+#      crates inherit via `version.workspace = true`) and rewrites CHANGELOG.md.
+#   3. Merging that PR makes release-please create the GitHub Release + push tag
+#      `v{version}`.
+#   4. This workflow then dispatches `release.yml` for that tag (the crates.io
+#      publish + binaries). It must dispatch explicitly: the tag is pushed with
+#      GITHUB_TOKEN, and GitHub's recursion guard means a GITHUB_TOKEN tag push does
+#      NOT trigger `release.yml`'s `on: push: tags`, so the publish would never fire.
+#
+# Version-bump mechanics (see release-please-config.json): release-type `simple`
+# (CHANGELOG + manifest + tag only — it does NOT edit Cargo.toml, so it can't break
+# the facade's `version.workspace = true` inheritance) plus an `extra-files` generic
+# TOML updater that bumps `$.workspace.package.version`. Pre-1.0: feat→minor,
+# fix→patch, breaking→minor (bump-minor-pre-major).
+
+name: Release Please
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Open/maintain the release PR, and on merge create the release + tag, then
+# dispatch the publish workflow.
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  release-please:
+    name: maintain release PR · cut release on merge
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@a02a34c4d625f9be7cb89156071d8567266a2445 # v4.2.0
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      # Kick off the crates.io publish + binary build for the freshly-pushed tag.
+      # (Why dispatch instead of relying on release.yml's own `on: push: tags`: the
+      # release-please tag push uses GITHUB_TOKEN, which GitHub deliberately does not
+      # let trigger further workflow runs — the recursion guard. release.yml keeps its
+      # tag trigger for manual/CLI tag pushes, but a release-please release reaches it
+      # only via this explicit dispatch.)
+      - name: Dispatch publish for the new tag
+        if: ${{ steps.release.outputs.release_created }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag_name }}
+        run: gh workflow run release.yml --repo "${GITHUB_REPOSITORY}" --ref "${TAG}"
