@@ -1345,6 +1345,42 @@ impl MemAumStore {
     pub fn is_empty(&self) -> bool {
         self.by_hash.is_empty()
     }
+
+    /// Walk the chain from `oldest` (the genesis) forward to the head, returning the AUMs in
+    /// parent→child order — the linear form [`VerifiedAumChain::verify`] / [`Authority::from_chain`]
+    /// expect. At a fork (a parent with more than one child) the deterministic [`pick_next_aum`] rule
+    /// chooses the branch, so the result is the active chain (matching how the chain is replayed).
+    ///
+    /// Used by the runtime sync driver to turn the AUMs accumulated in the store (genesis +
+    /// sync-received) into the ordered chain it re-verifies into an [`Authority`]. Bounded by
+    /// [`MAX_SYNC_ITER`] so a malformed/cyclic store cannot loop forever.
+    ///
+    /// # Errors
+    /// [`TkaError::BadChain`] if `oldest` is not in the store, or the walk exceeds the iteration cap
+    /// (a cycle or an over-long chain). Signature/structure are NOT checked here — that is `verify`'s
+    /// job; this only orders the AUMs.
+    pub fn linear_chain_from(&self, oldest: AumHash) -> Result<Vec<Aum>, TkaError> {
+        let mut out = Vec::new();
+        let Some(mut curs) = self.aum(&oldest) else {
+            return Err(TkaError::BadChain);
+        };
+        for _ in 0..MAX_SYNC_ITER {
+            out.push(curs.clone());
+            let children = self.child_aums(&curs.hash());
+            if children.is_empty() {
+                return Ok(out);
+            }
+            // Deterministic branch choice at a fork (weight → RemoveKey → lowest-hash). For a linear
+            // chain there is exactly one child; `pick_next_aum` returns it. We don't have a replayed
+            // `ReplayState` here, so use a default (empty-key) state — at a genuine fork that means
+            // the weight term is 0 for both and the tiebreak falls through to the lowest-hash rule,
+            // which is still deterministic and matches what a fresh verifier would pick before any
+            // keys are trusted. (Sync stores are linear in practice; forks are the rare case.)
+            let next = pick_next_aum(&ReplayState::default(), &children).clone();
+            curs = next;
+        }
+        Err(TkaError::BadChain) // iteration cap: cycle or over-long chain
+    }
 }
 
 impl AumStore for MemAumStore {
@@ -5186,5 +5222,49 @@ mod tests {
         // First sampled ancestor is 4 back from head (i=4 is the first i%4==0 with i>0): chain[56].
         assert_eq!(offer.ancestors[0], chain[60 - 1 - 4].hash());
         assert_eq!(*offer.ancestors.last().unwrap(), chain[0].hash());
+    }
+
+    #[test]
+    fn linear_chain_from_returns_ordered_chain() {
+        // A store built from a linear chain returns it genesis→head in order, regardless of insert
+        // order, so it round-trips through `VerifiedAumChain`/`from_chain`.
+        let chain = linear_chain(5);
+        // Insert in reverse to prove ordering is by chain links, not insert order.
+        let mut store = MemAumStore::new();
+        for aum in chain.iter().rev() {
+            store.insert(aum.clone());
+        }
+        let ordered = store.linear_chain_from(chain[0].hash()).expect("walk");
+        let got: Vec<AumHash> = ordered.iter().map(Aum::hash).collect();
+        let want: Vec<AumHash> = chain.iter().map(Aum::hash).collect();
+        assert_eq!(got, want, "linear_chain_from must yield genesis→head order");
+        // And it replays into the same head a direct from_chain produces.
+        assert_eq!(
+            Authority::from_chain(&ordered).unwrap().head(),
+            chain[4].hash()
+        );
+    }
+
+    #[test]
+    fn linear_chain_from_missing_genesis_errors() {
+        let chain = linear_chain(3);
+        let store = MemAumStore::from_aums(chain.clone());
+        // A genesis hash not in the store is BadChain, not a panic.
+        assert_eq!(
+            store
+                .linear_chain_from(AumHash([0xEE; AUM_HASH_LEN]))
+                .unwrap_err(),
+            TkaError::BadChain
+        );
+    }
+
+    #[test]
+    fn linear_chain_from_single_genesis() {
+        // A store with only the genesis returns just it (the bootstrap case before any sync).
+        let g = genesis_add(test_aum_key(1, 1));
+        let store = MemAumStore::from_aums([g.clone()]);
+        let ordered = store.linear_chain_from(g.hash()).expect("walk");
+        assert_eq!(ordered.len(), 1);
+        assert_eq!(ordered[0].hash(), g.hash());
     }
 }

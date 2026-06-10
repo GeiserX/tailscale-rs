@@ -35,6 +35,19 @@ pub struct ControlRunner {
     ssh_policy: watch::Sender<Option<SshPolicy>>,
     /// Latest Tailnet Lock status pushed by control, or `None` until control sends one.
     tka: watch::Sender<Option<TkaStatus>>,
+    /// The locally-synced Tailnet-Lock state (verified `Authority` + AUM store), or `None` until a
+    /// successful bootstrap+sync. Held here because `ControlRunner` owns the netmap stream that
+    /// triggers resync. Mutated only on the actor thread (the netmap handler spawns the sync RPC and
+    /// the result returns via the [`TkaSynced`] self-message).
+    tka_synced: Option<crate::tka_sync::SyncedTka>,
+    /// Published copy of the synced TKA [`Authority`](ts_tka::Authority) for the verify-and-log
+    /// consumer. `None` until the first successful sync. Observe-only: a reader uses it to *log*
+    /// whether a peer's node-key signature verifies, never to drop a peer (enforcement is a separate
+    /// gated decision).
+    tka_authority: watch::Sender<Option<Arc<ts_tka::Authority>>>,
+    /// In-flight guard: `true` while a sync RPC task is running, so a burst of netmap updates does
+    /// not spawn overlapping syncs (Go serializes sync under `b.mu`).
+    tka_syncing: bool,
     /// Latest cert-domain list from control's netmap DNS config (Go `nm.DNS.CertDomains`), or empty
     /// until control sends a DNS config carrying one. The facade reads this for `Device::cert_domains`.
     cert_domains: watch::Sender<Vec<String>>,
@@ -153,12 +166,93 @@ impl kameo::Actor for ControlRunner {
             self_node: Default::default(),
             ssh_policy: Default::default(),
             tka: Default::default(),
+            tka_synced: None,
+            tka_authority: Default::default(),
+            tka_syncing: false,
             cert_domains: Default::default(),
         })
     }
 }
 
 impl ControlRunner {
+    /// Decide whether the latest netmap's Tailnet-Lock status warrants a (re)sync and, if so, spawn
+    /// the bootstrap+sync RPC off the actor thread (so the netmap stream never blocks on a control
+    /// round-trip). The result returns via the [`TkaSynced`] self-message.
+    ///
+    /// Triggers when control reports TKA enabled (`is_enabled`) AND we are not already syncing AND
+    /// either we hold no `Authority` yet (→ bootstrap) or control's head differs from ours (→ catch
+    /// up). When TKA is disabled, clears any synced state (the lock was turned off). Mirrors Go's
+    /// `tkaSyncIfNeeded`: a no-op when our head already matches.
+    fn maybe_sync_tka(&mut self, tka: &TkaStatus, self_ref: ActorRef<Self>) {
+        if !tka.is_enabled() {
+            // Lock disabled (or never enabled): drop any synced state and stop publishing an
+            // Authority. Never an error; peers are unaffected.
+            if self.tka_synced.is_some() {
+                self.tka_synced = None;
+                self.tka_authority.send_replace(None);
+            }
+            return;
+        }
+        if self.tka_syncing {
+            return; // a sync is already in flight; the next netmap will re-trigger if still stale
+        }
+        // Up-to-date check: if we already have an Authority whose head matches control's, nothing to
+        // do. A malformed control head is treated as "different" (we'll attempt a sync, which
+        // fail-closes harmlessly).
+        if let Some(synced) = &self.tka_synced
+            && let Some(control_head) = ts_tka::AumHash::from_base32(&tka.head)
+            && synced.authority.head_matches(&control_head)
+        {
+            return;
+        }
+
+        // Spawn the sync. Move the current synced state out (the driver takes it by value and returns
+        // the advanced state); `tka_synced` stays `None` until the result lands, guarded by
+        // `tka_syncing` so we don't spawn a second concurrent sync.
+        self.tka_syncing = true;
+        let current = self.tka_synced.take();
+        let config = self.params.config.clone();
+        let keys = self.params.env.keys.clone();
+        tokio::spawn(async move {
+            let result = crate::tka_sync::sync_tka(&config, &keys, current).await;
+            // Hand the outcome back to the actor thread to apply (mutating actor state off-thread is
+            // not allowed). A send failure just means the actor is gone — nothing to do.
+            if let Err(e) = self_ref.tell(TkaSynced { result }).await {
+                tracing::debug!(error = ?e, "TKA sync result not delivered (actor gone)");
+            }
+        });
+    }
+
+    /// Apply the outcome of a spawned [`maybe_sync_tka`] task on the actor thread: store the advanced
+    /// state + publish the `Authority` (or, on inert/failed sync, leave peers unaffected). Always
+    /// clears the in-flight guard.
+    fn apply_tka_synced(
+        &mut self,
+        result: Result<Option<crate::tka_sync::SyncedTka>, crate::tka_sync::TkaSyncDriverError>,
+    ) {
+        self.tka_syncing = false;
+        match result {
+            Ok(Some(synced)) => {
+                tracing::info!(
+                    head = %synced.authority.head().to_base32(),
+                    "TKA sync succeeded; publishing verified Authority (observe-only)"
+                );
+                self.tka_authority
+                    .send_replace(Some(synced.authority.clone()));
+                self.tka_synced = Some(synced);
+            }
+            Ok(None) => {
+                // Control has no lock for us (no genesis / disabled): stay inert. Not an error.
+                tracing::debug!("TKA sync: control reported no lock for this node (inert)");
+            }
+            Err(e) => {
+                // Transport or verify failure: log and stay inert. NEVER errors the netmap or drops a
+                // peer. The next netmap update re-triggers a sync attempt.
+                tracing::warn!(error = %e, "TKA sync failed; staying inert (no peer impact)");
+            }
+        }
+    }
+
     fn with_self_node<F, R>(&self, f: F) -> impl Future<Output = Option<R>> + use<F, R>
     where
         F: FnOnce(&Node) -> R,
@@ -417,7 +511,7 @@ impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
     async fn handle(
         &mut self,
         msg: StreamMessage<Arc<StateUpdate>, (), ()>,
-        _ctx: &mut Context<Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) {
         match msg {
             StreamMessage::Started(_) => {
@@ -459,6 +553,7 @@ impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
 
                 if let Some(tka) = msg.tka.as_ref() {
                     self.tka.send_replace(Some(tka.clone()));
+                    self.maybe_sync_tka(tka, ctx.actor_ref().clone());
                 }
 
                 // Track the cert-domain list from the netmap DNS config (Go `nm.DNS.CertDomains`).
@@ -480,6 +575,24 @@ impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
                 tracing::error!("state update stream terminated")
             }
         }
+    }
+}
+
+/// The outcome of a spawned TKA bootstrap+sync task, delivered back to the actor thread so the
+/// result can be applied to actor state (which a spawned task cannot touch directly). Sent by
+/// [`ControlRunner::maybe_sync_tka`]; handled by applying via
+/// [`ControlRunner::apply_tka_synced`](ControlRunner).
+#[doc(hidden)]
+pub struct TkaSynced {
+    pub(crate) result:
+        Result<Option<crate::tka_sync::SyncedTka>, crate::tka_sync::TkaSyncDriverError>,
+}
+
+impl Message<TkaSynced> for ControlRunner {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: TkaSynced, _ctx: &mut Context<Self, Self::Reply>) {
+        self.apply_tka_synced(msg.result);
     }
 }
 
