@@ -2,6 +2,28 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.8.1](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.8.1) - 2026-06-10
+
+### Fixed
+- **Peers with no netmap DERP home region are now reachable over DERP (#24).** A peer whose netmap
+  entry carried no home region (`derp_region == None`) was given **no underlay route at all** — the
+  route updater skipped it, so the outbound router dropped every WireGuard packet to it, handshake
+  included. The failure was symmetric (the dataplane's only egress is the underlay route table, so we
+  could neither initiate to nor respond to such a peer) and presented as a 30s dial timeout. This is
+  the live blocker for routing through a NAT'd peer on a self-hosted control plane (e.g. Headscale)
+  that doesn't echo `preferred_derp`. DERP is the connectivity floor in Tailscale; this restores it.
+  When the netmap supplies no region, the relay region is now inferred — mirroring Go magicsock's
+  `c.derpRoute`: an **observed route** (a region we have actually received a DERP frame from the peer
+  on — it is demonstrably listening there), else our **own current home region** as a bounded,
+  interop-safe last resort (it rendezvouses a co-regional peer even when control never echoes the
+  peer's region; if the peer is not on that region the DERP server simply drops the relayed frame —
+  no host dial, no leak). The inference is gated on the region having a live transport task and is
+  consulted both for the WireGuard underlay route and for the `CallMeMaybe` direct-path prompt, so a
+  no-region peer also gets its direct-path upgrade attempted instead of being silently skipped.
+  Anti-leak posture preserved: the inferred region only ever resolves to a DERP transport (never the
+  direct host-dial path). Observed routes are pruned to the live netmap. Patch bump (internal
+  route-layer change; no public API change).
+
 ## [0.8.0](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.8.0) - 2026-06-10
 
 ### Added
