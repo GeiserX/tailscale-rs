@@ -183,6 +183,19 @@ impl DirectManager {
 
         ready
     }
+
+    /// Re-bind the underlay UDP socket after a network/link change (the engine half of
+    /// `Device::rebind`). Delegates to [`MagicSock::rebind`], which swaps the socket and resets the
+    /// stale local mapping (clears reflexive + confirmed best paths, keeps candidates) so peers
+    /// re-probe over the new socket and fail closed to DERP meanwhile. No-op (`Ok`) when the underlay
+    /// bind failed at startup (DERP-only inert mode — there is no socket to rebind).
+    #[message]
+    pub async fn rebind(&self) -> Result<(), ts_magicsock::Error> {
+        match self.sock.as_ref() {
+            Some(sock) => sock.rebind().await,
+            None => Ok(()),
+        }
+    }
 }
 
 /// The disco<->node-key binding verifier installed on the [`MagicSock`] (see

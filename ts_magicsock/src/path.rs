@@ -88,6 +88,19 @@ impl PeerPaths {
         self.add_candidates(endpoints, CandidateSource::Learned);
     }
 
+    /// Drop the confirmed best path and its trust, **keeping the candidate set**. Used on a socket
+    /// rebind ([`MagicSock::rebind`]): the local NAT mapping changed, so any previously-confirmed
+    /// direct `best` is stale and must be re-validated by a fresh pong — but the candidate endpoints
+    /// (where the peer *might* be reachable) are still valid and should be re-probed, not forgotten.
+    /// The peer fails closed back to DERP (best `None`) until a candidate re-confirms over the new
+    /// socket. Mirrors Go magicsock's `resetEndpointStates` on rebind (clears best-addr, keeps
+    /// candidates), the in-flight probes are also cleared since they were sent from the old socket.
+    pub fn invalidate_best(&mut self) {
+        self.best = None;
+        self.trust_until = None;
+        self.in_flight.clear();
+    }
+
     /// Reconcile the netmap-advertised candidate set to exactly `endpoints`.
     ///
     /// Netmap candidates absent from `endpoints` are removed (control revoked them); endpoints

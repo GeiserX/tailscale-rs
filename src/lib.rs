@@ -917,6 +917,28 @@ impl Device {
         self.runtime.exit_node()
     }
 
+    /// Re-bind the underlay UDP socket after a **network/link change** — Wi-Fi switch, sleep/wake,
+    /// or any event that invalidates the device's local address/NAT mapping. This is the Rust
+    /// analog of Go magicsock's `Conn.Rebind()`.
+    ///
+    /// The embedder owns deciding *when* to call this (it watches the OS for link changes — there is
+    /// no built-in network monitor); `rebind` is the engine half that does the socket work:
+    /// - Re-binds the underlay UDP socket, preferring the same local port (so the advertised
+    ///   endpoint stays stable) and falling back to an ephemeral port. The IPv4-only-by-default
+    ///   invariant is preserved.
+    /// - Invalidates the now-stale local mapping: learned reflexive (STUN) addresses and every
+    ///   peer's *confirmed* direct path are cleared, while candidate endpoints are kept — so peers
+    ///   are re-probed over the new socket and **relay over DERP (never a direct host dial) until a
+    ///   path re-confirms**. Endpoint discovery re-runs on its normal cadence.
+    /// - Leaves peers, control, the netmap, disco keys, and DERP connections untouched; existing
+    ///   WireGuard sessions survive (they ride whatever underlay carries them).
+    ///
+    /// A no-op if the underlay socket failed to bind at startup (the device is DERP-only). Existing
+    /// connectivity is preserved on a re-bind error (the old socket is kept; the error is returned).
+    pub async fn rebind(&self) -> Result<(), Error> {
+        self.runtime.rebind().await.map_err(Into::into)
+    }
+
     /// The stable id of the exit node traffic is **currently** egressing through, or `None` if none
     /// is engaged (the equivalent of Go `tsnet`'s `Status.ExitNodeStatus.ID`).
     ///

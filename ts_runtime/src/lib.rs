@@ -66,6 +66,9 @@ pub struct Runtime {
     /// Reference to the control actor.
     pub control: ActorRef<ControlRunner>,
     dataplane: ActorRef<DataplaneActor>,
+    /// Reference to the direct (disco/UDP underlay) manager, retained so [`Runtime::rebind`] can
+    /// ask it to re-bind the underlay socket on a network/link change.
+    direct: ActorRef<DirectManager>,
     /// Reference to the application netstack actor. `None` in TUN transport mode, where there is
     /// no userspace application netstack (the application data path is a real kernel TUN device).
     netstack: Option<WeakActorRef<NetstackActor>>,
@@ -253,6 +256,7 @@ impl Runtime {
         Ok(Self {
             control,
             dataplane,
+            direct,
             peer_tracker,
             fallback_tcp,
             netstack,
@@ -351,6 +355,18 @@ impl Runtime {
             .ask(dataplane::InstallCapture { hook })
             .await
             .map_err(Into::into)
+    }
+
+    /// Re-bind the underlay UDP socket after a network/link change (Wi-Fi switch, sleep/wake). The
+    /// embedder's own link monitor calls this (the engine owns the socket re-bind; the embedder owns
+    /// OS netmon). Re-binds the socket (same-port-preferred, IPv4-only invariant preserved) and
+    /// resets the now-stale local NAT mapping — clearing learned reflexive addresses and every
+    /// confirmed direct path while keeping candidate endpoints, so peers re-probe over the new socket
+    /// and relay over DERP (never a direct host dial) until a path re-confirms. Peers, control, the
+    /// netmap, disco state, and DERP are untouched. A no-op when the underlay is inert (bind failed
+    /// at startup, DERP-only). Mirrors Go magicsock `Conn.Rebind` + `resetEndpointStates`.
+    pub async fn rebind(&self) -> Result<(), Error> {
+        self.direct.ask(direct::Rebind).await.map_err(Error::from)
     }
 
     /// A snapshot of the local netmap: this node plus every known peer.
