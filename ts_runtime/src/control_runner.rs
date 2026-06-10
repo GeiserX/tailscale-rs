@@ -51,6 +51,11 @@ pub struct ControlRunner {
     /// Latest cert-domain list from control's netmap DNS config (Go `nm.DNS.CertDomains`), or empty
     /// until control sends a DNS config carrying one. The facade reads this for `Device::cert_domains`.
     cert_domains: watch::Sender<Vec<String>>,
+    /// Latest full DNS config from control's netmap (Go `netmap.NetworkMap.DNS`), or `None` until
+    /// control sends one. The facade reads this for `Device::dns_config` (the daemon's
+    /// `tnet dns status`). A superset of [`cert_domains`](Self::cert_domains), which is kept as its
+    /// own cell for the narrower TLS-cert use.
+    dns_config: watch::Sender<Option<ts_control::DnsConfig>>,
 }
 
 /// Control runner args.
@@ -170,6 +175,7 @@ impl kameo::Actor for ControlRunner {
             tka_authority: Default::default(),
             tka_syncing: false,
             cert_domains: Default::default(),
+            dns_config: Default::default(),
         })
     }
 }
@@ -375,6 +381,14 @@ mod msg_impl {
             self.cert_domains.borrow().clone()
         }
 
+        /// The full DNS config from control's netmap (Go `netmap.NetworkMap.DNS`), or `None` when
+        /// control has sent no DNS config yet. An immediate answer (does not block); the facade
+        /// surfaces this for `Device::dns_config` (the daemon's `tnet dns status`).
+        #[message]
+        pub fn dns_config(&self) -> Option<ts_control::DnsConfig> {
+            self.dns_config.borrow().clone()
+        }
+
         /// Request an OIDC ID token from control scoped to `audience` (workload-identity federation).
         ///
         /// Opens a fresh Noise channel and POSTs `/machine/id-token`; returns the signed JWT or an
@@ -565,6 +579,11 @@ impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
                     .map(|d| d.cert_domains.clone())
                     .unwrap_or_default();
                 self.cert_domains.send_replace(cert_domains);
+
+                // Track the full DNS config for `Device::dns_config` (the daemon's `tnet dns status`).
+                // `None` when control sent no DNS config on this update — distinct from a present but
+                // empty config (Go `netmap.NetworkMap.DNS`).
+                self.dns_config.send_replace(msg.dns_config.clone());
 
                 if let Err(e) = self.params.env.publish(msg).await {
                     tracing::error!(error = %e, "publishing netmap update");

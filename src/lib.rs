@@ -151,6 +151,9 @@ pub use ts_control::Node as NodeInfo;
 pub use ts_control::tls::{CertifiedKey, TlsAcceptor, TlsStream};
 #[doc(inline)]
 pub use ts_control::{CertError, MISSING_CERT_RPC, ServeConfig, ServeState, ServeTarget};
+/// The netmap DNS configuration returned by [`Device::dns_config`] (Go `netmap.NetworkMap.DNS`).
+#[doc(inline)]
+pub use ts_control::{DnsConfig, DnsResolver, ExtraRecord};
 #[doc(inline)]
 pub use ts_control::{ExitProxyConfig, ExitProxyScheme};
 pub use ts_control::{
@@ -761,6 +764,23 @@ impl Device {
         self.runtime
             .control
             .ask(ts_runtime::control_runner::CertDomains)
+            .await
+            .map_err(ts_runtime::Error::from)
+            .map_err(Into::into)
+    }
+
+    /// The DNS configuration control pushed in the latest netmap — Go `tsnet`'s view of
+    /// `netmap.NetworkMap.DNS` (what `tailscale dns status` reports).
+    ///
+    /// Returns the full [`DnsConfig`] — MagicDNS on/off, search domains, global + fallback resolvers,
+    /// split-DNS routes, extra records, cert domains — or `None` before the first netmap / when
+    /// control has sent no DNS config. A superset of [`cert_domains`](Device::cert_domains), which
+    /// remains a separate narrower accessor for the TLS-cert use. Mirrors Go reading a clone of
+    /// `nm.DNS` (absent ⇒ `None`).
+    pub async fn dns_config(&self) -> Result<Option<DnsConfig>, Error> {
+        self.runtime
+            .control
+            .ask(ts_runtime::control_runner::DnsConfig)
             .await
             .map_err(ts_runtime::Error::from)
             .map_err(Into::into)
