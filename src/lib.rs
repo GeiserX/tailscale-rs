@@ -138,6 +138,11 @@ use std::{
 pub use config::Config;
 #[doc(inline)]
 pub use error::{Error, InternalErrorKind};
+// Re-exported so a downstream crate depending only on `tailscale` can name the auth-key secret type
+// for [`Device::new_with_secret`] without taking a separate, version-pinned dependency on `secrecy`
+// (which would risk a `SecretString`-type mismatch if the two `secrecy` majors diverged). Callers
+// pass `tailscale::SecretString`; `secrecy` is a pure-Rust wrapper (no aws-lc/openssl/ring).
+pub use secrecy::SecretString;
 #[doc(inline)]
 pub use ts_control::ExitNodeSelector;
 #[doc(inline)]
@@ -329,6 +334,49 @@ impl Device {
             serve: std::sync::Mutex::new(None),
             funnel: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Create a device from the given [`Config`] and a [`SecretString`] auth key.
+    ///
+    /// This is a back-compat-preserving convenience over [`new`](Self::new) for callers that already
+    /// hold the registration auth key as a [`secrecy::SecretString`] (e.g. a daemon that keeps the
+    /// pre-auth key wrapped end-to-end). It lets the caller avoid materializing a plain `String` at
+    /// the engine boundary: the secret is exposed only on the last inch, immediately before being
+    /// handed to [`new`](Self::new).
+    ///
+    /// # Honesty about the plaintext window
+    ///
+    /// This closes the *caller's* boundary, **not** the engine's internal handling. The engine still
+    /// resolves the auth key to a plain `String` internally for registration (the plaintext `String`
+    /// window inside the engine is identical to calling [`new`](Self::new) directly) — this method
+    /// does not make the engine itself secret-clean. If you call [`new`](Self::new) you create that
+    /// `String` yourself; if you call this you do not, but the engine creates one either way.
+    ///
+    /// Passing `None` is equivalent to `new(config, None)` (falls back to `config.auth_key`).
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # use tailscale::*;
+    /// let dev = Device::new_with_secret(
+    ///     &Config::default_with_key_file("tsrs_keys.json").await?,
+    ///     Some(SecretString::from("MY_AUTH_KEY")),
+    /// ).await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn new_with_secret(
+        config: &Config,
+        auth_key: Option<SecretString>,
+    ) -> Result<Self, Error> {
+        use secrecy::ExposeSecret as _;
+
+        // Expose the secret on the last inch and delegate to `new`, so the spawn/registration path
+        // is shared verbatim (no duplicated runtime-spawn logic) and the engine-internal plaintext
+        // window is byte-for-byte identical to a direct `new` call.
+        let plain = auth_key.map(|s| s.expose_secret().to_string());
+        Self::new(config, plain).await
     }
 
     /// The application netstack command channel, or an error in TUN transport mode (no application
@@ -1264,4 +1312,58 @@ guarantees.
     };
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use secrecy::ExposeSecret as _;
+
+    use super::*;
+
+    // `Device::new`/`new_with_secret` cannot be unit-tested end-to-end without a live control
+    // server (registration). The only behavioral difference `new_with_secret` introduces over `new`
+    // is exposing the `SecretString` to a plain `String` on the last inch; everything after is the
+    // shared `new` path. So we assert that equivalence at the auth-key-resolution level: the secret
+    // path must resolve to the exact same key the plain path feeds into `resolve_auth_key`.
+    const SAMPLE_KEY: &str = "tskey-auth-koCgSLP5R811CNTRL-EXAMPLEEXAMPLEEXAMPLEEXAMPLE";
+
+    // The mapping `new_with_secret` applies (`Option<SecretString>` -> `Option<String>`) must be a
+    // byte-for-byte round-trip, so the spawn arg is identical to a direct `new(config, Some(..))`.
+    #[test]
+    fn secret_exposes_to_identical_string() {
+        let plain = Some(SAMPLE_KEY.to_string());
+        let from_secret =
+            Some(SecretString::from(SAMPLE_KEY)).map(|s| s.expose_secret().to_string());
+        assert_eq!(from_secret, plain);
+
+        // `None` must pass through unchanged (so it falls back to `config.auth_key` exactly as `new`).
+        let none_secret: Option<SecretString> = None;
+        assert_eq!(
+            none_secret.map(|s| s.expose_secret().to_string()),
+            None::<String>
+        );
+    }
+
+    // End-to-end equivalence at the resolve layer: feeding the exposed secret through
+    // `resolve_auth_key` yields the same `Option<String>` as feeding the plain string — i.e. both
+    // constructors reach the same spawn argument, without registering against a control server.
+    #[tokio::test]
+    async fn new_with_secret_resolves_same_as_new() {
+        let config = Config::default();
+
+        let via_plain = resolve_auth_key(&config, Some(SAMPLE_KEY.to_string()))
+            .await
+            .expect("plain auth key resolves");
+
+        let exposed = Some(SecretString::from(SAMPLE_KEY)).map(|s| s.expose_secret().to_string());
+        let via_secret = resolve_auth_key(&config, exposed)
+            .await
+            .expect("secret-derived auth key resolves");
+
+        assert_eq!(via_plain, via_secret);
+        // Without the `identity-federation` feature `resolve_auth_key` is a pass-through, so the
+        // resolved key is the input verbatim; assert that too to pin the default-build behavior.
+        #[cfg(not(feature = "identity-federation"))]
+        assert_eq!(via_secret, Some(SAMPLE_KEY.to_string()));
+    }
 }

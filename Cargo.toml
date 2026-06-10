@@ -93,6 +93,11 @@ proptest = "1"
 itertools = "0.14"
 rand = "0.10"
 reqwest = "0.13"
+# Pure-Rust secret wrapper (zeroize-on-drop, redacted Debug). Used by the facade's
+# `Device::new_with_secret` so callers can pass the registration auth key as `SecretString`
+# without materializing a plain `String` at the engine boundary. Ring-clean: pulls only `zeroize`
+# (already pervasive in this tree), NO aws-lc/openssl/ring — safe for the ring-only invariant.
+secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_with = "3"
@@ -238,6 +243,7 @@ rand.workspace = true
 ratatui = { version = "0.30", optional = true }
 # exclude rsa to avoid https://rustsec.org/advisories/RUSTSEC-2023-0071
 russh = { version = "0.61.2", optional = true, default-features = false, features = ["flate2", "aws-lc-rs"] }
+secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
