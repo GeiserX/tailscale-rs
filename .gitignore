@@ -27,3 +27,7 @@ tailscale.h
 .beads-credential-key
 .beads/proxieddb/
 .omc/
+
+# Cross-lane working docs — intentionally untracked (never commit; they carry working state)
+docs/COORDINATE.md
+docs/GOAL.md
