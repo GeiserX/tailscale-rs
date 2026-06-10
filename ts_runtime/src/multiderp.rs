@@ -54,6 +54,16 @@ pub struct Multiderp {
     regions: HashMap<RegionId, DerpRegion>,
     current_home_derp: Option<RegionId>,
     peer_db: Arc<RwLock<Option<Arc<PeerDb>>>>,
+    /// Observed DERP routes: the region we last *received* a frame from each peer on. Mirrors Go
+    /// magicsock's `c.derpRoute` (`wgengine/magicsock/derp.go`), whose doc says it lets a node
+    /// "learn the DERP home upon getting the first connection … help nodes from a slow or
+    /// misbehaving control plane." When the netmap carries no home region for a peer (common on a
+    /// self-hosted control plane that doesn't echo `preferred_derp`), [`RouteUpdater`] consults this
+    /// so a peer that has reached us over some region becomes reachable on that same region — the
+    /// rendezvous holds because the peer is demonstrably listening there. Region runners write it
+    /// live (each knows its own region + the inbound peer id); pruned to the live netmap on each
+    /// peer-state update so a departed peer's route can't pin a stale region forever.
+    observed_routes: Arc<RwLock<HashMap<PeerId, RegionId>>>,
     /// The direct underlay socket, installed by [`crate::direct::DirectManager`] once it binds.
     ///
     /// A live handle (shared `RwLock`) so a disco frame (e.g. a `CallMeMaybe`) relayed to us over
@@ -116,6 +126,7 @@ impl Multiderp {
 
         let peer_db = self.peer_db.clone();
         let direct_sock = self.direct_sock.clone();
+        let observed_routes = self.observed_routes.clone();
 
         self.tasks.spawn(async move {
             while !*shutdown.borrow() {
@@ -133,6 +144,7 @@ impl Multiderp {
                         &mut disco_rx,
                         &peer_db,
                         &direct_sock,
+                        &observed_routes,
                     ) => if let Err(e) = ret {
                         tracing::error!(error = %e, region_id = %id, "running derp client");
                         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -167,6 +179,43 @@ impl Multiderp {
     #[message]
     pub fn transport_id_for_region(&self, id: RegionId) -> Option<UnderlayTransportId> {
         Some(self.derps.get(&id)?.transport_id)
+    }
+
+    /// The relay region to reach `peer` on when the netmap carried no home region for it.
+    ///
+    /// Resolution order (mirrors Go's netmap-home → `derpRoute` learned route, plus a bounded
+    /// last resort): an **observed** route (a region we have actually received a frame from this
+    /// peer on — the peer is demonstrably listening there), else our **own current home region**
+    /// as a last resort. The home-region fallback is a deliberate, interop-safe divergence from
+    /// strict Go (which returns no route): it rendezvouses a *co-regional* peer — the dominant
+    /// geo-close / same-tailnet deployment — even when a self-hosted control plane never echoes the
+    /// peer's `preferred_derp`. If the peer is not connected to that region the DERP server simply
+    /// drops the relayed frame (no host dial, no leak); it is strictly better than dropping the peer
+    /// outright, and self-heals to the peer's real region the moment one is observed or the netmap
+    /// supplies it. `None` only if we have learned no route *and* have no home region yet.
+    #[message]
+    pub fn region_for_peer(&self, peer: PeerId) -> Option<RegionId> {
+        let observed = poisoned_read(&self.observed_routes).get(&peer).copied();
+        resolve_region_for_peer(observed, self.current_home_derp, |r| {
+            self.derps.contains_key(&r)
+        })
+    }
+
+    /// Like [`Multiderp::region_for_peer`] but keyed by node public key, for callers (the
+    /// CallMeMaybe relay loop) that hold a `NodePublicKey` rather than a `PeerId`. Resolves the key
+    /// to a `PeerId` via the peer db, then applies the same observed-route → home-region inference.
+    /// `None` if the key isn't a current netmap member, or if no live region can be inferred.
+    #[message]
+    pub fn region_for_node(&self, node: NodePublicKey) -> Option<RegionId> {
+        let peer = {
+            let db = poisoned_read(&self.peer_db);
+            let (id, _) = db.as_ref()?.get(&node)?;
+            id
+        };
+        let observed = poisoned_read(&self.observed_routes).get(&peer).copied();
+        resolve_region_for_peer(observed, self.current_home_derp, |r| {
+            self.derps.contains_key(&r)
+        })
     }
 
     /// v4 STUN server addresses from the current derp map, for leak-safe single-socket STUN.
@@ -255,6 +304,23 @@ fn poisoned_write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The relay region to reach a peer whose netmap entry carried no home region: prefer an `observed`
+/// route (a region we've received a frame from this peer on — it's listening there), else our own
+/// `home` region as a last resort. Only a region with a live transport task (`region_is_live`) is
+/// returned — a region whose `ensure_region` hasn't run yet has no `transport_id` for the route
+/// updater to map, so offering it would just produce a no-route drop a step later; skipping it lets
+/// the caller fall through cleanly (and the periodic recompute retries once the task is up).
+/// Extracted as a pure function so the resolution order is unit-testable without the actor/lock
+/// machinery. See [`Multiderp::region_for_peer`] for the full rationale (Go `derpRoute` parity + the
+/// bounded home-region divergence).
+fn resolve_region_for_peer(
+    observed: Option<RegionId>,
+    home: Option<RegionId>,
+    region_is_live: impl Fn(RegionId) -> bool,
+) -> Option<RegionId> {
+    observed.or(home).filter(|r| region_is_live(*r))
+}
+
 struct PeerDbLookup<'a>(&'a RwLock<Option<Arc<PeerDb>>>);
 
 impl ts_transport::PeerLookup<PeerId, NodePublicKey> for PeerDbLookup<'_> {
@@ -289,6 +355,7 @@ async fn run_derp_once(
     disco_rx: &mut mpsc::Receiver<(NodePublicKey, Vec<u8>)>,
     peer_db: &RwLock<Option<Arc<PeerDb>>>,
     direct_sock: &RwLock<Option<Arc<MagicSock>>>,
+    observed_routes: &RwLock<HashMap<PeerId, RegionId>>,
 ) -> Result<(), ts_derp::Error> {
     const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -368,6 +435,16 @@ async fn run_derp_once(
                     let sock = poisoned_read(direct_sock).clone();
                     for ret in from_derp.batch_iter() {
                         let (peer_id, pkts) = ret?;
+
+                        // Observed-route learning (Go `derpRoute` parity): a frame reached us from
+                        // this peer on region `id`, so the peer is listening there. Record it (any
+                        // frame counts — disco or WG data) so [`Multiderp::region_for_peer`] can
+                        // relay back to a peer whose netmap home region we never learned. Only write
+                        // on an actual change to avoid churning the lock on every received batch.
+                        if poisoned_read(observed_routes).get(&peer_id) != Some(&id) {
+                            poisoned_write(observed_routes).insert(peer_id, id);
+                            tracing::trace!(parent: &span, %peer_id, region_id = %id, "learned observed derp route for peer");
+                        }
 
                         let data = demux_relayed_disco(pkts, sock.as_deref());
                         if data.is_empty() {
@@ -478,6 +555,7 @@ impl kameo::Actor for Multiderp {
             dataplane,
             peer_db: Default::default(),
             direct_sock: Default::default(),
+            observed_routes: Default::default(),
             derps: Default::default(),
             regions: Default::default(),
             tasks: JoinSet::new(),
@@ -523,6 +601,12 @@ impl Message<Arc<PeerState>> for Multiderp {
     type Reply = ();
 
     async fn handle(&mut self, msg: Arc<PeerState>, _ctx: &mut Context<Self, Self::Reply>) {
+        // Prune observed routes for peers that left the netmap, so a departed/reassigned peer can't
+        // pin a stale region forever (bounds the map to the live peer set). Done before swapping the
+        // db so the retain reads the incoming snapshot.
+        poisoned_write(&self.observed_routes)
+            .retain(|peer_id, _| msg.peers.peers().contains_key(peer_id));
+
         let mut db = poisoned_write(&self.peer_db);
         *db = Some(msg.peers.clone());
     }
@@ -780,6 +864,91 @@ mod tests {
         assert!(
             stun_servers_from_regions([&r]).is_empty(),
             "no FixedAddr-v4 STUN server => empty probe list"
+        );
+    }
+
+    fn rid(n: u32) -> RegionId {
+        RegionId(core::num::NonZeroU32::new(n).unwrap())
+    }
+
+    /// The relay-region resolution order for a peer whose netmap carried no home region:
+    /// an observed route wins; absent that, our own home region is the last resort; absent both,
+    /// there is no route (the peer is dropped, as before — the floor can't be lowered with no relay
+    /// to offer). This is issue #24's connectivity floor.
+    #[test]
+    fn resolve_region_prefers_observed_then_home() {
+        // All regions live for this case.
+        let live = |_: RegionId| true;
+        // Observed route wins even when a home region exists (the peer is provably listening there).
+        assert_eq!(
+            resolve_region_for_peer(Some(rid(7)), Some(rid(19)), live),
+            Some(rid(7)),
+            "an observed route must win over the home-region fallback"
+        );
+        // No observed route => fall back to our own home region.
+        assert_eq!(
+            resolve_region_for_peer(None, Some(rid(19)), live),
+            Some(rid(19)),
+            "with no observed route, relay via our own home region"
+        );
+        // Observed route, no home region yet => still routable.
+        assert_eq!(
+            resolve_region_for_peer(Some(rid(7)), None, live),
+            Some(rid(7)),
+            "an observed route is usable even before a home region is known"
+        );
+        // Neither => no route (unchanged drop behavior; nothing to relay through).
+        assert_eq!(
+            resolve_region_for_peer(None, None, live),
+            None,
+            "with neither an observed route nor a home region there is no relay route"
+        );
+    }
+
+    /// A region with no live transport task is not offered: returning it would only produce a
+    /// no-route drop a step later (the route updater's `TransportIdForRegion` would miss). The
+    /// caller falls through and the periodic recompute retries once the region's task is up.
+    #[test]
+    fn resolve_region_skips_region_without_live_transport() {
+        // Home region 19 is resolved but has no live transport task → not offered.
+        assert_eq!(
+            resolve_region_for_peer(None, Some(rid(19)), |_| false),
+            None,
+            "a home region with no live transport must not be returned"
+        );
+        // Even an observed route is gated on liveness (a region whose task died/not-yet-spawned).
+        assert_eq!(
+            resolve_region_for_peer(Some(rid(7)), Some(rid(19)), |r| r == rid(19)),
+            None,
+            "an observed region without a live transport is skipped even if home is live-but-not-chosen"
+        );
+        // The observed route is returned when it is the live one.
+        assert_eq!(
+            resolve_region_for_peer(Some(rid(7)), Some(rid(19)), |r| r == rid(7)),
+            Some(rid(7)),
+            "the observed route is returned when its transport is live"
+        );
+    }
+
+    /// Observed routes are pruned to the live peer set: a peer that left the netmap must not keep
+    /// pinning a stale region. Exercises the retain in the `PeerState` handler against a plain map
+    /// (the handler's prune logic, independent of the actor).
+    #[test]
+    fn observed_routes_prune_to_live_peers() {
+        let mut routes: HashMap<PeerId, RegionId> = HashMap::new();
+        routes.insert(PeerId(1), rid(19));
+        routes.insert(PeerId(2), rid(7));
+        routes.insert(PeerId(3), rid(19));
+
+        // Only peers 1 and 3 remain in the netmap.
+        let live: std::collections::HashSet<PeerId> = [PeerId(1), PeerId(3)].into_iter().collect();
+        routes.retain(|peer_id, _| live.contains(peer_id));
+
+        assert_eq!(routes.get(&PeerId(1)), Some(&rid(19)), "live peer kept");
+        assert_eq!(routes.get(&PeerId(3)), Some(&rid(19)), "live peer kept");
+        assert!(
+            !routes.contains_key(&PeerId(2)),
+            "a peer no longer in the netmap must have its observed route pruned"
         );
     }
 }
