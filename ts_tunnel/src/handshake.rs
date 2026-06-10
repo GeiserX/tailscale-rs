@@ -227,7 +227,7 @@ impl ReceivedHandshake {
         // TODO: cookie DoS protection. Deferring implementation until more of the surrounding code is in place,
         // because the right place to do cookie enforcement might be outside of the core Noise handshake logic.
         let peer_ephemeral = x25519_dalek::PublicKey::from(pkt.ephemeral_pub);
-        let my_static_dalek = x25519_dalek::StaticSecret::from(my_static.private);
+        let my_static_dalek = x25519_dalek::StaticSecret::from(&my_static.private);
         let mut peer_static_bytes = [0; 32];
         let mut timestamp = TAI64N::new_zeroed();
         let handshake = HandshakeState::new(my_static.public)
@@ -305,7 +305,9 @@ pub fn initiate_handshake(
 ) -> (SentHandshake, HandshakeInitiation) {
     let ephemeral = x25519_dalek::ReusableSecret::random();
     let ephemeral_pub = x25519_dalek::PublicKey::from(&ephemeral);
-    let endpoint_static_pub = NodePublicKey::from(endpoint_static);
+    // Derive from borrows: `endpoint_static` is moved into `SentHandshake.my_static` below and is
+    // no longer `Copy`, so the public-key and DH derivations must not consume it here.
+    let endpoint_static_pub = NodePublicKey::from(&endpoint_static);
 
     let mut pkt = HandshakeInitiation {
         sender_id: session_id,
@@ -319,7 +321,7 @@ pub fn initiate_handshake(
         .mix_key(ephemeral.diffie_hellman(&peer_static.into()).as_bytes()) // es
         .encrypt(endpoint_static_pub.as_bytes(), &mut pkt.static_pub_sealed) // s
         .mix_key(
-            x25519_dalek::StaticSecret::from(endpoint_static)
+            x25519_dalek::StaticSecret::from(&endpoint_static)
                 .diffie_hellman(&peer_static.into())
                 .as_bytes(),
         ) // ss
@@ -479,7 +481,7 @@ impl Handshake {
                     .as_bytes(),
             ) // ee
             .mix_key(
-                x25519_dalek::StaticSecret::from(sent_handshake.my_static)
+                x25519_dalek::StaticSecret::from(&sent_handshake.my_static)
                     .diffie_hellman(&peer_ephemeral)
                     .as_bytes(),
             ) // se
@@ -595,7 +597,7 @@ mod tests {
         let psk = Psk::from([0x05; 32]);
         let timestamp = [0x07u8; 12];
 
-        let init_static_dalek = x25519_dalek::StaticSecret::from(init_static.private);
+        let init_static_dalek = x25519_dalek::StaticSecret::from(&init_static.private);
         let resp_static_pub_dalek = x25519_dalek::PublicKey::from(resp_static.public);
 
         // Confirm our clamped public keys match Go's curve25519 output (a guard that the fixed
@@ -611,7 +613,7 @@ mod tests {
             "resp ephemeral public mismatch"
         );
         assert_eq!(
-            NodePublicKey::from(init_static.private).to_bytes(),
+            NodePublicKey::from(&init_static.private).to_bytes(),
             unhex32("a4e09292b651c278b9772c569f5fa9bb13d906b46ab68c9df9dc2b4409f8a209"),
             "init static public mismatch"
         );
@@ -629,7 +631,7 @@ mod tests {
             .mix_key(init_ephem_pub.as_bytes()) // e (psk double-mix)
             .mix_key(init_ephem.diffie_hellman(&resp_static_pub_dalek).as_bytes()) // es
             .encrypt(
-                NodePublicKey::from(init_static.private).as_bytes(),
+                NodePublicKey::from(&init_static.private).as_bytes(),
                 &mut static_sealed,
             ); // s
         let handshake = handshake
@@ -692,8 +694,12 @@ mod tests {
         // A initiates.
         let a_mac_send = MACSender::new(&b_static.public);
         let a_session = SessionId::random();
-        let (a_handshake, init_pkt) =
-            initiate_handshake(a_static.private, b_static.public, a_session, TAI64N::now());
+        let (a_handshake, init_pkt) = initiate_handshake(
+            a_static.private.clone(),
+            b_static.public,
+            a_session,
+            TAI64N::now(),
+        );
         let mut init_pkt = PacketMut::from(init_pkt.as_bytes());
         let handshake_mac = a_mac_send.write_macs(init_pkt.as_mut());
 
@@ -792,8 +798,12 @@ mod tests {
     ) -> (Handshake, SessionId, SessionPair) {
         let a_mac_send = MACSender::new(&b_static.public);
         let a_session = SessionId::random();
-        let (a_handshake, init_pkt) =
-            initiate_handshake(a_static.private, b_static.public, a_session, TAI64N::now());
+        let (a_handshake, init_pkt) = initiate_handshake(
+            a_static.private.clone(),
+            b_static.public,
+            a_session,
+            TAI64N::now(),
+        );
         let mut init_pkt = PacketMut::from(init_pkt.as_bytes());
         let handshake_mac = a_mac_send.write_macs(init_pkt.as_mut());
         let timeout = scheduler.add(

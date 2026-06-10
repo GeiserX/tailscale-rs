@@ -2,6 +2,27 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.13.0](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.13.0) - 2026-06-10
+
+### Security
+- **Private keys now zeroize on drop and are no longer `Copy` (tsr-9nu).** The private-key newtypes
+  (`NodePrivateKey`, `MachinePrivateKey`, `DiscoPrivateKey`, `NetworkLockPrivateKey` — and the
+  keypairs that embed them) now derive `zeroize::ZeroizeOnDrop`, so their 32-byte secret is wiped
+  from memory when the last owner drops, and they **drop `Copy`** so the secret can no longer be
+  silently bit-copied to scattered stack/heap locations the zeroizer can never reach. This makes
+  the `NodeState`/`PersistState` doc promise ("the dedicated key types are zeroized in memory on
+  drop") actually true — previously the types had no `Drop` at all. Public keys are unchanged: they
+  keep `Copy` and the full `zerocopy` (`FromBytes`/`IntoBytes`) wire surface, because they are not
+  secret. Mirrors Go's `key` package, where private-key material is held in non-copied value types
+  and a private key's `Public()` derivation takes a pointer receiver.
+  - **Breaking (minor, source-level):** `*PrivateKey: Copy` is removed and `PrivateKey::public_key()`
+    now takes `&self` instead of `self`. Existing `key.public_key()` calls are unaffected (the
+    receiver widened). Code that *relied* on implicit copies of a private key must now `.clone()`
+    explicitly. Private keys are also no longer `zerocopy::FromBytes`/`IntoBytes`; construct them
+    from a `[u8; 32]` via `From<[u8; 32]>` (or `FromStr`) rather than `read_from_bytes`.
+  - No new dependency (zeroize was already a dep for the ACME key; only its `derive` feature is
+    added). Adds a behavioral regression test that `Zeroize::zeroize` wipes the secret to zero.
+
 ## [0.12.0](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.12.0) - 2026-06-10
 
 ### Added

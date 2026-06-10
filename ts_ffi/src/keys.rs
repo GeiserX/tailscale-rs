@@ -43,7 +43,10 @@ macro_rules! impl_to_from {
         }
         impl From<&$key> for key {
             fn from(value: &$key) -> Self {
-                key((*value).into())
+                // `to_bytes()` (takes `&self`, returns a copy of the 32 bytes) rather than
+                // `(*value).into()`: private keys are no longer `Copy`, so dereferencing the
+                // borrow would be an illegal move-out. Works uniformly for public + private keys.
+                key(value.to_bytes())
             }
         }
     };

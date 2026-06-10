@@ -108,7 +108,10 @@ async fn bind_underlay_addr(
 
     // Overlay IPv6 enabled: try the dual-stack bind first.
     let v6: SocketAddr = BIND_ADDR_V6.parse().expect("valid bind address");
-    match MagicSock::bind(v6, our_disco, our_node_key).await {
+    // Clone the disco key for the v6 attempt: `MagicSock::bind` consumes it (it is no longer
+    // `Copy`), and the IPv4 fallback below needs its own copy. `our_node_key` is a public key
+    // (still `Copy`), so it needs no clone.
+    match MagicSock::bind(v6, our_disco.clone(), our_node_key).await {
         Ok(sock) => Ok(sock),
         Err(e) => {
             // Inert fallback: the host likely has IPv6 disabled at the kernel. Come up IPv4-only
@@ -569,7 +572,9 @@ impl kameo::Actor for DirectManager {
         // [`bind_underlay_addr`].
         let sock = match bind_underlay_addr(
             env.enable_ipv6,
-            env.keys.disco_keys.private,
+            // `.clone()`: the disco private key is no longer `Copy` and `env` is shared (`Arc`),
+            // so clone it out for the bind. `node_keys.public` is a `Copy` public key.
+            env.keys.disco_keys.private.clone(),
             env.keys.node_keys.public,
         )
         .await

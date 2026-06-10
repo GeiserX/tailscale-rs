@@ -75,9 +75,12 @@ impl PersistState {
 impl From<&NodeState> for PersistState {
     fn from(value: &NodeState) -> Self {
         Self {
-            node_key: value.node_keys.private,
-            machine_key: value.machine_keys.private,
-            network_lock_key: value.network_lock_keys.private,
+            // `.clone()` (not a bare field read): the private keys are no longer `Copy`, so copying
+            // them out of a `&NodeState` is now an explicit clone. The original keys stay owned by
+            // `value` and zeroize on their own drop.
+            node_key: value.node_keys.private.clone(),
+            machine_key: value.machine_keys.private.clone(),
+            network_lock_key: value.network_lock_keys.private.clone(),
             old_node_key: value.old_node_key,
             acme_account_key: value.acme_account_key.clone(),
         }
@@ -163,9 +166,12 @@ impl From<&PersistState> for NodeState {
     fn from(value: &PersistState) -> Self {
         Self {
             disco_keys: Default::default(),
-            node_keys: value.node_key.into(),
-            machine_keys: value.machine_key.into(),
-            network_lock_keys: value.network_lock_key.into(),
+            // `.clone().into()`: building each keypair consumes a private key, which can no longer
+            // be `Copy`-d out of the `&PersistState`. Clone the stored key, then derive the pair
+            // (the pair's public half is computed from a borrow inside `From<$private>`).
+            node_keys: value.node_key.clone().into(),
+            machine_keys: value.machine_key.clone().into(),
+            network_lock_keys: value.network_lock_key.clone().into(),
             old_node_key: value.old_node_key,
             acme_account_key: value.acme_account_key.clone(),
         }

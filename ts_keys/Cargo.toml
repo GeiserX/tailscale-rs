@@ -21,8 +21,10 @@ serde = { workspace = true, optional = true }
 # drop. `alloc` (not `std`, this crate is `no_std`) is required for the `Zeroize`/`ZeroizeOnDrop`
 # impls on `alloc::vec::Vec`, which is what `Zeroizing<Vec<u8>>` relies on for the persisted ACME
 # account key. `Zeroizing<Vec<u8>>` serializes transparently via its inner `Vec`, so the on-wire
-# JSON shape of `PersistState`/`NodeState` is unchanged.
-zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
+# JSON shape of `PersistState`/`NodeState` is unchanged. `derive` provides the
+# `#[derive(Zeroize, ZeroizeOnDrop)]` proc-macros used on the private-key newtypes so their secret
+# 32-byte buffer is wiped on drop (the `[u8; 32]` field zeroizes in place — no heap, no realloc).
+zeroize = { version = "1.8", default-features = false, features = ["alloc", "derive"] }
 x25519-dalek.workspace = true
 crypto_box.workspace = true
 # ed25519-dalek (v2, already in the workspace tree via ts_tka) provides the RFC 8032
