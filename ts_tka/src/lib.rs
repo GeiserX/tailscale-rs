@@ -68,7 +68,10 @@ const MAX_KEY_VOTES: u32 = 4096;
 
 /// A BLAKE2s-256 hash of an AUM's canonical serialization. Identifies an AUM and links the chain
 /// (`PrevAUMHash`). Text form is RFC4648 standard base32, no padding (Go `AUMHash.MarshalText`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// `Ord`/`PartialOrd` order by the raw 32 bytes — used to key the sync store (a `BTreeMap`, since the
+/// crate is `no_std`) and already relied on by [`pick_next_aum`]'s lowest-hash fork tiebreak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AumHash(pub [u8; AUM_HASH_LEN]);
 
 impl AumHash {
@@ -1248,6 +1251,426 @@ impl Authority {
             state: state.to_state(),
         })
     }
+}
+
+// ===========================================================================================
+// AUM-chain sync (issue #7, chunk 2 — `tsr-5po`): the acquisition-side machinery a client uses
+// to catch its local chain up to the control server's, mirroring Go `tka/sync.go` + the
+// `computeStateAt`/`fastForward` chain walkers in `tka/tka.go` (v1.100.0). This is the storage +
+// offer/missing layer the `/machine/tka/sync` RPC (a later chunk) drives; it does NOT itself talk
+// to the network.
+//
+// Verification posture: the walkers fold AUMs with `ReplayState::apply_verified_aum`
+// (structural-only, exactly Go's `applyVerifiedAUM`), NOT `verify_aum_signatures`. Authenticity is
+// enforced separately when a synced chain is turned into an `Authority` (via
+// `VerifiedAumChain::verify` + `from_verified_chain`, the un-bypassable trust boundary). The store
+// itself is untrusted scratch space — putting unverified AUMs in it is fine because nothing trusts
+// them until that boundary runs.
+// ===========================================================================================
+
+/// The starting number of AUMs to skip between ancestors in a [`SyncOffer`] (Go
+/// `ancestorsSkipStart`). The gap grows exponentially (`<< ancestorsSkipShift` each step).
+const ANCESTORS_SKIP_START: u64 = 4;
+/// How many bits to advance the ancestor skip count each step (Go `ancestorsSkipShift`): `4 << 2 =
+/// 16`, so after skipping 4 it skips 16, then 64…
+const ANCESTORS_SKIP_SHIFT: u64 = 2;
+/// Iteration cap for the backward head-intersection walk + offer ancestor walk (Go
+/// `maxSyncHeadIntersectionIter`, `tka/limits.go`).
+const MAX_SYNC_HEAD_INTERSECTION_ITER: u64 = 400;
+/// Iteration cap for forward fast-forward / `computeStateAt` walks (Go `maxSyncIter` /
+/// `maxScanIterations`, `tka/limits.go`).
+const MAX_SYNC_ITER: usize = 2000;
+
+/// A read-only store of AUMs keyed by hash, plus the parent→children index the forward walk needs
+/// (Go's `tka.Chonk`, reduced to the methods the sync/offer path actually calls). The client builds
+/// one of these from the AUMs it has on hand; the sync RPC populates it with what control sends.
+///
+/// "Not found" is signalled by `None` from [`aum`](AumStore::aum) (Go's `os.ErrNotExist` sentinel),
+/// which the walkers treat as a loop terminator, not an error.
+pub trait AumStore {
+    /// Fetch the AUM with this hash, or `None` if the store does not hold it.
+    fn aum(&self, hash: &AumHash) -> Option<Aum>;
+    /// The AUMs whose `prev_aum_hash` is `hash` — the forward links out of `hash` (Go
+    /// `Chonk.ChildAUMs`). Order is unspecified; the caller resolves forks deterministically.
+    fn child_aums(&self, hash: &AumHash) -> Vec<Aum>;
+}
+
+/// An in-memory [`AumStore`]: a hash→AUM map plus a parent-hash→child-hashes index, both built as
+/// AUMs are inserted. `no_std`-friendly (`BTreeMap`, not `HashMap`). This is the store a client uses
+/// to stage the AUMs it knows about while computing a [`SyncOffer`] / the AUMs a peer is missing.
+#[derive(Debug, Clone, Default)]
+pub struct MemAumStore {
+    by_hash: alloc::collections::BTreeMap<AumHash, Aum>,
+    /// parent hash → child hashes (the forward index). A genesis AUM (no parent) contributes no
+    /// entry here; it is found only via `by_hash`.
+    children: alloc::collections::BTreeMap<AumHash, Vec<AumHash>>,
+}
+
+impl MemAumStore {
+    /// A new, empty store.
+    pub fn new() -> MemAumStore {
+        MemAumStore::default()
+    }
+
+    /// Insert an AUM, indexing it by its own hash and (if it has a parent) under its parent's child
+    /// list. Idempotent: re-inserting the same AUM hash replaces it and does not duplicate the child
+    /// edge. Returns the inserted AUM's hash.
+    pub fn insert(&mut self, aum: Aum) -> AumHash {
+        let hash = aum.hash();
+        if let Some(parent) = aum.prev_aum_hash {
+            let kids = self.children.entry(parent).or_default();
+            if !kids.contains(&hash) {
+                kids.push(hash);
+            }
+        }
+        self.by_hash.insert(hash, aum);
+        hash
+    }
+
+    /// Build a store from an iterator of AUMs (e.g. a chain or a sync batch).
+    pub fn from_aums(aums: impl IntoIterator<Item = Aum>) -> MemAumStore {
+        let mut store = MemAumStore::new();
+        for aum in aums {
+            store.insert(aum);
+        }
+        store
+    }
+
+    /// Number of AUMs held.
+    pub fn len(&self) -> usize {
+        self.by_hash.len()
+    }
+
+    /// Whether the store holds no AUMs.
+    pub fn is_empty(&self) -> bool {
+        self.by_hash.is_empty()
+    }
+}
+
+impl AumStore for MemAumStore {
+    fn aum(&self, hash: &AumHash) -> Option<Aum> {
+        self.by_hash.get(hash).cloned()
+    }
+
+    fn child_aums(&self, hash: &AumHash) -> Vec<Aum> {
+        self.children
+            .get(hash)
+            .map(|kids| {
+                kids.iter()
+                    .filter_map(|h| self.by_hash.get(h).cloned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// A node's view of where its chain is, offered to a peer so the peer can work out what to send (Go
+/// `tka.SyncOffer`): the current `head` plus a sparse, exponentially-spaced sample of `ancestors`
+/// back to the oldest AUM the node holds. The last entry is always the oldest-known AUM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncOffer {
+    /// The node's current chain head.
+    pub head: AumHash,
+    /// A subset of the chain's ancestors, newest-first, ending with the oldest-known AUM. Used by a
+    /// peer to find a "tail intersection" when it doesn't recognise the head.
+    pub ancestors: Vec<AumHash>,
+}
+
+/// The result of comparing two [`SyncOffer`]s (Go `tka.intersection`): where (if anywhere) the two
+/// chains meet, which tells [`missing_aums`](sync_missing_aums) where to start gathering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Intersection {
+    /// Both heads are equal — nothing to exchange.
+    up_to_date: bool,
+    /// The newest common AUM that is the *remote's* head and an ancestor of ours (we have updates
+    /// building on it to send).
+    head_intersection: Option<AumHash>,
+    /// The oldest common AUM, where the chains diverge — a starting point to send from when we don't
+    /// recognise the remote's head.
+    tail_intersection: Option<AumHash>,
+}
+
+/// Compute the state at `want_hash` by walking back to a checkpoint or genesis, then forward along
+/// the taken path (Go `computeStateAt`, `tka/tka.go`). Structural fold only (no signature check) —
+/// the verify boundary is elsewhere. Returns `None` (not an error) if `want_hash` is not in the
+/// store, mirroring the `os.ErrNotExist` sentinel Go callers special-case.
+fn compute_state_at(
+    storage: &dyn AumStore,
+    max_iter: usize,
+    want_hash: AumHash,
+) -> Result<Option<ReplayState>, TkaError> {
+    let Some(top) = storage.aum(&want_hash) else {
+        return Ok(None);
+    };
+
+    // Walk backwards to a starting point: a checkpoint AUM (which carries full state) or a genesis
+    // AUM (no parent — valid only for NoOp/AddKey/Checkpoint). `path` records every hash on the way
+    // so the forward pass can follow exactly this branch (which, for a non-primary fork, may differ
+    // from standard fork resolution).
+    let mut curs = top;
+    let mut state = ReplayState::default();
+    let mut path: alloc::collections::BTreeSet<AumHash> = alloc::collections::BTreeSet::new();
+    let mut started = false;
+    for i in 0..=max_iter {
+        if i == max_iter {
+            return Err(TkaError::BadChain); // iteration limit exceeded
+        }
+        path.insert(curs.hash());
+
+        if curs.message_kind == AumKind::Checkpoint {
+            // A checkpoint encapsulates the state at that point: fold it into an empty state.
+            let mut s = ReplayState::default();
+            s.apply_verified_aum(&curs)?;
+            state = s;
+            started = true;
+            break;
+        }
+        match curs.prev_aum_hash {
+            None => {
+                // Genesis: applies to the empty state. Only NoOp/AddKey reach here (Checkpoint broke
+                // above); anything else is an invalid genesis. `apply_verified_aum` enforces the
+                // same kind restriction, so just fold and let it reject a bad genesis.
+                let mut s = ReplayState::default();
+                s.apply_verified_aum(&curs)?;
+                state = s;
+                started = true;
+                break;
+            }
+            Some(parent) => {
+                let Some(p) = storage.aum(&parent) else {
+                    return Err(TkaError::BadParent); // dangling parent link
+                };
+                curs = p;
+            }
+        }
+    }
+    debug_assert!(
+        started,
+        "compute_state_at must find a checkpoint or genesis"
+    );
+
+    // Fast-forward from the starting point, following only AUMs on `path` (the custom advancer),
+    // until we reach `want_hash`. No gather side-effect here — we only want the final state.
+    let (_, end_state) = fast_forward(
+        storage,
+        max_iter,
+        state,
+        &mut |_: &Aum, _: &mut ReplayState| Ok(false),
+        Some(&path),
+        Some(want_hash),
+    )?;
+    Ok(Some(end_state))
+}
+
+/// Fast-forward from `start_state` along the chain (Go `fastForwardWithAdvancer` +
+/// `advanceByPrimary`). At each step it takes the children of the current AUM and advances by:
+/// - the child on `path` when `path` is `Some` (the `computeStateAt` custom advancer), or
+/// - [`pick_next_aum`]'s deterministic fork resolution otherwise (the primary advancer).
+///
+/// Stops when `stop_at` (when set) is reached — returning that AUM + the state *before* applying it
+/// for a gather caller, matching Go's `done(curs, state)` check at the top of the loop — or when
+/// there are no more children. `gather` is invoked for each visited AUM (Go's `done` callback side
+/// effect) and its boolean return additionally stops the walk when true.
+///
+/// Returns the final AUM reached and the folded state at it. Structural fold only.
+fn fast_forward(
+    storage: &dyn AumStore,
+    max_iter: usize,
+    start_state: ReplayState,
+    gather: &mut dyn FnMut(&Aum, &mut ReplayState) -> Result<bool, TkaError>,
+    path: Option<&alloc::collections::BTreeSet<AumHash>>,
+    stop_at: Option<AumHash>,
+) -> Result<(Aum, ReplayState), TkaError> {
+    let start_hash = start_state
+        .last_aum_hash
+        .ok_or(TkaError::Decode("fast_forward from a state with no head"))?;
+    let mut curs = storage.aum(&start_hash).ok_or(TkaError::BadParent)?;
+    let mut state = start_state;
+
+    for _ in 0..max_iter {
+        // Done check runs BEFORE advancing (Go checks `done(curs, state)` at loop top): for a
+        // `stop_at` caller this returns the stop AUM with the state *before* applying it.
+        if Some(curs.hash()) == stop_at {
+            return Ok((curs, state));
+        }
+        // Side-effect callback (the gather closure for `missing_aums`); a `true` return also stops.
+        if gather(&curs, &mut state)? {
+            return Ok((curs, state));
+        }
+
+        let children = storage.child_aums(&curs.hash());
+        let next = match path {
+            // `computeStateAt` advancer: follow the unique child that is on the recorded path.
+            Some(p) => children.into_iter().find(|c| p.contains(&c.hash())),
+            // Primary advancer: deterministic fork resolution.
+            None => {
+                if children.is_empty() {
+                    None
+                } else {
+                    Some(pick_next_aum(&state, &children).clone())
+                }
+            }
+        };
+        match next {
+            None => return Ok((curs, state)), // no more children: we are at head
+            Some(n) => {
+                state.apply_verified_aum(&n)?;
+                curs = n;
+            }
+        }
+    }
+    Err(TkaError::BadChain) // iteration limit exceeded
+}
+
+impl Authority {
+    /// Build the [`SyncOffer`] this authority would send a peer (Go `Authority.SyncOffer`): its
+    /// `head` plus an exponentially-spaced sample of ancestors back to `oldest`, ending with
+    /// `oldest`. `oldest` is the oldest AUM the caller holds (Go `a.oldestAncestor.Hash()`); our
+    /// verify-only [`Authority`] does not track it, so it is passed in — typically the genesis hash
+    /// of the chain the caller staged in `storage`.
+    ///
+    /// `storage` must contain the chain from `head` back to `oldest`; a gap simply truncates the
+    /// ancestor list early (the walk breaks on the first missing parent, exactly like Go).
+    pub fn sync_offer(
+        &self,
+        storage: &dyn AumStore,
+        oldest: AumHash,
+    ) -> Result<SyncOffer, TkaError> {
+        let mut out = SyncOffer {
+            head: self.head,
+            ancestors: Vec::with_capacity(6),
+        };
+        let mut skip_amount = ANCESTORS_SKIP_START;
+        let mut curs = self.head;
+        for i in 0..MAX_SYNC_HEAD_INTERSECTION_ITER {
+            if i > 0 && skip_amount != 0 && i % skip_amount == 0 {
+                out.ancestors.push(curs);
+                skip_amount <<= ANCESTORS_SKIP_SHIFT;
+            }
+            let Some(parent) = storage.aum(&curs) else {
+                break; // os.ErrNotExist: stop, don't error
+            };
+            // We append `oldest` after the loop, so don't duplicate it.
+            if parent.hash() == oldest {
+                break;
+            }
+            match parent.prev_aum_hash {
+                Some(prev) => curs = prev,
+                None => break, // reached a genesis that isn't `oldest`; nothing earlier to walk
+            }
+        }
+        out.ancestors.push(oldest);
+        Ok(out)
+    }
+
+    /// Given a peer's [`SyncOffer`], compute the AUMs **they** are missing — the ones to send them so
+    /// their chain catches up to ours (Go `Authority.MissingAUMs`). `storage` must hold our chain.
+    /// Returns an empty `Vec` when the peer is already up to date.
+    ///
+    /// Mirrors Go: compute our own offer, find the intersection of the two chains, then gather every
+    /// AUM from the intersection forward to our head (excluding the intersection AUM itself).
+    pub fn missing_aums(
+        &self,
+        storage: &dyn AumStore,
+        remote_offer: &SyncOffer,
+        oldest: AumHash,
+    ) -> Result<Vec<Aum>, TkaError> {
+        let local_offer = self.sync_offer(storage, oldest)?;
+        let isect = compute_sync_intersection(storage, &local_offer, remote_offer)?;
+        if isect.up_to_date {
+            return Ok(Vec::new());
+        }
+        let from = isect
+            .head_intersection
+            .or(isect.tail_intersection)
+            .ok_or(TkaError::BadChain)?; // Go panics "unreachable"; we fail closed instead.
+
+        let Some(state) = compute_state_at(storage, MAX_SYNC_ITER, from)? else {
+            return Err(TkaError::BadParent);
+        };
+        let mut out: Vec<Aum> = Vec::with_capacity(12);
+        fast_forward(
+            storage,
+            MAX_SYNC_ITER,
+            state,
+            &mut |curs: &Aum, _: &mut ReplayState| -> Result<bool, TkaError> {
+                // Gather every AUM from the intersection forward, excluding the intersection itself.
+                if curs.hash() != from {
+                    out.push(curs.clone());
+                }
+                Ok(false) // never stop early; walk to head (no more children)
+            },
+            None,
+            None,
+        )?;
+        Ok(out)
+    }
+}
+
+/// Find where two chains meet (Go `computeSyncIntersection`). See [`Intersection`].
+fn compute_sync_intersection(
+    storage: &dyn AumStore,
+    local_offer: &SyncOffer,
+    remote_offer: &SyncOffer,
+) -> Result<Intersection, TkaError> {
+    // Simple case: identical heads → up to date.
+    if remote_offer.head == local_offer.head {
+        return Ok(Intersection {
+            up_to_date: true,
+            head_intersection: Some(local_offer.head),
+            tail_intersection: None,
+        });
+    }
+
+    // Head intersection: if we hold the remote's head, walk back from our head looking for it. If
+    // found, their head is an ancestor of ours and we have the AUMs that build on it.
+    if storage.aum(&remote_offer.head).is_some() {
+        let mut curs = local_offer.head;
+        for _ in 0..MAX_SYNC_HEAD_INTERSECTION_ITER {
+            let Some(parent) = storage.aum(&curs) else {
+                break; // os.ErrNotExist
+            };
+            if parent.hash() == remote_offer.head {
+                return Ok(Intersection {
+                    up_to_date: false,
+                    head_intersection: Some(parent.hash()),
+                    tail_intersection: None,
+                });
+            }
+            match parent.prev_aum_hash {
+                Some(prev) => curs = prev,
+                None => break,
+            }
+        }
+    }
+
+    // Tail intersection: we don't recognise their head, but if one of the ancestors they offered is
+    // on our chain, that's a starting point. Iterate in their order (newest-first) so we pick the
+    // most-recent shared ancestor and send the fewest AUMs.
+    for ancestor in &remote_offer.ancestors {
+        let state = match compute_state_at(storage, MAX_SYNC_ITER, *ancestor)? {
+            Some(s) => s,
+            None => continue, // os.ErrNotExist: we don't have this ancestor; try the next
+        };
+        let (end, _) = fast_forward(
+            storage,
+            MAX_SYNC_ITER,
+            state,
+            &mut |_: &Aum, _: &mut ReplayState| Ok(false),
+            None,
+            Some(local_offer.head),
+        )?;
+        // fast_forward can stop early (no more children) before reaching the target, so re-check.
+        if end.hash() == local_offer.head {
+            return Ok(Intersection {
+                up_to_date: false,
+                head_intersection: None,
+                tail_intersection: Some(*ancestor),
+            });
+        }
+    }
+
+    Err(TkaError::BadChain) // ErrNoIntersection
 }
 
 /// Verify a standard (RFC 8032, non-cofactored) Ed25519 signature.
@@ -4548,5 +4971,220 @@ mod tests {
             TkaError::BadKeyState,
             "an UpdateKey that sets votes > 4096 is rejected (post-mutation re-validate)"
         );
+    }
+
+    // ===== AUM-chain sync: store + SyncOffer + MissingAUMs (issue #7 chunk 2, tsr-5po) =====
+
+    /// Build a simple linear chain `genesis(AddKey) -> NoOp -> NoOp -> ...` of `len` AUMs, returning
+    /// the AUMs in parent→child order. The genesis adds `test_aum_key(1, 1)`.
+    fn linear_chain(len: usize) -> Vec<Aum> {
+        assert!(len >= 1);
+        let mut chain = alloc::vec![genesis_add(test_aum_key(1, 1))];
+        for _ in 1..len {
+            let parent = chain.last().unwrap();
+            chain.push(child(parent, AumKind::NoOp, None, Vec::new()));
+        }
+        chain
+    }
+
+    /// An [`Authority`] whose head is the last AUM of `chain` (via the structural `from_chain`; the
+    /// sync layer is signature-agnostic, so unsigned test chains are fine here).
+    fn authority_at_head(chain: &[Aum]) -> Authority {
+        Authority::from_chain(chain).expect("linear test chain replays")
+    }
+
+    #[test]
+    fn mem_store_indexes_by_hash_and_children() {
+        let chain = linear_chain(3);
+        let store = MemAumStore::from_aums(chain.clone());
+        assert_eq!(store.len(), 3);
+        // by-hash lookup
+        assert_eq!(store.aum(&chain[1].hash()).as_ref(), Some(&chain[1]));
+        assert!(store.aum(&AumHash([0xFF; AUM_HASH_LEN])).is_none());
+        // child index: genesis has one child (chain[1]); the tail has none.
+        let kids = store.child_aums(&chain[0].hash());
+        assert_eq!(kids.len(), 1);
+        assert_eq!(kids[0], chain[1]);
+        assert!(store.child_aums(&chain[2].hash()).is_empty());
+        // insert is idempotent on hash + child edge.
+        let mut s2 = store.clone();
+        s2.insert(chain[1].clone());
+        assert_eq!(s2.len(), 3, "re-insert must not grow the store");
+        assert_eq!(
+            s2.child_aums(&chain[0].hash()).len(),
+            1,
+            "child edge not duplicated"
+        );
+    }
+
+    #[test]
+    fn sync_offer_head_and_oldest_bookend() {
+        let chain = linear_chain(5);
+        let store = MemAumStore::from_aums(chain.clone());
+        let auth = authority_at_head(&chain);
+        let oldest = chain[0].hash();
+
+        let offer = auth.sync_offer(&store, oldest).expect("offer");
+        assert_eq!(offer.head, chain[4].hash(), "offer head is the chain head");
+        assert_eq!(
+            *offer.ancestors.last().unwrap(),
+            oldest,
+            "the last ancestor is always the oldest AUM"
+        );
+        // Every ancestor is a real hash in the chain.
+        for a in &offer.ancestors {
+            assert!(
+                store.aum(a).is_some(),
+                "ancestor {a:?} must be in the store"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_offer_truncates_on_a_gap() {
+        // A store missing an interior AUM: the backward walk breaks early, but `oldest` is still
+        // appended (matching Go's break-then-append). Drop chain[1] so walking back from head hits
+        // a gap.
+        let chain = linear_chain(4);
+        let store = MemAumStore::from_aums(
+            chain
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != 1)
+                .map(|(_, a)| a.clone()),
+        );
+        let auth = authority_at_head(&chain);
+        let offer = auth
+            .sync_offer(&store, chain[0].hash())
+            .expect("offer despite gap");
+        assert_eq!(*offer.ancestors.last().unwrap(), chain[0].hash());
+    }
+
+    #[test]
+    fn missing_aums_empty_when_up_to_date() {
+        let chain = linear_chain(4);
+        let store = MemAumStore::from_aums(chain.clone());
+        let auth = authority_at_head(&chain);
+        let oldest = chain[0].hash();
+        // Peer offers the SAME head → nothing missing.
+        let peer_offer = auth.sync_offer(&store, oldest).expect("offer");
+        let missing = auth
+            .missing_aums(&store, &peer_offer, oldest)
+            .expect("missing");
+        assert!(missing.is_empty(), "an up-to-date peer is missing nothing");
+    }
+
+    #[test]
+    fn missing_aums_head_intersection_sends_the_tail() {
+        // We are at head chain[4]; the peer is behind at chain[2] (their head is an ancestor of
+        // ours). We must send them chain[3] and chain[4] (everything after the intersection).
+        let chain = linear_chain(5);
+        let store = MemAumStore::from_aums(chain.clone());
+        let oldest = chain[0].hash();
+        let us = authority_at_head(&chain); // head = chain[4]
+
+        // The peer's offer: head = chain[2], ancestors back to oldest. Build it from a peer authority
+        // whose head is chain[2] over a store holding the prefix [0..=2].
+        let peer_prefix: Vec<Aum> = chain[0..=2].to_vec();
+        let peer_store = MemAumStore::from_aums(peer_prefix.clone());
+        let peer = authority_at_head(&peer_prefix); // head = chain[2]
+        let peer_offer = peer.sync_offer(&peer_store, oldest).expect("peer offer");
+
+        let missing = us
+            .missing_aums(&store, &peer_offer, oldest)
+            .expect("missing");
+        let missing_hashes: Vec<AumHash> = missing.iter().map(Aum::hash).collect();
+        assert_eq!(
+            missing_hashes,
+            alloc::vec![chain[3].hash(), chain[4].hash()],
+            "must send exactly the AUMs after the peer's head, in order"
+        );
+    }
+
+    #[test]
+    fn missing_aums_excludes_the_intersection_itself() {
+        // The intersection AUM (the peer's head) must NOT be in the sent set — they already have it.
+        let chain = linear_chain(4);
+        let store = MemAumStore::from_aums(chain.clone());
+        let oldest = chain[0].hash();
+        let us = authority_at_head(&chain);
+
+        let peer_prefix: Vec<Aum> = chain[0..=1].to_vec();
+        let peer = authority_at_head(&peer_prefix);
+        let peer_offer = peer
+            .sync_offer(&MemAumStore::from_aums(peer_prefix.clone()), oldest)
+            .expect("peer offer");
+
+        let missing = us
+            .missing_aums(&store, &peer_offer, oldest)
+            .expect("missing");
+        assert!(
+            !missing.iter().any(|a| a.hash() == chain[1].hash()),
+            "the intersection AUM (peer's head) must be excluded"
+        );
+        assert_eq!(missing.len(), 2, "only chain[2] and chain[3] are missing");
+    }
+
+    #[test]
+    fn missing_aums_no_intersection_errors() {
+        // Two totally unrelated chains (different genesis keys → different hashes everywhere): no
+        // intersection, so `missing_aums` fails closed rather than mis-rooting.
+        let ours = linear_chain(3);
+        let store = MemAumStore::from_aums(ours.clone());
+        let us = authority_at_head(&ours);
+
+        // A foreign chain the peer offers; we hold none of it.
+        let theirs = {
+            let mut c = alloc::vec![genesis_add(test_aum_key(9, 1))];
+            c.push(child(&c[0], AumKind::NoOp, None, Vec::new()));
+            c
+        };
+        let foreign_offer = SyncOffer {
+            head: theirs[1].hash(),
+            ancestors: alloc::vec![theirs[1].hash(), theirs[0].hash()],
+        };
+        assert!(
+            us.missing_aums(&store, &foreign_offer, ours[0].hash())
+                .is_err(),
+            "no intersection must fail closed, not mis-root"
+        );
+    }
+
+    #[test]
+    fn compute_state_at_matches_replay_at_each_point() {
+        // The state computed at an interior AUM via the store walk must equal a direct linear replay
+        // of the prefix up to that AUM (the verify-only Authority's state).
+        let chain = linear_chain(4);
+        let store = MemAumStore::from_aums(chain.clone());
+        for i in 0..chain.len() {
+            let want = chain[i].hash();
+            let via_store = compute_state_at(&store, MAX_SYNC_ITER, want)
+                .expect("compute_state_at ok")
+                .expect("hash present");
+            let via_replay = Authority::from_chain(&chain[0..=i]).expect("prefix replays");
+            assert_eq!(
+                via_store.to_state(),
+                *via_replay.state(),
+                "computed state at chain[{i}] must match a direct prefix replay"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_offer_ancestors_are_exponentially_spaced() {
+        // With a long chain the ancestor sampling thins out (skip 4, then 16, ...), so the count is
+        // far below the chain length — the whole point of the offer.
+        let chain = linear_chain(60);
+        let store = MemAumStore::from_aums(chain.clone());
+        let auth = authority_at_head(&chain);
+        let offer = auth.sync_offer(&store, chain[0].hash()).expect("offer");
+        assert!(
+            offer.ancestors.len() < 12,
+            "exponential spacing keeps the ancestor list small (got {})",
+            offer.ancestors.len()
+        );
+        // First sampled ancestor is 4 back from head (i=4 is the first i%4==0 with i>0): chain[56].
+        assert_eq!(offer.ancestors[0], chain[60 - 1 - 4].hash());
+        assert_eq!(*offer.ancestors.last().unwrap(), chain[0].hash());
     }
 }
