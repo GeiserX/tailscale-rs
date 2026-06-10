@@ -68,9 +68,18 @@ publisher with:
 Until a crate has its trusted publisher configured, `release.yml`'s publish step fails *for that
 crate only*; the version-bump + tag + GitHub-Release half (release-please.yml) works regardless.
 
-> **Bulk option (optional):** the 43 entries can be created in one pass via the crates.io
-> trusted-publishing API (`/api/v1/trusted_publishing/github_configs`) with a crates.io API token —
-> see the helper noted in `scripts/` if present. The manual web form is the supported baseline.
+> **Bulk option (recommended over 43 web forms):** `scripts/setup-trusted-publishing.sh` registers
+> the trusted publisher on every publishable crate in one pass via the crates.io API. It is
+> idempotent (skips crates already configured) and derives the crate list from `cargo metadata`, so
+> it never drifts from what `publish-crates.sh` ships:
+>
+> ```sh
+> export CARGO_REGISTRY_TOKEN=<a crates.io API token>   # publish-scoped is fine
+> ./scripts/setup-trusted-publishing.sh --dry-run       # preview (no token needed, no writes)
+> ./scripts/setup-trusted-publishing.sh                 # register all 43
+> ```
+>
+> The manual web form (above) remains the supported baseline for a single crate.
 
 ## Manual fallback
 
