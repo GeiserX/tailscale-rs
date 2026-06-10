@@ -17,9 +17,18 @@
 //!   revisit this to ensure pure-bytewise ordering on the encoded key.
 //! - **No duplicate map keys** (CTAP2 forbids them; a duplicate would be a malformed map).
 //! - **`omitempty`**: a field whose value is absent/empty is not emitted at all.
+//! - **`null` for non-`omitempty` nil byte fields** ([`Value::Null`], `0xf6`): Go's `fxamacker/cbor`
+//!   encodes a nil/empty `[]byte` in a *non*-`omitempty` field (e.g. an AUM's genesis `PrevAUMHash`,
+//!   `tkatype.Signature.{KeyID,Signature}`, `State.LastAUMHash`) as CBOR null — not an empty byte
+//!   string and not omitted. Distinct from the `omitempty` rule above (which drops the field).
+//! - **Text-keyed maps** ([`Value::TextMap`], for Go `map[string]string` fields like an AUM/Key
+//!   `Meta`): same CTAP2 bytewise-lexicographic key ordering, but on the *encoded text* key — which,
+//!   unlike the small integer keys, is **not** equivalent to plain content order when keys differ in
+//!   length (the length head sorts first).
 //!
-//! The encoder is a tiny value model ([`Value`]) plus [`Value::encode`]. It is deliberately not a
-//! general-purpose CBOR library.
+//! The value model ([`Value`]) covers the shapes the TKA wire types exercise — uint, byte string,
+//! text string, array, integer-keyed map, text-keyed map, and null — plus [`Value::encode`]. It is
+//! deliberately not a general-purpose CBOR library (e.g. no negative ints, tags, or floats).
 
 use alloc::vec::Vec;
 

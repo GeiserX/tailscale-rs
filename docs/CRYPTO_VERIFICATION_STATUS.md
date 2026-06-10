@@ -108,13 +108,44 @@ asserted byte-equal in Rust KATs:
 | WireGuard handshake | [`tests/vectors/gen/wg/main.go`](../tests/vectors/gen/wg/main.go) | [`ts_tunnel/src/handshake.rs`](../ts_tunnel/src/handshake.rs) | Noise handshake keys / key schedule |
 | Transport AEAD | [`tests/vectors/gen/aead/main.go`](../tests/vectors/gen/aead/main.go) | [`ts_tunnel/src/session.rs`](../ts_tunnel/src/session.rs) | transport nonce construction |
 | Control AEAD | *(part of the Noise/control surface)* | [`ts_control_noise/src/cipher.rs`](../ts_control_noise/src/cipher.rs) | big-endian control-plane AEAD framing |
-| Tailnet Lock | [`tests/vectors/gen/tka/main.go`](../tests/vectors/gen/tka/main.go) | [`ts_tka/src/lib.rs`](../ts_tka/src/lib.rs) | AUM CBOR encoding + SigHash |
+| Tailnet Lock | [`tests/vectors/gen/tka/main.go`](../tests/vectors/gen/tka/main.go) | [`ts_tka/src/lib.rs`](../ts_tka/src/lib.rs) | `NodeKeySignature` CBOR + SigHash, **and** `AUM` `Serialize`/`Hash`/`SigHash` (one AUM per kind) |
 | ZIP-215 verify | [`tests/vectors/gen/zip215/main.go`](../tests/vectors/gen/zip215/main.go) | [`ts_tka/src/lib.rs`](../ts_tka/src/lib.rs) | dual-verifier (ZIP-215 vs standard) vs Go |
 
 Plus the **12-vector `ed25519-speccheck` dual-verifier KAT**
 ([`ts_tka/src/lib.rs`](../ts_tka/src/lib.rs), `ed25519_speccheck_dual_verifier_kat`), which proves
 the standard (cofactorless, `ed25519-dalek`) vs ZIP-215 (cofactored, `ed25519-zebra`) dispatch
 agrees with Go's accept/reject behavior on the 12 adversarial Ed25519 edge cases.
+
+**AUM `Serialize`/`Hash`/`SigHash` Go cross-vector (new).** The Go vector generator
+([`tests/vectors/gen/tka/main.go`](../tests/vectors/gen/tka/main.go)) now also imports the real
+`tailscale.com/tka` and dumps, for one `tka.AUM` per `MessageKind` (AddKey, RemoveKey, UpdateKey, a
+signed AddKey with `Signatures` at CBOR key 23, and a Checkpoint with a populated `State`), the
+authoritative `AUM.Serialize()` / `AUM.Hash()` (`BLAKE2s-256` of the serialization) /
+`AUM.SigHash()` (`BLAKE2s-256` of the serialization with `Signatures` nil'd) — committed at
+[`tests/vectors/tka_aum_hash_golden.json`](../tests/vectors/tka_aum_hash_golden.json). The Rust KAT
+`aum_hash_sighash_matches_go_golden` asserts `Aum::serialize`/`hash`/`sig_hash` byte-match those Go
+goldens. This closes the one residual axis-B gap for Tailnet Lock: the prior
+`aum_serialize_matches_go_test_serialization_vectors` test pinned only Go's *Serialize()* literals
+(from `tka/aum_test.go`); **no Go-produced `AUM.Hash()` digest was pinned**, so an error in the
+BLAKE2s-over-canonical-CBOR digest — the value that links the whole chain and is what gets signed —
+could have gone undetected. The signed-AddKey case also proves `Hash() != SigHash()` (key 23 is in
+`Hash`, excluded from `SigHash`), matching Go's `AUM.SigHash` which nils `Signatures` first.
+Provenance is a **real Go run**, not literal-derivation: regenerating with the in-tree generator
+(`go run ./tka`, `tailscale.com v1.100.0`, toolchain go1.26.3) reproduces
+`tka_aum_hash_golden.json` **byte-for-byte**, and a standalone Go oracle confirms `AUM.Hash() ==
+blake2s.Sum256(Serialize())` and `SigHash() == blake2s.Sum256(Serialize-with-Signatures-nil)` for
+every case, with `blake2s.Size == 32` (BLAKE2s-**256**, not BLAKE2b).
+
+> ✅ **One Go-interop divergence found by this audit — now FIXED (nil-vs-empty `DisablementValues`).**
+> For an `AUMCheckpoint` whose embedded `State.DisablementValues` (or `Keys`) is **nil** (the Go zero
+> value, and the common case), Go's `fxamacker/cbor` emits CBOR null `0xf6`; Rust's `AumState`
+> originally modelled the field as `Vec<Vec<u8>>` and always emitted an empty array `0x80`, diverging
+> the checkpoint's `Hash`/head from Go on the **chain-replay** path (the shipped `node_key_authorized`
+> verify path never serializes an `AumState`, so it was never affected). **Fixed:**
+> `AumState.{disablement_values,keys}` are now `Option<Vec<…>>` — `None` (Go nil) encodes as null
+> `0xf6`, `Some(vec)` as an array — so the nil case byte-matches Go. The regression guard is now a
+> **passing** Go-match golden (`aum_checkpoint_nil_disablement_matches_go`, pinning both the Go
+> serialization and the Go `Hash`), alongside the populated case in `aum_hash_sighash_matches_go_golden`.
 
 **BLAKE2s-256 reference KAT.** BLAKE2s was previously the only hand-rolled primitive exercised
 *only* transitively (through the WireGuard handshake vectors). It now has a direct KAT
@@ -217,7 +248,7 @@ flowchart LR
   [`.github/workflows/release-binaries.yml`](../.github/workflows/release-binaries.yml) is uploaded
   with a plain `gh release upload` and **no attestation**.
 
-**B — correctness:** no open gap. The two previously-listed items both landed in this change and
+**B — correctness:** strong, with **one recorded byte-level divergence** (not a verify-path gap). The two previously-listed items both landed in this change and
 are documented under *Current coverage → B* above: the direct **BLAKE2s-256 KAT**
 ([`ts_tunnel/tests/blake2s_kat.rs`](../ts_tunnel/tests/blake2s_kat.rs)) and the **CBOR differential
 fuzz target** for Tailnet Lock ([`ts_tka/fuzz/fuzz_targets/cbor_decode.rs`](../ts_tka/fuzz/fuzz_targets/cbor_decode.rs)
@@ -225,7 +256,15 @@ fuzz target** for Tailnet Lock ([`ts_tka/fuzz/fuzz_targets/cbor_decode.rs`](../t
 *follow-on* hardening, not a correctness gap: wiring the fuzzer's Rust↔Go accept/reject comparison
 into an automated differential loop (it needs nightly + `cargo-fuzz`, so it stays out of normal CI —
 the decoder's panic-free invariant is already covered in stable CI by
-[`ts_tka/tests/cbor_decode_smoke.rs`](../ts_tka/tests/cbor_decode_smoke.rs)).
+[`ts_tka/tests/cbor_decode_smoke.rs`](../ts_tka/tests/cbor_decode_smoke.rs)). The **AUM `Serialize`/`Hash`/`SigHash`** surface is now Go-cross-validated too (see *Current
+coverage → B*), closing the prior "no Go-produced `AUM.Hash()` pinned" gap. The one Go-interop
+divergence this audit surfaced — the **nil-vs-empty `DisablementValues`** encoding in `AumState`
+(Go null `0xf6` vs Rust empty-array `0x80`, which affected only the chain-replay `Hash`, never the
+shipped verify path) — has since been **fixed**: `AumState.{disablement_values,keys}` are now
+`Option`, so a nil slice encodes as `0xf6` and the nil-checkpoint case byte-matches Go (regression
+guard: the passing `aum_checkpoint_nil_disablement_matches_go` golden). Axis B has no open
+correctness divergence on the Tailnet-Lock surface.
+
 
 **D — side-channel (in progress):**
 - **Record a `max_t` result on a quiet machine.** The dudect harness source now exists

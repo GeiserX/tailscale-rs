@@ -168,6 +168,16 @@ pub struct Config {
     /// Like [`accept_routes`](Config::accept_routes), this is a client-side preference not read
     /// inside `ts_control`; it is carried here only to be threaded through to the runtime's route
     /// filter.
+    ///
+    /// **Full-tunnel exit vs. just reaching a peer's port — leave this `None` unless you mean
+    /// full-tunnel.** Set `exit_node` *only* to route **all** internet-bound traffic through a peer
+    /// that advertises a default route (`advertise_exit_node`). To merely **reach a specific peer's
+    /// service over the tailnet** — e.g. `Device::tcp_connect` to its `100.x.y.z:1080` — you do
+    /// **not** set `exit_node` at all; direct peer dials need no exit node. Setting `exit_node` to a
+    /// peer that is only a selective CONNECT proxy (advertises no `0.0.0.0/0`) leaves egress
+    /// fail-closed and logs a warning that internet-bound traffic is dropped — which looks like a
+    /// failure but is just "that peer isn't a full-tunnel exit." If you saw that warning while only
+    /// trying to dial a peer's port, the fix is to unset `exit_node`.
     #[serde(default)]
     pub exit_node: Option<crate::ExitNodeSelector>,
 

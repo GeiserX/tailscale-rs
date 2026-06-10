@@ -438,6 +438,34 @@ flowchart LR
   verdict columns — `ed25519-dalek` ≡ Go `crypto/ed25519` (standard) and `ed25519-zebra` ≡ Go
   `ed25519consensus` (ZIP-215) — proving the dispatch asymmetry of §5.1 matches Go on the
   discriminating cases.
+- **AUM `Serialize` / `Hash` / `SigHash`.** The full `AUM` wire type (not just `NodeKeySignature`)
+  is now Go-cross-validated. The generator at `tests/vectors/gen/tka/main.go` builds one real
+  `tka.AUM` per `MessageKind` — AddKey (with a `Key25519` + meta), RemoveKey, UpdateKey (votes +
+  meta), a signed AddKey (Signatures at CBOR key 23), and a Checkpoint carrying a populated `State`
+  — and dumps each AUM's `Serialize()` (hex), `Hash()` (Go `AUM.Hash` = `BLAKE2s-256(Serialize())`)
+  and `SigHash()` (Go `AUM.SigHash` = `BLAKE2s-256` of `Serialize` with `Signatures` nil'd) to
+  [`../tests/vectors/tka_aum_hash_golden.json`](../tests/vectors/tka_aum_hash_golden.json). The Rust
+  KAT `aum_hash_sighash_matches_go_golden` (`ts_tka/src/lib.rs`) asserts `Aum::serialize`/`hash`/
+  `sig_hash` byte-match those goldens. This closes the prior gap where the sibling
+  `aum_serialize_matches_go_test_serialization_vectors` test pinned only Go's *Serialize()* literals
+  (from `tka/aum_test.go`) and **no Go-produced `AUM.Hash()` digest was pinned** — so an error in
+  the BLAKE2s-over-canonical-CBOR digest (the value that links the whole chain and is signed) could
+  have gone undetected. The signed-AddKey case additionally proves `Hash() != SigHash()` (key 23
+  covered by `Hash`, excluded from `SigHash`), exactly as Go nils `Signatures` before serializing.
+- **Known nil-vs-empty divergence (recorded, fails closed).** One byte-level interop bug is captured
+  as an executable oracle (`aum_checkpoint_nil_disablement_diverges_from_go_known_bug`): for an
+  `AUMCheckpoint` whose embedded `State.DisablementValues` (or `Keys`) is **nil** (the Go zero value
+  — the common case), Go's `fxamacker/cbor` emits **CBOR null `0xf6`**, whereas Rust's `AumState`
+  models the field as `Vec<Vec<u8>>` and always emits an **empty array `0x80`**. The array encoding
+  itself is correct for *populated* slices (the populated Checkpoint matches Go byte-for-byte); the
+  divergence is confined to the nil/empty case, where Go distinguishes nil (`0xf6`) from
+  explicitly-empty-non-nil (`0x80`) — a distinction the current Rust type cannot represent. It is a
+  real client-side **chain-replay** concern (a nil-disablement checkpoint computes a different
+  `Hash`/`PrevAUMHash` than Go, so head-matching would diverge); it is **not** on the shipped
+  `node_key_authorized` verify path, which never serializes an `AumState`. The test pins *both* the
+  authoritative Go bytes and today's Rust output so the divergence cannot regress silently and
+  `cargo test` stays green; the fix is to give `AumState` a nil/empty distinction (e.g.
+  `Option<Vec<…>>`) so a nil slice encodes as `0xf6`.
 
 ### 8a.2 Provenance
 

@@ -438,16 +438,22 @@ impl AumKey {
 /// A full authority-state snapshot as carried in an `AUMCheckpoint` (Go `tka.State`).
 ///
 /// CBOR keymap: `last_aum_hash`=1, `disablement_values`=2, `keys`=3, `state_id1`=4 (omitempty),
-/// `state_id2`=5 (omitempty). Keys 1/2/3 are **non-`omitempty`** (a nil `last_aum_hash` encodes as
-/// CBOR null, a nil `disablement_values`/`keys` as an empty array — matching Go's struct encoding).
+/// `state_id2`=5 (omitempty). Keys 1/2/3 are **non-`omitempty`**, and Go's `fxamacker/cbor`
+/// distinguishes a **nil** slice/pointer from an **empty-but-present** one: a nil field encodes as
+/// CBOR **null** (`0xf6`), an empty-non-nil slice as an empty **array** (`0x80`). `last_aum_hash`,
+/// `disablement_values`, and `keys` are therefore `Option`: `None` ⇒ Go nil ⇒ `0xf6`; `Some(vec)`
+/// (incl. `Some(empty)`) ⇒ array. Getting this wrong changes the checkpoint's `Hash` — and thus the
+/// chain head — versus Go, so it is consensus-relevant (this was a recorded interop bug; fixed here).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AumState {
-    /// The hash of the AUM this state was produced by (Go `LastAUMHash`); `None` encodes as null.
+    /// The hash of the AUM this state was produced by (Go `LastAUMHash`); `None` (Go nil) ⇒ null.
     pub last_aum_hash: Option<AumHash>,
-    /// Disablement secret hashes (Go `DisablementValues`).
-    pub disablement_values: Vec<Vec<u8>>,
-    /// The trusted keys at this state.
-    pub keys: Vec<AumKey>,
+    /// Disablement secret hashes (Go `DisablementValues`). `None` (Go nil) ⇒ CBOR null `0xf6`;
+    /// `Some(vec)` ⇒ array (empty array `0x80` when `Some(vec![])`).
+    pub disablement_values: Option<Vec<Vec<u8>>>,
+    /// The trusted keys at this state (Go `Keys`). `None` (Go nil) ⇒ CBOR null `0xf6`; `Some(vec)` ⇒
+    /// array.
+    pub keys: Option<Vec<AumKey>>,
     /// Optional state identifier, high half (Go `StateID1`); omitted from CBOR when 0.
     pub state_id1: u64,
     /// Optional state identifier, low half (Go `StateID2`); omitted from CBOR when 0.
@@ -466,18 +472,20 @@ impl AumState {
             ),
             (
                 2,
-                Some(Value::Array(
-                    self.disablement_values
-                        .iter()
-                        .map(|d| Value::Bytes(d.clone()))
-                        .collect(),
-                )),
+                Some(match &self.disablement_values {
+                    // Go nil ⇒ CBOR null; Some(vec) ⇒ array (empty array for Some(vec![])).
+                    None => Value::Null,
+                    Some(vals) => {
+                        Value::Array(vals.iter().map(|d| Value::Bytes(d.clone())).collect())
+                    }
+                }),
             ),
             (
                 3,
-                Some(Value::Array(
-                    self.keys.iter().map(AumKey::to_cbor).collect(),
-                )),
+                Some(match &self.keys {
+                    None => Value::Null,
+                    Some(keys) => Value::Array(keys.iter().map(AumKey::to_cbor).collect()),
+                }),
             ),
             (
                 4,
@@ -735,7 +743,9 @@ impl ReplayState {
                     }
                     _ => self.state_id = Some(incoming),
                 }
-                self.keys = state.keys.clone();
+                // A checkpoint replaces the key set with its snapshot; a nil `keys` (Go nil) means
+                // "no trusted keys", i.e. the empty set.
+                self.keys = state.keys.clone().unwrap_or_default();
             }
             AumKind::AddKey => {
                 let key = aum
@@ -751,6 +761,15 @@ impl ReplayState {
                 let idx = self
                     .find_key_index(&aum.key_id)
                     .ok_or(TkaError::BadKeyState)?;
+                // Mirror Go `applyVerifiedAUM` (AUMUpdateKey): each field is applied only when the
+                // update carries it — `if update.Votes != nil` / `if update.Meta != nil`. `votes`
+                // maps cleanly to `Option<u32>`. `meta` is a `Vec`, which cannot distinguish Go's
+                // nil map (leave unchanged) from an empty-but-present map (clear) — we treat empty
+                // as "not carried / leave unchanged", matching the nil case. The empty-but-present
+                // "clear meta" case is both unrepresentable here and verify-irrelevant (the
+                // verify-path `Key` drops `meta` entirely via `to_key`, so it never reaches a
+                // `node_key_authorized` decision); document the limitation rather than assign
+                // unconditionally, which would wrongly wipe `meta` on a votes-only update.
                 if let Some(votes) = aum.votes {
                     self.keys[idx].votes = votes;
                 }
@@ -1048,6 +1067,13 @@ fn decode_value(buf: &[u8], depth: usize) -> Result<(Value, &[u8]), TkaError> {
             }
             Ok((Value::IntMap(entries), cur))
         }
+        // Major types 1 (negative int), 6 (tag), and 7 (simple/float — incl. `null` 0xf6) are
+        // rejected. This decoder backs only the `NodeKeySignature` shape, whose fields are all
+        // uint/bytes/text/array/map and never null. NOTE for the future AUM-chain decoder (issue #7
+        // chunk 2): AUMs *do* encode `null` (major 7, `0xf6`) for non-`omitempty` nil byte fields
+        // (genesis `prev_aum_hash`, `AumSignature.{key_id,signature}`, `AumState.last_aum_hash`) — see
+        // the encoder's `Value::Null` arm — so an AUM decoder must add a `7 => null` case here (or in
+        // a dedicated decoder) or it will reject every real AUM.
         _ => Err(TkaError::Decode("unsupported CBOR major type")),
     }
 }
@@ -2072,13 +2098,13 @@ mod tests {
             key_id: Vec::new(),
             state: Some(AumState {
                 last_aum_hash: Some(AumHash([0u8; AUM_HASH_LEN])),
-                disablement_values: Vec::new(),
-                keys: alloc::vec![AumKey {
+                disablement_values: Some(Vec::new()),
+                keys: Some(alloc::vec![AumKey {
                     kind: KeyKind::Ed25519,
                     votes: 1,
                     public: alloc::vec![5, 6],
                     meta: Vec::new(),
-                }],
+                }]),
                 state_id1: 0,
                 state_id2: 0,
             }),
@@ -2495,8 +2521,8 @@ mod tests {
             key_id: Vec::new(),
             state: Some(AumState {
                 last_aum_hash: None,
-                disablement_values: Vec::new(),
-                keys: alloc::vec![k.clone()],
+                disablement_values: Some(Vec::new()),
+                keys: Some(alloc::vec![k.clone()]),
                 state_id1: 7,
                 state_id2: 0,
             }),
@@ -2512,8 +2538,8 @@ mod tests {
             key_id: Vec::new(),
             state: Some(AumState {
                 last_aum_hash: Some(genesis.hash()),
-                disablement_values: Vec::new(),
-                keys: alloc::vec![k.clone()],
+                disablement_values: Some(Vec::new()),
+                keys: Some(alloc::vec![k.clone()]),
                 state_id1: 8, // ← mismatch
                 state_id2: 0,
             }),
@@ -2534,8 +2560,8 @@ mod tests {
             key_id: Vec::new(),
             state: Some(AumState {
                 last_aum_hash: Some(genesis.hash()),
-                disablement_values: Vec::new(),
-                keys: alloc::vec![k],
+                disablement_values: Some(Vec::new()),
+                keys: Some(alloc::vec![k]),
                 state_id1: 7,
                 state_id2: 0,
             }),
@@ -2561,6 +2587,271 @@ mod tests {
             Authority::from_forked_chain(&[a0], &[&single[..], &multi[..]]).unwrap_err(),
             TkaError::BadChain,
             "a multi-step branch must be rejected, not judged by its first AUM"
+        );
+    }
+
+    /// Cross-implementation Known-Answer-Test for the **AUM** type: [`Aum::serialize`],
+    /// [`Aum::hash`] (Go `AUM.Hash`), and [`Aum::sig_hash`] (Go `AUM.SigHash`) must byte-match the
+    /// REAL `tailscale.com/tka` package, version **v1.100.0** (toolchain **go1.26.3+**).
+    ///
+    /// Provenance: every golden below is authoritative upstream output produced by the Go generator
+    /// at `tests/vectors/gen/tka/main.go` (which imports the real `tailscale.com/tka`, builds one
+    /// `tka.AUM` per `MessageKind`, and dumps `AUM.Serialize()`/`AUM.Hash()`/`AUM.SigHash()` hex).
+    /// The same values are committed for provenance at `tests/vectors/tka_aum_hash_golden.json`.
+    /// This is the missing half of axis-B for AUM: the sibling
+    /// [`aum_serialize_matches_go_test_serialization_vectors`] test pins Go's *Serialize()* literals
+    /// from `tka/aum_test.go`, but no Go-produced *AUM.Hash()* digest was pinned until now — so an
+    /// error in the BLAKE2s-over-canonical-CBOR digest (the value that links the whole chain and is
+    /// signed) would have gone undetected. Here `hash`/`sig_hash` are pinned to Go directly.
+    ///
+    /// Covered kinds: AddKey (genesis, with a real Key25519 + meta), RemoveKey, UpdateKey
+    /// (votes+meta), a signed AddKey (Signatures at CBOR key 23), and a Checkpoint with a populated
+    /// `State`. The signed AUM additionally proves `hash() != sig_hash()` — i.e. `Hash()` covers the
+    /// signatures and `SigHash()` excludes them, exactly as Go's `AUM.SigHash` nils `Signatures`
+    /// before serializing.
+    #[test]
+    fn aum_hash_sighash_matches_go_golden() {
+        // Deterministic field material — identical to the Go generator's inputs.
+        let prev = AumHash({
+            let mut a = [0u8; AUM_HASH_LEN];
+            let mut i = 0;
+            while i < AUM_HASH_LEN {
+                a[i] = 0x20u8.wrapping_add(i as u8);
+                i += 1;
+            }
+            a
+        });
+        let key_pub: Vec<u8> = (0..32u16).map(|i| 0x40u8.wrapping_add(i as u8)).collect();
+        let key_pub2: Vec<u8> = (0..32u16).map(|i| 0x60u8.wrapping_add(i as u8)).collect();
+        let sig_bytes: Vec<u8> = (0..64u16).map(|i| 0x80u8.wrapping_add(i as u8)).collect();
+
+        // Assert one AUM's serialize/hash/sig_hash against the authoritative Go hex.
+        let check = |label: &str, aum: &Aum, ser_hex: &str, hash_hex: &str, sig_hash_hex: &str| {
+            assert_eq!(
+                hex(&aum.serialize()),
+                ser_hex,
+                "{label}: Aum::serialize diverged from Go tka v1.100.0"
+            );
+            assert_eq!(
+                hex(&aum.hash().0),
+                hash_hex,
+                "{label}: Aum::hash (Go AUM.Hash) diverged from Go tka v1.100.0"
+            );
+            assert_eq!(
+                hex(&aum.sig_hash()),
+                sig_hash_hex,
+                "{label}: Aum::sig_hash (Go AUM.SigHash) diverged from Go tka v1.100.0"
+            );
+        };
+
+        // (a) AddKey genesis (nil prev) with a real Key25519 + meta {"name":"alpha"}.
+        let add_key = Aum {
+            message_kind: AumKind::AddKey,
+            prev_aum_hash: None,
+            key: Some(AumKey {
+                kind: KeyKind::Ed25519,
+                votes: 7,
+                public: key_pub.clone(),
+                meta: alloc::vec![("name".into(), "alpha".into())],
+            }),
+            key_id: Vec::new(),
+            state: None,
+            votes: None,
+            meta: Vec::new(),
+            signatures: Vec::new(),
+        };
+        check(
+            "AddKey",
+            &add_key,
+            "a3010102f603a401010207035820404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f0ca1646e616d6565616c706861",
+            "921ca301077ae2b892ca8c40b3315e5f2a9ccc9ac99eec784e93b323577e1e14",
+            "921ca301077ae2b892ca8c40b3315e5f2a9ccc9ac99eec784e93b323577e1e14",
+        );
+
+        // (b) RemoveKey with a non-nil prev.
+        let remove_key = Aum {
+            message_kind: AumKind::RemoveKey,
+            prev_aum_hash: Some(prev),
+            key: None,
+            key_id: key_pub.clone(),
+            state: None,
+            votes: None,
+            meta: Vec::new(),
+            signatures: Vec::new(),
+        };
+        check(
+            "RemoveKey",
+            &remove_key,
+            "a30102025820202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f045820404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+            "46be17c398760d2e649147b06a68e8576ee37c59cf0558046182f48ba20aa912",
+            "46be17c398760d2e649147b06a68e8576ee37c59cf0558046182f48ba20aa912",
+        );
+
+        // (c) UpdateKey with votes=2 + meta {"role":"ci"}.
+        let update_key = Aum {
+            message_kind: AumKind::UpdateKey,
+            prev_aum_hash: Some(prev),
+            key: None,
+            key_id: key_pub.clone(),
+            state: None,
+            votes: Some(2),
+            meta: alloc::vec![("role".into(), "ci".into())],
+            signatures: Vec::new(),
+        };
+        check(
+            "UpdateKey",
+            &update_key,
+            "a50104025820202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f045820404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f060207a164726f6c65626369",
+            "42d160d81a0922511b4ce60050dba76569f79423b6e721c5040faf414c250e43",
+            "42d160d81a0922511b4ce60050dba76569f79423b6e721c5040faf414c250e43",
+        );
+
+        // (e) AddKey carrying one Signature (CBOR key 23). hash (incl sigs) MUST differ from
+        // sig_hash (excl sigs) — the property the whole signing scheme depends on.
+        let signed = Aum {
+            message_kind: AumKind::AddKey,
+            prev_aum_hash: Some(prev),
+            key: Some(AumKey {
+                kind: KeyKind::Ed25519,
+                votes: 1,
+                public: key_pub.clone(),
+                meta: Vec::new(),
+            }),
+            key_id: Vec::new(),
+            state: None,
+            votes: None,
+            meta: Vec::new(),
+            signatures: alloc::vec![AumSignature {
+                key_id: key_pub2.clone(),
+                signature: sig_bytes.clone(),
+            }],
+        };
+        check(
+            "AddKey+Signature",
+            &signed,
+            "a40101025820202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f03a301010201035820404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f1781a2015820606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f025840808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+            "e70332d9a03b205577204f1896bb8dcb7c8f8894cc87a5b5c4d5dabcdf6ef135",
+            "0a7a0ecdf854ad99e8728a1de89ac23c1f08457132a537a3add9594749a7f536",
+        );
+        assert_ne!(
+            hex(&signed.hash().0),
+            hex(&signed.sig_hash()),
+            "Hash() must cover Signatures while SigHash() excludes them (Go AUM.SigHash nils them)"
+        );
+
+        // (f) Checkpoint carrying a State with a POPULATED DisablementValues [{0xaa,0xbb}] + 1 key.
+        // This is the common real shape and matches Go byte-for-byte (the array encoding is correct).
+        let checkpoint = Aum {
+            message_kind: AumKind::Checkpoint,
+            prev_aum_hash: Some(prev),
+            key: None,
+            key_id: Vec::new(),
+            state: Some(AumState {
+                last_aum_hash: Some(prev),
+                disablement_values: Some(alloc::vec![alloc::vec![0xaa, 0xbb]]),
+                keys: Some(alloc::vec![AumKey {
+                    kind: KeyKind::Ed25519,
+                    votes: 1,
+                    public: key_pub.clone(),
+                    meta: Vec::new(),
+                }]),
+                state_id1: 0,
+                state_id2: 0,
+            }),
+            votes: None,
+            meta: Vec::new(),
+            signatures: Vec::new(),
+        };
+        check(
+            "Checkpoint(populated DisablementValues)",
+            &checkpoint,
+            "a30105025820202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f05a3015820202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f028142aabb0381a301010201035820404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+            "38c35c51580dcb75212d79c07695c8ec8b399b59ba552ea93f080b126fdaa0ae",
+            "38c35c51580dcb75212d79c07695c8ec8b399b59ba552ea93f080b126fdaa0ae",
+        );
+    }
+
+    /// Go-match golden for the nil-`DisablementValues` checkpoint — the case that was a recorded
+    /// interop bug (Rust forced an empty array `0x80` where Go emits CBOR null `0xf6`) and is now
+    /// FIXED by making `AumState.{disablement_values,keys}` `Option` (None = Go nil = `0xf6`).
+    ///
+    /// When an `AUMCheckpoint`'s embedded `State` has a **nil** `DisablementValues` (Go's zero value,
+    /// the overwhelmingly common case), Go's `fxamacker/cbor` CTAP2 encoder emits the field as
+    /// **CBOR null `0xf6`**; a populated slice encodes as an array (proven by the populated case in
+    /// [`aum_hash_sighash_matches_go_golden`]). This test pins the Go bytes + Hash for the nil case
+    /// and asserts the Rust output now byte-matches — guarding the fix against regression.
+    #[test]
+    fn aum_checkpoint_nil_disablement_matches_go() {
+        let prev = AumHash({
+            let mut a = [0u8; AUM_HASH_LEN];
+            let mut i = 0;
+            while i < AUM_HASH_LEN {
+                a[i] = 0x20u8.wrapping_add(i as u8);
+                i += 1;
+            }
+            a
+        });
+        let key_pub: Vec<u8> = (0..32u16).map(|i| 0x40u8.wrapping_add(i as u8)).collect();
+        let key_pub2: Vec<u8> = (0..32u16).map(|i| 0x60u8.wrapping_add(i as u8)).collect();
+
+        // Checkpoint with a State whose DisablementValues is EMPTY (== Go nil zero value), 2 keys.
+        let checkpoint = Aum {
+            message_kind: AumKind::Checkpoint,
+            prev_aum_hash: Some(prev),
+            key: None,
+            key_id: Vec::new(),
+            state: Some(AumState {
+                last_aum_hash: Some(prev),
+                disablement_values: Some(Vec::new()),
+                keys: Some(alloc::vec![
+                    AumKey {
+                        kind: KeyKind::Ed25519,
+                        votes: 1,
+                        public: key_pub.clone(),
+                        meta: Vec::new(),
+                    },
+                    AumKey {
+                        kind: KeyKind::Ed25519,
+                        votes: 3,
+                        public: key_pub2.clone(),
+                        meta: alloc::vec![("k".into(), "v".into())],
+                    },
+                ]),
+                state_id1: 0,
+                state_id2: 0,
+            }),
+            votes: None,
+            meta: Vec::new(),
+            signatures: Vec::new(),
+        };
+
+        // Authoritative Go bytes (generator case "checkpoint: State w/ nil DisablementValues"):
+        // the State map is `…02 f6 03 82 …` — a NIL DisablementValues encodes as CBOR null (0xf6).
+        // FIXED: `AumState.disablement_values` is now `Option`, so the nil case (`None`) is
+        // representable and encodes as null, byte-matching Go. (Was a recorded interop bug where the
+        // `Vec` type forced an empty array `0x80` and diverged the checkpoint Hash from Go.)
+        const GO_SERIALIZE: &str = "a30105025820202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f05a3015820202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f02f60382a301010201035820404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5fa401010203035820606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f0ca1616b6176";
+        const GO_HASH: &str = "cae17cc938c5a954cd4389d83c6afe4d3487edac38b94824bec3312b82f35710";
+
+        // Re-point the checkpoint's State to a genuinely-nil DisablementValues (`None`), which is the
+        // case the Go golden above was generated from.
+        let checkpoint = {
+            let mut c = checkpoint;
+            if let Some(state) = c.state.as_mut() {
+                state.disablement_values = None;
+            }
+            c
+        };
+
+        assert_eq!(
+            hex(&checkpoint.serialize()),
+            GO_SERIALIZE,
+            "nil DisablementValues must encode as CBOR null (0xf6), byte-matching Go"
+        );
+        assert_eq!(
+            hex(&checkpoint.hash().0),
+            GO_HASH,
+            "with the nil-vs-empty fix, the checkpoint chain-link Hash matches Go"
         );
     }
 }

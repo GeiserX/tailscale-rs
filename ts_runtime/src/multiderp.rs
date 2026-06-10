@@ -321,6 +321,24 @@ fn resolve_region_for_peer(
     observed.or(home).filter(|r| region_is_live(*r))
 }
 
+/// Record that a frame from `peer` arrived on region `region` (Go `derpRoute` learning), updating
+/// `routes` only when the mapping actually changes — so a steady stream of frames from a peer on its
+/// established region doesn't churn the write lock. Returns `true` iff the map was modified (the
+/// caller logs on a genuine change). Extracted from `run_derp_once` so the learn→resolve round-trip
+/// is unit-testable without the async DERP runner: a recorded route is exactly what
+/// [`resolve_region_for_peer`]'s `observed` arm later consumes.
+fn record_observed_route(
+    routes: &RwLock<HashMap<PeerId, RegionId>>,
+    peer: PeerId,
+    region: RegionId,
+) -> bool {
+    if poisoned_read(routes).get(&peer) == Some(&region) {
+        return false;
+    }
+    poisoned_write(routes).insert(peer, region);
+    true
+}
+
 struct PeerDbLookup<'a>(&'a RwLock<Option<Arc<PeerDb>>>);
 
 impl ts_transport::PeerLookup<PeerId, NodePublicKey> for PeerDbLookup<'_> {
@@ -439,10 +457,9 @@ async fn run_derp_once(
                         // Observed-route learning (Go `derpRoute` parity): a frame reached us from
                         // this peer on region `id`, so the peer is listening there. Record it (any
                         // frame counts — disco or WG data) so [`Multiderp::region_for_peer`] can
-                        // relay back to a peer whose netmap home region we never learned. Only write
-                        // on an actual change to avoid churning the lock on every received batch.
-                        if poisoned_read(observed_routes).get(&peer_id) != Some(&id) {
-                            poisoned_write(observed_routes).insert(peer_id, id);
+                        // relay back to a peer whose netmap home region we never learned. The helper
+                        // writes only on an actual change, to avoid churning the lock on every batch.
+                        if record_observed_route(observed_routes, peer_id, id) {
                             tracing::trace!(parent: &span, %peer_id, region_id = %id, "learned observed derp route for peer");
                         }
 
@@ -949,6 +966,72 @@ mod tests {
         assert!(
             !routes.contains_key(&PeerId(2)),
             "a peer no longer in the netmap must have its observed route pruned"
+        );
+    }
+
+    /// Observed-route LEARNING (`record_observed_route`, the logic `run_derp_once` runs on each
+    /// inbound DERP frame): a first frame records the route and returns `true`; a repeat frame from
+    /// the same peer on the same region is a no-op returning `false` (no lock churn); a frame on a
+    /// *different* region updates the route and returns `true` (a peer that moved regions). This is
+    /// the producer side of issue #24's observed-route mechanism — previously only the resolver was
+    /// tested.
+    #[test]
+    fn record_observed_route_learns_and_dedups() {
+        let routes: RwLock<HashMap<PeerId, RegionId>> = RwLock::new(HashMap::new());
+
+        // First frame from peer 1 on region 19 → learned.
+        assert!(
+            record_observed_route(&routes, PeerId(1), rid(19)),
+            "first frame learns the route (returns changed=true)"
+        );
+        assert_eq!(poisoned_read(&routes).get(&PeerId(1)), Some(&rid(19)));
+
+        // Repeat frame, same region → no change.
+        assert!(
+            !record_observed_route(&routes, PeerId(1), rid(19)),
+            "a repeat frame on the same region is a no-op (returns changed=false, no lock write)"
+        );
+
+        // Frame on a different region → peer moved, route updated.
+        assert!(
+            record_observed_route(&routes, PeerId(1), rid(7)),
+            "a frame on a new region updates the route (returns changed=true)"
+        );
+        assert_eq!(
+            poisoned_read(&routes).get(&PeerId(1)),
+            Some(&rid(7)),
+            "the observed route follows the peer to its new region"
+        );
+    }
+
+    /// The full observed-route round-trip: learning a route via `record_observed_route` makes
+    /// `resolve_region_for_peer` (the consumer) return exactly that region for the peer — even with
+    /// NO netmap home region and no own-home fallback. This pins issue #24's core promise (a peer we
+    /// have heard from over DERP becomes reachable on that region) across the producer→consumer seam,
+    /// which the two helpers' isolated tests don't cover together.
+    #[test]
+    fn observed_route_learn_then_resolve_round_trip() {
+        let routes: RwLock<HashMap<PeerId, RegionId>> = RwLock::new(HashMap::new());
+        let peer = PeerId(42);
+
+        // Before any frame: no observed route, no home region → unreachable.
+        let observed_before = poisoned_read(&routes).get(&peer).copied();
+        assert_eq!(
+            resolve_region_for_peer(observed_before, None, |_| true),
+            None,
+            "with neither an observed route nor a home region the peer has no relay route"
+        );
+
+        // A frame from the peer arrives on region 5 → learned.
+        assert!(record_observed_route(&routes, peer, rid(5)));
+
+        // Now the resolver returns region 5 from the observed route alone (home = None), provided
+        // that region has a live transport.
+        let observed_after = poisoned_read(&routes).get(&peer).copied();
+        assert_eq!(
+            resolve_region_for_peer(observed_after, None, |r| r == rid(5)),
+            Some(rid(5)),
+            "a learned observed route makes the peer reachable on that region with no netmap home"
         );
     }
 }
