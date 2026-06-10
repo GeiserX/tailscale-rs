@@ -16,7 +16,9 @@
 set -euo pipefail
 
 DRY=""
-[ "${1:-}" = "--dry-run" ] && DRY="--dry-run --allow-dirty"
+# `--allow-dirty` is now passed unconditionally on the publish call (lockfile churn mid-publish), so
+# the dry-run flag only adds `--dry-run`.
+[ "${1:-}" = "--dry-run" ] && DRY="--dry-run"
 
 : "${TS_RS_EXPERIMENT:?set TS_RS_EXPERIMENT=this_is_unstable_software}"
 if [ -z "$DRY" ] && [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
@@ -44,11 +46,21 @@ if [ -z "$WS_VERSION" ]; then
   echo "ERROR: could not read workspace version from Cargo.toml" >&2
   exit 1
 fi
-echo "Syncing inter-crate version pins to workspace version $WS_VERSION ..."
-# Only touch lines in [workspace.dependencies] that are local geiserx_ path deps carrying a version.
-# Match `package = "geiserx_..."` AND `version = "..."` on the same line and rewrite the version.
-perl -i -pe 'if (/package = "geiserx_/ && /version = "[0-9]+\.[0-9]+\.[0-9]+"/) { s/version = "[0-9]+\.[0-9]+\.[0-9]+"/version = "'"$WS_VERSION"'"/ }' Cargo.toml
-echo "Inter-crate pins now at $WS_VERSION ($(grep -cE 'package = "geiserx_.*version = "'"$WS_VERSION"'"' Cargo.toml) deps)."
+# Count inter-crate geiserx_ pins NOT already at the workspace version. Only rewrite when some lag,
+# so a tree whose pins already match stays byte-identical (a `cargo publish` verify step rejects a
+# dirty working tree — editing an already-synced Cargo.toml would needlessly dirty it and fail the
+# publish, which is exactly what broke the first v0.13.0 attempt).
+STALE=$(grep -cE 'package = "geiserx_' Cargo.toml | head -1)
+MATCHED=$(grep -cE 'package = "geiserx_.*version = "'"$WS_VERSION"'"' Cargo.toml || true)
+GEISER_DEPS=$(grep -cE 'package = "geiserx_.*version = "[0-9]+\.[0-9]+\.[0-9]+"' Cargo.toml || true)
+if [ "$MATCHED" -eq "$GEISER_DEPS" ]; then
+  echo "Inter-crate version pins already at $WS_VERSION ($MATCHED deps) — no edit needed."
+else
+  echo "Syncing $((GEISER_DEPS - MATCHED)) inter-crate version pins to workspace version $WS_VERSION ..."
+  # Only touch lines in [workspace.dependencies] that are local geiserx_ path deps carrying a version.
+  perl -i -pe 'if (/package = "geiserx_/ && /version = "[0-9]+\.[0-9]+\.[0-9]+"/) { s/version = "[0-9]+\.[0-9]+\.[0-9]+"/version = "'"$WS_VERSION"'"/ }' Cargo.toml
+  echo "Inter-crate pins now at $WS_VERSION."
+fi
 
 # Leaf-first publish order (topologically sorted; facade at #40, bindings last).
 CRATES=(
@@ -109,7 +121,12 @@ for crate in "${CRATES[@]}"; do
   echo "==== [$i/$total] $crate ===="
   while :; do
     # Capture the single publish attempt's combined output so we can branch on the failure reason.
-    out=$(cargo publish -p "$crate" $DRY 2>&1) && rc=0 || rc=$?
+    # `--allow-dirty`: publishing crate N updates `Cargo.lock` (recording each just-published dep's
+    # version), which dirties the working tree and would make crate N+1's publish-verify abort with
+    # "files in the working directory contain changes not yet committed". CI checks out a clean tag,
+    # so the only dirt is cargo's own lockfile churn mid-publish — benign and expected. (This bit the
+    # first v0.13.0 attempt at the facade crate, which has the most published deps.)
+    out=$(cargo publish -p "$crate" --allow-dirty $DRY 2>&1) && rc=0 || rc=$?
     printf '%s\n' "$out"
     if [ "$rc" -eq 0 ]; then
       [ -n "$DRY" ] && break
