@@ -2,6 +2,31 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.10.0](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.10.0) - 2026-06-10
+
+### Fixed
+- **Handshake no longer rejected for a non-zero `mac2` (cookie MAC) (#23).** `MACReceiver::verify_macs`
+  rejected any inbound handshake carrying a non-zero `mac2`. Per WireGuard, a peer sends a non-zero
+  `mac2` when replying to a `CookieReply` the receiver issued under load — so this deterministically
+  failed the handshake for a correct peer that sends `mac2`, a real interop bug that can surface as
+  `handshake failed to complete`. This fork's responder never issues `CookieReply`s (it holds only a
+  `mac1_key`, no cookie secret/state), so it has nothing to verify `mac2` against: the WireGuard-correct
+  behavior is `mac1` is the authenticator, `mac2` is ignored — matching wireguard-go (checks `mac2`
+  only when `UnderLoad`) and boringtun (only while a cookie is active). `mac1` verification is
+  unchanged. The Go handshake KAT still passes byte-for-byte.
+
+### Added
+- **`tka::Authority::from_chain` / `from_forked_chain` — the AUM-chain replayer (#7).** Derives a
+  trusted-key `State`/`Authority` by replaying a chain of `Aum`s (chunk 1A, v0.9.0, added the `Aum`
+  type + byte-exact CBOR). `apply_verified_aum` folds each AUM (Go `State.applyVerifiedAUM`:
+  parent-hash chain check, genesis-kind guard, per-kind key mutation, checkpoint StateID match);
+  `pick_next_aum` resolves a fork by Go `tka.pickNextAUM`'s rules (signature weight → `RemoveKey`
+  preference → lowest hash) — a total, deterministic comparator so all nodes select the same active
+  branch; `weight` sums distinct trusted signers' votes. The consensus logic was reviewed
+  rule-by-rule against Go v1.100.0. No production caller yet (the verify-and-log seam + the
+  `/machine/tka/sync` RPC are the remaining #7 chunks); the client verify path is unchanged. Minor
+  bump (additive public API).
+
 ## [0.9.0](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.9.0) - 2026-06-10
 
 ### Added
