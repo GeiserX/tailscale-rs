@@ -25,6 +25,7 @@ mod service_vip;
 mod set_dns;
 mod ssh_policy;
 mod tka_info;
+mod tka_sync;
 mod tpm;
 mod user;
 pub mod util;
@@ -53,5 +54,8 @@ pub use service_vip::{
 pub use set_dns::{SetDnsRequest, SetDnsResponse};
 pub use ssh_policy::{SSHAction, SSHPolicy, SSHPrincipal, SSHRecorderFailureAction, SSHRule};
 pub use tka_info::TkaInfo;
+pub use tka_sync::{
+    TkaSyncOfferRequest, TkaSyncOfferResponse, TkaSyncSendRequest, TkaSyncSendResponse,
+};
 pub use tpm::TpmInfo;
 pub use user::{Login, LoginId, User, UserId, UserProfile};
