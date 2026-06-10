@@ -576,10 +576,17 @@ impl Device {
         match net.transport {
             dial::Transport::Tcp => Ok(DialConn::Tcp(self.tcp_connect(remote).await?)),
             dial::Transport::Udp => {
-                // Bind an ephemeral local UDP socket on this node's tailnet address, then connect it
-                // to the remote peer (Go's `Dial("udp", …)` returns a connected UDP `net.Conn`).
-                let local: SocketAddr = (self.ipv4_addr().await?, 0).into();
-                let sock = self.udp_bind(local).await?;
+                // Bind an ephemeral local UDP socket on this node's tailnet address of the SAME
+                // family as the remote, then connect it (Go's `Dial("udp", …)` returns a connected
+                // UDP `net.Conn`, with the local source picked by `IfElse(dst.Is6(), v6, v4)`). A v4
+                // local socket cannot send to a v6 peer, so the family must match `remote`. (TCP gets
+                // this for free: `tcp_connect` already picks the source family from `remote`.)
+                let local_ip: IpAddr = if remote.is_ipv6() {
+                    self.ipv6_addr().await?.into()
+                } else {
+                    self.ipv4_addr().await?.into()
+                };
+                let sock = self.udp_bind((local_ip, 0).into()).await?;
                 Ok(DialConn::Udp(ConnectedUdpSocket::new(sock, remote)))
             }
         }
@@ -634,13 +641,22 @@ impl Device {
             .map_err(|_| Error::Internal(InternalErrorKind::BadRequest))?;
         dial::check_family(net.family, ip)?;
 
-        // An unspecified bind host means "this node's tailnet address".
+        // A v6 bind (whether an explicit literal or an unspecified `[::]`) requires IPv6 to be
+        // provisioned — enforce the gate for BOTH cases (the unspecified `[::]` path used to skip it).
+        if ip.is_ipv6() && !self.enable_ipv6 {
+            return Err(Error::Internal(InternalErrorKind::BadRequest));
+        }
+
+        // An unspecified bind host (`0.0.0.0` / `[::]`) means "this node's tailnet address" — of the
+        // SAME family as the requested address, so a `udp6` `[::]:0` binds a v6 socket (it used to
+        // fall through to the v4 address regardless, silently yielding an IPv4 socket for a v6 listen).
         let bind_ip: IpAddr = if ip.is_unspecified() {
-            self.ipv4_addr().await?.into()
-        } else {
-            if ip.is_ipv6() && !self.enable_ipv6 {
-                return Err(Error::Internal(InternalErrorKind::BadRequest));
+            if ip.is_ipv6() {
+                self.ipv6_addr().await?.into()
+            } else {
+                self.ipv4_addr().await?.into()
             }
+        } else {
             ip
         };
 
