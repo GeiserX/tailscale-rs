@@ -29,7 +29,11 @@ AUM-sync RPC + chain replayer aren't, so enforcement stays inert. The next step 
 control as trusted and the `ts_tka` crypto is unaudited — fail-closed on unaudited verification would
 risk a self-inflicted outage guarding an out-of-model threat. See issue #7.
 
-## Where we are (v0.5.39 — near-complete tsnet parity)
+## Where we are (v0.8.1 — near-complete tsnet parity)
+
+> Per-lane percentages below were last measured at v0.5.39; the numbered roadmap was reconciled
+> against the tree at v0.8.1 (see "Roadmap" — 16/21 shipped, 1 genuinely open). Treat the lane
+> percentages as a floor, not a ceiling.
 
 Crucially, the fork is **more mature than its own stale README suggests**:
 
@@ -134,52 +138,55 @@ sense, while keeping the anti-leak/egress posture (see `AGENTS.md`).
 
 ## Roadmap (ranked by leverage)
 
-### Tier 1 — Highest leverage (unblocks both consumers)
-1. **Direct-path orchestration glue** — wire `ts_netcheck::StunProber` into
-   `MagicSock::self_endpoints`; add a runtime loop that sends `CallMeMaybe` over DERP and runs
-   periodic `send_disco_pings`. Core exists; only orchestration is missing. Skip the
-   birthday-paradox symmetric-NAT spray (k8s pods are low-bandwidth, acceptably DERP-relayed).
-2. **Enforce disco↔node-key binding** in the netmap-owning layer (`ts_magicsock/src/disco.rs:125`,
-   `sock.rs:400`) — the one explicit `TODO(parity)`, security-relevant.
-3. **musl static-build target + CI lane** — `ssh`/`aws-lc-rs` feature OFF (ring-only stays
-   musl-clean). Required for minimal pod images and a self-contained proxy daemon.
+> **Status reconciled at v0.8.1** (2026-06-10) against the actual tree. The original Tier-1..5
+> numbered list (authored ~v0.5.39) is **badly stale**: of its 21 items, **16 shipped, 4 are partial
+> by design / external-blocked, and only 1 is genuinely unbuilt**. The closed items are preserved
+> below (struck, with the proof) so the history is legible; the live work is the short
+> "**Actually remaining**" list. Don't re-investigate a struck item as if open — that mis-step is
+> exactly what the closed `~~item~~` lines exist to prevent (it cost a misdiagnosis on #24).
 
-### Tier 2 — Deployment-critical correctness
-4. **Wire `config.tags` → `HostInfo.request_tags`** at registration (`ts_control/.../register.rs`).
-   Currently dropped; silently breaks a self-hosted control plane's tag-keyed route auto-approvers.
-5. **Make `ephemeral` config-driven** (`register.rs` hardcodes `true`) — persistent exit nodes get
-   GC'd otherwise.
-6. **Upstream SOCKS/HTTP proxy dialer seam** for the exit hop — residential proxy egress sits
-   *behind* the exit node; `HostExitDialer` must dial via an upstream proxy.
-7. **Netmap stream resumption on reconnect** (`ts_control/src/tokio/client.rs:211`).
+### Actually remaining (the real backlog)
 
-### Tier 3 — Performance hardening (before bulk traffic)
-8. **`tcp_buffer_size` 16KiB → 256KiB** as a per-deployment knob — the 16KiB window caps a flow at
-   ~1.6 Mbps@80ms RTT, throttling large model responses *at 1x*. Highest-ROI perf change.
-9. **Shard the netstack** per ~50-100 sessions instead of one shared smoltcp poll loop.
-   smoltcp has no SACK/auto-tune — **benchmark over a real exit before committing the
-   dataplane**.
+- **Netstack sharding** (was Tier-3 #9; bead `tsr-4pp`) — the one fully-unbuilt numbered item. One
+  shared smoltcp poll loop serves all flows; shard per ~50–100 sessions. smoltcp has no SACK/auto-tune,
+  so **benchmark over a real exit before committing the dataplane** (deliberately gated, not neglected).
+- **Live Tailnet-Lock (TKA) enforcement** (part of old #20; issue #7) — the `ts_tka::Authority` exists
+  but is wired inert (`peer_tracker tka_authority: None` in prod). Needs the `/machine/tka/sync/*`
+  AUM-sync RPC + chain replayer. Next step is **verify-and-log**, not fail-closed (the `ts_tka` crypto
+  is unaudited and current deployments trust control — see "Invariants").
+- **Own/private DERP server** (part of old #20) — `ts_derp` is client + mesh-frame types only (no
+  server accept loop). Consuming public relays as fallback already works; running our own mesh is the
+  open piece. Low priority for the egress use case.
+- **DERP connectivity floor for no-region peers** — ✅ **shipped v0.8.1** (#24): a peer with no netmap
+  home region was denied any underlay route; now the relay region is inferred (observed-route à la Go
+  `c.derpRoute`, then home-region last resort). Listed here only as the most recent close.
 
-### Tier 4 — True tsnet API-surface gaps
-10. **ACME-over-control cert RPC** (`POST /machine/<key>/cert/<domain>`) to unblock all of Lane E.
-11. **Serve config** (`Get/SetServeConfig`) + `RegisterFallbackTCPHandler`.
-12. **Propagate the 5 lanes into `ts_ffi`/`ts_python`/`ts_elixir`** (~30% today).
+A handful of **partial-by-design** items are NOT backlog (they are as-complete-as-they-can-be for our
+deployment): client-side ACME is shipped but a self-hosted control plane 501s on `set-dns` (external,
+old #10); TUN mode is shipped but userspace-only seams (`tcp_connect`/loopback) are `UnsupportedInTunMode`
+by design (old #14); `listen_funnel` client leg is shipped but the public relay leg is Tailscale-operated
+and external-blocked (old #16). These are environment limits, not engine work.
 
-### Tier 5 — Full-parity completion (the "build everything" set)
-Previously a "don't-build for egress" list; per direction we are pursuing **complete** tsnet parity,
-so these are now in scope:
-13. **IPv6 on the tailnet** — gated behind a build/runtime flag; default stays IPv4-only to preserve
-    the IPv6-off leak invariant. Parity for general embedders.
-14. **TUN-mode transport** (`ts_transport_tun`) to full parity — for embedders that want a real
-    kernel interface.
-15. **Full MagicDNS server** (`100.100.100.100` resolver) + exit-node DNS.
-16. **`ListenFunnel`** (public ingress via relay, 443/8443/10000) + FunnelOptions.
-17. **`ListenSSH`** (Tailscale SSH server, `feature/ssh`) — isolated in a non-musl binary.
-18. **`ListenService` / Tailscale Services (VIP)** + ServiceMode TCP/HTTP.
-19. **Symmetric-NAT birthday-paradox hole-punching** — full Go NAT-traversal parity.
-20. **Taildrop / file transfer**, **Tailnet Lock**, **key rotation**, **private DERP / peer relays**,
-    **observability/metrics**.
-21. **Workload identity federation fields** (`ClientID`/`IDToken`/`Audience`) + `Sys()` internals.
+### Closed (shipped — verified in-tree at v0.8.1)
+
+Tier 1 — ~~direct-path orchestration glue~~ (`direct.rs` `run_pinger`/`run_stun_prober`/`run_call_me_maybe`),
+~~disco↔node-key binding~~ (`sock.rs` `BindingVerifier`, fail-closed; the `TODO(parity)` is gone),
+~~musl static build + CI lane~~ (`ci.yml` `musl_static`, aws-lc-absence guard).
+Tier 2 — ~~`config.tags`→`HostInfo.request_tags`~~ (`client.rs:298`, `register.rs`),
+~~config-driven `ephemeral`~~ (`Config::ephemeral`), ~~upstream proxy dialer for the exit hop~~
+(`ProxyExitDialer`, `ExitProxyConfig`), ~~netmap stream resumption~~ (`MapSession`/`advance_session`).
+Tier 3 — ~~`tcp_buffer_size` knob~~ (default already 256 KiB; per-deployment `Config::tcp_buffer_size`).
+Tier 4 — ~~Serve config + `RegisterFallbackTCPHandler`~~ (`ts_runtime/src/serve.rs` `ServeManager`),
+~~bindings lane propagation~~ (FFI/Python/Elixir at ~90%, not the stale "~30%").
+Tier 5 — ~~IPv6 on the tailnet (flag-gated)~~ (`Config::enable_ipv6`), ~~full MagicDNS server~~
+(`magic_dns.rs`, `100.100.100.100:53` + exit-node DoH), ~~`ListenSSH`~~ (`src/ssh/`, feature-gated),
+~~`ListenService`/VIP + ServiceMode~~ (consume + advertise), ~~symmetric-NAT traversal~~ (Go has no
+256-port spray; the hard-NAT `Stun4LocalPort` guess **is** implemented — at parity), ~~Taildrop~~,
+~~key rotation~~, ~~metrics/observability~~, ~~WIF fields + `Sys()` accessors~~.
+
+> Reclassified, not "done by us": old #10 (ACME) — real Tailscale has no `cert/<domain>` RPC; the node
+> is the ACME client, which is shipped. Old #19 (birthday-paradox spray) — a real spray was rejected as
+> a Go divergence + SSRF risk; matching Go's actual `Stun4LocalPort` tactic is the parity bar and is met.
 
 ## Cross-cutting doc-hygiene
 - ~~Reconcile README DERP-vs-direct~~ — **done.** The README now states direct NAT traversal is
