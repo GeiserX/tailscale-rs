@@ -55,8 +55,10 @@ pub trait ChannelHandler: Sized {
 /// resolves the source IP to a known tailnet peer and evaluates the policy via
 /// [`Device::authorize_ssh`][crate::Device::authorize_ssh] (fail-closed — an unknown peer, an
 /// absent policy, or a non-matching policy all reject). The `ssh` policy block's accept/reject
-/// rules, principal matching, and SSH-user mapping are honored; advanced features (recording,
-/// `holdAndDelegate`, per-session capability enforcement) are not yet implemented.
+/// rules, principal matching, and SSH-user mapping are honored. A rule that **demands** session
+/// recording (non-empty `recorders`) or `holdAndDelegate` is enforced **fail-closed**: since this
+/// fork has no recorder transport / delegate round-trip yet, such a session is refused rather than
+/// silently accepted un-recorded (see [`auth_none`]). Building those transports is deferred.
 ///
 /// [`auth_none`]: russh::server::Handler::auth_none
 pub struct ChannelServer<H> {
@@ -84,6 +86,38 @@ const MAX_CHANNELS_PER_CONN: usize = 16;
 /// a live russh [`Session`].
 fn at_channel_cap(open_channels: usize) -> bool {
     open_channels >= MAX_CHANNELS_PER_CONN
+}
+
+/// Fallback message logged when a `recording_required` session is refused and the policy supplied
+/// no message of its own.
+const DEFAULT_RECORDING_REFUSAL: &str =
+    "policy requires session recording but recording is not available";
+
+/// The fail-closed recording gate (tsr-0h2), extracted as a pure predicate so it can be unit-tested
+/// without a live russh [`Session`]/[`Device`] (mirrors [`at_channel_cap`]).
+///
+/// Returns `Some(message)` when the accepted session must be **refused** because the matched rule
+/// demands a capability this fork cannot provide — session recording (non-empty `recorders`) or a
+/// `holdAndDelegate` decision (both surfaced as [`SshAccept::recording_required`]) — and there is no
+/// recorder/delegate transport yet. The message is the policy's
+/// [`recording_refusal_message`][crate::ssh::SshAccept::recording_refusal_message] when non-empty,
+/// else [`DEFAULT_RECORDING_REFUSAL`]. Returns `None` for the common case (no recorders, no
+/// delegate), so those sessions accept unchanged.
+///
+/// TODO(tsr-0h2 follow-up): once the recorder stream transport exists (dial `recorders`, asciinema/
+/// CastV2 stream, tee PTY I/O at `shell.rs`) — and a Noise control round-trip backs `holdAndDelegate`
+/// — relax this to Go `tailssh`'s true default: fail-OPEN on a recorder-connect failure UNLESS
+/// `on_recording_failure.reject_session_with_message` is set. Until then, refuse rather than record
+/// nothing.
+fn recording_refusal(accept: &SshAccept) -> Option<String> {
+    if !accept.recording_required {
+        return None;
+    }
+    if accept.recording_refusal_message.is_empty() {
+        Some(DEFAULT_RECORDING_REFUSAL.to_string())
+    } else {
+        Some(accept.recording_refusal_message.clone())
+    }
 }
 
 #[derive(thiserror::Error, Debug, Copy, Clone, PartialEq, Eq)]
@@ -159,6 +193,22 @@ where
         // absent policy, a non-matching policy, or any lookup error all reject the connection.
         match self.dev.authorize_ssh(self.remote, user).await {
             Ok(crate::ssh::SshDecision::Accept(accept)) => {
+                // SECURITY (tsr-0h2): a matched rule that DEMANDS session recording (non-empty
+                // `recorders`) — or a `holdAndDelegate` decision — cannot be honored because this
+                // fork has no recorder transport / delegate round-trip yet. Refuse the session
+                // (fail-closed) rather than silently downgrade it to a plain accept. This mirrors
+                // Go `tailssh`'s posture when `OnRecordingFailure.RejectSessionWithMessage` is set.
+                // `Auth::reject()` (the SSH `none`-method rejection) carries no client-visible
+                // message, so the policy's refusal message is surfaced in the warning log.
+                if let Some(msg) = recording_refusal(&accept) {
+                    tracing::warn!(
+                        local_user = %accept.local_user,
+                        recorders = ?accept.recorders,
+                        message = %msg,
+                        "ssh: session refused: policy requires session recording but recording is not available"
+                    );
+                    return Ok(Auth::reject());
+                }
                 tracing::debug!(
                     local_user = %accept.local_user,
                     "ssh: policy accepted connection"
@@ -361,7 +411,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_CHANNELS_PER_CONN, at_channel_cap};
+    use super::{
+        DEFAULT_RECORDING_REFUSAL, MAX_CHANNELS_PER_CONN, at_channel_cap, recording_refusal,
+    };
+    use crate::ssh::SshAccept;
 
     /// The per-connection channel cap (fork-bomb guard) refuses at and beyond `MAX_CHANNELS_PER_CONN`
     /// and allows below it. Pins the exact boundary: a `>=`→`>` flip would let `MAX_CHANNELS_PER_CONN`
@@ -378,5 +431,44 @@ mod tests {
         assert!(at_channel_cap(17));
         // The const itself is the documented value.
         assert_eq!(MAX_CHANNELS_PER_CONN, 16);
+    }
+
+    fn accept(recording_required: bool, refusal_message: &str) -> SshAccept {
+        SshAccept {
+            local_user: "root".to_string(),
+            accept_env: Vec::new(),
+            session_duration_nanos: None,
+            allow_agent_forwarding: false,
+            allow_local_port_forwarding: false,
+            allow_remote_port_forwarding: false,
+            recorders: Vec::new(),
+            recording_required,
+            recording_refusal_message: refusal_message.to_string(),
+        }
+    }
+
+    /// tsr-0h2: an accept that demands recording must be REFUSED (the bypass is closed). With a
+    /// policy-supplied message, that exact message is used; without one, the default is logged.
+    #[test]
+    fn recording_required_accept_is_refused() {
+        // Policy-supplied refusal message wins.
+        assert_eq!(
+            recording_refusal(&accept(true, "recording required by policy")),
+            Some("recording required by policy".to_string()),
+        );
+        // No message → default refusal text, but still a refusal (Some).
+        assert_eq!(
+            recording_refusal(&accept(true, "")),
+            Some(DEFAULT_RECORDING_REFUSAL.to_string()),
+        );
+    }
+
+    /// Regression guard for the common path: a normal accept (no recording demanded) is NOT refused,
+    /// so the gate is a no-op and the session proceeds.
+    #[test]
+    fn normal_accept_is_not_refused() {
+        assert_eq!(recording_refusal(&accept(false, "")), None);
+        // Even a stray non-empty message never forces a refusal when recording isn't required.
+        assert_eq!(recording_refusal(&accept(false, "ignored")), None);
     }
 }
