@@ -50,6 +50,9 @@ pub mod status;
 /// Taildrop peer-to-peer file transfer store.
 pub mod taildrop;
 pub mod taildrop_send;
+/// Tailnet-Lock (TKA) chain-sync orchestration: bootstrap + offer/send driver (the runtime layer
+/// that bridges the `ts_control` sync RPCs and the `ts_tka` chain logic).
+mod tka_sync;
 #[cfg(feature = "tun")]
 mod tun_actor;
 

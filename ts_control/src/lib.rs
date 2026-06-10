@@ -66,7 +66,10 @@ pub use ssh_policy::{
     SshRule,
 };
 pub use tka::TkaStatus;
-pub use ts_control_serde::{Endpoint, EndpointType, UserId};
+pub use ts_control_serde::{
+    Endpoint, EndpointType, TkaBootstrapRequest, TkaBootstrapResponse, TkaSyncOfferRequest,
+    TkaSyncOfferResponse, TkaSyncSendRequest, TkaSyncSendResponse, UserId,
+};
 #[cfg(feature = "identity-federation")]
 pub use wif::{WifConfig, WifError, resolve_auth_key};
 
