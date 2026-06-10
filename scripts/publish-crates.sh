@@ -30,6 +30,26 @@ fi
 # packages cleanly. Harmless for the other crates.
 export TS_FFI_BUILDRS_STRICT=1
 
+# Keep the inter-crate version pins in lockstep with the workspace version.
+#
+# `release-please` bumps only `[workspace.package].version` in the root Cargo.toml (its `extra-files`
+# jsonpath). But each inter-crate dep in `[workspace.dependencies]` carries an explicit
+# `version = "X.Y.Z"` (required so the *published* crates depend by version, not just path). If those
+# pins lag the workspace version, `cargo publish` fails to resolve ("candidate versions found which
+# didn't match") — exactly what broke the v0.13.0 publish. Rather than make release-please rewrite 40
+# heterogeneous lines, the workspace version is the single source of truth and we sync the pins to it
+# here, right before publishing. Idempotent: a no-op once they already match.
+WS_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+if [ -z "$WS_VERSION" ]; then
+  echo "ERROR: could not read workspace version from Cargo.toml" >&2
+  exit 1
+fi
+echo "Syncing inter-crate version pins to workspace version $WS_VERSION ..."
+# Only touch lines in [workspace.dependencies] that are local geiserx_ path deps carrying a version.
+# Match `package = "geiserx_..."` AND `version = "..."` on the same line and rewrite the version.
+perl -i -pe 'if (/package = "geiserx_/ && /version = "[0-9]+\.[0-9]+\.[0-9]+"/) { s/version = "[0-9]+\.[0-9]+\.[0-9]+"/version = "'"$WS_VERSION"'"/ }' Cargo.toml
+echo "Inter-crate pins now at $WS_VERSION ($(grep -cE 'package = "geiserx_.*version = "'"$WS_VERSION"'"' Cargo.toml) deps)."
+
 # Leaf-first publish order (topologically sorted; facade at #40, bindings last).
 CRATES=(
   geiserx_ts_bitset
