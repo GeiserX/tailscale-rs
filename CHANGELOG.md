@@ -2,6 +2,38 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.11.0](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.11.0) - 2026-06-10
+
+### Fixed
+- **Receive-triggered rekey (#26), and the receive expiry tightened 240→180s.** The fork previously
+  rekeyed only on outbound `Peer::send`, so a mostly-inbound, send-idle session had nothing to
+  refresh its keys — which forced a lenient 240s receive expiry (`REJECT_AFTER_TIME_RECV`) instead of
+  the spec 180s. Added receive-triggered rekey mirroring Go wireguard-go's `keepKeyFreshReceiving`:
+  on a successfully-decrypted inbound packet, if **we were the initiator** of the current keypair and
+  it is older than 165s (`RejectAfterTime − KeepaliveTimeout − RekeyTimeout`), enqueue a fresh
+  handshake — **initiator-only** (the responder must not, or both ends initiate at once), one-shot
+  per keypair. With this in place an inbound session rehandshakes ~15s before its keys hard-expire, so
+  `REJECT_AFTER_TIME_RECV` is now the spec `REJECT_AFTER_TIME` (180s). The Go handshake KAT stays
+  byte-exact.
+- **Tailnet-Lock `AumState` nil-vs-empty CBOR (Go interop).** A checkpoint with a nil
+  `DisablementValues`/`Keys` must encode as CBOR null `0xf6` (Go), not an empty array `0x80`; the
+  divergence changed the checkpoint `Hash`/chain head vs Go on the replay path (the shipped verify
+  path was never affected). Found by a crypto audit cross-validating AUM `Hash`/`SigHash`/`Serialize`
+  against a real Go run.
+
+### Changed (source-breaking → minor bump)
+- **`tka::AumState.{disablement_values,keys}` are now `Option<Vec<…>>`** (were `Vec<…>`), so a nil
+  slice (Go's zero value) is representable and encodes as CBOR null — fixing the interop bug above.
+  `None` = Go nil = `0xf6`; `Some(vec)` = array.
+
+### Added / internal
+- ts_tka crypto audit: a Go-produced `AUM.Hash`/`SigHash`/`Serialize` golden + the
+  `aum_hash_sighash_matches_go_golden` KAT (closes the prior "no Go `AUM.Hash()` pinned" gap);
+  `CRYPTO_VERIFICATION_STATUS.md`/`CRYPTOGRAPHY.md` axis B updated.
+- Two review-code! passes' fixes (observed-route learning extracted + tested; doc/comment
+  clarifications) and a clearer exit-node "not full-tunnel" warning + `Config::exit_node` doc note
+  distinguishing full-tunnel egress from reaching a peer's port.
+
 ## [0.10.0](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.10.0) - 2026-06-10
 
 ### Fixed
