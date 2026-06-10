@@ -1392,23 +1392,27 @@ impl Aum {
 /// Decode one CBOR value (the subset the encoder produces) from `buf`, returning the value and the
 /// remaining bytes. Minimal — only the major types TKA uses.
 fn decode_value(buf: &[u8], depth: usize) -> Result<(Value, &[u8]), TkaError> {
-    // Bound generic CBOR container nesting so a deeply-nested array/map (even a non-signature one)
-    // cannot overflow the recursive decoder before signature-shape validation runs.
+    // Bound generic CBOR container nesting so a deeply-nested array/map (even a non-signature one,
+    // e.g. an AUM with nested arrays) cannot overflow the recursive decoder before shape validation
+    // runs. Shared by the AUM and node-key-signature paths, so the message is kept neutral (the
+    // signature-specific depth guard with its own message lives in `node_key_signature_from_value`).
     if depth > MAX_SIG_NESTING_DEPTH {
-        return Err(TkaError::Decode("nested signature too deep"));
+        return Err(TkaError::Decode("CBOR nesting too deep"));
     }
     let (major, arg, rest) = decode_head(buf)?;
     match major {
         0 => Ok((Value::Uint(arg), rest)),
         2 => {
-            let len = arg as usize;
+            // `usize::try_from` rather than `as usize`: on a 32-bit target a `u64` length above
+            // `usize::MAX` must fail closed, not silently truncate to a smaller in-bounds length.
+            let len = usize::try_from(arg).map_err(|_| TkaError::Decode("byte string too long"))?;
             if rest.len() < len {
                 return Err(TkaError::Decode("byte string truncated"));
             }
             Ok((Value::Bytes(rest[..len].to_vec()), &rest[len..]))
         }
         3 => {
-            let len = arg as usize;
+            let len = usize::try_from(arg).map_err(|_| TkaError::Decode("text string too long"))?;
             if rest.len() < len {
                 return Err(TkaError::Decode("text string truncated"));
             }
@@ -1474,13 +1478,11 @@ fn decode_map(buf: &[u8], count: u64, depth: usize) -> Result<(Value, &[u8]), Tk
                         Err(TkaError::Decode("mixed map key types"))
                     }
                 })?;
-                if entries.iter().any(|(existing, _)| *existing == k) {
-                    return Err(TkaError::Decode("duplicate map key"));
-                }
                 let (v, next2) = decode_value(next, depth + 1)?;
                 entries.push((k, v));
                 cur = next2;
             }
+            reject_duplicate_keys(entries.iter().map(|(k, _)| *k))?;
             Ok((Value::IntMap(entries), cur))
         }
         3 => {
@@ -1493,17 +1495,30 @@ fn decode_map(buf: &[u8], count: u64, depth: usize) -> Result<(Value, &[u8]), Tk
                 let Value::Text(k) = key_val else {
                     return Err(TkaError::Decode("mixed map key types"));
                 };
-                if entries.iter().any(|(existing, _)| *existing == k) {
-                    return Err(TkaError::Decode("duplicate map key"));
-                }
                 let (v, next2) = decode_value(next, depth + 1)?;
                 entries.push((k, v));
                 cur = next2;
             }
+            reject_duplicate_keys(entries.iter().map(|(k, _)| k.clone()))?;
             Ok((Value::TextMap(entries), cur))
         }
         _ => Err(TkaError::Decode("map key not uint or text string")),
     }
+}
+
+/// Reject a CBOR map with duplicate keys (CTAP2 / Go forbid them) in `O(n log n)` via a sort, rather
+/// than the `O(n²)` per-insert linear scan a naive decoder uses. The map element count is
+/// attacker-controlled (a CBOR head can claim a large count), so the quadratic form is a latent
+/// super-linear CPU-DoS on a hostile control-plane blob; the sort keeps it linear-ish. Insertion
+/// order of the map itself is preserved by the caller (the verify path re-serializes canonically
+/// before hashing, so wire order never reaches a hash).
+fn reject_duplicate_keys<K: Ord>(keys: impl Iterator<Item = K>) -> Result<(), TkaError> {
+    let mut ks: Vec<K> = keys.collect();
+    ks.sort_unstable();
+    if ks.windows(2).any(|w| w[0] == w[1]) {
+        return Err(TkaError::Decode("duplicate map key"));
+    }
+    Ok(())
 }
 
 /// Decode a CBOR head: returns `(major, argument, rest)`.
@@ -1768,7 +1783,9 @@ mod tests {
         }
         let cbor = sig.to_cbor(true).to_vec();
         let err = decode_node_key_signature(&cbor).unwrap_err();
-        assert_eq!(err, TkaError::Decode("nested signature too deep"));
+        // The shared generic-container depth guard in `decode_value` trips first (the CBOR is
+        // nested past the cap before the signature-shape walk runs), so the neutral message.
+        assert_eq!(err, TkaError::Decode("CBOR nesting too deep"));
     }
 
     // ----- Fix 5: duplicate CBOR map keys rejected -----
@@ -3741,5 +3758,267 @@ mod tests {
             v,
             Value::TextMap(alloc::vec![(b"a".to_vec(), Value::Text(b"b".to_vec()))])
         );
+    }
+
+    // ===== Review follow-ups (PR #48 review): close decode coverage gaps =====
+
+    /// Gap 2 (highest value): decode the authoritative frozen **Go checkpoint** bytes — the most
+    /// complex AUM shape (null `disablement_values` arm, two nested keys, the second carrying a
+    /// `Meta`, 32-byte hashes). The encode side asserts these exact bytes
+    /// (`aum_checkpoint_nil_disablement_matches_go`); here we prove the *decoder* consumes them and
+    /// round-trips byte-identically (so `hash()` is stable), exercising `AumState::from_value` +
+    /// nested `AumKey::from_value` against real Go output rather than our own encoder.
+    #[test]
+    fn aum_from_cbor_decodes_frozen_go_checkpoint() {
+        const GO_SERIALIZE: &str = "a30105025820202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f05a3015820202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f02f60382a301010201035820404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5fa401010203035820606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f0ca1616b6176";
+        const GO_HASH: &str = "cae17cc938c5a954cd4389d83c6afe4d3487edac38b94824bec3312b82f35710";
+        let bytes = unhex(GO_SERIALIZE);
+
+        let aum = Aum::from_cbor(&bytes).expect("decode the frozen Go checkpoint");
+        assert_eq!(aum.message_kind, AumKind::Checkpoint);
+        let st = aum.state.as_ref().expect("checkpoint carries a State");
+        assert_eq!(
+            st.disablement_values, None,
+            "nil DisablementValues → the null arm → None"
+        );
+        let keys = st.keys.as_ref().expect("State has keys");
+        assert_eq!(keys.len(), 2, "two nested keys");
+        assert_eq!(keys[0].votes, 1);
+        assert_eq!(keys[1].votes, 3);
+        assert_eq!(
+            keys[1].meta,
+            alloc::vec![(
+                alloc::string::String::from("k"),
+                alloc::string::String::from("v")
+            )],
+            "the second nested key carries Meta {{\"k\":\"v\"}}"
+        );
+        // Byte-exact re-encode → the chain-link Hash matches Go's golden hash.
+        assert_eq!(
+            aum.serialize(),
+            bytes,
+            "re-serialize must be byte-identical to the Go bytes"
+        );
+        assert_eq!(
+            hex(&aum.hash().0),
+            GO_HASH,
+            "decoded checkpoint's Hash matches Go golden"
+        );
+    }
+
+    /// Gap 1: round-trip the field combinations the original cases missed — multi-entry `Meta`
+    /// (canonical-ordering), both `state_id`s non-zero (key-4/key-5 routing), `votes` at the u32
+    /// boundary, a both-empty (`null`/`null`) `AumSignature`, and `key`+`key_id`+`signatures`
+    /// coexisting (key 3/4/23 cross-talk).
+    #[test]
+    fn aum_from_cbor_roundtrips_review_gap_shapes() {
+        let cases: alloc::vec::Vec<(&str, Aum)> = alloc::vec![
+            (
+                "multi-entry meta, pre-sorted (serialize() canonicalises key order)",
+                Aum {
+                    message_kind: AumKind::UpdateKey,
+                    prev_aum_hash: None,
+                    key: None,
+                    key_id: alloc::vec![1],
+                    state: None,
+                    votes: Some(1),
+                    // Pre-sorted: `serialize()` emits TextMap keys in CTAP2 order, so the decoded
+                    // meta is sorted; supplying sorted input keeps the `==` round-trip exact.
+                    meta: alloc::vec![
+                        ("a".into(), "2".into()),
+                        ("mid".into(), "3".into()),
+                        ("zebra".into(), "1".into()),
+                    ],
+                    signatures: Vec::new(),
+                },
+            ),
+            (
+                "both state_ids non-zero (key 4 and key 5 must not be swapped)",
+                Aum {
+                    message_kind: AumKind::Checkpoint,
+                    prev_aum_hash: Some(AumHash([0u8; AUM_HASH_LEN])),
+                    key: None,
+                    key_id: Vec::new(),
+                    state: Some(AumState {
+                        last_aum_hash: None,
+                        disablement_values: None,
+                        keys: Some(Vec::new()),
+                        state_id1: 7,
+                        state_id2: 9,
+                    }),
+                    votes: None,
+                    meta: Vec::new(),
+                    signatures: Vec::new(),
+                },
+            ),
+            (
+                "votes at u32::MAX + AddKey with key.votes at u32::MAX and multi-meta",
+                Aum {
+                    message_kind: AumKind::AddKey,
+                    prev_aum_hash: Some(AumHash([0x33; AUM_HASH_LEN])),
+                    key: Some(AumKey {
+                        kind: KeyKind::Ed25519,
+                        votes: u32::MAX,
+                        public: alloc::vec![1, 2, 3],
+                        meta: alloc::vec![("a".into(), "x".into()), ("b".into(), "y".into())],
+                    }),
+                    key_id: Vec::new(),
+                    state: None,
+                    votes: None,
+                    meta: Vec::new(),
+                    signatures: Vec::new(),
+                },
+            ),
+            (
+                "both-empty AumSignature (key_id null AND signature null)",
+                Aum {
+                    message_kind: AumKind::AddKey,
+                    prev_aum_hash: None,
+                    key: None,
+                    key_id: Vec::new(),
+                    state: None,
+                    votes: None,
+                    meta: Vec::new(),
+                    signatures: alloc::vec![AumSignature {
+                        key_id: Vec::new(),
+                        signature: Vec::new(),
+                    }],
+                },
+            ),
+            (
+                "key + key_id + signatures coexisting (keys 3, 4, 23)",
+                Aum {
+                    message_kind: AumKind::AddKey,
+                    prev_aum_hash: Some(AumHash([0x55; AUM_HASH_LEN])),
+                    key: Some(AumKey {
+                        kind: KeyKind::Ed25519,
+                        votes: 2,
+                        public: alloc::vec![7, 7, 7],
+                        meta: Vec::new(),
+                    }),
+                    key_id: alloc::vec![9, 9],
+                    state: None,
+                    votes: None,
+                    meta: Vec::new(),
+                    signatures: alloc::vec![AumSignature {
+                        key_id: alloc::vec![1],
+                        signature: alloc::vec![2, 3, 4],
+                    }],
+                },
+            ),
+            (
+                "votes = 0 (boundary; Some(0) must survive, distinct from None)",
+                Aum {
+                    message_kind: AumKind::UpdateKey,
+                    prev_aum_hash: None,
+                    key: None,
+                    key_id: alloc::vec![1],
+                    state: None,
+                    votes: Some(0),
+                    meta: Vec::new(),
+                    signatures: Vec::new(),
+                },
+            ),
+        ];
+        for (label, aum) in cases {
+            let bytes = aum.serialize();
+            let decoded = Aum::from_cbor(&bytes)
+                .unwrap_or_else(|e| panic!("from_cbor failed for {label:?}: {e}"));
+            assert_eq!(decoded, aum, "round-trip mismatch for {label:?}");
+            assert_eq!(
+                decoded.serialize(),
+                bytes,
+                "re-serialize differs for {label:?}"
+            );
+        }
+    }
+
+    /// Gap 3: additional fail-closed guards on the AUM entry point — truncated map (count > entries),
+    /// a duplicate key at the AUM level, votes > u32::MAX, an unsupported key kind, and a malformed
+    /// (non-map) `state` value. Each must `Err`, never panic, never `Ok`.
+    #[test]
+    fn aum_from_cbor_fails_closed_review_gaps() {
+        // Truncated map: header claims 3 pairs, only 2 present then EOF.
+        assert!(
+            Aum::from_cbor(&[0xa3, 0x01, 0x03, 0x02, 0xf6]).is_err(),
+            "a map claiming more pairs than present must be rejected"
+        );
+        // Duplicate key at the AUM level: key 1 appears twice (a3 01 03 02 f6 01 04).
+        assert!(
+            Aum::from_cbor(&[0xa3, 0x01, 0x03, 0x02, 0xf6, 0x01, 0x04]).is_err(),
+            "a duplicate AUM map key must be rejected"
+        );
+        // votes > u32::MAX: 06 1b 0000_0001_0000_0000 (= 2^32).
+        assert!(
+            Aum::from_cbor(&[
+                0xa3, 0x01, 0x04, 0x02, 0xf6, 0x06, 0x1b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+                0x00,
+            ])
+            .is_err(),
+            "votes above u32::MAX must be rejected (fail-closed narrowing)"
+        );
+        // Unsupported key kind: AddKey embedding a key with kind=2. a3 01 01 02 f6 03 a3 01 02 02 01 03 41 09
+        assert!(
+            Aum::from_cbor(&[
+                0xa3, 0x01, 0x01, 0x02, 0xf6, 0x03, 0xa3, 0x01, 0x02, 0x02, 0x01, 0x03, 0x41, 0x09,
+            ])
+            .is_err(),
+            "an unsupported key kind must be rejected (not silently treated as Ed25519)"
+        );
+        // Malformed state: key 5 is a uint, not a map. a2 01 05 05 00 — but prev (key 2) missing too;
+        // use a3 with prev null: a3 01 05 02 f6 05 00.
+        assert!(
+            Aum::from_cbor(&[0xa3, 0x01, 0x05, 0x02, 0xf6, 0x05, 0x00]).is_err(),
+            "a non-map `state` value must be rejected"
+        );
+        // A deeply-nested array inside an AUM field must error (shared depth cap), not overflow.
+        let mut nested = alloc::vec![0xa2u8, 0x01, 0x03, 0x02]; // map(2){1:3, 2: <nested>}
+        nested.extend(core::iter::repeat_n(0x81u8, MAX_SIG_NESTING_DEPTH + 8)); // array(1) per level
+        nested.push(0x00); // innermost uint
+        assert!(
+            Aum::from_cbor(&nested).is_err(),
+            "an AUM field nested past the depth cap must be rejected, not overflow the stack"
+        );
+    }
+
+    /// Gap 5 + Finding L2: a NON-canonical encoding decodes to the SAME `Aum` (and thus the same
+    /// `hash()`) as its canonical form — pinning the property that makes the lenient decode benign
+    /// (the verify path re-serializes canonically, so wire-form variation can never forge a hash).
+    #[test]
+    fn aum_from_cbor_noncanonical_decodes_to_same_hash() {
+        // Canonical NoOp with null prev: a2 01 03 02 f6.
+        let canonical = [0xa2u8, 0x01, 0x03, 0x02, 0xf6];
+        // Non-canonical variants that must decode to the SAME struct:
+        //  (a) message_kind via a non-minimal 2-byte int head (0x18 0x03 instead of 0x03):
+        let noncanon_int = [0xa2u8, 0x01, 0x18, 0x03, 0x02, 0xf6];
+        //  (b) prev=null via the 2-byte simple-value form (0xf8 0x16 instead of 0xf6):
+        let noncanon_null = [0xa2u8, 0x01, 0x03, 0x02, 0xf8, 0x16];
+        //  (c) map keys in DESCENDING order (2 before 1):
+        let noncanon_order = [0xa2u8, 0x02, 0xf6, 0x01, 0x03];
+
+        let base = Aum::from_cbor(&canonical).expect("canonical decodes");
+        for (label, bytes) in [
+            ("non-minimal int head", &noncanon_int[..]),
+            ("2-byte null simple value", &noncanon_null[..]),
+            ("descending key order", &noncanon_order[..]),
+        ] {
+            let got = Aum::from_cbor(bytes)
+                .unwrap_or_else(|e| panic!("non-canonical ({label}) should still decode: {e}"));
+            assert_eq!(
+                got, base,
+                "non-canonical ({label}) must decode to the same Aum"
+            );
+            assert_eq!(
+                got.hash(),
+                base.hash(),
+                "non-canonical ({label}) must hash identically (re-serialized canonically)"
+            );
+            // And it normalises: re-serialize equals the canonical bytes.
+            assert_eq!(
+                got.serialize(),
+                canonical,
+                "non-canonical ({label}) must re-serialize to the canonical form"
+            );
+        }
     }
 }

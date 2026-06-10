@@ -27,3 +27,9 @@ name = "cbor_decode"
 path = "fuzz_targets/cbor_decode.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "aum_from_cbor"
+path = "fuzz_targets/aum_from_cbor.rs"
+test = false
+doc = false
