@@ -116,6 +116,37 @@ where
             self.send(req).await
         }
     }
+
+    /// Sends an HTTP **GET request carrying a body** and returns the [`Response`].
+    ///
+    /// A GET with a request body is unusual, but it is exactly what the upstream Tailnet-Lock sync
+    /// RPCs (`/machine/tka/sync/{offer,send}`) do: control routes on the path and reads a JSON body
+    /// off a `GET`. This mirrors [`ClientExt::post`] but with the `GET` method, so callers that must
+    /// match that wire shape don't have to hand-build a [`Request`] (and reach for the private
+    /// origin-form target helper). Same header defaults as `get`/`post` (UA + `Host`).
+    fn get_with_body(
+        &self,
+        url: &url::Url,
+        headers: impl IntoIterator<Item = (HeaderName, HeaderValue)>,
+        body: B,
+    ) -> impl Future<Output = Result<Response<Incoming>, Error>> {
+        let mut req = Request::get(origin_form_target(url));
+
+        if let Some(hdrs) = req.headers_mut() {
+            hdrs.append(USER_AGENT, HeaderValue::from_static(DEFAULT_USER_AGENT));
+            hdrs.extend(crate::host_header(url));
+            hdrs.extend(headers);
+        }
+
+        async move {
+            let req = req.body(body).map_err(|e| {
+                tracing::error!(error = %e, "constructing request");
+                Error::InvalidInput
+            })?;
+
+            self.send(req).await
+        }
+    }
 }
 
 impl<T, B> ClientExt<B> for T
