@@ -2,6 +2,18 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.15.0](https://github.com/GeiserX/tailscale-rs/compare/v0.14.0...v0.15.0) (2026-06-10)
+
+
+### Features
+
+* **tsnet:** Device::dns_config() accessor (Go nm.DNS / tnet dns status) ([#59](https://github.com/GeiserX/tailscale-rs/issues/59)) ([7a4ff31](https://github.com/GeiserX/tailscale-rs/commit/7a4ff3144cd5e156ad7dc0c1a97c435abd018c53))
+
+
+### Bug Fixes
+
+* **release:** bump inter-crate pins to 0.14.0 + auto-bump them in future releases ([#57](https://github.com/GeiserX/tailscale-rs/issues/57)) ([a33e5bc](https://github.com/GeiserX/tailscale-rs/commit/a33e5bcbce036773bf684e16f0532899f49d0e86))
+
 ## [0.14.0](https://github.com/GeiserX/tailscale-rs/compare/v0.13.0...v0.14.0) (2026-06-10)
 
 
