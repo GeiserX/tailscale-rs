@@ -2,6 +2,20 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.8.0](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.8.0) - 2026-06-10
+
+### Added
+- **`Device::new_with_secret(&Config, Option<secrecy::SecretString>)`** — a back-compat secret-typed
+  constructor for embedders that hold the registration auth key as a `secrecy::SecretString` (e.g. a
+  daemon that keeps the key zeroized end-to-end). The caller no longer has to expose the secret into
+  a plain `String` at the engine boundary. `Device::new(Option<String>)` is unchanged. The engine
+  still resolves the key to a `String` internally for registration (so this closes the *caller's*
+  plaintext window, not the engine's internal handling — engine-side key zeroization is tracked
+  separately). Adds a `secrecy` dependency (pure-Rust, no aws-lc/openssl/ring — the ring-only egress
+  invariant is preserved) and re-exports `tailscale::SecretString`. Minor bump (additive public API).
+- **`docs/LIVE_SETTABLE_PREFS.md`** — documents which `Device` prefs are mutable on a running device
+  (`set_exit_node`, `set_serve_config`, `logout`) vs which require a `Device::new` rebuild.
+
 ## [0.7.3](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.7.3) - 2026-06-10
 
 ### Fixed (security)
