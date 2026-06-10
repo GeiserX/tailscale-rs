@@ -178,11 +178,14 @@ pub use ts_runtime::{DeviceState, RegistrationError, Status, StatusNode, WhoIs};
 #[cfg(feature = "axum")]
 pub mod axum;
 pub mod config;
+mod dial;
 mod error;
 mod loopback;
 #[cfg(feature = "ssh")]
 pub mod ssh;
 
+#[doc(inline)]
+pub use dial::{ConnectedUdpSocket, DialConn};
 #[doc(inline)]
 pub use loopback::LoopbackHandle;
 
@@ -496,6 +499,134 @@ impl Device {
             .ok_or(Error::Internal(InternalErrorKind::BadRequest))?;
 
         self.tcp_connect((addr, port).into()).await
+    }
+
+    /// Resolve a `host:port` string to a tailnet [`SocketAddr`], honoring the family forced by a
+    /// `network` suffix. The host may be an IP literal (parsed directly) or a MagicDNS name
+    /// (resolved via [`Device::resolve`], which yields a tailnet IPv4). Shared by [`Device::dial`]
+    /// and [`Device::dial_tcp`]. The IPv4-only invariant is enforced here: a `…6` network, or any v6
+    /// destination, requires `Config::enable_ipv6` and otherwise returns
+    /// [`InternalErrorKind::BadRequest`] (a clean typed error rather than a downstream actor error).
+    async fn resolve_dial_addr(
+        &self,
+        network: dial::Network,
+        addr: &str,
+    ) -> Result<SocketAddr, Error> {
+        let (host, port) = dial::split_host_port(addr)?;
+
+        // An IP literal is used directly; otherwise resolve the MagicDNS name (IPv4 only).
+        let ip: IpAddr = if let Ok(ip) = host.parse::<IpAddr>() {
+            ip
+        } else {
+            self.resolve(host)
+                .await?
+                .ok_or(Error::Internal(InternalErrorKind::BadRequest))?
+                .into()
+        };
+
+        dial::check_family(network.family, ip)?;
+
+        // IPv4-only invariant: a v6 destination is only reachable when IPv6 is provisioned.
+        if ip.is_ipv6() && !self.enable_ipv6 {
+            return Err(Error::Internal(InternalErrorKind::BadRequest));
+        }
+
+        Ok((ip, port).into())
+    }
+
+    /// Connect to a tailnet address over TCP or UDP, the Rust analog of Go
+    /// `tsnet.Server.Dial(ctx, network, address)`.
+    ///
+    /// `network` is one of `"tcp"`, `"tcp4"`, `"tcp6"`, `"udp"`, `"udp4"`, `"udp6"`; `addr` is a
+    /// `host:port` string where `host` is a MagicDNS name, an IPv4 literal, or a bracketed IPv6
+    /// literal (`[2001:db8::1]:443`). The host is resolved in-process via [`Device::resolve`] (no DNS
+    /// server). Returns a [`DialConn`] whose arm matches the transport — use [`Device::dial_tcp`]
+    /// when you want the TCP stream directly.
+    ///
+    /// Differences from Go (documented for parity): ports must be **numeric** (Go's `LookupPort`
+    /// also resolves named ports like `"http"`; this fork avoids a services-file dependency), and
+    /// `…6`/v6 destinations require `Config::enable_ipv6` (the tailnet is IPv4-only by default).
+    ///
+    /// # Errors
+    /// [`InternalErrorKind::BadRequest`] for an unsupported `network`, a malformed/portless `addr`,
+    /// an unresolvable name, or a v6 destination while IPv6 is disabled; otherwise the transport's
+    /// own connect error.
+    pub async fn dial(&self, network: &str, addr: &str) -> Result<DialConn, Error> {
+        let net = dial::parse_network(network)?;
+        let remote = self.resolve_dial_addr(net, addr).await?;
+
+        match net.transport {
+            dial::Transport::Tcp => Ok(DialConn::Tcp(self.tcp_connect(remote).await?)),
+            dial::Transport::Udp => {
+                // Bind an ephemeral local UDP socket on this node's tailnet address, then connect it
+                // to the remote peer (Go's `Dial("udp", …)` returns a connected UDP `net.Conn`).
+                let local: SocketAddr = (self.ipv4_addr().await?, 0).into();
+                let sock = self.udp_bind(local).await?;
+                Ok(DialConn::Udp(ConnectedUdpSocket::new(sock, remote)))
+            }
+        }
+    }
+
+    /// Connect to a tailnet address over TCP, returning the stream directly — the common case of
+    /// [`Device::dial`] for `"tcp"`. `addr` is a `host:port` string (MagicDNS name or IP literal).
+    /// This is the building block for HTTP-over-tailnet: an embedder's `hyper`/`reqwest` client can
+    /// route requests by calling `dial_tcp(&format!("{host}:{port}"))` from its connector, mirroring
+    /// how Go `tsnet.Server.HTTPClient` sets `http.Transport.DialContext = Server.Dial`.
+    ///
+    /// # Errors
+    /// As [`Device::dial`] for the `"tcp"` network.
+    pub async fn dial_tcp(&self, addr: &str) -> Result<netstack::TcpStream, Error> {
+        let remote = self
+            .resolve_dial_addr(
+                dial::Network {
+                    transport: dial::Transport::Tcp,
+                    family: dial::Family::Any,
+                },
+                addr,
+            )
+            .await?;
+        self.tcp_connect(remote).await
+    }
+
+    /// Bind a UDP socket from a `host:port` string, the Rust analog of Go
+    /// `tsnet.Server.ListenPacket(network, addr)`.
+    ///
+    /// `network` is one of `"udp"`, `"udp4"`, `"udp6"`; `addr` must be a **valid IP literal**
+    /// `host:port` (Go's `ListenPacket` rejects a name or empty host — unlike `Listen`). An
+    /// unspecified host (`0.0.0.0`/`[::]`) binds on this node's tailnet address. Returns the
+    /// unconnected [`netstack::UdpSocket`] (a `net.PacketConn`).
+    ///
+    /// # Errors
+    /// [`InternalErrorKind::BadRequest`] for a non-UDP/unsupported `network`, a malformed addr, a
+    /// non-IP host, a family mismatch, or a v6 bind while IPv6 is disabled.
+    pub async fn listen_packet(
+        &self,
+        network: &str,
+        addr: &str,
+    ) -> Result<netstack::UdpSocket, Error> {
+        let net = dial::parse_network(network)?;
+        if net.transport != dial::Transport::Udp {
+            return Err(Error::Internal(InternalErrorKind::BadRequest));
+        }
+        let (host, port) = dial::split_host_port(addr)?;
+
+        // ListenPacket requires a valid IP host (Go rejects a name here).
+        let ip: IpAddr = host
+            .parse()
+            .map_err(|_| Error::Internal(InternalErrorKind::BadRequest))?;
+        dial::check_family(net.family, ip)?;
+
+        // An unspecified bind host means "this node's tailnet address".
+        let bind_ip: IpAddr = if ip.is_unspecified() {
+            self.ipv4_addr().await?.into()
+        } else {
+            if ip.is_ipv6() && !self.enable_ipv6 {
+                return Err(Error::Internal(InternalErrorKind::BadRequest));
+            }
+            ip
+        };
+
+        self.udp_bind((bind_ip, port).into()).await
     }
 
     /// Connect to a TCP socket at the remote address.
