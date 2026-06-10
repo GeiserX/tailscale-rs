@@ -423,9 +423,14 @@ async fn run_advertiser(
 /// [`MagicSock::best_addr`] being `None`: once a path is confirmed we stop relaying to that peer,
 /// so this never spams DERP for peers that are already direct.
 ///
-/// We only target peers that have a disco key and a known home DERP region (we relay to that
-/// region). The frame carries our [`MagicSock::self_endpoints`] — the same set advertised to
-/// control — so no host-identifying address beyond that is disclosed.
+/// We only target peers that have a disco key. The relay region is the peer's netmap home region
+/// when control supplied one, else the inferred region from [`Multiderp::region_for_peer`] (an
+/// observed route, or our own home region as a last resort) — the same connectivity-floor inference
+/// the route updater uses, so a peer whose netmap carried no region can still be prompted to open a
+/// direct path (issue #24: without this the WireGuard floor came up over DERP but the direct upgrade
+/// was never even attempted for a no-region peer). The frame carries our
+/// [`MagicSock::self_endpoints`] — the same set advertised to control — so no host-identifying
+/// address beyond that is disclosed.
 async fn run_call_me_maybe(
     sock: Arc<MagicSock>,
     peer_db: Arc<RwLock<Option<Arc<PeerDb>>>>,
@@ -453,7 +458,10 @@ async fn run_call_me_maybe(
                 }
 
                 // Snapshot the targets under the read lock, then release it before any await.
-                let targets: Vec<(ts_keys::NodePublicKey, DiscoPublicKey, ts_derp::RegionId)> = {
+                // `region` is the netmap home region when control gave one, else `None` to be
+                // resolved via the fallback below (outside the lock — it's an actor `ask`). We keep
+                // the peer either way so a no-region peer is still prompted to go direct.
+                let targets: Vec<(ts_keys::NodePublicKey, DiscoPublicKey, Option<ts_derp::RegionId>)> = {
                     let db = poisoned_read(&peer_db);
                     let Some(db) = db.as_ref() else { continue; };
 
@@ -461,17 +469,37 @@ async fn run_call_me_maybe(
                         .values()
                         .filter_map(|node| {
                             let disco = node.disco_key?;
-                            let region = node.derp_region?;
                             // Only prompt peers that don't already have a confirmed direct path.
                             if sock.best_addr(&disco).is_some() {
                                 return None;
                             }
-                            Some((node.node_key, disco, region))
+                            Some((node.node_key, disco, node.derp_region))
                         })
                         .collect()
                 };
 
-                for (node_key, disco, region) in targets {
+                for (node_key, disco, netmap_region) in targets {
+                    // Resolve the relay region: netmap home region, else the inferred fallback
+                    // (observed route / our home region) — the same floor the route updater uses.
+                    let region = match netmap_region {
+                        Some(region) => Some(region),
+                        None => {
+                            // PeerId lookup + region inference both live in multiderp; ask it.
+                            match multiderp.ask(multiderp::RegionForNode { node: node_key }).await {
+                                Ok(region) => region,
+                                Err(e) => {
+                                    tracing::trace!(error = %e, "inferring call-me-maybe relay region");
+                                    None
+                                }
+                            }
+                        }
+                    };
+                    let Some(region) = region else {
+                        // No region from netmap, no observed route, no home region yet: nothing to
+                        // relay through this round. Recovered on the next cadence once one appears.
+                        continue;
+                    };
+
                     let frame = match sock.seal_call_me_maybe(&disco) {
                         Ok(frame) => frame,
                         Err(e) => {

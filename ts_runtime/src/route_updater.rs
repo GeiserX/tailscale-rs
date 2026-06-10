@@ -248,8 +248,30 @@ impl RouteUpdater {
                 overlay_out.insert(*route, OutboundRouteAction::Wireguard(*id));
             }
 
-            let Some(region) = peer.derp_region else {
-                tracing::trace!(parent: &span, "peer has no derp region");
+            // The relay region for this peer. Prefer the netmap's home region; when control carried
+            // none (common on a self-hosted control plane that doesn't echo `preferred_derp`, or in
+            // the window before a peer's netcheck propagates), fall back to a region multiderp has
+            // observed traffic from this peer on, else our own home region — so the peer still gets
+            // a DERP underlay route instead of being silently dropped (issue #24: a peer with no
+            // region got no route at all, so every WireGuard packet to it — handshake included —
+            // was discarded, symmetric, and the dial timed out). This is the connectivity floor; the
+            // disco machinery still upgrades to a direct path on top whenever one opens.
+            let region = match peer.derp_region {
+                Some(region) => Some(region),
+                None => match self
+                    .multiderp
+                    .ask(multiderp::RegionForPeer { peer: *id })
+                    .await
+                {
+                    Ok(region) => region,
+                    Err(e) => {
+                        tracing::error!(error = %e, "multiderp unavailable");
+                        None
+                    }
+                },
+            };
+            let Some(region) = region else {
+                tracing::trace!(parent: &span, "peer has no derp region and none could be inferred");
                 continue;
             };
 
