@@ -35,6 +35,9 @@ pub struct ControlRunner {
     ssh_policy: watch::Sender<Option<SshPolicy>>,
     /// Latest Tailnet Lock status pushed by control, or `None` until control sends one.
     tka: watch::Sender<Option<TkaStatus>>,
+    /// Latest cert-domain list from control's netmap DNS config (Go `nm.DNS.CertDomains`), or empty
+    /// until control sends a DNS config carrying one. The facade reads this for `Device::cert_domains`.
+    cert_domains: watch::Sender<Vec<String>>,
 }
 
 /// Control runner args.
@@ -150,6 +153,7 @@ impl kameo::Actor for ControlRunner {
             self_node: Default::default(),
             ssh_policy: Default::default(),
             tka: Default::default(),
+            cert_domains: Default::default(),
         })
     }
 }
@@ -265,6 +269,16 @@ mod msg_impl {
         #[message]
         pub fn current_tka_status(&self) -> Option<TkaStatus> {
             self.tka.borrow().clone()
+        }
+
+        /// The cert-eligible DNS names from control's netmap DNS config (Go `nm.DNS.CertDomains`).
+        ///
+        /// Returns an empty `Vec` when control has sent no DNS config, or one carrying no cert
+        /// domains (an empty list is a legitimate, immediate answer — like `current_ssh_policy`, this
+        /// does not block waiting for a value).
+        #[message]
+        pub fn cert_domains(&self) -> Vec<String> {
+            self.cert_domains.borrow().clone()
         }
 
         /// Request an OIDC ID token from control scoped to `audience` (workload-identity federation).
@@ -446,6 +460,16 @@ impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
                 if let Some(tka) = msg.tka.as_ref() {
                     self.tka.send_replace(Some(tka.clone()));
                 }
+
+                // Track the cert-domain list from the netmap DNS config (Go `nm.DNS.CertDomains`).
+                // An update with no DNS config, or one carrying no cert domains, means "none" — Go
+                // reads an empty slice off an absent config too, so mirror that as an empty `Vec`.
+                let cert_domains = msg
+                    .dns_config
+                    .as_ref()
+                    .map(|d| d.cert_domains.clone())
+                    .unwrap_or_default();
+                self.cert_domains.send_replace(cert_domains);
 
                 if let Err(e) = self.params.env.publish(msg).await {
                     tracing::error!(error = %e, "publishing netmap update");

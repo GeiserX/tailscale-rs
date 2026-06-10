@@ -40,6 +40,11 @@ pub struct Status {
     /// engaged, not merely what [`Config::exit_node`](ts_control::Config) requested. Find the peer's
     /// details by matching this id against [`peers`](Status::peers).
     pub active_exit_node: Option<StableNodeId>,
+    /// The tailnet's MagicDNS suffix (e.g. `"tail0123.ts.net"`) — Go `ipnstate.Status.MagicDNSSuffix`.
+    /// Derived (like Go's `NetworkMap.MagicDNSSuffix`) from the self node's FQDN minus its host label,
+    /// **not** from the DNS config and **not** from the tailnet `Domain` name. `None` before the first
+    /// netmap, or when the self FQDN has no tailnet component (a bare hostname).
+    pub magic_dns_suffix: Option<String>,
 }
 
 /// A single node entry in a [`Status`] snapshot.

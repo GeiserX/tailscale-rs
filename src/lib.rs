@@ -410,6 +410,24 @@ impl Device {
             .ok_or(Error::Internal(InternalErrorKind::Actor))
     }
 
+    /// This node's tailnet IPv4 and (when provisioned) IPv6 addresses as a pair — the Rust analog of
+    /// Go `tsnet.Server.TailscaleIPs() (ip4, ip6 netip.Addr)`.
+    ///
+    /// Reads the self node's assigned addresses (the same source Go splits by family). The tailnet
+    /// is IPv4-only unless [`Config::enable_ipv6`](crate::config::Config) is set, so the IPv6 half is
+    /// `None` when no v6 address is assigned — the Rust shape for Go returning the zero `netip.Addr`
+    /// in that case (Go's IPv6-absent sentinel). Errors until the first netmap is received (no self
+    /// node yet), matching Go returning invalid addresses before the node has joined.
+    pub async fn tailscale_ips(&self) -> Result<(Ipv4Addr, Option<Ipv6Addr>), Error> {
+        let me = self.self_node().await?;
+        let v4 = me.tailnet_address.ipv4.addr();
+        let v6 = me.tailnet_address.ipv6.addr();
+        // The decoder synthesizes the unspecified `::` placeholder on an IPv4-only tailnet; surface
+        // a real v6 only when IPv6 is enabled AND a non-placeholder address was assigned.
+        let v6 = (self.enable_ipv6 && !v6.is_unspecified()).then_some(v6);
+        Ok((v4, v6))
+    }
+
     /// Bind a UDP socket to the specified [`SocketAddr`].
     ///
     /// Returns an error in TUN transport mode (there is no application netstack to bind on).
@@ -715,6 +733,21 @@ impl Device {
             .await
             .map_err(ts_runtime::Error::from)?
             .ok_or(Error::Internal(InternalErrorKind::Actor))
+    }
+
+    /// The DNS names this node can obtain TLS certificates for — Go `tsnet.Server.CertDomains()`.
+    ///
+    /// These are the `CertDomains` control pushed in the netmap DNS config: the names a TLS-serving
+    /// consumer (e.g. a `ListenTLS`/`GetCertificate`-style caller) should request a cert for. Returns
+    /// an empty `Vec` before the first netmap, or when control granted none — mirroring Go returning a
+    /// clone of `nm.DNS.CertDomains` (empty/`nil` when absent).
+    pub async fn cert_domains(&self) -> Result<Vec<String>, Error> {
+        self.runtime
+            .control
+            .ask(ts_runtime::control_runner::CertDomains)
+            .await
+            .map_err(ts_runtime::Error::from)
+            .map_err(Into::into)
     }
 
     /// This node's key-expiry instant as Unix seconds (`Node.KeyExpiry` in Go), or `Ok(None)` if
