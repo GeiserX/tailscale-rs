@@ -173,7 +173,7 @@ pub use ts_runtime::fallback_tcp::{
 #[doc(inline)]
 pub use ts_runtime::taildrop::WaitingFile;
 #[doc(inline)]
-pub use ts_runtime::{DeviceState, RegistrationError, Status, StatusNode, WhoIs};
+pub use ts_runtime::{DeviceState, FileTarget, RegistrationError, Status, StatusNode, WhoIs};
 
 #[cfg(feature = "axum")]
 pub mod axum;
@@ -926,6 +926,22 @@ impl Device {
         ts_runtime::taildrop_send::send_file(channel, self_ipv4, dst, name, content_length, reader)
             .await
             .map_err(taildrop_send_err)
+    }
+
+    /// List the tailnet peers this node can Taildrop a file *to* — the Rust analog of Go's LocalAPI
+    /// `FileTargets`.
+    ///
+    /// Each [`FileTarget`] pairs a peer's node record with the `http://ip:port` base of its peerAPI;
+    /// pass `target.node` straight to [`Device::send_file`]. A peer qualifies when it advertises a
+    /// reachable IPv4 peerAPI **and** is either owned by the same user as this node **or** explicitly
+    /// granted the file-sharing-target capability — mirroring upstream's send-path filter. The list is
+    /// gated on this node holding the file-sharing capability (control grants it when the admin
+    /// enables Taildrop); absent that, the result is empty (fail-closed, not an error). Sorted by the
+    /// peer's MagicDNS name. Targets are listed regardless of online state (matching upstream — an
+    /// offline target's [`send_file`](Device::send_file) simply times out). Empty before the first
+    /// netmap.
+    pub async fn file_targets(&self) -> Result<Vec<FileTarget>, Error> {
+        self.runtime.file_targets().await.map_err(Into::into)
     }
 
     /// Begin a debug packet capture, streaming a pcap of every packet crossing the dataplane to

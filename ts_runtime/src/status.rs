@@ -22,7 +22,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use ts_control::{Node, StableNodeId};
+use ts_control::{Node, StableNodeId, UserId};
 
 /// A snapshot of the local netmap: this node plus every known peer.
 ///
@@ -145,6 +145,58 @@ impl WhoIs {
 /// Resolve which node owns a tailnet source address, used by WhoIs.
 pub(crate) fn whois_addr(addr: SocketAddr) -> IpAddr {
     addr.ip()
+}
+
+/// A tailnet peer this node can send a Taildrop file *to*, plus the peerAPI base URL to reach it.
+///
+/// Analogous to tsnet's `apitype.FileTarget`. The set is produced by
+/// [`Runtime::file_targets`](crate::Runtime::file_targets) (exposed as `Device::file_targets`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileTarget {
+    /// The target peer's node record — pass straight to the Taildrop send path
+    /// (`Device::send_file`), which re-derives the same peerAPI address.
+    pub node: Node,
+    /// The `http://ip:port` base URL of the peer's peerAPI, with no trailing path — the exact shape
+    /// of Go's `apitype.FileTarget.PeerAPIURL`. Derived from
+    /// [`Node::peerapi_addr`](ts_control::Node::peerapi_addr).
+    pub peerapi_url: String,
+}
+
+/// Compute the sorted Taildrop send-target list from the peer set, given the local node's owning
+/// user id. The pure core of [`Runtime::file_targets`](crate::Runtime::file_targets) — separated out
+/// so the eligibility + ordering rules are unit-testable without spinning up the actor graph (the
+/// node-level file-sharing gate is applied by the caller before this runs).
+///
+/// A peer is a target when it advertises a reachable peerAPI (Go `PeerAPIBase(p) != ""`) **and** is
+/// either owned by `self_user_id` **or** carries the file-sharing-target capability — Go's two-way
+/// OR. Sorted by MagicDNS name (Go sorts by `Node.Name`), falling back to the bare hostname.
+pub(crate) fn build_file_targets(peers: Vec<Node>, self_user_id: UserId) -> Vec<FileTarget> {
+    let mut targets: Vec<FileTarget> = peers
+        .into_iter()
+        .filter_map(|peer| {
+            // Must advertise a reachable peerAPI (Go `PeerAPIBase(p) != ""`).
+            let addr = peer.peerapi_addr()?;
+            // Same owner OR explicitly an ACL file-sharing target (Go's two-way OR).
+            let eligible = peer.user_id == self_user_id || peer.is_file_sharing_target();
+            if !eligible {
+                return None;
+            }
+            Some(FileTarget {
+                peerapi_url: format!("http://{addr}"),
+                node: peer,
+            })
+        })
+        .collect();
+    // Sort by MagicDNS name (Go sorts by `Node.Name`), bare hostname as the fallback key.
+    targets.sort_by(|a, b| {
+        let name = |t: &FileTarget| {
+            t.node
+                .fqdn_opt(false)
+                .unwrap_or_else(|| t.node.hostname.clone())
+        };
+        name(a).cmp(&name(b))
+    });
+    targets
 }
 
 #[cfg(test)]
@@ -286,5 +338,74 @@ mod tests {
             whois.capabilities,
             vec![("cap/x".to_string(), vec!["y".to_string()])]
         );
+    }
+
+    /// Build a peer with a reachable peerAPI on `ipv4`, owned by `user`.
+    fn peer_with_peerapi(stable: &str, hostname: &str, ipv4: &str, user: UserId) -> Node {
+        let mut n = node(stable, hostname, Some("ts.net"), ipv4);
+        n.user_id = user;
+        n.peerapi_port = Some(8089);
+        n
+    }
+
+    #[test]
+    fn file_targets_includes_same_owner_peer_with_peerapi() {
+        let peer = peer_with_peerapi("p1", "host", "100.64.0.5", 42);
+        let targets = build_file_targets(vec![peer], 42);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].peerapi_url, "http://100.64.0.5:8089");
+        assert_eq!(targets[0].node.hostname, "host");
+    }
+
+    #[test]
+    fn file_targets_includes_cross_owner_peer_with_target_cap() {
+        // Different owner, but carries the file-sharing-target cap → still a target (Go's OR).
+        let mut peer = peer_with_peerapi("p1", "host", "100.64.0.5", 99);
+        peer.cap_map
+            .insert("tailscale.com/cap/file-sharing-target".to_string(), vec![]);
+        let targets = build_file_targets(vec![peer], 42);
+
+        assert_eq!(
+            targets.len(),
+            1,
+            "cross-owner peer with the target cap qualifies"
+        );
+    }
+
+    #[test]
+    fn file_targets_excludes_cross_owner_peer_without_cap() {
+        // Different owner and no target cap → excluded.
+        let peer = peer_with_peerapi("p1", "host", "100.64.0.5", 99);
+        let targets = build_file_targets(vec![peer], 42);
+
+        assert!(
+            targets.is_empty(),
+            "a different owner without the cap is not a target"
+        );
+    }
+
+    #[test]
+    fn file_targets_excludes_peer_without_peerapi() {
+        // Same owner, but advertises no peerAPI (no port) → excluded (Go `PeerAPIBase(p) == ""`).
+        let mut peer = peer_with_peerapi("p1", "host", "100.64.0.5", 42);
+        peer.peerapi_port = None;
+        let targets = build_file_targets(vec![peer], 42);
+
+        assert!(
+            targets.is_empty(),
+            "a peer with no peerAPI cannot be a Taildrop target"
+        );
+    }
+
+    #[test]
+    fn file_targets_sorted_by_magic_dns_name() {
+        // Insert out of order; expect sorted by fqdn ("alpha.ts.net" < "zeta.ts.net").
+        let zeta = peer_with_peerapi("p2", "zeta", "100.64.0.6", 42);
+        let alpha = peer_with_peerapi("p1", "alpha", "100.64.0.5", 42);
+        let targets = build_file_targets(vec![zeta, alpha], 42);
+
+        let names: Vec<_> = targets.iter().map(|t| t.node.hostname.clone()).collect();
+        assert_eq!(names, vec!["alpha", "zeta"]);
     }
 }
