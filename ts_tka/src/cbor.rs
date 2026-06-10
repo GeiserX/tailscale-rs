@@ -28,6 +28,10 @@ use alloc::vec::Vec;
 pub enum Value {
     /// Unsigned integer (CBOR major type 0).
     Uint(u64),
+    /// The `null` simple value (major type 7, value 22 → `0xf6`). Go encodes a nil non-`omitempty`
+    /// pointer/slice field (e.g. an AUM's genesis `PrevAUMHash`) as CBOR null, *not* as an empty
+    /// byte string and *not* omitted.
+    Null,
     /// Byte string (CBOR major type 2).
     Bytes(Vec<u8>),
     /// Text string (CBOR major type 3).
@@ -37,6 +41,12 @@ pub enum Value {
     /// Map with unsigned-integer keys (CBOR major type 5, `keyasint`). Encoded in CTAP2 canonical
     /// key order regardless of insertion order.
     IntMap(Vec<(u64, Value)>),
+    /// Map with text-string keys (CBOR major type 5), for Go `map[string]string` fields (e.g. an
+    /// AUM/Key `Meta`). Encoded in CTAP2 canonical key order: bytewise-lexicographic on the *encoded*
+    /// key (its text head + bytes). Unlike the small integer keys, this is **not** equivalent to
+    /// plain content ordering when keys differ in length — a shorter string has a smaller length head
+    /// and sorts first — so we compare the fully-encoded key bytes, matching `fxamacker` SortCTAP2.
+    TextMap(Vec<(Vec<u8>, Value)>),
 }
 
 impl Value {
@@ -44,6 +54,8 @@ impl Value {
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {
             Value::Uint(n) => encode_head(out, 0, *n),
+            // major type 7, simple value 22 = null.
+            Value::Null => out.push(0xf6),
             Value::Bytes(b) => {
                 encode_head(out, 2, b.len() as u64);
                 out.extend_from_slice(b);
@@ -76,6 +88,29 @@ impl Value {
                 encode_head(out, 5, sorted.len() as u64);
                 for (k, v) in sorted {
                     encode_head(out, 0, *k); // key: unsigned int
+                    v.encode(out);
+                }
+            }
+            Value::TextMap(entries) => {
+                // CTAP2 canonical key order = bytewise-lexicographic on the *encoded* text key
+                // (head + bytes). Precompute each encoded key once, sort by it, then emit.
+                let mut encoded: Vec<(Vec<u8>, &Value)> = entries
+                    .iter()
+                    .map(|(k, v)| {
+                        let mut ek = Vec::with_capacity(k.len() + 1);
+                        encode_head(&mut ek, 3, k.len() as u64);
+                        ek.extend_from_slice(k);
+                        (ek, v)
+                    })
+                    .collect();
+                encoded.sort_by(|a, b| a.0.cmp(&b.0));
+                debug_assert!(
+                    encoded.windows(2).all(|w| w[0].0 != w[1].0),
+                    "TextMap has duplicate keys; CTAP2 canonical CBOR forbids duplicate map keys"
+                );
+                encode_head(out, 5, encoded.len() as u64);
+                for (ek, v) in encoded {
+                    out.extend_from_slice(&ek); // key: already-encoded text string
                     v.encode(out);
                 }
             }
@@ -169,5 +204,29 @@ mod tests {
         ]);
         // Only keys 1 and 3 present.
         assert_eq!(m.to_vec(), vec![0xa2, 0x01, 0x01, 0x03, 0x03]);
+    }
+
+    #[test]
+    fn text_map_single_entry() {
+        // map(1){ "a": "b" } — matches the Meta field in Go's UpdateKey TestSerialization vector
+        // (`07 a1 61 61 61 62`, here without the outer keyasint wrapper).
+        let m = Value::TextMap(vec![(b"a".to_vec(), Value::Text(b"b".to_vec()))]);
+        assert_eq!(m.to_vec(), vec![0xa1, 0x61, 0x61, 0x61, 0x62]);
+    }
+
+    #[test]
+    fn text_map_ctap2_orders_by_encoded_key_length_first() {
+        // CTAP2 = bytewise on the ENCODED key, so a shorter key (smaller length head) sorts before a
+        // longer one even if its content would sort later lexically. "z" (head 0x61) must precede
+        // "aa" (head 0x62) because 0x61 < 0x62.
+        let m = Value::TextMap(vec![
+            (b"aa".to_vec(), Value::Uint(2)),
+            (b"z".to_vec(), Value::Uint(1)),
+        ]);
+        assert_eq!(
+            m.to_vec(),
+            // map(2){ "z":1, "aa":2 } — "z" first (1-byte string head 0x61 < 2-byte head 0x62)
+            vec![0xa2, 0x61, 0x7a, 0x01, 0x62, 0x61, 0x61, 0x02]
+        );
     }
 }
