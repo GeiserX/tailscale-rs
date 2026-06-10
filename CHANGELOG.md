@@ -2,6 +2,31 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.13.0](https://github.com/GeiserX/tailscale-rs/compare/v0.12.0...v0.13.0) (2026-06-10)
+
+
+### ⚠ BREAKING CHANGES
+
+* **ts_keys:** zeroize private keys on drop, drop Copy (tsr-9nu) ([#39](https://github.com/GeiserX/tailscale-rs/issues/39))
+
+### Features
+
+* **runtime:** add Device::file_targets() Taildrop send-target enumeration ([#47](https://github.com/GeiserX/tailscale-rs/issues/47)) ([b0bcb13](https://github.com/GeiserX/tailscale-rs/commit/b0bcb13ea8d667001f1e8aad8ca1e7fb1d89fae1))
+* **status:** retain per-peer online/last_seen (Go PeerStatus.Online) ([#45](https://github.com/GeiserX/tailscale-rs/issues/45)) ([651d091](https://github.com/GeiserX/tailscale-rs/commit/651d09193f1a01efbc06b5ec9253b8a8b5fd3145))
+* **ts_control:** /machine/tka/sync Noise RPC client (offer + send) ([#50](https://github.com/GeiserX/tailscale-rs/issues/50)) ([08b22e1](https://github.com/GeiserX/tailscale-rs/commit/08b22e14e9463b97bb77a90439d16d60010c6c71))
+* **ts_keys:** zeroize private keys on drop, drop Copy (tsr-9nu) ([#39](https://github.com/GeiserX/tailscale-rs/issues/39)) ([bf429a0](https://github.com/GeiserX/tailscale-rs/commit/bf429a09b44b8df952727aaf03c44b7f2d90a36b))
+* **ts_tka:** AUM-chain sync — store + SyncOffer + MissingAUMs ([#49](https://github.com/GeiserX/tailscale-rs/issues/49)) ([1666319](https://github.com/GeiserX/tailscale-rs/commit/1666319e18924db1f88f7e4f8aa3727fa392a3a7))
+* **ts_tka:** decode AUMs from CBOR (Aum::from_cbor) ([#48](https://github.com/GeiserX/tailscale-rs/issues/48)) ([e753e05](https://github.com/GeiserX/tailscale-rs/commit/e753e054db0148f3584cbc8758c7fc61da2b17de))
+* **ts_tka:** port Go StaticValidate cluster + last-key guard (consensus parity) ([#41](https://github.com/GeiserX/tailscale-rs/issues/41)) ([25e604c](https://github.com/GeiserX/tailscale-rs/commit/25e604c33e6b465f7e3388056982098b9d1db932))
+* **ts_tka:** type-enforce AUM signature verification (VerifiedAumChain, [#7](https://github.com/GeiserX/tailscale-rs/issues/7) MUST-1) ([#40](https://github.com/GeiserX/tailscale-rs/issues/40)) ([5c6747f](https://github.com/GeiserX/tailscale-rs/commit/5c6747f61b45c877ef47946a184959a54c0bfa99))
+* **tsnet:** Device::dial/dial_tcp/listen_packet string-address entry points ([#42](https://github.com/GeiserX/tailscale-rs/issues/42)) ([6e7a3d9](https://github.com/GeiserX/tailscale-rs/commit/6e7a3d9276a6f00f7ddd97eeb8c2ac63de4a5073))
+* **tsnet:** TailscaleIPs/CertDomains/MagicDNSSuffix self-identity accessors ([#44](https://github.com/GeiserX/tailscale-rs/issues/44)) ([2f065cd](https://github.com/GeiserX/tailscale-rs/commit/2f065cd7d20aff45d57246c87c7fd6cc1baeb490))
+
+
+### Bug Fixes
+
+* **tsnet:** bind UDP local socket on the remote's address family (dial/listen_packet) ([#46](https://github.com/GeiserX/tailscale-rs/issues/46)) ([719d18b](https://github.com/GeiserX/tailscale-rs/commit/719d18b1b83e87a953e094a11b28127d0bd868bb))
+
 ## [0.13.0](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.13.0) - 2026-06-10
 
 ### Security
