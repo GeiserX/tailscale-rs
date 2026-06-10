@@ -2,6 +2,30 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.7.2](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.7.2) - 2026-06-10
+
+### Fixed
+- **Session-lifetime correctness (internal; no public API change).** Four fixes surfaced during the
+  #20/#21 handshake-race review:
+  - **`confirm()` now bounds the tentative responder session** — it takes the current time and
+    rejects (returns `None`, slot intact, no id leak) when the not-yet-confirmed responder session
+    is past its receive expiry, so a delayed or replayed (but still AEAD-valid) transport packet can
+    no longer activate a stale responder session arbitrarily later. Mirrors WireGuard bounding a
+    not-yet-confirmed keypair by the reject-after time on the receive path.
+  - **`get_recv` previous-session expiry fix** — the `recv_prev` branch checked the *current*
+    session's expiry instead of the previous one's, so it could return an expired previous session
+    (or drop a still-valid one).
+  - **Receive-session id leak fixed** — when a transmit session expired and the session state reset,
+    the receive sessions were dropped without freeing their ids from the id map (an unreclaimable
+    leak that accumulates on long-lived hosts). The reset now routes through the id-freeing path.
+  - **WireGuard timer constants** — the inline `120`/`240`-second magic numbers are now named
+    `REKEY_AFTER_TIME` (120s) and `REJECT_AFTER_TIME` (180s, the spec value), applied to the
+    transmit side (self-correcting: an outbound send past this age triggers a fresh handshake). The
+    receive bound is deliberately kept at a more lenient `REJECT_AFTER_TIME_RECV` (240s): this fork
+    triggers rekey only on outbound traffic (no receive-triggered rekey yet), so a strict 180s
+    receive bound would silently drop inbound traffic on a send-idle, mostly-inbound session.
+    Tightening the receive bound to 180s is gated on adding a receive-triggered rekey.
+
 ## [0.7.1](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.7.1) - 2026-06-10
 
 ### Fixed
