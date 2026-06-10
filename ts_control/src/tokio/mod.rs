@@ -11,7 +11,9 @@ use register::register;
 // it; gate the `mod`/`pub use` on `acme` so the default build stays dead-code-warning-clean.
 #[cfg(feature = "acme")]
 pub use set_dns::{SetDnsError, set_dns};
-pub use tka_sync::{TkaSyncError, TkaSyncInternalErrorKind, tka_sync_offer, tka_sync_send};
+pub use tka_sync::{
+    TkaSyncError, TkaSyncInternalErrorKind, tka_bootstrap, tka_sync_offer, tka_sync_send,
+};
 
 mod client;
 mod connect;
