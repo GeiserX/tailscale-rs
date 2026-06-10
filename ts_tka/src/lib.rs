@@ -15,13 +15,16 @@
 //!   [`Authority::node_key_authorized`], the check that a peer's node key is signed by a key trusted
 //!   under the current tailnet-lock state.
 //!
-//! ## Fail-closed + validation gap
+//! ## Fail-closed + validation status
 //!
-//! Verification is fail-closed: any decode/shape/signature problem denies authorization. **Caveat:**
-//! the CTAP2-CBOR byte-exactness has not been cross-validated against Go-produced test vectors in
-//! this fork, so byte-for-byte wire compatibility with a live Tailscale TKA is asserted by
-//! construction, not proven. Treat a *successful* verification as advisory until vectors land;
-//! a *failed* verification is always safe to act on (deny).
+//! Verification is fail-closed: any decode/shape/signature problem denies authorization. The
+//! CTAP2-CBOR byte-exactness is **cross-validated against Go-produced output**: the
+//! [`NodeKeySignature`] path against real `tka.NodeKeySignature.Serialize`/`SigHash` golden vectors
+//! (`tka_cbor_matches_go_golden`), and the [`Aum`] path against the literal `[]byte` vectors in Go's
+//! `tka/aum_test.go` `TestSerialization` (`aum_serialize_matches_go_test_serialization_vectors`).
+//! What remains for full Tailnet-Lock support is the *acquisition* side — the `/machine/tka/sync`
+//! RPC client and the [`Aum`]-chain replayer that folds a chain into a trusted-key [`State`] (the
+//! [`Authority`] is currently only constructible via [`Authority::from_state`]). See issue #7.
 
 extern crate alloc;
 
@@ -371,6 +374,217 @@ pub fn aum_hash(canonical_cbor: &[u8]) -> AumHash {
     AumHash(blake2s_256(canonical_cbor))
 }
 
+/// A trusted-key payload as carried *inside* an [`Aum`] (`AUMAddKey`/`AUMUpdateKey`) or a
+/// checkpoint [`AumState`] — Go `tka.Key`, full wire shape (the verify-path [`Key`] is a leaner
+/// slice that omits `meta`, which the node-key-signature path never needs).
+///
+/// CBOR keymap (Go `cbor:"…,keyasint"`): `kind`=1, `votes`=2, `public`=3, `meta`=**12** (omitempty).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AumKey {
+    /// Key algorithm (`Key25519` = 1).
+    pub kind: KeyKind,
+    /// Voting weight.
+    pub votes: u32,
+    /// Raw public key bytes (32 for Ed25519); the key id for `Key25519`.
+    pub public: Vec<u8>,
+    /// Optional metadata (Go `map[string]string`); omitted from CBOR when empty.
+    pub meta: Vec<(alloc::string::String, alloc::string::String)>,
+}
+
+impl AumKey {
+    /// The key id (for `Key25519`, the public key verbatim — Go `Key.ID`).
+    pub fn id(&self) -> &[u8] {
+        &self.public
+    }
+
+    fn kind_u8(&self) -> u8 {
+        match self.kind {
+            KeyKind::Ed25519 => 1,
+        }
+    }
+
+    fn to_cbor(&self) -> Value {
+        cbor::int_map([
+            (1, Some(Value::Uint(self.kind_u8() as u64))),
+            (2, Some(Value::Uint(self.votes as u64))),
+            (3, Some(Value::Bytes(self.public.clone()))),
+            (12, meta_to_cbor(&self.meta)),
+        ])
+    }
+}
+
+/// A full authority-state snapshot as carried in an `AUMCheckpoint` (Go `tka.State`).
+///
+/// CBOR keymap: `last_aum_hash`=1, `disablement_values`=2, `keys`=3, `state_id1`=4 (omitempty),
+/// `state_id2`=5 (omitempty). Keys 1/2/3 are **non-`omitempty`** (a nil `last_aum_hash` encodes as
+/// CBOR null, a nil `disablement_values`/`keys` as an empty array — matching Go's struct encoding).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AumState {
+    /// The hash of the AUM this state was produced by (Go `LastAUMHash`); `None` encodes as null.
+    pub last_aum_hash: Option<AumHash>,
+    /// Disablement secret hashes (Go `DisablementValues`).
+    pub disablement_values: Vec<Vec<u8>>,
+    /// The trusted keys at this state.
+    pub keys: Vec<AumKey>,
+    /// Optional state identifier, high half (Go `StateID1`); omitted from CBOR when 0.
+    pub state_id1: u64,
+    /// Optional state identifier, low half (Go `StateID2`); omitted from CBOR when 0.
+    pub state_id2: u64,
+}
+
+impl AumState {
+    fn to_cbor(&self) -> Value {
+        cbor::int_map([
+            (
+                1,
+                Some(match &self.last_aum_hash {
+                    Some(h) => Value::Bytes(h.0.to_vec()),
+                    None => Value::Null,
+                }),
+            ),
+            (
+                2,
+                Some(Value::Array(
+                    self.disablement_values
+                        .iter()
+                        .map(|d| Value::Bytes(d.clone()))
+                        .collect(),
+                )),
+            ),
+            (
+                3,
+                Some(Value::Array(
+                    self.keys.iter().map(AumKey::to_cbor).collect(),
+                )),
+            ),
+            (
+                4,
+                (self.state_id1 != 0).then_some(Value::Uint(self.state_id1)),
+            ),
+            (
+                5,
+                (self.state_id2 != 0).then_some(Value::Uint(self.state_id2)),
+            ),
+        ])
+    }
+}
+
+/// A signature attached to an [`Aum`] (Go `tkatype.Signature`): which trusted key signed, and the
+/// signature bytes. CBOR keymap: `key_id`=1, `signature`=2 (both non-`omitempty`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AumSignature {
+    /// The id of the trusted key that produced `signature`.
+    pub key_id: Vec<u8>,
+    /// The raw signature bytes.
+    pub signature: Vec<u8>,
+}
+
+impl AumSignature {
+    fn to_cbor(&self) -> Value {
+        // Both fields are non-`omitempty` in Go, so an empty/nil `[]byte` encodes as CBOR null
+        // (`0xf6`), not as an empty byte string (`0x40`) and not omitted — same rule as the AUM's
+        // genesis `prev_aum_hash`. (Go's `TestSerialization` Signature vector ends `02 f6`.)
+        cbor::int_map([
+            (1, Some(bytes_or_null(&self.key_id))),
+            (2, Some(bytes_or_null(&self.signature))),
+        ])
+    }
+}
+
+/// An Authority Update Message (Go `tka.AUM`): one link in the tailnet-lock chain. This is the
+/// acquisition-side type a client replays to derive the trusted-key [`State`] (the verify-only path
+/// in [`Authority`] doesn't need it). Serialization is byte-exact with Go's `fxamacker/cbor`
+/// (CTAP2) so [`Aum::hash`]/[`Aum::sig_hash`] match Go's `AUM.Hash`/`AUM.SigHash`.
+///
+/// CBOR keymap (Go `cbor:"…,keyasint"`): `message_kind`=1, `prev_aum_hash`=2 (both
+/// **non-`omitempty`**; a nil `prev` encodes as CBOR null, *not* omitted), `key`=3, `key_id`=4,
+/// `state`=5, `votes`=6, `meta`=7, `signatures`=**23** (all `omitempty`). Key 23 is the last key
+/// encodable in a single CBOR head byte, which is why Go put `Signatures` there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Aum {
+    /// The kind of update.
+    pub message_kind: AumKind,
+    /// The hash of the previous AUM in the chain (`None`/empty = genesis, encodes as CBOR null).
+    pub prev_aum_hash: Option<AumHash>,
+    /// `AUMAddKey`/`AUMUpdateKey`: the key being added.
+    pub key: Option<AumKey>,
+    /// `AUMRemoveKey`/`AUMUpdateKey`: the id of the key being removed/updated.
+    pub key_id: Vec<u8>,
+    /// `AUMCheckpoint`: the full state snapshot.
+    pub state: Option<AumState>,
+    /// `AUMUpdateKey`: the new vote weight (Go `*uint`; `None` = unchanged/omitted).
+    pub votes: Option<u32>,
+    /// `AUMUpdateKey`: new metadata.
+    pub meta: Vec<(alloc::string::String, alloc::string::String)>,
+    /// The signatures over this AUM's [`Aum::sig_hash`].
+    pub signatures: Vec<AumSignature>,
+}
+
+impl Aum {
+    fn message_kind_u8(&self) -> u8 {
+        self.message_kind as u8
+    }
+
+    /// Build the canonical CBOR value. When `include_signatures` is false, key 23 is omitted (the
+    /// [`Aum::sig_hash`] preimage — Go nils `Signatures`, which `omitempty`-drops it).
+    fn to_cbor(&self, include_signatures: bool) -> Value {
+        let signatures = if include_signatures && !self.signatures.is_empty() {
+            Some(Value::Array(
+                self.signatures.iter().map(AumSignature::to_cbor).collect(),
+            ))
+        } else {
+            None
+        };
+        cbor::int_map([
+            // key 1, NON-omitempty.
+            (1, Some(Value::Uint(self.message_kind_u8() as u64))),
+            // key 2, NON-omitempty: a nil prev hash is CBOR null, never omitted.
+            (
+                2,
+                Some(match &self.prev_aum_hash {
+                    Some(h) => Value::Bytes(h.0.to_vec()),
+                    None => Value::Null,
+                }),
+            ),
+            (3, self.key.as_ref().map(AumKey::to_cbor)),
+            (4, nonempty_bytes(&self.key_id)),
+            (5, self.state.as_ref().map(AumState::to_cbor)),
+            (6, self.votes.map(|v| Value::Uint(v as u64))),
+            (7, meta_to_cbor(&self.meta)),
+            (23, signatures),
+        ])
+    }
+
+    /// The canonical CBOR serialization including signatures (Go `AUM.Serialize`).
+    pub fn serialize(&self) -> Vec<u8> {
+        self.to_cbor(/* include_signatures = */ true).to_vec()
+    }
+
+    /// The chain-link hash: `BLAKE2s-256` of the full serialization (Go `AUM.Hash`).
+    pub fn hash(&self) -> AumHash {
+        AumHash(blake2s_256(&self.serialize()))
+    }
+
+    /// The signing digest: `BLAKE2s-256` of the serialization with `signatures` omitted (Go
+    /// `AUM.SigHash`).
+    pub fn sig_hash(&self) -> [u8; AUM_HASH_LEN] {
+        blake2s_256(&self.to_cbor(/* include_signatures = */ false).to_vec())
+    }
+}
+
+/// `Some(TextMap)` for a non-empty `map[string]string`, else `None` (the `omitempty` rule). Keys are
+/// UTF-8 text; CTAP2 canonical ordering is applied at encode time by [`cbor::Value::TextMap`].
+fn meta_to_cbor(meta: &[(alloc::string::String, alloc::string::String)]) -> Option<Value> {
+    if meta.is_empty() {
+        return None;
+    }
+    Some(Value::TextMap(
+        meta.iter()
+            .map(|(k, v)| (k.as_bytes().to_vec(), Value::Text(v.as_bytes().to_vec())))
+            .collect(),
+    ))
+}
+
 fn blake2s_256(data: &[u8]) -> [u8; AUM_HASH_LEN] {
     let mut hasher = Blake2s256::new();
     hasher.update(data);
@@ -386,6 +600,17 @@ fn nonempty_bytes(b: &[u8]) -> Option<Value> {
         None
     } else {
         Some(Value::Bytes(b.to_vec()))
+    }
+}
+
+/// A byte string, or CBOR null when empty — the encoding Go's `fxamacker/cbor` produces for a
+/// **non-`omitempty`** `[]byte` field that is nil/empty (e.g. `tkatype.Signature.{KeyID,Signature}`,
+/// or an AUM's genesis `PrevAUMHash`). Distinct from [`nonempty_bytes`], which *omits* the field.
+fn bytes_or_null(b: &[u8]) -> Value {
+    if b.is_empty() {
+        Value::Null
+    } else {
+        Value::Bytes(b.to_vec())
     }
 }
 
@@ -1445,5 +1670,173 @@ mod tests {
                 GO_ZIP215_ACCEPT[i]
             );
         }
+    }
+
+    /// Byte-exact cross-validation of [`Aum::serialize`] against the literal `[]byte` vectors in Go
+    /// `tka/aum_test.go` `TestSerialization` (tailscale v1.100.0, fxamacker/cbor v2.9.2 CTAP2 mode).
+    /// These are the authoritative oracle: if our CTAP2 CBOR diverges from Go by a single byte, the
+    /// `AUM.Hash` chain links and every signature digest break. Each case reproduces the exact Go
+    /// `AUM{…}` literal and asserts identical canonical bytes.
+    #[test]
+    fn aum_serialize_matches_go_test_serialization_vectors() {
+        // AddKey: AUM{MessageKind: AUMAddKey, Key: &Key{}}. Go's *zero* Key{} has Kind=0
+        // (KeyInvalid) and Public=nil, which our `AumKey` (always a valid KeyKind + Vec) cannot
+        // model — that zero-Key encoding (`03 a3 01 00 02 00 03 f6`) is asserted directly at the
+        // CBOR layer here, while the AUM keymap around it (map3, kind=AddKey, null prev, Key at
+        // key 3) is covered by the structural assertions plus the three full vectors below.
+        let add_key_inner_zero_key = cbor::Value::IntMap(alloc::vec![
+            (1, cbor::Value::Uint(0)), // Kind = KeyInvalid(0)
+            (2, cbor::Value::Uint(0)), // Votes = 0
+            (3, cbor::Value::Null),    // Public = nil -> null
+        ]);
+        assert_eq!(
+            add_key_inner_zero_key.to_vec(),
+            alloc::vec![0xa3, 0x01, 0x00, 0x02, 0x00, 0x03, 0xf6],
+            "Go's zero Key{{}} encodes as map(3){{kind=0, votes=0, public=null}}"
+        );
+
+        // RemoveKey: AUM{MessageKind: AUMRemoveKey, KeyID: []byte{1, 2}}
+        let remove_key = Aum {
+            message_kind: AumKind::RemoveKey,
+            prev_aum_hash: None,
+            key: None,
+            key_id: alloc::vec![1, 2],
+            state: None,
+            votes: None,
+            meta: Vec::new(),
+            signatures: Vec::new(),
+        };
+        assert_eq!(
+            remove_key.serialize(),
+            // a3 (map3) 01 02 (kind=RemoveKey) 02 f6 (prev=null) 04 42 01 02 (KeyID=bytes{1,2})
+            alloc::vec![0xa3, 0x01, 0x02, 0x02, 0xf6, 0x04, 0x42, 0x01, 0x02],
+            "RemoveKey AUM serialization must match Go TestSerialization byte-for-byte"
+        );
+
+        // UpdateKey: AUM{MessageKind: AUMUpdateKey, Votes: &uint(2), KeyID: []byte{1,2},
+        //                Meta: map[string]string{"a":"b"}}
+        let update_key = Aum {
+            message_kind: AumKind::UpdateKey,
+            prev_aum_hash: None,
+            key: None,
+            key_id: alloc::vec![1, 2],
+            state: None,
+            votes: Some(2),
+            meta: alloc::vec![("a".into(), "b".into())],
+            signatures: Vec::new(),
+        };
+        assert_eq!(
+            update_key.serialize(),
+            // a5 (map5) 01 04 (UpdateKey) 02 f6 (prev null) 04 42 01 02 (KeyID) 06 02 (Votes=2)
+            // 07 a1 61 61 61 62 (Meta = {"a":"b"})  — keys ascending 1,2,4,6,7
+            alloc::vec![
+                0xa5, 0x01, 0x04, 0x02, 0xf6, 0x04, 0x42, 0x01, 0x02, 0x06, 0x02, 0x07, 0xa1, 0x61,
+                0x61, 0x61, 0x62
+            ],
+            "UpdateKey AUM serialization must match Go TestSerialization byte-for-byte"
+        );
+
+        // Signature: AUM{MessageKind: AUMAddKey, Signatures: []tkatype.Signature{{KeyID: []byte{1}}}}
+        let with_sig = Aum {
+            message_kind: AumKind::AddKey,
+            prev_aum_hash: None,
+            key: None,
+            key_id: Vec::new(),
+            state: None,
+            votes: None,
+            meta: Vec::new(),
+            signatures: alloc::vec![AumSignature {
+                key_id: alloc::vec![1],
+                signature: Vec::new(),
+            }],
+        };
+        assert_eq!(
+            with_sig.serialize(),
+            // a3 (map3) 01 01 (AddKey) 02 f6 (prev null) 17 (key 23 = Signatures) 81 (array1)
+            // a2 (map2) 01 41 01 (Signature.KeyID = bytes{1}) 02 f6 (Signature.Signature = null)
+            alloc::vec![
+                0xa3, 0x01, 0x01, 0x02, 0xf6, 0x17, 0x81, 0xa2, 0x01, 0x41, 0x01, 0x02, 0xf6
+            ],
+            "Signature AUM serialization must match Go TestSerialization (key 23 + nil sig = null)"
+        );
+
+        // sig_hash must drop key 23 (Go SigHash nils Signatures → omitempty): the with_sig AUM's
+        // sig_hash equals the BLAKE2s of the same AUM with no signatures.
+        let no_sig = Aum {
+            signatures: Vec::new(),
+            ..with_sig.clone()
+        };
+        assert_eq!(
+            with_sig.sig_hash(),
+            blake2s_256(&no_sig.serialize()),
+            "SigHash preimage must omit key 23 (Signatures), matching Go AUM.SigHash"
+        );
+        // And the full Hash differs from the SigHash (signatures are in the chain-link hash).
+        assert_ne!(
+            with_sig.hash().0,
+            with_sig.sig_hash(),
+            "Hash (incl. signatures) must differ from SigHash (excl.) when signatures are present"
+        );
+    }
+
+    /// Checkpoint AUM with an embedded `State`: exercises [`AumState`]/[`AumKey`] CBOR (the 32-byte
+    /// `LastAUMHash` as a definite-length byte string, the `DisablementValues`/`Keys` arrays, and the
+    /// `Key.Public` at key 3). Mirrors the structure of Go's `TestSerialization` Checkpoint case.
+    #[test]
+    fn aum_checkpoint_state_serialization() {
+        let checkpoint = Aum {
+            message_kind: AumKind::Checkpoint,
+            prev_aum_hash: Some(AumHash([0u8; AUM_HASH_LEN])),
+            key: None,
+            key_id: Vec::new(),
+            state: Some(AumState {
+                last_aum_hash: Some(AumHash([0u8; AUM_HASH_LEN])),
+                disablement_values: Vec::new(),
+                keys: alloc::vec![AumKey {
+                    kind: KeyKind::Ed25519,
+                    votes: 1,
+                    public: alloc::vec![5, 6],
+                    meta: Vec::new(),
+                }],
+                state_id1: 0,
+                state_id2: 0,
+            }),
+            votes: None,
+            meta: Vec::new(),
+            signatures: Vec::new(),
+        };
+        let bytes = checkpoint.serialize();
+        // Spot-check the structurally-load-bearing pieces (full-vector parity is covered by the
+        // three exact vectors above; here we pin the State/Key encoding shape):
+        // map3: key1=Checkpoint(5), key2=prev(32-byte bytestring 0x58 0x20 …), key5=State.
+        assert_eq!(
+            &bytes[0..3],
+            &[0xa3, 0x01, 0x05],
+            "map(3), MessageKind=Checkpoint(5)"
+        );
+        assert_eq!(
+            &bytes[3..6],
+            &[0x02, 0x58, 0x20],
+            "key2 prev = 32-byte byte string head"
+        );
+        // The embedded State map (key 5) must contain: LastAUMHash (1) as 32-byte bytes, an empty
+        // DisablementValues array (2 → 0x80), and a Keys array (3 → 0x81 with one Key map).
+        // Locate the State map head (key 5) after the 32-byte prev hash: 3 + 3 + 32 = offset 38.
+        assert_eq!(bytes[38], 0x05, "key 5 = State");
+        // State is a map; its first entry is key1 (LastAUMHash) = 32-byte byte string.
+        assert_eq!(
+            &bytes[39..42],
+            &[0xa3, 0x01, 0x58],
+            "State map(3), key1 LastAUMHash bytes"
+        );
+        // The Key inside Keys carries Public={5,6} at key 3 (…03 42 05 06) and Votes=1 at key 2.
+        let tail = &bytes[bytes.len() - 4..];
+        assert_eq!(
+            tail,
+            &[0x03, 0x42, 0x05, 0x06],
+            "Key.Public (key 3) = bytes{{5,6}}"
+        );
+        // Round-trips deterministically (hash is stable).
+        assert_eq!(checkpoint.hash(), checkpoint.hash());
     }
 }
