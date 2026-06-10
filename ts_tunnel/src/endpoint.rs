@@ -77,6 +77,17 @@ enum SessionState {
         recv: Box<ReceiveSession>,
         recv_prev: Option<Box<ReceiveSession>>,
         send: TransmitSession,
+        /// Whether *we* were the initiator of the handshake that produced this keypair. Only the
+        /// original initiator may trigger a receive-path rekey (Go `keepKeyFreshReceiving` checks
+        /// `keypair.isInitiator`); the responder must not, or both sides would initiate
+        /// simultaneously (the hazard #20 fixed). Send-path rekey (`needs_rotation`) is unaffected
+        /// by this — either side rekeys when *it* sends on a stale keypair.
+        is_initiator: bool,
+        /// One-shot guard for the receive-path "last minute" rekey, mirroring Go's
+        /// `sentLastMinuteHandshake`: set once `keep_key_fresh_receiving` fires for this keypair so a
+        /// stream of inbound packets enqueues exactly one handshake, not one per packet. Reset on the
+        /// next `activate` (a new keypair).
+        last_minute_handshake_sent: bool,
     },
 }
 
@@ -90,8 +101,13 @@ impl SessionState {
     ///
     /// Existing sessions are rotated appropriately. Returns encrypted packets to send to the
     /// peer, if any were queued.
-    fn activate(&mut self, endpoint: &mut EndpointState, next: SessionPair) -> Vec<PacketMut> {
-        tracing::trace!(recv_id = ?next.recv.id(), "activating new session");
+    fn activate(
+        &mut self,
+        endpoint: &mut EndpointState,
+        next: SessionPair,
+        is_initiator: bool,
+    ) -> Vec<PacketMut> {
+        tracing::trace!(recv_id = ?next.recv.id(), is_initiator, "activating new session");
 
         match self.take() {
             SessionState::None(queue) => {
@@ -101,6 +117,8 @@ impl SessionState {
                     send: next.send,
                     recv: Box::new(next.recv),
                     recv_prev: None,
+                    is_initiator,
+                    last_minute_handshake_sent: false,
                 };
                 ret
             }
@@ -116,10 +134,32 @@ impl SessionState {
                     send: next.send,
                     recv: Box::new(next.recv),
                     recv_prev: Some(recv),
+                    is_initiator,
+                    last_minute_handshake_sent: false,
                 };
                 vec![]
             }
         }
+    }
+
+    /// Whether a receive-path rekey should fire now (Go `keepKeyFreshReceiving`): we were the
+    /// handshake **initiator** for this keypair, the keypair is older than the receive rekey
+    /// threshold, and we haven't already fired for it. Returns false for a non-initiator (the
+    /// responder must never initiate a rekey) or when there is no active session. On a `true`
+    /// return it also arms the one-shot guard, so the caller enqueues exactly one handshake.
+    fn keep_key_fresh_receiving(&mut self, now: Instant) -> bool {
+        if let SessionState::Active {
+            send,
+            is_initiator: true,
+            last_minute_handshake_sent: fired @ false,
+            ..
+        } = self
+            && send.needs_receive_rekey(now)
+        {
+            *fired = true;
+            return true;
+        }
+        false
     }
 
     /// Deactivate the session, releasing any active session IDs.
@@ -461,7 +501,10 @@ impl Peer {
             return;
         };
 
-        let mut packets = self.session.activate(endpoint, session);
+        // We sent the initiation and finished on the response: we are the INITIATOR of this keypair.
+        let mut packets = self
+            .session
+            .activate(endpoint, session, /* is_initiator = */ true);
         if packets.is_empty() {
             // Upon completing a handshake, the initiator must send at least one packet to confirm
             // the session. Usually that can be a queued packet, but if we happen to complete a
@@ -489,6 +532,14 @@ impl Peer {
             if !packets.is_empty() {
                 out.queue_to_local(self.id).append(&mut packets);
                 self.schedule_keepalive(&mut endpoint.scheduler);
+                // Receive-triggered rekey (Go `keepKeyFreshReceiving`): a packet authenticated on
+                // this keypair; if we initiated it and it is past the receive rekey threshold,
+                // enqueue a fresh handshake so the keys refresh before they hard-expire at
+                // REJECT_AFTER_TIME — keeping a mostly-inbound, send-idle session alive. One-shot per
+                // keypair (the guard lives in `keep_key_fresh_receiving`); initiator-only.
+                if self.session.keep_key_fresh_receiving(Instant::now()) {
+                    self.start_handshake(endpoint, out);
+                }
             }
             return;
         }
@@ -503,7 +554,11 @@ impl Peer {
         out.queue_to_local(self.id).append(&mut packets);
         self.schedule_keepalive(&mut endpoint.scheduler);
 
-        let mut packets_for_peer = self.session.activate(endpoint, session);
+        // The peer initiated and we responded; this transport packet confirms the tentative
+        // responder session: we are the RESPONDER of this keypair (must not receive-rekey it).
+        let mut packets_for_peer = self
+            .session
+            .activate(endpoint, session, /* is_initiator = */ false);
         // A fresh send session is live (responder side): start the persistent-keepalive clock.
         self.arm_persistent_keepalive(&mut endpoint.scheduler);
         if !packets_for_peer.is_empty() {
@@ -1013,6 +1068,8 @@ mod tests {
                 prev_id,
                 old,
             ))),
+            is_initiator: false,
+            last_minute_handshake_sent: false,
         };
         assert!(
             state.get_recv(recv_id).is_some(),
@@ -1033,6 +1090,8 @@ mod tests {
                 prev_id,
                 now,
             ))),
+            is_initiator: false,
+            last_minute_handshake_sent: false,
         };
         assert!(
             state.get_recv(recv_id).is_none(),
@@ -1043,6 +1102,53 @@ mod tests {
             "a FRESH recv_prev must be returnable even when the current recv is expired \
              (this is the case the bug broke)"
         );
+    }
+
+    /// Receive-triggered rekey decision (`keep_key_fresh_receiving`, Go `keepKeyFreshReceiving`):
+    /// fires only when WE were the initiator, only past REKEY_AFTER_TIME_RECEIVING (165s), and only
+    /// ONCE per keypair. A responder-side session must NEVER fire (else both ends rekey at once).
+    #[test]
+    fn keep_key_fresh_receiving_is_initiator_only_aged_and_one_shot() {
+        let now = Instant::now();
+        let id = SessionId::from(0xCAFE);
+        let aged = now + Duration::from_secs(170); // past 165s
+        let fresh = now + Duration::from_secs(100); // well within the keypair life
+
+        let make = |is_initiator: bool| SessionState::Active {
+            send: TransmitSession::new(random_session_key(), id, now),
+            recv: Box::new(ReceiveSession::new(random_session_key(), id, now)),
+            recv_prev: None,
+            is_initiator,
+            last_minute_handshake_sent: false,
+        };
+
+        // Responder: never fires, no matter the age.
+        let mut responder = make(false);
+        assert!(
+            !responder.keep_key_fresh_receiving(aged),
+            "the responder must not trigger a receive-path rekey (avoids simultaneous initiation)"
+        );
+
+        // Initiator, but keypair still young: not yet.
+        let mut initiator = make(true);
+        assert!(
+            !initiator.keep_key_fresh_receiving(fresh),
+            "an initiator session younger than 165s must not rekey yet"
+        );
+
+        // Initiator past 165s: fires exactly once, then the one-shot guard suppresses repeats.
+        assert!(
+            initiator.keep_key_fresh_receiving(aged),
+            "an initiator session past 165s must trigger a receive-path rekey"
+        );
+        assert!(
+            !initiator.keep_key_fresh_receiving(aged),
+            "the trigger is one-shot per keypair — a stream of inbound packets enqueues one handshake"
+        );
+
+        // A `None` (no active session) never fires.
+        let mut none = SessionState::None(Queue::default());
+        assert!(!none.keep_key_fresh_receiving(aged));
     }
 
     /// FIX #4: when a session's transmit side has expired, `encrypt_or_queue` tears the session
@@ -1073,6 +1179,8 @@ mod tests {
                 prev_id,
                 old,
             ))),
+            is_initiator: false,
+            last_minute_handshake_sent: false,
         };
 
         // encrypt_or_queue on the expired send must queue the packet (returns None) AND reclaim

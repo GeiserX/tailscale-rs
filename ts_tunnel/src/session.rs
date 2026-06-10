@@ -31,15 +31,24 @@ pub(crate) const REKEY_AFTER_TIME: Duration = Duration::from_secs(120);
 /// driven at `REKEY_AFTER_TIME` = 120s).
 pub(crate) const REJECT_AFTER_TIME: Duration = Duration::from_secs(180);
 
-/// Age past which a **receive** session is dropped. Deliberately MORE LENIENT than the canonical
-/// `REJECT_AFTER_TIME` (180s): rekey in this fork is triggered ONLY by outbound `Peer::send`, with
-/// no receive-triggered or timer-driven rekey (the trigger real WireGuard has). A mostly-*inbound*
-/// session (a download / event stream) that goes idle on the send side past 120s would, at a strict
-/// 180s receive bound, have its receive keys hard-expire and silently drop inbound traffic until the
-/// next outbound packet forces a new handshake. Keeping the receive bound at 240s preserves the
-/// cushion that makes that invisible. Tightening this to `REJECT_AFTER_TIME` is correct ONLY once a
-/// receive-triggered rekey exists (tracked separately); until then this is the safe value.
-pub(crate) const REJECT_AFTER_TIME_RECV: Duration = Duration::from_secs(240);
+/// Keypair age past which the **receive** path triggers a rekey, mirroring Go wireguard-go's
+/// `keepKeyFreshReceiving` threshold `RejectAfterTime - KeepaliveTimeout - RekeyTimeout`
+/// = 180 − 10 − 5 = **165s**. When an authenticated transport packet is received on a keypair this
+/// old *and we were its initiator*, a fresh handshake is enqueued — so a mostly-*inbound*,
+/// send-idle session rekeys ~15s before its receive keys would hard-expire at [`REJECT_AFTER_TIME`],
+/// keeping live inbound traffic flowing. Initiator-only (the responder must not rekey, per WireGuard,
+/// or both sides initiate at once).
+pub(crate) const REKEY_AFTER_TIME_RECEIVING: Duration = Duration::from_secs(165);
+
+/// Age past which a **receive** session is dropped — now the canonical `REJECT_AFTER_TIME` (180s),
+/// matching the transmit side and the WireGuard spec. This was held at a lenient 240s while the fork
+/// lacked a receive-triggered rekey (a send-idle, mostly-inbound session had nothing to refresh its
+/// keys, so a strict 180s bound would silently drop inbound traffic). With receive-triggered rekey
+/// now in place ([`REKEY_AFTER_TIME_RECEIVING`] = 165s, initiator-side), a live inbound session
+/// rehandshakes before the 180s ceiling, so the spec bound is safe. Kept as a named alias of
+/// `REJECT_AFTER_TIME` (rather than folded into it) to document that the receive teardown is a
+/// distinct decision that only became spec-tight once receive-rekey landed.
+pub(crate) const REJECT_AFTER_TIME_RECV: Duration = REJECT_AFTER_TIME;
 
 /// A generator of monotonically increasing 64-bit nonces.
 #[derive(Default)]
@@ -176,6 +185,15 @@ impl TransmitSession {
 
     pub fn expired(&self, now: Instant) -> bool {
         now.duration_since(self.created) > REJECT_AFTER_TIME
+    }
+
+    /// Whether this keypair is old enough to warrant a receive-path rekey
+    /// ([`REKEY_AFTER_TIME_RECEIVING`] = 165s; Go `keepKeyFreshReceiving`). The send and receive
+    /// sessions of a pair share a `created` instant, so the transmit session's age is the keypair
+    /// age the receive-rekey decision needs. The caller additionally gates on being the initiator
+    /// and a once-per-keypair guard.
+    pub fn needs_receive_rekey(&self, now: Instant) -> bool {
+        now.duration_since(self.created) > REKEY_AFTER_TIME_RECEIVING
     }
 }
 
@@ -411,16 +429,25 @@ mod tests {
         assert!(!send.expired(now + Duration::from_secs(130)));
         assert!(send.expired(now + Duration::from_secs(250)));
 
-        // ReceiveSession::expired() uses the LENIENT REJECT_AFTER_TIME_RECV (240s), deliberately
-        // more generous than the transmit side's 180s — see REJECT_AFTER_TIME_RECV. The 200s point
-        // pins this difference: the send side is already expired at 200s (200 > 180) but the receive
-        // side is still live (200 < 240), so a send-idle inbound session keeps accepting traffic.
+        // ReceiveSession::expired() now uses REJECT_AFTER_TIME_RECV == REJECT_AFTER_TIME (180s),
+        // matching the transmit side and the WireGuard spec. (It was a lenient 240s only while the
+        // fork lacked a receive-triggered rekey; now that receive-rekey fires at 165s — see below —
+        // a live inbound session rehandshakes before the 180s ceiling, so the spec bound is safe.)
+        // The recv and send bounds now agree: both live at 130s, both expired at 200s.
         assert!(!recv.expired(now));
         assert!(!recv.expired(now + Duration::from_secs(100)));
         assert!(!recv.expired(now + Duration::from_secs(130)));
         assert!(send.expired(now + Duration::from_secs(200)));
-        assert!(!recv.expired(now + Duration::from_secs(200)));
+        assert!(recv.expired(now + Duration::from_secs(200)));
         assert!(recv.expired(now + Duration::from_secs(250)));
+
+        // needs_receive_rekey() is keyed on REKEY_AFTER_TIME_RECEIVING (165s = 180 − 10 − 5, Go's
+        // keepKeyFreshReceiving threshold): not yet at 130s (still well inside the keypair's life),
+        // true at 170s — ~10s before the 180s receive ceiling, so an initiator-side, mostly-inbound
+        // session enqueues a fresh handshake before its receive keys hard-expire.
+        assert!(!send.needs_receive_rekey(now + Duration::from_secs(130)));
+        assert!(!send.needs_receive_rekey(now + Duration::from_secs(160)));
+        assert!(send.needs_receive_rekey(now + Duration::from_secs(170)));
     }
 
     /// A persistent keepalive is an *empty* authenticated packet. Emitting one must NOT push the
