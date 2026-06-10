@@ -2,6 +2,23 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.7.3](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.7.3) - 2026-06-10
+
+### Fixed (security)
+- **SSH session-recording policy is now enforced (closed a silent bypass).** The SSH server
+  (`ssh` feature) parsed an `SSHAction`'s `recorders` / `on_recording_failure` / `hold_and_delegate`
+  off the wire but dropped them in the domain conversion, so a control policy demanding *"record this
+  session or refuse it"* was silently downgraded to a plain accept. Those fields are now carried into
+  the domain action, and the server applies a **fail-closed gate**: when a matched rule requires
+  recording (non-empty `recorders`) but no recorder transport is available, the session is **refused**
+  (with the policy's `reject_session_with_message` if set). This matches Go `tailssh`'s posture when
+  reject-on-failure is configured — a turnkey server with no recorder can only honor a record-required
+  policy by refusing. A rule carrying `hold_and_delegate` (check-mode) is likewise not silently
+  accepted. The common no-recording path (empty `recorders`) is unchanged. *Deferred to a follow-up:*
+  the recorder transport itself (dial recorders + asciinema/CastV2 PTY stream), after which the
+  interim fail-closed relaxes to Go's fail-open-unless-reject-on-failure default; and the
+  `hold_and_delegate` delegate round-trip.
+
 ## [0.7.2](https://github.com/GeiserX/tailscale-rs/releases/tag/v0.7.2) - 2026-06-10
 
 ### Fixed
