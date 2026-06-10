@@ -466,6 +466,28 @@ impl Node {
         self.has_node_attr(Self::CAP_HTTPS) && self.has_node_attr(Self::NODE_ATTR_FUNNEL)
     }
 
+    /// The capability control grants the **self** node when Taildrop is enabled for the tailnet (Go
+    /// `tailcfg.CapabilityFileSharing`). Gates [`Node::can_share_files`].
+    const CAP_FILE_SHARING: &'static str = "https://tailscale.com/cap/file-sharing";
+
+    /// The capability marking a **peer** as an explicit Taildrop send target even across owners (Go
+    /// `tailcfg.PeerCapabilityFileSharingTarget`). Checked by [`Node::is_file_sharing_target`].
+    const CAP_FILE_SHARING_TARGET: &'static str = "tailscale.com/cap/file-sharing-target";
+
+    /// Report whether this node may send Taildrop files — i.e. the admin has enabled file sharing for
+    /// the tailnet (Go `self.CapMap().Contains(CapabilityFileSharing)`). Applied to the **self** node
+    /// as the node-level gate in `FileTargets`; fail-closed when the cap is absent.
+    pub fn can_share_files(&self) -> bool {
+        self.has_node_attr(Self::CAP_FILE_SHARING)
+    }
+
+    /// Report whether this **peer** is an explicit Taildrop send target via ACL caps (Go
+    /// `PeerHasCap(p, PeerCapabilityFileSharingTarget)`) — the cross-owner path that lets a peer owned
+    /// by a different user still be a valid target.
+    pub fn is_file_sharing_target(&self) -> bool {
+        self.has_node_attr(Self::CAP_FILE_SHARING_TARGET)
+    }
+
     /// Report whether `wanted_port` is allowed for Funnel on this node.
     ///
     /// Mirrors Go `ipn.CheckFunnelPort`: scan the cap-map keys for one prefixed by
@@ -1348,6 +1370,33 @@ mod tests {
 
         // WireGuard-only peers run no peerAPI, even with a port set.
         assert_eq!(n.peerapi_addr(), None);
+    }
+
+    #[test]
+    fn can_share_files_gated_on_self_capability() {
+        let mut n = node("self", Some("ts.net"));
+        assert!(
+            !n.can_share_files(),
+            "no cap → file sharing not enabled (fail-closed)"
+        );
+        n.cap_map
+            .insert("https://tailscale.com/cap/file-sharing".to_string(), vec![]);
+        assert!(n.can_share_files(), "the file-sharing cap enables it");
+    }
+
+    #[test]
+    fn is_file_sharing_target_gated_on_peer_capability() {
+        let mut n = node("peer", Some("ts.net"));
+        assert!(
+            !n.is_file_sharing_target(),
+            "no cap → not an explicit target"
+        );
+        n.cap_map
+            .insert("tailscale.com/cap/file-sharing-target".to_string(), vec![]);
+        assert!(
+            n.is_file_sharing_target(),
+            "the file-sharing-target cap marks a cross-owner target"
+        );
     }
 
     #[test]

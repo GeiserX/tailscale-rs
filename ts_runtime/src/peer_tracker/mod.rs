@@ -282,6 +282,18 @@ mod msg_impl {
             deleg
         }
 
+        /// Return every known peer's full domain [`Node`] (not the lossy [`StatusNode`]).
+        ///
+        /// Used by [`Runtime::file_targets`](crate::Runtime::file_targets), which needs the full node
+        /// (peerAPI address, owning user id, cap map) to compute Taildrop send targets. The self node
+        /// is not included (it lives in the control runner). Returns empty before the first netmap —
+        /// the natural "not connected yet" analog (an immediate answer, no queueing needed: callers
+        /// that need a populated list await `Running` first).
+        #[message]
+        pub fn all_peers(&self) -> Vec<Node> {
+            self.peer_db.peers().values().cloned().collect()
+        }
+
         /// Resolve which node owns a tailnet source address.
         ///
         /// Maps the source IP of `addr` to the owning node via the tailnet-IP index, returning a

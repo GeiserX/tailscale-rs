@@ -56,7 +56,7 @@ mod tun_actor;
 pub use device_state::{DeviceState, RegistrationError};
 pub(crate) use env::Env;
 pub use error::{Error, ErrorKind};
-pub use status::{Status, StatusNode, WhoIs};
+pub use status::{FileTarget, Status, StatusNode, WhoIs};
 pub use ts_dataplane::{CaptureHook, CapturePath};
 
 use crate::peer_tracker::PeerTracker;
@@ -400,6 +400,49 @@ impl Runtime {
             peers,
             active_exit_node: self.active_exit_node(),
         })
+    }
+
+    /// List the tailnet peers this node can Taildrop a file *to* (Go LocalAPI `FileTargets`).
+    ///
+    /// Mirrors the upstream send-path filter (`feature/taildrop` `Extension::FileTargets`): a peer
+    /// qualifies when it advertises a reachable peerAPI **and** is either owned by the same user as
+    /// this node **or** explicitly granted the file-sharing-target capability. The whole list is
+    /// gated on this node holding the file-sharing capability (control sets it when the admin enables
+    /// Taildrop) — absent that, an empty list (fail-closed, not an error, matching how the receive
+    /// store returns empty when disabled). Results are sorted by the peer's MagicDNS name.
+    ///
+    /// Targets are listed regardless of current online state (upstream's `FileTargets` does not gate
+    /// on online either; an offline target's send will simply time out). The self node is never
+    /// included. Returns empty before the first netmap.
+    ///
+    /// Divergence from Go: the upstream filter also excludes `tvOS` peers, which this fork cannot
+    /// reproduce (the domain node carries no OS string); the impact is negligible — the actual send
+    /// fail-closes if such a peer refused the transfer.
+    pub async fn file_targets(&self) -> Result<Vec<FileTarget>, Error> {
+        // Node-level gate: this node must hold the file-sharing capability (Taildrop enabled by the
+        // admin). Read it off the self node's cap map, like Go's `hasCapFileSharing()`.
+        let self_node = self.control.ask(control_runner::SelfNode).await?;
+        let Some(self_node) = self_node else {
+            return Ok(Vec::new()); // no netmap yet
+        };
+        if !self_node.can_share_files() {
+            return Ok(Vec::new()); // Taildrop not enabled for the tailnet — fail-closed
+        }
+        let self_user_id = self_node.user_id;
+
+        let peers = self
+            .peer_tracker
+            .upgrade()
+            .ok_or(Error {
+                kind: ErrorKind::ActorGone,
+                target_actor: None,
+                message_ty: None,
+            })?
+            .ask(peer_tracker::AllPeers)
+            .await?;
+
+        // Eligibility + ordering live in `build_file_targets` (pure, unit-tested in `status`).
+        Ok(status::build_file_targets(peers, self_user_id))
     }
 
     /// The stable id of the exit node traffic is currently egressing through, or `None` if none is
