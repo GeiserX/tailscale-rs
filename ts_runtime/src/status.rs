@@ -15,9 +15,10 @@
 //!   user's login/display name, resolved by joining the node's owning user id against the netmap's
 //!   `UserProfiles` table (accumulated by the [`PeerTracker`](crate::peer_tracker::PeerTracker)
 //!   across delta updates). `None` when control sent no profile for that user.
-//! - **Online state** — still a gap: the domain `Node` does not retain the wire-level `online` /
-//!   `last_seen` fields, so `StatusNode::online` is always `None`. We surface what the domain model
-//!   actually holds rather than inventing a value.
+//! - **Online state** — surfaced: [`StatusNode::online`] / [`StatusNode::last_seen`] reflect the
+//!   domain [`Node`](ts_control::Node)'s retained `online`/`last_seen`, populated from the netmap
+//!   node and its online deltas (`PeerChange`, `MapResponse.online_change`/`peer_seen_change`).
+//!   `online` stays tri-state (`None` = unknown), never fabricated to `false`.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -56,11 +57,14 @@ pub struct StatusNode {
     pub ipv4: IpAddr,
     /// The node's tailnet IPv6 address.
     pub ipv6: IpAddr,
-    /// Whether the node is online, if known.
-    ///
-    /// Always `None` in this fork: the domain [`Node`](ts_control::Node) does not retain the
-    /// wire-level `online` field (see the module-level capability/user gap note).
+    /// Whether the node is online, if known (`ipnstate.PeerStatus.Online`). Tri-state: `Some(true)`
+    /// connected to control, `Some(false)` offline, `None` unknown (control sent no online status or
+    /// the local node lacks permission to know). Reflects control's liveness state, retained from the
+    /// netmap node + its online deltas — `None` is *unknown*, never fabricated to `false`.
     pub online: Option<bool>,
+    /// When control last saw this node online (`ipnstate.PeerStatus.LastSeen`). Per Go, only
+    /// meaningful while the node is not currently online. `None` when unknown or never seen.
+    pub last_seen: Option<chrono::DateTime<chrono::Utc>>,
     /// The routes this node accepts traffic for (its own `/32` and `/128`, plus any advertised
     /// subnet routes and possibly the exit-node default route).
     pub allowed_routes: Vec<ipnet::IpNet>,
@@ -84,8 +88,8 @@ impl StatusNode {
                 .unwrap_or_else(|| node.hostname.clone()),
             ipv4: node.tailnet_address.ipv4.addr().into(),
             ipv6: node.tailnet_address.ipv6.addr().into(),
-            // The domain `Node` carries no online state; do not fabricate one.
-            online: None,
+            online: node.online,
+            last_seen: node.last_seen,
             allowed_routes: node.accepted_routes.clone(),
             is_exit_node,
         }
@@ -158,6 +162,8 @@ mod tests {
             },
             node_key: [0u8; 32].into(),
             node_key_expiry: None,
+            online: None,
+            last_seen: None,
             key_signature: vec![],
             machine_key: None,
             disco_key: None,
@@ -188,15 +194,25 @@ mod tests {
     }
 
     #[test]
-    fn status_node_addresses_and_online_gap() {
+    fn status_node_addresses_and_online_surfaced() {
         let n = node("n1", "host", Some("ts.net"), "100.64.0.7");
         let s = StatusNode::from_node(&n);
 
         assert_eq!(s.ipv4, "100.64.0.7".parse::<IpAddr>().unwrap());
         assert_eq!(s.ipv6, "fd7a::1".parse::<IpAddr>().unwrap());
-        // The domain Node carries no online state; we surface the gap as None, never a fabricated
-        // value.
+        // A node with no online data surfaces `None` (unknown) — never a fabricated `false`.
         assert_eq!(s.online, None);
+        assert_eq!(s.last_seen, None);
+
+        // A node whose domain online state is known surfaces it through StatusNode (no longer
+        // hardwired to None).
+        let mut online = node("n2", "up", Some("ts.net"), "100.64.0.8");
+        online.online = Some(true);
+        assert_eq!(StatusNode::from_node(&online).online, Some(true));
+
+        let mut offline = node("n3", "down", Some("ts.net"), "100.64.0.9");
+        offline.online = Some(false);
+        assert_eq!(StatusNode::from_node(&offline).online, Some(false));
     }
 
     #[test]

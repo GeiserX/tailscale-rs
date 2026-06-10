@@ -125,6 +125,15 @@ pub struct StateUpdate {
     /// New Tailnet Lock (TKA) status from control (`MapResponse.TKAInfo`). `None` means no change in
     /// this response; `Some` carries the current authority head + disablement signal.
     pub tka: Option<crate::TkaStatus>,
+    /// Per-peer online-status flips (`MapResponse.OnlineChange`), keyed by control node [`NodeId`](crate::NodeId).
+    /// The dominant standalone channel for online transitions (control sends these far more often
+    /// than a full [`PeerChange`](crate::PeerChange)). Each entry *sets* `Node::online` to the given
+    /// value; empty when this response carried none.
+    pub online_change: alloc::collections::BTreeMap<crate::NodeId, bool>,
+    /// Per-peer last-seen flips (`MapResponse.PeerSeenChange`), keyed by control node [`NodeId`](crate::NodeId).
+    /// `true` ⇒ the peer was just seen (update last-seen to now); `false` ⇒ the peer is gone
+    /// (mark offline). Empty when this response carried none.
+    pub peer_seen_change: alloc::collections::BTreeMap<crate::NodeId, bool>,
 }
 
 pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpdate> {
@@ -239,6 +248,13 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
                     .tka_info
                     .as_ref()
                     .map(crate::TkaStatus::from_serde),
+                // Online/last-seen delta maps (channels C/D). `NodeId` is the control node id
+                // (`Id`), so these copy across directly. The peer tracker applies them on every
+                // update — including responses that carry NO peer_update — so a standalone online
+                // flip (the common case) isn't lost. (Control sends these on their own, never
+                // alongside a `peers*` set for the same node, so apply-order vs the peer set is moot.)
+                online_change: map_response.online_change.clone(),
+                peer_seen_change: map_response.peer_seen_change.clone(),
             },
             reader,
         ))

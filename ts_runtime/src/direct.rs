@@ -699,6 +699,8 @@ mod tests {
             },
             node_key,
             node_key_expiry: None,
+            online: None,
+            last_seen: None,
             key_signature: vec![],
             machine_key: None,
             disco_key: Some(disco),
