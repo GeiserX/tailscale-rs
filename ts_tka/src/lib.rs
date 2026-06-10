@@ -714,6 +714,26 @@ impl Aum {
     ///   - `UpdateKey`: must have `key_id` **and** (`votes` or `meta`); must NOT set `key`/`state`;
     ///   - `Checkpoint`: must have `state`; must NOT set `key_id`/`key`/`votes`/`meta`;
     ///   - `NoOp`/`Invalid`/unknown: no field constraints (Go's forward-compat `default`).
+    ///
+    /// # `key_id`/`meta` nil-vs-empty (a decoder invariant, not a divergence today)
+    /// Go's allow-list tests are asymmetric: the *required*-field checks use `len(KeyID)==0`, but the
+    /// *forbidden*-field checks use `KeyID != nil` / `Meta != nil` — so in Go an empty-but-**non-nil**
+    /// `[]byte{}`/`map{}` counts as "present". This fork models `key_id` as `Vec<u8>` and `meta` as a
+    /// `Vec` (no nil-vs-empty distinction), so "present" == non-empty here. This is **not** an
+    /// accept/reject divergence in practice: Go's encoder `omitempty`-drops an empty `key_id`/`meta`,
+    /// so a well-formed AUM never carries an empty-non-nil one, and on the wire an absent field
+    /// decodes to the nil/empty representation either way. The invariant the future AUM wire decoder
+    /// (chunk 2) MUST uphold to stay consensus-identical with Go: decode an **absent OR empty** key 4
+    /// / key 7 to the empty `Vec` (i.e. collapse Go's empty-non-nil into "absent"), never surfacing a
+    /// distinct empty-but-present state that would flip one of these checks.
+    ///
+    /// The same invariant covers **`prev_aum_hash` (key 2)**: Go `AUM.StaticValidate` rejects a
+    /// present-but-zero-length `PrevAUMHash` ("absent parent must be a nil slice"), but this fork's
+    /// `Option<AumHash>` (`AumHash` wraps a fixed `[u8; 32]`) can only be `None` (nil) or a full
+    /// 32-byte hash — Go's rejected empty-non-nil state is structurally unrepresentable, so the check
+    /// is unnecessary here. The decoder MUST likewise map an absent OR empty key-2 byte string to
+    /// `None`, never an empty-present hash, or a future widening of the representation could
+    /// reintroduce that divergence.
     pub fn static_validate(&self) -> Result<(), TkaError> {
         if let Some(key) = &self.key {
             key.static_validate()?;
@@ -3737,12 +3757,73 @@ mod tests {
         // Duplicate keys → rejected.
         let dup_keys = AumState {
             keys: Some(alloc::vec![trusted.clone(), trusted.clone()]),
-            ..base
+            ..base.clone()
         };
         assert_eq!(
             VerifiedAumChain::verify(&[mk(dup_keys)]).unwrap_err(),
             TkaError::BadKeyState,
             "a checkpoint with duplicate key ids is rejected"
+        );
+
+        // F5: a NON-adjacent duplicate ([a, b, a]) is also caught (the prefix-scan dedup checks all
+        // earlier elements, not just the neighbor).
+        let nonadjacent_dup = AumState {
+            keys: Some(alloc::vec![
+                test_aum_key(1, 1),
+                test_aum_key(2, 1),
+                test_aum_key(1, 1)
+            ]),
+            ..base.clone()
+        };
+        assert_eq!(
+            VerifiedAumChain::verify(&[mk(nonadjacent_dup)]).unwrap_err(),
+            TkaError::BadKeyState,
+            "a non-adjacent duplicate key id is rejected"
+        );
+
+        // F4: more than MAX_KEYS (512) keys → rejected. Use distinct 32-byte public keys (index-
+        // encoded) so there are no duplicate ids — only the `> MAX_KEYS` cap can be the failure.
+        let distinct_over_cap: alloc::vec::Vec<AumKey> = (0u32..=(MAX_KEYS as u32))
+            .map(|i| AumKey {
+                kind: KeyKind::Ed25519,
+                votes: 1,
+                // Distinct 32-byte public keys by encoding the index — no dup, so only the >512 cap trips.
+                public: {
+                    let mut p = alloc::vec![0u8; 32];
+                    p[0..4].copy_from_slice(&i.to_le_bytes());
+                    p
+                },
+                meta: Vec::new(),
+            })
+            .collect();
+        assert_eq!(distinct_over_cap.len(), MAX_KEYS + 1);
+        let over_keys = AumState {
+            keys: Some(distinct_over_cap),
+            ..base.clone()
+        };
+        assert_eq!(
+            VerifiedAumChain::verify(&[mk(over_keys)]).unwrap_err(),
+            TkaError::BadKeyState,
+            "a checkpoint with > MAX_KEYS keys is rejected"
+        );
+
+        // F4: more than MAX_DISABLEMENT_VALUES (32) disablement values → rejected (each distinct).
+        let over_disablements = AumState {
+            disablement_values: Some(
+                (0u8..=(MAX_DISABLEMENT_VALUES as u8))
+                    .map(|i| {
+                        let mut d = alloc::vec![0u8; DISABLEMENT_LENGTH];
+                        d[0] = i;
+                        d
+                    })
+                    .collect(),
+            ),
+            ..base
+        };
+        assert_eq!(
+            VerifiedAumChain::verify(&[mk(over_disablements)]).unwrap_err(),
+            TkaError::BadKeyState,
+            "a checkpoint with > MAX_DISABLEMENT_VALUES disablement values is rejected"
         );
     }
 
