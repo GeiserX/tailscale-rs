@@ -77,9 +77,18 @@ macro_rules! _create_x25519_base_key_type {
 
                 let mut key = $key_name([0u8; $key_name::KEY_LEN_BYTES]);
                 for i in (0..$key_name::KEY_LEN_HEX_STR).step_by(2) {
-                    let slice = hex_str.get(i..i + 2).unwrap();
+                    // The length check above guarantees the byte length, but a multi-byte UTF-8
+                    // char makes `get(i..i+2)` return `None` (split boundary), and a non-hex digit
+                    // makes `from_str_radix` error — both must surface as a parse error, never a
+                    // panic. A malformed key in an (authenticated but possibly buggy) control
+                    // response would otherwise unwind and kill the netmap decoder. Go's key parse
+                    // returns an error here.
+                    let slice = hex_str
+                        .get(i..i + 2)
+                        .ok_or($crate::ParseError::InvalidFormat)?;
                     let keyidx = i / 2;
-                    let x = u8::from_str_radix(slice, 16).unwrap();
+                    let x = u8::from_str_radix(slice, 16)
+                        .map_err(|_| $crate::ParseError::InvalidFormat)?;
                     key.0[keyidx] = x;
                 }
                 Ok(key)

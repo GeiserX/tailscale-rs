@@ -181,6 +181,31 @@ mod debug_redaction_tests {
         // And a clone derives the same public key (clone copies the secret faithfully).
         assert_eq!(k.clone().public_key(), p1);
     }
+
+    /// A key string of the right length+prefix but containing non-hex (or a non-ASCII char that
+    /// splits a 2-byte window) must parse to `Err`, NOT panic. Regression: the hex loop used
+    /// `.unwrap()` on `get(i..i+2)` and `from_str_radix`, so a malformed key in a control response
+    /// would unwind and kill the netmap decoder. Go's key parse returns an error here.
+    #[test]
+    fn malformed_hex_key_errors_not_panics() {
+        use core::str::FromStr;
+
+        // 64 non-hex ASCII chars: length + prefix pass, `from_str_radix("zz",16)` must error.
+        let non_hex = alloc::format!("nodekey:{}", "z".repeat(64));
+        assert!(
+            NodePublicKey::from_str(&non_hex).is_err(),
+            "non-hex key body must be a parse error, not a panic"
+        );
+
+        // A multi-byte UTF-8 char makes the byte length 64 while `get(i..i+2)` can land on a char
+        // boundary and return None — must also be an error, not a panic. "é" is 2 UTF-8 bytes.
+        let multibyte = alloc::format!("nodekey:{}", "é".repeat(32));
+        assert_eq!(multibyte.len() - "nodekey:".len(), 64, "body is 64 bytes");
+        assert!(
+            NodePublicKey::from_str(&multibyte).is_err(),
+            "a non-ASCII body must be a parse error, not a panic"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "serde"))]
