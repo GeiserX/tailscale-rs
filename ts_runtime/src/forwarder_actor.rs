@@ -16,7 +16,7 @@ use netstack::{
 };
 use tokio::task::JoinSet;
 use ts_forwarder::{
-    DirectDialer, Forwarder, HostExitDialer, ProxyExitDialer, RealDialer, RouteTable,
+    DirectDialer, Forwarder, HostExitDialer, ProxyExitDialer, RealDialer, RouteTable, RouteUpdater,
 };
 use ts_packet::PacketMut;
 
@@ -29,6 +29,9 @@ use crate::{
 pub struct ForwarderActor {
     _joinset: JoinSet<()>,
     channel: Channel,
+    /// Live handle to swap the forwarder's accept/dial route table at runtime (a
+    /// `set_advertise_routes`). New flows see the new set; in-flight flows keep their classification.
+    route_updater: RouteUpdater,
 }
 
 /// Build a [`Forwarder`] with the given dialer and spawn its run loop onto `joinset`.
@@ -46,16 +49,21 @@ fn spawn_forwarder<D: RealDialer>(
     all_ports: bool,
     tcp_ports: Vec<u16>,
     udp_ports: Vec<u16>,
-) {
+) -> RouteUpdater {
     let forwarder = match forwarder_mode(all_ports) {
         ForwarderMode::AllPorts => Forwarder::all_ports(channel, routes, dialer),
         ForwarderMode::Ports => Forwarder::new(channel, routes, dialer, tcp_ports, udp_ports),
     };
+    // Grab the live route-update handle BEFORE `run()` consumes the forwarder, so the actor can
+    // push a new `RouteTable` (a runtime `set_advertise_routes`) onto the running forwarder. New
+    // flows pick up the change; in-flight flows keep their classification.
+    let route_updater = forwarder.route_updater();
     joinset.spawn(async move {
         if let Err(e) = forwarder.run().await {
             tracing::error!(error = %e, "forwarder run loop exited");
         }
     });
+    route_updater
 }
 
 /// Which concrete dialer the forwarder is wired with — the anti-leak gate's only output.
@@ -194,7 +202,7 @@ impl kameo::Actor for ForwarderActor {
         let n_udp_ports = udp_ports.len();
 
         let choice = dialer_choice(env.forward_exit_egress, env.exit_proxy.is_some());
-        match choice {
+        let route_updater = match choice {
             DialerChoice::Proxy => {
                 // `dialer_choice` returns `Proxy` only when `exit_proxy.is_some()`, so this clone
                 // is always present; expressed as an expect so a future gate change can't silently
@@ -211,7 +219,7 @@ impl kameo::Actor for ForwarderActor {
                     all_ports,
                     tcp_ports,
                     udp_ports,
-                );
+                )
             }
             DialerChoice::HostExit => spawn_forwarder(
                 &mut joinset,
@@ -231,7 +239,7 @@ impl kameo::Actor for ForwarderActor {
                 tcp_ports,
                 udp_ports,
             ),
-        }
+        };
 
         tracing::debug!(
             n_routes,
@@ -247,6 +255,7 @@ impl kameo::Actor for ForwarderActor {
         Ok(Self {
             _joinset: joinset,
             channel,
+            route_updater,
         })
     }
 }
@@ -256,6 +265,16 @@ impl ForwarderActor {
     #[message]
     pub fn get_channel(&self) -> (Channel,) {
         (self.channel.clone(),)
+    }
+
+    /// Replace the forwarder's accept/dial route table with `routes` (a runtime
+    /// `set_advertise_routes`). New flows are classified against the new set; in-flight flows keep
+    /// their existing classification. The local half of advertising routes — paired with the wire
+    /// half (re-advertising `Hostinfo.RoutableIPs` to control) so the node both forwards and is
+    /// granted exactly the prefixes it advertises.
+    #[message]
+    pub fn update_routes(&self, routes: Vec<ipnet::IpNet>) {
+        self.route_updater.update(RouteTable::new(routes));
     }
 }
 

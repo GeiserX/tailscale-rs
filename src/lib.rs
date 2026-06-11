@@ -1220,6 +1220,23 @@ impl Device {
         self.runtime.exit_node()
     }
 
+    /// Change the subnet routes this node advertises at runtime — Go `tailscale set
+    /// --advertise-routes`. This is the runtime equivalent of
+    /// [`Config::advertise_routes`](crate::Config::advertise_routes): the node re-advertises the
+    /// prefixes to control (so it is granted the subnet-router role for them) AND starts forwarding
+    /// them on the data path, applied together so the two never disagree.
+    ///
+    /// `routes` is filtered to the IPv4-only, deduplicated set this fork honors (IPv6 prefixes are
+    /// dropped under the IPv6-off posture). This sets the explicit subnet prefixes only; it does not
+    /// affect the exit-node `0.0.0.0/0` advertisement. Only NEW forwarded flows use the changed set;
+    /// in-flight flows keep their existing routing until they close.
+    pub async fn set_advertise_routes(&self, routes: Vec<ipnet::IpNet>) -> Result<(), Error> {
+        self.runtime
+            .set_advertise_routes(routes)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Re-bind the underlay UDP socket after a **network/link change** — Wi-Fi switch, sleep/wake,
     /// or any event that invalidates the device's local address/NAT mapping. This is the Rust
     /// analog of Go magicsock's `Conn.Rebind()`.

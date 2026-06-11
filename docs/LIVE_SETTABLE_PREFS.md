@@ -14,6 +14,7 @@ it means building a new `Device`.
 | Pref / action | Method | How it applies live |
 |---------------|--------|---------------------|
 | **Exit node** (select / clear) | `Device::set_exit_node(Option<ExitNodeSelector>)` | Updates a `watch` cell every reader borrows, then asks the peer tracker to `RepublishState` — the route updater (outbound routes + DoH delegation) and the source filter (inbound validation) recompute against the current peer set immediately, without waiting for the next netmap poll. (`src/lib.rs` → `ts_runtime::Env::set_exit_node` → `peer_tracker::RepublishState`.) |
+| **Advertised subnet routes** | `Device::set_advertise_routes(Vec<ipnet::IpNet>)` | Applies both halves together: re-advertises `Hostinfo.RoutableIPs` to control on the live map-poll connection (so control grants the subnet-router role), AND swaps the forwarder's accept/dial route table (so the node forwards what it advertises). New flows see the new set; in-flight flows keep their routing. IPv4-only/deduped (IPv6 dropped, IPv6-off posture). Explicit prefixes only — not the exit-node `0.0.0.0/0`. (`src/lib.rs` → `ts_runtime::Runtime::set_advertise_routes` → `control_runner::SetAdvertiseRoutes` + `forwarder_actor::UpdateRoutes`.) |
 | **Serve config** (ports / TLS / Funnel targets) | `Device::set_serve_config(ServeState)` | Validates, then builds each TLS-terminating port's acceptor up-front (ACME-aware, fail-closed — no plaintext downgrade if a cert can't be issued) and (re)binds the serve listeners live. `get_serve_config()` reads the current state. |
 | **Logout / deregister** | `Device::logout()` | Re-registers with a past expiry; the device stays up but transitions state. Not a pref mutation per se, but a live state change (no rebuild). |
 
@@ -33,15 +34,17 @@ updated `Config`:
   registration).
 - **Exit-egress proxy** — `Config::exit_proxy` (`ExitProxyConfig`) and `forward_exit_egress`. The
   forwarder's dialer choice is fixed at construction (fail-closed anti-leak chokepoint).
-- **`enable_ipv6`**, **`tcp_buffer_size`**, advertised routes / exit-node advertisement, and the other
+- **`enable_ipv6`**, **`tcp_buffer_size`**, the exit-node advertisement (`advertise_exit_node`, the
+  `0.0.0.0/0` route — distinct from the now-live subnet routes above), and the other
   `Config`/`ForwarderConfig` transport knobs.
 - **Persistent-keepalive interval** (`PeerConfig::persistent_keepalive_interval`) — per-peer, applied
   when the peer config is built.
 
 ## Guidance for a `set` command
 
-1. **Fast-path** the two live mutators: route an `exit_node` change to `set_exit_node` and a serve
-   change to `set_serve_config` — no `up`/`down` cycle.
+1. **Fast-path** the live mutators: route an `exit_node` change to `set_exit_node`, an advertised
+   subnet-route change to `set_advertise_routes`, and a serve change to `set_serve_config` — no
+   `up`/`down` cycle.
 2. For everything else, **preflight the rebuilt `Config` before tearing down the live device** (build
    the new config, validate it, only then drop-and-recreate) so a bad value doesn't leave the node
    down. (`tailscaled-rs` already does this.)

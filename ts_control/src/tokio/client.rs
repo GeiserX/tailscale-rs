@@ -154,6 +154,23 @@ impl AsyncControlClient {
         }
     }
 
+    /// Re-advertise this node's routable IP prefixes (`Hostinfo.RoutableIPs`) to control mid-session
+    /// — the wire half of a runtime `set_advertise_routes`. `routes` is the final advertised set
+    /// (already filtered); it is sent on the live map-poll connection without tearing down the
+    /// long-poll, exactly like [`set_endpoints`](Self::set_endpoints).
+    #[tracing::instrument(skip_all, fields(map_url = %self.map_url(), n_routes = routes.len()), level = "trace")]
+    pub async fn set_routable_ips(&mut self, routes: Vec<ipnet::IpNet>) {
+        tracing::trace!("reporting routable IPs to control server");
+
+        if let Err(e) = self
+            .command_tx
+            .send(Command::SetRoutableIPs { routes })
+            .await
+        {
+            tracing::error!(error = %e, "setting routable IPs");
+        }
+    }
+
     /// Construct the URL that should be used to fetch the netmap.
     pub fn map_url(&self) -> Url {
         self.base_url
@@ -167,6 +184,11 @@ impl AsyncControlClient {
     }
 }
 
+// Every variant is a "set X on the next map request" command, so they all legitimately share the
+// `Set` prefix (each mirrors a control-side field a side MapRequest carries). The shared prefix is
+// the point, not an accident — silence the variant-name lint rather than rename to something less
+// clear.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug)]
 pub enum Command {
     SetDerpHomeRegion {
@@ -176,6 +198,11 @@ pub enum Command {
     SetEndpoints {
         endpoints: Vec<ts_control_serde::Endpoint>,
     },
+    /// Re-advertise this node's routable IP prefixes (`Hostinfo.RoutableIPs`) mid-session — the wire
+    /// half of a runtime `set_advertise_routes`. The routes travel IN the command (not read from the
+    /// run-loop's frozen `config` clone), already filtered to the final advertised set the caller
+    /// wants control to see.
+    SetRoutableIPs { routes: Vec<ipnet::IpNet> },
 }
 
 /// Identifies a map-poll session so a reconnect can resume the delta stream instead of
@@ -369,6 +396,23 @@ async fn run_once(
                             .stream(false)
                             .routable_ips(config.advertised_routes())
                             .endpoints(endpoints);
+
+                        if let Some(hostname) = &config.hostname {
+                            builder = builder.hostname(hostname);
+                        }
+                        let req = builder.build();
+
+                        drop(send_map_request(req, &map_url, &h2_client).await?);
+                    },
+                    Command::SetRoutableIPs { routes } => {
+                        // The routes come from the command payload, NOT `config.advertised_routes()`:
+                        // `config` is a frozen clone captured when this loop started, so a runtime
+                        // route change can only reach here through the command itself.
+                        let mut builder = MapRequestBuilder::new(node_keys)
+                            .keep_alive(false)
+                            .omit_peers(true)
+                            .stream(false)
+                            .routable_ips(routes);
 
                         if let Some(hostname) = &config.hostname {
                             builder = builder.hostname(hostname);
