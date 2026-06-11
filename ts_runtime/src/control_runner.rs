@@ -746,3 +746,22 @@ impl Message<EndpointAdvertisement> for ControlRunner {
         self.client.set_endpoints(endpoints).await;
     }
 }
+
+/// Re-advertise this node's routable IP prefixes (`Hostinfo.RoutableIPs`) to control — the wire
+/// half of a runtime [`Runtime::set_advertise_routes`](crate::Runtime::set_advertise_routes). Sent
+/// as a direct `ask` from the runtime (not over the bus), so the route change reaches the live
+/// map-poll client. `routes` is the final advertised set the caller wants control to grant.
+#[derive(Debug)]
+pub struct SetAdvertiseRoutes {
+    /// The prefixes to advertise to control (already filtered to the final set).
+    pub routes: Vec<ipnet::IpNet>,
+}
+
+impl Message<SetAdvertiseRoutes> for ControlRunner {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: SetAdvertiseRoutes, _ctx: &mut Context<Self, Self::Reply>) {
+        tracing::debug!(n_routes = msg.routes.len(), "advertising routes to control");
+        self.client.set_routable_ips(msg.routes).await;
+    }
+}

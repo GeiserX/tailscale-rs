@@ -80,6 +80,11 @@ pub struct Runtime {
     /// Fallback TCP handler registry, bound to the application netstack. `None` in TUN transport
     /// mode (no application netstack exists to attach it to).
     fallback_tcp: Option<fallback_tcp::FallbackTcpManager>,
+    /// Reference to the forwarder actor, retained so [`Runtime::set_advertise_routes`] can push a
+    /// new accept/dial route table onto the running forwarder (the local half of advertising
+    /// routes). Without this the strong ref would drop after the startup `GetChannel` and the
+    /// forwarder would be reachable only via the message bus.
+    forwarder: ActorRef<ForwarderActor>,
     env: Env,
     shutdown: watch::Sender<bool>,
     /// Sender side of the exit-node selector `watch` cell. Held privately here (not on the cloned
@@ -262,6 +267,7 @@ impl Runtime {
             direct,
             peer_tracker,
             fallback_tcp,
+            forwarder,
             netstack,
             env,
             shutdown: shutdown_tx,
@@ -583,6 +589,39 @@ impl Runtime {
         self.env.exit_node()
     }
 
+    /// Change the set of subnet routes this node advertises at runtime (Go `tailscale set
+    /// --advertise-routes`). Applies BOTH halves together so the wire and the data path agree:
+    ///
+    /// 1. **Wire** — re-advertise `Hostinfo.RoutableIPs` to control on the live map-poll connection
+    ///    (so control grants the node the subnet-router role for exactly these prefixes).
+    /// 2. **Local** — swap the forwarder's accept/dial route table (so the node actually forwards the
+    ///    prefixes it advertises). New flows see the new set; in-flight flows keep their routing.
+    ///
+    /// `routes` is filtered to the IPv4-only, deduplicated set this fork can honor (IPv6 prefixes are
+    /// dropped under the IPv6-off posture — we never advertise a route we won't forward), so the wire
+    /// and forwarder are fed the identical final set. This sets the explicit subnet prefixes only; it
+    /// does NOT touch the exit-node `0.0.0.0/0` advertisement (a separate concern).
+    pub async fn set_advertise_routes(&self, routes: Vec<ipnet::IpNet>) -> Result<(), Error> {
+        // IPv4-only + dedup, mirroring `ts_control::Config::advertised_routes` so the wire grant and
+        // the forwarder accept set never disagree.
+        let filtered = filter_advertise_routes(routes);
+
+        // Local half first: start forwarding the prefixes before control grants them, so there is no
+        // window where control has granted a route the node black-holes. (The reverse order would
+        // briefly advertise a route we don't yet forward.) New flows pick up the table immediately.
+        self.forwarder
+            .ask(forwarder_actor::UpdateRoutes {
+                routes: filtered.clone(),
+            })
+            .await?;
+
+        // Wire half: re-advertise to control on the live map-poll connection.
+        self.control
+            .ask(control_runner::SetAdvertiseRoutes { routes: filtered })
+            .await
+            .map_err(Into::into)
+    }
+
     /// Subscribe to netmap peer-change events.
     ///
     /// Returns a [`watch::Receiver`] whose value is the current set of peer [`StatusNode`]s,
@@ -728,6 +767,25 @@ fn netstack_config_from(tcp_buffer_size: Option<usize>) -> netstack::netcore::Co
     c
 }
 
+/// Filter a requested advertise-route set to the IPv4-only, deduplicated set this fork can honor,
+/// mirroring [`ts_control::Config::advertised_routes`] so a runtime `set_advertise_routes` feeds the
+/// wire (control grant) and the forwarder (accept/dial table) the identical final set. IPv6 prefixes
+/// are dropped under the IPv6-off posture — we never advertise a route we won't forward. Order is
+/// preserved (first occurrence wins). Factored out so the filter is unit-testable without an actor.
+fn filter_advertise_routes(routes: Vec<ipnet::IpNet>) -> Vec<ipnet::IpNet> {
+    let mut filtered: Vec<ipnet::IpNet> = Vec::new();
+    for net in routes {
+        if matches!(net, ipnet::IpNet::V4(_)) {
+            if !filtered.contains(&net) {
+                filtered.push(net);
+            }
+        } else {
+            tracing::warn!(prefix = %net, "dropping IPv6 advertise route (IPv6-off posture)");
+        }
+    }
+    filtered
+}
+
 /// Flatten a kameo delegated-reply [`SendError`] for the id-token RPC into the RPC's own
 /// [`ts_control::IdTokenError`].
 ///
@@ -822,6 +880,32 @@ mod tests {
             64 * 1024,
             "Some(n) must override the TCP buffer size that both netstacks use"
         );
+    }
+
+    /// `set_advertise_routes` must feed the wire and the forwarder the IDENTICAL filtered set:
+    /// IPv4-only (IPv6 dropped under the IPv6-off posture), deduplicated, order preserved.
+    #[test]
+    fn filter_advertise_routes_keeps_v4_dedups_drops_v6() {
+        let v4a: ipnet::IpNet = "10.0.0.0/24".parse().unwrap();
+        let v4b: ipnet::IpNet = "192.168.1.0/24".parse().unwrap();
+        let v6: ipnet::IpNet = "2001:db8::/32".parse().unwrap();
+
+        // Mixed input with a duplicate v4 and a v6 prefix.
+        let out = filter_advertise_routes(vec![v4a, v6, v4b, v4a]);
+
+        assert_eq!(
+            out,
+            vec![v4a, v4b],
+            "v6 dropped, duplicate v4 collapsed, first-occurrence order preserved"
+        );
+    }
+
+    /// An all-IPv6 request filters to empty (we never advertise a route we won't forward) rather
+    /// than erroring — clearing the advertised set is a legitimate outcome.
+    #[test]
+    fn filter_advertise_routes_all_v6_is_empty() {
+        let v6: ipnet::IpNet = "2001:db8::/32".parse().unwrap();
+        assert!(filter_advertise_routes(vec![v6]).is_empty());
     }
 
     /// A `HandlerError` carries the real `IdTokenError` from the RPC handler and must pass through
