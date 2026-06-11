@@ -237,7 +237,7 @@ impl ControlRunner {
     /// Apply the outcome of a spawned [`maybe_sync_tka`] task on the actor thread: store the advanced
     /// state + publish the `Authority` (or, on inert/failed sync, leave peers unaffected). Always
     /// clears the in-flight guard.
-    fn apply_tka_synced(
+    async fn apply_tka_synced(
         &mut self,
         result: Result<Option<crate::tka_sync::SyncedTka>, crate::tka_sync::TkaSyncDriverError>,
     ) {
@@ -250,6 +250,18 @@ impl ControlRunner {
                 );
                 self.tka_authority
                     .send_replace(Some(synced.authority.clone()));
+                // Deliver the verified Authority to the peer tracker's observe-only verify-and-log
+                // seam (#136) over the bus. Re-published on every successful sync (no bus replay).
+                if let Err(e) = self
+                    .params
+                    .env
+                    .publish(crate::peer_tracker::TkaAuthorityUpdate(
+                        synced.authority.clone(),
+                    ))
+                    .await
+                {
+                    tracing::warn!(error = %e, "publishing TKA authority to peer tracker failed");
+                }
                 self.tka_synced = Some(synced);
             }
             Ok(None) => {
@@ -624,7 +636,7 @@ impl Message<TkaSynced> for ControlRunner {
     type Reply = ();
 
     async fn handle(&mut self, msg: TkaSynced, _ctx: &mut Context<Self, Self::Reply>) {
-        self.apply_tka_synced(msg.result);
+        self.apply_tka_synced(msg.result).await;
     }
 }
 
