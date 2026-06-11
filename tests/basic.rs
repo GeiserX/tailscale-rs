@@ -187,6 +187,44 @@ async fn test_udp(dev: &tailscale::Device, ip: IpAddr) {
     test_udp_unidir(&udp2, &udp1).await;
 }
 
+/// `Device::dial_udp` round-trip: an unconnected `listen_packet` socket as the server, a
+/// `dial_udp`-connected socket as the client. Exercises the connected-`net.Conn` path
+/// (`ConnectedUdpSocket::send`/`recv` against a fixed peer) over this node's own tailnet address.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn dial_udp_roundtrip() {
+    if !ts_test_util::run_net_tests() {
+        tracing::warn!("net tests disabled");
+        return;
+    }
+
+    timeout(NET_TIMEOUT, async move {
+        let dev = make_ts_device().await.unwrap();
+        let ip: IpAddr = dev.ipv4_addr().await.unwrap().into();
+
+        // Server: an unconnected packet socket on a fixed port.
+        let server = dev.udp_bind((ip, 4242).into()).await.unwrap();
+
+        // Client: connect to the server via the public dial_udp accessor (resolves + binds an
+        // ephemeral local socket of the remote's family, wraps it as a connected socket).
+        let client = dev.dial_udp(&format!("{ip}:4242")).await.unwrap();
+        assert_eq!(client.peer(), (ip, 4242).into());
+
+        client.send(b"ping").await.unwrap();
+        let (from, msg) = server.recv_from_bytes().await.unwrap();
+        assert_eq!(from, client.local_addr());
+        assert_eq!(msg.as_ref(), b"ping");
+
+        // And the reply path: server -> client's ephemeral local address; recv() filters to the peer.
+        server.send_to(client.local_addr(), b"pong").await.unwrap();
+        let mut buf = [0u8; 8];
+        let n = client.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"pong");
+    })
+    .await
+    .unwrap();
+}
+
 async fn test_udp_unidir(tx: &UdpSocket, rx: &UdpSocket) {
     tx.send_to(rx.local_addr(), b"hello").await.unwrap();
 

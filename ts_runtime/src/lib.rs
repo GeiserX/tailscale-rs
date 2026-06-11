@@ -491,6 +491,24 @@ impl Runtime {
             .map_err(flatten_logout_send_err)
     }
 
+    /// Publish a `TXT` DNS record for this node via control's `/machine/set-dns` (Go
+    /// `LocalClient.SetDNS`).
+    ///
+    /// Forwards to the control runner, which POSTs the record over a fresh Noise channel. The kameo
+    /// delegated-reply send error is flattened the same way as [`fetch_id_token`](Self::fetch_id_token):
+    /// a handler error carries the real [`ts_control::SetDnsError`]; any other send failure (actor
+    /// shutdown / mailbox closed) is surfaced as [`ts_control::SetDnsError::NetworkError`].
+    pub async fn set_dns(
+        &self,
+        name: String,
+        value: String,
+    ) -> Result<(), ts_control::SetDnsError> {
+        self.control
+            .ask(control_runner::SetDns { name, value })
+            .await
+            .map_err(flatten_set_dns_send_err)
+    }
+
     /// Issue a real Let's Encrypt certificate for this node's MagicDNS `name` (`acme` feature).
     ///
     /// Mirrors [`fetch_id_token`](Self::fetch_id_token): forwards to the control runner, which runs
@@ -743,6 +761,22 @@ fn flatten_logout_send_err<M>(
     }
 }
 
+/// Flatten a kameo `SendError` from the `SetDns` ask into a [`ts_control::SetDnsError`].
+///
+/// A `HandlerError` carries the real `SetDnsError` from the set-dns RPC and is surfaced verbatim;
+/// any other send failure (actor not running / stopped, mailbox full, send timeout) — a delivery
+/// problem, not a publish result — collapses to the transient
+/// [`ts_control::SetDnsError::NetworkError`]. Factored out of [`Runtime::set_dns`] so the mapping is
+/// unit-testable without standing up an actor.
+fn flatten_set_dns_send_err<M>(
+    e: kameo::error::SendError<M, ts_control::SetDnsError>,
+) -> ts_control::SetDnsError {
+    match e {
+        kameo::error::SendError::HandlerError(err) => err,
+        _ => ts_control::SetDnsError::NetworkError,
+    }
+}
+
 /// Flatten a kameo `SendError` from the `GetCertificate` ask into a [`ts_control::CertError`].
 ///
 /// A `HandlerError` carries the real `CertError` produced by the ACME issuance and is surfaced
@@ -851,6 +885,30 @@ mod tests {
         assert_eq!(
             flatten_logout_send_err(e),
             ts_control::LogoutError::NetworkError
+        );
+    }
+
+    /// A `HandlerError` from the set-dns RPC carries the real `SetDnsError` and must pass through
+    /// verbatim. An `Internal(_)` payload (distinct from the `_ => NetworkError` fallback) makes the
+    /// passthrough observable.
+    #[test]
+    fn flatten_set_dns_send_err_handler_error_passes_through() {
+        let inner = ts_control::SetDnsError::Internal(ts_control::SetDnsInternalErrorKind::Http);
+        assert!(matches!(inner, ts_control::SetDnsError::Internal(_)));
+        let e: kameo::error::SendError<control_runner::SetDns, ts_control::SetDnsError> =
+            kameo::error::SendError::HandlerError(inner.clone());
+        assert_eq!(flatten_set_dns_send_err(e), inner);
+    }
+
+    /// A non-handler send failure (actor stopped) is a delivery problem, not a publish result, and
+    /// collapses to a transient `NetworkError`.
+    #[test]
+    fn flatten_set_dns_send_err_actor_stopped_is_network_error() {
+        let e: kameo::error::SendError<control_runner::SetDns, ts_control::SetDnsError> =
+            kameo::error::SendError::ActorStopped;
+        assert_eq!(
+            flatten_set_dns_send_err(e),
+            ts_control::SetDnsError::NetworkError
         );
     }
 }

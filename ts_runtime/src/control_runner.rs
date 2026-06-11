@@ -13,7 +13,7 @@ use kameo::{
 use tokio::sync::watch;
 use ts_control::{
     AsyncControlClient, Endpoint, EndpointType, Error as ControlError, IdTokenError, LogoutError,
-    Node, SshPolicy, StateUpdate, TkaStatus,
+    Node, SetDnsError, SshPolicy, StateUpdate, TkaStatus,
 };
 use ts_magicsock::SelfEndpointType;
 
@@ -56,6 +56,11 @@ pub struct ControlRunner {
     /// `tnet dns status`). A superset of [`cert_domains`](Self::cert_domains), which is kept as its
     /// own cell for the narrower TLS-cert use.
     dns_config: watch::Sender<Option<ts_control::DnsConfig>>,
+    /// Latest interactive-login / consent URL control asked this node to open
+    /// (`MapResponse.PopBrowserURL`), or `None` until control sends one. The facade reads this for
+    /// `Device::pop_browser_url` (a daemon driving a non-authkey login surfaces it to the user).
+    /// Replaced (not accumulated) on each update.
+    pop_browser_url: watch::Sender<Option<url::Url>>,
     /// Latest network-conditions report (preferred DERP region + per-region latencies), updated each
     /// time the DERP-latency measurer reports in. The facade reads this for `Device::netcheck` (the
     /// daemon's `tnet netcheck`). Empty until the first measurement.
@@ -180,6 +185,7 @@ impl kameo::Actor for ControlRunner {
             tka_syncing: false,
             cert_domains: Default::default(),
             dns_config: Default::default(),
+            pop_browser_url: Default::default(),
             netcheck: Default::default(),
         })
     }
@@ -406,6 +412,14 @@ mod msg_impl {
             self.dns_config.borrow().clone()
         }
 
+        /// The interactive-login / consent URL control last asked this node to open
+        /// (`MapResponse.PopBrowserURL`), or `None` when control has sent none. An immediate answer
+        /// (does not block); the facade surfaces this for `Device::pop_browser_url`.
+        #[message]
+        pub fn pop_browser_url(&self) -> Option<url::Url> {
+            self.pop_browser_url.borrow().clone()
+        }
+
         /// The latest network-conditions report (preferred DERP region + per-region latencies). An
         /// immediate answer (does not block); empty before the first DERP-latency measurement. The
         /// facade surfaces this for `Device::netcheck` (the daemon's `tnet netcheck`).
@@ -459,6 +473,35 @@ mod msg_impl {
                 let keys = self.params.env.keys.clone();
                 tokio::spawn(async move {
                     let result = ts_control::logout(&config, &keys).await;
+                    replier.send(result);
+                });
+            }
+
+            deleg
+        }
+
+        /// Publish a DNS record for this node via control's `/machine/set-dns` (Go
+        /// `LocalClient.SetDNS`).
+        ///
+        /// Mirrors [`fetch_id_token`](Self::fetch_id_token): clones the control config + node keys
+        /// into a spawned task (delegated reply, so the round-trip doesn't block the mailbox) and
+        /// POSTs the record over a fresh Noise channel. Go's `SetDNS` is `TXT`-only (its sole use is
+        /// the ACME DNS-01 `_acme-challenge` record); the record type is fixed to `"TXT"` here to
+        /// match, so the surfaced API takes only `name` + `value`.
+        #[message(ctx)]
+        pub fn set_dns(
+            &self,
+            ctx: &mut Context<Self, DelegatedReply<Result<(), SetDnsError>>>,
+            name: String,
+            value: String,
+        ) -> DelegatedReply<Result<(), SetDnsError>> {
+            let (deleg, replier) = ctx.reply_sender();
+
+            if let Some(replier) = replier {
+                let config = self.params.config.clone();
+                let keys = self.params.env.keys.clone();
+                tokio::spawn(async move {
+                    let result = ts_control::set_dns(&config, &keys, &name, "TXT", &value).await;
                     replier.send(result);
                 });
             }
@@ -609,6 +652,12 @@ impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
                 // `None` when control sent no DNS config on this update — distinct from a present but
                 // empty config (Go `netmap.NetworkMap.DNS`).
                 self.dns_config.send_replace(msg.dns_config.clone());
+
+                // Track the interactive-login URL for `Device::pop_browser_url`. `None` on updates
+                // that carry none — control sends it only when it wants a browser opened
+                // (`MapResponse.PopBrowserURL`); replace rather than accumulate.
+                self.pop_browser_url
+                    .send_replace(msg.pop_browser_url.clone());
 
                 if let Err(e) = self.params.env.publish(msg).await {
                     tracing::error!(error = %e, "publishing netmap update");
