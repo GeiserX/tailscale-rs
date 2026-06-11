@@ -608,6 +608,48 @@ impl Runtime {
             .map_err(Into::into)
     }
 
+    /// Send a disco ping to the peer holding tailnet IP `dst` **now** and await the pong, returning
+    /// the fresh round-trip latency and the endpoint that answered, or `None` if no pong arrives
+    /// within `timeout` (or the peer is unknown / has no disco key / no candidate path). This is the
+    /// true on-demand `PingType::Disco` (Go `tailscale ping`), as opposed to
+    /// [`direct_path`](Self::direct_path) which reports the last periodic probe's RTT.
+    ///
+    /// The ping round-trip is awaited OFF the direct manager's mailbox (we take a `MagicSock` handle
+    /// and await on it directly), so a slow/timing-out ping never blocks the actor.
+    pub async fn ping_disco(
+        &self,
+        dst: core::net::IpAddr,
+        timeout: Duration,
+    ) -> Result<Option<(core::net::SocketAddr, Duration)>, Error> {
+        let peer_tracker = self.peer_tracker.upgrade().ok_or(Error {
+            kind: ErrorKind::ActorGone,
+            target_actor: None,
+            message_ty: None,
+        })?;
+
+        let Some(node) = peer_tracker
+            .ask(peer_tracker::PeerByTailnetIp { ip: dst })
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(disco) = node.disco_key else {
+            return Ok(None);
+        };
+
+        // Cheap synchronous handle fetch, then await the ping OFF the actor mailbox.
+        let Some(sock) = self.direct.ask(direct::SockHandle).await? else {
+            return Ok(None);
+        };
+        // A `ping_now` error is an underlay UDP send failure (not an actor problem); surface it as a
+        // reply-level error. A timed-out / unanswered ping is `Ok(None)`, not an error.
+        sock.ping_now(&disco, timeout).await.map_err(|_| Error {
+            kind: ErrorKind::ReplyErr,
+            target_actor: None,
+            message_ty: None,
+        })
+    }
+
     /// Change the selected exit node at runtime (the equivalent of Go `tsnet`'s
     /// `LocalClient.EditPrefs(ExitNodeID/ExitNodeIP)`), without recreating the device.
     ///

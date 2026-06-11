@@ -197,6 +197,16 @@ impl DirectManager {
         self.sock.as_ref()?.best_addr_and_latency(&disco)
     }
 
+    /// Hand out the underlay [`MagicSock`] handle (or `None` if the bind failed / inert DERP-only
+    /// mode). This is a cheap synchronous clone so the caller can run an **awaiting** operation —
+    /// `MagicSock::ping_now`, which sends a disco ping and awaits the pong for up to a timeout — OFF
+    /// this actor's mailbox. Doing the await here (in a `#[message]`) would block the DirectManager
+    /// for the whole ping timeout, serializing every other message behind it.
+    #[message]
+    pub fn sock_handle(&self) -> Option<Arc<MagicSock>> {
+        self.sock.clone()
+    }
+
     /// Of the given peers, return those that currently have a trusted direct path — the key set of
     /// [`best_addrs`](Self::best_addrs). A peer is included only if its disco key is known and
     /// [`MagicSock::best_addr`] returns `Some` for it right now (live query — never cached — so trust
