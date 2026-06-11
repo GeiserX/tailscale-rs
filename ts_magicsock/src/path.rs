@@ -42,6 +42,19 @@ const REFRESH_BEFORE_EXPIRY: Duration = Duration::from_millis(3500);
 /// discipline. Sized above any realistic RTT and the re-ping cadence.
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Maximum number of [`CandidateSource::Learned`] candidate endpoints tracked per peer.
+///
+/// Anti-amplification (the per-peer accumulation bound complementing the per-message
+/// [`MAX_INBOUND_CALLMEMAYBE_ENDPOINTS`][crate::disco::MAX_INBOUND_CALLMEMAYBE_ENDPOINTS] cap):
+/// learned candidates (from `CallMeMaybe` / inbound-ping sources) persist across netmap reconcile,
+/// so without this a peer drip-feeding fresh addresses across many messages could grow this node's
+/// disco-ping target set (each emitted from the real host socket) without limit. Sized at 2× the
+/// per-message cap: a real peer advertises at most its own reflexive set, itself bounded by
+/// `MAX_REFLEXIVE_ADDRS` (16) — so 32 admits roughly two full legitimate advertisements before
+/// clamping, while bounding abuse. Netmap candidates are not counted (control-authoritative,
+/// already bounded by reconcile).
+const MAX_LEARNED_CANDIDATES_PER_PEER: usize = 32;
+
 /// Where a candidate endpoint came from, which decides how it is reconciled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum CandidateSource {
@@ -84,17 +97,48 @@ impl PeerPaths {
     /// ones keep their measured state. A netmap-advertised endpoint upgrades a previously-learned
     /// one to [`CandidateSource::Netmap`] (so control's authority subsumes the learned path), but
     /// a learned endpoint never downgrades a netmap one.
+    ///
+    /// Anti-amplification: the number of [`CandidateSource::Learned`] candidates a single peer can
+    /// accumulate is bounded by [`MAX_LEARNED_CANDIDATES_PER_PEER`]. The per-message cap in
+    /// `disco::open` bounds one `CallMeMaybe`, but a peer could otherwise send many of them over
+    /// time (each carrying fresh addresses) to grow the learned set without limit — and learned
+    /// candidates persist across netmap reconcile, so they'd never be pruned. Once at the cap, *new*
+    /// learned endpoints are dropped (existing candidates stay — an established/confirmed path must
+    /// not be evicted by a flood of junk). Netmap (control-authoritative) candidates are never
+    /// capped: control is trusted and `reconcile_netmap_candidates` already bounds them to the
+    /// advertised set.
     fn add_candidates(
         &mut self,
         endpoints: impl IntoIterator<Item = SocketAddr>,
         source: CandidateSource,
     ) {
         for ep in endpoints {
+            // For learned candidates, refuse to grow the learned set past the cap. Updating an
+            // endpoint we already track is always fine (no growth); only a brand-new learned address
+            // is gated.
+            if source == CandidateSource::Learned
+                && !self.candidates.contains_key(&ep)
+                && self.learned_candidate_count() >= MAX_LEARNED_CANDIDATES_PER_PEER
+            {
+                tracing::debug!(
+                    %ep,
+                    "dropping learned candidate: peer at MAX_LEARNED_CANDIDATES_PER_PEER"
+                );
+                continue;
+            }
             let cand = self.candidates.entry(ep).or_default();
             if source == CandidateSource::Netmap {
                 cand.source = CandidateSource::Netmap;
             }
         }
+    }
+
+    /// The number of candidates currently tracked with [`CandidateSource::Learned`].
+    fn learned_candidate_count(&self) -> usize {
+        self.candidates
+            .values()
+            .filter(|c| c.source == CandidateSource::Learned)
+            .count()
     }
 
     /// Add candidate endpoints advertised by the control netmap.
@@ -528,5 +572,56 @@ mod tests {
             None
         );
         assert_eq!(p.best_addr(now + Duration::from_millis(8)), None);
+    }
+
+    /// Anti-amplification: learned candidates per peer are bounded by
+    /// `MAX_LEARNED_CANDIDATES_PER_PEER`. Feeding more (as a peer drip-feeding CallMeMaybes over
+    /// time would) does not grow the set past the cap — excess new learned addresses are dropped.
+    #[test]
+    fn learned_candidates_capped_per_peer() {
+        let mut p = PeerPaths::default();
+        let over = MAX_LEARNED_CANDIDATES_PER_PEER + 40;
+        // Feed in several batches (mimicking repeated CallMeMaybes), each with fresh addresses.
+        for i in 0..over {
+            let addr: SocketAddr = format!("203.0.113.7:{}", 40000 + i as u16).parse().unwrap();
+            p.add_learned_candidates([addr]);
+        }
+        assert_eq!(
+            p.candidate_addrs().len(),
+            MAX_LEARNED_CANDIDATES_PER_PEER,
+            "learned candidates must be bounded by MAX_LEARNED_CANDIDATES_PER_PEER"
+        );
+    }
+
+    /// The learned cap must NOT block netmap candidates (control-authoritative): even with the
+    /// learned set full, control's advertised endpoints are still installed. Nor does re-adding an
+    /// already-tracked learned address count as growth.
+    #[test]
+    fn learned_cap_does_not_block_netmap_or_dedup() {
+        let mut p = PeerPaths::default();
+        // Saturate the learned set.
+        for i in 0..MAX_LEARNED_CANDIDATES_PER_PEER {
+            let addr: SocketAddr = format!("203.0.113.7:{}", 40000 + i as u16).parse().unwrap();
+            p.add_learned_candidates([addr]);
+        }
+        let learned = p.candidate_addrs().len();
+        assert_eq!(learned, MAX_LEARNED_CANDIDATES_PER_PEER);
+
+        // Re-adding an existing learned address is a no-op (no growth, not rejected as "new").
+        let existing: SocketAddr = "203.0.113.7:40000".parse().unwrap();
+        p.add_learned_candidates([existing]);
+        assert_eq!(
+            p.candidate_addrs().len(),
+            learned,
+            "re-add must not grow the set"
+        );
+
+        // A NEW netmap candidate is still installed despite the full learned set.
+        let netmap_ep: SocketAddr = "198.51.100.9:3478".parse().unwrap();
+        p.add_netmap_candidates([netmap_ep]);
+        assert!(
+            p.candidate_addrs().contains(&netmap_ep),
+            "netmap (control-authoritative) candidates must not be capped by the learned limit"
+        );
     }
 }

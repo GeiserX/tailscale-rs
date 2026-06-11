@@ -21,6 +21,22 @@ use zerocopy::IntoBytes;
 
 use crate::error::DiscoError;
 
+/// Maximum number of endpoints accepted from a single inbound `CallMeMaybe`.
+///
+/// Anti-amplification cap. A `CallMeMaybe` carries a peer's candidate endpoints, each of which we
+/// disco-ping from the real host socket to try to open a direct path. The wire message is only
+/// bounded by the transport frame size (~64 KiB over DERP ≈ 3,600 endpoints at 18 bytes each), so
+/// without a cap an authenticated-but-malicious tailnet peer could make this node emit thousands of
+/// host-sourced UDP probes per ping interval at attacker-chosen public IPs — an SSRF-style scanner /
+/// amplifier sourced from this node's real IP. We keep only the first N (the order the peer
+/// serialized them, freshest-first by convention) and drop the rest.
+///
+/// Upstream Go v1.100.0 has **no** per-message cap here (its `handleCallMeMaybe` ingests and pings
+/// every endpoint, and its soft >100 candidate prune explicitly exempts CallMeMaybe-sourced entries),
+/// so this is deliberately *stricter* than Go. Kept separate from `MAX_REFLEXIVE_ADDRS` (the
+/// send-side self-endpoint cap) so the receive and send limits can diverge.
+pub const MAX_INBOUND_CALLMEMAYBE_ENDPOINTS: usize = 16;
+
 /// A per-ping transaction id (12 bytes, matching the wire format).
 pub type TxId = [u8; 12];
 
@@ -174,7 +190,14 @@ pub fn open(our_disco: &DiscoPrivateKey, buf: &mut [u8]) -> Result<Inbound, Disc
         }
         Some(MessageType::CallMeMaybe) => {
             let cmm = plain.as_msg::<CallMeMaybe>().ok_or(DiscoError::Malformed)?;
-            let endpoints = cmm.endpoints.iter().map(|e| e.socket_addr()).collect();
+            // Cap the endpoints we accept from one message (anti-amplification — see
+            // [`MAX_INBOUND_CALLMEMAYBE_ENDPOINTS`]). Keep the first N the peer listed.
+            let endpoints = cmm
+                .endpoints
+                .iter()
+                .take(MAX_INBOUND_CALLMEMAYBE_ENDPOINTS)
+                .map(|e| e.socket_addr())
+                .collect();
             Ok(Inbound::CallMeMaybe { sender, endpoints })
         }
         _ => Err(DiscoError::UnknownMessageType),
@@ -274,6 +297,82 @@ mod tests {
                 assert_eq!(sender, a_sk.public_key());
                 assert_eq!(endpoints, eps);
             }
+            other => panic!("expected call-me-maybe, got {other:?}"),
+        }
+    }
+
+    /// Anti-amplification: a `CallMeMaybe` advertising far more than
+    /// [`MAX_INBOUND_CALLMEMAYBE_ENDPOINTS`] is accepted but only its first N endpoints are kept,
+    /// so a malicious peer can't make us disco-ping thousands of attacker-chosen addresses from one
+    /// datagram.
+    #[test]
+    fn call_me_maybe_endpoints_capped_to_first_n() {
+        let (a_sk, _a_pk) = keypair();
+        let (b_sk, b_pk) = keypair();
+
+        // Build a list well over the cap with distinct, order-revealing addresses.
+        let over = MAX_INBOUND_CALLMEMAYBE_ENDPOINTS + 50;
+        let eps: Vec<SocketAddr> = (0..over)
+            .map(|i| format!("203.0.113.7:{}", 40000 + i as u16).parse().unwrap())
+            .collect();
+
+        let wire = seal_call_me_maybe(&a_sk, &b_pk, &eps).unwrap();
+        let mut buf = wire;
+        match open(&b_sk, &mut buf).unwrap() {
+            Inbound::CallMeMaybe { endpoints, .. } => {
+                assert_eq!(
+                    endpoints.len(),
+                    MAX_INBOUND_CALLMEMAYBE_ENDPOINTS,
+                    "endpoints must be capped at MAX_INBOUND_CALLMEMAYBE_ENDPOINTS"
+                );
+                // The kept ones are the FIRST N, in order.
+                assert_eq!(
+                    endpoints,
+                    eps[..MAX_INBOUND_CALLMEMAYBE_ENDPOINTS].to_vec(),
+                    "the kept endpoints must be the first N the peer listed"
+                );
+            }
+            other => panic!("expected call-me-maybe, got {other:?}"),
+        }
+    }
+
+    /// Exact N→N+1 boundary: one endpoint over the cap drops precisely the last (overflow) one and
+    /// keeps the first N — pinning the `>= cap` / `take(N)` operators against an off-by-one.
+    #[test]
+    fn call_me_maybe_drops_exactly_the_overflow_endpoint() {
+        let (a_sk, _a_pk) = keypair();
+        let (b_sk, b_pk) = keypair();
+        let eps: Vec<SocketAddr> = (0..MAX_INBOUND_CALLMEMAYBE_ENDPOINTS + 1)
+            .map(|i| format!("203.0.113.7:{}", 40000 + i as u16).parse().unwrap())
+            .collect();
+
+        let wire = seal_call_me_maybe(&a_sk, &b_pk, &eps).unwrap();
+        let mut buf = wire;
+        match open(&b_sk, &mut buf).unwrap() {
+            Inbound::CallMeMaybe { endpoints, .. } => {
+                assert_eq!(endpoints, eps[..MAX_INBOUND_CALLMEMAYBE_ENDPOINTS].to_vec());
+                assert!(
+                    !endpoints.contains(eps.last().unwrap()),
+                    "the single overflow endpoint must be the one dropped"
+                );
+            }
+            other => panic!("expected call-me-maybe, got {other:?}"),
+        }
+    }
+
+    /// A `CallMeMaybe` at or under the cap is unaffected (no truncation of a legitimate list).
+    #[test]
+    fn call_me_maybe_at_cap_is_unchanged() {
+        let (a_sk, _a_pk) = keypair();
+        let (b_sk, b_pk) = keypair();
+        let eps: Vec<SocketAddr> = (0..MAX_INBOUND_CALLMEMAYBE_ENDPOINTS)
+            .map(|i| format!("198.51.100.2:{}", 3478 + i as u16).parse().unwrap())
+            .collect();
+
+        let wire = seal_call_me_maybe(&a_sk, &b_pk, &eps).unwrap();
+        let mut buf = wire;
+        match open(&b_sk, &mut buf).unwrap() {
+            Inbound::CallMeMaybe { endpoints, .. } => assert_eq!(endpoints, eps),
             other => panic!("expected call-me-maybe, got {other:?}"),
         }
     }

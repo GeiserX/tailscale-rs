@@ -1782,6 +1782,55 @@ mod tests {
         assert!(!a2d.contains_key(&private), "private must not be learned");
     }
 
+    /// End-to-end through the live ingress (`add_peer_endpoints`): the per-peer learned cap holds
+    /// across the `is_pingable_candidate` filter, and the filter runs FIRST so forbidden candidates
+    /// don't consume cap budget. This is the composition the per-message (disco) and per-peer (path)
+    /// caps only exercise in isolation — and the same sink the inbound-ping-source path feeds, so it
+    /// also covers that ingress's bound. Cap value mirrors `path::MAX_LEARNED_CANDIDATES_PER_PEER`
+    /// (private to `path`; hardcoded here as the sibling tests hardcode their fixtures).
+    #[tokio::test]
+    async fn add_peer_endpoints_caps_learned_after_filtering() {
+        const MAX_LEARNED_PER_PEER: usize = 32;
+
+        let a = MagicSock::bind(
+            localhost(),
+            DiscoPrivateKey::random(),
+            ts_keys::NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap();
+        let peer = DiscoPrivateKey::random().public_key();
+
+        // A flood of private addresses — all dropped by `is_pingable_candidate` — must NOT consume
+        // cap budget (the filter runs before the per-peer cap).
+        let junk: Vec<SocketAddr> = (0..40)
+            .map(|i| format!("192.168.1.{}:41641", i).parse().unwrap())
+            .collect();
+        a.add_peer_endpoints(peer, junk);
+
+        // Then more PUBLIC candidates than the cap, across two batches (mimicking repeated
+        // CallMeMaybes): the learned set clamps to exactly the per-peer cap.
+        for batch in 0..2u16 {
+            let public: Vec<SocketAddr> = (0..30)
+                .map(|i| {
+                    format!("203.0.113.{}:{}", batch + 1, 40000 + i as u16)
+                        .parse()
+                        .unwrap()
+                })
+                .collect();
+            a.add_peer_endpoints(peer, public);
+        }
+
+        let n = {
+            let paths = a.paths.lock().unwrap();
+            paths.get(&peer).unwrap().candidate_addrs().len()
+        };
+        assert_eq!(
+            n, MAX_LEARNED_PER_PEER,
+            "public candidates clamp to the per-peer learned cap; filtered junk consumed no budget"
+        );
+    }
+
     /// If every offered candidate is forbidden, the peer is not even created as a paths entry
     /// (nothing to ping), and no attribution is learned.
     #[tokio::test]
