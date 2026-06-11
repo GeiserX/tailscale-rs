@@ -1237,6 +1237,24 @@ impl Device {
             .map_err(Into::into)
     }
 
+    /// Advertise (or stop advertising) this node as an **exit node** at runtime — Go `tailscale set
+    /// --advertise-exit-node`. The runtime equivalent of
+    /// [`Config::advertise_exit_node`](crate::Config::advertise_exit_node): when `enable` it adds the
+    /// `0.0.0.0/0` default route to what this node advertises (and forwards), when `false` it removes
+    /// it.
+    ///
+    /// Composes with [`set_advertise_routes`](Device::set_advertise_routes): the explicit subnet
+    /// routes and the exit-node advertisement are independent — toggling one preserves the other.
+    /// Advertising an exit node only makes this node *eligible*; control + the peer still decide
+    /// whether to route through it. Only NEW forwarded flows see the change; in-flight flows keep
+    /// their routing.
+    pub async fn set_advertise_exit_node(&self, enable: bool) -> Result<(), Error> {
+        self.runtime
+            .set_advertise_exit_node(enable)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Re-bind the underlay UDP socket after a **network/link change** — Wi-Fi switch, sleep/wake,
     /// or any event that invalidates the device's local address/NAT mapping. This is the Rust
     /// analog of Go magicsock's `Conn.Rebind()`.

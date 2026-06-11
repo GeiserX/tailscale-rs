@@ -106,6 +106,10 @@ pub struct Runtime {
     /// Receiver for the retained peer-capability grants, fed by the packet-filter updater. Read by
     /// [`Runtime::whois`] to resolve the flow-scoped cap map (Go `apitype.WhoIsResponse.CapMap`).
     cap_grants_rx: watch::Receiver<packetfilter::CapGrants>,
+    /// Live advertised-route preference (explicit subnet routes + the exit-node flag), seeded from
+    /// the startup config. [`Runtime::set_advertise_routes`] and [`set_advertise_exit_node`] each
+    /// mutate their part under this lock then re-send the composed set, so the two compose.
+    advertise: std::sync::Mutex<AdvertiseState>,
 }
 
 impl Runtime {
@@ -266,6 +270,13 @@ impl Runtime {
         // being tied to a `Self` that never gets constructed on a hard registration failure.
         let (state_tx, state_rx) = watch::channel(DeviceState::Connecting);
 
+        // Seed the live advertised-route preference from the startup config before `config` moves
+        // into the control runner, so the runtime setters compose against the configured baseline.
+        let advertise = std::sync::Mutex::new(AdvertiseState {
+            routes: config.advertise_routes.clone(),
+            exit_node: config.advertise_exit_node,
+        });
+
         let control = ControlRunner::spawn(control_runner::Params {
             config,
             auth_key,
@@ -288,6 +299,7 @@ impl Runtime {
             active_exit_rx,
             state_rx,
             cap_grants_rx,
+            advertise,
         })
     }
 
@@ -762,22 +774,45 @@ impl Runtime {
     /// and forwarder are fed the identical final set. This sets the explicit subnet prefixes only; it
     /// does NOT touch the exit-node `0.0.0.0/0` advertisement (a separate concern).
     pub async fn set_advertise_routes(&self, routes: Vec<ipnet::IpNet>) -> Result<(), Error> {
-        // IPv4-only + dedup, mirroring `ts_control::Config::advertised_routes` so the wire grant and
-        // the forwarder accept set never disagree.
-        let filtered = filter_advertise_routes(routes);
+        // Update the explicit-subnet part of the live preference, keep the exit-node flag, and
+        // re-send the composed set. Composes with `set_advertise_exit_node` (neither clobbers the
+        // other's contribution to `Hostinfo.RoutableIPs`).
+        let composed = {
+            let mut adv = self.advertise.lock().unwrap_or_else(|p| p.into_inner());
+            adv.routes = routes;
+            compose_advertised_routes(adv.routes.clone(), adv.exit_node)
+        };
+        self.apply_advertised_routes(composed).await
+    }
 
-        // Local half first: start forwarding the prefixes before control grants them, so there is no
-        // window where control has granted a route the node black-holes. (The reverse order would
-        // briefly advertise a route we don't yet forward.) New flows pick up the table immediately.
+    /// Advertise (or stop advertising) this node as an **exit node** — the `0.0.0.0/0` default route
+    /// (Go `tailscale set --advertise-exit-node`). Composes with
+    /// [`set_advertise_routes`](Self::set_advertise_routes): toggling the exit node re-sends the
+    /// explicit subnet routes plus (when `enable`) `0.0.0.0/0`, so the two preferences are
+    /// independent. Like `set_advertise_routes`, this both re-advertises `Hostinfo.RoutableIPs` to
+    /// control AND updates the forwarder's accept/dial set, applied together. Control still gates
+    /// whether the advertised exit node is actually *usable* by peers (this only advertises it).
+    pub async fn set_advertise_exit_node(&self, enable: bool) -> Result<(), Error> {
+        let composed = {
+            let mut adv = self.advertise.lock().unwrap_or_else(|p| p.into_inner());
+            adv.exit_node = enable;
+            compose_advertised_routes(adv.routes.clone(), adv.exit_node)
+        };
+        self.apply_advertised_routes(composed).await
+    }
+
+    /// Push a freshly-composed advertised-route set to BOTH halves: the forwarder's accept/dial
+    /// table (local) FIRST — so the node forwards a prefix before control grants it, never the
+    /// reverse — then re-advertise `Hostinfo.RoutableIPs` to control on the live map-poll connection
+    /// (wire). `composed` is already filtered + exit-node-folded by [`compose_advertised_routes`].
+    async fn apply_advertised_routes(&self, composed: Vec<ipnet::IpNet>) -> Result<(), Error> {
         self.forwarder
             .ask(forwarder_actor::UpdateRoutes {
-                routes: filtered.clone(),
+                routes: composed.clone(),
             })
             .await?;
-
-        // Wire half: re-advertise to control on the live map-poll connection.
         self.control
-            .ask(control_runner::SetAdvertiseRoutes { routes: filtered })
+            .ask(control_runner::SetAdvertiseRoutes { routes: composed })
             .await
             .map_err(Into::into)
     }
@@ -946,6 +981,39 @@ fn filter_advertise_routes(routes: Vec<ipnet::IpNet>) -> Vec<ipnet::IpNet> {
     filtered
 }
 
+/// Compose the final advertised-route set from the explicit subnet `routes` and the exit-node flag,
+/// mirroring [`ts_control::Config::advertised_routes`]: the IPv4-only, deduplicated subnet prefixes,
+/// plus `0.0.0.0/0` appended when `exit_node` is set. This is the single source of truth both
+/// runtime advertise mutators (`set_advertise_routes`, `set_advertise_exit_node`) feed, so the two
+/// compose instead of clobbering. Factored out so the composition is unit-testable without an actor.
+fn compose_advertised_routes(routes: Vec<ipnet::IpNet>, exit_node: bool) -> Vec<ipnet::IpNet> {
+    let mut filtered = filter_advertise_routes(routes);
+    if exit_node {
+        let default_v4 = ipnet::IpNet::V4(
+            ipnet::Ipv4Net::new(core::net::Ipv4Addr::UNSPECIFIED, 0)
+                .expect("0.0.0.0/0 is a valid prefix"),
+        );
+        if !filtered.contains(&default_v4) {
+            filtered.push(default_v4);
+        }
+    }
+    filtered
+}
+
+/// The runtime's live advertised-route preference: the explicit subnet routes plus whether this node
+/// advertises itself as an exit node. Held behind a `Mutex` on the [`Runtime`] so
+/// [`Runtime::set_advertise_routes`] and [`Runtime::set_advertise_exit_node`] each mutate their own
+/// part and re-send the composed set — they compose rather than clobber (Go `EditPrefs` keeps
+/// `AdvertiseRoutes` and the exit-node advertisement as independent prefs that both feed
+/// `Hostinfo.RoutableIPs`).
+#[derive(Debug, Default, Clone)]
+struct AdvertiseState {
+    /// The explicit subnet prefixes (pre-filter; the last value passed to `set_advertise_routes`).
+    routes: Vec<ipnet::IpNet>,
+    /// Whether this node advertises the exit-node default route (`0.0.0.0/0`).
+    exit_node: bool,
+}
+
 /// Flatten a kameo delegated-reply [`SendError`] for the id-token RPC into the RPC's own
 /// [`ts_control::IdTokenError`].
 ///
@@ -1066,6 +1134,40 @@ mod tests {
     fn filter_advertise_routes_all_v6_is_empty() {
         let v6: ipnet::IpNet = "2001:db8::/32".parse().unwrap();
         assert!(filter_advertise_routes(vec![v6]).is_empty());
+    }
+
+    /// `compose_advertised_routes` folds the exit-node `0.0.0.0/0` onto the filtered subnet routes
+    /// when (and only when) the exit-node flag is set — so `set_advertise_routes` and
+    /// `set_advertise_exit_node` compose. The two preferences are independent.
+    #[test]
+    fn compose_advertised_routes_folds_exit_node() {
+        let subnet: ipnet::IpNet = "10.0.0.0/24".parse().unwrap();
+        let default_v4: ipnet::IpNet = "0.0.0.0/0".parse().unwrap();
+
+        // Exit node off: just the (filtered) subnet routes.
+        assert_eq!(
+            compose_advertised_routes(vec![subnet], false),
+            vec![subnet],
+            "exit-node off ⇒ no default route"
+        );
+        // Exit node on: subnet routes PLUS 0.0.0.0/0.
+        assert_eq!(
+            compose_advertised_routes(vec![subnet], true),
+            vec![subnet, default_v4],
+            "exit-node on ⇒ 0.0.0.0/0 appended"
+        );
+        // Exit node on with NO subnet routes: just the default route.
+        assert_eq!(
+            compose_advertised_routes(vec![], true),
+            vec![default_v4],
+            "exit-node alone advertises only 0.0.0.0/0"
+        );
+        // Idempotent: an explicit 0.0.0.0/0 already in the routes isn't duplicated by the fold.
+        assert_eq!(
+            compose_advertised_routes(vec![default_v4], true),
+            vec![default_v4],
+            "the exit-node fold dedups against an explicit default route"
+        );
     }
 
     /// A `HandlerError` carries the real `IdTokenError` from the RPC handler and must pass through
