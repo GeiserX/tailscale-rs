@@ -630,9 +630,10 @@ impl Runtime {
         };
 
         // Fill the flow-scoped cap map: src = this node's own tailnet IP (of the dst's family),
-        // dst = the queried address. A grant applies when src ∈ its src prefixes AND dst ∈ its dst
-        // prefixes (Go `Filter.CapsWithValues`). Resolve our own IP from the self node; if it isn't
-        // known yet, leave the map empty (no grants resolvable without a source).
+        // dst = the queried address. A grant applies when its source matches the flow source — `src`
+        // ∈ its src prefixes OR this node holds one of its source node-caps — AND `dst` ∈ its dst
+        // prefixes (Go `Filter.CapsWithValues`). Resolve our own IP + cap map from the self node; if
+        // it isn't known yet, leave the map empty (no grants resolvable without a source).
         let dst = addr.ip();
         if let Some(self_node) = self.control.ask(control_runner::SelfNode).await? {
             let src: core::net::IpAddr = if dst.is_ipv6() {
@@ -641,7 +642,9 @@ impl Runtime {
                 self_node.tailnet_address.ipv4.addr().into()
             };
             let grants = self.cap_grants_rx.borrow();
-            whois.cap_map = ts_packetfilter_state::caps_for(&grants, src, dst);
+            whois.cap_map = ts_packetfilter_state::caps_for(&grants, src, dst, |cap| {
+                self_node.has_node_attr(cap)
+            });
         }
 
         Ok(Some(whois))
