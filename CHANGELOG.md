@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.20.0](https://github.com/GeiserX/tailscale-rs/compare/v0.19.0...v0.20.0) (2026-06-11)
+
+
+### Features
+
+* **status:** surface per-peer current direct endpoint (CurAddr) in Status ([#77](https://github.com/GeiserX/tailscale-rs/issues/77)) ([6dc0d30](https://github.com/GeiserX/tailscale-rs/commit/6dc0d30d83fc7c523fd16d38937f4d3a224a4c9d))
+
 ## [0.19.0](https://github.com/GeiserX/tailscale-rs/compare/v0.18.2...v0.19.0) (2026-06-11)
 
 
