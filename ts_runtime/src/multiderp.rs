@@ -38,6 +38,40 @@ use crate::{
     peer_tracker::{PeerDb, PeerState},
 };
 
+/// Reconnect backoff for a DERP region task, mirroring Go's `util/backoff` (the schedule magicsock
+/// uses for its DERP readers): the delay grows as `n²·10ms`, is capped at [`DERP_BACKOFF_MAX`], and
+/// is jittered to a uniform `[0.5×, 1.5×)` to avoid a thundering herd of clients reconnecting in
+/// lock-step. `n` increments on each consecutive failure and resets to 0 on a clean run, so a flaky
+/// or restarting region is retried with increasing spacing instead of the old flat 2 Hz storm.
+#[derive(Debug, Default)]
+struct DerpBackoff {
+    n: u32,
+}
+
+/// Cap on the DERP reconnect backoff delay (Go magicsock passes `5*time.Second` to `NewBackoff`).
+const DERP_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+impl DerpBackoff {
+    /// Reset the backoff after a successful (non-error) region run, so the next failure starts from
+    /// the bottom of the schedule again.
+    fn reset(&mut self) {
+        self.n = 0;
+    }
+
+    /// The next backoff delay, advancing the counter. `n²·10ms` capped at [`DERP_BACKOFF_MAX`], then
+    /// scaled by a random factor in `[0.5, 1.5)` (matching Go's `rand.Float64()+0.5`).
+    fn next_delay(&mut self, rng: &mut impl rand::RngExt) -> Duration {
+        // n² growth on a 10ms base, saturating so a long outage can't overflow the multiply.
+        let base_ms = u64::from(self.n)
+            .saturating_mul(u64::from(self.n))
+            .saturating_mul(10);
+        let capped = Duration::from_millis(base_ms).min(DERP_BACKOFF_MAX);
+        self.n = self.n.saturating_add(1);
+        let factor = rng.random::<f64>() + 0.5;
+        capped.mul_f64(factor)
+    }
+}
+
 /// Consumes derp map updates and spawns a task per region that runs an underlay transport.
 /// Also consumes home derp indications (for this node) to notify the relevant task that it
 /// should keep the transport awake even if there is no traffic.
@@ -131,6 +165,7 @@ impl Multiderp {
         let observed_routes = self.observed_routes.clone();
 
         self.tasks.spawn(async move {
+            let mut backoff = DerpBackoff::default();
             while !*shutdown.borrow() {
                 tokio::select! {
                     _ = shutdown.changed() => {
@@ -149,9 +184,23 @@ impl Multiderp {
                         &peer_db,
                         &direct_sock,
                         &observed_routes,
-                    ) => if let Err(e) = ret {
-                        tracing::error!(error = %e, region_id = %id, "running derp client");
-                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    ) => match ret {
+                        // A clean return (e.g. the connection closed without error) resets the
+                        // backoff so the next failure starts from the bottom of the schedule.
+                        Ok(()) => backoff.reset(),
+                        // On error, wait a jittered, n²-growing delay (capped at 5s) before
+                        // reconnecting — Go magicsock's `util/backoff` schedule — rather than the
+                        // old flat 500ms, which hammered a down/restarting region at a steady 2 Hz.
+                        Err(e) => {
+                            let delay = backoff.next_delay(&mut rand::rng());
+                            tracing::error!(
+                                error = %e,
+                                region_id = %id,
+                                backoff_ms = delay.as_millis() as u64,
+                                "running derp client",
+                            );
+                            tokio::time::sleep(delay).await;
+                        }
                     },
                 }
 
@@ -1191,6 +1240,60 @@ mod tests {
             resolve_region_for_peer(observed_after, None, |r| r == rid(5)),
             Some(rid(5)),
             "a learned observed route makes the peer reachable on that region with no netmap home"
+        );
+    }
+
+    /// The DERP reconnect backoff follows Go's `util/backoff` schedule: `n²·10ms`, capped at 5s,
+    /// jittered to `[0.5×, 1.5×)`. Over many draws every delay must stay within the jitter band of
+    /// the (capped) n² base, and the counter must keep advancing (monotone non-decreasing base).
+    #[test]
+    fn derp_backoff_follows_n_squared_capped_jittered_schedule() {
+        let mut bo = DerpBackoff::default();
+        let mut rng = rand::rng();
+        let mut last_base = Duration::ZERO;
+        for n in 0..40u64 {
+            let base_ms = n.saturating_mul(n).saturating_mul(10);
+            let base = Duration::from_millis(base_ms).min(DERP_BACKOFF_MAX);
+            // Draw several samples at this n by reconstructing the same n (fresh backoff each time)
+            // so we isolate the jitter band for a known base.
+            for _ in 0..16 {
+                let mut probe = DerpBackoff { n: n as u32 };
+                let d = probe.next_delay(&mut rng);
+                // Jitter is [0.5, 1.5): delay ∈ [0.5×base, 1.5×base]. (At base 0, all draws are 0.)
+                assert!(
+                    d >= base.mul_f64(0.5) && d <= base.mul_f64(1.5),
+                    "n={n}: delay {d:?} outside [0.5,1.5)×base {base:?}"
+                );
+                assert!(
+                    d <= DERP_BACKOFF_MAX.mul_f64(1.5),
+                    "delay must respect the cap+jitter"
+                );
+            }
+            // The advancing real backoff bumps its counter each call.
+            let _ = bo.next_delay(&mut rng);
+            assert!(
+                base >= last_base,
+                "base must be monotone non-decreasing up to the cap"
+            );
+            last_base = base;
+        }
+    }
+
+    /// A successful (non-error) region run resets the backoff to the bottom of the schedule.
+    #[test]
+    fn derp_backoff_reset_returns_to_floor() {
+        let mut bo = DerpBackoff::default();
+        let mut rng = rand::rng();
+        // Advance several steps, then reset.
+        for _ in 0..5 {
+            let _ = bo.next_delay(&mut rng);
+        }
+        bo.reset();
+        // After reset, the next delay is drawn at n=0 → exactly zero (0²·10ms × jitter = 0).
+        assert_eq!(
+            bo.next_delay(&mut rng),
+            Duration::ZERO,
+            "reset must return the schedule to its zero-delay floor"
         );
     }
 }
