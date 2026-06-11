@@ -745,6 +745,17 @@ impl MagicSock {
         paths.get(peer)?.best_addr(Instant::now())
     }
 
+    /// The current best confirmed direct address for a peer **and its last-measured RTT**, or `None`
+    /// if there is no trusted direct path. The latency is from the most recent confirming pong (up
+    /// to one probe interval stale). Used to report per-peer direct-path latency.
+    pub fn best_addr_and_latency(
+        &self,
+        peer: &DiscoPublicKey,
+    ) -> Option<(SocketAddr, core::time::Duration)> {
+        let paths = lock(&self.paths);
+        paths.get(peer)?.best_addr_and_latency(Instant::now())
+    }
+
     /// Send a WireGuard datagram to a peer over its confirmed direct path.
     ///
     /// Fails with [`Error::NoPath`] if no trusted direct path exists. This is deliberately a

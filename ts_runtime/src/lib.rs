@@ -573,6 +573,41 @@ impl Runtime {
             .map_err(Into::into)
     }
 
+    /// The current direct-path status to the peer holding tailnet IP `dst`: its confirmed direct UDP
+    /// endpoint and that path's last-measured RTT, or `None` when there is no direct path right now
+    /// (the peer is relayed via DERP, is unknown, or has no disco key).
+    ///
+    /// The latency is the RTT of the most recent disco ping/pong that confirmed the path — a live
+    /// snapshot up to one probe interval stale, NOT a fresh on-demand round-trip (that is a separate,
+    /// heavier capability). Mirrors the direct-path latency Go surfaces for `ipnstate.PeerStatus`.
+    pub async fn direct_path(
+        &self,
+        dst: core::net::IpAddr,
+    ) -> Result<Option<(core::net::SocketAddr, Duration)>, Error> {
+        let peer_tracker = self.peer_tracker.upgrade().ok_or(Error {
+            kind: ErrorKind::ActorGone,
+            target_actor: None,
+            message_ty: None,
+        })?;
+
+        // Resolve the tailnet IP to its node, then to its disco key. No node / no disco key ⇒ no
+        // direct path is possible (a peer with no disco key can only be reached via DERP).
+        let Some(node) = peer_tracker
+            .ask(peer_tracker::PeerByTailnetIp { ip: dst })
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(disco) = node.disco_key else {
+            return Ok(None);
+        };
+
+        self.direct
+            .ask(direct::DirectPathLatency { disco })
+            .await
+            .map_err(Into::into)
+    }
+
     /// Change the selected exit node at runtime (the equivalent of Go `tsnet`'s
     /// `LocalClient.EditPrefs(ExitNodeID/ExitNodeIP)`), without recreating the device.
     ///

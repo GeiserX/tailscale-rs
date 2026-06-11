@@ -1337,6 +1337,21 @@ impl Device {
         ts_netstack_smoltcp::ping(channel, src, dst, timeout).await
     }
 
+    /// The current **direct path** to the peer at tailnet IP `dst`: its confirmed direct UDP
+    /// endpoint and that path's last-measured round-trip latency, or `None` when traffic to the peer
+    /// is **relayed via DERP** (no trusted direct path right now), the peer is unknown, or it has no
+    /// disco key.
+    ///
+    /// This is the direct-path analog of Go's `tailscale ping`/`PeerStatus` connectivity: a present
+    /// result means packets reach the peer directly at the returned address, with roughly the
+    /// returned RTT. The latency is a live snapshot taken from the most recent disco ping/pong that
+    /// confirmed the path (up to one probe interval stale) — not a fresh on-demand round-trip. Unlike
+    /// [`ping`](Device::ping) (an ICMP echo over the netstack), this reports the *underlay* path the
+    /// data plane actually uses, distinguishing a direct connection from a DERP-relayed one.
+    pub async fn direct_path(&self, dst: IpAddr) -> Result<Option<(SocketAddr, Duration)>, Error> {
+        self.runtime.direct_path(dst).await.map_err(Into::into)
+    }
+
     /// Obtain a TLS certificate for a node's MagicDNS `name` (like `tsnet`'s `GetCertificate`).
     ///
     /// **Fail-closed without the `acme` feature.** By default this fork has no client-side ACME

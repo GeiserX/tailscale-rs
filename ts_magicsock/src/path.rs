@@ -219,6 +219,21 @@ impl PeerPaths {
         }
     }
 
+    /// The current best direct address **and its last-measured round-trip latency**, if a trusted
+    /// direct path is confirmed. `None` under the same condition as [`best_addr`](Self::best_addr)
+    /// (no path / trust expired). The latency is the RTT from the most recent ping/pong that
+    /// confirmed this path — up to one probe interval stale, not a fresh on-demand measurement.
+    /// Backs the per-peer direct-path latency a status/ping reporter surfaces (Go
+    /// `ipnstate.PeerStatus`-style RTT).
+    pub fn best_addr_and_latency(&self, now: Instant) -> Option<(SocketAddr, Duration)> {
+        let best = self.best_addr(now)?;
+        // The best addr is only ever set by `recompute_best` from a candidate that has a measured
+        // latency, so this lookup is `Some` whenever `best_addr` is — but resolve it through the map
+        // rather than assume, so a future change to `best` selection can't silently desync.
+        let latency = self.candidates.get(&best).and_then(|c| c.latency)?;
+        Some((best, latency))
+    }
+
     /// Whether the best path warrants a re-ping. Fires once the path is within
     /// [`REFRESH_BEFORE_EXPIRY`] of its `trust_until` — *proactively, before* trust lapses — so a
     /// fresh pong re-confirms the path inside the current trust window and `best_addr` never goes
@@ -281,6 +296,41 @@ mod tests {
 
         let after = now + Duration::from_millis(11);
         assert_eq!(p.best_addr(after), Some(addr), "pong should confirm path");
+    }
+
+    /// `best_addr_and_latency` returns the confirmed best addr together with its measured RTT, and
+    /// `None` under exactly the same conditions as `best_addr` (no path yet / trust expired).
+    #[test]
+    fn best_addr_and_latency_reports_rtt() {
+        let mut p = PeerPaths::default();
+        let addr: SocketAddr = "203.0.113.1:41641".parse().unwrap();
+        p.add_netmap_candidates([addr]);
+
+        let now = Instant::now();
+        assert_eq!(
+            p.best_addr_and_latency(now),
+            None,
+            "no addr+latency before any pong"
+        );
+
+        p.note_ping_sent(tx(1), addr, now);
+        p.note_pong(tx(1), addr, now + Duration::from_millis(10));
+
+        let after = now + Duration::from_millis(11);
+        assert_eq!(
+            p.best_addr_and_latency(after),
+            Some((addr, Duration::from_millis(10))),
+            "a confirmed path reports its addr and measured RTT"
+        );
+
+        // Past the trust window it falls back to None, in lockstep with best_addr.
+        let expired = now + TRUST_DURATION + Duration::from_secs(1);
+        assert_eq!(p.best_addr(expired), None);
+        assert_eq!(
+            p.best_addr_and_latency(expired),
+            None,
+            "expired trust drops addr+latency just like best_addr"
+        );
     }
 
     #[test]
