@@ -278,6 +278,20 @@ impl NodeKeySignature {
         }
     }
 
+    /// The rotation pubkey this signature wraps (Go `NodeKeySignature.wrappingPublic`). If this
+    /// signature carries a `wrapping_pubkey`, that is it; otherwise — for a rotation — recurse into
+    /// the nested signature (intermediate rotation layers may omit their own wrapping pubkey, in
+    /// which case the inner one applies). `None` for a non-rotation with no wrapping pubkey.
+    fn wrapping_public(&self) -> Option<&[u8]> {
+        if !self.wrapping_pubkey.is_empty() {
+            return Some(&self.wrapping_pubkey);
+        }
+        match self.sig_kind {
+            SigKind::Rotation => self.nested.as_ref()?.wrapping_public(),
+            _ => None,
+        }
+    }
+
     /// Verify this signature authorizes `node_key`, rooted in the trusted `verification_key` (Go
     /// `NodeKeySignature.verifySignature`).
     fn verify_signature(&self, node_key: &[u8], verification_key: &Key) -> Result<(), TkaError> {
@@ -294,23 +308,32 @@ impl NodeKeySignature {
                     .nested
                     .as_ref()
                     .ok_or(TkaError::Decode("rotation signature missing nested"))?;
-                // The outer rotation signature is verified with STANDARD ed25519 against the nested
-                // signature's wrapping public key.
-                let verify_pub = &nested.wrapping_pubkey;
+                // The outer rotation signature is verified with STANDARD ed25519 against the rotation
+                // pubkey. Go resolves this via `s.Nested.wrappingPublic()`, which RECURSES: an
+                // intermediate rotation layer may omit its own `WrappingPubkey`, in which case the
+                // next-inner one applies. (Reading `nested.wrapping_pubkey` directly broke multi-level
+                // rotation chains — the deny-direction consensus split this fixes.)
+                let verify_pub = nested
+                    .wrapping_public()
+                    .ok_or(TkaError::Decode("missing rotation key"))?;
                 if verify_pub.len() != 32 {
                     return Err(TkaError::Decode("wrapping pubkey wrong length"));
                 }
                 verify_ed25519_std(verify_pub, &sig_hash, &self.signature)?;
-                // The nested signature must cover the rotation pivot (`verify_pub`). For a nested
-                // Direct this is enforced inside its own `verify_signature` (the non-credential
-                // `pubkey != node_key` check). A nested Credential SKIPS that check, so bind it
-                // here: the credential must cover exactly the wrapping pubkey it is rotating, or an
-                // attacker could splice an unrelated valid credential into the chain.
-                if nested.sig_kind == SigKind::Credential && nested.pubkey != *verify_pub {
-                    return Err(TkaError::NodeKeyMismatch);
-                }
-                // Then the nested signature must itself be valid, rooting in the trusted key.
-                nested.verify_signature(verify_pub, verification_key)
+                // Recurse to verify the nested signature, rooting in the trusted key. The nested node
+                // key Go passes is the nested signature's own `Pubkey` — EXCEPT for a nested
+                // Credential, which "certifies an indirection key rather than a node key, so there's
+                // no need to check the node key" (Go passes an empty node key, and the nested
+                // `verify_signature` skips its `pubkey != node_key` check for `Credential`). We must
+                // NOT add an extra `nested.pubkey == verify_pub` bind here — Go has none, and a
+                // SigCredential leaves `Pubkey` unused, so that bind wrongly rejected legitimate
+                // credential-provisioned peers.
+                let nested_node_key: &[u8] = if nested.sig_kind == SigKind::Credential {
+                    &[]
+                } else {
+                    &nested.pubkey
+                };
+                nested.verify_signature(nested_node_key, verification_key)
             }
             SigKind::Direct | SigKind::Credential => {
                 if self.nested.is_some() {
@@ -2550,10 +2573,18 @@ mod tests {
         );
     }
 
-    // ----- Fix 2: nested-Credential pubkey must bind to the rotation pivot -----
+    // ----- tsr-358: nested-Credential `pubkey` is UNUSED (Go parity) -----
 
+    /// A rotation wrapping a nested **Credential** must verify regardless of the credential's
+    /// `pubkey` field — Go's `SigCredential` "certifies an indirection key rather than a node key,
+    /// so there's no need to check the node key", and `verifySignature` adds NO `nested.pubkey ==
+    /// wrappingPublic` bind. The pre-fix code rejected the real Go shape (empty credential `pubkey`)
+    /// and only accepted a fork-invented `pubkey == wrapping_pub` construction — a deny-direction
+    /// consensus split (legitimate credential-provisioned peers wrongly denied under enforce). This
+    /// pins the Go behavior: empty `pubkey` accepted, and an arbitrary (ignored) `pubkey` also
+    /// accepted; security comes purely from the two signatures verifying, not from the field.
     #[test]
-    fn rotation_nested_credential_pubkey_bind() {
+    fn rotation_nested_credential_pubkey_is_unused() {
         use ed25519_dalek::{Signer, SigningKey};
 
         let trusted = SigningKey::from_bytes(&[11u8; 32]);
@@ -2573,7 +2604,9 @@ mod tests {
             },
         );
 
-        // Helper: build a rotation wrapping a nested Credential whose `pubkey` is `cred_pubkey`.
+        // Build a rotation wrapping a nested Credential whose `pubkey` is `cred_pubkey`. The
+        // credential is signed by the trusted key over its own sig-hash; the credential's
+        // `wrapping_pubkey` is the rotation pivot the outer signature is verified against.
         let build = |cred_pubkey: Vec<u8>| -> Vec<u8> {
             let mut inner = NodeKeySignature {
                 sig_kind: SigKind::Credential,
@@ -2599,16 +2632,123 @@ mod tests {
             outer.to_cbor(true).to_vec()
         };
 
-        // Matching: credential covers exactly the wrapping pivot pubkey -> accepted.
-        let cbor_ok = build(wrapping_pub.clone());
-        assert!(auth.node_key_authorized(&node_key, &cbor_ok).is_ok());
+        // The real Go shape: a SigCredential leaves `Pubkey` EMPTY. Must be accepted.
+        let cbor_empty = build(Vec::new());
+        assert!(
+            auth.node_key_authorized(&node_key, &cbor_empty).is_ok(),
+            "a credential with empty pubkey (the Go shape) must verify"
+        );
 
-        // Mismatch: credential covers an unrelated pubkey -> rejected (NodeKeyMismatch), even though
-        // the credential is otherwise signed by the trusted key.
-        let cbor_bad = build(alloc::vec![0xaau8; 32]);
+        // An arbitrary credential `pubkey` is IGNORED (Go never checks it) — also accepted.
+        let cbor_arbitrary = build(alloc::vec![0xaau8; 32]);
+        assert!(
+            auth.node_key_authorized(&node_key, &cbor_arbitrary).is_ok(),
+            "a credential's pubkey is unused; an arbitrary value must not change the verdict"
+        );
+
+        // Sanity: tampering the OUTER rotation signature is still rejected (the real security gate).
+        let mut outer_bad_cbor = {
+            let mut inner = NodeKeySignature {
+                sig_kind: SigKind::Credential,
+                pubkey: Vec::new(),
+                key_id: trusted_pub.clone(),
+                signature: Vec::new(),
+                nested: None,
+                wrapping_pubkey: wrapping_pub.clone(),
+            };
+            let ih = inner.sig_hash();
+            inner.signature = trusted.sign(&ih).to_bytes().to_vec();
+            let mut outer = NodeKeySignature {
+                sig_kind: SigKind::Rotation,
+                pubkey: node_key.clone(),
+                key_id: Vec::new(),
+                signature: Vec::new(),
+                nested: Some(alloc::boxed::Box::new(inner)),
+                wrapping_pubkey: Vec::new(),
+            };
+            let oh = outer.sig_hash();
+            let mut sig = wrapping.sign(&oh).to_bytes().to_vec();
+            sig[0] ^= 0xff;
+            outer.signature = sig;
+            outer.to_cbor(true).to_vec()
+        };
         assert_eq!(
-            auth.node_key_authorized(&node_key, &cbor_bad).unwrap_err(),
-            TkaError::NodeKeyMismatch
+            auth.node_key_authorized(&node_key, &outer_bad_cbor)
+                .unwrap_err(),
+            TkaError::BadSignature,
+            "a tampered rotation-wrap signature must still be rejected"
+        );
+        outer_bad_cbor.clear();
+    }
+
+    /// Multi-level rotation: an intermediate rotation layer omits its own `wrapping_pubkey`, so the
+    /// outer signature's verify key must be resolved by RECURSING (`wrapping_public`) into the
+    /// inner-most layer that defines one — Go `NodeKeySignature.wrappingPublic`. The pre-fix code
+    /// read `nested.wrapping_pubkey` directly and rejected this with "wrapping pubkey wrong length"
+    /// (the second deny-direction consensus split).
+    #[test]
+    fn multi_level_rotation_resolves_wrapping_key_by_recursion() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let trusted = SigningKey::from_bytes(&[21u8; 32]);
+        let trusted_pub = trusted.verifying_key().to_bytes().to_vec();
+        // The single rotation pivot key, carried only on the INNERMOST signature.
+        let pivot = SigningKey::from_bytes(&[23u8; 32]);
+        let pivot_pub = pivot.verifying_key().to_bytes().to_vec();
+        let node_key = alloc::vec![7u8; 32];
+
+        let auth = Authority::from_state(
+            AumHash([0; 32]),
+            State {
+                keys: alloc::vec![Key {
+                    kind: KeyKind::Ed25519,
+                    votes: 1,
+                    public: trusted_pub.clone(),
+                }],
+            },
+        );
+
+        // Innermost: a Direct signature by the trusted key, carrying the pivot as its wrapping key.
+        let mut inner = NodeKeySignature {
+            sig_kind: SigKind::Direct,
+            pubkey: pivot_pub.clone(),
+            key_id: trusted_pub.clone(),
+            signature: Vec::new(),
+            nested: None,
+            wrapping_pubkey: pivot_pub.clone(),
+        };
+        let inner_hash = inner.sig_hash();
+        inner.signature = trusted.sign(&inner_hash).to_bytes().to_vec();
+
+        // Middle rotation: OMITS its own wrapping_pubkey (empty) — wrapping_public must recurse to
+        // `inner`'s pivot. Its outer-of-inner signature is verified under the pivot key.
+        let mut middle = NodeKeySignature {
+            sig_kind: SigKind::Rotation,
+            pubkey: pivot_pub.clone(),
+            key_id: Vec::new(),
+            signature: Vec::new(),
+            nested: Some(alloc::boxed::Box::new(inner)),
+            wrapping_pubkey: Vec::new(),
+        };
+        let middle_hash = middle.sig_hash();
+        middle.signature = pivot.sign(&middle_hash).to_bytes().to_vec();
+
+        // Outer rotation over `middle`: also resolves its verify key by recursing to the pivot.
+        let mut outer = NodeKeySignature {
+            sig_kind: SigKind::Rotation,
+            pubkey: node_key.clone(),
+            key_id: Vec::new(),
+            signature: Vec::new(),
+            nested: Some(alloc::boxed::Box::new(middle)),
+            wrapping_pubkey: Vec::new(),
+        };
+        let outer_hash = outer.sig_hash();
+        outer.signature = pivot.sign(&outer_hash).to_bytes().to_vec();
+
+        let cbor = outer.to_cbor(true).to_vec();
+        assert!(
+            auth.node_key_authorized(&node_key, &cbor).is_ok(),
+            "a multi-level rotation with an intermediate omitting wrapping_pubkey must verify via recursion"
         );
     }
 
