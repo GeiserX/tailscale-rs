@@ -186,6 +186,17 @@ impl DirectManager {
         addrs
     }
 
+    /// The current trusted direct endpoint **and its last-measured RTT** for the peer with this
+    /// disco key, or `None` if it has no direct path right now (relayed via DERP, or the underlay is
+    /// inert). The latency is the most recent confirming pong's RTT — up to one probe interval
+    /// stale, not a fresh on-demand measurement. Keyed by disco (the caller resolves the peer's
+    /// disco key from its node) so no `PeerId`↔node-id ambiguity enters here. Backs `Device`'s
+    /// direct-path report.
+    #[message]
+    pub fn direct_path_latency(&self, disco: DiscoPublicKey) -> Option<(SocketAddr, Duration)> {
+        self.sock.as_ref()?.best_addr_and_latency(&disco)
+    }
+
     /// Of the given peers, return those that currently have a trusted direct path — the key set of
     /// [`best_addrs`](Self::best_addrs). A peer is included only if its disco key is known and
     /// [`MagicSock::best_addr`] returns `Some` for it right now (live query — never cached — so trust
