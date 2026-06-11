@@ -1212,6 +1212,7 @@ mod tests {
             derp: None,
             node: Some(fixture_node()),
             peer_update: None,
+            peer_patches: Vec::new(),
             user_profiles: Vec::new(),
             ping: None,
             packetfilter: None,

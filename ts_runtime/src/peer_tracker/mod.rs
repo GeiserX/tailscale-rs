@@ -425,9 +425,9 @@ impl Message<Arc<ts_control::StateUpdate>> for PeerTracker {
         let liveness_changed =
             self.apply_liveness_changes(&msg.online_change, &msg.peer_seen_change);
 
-        let Some(peer_update) = &msg.peer_update else {
-            // No peer set/patch this response. If a liveness delta still mutated the netmap, publish
-            // the refreshed snapshot so watchers (and `GetStatus`) see the new online state.
+        if msg.peer_update.is_none() && msg.peer_patches.is_empty() {
+            // No peer set or patch this response. If a liveness delta still mutated the netmap,
+            // publish the refreshed snapshot so watchers (and `GetStatus`) see the new online state.
             if liveness_changed {
                 self.service_pending_requests();
                 self.peer_watch.send_replace(self.status_peers());
@@ -444,9 +444,32 @@ impl Message<Arc<ts_control::StateUpdate>> for PeerTracker {
                 }
             }
             return;
-        };
+        }
 
-        let (upserts, deletions) = self.apply_peer_update(peer_update);
+        // Apply the whole-node peer set (if any) FIRST, then the field-level patches on top —
+        // mirroring Go's `controlclient` order (`Peers*` then `PeersChangedPatch`). A response may
+        // carry either, both, or (with a liveness-only delta) neither. Merge the upsert/deletion sets
+        // so the published `PeerState` reflects every node touched by both passes; a node both
+        // upserted by the set and patched stays in `upserts` (the patch removes it from `deletions`).
+        let (mut upserts, mut deletions) = msg
+            .peer_update
+            .as_ref()
+            .map(|u| self.apply_peer_update(u))
+            .unwrap_or_default();
+
+        if !msg.peer_patches.is_empty() {
+            let (patch_upserts, patch_deletions) = self.apply_peer_patches(&msg.peer_patches);
+            // A patch can evict a node the set just upserted (TKA rejection after key rotation), or
+            // re-admit/patch one not in the set — reconcile so each id lands in exactly one set.
+            for id in &patch_upserts {
+                deletions.remove(id);
+            }
+            for id in &patch_deletions {
+                upserts.remove(id);
+            }
+            upserts.extend(patch_upserts);
+            deletions.extend(patch_deletions);
+        }
 
         tracing::debug!(
             n_upsert = upserts.len(),
@@ -599,81 +622,95 @@ impl PeerTracker {
                     deletions.insert(id);
                 }
             }
+        }
 
-            ts_control::PeerUpdate::Patch(patches) => {
-                tracing::trace!(n = patches.len(), "peer patch update");
+        (upserts, deletions)
+    }
 
-                for patch in patches {
-                    // A patch only mutates a peer already in the netmap; an unknown node id is
-                    // ignored (the wire contract — a patch never creates a node). Clone the current
-                    // node, apply the present fields, and re-upsert through the same path as a
-                    // delta so indexes/routes stay consistent.
-                    let Some((_id, existing)) = self.peer_db.get(&patch.id) else {
-                        tracing::debug!(
-                            control_node_id = patch.id,
-                            "peer patch for unknown node; ignoring"
-                        );
-                        continue;
-                    };
+    /// Apply field-level peer patches (`MapResponse.PeersChangedPatch`), returning the upserted /
+    /// deleted [`PeerId`]s.
+    ///
+    /// This is a SEPARATE channel from [`apply_peer_update`](Self::apply_peer_update): Go's
+    /// `controlclient` applies the whole-node `Peers*` set first and then `PeersChangedPatch`, so a
+    /// response that carries both has the peer set applied first (by the caller) and these patches
+    /// applied second, on top of the freshly-synced nodes. A patch only mutates a peer already in the
+    /// netmap; an unknown node id is ignored (the wire contract — a patch never creates a node).
+    fn apply_peer_patches(
+        &mut self,
+        patches: &[ts_control::PeerChange],
+    ) -> (HashSet<PeerId>, HashSet<PeerId>) {
+        let mut upserts = HashSet::default();
+        let mut deletions = HashSet::default();
 
-                    let mut node = existing.clone();
-                    if let Some(endpoints) = &patch.underlay_addresses {
-                        node.underlay_addresses = endpoints.clone();
-                    }
-                    if let Some(derp) = patch.derp_region {
-                        node.derp_region = Some(derp);
-                    }
-                    if let Some(cap) = patch.cap {
-                        node.cap = cap;
-                    }
-                    if let Some(cap_map) = &patch.cap_map {
-                        node.cap_map = cap_map.clone();
-                    }
-                    if let Some(disco_key) = patch.disco_key {
-                        node.disco_key = Some(disco_key);
-                    }
-                    if let Some(expiry) = patch.node_key_expiry {
-                        node.node_key_expiry = Some(expiry);
-                    }
-                    // Online/last-seen liveness deltas (`PeerChange.Online`/`LastSeen`) — the
-                    // dominant channel by which peer online transitions arrive mid-session. A patch
-                    // only ever *sets* a value (never patches back to unknown), so apply when present.
-                    if let Some(online) = patch.online {
-                        node.online = Some(online);
-                    }
-                    if let Some(last_seen) = patch.last_seen {
-                        node.last_seen = Some(last_seen);
-                    }
-                    // Key rotation: a patch may swap the node key (and its TKA signature). Apply
-                    // both together so the trust gate below verifies the new signature against the
-                    // new key, never a mismatched pair.
-                    if let Some(node_key) = patch.node_key {
-                        node.node_key = node_key;
-                    }
-                    if let Some(sig) = &patch.key_signature {
-                        node.key_signature = sig.clone();
-                    }
+        tracing::trace!(n = patches.len(), "peer patch update");
 
-                    // Re-run the tailnet-lock gate on the patched node: a patch that rotates the key
-                    // must satisfy the active authority, exactly like a `Delta` upsert, or it would
-                    // be a trust-enforcement bypass. fail-CLOSED — if the patched node is no longer
-                    // admitted, evict it rather than keep the stale (now-unverified) entry.
-                    if !self.tka_admits(&node) {
-                        if let Some((id, _)) = self.peer_db.remove(&patch.id) {
-                            tracing::warn!(
-                                control_node_id = patch.id,
-                                "peer patch rejected by tailnet lock; evicting peer"
-                            );
-                            deletions.insert(id);
-                        }
-                        continue;
-                    }
+        for patch in patches {
+            // Clone the current node, apply the present fields, and re-upsert through the same path
+            // as a delta so indexes/routes stay consistent.
+            let Some((_id, existing)) = self.peer_db.get(&patch.id) else {
+                tracing::debug!(
+                    control_node_id = patch.id,
+                    "peer patch for unknown node; ignoring"
+                );
+                continue;
+            };
 
-                    self.tka_observe_log(&node); // verify-and-LOG (#136); never gates admission
-                    let id = self.peer_db.upsert(&node);
-                    upserts.insert(id);
-                }
+            let mut node = existing.clone();
+            if let Some(endpoints) = &patch.underlay_addresses {
+                node.underlay_addresses = endpoints.clone();
             }
+            if let Some(derp) = patch.derp_region {
+                node.derp_region = Some(derp);
+            }
+            if let Some(cap) = patch.cap {
+                node.cap = cap;
+            }
+            if let Some(cap_map) = &patch.cap_map {
+                node.cap_map = cap_map.clone();
+            }
+            if let Some(disco_key) = patch.disco_key {
+                node.disco_key = Some(disco_key);
+            }
+            if let Some(expiry) = patch.node_key_expiry {
+                node.node_key_expiry = Some(expiry);
+            }
+            // Online/last-seen liveness deltas (`PeerChange.Online`/`LastSeen`) — the dominant
+            // channel by which peer online transitions arrive mid-session. A patch only ever *sets*
+            // a value (never patches back to unknown), so apply when present.
+            if let Some(online) = patch.online {
+                node.online = Some(online);
+            }
+            if let Some(last_seen) = patch.last_seen {
+                node.last_seen = Some(last_seen);
+            }
+            // Key rotation: a patch may swap the node key (and its TKA signature). Apply both
+            // together so the trust gate below verifies the new signature against the new key, never
+            // a mismatched pair.
+            if let Some(node_key) = patch.node_key {
+                node.node_key = node_key;
+            }
+            if let Some(sig) = &patch.key_signature {
+                node.key_signature = sig.clone();
+            }
+
+            // Re-run the tailnet-lock gate on the patched node: a patch that rotates the key must
+            // satisfy the active authority, exactly like a `Delta` upsert, or it would be a
+            // trust-enforcement bypass. fail-CLOSED — if the patched node is no longer admitted,
+            // evict it rather than keep the stale (now-unverified) entry.
+            if !self.tka_admits(&node) {
+                if let Some((id, _)) = self.peer_db.remove(&patch.id) {
+                    tracing::warn!(
+                        control_node_id = patch.id,
+                        "peer patch rejected by tailnet lock; evicting peer"
+                    );
+                    deletions.insert(id);
+                }
+                continue;
+            }
+
+            self.tka_observe_log(&node); // verify-and-LOG (#136); never gates admission
+            let id = self.peer_db.upsert(&node);
+            upserts.insert(id);
         }
 
         (upserts, deletions)
@@ -1190,8 +1227,7 @@ mod tka_tests {
             online: None,
             last_seen: None,
         };
-        let (upserts, deletions) =
-            tracker.apply_peer_update(&ts_control::PeerUpdate::Patch(vec![patch]));
+        let (upserts, deletions) = tracker.apply_peer_patches(std::slice::from_ref(&patch));
 
         assert_eq!(upserts.len(), 1);
         assert_eq!(deletions.len(), 0);
@@ -1204,6 +1240,57 @@ mod tka_tests {
             Some(ts_derp::RegionId(core::num::NonZeroU32::new(5).unwrap()))
         );
         assert_eq!(after.node_key, peer.node_key);
+    }
+
+    /// Regression for `tsr-5u0`: when a whole-node set (`Delta`/`Full`) and a patch co-occur in one
+    /// response, the patch is applied *on top of* the node the set just upserted — mirroring the
+    /// handler's apply-order (peer set first, then `peer_patches`). Before the fix the patch shared
+    /// the single `peer_update` slot and the co-occurring set silently dropped it, so a peer brought
+    /// in by the delta kept stale (empty) reachability.
+    #[tokio::test]
+    async fn patch_applies_on_top_of_co_occurring_delta() {
+        let mut tracker = PeerTracker::for_test(test_env(), None, None);
+
+        // The whole-node delta upserts a brand-new peer (id == 1) with no reachability.
+        let peer = peer_node("mover", [1u8; 32], vec![]);
+        let (set_upserts, _) = tracker.apply_peer_update(&ts_control::PeerUpdate::Delta {
+            upsert: vec![peer.clone()],
+            remove: vec![],
+        });
+        assert_eq!(set_upserts.len(), 1, "delta upserts the new peer");
+
+        // The patch from the SAME response then sets that peer's endpoints + DERP. This is exactly
+        // the consumer order the handler runs (apply_peer_update then apply_peer_patches).
+        let new_ep: std::net::SocketAddr = "203.0.113.7:41641".parse().unwrap();
+        let patch = ts_control::PeerChange {
+            id: 1,
+            derp_region: Some(ts_derp::RegionId(core::num::NonZeroU32::new(7).unwrap())),
+            cap: None,
+            cap_map: None,
+            underlay_addresses: Some(vec![new_ep]),
+            node_key: None,
+            key_signature: None,
+            disco_key: None,
+            node_key_expiry: None,
+            online: None,
+            last_seen: None,
+        };
+        let (patch_upserts, patch_deletions) =
+            tracker.apply_peer_patches(std::slice::from_ref(&patch));
+
+        assert_eq!(
+            patch_upserts.len(),
+            1,
+            "patch re-upserts the just-added peer"
+        );
+        assert_eq!(patch_deletions.len(), 0);
+        // The peer added by the delta now carries the patched reachability — the patch was NOT lost.
+        let (_pid, after) = tracker.peer_db.get(&(1 as ts_control::NodeId)).unwrap();
+        assert_eq!(after.underlay_addresses, vec![new_ep]);
+        assert_eq!(
+            after.derp_region,
+            Some(ts_derp::RegionId(core::num::NonZeroU32::new(7).unwrap()))
+        );
     }
 
     /// A `Patch` whose node id is not in the current netmap is ignored (the wire contract: a patch
@@ -1227,8 +1314,7 @@ mod tka_tests {
             online: None,
             last_seen: None,
         };
-        let (upserts, deletions) =
-            tracker.apply_peer_update(&ts_control::PeerUpdate::Patch(vec![patch]));
+        let (upserts, deletions) = tracker.apply_peer_patches(std::slice::from_ref(&patch));
 
         assert_eq!(upserts.len(), 0);
         assert_eq!(deletions.len(), 0);
@@ -1260,7 +1346,7 @@ mod tka_tests {
             online: None,
             last_seen: None,
         };
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Patch(vec![patch]));
+        tracker.apply_peer_patches(std::slice::from_ref(&patch));
 
         let (_pid, after) = tracker.peer_db.get(&(1 as ts_control::NodeId)).unwrap();
         assert_eq!(after.node_key_expiry, Some(expiry));
@@ -1295,7 +1381,7 @@ mod tka_tests {
             online: Some(true),
             last_seen: None,
         };
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Patch(vec![patch.clone()]));
+        tracker.apply_peer_patches(std::slice::from_ref(&patch));
         assert_eq!(
             tracker
                 .peer_db
@@ -1309,7 +1395,7 @@ mod tka_tests {
 
         // A subsequent patch flips it offline.
         patch.online = Some(false);
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Patch(vec![patch]));
+        tracker.apply_peer_patches(std::slice::from_ref(&patch));
         assert_eq!(
             tracker
                 .peer_db
@@ -1399,8 +1485,7 @@ mod tka_tests {
             online: None,
             last_seen: None,
         };
-        let (upserts, deletions) =
-            tracker.apply_peer_update(&ts_control::PeerUpdate::Patch(vec![patch]));
+        let (upserts, deletions) = tracker.apply_peer_patches(std::slice::from_ref(&patch));
 
         assert_eq!(upserts.len(), 0);
         assert_eq!(deletions.len(), 1);
