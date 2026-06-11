@@ -820,6 +820,17 @@ impl Runtime {
             .map_err(Into::into)
     }
 
+    /// Change this node's hostname at runtime (Go `tailscale set --hostname`), re-reporting
+    /// `Hostinfo.Hostname` to control on the live map-poll connection. Hostname is display-only
+    /// (control reflects it in the netmap), so there is no dataplane half. The new value is also
+    /// what a subsequent re-registration reports, so it persists across a reconnect.
+    pub async fn set_hostname(&self, hostname: String) -> Result<(), Error> {
+        self.control
+            .ask(control_runner::SetHostname { hostname })
+            .await
+            .map_err(Into::into)
+    }
+
     /// Subscribe to netmap peer-change events.
     ///
     /// Returns a [`watch::Receiver`] whose value is the current set of peer [`StatusNode`]s,

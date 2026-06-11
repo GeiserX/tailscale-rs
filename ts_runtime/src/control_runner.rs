@@ -765,3 +765,21 @@ impl Message<SetAdvertiseRoutes> for ControlRunner {
         self.client.set_routable_ips(msg.routes).await;
     }
 }
+
+/// Update this node's `Hostinfo.Hostname` at control — the wire half of a runtime
+/// [`Runtime::set_hostname`](crate::Runtime::set_hostname). A direct `ask` from the runtime, so the
+/// change reaches the live map-poll client.
+#[derive(Debug)]
+pub struct SetHostname {
+    /// The new hostname to report to control.
+    pub hostname: String,
+}
+
+impl Message<SetHostname> for ControlRunner {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: SetHostname, _ctx: &mut Context<Self, Self::Reply>) {
+        tracing::debug!("updating hostname at control");
+        self.client.set_hostname(msg.hostname).await;
+    }
+}

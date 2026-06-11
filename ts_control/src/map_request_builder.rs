@@ -231,6 +231,19 @@ mod tests {
         assert_eq!(req.host_info.unwrap().routable_ips, None);
     }
 
+    /// The `hostname` setter populates `HostInfo.hostname` — the mechanism a runtime
+    /// `Device::set_hostname` relies on (its side-MapRequest carries the new name here).
+    #[test]
+    fn hostname_setter_populates_host_info() {
+        let node_state = ts_keys::NodeState::generate();
+
+        let req = MapRequestBuilder::new(&node_state)
+            .hostname("my-new-host")
+            .build();
+
+        assert_eq!(req.host_info.unwrap().hostname, Some("my-new-host"));
+    }
+
     #[test]
     fn request_tags_setter_populates_host_info() {
         let node_state = ts_keys::NodeState::generate();

@@ -171,6 +171,22 @@ impl AsyncControlClient {
         }
     }
 
+    /// Update this node's `Hostinfo.Hostname` to `hostname` at control mid-session — the wire half of
+    /// a runtime `set_hostname`. Sent on the live map-poll connection without tearing down the
+    /// long-poll, exactly like [`set_routable_ips`](Self::set_routable_ips).
+    #[tracing::instrument(skip_all, fields(map_url = %self.map_url()), level = "trace")]
+    pub async fn set_hostname(&mut self, hostname: String) {
+        tracing::trace!("reporting hostname to control server");
+
+        if let Err(e) = self
+            .command_tx
+            .send(Command::SetHostname { hostname })
+            .await
+        {
+            tracing::error!(error = %e, "setting hostname");
+        }
+    }
+
     /// Construct the URL that should be used to fetch the netmap.
     pub fn map_url(&self) -> Url {
         self.base_url
@@ -203,6 +219,11 @@ pub enum Command {
     /// run-loop's frozen `config` clone), already filtered to the final advertised set the caller
     /// wants control to see.
     SetRoutableIPs { routes: Vec<ipnet::IpNet> },
+    /// Update this node's `Hostinfo.Hostname` mid-session — the wire half of a runtime
+    /// `set_hostname`. The hostname travels IN the command (the run-loop's `config` clone is frozen,
+    /// so a runtime change can only reach here through the command). Hostname is display-only, so
+    /// there is no local/dataplane half; control reflects the new name on the next netmap.
+    SetHostname { hostname: String },
 }
 
 /// Identifies a map-poll session so a reconnect can resume the delta stream instead of
@@ -418,6 +439,21 @@ async fn run_once(
                             builder = builder.hostname(hostname);
                         }
                         let req = builder.build();
+
+                        drop(send_map_request(req, &map_url, &h2_client).await?);
+                    },
+                    Command::SetHostname { hostname } => {
+                        // The hostname comes from the command payload, NOT `config.hostname`: the
+                        // run-loop's `config` is a frozen clone, so a runtime hostname change can only
+                        // reach here through the command. Preserve the advertised routes on this
+                        // request so a hostname update doesn't transiently withdraw them.
+                        let req = MapRequestBuilder::new(node_keys)
+                            .keep_alive(false)
+                            .omit_peers(true)
+                            .stream(false)
+                            .routable_ips(config.advertised_routes())
+                            .hostname(&hostname)
+                            .build();
 
                         drop(send_map_request(req, &map_url, &h2_client).await?);
                     },
