@@ -275,6 +275,7 @@ mod tests {
             forward_udp_ports: vec![],
             forward_all_ports,
             forward_exit_egress,
+            block_incoming: false,
             exit_proxy: None,
             peerapi_port: None,
             taildrop_dir: None,

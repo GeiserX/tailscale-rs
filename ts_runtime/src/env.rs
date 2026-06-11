@@ -71,6 +71,11 @@ pub struct ForwarderConfig {
     /// [`Config::forward_exit_egress`](ts_control::Config::forward_exit_egress).
     pub forward_exit_egress: bool,
 
+    /// Shields-up: when `true`, the packet-filter updater wraps the live filter so inbound packets
+    /// destined to this node's own addresses are dropped (refuse inbound peer connections).
+    /// See [`Config::block_incoming`](ts_control::Config::block_incoming).
+    pub block_incoming: bool,
+
     /// Optional upstream proxy that exit-node egress is routed through (product capability beyond
     /// strict tsnet parity — residential-proxy egress).
     ///
@@ -140,6 +145,7 @@ impl ForwarderConfig {
             forward_udp_ports: config.forward_udp_ports.clone(),
             forward_all_ports: config.forward_all_ports,
             forward_exit_egress: config.forward_exit_egress,
+            block_incoming: config.block_incoming,
             exit_proxy: config.exit_proxy.as_ref().map(exit_proxy_to_forwarder),
             peerapi_port: config.peerapi_port,
             taildrop_dir: config.taildrop_dir.clone(),
@@ -206,6 +212,10 @@ pub struct Env {
     ///
     /// See [`ForwarderConfig::forward_exit_egress`].
     pub forward_exit_egress: bool,
+
+    /// Shields-up: drop inbound peer connections terminating on this node (read by the
+    /// packet-filter updater). See [`ForwarderConfig::block_incoming`].
+    pub block_incoming: bool,
 
     /// Optional upstream proxy that exit-node egress is routed through.
     ///
@@ -294,6 +304,7 @@ impl Env {
             forward_udp_ports,
             forward_all_ports,
             forward_exit_egress,
+            block_incoming,
             exit_proxy,
             peerapi_port,
             taildrop_dir,
@@ -327,6 +338,7 @@ impl Env {
             forward_udp_ports: Arc::new(forward_udp_ports),
             forward_all_ports,
             forward_exit_egress,
+            block_incoming,
             exit_proxy,
             peerapi_port,
             taildrop_store,

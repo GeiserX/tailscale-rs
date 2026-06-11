@@ -130,6 +130,12 @@ pub struct Config {
     /// cloud VPS). Subnet routes are dialed identically regardless of this flag.
     pub forward_exit_egress: bool,
 
+    /// Shields-up (Go `tailscale set --shields-up` / `ipn` `ShieldsUp`): when `true`, refuse all
+    /// **inbound** connections from peers that terminate on this node. The packet filter drops
+    /// inbound packets destined to this node's own addresses; forwarded subnet/exit transit and
+    /// replies to connections this node itself initiated are unaffected. Defaults to `false`.
+    pub block_incoming: bool,
+
     /// Optional upstream proxy that exit-node egress is routed through, so the node egresses via
     /// the proxy's IP rather than its own origin IP.
     ///
@@ -462,6 +468,7 @@ impl From<&Config> for ts_control::Config {
             forward_udp_ports: value.forward_udp_ports.clone(),
             forward_all_ports: value.forward_all_ports,
             forward_exit_egress: value.forward_exit_egress,
+            block_incoming: value.block_incoming,
             exit_proxy: value.exit_proxy.clone(),
             tcp_buffer_size: value.tcp_buffer_size,
             persistent_keepalive_interval: value.persistent_keepalive_interval,
@@ -497,6 +504,7 @@ impl Default for Config {
             forward_udp_ports: vec![],
             forward_all_ports: false,
             forward_exit_egress: false,
+            block_incoming: false,
             exit_proxy: None,
             tcp_buffer_size: None,
             persistent_keepalive_interval: Some(ts_control::DEFAULT_PERSISTENT_KEEPALIVE),

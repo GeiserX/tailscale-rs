@@ -834,6 +834,7 @@ mod tka_tests {
                 forward_udp_ports: Vec::new(),
                 forward_all_ports: false,
                 forward_exit_egress: false,
+                block_incoming: false,
                 exit_proxy: None,
                 peerapi_port: None,
                 taildrop_dir: None,
