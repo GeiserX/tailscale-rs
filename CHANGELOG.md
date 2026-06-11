@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.19.0](https://github.com/GeiserX/tailscale-rs/compare/v0.18.2...v0.19.0) (2026-06-11)
+
+
+### Features
+
+* **device:** add Device::set_advertise_routes() runtime EditPrefs (tsnet parity) ([#75](https://github.com/GeiserX/tailscale-rs/issues/75)) ([def7e46](https://github.com/GeiserX/tailscale-rs/commit/def7e46981e98e68bb6dd2d87da7354822f77edb))
+
 ## [0.18.2](https://github.com/GeiserX/tailscale-rs/compare/v0.18.1...v0.18.2) (2026-06-11)
 
 
