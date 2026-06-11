@@ -2,6 +2,18 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.18.0](https://github.com/GeiserX/tailscale-rs/compare/v0.17.0...v0.18.0) (2026-06-11)
+
+
+### Features
+
+* **device:** add set_dns, dial_udp, and pop_browser_url accessors (tsnet parity) ([#68](https://github.com/GeiserX/tailscale-rs/issues/68)) ([5f8e5d1](https://github.com/GeiserX/tailscale-rs/commit/5f8e5d103ee7cbe0dd0fd3888733bd9854887abe))
+
+
+### Bug Fixes
+
+* **tunnel,control:** bound netmap/control frames, reject equal-timestamp handshake replay ([#66](https://github.com/GeiserX/tailscale-rs/issues/66)) ([4aaac31](https://github.com/GeiserX/tailscale-rs/commit/4aaac31f65430cc1e4d7356b981b7dc2c942753e))
+
 ## [0.17.0](https://github.com/GeiserX/tailscale-rs/compare/v0.16.0...v0.17.0) (2026-06-11)
 
 
