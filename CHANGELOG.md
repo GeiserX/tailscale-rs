@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.21.0](https://github.com/GeiserX/tailscale-rs/compare/v0.20.0...v0.21.0) (2026-06-11)
+
+
+### Features
+
+* **device:** add Device::direct_path() — underlay direct path + RTT (tsnet parity) ([#79](https://github.com/GeiserX/tailscale-rs/issues/79)) ([a187d00](https://github.com/GeiserX/tailscale-rs/commit/a187d0064130d4ce37196a1e992103e2024db565))
+
 ## [0.20.0](https://github.com/GeiserX/tailscale-rs/compare/v0.19.0...v0.20.0) (2026-06-11)
 
 
