@@ -50,6 +50,20 @@ pub(crate) const REKEY_AFTER_TIME_RECEIVING: Duration = Duration::from_secs(165)
 /// distinct decision that only became spec-tight once receive-rekey landed.
 pub(crate) const REJECT_AFTER_TIME_RECV: Duration = REJECT_AFTER_TIME;
 
+/// Hard message-count ceiling for a keypair: no transport message may be sent with a nonce at or
+/// beyond this. Matches wireguard-go `device/constants.go` `RejectAfterMessages = MaxUint64 - 2^13 - 1`
+/// (the whitepaper's "2^60" is a looser conceptual bound; this is the value Go/boringtun actually
+/// enforce, so we match it byte-for-byte for parity). Time-based rekey/expiry (120s/180s) makes this
+/// physically unreachable on any real link, but enforcing it removes the only `panic!` on the send
+/// path and makes rotation volume-aware exactly like Go.
+pub(crate) const REJECT_AFTER_MESSAGES: u64 = u64::MAX - (1 << 13) - 1;
+
+/// Message count past which a key rotation (rehandshake) should be initiated — the volume analog of
+/// [`REKEY_AFTER_TIME`]. Matches wireguard-go `RekeyAfterMessages = MaxUint64 - 2^16 - 1`: an
+/// actively-sending peer rekeys on whichever of time-or-volume it reaches first, so the nonce never
+/// approaches [`REJECT_AFTER_MESSAGES`].
+pub(crate) const REKEY_AFTER_MESSAGES: u64 = u64::MAX - (1 << 16) - 1;
+
 /// A generator of monotonically increasing 64-bit nonces.
 #[derive(Default)]
 struct NonceGenerator {
@@ -70,21 +84,37 @@ impl NonceGenerator {
             .nonce
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let end = match nonce.checked_add(num as u64) {
-            Some(end) => end,
-            // NonceGenerator is used to produce nonces for a wireguard session.
-            // A single wireguard session lives for 120s before being replaced.
-            // To exhaust a u64 in that time, assuming 1500b packets, you would
-            // have to be sending 27.6 zettabytes every two minutes, or 230
-            // exabytes/sec.
-            //
-            // If you're still running this code on a computer capable of that
-            // kind of data rate: hello from the past! Enjoy your panic.
-            None => panic!("nonce exhausted"),
-        };
+        // Clamp at the u64 ceiling rather than panic. This is doubly unreachable in practice — a
+        // session is torn down at REJECT_AFTER_TIME (180s) and `expired()` now also fires at
+        // REJECT_AFTER_MESSAGES well before the counter could reach u64::MAX — but a `panic!` on the
+        // data/send path can become UB across the FFI boundary, so clamp-and-stop instead: the
+        // returned iter yields no more nonces past the ceiling (the caller's packet is dropped, and
+        // `expired()` has already forced a rekey). To exhaust a u64 in 180s at 1500-byte packets you
+        // would have to push ~230 exabytes/sec; this branch exists only as a non-panicking backstop.
+        let end = nonce.checked_add(num as u64).unwrap_or(u64::MAX);
         let ret = NonceIter { cur: *nonce, end };
         *nonce = end;
         ret
+    }
+
+    /// The next nonce that would be issued — i.e. the count of nonces already consumed. Used to
+    /// drive volume-based rotation ([`REKEY_AFTER_MESSAGES`]) and the hard ceiling
+    /// ([`REJECT_AFTER_MESSAGES`]) without consuming a nonce.
+    fn count(&self) -> u64 {
+        *self
+            .nonce
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Test-only: seed the counter directly so volume-threshold logic (which is otherwise reachable
+    /// only after ~2^64 packets) can be exercised without exhausting the generator.
+    #[cfg(test)]
+    fn set_count(&self, value: u64) {
+        *self
+            .nonce
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = value;
     }
 }
 struct NonceIter {
@@ -179,12 +209,20 @@ impl TransmitSession {
         }
     }
 
+    /// Whether a key rotation should be initiated — on whichever of TIME or VOLUME is reached first,
+    /// matching wireguard-go (`REKEY_AFTER_TIME` 120s OR `REKEY_AFTER_MESSAGES`). The volume term
+    /// makes rotation message-aware so the nonce never approaches the hard ceiling.
     pub fn stale(&self, now: Instant) -> bool {
         now.duration_since(self.created) > REKEY_AFTER_TIME
+            || self.nonce.count() >= REKEY_AFTER_MESSAGES
     }
 
+    /// Whether this session must no longer send — TIME past [`REJECT_AFTER_TIME`] (180s) OR the
+    /// message count at/over the hard [`REJECT_AFTER_MESSAGES`] ceiling (wireguard-go parity). Past
+    /// this the caller drops the send session and triggers a fresh handshake.
     pub fn expired(&self, now: Instant) -> bool {
         now.duration_since(self.created) > REJECT_AFTER_TIME
+            || self.nonce.count() >= REJECT_AFTER_MESSAGES
     }
 
     /// Whether this keypair is old enough to warrant a receive-path rekey
@@ -448,6 +486,71 @@ mod tests {
         assert!(!send.needs_receive_rekey(now + Duration::from_secs(130)));
         assert!(!send.needs_receive_rekey(now + Duration::from_secs(160)));
         assert!(send.needs_receive_rekey(now + Duration::from_secs(170)));
+    }
+
+    /// Rotation/expiry are VOLUME-aware, not only time-aware (wireguard-go parity): a session that
+    /// has sent past `REKEY_AFTER_MESSAGES` is `stale()` (rekey) even when young, and one past
+    /// `REJECT_AFTER_MESSAGES` is `expired()` even at t=0 — so the nonce can never reach the u64
+    /// ceiling. Seeded directly because the thresholds are otherwise ~2^64 packets away.
+    #[test]
+    fn rotation_and_expiry_are_volume_aware() {
+        let k: [u8; 32] = rand::random();
+        let now = Instant::now();
+
+        // Just below the rekey-volume threshold: a fresh session is neither stale nor expired.
+        let send = TransmitSession::new(k.into(), SessionId::random(), now);
+        send.nonce.set_count(REKEY_AFTER_MESSAGES - 1);
+        assert!(
+            !send.stale(now),
+            "below the volume threshold and young: not stale"
+        );
+        assert!(!send.expired(now));
+
+        // At/over the rekey-volume threshold (but below reject): stale → rekey, not yet expired.
+        let send = TransmitSession::new(k.into(), SessionId::random(), now);
+        send.nonce.set_count(REKEY_AFTER_MESSAGES);
+        assert!(
+            send.stale(now),
+            "at REKEY_AFTER_MESSAGES: must rotate even when young"
+        );
+        assert!(
+            !send.expired(now),
+            "rekey volume is below the reject ceiling"
+        );
+
+        // At the hard reject ceiling: expired even at t=0 (the send session must stop).
+        let send = TransmitSession::new(k.into(), SessionId::random(), now);
+        send.nonce.set_count(REJECT_AFTER_MESSAGES);
+        assert!(
+            send.expired(now),
+            "at REJECT_AFTER_MESSAGES: must stop sending"
+        );
+    }
+
+    /// The Go-parity ordering invariant: rekey volume is below reject volume, so a session rotates
+    /// before it can hit the hard ceiling. A compile-time check (the values are consts).
+    const _: () = assert!(REKEY_AFTER_MESSAGES < REJECT_AFTER_MESSAGES);
+
+    /// The nonce generator clamps at the u64 ceiling instead of panicking (defense-in-depth on the
+    /// send path — a panic there can become UB across the FFI boundary). Past the ceiling the batch
+    /// yields no further nonces, so the caller drops the packet rather than crashing.
+    #[test]
+    fn nonce_generator_clamps_at_ceiling_without_panic() {
+        let ng = NonceGenerator::default();
+        ng.set_count(u64::MAX - 2);
+        // Reserve more than remain: must not panic; the count clamps to u64::MAX.
+        let mut iter = ng.batch(10);
+        // Only the two nonces below the ceiling are yielded (u64::MAX-2, u64::MAX-1).
+        assert_eq!(
+            iter.next().map(|n| u64::from(n.counter)),
+            Some(u64::MAX - 2)
+        );
+        assert_eq!(
+            iter.next().map(|n| u64::from(n.counter)),
+            Some(u64::MAX - 1)
+        );
+        assert_eq!(iter.next().map(|n| u64::from(n.counter)), None);
+        assert_eq!(ng.count(), u64::MAX, "the counter clamps at the ceiling");
     }
 
     /// A persistent keepalive is an *empty* authenticated packet. Emitting one must NOT push the
