@@ -18,11 +18,15 @@ name = "ts_packetfilter_state"
 ts_packetfilter.workspace = true
 ts_packetfilter_serde.workspace = true
 
+# For the destination prefixes of a retained cap-grant (`CapGrant`).
+ipnet.workspace = true
+
 [dev-dependencies]
 divan.workspace = true
 serde_json.workspace = true
 ts_bart_packetfilter = { workspace = true }
 ts_packetfilter = { workspace = true, features = ["std"] }
+ts_peercapability.workspace = true
 
 [lints]
 workspace = true

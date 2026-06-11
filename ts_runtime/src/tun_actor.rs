@@ -1216,6 +1216,7 @@ mod tests {
             user_profiles: Vec::new(),
             ping: None,
             packetfilter: None,
+            cap_grants: None,
             pop_browser_url: None,
             dial_plan: None,
             dns_config: Some(ts_control::DnsConfig {

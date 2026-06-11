@@ -20,7 +20,10 @@
 //!   node and its online deltas (`PeerChange`, `MapResponse.online_change`/`peer_seen_change`).
 //!   `online` stays tri-state (`None` = unknown), never fabricated to `false`.
 
-use std::net::{IpAddr, SocketAddr};
+use std::{
+    collections::BTreeMap,
+    net::{IpAddr, SocketAddr},
+};
 
 use ts_control::{Node, StableNodeId, UserId};
 
@@ -131,12 +134,17 @@ pub struct WhoIs {
     /// Always `None` in this fork: the domain [`Node`](ts_control::Node) does not retain the
     /// wire-level user/login mapping (see the module-level capability/user gap note).
     pub user: Option<String>,
-    /// The node's capability map, as `(capability, args)` pairs.
-    ///
-    /// Populated from the domain [`Node`](ts_control::Node)'s `cap_map` (the control-pushed
-    /// `CapMap`), sorted by capability name (the underlying map is a `BTreeMap`). Empty when control
-    /// granted the node no capabilities. Mirrors tsnet's `WhoIsResponse.CapMap`.
+    /// The node's **node-level** capability map (Go `Node.CapMap` — node attributes like
+    /// `can-funnel`), as `(capability, args)` pairs, populated from the domain
+    /// [`Node`](ts_control::Node)'s `cap_map`, sorted by capability name. Distinct from
+    /// [`cap_map`](Self::cap_map), which is the flow-scoped *peer-capability* grants.
     pub capabilities: Vec<(String, Vec<String>)>,
+    /// The **flow-scoped** peer-capability grants for the queried `src -> dst` flow — Go
+    /// `apitype.WhoIsResponse.CapMap` (`tailcfg.PeerCapMap`). The grants control's packet-filter
+    /// application rules authorize for traffic from this node to the queried address, keyed by
+    /// capability name with raw-JSON values. Empty when no grant matches the flow (or no scoped
+    /// query was made). Distinct from the node-level [`capabilities`](Self::capabilities).
+    pub cap_map: BTreeMap<String, Vec<String>>,
 }
 
 impl WhoIs {
@@ -144,7 +152,8 @@ impl WhoIs {
     /// netmap's `UserProfiles` table mapped the node's owning user id to a profile; `None` when
     /// control sent no profile — e.g. a tagged node with no human owner).
     ///
-    /// `capabilities` is always populated from the node's `cap_map`.
+    /// `capabilities` is the node-level cap map; `cap_map` (the flow-scoped grants) is filled
+    /// separately by [`Runtime::whois`](crate::Runtime::whois) and defaults to empty here.
     pub(crate) fn from_node_with_user(node: Node, user: Option<String>) -> Self {
         let capabilities = node
             .cap_map
@@ -155,6 +164,7 @@ impl WhoIs {
             node,
             user,
             capabilities,
+            cap_map: BTreeMap::new(),
         }
     }
 }

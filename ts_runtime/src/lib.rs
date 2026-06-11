@@ -103,6 +103,9 @@ pub struct Runtime {
     /// Receiver for the device connection-state cell, fed by the control runner. Read by
     /// [`Runtime::watch_state`] and [`Runtime::wait_until_running`].
     state_rx: watch::Receiver<DeviceState>,
+    /// Receiver for the retained peer-capability grants, fed by the packet-filter updater. Read by
+    /// [`Runtime::whois`] to resolve the flow-scoped cap map (Go `apitype.WhoIsResponse.CapMap`).
+    cap_grants_rx: watch::Receiver<packetfilter::CapGrants>,
 }
 
 impl Runtime {
@@ -180,7 +183,11 @@ impl Runtime {
             forwarder_id,
             active_exit_tx,
         ));
-        packetfilter::PacketfilterUpdater::spawn(env.clone());
+        // The packet-filter updater also surfaces the retained cap-grants (for flow-scoped WhoIs)
+        // through a `watch` cell whose receiver the `Runtime` holds — the bus has no replay, so a
+        // `watch` is how `Runtime::whois` reads the current grants on demand.
+        let (cap_grants_tx, cap_grants_rx) = watch::channel(Default::default());
+        packetfilter::PacketfilterUpdater::spawn((env.clone(), cap_grants_tx));
         src_filter::SourceFilterUpdater::spawn(env.clone());
         let peer_tracker = PeerTracker::spawn(env.clone()).downgrade();
 
@@ -280,6 +287,7 @@ impl Runtime {
             exit_node_tx,
             active_exit_rx,
             state_rx,
+            cap_grants_rx,
         })
     }
 
@@ -585,11 +593,17 @@ impl Runtime {
 
     /// Resolve which node owns a tailnet source address.
     ///
-    /// Maps the source IP of `addr` to its owning node. Mirrors tsnet's `LocalClient::WhoIs`.
-    /// Returns `None` if no peer holds that tailnet IP. The returned [`WhoIs`] carries no
-    /// user/login or capability data in this fork (see the [`status`] module docs).
+    /// Maps the destination IP of `addr` to its owning node. Mirrors tsnet's `LocalClient::WhoIs`.
+    /// Returns `None` if no peer holds that tailnet IP.
+    ///
+    /// The returned [`WhoIs`] additionally carries the **flow-scoped** peer-capability grants
+    /// ([`WhoIs::cap_map`], Go `apitype.WhoIsResponse.CapMap`): the caps control's packet-filter
+    /// application rules authorize for traffic from THIS node (the flow source) to `addr` (the
+    /// destination). Empty when no grant matches. (The node-level cap map rides
+    /// [`WhoIs::capabilities`].)
     pub async fn whois(&self, addr: core::net::SocketAddr) -> Result<Option<WhoIs>, Error> {
-        self.peer_tracker
+        let whois = self
+            .peer_tracker
             .upgrade()
             .ok_or(Error {
                 kind: ErrorKind::ActorGone,
@@ -597,8 +611,28 @@ impl Runtime {
                 message_ty: None,
             })?
             .ask(peer_tracker::Whois { addr })
-            .await
-            .map_err(Into::into)
+            .await?;
+
+        let Some(mut whois) = whois else {
+            return Ok(None);
+        };
+
+        // Fill the flow-scoped cap map: src = this node's own tailnet IP (of the dst's family),
+        // dst = the queried address. A grant applies when src ∈ its src prefixes AND dst ∈ its dst
+        // prefixes (Go `Filter.CapsWithValues`). Resolve our own IP from the self node; if it isn't
+        // known yet, leave the map empty (no grants resolvable without a source).
+        let dst = addr.ip();
+        if let Some(self_node) = self.control.ask(control_runner::SelfNode).await? {
+            let src: core::net::IpAddr = if dst.is_ipv6() {
+                self_node.tailnet_address.ipv6.addr().into()
+            } else {
+                self_node.tailnet_address.ipv4.addr().into()
+            };
+            let grants = self.cap_grants_rx.borrow();
+            whois.cap_map = ts_packetfilter_state::caps_for(&grants, src, dst);
+        }
+
+        Ok(Some(whois))
     }
 
     /// The current direct-path status to the peer holding tailnet IP `dst`: its confirmed direct UDP

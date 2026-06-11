@@ -115,6 +115,12 @@ pub struct StateUpdate {
     pub ping: Option<PingRequest>,
     /// Update to the packet filter.
     pub packetfilter: Option<FilterUpdate>,
+    /// The peer-capability grants retained from this response's packet-filter application rules
+    /// (Go `tailcfg.FilterRule` cap-grants), which the network-rule compile in [`packetfilter`] drops.
+    /// `Some` exactly when [`packetfilter`] is `Some` (the same source rules); the consumer keeps
+    /// these for flow-scoped WhoIs (`apitype.WhoIsResponse.CapMap`). Empty `Vec` when the response's
+    /// rules carried no application/cap-grant rule.
+    pub cap_grants: Option<Vec<ts_packetfilter_state::CapGrant>>,
     /// This URL should be displayed to the user or opened in their browser automatically.
     pub pop_browser_url: Option<Url>,
     /// New dial plan sent by control.
@@ -189,6 +195,7 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
         tracing::trace!(?msg_len, ?map_response);
 
         let packetfilter = packet_filter(&map_response);
+        let cap_grants = cap_grants(&map_response);
 
         fn nonempty<T>(x: &Option<Vec<T>>) -> bool {
             x.as_ref().is_some_and(|x| !x.is_empty())
@@ -242,6 +249,7 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
                     .map(|x| crate::convert_derp_map(x).collect()),
                 ping: map_response.ping_request,
                 packetfilter,
+                cap_grants,
                 pop_browser_url: map_response.pop_browser_url.and_then(|u| {
                     u.parse()
                         .inspect_err(|e| tracing::error!(error = %e, "invalid pop browser url"))
@@ -297,6 +305,26 @@ fn packet_filter(map_response: &MapResponse<'_>) -> Option<FilterUpdate> {
             })
             .collect(),
     ))
+}
+
+/// Retain the peer-capability grants from the same packet-filter rules [`packet_filter`] compiles —
+/// the application-rule cap-grants that the network-rule compile discards. Collected across the
+/// legacy `packet_filter` and every named `packet_filters` ruleset. `Some` exactly when
+/// [`packet_filter`] is `Some`; an empty `Vec` means the rules carried no cap-grant. Backs
+/// flow-scoped WhoIs.
+fn cap_grants(map_response: &MapResponse<'_>) -> Option<Vec<ts_packetfilter_state::CapGrant>> {
+    if map_response.packet_filter.is_none() && map_response.packet_filters.is_empty() {
+        return None;
+    }
+
+    let mut grants = Vec::new();
+    if let Some(rules) = map_response.packet_filter.as_ref() {
+        grants.extend(pf_state::retain_cap_grants(rules));
+    }
+    for rules in map_response.packet_filters.values().flatten() {
+        grants.extend(pf_state::retain_cap_grants(rules));
+    }
+    Some(grants)
 }
 
 #[tracing::instrument(skip_all, fields(map_url = %url.as_str()))]

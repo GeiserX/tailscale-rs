@@ -4,8 +4,14 @@ use kameo::{
     actor::ActorRef,
     message::{Context, Message},
 };
+use tokio::sync::watch;
 
 use crate::{Error, env::Env};
+
+/// The latest peer-capability grants retained from control's packet-filter application rules, shared
+/// from the [`PacketfilterUpdater`] to [`Runtime::whois`](crate::Runtime::whois) for flow-scoped cap
+/// resolution. `Arc`-wrapped so a `watch` clone is cheap.
+pub type CapGrants = Arc<Vec<ts_packetfilter_state::CapGrant>>;
 
 pub struct PacketfilterUpdater {
     env: Env,
@@ -17,22 +23,30 @@ pub struct PacketfilterUpdater {
     /// the latest netmap self node — the destinations shields-up ([`Env::block_incoming`]) denies.
     /// Empty until the first netmap carrying a self node.
     self_addrs: Vec<std::net::IpAddr>,
+    /// Sender for the latest retained cap-grants. The control runner publishes the compiled filter
+    /// on the bus (no replay), but `Runtime::whois` needs the *current* grants on demand, so they
+    /// ride a `watch` cell whose receiver `Runtime` holds — mirroring `active_exit_rx`/`state_rx`.
+    cap_grants_tx: watch::Sender<CapGrants>,
 }
 
 #[derive(Clone)]
 pub struct PacketFilterState(pub Arc<dyn ts_packetfilter::Filter + Send + Sync>);
 
 impl kameo::Actor for PacketfilterUpdater {
-    type Args = Env;
+    type Args = (Env, watch::Sender<CapGrants>);
     type Error = Error;
 
-    async fn on_start(env: Self::Args, slf: ActorRef<Self>) -> Result<Self, Self::Error> {
+    async fn on_start(
+        (env, cap_grants_tx): Self::Args,
+        slf: ActorRef<Self>,
+    ) -> Result<Self, Self::Error> {
         env.subscribe::<Arc<ts_control::StateUpdate>>(&slf).await?;
 
         Ok(Self {
             env,
             pf_state: Default::default(),
             self_addrs: Vec::new(),
+            cap_grants_tx,
         })
     }
 }
@@ -71,6 +85,13 @@ impl Message<Arc<ts_control::StateUpdate>> for PacketfilterUpdater {
             && let Some(self_node) = state_update.node.as_ref()
         {
             self.self_addrs = self_node_addresses(self_node, self.env.enable_ipv6);
+        }
+
+        // Surface the retained cap-grants for flow-scoped WhoIs. They ride the same response as the
+        // compiled filter (`Some` exactly when `packetfilter` is `Some`), so update the cell here —
+        // `send_replace` keeps the latest current even with no active receiver.
+        if let Some(grants) = &state_update.cap_grants {
+            self.cap_grants_tx.send_replace(Arc::new(grants.clone()));
         }
 
         let Some((pf_ruleset, pf_map)) = &state_update.packetfilter else {
