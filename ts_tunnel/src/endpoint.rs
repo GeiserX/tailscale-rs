@@ -573,13 +573,17 @@ impl Peer {
         out: &mut RecvResult,
     ) {
         if let Some(timestamp) = self.last_seen_timestamp
-            && handshake.timestamp < timestamp
+            && handshake.timestamp <= timestamp
         {
-            // Replayed handshake initiation
-            // TODO: because we buffer the raw initiation packet on the sender side, we need to accept
-            // initiations with an equal timestamp to the last one received. Check against reference
-            // implementations and see if we should instead regenerate a fresh handshake with new timestamp
-            // on retransmit.
+            // Replayed handshake initiation. Mirror wireguard-go `consumeMessageInitiation`, which
+            // accepts only `timestamp.After(lastTimestamp)` (strictly greater) — an initiation whose
+            // TAI64N timestamp is **equal to or below** the last accepted one is a replay and is
+            // dropped. (Earlier this used `<`, which re-processed an equal-timestamp msg1: allocating
+            // a fresh session id, emitting a response, and resetting the responder session — a
+            // bounded churn/DoS on a captured-and-duplicated initiation.) A *correct* peer re-stamps
+            // its initiation on every retransmit (the local TAI64N clock is strictly increasing), so
+            // a legitimate retransmit always carries a strictly-greater timestamp and is accepted;
+            // only a byte-replayed initiation collides at `==` and is now correctly rejected.
             tracing::warn!("handshake replay detected, bailing out");
             return;
         }
@@ -2060,6 +2064,90 @@ mod tests {
             a_ep.session_id_count(),
             0,
             "every id is freed on teardown — no leak from the displacement path"
+        );
+    }
+
+    /// Regression for the handshake-timestamp replay guard (`tsr-k5j`): an initiation whose TAI64N
+    /// timestamp is **equal** to the last accepted one must be rejected as a replay, mirroring
+    /// wireguard-go `consumeMessageInitiation` (`timestamp.After(lastTimestamp)`, strictly greater).
+    ///
+    /// The guard in `respond_to_handshake` used `<` (strict less-than), so an equal-timestamp msg1
+    /// slipped through: A re-processed it, allocating a *fresh* receive id and emitting a *second*
+    /// response. The fix is `<=` (reject equal). A correct peer re-stamps every retransmit (its
+    /// local TAI64N clock is strictly increasing), so a byte-identical-timestamp initiation only
+    /// arises from a captured-and-duplicated packet.
+    ///
+    /// `A` is the responder. Synthetic peer `C` sends two initiations carrying the **same**
+    /// timestamp (distinct ephemerals/session-ids — a genuine byte-replay re-sends identical bytes,
+    /// but using a fresh ephemeral here is strictly *more* permissive and still must be rejected on
+    /// the timestamp alone). We assert the second produces **no response packet** and allocates **no
+    /// new id** — proving the equal-timestamp initiation was dropped before `respond()`.
+    ///
+    /// Deterministic: pure message passing plus a single fixed-offset timestamp (no real sleeps).
+    #[test]
+    fn equal_timestamp_initiation_is_rejected_as_replay() {
+        let (a_static, c_static) = (NodeKeyPair::new(), NodeKeyPair::new());
+        let psk = rand::random();
+        let mut a_ep = Endpoint::new(a_static.clone());
+        let a_peer = PeerId(1);
+
+        a_ep.upsert_peer(
+            a_peer,
+            PeerConfig {
+                key: c_static.public,
+                psk,
+                persistent_keepalive_interval: None,
+            },
+        );
+
+        // Both initiations carry the SAME timestamp — only the first may be accepted.
+        let (t_replay, _t_unused) = ordered_timestamps();
+        let mut c_scheduler = Scheduler::<Event>::default();
+
+        // (1) C's first initiation. A accepts it, allocates one responder receive id, and responds.
+        let (_c_first, init_first) = build_initiation(
+            &c_static,
+            &a_static,
+            SessionId::from(0x1111),
+            t_replay,
+            &mut c_scheduler,
+        );
+        let resp_first = a_ep.recv([init_first]);
+        only_to_peer(
+            &resp_first.to_peers,
+            a_peer,
+            "A's response to C's first init",
+        );
+        assert_eq!(
+            a_ep.session_id_count(),
+            1,
+            "A allocated one responder receive id for the first initiation"
+        );
+
+        // (2) C's second initiation with the SAME timestamp. The replay guard (`<=`) must drop it
+        // BEFORE `respond()`: no response packet, and the id count is unchanged (no fresh id). Under
+        // the old `<` guard this re-processed the initiation — emitting a second response and
+        // allocating/displacing an id.
+        let (_c_second, init_second) = build_initiation(
+            &c_static,
+            &a_static,
+            SessionId::from(0x2222),
+            t_replay,
+            &mut c_scheduler,
+        );
+        let resp_second = a_ep.recv([init_second]);
+        assert!(
+            resp_second.to_peers.is_empty(),
+            "an equal-timestamp initiation is a replay and must produce no response"
+        );
+        assert!(
+            resp_second.to_local.is_empty(),
+            "a replayed initiation delivers no local payload"
+        );
+        assert_eq!(
+            a_ep.session_id_count(),
+            1,
+            "a replayed initiation must not allocate a new receive id (still exactly one)"
         );
     }
 
