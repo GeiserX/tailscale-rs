@@ -2,6 +2,15 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.27.0](https://github.com/GeiserX/tailscale-rs/compare/v0.26.0...v0.27.0) (2026-06-11)
+
+
+### Features
+
+* **device:** add Device::set_hostname() — runtime hostname change (tsnet parity) ([#97](https://github.com/GeiserX/tailscale-rs/issues/97)) ([8a1522a](https://github.com/GeiserX/tailscale-rs/commit/8a1522a139f745c279893d697d1256b55bf89f7d))
+* **device:** add Device::watch_ipn_bus() — unified IPN notification stream (tsnet parity) ([#99](https://github.com/GeiserX/tailscale-rs/issues/99)) ([dbf4c66](https://github.com/GeiserX/tailscale-rs/commit/dbf4c661a24b8be4e04b42e3546dfa7a5f9b4ac5))
+* **ipn-bus:** surface running-node PopBrowserURL + de-thrash the consent-URL cell (tsnet parity) ([#100](https://github.com/GeiserX/tailscale-rs/issues/100)) ([09244c0](https://github.com/GeiserX/tailscale-rs/commit/09244c04a148db356179df98058696e1fc94d57b))
+
 ## [0.26.0](https://github.com/GeiserX/tailscale-rs/compare/v0.25.0...v0.26.0) (2026-06-11)
 
 
