@@ -115,10 +115,16 @@ i=0
 # On a 429 we parse its "try again after <RFC2822>" and sleep until then, so a 43-new-crate split
 # publishes unattended (it just takes hours). Publishing new *versions* of existing crates is not
 # limited, so a resume after the burst flies through already-published ones via SKIP_PUBLISHED.
+# Max attempts to wait out a crates.io index-propagation lag for a single crate before giving up
+# (each attempt waits INDEX_WAIT seconds). 12 × 20s = 4 min, comfortably longer than any observed lag.
+INDEX_MAX_RETRIES=12
+INDEX_WAIT=20
+
 for crate in "${CRATES[@]}"; do
   i=$((i+1))
   echo ""
   echo "==== [$i/$total] $crate ===="
+  index_retries=0
   while :; do
     # Capture the single publish attempt's combined output so we can branch on the failure reason.
     # `--allow-dirty`: publishing crate N updates `Cargo.lock` (recording each just-published dep's
@@ -148,6 +154,22 @@ for crate in "${CRATES[@]}"; do
       fi
       echo "   rate-limited (429). Waiting ${wait_s}s (until ${after:-~10min}) then retrying $crate ..."
       sleep "$wait_s"
+      # loop retries the same crate
+    elif printf '%s' "$out" | grep -qiE "failed to select a version for the requirement .geiserx_"; then
+      # A just-published workspace dependency isn't visible on the crates.io sparse index YET: cargo
+      # uploaded crate N-k seconds ago, but the index entry for that version hasn't propagated to this
+      # runner, so resolving crate N's `geiserx_* = "^X.Y.Z"` requirement fails. This is purely a
+      # propagation race (the dep IS uploaded), not a real version mismatch — wait for the index and
+      # retry the SAME crate. (Broke the v0.18.1 publish twice at ts_netcheck → ts_derp.) `cargo
+      # update` refreshes the local index view between attempts so the new version is picked up.
+      index_retries=$((index_retries + 1))
+      if [ "$index_retries" -gt "$INDEX_MAX_RETRIES" ]; then
+        echo "ERROR: $crate still cannot resolve a geiserx_ dep after $INDEX_MAX_RETRIES index-propagation retries; giving up." >&2
+        exit "$rc"
+      fi
+      echo "   a just-published workspace dep isn't on the crates.io index yet (propagation lag); refreshing index, waiting ${INDEX_WAIT}s, then retrying $crate (attempt ${index_retries}/${INDEX_MAX_RETRIES}) ..."
+      cargo update -p "$crate" >/dev/null 2>&1 || true
+      sleep "$INDEX_WAIT"
       # loop retries the same crate
     else
       echo "ERROR: publishing $crate failed (rc=$rc). Stopping. Fix and re-run." >&2
