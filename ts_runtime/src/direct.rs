@@ -16,7 +16,7 @@
 
 use core::{net::SocketAddr, time::Duration};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, RwLock},
 };
 
@@ -153,23 +153,22 @@ impl DirectManager {
         self.transport_id
     }
 
-    /// Of the given peers, return those that currently have a trusted direct path.
-    ///
-    /// A peer is included only if its disco key is known and [`MagicSock::best_addr`] returns
-    /// `Some` for it right now (live query — never cached — so trust expiry downgrades
-    /// immediately).
+    /// Of the given peers, the current trusted direct UDP endpoint (`MagicSock::best_addr`) for each
+    /// that has one — Go's per-peer `CurAddr`. A peer appears in the map only if its disco key is
+    /// known and `best_addr` returns `Some` right now (live query — never cached — so trust expiry
+    /// downgrades immediately); an absent peer is relayed via DERP.
     #[message]
-    pub fn peers_with_direct_path(&self, ids: Vec<PeerId>) -> HashSet<PeerId> {
-        let mut ready = HashSet::new();
+    pub fn best_addrs(&self, ids: Vec<PeerId>) -> HashMap<PeerId, SocketAddr> {
+        let mut addrs = HashMap::new();
 
         // No bound underlay socket (bind failed => inert, DERP-only): no peer has a direct path.
         let Some(sock) = self.sock.as_ref() else {
-            return ready;
+            return addrs;
         };
 
         let db = poisoned_read(&self.peer_db);
         let Some(db) = db.as_ref() else {
-            return ready;
+            return addrs;
         };
 
         for id in ids {
@@ -179,12 +178,21 @@ impl DirectManager {
             let Some(disco) = node.disco_key else {
                 continue;
             };
-            if sock.best_addr(&disco).is_some() {
-                ready.insert(id);
+            if let Some(addr) = sock.best_addr(&disco) {
+                addrs.insert(id, addr);
             }
         }
 
-        ready
+        addrs
+    }
+
+    /// Of the given peers, return those that currently have a trusted direct path — the key set of
+    /// [`best_addrs`](Self::best_addrs). A peer is included only if its disco key is known and
+    /// [`MagicSock::best_addr`] returns `Some` for it right now (live query — never cached — so trust
+    /// expiry downgrades immediately).
+    #[message]
+    pub fn peers_with_direct_path(&self, ids: Vec<PeerId>) -> HashSet<PeerId> {
+        self.best_addrs(ids).into_keys().collect()
     }
 
     /// Re-bind the underlay UDP socket after a network/link change (the engine half of
