@@ -2,6 +2,19 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.28.0](https://github.com/GeiserX/tailscale-rs/compare/v0.27.0...v0.28.0) (2026-06-11)
+
+
+### Features
+
+* **device:** add Device::set_accept_routes() — runtime accept-routes toggle (tsnet parity) ([#101](https://github.com/GeiserX/tailscale-rs/issues/101)) ([abd32ee](https://github.com/GeiserX/tailscale-rs/commit/abd32ee97a372f80fa0cb096f1497c4f4366bd53))
+
+
+### Bug Fixes
+
+* **derp:** handle Health/Restarting frames as non-fatal + jittered reconnect backoff (tsnet parity) ([#103](https://github.com/GeiserX/tailscale-rs/issues/103)) ([5bb6a3d](https://github.com/GeiserX/tailscale-rs/commit/5bb6a3db9df362ef45da501bd84a4a2edfe308d1))
+* **magicsock:** cap inbound CallMeMaybe endpoints (anti-amplification) ([#104](https://github.com/GeiserX/tailscale-rs/issues/104)) ([43e501d](https://github.com/GeiserX/tailscale-rs/commit/43e501d4bb391918f6d24aa897ef40d6635ef1ca))
+
 ## [0.27.0](https://github.com/GeiserX/tailscale-rs/compare/v0.26.0...v0.27.0) (2026-06-11)
 
 
