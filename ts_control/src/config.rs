@@ -246,6 +246,15 @@ pub struct Config {
     #[serde(default)]
     pub forward_exit_egress: bool,
 
+    /// Shields-up (Go `ipn` prefs `ShieldsUp`): when `true`, refuse all **inbound** connections from
+    /// peers that terminate on this node — the packet filter drops inbound packets aimed at this
+    /// node's own addresses. Replies to connections this node itself initiated, and forwarded
+    /// subnet/exit transit, are unaffected (the deny is scoped to self-destined packets; see
+    /// `ts_packetfilter::ShieldsUpFilter`). Transport-only client preference — `ts_control` never
+    /// reads it; the runtime's packet-filter updater consumes it. Defaults to `false`.
+    #[serde(default)]
+    pub block_incoming: bool,
+
     /// Optional upstream proxy that exit-node egress is routed through, so the node egresses via
     /// the proxy's IP rather than its own origin IP.
     ///
@@ -581,6 +590,7 @@ impl Default for Config {
             forward_udp_ports: Vec::new(),
             forward_all_ports: false,
             forward_exit_egress: false,
+            block_incoming: false,
             exit_proxy: None,
             peerapi_port: None,
             taildrop_dir: None,
