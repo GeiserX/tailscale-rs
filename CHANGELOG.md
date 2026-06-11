@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.21.1](https://github.com/GeiserX/tailscale-rs/compare/v0.21.0...v0.21.1) (2026-06-11)
+
+
+### Bug Fixes
+
+* **keys,http:** stop panicking on malformed control wire input (parse errors, not unwinds) ([#81](https://github.com/GeiserX/tailscale-rs/issues/81)) ([0a4970f](https://github.com/GeiserX/tailscale-rs/commit/0a4970f069fbe977436a801c69e763c743e7eb0f))
+
 ## [0.21.0](https://github.com/GeiserX/tailscale-rs/compare/v0.20.0...v0.21.0) (2026-06-11)
 
 
