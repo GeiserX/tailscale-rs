@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.17.0](https://github.com/GeiserX/tailscale-rs/compare/v0.16.0...v0.17.0) (2026-06-11)
+
+
+### Features
+
+* **tsnet:** shields-up (block_incoming) — refuse inbound peer connections ([#63](https://github.com/GeiserX/tailscale-rs/issues/63)) ([b4fdb9e](https://github.com/GeiserX/tailscale-rs/commit/b4fdb9e23a5be818a3ab2494e2d960b4ce387b73))
+
 ## [0.16.0](https://github.com/GeiserX/tailscale-rs/compare/v0.15.0...v0.16.0) (2026-06-11)
 
 
