@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.23.0](https://github.com/GeiserX/tailscale-rs/compare/v0.22.1...v0.23.0) (2026-06-11)
+
+
+### Features
+
+* **status:** populate PeerStatus.Relay — the DERP region code (completes direct-vs-relay) ([#89](https://github.com/GeiserX/tailscale-rs/issues/89)) ([1bb1d50](https://github.com/GeiserX/tailscale-rs/commit/1bb1d5022802fe553e606bf12076599434de9647))
+
 ## [0.22.1](https://github.com/GeiserX/tailscale-rs/compare/v0.22.0...v0.22.1) (2026-06-11)
 
 
