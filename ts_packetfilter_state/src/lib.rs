@@ -74,6 +74,85 @@ where
     rules.into_iter().filter_map(rule_to_pf)
 }
 
+/// An owned peer-capability grant retained from a `MapResponse`'s application
+/// ([`FilterRule::Application`][pf_serde::FilterRule]) rules — the data the network-rule compile path
+/// ([`rule_to_pf`]) discards. Owns its strings (the wire form borrows from the transient netmap
+/// buffer). Backs flow-scoped WhoIs (Go `apitype.WhoIsResponse.CapMap` / `Filter.CapsWithValues`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CapGrant {
+    /// Source IP prefixes the grant applies to (the flow's source must fall in one). `SrcIp::NodeCap`
+    /// sources are not captured here (deferred — they need the self node's cap map to evaluate).
+    pub src_pfxs: Vec<ipnet::IpNet>,
+    /// Destination IP prefixes the grant covers (the flow's destination must fall in one).
+    pub dst_pfxs: Vec<ipnet::IpNet>,
+    /// The granted capabilities: name -> list of raw-JSON values (Go `tailcfg.PeerCapMap`).
+    pub caps: BTreeMap<String, Vec<String>>,
+}
+
+/// Retain the peer-capability grants from a set of `MapResponse` filter rules — the application-rule
+/// counterpart to [`rules_to_pf`], which keeps exactly what that drops. Network rules are skipped.
+/// `SrcIp::NodeCap` sources are skipped (deferred); a grant with only NodeCap sources keeps an empty
+/// `src_pfxs` and so matches no IP flow, which is the safe (no-grant) default.
+pub fn retain_cap_grants<'r, 'f>(
+    rules: impl IntoIterator<Item = &'f pf_serde::FilterRule<'r>>,
+) -> Vec<CapGrant>
+where
+    'r: 'f,
+{
+    let mut out = Vec::new();
+    for rule in rules {
+        let Some(app) = rule.as_app() else {
+            continue;
+        };
+        let mut src_pfxs = Vec::new();
+        for src in &app.src_ips {
+            if let pf_serde::SrcIp::IpRange(r) = src {
+                src_pfxs.extend(r.iter_prefixes());
+            }
+            // NodeCap sources are intentionally not captured (deferred).
+        }
+        for grant in &app.cap_grant {
+            let caps = grant
+                .peer_caps
+                .iter()
+                .map(|(name, vals)| {
+                    (
+                        name.as_ref().to_string(),
+                        vals.iter().map(|v| v.to_string()).collect::<Vec<String>>(),
+                    )
+                })
+                .collect::<BTreeMap<String, Vec<String>>>();
+            out.push(CapGrant {
+                src_pfxs: src_pfxs.clone(),
+                dst_pfxs: grant.dsts.clone(),
+                caps,
+            });
+        }
+    }
+    out
+}
+
+/// The flow-scoped peer-capability map for a `src -> dst` flow (Go `Filter.CapsWithValues`): union
+/// the `caps` of every retained grant whose `src_pfxs` contains `src` AND whose `dst_pfxs` contains
+/// `dst`, accumulating values per capability name. Empty when no grant matches.
+pub fn caps_for(
+    grants: &[CapGrant],
+    src: core::net::IpAddr,
+    dst: core::net::IpAddr,
+) -> BTreeMap<String, Vec<String>> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for grant in grants {
+        let src_ok = grant.src_pfxs.iter().any(|p| p.contains(&src));
+        let dst_ok = grant.dst_pfxs.iter().any(|p| p.contains(&dst));
+        if src_ok && dst_ok {
+            for (name, vals) in &grant.caps {
+                out.entry(name.clone()).or_default().extend(vals.clone());
+            }
+        }
+    }
+    out
+}
+
 /// Report whether the special key indicating that the filter state should be
 /// cleared is present and has a `null` value.
 #[inline]
@@ -138,6 +217,57 @@ mod test {
 
     const SRC: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
     const DST: IpAddr = IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8));
+
+    /// `retain_cap_grants` keeps application-rule grants (which `rule_to_pf` drops), and `caps_for`
+    /// unions the caps of every grant matching the `src -> dst` flow — Go `Filter.CapsWithValues`.
+    #[test]
+    fn cap_grants_retained_and_matched_for_flow() {
+        use pf_serde::{AppRule, CapGrant as SerdeCapGrant, FilterRule};
+        use ts_peercapability::Name;
+
+        let src_net: ipnet::IpNet = "100.64.0.0/10".parse().unwrap();
+        let dst_net: ipnet::IpNet = "100.99.0.0/16".parse().unwrap();
+
+        // An application rule granting `cap/web` (value `["read"]`) for the dst prefix, plus a plain
+        // network rule that must be ignored by the cap-grant retention.
+        let app = FilterRule::Application(AppRule {
+            src_ips: vec![SrcIp::from(src_net)],
+            cap_grant: vec![SerdeCapGrant {
+                dsts: vec![dst_net],
+                peer_caps: [(Name("tailscale.com/cap/web"), vec!["\"read\""])]
+                    .into_iter()
+                    .collect(),
+            }],
+        });
+        let net = FilterRule::Network(NetworkRule {
+            src_ips: vec![SrcIp::from(SRC)],
+            ip_proto: IpProto::NULL_DEFAULTS.to_vec(),
+            dst_ports: vec![DstPort {
+                ports: PORT..=PORT,
+                ip: DST.into(),
+            }],
+        });
+
+        let grants = retain_cap_grants([&app, &net]);
+        assert_eq!(grants.len(), 1, "only the application rule yields a grant");
+
+        // A flow from inside src_net to inside dst_net gets the cap.
+        let in_src = IpAddr::V4(Ipv4Addr::new(100, 64, 1, 1));
+        let in_dst = IpAddr::V4(Ipv4Addr::new(100, 99, 5, 5));
+        let caps = caps_for(&grants, in_src, in_dst);
+        assert_eq!(
+            caps.get("tailscale.com/cap/web").map(Vec::as_slice),
+            Some(&["\"read\"".to_string()][..]),
+            "the matching flow gets the granted cap value"
+        );
+
+        // A flow to a dst outside the grant's prefixes gets nothing.
+        let out_dst = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        assert!(
+            caps_for(&grants, in_src, out_dst).is_empty(),
+            "a dst outside the grant prefix yields no caps"
+        );
+    }
 
     #[test]
     fn basic() {
