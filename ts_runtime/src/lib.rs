@@ -908,12 +908,14 @@ impl Runtime {
     /// snapshot on subscribe (`INITIAL_STATE` / `INITIAL_NETMAP`), exactly like Go's
     /// `NotifyInitialState` / `NotifyInitialNetMap`.
     ///
-    /// This composes the same `watch` cells as [`watch_state`](Self::watch_state) and
-    /// [`watch_netmap`](Self::watch_netmap) — one source of truth, so the merged feed cannot diverge
-    /// from those narrow views. Delivery is best-effort/lossy (a bounded per-watcher buffer; a
-    /// notification is dropped rather than blocking the runtime if a slow consumer's buffer fills),
-    /// matching Go's bus. The stream ends (`next` returns `None`) on runtime shutdown or when the
-    /// watcher is dropped.
+    /// This composes the same `watch` cells as [`watch_state`](Self::watch_state),
+    /// [`watch_netmap`](Self::watch_netmap), and `pop_browser_url` — one source of truth, so the
+    /// merged feed cannot diverge from those narrow views. Besides the registration-time login URL
+    /// (carried by `NeedsLogin`), `browse_to_url` also streams the mid-session
+    /// `MapResponse.PopBrowserURL` (re-auth / consent on an already-running node). Delivery is
+    /// best-effort/lossy (a bounded per-watcher buffer; a notification is dropped rather than
+    /// blocking the runtime if a slow consumer's buffer fills), matching Go's bus. The stream ends
+    /// (`next` returns `None`) on runtime shutdown or when the watcher is dropped.
     pub async fn watch_ipn_bus(&self, mask: NotifyWatchOpt) -> Result<IpnBusWatcher, Error> {
         // The peer-set cell lives on the peer-tracker actor; obtain a receiver the same way
         // `watch_netmap` does. State + shutdown cells are held here.
@@ -927,10 +929,14 @@ impl Runtime {
             })?
             .ask(peer_tracker::WatchNetmap)
             .await?;
+        // The running-node consent-URL cell lives on the control runner; obtain its receiver the
+        // same way (the control actor ref is strong, so no upgrade needed).
+        let browser_rx = self.control.ask(control_runner::WatchBrowserUrl).await?;
         Ok(ipn_bus::spawn_watcher(
             mask,
             self.state_rx.clone(),
             peer_rx,
+            browser_rx,
             self.shutdown.subscribe(),
         ))
     }

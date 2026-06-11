@@ -826,13 +826,22 @@ impl Device {
     }
 
     /// The URL control last asked this node to open in a browser (`MapResponse.PopBrowserURL`), or
-    /// `None` if control has sent none.
+    /// `None` if control has never sent one.
     ///
     /// This is the interactive-login / consent URL an embedder driving a non-authkey (interactive)
     /// login must surface to the user — the Rust analog of Go `ipn` delivering `BrowseToURL` through
     /// the notification bus. A daemon polls this after starting an interactive login to obtain the
-    /// auth URL to present. `None` until control sends one; the value is replaced (not accumulated)
-    /// each time control pushes a new one.
+    /// auth URL to present.
+    ///
+    /// **Sticky semantics** (Go `controlclient`'s `sess.lastPopBrowserURL`): once control sends a
+    /// URL it remains the returned value until control sends a *different* non-empty one — it is
+    /// **never cleared back to `None`** (control sends `PopBrowserURL` empty on nearly every netmap
+    /// tick; those empty updates are ignored, not treated as "clear"). So a non-`None` result does
+    /// **not** signal "control is asking *right now*" vs. "already handled" — it is the last URL
+    /// seen this session. A consumer that acts on it should de-duplicate on the URL value rather than
+    /// re-acting on every poll. For a push stream of *new* consent URLs (rather than polling this
+    /// sticky value), subscribe to [`watch_ipn_bus`](Self::watch_ipn_bus) and react to
+    /// [`Notify::browse_to_url`](crate::Notify::browse_to_url).
     pub async fn pop_browser_url(&self) -> Result<Option<Url>, Error> {
         self.runtime
             .control

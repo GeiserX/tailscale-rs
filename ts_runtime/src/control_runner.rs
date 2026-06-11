@@ -58,8 +58,17 @@ pub struct ControlRunner {
     dns_config: watch::Sender<Option<ts_control::DnsConfig>>,
     /// Latest interactive-login / consent URL control asked this node to open
     /// (`MapResponse.PopBrowserURL`), or `None` until control sends one. The facade reads this for
-    /// `Device::pop_browser_url` (a daemon driving a non-authkey login surfaces it to the user).
-    /// Replaced (not accumulated) on each update.
+    /// `Device::pop_browser_url` (a daemon driving a non-authkey login surfaces it to the user), and
+    /// [`Runtime::watch_ipn_bus`](crate::Runtime::watch_ipn_bus) subscribes to it for the bus's
+    /// `browse_to_url` running-node events.
+    ///
+    /// **Sticky, not per-update** (Go `controlclient` `sess.lastPopBrowserURL`): control sends
+    /// `MapResponse.PopBrowserURL` empty on nearly every netmap tick, so this cell is updated ONLY on
+    /// a non-empty URL that differs from its current value (`sticky_update_pop_browser_url`, via
+    /// `send_if_modified` — the cell's own value is the "last URL seen", so no separate mirror is
+    /// needed). It is never reset to `None` by an empty update — matching Go's `direct.go` guard
+    /// `u != "" && u != sess.lastPopBrowserURL`. Updating on every tick would thrash the cell to
+    /// `None` and coalesce the URL away for a `watch` subscriber.
     pop_browser_url: watch::Sender<Option<url::Url>>,
     /// Latest network-conditions report (preferred DERP region + per-region latencies), updated each
     /// time the DERP-latency measurer reports in. The facade reads this for `Device::netcheck` (the
@@ -302,6 +311,39 @@ impl ControlRunner {
     }
 }
 
+/// Apply Go's sticky `PopBrowserURL` semantics to the consent-URL `watch` cell.
+///
+/// Control sends `MapResponse.PopBrowserURL` empty on nearly every netmap update, so the cell is
+/// updated ONLY when `incoming` is a non-empty URL that differs from the cell's current value —
+/// Go's `direct.go` guard `u != "" && u != sess.lastPopBrowserURL`. The cell is **never reset to
+/// `None`** by an empty/absent update — the running-node consent URL is sticky for the session.
+/// Updating unconditionally would thrash the cell to `None` on every tick and coalesce the URL away
+/// for a `watch`/bus subscriber.
+///
+/// The dedupe is in-place via [`watch::Sender::send_if_modified`] — the cell's own value is the
+/// "last URL sent" (this sticky path is its only writer), so no separate mirror field is needed and
+/// the watch is woken only on a genuine change (Go's `sess.lastPopBrowserURL` role, for free). This
+/// matches the [`send_if_modified`](watch::Sender::send_if_modified) idiom already used for the
+/// device-state cell in this handler.
+///
+/// Factored out of the netmap-update handler so the (easy-to-regress) sticky logic is unit-testable
+/// against a plain `watch` channel without standing up the actor.
+fn sticky_update_pop_browser_url(
+    cell: &watch::Sender<Option<url::Url>>,
+    incoming: Option<&url::Url>,
+) {
+    if let Some(url) = incoming {
+        cell.send_if_modified(|current| {
+            if current.as_ref() == Some(url) {
+                false
+            } else {
+                *current = Some(url.clone());
+                true
+            }
+        });
+    }
+}
+
 // The `#[kameo::messages]` macro generates message structs whose fields mirror the method params;
 // those generated fields carry no doc and can't take attributes, so wrap in a module where
 // missing-docs is allowed (same pattern as PeerTracker's `msg_impl`). The generated message structs
@@ -418,6 +460,18 @@ mod msg_impl {
         #[message]
         pub fn pop_browser_url(&self) -> Option<url::Url> {
             self.pop_browser_url.borrow().clone()
+        }
+
+        /// Subscribe to the interactive-login / consent URL cell (`MapResponse.PopBrowserURL`).
+        ///
+        /// Returns a [`watch::Receiver`] whose value is the latest running-node consent URL, used by
+        /// [`Runtime::watch_ipn_bus`](crate::Runtime::watch_ipn_bus) to surface `browse_to_url`
+        /// events mid-session. The cell is sticky (updated only on a new non-empty URL, never reset
+        /// to `None` by an empty update — see the field docs), so a subscriber is not thrashed and a
+        /// late subscriber sees the current URL. The initial value is `None` until control sends one.
+        #[message(derive(Clone))]
+        pub fn watch_browser_url(&self) -> watch::Receiver<Option<url::Url>> {
+            self.pop_browser_url.subscribe()
         }
 
         /// The latest network-conditions report (preferred DERP region + per-region latencies). An
@@ -653,11 +707,10 @@ impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
                 // empty config (Go `netmap.NetworkMap.DNS`).
                 self.dns_config.send_replace(msg.dns_config.clone());
 
-                // Track the interactive-login URL for `Device::pop_browser_url`. `None` on updates
-                // that carry none — control sends it only when it wants a browser opened
-                // (`MapResponse.PopBrowserURL`); replace rather than accumulate.
-                self.pop_browser_url
-                    .send_replace(msg.pop_browser_url.clone());
+                // Track the interactive-login URL for `Device::pop_browser_url` /
+                // `Runtime::watch_ipn_bus`. See `sticky_update_pop_browser_url` for the Go-faithful
+                // sticky semantics (update only on a new non-empty URL; never reset to `None`).
+                sticky_update_pop_browser_url(&self.pop_browser_url, msg.pop_browser_url.as_ref());
 
                 if let Err(e) = self.params.env.publish(msg).await {
                     tracing::error!(error = %e, "publishing netmap update");
@@ -781,5 +834,133 @@ impl Message<SetHostname> for ControlRunner {
     async fn handle(&mut self, msg: SetHostname, _ctx: &mut Context<Self, Self::Reply>) {
         tracing::debug!("updating hostname at control");
         self.client.set_hostname(msg.hostname).await;
+    }
+}
+
+#[cfg(test)]
+mod sticky_pop_browser_url_tests {
+    use tokio::sync::watch;
+
+    use super::sticky_update_pop_browser_url;
+
+    fn url(s: &str) -> url::Url {
+        s.parse().unwrap()
+    }
+
+    /// A non-empty URL publishes to the cell.
+    #[test]
+    fn non_empty_url_publishes() {
+        let (tx, rx) = watch::channel(None);
+        let u = url("https://login.example/consent");
+        sticky_update_pop_browser_url(&tx, Some(&u));
+        assert_eq!(*rx.borrow(), Some(u));
+    }
+
+    /// An absent (`None`) update — the common netmap tick — must NOT reset the cell. This is the
+    /// regression guard for the thrash bug (a reset-every-tick would coalesce the URL away on the bus).
+    #[test]
+    fn absent_update_does_not_reset() {
+        let u = url("https://login.example/consent");
+        let (tx, rx) = watch::channel(Some(u.clone()));
+        // Simulate many empty netmap updates.
+        for _ in 0..5 {
+            sticky_update_pop_browser_url(&tx, None);
+        }
+        assert_eq!(
+            *rx.borrow(),
+            Some(u),
+            "empty updates must not clear the URL"
+        );
+    }
+
+    /// The same URL repeated does not re-fire the watch (in-place dedupe via `send_if_modified`), so
+    /// a subscriber isn't woken spuriously. Proven by the borrow not having been marked changed.
+    #[test]
+    fn repeated_same_url_does_not_refire() {
+        let u = url("https://login.example/consent");
+        let (tx, mut rx) = watch::channel(None);
+        sticky_update_pop_browser_url(&tx, Some(&u)); // first: fires
+        assert!(rx.has_changed().unwrap(), "first non-empty URL fires");
+        rx.mark_unchanged();
+        sticky_update_pop_browser_url(&tx, Some(&u)); // same: deduped
+        assert!(
+            !rx.has_changed().unwrap(),
+            "repeating the same URL must not re-fire the watch"
+        );
+    }
+
+    /// A genuinely new URL after a prior one fires again (sticky but tracks changes).
+    #[test]
+    fn new_url_after_prior_fires() {
+        let a = url("https://login.example/a");
+        let b = url("https://login.example/b");
+        let (tx, rx) = watch::channel(None);
+        sticky_update_pop_browser_url(&tx, Some(&a));
+        sticky_update_pop_browser_url(&tx, Some(&b));
+        assert_eq!(*rx.borrow(), Some(b));
+    }
+
+    /// The realistic session sequence: a URL stays sticky through a run of `None` ticks, and a
+    /// *different* URL after that gap still fires. Chains the legs the other tests cover in isolation
+    /// (the actual control cadence is "URL, then many empty updates, then maybe a new URL").
+    #[test]
+    fn sticky_through_none_gap_then_new_url_fires() {
+        let a = url("https://login.example/a");
+        let b = url("https://login.example/b");
+        let (tx, rx) = watch::channel(None);
+        sticky_update_pop_browser_url(&tx, Some(&a));
+        for _ in 0..3 {
+            sticky_update_pop_browser_url(&tx, None);
+        }
+        assert_eq!(*rx.borrow(), Some(a), "stayed sticky through the None gap");
+        sticky_update_pop_browser_url(&tx, Some(&b));
+        assert_eq!(
+            *rx.borrow(),
+            Some(b),
+            "a new URL after a None gap still fires"
+        );
+    }
+
+    /// Returning to a previously-seen URL (A → B → A) re-fires: the dedupe is against the cell's
+    /// *current* value, not a full history, so A after B is a genuine change.
+    #[test]
+    fn returning_to_prior_url_refires() {
+        let a = url("https://login.example/a");
+        let b = url("https://login.example/b");
+        let (tx, mut rx) = watch::channel(None);
+        sticky_update_pop_browser_url(&tx, Some(&a));
+        sticky_update_pop_browser_url(&tx, Some(&b));
+        rx.mark_unchanged();
+        sticky_update_pop_browser_url(&tx, Some(&a)); // back to A: differs from current (B) → fires
+        assert!(
+            rx.has_changed().unwrap(),
+            "returning to a prior URL re-fires"
+        );
+        assert_eq!(*rx.borrow(), Some(a));
+    }
+
+    /// End-to-end de-thrash: feed a realistic netmap cadence (empty, empty, URL, empty, empty)
+    /// through the producer into a cell, and count the changes a `run_bus`-style subscriber would
+    /// observe via `changed()`. The whole point of the fix is that exactly ONE change survives the
+    /// surrounding `None` thrash — the pre-fix code (`send_replace` every tick) would have woken the
+    /// subscriber on every empty tick and coalesced the URL away. This exercises the producer + the
+    /// watch-subscribe path together (the two halves the unit tests cover in isolation).
+    #[tokio::test]
+    async fn end_to_end_one_change_survives_none_thrash() {
+        let u = url("https://login.example/consent");
+        let (tx, mut rx) = watch::channel(None);
+        // The cadence control actually sends: mostly-empty MapResponses with one carrying the URL.
+        let cadence = [None, None, Some(&u), None, None];
+        for incoming in cadence {
+            sticky_update_pop_browser_url(&tx, incoming);
+        }
+        // A subscriber sees exactly one change, and it carries the URL (not a coalesced `None`).
+        let mut changes = 0;
+        while rx.has_changed().unwrap() {
+            let v = rx.borrow_and_update().clone();
+            changes += 1;
+            assert_eq!(v, Some(u.clone()), "the surviving change carries the URL");
+        }
+        assert_eq!(changes, 1, "exactly one change survives the None thrash");
     }
 }

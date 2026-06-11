@@ -29,16 +29,18 @@
 //! source of truth — it cannot diverge from the narrow views) into the merged feed an embedder
 //! porting from Go's `WatchIPNBus` expects. The two cells it reads map onto Go `Notify` fields:
 //!
-//! - [`DeviceState`] → `Notify.State`. The interactive-login URL is carried by
-//!   [`DeviceState::NeedsLogin`], so `Notify.browse_to_url` is **derived from that state**. This
-//!   covers the **registration-time** auth URL (control's `MachineNotAuthorized`). NOTE — partial vs.
-//!   Go: Go also forwards a *mid-session* `BrowseToURL` from `MapResponse.PopBrowserURL` for an
-//!   already-`Running` node (re-auth / forced-re-login nudges). This bus does **not yet** surface
-//!   that: the fork captures it in a separate cell (exposed via the `pop_browser_url` pull API), but
-//!   that cell is reset to `None` on nearly every netmap update, so it cannot be merged naively
-//!   without coalescing the URL away. Surfacing the running-node `PopBrowserURL` on the bus (which
-//!   needs the producer to stop thrashing the cell to `None`) is tracked as follow-up work. Until
-//!   then, `browse_to_url` reflects the registration-path URL only.
+//! - [`DeviceState`] → `Notify.State`, and the **registration-time** interactive-login URL carried
+//!   by [`DeviceState::NeedsLogin`] (`Notify.browse_to_url`, derived from that state — control's
+//!   `MachineNotAuthorized`).
+//! - the running-node consent URL (`MapResponse.PopBrowserURL`) → `Notify.browse_to_url` as a
+//!   mid-session event. Go also forwards this `BrowseToURL` for an already-`Running` node (re-auth /
+//!   forced-re-login nudges). The fork's backing cell is **sticky** (the producer updates it only on
+//!   a new non-empty URL, never resets it to `None` on an empty update — Go's `direct.go` guard
+//!   `u != "" && u != sess.lastPopBrowserURL`), so a `watch` subscriber is not thrashed. It is
+//!   streamed post-subscribe but **not** front-loaded into the initial snapshot — Go replays only the
+//!   registration `b.authURL` (the `NeedsLogin`-derived URL above) on a new watcher, never the
+//!   running-node `PopBrowserURL`; a consumer wanting the current pending URL at subscribe time reads
+//!   the sticky `pop_browser_url` pull API.
 //! - the peer set (`Vec<StatusNode>`) → `Notify.NetMap` (the embedder-facing peer view).
 //!
 //! Go's `Notify` has no packet-filter cap-grant field (caps are an internal `WhoIs` input, not an
@@ -112,11 +114,12 @@ pub struct Notify {
     pub state: Option<DeviceState>,
     /// The new peer set, if the netmap changed (Go `Notify.NetMap`, embedder-facing peer view).
     pub net_map: Option<Vec<StatusNode>>,
-    /// An interactive-login URL the embedder should open (Go `Notify.BrowseToURL`). Derived from
-    /// [`DeviceState::NeedsLogin`]: set alongside `state` whenever the device enters that state, so
-    /// it shares the (de-duplicated) state cell's source of truth. This is the **registration-time**
-    /// auth URL; the mid-session `MapResponse.PopBrowserURL` (re-auth on an already-running node) is
-    /// not yet surfaced on the bus — see the module docs.
+    /// An interactive-login / consent URL the embedder should open (Go `Notify.BrowseToURL`). Two
+    /// sources feed it: the **registration-time** auth URL, derived from [`DeviceState::NeedsLogin`]
+    /// and set alongside `state` when the device enters that state; and the **mid-session**
+    /// `MapResponse.PopBrowserURL` (re-auth / consent on an already-running node), streamed on its own
+    /// as a standalone event. See the module docs for which is front-loaded into the initial snapshot
+    /// (only the registration URL) vs. streamed (both).
     pub browse_to_url: Option<url::Url>,
 }
 
@@ -155,10 +158,18 @@ pub(crate) fn spawn_watcher(
     mask: NotifyWatchOpt,
     state_rx: watch::Receiver<DeviceState>,
     peer_rx: watch::Receiver<Vec<StatusNode>>,
+    browser_rx: watch::Receiver<Option<url::Url>>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> IpnBusWatcher {
     let (tx, rx) = mpsc::channel(NOTIFY_BUFFER);
-    tokio::spawn(run_bus(mask, state_rx, peer_rx, shutdown_rx, tx));
+    tokio::spawn(run_bus(
+        mask,
+        state_rx,
+        peer_rx,
+        browser_rx,
+        shutdown_rx,
+        tx,
+    ));
     IpnBusWatcher { rx }
 }
 
@@ -203,6 +214,7 @@ pub(crate) async fn run_bus(
     mask: NotifyWatchOpt,
     mut state_rx: watch::Receiver<DeviceState>,
     mut peer_rx: watch::Receiver<Vec<StatusNode>>,
+    mut browser_rx: watch::Receiver<Option<url::Url>>,
     mut shutdown_rx: watch::Receiver<bool>,
     tx: mpsc::Sender<Notify>,
 ) {
@@ -231,6 +243,14 @@ pub(crate) async fn run_bus(
             initial.net_map = Some(peers.clone());
         }
     }
+    // Mark the running-node browser-URL cell's initial value seen so the streaming arm waits for a
+    // real post-subscribe change (busy-loop prevention, same as the cells above). Its current value
+    // is deliberately NOT front-loaded into the initial snapshot: Go replays only the
+    // registration-time auth URL (the `NeedsLogin`-derived `browse_to_url` above), never the
+    // running-node `MapResponse.PopBrowserURL`, on a new watcher's initial state. A consumer wanting
+    // the current pending consent URL at subscribe time reads the sticky `pop_browser_url` pull API;
+    // the bus streams future transitions.
+    browser_rx.borrow_and_update();
     if !initial.is_empty() && deliver(&tx, initial) {
         return;
     }
@@ -273,6 +293,26 @@ pub(crate) async fn run_bus(
                     return;
                 }
             }
+            changed = browser_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                // The running-node consent URL (`MapResponse.PopBrowserURL`). The producer cell is
+                // de-thrashed (updated only on a new non-empty URL, never reset to `None`), so a
+                // change here carries a fresh `Some(url)`; skip the defensive `None` case rather than
+                // emit an empty `browse_to_url`.
+                let url = browser_rx.borrow_and_update().clone();
+                if let Some(url) = url {
+                    let notify = Notify {
+                        state: None,
+                        net_map: None,
+                        browse_to_url: Some(url),
+                    };
+                    if deliver(&tx, notify) {
+                        return;
+                    }
+                }
+            }
         }
     }
 }
@@ -285,28 +325,49 @@ mod tests {
 
     use super::*;
 
-    /// Drive `run_bus` on a task against hand-made channels, returning the senders and the consumer
-    /// handle. Mirrors how `device_state` tests drive `wait_for_running` off a plain `watch`.
-    fn harness(
-        mask: NotifyWatchOpt,
-        state: DeviceState,
-        peers: Vec<StatusNode>,
-    ) -> (
+    /// The hand-made channel senders (state, peer, browser-URL, shutdown) plus the consumer handle
+    /// that [`harness`] returns — the four source senders let a test drive `run_bus`, and the
+    /// `IpnBusWatcher` observes what it emits.
+    type Harness = (
         watch::Sender<DeviceState>,
         watch::Sender<Vec<StatusNode>>,
+        watch::Sender<Option<url::Url>>,
         watch::Sender<bool>,
         IpnBusWatcher,
-    ) {
+    );
+
+    /// Drive `run_bus` on a task against hand-made channels, returning the senders (state, peer,
+    /// browser-URL, shutdown) and the consumer handle. Mirrors how `device_state` tests drive
+    /// `wait_for_running` off a plain `watch`.
+    fn harness(mask: NotifyWatchOpt, state: DeviceState, peers: Vec<StatusNode>) -> Harness {
         let (state_tx, state_rx) = watch::channel(state);
         let (peer_tx, peer_rx) = watch::channel(peers);
+        let (browser_tx, browser_rx) = watch::channel(None);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (tx, rx) = mpsc::channel(NOTIFY_BUFFER);
-        tokio::spawn(run_bus(mask, state_rx, peer_rx, shutdown_rx, tx));
-        (state_tx, peer_tx, shutdown_tx, IpnBusWatcher { rx })
+        tokio::spawn(run_bus(
+            mask,
+            state_rx,
+            peer_rx,
+            browser_rx,
+            shutdown_rx,
+            tx,
+        ));
+        (
+            state_tx,
+            peer_tx,
+            browser_tx,
+            shutdown_tx,
+            IpnBusWatcher { rx },
+        )
     }
 
     fn login_url() -> url::Url {
         "https://login.example/auth".parse().unwrap()
+    }
+
+    fn consent_url() -> url::Url {
+        "https://login.example/consent".parse().unwrap()
     }
 
     /// A minimal non-empty peer, so a `net_map` payload assertion exercises a real value rather than
@@ -348,7 +409,7 @@ mod tests {
     /// net_map).
     #[tokio::test]
     async fn initial_state_snapshot_emitted_when_masked() {
-        let (_s, _p, _sd, mut w) = harness(
+        let (_s, _p, _b, _sd, mut w) = harness(
             NotifyWatchOpt::INITIAL_STATE,
             DeviceState::Running,
             Vec::new(),
@@ -362,7 +423,7 @@ mod tests {
     /// `NotifyInitialNetMap` front-loads the current peer set (net_map only, no state).
     #[tokio::test]
     async fn initial_netmap_snapshot_emitted_when_masked() {
-        let (_s, _p, _sd, mut w) = harness(
+        let (_s, _p, _b, _sd, mut w) = harness(
             NotifyWatchOpt::INITIAL_NETMAP,
             DeviceState::Running,
             Vec::new(),
@@ -376,7 +437,7 @@ mod tests {
     /// separate events.
     #[tokio::test]
     async fn initial_snapshot_coalesces_both_fields() {
-        let (_s, _p, _sd, mut w) = harness(
+        let (_s, _p, _b, _sd, mut w) = harness(
             NotifyWatchOpt::INITIAL_STATE | NotifyWatchOpt::INITIAL_NETMAP,
             DeviceState::Running,
             Vec::new(),
@@ -389,7 +450,7 @@ mod tests {
     /// An empty mask sends NO initial snapshot; the watcher then receives the next real transition.
     #[tokio::test]
     async fn empty_mask_skips_initial_then_streams_change() {
-        let (state_tx, _p, _sd, mut w) =
+        let (state_tx, _p, _b, _sd, mut w) =
             harness(NotifyWatchOpt::empty(), DeviceState::Connecting, Vec::new());
         // No initial snapshot: nothing within the quiet window.
         assert!(
@@ -412,7 +473,7 @@ mod tests {
         // streaming loop — only then is a post-subscribe send guaranteed to be observed (no sleeps,
         // no spawn-vs-send race). Any change after `.changed()`'s seen-version is detected even if
         // the loop is not yet parked on `.changed()`.
-        let (state_tx, _p, _sd, mut w) = harness(
+        let (state_tx, _p, _b, _sd, mut w) = harness(
             NotifyWatchOpt::INITIAL_STATE,
             DeviceState::Connecting,
             Vec::new(),
@@ -430,7 +491,7 @@ mod tests {
     /// initial snapshot carries `BrowseToURL` only when `state == NeedsLogin`).
     #[tokio::test]
     async fn initial_needs_login_includes_browse_to_url() {
-        let (_s, _p, _sd, mut w) = harness(
+        let (_s, _p, _b, _sd, mut w) = harness(
             NotifyWatchOpt::INITIAL_STATE,
             DeviceState::NeedsLogin(login_url()),
             Vec::new(),
@@ -445,7 +506,7 @@ mod tests {
     async fn peer_change_streams_netmap() {
         // INITIAL_NETMAP snapshot is the barrier (proves the task finished its init borrows and is
         // in the streaming loop) before we send — avoids the spawn-vs-send race.
-        let (_s, peer_tx, _sd, mut w) = harness(
+        let (_s, peer_tx, _b, _sd, mut w) = harness(
             NotifyWatchOpt::INITIAL_NETMAP,
             DeviceState::Running,
             Vec::new(),
@@ -465,7 +526,7 @@ mod tests {
     /// `borrow_and_update` correctly marks the snapshotted values seen (no initial-value busy-loop).
     #[tokio::test]
     async fn no_spurious_reemit_after_initial() {
-        let (state_tx, _p, _sd, mut w) = harness(
+        let (state_tx, _p, _b, _sd, mut w) = harness(
             NotifyWatchOpt::INITIAL_STATE | NotifyWatchOpt::INITIAL_NETMAP,
             DeviceState::Running,
             Vec::new(),
@@ -489,7 +550,7 @@ mod tests {
     /// Flipping the shutdown cell terminates the stream: `next()` returns `None`.
     #[tokio::test]
     async fn shutdown_terminates_stream() {
-        let (_s, _p, shutdown_tx, mut w) =
+        let (_s, _p, _b, shutdown_tx, mut w) =
             harness(NotifyWatchOpt::empty(), DeviceState::Running, Vec::new());
         shutdown_tx.send_replace(true);
         assert_eq!(w.next().await, None, "shutdown must end the stream");
@@ -500,12 +561,14 @@ mod tests {
     async fn already_shutdown_ends_immediately() {
         let (state_tx, state_rx) = watch::channel(DeviceState::Running);
         let (peer_tx, peer_rx) = watch::channel(Vec::new());
+        let (browser_tx, browser_rx) = watch::channel(None);
         let (_shutdown_tx, shutdown_rx) = watch::channel(true);
         let (tx, rx) = mpsc::channel(NOTIFY_BUFFER);
         tokio::spawn(run_bus(
             NotifyWatchOpt::INITIAL_STATE,
             state_rx,
             peer_rx,
+            browser_rx,
             shutdown_rx,
             tx,
         ));
@@ -513,16 +576,16 @@ mod tests {
         assert_eq!(w.next().await, None, "already-shutdown must emit nothing");
         // Keep the source senders alive until after the assertion so termination is attributable to
         // the shutdown flag, not a sender drop.
-        drop((state_tx, peer_tx));
+        drop((state_tx, peer_tx, browser_tx));
     }
 
     /// Dropping every source sender (runtime tearing down without the graceful flag) also ends the
     /// stream rather than hanging.
     #[tokio::test]
     async fn source_sender_drop_terminates_stream() {
-        let (state_tx, _p, _sd, mut w) =
+        let (state_tx, _p, _b, _sd, mut w) =
             harness(NotifyWatchOpt::empty(), DeviceState::Running, Vec::new());
-        drop((state_tx, _p, _sd));
+        drop((state_tx, _p, _b, _sd));
         assert_eq!(w.next().await, None, "all senders gone must end the stream");
     }
 
@@ -532,7 +595,7 @@ mod tests {
     /// the merge loop can't silently alter it.
     #[tokio::test]
     async fn streamed_events_are_per_source_not_coalesced() {
-        let (state_tx, peer_tx, _sd, mut w) = harness(
+        let (state_tx, peer_tx, _b, _sd, mut w) = harness(
             NotifyWatchOpt::INITIAL_STATE,
             DeviceState::Connecting,
             Vec::new(),
@@ -566,7 +629,7 @@ mod tests {
     /// more than a single cycle and preserves order.
     #[tokio::test]
     async fn sequential_state_transitions_stream_in_order() {
-        let (state_tx, _p, _sd, mut w) = harness(
+        let (state_tx, _p, _b, _sd, mut w) = harness(
             NotifyWatchOpt::INITIAL_STATE,
             DeviceState::Connecting,
             Vec::new(),
@@ -597,7 +660,7 @@ mod tests {
             DeviceState::Expired,
             DeviceState::Failed(crate::RegistrationError::AuthRejected("bad key".into())),
         ] {
-            let (state_tx, _p, _sd, mut w) = harness(
+            let (state_tx, _p, _b, _sd, mut w) = harness(
                 NotifyWatchOpt::INITIAL_STATE,
                 DeviceState::Connecting,
                 Vec::new(),
@@ -617,7 +680,7 @@ mod tests {
     /// hang (caught by the suite timeout). Proves the non-blocking `try_send` contract.
     #[tokio::test]
     async fn full_buffer_drops_and_never_blocks_producer() {
-        let (state_tx, _p, shutdown_tx, mut w) =
+        let (state_tx, _p, _b, shutdown_tx, mut w) =
             harness(NotifyWatchOpt::empty(), DeviceState::Connecting, Vec::new());
         // Never call w.next(): the per-watcher mpsc fills to NOTIFY_BUFFER then drops the rest.
         // Push well past the buffer depth; yield so the bus task runs each send.
@@ -646,7 +709,7 @@ mod tests {
     /// the sender's `receiver_count` back to 0 once the task returns.
     #[tokio::test]
     async fn consumer_drop_terminates_task() {
-        let (state_tx, _p, _sd, w) =
+        let (state_tx, _p, _b, _sd, w) =
             harness(NotifyWatchOpt::empty(), DeviceState::Connecting, Vec::new());
         // Sanity: the bus task is live and holds a clone of the state receiver.
         assert_eq!(
@@ -666,6 +729,124 @@ mod tests {
             state_tx.receiver_count(),
             0,
             "bus task must reclaim (drop its source receiver) once the consumer is gone"
+        );
+    }
+
+    /// A running-node consent URL (`MapResponse.PopBrowserURL`, via the de-thrashed browser cell)
+    /// streams as a standalone `browse_to_url` event — no `state`, no `net_map`.
+    #[tokio::test]
+    async fn running_node_browser_url_streams_standalone() {
+        // INITIAL_STATE snapshot is the barrier proving the task is in its streaming loop.
+        let (_s, _p, browser_tx, _sd, mut w) = harness(
+            NotifyWatchOpt::INITIAL_STATE,
+            DeviceState::Running,
+            Vec::new(),
+        );
+        let snap = w.next().await.expect("initial snapshot");
+        assert_eq!(snap.state, Some(DeviceState::Running));
+        assert_eq!(
+            snap.browse_to_url, None,
+            "running-node URL is not front-loaded"
+        );
+        // Control pushes a consent URL mid-session (the producer sends Some on a new URL).
+        browser_tx.send_replace(Some(consent_url()));
+        let n = w.next().await.expect("browse-to-url event");
+        assert_eq!(n.browse_to_url, Some(consent_url()));
+        assert_eq!(n.state, None);
+        assert_eq!(n.net_map, None);
+    }
+
+    /// The running-node consent URL is NOT front-loaded into the initial snapshot even when present
+    /// at subscribe time (Go replays only the registration `b.authURL`, never `PopBrowserURL`). The
+    /// sticky value is reachable via the pull API, not the bus snapshot.
+    #[tokio::test]
+    async fn running_node_browser_url_not_in_initial_snapshot() {
+        let (state_tx, state_rx) = watch::channel(DeviceState::Running);
+        let (peer_tx, peer_rx) = watch::channel(Vec::new());
+        // Browser cell already holds a URL at subscribe time.
+        let (browser_tx, browser_rx) = watch::channel(Some(consent_url()));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (tx, rx) = mpsc::channel(NOTIFY_BUFFER);
+        tokio::spawn(run_bus(
+            NotifyWatchOpt::INITIAL_STATE | NotifyWatchOpt::INITIAL_NETMAP,
+            state_rx,
+            peer_rx,
+            browser_rx,
+            shutdown_rx,
+            tx,
+        ));
+        let mut w = IpnBusWatcher { rx };
+        let snap = w.next().await.expect("initial snapshot");
+        // The snapshot carries state + net_map (masked) but NOT the pre-existing browser URL.
+        assert_eq!(snap.state, Some(DeviceState::Running));
+        assert_eq!(snap.net_map, Some(Vec::new()));
+        assert_eq!(
+            snap.browse_to_url, None,
+            "pre-existing running-node URL must not be front-loaded"
+        );
+        // It only arrives once it CHANGES post-subscribe.
+        let next = consent_url();
+        let mut next2 = next.clone();
+        next2.set_path("/consent2");
+        browser_tx.send_replace(Some(next2.clone()));
+        let n = w.next().await.expect("browser-url change after subscribe");
+        assert_eq!(n.browse_to_url, Some(next2));
+        drop((state_tx, peer_tx, shutdown_tx));
+    }
+
+    /// Two distinct consent URLs in sequence stream as two `browse_to_url` events.
+    #[tokio::test]
+    async fn sequential_browser_urls_stream_each() {
+        let (_s, _p, browser_tx, _sd, mut w) = harness(
+            NotifyWatchOpt::INITIAL_STATE,
+            DeviceState::Running,
+            Vec::new(),
+        );
+        let _snap = w.next().await.expect("snapshot barrier");
+        let url_a = consent_url();
+        let mut url_b = consent_url();
+        url_b.set_path("/consent-b");
+        browser_tx.send_replace(Some(url_a.clone()));
+        assert_eq!(
+            w.next().await.expect("first url").browse_to_url,
+            Some(url_a)
+        );
+        browser_tx.send_replace(Some(url_b.clone()));
+        assert_eq!(
+            w.next().await.expect("second url").browse_to_url,
+            Some(url_b)
+        );
+    }
+
+    /// A browser-URL change and a state change arrive as TWO distinct single-field events (the new
+    /// browser arm doesn't coalesce into, or clobber, a concurrent state transition). Companion to
+    /// `streamed_events_are_per_source_not_coalesced` (state+peer), for the browser+state pair.
+    #[tokio::test]
+    async fn browser_url_and_state_change_interleave() {
+        let (state_tx, _p, browser_tx, _sd, mut w) = harness(
+            NotifyWatchOpt::INITIAL_STATE,
+            DeviceState::Running,
+            Vec::new(),
+        );
+        let _snap = w.next().await.expect("snapshot barrier");
+        browser_tx.send_replace(Some(consent_url()));
+        state_tx.send_replace(DeviceState::Expired);
+        let a = w.next().await.expect("first event");
+        let b = w.next().await.expect("second event");
+        for n in [&a, &b] {
+            assert!(
+                n.state.is_some() ^ n.browse_to_url.is_some(),
+                "each streamed event carries exactly one of state / browse_to_url, got {n:?}"
+            );
+            assert_eq!(n.net_map, None);
+        }
+        assert!(
+            a.browse_to_url.is_some() || b.browse_to_url.is_some(),
+            "a browse_to_url event arrived"
+        );
+        assert!(
+            a.state.is_some() || b.state.is_some(),
+            "a state event arrived"
         );
     }
 }
