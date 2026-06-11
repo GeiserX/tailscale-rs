@@ -85,6 +85,11 @@ pub struct Runtime {
     /// routes). Without this the strong ref would drop after the startup `GetChannel` and the
     /// forwarder would be reachable only via the message bus.
     forwarder: ActorRef<ForwarderActor>,
+    /// Reference to the multiderp manager, retained so [`Runtime::status`] can resolve each
+    /// relayed peer's DERP region id to its region **code** (`ipnstate.PeerStatus.Relay`). Without
+    /// this the strong ref would drop after startup (it is cloned into the direct manager + route
+    /// updater) and the region-code map would be unreachable.
+    multiderp: ActorRef<Multiderp>,
     env: Env,
     shutdown: watch::Sender<bool>,
     /// Sender side of the exit-node selector `watch` cell. Held privately here (not on the cloned
@@ -268,6 +273,7 @@ impl Runtime {
             peer_tracker,
             fallback_tcp,
             forwarder,
+            multiderp,
             netstack,
             env,
             shutdown: shutdown_tx,
@@ -413,15 +419,37 @@ impl Runtime {
         let ids: Vec<ts_transport::PeerId> = peers_with_ids.iter().map(|(id, _)| *id).collect();
         let best_addrs = self
             .direct
-            .ask(direct::BestAddrs { ids })
+            .ask(direct::BestAddrs { ids: ids.clone() })
             .await
             .unwrap_or_default();
 
+        // For the peers with NO direct path (relayed via DERP), resolve the region CODE they relay
+        // through (Go `PeerStatus.Relay`). One batched ask to multiderp; `cur_addr` and `relay` are
+        // mutually exclusive for a routed peer, mirroring Go's empty-vs-set strings.
+        let relay_ids: Vec<ts_transport::PeerId> = ids
+            .into_iter()
+            .filter(|id| !best_addrs.contains_key(id))
+            .collect();
+        let relay_codes = if relay_ids.is_empty() {
+            Default::default()
+        } else {
+            self.multiderp
+                .ask(multiderp::RelayCodesForPeers { ids: relay_ids })
+                .await
+                .unwrap_or_default()
+        };
+
         let peers = peers_with_ids
             .into_iter()
-            .map(|(id, mut node)| {
-                node.cur_addr = best_addrs.get(&id).copied();
-                node
+            .map(|(id, mut node)| match best_addrs.get(&id).copied() {
+                Some(addr) => {
+                    node.cur_addr = Some(addr);
+                    node
+                }
+                None => {
+                    node.relay = relay_codes.get(&id).cloned();
+                    node
+                }
             })
             .collect();
 

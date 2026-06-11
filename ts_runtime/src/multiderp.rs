@@ -222,6 +222,24 @@ impl Multiderp {
         })
     }
 
+    /// Resolve each of the given peers to the DERP region **code** it relays through (Go
+    /// `tailcfg.DERPRegion.RegionCode`, surfaced as `ipnstate.PeerStatus.Relay`). For each peer the
+    /// home/observed region is inferred exactly as [`region_for_peer`](Self::region_for_peer), then
+    /// mapped to its region code from the current derp map. A peer with no inferable region, or whose
+    /// region has no known code, is omitted. Batched so a status snapshot resolves every relayed
+    /// peer's code in one round-trip rather than one ask per peer.
+    #[message]
+    pub fn relay_codes_for_peers(&self, ids: Vec<PeerId>) -> HashMap<PeerId, String> {
+        let observed = poisoned_read(&self.observed_routes);
+        relay_codes_for_peers(
+            &ids,
+            |id| observed.get(&id).copied(),
+            self.current_home_derp,
+            |r| self.derps.contains_key(&r),
+            |r| self.regions.get(&r).map(|reg| reg.info.code.clone()),
+        )
+    }
+
     /// v4 STUN server addresses from the current derp map, for leak-safe single-socket STUN.
     /// Only FixedAddr v4 STUN nodes are returned; UseDns nodes are skipped (resolving them
     /// would be a second egress / DNS-leak path). May be empty (then we fall back to pong-harvest).
@@ -323,6 +341,26 @@ fn resolve_region_for_peer(
     region_is_live: impl Fn(RegionId) -> bool,
 ) -> Option<RegionId> {
     observed.or(home).filter(|r| region_is_live(*r))
+}
+
+/// Resolve each peer to the DERP region **code** it relays through, composing
+/// [`resolve_region_for_peer`] (peer → region) with a region → code lookup. A peer with no inferable
+/// live region, or whose region has no known code, is omitted. Extracted as a pure function (the
+/// closures supply the observed-route, home-region, liveness, and code lookups) so the composition is
+/// unit-testable without standing up the actor + its locks. Backs `ipnstate.PeerStatus.Relay`.
+fn relay_codes_for_peers(
+    ids: &[PeerId],
+    observed: impl Fn(PeerId) -> Option<RegionId>,
+    home: Option<RegionId>,
+    region_is_live: impl Fn(RegionId) -> bool,
+    region_code: impl Fn(RegionId) -> Option<String>,
+) -> HashMap<PeerId, String> {
+    ids.iter()
+        .filter_map(|&id| {
+            let region = resolve_region_for_peer(observed(id), home, &region_is_live)?;
+            Some((id, region_code(region)?))
+        })
+        .collect()
 }
 
 /// Record that a frame from `peer` arrived on region `region` (Go `derpRoute` learning), updating
@@ -1013,6 +1051,59 @@ mod tests {
             Some(rid(7)),
             "the observed route is returned when its transport is live"
         );
+    }
+
+    /// `relay_codes_for_peers` composes peer→region (resolve_region_for_peer) with region→code: a
+    /// relayed peer gets its DERP region CODE (Go `PeerStatus.Relay`); a peer with no inferable live
+    /// region, or whose region has no code, is omitted. Backs the Status relay field.
+    #[test]
+    fn relay_codes_for_peers_maps_peer_to_region_code() {
+        use ts_transport::PeerId;
+
+        let p_observed = PeerId(1); // has an observed route to a live, coded region
+        let p_home = PeerId(2); // falls back to the home region
+        let p_dead_region = PeerId(3); // observes a region whose transport isn't live → omitted
+        let p_no_code = PeerId(4); // resolves a live region, but that region has no code → omitted
+
+        let home = Some(rid(50)); // the home region (coded "home")
+        let observed = |id: PeerId| match id {
+            id if id == p_observed => Some(rid(7)),
+            id if id == p_dead_region => Some(rid(8)), // region 8 is NOT live (see `live`)
+            id if id == p_no_code => Some(rid(99)),
+            _ => None,
+        };
+        // Regions 7, 50, 99 are live; region 8 is NOT (so p_dead_region's observed route is skipped,
+        // and with no home fallback distinct from it, it resolves to nothing). Only 7 and 50 have codes.
+        let live = |r: RegionId| r == rid(7) || r == rid(50) || r == rid(99);
+        let code = |r: RegionId| match r {
+            r if r == rid(7) => Some("nyc".to_string()),
+            r if r == rid(50) => Some("home".to_string()),
+            _ => None, // region 99 has no code
+        };
+
+        let got = relay_codes_for_peers(
+            &[p_observed, p_home, p_dead_region, p_no_code],
+            observed,
+            home,
+            live,
+            code,
+        );
+
+        assert_eq!(got.get(&p_observed).map(String::as_str), Some("nyc"));
+        assert_eq!(
+            got.get(&p_home).map(String::as_str),
+            Some("home"),
+            "a peer with no observed route falls back to the home region's code"
+        );
+        assert!(
+            !got.contains_key(&p_dead_region),
+            "an observed region with no live transport → omitted"
+        );
+        assert!(
+            !got.contains_key(&p_no_code),
+            "region without a code → omitted"
+        );
+        assert_eq!(got.len(), 2);
     }
 
     /// Observed routes are pruned to the live peer set: a peer that left the netmap must not keep
