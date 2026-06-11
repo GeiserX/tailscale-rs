@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.22.1](https://github.com/GeiserX/tailscale-rs/compare/v0.22.0...v0.22.1) (2026-06-11)
+
+
+### Bug Fixes
+
+* **tunnel:** enforce REJECT_AFTER_MESSAGES — volume-aware rotation, non-panicking nonce ceiling ([#87](https://github.com/GeiserX/tailscale-rs/issues/87)) ([7ccc366](https://github.com/GeiserX/tailscale-rs/commit/7ccc3665e4aff872b38533304b74a21da97b62c9))
+
 ## [0.22.0](https://github.com/GeiserX/tailscale-rs/compare/v0.21.2...v0.22.0) (2026-06-11)
 
 
