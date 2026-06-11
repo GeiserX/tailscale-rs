@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.26.0](https://github.com/GeiserX/tailscale-rs/compare/v0.25.0...v0.26.0) (2026-06-11)
+
+
+### Features
+
+* **whois:** match cap-grants with a node-capability source (SrcIp::NodeCap) ([#95](https://github.com/GeiserX/tailscale-rs/issues/95)) ([69ec39a](https://github.com/GeiserX/tailscale-rs/commit/69ec39af2659afacbc78f7168c55530ade3d0466))
+
 ## [0.25.0](https://github.com/GeiserX/tailscale-rs/compare/v0.24.0...v0.25.0) (2026-06-11)
 
 
