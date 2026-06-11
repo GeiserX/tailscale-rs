@@ -14,7 +14,8 @@ it means building a new `Device`.
 | Pref / action | Method | How it applies live |
 |---------------|--------|---------------------|
 | **Exit node** (select / clear) | `Device::set_exit_node(Option<ExitNodeSelector>)` | Updates a `watch` cell every reader borrows, then asks the peer tracker to `RepublishState` — the route updater (outbound routes + DoH delegation) and the source filter (inbound validation) recompute against the current peer set immediately, without waiting for the next netmap poll. (`src/lib.rs` → `ts_runtime::Env::set_exit_node` → `peer_tracker::RepublishState`.) |
-| **Advertised subnet routes** | `Device::set_advertise_routes(Vec<ipnet::IpNet>)` | Applies both halves together: re-advertises `Hostinfo.RoutableIPs` to control on the live map-poll connection (so control grants the subnet-router role), AND swaps the forwarder's accept/dial route table (so the node forwards what it advertises). New flows see the new set; in-flight flows keep their routing. IPv4-only/deduped (IPv6 dropped, IPv6-off posture). Explicit prefixes only — not the exit-node `0.0.0.0/0`. (`src/lib.rs` → `ts_runtime::Runtime::set_advertise_routes` → `control_runner::SetAdvertiseRoutes` + `forwarder_actor::UpdateRoutes`.) |
+| **Advertised subnet routes** | `Device::set_advertise_routes(Vec<ipnet::IpNet>)` | Applies both halves together: re-advertises `Hostinfo.RoutableIPs` to control on the live map-poll connection (so control grants the subnet-router role), AND swaps the forwarder's accept/dial route table (so the node forwards what it advertises). New flows see the new set; in-flight flows keep their routing. IPv4-only/deduped (IPv6 dropped, IPv6-off posture). Explicit subnet prefixes only; the exit-node `0.0.0.0/0` is a separate live pref (next row), composed with these. (`src/lib.rs` → `ts_runtime::Runtime::set_advertise_routes` → `control_runner::SetAdvertiseRoutes` + `forwarder_actor::UpdateRoutes`.) |
+| **Advertise exit node** | `Device::set_advertise_exit_node(bool)` | Adds/removes the `0.0.0.0/0` default route from what this node advertises + forwards, via the same wire + forwarder machinery as the subnet routes. Composes with `set_advertise_routes` (independent prefs, both fold into `Hostinfo.RoutableIPs`). Only advertises eligibility — control/peer still decide whether to route through it. (`src/lib.rs` → `ts_runtime::Runtime::set_advertise_exit_node`.) |
 | **Serve config** (ports / TLS / Funnel targets) | `Device::set_serve_config(ServeState)` | Validates, then builds each TLS-terminating port's acceptor up-front (ACME-aware, fail-closed — no plaintext downgrade if a cert can't be issued) and (re)binds the serve listeners live. `get_serve_config()` reads the current state. |
 | **Logout / deregister** | `Device::logout()` | Re-registers with a past expiry; the device stays up but transitions state. Not a pref mutation per se, but a live state change (no rebuild). |
 
@@ -34,9 +35,7 @@ updated `Config`:
   registration).
 - **Exit-egress proxy** — `Config::exit_proxy` (`ExitProxyConfig`) and `forward_exit_egress`. The
   forwarder's dialer choice is fixed at construction (fail-closed anti-leak chokepoint).
-- **`enable_ipv6`**, **`tcp_buffer_size`**, the exit-node advertisement (`advertise_exit_node`, the
-  `0.0.0.0/0` route — distinct from the now-live subnet routes above), and the other
-  `Config`/`ForwarderConfig` transport knobs.
+- **`enable_ipv6`**, **`tcp_buffer_size`**, and the other `Config`/`ForwarderConfig` transport knobs.
 - **Persistent-keepalive interval** (`PeerConfig::persistent_keepalive_interval`) — per-peer, applied
   when the peer config is built.
 
