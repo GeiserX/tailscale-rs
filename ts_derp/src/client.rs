@@ -34,7 +34,10 @@ pub struct Client<Io> {
 pub async fn connect<'c>(
     region: impl IntoIterator<Item = &'c ServerConnInfo>,
 ) -> Result<Option<DefaultIo>, Error> {
-    let Some((conn, _, addr)) = crate::dial::dial_region_tls(region).await.unwrap() else {
+    // A TLS-setup failure is a transient (`dial::Error::Io`); propagate it as `Err` so the caller's
+    // reconnect loop retries, rather than `.unwrap()`-panicking and killing the region task. A
+    // reachable-but-unconnectable region is still `Ok(None)`.
+    let Some((conn, _, addr)) = crate::dial::dial_region_tls(region).await? else {
         return Ok(None);
     };
 
@@ -214,7 +217,15 @@ impl Client<DefaultIo> {
         region: impl IntoIterator<Item = &'c ServerConnInfo>,
         node_keypair: &NodeKeyPair,
     ) -> Result<Self, Error> {
-        let conn = connect(region).await?.unwrap();
+        // `connect` returns `Ok(None)` when no server in the region was reachable. This method must
+        // yield a `Client`, so a `None` is a (retryable) connection failure, not a success — surface
+        // it as an `Err` for the caller's reconnect loop rather than `.unwrap()`-panicking.
+        let conn = connect(region).await?.ok_or_else(|| {
+            Error::IoFailure(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "no derp server in region was reachable",
+            ))
+        })?;
 
         Client::handshake(conn, node_keypair).await
     }
@@ -303,5 +314,58 @@ where
 
     async fn recv(&self) -> impl BatchRecvIter<Self::PeerKey, Error = Self::Error> {
         [self.recv_one().await.map(|(k, pkt)| (k, [pkt]))]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{IpUsage, ServerConnInfo, TlsValidationConfig};
+
+    /// A region whose only server has both IP families disabled: `dial_region_tls` returns
+    /// `Ok(None)` (unreachable) synchronously, with no network I/O.
+    fn unreachable_region() -> Vec<ServerConnInfo> {
+        vec![ServerConnInfo {
+            hostname: "derp.invalid".to_owned(),
+            ipv4: IpUsage::Disable,
+            ipv6: IpUsage::Disable,
+            // Both IP families are disabled, so the dial returns `Ok(None)` before TLS is ever
+            // attempted — the validation variant is irrelevant here (just pick a non-feature-gated
+            // one).
+            tls_validation_config: TlsValidationConfig::CommonName {
+                common_name: "derp.invalid".to_owned(),
+            },
+            https_port: 443,
+            stun_port: None,
+            stun_only: false,
+            supports_port_80: false,
+        }]
+    }
+
+    /// Regression for `tsr-u6i`: the free `connect` must report an unreachable region as `Ok(None)`,
+    /// never `.unwrap()`-panic. (The bug `.unwrap()`'d the `dial_region_tls` result, which panics on
+    /// a TLS-setup `Err`; this also pins that the no-reachable-server path stays a clean `Ok(None)`.)
+    #[tokio::test]
+    async fn connect_unreachable_region_is_none_not_panic() {
+        let region = unreachable_region();
+        let got = super::connect(&region).await;
+        assert!(
+            matches!(got, Ok(None)),
+            "an unreachable region must be Ok(None), got {got:?}"
+        );
+    }
+
+    /// Regression for `tsr-u6i`: `Client::connect` must yield an `Err` for an unreachable region
+    /// rather than `.unwrap()`-panicking on the `Ok(None)`. A panic here unwinds the spawned region
+    /// task past its reconnect loop and is silently absorbed by the `JoinSet`, permanently killing
+    /// the region; an `Err` lets the loop retry.
+    #[tokio::test]
+    async fn client_connect_unreachable_region_is_err_not_panic() {
+        let region = unreachable_region();
+        let keys = ts_keys::NodeKeyPair::new();
+        let got = super::Client::connect(&region, &keys).await;
+        assert!(
+            got.is_err(),
+            "Client::connect on an unreachable region must be Err, not a panic or Ok"
+        );
     }
 }
