@@ -11,7 +11,10 @@ use std::{
 };
 
 use rand::Rng;
-use tokio::{net::UdpSocket, sync::mpsc};
+use tokio::{
+    net::UdpSocket,
+    sync::{mpsc, oneshot},
+};
 use ts_keys::{DiscoPrivateKey, DiscoPublicKey, NodePublicKey};
 use ts_packet::PacketMut;
 use ts_transport::{BatchRecvIter, BatchSendIter, UnderlayTransport};
@@ -211,6 +214,14 @@ pub struct MagicSock {
     /// with the local bound port. Set via [`set_symmetric_nat`](Self::set_symmetric_nat); defaults
     /// `false` (no extra candidate — byte-for-byte the prior behavior).
     symmetric_nat: AtomicBool,
+    /// Waiters for an **on-demand** disco ping ([`ping_now`](Self::ping_now)): a `tx_id -> oneshot`
+    /// registry the inbound-pong handler notifies with the measured RTT. Each on-demand ping uses a
+    /// FRESH random `tx_id` distinct from any the periodic prober ([`send_pings`](Self::send_pings))
+    /// generates, so the prober can never consume an on-demand pong (and vice-versa). Notified only
+    /// inside the `solicited` branch (a genuine `(tx_id, from)` match), and pruned on timeout by the
+    /// waiter dropping its end — a stale entry is harmlessly overwritten/ignored. Locked disjointly
+    /// from `paths`/`addr_to_disco`/`reflexive`/`stun_in_flight` — never nested with them.
+    ping_waiters: Arc<Mutex<HashMap<disco::TxId, oneshot::Sender<Duration>>>>,
 }
 
 impl MagicSock {
@@ -237,6 +248,7 @@ impl MagicSock {
             warned_no_verifier: AtomicBool::new(false),
             enable_ipv6: false,
             symmetric_nat: AtomicBool::new(false),
+            ping_waiters: Default::default(),
         })
     }
 
@@ -719,6 +731,62 @@ impl MagicSock {
         Ok(sent)
     }
 
+    /// Send a disco ping to `peer` **now** and await the matching pong, returning the fresh
+    /// round-trip latency and the address that answered — a true on-demand `PingType::Disco` (Go
+    /// `tailscale ping`), as opposed to [`best_addr_and_latency`](Self::best_addr_and_latency) which
+    /// reports the last periodic probe's RTT.
+    ///
+    /// Returns `None` if the peer has no candidate endpoint to ping, or `Ok(None)` semantics fold
+    /// into the timeout: if no pong arrives within `timeout`, returns `None`. The ping targets the
+    /// confirmed best path if there is one, else the first known candidate (disco ping confirms a
+    /// candidate regardless of prior trust). A FRESH random `tx_id` is used, registered in both the
+    /// path's in-flight set (so the inbound pong is recognized as solicited) and the `ping_waiters`
+    /// oneshot registry (so the pong handler hands us the RTT) — distinct from any prober `tx_id`, so
+    /// the periodic prober never races for this pong. The waiter entry is removed on timeout.
+    pub async fn ping_now(
+        &self,
+        peer: &DiscoPublicKey,
+        timeout: Duration,
+    ) -> Result<Option<(SocketAddr, Duration)>, Error> {
+        let now = Instant::now();
+
+        // Choose the target: the confirmed best path, else the first candidate. Register the fresh
+        // tx_id in the path's in-flight set under the same lock so a racing pong is recognized.
+        let tx_id = disco::random_tx_id();
+        let addr = {
+            let mut paths = lock(&self.paths);
+            let Some(pp) = paths.get_mut(peer) else {
+                return Ok(None);
+            };
+            let Some(addr) = pp
+                .best_addr(now)
+                .or_else(|| pp.candidate_addrs().first().copied())
+            else {
+                return Ok(None);
+            };
+            pp.note_ping_sent(tx_id, addr, now);
+            addr
+        };
+
+        // Register the oneshot BEFORE sending, so a fast pong can't arrive before the waiter exists.
+        let (tx, rx) = oneshot::channel();
+        lock(&self.ping_waiters).insert(tx_id, tx);
+
+        let wire = disco::seal_ping(&self.our_disco, self.our_node_key, peer, tx_id)?;
+        self.sock().send_to(&wire, addr).await?;
+        crate::metrics::metrics().disco_ping_sent.inc();
+
+        // Await the pong-handler's notification, bounded by `timeout`. On timeout (or a dropped
+        // sender) remove the now-dead waiter so the registry can't grow.
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(latency)) => Ok(Some((addr, latency))),
+            _ => {
+                lock(&self.ping_waiters).remove(&tx_id);
+                Ok(None)
+            }
+        }
+    }
+
     /// The candidate endpoint addresses currently known for a peer (learned and/or
     /// control-advertised), regardless of whether any is confirmed.
     ///
@@ -736,6 +804,14 @@ impl MagicSock {
             .get(peer)
             .map(|pp| pp.candidate_addrs())
             .unwrap_or_default()
+    }
+
+    /// Whether the on-demand-ping waiter registry is empty. Test-observability only: pins that
+    /// [`ping_now`](Self::ping_now) consumes its waiter on both the pong and the timeout path (no
+    /// registry leak).
+    #[doc(hidden)]
+    pub fn ping_waiters_is_empty(&self) -> bool {
+        lock(&self.ping_waiters).is_empty()
     }
 
     /// The current best confirmed direct address for a peer, or `None` if there is no
@@ -1088,17 +1164,26 @@ impl MagicSock {
             Inbound::Pong { sender, tx_id, src } => {
                 // Count every inbound pong, solicited or not, before classifying it.
                 crate::metrics::metrics().disco_pong_recv.inc();
-                let solicited = {
+                let latency = {
                     let mut paths = lock(&self.paths);
                     match paths.get_mut(&sender) {
                         // Bind the pong to the address it arrived from (`from`): a pong only
                         // confirms a path (and only counts as solicited) if it came from the
-                        // address we pinged for this tx_id. `note_pong` returns `Some(_)` exactly
+                        // address we pinged for this tx_id. `note_pong` returns `Some(rtt)` exactly
                         // when the `(tx_id, from)` pair matched an outstanding ping we sent.
-                        Some(pp) => pp.note_pong(tx_id, from, Instant::now()).is_some(),
-                        None => false,
+                        Some(pp) => pp.note_pong(tx_id, from, Instant::now()),
+                        None => None,
                     }
                 };
+                let solicited = latency.is_some();
+                // Wake any on-demand `ping_now` waiter for this tx_id with the fresh RTT. Gated on
+                // `solicited` (a genuine match) and locked disjointly from `paths` above. The send
+                // can fail only if the waiter already timed out and dropped its receiver — harmless.
+                if let Some(rtt) = latency
+                    && let Some(waiter) = lock(&self.ping_waiters).remove(&tx_id)
+                {
+                    let _ = waiter.send(rtt);
+                }
                 // The peer echoed the address it saw our ping arrive from: that is our reflexive
                 // (STUN-equivalent) endpoint on this path. Harvesting it advertises it to control
                 // and offers it in every `CallMeMaybe`, so an attacker who knows our disco pubkey
@@ -1815,6 +1900,111 @@ mod tests {
 
         pump.abort();
         a_pump.abort();
+    }
+
+    /// `ping_now` sends a disco ping on demand and returns the FRESH round-trip latency + the
+    /// endpoint that answered. B's receive loop pongs; A's loop processes the pong, which wakes the
+    /// `ping_now` waiter. Distinct from `send_pings` (the periodic prober) — this is the on-demand
+    /// `PingType::Disco` path.
+    #[tokio::test]
+    async fn ping_now_returns_fresh_rtt() {
+        let a_disco = DiscoPrivateKey::random();
+        let b_disco = DiscoPrivateKey::random();
+        let a_node = ts_keys::NodePrivateKey::random().public_key();
+        let b_node = ts_keys::NodePrivateKey::random().public_key();
+
+        let a = Arc::new(
+            MagicSock::bind(localhost(), a_disco.clone(), a_node)
+                .await
+                .unwrap(),
+        );
+        let b = Arc::new(
+            MagicSock::bind(localhost(), b_disco.clone(), b_node)
+                .await
+                .unwrap()
+                .with_binding_verifier(allow_all()),
+        );
+
+        let a_addr = a.local_addr().unwrap();
+        let b_addr = b.local_addr().unwrap();
+
+        // Seed both directions (loopback is filtered by the production candidate gate).
+        b.add_peer_endpoints_unfiltered(a_disco.public_key(), [a_addr]);
+        a.add_peer_endpoints_unfiltered(b_disco.public_key(), [b_addr]);
+
+        // B answers pings; A processes the pong (which wakes the ping_now waiter).
+        let b_for_pump = b.clone();
+        let b_pump =
+            tokio::spawn(async move { while let Ok(Some(_)) = b_for_pump.recv_data().await {} });
+        let a_for_pump = a.clone();
+        let a_pump =
+            tokio::spawn(async move { while let Ok(Some(_)) = a_for_pump.recv_data().await {} });
+
+        // On-demand ping: sends now, awaits the pong, returns the fresh RTT + answering endpoint.
+        let result = a
+            .ping_now(&b_disco.public_key(), std::time::Duration::from_secs(2))
+            .await
+            .expect("ping_now must not error on a healthy send");
+
+        let (addr, _rtt) = result.expect("a healthy peer must pong within the timeout");
+        assert_eq!(addr, b_addr, "the answering endpoint is B's address");
+
+        // The waiter registry must be empty afterward (consumed by the pong, not leaked).
+        assert!(
+            a.ping_waiters_is_empty(),
+            "the ping_now waiter must be consumed, not leaked"
+        );
+
+        b_pump.abort();
+        a_pump.abort();
+    }
+
+    /// `ping_now` to a peer that never answers times out cleanly (returns `None`) and removes its
+    /// waiter — no registry leak. We ping B's seeded endpoint but run NO pump on B, so no pong ever
+    /// comes back.
+    #[tokio::test]
+    async fn ping_now_times_out_without_leaking_waiter() {
+        let a_disco = DiscoPrivateKey::random();
+        let b_disco = DiscoPrivateKey::random();
+        let a_node = ts_keys::NodePrivateKey::random().public_key();
+
+        let a = Arc::new(
+            MagicSock::bind(localhost(), a_disco.clone(), a_node)
+                .await
+                .unwrap(),
+        );
+        // A dead endpoint that will never pong.
+        a.add_peer_endpoints_unfiltered(b_disco.public_key(), ["127.0.0.1:9".parse().unwrap()]);
+
+        let got = a
+            .ping_now(&b_disco.public_key(), std::time::Duration::from_millis(150))
+            .await
+            .expect("a send to a dead local addr still succeeds at the socket layer");
+        assert!(got.is_none(), "an unanswered ping must time out to None");
+        assert!(
+            a.ping_waiters_is_empty(),
+            "a timed-out ping must remove its waiter (no leak)"
+        );
+    }
+
+    /// `ping_now` to a peer with no known candidate endpoint returns `None` immediately (nothing to
+    /// ping) without registering a waiter.
+    #[tokio::test]
+    async fn ping_now_no_candidate_is_none() {
+        let a_disco = DiscoPrivateKey::random();
+        let b_disco = DiscoPrivateKey::random();
+        let a_node = ts_keys::NodePrivateKey::random().public_key();
+        let a = Arc::new(MagicSock::bind(localhost(), a_disco, a_node).await.unwrap());
+
+        let got = a
+            .ping_now(&b_disco.public_key(), std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(got.is_none(), "no candidate endpoint => None");
+        assert!(
+            a.ping_waiters_is_empty(),
+            "no waiter registered when there's nothing to ping"
+        );
     }
 
     /// A disco ping whose `claimed_node_key` is not the one bound to the sender's disco key in the

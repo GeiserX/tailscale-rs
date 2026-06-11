@@ -1352,6 +1352,27 @@ impl Device {
         self.runtime.direct_path(dst).await.map_err(Into::into)
     }
 
+    /// Send a disco ping to the peer at tailnet IP `dst` **now** and await the pong — a fresh,
+    /// on-demand round-trip measurement (Go's `tailscale ping`, `PingType::Disco`). Returns the
+    /// endpoint that answered and the measured RTT, or `None` if no pong arrives within `timeout`
+    /// (or the peer is unknown / has no candidate direct path).
+    ///
+    /// Unlike [`direct_path`](Device::direct_path) — which reports the *last periodic probe's* RTT
+    /// from cache — this actively sends a ping and waits for the reply, so the latency is current. A
+    /// `None` here means "no direct path confirmed within the timeout" (the peer may still be
+    /// reachable via DERP). Unlike [`ping`](Device::ping) (an ICMP echo over the netstack), this
+    /// measures the disco/underlay path the data plane uses for direct connections.
+    pub async fn ping_disco(
+        &self,
+        dst: IpAddr,
+        timeout: Duration,
+    ) -> Result<Option<(SocketAddr, Duration)>, Error> {
+        self.runtime
+            .ping_disco(dst, timeout)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Obtain a TLS certificate for a node's MagicDNS `name` (like `tsnet`'s `GetCertificate`).
     ///
     /// **Fail-closed without the `acme` feature.** By default this fork has no client-side ACME
