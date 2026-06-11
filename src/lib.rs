@@ -178,8 +178,8 @@ pub use ts_runtime::fallback_tcp::{
 pub use ts_runtime::taildrop::WaitingFile;
 #[doc(inline)]
 pub use ts_runtime::{
-    DeviceState, FileTarget, NetcheckReport, RegionLatency, RegistrationError, Status, StatusNode,
-    WhoIs,
+    DeviceState, FileTarget, IpnBusWatcher, NetcheckReport, Notify, NotifyWatchOpt, RegionLatency,
+    RegistrationError, Status, StatusNode, WhoIs,
 };
 /// The interactive-login URL type returned by [`Device::pop_browser_url`].
 #[doc(inline)]
@@ -1302,7 +1302,9 @@ impl Device {
     }
 
     /// Watch for netmap changes: the returned receiver's value is the current set of peer
-    /// [`StatusNode`]s and updates on every netmap change (like subscribing to `ipn` notifications).
+    /// [`StatusNode`]s and updates on every netmap change. This is the narrow peer-only view; for
+    /// the unified Go-`WatchIPNBus` feed (peers + device-state + login URL in one stream) use
+    /// [`watch_ipn_bus`](Self::watch_ipn_bus).
     pub async fn watch_netmap(
         &self,
     ) -> Result<tokio::sync::watch::Receiver<Vec<StatusNode>>, Error> {
@@ -1323,6 +1325,21 @@ impl Device {
     /// initial value is the current state.
     pub fn watch_state(&self) -> tokio::sync::watch::Receiver<DeviceState> {
         self.runtime.watch_state()
+    }
+
+    /// Subscribe to the unified IPN notification bus (Go `ipn`'s `WatchIPNBus`).
+    ///
+    /// Returns an [`IpnBusWatcher`]; await [`next`](IpnBusWatcher::next) to receive [`Notify`]
+    /// events that merge device-[`DeviceState`] transitions (with the interactive-login URL surfaced
+    /// as [`Notify::browse_to_url`]) and netmap peer-set changes into one feed — the single stream a
+    /// consumer porting from Go's `WatchNotifications` expects, instead of composing
+    /// [`watch_state`](Self::watch_state) and [`watch_netmap`](Self::watch_netmap) by hand. `mask`
+    /// ([`NotifyWatchOpt`]) front-loads the current state as an initial snapshot on subscribe
+    /// (`INITIAL_STATE` / `INITIAL_NETMAP`), mirroring Go's `NotifyInitialState` /
+    /// `NotifyInitialNetMap`. Delivery is best-effort (a slow consumer drops notifications rather
+    /// than stalling the runtime); the stream ends when the device shuts down.
+    pub async fn watch_ipn_bus(&self, mask: NotifyWatchOpt) -> Result<IpnBusWatcher, Error> {
+        self.runtime.watch_ipn_bus(mask).await.map_err(Into::into)
     }
 
     /// Wait until the device finishes registering, returning a typed outcome — the clean

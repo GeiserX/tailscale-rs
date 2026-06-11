@@ -34,6 +34,9 @@ pub mod fallback_tcp;
 mod forwarder_actor;
 /// Client-side Funnel ingress termination (`tsnet`'s `ListenFunnel` data path).
 pub mod funnel;
+/// Unified IPN notification bus ([`Notify`] / [`watch_ipn_bus`](Runtime::watch_ipn_bus)), mirroring
+/// Go `ipn` `LocalBackend.WatchNotifications` / the `WatchIPNBus` LocalAPI.
+pub mod ipn_bus;
 mod magic_dns;
 mod multiderp;
 mod netstack_actor;
@@ -59,6 +62,7 @@ mod tun_actor;
 pub use device_state::{DeviceState, RegistrationError};
 pub(crate) use env::Env;
 pub use error::{Error, ErrorKind};
+pub use ipn_bus::{IpnBusWatcher, Notify, NotifyWatchOpt};
 pub use status::{FileTarget, NetcheckReport, RegionLatency, Status, StatusNode, WhoIs};
 pub use ts_dataplane::{CaptureHook, CapturePath};
 
@@ -831,12 +835,14 @@ impl Runtime {
             .map_err(Into::into)
     }
 
-    /// Subscribe to netmap peer-change events.
+    /// Subscribe to netmap peer-change events: the **narrow** peer-set view.
     ///
     /// Returns a [`watch::Receiver`] whose value is the current set of peer [`StatusNode`]s,
-    /// updated on every netmap state update from control. Mirrors tsnet's `WatchIPNBus`. Await
+    /// updated on every netmap state update from control. Await
     /// [`watch::Receiver::changed`](tokio::sync::watch::Receiver::changed) to react to peers
-    /// joining, leaving, or changing.
+    /// joining, leaving, or changing. For the unified Go-`WatchIPNBus` feed that merges this with
+    /// device-state and the interactive-login URL, see [`watch_ipn_bus`](Self::watch_ipn_bus); this
+    /// method is the peer-only projection of the same underlying cell.
     pub async fn watch_netmap(&self) -> Result<watch::Receiver<Vec<StatusNode>>, Error> {
         self.peer_tracker
             .upgrade()
@@ -890,6 +896,43 @@ impl Runtime {
         timeout: Option<Duration>,
     ) -> Result<(), RegistrationError> {
         device_state::wait_for_running(self.state_rx.clone(), timeout).await
+    }
+
+    /// Subscribe to the unified IPN notification bus (Go `ipn` `WatchIPNBus` /
+    /// `LocalBackend.WatchNotifications`).
+    ///
+    /// Returns an [`IpnBusWatcher`]; await [`next`](IpnBusWatcher::next) to receive [`Notify`]
+    /// events that coalesce device-[`DeviceState`] changes (including the interactive-login URL as
+    /// `browse_to_url`) and netmap peer-set changes into one feed. `mask`
+    /// ([`NotifyWatchOpt`]) selects which current-state fields are front-loaded as an initial
+    /// snapshot on subscribe (`INITIAL_STATE` / `INITIAL_NETMAP`), exactly like Go's
+    /// `NotifyInitialState` / `NotifyInitialNetMap`.
+    ///
+    /// This composes the same `watch` cells as [`watch_state`](Self::watch_state) and
+    /// [`watch_netmap`](Self::watch_netmap) — one source of truth, so the merged feed cannot diverge
+    /// from those narrow views. Delivery is best-effort/lossy (a bounded per-watcher buffer; a
+    /// notification is dropped rather than blocking the runtime if a slow consumer's buffer fills),
+    /// matching Go's bus. The stream ends (`next` returns `None`) on runtime shutdown or when the
+    /// watcher is dropped.
+    pub async fn watch_ipn_bus(&self, mask: NotifyWatchOpt) -> Result<IpnBusWatcher, Error> {
+        // The peer-set cell lives on the peer-tracker actor; obtain a receiver the same way
+        // `watch_netmap` does. State + shutdown cells are held here.
+        let peer_rx = self
+            .peer_tracker
+            .upgrade()
+            .ok_or(Error {
+                kind: ErrorKind::ActorGone,
+                target_actor: None,
+                message_ty: None,
+            })?
+            .ask(peer_tracker::WatchNetmap)
+            .await?;
+        Ok(ipn_bus::spawn_watcher(
+            mask,
+            self.state_rx.clone(),
+            peer_rx,
+            self.shutdown.subscribe(),
+        ))
     }
 
     /// Attempt to shut down the runtime gracefully.
