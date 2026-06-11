@@ -203,6 +203,19 @@ flowchart LR
   `crypto/ed25519`). See §5.
 - **Serialization:** CTAP2-canonical CBOR (must byte-match Go's `fxamacker/cbor` CTAP2 mode). See §5.
 - **Disablement:** ten Argon2id-hashed disablement secrets; any one disables the lock.
+- **Acquisition (sync):** the chain is fetched from control over Noise — `/machine/tka/bootstrap`
+  (genesis AUM) then the `/machine/tka/sync/{offer,send}` offer/send handshake (`ts_control`
+  transport; `ts_runtime::tka_sync` driver). A control-supplied chain becomes an `Authority` **only**
+  through `VerifiedAumChain::verify` → `Authority::from_verified_chain` (the un-bypassable trust
+  boundary — `from_chain` is documented "NOT a trust boundary"), so a malicious control plane cannot
+  inject trusted keys here.
+- **Enforcement posture — observe-only (verify-and-LOG), not fail-closed yet.** The synced
+  `Authority` is delivered to the peer tracker, which **logs** each peer's signature verdict
+  (`verified`/`unsigned`/`failed`) but does **not** drop any peer (`tka_observe`, distinct from the
+  gated fail-closed `tka_authority`). This is deliberate while (a) the `ts_tka` crypto is unaudited
+  beyond the KAT in §5 and (b) deployments treat control as trusted; flipping to fail-closed enforce
+  is a separate gated decision. (Distinct from *shields-up*/`block_incoming`, which is an
+  unconditional inbound-connection refusal at the packet filter, unrelated to TKA trust.)
 
 ---
 
