@@ -21,7 +21,26 @@ use std::{
 use crate::disco::TxId;
 
 /// How long a confirmed best path is trusted before it must be re-validated by a new pong.
-pub const TRUST_DURATION: Duration = Duration::from_secs(6);
+///
+/// Matches Go magicsock's `trustUDPAddrDuration` (6.5s).
+pub const TRUST_DURATION: Duration = Duration::from_millis(6500);
+
+/// Re-ping the best path once it is within this much of its `trust_until` expiry — *before* trust
+/// lapses, not after. Go magicsock re-pings the active best path on a `heartbeatInterval` (3s)
+/// cadence so trust is refreshed well inside the 6.5s `trustUDPAddrDuration` and an active direct
+/// path never goes dark. With `TRUST_DURATION = 6.5s` a `3.5s` lead means a path is re-pinged once
+/// it is ~3s old (= Go's heartbeat), leaving ample room for the global pinger (every
+/// `PING_INTERVAL`, 2s in `ts_runtime::direct`) to re-ping and the pong to re-confirm before the
+/// old trust window closes. Without this the path was re-pinged only *after* `trust_until` had
+/// already passed, so `best_addr` returned `None` for a ping-interval + RTT every trust window and
+/// the peer flapped direct↔DERP every ~6s.
+const REFRESH_BEFORE_EXPIRY: Duration = Duration::from_millis(3500);
+
+/// A ping with no pong after this long is presumed lost; its in-flight record is pruned so the
+/// `in_flight` map cannot grow unbounded for a peer whose paths never confirm (it would otherwise
+/// gain an entry per candidate every `PING_INTERVAL`, forever). Mirrors the STUN in-flight TTL
+/// discipline. Sized above any realistic RTT and the re-ping cadence.
+const PING_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Where a candidate endpoint came from, which decides how it is reconciled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -153,7 +172,15 @@ impl PeerPaths {
     }
 
     /// Record that we sent a ping with `tx_id` to `to` at time `sent`.
+    ///
+    /// First prunes any in-flight probe older than [`PING_TIMEOUT`] (presumed lost — its pong will
+    /// never arrive, or arrived from the wrong source and was dropped). Without this the map grows
+    /// unbounded for a peer whose candidates never pong: it would gain an entry per candidate every
+    /// ping cycle, forever. A genuinely-late pong for a pruned tx_id is simply treated as
+    /// unsolicited (`note_pong` returns `None`), which is correct — we've already given up on it.
     pub fn note_ping_sent(&mut self, tx_id: TxId, to: SocketAddr, sent: Instant) {
+        self.in_flight
+            .retain(|_, inflight| sent.saturating_duration_since(inflight.sent) < PING_TIMEOUT);
         self.in_flight.insert(tx_id, InFlight { to, sent });
     }
 
@@ -192,12 +219,22 @@ impl PeerPaths {
         }
     }
 
-    /// Whether the best path's trust has expired and a re-ping is warranted.
+    /// Whether the best path warrants a re-ping. Fires once the path is within
+    /// [`REFRESH_BEFORE_EXPIRY`] of its `trust_until` — *proactively, before* trust lapses — so a
+    /// fresh pong re-confirms the path inside the current trust window and `best_addr` never goes
+    /// dark for an active peer (Go magicsock's heartbeat-before-expiry behavior). Always `true` when
+    /// there is no trusted path yet (nothing to lose by probing).
     pub fn needs_refresh(&self, now: Instant) -> bool {
         match self.trust_until {
-            Some(until) => now > until,
+            Some(until) => now + REFRESH_BEFORE_EXPIRY >= until,
             None => true,
         }
+    }
+
+    /// Number of in-flight (awaiting-pong) probes. Test-only: pins the `in_flight` prune invariant.
+    #[cfg(test)]
+    fn in_flight_len(&self) -> usize {
+        self.in_flight.len()
     }
 
     fn recompute_best(&mut self, now: Instant) {
@@ -343,6 +380,71 @@ mod tests {
         // No ping was sent for tx(9): the pong must not confirm anything.
         assert_eq!(p.note_pong(tx(9), addr, now), None);
         assert_eq!(p.best_addr(now), None);
+    }
+
+    /// Regression for `tsr-73g`: an active best path is re-pinged *before* its trust lapses, while
+    /// `best_addr` is still trusted — so a fresh pong re-confirms it inside the current window and
+    /// the path never goes dark. The old code only set `needs_refresh` true *after* `trust_until`
+    /// had already passed, causing a direct↔DERP flap every trust window.
+    #[test]
+    fn refresh_fires_before_trust_lapses_while_still_trusted() {
+        let mut p = PeerPaths::default();
+        let addr: SocketAddr = "203.0.113.1:41641".parse().unwrap();
+        p.add_netmap_candidates([addr]);
+
+        let now = Instant::now();
+        p.note_ping_sent(tx(1), addr, now);
+        p.note_pong(tx(1), addr, now); // confirmed at `now`, trusted until now + TRUST_DURATION
+
+        // Just inside the refresh lead window (well before expiry): a re-ping is already warranted,
+        // yet the path is STILL trusted (best_addr returns it) — the two conditions overlap, which
+        // is exactly what prevents the flap.
+        let refresh_at = now + TRUST_DURATION - REFRESH_BEFORE_EXPIRY + Duration::from_millis(1);
+        assert!(
+            p.needs_refresh(refresh_at),
+            "re-ping must be warranted before trust lapses"
+        );
+        assert_eq!(
+            p.best_addr(refresh_at),
+            Some(addr),
+            "path must remain trusted while the proactive re-ping is in flight"
+        );
+
+        // Early in the trust window (before the lead): no re-ping yet (don't ping every tick).
+        let early = now + Duration::from_millis(100);
+        assert!(
+            !p.needs_refresh(early),
+            "no re-ping early in the trust window"
+        );
+        assert_eq!(p.best_addr(early), Some(addr));
+    }
+
+    /// Regression for `tsr-v6t`: the `in_flight` map prunes probes older than `PING_TIMEOUT` on each
+    /// new ping, so it cannot grow unbounded for a peer whose candidates never pong.
+    #[test]
+    fn in_flight_prunes_presumed_lost_probes() {
+        let mut p = PeerPaths::default();
+        let addr: SocketAddr = "203.0.113.1:41641".parse().unwrap();
+
+        let now = Instant::now();
+        // A stale probe that will never pong.
+        p.note_ping_sent(tx(1), addr, now);
+        assert_eq!(p.in_flight_len(), 1);
+
+        // A fresh probe sent past the timeout prunes the stale one (map stays bounded at 1, not 2).
+        p.note_ping_sent(tx(2), addr, now + PING_TIMEOUT + Duration::from_millis(1));
+        assert_eq!(
+            p.in_flight_len(),
+            1,
+            "a probe older than PING_TIMEOUT must be pruned, not accumulated"
+        );
+
+        // The pruned tx_id can no longer confirm a path (treated as unsolicited) — correct, we gave up.
+        assert_eq!(
+            p.note_pong(tx(1), addr, now + PING_TIMEOUT + Duration::from_millis(2)),
+            None,
+            "a pong for a pruned probe is unsolicited"
+        );
     }
 
     /// A pong that echoes a tx_id we have in flight but arrives from a *different* source address

@@ -39,7 +39,7 @@ use crate::{
 /// Direct paths are confirmed/expired asynchronously by the disco machinery, so we poll on
 /// this interval to upgrade peers onto a freshly-confirmed direct path and (critically)
 /// downgrade them back to DERP the moment a path's trust lapses. Matched to the disco pinger
-/// interval; `TRUST_DURATION` (6s) is the actual bound on staleness.
+/// interval; `TRUST_DURATION` (6.5s) is the actual bound on staleness.
 const RECOMPUTE_INTERVAL: Duration = Duration::from_secs(2);
 
 pub struct RouteUpdater {
