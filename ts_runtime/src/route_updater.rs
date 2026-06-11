@@ -238,10 +238,12 @@ impl RouteUpdater {
 
             // Outbound peer-selection. This MUST use the same filtered set as the inbound source
             // filter in `src_filter.rs` (both call `Node::routes_to_install` with the same
-            // `env.accept_routes` and the exit node resolved from `env.exit_node`), so a peer can
+            // `env.accept_routes()` and the exit node resolved from `env.exit_node`), so a peer can
             // only source traffic from the exact subnets we route to it. Don't change the filter
-            // here without changing it there.
-            for route in peer.routes_to_install(self.env.accept_routes, exit_node_id.as_ref()) {
+            // here without changing it there. Both read the live `accept_routes` cell, so a runtime
+            // `set_accept_routes` toggle re-filters both on the next recompute (driven by the
+            // `RepublishState` kick), keeping them coupled.
+            for route in peer.routes_to_install(self.env.accept_routes(), exit_node_id.as_ref()) {
                 if route.prefix_len() == 0 {
                     exit_node_satisfied = true;
                 }

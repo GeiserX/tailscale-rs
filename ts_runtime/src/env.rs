@@ -177,8 +177,14 @@ pub struct Env {
 
     /// Whether to accept subnet routes advertised by peers (`--accept-routes` / `RouteAll`).
     ///
-    /// See [`ForwarderConfig::accept_routes`].
-    pub accept_routes: bool,
+    /// A live cell rather than a snapshot (mirroring [`exit_node_rx`](Env::exit_node_rx)):
+    /// `Device::set_accept_routes` updates the backing [`watch::Sender`] (held privately on the
+    /// runtime, not here) at runtime, and both readers (the route updater and the source filter)
+    /// re-read it via [`Env::accept_routes`](Env::accept_routes) on their next recompute, so the
+    /// preference can change without recreating the device. `accept-routes` is a purely *local*
+    /// preference (unlike advertised routes it is never reported to control), so flipping it only
+    /// re-runs the local route/source-filter recompute. See [`ForwarderConfig::accept_routes`].
+    pub accept_routes_rx: watch::Receiver<bool>,
 
     /// Which peer (if any) is selected as this node's exit node (`ExitNodeID`).
     ///
@@ -282,20 +288,37 @@ impl Env {
         self.exit_node_rx.borrow().clone()
     }
 
-    /// Build an [`Env`] and the exit-node [`watch::Sender`] separately, so the `Sender` (the
-    /// mutation capability) can be retained privately by the runtime while only the read side
-    /// (`exit_node_rx`) is cloned into the many actors that subscribe to `Env`. The `Sender` is
-    /// seeded with [`ForwarderConfig::exit_node`]. The runtime uses this; callers that never mutate
-    /// the exit node (e.g. tests) use [`Env::new`], which discards the `Sender`.
-    pub fn new_with_exit_tx(
+    /// Whether peer-advertised subnet routes are currently accepted (`--accept-routes` / `RouteAll`),
+    /// re-read live (it can change at runtime via `Device::set_accept_routes`). Both the route
+    /// updater and the source filter call this on each recompute so a runtime toggle takes effect on
+    /// the next netmap update / republish.
+    pub fn accept_routes(&self) -> bool {
+        // `bool` is `Copy`, so deref the borrow guard rather than cloning.
+        *self.accept_routes_rx.borrow()
+    }
+
+    /// Build an [`Env`] and the runtime-mutable preference [`watch::Sender`]s separately, so each
+    /// `Sender` (the mutation capability) can be retained privately by the runtime while only the
+    /// read sides (`exit_node_rx`, `accept_routes_rx`) are cloned into the many actors that subscribe
+    /// to `Env`. The senders are seeded from [`ForwarderConfig::exit_node`] /
+    /// [`ForwarderConfig::accept_routes`]. The runtime uses this; callers that never mutate these
+    /// (e.g. tests) use [`Env::new`], which discards the senders.
+    pub fn new_with_runtime_txs(
         keys: ts_keys::NodeState,
         shutdown: watch::Receiver<bool>,
         forwarding: ForwarderConfig,
-    ) -> (Self, watch::Sender<Option<ts_control::ExitNodeSelector>>) {
+    ) -> (
+        Self,
+        watch::Sender<Option<ts_control::ExitNodeSelector>>,
+        watch::Sender<bool>,
+    ) {
         let (exit_node_tx, exit_node_rx) = watch::channel(forwarding.exit_node.clone());
+        let (accept_routes_tx, accept_routes_rx) = watch::channel(forwarding.accept_routes);
 
         let ForwarderConfig {
-            accept_routes,
+            // Already consumed above to seed the `watch` channel; the `Sender` is returned so the
+            // runtime can hold it privately, narrowing mutation away from the cloned `Env`.
+            accept_routes: _,
             // Already consumed above to seed the `watch` channel; the `Sender` is returned so the
             // runtime can hold it privately, narrowing mutation away from the cloned `Env`.
             exit_node: _,
@@ -331,7 +354,7 @@ impl Env {
             bus: MessageBus::spawn_default(),
             keys: Arc::new(keys),
             shutdown,
-            accept_routes,
+            accept_routes_rx,
             exit_node_rx,
             forward_routes: Arc::new(forward_routes),
             forward_tcp_ports: Arc::new(forward_tcp_ports),
@@ -348,18 +371,18 @@ impl Env {
             funnel_ingress: Arc::new(std::sync::Mutex::new(None)),
         };
 
-        (env, exit_node_tx)
+        (env, exit_node_tx, accept_routes_tx)
     }
 
-    /// Build an [`Env`] without retaining the exit-node [`watch::Sender`] — for callers that only
-    /// read the exit node and never mutate it (e.g. tests). The selector is still seeded from
-    /// [`ForwarderConfig::exit_node`] but becomes immutable since the `Sender` is dropped.
+    /// Build an [`Env`] without retaining the runtime-mutable preference [`watch::Sender`]s — for
+    /// callers that only read these and never mutate them (e.g. tests). The exit node / accept-routes
+    /// are still seeded from [`ForwarderConfig`] but become immutable since the senders are dropped.
     pub fn new(
         keys: ts_keys::NodeState,
         shutdown: watch::Receiver<bool>,
         forwarding: ForwarderConfig,
     ) -> Self {
-        Self::new_with_exit_tx(keys, shutdown, forwarding).0
+        Self::new_with_runtime_txs(keys, shutdown, forwarding).0
     }
 
     pub async fn subscribe<M>(&self, slf: &ActorRef<impl Message<M>>) -> Result<(), Error>
@@ -384,5 +407,90 @@ impl Env {
             .with_actor_info(&self.bus)?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal `ForwarderConfig` for exercising the live preference cells, seeding `accept_routes`.
+    fn cfg(accept_routes: bool) -> ForwarderConfig {
+        ForwarderConfig {
+            accept_routes,
+            exit_node: None,
+            forward_routes: vec![],
+            forward_tcp_ports: vec![],
+            forward_udp_ports: vec![],
+            forward_all_ports: false,
+            forward_exit_egress: false,
+            block_incoming: false,
+            exit_proxy: None,
+            peerapi_port: None,
+            taildrop_dir: None,
+            enable_ipv6: false,
+            persistent_keepalive_interval: None,
+            ingress_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn env_with(accept_routes: bool) -> (Env, watch::Sender<bool>) {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (env, _exit_tx, accept_tx) = Env::new_with_runtime_txs(
+            ts_keys::NodeState::generate(),
+            shutdown_rx,
+            cfg(accept_routes),
+        );
+        (env, accept_tx)
+    }
+
+    /// `Env::accept_routes()` reflects the `ForwarderConfig` seed.
+    // `Env::new_with_runtime_txs` spawns the `MessageBus` actor, which needs a Tokio reactor.
+    #[tokio::test]
+    async fn accept_routes_seeded_from_config() {
+        let (env_on, _t1) = env_with(true);
+        assert!(env_on.accept_routes(), "seeded true");
+        let (env_off, _t2) = env_with(false);
+        assert!(!env_off.accept_routes(), "seeded false");
+    }
+
+    /// The accessor re-reads the LIVE cell: a `send_replace` on the runtime-held sender is observed
+    /// by `Env::accept_routes()` (the mechanism `Device::set_accept_routes` relies on), and a clone
+    /// of `Env` (as the actors hold) sees the same update.
+    #[tokio::test]
+    async fn accept_routes_accessor_tracks_live_toggle() {
+        let (env, accept_tx) = env_with(false);
+        let env_clone = env.clone();
+        assert!(!env.accept_routes());
+
+        accept_tx.send_replace(true);
+        assert!(env.accept_routes(), "accessor reflects toggle ON");
+        assert!(
+            env_clone.accept_routes(),
+            "a cloned Env (held by actors) sees the same live toggle"
+        );
+
+        accept_tx.send_replace(false);
+        assert!(!env.accept_routes(), "accessor reflects toggle OFF");
+
+        // OFF → ON again: toggling is repeatable / idempotent (not a one-way latch).
+        accept_tx.send_replace(true);
+        assert!(
+            env.accept_routes(),
+            "accessor reflects a repeated toggle ON"
+        );
+    }
+
+    /// `Env::new` drops the accept-routes `Sender`, but the seeded value must survive (a `watch`
+    /// `Receiver::borrow` still returns the last-sent value after the sole sender drops). The actor
+    /// unit tests that build an `Env` via `Env::new` rely on this immutable-but-readable behavior.
+    #[tokio::test]
+    async fn accept_routes_survives_dropped_sender_via_new() {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let env = Env::new(ts_keys::NodeState::generate(), shutdown_rx, cfg(true));
+        assert!(
+            env.accept_routes(),
+            "seed survives the dropped sender (Env::new path)"
+        );
     }
 }
