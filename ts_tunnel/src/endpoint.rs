@@ -342,6 +342,12 @@ struct Peer {
     /// re-arms unconditionally and fires on a totally idle tunnel. See
     /// [`PeerConfig::persistent_keepalive_interval`].
     persistent_keepalive: Option<Handle<Event>>,
+    /// Consecutive failed handshake-initiation retransmits for the current attempt (Go wireguard-go
+    /// `peer.timers.handshakeAttempts`). Incremented each time `HANDSHAKE_TIMEOUT` fires with no
+    /// response; reset to 0 when a *fresh* (non-retry) handshake is started or a handshake completes.
+    /// Once it exceeds [`MAX_TIMER_HANDSHAKES`] the peer gives up retransmitting (see
+    /// [`Peer::handshake_timeout`]) rather than re-initiating every `HANDSHAKE_TIMEOUT` forever.
+    handshake_attempts: u32,
 }
 
 impl Peer {
@@ -357,6 +363,7 @@ impl Peer {
             keepalive: None,
             send_another_keepalive: false,
             persistent_keepalive: None,
+            handshake_attempts: 0,
         }
     }
 
@@ -432,7 +439,8 @@ impl Peer {
             return;
         }
 
-        self.start_handshake(endpoint, out);
+        // Outbound-traffic-triggered: a fresh handshake (resets the give-up counter).
+        self.start_handshake(endpoint, out, false);
     }
 
     #[tracing::instrument(skip_all, fields(?session_id, n_packets = packets.len()))]
@@ -501,6 +509,12 @@ impl Peer {
             return;
         };
 
+        // Handshake completed: reset the give-up retransmit counter (Go wireguard-go
+        // `timersHandshakeComplete` → `handshakeAttempts.Store(0)`), so a future rekey starts a fresh
+        // give-up window. (Only the initiator role runs the retransmit timer/counter; the responder
+        // `confirm` path never started one.)
+        self.handshake_attempts = 0;
+
         // We sent the initiation and finished on the response: we are the INITIATOR of this keypair.
         let mut packets = self
             .session
@@ -538,7 +552,8 @@ impl Peer {
                 // REJECT_AFTER_TIME — keeping a mostly-inbound, send-idle session alive. One-shot per
                 // keypair (the guard lives in `keep_key_fresh_receiving`); initiator-only.
                 if self.session.keep_key_fresh_receiving(Instant::now()) {
-                    self.start_handshake(endpoint, out);
+                    // Receive-triggered rekey is a fresh handshake (resets the give-up counter).
+                    self.start_handshake(endpoint, out, false);
                 }
             }
             return;
@@ -612,10 +627,39 @@ impl Peer {
             return;
         }
 
+        // The in-flight initiation went unanswered. Free its session id and clear the initiator slot
+        // regardless of whether we retry or give up.
         endpoint.ids.remove_handshake_session(&self.handshake);
         self.handshake = Handshake::none();
 
-        self.start_handshake(endpoint, out);
+        // Give-up bound (Go wireguard-go `expiredRetransmitHandshake`): after
+        // `MAX_TIMER_HANDSHAKES` consecutive failed retransmits stop retransmitting rather than
+        // re-initiating every `HANDSHAKE_TIMEOUT` forever to an unreachable peer. On give-up, tear
+        // the session down: `deactivate` frees the recv ids of any live keypair AND drops the staged
+        // outbound queue (a peer with no reachable path shouldn't accumulate a queue indefinitely) —
+        // Go's `FlushStagedPackets`. We do NOT re-arm: the next outbound packet re-triggers a fresh
+        // handshake via `Peer::send` (`needs_rotation()` is true once the session is torn down),
+        // which resets the counter.
+        //
+        // The session may be `Active` here, not just `None`: a *receive-triggered rekey*
+        // (`keep_key_fresh_receiving`) arms a fresh handshake while the converged keypair is still
+        // live, so an unanswered rekey can reach give-up with the old keypair still `Active`. Using
+        // `deactivate` (not a bare `take`, which would drop the keypair WITHOUT freeing its recv ids
+        // — a leak) frees those ids in that case and is a clean no-op for the `None` initial-handshake
+        // case.
+        if self.handshake_attempts >= MAX_TIMER_HANDSHAKES {
+            tracing::debug!(
+                peer_id = ?self.id,
+                attempts = self.handshake_attempts,
+                "handshake did not complete after max attempts; giving up (next outbound packet retries)"
+            );
+            self.session.deactivate(endpoint);
+            self.handshake_attempts = 0;
+            return;
+        }
+
+        self.handshake_attempts += 1;
+        self.start_handshake(endpoint, out, true);
     }
 
     fn send_keepalive(&mut self, scheduler: &mut Scheduler<Event>, out: &mut EventResult) {
@@ -678,7 +722,22 @@ impl Peer {
 
     /// (Soft) precondition: `self.handshake == HandshakeState::None` (previous handshake is lost, but
     /// that shouldn't cause anything terrible to happen).
-    fn start_handshake(&mut self, endpoint: &mut EndpointState, out: &mut impl QueueToPeer) {
+    ///
+    /// `is_retry` distinguishes a fresh handshake (a new outbound packet or receive-triggered rekey)
+    /// from a retransmit of the current one (driven by [`handshake_timeout`](Self::handshake_timeout)).
+    /// A fresh handshake resets the [`handshake_attempts`](Self::handshake_attempts) give-up counter
+    /// to 0 — mirroring Go wireguard-go's `SendHandshakeInitiation(isRetry)`, where only `isRetry ==
+    /// false` zeroes the counter. The retransmit path increments the counter itself before calling
+    /// this, so it must pass `true` to avoid resetting its own progress.
+    fn start_handshake(
+        &mut self,
+        endpoint: &mut EndpointState,
+        out: &mut impl QueueToPeer,
+        is_retry: bool,
+    ) {
+        if !is_retry {
+            self.handshake_attempts = 0;
+        }
         // TODO most of this logic might be better in the `handshake` module.
         let session_id = endpoint.ids.allocate_session(self.id);
         let (handshake, packet) = initiate_handshake(
@@ -1024,6 +1083,19 @@ pub enum Event {
 }
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Max consecutive handshake-initiation retransmits before giving up (Go wireguard-go
+/// `MaxTimerHandshakes = RekeyAttemptTime / RekeyTimeout = 90s / 5s = 18`). After this many failed
+/// retransmits, [`Peer::handshake_timeout`] stops retransmitting and tears the session down rather
+/// than re-initiating forever; the next outbound packet re-triggers a fresh handshake. Count-based
+/// (not a wall clock) to avoid drift from the per-retransmit jitter.
+///
+/// Total initiations before give-up = 1 (initial) + 18 retransmits = 19, ≈95s of trying. This is
+/// one retransmit (~5s) shy of wireguard-go, which gives up on `attempts > 18` (20 initiations,
+/// ≈100s); the gate here is `attempts >= 18` after the post-increment. The difference is immaterial
+/// — both are within `REKEY_ATTEMPT_TIME`'s intent and the give-up→retry-on-next-packet behavior is
+/// identical — but noting it so the count isn't mistaken for byte-exact Go parity.
+const MAX_TIMER_HANDSHAKES: u32 = 18;
 
 #[cfg(test)]
 mod tests {
@@ -2064,6 +2136,135 @@ mod tests {
             a_ep.session_id_count(),
             0,
             "every id is freed on teardown — no leak from the displacement path"
+        );
+    }
+
+    /// Count the handshake-initiation packets in a per-peer emission map (a fired retransmit or a
+    /// fresh initiation both emit exactly one msg1 to the peer).
+    fn count_initiations(map: &HashMap<PeerId, Vec<PacketMut>>, peer: PeerId) -> usize {
+        map.get(&peer)
+            .map(|pkts| {
+                pkts.iter()
+                    .filter(|p| {
+                        matches!(
+                            Message::try_from(p.as_ref()),
+                            Ok(Message::HandshakeInitiation(_))
+                        )
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Regression for the WG handshake give-up bound (Go wireguard-go `expiredRetransmitHandshake` /
+    /// `MaxTimerHandshakes`): the initiator must stop retransmitting after [`MAX_TIMER_HANDSHAKES`]
+    /// failed attempts instead of re-initiating every `HANDSHAKE_TIMEOUT` forever to an unreachable
+    /// peer, and the next outbound packet must re-trigger exactly one fresh handshake.
+    ///
+    /// A is the initiator; its peer B never answers (no `recv` is fed back). We `send` once to kick
+    /// off the first initiation, then fire `HandshakeTimeout` past the cap and assert: (i) once at
+    /// the cap a fired timeout emits NO further initiation (give-up), (ii) the give-up freed the
+    /// in-flight id (no leak / no accumulation), and (iii) a subsequent `send` re-triggers exactly
+    /// one fresh initiation. Deterministic: pure event dispatch, no real sleeps.
+    #[test]
+    fn handshake_retransmit_gives_up_after_max_attempts_then_retriggers() {
+        let (a_static, b_static) = (NodeKeyPair::new(), NodeKeyPair::new());
+        let mut a_ep = Endpoint::new(a_static);
+        let b_peer = PeerId(1);
+        a_ep.upsert_peer(
+            b_peer,
+            PeerConfig {
+                key: b_static.public,
+                psk: rand::random(),
+                persistent_keepalive_interval: None,
+            },
+        );
+
+        // Kick off the first handshake by sending an outbound packet (no live session → initiation).
+        let first = a_ep.send([(b_peer, vec![PacketMut::new(32)])]);
+        let mut total_initiations = count_initiations(&first.to_peers, b_peer);
+        assert_eq!(
+            total_initiations, 1,
+            "the first outbound packet triggers exactly one handshake initiation"
+        );
+        assert_eq!(a_ep.session_id_count(), 1, "one in-flight handshake id");
+
+        // Fire HandshakeTimeout well past the cap. Each fire below the cap re-initiates (one new
+        // msg1); once attempts reach the cap the give-up fires and NO further initiation is emitted.
+        // Sum every initiation so the EXACT give-up count is pinned (catches an off-by-one in either
+        // direction — a regression that gave up too early or too late would change this total).
+        let mut now = Instant::now();
+        for _ in 0..(MAX_TIMER_HANDSHAKES + 5) {
+            now += HANDSHAKE_TIMEOUT * 2; // well past the (jittered) timeout window
+            total_initiations += count_initiations(&a_ep.dispatch_events(now).to_peers, b_peer);
+        }
+        assert_eq!(
+            total_initiations,
+            (MAX_TIMER_HANDSHAKES + 1) as usize,
+            "exactly the initial initiation + MAX_TIMER_HANDSHAKES retransmits, then give-up (no more)"
+        );
+        assert_eq!(
+            a_ep.session_id_count(),
+            0,
+            "give-up frees the in-flight handshake id (no leak / no accumulation)"
+        );
+
+        // A subsequent outbound packet re-triggers exactly one fresh handshake (the counter reset).
+        let again = a_ep.send([(b_peer, vec![PacketMut::new(32)])]);
+        assert_eq!(
+            count_initiations(&again.to_peers, b_peer),
+            1,
+            "a new outbound packet after give-up re-triggers exactly one fresh initiation"
+        );
+        assert_eq!(
+            a_ep.session_id_count(),
+            1,
+            "exactly one fresh in-flight id after re-trigger"
+        );
+    }
+
+    /// Regression: giving up on a rekey while the previous keypair is still **Active** must FREE that
+    /// keypair's receive ids, not leak them. A receive-triggered rekey (`keep_key_fresh_receiving`)
+    /// arms a fresh handshake while the converged session stays live; if that rekey goes unanswered
+    /// and hits the give-up bound, the teardown must go through `deactivate` (frees recv ids), not a
+    /// bare `take` (drops the keypair WITHOUT freeing its ids — a permanent leak). We establish a
+    /// real session (A is initiator, so it owns the keypair's recv id), then simulate the rekey by
+    /// arming a fresh handshake on A's peer and driving `HandshakeTimeout` past the cap with B
+    /// unreachable. A's id count must return to the post-handshake baseline.
+    #[test]
+    fn giveup_on_rekey_of_active_session_frees_recv_ids() {
+        let (mut a_ep, _b_ep, a_peer, _b_peer) = establish_session(None, b"hello");
+        let baseline = a_ep.session_id_count();
+        assert_eq!(
+            baseline, 1,
+            "A holds exactly its established keypair's recv id"
+        );
+
+        // Simulate the receive-triggered rekey: arm a fresh handshake on A's peer WHILE the keypair
+        // is still Active (this is exactly what `keep_key_fresh_receiving` does). `is_retry=false`
+        // resets the give-up counter, mirroring the live path. This allocates the rekey's id.
+        let peer = a_ep.peers.get_mut(&a_peer).expect("A's peer");
+        peer.start_handshake(&mut a_ep.state, &mut EventResult::default(), false);
+        assert_eq!(
+            a_ep.session_id_count(),
+            baseline + 1,
+            "rekey-while-active allocates a second (handshake) id atop the live keypair"
+        );
+
+        // B is unreachable: drive the rekey's HandshakeTimeout past the cap so it gives up.
+        let mut now = Instant::now();
+        for _ in 0..(MAX_TIMER_HANDSHAKES + 5) {
+            now += HANDSHAKE_TIMEOUT * 2;
+            a_ep.dispatch_events(now);
+        }
+
+        // The give-up must have torn the Active keypair down via `deactivate`, freeing BOTH the live
+        // keypair's recv id and the abandoned rekey id — back to zero. The old `take()` would have
+        // leaked the keypair's recv id here (count stuck at 1).
+        assert_eq!(
+            a_ep.session_id_count(),
+            0,
+            "give-up on an Active session frees the keypair's recv ids (no leak)"
         );
     }
 
