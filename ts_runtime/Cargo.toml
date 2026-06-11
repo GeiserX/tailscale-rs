@@ -56,6 +56,9 @@ smallvec.workspace = true
 # For `DeviceState::NeedsLogin(url::Url)` / `RegistrationError::NeedsLogin` — the interactive-auth
 # URL control hands back, surfaced through the device-state machine.
 url.workspace = true
+# Jitter for the DERP reconnect backoff (multiderp). Already a normal dependency of the sibling
+# magicsock/tunnel crates, so this pulls in nothing new.
+rand.workspace = true
 
 [features]
 # Off by default. Enables the TUN-mode overlay transport (ts_transport_tun) so the runtime can
@@ -69,7 +72,6 @@ tun = ["dep:ts_transport_tun", "dep:ts_host_net", "dep:etherparse"]
 acme = ["ts_control/acme"]
 
 [dev-dependencies]
-rand = "0.10"
 proptest = "1.11"
 itertools = "0.14"
 # Test-only: sign the TKA node-key-signature fixtures the peer_tracker TKA enforcement tests verify

@@ -15,7 +15,9 @@ use url::Url;
 
 use crate::{
     Error, ServerConnInfo, frame,
-    frame::{ClientInfo, FrameType, PeerGone, Ping, RawFrame, ServerInfo, ServerKey},
+    frame::{
+        ClientInfo, FrameType, Health, PeerGone, Ping, RawFrame, Restarting, ServerInfo, ServerKey,
+    },
 };
 
 type DefaultIo = ts_http_util::Upgraded;
@@ -198,13 +200,51 @@ where
                         "peer gone from derp server"
                     );
                 }
+                FrameType::Health => {
+                    // The server reports a connection-health problem; the whole trailing payload is
+                    // a UTF-8 problem string (empty = healthy again). Informational, NOT a teardown
+                    // signal — Go's client returns it as a `HealthMessage` and the engine forwards it
+                    // to a health tracker, never disconnecting. Log it and keep reading.
+                    let problem = frame
+                        .as_type::<Health>()
+                        .map(|(_health, payload)| String::from_utf8_lossy(payload))
+                        .unwrap_or_default();
+                    if problem.is_empty() {
+                        tracing::debug!("derp server reports connection healthy again");
+                    } else {
+                        tracing::warn!(%problem, "derp server reports connection health problem");
+                    }
+                }
+                FrameType::Restarting => {
+                    // The server announces it is restarting, advising when / how long to reconnect
+                    // (two big-endian u32 millisecond durations). Advisory only — Go's own clients
+                    // parse but don't act on the timings, relying on the normal reconnect-with-backoff
+                    // path once the connection drops; we do the same (log and keep reading — the loop
+                    // ends naturally when the server closes the connection, then the caller reconnects
+                    // with backoff). A short (<8-byte) frame is tolerated, not fatal.
+                    match frame.as_type::<Restarting>() {
+                        Some((restarting, _rest)) => tracing::info!(
+                            reconnect_in_ms = restarting.reconnect.get(),
+                            try_for_ms = restarting.total.get(),
+                            "derp server is restarting"
+                        ),
+                        None => tracing::warn!("dropping short derp server-restarting frame"),
+                    }
+                }
                 FrameType::RecvPacket => {
                     let (recv, payload) = frame.as_type::<frame::RecvPacket>().unwrap();
 
                     return Ok((recv.src, payload.into()));
                 }
                 t => {
-                    return Err(Error::UnexpectedRecvFrameType(t));
+                    // A known-but-not-yet-handled server frame type is SKIPPED, never fatal — like
+                    // Go's DERP client (`recvTimeout` has a `default: continue`). Treating it as an
+                    // error (the old behavior) tore down and reconnected the connection on benign
+                    // control frames the server legitimately sends, flapping the home-DERP relay that
+                    // DERP-only peers depend on. (A *truly unknown* wire byte never reaches here: the
+                    // codec's `FrameType::try_from` rejects it at decode time — widening that to a
+                    // skip too would be a separate codec change.)
+                    tracing::debug!(frame_type = ?t, "ignoring unhandled derp frame type");
                 }
             }
         }
@@ -319,7 +359,125 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::{IpUsage, ServerConnInfo, TlsValidationConfig};
+    use tokio::io::AsyncWriteExt;
+    use tokio_util::codec::{FramedRead, FramedWrite};
+
+    use super::*;
+    use crate::{
+        Error, IpUsage, ServerConnInfo, TlsValidationConfig,
+        frame::{self, Header, RawFrame},
+    };
+
+    /// Build a `Client` over an in-memory duplex whose server side has already been fed `frames`
+    /// (each `(FrameType, body)`), then closed. Lets `recv_one` be driven against synthetic
+    /// server→client frames without a real DERP server.
+    async fn client_fed(frames: &[(FrameType, &[u8])]) -> Client<tokio::io::DuplexStream> {
+        let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+
+        // Encode each frame onto the server side using the wire Codec, then EOF. The body lives in
+        // `raw_body`; pass it as the extra-payload tuple element (the `(RawFrame, &[u8])` encoder)
+        // with an empty `RawFrame` body so the header length matches `raw_body.len()`.
+        let mut enc = FramedWrite::new(&mut server_io, frame::Codec);
+        for (typ, body) in frames {
+            let header = Header::new(*typ, body.len() as u32).expect("valid header");
+            let raw = RawFrame {
+                header,
+                raw_body: &[],
+            };
+            // `SinkExt::feed` with an explicit tuple item disambiguates the two `Encoder` impls.
+            futures::SinkExt::<(RawFrame, &[u8])>::feed(&mut enc, (raw, *body))
+                .await
+                .expect("encode frame");
+        }
+        futures::SinkExt::<(RawFrame, &[u8])>::flush(&mut enc)
+            .await
+            .expect("flush");
+        server_io.shutdown().await.expect("close server side");
+
+        let (read_conn, write_conn) = tokio::io::split(client_io);
+        Client {
+            read_conn: Mutex::new(FramedRead::new(read_conn, frame::Codec)),
+            write_conn: Mutex::new(FramedWrite::new(write_conn, frame::Codec)),
+        }
+    }
+
+    /// Regression: a `Health` frame (0x14) must be consumed in-band, NOT treated as a fatal
+    /// "unexpected frame type". Before the fix, `recv_one` returned `Err(UnexpectedRecvFrameType)`
+    /// on any non-data control frame, tearing down + reconnecting the DERP connection on benign
+    /// frames the server legitimately sends (flapping the home-DERP relay). Here we feed a Health
+    /// frame then EOF: the loop must skip the Health frame and surface the EOF (`UnexpectedEof`),
+    /// proving the Health frame itself was not the error.
+    #[tokio::test]
+    async fn health_frame_is_skipped_not_fatal() {
+        let client = client_fed(&[(FrameType::Health, b"duplicate connection")]).await;
+        let got = client.recv_one().await;
+        match got {
+            Err(Error::IoFailure(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+            other => panic!("expected EOF after a skipped Health frame, got {other:?}"),
+        }
+    }
+
+    /// Regression: a `Restarting` frame (0x15) — two big-endian u32 ms durations — is likewise
+    /// skipped, not fatal.
+    #[tokio::test]
+    async fn restarting_frame_is_skipped_not_fatal() {
+        // Restarting: reconnect_in = 1234ms, try_for = 5678ms (big-endian u32s).
+        let mut body = Vec::new();
+        body.extend_from_slice(&1234u32.to_be_bytes());
+        body.extend_from_slice(&5678u32.to_be_bytes());
+        let client = client_fed(&[(FrameType::Restarting, &body)]).await;
+        let got = client.recv_one().await;
+        match got {
+            Err(Error::IoFailure(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+            other => panic!("expected EOF after a skipped Restarting frame, got {other:?}"),
+        }
+    }
+
+    /// Regression for the forward-compatible catch-all: a known-but-unhandled server frame type
+    /// (here `Pong`, 0x13, which the client never special-cases) must hit the `t => skip` arm and be
+    /// ignored, not tear down the connection. (A *truly unknown* wire byte is rejected earlier by the
+    /// codec's `FrameType::try_from`, so it can't reach `recv_one`; a known-but-unhandled variant is
+    /// what actually exercises the catch-all — the arm most likely to silently regress.)
+    #[tokio::test]
+    async fn unhandled_known_frame_type_is_skipped_not_fatal() {
+        let client = client_fed(&[(FrameType::Pong, &[0u8; 8])]).await;
+        match client.recv_one().await {
+            Err(Error::IoFailure(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+            other => panic!("expected EOF after a skipped Pong frame, got {other:?}"),
+        }
+    }
+
+    /// The production scenario: a `Health` control frame interleaved *before* a real `RecvPacket`
+    /// data frame. `recv_one` must skip the Health frame and then DELIVER the following data packet
+    /// (src + payload) — proving the loop continues to useful data, not merely that the control
+    /// frame wasn't fatal. A refactor that turned the Health arm into an early `return` would pass
+    /// the skip-then-EOF tests but fail this one.
+    #[tokio::test]
+    async fn health_frame_is_skipped_then_following_data_packet_is_delivered() {
+        let src: NodePublicKey = [7u8; 32].into();
+        // RecvPacket wire body = src (32 bytes) followed by the data payload.
+        let mut recv_body = Vec::new();
+        recv_body.extend_from_slice(&src.to_bytes());
+        recv_body.extend_from_slice(b"hello-derp");
+        let client = client_fed(&[
+            (FrameType::Health, b"duplicate connection"),
+            (FrameType::RecvPacket, &recv_body),
+        ])
+        .await;
+        let (got_src, pkt) = client
+            .recv_one()
+            .await
+            .expect("data packet delivered after a skipped Health frame");
+        assert_eq!(
+            got_src, src,
+            "delivered packet carries the original src key"
+        );
+        assert_eq!(
+            pkt.as_ref(),
+            b"hello-derp",
+            "delivered packet carries the payload"
+        );
+    }
 
     /// A region whose only server has both IP families disabled: `dial_region_tls` returns
     /// `Ok(None)` (unreachable) synchronously, with no network I/O.
