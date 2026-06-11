@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.24.0](https://github.com/GeiserX/tailscale-rs/compare/v0.23.0...v0.24.0) (2026-06-11)
+
+
+### Features
+
+* **whois:** flow-scoped peer-capability grants (CapMap) — retain cap-grants end to end ([#91](https://github.com/GeiserX/tailscale-rs/issues/91)) ([8c0bbac](https://github.com/GeiserX/tailscale-rs/commit/8c0bbacb5f03ff7c0bb899680e8899d48fa60cea))
+
 ## [0.23.0](https://github.com/GeiserX/tailscale-rs/compare/v0.22.1...v0.23.0) (2026-06-11)
 
 
