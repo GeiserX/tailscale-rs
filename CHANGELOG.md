@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.21.2](https://github.com/GeiserX/tailscale-rs/compare/v0.21.1...v0.21.2) (2026-06-11)
+
+
+### Bug Fixes
+
+* **tka:** match Go's rotation/credential verify — recurse wrapping key, drop synthetic pubkey bind ([#83](https://github.com/GeiserX/tailscale-rs/issues/83)) ([1f91f03](https://github.com/GeiserX/tailscale-rs/commit/1f91f03ab66cdfe4fbadd69013b11d8c786cacc2))
+
 ## [0.21.1](https://github.com/GeiserX/tailscale-rs/compare/v0.21.0...v0.21.1) (2026-06-11)
 
 
