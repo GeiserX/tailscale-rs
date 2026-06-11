@@ -2,6 +2,14 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.16.0](https://github.com/GeiserX/tailscale-rs/compare/v0.15.0...v0.16.0) (2026-06-11)
+
+
+### Features
+
+* **ts_runtime:** TKA verify-and-log seam in peer_tracker ([#136](https://github.com/GeiserX/tailscale-rs/issues/136), observe-only) ([#62](https://github.com/GeiserX/tailscale-rs/issues/62)) ([acc70ee](https://github.com/GeiserX/tailscale-rs/commit/acc70eea3ba39516faf5f0927e324aa83bf98a61))
+* **tsnet:** Device::netcheck() net-report accessor (Go netcheck.Report / tnet netcheck) ([#60](https://github.com/GeiserX/tailscale-rs/issues/60)) ([e30a4be](https://github.com/GeiserX/tailscale-rs/commit/e30a4be26a1cc795f3414858eeb6cc344cee40e5))
+
 ## [0.15.0](https://github.com/GeiserX/tailscale-rs/compare/v0.14.0...v0.15.0) (2026-06-10)
 
 
