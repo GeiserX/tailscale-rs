@@ -2,6 +2,14 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.28.1](https://github.com/GeiserX/tailscale-rs/compare/v0.28.0...v0.28.1) (2026-06-11)
+
+
+### Bug Fixes
+
+* **magicsock:** bound addr_to_disco attribution map in lockstep with the learned cap (anti-amplification) ([#105](https://github.com/GeiserX/tailscale-rs/issues/105)) ([57083ba](https://github.com/GeiserX/tailscale-rs/commit/57083bae3989c96f1be192195f0c64f8fa7d29b6))
+* **tunnel:** bound handshake retransmits at REKEY_ATTEMPT_TIME (give up after MAX_TIMER_HANDSHAKES) ([#107](https://github.com/GeiserX/tailscale-rs/issues/107)) ([a534944](https://github.com/GeiserX/tailscale-rs/commit/a534944652d42779d204401aac172799812eb12e))
+
 ## [0.28.0](https://github.com/GeiserX/tailscale-rs/compare/v0.27.0...v0.28.0) (2026-06-11)
 
 
