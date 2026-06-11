@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.18.2](https://github.com/GeiserX/tailscale-rs/compare/v0.18.1...v0.18.2) (2026-06-11)
+
+
+### Bug Fixes
+
+* **control:** apply peers_changed_patch alongside a co-occurring full/delta peer set ([#72](https://github.com/GeiserX/tailscale-rs/issues/72)) ([587e2ae](https://github.com/GeiserX/tailscale-rs/commit/587e2ae315a0102731ac09890e64ea6cfd03b3c1))
+
 ## [0.18.1](https://github.com/GeiserX/tailscale-rs/compare/v0.18.0...v0.18.1) (2026-06-11)
 
 
