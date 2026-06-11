@@ -68,11 +68,26 @@ impl PeerTracker {
     }
 
     /// Build the peer entries for a [`Status`](crate::Status) snapshot from the current peer db.
+    ///
+    /// Connectivity fields (`cur_addr`/`relay`) are left at their `from_node` defaults (`None`) here:
+    /// this is the live-watch/hot path and must stay magicsock-free and synchronous. The explicit
+    /// [`GetStatus`] snapshot enriches them ([`status_peers_with_ids`](Self::status_peers_with_ids)).
     fn status_peers(&self) -> Vec<StatusNode> {
         self.peer_db
             .peers()
             .values()
             .map(StatusNode::from_node)
+            .collect()
+    }
+
+    /// Like [`status_peers`](Self::status_peers) but pairs each entry with its [`PeerId`], so the
+    /// caller can join per-peer connectivity (the direct manager's `best_addrs`, keyed by `PeerId`)
+    /// onto the `StatusNode` before returning it. Order is unspecified (a `HashMap` walk).
+    fn status_peers_with_ids(&self) -> Vec<(PeerId, StatusNode)> {
+        self.peer_db
+            .peers()
+            .iter()
+            .map(|(id, node)| (*id, StatusNode::from_node(node)))
             .collect()
     }
 
@@ -198,7 +213,7 @@ enum Pending {
     PeerByName(PeerByName, ReplySender<Option<Node>>),
     AcceptedRoute(PeerByAcceptedRoute, ReplySender<Vec<Node>>),
     TailnetIp(PeerByTailnetIp, ReplySender<Option<Node>>),
-    Status(ReplySender<Vec<StatusNode>>),
+    Status(ReplySender<Vec<(PeerId, StatusNode)>>),
     WhoIs(Whois, ReplySender<Option<crate::status::WhoIs>>),
 }
 
@@ -307,17 +322,18 @@ mod msg_impl {
             deleg
         }
 
-        /// Build the peer entries of a [`Status`](crate::Status) snapshot.
-        ///
-        /// Returns one [`StatusNode`] per known peer. The self node is *not* included here (it
-        /// lives in the control runner); [`Runtime::status`](crate::Runtime::status) combines both.
+        /// Build the peer entries of a [`Status`](crate::Status) snapshot, each paired with its
+        /// [`PeerId`] so [`Runtime::status`](crate::Runtime::status) can join per-peer connectivity
+        /// (`cur_addr`/`relay`) from the direct manager before returning. The self node is *not*
+        /// included here (it lives in the control runner); `Runtime::status` combines both and drops
+        /// the ids.
         ///
         /// Waits until we've received at least one peer update from control.
         #[message(ctx)]
         pub fn get_status(
             &mut self,
-            ctx: &mut Context<Self, DelegatedReply<Vec<StatusNode>>>,
-        ) -> DelegatedReply<Vec<StatusNode>> {
+            ctx: &mut Context<Self, DelegatedReply<Vec<(PeerId, StatusNode)>>>,
+        ) -> DelegatedReply<Vec<(PeerId, StatusNode)>> {
             let (deleg, sender) = ctx.reply_sender();
             let Some(sender) = sender else { return deleg };
 
@@ -327,7 +343,7 @@ mod msg_impl {
                 return deleg;
             }
 
-            sender.send(self.status_peers());
+            sender.send(self.status_peers_with_ids());
 
             deleg
         }
@@ -820,7 +836,7 @@ impl PeerTracker {
                     );
                 }
                 Pending::Status(reply) => {
-                    reply.send(self.status_peers());
+                    reply.send(self.status_peers_with_ids());
                 }
                 Pending::WhoIs(Whois { addr }, reply) => {
                     reply.send(self.whois_opt(addr));

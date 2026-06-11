@@ -393,7 +393,7 @@ impl Runtime {
         let magic_dns_suffix = self_node_domain.as_ref().and_then(|n| n.tailnet.clone());
         let self_node = self_node_domain.as_ref().map(StatusNode::from_node);
 
-        let peers = self
+        let peers_with_ids = self
             .peer_tracker
             .upgrade()
             .ok_or(Error {
@@ -403,6 +403,27 @@ impl Runtime {
             })?
             .ask(peer_tracker::GetStatus)
             .await?;
+
+        // Join per-peer connectivity (Go `PeerStatus.CurAddr`): one batched query to the direct
+        // manager for every peer's current trusted direct endpoint, then fill `cur_addr` on each
+        // `StatusNode`. A peer absent from the map is relayed via DERP (`cur_addr = None`). This is a
+        // live snapshot — the direct path can expire/re-confirm between calls (matches Go's snapshot
+        // semantics). The `watch_netmap` stream intentionally carries no connectivity (it is a netmap
+        // watch, not a path-state watch, and does not re-fire on direct↔relay flips).
+        let ids: Vec<ts_transport::PeerId> = peers_with_ids.iter().map(|(id, _)| *id).collect();
+        let best_addrs = self
+            .direct
+            .ask(direct::BestAddrs { ids })
+            .await
+            .unwrap_or_default();
+
+        let peers = peers_with_ids
+            .into_iter()
+            .map(|(id, mut node)| {
+                node.cur_addr = best_addrs.get(&id).copied();
+                node
+            })
+            .collect();
 
         Ok(Status {
             self_node,

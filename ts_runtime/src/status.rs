@@ -76,6 +76,18 @@ pub struct StatusNode {
     /// Whether this node advertises a default route (`0.0.0.0/0` or `::/0`), making it eligible to
     /// be selected as an exit node.
     pub is_exit_node: bool,
+    /// The current trusted direct UDP endpoint for this peer, if a direct path is confirmed right now
+    /// (Go `ipnstate.PeerStatus.CurAddr`). `Some` ⇒ traffic to this peer flows directly to this
+    /// address; `None` ⇒ it relays via DERP (see [`relay`](Self::relay)). Mutually exclusive with a
+    /// `relay` for a routed peer, mirroring Go's empty-vs-set `CurAddr`/`Relay` strings. A live
+    /// snapshot — the direct path can expire/re-confirm between calls. Always `None` for the self node
+    /// and a whois lookup (no path to oneself; whois is an ownership query).
+    pub cur_addr: Option<SocketAddr>,
+    /// The DERP region code this peer relays through when there is **no** direct path (Go
+    /// `ipnstate.PeerStatus.Relay`, e.g. `"nyc"`). `Some` ⇔ [`cur_addr`](Self::cur_addr) is `None`
+    /// and the peer's home DERP region is known; `None` when a direct path is confirmed, or the
+    /// region code is unknown. Carries the region **code**, not its numeric id.
+    pub relay: Option<String>,
 }
 
 impl StatusNode {
@@ -97,6 +109,11 @@ impl StatusNode {
             last_seen: node.last_seen,
             allowed_routes: node.accepted_routes.clone(),
             is_exit_node,
+            // A bare `Node` carries no live path state, so connectivity is unknown here. The peer
+            // tracker overwrites these in `status_peers` by joining against the direct manager; the
+            // self node and whois lookups (which also use `from_node`) correctly keep `None`.
+            cur_addr: None,
+            relay: None,
         }
     }
 }
@@ -340,6 +357,18 @@ mod tests {
         let mut exit6 = node("n3", "c", Some("ts.net"), "100.64.0.3");
         exit6.accepted_routes = vec!["::/0".parse().unwrap()];
         assert!(StatusNode::from_node(&exit6).is_exit_node);
+    }
+
+    /// `from_node` carries NO live connectivity: a bare domain `Node` has no path state, so
+    /// `cur_addr`/`relay` default to `None`. `Runtime::status` overwrites `cur_addr` by joining the
+    /// direct manager's `best_addrs`; the self node and whois (which also use `from_node`) keep
+    /// `None`. This pins the default so the enrichment seam stays the single source of connectivity.
+    #[test]
+    fn status_node_from_node_has_no_connectivity_by_default() {
+        let n = node("n1", "host", Some("ts.net"), "100.64.0.7");
+        let s = StatusNode::from_node(&n);
+        assert_eq!(s.cur_addr, None, "a bare Node has no direct endpoint");
+        assert_eq!(s.relay, None, "a bare Node has no resolved relay");
     }
 
     #[test]
