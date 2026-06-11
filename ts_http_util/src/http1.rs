@@ -193,12 +193,23 @@ fn parse_body(headers: &HeaderMap, body: &[u8]) -> Result<Bytes, Error> {
             while let Ok(httparse::Status::Complete((start_offset, chunk_size))) =
                 httparse::parse_chunk_size(&body[idx..])
             {
+                // A zero-size chunk is the terminator (RFC 7230 §4.1): stop reading.
+                if chunk_size == 0 {
+                    break;
+                }
                 let start_idx = idx + start_offset;
                 let end_idx = start_idx + chunk_size as usize;
-                let chunk = &body[start_idx..end_idx];
+                // Bounds-check before slicing: a chunk header may declare more bytes than the body
+                // actually contains (truncated / malformed input). Go's chunked reader returns
+                // `io.ErrUnexpectedEOF` here — we must error, never index out of bounds and panic.
+                // Advancing `idx = end_idx` (only after this check passes) also keeps the next
+                // `&body[idx..]` in bounds.
+                let Some(chunk) = body.get(start_idx..end_idx) else {
+                    return Err(Error::InvalidInput);
+                };
                 tracing::trace!(start_idx, end_idx, ?chunk, "parsed chunk");
                 bytes.extend_from_slice(chunk);
-                idx += start_offset + chunk_size as usize;
+                idx = end_idx;
             }
             Ok(bytes.freeze())
         }
@@ -219,4 +230,48 @@ pub fn parse_request(buf: &[u8]) -> Result<Request<String>, Error> {
     let bytes = parse_body(&parts.headers, &buf[offset..])?;
     let body = String::from_utf8(bytes.to_vec()).map_err(|_| Error::InvalidInput)?;
     Ok(Request::from_parts(parts, body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunked_headers() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("transfer-encoding", ENCODING_CHUNKED);
+        h
+    }
+
+    /// A well-formed chunked body reassembles, and the zero-size terminator stops the read.
+    #[test]
+    fn parse_body_chunked_roundtrip() {
+        // "5\r\nhello\r\n0\r\n\r\n" — one 5-byte chunk then the terminator.
+        let body = b"5\r\nhello\r\n0\r\n\r\n";
+        let out = parse_body(&chunked_headers(), body).expect("valid chunked body");
+        assert_eq!(out.as_ref(), b"hello");
+    }
+
+    /// Regression: a chunk header declaring MORE bytes than the body contains must error, not panic
+    /// (the slice used to index out of bounds). `ff` = 255 bytes declared, but only one follows.
+    #[test]
+    fn parse_body_chunked_oversized_chunk_errors_not_panics() {
+        let body = b"ff\r\nX";
+        let got = parse_body(&chunked_headers(), body);
+        assert!(
+            got.is_err(),
+            "an over-declared chunk size must be an error, not an out-of-bounds panic"
+        );
+    }
+
+    /// A truncated chunk (size header but no CRLF/data) must not panic either.
+    #[test]
+    fn parse_body_chunked_truncated_is_safe() {
+        // Just a size with nothing after it: parse_chunk_size returns Partial (loop exits cleanly).
+        let body = b"5";
+        let got = parse_body(&chunked_headers(), body);
+        assert!(
+            got.is_ok(),
+            "an incomplete chunk size yields an empty body, no panic"
+        );
+    }
 }
