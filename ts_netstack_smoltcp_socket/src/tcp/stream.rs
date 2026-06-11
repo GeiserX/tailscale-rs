@@ -19,6 +19,14 @@ pub struct TcpStream {
 
     #[cfg(any(feature = "tokio", feature = "futures-io"))]
     read_fut: Option<PinBoxFut<Result<Bytes, netcore::Error>>>,
+    /// Bytes received from a completed `Recv` that did not fit the caller's buffer on the poll that
+    /// produced them, carried to the next `poll_read`. A `Recv` is sized by the buffer length at
+    /// future-creation, but the `AsyncRead` contract permits the caller to re-poll with a *smaller*
+    /// buffer, so the response can exceed the live buffer — copying it whole would panic
+    /// (`copy_from_slice` length mismatch). We copy what fits and stash the tail here (lossless),
+    /// draining it before issuing the next `Recv`.
+    #[cfg(any(feature = "tokio", feature = "futures-io"))]
+    read_remainder: Option<Bytes>,
     #[cfg(any(feature = "tokio", feature = "futures-io"))]
     write_fut: Option<PinBoxFut<Result<usize, netcore::Error>>>,
 }
@@ -38,6 +46,9 @@ impl TcpStream {
 
             #[cfg(any(feature = "tokio", feature = "futures-io"))]
             read_fut: None,
+
+            #[cfg(any(feature = "tokio", feature = "futures-io"))]
+            read_remainder: None,
 
             #[cfg(any(feature = "tokio", feature = "futures-io"))]
             write_fut: None,
@@ -165,6 +176,35 @@ impl TcpStream {
     ) -> core::task::Poll<std::io::Result<usize>> {
         use netcore::HasChannel;
 
+        // Callers must pass a non-empty buffer: an `Ok(0)` return is `AsyncRead`'s EOF signal, so
+        // returning it while `read_remainder` still holds bytes (which a zero-length `buf` would
+        // force) would silently truncate the stream. Every in-tree caller passes a non-empty buffer;
+        // this guards the invariant for the public type so a zero-length read can't be mistaken for
+        // EOF-with-data-pending. `tokio`/`futures-io` themselves never poll a read with an empty buf.
+        debug_assert!(
+            !buf.is_empty() || self.read_remainder.is_none(),
+            "poll_read called with an empty buffer while bytes are buffered — Ok(0) would look like EOF"
+        );
+
+        // Copy up to `buf.len()` bytes out of `data` into `buf`, returning `(written, remainder)`
+        // where `remainder` is the unwritten tail (empty if it all fit). `Bytes::split_to` is a
+        // cheap refcount split, so carrying a remainder is allocation-free. Free fn (not a
+        // self-capturing closure) so it doesn't conflict with the `&mut self.read_fut` borrow below.
+        fn copy_into_buf(mut data: Bytes, buf: &mut [u8]) -> (usize, Bytes) {
+            let n = data.len().min(buf.len());
+            buf[..n].copy_from_slice(&data.split_to(n));
+            (n, data)
+        }
+
+        // Drain any stashed remainder first — never issue a fresh `Recv` while bytes are buffered.
+        if let Some(rem) = self.read_remainder.take() {
+            let (n, tail) = copy_into_buf(rem, buf);
+            if !tail.is_empty() {
+                self.read_remainder = Some(tail);
+            }
+            return core::task::Poll::Ready(Ok(n));
+        }
+
         let handle = self.handle;
         let cap = buf.len();
 
@@ -193,11 +233,17 @@ impl TcpStream {
                     let poll_result = x.as_mut().poll(cx);
                     let ret = core::task::ready!(poll_result)?;
 
-                    buf[..ret.len()].copy_from_slice(&ret);
-
                     self.read_fut.take();
 
-                    break core::task::Poll::Ready(Ok(ret.len()));
+                    // Copy what fits into the CURRENT buffer (which the caller may have shrunk since
+                    // the `Recv` was issued at `cap`); stash any tail. A whole-`ret` copy would panic
+                    // when `ret.len() > buf.len()`.
+                    let (n, tail) = copy_into_buf(ret, buf);
+                    if !tail.is_empty() {
+                        self.read_remainder = Some(tail);
+                    }
+
+                    break core::task::Poll::Ready(Ok(n));
                 }
             }
         }

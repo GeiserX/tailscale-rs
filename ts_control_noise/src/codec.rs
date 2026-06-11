@@ -143,6 +143,21 @@ where
 
         match header.typ {
             MessageType::Record => {
+                // A `Record` body is ciphertext + a `tag_len()`-byte AEAD tag, so a well-formed frame
+                // is always at least `tag_len()` bytes (the encoder enforces this). Reject a shorter
+                // body here: `decrypt_in_place` asserts `ciphertext_len >= tag_len()` and would
+                // otherwise PANIC on a control-supplied short `Record` frame (e.g. a 3-byte header
+                // declaring `len = 0`). Go `controlbase` surfaces a decode error (the AEAD `Open`
+                // fails) rather than crashing; mirror that — turn the hostile/buggy short frame into a
+                // clean `InvalidData` error, the same path the over-max and decrypt-failure cases take.
+                if len < C::tag_len() {
+                    tracing::error!(
+                        len,
+                        tag_len = C::tag_len(),
+                        "control Record frame shorter than the AEAD tag"
+                    );
+                    return Err(ErrorKind::InvalidData.into());
+                }
                 match self.cipher_state.decrypt_in_place(&mut body, len) {
                     Ok(n) => body.truncate(n),
                     Err(()) => {
@@ -245,6 +260,60 @@ mod test {
 
         let decoded = decrypt_codec.decode(&mut buf).unwrap().unwrap();
         assert_eq!(decoded.as_ref(), TEST_PAYLOAD);
+    }
+
+    /// A `Record` frame whose declared body length is below the AEAD tag length must be rejected as
+    /// an `InvalidData` decode error, NOT panic. Before the tag-length floor, such a frame reached
+    /// `decrypt_in_place`'s `assert!(ciphertext_len >= tag_len())` and crashed the control task — a
+    /// malicious/buggy control server could panic the client with a 3-byte header (e.g. `len = 0`).
+    #[test]
+    fn short_record_frame_is_rejected_not_panic() {
+        for len in 0..Cipher::tag_len() as u16 {
+            let (_enc, mut dec) = rand_codec_pair();
+            // Hand-build a `Record` header (typ=0x04) declaring `len` body bytes, then `len` bytes of
+            // body — a complete-but-undersized frame the decoder must reject (not return `None` for
+            // "need more bytes", and not panic).
+            let mut buf = BytesMut::new();
+            buf.put_u8(MessageType::Record as u8);
+            buf.put_u16(len); // network-endian U16, matching the Header layout
+            buf.put_bytes(0, len as usize);
+
+            let got = dec.decode(&mut buf);
+            assert!(
+                matches!(&got, Err(e) if e.kind() == ErrorKind::InvalidData),
+                "a Record frame with len={len} (< tag_len) must be InvalidData, got {got:?}"
+            );
+        }
+    }
+
+    /// The lower boundary of the tag-length floor: a record with `len == tag_len()` (an empty
+    /// plaintext plus the AEAD tag) is legitimate and must decode to an empty payload, NOT be
+    /// rejected. Pins the floor at `< tag_len` (not `<= tag_len`), so a future off-by-one tightening
+    /// the guard to `<=` would be caught. The `encode` loop skips empty input (`[].chunks(_)` yields
+    /// nothing), so the frame is hand-built the way the encoder builds a chunk (a header, a
+    /// tag-sized zeroed body, then `encrypt_in_place(.., 0)`).
+    #[test]
+    fn empty_record_at_tag_len_boundary_roundtrips() {
+        let (mut encrypt_codec, mut decrypt_codec) = rand_codec_pair();
+
+        let mut buf = BytesMut::new();
+        let hdr = Header {
+            typ: MessageType::Record,
+            len: U16::new(Cipher::tag_len() as u16), // 0 plaintext + tag
+        };
+        buf.put(hdr.as_bytes());
+        let body_start = buf.len();
+        buf.put_bytes(0, Cipher::tag_len()); // tag-sized body, 0 plaintext
+        encrypt_codec
+            .cipher_state
+            .encrypt_in_place(&mut buf[body_start..], 0);
+        assert_eq!(buf.len(), Cipher::tag_len() + size_of::<Header>());
+
+        let decoded = decrypt_codec.decode(&mut buf).unwrap().unwrap();
+        assert!(
+            decoded.is_empty(),
+            "an empty record (len == tag_len) must decode to an empty payload, not be rejected"
+        );
     }
 
     static RUNTIME: LazyLock<tokio::runtime::Runtime> =

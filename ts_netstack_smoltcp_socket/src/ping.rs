@@ -7,17 +7,24 @@
 //! Anti-leak: this rides the overlay netstack only (via the [`CreateSocket`] channel); it never
 //! touches a host socket. ICMPv4 only — IPv6 is rejected (IPv6-off posture).
 
+// The echo-build/match helpers (and their smoltcp wire imports + `Ipv4Addr` + `alloc::vec`) are used
+// only by the `tokio`-gated `ping` entry point and the tests; `IpAddr`/`Duration`/`CreateSocket`
+// only by `ping` itself. Gating the imports to match their users keeps the default (no-`tokio`) lib
+// build free of unused-import warnings under `-D warnings`.
+#[cfg(any(feature = "tokio", test))]
 use alloc::vec;
-use core::{
-    net::{IpAddr, Ipv4Addr},
-    time::Duration,
-};
+#[cfg(any(feature = "tokio", test))]
+use core::net::Ipv4Addr;
+#[cfg(feature = "tokio")]
+use core::{net::IpAddr, time::Duration};
 
+#[cfg(any(feature = "tokio", test))]
 use netcore::smoltcp::{
     phy::ChecksumCapabilities,
     wire::{IPV4_HEADER_LEN, Icmpv4Packet, Icmpv4Repr, IpProtocol, Ipv4Packet, Ipv4Repr},
 };
 
+#[cfg(feature = "tokio")]
 use crate::CreateSocket;
 
 /// Errors returned by [`ping`].
@@ -56,6 +63,9 @@ impl From<netcore::Error> for PingError {
     }
 }
 
+// Only the `tokio`-gated `ping` path (and its tests) build/scan ICMP echo packets; gate these so
+// the lib builds clean without the `tokio` feature (they'd otherwise be dead code under `-D warnings`).
+#[cfg(any(feature = "tokio", test))]
 const PING_PAYLOAD: &[u8] = b"ts_netstack_smoltcp ping";
 
 /// Per-call counter mixed into the ICMP `ident`.
@@ -144,6 +154,7 @@ pub async fn ping<C: CreateSocket + Sync>(
 /// The raw socket send path parses the buffer as a full IPv4 packet and fills the IPv4 header
 /// checksum on dispatch, but the ICMP checksum and the rest of the IPv4 header must be valid
 /// here.
+#[cfg(any(feature = "tokio", test))]
 fn build_echo_request(
     src: Ipv4Addr,
     dst: Ipv4Addr,
@@ -184,6 +195,7 @@ fn build_echo_request(
 }
 
 /// Parse a received raw IPv4 datagram and check whether it is the Echo Reply we are waiting for.
+#[cfg(any(feature = "tokio", test))]
 fn matches_reply(
     bytes: &[u8],
     expect_src: Ipv4Addr,
