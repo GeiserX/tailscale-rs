@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.22.0](https://github.com/GeiserX/tailscale-rs/compare/v0.21.2...v0.22.0) (2026-06-11)
+
+
+### Features
+
+* **device:** add Device::ping_disco() — true on-demand disco ping with fresh RTT ([#85](https://github.com/GeiserX/tailscale-rs/issues/85)) ([f6b465d](https://github.com/GeiserX/tailscale-rs/commit/f6b465d7f93698bfeeccf1fa7de7d7e16caf4ad9))
+
 ## [0.21.2](https://github.com/GeiserX/tailscale-rs/compare/v0.21.1...v0.21.2) (2026-06-11)
 
 
