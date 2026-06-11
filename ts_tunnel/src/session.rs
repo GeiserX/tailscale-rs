@@ -286,10 +286,10 @@ impl ReceiveSession {
         self.id
     }
 
-    /// Whether this receive session is too old to accept inbound transport data. Uses the lenient
-    /// [`REJECT_AFTER_TIME_RECV`] (240s), NOT `REJECT_AFTER_TIME` (180s): without a receive-triggered
-    /// rekey, tightening the receive bound would silently drop inbound traffic on a send-idle,
-    /// mostly-inbound session. See [`REJECT_AFTER_TIME_RECV`].
+    /// Whether this receive session is too old to accept inbound transport data. Uses
+    /// [`REJECT_AFTER_TIME_RECV`], which now equals `REJECT_AFTER_TIME` (180s) — matching the
+    /// transmit side and the WireGuard spec, once the receive-triggered rekey (#26) made the
+    /// previously-lenient 240s bound unnecessary. See [`REJECT_AFTER_TIME_RECV`].
     pub fn expired(&self, now: Instant) -> bool {
         now.duration_since(self.created) > REJECT_AFTER_TIME_RECV
     }

@@ -136,6 +136,16 @@ pub struct StateUpdate {
     pub peer_seen_change: alloc::collections::BTreeMap<crate::NodeId, bool>,
 }
 
+/// Upper bound on a single netmap frame, checked before allocating the read buffer.
+///
+/// The frame length is a `u32` read straight off the (authenticated, ts2021-Noise) control stream;
+/// without a cap, `PacketMut::new(msg_len)` eagerly zero-allocates up to ~4 GiB, so a malformed or
+/// hostile control frame OOMs the client. Every other framed path in the fork bounds before
+/// allocating (DERP 64 KiB, TKA-sync 10 MiB, control-noise `MAX_MESSAGE_SIZE`); this matches that
+/// discipline. 16 MiB is comfortably above any real netmap (Go bounds this similarly) and `compress`
+/// is sent empty, so the on-wire length equals the buffer size with no decompression amplification.
+const MAX_NETMAP_FRAME: u32 = 16 * 1024 * 1024;
+
 pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpdate> {
     futures_util::stream::unfold(reader, async |mut reader| {
         let msg_len = reader
@@ -145,6 +155,17 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
                 tracing::error!(error = %e, "could not read netmap length");
             })
             .ok()?;
+
+        // Bound the frame before allocating: a `u32` length of `0xFFFF_FFFF` would otherwise force a
+        // ~4 GiB zeroed allocation (OOM). End the stream on an over-large frame rather than abort.
+        if msg_len > MAX_NETMAP_FRAME {
+            tracing::error!(
+                ?msg_len,
+                max = MAX_NETMAP_FRAME,
+                "netmap frame too large; ending stream"
+            );
+            return None;
+        }
 
         let mut buf = PacketMut::new(msg_len as usize);
         tracing::trace!(?msg_len, "reading netmap");

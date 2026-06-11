@@ -122,6 +122,18 @@ where
         };
         let len = header.len.get() as usize;
 
+        // A frame's declared body length must fit one Noise message (Go `controlbase` rejects
+        // `length > maxMessageSize`). The encoder never emits a chunk larger than this, so a bigger
+        // `len` is a malformed/hostile frame — reject it rather than `split_to` a 64 KiB-capable body.
+        if len > MAX_MESSAGE_SIZE {
+            tracing::error!(
+                len,
+                max = MAX_MESSAGE_SIZE,
+                "control message frame too large"
+            );
+            return Err(ErrorKind::InvalidData.into());
+        }
+
         if rest_len < len {
             return Ok(None);
         }
