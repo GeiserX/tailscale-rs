@@ -1255,6 +1255,18 @@ impl Device {
             .map_err(Into::into)
     }
 
+    /// Change this node's hostname at runtime — Go `tailscale set --hostname`. Re-reports
+    /// `Hostinfo.Hostname` to control on the live connection (no rebuild, no reconnect); control
+    /// reflects the new name in the netmap (it drives the node's MagicDNS name / `tailscale status`
+    /// display). Hostname is display metadata, so there is no data-path effect. The new value also
+    /// persists across a later re-registration.
+    pub async fn set_hostname(&self, hostname: String) -> Result<(), Error> {
+        self.runtime
+            .set_hostname(hostname)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Re-bind the underlay UDP socket after a **network/link change** — Wi-Fi switch, sleep/wake,
     /// or any event that invalidates the device's local address/NAT mapping. This is the Rust
     /// analog of Go magicsock's `Conn.Rebind()`.
