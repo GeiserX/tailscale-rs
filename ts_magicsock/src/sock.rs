@@ -599,30 +599,36 @@ impl MagicSock {
             return;
         }
 
-        {
-            let mut a2d = lock(&self.addr_to_disco);
-            for ep in &eps {
-                // Don't let a learned (disco-supplied) candidate steal an address already
-                // attributed to a *different* peer: an authenticated-but-malicious peer could
-                // otherwise claim a victim peer's known endpoint and hijack inbound-data
-                // attribution. First writer wins for learned candidates; only the authoritative
-                // netmap path ([`set_netmap_endpoints`]) may reassign an address across peers.
-                match a2d.get(ep) {
-                    Some(existing) if *existing != peer => {
-                        tracing::debug!(
-                            %ep,
-                            "ignoring learned candidate for already-attributed address"
-                        );
-                    }
-                    _ => {
-                        a2d.insert(*ep, peer);
-                    }
+        // Add to the path set FIRST: `add_learned_candidates` enforces the per-peer learned cap
+        // ([`MAX_LEARNED_CANDIDATES_PER_PEER`]) and returns only the addresses it actually accepted.
+        // We then attribute ONLY those in `addr_to_disco`. Inserting every filtered `ep` into the
+        // reverse map unconditionally (the old behavior) let an authenticated peer flood fresh
+        // over-cap addresses that the path set dropped yet the reverse map retained forever — an
+        // unbounded per-peer attribution-map leak. Keeping the two in lockstep bounds both.
+        let accepted = {
+            let mut paths = lock(&self.paths);
+            paths.entry(peer).or_default().add_learned_candidates(eps)
+        };
+
+        let mut a2d = lock(&self.addr_to_disco);
+        for ep in &accepted {
+            // Don't let a learned (disco-supplied) candidate steal an address already attributed to
+            // a *different* peer: an authenticated-but-malicious peer could otherwise claim a victim
+            // peer's known endpoint and hijack inbound-data attribution. First writer wins for
+            // learned candidates; only the authoritative netmap path ([`set_netmap_endpoints`]) may
+            // reassign an address across peers.
+            match a2d.get(ep) {
+                Some(existing) if *existing != peer => {
+                    tracing::debug!(
+                        %ep,
+                        "ignoring learned candidate for already-attributed address"
+                    );
+                }
+                _ => {
+                    a2d.insert(*ep, peer);
                 }
             }
         }
-
-        let mut paths = lock(&self.paths);
-        paths.entry(peer).or_default().add_learned_candidates(eps);
     }
 
     /// Test-only: register candidate endpoints *without* the [`is_pingable_candidate`] filter.
@@ -1829,6 +1835,95 @@ mod tests {
             n, MAX_LEARNED_PER_PEER,
             "public candidates clamp to the per-peer learned cap; filtered junk consumed no budget"
         );
+
+        // The reverse `addr -> disco` attribution map must stay in LOCKSTEP with the capped
+        // candidate set: only addresses the path set actually accepted are attributed. Before the
+        // fix, `add_peer_endpoints` inserted every filtered endpoint into `addr_to_disco` *before*
+        // the per-peer cap dropped the over-cap ones, so the reverse map grew without bound across a
+        // flood of fresh addresses (a pre-existing per-peer attribution-map leak). It must now match
+        // the candidate count exactly.
+        let attributed = a.addr_to_disco.lock().unwrap().len();
+        assert_eq!(
+            attributed, MAX_LEARNED_PER_PEER,
+            "addr_to_disco must be bounded in lockstep with the learned candidate cap, \
+             not grow with over-cap addresses the path set dropped"
+        );
+
+        // Re-sending an ALREADY-accepted address must keep it attributed and must NOT grow the map
+        // (the `accepted` set includes already-present addresses, so the re-add re-attributes
+        // idempotently). Guards against a future "only attribute fresh inserts" regression that
+        // would silently drop an established peer's address from attribution.
+        let already: SocketAddr = "203.0.113.1:40000".parse().unwrap();
+        a.add_peer_endpoints(peer, [already]);
+        {
+            let a2d = a.addr_to_disco.lock().unwrap();
+            assert_eq!(
+                a2d.len(),
+                MAX_LEARNED_PER_PEER,
+                "re-adding an already-accepted address must not grow the attribution map"
+            );
+            assert_eq!(
+                a2d.get(&already),
+                Some(&peer),
+                "a re-added already-accepted address must stay attributed to its peer"
+            );
+        }
+    }
+
+    /// The netmap (control-authoritative) attribution path is deliberately NOT subject to the
+    /// learned cap and NOT filtered: `set_netmap_endpoints` attributes every advertised endpoint in
+    /// `addr_to_disco`, and reconciling to a smaller set prunes the dropped ones. This pins the
+    /// learned-vs-netmap contrast the lockstep fix relies on — a future change that capped the netmap
+    /// insert (by symmetry with the learned path) would silently break authoritative attribution,
+    /// and this test would catch it.
+    #[tokio::test]
+    async fn set_netmap_endpoints_attributes_uncapped_and_prunes_on_reconcile() {
+        let a = MagicSock::bind(
+            localhost(),
+            DiscoPrivateKey::random(),
+            ts_keys::NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap();
+        let peer = DiscoPrivateKey::random().public_key();
+
+        // Advertise more public endpoints than the LEARNED cap (32): netmap is authoritative, so all
+        // of them must be attributed (the learned cap must not apply here).
+        let eps: Vec<SocketAddr> = (0..40)
+            .map(|i| format!("203.0.113.9:{}", 40000 + i as u16).parse().unwrap())
+            .collect();
+        a.set_netmap_endpoints(peer, eps.clone());
+        {
+            let a2d = a.addr_to_disco.lock().unwrap();
+            assert_eq!(
+                a2d.len(),
+                eps.len(),
+                "netmap attribution is uncapped: every advertised endpoint is attributed"
+            );
+            assert_eq!(a2d.get(&eps[0]), Some(&peer));
+        }
+
+        // Reconcile to a strict subset: the dropped endpoints lose their attribution.
+        let kept = vec![eps[0], eps[1]];
+        a.set_netmap_endpoints(peer, kept.clone());
+        {
+            let a2d = a.addr_to_disco.lock().unwrap();
+            assert_eq!(
+                a2d.len(),
+                kept.len(),
+                "revoked netmap endpoints are pruned from attribution"
+            );
+            assert_eq!(
+                a2d.get(&eps[0]),
+                Some(&peer),
+                "kept endpoint stays attributed"
+            );
+            assert_eq!(
+                a2d.get(&eps[39]),
+                None,
+                "revoked endpoint is no longer attributed"
+            );
+        }
     }
 
     /// If every offered candidate is forbidden, the peer is not even created as a paths entry

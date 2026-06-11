@@ -107,11 +107,16 @@ impl PeerPaths {
     /// not be evicted by a flood of junk). Netmap (control-authoritative) candidates are never
     /// capped: control is trusted and `reconcile_netmap_candidates` already bounds them to the
     /// advertised set.
+    /// Returns the addresses that were actually accepted into the candidate set (newly inserted, or
+    /// already present) — i.e. *not* the ones dropped at the learned cap. The caller uses this to
+    /// keep the socket's reverse `addr -> disco` attribution map in lockstep, so a flood of
+    /// over-cap learned addresses can't grow that map with entries the path set never accepted.
     fn add_candidates(
         &mut self,
         endpoints: impl IntoIterator<Item = SocketAddr>,
         source: CandidateSource,
-    ) {
+    ) -> Vec<SocketAddr> {
+        let mut accepted = Vec::new();
         for ep in endpoints {
             // For learned candidates, refuse to grow the learned set past the cap. Updating an
             // endpoint we already track is always fine (no growth); only a brand-new learned address
@@ -130,7 +135,9 @@ impl PeerPaths {
             if source == CandidateSource::Netmap {
                 cand.source = CandidateSource::Netmap;
             }
+            accepted.push(ep);
         }
+        accepted
     }
 
     /// The number of candidates currently tracked with [`CandidateSource::Learned`].
@@ -146,9 +153,18 @@ impl PeerPaths {
         self.add_candidates(endpoints, CandidateSource::Netmap);
     }
 
-    /// Add candidate endpoints learned from authenticated disco traffic.
-    pub fn add_learned_candidates(&mut self, endpoints: impl IntoIterator<Item = SocketAddr>) {
-        self.add_candidates(endpoints, CandidateSource::Learned);
+    /// Add candidate endpoints learned from authenticated disco traffic, returning the addresses
+    /// actually accepted (those not dropped at [`MAX_LEARNED_CANDIDATES_PER_PEER`]). The caller
+    /// ([`MagicSock::add_peer_endpoints`]) inserts only the accepted addresses into the reverse
+    /// `addr -> disco` map, keeping it bounded in lockstep with the capped candidate set — so a flood
+    /// of over-cap learned addresses can't grow the attribution map with entries the path set
+    /// dropped. (Not `#[must_use]`: the lone production caller consumes the return, and the test
+    /// seams legitimately ignore it.)
+    pub fn add_learned_candidates(
+        &mut self,
+        endpoints: impl IntoIterator<Item = SocketAddr>,
+    ) -> Vec<SocketAddr> {
+        self.add_candidates(endpoints, CandidateSource::Learned)
     }
 
     /// Drop the confirmed best path and its trust, **keeping the candidate set**. Used on a socket
