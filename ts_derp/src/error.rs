@@ -35,3 +35,20 @@ impl From<ts_http_util::Error> for Error {
         Error::Http
     }
 }
+
+impl From<crate::dial::Error> for Error {
+    fn from(e: crate::dial::Error) -> Self {
+        // A dial/TLS-setup failure is an IO-class transient (the reconnect loop retries it), not a
+        // protocol error. `dial::Error` carries no inner `io::Error` to forward, so map to a fresh
+        // one preserving the variant intent.
+        match e {
+            crate::dial::Error::Io => {
+                Error::IoFailure(std::io::Error::other("derp region TLS dial failed"))
+            }
+            crate::dial::Error::InvalidParam => Error::IoFailure(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid derp region dial parameter",
+            )),
+        }
+    }
+}

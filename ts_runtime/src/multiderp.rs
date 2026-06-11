@@ -633,6 +633,30 @@ impl Message<Arc<PeerState>> for Multiderp {
     }
 }
 
+/// The home-DERP transition implied by a fresh latency measurement, given the current home.
+#[derive(Debug, PartialEq, Eq)]
+enum HomeTransition {
+    /// The measurement selected the region that is already home — leave the always-on connection
+    /// untouched (sticky). Demoting and re-promoting here would briefly clear the home flag and arm
+    /// the inactivity timeout.
+    Unchanged,
+    /// The home region changed. `demote` is the previous home to turn off (`None` on the first
+    /// selection); the new home (the measurement's region) is promoted by the caller.
+    Changed { demote: Option<RegionId> },
+}
+
+/// Decide the home-DERP transition for a newly-measured closest `selected` region against the
+/// `current` home. Pure (no I/O) so the stickiness rule is unit-testable: a re-measurement of the
+/// same region must be `Unchanged` (Go magicsock keeps the home connection always-on across
+/// same-region re-selection), and only a genuine change demotes the old home.
+fn home_transition(current: Option<RegionId>, selected: RegionId) -> HomeTransition {
+    if current == Some(selected) {
+        HomeTransition::Unchanged
+    } else {
+        HomeTransition::Changed { demote: current }
+    }
+}
+
 impl Message<DerpLatencyMeasurement> for Multiderp {
     type Reply = ();
 
@@ -642,25 +666,33 @@ impl Message<DerpLatencyMeasurement> for Multiderp {
             return;
         };
 
-        if let Some(home_derp) = self.current_home_derp {
-            self.derps
-                .get_mut(&home_derp)
-                .unwrap()
-                .home_derp
-                .send_replace(false);
-        }
+        match home_transition(self.current_home_derp, result.id) {
+            // Re-selecting the *same* home region is a no-op: the existing always-on connection must
+            // stay sticky. (Previously this demoted the current home unconditionally and re-promoted
+            // only on change, so a same-region re-measurement — the common case on any mid-session
+            // derp-map re-push — left the home flag `false`, arming the 10s inactivity timeout and
+            // dropping the home DERP connection. Go's magicsock keeps the selected home connection
+            // always-on across re-selection of the same region.)
+            HomeTransition::Unchanged => {}
+            HomeTransition::Changed { demote } => {
+                // Demote the previous home (if any) before promoting the new one.
+                if let Some(old) = demote
+                    && let Some(derp) = self.derps.get_mut(&old)
+                {
+                    derp.home_derp.send_replace(false);
+                }
 
-        if self.current_home_derp.is_none_or(|id| id != result.id) {
-            self.current_home_derp = Some(result.id);
-            if let Some(derp) = self.derps.get_mut(&result.id) {
-                derp.home_derp.send_replace(true);
+                self.current_home_derp = Some(result.id);
+                if let Some(derp) = self.derps.get_mut(&result.id) {
+                    derp.home_derp.send_replace(true);
+                }
+
+                tracing::info!(
+                    region_id = %result.id,
+                    latency_ms = result.latency.as_secs_f32() * 1000.,
+                    "new home derp region selected"
+                );
             }
-
-            tracing::info!(
-                region_id = %result.id,
-                latency_ms = result.latency.as_secs_f32() * 1000.,
-                "new home derp region selected"
-            );
         }
     }
 }
@@ -674,6 +706,38 @@ mod tests {
 
     fn localhost() -> std::net::SocketAddr {
         "127.0.0.1:0".parse().unwrap()
+    }
+
+    fn region_id(n: u32) -> RegionId {
+        RegionId(core::num::NonZeroU32::new(n).unwrap())
+    }
+
+    /// Regression for `tsr-fv5`: re-measuring the *same* closest region must NOT demote the home
+    /// DERP. The old code demoted unconditionally and re-promoted only on change, so a same-region
+    /// re-measurement left the home flag `false` → 10s inactivity timeout → idle home disconnect.
+    #[test]
+    fn same_region_remeasurement_keeps_home_sticky() {
+        // Re-selecting the current home is a no-op (no demote, no flag churn).
+        assert_eq!(
+            home_transition(Some(region_id(1)), region_id(1)),
+            HomeTransition::Unchanged
+        );
+    }
+
+    /// The first-ever selection promotes with nothing to demote; a genuine change demotes the prior
+    /// home and promotes the new one.
+    #[test]
+    fn home_transition_changes_demote_the_old_home() {
+        assert_eq!(
+            home_transition(None, region_id(1)),
+            HomeTransition::Changed { demote: None }
+        );
+        assert_eq!(
+            home_transition(Some(region_id(1)), region_id(2)),
+            HomeTransition::Changed {
+                demote: Some(region_id(1))
+            }
+        );
     }
 
     /// A binding verifier accepting every disco frame. The demux tests are not exercising the
