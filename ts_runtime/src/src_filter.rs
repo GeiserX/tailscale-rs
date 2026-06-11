@@ -49,10 +49,12 @@ impl Message<Arc<PeerState>> for SourceFilterUpdater {
         for (id, node) in state_update.peers.peers() {
             // Inbound source validation. This MUST use the same filtered set as the outbound
             // route table in `route_updater.rs` (both call `Node::routes_to_install` with the same
-            // `env.accept_routes` and the exit node resolved from `env.exit_node`), so a peer can
+            // `env.accept_routes()` and the exit node resolved from `env.exit_node`), so a peer can
             // only source traffic from the exact subnets we route to it. Don't change the filter
-            // here without changing it there.
-            for route in node.routes_to_install(self.env.accept_routes, exit_node_id.as_ref()) {
+            // here without changing it there. Reading the live `accept_routes` cell means a runtime
+            // toggle tightens this source filter in lock-step with the route table (a flip OFF
+            // removes a now-unrouted subnet from BOTH — never accept a source for a route we dropped).
+            for route in node.routes_to_install(self.env.accept_routes(), exit_node_id.as_ref()) {
                 src_filter.insert(route.to_owned(), *id);
             }
         }
@@ -142,6 +144,47 @@ mod tests {
         // accept_routes on: the peer may now source the advertised subnet too.
         let on = build_table(&node, true, None);
         assert_eq!(on.lookup("192.168.1.5".parse().unwrap()), Some(&peer));
+    }
+
+    /// Guards the runtime accept-routes toggle (`Device::set_accept_routes` → the `Env::accept_routes`
+    /// watch cell). Against a FIXED peer set, re-filtering after a flip must ADD the advertised subnet
+    /// on ON and REMOVE it on OFF — the anti-leak removal direction, in lock-step with the route
+    /// table (both rebuild from the same `routes_to_install` against the same live cell). The peer's
+    /// own tailnet address stays reachable regardless. Pure (no `Env` / network) — the network-free
+    /// analog of flipping the cell, mirroring `exit_node_selector_change_reresolves_to_different_peer`.
+    #[test]
+    fn accept_routes_toggle_adds_then_removes_subnet_source() {
+        let node = subnet_router_node();
+        let peer = PeerId(node.id as u32);
+        let subnet_host = "192.168.1.5".parse().unwrap();
+        let own_addr = "100.64.0.7".parse().unwrap();
+
+        // ON: the advertised subnet source is attributable to the peer.
+        let on = build_table(&node, true, None);
+        assert_eq!(on.lookup(subnet_host), Some(&peer));
+        assert_eq!(on.lookup(own_addr), Some(&peer));
+
+        // Flip OFF (same fixed node): the subnet source is REMOVED from the filter (the anti-leak
+        // removal — never accept a source for a route we no longer install), own addr kept.
+        let off = build_table(&node, false, None);
+        assert_eq!(
+            off.lookup(subnet_host),
+            None,
+            "flip OFF removes the subnet from the source filter"
+        );
+        assert_eq!(
+            off.lookup(own_addr),
+            Some(&peer),
+            "the peer's own tailnet addr is always reachable"
+        );
+
+        // Flip back ON: re-widens (repeatable / idempotent toggling).
+        let on_again = build_table(&node, true, None);
+        assert_eq!(
+            on_again.lookup(subnet_host),
+            Some(&peer),
+            "OFF→ON re-installs the subnet source"
+        );
     }
 
     /// A peer advertising a default route may only source arbitrary internet IPs when it is the

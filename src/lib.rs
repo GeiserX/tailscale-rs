@@ -1229,6 +1229,33 @@ impl Device {
         self.runtime.exit_node()
     }
 
+    /// Toggle whether this node accepts peer-advertised subnet routes at runtime, without recreating
+    /// the [`Device`] — the equivalent of Go `tsnet`'s `LocalClient.EditPrefs(RouteAll)` /
+    /// `tailscale set --accept-routes`.
+    ///
+    /// This is a purely **local** preference: unlike [`set_advertise_routes`](Self::set_advertise_routes)
+    /// it is never reported to control, so it only changes which peer-advertised subnet routes *this*
+    /// node installs. The change is applied immediately — the outbound route table and the inbound
+    /// source filter are recomputed together against the live peer set, so turning it on installs (and
+    /// accepts traffic from) newly-accepted subnets and turning it off removes them from both in
+    /// lock-step. A peer's own tailnet address is always reachable regardless; the exit-node default
+    /// route is governed by [`set_exit_node`](Self::set_exit_node), not this flag.
+    ///
+    /// Only NEW flows are affected; in-flight connections are not torn down. In TUN transport mode the
+    /// netstack data path honors the toggle immediately, but the host routing table is not re-steered
+    /// until the device is rebuilt.
+    pub async fn set_accept_routes(&self, accept: bool) -> Result<(), Error> {
+        self.runtime
+            .set_accept_routes(accept)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Whether this node currently accepts peer-advertised subnet routes (`--accept-routes`).
+    pub fn accept_routes(&self) -> bool {
+        self.runtime.accept_routes()
+    }
+
     /// Change the subnet routes this node advertises at runtime — Go `tailscale set
     /// --advertise-routes`. This is the runtime equivalent of
     /// [`Config::advertise_routes`](crate::Config::advertise_routes): the node re-advertises the

@@ -536,9 +536,10 @@ impl Message<TkaAuthorityUpdate> for PeerTracker {
 }
 
 /// Ask the peer tracker to re-broadcast its current peer snapshot on the bus, without any peer
-/// change. `Device::set_exit_node` sends this after changing the exit-node selector so the route
-/// updater and source filter (both `Arc<PeerState>` subscribers) re-resolve the new selector
-/// immediately, rather than waiting for the next netmap update.
+/// change. Sent after a runtime preference change so the route updater and source filter (both
+/// `Arc<PeerState>` subscribers) re-resolve against the new value immediately, rather than waiting
+/// for the next netmap update: `Device::set_exit_node` (new exit-node selector) and
+/// `Device::set_accept_routes` (new accept-routes flag) both send it.
 #[derive(Debug, Clone, Copy)]
 pub struct RepublishState;
 
@@ -548,7 +549,7 @@ impl Message<RepublishState> for PeerTracker {
     async fn handle(&mut self, _msg: RepublishState, _ctx: &mut Context<Self, Self::Reply>) {
         // An empty upsert/deletion set: this is a re-broadcast of the unchanged peer set, not a
         // delta. Subscribers recompute their routes/filters against the current peers and the
-        // (just-updated) exit-node selector.
+        // (just-updated) runtime preferences (exit-node selector, accept-routes flag).
         if let Err(e) = self
             .env
             .publish(Arc::new(PeerState {
@@ -558,7 +559,7 @@ impl Message<RepublishState> for PeerTracker {
             }))
             .await
         {
-            tracing::error!(error = %e, "re-publishing peer state after exit-node change");
+            tracing::error!(error = %e, "re-publishing peer state after a runtime preference change");
         }
     }
 }

@@ -100,6 +100,10 @@ pub struct Runtime {
     /// `Env`, which keeps only the read side) so that only `Runtime::set_exit_node` can mutate the
     /// selection; the route updater and source filter re-read it via [`Env::exit_node`].
     exit_node_tx: watch::Sender<Option<ts_control::ExitNodeSelector>>,
+    /// Sender side of the accept-routes preference `watch` cell. Held privately here (same rationale
+    /// as [`exit_node_tx`](Self::exit_node_tx)) so that only [`Runtime::set_accept_routes`] can
+    /// toggle it; the route updater and source filter re-read it via [`Env::accept_routes`].
+    accept_routes_tx: watch::Sender<bool>,
     /// Receiver mirroring the *active* (resolved + fail-closed) exit node's stable id, fed by the
     /// route updater. Read by [`Runtime::status`] / [`Runtime::active_exit_node`] to report which
     /// exit node traffic is actually egressing through (vs. the merely-configured selector).
@@ -125,11 +129,12 @@ impl Runtime {
     ) -> Result<Self, Error> {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        // The exit-node selector is a live `watch` cell so `Device::set_exit_node` can change it at
-        // runtime. `new_with_exit_tx` returns the `Sender` (mutation capability) separately so it is
-        // retained privately on the `Runtime`, while only the `Receiver` (the readers' contract)
-        // lives on the cloned `Env`. The initial value comes from `ForwarderConfig.exit_node`.
-        let (env, exit_node_tx) = Env::new_with_exit_tx(
+        // The exit-node selector and accept-routes preference are live `watch` cells so
+        // `Device::set_exit_node` / `set_accept_routes` can change them at runtime.
+        // `new_with_runtime_txs` returns each `Sender` (mutation capability) separately so they are
+        // retained privately on the `Runtime`, while only the `Receiver`s (the readers' contract)
+        // live on the cloned `Env`. Initial values come from `ForwarderConfig`.
+        let (env, exit_node_tx, accept_routes_tx) = Env::new_with_runtime_txs(
             keys,
             shutdown_rx,
             env::ForwarderConfig::from_control_config(&config),
@@ -243,11 +248,17 @@ impl Runtime {
                     tun_cfg.clone(),
                     netstack_up,
                     netstack_down,
-                    // Host-route gating inputs derived from `Env`: subnet routes are only steered
-                    // into the TUN when `--accept-routes` is set, and the host `/0` only when the
-                    // embedder configured an exit node. See `tun_actor::host_routes_from_node`.
+                    // Host-route gating inputs read from `Env`'s live cells: subnet routes are only
+                    // steered into the TUN when `--accept-routes` is set, and the host `/0` only when
+                    // the embedder configured an exit node. See `tun_actor::host_routes_from_node`.
+                    // NOTE: TUN mode programs the host FIB once at device build; a runtime
+                    // `set_accept_routes` / `set_exit_node` toggle is honored by the netstack data
+                    // path immediately, but does not re-steer the host routing table until the device
+                    // is (re)built — re-steering is tracked as a follow-up. Reading the live cells
+                    // here (rather than a frozen config snapshot) keeps this gating correct as of
+                    // whenever the device is actually built.
                     tun_actor::HostRouteGating {
-                        accept_routes: env.accept_routes,
+                        accept_routes: env.accept_routes(),
                         exit_node_configured: env.exit_node().is_some(),
                     },
                     // Reuse the forwarder netstack's overlay `Channel` for recursive / exit-node-DoH
@@ -300,6 +311,7 @@ impl Runtime {
             env,
             shutdown: shutdown_tx,
             exit_node_tx,
+            accept_routes_tx,
             active_exit_rx,
             state_rx,
             cap_grants_rx,
@@ -766,6 +778,48 @@ impl Runtime {
     /// The currently-selected exit node, or `None` if none is selected.
     pub fn exit_node(&self) -> Option<ts_control::ExitNodeSelector> {
         self.env.exit_node()
+    }
+
+    /// Toggle whether this node accepts peer-advertised subnet routes at runtime (the equivalent of
+    /// Go `tsnet`'s `LocalClient.EditPrefs(RouteAll)` / `tailscale set --accept-routes`), without
+    /// recreating the device.
+    ///
+    /// `accept-routes` is a purely **local** preference — unlike advertised routes it is never
+    /// reported to control (no `Hostinfo` / MapRequest side), so this only re-runs the local
+    /// route/source-filter recompute, mirroring [`set_exit_node`](Self::set_exit_node) rather than
+    /// [`set_advertise_routes`](Self::set_advertise_routes). Updates the live cell, then asks the peer
+    /// tracker to re-broadcast the current peer set so the route updater (outbound routes) and the
+    /// source filter (inbound validation) re-filter against the new value immediately: turning it on
+    /// installs newly-accepted subnet routes (and widens the source filter to match); turning it off
+    /// removes them from BOTH in lock-step (never accepting a source for a route no longer installed).
+    /// Self routes and the exit-node default `/0` are unaffected (the latter is gated by the exit-node
+    /// selection, not this flag).
+    ///
+    /// In TUN transport mode the netstack data path honors the toggle immediately, but the host
+    /// routing table (programmed once at device build) is not re-steered until the device is rebuilt.
+    pub async fn set_accept_routes(&self, accept: bool) -> Result<(), Error> {
+        // Update the live cell every reader borrows from (same primitive/rationale as set_exit_node).
+        self.accept_routes_tx.send_replace(accept);
+
+        // Trigger an immediate re-filter: the route updater and source filter both recompute on an
+        // `Arc<PeerState>`, so a re-broadcast applies the new preference without waiting for the next
+        // netmap update. Both re-read the same live cell, so the outbound route set and the inbound
+        // source filter stay coupled (the anti-leak invariant).
+        self.peer_tracker
+            .upgrade()
+            .ok_or(Error {
+                kind: ErrorKind::ActorGone,
+                target_actor: None,
+                message_ty: None,
+            })?
+            .ask(peer_tracker::RepublishState)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Whether this node currently accepts peer-advertised subnet routes (`--accept-routes`).
+    pub fn accept_routes(&self) -> bool {
+        self.env.accept_routes()
     }
 
     /// Change the set of subnet routes this node advertises at runtime (Go `tailscale set
