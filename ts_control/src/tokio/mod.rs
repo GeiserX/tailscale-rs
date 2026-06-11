@@ -7,10 +7,10 @@ pub use id_token::{IdTokenError, fetch_id_token};
 pub use logout::{LogoutError, LogoutInternalErrorKind, logout};
 pub use map_stream::{FilterUpdate, PeerUpdate, StateUpdate};
 use register::register;
-// `set_dns` is a generic control RPC, but in this fork only the (feature-gated) ACME engine calls
-// it; gate the `mod`/`pub use` on `acme` so the default build stays dead-code-warning-clean.
-#[cfg(feature = "acme")]
-pub use set_dns::{SetDnsError, set_dns};
+// `set_dns` is a generic control RPC. It is exposed unconditionally because the `tailscale` facade
+// surfaces it as `Device::set_dns` (Go `LocalClient.SetDNS`), independent of the `acme` feature;
+// the (feature-gated) ACME DNS-01 engine is a second caller, not the only one.
+pub use set_dns::{SetDnsError, SetDnsInternalErrorKind, set_dns};
 pub use tka_sync::{
     TkaSyncError, TkaSyncInternalErrorKind, tka_bootstrap, tka_sync_offer, tka_sync_send,
 };
@@ -23,6 +23,5 @@ mod map_stream;
 mod ping;
 mod prefixed_reader;
 mod register;
-#[cfg(feature = "acme")]
 mod set_dns;
 mod tka_sync;

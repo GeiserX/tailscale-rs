@@ -157,8 +157,9 @@ pub use ts_control::{DnsConfig, DnsResolver, ExtraRecord};
 #[doc(inline)]
 pub use ts_control::{ExitProxyConfig, ExitProxyScheme};
 pub use ts_control::{
-    IdTokenError, LogoutError, ServiceError, ServiceMode, SshAccept, SshAction, SshConnIdentity,
-    SshDecision, SshDenyReason, SshPolicy, SshPrincipal, SshRule, StableNodeId,
+    IdTokenError, LogoutError, ServiceError, ServiceMode, SetDnsError, SetDnsInternalErrorKind,
+    SshAccept, SshAction, SshConnIdentity, SshDecision, SshDenyReason, SshPolicy, SshPrincipal,
+    SshRule, StableNodeId,
 };
 // Re-exported so the application data-path transport can be selected through the `tailscale`
 // facade alone: `Config::transport_mode` is `TransportMode` (default `Netstack`; `Tun(TunConfig {
@@ -180,6 +181,9 @@ pub use ts_runtime::{
     DeviceState, FileTarget, NetcheckReport, RegionLatency, RegistrationError, Status, StatusNode,
     WhoIs,
 };
+/// The interactive-login URL type returned by [`Device::pop_browser_url`].
+#[doc(inline)]
+pub use url::Url;
 
 #[cfg(feature = "axum")]
 pub mod axum;
@@ -619,6 +623,38 @@ impl Device {
         self.tcp_connect(remote).await
     }
 
+    /// Connect to a tailnet address over UDP, returning a connected socket directly — the `"udp"`
+    /// sibling of [`dial_tcp`](Device::dial_tcp) and the common case of [`Device::dial`] for
+    /// `"udp"`. `addr` is a `host:port` string (MagicDNS name or IP literal).
+    ///
+    /// Returns a [`ConnectedUdpSocket`] (`send`/`recv` against a fixed peer), the connected
+    /// UDP-`net.Conn` shape Go's `tsnet.Server.Dial("udp", …)` returns — as opposed to
+    /// [`listen_packet`](Device::listen_packet), which yields an unconnected `net.PacketConn`. An
+    /// ephemeral local UDP socket is bound on this node's tailnet address of the same family as the
+    /// resolved remote (a v4 local socket cannot send to a v6 peer).
+    ///
+    /// # Errors
+    /// As [`Device::dial`] for the `"udp"` network (name resolution, the IPv4-only / `enable_ipv6`
+    /// family invariant, or TUN transport mode having no application netstack to bind on).
+    pub async fn dial_udp(&self, addr: &str) -> Result<ConnectedUdpSocket, Error> {
+        let remote = self
+            .resolve_dial_addr(
+                dial::Network {
+                    transport: dial::Transport::Udp,
+                    family: dial::Family::Any,
+                },
+                addr,
+            )
+            .await?;
+        let local_ip: IpAddr = if remote.is_ipv6() {
+            self.ipv6_addr().await?.into()
+        } else {
+            self.ipv4_addr().await?.into()
+        };
+        let sock = self.udp_bind((local_ip, 0).into()).await?;
+        Ok(ConnectedUdpSocket::new(sock, remote))
+    }
+
     /// Bind a UDP socket from a `host:port` string, the Rust analog of Go
     /// `tsnet.Server.ListenPacket(network, addr)`.
     ///
@@ -784,6 +820,23 @@ impl Device {
         self.runtime
             .control
             .ask(ts_runtime::control_runner::DnsConfig)
+            .await
+            .map_err(ts_runtime::Error::from)
+            .map_err(Into::into)
+    }
+
+    /// The URL control last asked this node to open in a browser (`MapResponse.PopBrowserURL`), or
+    /// `None` if control has sent none.
+    ///
+    /// This is the interactive-login / consent URL an embedder driving a non-authkey (interactive)
+    /// login must surface to the user — the Rust analog of Go `ipn` delivering `BrowseToURL` through
+    /// the notification bus. A daemon polls this after starting an interactive login to obtain the
+    /// auth URL to present. `None` until control sends one; the value is replaced (not accumulated)
+    /// each time control pushes a new one.
+    pub async fn pop_browser_url(&self) -> Result<Option<Url>, Error> {
+        self.runtime
+            .control
+            .ask(ts_runtime::control_runner::PopBrowserUrl)
             .await
             .map_err(ts_runtime::Error::from)
             .map_err(Into::into)
@@ -1083,6 +1136,21 @@ impl Device {
     /// Requires the control plane to support capability version ≥ 30.
     pub async fn fetch_id_token(&self, audience: &str) -> Result<String, ts_control::IdTokenError> {
         self.runtime.fetch_id_token(audience.to_string()).await
+    }
+
+    /// Publish a `TXT` DNS record for this node into the tailnet's `ts.net` zone via control's
+    /// `/machine/set-dns` RPC — the Rust analog of Go `tailscale.com/client/tailscale`'s
+    /// `LocalClient.SetDNS(ctx, name, value)`.
+    ///
+    /// `name` is the full record name (e.g. `_acme-challenge.host.tailnet.ts.net`) and `value` is
+    /// the record value (e.g. the base64url DNS-01 digest). Like Go's `SetDNS`, this publishes a
+    /// `TXT` record specifically — its canonical use is satisfying an ACME DNS-01 challenge so a CA
+    /// can verify control of a `*.ts.net` name. Issuance over the Noise transport (`POST
+    /// /machine/set-dns`), not a login path.
+    pub async fn set_dns(&self, name: &str, value: &str) -> Result<(), ts_control::SetDnsError> {
+        self.runtime
+            .set_dns(name.to_string(), value.to_string())
+            .await
     }
 
     /// Log this node out of the tailnet — deregister it from the control plane (the equivalent of
