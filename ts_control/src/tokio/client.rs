@@ -408,6 +408,7 @@ mod tests {
             derp: None,
             node: None,
             peer_update: None,
+            peer_patches: Vec::new(),
             user_profiles: Vec::new(),
             ping: None,
             packetfilter: None,
