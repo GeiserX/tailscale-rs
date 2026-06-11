@@ -2,6 +2,14 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.18.1](https://github.com/GeiserX/tailscale-rs/compare/v0.18.0...v0.18.1) (2026-06-11)
+
+
+### Bug Fixes
+
+* **derp:** keep home region sticky on same-region re-measure; stop connect() panicking on transient failures ([#69](https://github.com/GeiserX/tailscale-rs/issues/69)) ([2a15b18](https://github.com/GeiserX/tailscale-rs/commit/2a15b18143e17f9da619d80b6c7a5014126f30e5))
+* **magicsock:** re-ping direct paths before trust lapses; bound the in-flight ping map ([#71](https://github.com/GeiserX/tailscale-rs/issues/71)) ([e7afad9](https://github.com/GeiserX/tailscale-rs/commit/e7afad93997708148746224c05031cc0ddf126e1))
+
 ## [0.18.0](https://github.com/GeiserX/tailscale-rs/compare/v0.17.0...v0.18.0) (2026-06-11)
 
 
