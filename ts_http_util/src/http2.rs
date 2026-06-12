@@ -10,7 +10,7 @@ use hyper::{
     body::{Body, Incoming},
     client::conn::http2::SendRequest,
 };
-use hyper_util::rt::{TokioExecutor, tokio::WithHyperIo};
+use hyper_util::rt::{TokioExecutor, TokioTimer, tokio::WithHyperIo};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::Mutex,
@@ -64,13 +64,33 @@ where
     B::Data: Send,
     B::Error: core::error::Error + Send + Sync + 'static,
 {
-    let (client, conn) =
-        hyper::client::conn::http2::handshake(TokioExecutor::new(), WithHyperIo::new(io))
-            .await
-            .inspect_err(|e| {
-                tracing::error!(error = %e, "http2 handshake");
-            })
-            .map_err(Error::from)?;
+    // Configure HTTP/2 protocol-level keep-alive PINGs. The control map poll is a long-lived
+    // stream that can sit idle between netmap updates (control sends an application keep-alive only
+    // ~once a minute), so without PINGs a half-open/silently-dead connection is never detected at
+    // the transport layer and the poll hangs indefinitely. `keep_alive_while_idle(true)` makes
+    // hyper PING even when no request body is in flight, and `keep_alive_timeout` tears the
+    // connection down if a PING goes unanswered — turning a dead connection into a read error the
+    // caller reconnects from. This is defense-in-depth alongside the read watchdog in the map-poll
+    // reader: the PING (≈80s to tear-down) usually wins, and the read watchdog is the backstop for
+    // the case where PINGs are answered but no application frame ever flows (a control server stuck
+    // *above* the h2 layer). Interval/timeout mirror Go's ~60s keep-alive cadence.
+    //
+    // The settings apply to every `connect` caller, not just the long poll, but they are inert for
+    // the short request/response callers (key fetch, register, set-dns, tka-sync, logout, ACME):
+    // each issues one RPC and drops the connection within milliseconds — far inside the 60s
+    // interval — so no idle PING is ever emitted on them. PING is a connection-level frame an
+    // RFC-9113 §6.7 server MUST answer and never carries a stream id, so it cannot RST a request.
+    let (client, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .timer(TokioTimer::new())
+        .keep_alive_interval(core::time::Duration::from_secs(60))
+        .keep_alive_timeout(core::time::Duration::from_secs(20))
+        .keep_alive_while_idle(true)
+        .handshake(WithHyperIo::new(io))
+        .await
+        .inspect_err(|e| {
+            tracing::error!(error = %e, "http2 handshake");
+        })
+        .map_err(Error::from)?;
 
     let mut tasks = JoinSet::new();
 

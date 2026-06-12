@@ -57,8 +57,12 @@ zerocopy.workspace = true
 
 # Required dependencies for the async_tokio feature.
 futures-util = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true, features = ["fs"] }
+tokio = { workspace = true, optional = true, features = ["fs", "time"] }
 tokio-stream = { version = "0.1", optional = true, default-features = false, features = ["sync"] }
+# Jittered reconnect backoff for the map-poll loop (`ControlBackoff`, mirrors Go `util/backoff`);
+# only the `async_tokio` map-poll path uses it. `RngExt`/`rng()` is the same API the rest of the
+# stack uses (e.g. `ts_runtime`'s DERP backoff) — no new crypto/RNG backend.
+rand = { workspace = true, optional = true }
 
 # Required dependencies for the `acme` feature (client-side ACME / Let's Encrypt cert issuance).
 # Hand-rolled on the existing ring-based HTTP/TLS stack (ts_http_util + tokio-rustls/ring), so it
@@ -72,11 +76,13 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"]
 # TEST-ONLY ephemeral self-signed cert to exercise the rustls acceptor wiring in
 # `serve`/`cert` tests. Never a production issuance path.
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+# `test-util` provides the paused virtual clock (`#[tokio::test(start_paused = true)]`) the map-poll
+# read-watchdog tests use to fire the 120s timeout instantly.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "test-util"] }
 
 [features]
 default = ["async_tokio"]
-async_tokio = ["dep:futures-util", "dep:tokio", "dep:tokio-stream"]
+async_tokio = ["dep:futures-util", "dep:tokio", "dep:tokio-stream", "dep:rand"]
 
 # Allow derp connections to be made without verifying TLS certs. Only for use in tests.
 insecure-derp = ["ts_derp/insecure-for-tests"]

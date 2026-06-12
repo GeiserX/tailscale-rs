@@ -268,6 +268,86 @@ fn advance_session(session: &mut MapSession, update: &StateUpdate) {
     }
 }
 
+/// Reconnect backoff for the map-poll loop, mirroring Go's `util/backoff` (the schedule
+/// `controlclient`'s `mapRoutine` uses): the delay grows as `n²·10ms`, is capped at
+/// [`MAP_BACKOFF_MAX`], and is jittered to a uniform `[0.5×, 1.5×)` to avoid a thundering herd of
+/// clients reconnecting in lock-step against a control server that just came back. `n` increments
+/// on each consecutive failed/empty poll and resets to 0 once a poll has actually delivered a
+/// response, so a flaky control plane is retried with increasing spacing instead of a flat 2 Hz
+/// storm (or, on the clean-EOF path, an unthrottled hot loop).
+///
+/// This is the same shape as `ts_runtime`'s `DerpBackoff`; it is duplicated here (rather than
+/// shared) because `ts_control` is an upstream crate that cannot depend on `ts_runtime`, and the
+/// cap differs (Go passes `30*time.Second` to `NewBackoff` for `mapRoutine`, vs `5s` for the DERP
+/// readers).
+///
+/// Residual (intentional, matches Go): because *any* received frame — including a bare keep-alive
+/// (`seq == 0`) — resets the schedule, a control server that sends one frame then closes the body
+/// can hold the backoff at the bottom and drive a reconnect every cycle. Go's `mapRoutine` has the
+/// identical property (it resets on any received `MapResponse`) and no max-consecutive-reconnect
+/// cap, relying on the fact that the node already has a machine-key relationship with the control
+/// server. The pre-fix behavior was a *busy* spin (zero handshake); the residual is now one full
+/// connect→TLS→Noise→register per cycle, symmetric in cost to the attacker — a large improvement,
+/// and faithful parity rather than a divergence. Gating the reset on `seq != 0` would punish a
+/// healthy keep-alive-only idle poll, so it is deliberately not done.
+#[derive(Debug, Default)]
+struct ControlBackoff {
+    n: u32,
+}
+
+/// Cap on the map-poll reconnect backoff delay (Go `controlclient` passes `30*time.Second` to
+/// `NewBackoff` for `mapRoutine`).
+const MAP_BACKOFF_MAX: core::time::Duration = core::time::Duration::from_secs(30);
+
+impl ControlBackoff {
+    /// Reset the backoff after a poll that actually received a response, so the next failure starts
+    /// from the bottom of the schedule again. Crucially this is driven by *receiving a frame*, not
+    /// by the poll merely ending: a control server that accepts the request then closes the body
+    /// with zero frames never resets, so the clean-EOF path still backs off and escalates.
+    fn reset(&mut self) {
+        self.n = 0;
+    }
+
+    /// The next backoff delay, advancing the counter. `n²·10ms` capped at [`MAP_BACKOFF_MAX`], then
+    /// scaled by a random factor in `[0.5, 1.5)` (matching Go's `rand.Float64()+0.5`).
+    fn next_delay(&mut self, rng: &mut impl rand::RngExt) -> core::time::Duration {
+        // n² growth on a 10ms base, saturating so a long outage can't overflow the multiply.
+        let base_ms = u64::from(self.n)
+            .saturating_mul(u64::from(self.n))
+            .saturating_mul(10);
+        let capped = core::time::Duration::from_millis(base_ms).min(MAP_BACKOFF_MAX);
+        self.n = self.n.saturating_add(1);
+        let factor = rng.random::<f64>() + 0.5;
+        capped.mul_f64(factor)
+    }
+}
+
+/// Decide how long to wait before the next map-poll reconnect, resetting the schedule when the poll
+/// made progress. This is the **single, tested site of the load-bearing anti-DoS gate**: a poll
+/// that delivered at least one frame (`received_frame`) proves the whole connect→register→poll path
+/// works, so it resets the backoff and the next reconnect is immediate (Go resets its backoff on a
+/// received netmap); a poll that delivered **zero** frames — a clean-EOF hot-loop, a watchdog kill,
+/// or a frame the stream swallowed to `None` — does **not** reset, so a zero-progress control server
+/// escalates up the `n²·10ms` schedule instead of being hammered at full speed.
+///
+/// The gate lives in this named function rather than as a bare `backoff.reset()` buried in the poll
+/// loop precisely so it cannot be silently relocated: moving the reset onto the poll-*end* path
+/// (e.g. resetting unconditionally on `Ok(())`) would reintroduce the clean-EOF hot loop, and
+/// [`reconnect_delay_resets_only_when_a_frame_arrived`] would fail. The reset granularity is
+/// observationally identical to resetting the instant a frame arrives: the backoff is only ever
+/// read here (after the poll returns), so deferring the reset to this point changes nothing the
+/// schedule can observe.
+fn reconnect_delay_after_poll(
+    received_frame: bool,
+    backoff: &mut ControlBackoff,
+    rng: &mut impl rand::RngExt,
+) -> core::time::Duration {
+    if received_frame {
+        backoff.reset();
+    }
+    backoff.next_delay(rng)
+}
+
 pub async fn run(
     state_tx: broadcast::Sender<Arc<StateUpdate>>,
     mut command_rx: mpsc::Receiver<Command>,
@@ -278,9 +358,14 @@ pub async fn run(
 ) {
     let mut dialer = ControlDialer::default();
     let mut session = MapSession::default();
+    let mut backoff = ControlBackoff::default();
 
     loop {
-        match run_once(
+        // `run_once` sets this to `true` the moment it receives its first frame on this poll, so
+        // the flag survives an error that occurs *after* frames flowed (a poll that worked then
+        // dropped still counts as progress and reconnects promptly).
+        let mut received_frame = false;
+        let outcome = run_once(
             &state_tx,
             &mut command_rx,
             &control_url,
@@ -289,13 +374,25 @@ pub async fn run(
             &config,
             &mut dialer,
             &mut session,
+            &mut received_frame,
         )
-        .await
-        {
+        .await;
+
+        // Back off before every reconnect, on BOTH the clean-EOF and error paths — Go's
+        // `mapRoutine` runs `bo.BackOff(ctx, err)` after every poll regardless of how it ended.
+        // The clean-EOF arm (`Ok(())`) previously reconnected with ZERO delay: a control server
+        // that returns 200 then closes the body (or sends one frame the stream swallows to `None`)
+        // would spin a full-speed connect→TLS→Noise→register loop, hammering control and pinning
+        // CPU. The reset is gated on `received_frame` (see `reconnect_delay_after_poll`), so a
+        // healthy long-lived poll that delivered frames reconnects promptly while a zero-progress
+        // server escalates up the n²·10ms schedule.
+        let delay = reconnect_delay_after_poll(received_frame, &mut backoff, &mut rand::rng());
+        match outcome {
             Ok(()) => {
                 tracing::warn!(
                     resume_handle = %session.handle,
                     resume_seq = session.seq,
+                    backoff_ms = delay.as_millis() as u64,
                     "netmap stream ended without error, attempting restart"
                 );
             }
@@ -304,11 +401,12 @@ pub async fn run(
                     error = %e,
                     resume_handle = %session.handle,
                     resume_seq = session.seq,
+                    backoff_ms = delay.as_millis() as u64,
                     "netmap stream failed, attempting restart"
                 );
-                tokio::time::sleep(core::time::Duration::from_millis(500)).await;
             }
         }
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -321,6 +419,7 @@ async fn run_once(
     config: &crate::Config,
     control_dialer: &mut ControlDialer,
     session: &mut MapSession,
+    received_frame: &mut bool,
 ) -> Result<(), Error> {
     let h2_client = control_dialer
         .full_connect_next(
@@ -374,6 +473,15 @@ async fn run_once(
                 let Some(state_update) = state_update else {
                     break;
                 };
+
+                // A frame arrived, so the full connect→register→poll path is demonstrably working:
+                // record it so `run` resets the reconnect backoff (Go resets on a received netmap).
+                // This is what makes the clean-EOF backoff in `run` safe — a server that delivers
+                // frames and later drops reconnects promptly, while one that closes the body with
+                // zero frames never reaches here and keeps escalating. Keep-alives (seq 0) count
+                // too: they prove the long poll is live. The reset decision itself lives in
+                // `reconnect_delay_after_poll` (the single tested gate); here we only flag progress.
+                *received_frame = true;
 
                 // Track the session cursor so a reconnect can resume after the last processed
                 // message instead of cold-restarting.
@@ -577,5 +685,120 @@ mod tests {
 
         assert_eq!(session.handle, "");
         assert_eq!(session.seq, 1);
+    }
+
+    /// The backoff delay for a given `n` must always land in `[0.5, 1.5)` of the unjittered
+    /// `min(n²·10ms, MAP_BACKOFF_MAX)` — the Go `util/backoff` envelope. Probing each `n` with a
+    /// fresh fixed-`n` `ControlBackoff` (the same technique `ts_runtime` uses for `DerpBackoff`)
+    /// keeps the assertion independent of the process RNG.
+    #[test]
+    fn control_backoff_delay_is_within_the_go_jitter_envelope() {
+        let mut rng = rand::rng();
+        for n in 0u32..80 {
+            let unjittered_ms = u64::from(n)
+                .saturating_mul(u64::from(n))
+                .saturating_mul(10)
+                .min(MAP_BACKOFF_MAX.as_millis() as u64);
+            let unjittered = core::time::Duration::from_millis(unjittered_ms);
+
+            // 100 draws per n to exercise the jitter range.
+            for _ in 0..100 {
+                let mut probe = ControlBackoff { n };
+                let d = probe.next_delay(&mut rng);
+                if unjittered.is_zero() {
+                    // n=0: the unjittered base is 0, so any jitter factor still yields exactly 0.
+                    assert_eq!(d, core::time::Duration::ZERO, "n=0 delay must be zero");
+                } else {
+                    assert!(
+                        d >= unjittered.mul_f64(0.5) && d < unjittered.mul_f64(1.5),
+                        "n={n}: delay {d:?} outside [0.5,1.5) x {unjittered:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The delay grows monotonically (in expectation) until the cap, then is bounded by the cap's
+    /// jitter envelope. We assert the *unjittered* schedule directly via the cap: by `n` large
+    /// enough that `n²·10ms >= 30s`, every draw is `< 1.5 × 30s` and `>= 0.5 × 30s`.
+    #[test]
+    fn control_backoff_saturates_at_the_cap() {
+        let mut rng = rand::rng();
+        // 30_000ms / 10 = 3000 = 55² (54.7..), so n >= 55 is past the cap.
+        let mut probe = ControlBackoff { n: 1000 };
+        let d = probe.next_delay(&mut rng);
+        assert!(
+            d >= MAP_BACKOFF_MAX.mul_f64(0.5) && d < MAP_BACKOFF_MAX.mul_f64(1.5),
+            "saturated delay {d:?} outside the cap's jitter envelope"
+        );
+        // A huge `n` must not overflow the n²·10 multiply (saturating math).
+        let mut probe = ControlBackoff { n: u32::MAX };
+        let d = probe.next_delay(&mut rng);
+        assert!(d < MAP_BACKOFF_MAX.mul_f64(1.5), "overflowed at u32::MAX");
+    }
+
+    /// `reset()` returns the schedule to the bottom: after several advances, a reset makes the next
+    /// delay the `n=0` delay (which is zero — `0²·10ms`), and the counter climbs again from there.
+    #[test]
+    fn control_backoff_reset_returns_to_bottom() {
+        let mut rng = rand::rng();
+        let mut bo = ControlBackoff::default();
+
+        // Advance a few times.
+        for _ in 0..5 {
+            let _ = bo.next_delay(&mut rng);
+        }
+        assert!(bo.n > 0, "counter advanced");
+
+        bo.reset();
+        assert_eq!(bo.n, 0, "reset zeroes the counter");
+
+        // The n=0 draw is 0ms (0²·10ms · jitter == 0), and the counter advances to 1 afterward.
+        let d = bo.next_delay(&mut rng);
+        assert_eq!(d, core::time::Duration::ZERO, "n=0 delay is zero");
+        assert_eq!(bo.n, 1, "counter advances after the n=0 draw");
+    }
+
+    /// The load-bearing anti-DoS gate: [`reconnect_delay_after_poll`] resets the schedule ONLY when
+    /// the poll delivered a frame. A poll that delivered ZERO frames (the clean-EOF hot-loop, a
+    /// watchdog kill, or a frame swallowed to `None`) must NOT reset, so a zero-progress control
+    /// server escalates up the schedule instead of being hammered at full speed.
+    ///
+    /// This pins the gate that protects the whole fix: if a future change resets the backoff on the
+    /// poll-*end* path (e.g. unconditionally on `Ok(())`) instead of on frame receipt, this test
+    /// fails — the frameless branch would start returning the `n=0` (zero) delay.
+    #[test]
+    fn reconnect_delay_resets_only_when_a_frame_arrived() {
+        let mut rng = rand::rng();
+        let mut backoff = ControlBackoff::default();
+
+        // A run of frameless polls (zero progress) must escalate: each delay strictly larger than
+        // the last in expectation, and crucially NONE collapses back to the n=0 zero delay.
+        let mut last_n = backoff.n;
+        for i in 0..6 {
+            let d = reconnect_delay_after_poll(false, &mut backoff, &mut rng);
+            assert!(
+                backoff.n > last_n,
+                "frameless poll {i} must advance the counter (no reset)"
+            );
+            last_n = backoff.n;
+            if i > 0 {
+                // Past n=0, a frameless reconnect is never the zero delay (the hot-loop we fixed).
+                assert!(
+                    d > core::time::Duration::ZERO,
+                    "frameless reconnect {i} must be delayed, not a 0ms spin"
+                );
+            }
+        }
+
+        // Now a poll that DID receive a frame resets the schedule: the next delay is the n=0 zero
+        // delay (immediate reconnect for a healthy, progressing poll), and the counter is back to 1.
+        let d = reconnect_delay_after_poll(true, &mut backoff, &mut rng);
+        assert_eq!(
+            d,
+            core::time::Duration::ZERO,
+            "a poll that delivered a frame resets to the immediate (n=0) reconnect"
+        );
+        assert_eq!(backoff.n, 1, "reset then one draw leaves the counter at 1");
     }
 }

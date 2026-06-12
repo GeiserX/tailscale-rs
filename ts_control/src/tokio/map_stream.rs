@@ -154,15 +154,33 @@ pub struct StateUpdate {
 /// is sent empty, so the on-wire length equals the buffer size with no decompression amplification.
 const MAX_NETMAP_FRAME: u32 = 16 * 1024 * 1024;
 
+/// Long-poll read watchdog: if no frame (not even a keep-alive) arrives within this window, end the
+/// stream so the caller reconnects. Control sends a keep-alive roughly every minute on a streaming
+/// map poll, so silence past this bound means the connection is dead-but-not-closed (a half-open
+/// socket after NAT/firewall state eviction, a silently-dropping middlebox, or a control server
+/// that hung without sending FIN/RST). Without it, `read_u32_le`/`read_exact` await forever and the
+/// node silently stops receiving netmap updates (missed peer/DERP/key-expiry/ACL/TKA changes) with
+/// no reconnect ever attempted. Mirrors Go `controlclient` `direct.go`'s `watchdogTimeout = 120s`.
+const MAP_READ_WATCHDOG: core::time::Duration = core::time::Duration::from_secs(120);
+
 pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpdate> {
     futures_util::stream::unfold(reader, async |mut reader| {
-        let msg_len = reader
-            .read_u32_le()
-            .await
-            .inspect_err(|e| {
-                tracing::error!(error = %e, "could not read netmap length");
-            })
-            .ok()?;
+        // Watchdog the length read: this is where the stream idles between frames, so a silently
+        // dead long poll blocks here. A timeout ends the stream (returns `None`) → reconnect.
+        let msg_len = match tokio::time::timeout(MAP_READ_WATCHDOG, reader.read_u32_le()).await {
+            Ok(res) => res
+                .inspect_err(|e| {
+                    tracing::error!(error = %e, "could not read netmap length");
+                })
+                .ok()?,
+            Err(_elapsed) => {
+                tracing::error!(
+                    watchdog_secs = MAP_READ_WATCHDOG.as_secs(),
+                    "no netmap frame within the keep-alive watchdog; ending stream to reconnect"
+                );
+                return None;
+            }
+        };
 
         // Bound the frame before allocating: a `u32` length of `0xFFFF_FFFF` would otherwise force a
         // ~4 GiB zeroed allocation (OOM). End the stream on an over-large frame rather than abort.
@@ -178,13 +196,22 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
         let mut buf = PacketMut::new(msg_len as usize);
         tracing::trace!(?msg_len, "reading netmap");
 
-        reader
-            .read_exact(buf.as_mut())
-            .await
-            .inspect_err(|e| {
-                tracing::error!(error = %e, "could not read netmap");
-            })
-            .ok()?;
+        // Watchdog the body read too: once the length is in, the body should follow promptly. A
+        // stall here (announced length, body never delivered) is the same dead-connection signal.
+        match tokio::time::timeout(MAP_READ_WATCHDOG, reader.read_exact(buf.as_mut())).await {
+            Ok(res) => res
+                .inspect_err(|e| {
+                    tracing::error!(error = %e, "could not read netmap");
+                })
+                .ok()?,
+            Err(_elapsed) => {
+                tracing::error!(
+                    watchdog_secs = MAP_READ_WATCHDOG.as_secs(),
+                    "netmap body did not arrive within the watchdog; ending stream to reconnect"
+                );
+                return None;
+            }
+        };
 
         let map_response: MapResponse = serde_json::from_slice(buf.as_ref())
             .inspect_err(|e| {
@@ -378,6 +405,94 @@ mod tests {
             buf.extend_from_slice(body.as_bytes());
         }
         buf
+    }
+
+    /// An `AsyncRead` that serves `prefix` bytes and then stalls forever (always `Pending`),
+    /// modelling a half-open/silently-dead long-poll connection: bytes flowed, then the peer went
+    /// silent without closing. Used to prove the read watchdog ends the stream instead of hanging.
+    struct StallAfter {
+        prefix: alloc::collections::VecDeque<u8>,
+    }
+
+    impl StallAfter {
+        fn new(prefix: &[u8]) -> Self {
+            Self {
+                prefix: prefix.iter().copied().collect(),
+            }
+        }
+    }
+
+    impl tokio::io::AsyncRead for StallAfter {
+        fn poll_read(
+            mut self: core::pin::Pin<&mut Self>,
+            _cx: &mut core::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> core::task::Poll<std::io::Result<()>> {
+            if self.prefix.is_empty() {
+                // Drained: stall forever. With a paused test clock the watchdog `timeout` is the
+                // only timer left, so it advances and fires — exactly the dead-connection case.
+                return core::task::Poll::Pending;
+            }
+            while buf.remaining() > 0 {
+                let Some(b) = self.prefix.pop_front() else {
+                    break;
+                };
+                buf.put_slice(&[b]);
+            }
+            core::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A long poll that delivers a frame and then goes silent (no further bytes, no close) must end
+    /// the stream once the read watchdog elapses, so the caller reconnects. Without the watchdog
+    /// the second `next()` would await forever (the node would silently stop getting updates).
+    /// `start_paused` makes the 120s watchdog fire instantly (auto-advanced virtual time).
+    #[tokio::test(start_paused = true)]
+    async fn map_stream_watchdog_ends_stream_on_silent_connection() {
+        let reader = StallAfter::new(&frame(&[r#"{"MapSessionHandle":"sess-1","Seq":1}"#]));
+
+        let mut stream = core::pin::pin!(map_stream(reader));
+
+        // First frame arrives normally.
+        let update = stream.next().await.expect("first frame");
+        assert_eq!(update.seq, 1);
+
+        // The connection then goes silent: the watchdog must end the stream (None), not hang.
+        assert!(
+            stream.next().await.is_none(),
+            "watchdog must end the stream on a silent connection"
+        );
+    }
+
+    /// A connection that never delivers even the first frame must also be bounded by the watchdog
+    /// (the idle-from-the-start case — e.g. control accepted the request then went silent).
+    #[tokio::test(start_paused = true)]
+    async fn map_stream_watchdog_ends_stream_when_no_frame_ever_arrives() {
+        let reader = StallAfter::new(&[]);
+
+        let mut stream = core::pin::pin!(map_stream(reader));
+
+        assert!(
+            stream.next().await.is_none(),
+            "watchdog must end a stream that never produces a frame"
+        );
+    }
+
+    /// A frame whose length prefix arrives but whose body stalls mid-way must be bounded by the
+    /// body-read watchdog (announced length, body never completes — a torn connection).
+    #[tokio::test(start_paused = true)]
+    async fn map_stream_watchdog_ends_stream_on_partial_body() {
+        // 4-byte LE length says 64 bytes follow, but we supply only the prefix + 3 body bytes.
+        let mut bytes = 64u32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(b"abc");
+        let reader = StallAfter::new(&bytes);
+
+        let mut stream = core::pin::pin!(map_stream(reader));
+
+        assert!(
+            stream.next().await.is_none(),
+            "watchdog must end the stream when the body never completes"
+        );
     }
 
     #[tokio::test]
