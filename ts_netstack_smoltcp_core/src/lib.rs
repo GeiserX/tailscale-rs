@@ -976,4 +976,45 @@ mod handle_aba_tests {
             "the completed command must not remain queued"
         );
     }
+
+    /// tsr-ufm: `pending_tcp_closes` has no dedup, so the same handle can appear twice. The first
+    /// occurrence's `remove_socket` frees the slot; a naive `socket_set.get::<tcp::Socket>` on the
+    /// second occurrence would PANIC (smoltcp `get` panics on a removed handle), killing the actor.
+    /// `drain_tcp_closes` must instead existence-check each handle and drop the already-gone
+    /// duplicate without a second remove — and still fully reclaim the socket.
+    #[test]
+    fn duplicate_pending_close_handle_does_not_panic_and_is_reclaimed() {
+        let mut stack = Netstack::new(Config::default(), Instant::ZERO);
+
+        // A fresh TCP socket starts in `Closed` with empty rx — exactly the drain-reclaim case.
+        // Built directly (not via the private `new_tcp_socket`) with tiny buffers; the reaping
+        // policy under test only inspects state + rx-emptiness, not buffer sizing.
+        let sock = smoltcp::socket::tcp::Socket::new(
+            smoltcp::socket::tcp::SocketBuffer::new(alloc::vec![0u8; 64]),
+            smoltcp::socket::tcp::SocketBuffer::new(alloc::vec![0u8; 64]),
+        );
+        assert_eq!(sock.state(), smoltcp::socket::tcp::State::Closed);
+        let handle = stack.add_socket(sock);
+        assert!(stack.handle_gen(handle).is_some());
+
+        // Push the SAME handle twice (the un-deduped Vec the eight push sites feed).
+        stack.pending_tcp_closes.push(handle);
+        stack.pending_tcp_closes.push(handle);
+
+        // Must not panic on the second (now-stale) occurrence.
+        stack.drain_tcp_closes();
+
+        assert!(
+            !stack.socket_set.iter().any(|(h, _)| h == handle),
+            "the Closed socket must be reclaimed"
+        );
+        assert!(
+            stack.handle_gen(handle).is_none(),
+            "remove_socket must clear the generation"
+        );
+        assert!(
+            stack.pending_tcp_closes.is_empty(),
+            "both occurrences (the live one + the stale duplicate) must drain"
+        );
+    }
 }
