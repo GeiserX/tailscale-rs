@@ -883,7 +883,7 @@ impl From<&ts_control_serde::UserProfile<'_>> for UserProfile {
         Self {
             id: value.id,
             login_name: value.login_name.to_string(),
-            display_name: value.display_name.map(str::to_string),
+            display_name: value.display_name.as_deref().map(str::to_string),
         }
     }
 }

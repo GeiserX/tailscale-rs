@@ -886,4 +886,42 @@ mod test {
             .expect("MapResponse with a plain Domain must decode");
         assert_eq!(resp.domain, "example.com");
     }
+
+    /// A single peer whose `Node::name` carries a JSON escape must NOT drop the whole netmap.
+    /// `Node::name` is `Cow<'a, str>`, so an escaped peer name (here `ho\nst`, i.e. a control name
+    /// arriving with a newline) is owned-and-unescaped by serde rather than failing the peer's
+    /// `Node` decode. Before the `Cow` conversion a bare `&'a str` failed that decode with `invalid
+    /// type: string "...", expected a borrowed string`, which bubbled up and silently dropped the
+    /// ENTIRE `MapResponse` (and thus every peer) from the netmap. This proves one escaped name no
+    /// longer poisons the whole map. The peer `Node` shape mirrors `null_sequences_decode_as_empty`.
+    #[test]
+    fn peer_name_with_escape_does_not_drop_netmap() {
+        const TEST: &str = r#"{
+            "Seq": 1,
+            "Peers": [
+                {
+                    "ID": 2,
+                    "StableID": "n2",
+                    "Name": "ho\nst.tail.ts.net.",
+                    "User": 1,
+                    "Addresses": ["100.64.0.2/32"],
+                    "AllowedIPs": null,
+                    "Endpoints": null,
+                    "PrimaryRoutes": null,
+                    "Capabilities": null,
+                    "CapMap": null,
+                    "Tags": null,
+                    "ExitNodeDNSResolvers": null,
+                    "Key": "nodekey:0000000000000000000000000000000000000000000000000000000000000000"
+                }
+            ]
+        }"#;
+        let resp = serde_json::from_str::<MapResponse>(TEST)
+            .expect("MapResponse with an escaped peer Name must decode (not drop the netmap)");
+        let peers = resp
+            .peers
+            .expect("peers present — the escaped name must not drop the netmap");
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].name, "ho\nst.tail.ts.net.");
+    }
 }
