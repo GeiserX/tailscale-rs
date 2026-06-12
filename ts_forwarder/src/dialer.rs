@@ -282,13 +282,20 @@ fn exit_dst_is_forbidden(dst: SocketAddr) -> bool {
             let is_cgnat = o[0] == 100 && (o[1] & 0xc0) == 0x40;
             // "This network" 0.0.0.0/8 (RFC 791); includes the unspecified address.
             let is_this_network = o[0] == 0;
+            // Class-E reserved 240.0.0.0/4 (RFC 1112). `Ipv4Addr::is_reserved` is nightly-only, so
+            // check the octet; the all-ones broadcast 255.255.255.255 is already caught above.
+            let is_class_e = o[0] >= 240;
             v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
                 || v4.is_unspecified()
                 || v4.is_broadcast()
+                // Multicast 224.0.0.0/4 (RFC 5771) — incl. link-local multicast and SSDP
+                // 239.255.255.250; never a valid unicast exit destination.
+                || v4.is_multicast()
                 || is_cgnat
                 || is_this_network
+                || is_class_e
         }
         // Exit egress is IPv4-only; any v6 dst is forbidden (and refused again in the handshake).
         IpAddr::V6(_) => true,
@@ -944,10 +951,14 @@ mod tests {
     fn exit_ssrf_guard_rejects_cgnat_broadcast_and_this_network() {
         // 100.64.0.0/10 (RFC 6598) — the Tailscale address range itself.
         for forbidden in [
-            "100.64.0.1:443",     // bottom of 100.64/10
-            "100.127.255.255:80", // top of 100.64/10
-            "255.255.255.255:80", // broadcast
-            "0.0.0.1:80",         // 0.0.0.0/8 "this network"
+            "100.64.0.1:443",       // bottom of 100.64/10
+            "100.127.255.255:80",   // top of 100.64/10
+            "255.255.255.255:80",   // broadcast
+            "0.0.0.1:80",           // 0.0.0.0/8 "this network"
+            "224.0.0.1:80",         // bottom of multicast 224.0.0.0/4 (all-systems)
+            "239.255.255.250:1900", // SSDP multicast, top-ish of 224/4
+            "240.0.0.1:80",         // bottom of class-E reserved 240.0.0.0/4
+            "254.255.255.255:80",   // top of class-E (below the 255.255.255.255 broadcast)
         ] {
             let dst: SocketAddr = forbidden.parse().unwrap();
             assert!(
@@ -969,6 +980,14 @@ mod tests {
         assert!(
             !exit_dst_is_forbidden(cgnat_adjacent),
             "100.128.0.1 is outside 100.64/10 and must remain allowed"
+        );
+
+        // 223.255.255.255 is the last unicast address BELOW multicast (224/4); it must remain
+        // allowed — proving the multicast guard starts exactly at 224, not earlier.
+        let below_multicast: SocketAddr = "223.255.255.255:443".parse().unwrap();
+        assert!(
+            !exit_dst_is_forbidden(below_multicast),
+            "223.255.255.255 is below the 224/4 multicast block and must remain allowed"
         );
     }
 

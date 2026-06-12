@@ -25,6 +25,13 @@ const UDP_REAP_INTERVAL: Duration = Duration::from_secs(15);
 const UDP_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Max payload we read from a real reply socket in one go.
 const MAX_DATAGRAM: usize = 65_535;
+/// Max concurrent UDP flows per port. Each flow holds a real OS socket (an fd) plus a reply-pump
+/// task, so without a cap a peer sweeping many distinct `(peer, dst)` pairs on one port would
+/// materialize an unbounded number of sockets/tasks between reap cycles — process-wide fd
+/// exhaustion. At the cap a datagram that would open a *new* flow is dropped (fail-closed, never
+/// dialed), so existing flows keep working and the reaper frees slots as flows idle out. Mirrors
+/// the TCP path's `MAX_INFLIGHT_SPLICES`; comparable to Go's bounded UDP conntrack table.
+const MAX_UDP_FLOWS: usize = 512;
 
 /// State for one active UDP flow, keyed by `(peer, dst)`.
 struct FlowState {
@@ -72,6 +79,17 @@ pub(crate) async fn run_udp_port<D: RealDialer>(
                         flow.real.clone()
                     }
                     None => {
+                        // Bound concurrent flows per port: at the cap, drop a datagram that would
+                        // open a NEW flow (fail-closed — no dial, no socket/task) rather than let a
+                        // dst-sweep exhaust fds. Existing flows are unaffected; the reaper frees
+                        // slots as flows idle out.
+                        if flows.len() >= MAX_UDP_FLOWS {
+                            tracing::warn!(
+                                %dst, %peer, max = MAX_UDP_FLOWS,
+                                "drop: at max concurrent udp flows"
+                            );
+                            continue;
+                        }
                         let Some(class) = routes.borrow().classify(dst.ip()) else {
                             tracing::warn!(%dst, %peer, "drop: destination not advertised");
                             continue;
