@@ -13,7 +13,7 @@ use crate::{
     ChaCha20Poly1305BigEndian, Error,
     codec::BiCodec,
     framed_io::FramedIo,
-    messages::{Header, Initiation, MessageType},
+    messages::{Header, Initiation, MessageType, RESPONSE_PAYLOAD_LEN},
 };
 
 type Cipher = ChaCha20Poly1305BigEndian;
@@ -70,6 +70,20 @@ impl Handshake {
 
         let hdr = Header::try_ref_from_bytes(&hdr_bytes)?;
 
+        // Validate the header BEFORE allocating on its length. `hdr.len` is an attacker-controlled
+        // `u16` straight off the wire; a malicious/buggy control server could otherwise force a
+        // 64 KiB zeroed allocation per handshake attempt. Go reads the response into a fixed
+        // 51-byte `responseMessage` and rejects a wrong type/length before trusting it; match that —
+        // the Noise IK response (message 2) body is exactly `RESPONSE_PAYLOAD_LEN` (48) bytes, so
+        // anything else is malformed. The record layer already caps its reads (codec.rs); this
+        // brings the handshake read to the same fail-closed discipline.
+        if hdr.typ != MessageType::Response {
+            return Err(Error::BadFormat);
+        }
+        if hdr.len.get() as usize != RESPONSE_PAYLOAD_LEN {
+            return Err(Error::BadFormat);
+        }
+
         let mut packet = BytesMut::zeroed(hdr.len.get() as _);
         conn.read_exact(&mut packet).await?;
 
@@ -82,9 +96,6 @@ impl Handshake {
                 .flatten()
                 .collect::<String>()
         );
-        if hdr.typ != MessageType::Response {
-            return Err(Error::BadFormat);
-        }
 
         let data = self.state.read_message_vec(&packet)?;
         if !data.is_empty() || !self.state.completed() {
@@ -100,5 +111,58 @@ impl Handshake {
                 rx: rx.into(),
             },
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ts_keys::MachinePrivateKey;
+
+    use super::*;
+
+    fn test_handshake() -> Handshake {
+        let node_sk = MachinePrivateKey::random();
+        let control_sk = MachinePrivateKey::random();
+        let (hs, _init) = Handshake::initialize(
+            "Tailscale Control Protocol v1",
+            &node_sk,
+            &control_sk.public_key(),
+            ts_capabilityversion::CapabilityVersion::CURRENT,
+        );
+        hs
+    }
+
+    /// A handshake response whose `Header::len` is oversized (here 0xFFFF) must be rejected as
+    /// `BadFormat` WITHOUT allocating on the attacker-controlled length. The header is validated
+    /// (type == Response, len == RESPONSE_PAYLOAD_LEN) before the `BytesMut::zeroed` read, so a
+    /// malicious/buggy control server can't make the client allocate ~64 KiB per handshake attempt.
+    #[tokio::test]
+    async fn oversized_response_len_is_rejected_before_alloc() {
+        let mut hs = test_handshake();
+        // 3-byte header: type=Response(0x2), len=0xFFFF (big-endian). No body follows — if the code
+        // tried to read `len` bytes it would block/EOF; rejecting on the header means it never does.
+        let header = [MessageType::Response as u8, 0xFF, 0xFF];
+        match hs.complete(&header[..]).await {
+            Err(Error::BadFormat) => {}
+            Err(e) => panic!("expected BadFormat, got {e:?}"),
+            Ok(_) => panic!("an oversized response length must be rejected"),
+        }
+    }
+
+    /// A response with the correct length but the WRONG type (here Record) is rejected as
+    /// `BadFormat`, before any body read.
+    #[tokio::test]
+    async fn wrong_response_type_is_rejected() {
+        let mut hs = test_handshake();
+        let header = [
+            MessageType::Record as u8,
+            0x00,
+            RESPONSE_PAYLOAD_LEN as u8, // a plausible length, but the type is wrong
+        ];
+        match hs.complete(&header[..]).await {
+            Err(Error::BadFormat) => {}
+            Err(e) => panic!("expected BadFormat, got {e:?}"),
+            Ok(_) => panic!("a non-Response handshake reply must be rejected"),
+        }
     }
 }
