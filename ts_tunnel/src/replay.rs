@@ -76,11 +76,22 @@ use std::fmt::Debug;
 /// so far are unconditionally accepted (and advance the tracker's sliding window); values that
 /// fall within the window are tracked explicitly with a bitset, to ensure they are accepted once
 /// only.
-#[derive(Default)]
 pub struct ReplayWindow {
     // nonce counter value of the end of the sliding window
     last: u64,
     blocks: [u64; ReplayWindow::N_BLOCKS as usize],
+}
+
+impl Default for ReplayWindow {
+    fn default() -> Self {
+        // `#[derive(Default)]` can't be used here: the std `Default` impl for `[T; N]` is provided
+        // by macro only up to length 32, and the 128-block ring (Go parity) exceeds that. Hand-write
+        // the obvious zero-init. A fresh window has seen nothing: `last = 0` and every block clear.
+        Self {
+            last: 0,
+            blocks: [0; Self::N_BLOCKS as usize],
+        }
+    }
 }
 
 impl Debug for ReplayWindow {
@@ -105,7 +116,14 @@ impl Debug for ReplayWindow {
 }
 
 impl ReplayWindow {
-    const TOTAL_BITS: u64 = 256;
+    /// Total bits in the ring, matching wireguard-go `replay/replay.go`:
+    /// `ringBlocks = 1 << 7 = 128` blocks of `blockBits = 1 << 6 = 64` bits, so `128 * 64 = 8192`.
+    /// One block is held back as the unused gap (so [`WINDOW_SIZE`] is `(128 - 1) * 64 = 8128`),
+    /// which is what lets the head advance by zeroing whole blocks without aliasing a still-live
+    /// counter. The prior 256-bit ring gave only a 192-counter window — spec-legal, but it rejects
+    /// legitimately-reordered packets more than 192 behind the head, far tighter than the
+    /// 8128-counter tolerance Go and the kernel allow, which bites on fast/bursty links.
+    const TOTAL_BITS: u64 = 8192;
     const N_BLOCKS: u64 = Self::TOTAL_BITS / u64::BITS as u64;
     const BIT_IDX_BITMASK: u64 = (u64::BITS - 1) as u64;
     const BIT_IDX_SHIFT: u32 = u64::BITS.ilog2();
@@ -113,8 +131,15 @@ impl ReplayWindow {
 
     pub const WINDOW_SIZE: u64 = (Self::N_BLOCKS - 1) * u64::BITS as u64;
 
+    /// The oldest counter still acceptable given the current head ([`last`](Self::last)).
+    ///
+    /// Matches wireguard-go `ValidateCounter`, which rejects a counter only when
+    /// `last - counter > windowSize` (strict `>`). So a counter exactly `WINDOW_SIZE` behind the
+    /// head is still accepted, and `smallest_valid == last - WINDOW_SIZE` (NOT `WINDOW_SIZE - 1`,
+    /// which would be one counter tighter than Go — a prior off-by-one this corrects). The held-back
+    /// block guarantees no aliasing even at this deepest-accepted distance.
     fn smallest_valid(&self) -> u64 {
-        self.last.saturating_sub(Self::WINDOW_SIZE - 1)
+        self.last.saturating_sub(Self::WINDOW_SIZE)
     }
 
     fn block_idx_unbounded(&self, counter: u64) -> u64 {
@@ -195,6 +220,7 @@ impl ReplayWindow {
     #[cfg(test)]
     fn received_in_window(&self) -> u64 {
         let counters = self.smallest_valid()..self.last + 1;
+        // `check(ctr) == false` means the counter has already been seen, i.e. it counts as received.
         counters
             .map(|ctr| if self.check(ctr) { 0 } else { 1 })
             .sum()
@@ -223,19 +249,147 @@ mod tests {
     #[test]
     fn out_of_order() {
         let mut window = ReplayWindow::default();
+        // Expressed relative to WINDOW_SIZE so the scenario holds for any ring size: pick a head
+        // past the window so that `head - WINDOW_SIZE` (the deepest still-acceptable counter) and
+        // `head - WINDOW_SIZE - 1` (the first too-old counter) both exist as non-negative values.
+        let w = ReplayWindow::WINDOW_SIZE;
+        let head = w + 100;
 
-        assert!(window.check_and_set(500));
-        assert!(!window.check(500));
-        assert!(!window.check(100));
+        assert!(window.check_and_set(head));
+        assert!(!window.check(head)); // replay of the head is rejected
+        assert!(window.check(head - w)); // distance exactly WINDOW_SIZE -> still accepted (Go strict >)
+        assert!(!window.check(head - w - 1)); // distance WINDOW_SIZE + 1 -> too old
         assert_eq!(window.received_in_window(), 1);
-        for (i, counter) in (400..450).rev().enumerate() {
+        // The 50 counters [head-100, head-50) arriving newest-first, all within the window.
+        for (i, counter) in ((head - 100)..(head - 50)).rev().enumerate() {
             assert!(window.check_and_set(counter));
             assert_eq!(window.received_in_window(), (i + 2) as u64);
         }
-        for (i, counter) in (451..500).enumerate() {
+        // The 49 counters [head-49, head) filling the remaining gap below the head.
+        for (i, counter) in ((head - 49)..head).enumerate() {
             assert!(window.check_and_set(counter));
             assert_eq!(window.received_in_window(), (i + 52) as u64);
         }
+    }
+
+    /// Pins the ring geometry to wireguard-go `replay/replay.go`'s values: `ringBlocks = 1 << 7 =
+    /// 128` 64-bit blocks (`TOTAL_BITS = 8192`), one block held back, `windowSize = 127 * 64 =
+    /// 8128`. `N_BLOCKS`/`WINDOW_SIZE` are derived from `TOTAL_BITS`, so this guards against an
+    /// accidental edit to `TOTAL_BITS` or the derivation; the runtime-behaviour parity (the boundary
+    /// itself) is proven against Go's own test vectors in [`replay_matches_wireguard_go_vectors`].
+    #[test]
+    fn window_geometry_matches_wireguard_go() {
+        assert_eq!(ReplayWindow::TOTAL_BITS, 8192);
+        assert_eq!(ReplayWindow::N_BLOCKS, 128);
+        assert_eq!(ReplayWindow::WINDOW_SIZE, 8128);
+        // The backing storage is exactly Go's `[128]uint64` (1024 bytes).
+        assert_eq!(ReplayWindow::default().blocks.len(), 128);
+    }
+
+    /// The reorder tolerance matches wireguard-go `ValidateCounter` exactly: it rejects only when
+    /// `last - counter > windowSize` (strict `>`), so a packet exactly `WINDOW_SIZE` behind the head
+    /// is still accepted and one `WINDOW_SIZE + 1` behind is rejected as too old. The 256 -> 8192
+    /// bump restores Go's 8128-counter tolerance (the old ring rejected anything past 192 behind).
+    #[test]
+    fn reorder_tolerance_is_exactly_window_size() {
+        let w = ReplayWindow::WINDOW_SIZE;
+        let head = w + 1_000; // comfortably clear of zero so the tail does not saturate
+
+        let mut window = ReplayWindow::default();
+        assert!(window.check_and_set(head));
+        // smallest_valid == head - WINDOW_SIZE: the oldest still-acceptable counter (Go's strict >).
+        assert!(
+            window.check(head - w),
+            "distance == WINDOW_SIZE must be accepted (matches Go's strict `>`)"
+        );
+        assert!(
+            !window.check(head - w - 1),
+            "distance == WINDOW_SIZE + 1 must be rejected as too old"
+        );
+    }
+
+    /// Authoritative parity oracle: a direct port of wireguard-go `replay/replay_test.go`
+    /// `TestReplay`. `check_and_set` has the same accept-and-advance semantics as Go's
+    /// `ValidateCounter`, minus the separate `counter >= limit` (`RejectAfterMessages`) guard, which
+    /// in this crate lives on the nonce ceiling in `session.rs` — so we port the pure sliding-window
+    /// vectors (Go tests 1..=24 and the reset-and-bulk loops). The decisive ones are the
+    /// distance-exactly-`WINDOW_SIZE` cases (Go test 18, bulk 6's `T(0, true)` at head ==
+    /// `WINDOW_SIZE`): Go accepts them via its strict `last - counter > windowSize`. They fail under
+    /// a `WINDOW_SIZE - 1` boundary, so this test is what pins the boundary to Go's exact value.
+    #[test]
+    fn replay_matches_wireguard_go_vectors() {
+        fn t(window: &mut ReplayWindow, n: u64, expected: bool) {
+            assert_eq!(
+                window.check_and_set(n),
+                expected,
+                "ValidateCounter({n}) should be {expected}"
+            );
+        }
+
+        // T_LIM = windowSize + 1 in Go's test.
+        let t_lim = ReplayWindow::WINDOW_SIZE + 1;
+
+        // Linear sequence (Go tests 1..=24); 25..=34 exercise the RejectAfterMessages limit, which
+        // is enforced outside the window in this crate, so they are intentionally not ported here.
+        let mut w = ReplayWindow::default();
+        t(&mut w, 0, true); // 1
+        t(&mut w, 1, true); // 2
+        t(&mut w, 1, false); // 3
+        t(&mut w, 9, true); // 4
+        t(&mut w, 8, true); // 5
+        t(&mut w, 7, true); // 6
+        t(&mut w, 7, false); // 7
+        t(&mut w, t_lim, true); // 8
+        t(&mut w, t_lim - 1, true); // 9
+        t(&mut w, t_lim - 1, false); // 10
+        t(&mut w, t_lim - 2, true); // 11
+        t(&mut w, 2, true); // 12
+        t(&mut w, 2, false); // 13
+        t(&mut w, t_lim + 16, true); // 14
+        t(&mut w, 3, false); // 15
+        t(&mut w, t_lim + 16, false); // 16
+        t(&mut w, t_lim * 4, true); // 17
+        t(&mut w, t_lim * 4 - (t_lim - 1), true); // 18 — distance == WINDOW_SIZE, accepted
+        t(&mut w, 10, false); // 19
+        t(&mut w, t_lim * 4 - t_lim, false); // 20 — distance == WINDOW_SIZE + 1, rejected
+        t(&mut w, t_lim * 4 - (t_lim + 1), false); // 21
+        t(&mut w, t_lim * 4 - (t_lim - 2), true); // 22 — distance == WINDOW_SIZE - 1, accepted
+        t(&mut w, t_lim * 4 + 1 - t_lim, false); // 23 — replay of test 18's counter
+        t(&mut w, 0, false); // 24 — far too old
+
+        let ws = ReplayWindow::WINDOW_SIZE;
+
+        // Bulk 1: fill 1..=windowSize ascending, then 0 is still in range (head == windowSize).
+        let mut w = ReplayWindow::default();
+        for i in 1..=ws {
+            t(&mut w, i, true);
+        }
+        t(&mut w, 0, true);
+        t(&mut w, 0, false);
+
+        // Bulk 3: fill windowSize+1 down to 1 — the all-descending case that walks the window to its
+        // full depth; the final `T(1, true)` sits exactly WINDOW_SIZE behind the head (t_lim).
+        let mut w = ReplayWindow::default();
+        for i in (1..=(ws + 1)).rev() {
+            t(&mut w, i, true);
+        }
+
+        // Bulk 5: windowSize..=1 descending, then advance one past the window, then 0 is too old.
+        let mut w = ReplayWindow::default();
+        for i in (1..=ws).rev() {
+            t(&mut w, i, true);
+        }
+        t(&mut w, ws + 1, true);
+        t(&mut w, 0, false);
+
+        // Bulk 6: windowSize..=1 descending (head == windowSize), then 0 is accepted at distance
+        // exactly WINDOW_SIZE — the vector that fails under an off-by-one tighter boundary.
+        let mut w = ReplayWindow::default();
+        for i in (1..=ws).rev() {
+            t(&mut w, i, true);
+        }
+        t(&mut w, 0, true);
+        t(&mut w, ws + 1, true);
     }
 
     proptest::proptest! {
