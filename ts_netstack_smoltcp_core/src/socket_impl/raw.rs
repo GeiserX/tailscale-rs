@@ -28,7 +28,7 @@ impl Netstack {
                     self.raw_buffer(),
                     self.raw_buffer(),
                 );
-                let handle = self.socket_set.add(sock);
+                let handle = self.add_socket(sock);
 
                 RawSocketResponse::Opened { handle }.into()
             }
@@ -93,7 +93,7 @@ impl Netstack {
                 // the double-close rather than panic the netstack actor.
                 let handle = unwrap_handle!(handle);
                 if self.socket_set.iter().any(|(h, _)| h == handle) {
-                    self.socket_set.remove(handle);
+                    self.remove_socket(handle);
                 }
                 Response::Ok
             }
