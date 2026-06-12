@@ -85,7 +85,7 @@ impl Netstack {
                     return Response::Error(e.into());
                 }
 
-                let socket_handle = self.socket_set.add(listener);
+                let socket_handle = self.add_socket(listener);
 
                 let listener_handle = ListenerHandle(self.next_tcp_listener_id);
                 self.next_tcp_listener_id += 1;
@@ -336,7 +336,7 @@ impl Netstack {
             panic!("opening new listen socket for accept: {e}");
         }
 
-        let socket_handle = self.socket_set.add(new_listener);
+        let socket_handle = self.add_socket(new_listener);
         self.tcp_listeners
             .get_mut(&handle)
             .expect("listener present")
@@ -406,7 +406,7 @@ mod tests {
         let local_endpoint = SocketAddr::from(([0, 0, 0, 0], port));
         let mut sock = stack.new_tcp_socket();
         sock.listen(listen_endpoint(local_endpoint)).unwrap();
-        let current = stack.socket_set.add(sock);
+        let current = stack.add_socket(sock);
         let lh = ListenerHandle(stack.next_tcp_listener_id);
         stack.next_tcp_listener_id += 1;
         stack.tcp_listeners.insert(
@@ -426,7 +426,8 @@ mod tests {
     fn fill_half_open(stack: &mut Netstack, lh: ListenerHandle, n: usize) -> Vec<SocketHandle> {
         let mut handles = Vec::new();
         for _ in 0..n {
-            let h = stack.socket_set.add(stack.new_tcp_socket());
+            let sock = stack.new_tcp_socket();
+            let h = stack.add_socket(sock);
             stack
                 .tcp_listeners
                 .get_mut(&lh)
@@ -542,7 +543,8 @@ mod tests {
         // Fill the ACCEPT queue (established-unaccepted) to the bound, leaving half-open empty.
         let mut established = Vec::new();
         for _ in 0..3 {
-            let h = stack.socket_set.add(stack.new_tcp_socket());
+            let sock = stack.new_tcp_socket();
+            let h = stack.add_socket(sock);
             stack
                 .tcp_listeners
                 .get_mut(&lh)

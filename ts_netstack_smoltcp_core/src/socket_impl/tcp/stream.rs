@@ -45,7 +45,7 @@ impl Netstack {
                     return Response::Error(e.into());
                 }
 
-                let handle = self.socket_set.add(sock);
+                let handle = self.add_socket(sock);
 
                 Response::WouldBlock {
                     handle: Some(handle),
@@ -130,7 +130,11 @@ impl Netstack {
     /// Drop all TCP sockets that have finished closing.
     #[tracing::instrument(skip_all)]
     pub(crate) fn drain_tcp_closes(&mut self) {
-        self.pending_tcp_closes.retain(|&handle| {
+        // Take the list out so the `retain` closure doesn't hold a borrow of `*self`: removing a
+        // socket now goes through `remove_socket` (which needs `&mut self` for the gen-map), and a
+        // method call inside a `pending_tcp_closes.retain` closure would conflict with that borrow.
+        let mut pending = core::mem::take(&mut self.pending_tcp_closes);
+        pending.retain(|&handle| {
             let state = {
                 let sock = self.socket_set.get::<tcp::Socket>(handle);
                 sock.state()
@@ -138,11 +142,12 @@ impl Netstack {
 
             let should_remove = state == tcp::State::Closed;
             if should_remove {
-                self.socket_set.remove(handle);
+                self.remove_socket(handle);
             }
 
             !should_remove
         });
+        self.pending_tcp_closes = pending;
     }
 
     fn check_conn(&mut self, handle: SocketHandle, orig_cmd: TcpStreamCommand) -> Response {

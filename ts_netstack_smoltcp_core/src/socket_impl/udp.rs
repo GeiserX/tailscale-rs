@@ -47,7 +47,7 @@ impl crate::Netstack {
                 // was already open. Those are handled, so failure is impossible here.
                 sock.bind(listen).unwrap();
 
-                let handle = self.socket_set.add(sock);
+                let handle = self.add_socket(sock);
 
                 UdpResponse::Bound {
                     local: endpoint,
@@ -171,7 +171,7 @@ impl crate::Netstack {
                 // could send it twice, so guard the double-close rather than panic the netstack.
                 let handle = unwrap_handle!(handle);
                 if self.socket_set.iter().any(|(h, _)| h == handle) {
-                    self.socket_set.remove(handle);
+                    self.remove_socket(handle);
                 }
 
                 Response::Ok
