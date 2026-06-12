@@ -634,4 +634,116 @@ mod tests {
             "a corrupted prefix must not demux as disco"
         );
     }
+
+    /// Seal a disco message with an explicit version byte (vs the `seal_*` helpers which use 0), so
+    /// the per-type version laxity can be exercised end-to-end through `open()`.
+    fn seal_versioned(
+        our_disco: &DiscoPrivateKey,
+        receiver: &DiscoPublicKey,
+        ty: MessageType,
+        version: u8,
+        message: &[u8],
+    ) -> Vec<u8> {
+        use ts_disco_protocol::Packet;
+        let mut buf = vec![0u8; Packet::size_for_message(message.len())];
+        let pkt = Packet::init_raw_message_versioned(&mut buf, ty, version, |msg| {
+            msg.copy_from_slice(message);
+        })
+        .expect("init versioned disco message");
+        pkt.encrypt_in_place(our_disco, receiver, random_nonce())
+            .expect("encrypt");
+        buf
+    }
+
+    /// A `Ping` with a future (non-zero) version byte must still parse — Go's `parsePing` ignores
+    /// the version. The old whole-packet version gate dropped it, which would silently force a
+    /// real Go peer onto DERP after a disco protocol bump. (tsr-ibc)
+    #[test]
+    fn future_version_ping_still_parses() {
+        let (a_sk, _a_pk) = keypair();
+        let (b_sk, b_pk) = keypair();
+        let node_key = ts_keys::NodePrivateKey::random().public_key();
+        let tx = random_tx_id();
+
+        // Canonical Ping body: tx_id(12) + node_key(32).
+        let mut body = Vec::new();
+        body.extend_from_slice(&tx);
+        body.extend_from_slice(&node_key.to_bytes());
+        let mut wire = seal_versioned(&a_sk, &b_pk, MessageType::Ping, 1, &body);
+
+        match open(&b_sk, &mut wire).expect("a future-version ping must still open") {
+            Inbound::Ping {
+                claimed_node_key,
+                tx_id,
+                ..
+            } => {
+                assert_eq!(claimed_node_key, node_key);
+                assert_eq!(tx_id, tx);
+            }
+            other => panic!("expected ping, got {other:?}"),
+        }
+    }
+
+    /// A `Pong` with a future version byte must still parse (Go's `parsePong` ignores version),
+    /// so a forward-version peer's pong still confirms the path instead of being dropped.
+    #[test]
+    fn future_version_pong_still_parses() {
+        let (a_sk, _a_pk) = keypair();
+        let (b_sk, b_pk) = keypair();
+        let tx = random_tx_id();
+        let src: SocketAddr = "203.0.113.9:41641".parse().unwrap();
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&tx);
+        body.extend_from_slice(Endpoint::from(src).as_bytes());
+        let mut wire = seal_versioned(&a_sk, &b_pk, MessageType::Pong, 2, &body);
+
+        match open(&b_sk, &mut wire).expect("a future-version pong must still open") {
+            Inbound::Pong {
+                tx_id, src: got, ..
+            } => {
+                assert_eq!(tx_id, tx);
+                assert_eq!(got, src);
+            }
+            other => panic!("expected pong, got {other:?}"),
+        }
+    }
+
+    /// A `CallMeMaybe` with a future version byte must open with NO endpoints (Go's
+    /// `parseCallMeMaybe` soft-empties when `ver != 0`), rather than being rejected wholesale.
+    #[test]
+    fn future_version_call_me_maybe_opens_empty() {
+        let (a_sk, _a_pk) = keypair();
+        let (b_sk, b_pk) = keypair();
+        let ep: SocketAddr = "203.0.113.10:3478".parse().unwrap();
+
+        let body = Endpoint::from(ep).as_bytes().to_vec();
+        let mut wire = seal_versioned(&a_sk, &b_pk, MessageType::CallMeMaybe, 1, &body);
+
+        match open(&b_sk, &mut wire).expect("a future-version call-me-maybe must still open") {
+            Inbound::CallMeMaybe { endpoints, .. } => {
+                assert!(
+                    endpoints.is_empty(),
+                    "a non-zero-version CallMeMaybe yields no endpoints (Go soft-empty), got {endpoints:?}"
+                );
+            }
+            other => panic!("expected call-me-maybe, got {other:?}"),
+        }
+    }
+
+    /// The version-0 path is unchanged: a normal CallMeMaybe still yields its endpoints.
+    #[test]
+    fn version_zero_call_me_maybe_still_yields_endpoints() {
+        let (a_sk, _a_pk) = keypair();
+        let (b_sk, b_pk) = keypair();
+        let ep: SocketAddr = "203.0.113.11:3478".parse().unwrap();
+
+        let mut wire = seal_call_me_maybe(&a_sk, &b_pk, &[ep]).unwrap();
+        match open(&b_sk, &mut wire).expect("v0 call-me-maybe opens") {
+            Inbound::CallMeMaybe { endpoints, .. } => {
+                assert_eq!(endpoints, vec![ep], "v0 endpoints must still be delivered");
+            }
+            other => panic!("expected call-me-maybe, got {other:?}"),
+        }
+    }
 }
