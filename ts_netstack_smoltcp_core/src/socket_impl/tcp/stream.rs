@@ -151,6 +151,19 @@ impl Netstack {
         // method call inside a `pending_tcp_closes.retain` closure would conflict with that borrow.
         let mut pending = core::mem::take(&mut self.pending_tcp_closes);
         pending.retain(|&handle| {
+            // `pending_tcp_closes` is a `Vec` with no dedup, and the eight push sites are not
+            // proven disjoint per handle, so the same handle CAN appear twice. The first
+            // occurrence's `remove_socket` then frees the slot, and a naive
+            // `socket_set.get::<tcp::Socket>(handle)` on the second occurrence PANICS (smoltcp's
+            // `get` panics on a removed handle), killing the netstack actor. Guard with the same
+            // existence scan `get_socket_mut!` uses: a handle no longer in the set is already gone
+            // (reaped here, by the orphan reap, or elsewhere) — drop it from `pending` without a
+            // second remove. (tsr-ufm)
+            let exists = self.socket_set.iter().any(|(h, _)| h == handle);
+            if !exists {
+                return false;
+            }
+
             let state = {
                 let sock = self.socket_set.get::<tcp::Socket>(handle);
                 sock.state()
