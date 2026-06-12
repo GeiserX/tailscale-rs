@@ -2,6 +2,15 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.28.3](https://github.com/GeiserX/tailscale-rs/compare/v0.28.2...v0.28.3) (2026-06-12)
+
+
+### Bug Fixes
+
+* **disco:** parse over-length Pong and non-multiple CallMeMaybe laxly for Go interop ([#115](https://github.com/GeiserX/tailscale-rs/issues/115)) ([98dd6ea](https://github.com/GeiserX/tailscale-rs/commit/98dd6ea2f1d2dfa4b0a17b1e96cf5e01e452f46f))
+* **packetfilter:** match ICMP and other portless protocols IPs-only like Go ([#113](https://github.com/GeiserX/tailscale-rs/issues/113)) ([fa7fac4](https://github.com/GeiserX/tailscale-rs/commit/fa7fac4952cb59b76eadbd6760b5411c2de38515))
+* **tka:** resolve forks against the real replayed weight, not an empty state ([#116](https://github.com/GeiserX/tailscale-rs/issues/116)) ([8ff99fd](https://github.com/GeiserX/tailscale-rs/commit/8ff99fd20ec504a0148b0d6431b8487f00c410b5))
+
 ## [0.28.2](https://github.com/GeiserX/tailscale-rs/compare/v0.28.1...v0.28.2) (2026-06-12)
 
 
