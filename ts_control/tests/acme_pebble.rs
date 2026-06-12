@@ -70,6 +70,7 @@ use std::{
 use ts_control::{
     CertError, PublishTxt,
     acme::{AcmeAccountKey, issue_certificate},
+    certified_key_from_pem,
 };
 
 /// challtestsrv management API URL (its `POST /set-txt` publishes the dns-01 TXT
@@ -261,7 +262,9 @@ async fn pebble_issues_a_real_certificate() {
     let name = "test-host.example.com";
 
     // --- The whole integration: real RFC 8555 issuance against Pebble ---
-    let certified = issue_certificate(name, &directory_url, &account_key, &publisher)
+    // `issue_certificate` returns an `IssuedCert`: the ready-to-serve `CertifiedKey` PLUS the raw
+    // chain + leaf-key PEMs (the `Device::cert_pair` / `tnet cert` path) from the SAME issuance.
+    let issued = issue_certificate(name, &directory_url, &account_key, &publisher)
         .await
         .unwrap_or_else(|e| {
             panic!(
@@ -269,6 +272,7 @@ async fn pebble_issues_a_real_certificate() {
                  (directory reachable + CA trusted? account/order/challenge/finalize step?)"
             )
         });
+    let certified = &issued.certified;
 
     // --- Assert we got a usable, non-empty cert chain ---
     assert!(
@@ -293,4 +297,29 @@ async fn pebble_issues_a_real_certificate() {
         0x30,
         "leaf certificate DER does not start with an ASN.1 SEQUENCE tag (0x30)"
     );
+
+    // --- Assert the PEM pair (the `Device::cert_pair` surface) is well-formed and matched ---
+    // The chain PEM parses to at least one certificate.
+    let chain_certs: Vec<_> = rustls_pemfile::certs(&mut issued.cert_chain_pem.as_bytes())
+        .collect::<Result<_, _>>()
+        .expect("cert_chain_pem must parse as PEM certificates");
+    assert!(
+        !chain_certs.is_empty(),
+        "cert_chain_pem parsed to ZERO certificates"
+    );
+    // The leaf-key PEM parses as a private key (the no-key-export-needed invariant: the PEM is
+    // already in hand). NOTE: never print `issued.key_pem` — it is private key material.
+    let parsed_key = rustls_pemfile::private_key(&mut issued.key_pem.as_bytes())
+        .expect("key_pem must parse as PEM")
+        .expect("key_pem must contain a private key");
+    assert!(
+        !parsed_key.secret_der().is_empty(),
+        "parsed leaf private key DER is empty"
+    );
+    // The pair MUST match: `certified_key_from_pem` rebuilds a `CertifiedKey` from these exact PEMs
+    // and runs `keys_match()` internally, so a mismatch fails here (reuses the production verifier —
+    // never weakened). This is the same check `IssuedCert::certified` already passed.
+    certified_key_from_pem(issued.cert_chain_pem.as_bytes(), issued.key_pem.as_bytes())
+        .expect("the returned cert_chain_pem + key_pem must form a matched CertifiedKey");
+    eprintln!("PASS: cert_pair PEMs are well-formed and the key matches the leaf");
 }

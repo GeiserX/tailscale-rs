@@ -41,7 +41,9 @@ pub use cert::{
     CertError, MISSING_CERT_RPC, certified_key_from_pem, get_certificate, is_tailnet_name,
 };
 #[cfg(feature = "acme")]
-pub use cert::{PublishTxt, SetDnsPublisher, issue_certificate_via_setdns};
+pub use cert::{
+    PublishTxt, SetDnsPublisher, issue_cert_pair_via_setdns, issue_certificate_via_setdns,
+};
 #[doc(inline)]
 pub use config::{
     Config, DEFAULT_CONTROL_SERVER, DEFAULT_PERSISTENT_KEEPALIVE, ExitProxyConfig, ExitProxyScheme,

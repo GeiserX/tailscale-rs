@@ -620,6 +620,44 @@ impl Runtime {
             .map_err(flatten_cert_send_err)
     }
 
+    /// Issue a real Let's Encrypt certificate for this node's MagicDNS `name` and return the
+    /// **PEM pair** `(cert_chain_pem, key_pem)` — the analog of Go's
+    /// `LocalClient.CertPairWithValidity`, for writing the daemon's on-disk `.crt` + `.key`
+    /// (`tnet cert`). `acme` feature.
+    ///
+    /// Same issuance as [`get_certificate`](Self::get_certificate) (one client-side ACME DNS-01
+    /// order, challenge published via the node's set-dns RPC) — only the result shape differs: this
+    /// returns the leaf+chain PEM and the leaf-key PEM instead of the opaque
+    /// [`CertifiedKey`](ts_control::tls::CertifiedKey). The second element is the **leaf private
+    /// key** PEM; it is never logged anywhere on this path.
+    ///
+    /// **`min_validity` (honest "always fresh").** Go's `CertPairWithValidity` reuses a cached cert
+    /// when it has at least `min_validity` of its lifetime left, and re-issues otherwise. This fork
+    /// has **no cert cache** — every call performs a fresh issuance — so `min_validity` is accepted
+    /// for signature compatibility but does not change behavior: a freshly issued cert (full
+    /// lifetime) trivially satisfies any `min_validity`. A reuse cache is separate future work; this
+    /// does NOT fake one.
+    ///
+    /// Mirrors [`get_certificate`](Self::get_certificate)'s error handling: the kameo
+    /// delegated-reply send error is flattened — a handler error carries the real
+    /// [`ts_control::CertError`]; any other send failure (actor shutdown / mailbox closed) collapses
+    /// to a [`ts_control::CertError::Io`]. SaaS-only: a self-hosted control plane 501s on set-dns.
+    #[cfg(feature = "acme")]
+    pub async fn cert_pair(
+        &self,
+        name: String,
+        min_validity: Option<Duration>,
+    ) -> Result<(String, String), ts_control::CertError> {
+        // No cert cache exists in this fork (every issuance is fresh), so `min_validity` is honored
+        // trivially by always issuing a full-lifetime cert. Bound (unused beyond this contract) so
+        // the parameter is explicitly accounted for rather than silently ignored.
+        let _ = min_validity;
+        self.control
+            .ask(control_runner::GetCertPair { name })
+            .await
+            .map_err(flatten_cert_send_err)
+    }
+
     /// Resolve which node owns a tailnet source address.
     ///
     /// Maps the destination IP of `addr` to its owning node. Mirrors tsnet's `LocalClient::WhoIs`.
@@ -1222,13 +1260,15 @@ fn flatten_set_dns_send_err<M>(
     }
 }
 
-/// Flatten a kameo `SendError` from the `GetCertificate` ask into a [`ts_control::CertError`].
+/// Flatten a kameo `SendError` from the `GetCertificate` / `GetCertPair` ask into a
+/// [`ts_control::CertError`].
 ///
 /// A `HandlerError` carries the real `CertError` produced by the ACME issuance and is surfaced
 /// verbatim. `CertError` has no transient-network variant, so any other send failure (actor not
 /// running / stopped, mailbox full, send timeout) — a delivery problem rather than an issuance
-/// result — collapses to a [`ts_control::CertError::Io`]. Factored out of
-/// [`Runtime::get_certificate`] so this mapping is unit-testable without standing up an actor.
+/// result — collapses to a [`ts_control::CertError::Io`]. Generic over the message type, so it
+/// serves both [`Runtime::get_certificate`] and [`Runtime::cert_pair`]; factored out so the mapping
+/// is unit-testable without standing up an actor.
 #[cfg(feature = "acme")]
 fn flatten_cert_send_err<M>(
     e: kameo::error::SendError<M, ts_control::CertError>,

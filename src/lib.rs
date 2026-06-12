@@ -1507,6 +1507,35 @@ impl Device {
         self.runtime.get_certificate(name.to_string()).await
     }
 
+    /// Issue a real Let's Encrypt certificate for a node's MagicDNS `name` and return the **PEM
+    /// pair** `(cert_chain_pem, key_pem)` — the analog of Go's `LocalClient.CertPairWithValidity`,
+    /// for writing the daemon's on-disk `.crt` + `.key` (`tnet cert`). **`acme` feature only.**
+    ///
+    /// This drives the same client-side ACME DNS-01 issuance as [`Device::get_certificate`] (one
+    /// order, the challenge TXT published via the node's `POST /machine/set-dns` RPC, routed through
+    /// the runtime → control runner); it differs only in returning the raw leaf+chain PEM and the
+    /// leaf private-key PEM instead of the opaque [`CertifiedKey`]. The second tuple element is
+    /// **secret key material**: it is never logged anywhere on this path — persist it to a `0600`
+    /// file and never trace it.
+    ///
+    /// **`min_validity` (honest "always fresh").** Go's `CertPairWithValidity` reuses a cached cert
+    /// when it has at least `min_validity` of its lifetime remaining, re-issuing otherwise. This
+    /// fork keeps **no cert cache** — every call issues fresh — so `min_validity` is accepted for
+    /// signature compatibility but does not alter behavior: a freshly issued (full-lifetime) cert
+    /// satisfies any `min_validity`. A reuse cache is separate future work; this does NOT fake one.
+    ///
+    /// Fail-closed: returns a [`ts_control::CertError`] (never a self-signed or partial pair) on any
+    /// ACME/HTTP failure. SaaS-only: a self-hosted control plane may 501 on set-dns, surfaced as
+    /// [`ts_control::CertError::Acme`].
+    #[cfg(feature = "acme")]
+    pub async fn cert_pair(
+        &self,
+        name: &str,
+        min_validity: Option<Duration>,
+    ) -> Result<(String, String), ts_control::CertError> {
+        self.runtime.cert_pair(name.to_string(), min_validity).await
+    }
+
     /// Build a [`TlsAcceptor`] terminating TLS for `cfg.name` on the overlay (like `tsnet`'s
     /// `ListenTLS`).
     ///

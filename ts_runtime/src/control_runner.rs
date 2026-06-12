@@ -564,6 +564,13 @@ mod msg_impl {
         }
     }
 
+    /// The reply type of the [`get_cert_pair`](ControlRunner::get_cert_pair) message: the issued
+    /// `(cert_chain_pem, key_pem)` PEM pair (the `tnet cert` surface) or a [`ts_control::CertError`].
+    /// Aliased so the message's `Context` type stays under clippy's `type_complexity` bar (the
+    /// nested `Result<(String, String), _>` trips it inline).
+    #[cfg(feature = "acme")]
+    pub type CertPairReply = Result<(String, String), ts_control::CertError>;
+
     // The `acme`-gated cert-issuance message lives in its own `#[kameo::messages]` impl block so the
     // proc-macro never sees it in a non-`acme` build (a `#[cfg]` *inside* a single messages-impl
     // block is not honored by the macro's generated dispatch — it would emit a `GetCertificate`
@@ -608,21 +615,89 @@ mod msg_impl {
 
             deleg
         }
+
+        /// Issue a real Let's Encrypt certificate for this node's MagicDNS `name` and return the
+        /// **PEM pair** — `(cert_chain_pem, key_pem)` — for writing the on-disk `.crt` + `.key`
+        /// (the daemon's `tnet cert`, Go's `LocalClient.CertPair`). `acme` feature.
+        ///
+        /// Identical issuance to [`get_certificate`](Self::get_certificate) (same client-side ACME
+        /// DNS-01 flow, same set-dns publish, same account-key handling), only the *shape* of the
+        /// result differs: this surfaces the raw chain + leaf-key PEMs instead of the opaque
+        /// [`CertifiedKey`](ts_control::tls::CertifiedKey). The leaf **private key** PEM is the
+        /// second tuple element and is NEVER logged — the spawned task sends it straight back to the
+        /// replier. SaaS-only: against a self-hosted control plane the set-dns publish 501s.
+        #[message(ctx)]
+        pub fn get_cert_pair(
+            &self,
+            ctx: &mut Context<Self, DelegatedReply<CertPairReply>>,
+            name: String,
+        ) -> DelegatedReply<CertPairReply> {
+            let (deleg, replier) = ctx.reply_sender();
+
+            if let Some(replier) = replier {
+                let config = self.params.config.clone();
+                let keys = self.params.env.keys.clone();
+                tokio::spawn(async move {
+                    let result = issue_cert_pair(&config, &keys, &name).await;
+                    replier.send(result);
+                });
+            }
+
+            deleg
+        }
     }
 }
 
-/// Load or generate the ACME account key, then issue a cert for `name` via set-dns DNS-01.
+/// Load or generate the ACME account key, then issue a cert for `name` via set-dns DNS-01,
+/// returning just the ready-to-serve [`CertifiedKey`](ts_control::tls::CertifiedKey) (the
+/// `get_certificate` / `ListenTLS` path).
 ///
-/// Reuses the persisted [`ts_keys::NodeState::acme_account_key`] (PKCS#8 DER) when present so the
-/// same Let's Encrypt account survives renewals; otherwise generates an ephemeral per-call key
-/// (logged at debug — a new ACME account each issuance, with no write-back). Always targets Let's
-/// Encrypt production ([`ts_control::acme::LETS_ENCRYPT_PRODUCTION_DIRECTORY`]).
+/// Thin wrapper over [`issue_cert_pair`] that drops the PEMs — one issuance, this caller just
+/// doesn't need the on-disk pair. See [`issue_cert_pair`] for the account-key handling.
 #[cfg(feature = "acme")]
 async fn issue_certificate(
     config: &ts_control::Config,
     keys: &ts_keys::NodeState,
     name: &str,
 ) -> Result<ts_control::tls::CertifiedKey, ts_control::CertError> {
+    issue_cert_pair_inner(config, keys, name)
+        .await
+        .map(|issued| issued.certified)
+}
+
+/// Load or generate the ACME account key, then issue a cert for `name` via set-dns DNS-01,
+/// returning the **PEM pair** `(cert_chain_pem, key_pem)` for the daemon's on-disk `.crt`/`.key`
+/// (`tnet cert`, Go `LocalClient.CertPair`).
+///
+/// Same single issuance as [`issue_certificate`]; only the result shape differs. The leaf
+/// **private key** PEM is the second element and is NEVER logged here.
+#[cfg(feature = "acme")]
+async fn issue_cert_pair(
+    config: &ts_control::Config,
+    keys: &ts_keys::NodeState,
+    name: &str,
+) -> Result<(String, String), ts_control::CertError> {
+    issue_cert_pair_inner(config, keys, name)
+        .await
+        .map(|issued| (issued.cert_chain_pem, issued.key_pem))
+}
+
+/// Shared issuance core for [`issue_certificate`] and [`issue_cert_pair`]: load (or generate) the
+/// ACME account key, target Let's Encrypt production, and run one DNS-01 issuance, returning the
+/// full [`IssuedCert`](ts_control::acme::IssuedCert) so each caller projects out what it needs (one
+/// ACME order, two consumers).
+///
+/// Reuses the persisted [`ts_keys::NodeState::acme_account_key`] (PKCS#8 DER) when present so the
+/// same Let's Encrypt account survives renewals; otherwise generates an ephemeral per-call key
+/// (logged at debug — a new ACME account each issuance, with no write-back). Always targets Let's
+/// Encrypt production ([`ts_control::acme::LETS_ENCRYPT_PRODUCTION_DIRECTORY`]). Never logs the leaf
+/// private key.
+#[cfg(feature = "acme")]
+async fn issue_cert_pair_inner(
+    config: &ts_control::Config,
+    keys: &ts_keys::NodeState,
+    name: &str,
+) -> Result<ts_control::acme::IssuedCert, ts_control::CertError> {
     let account_key = match keys.acme_account_key.as_deref() {
         Some(der) => ts_control::acme::AcmeAccountKey::from_pkcs8(der)?,
         None => {
@@ -638,7 +713,7 @@ async fn issue_certificate(
         .map_err(|e| {
             ts_control::CertError::Acme(format!("parsing Let's Encrypt directory URL: {e}"))
         })?;
-    ts_control::issue_certificate_via_setdns(config, keys, name, &account_key, &directory).await
+    ts_control::issue_cert_pair_via_setdns(config, keys, name, &account_key, &directory).await
 }
 
 impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
