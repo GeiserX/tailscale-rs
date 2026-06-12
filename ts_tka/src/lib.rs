@@ -2985,6 +2985,34 @@ mod tests {
         ),
     ];
 
+    /// Accept(`true`)/reject(`false`) matrix for [`SPECCHECK_VECTORS`] (vectors 0..=11), the SINGLE
+    /// source of truth shared by BOTH `ed25519_speccheck_dual_verifier_kat` (which asserts the pinned
+    /// Rust crates produce it) and `ed25519_dual_verifier_matches_go_verdicts` (which asserts Go's
+    /// real verifiers produce the same matrix). Sharing one const is deliberate: it makes the
+    /// "crate-observed" and "Go-pinned" expectations PHYSICALLY THE SAME bytes, so a dependency bump
+    /// that changes crate behavior cannot be silenced by editing the crate-side array to match the
+    /// new behavior while leaving the Go-side untouched — there is only one array, and changing it
+    /// re-asserts BOTH the crates AND Go.
+    ///
+    /// REGENERATION CONTRACT — read before touching these arrays. They are pinned to `ed25519-dalek
+    /// 2.2.0` (std, cofactorless) == Go `crypto/ed25519.Verify`, and `ed25519-zebra 4.2.0` (ZIP-215,
+    /// cofactored) == Go `github.com/hdevalence/ed25519consensus v0.2.0` (toolchain go1.26.4),
+    /// cross-validated by the generator at `tests/vectors/gen/zip215`. If a `cargo update` bumps
+    /// `ed25519-dalek` or `ed25519-zebra` and a verdict on any vector changes (most plausibly the
+    /// non-canonical cases 8..=11), you MUST RE-RUN that Go generator and confirm Go's verdicts STILL
+    /// MATCH the new crate behavior before editing these constants — never edit them merely to make
+    /// the Rust side pass, or the Go-equivalence proof becomes a Rust-vs-itself tautology and a
+    /// Tailnet-Lock consensus split could ship undetected. The SECURITY-CRITICAL rows are NOT
+    /// version-tunable regardless: STD must reject the S>=L malleability vectors (6,7), and STD/ZIP215
+    /// MUST disagree on the cofactored discriminator (vector 4) — asserted separately below.
+    //                                            0    1    2    3    4    5    6    7    8    9   10   11
+    const SPECCHECK_STD_ACCEPT: [bool; 12] = [
+        true, true, true, true, false, false, false, false, false, false, false, true,
+    ];
+    const SPECCHECK_ZIP215_ACCEPT: [bool; 12] = [
+        true, true, true, true, true, true, false, false, false, true, true, true,
+    ];
+
     /// Known-answer test guarding the dual-verifier split that backs TKA consensus correctness.
     ///
     /// `verify_ed25519_std` wraps `ed25519-dalek 2.x` (standard RFC-8032-ish, cofactorless) and is
@@ -3002,17 +3030,13 @@ mod tests {
     /// disagree on the cofactored discriminator (vector 4). Those are hard, separate assertions.
     #[test]
     fn ed25519_speccheck_dual_verifier_kat() {
-        // Observed accept(true)/reject(false) matrix for the pinned crates, vectors 0..=11.
-        // Anchored to the speccheck paper rows then corrected to what the crates actually do
-        // (see the per-vector run below — any divergence makes the test fail loudly).
-        //
-        //                              0    1    2    3    4    5    6    7    8    9    10   11
-        const STD_EXPECT: [bool; 12] = [
-            true, true, true, true, false, false, false, false, false, false, false, true,
-        ];
-        const ZIP215_EXPECT: [bool; 12] = [
-            true, true, true, true, true, true, false, false, false, true, true, true,
-        ];
+        // The accept/reject matrix is the SHARED [`SPECCHECK_STD_ACCEPT`] / [`SPECCHECK_ZIP215_ACCEPT`]
+        // const — the SAME bytes `ed25519_dual_verifier_matches_go_verdicts` pins to Go. This test
+        // asserts the pinned Rust crates produce that matrix; that test asserts Go does too. One array,
+        // so the two proofs can never silently diverge on a dependency bump (see the regeneration
+        // contract on the const).
+        const STD_EXPECT: [bool; 12] = SPECCHECK_STD_ACCEPT;
+        const ZIP215_EXPECT: [bool; 12] = SPECCHECK_ZIP215_ACCEPT;
 
         for (i, (msg_hex, pk_hex, sig_hex)) in SPECCHECK_VECTORS.iter().enumerate() {
             let msg = unhex(msg_hex);
@@ -3220,13 +3244,13 @@ mod tests {
     /// inputs the Go verdicts were never computed over.
     #[test]
     fn ed25519_dual_verifier_matches_go_verdicts() {
-        //                                  0    1    2    3    4    5    6    7    8    9   10   11
-        const GO_STD_ACCEPT: [bool; 12] = [
-            true, true, true, true, false, false, false, false, false, false, false, true,
-        ];
-        const GO_ZIP215_ACCEPT: [bool; 12] = [
-            true, true, true, true, true, true, false, false, false, true, true, true,
-        ];
+        // Go's verdicts ARE the shared matrix (the SAME const the crate-observed KAT asserts). The
+        // bindings below alias the shared const rather than re-listing literals, so the Go-pinning
+        // and the crate-observed expectation are physically one array — a dependency bump cannot
+        // change one without the other, forcing the regeneration contract (re-run the zip215
+        // generator) instead of a silent edit. See the const's doc.
+        const GO_STD_ACCEPT: [bool; 12] = SPECCHECK_STD_ACCEPT;
+        const GO_ZIP215_ACCEPT: [bool; 12] = SPECCHECK_ZIP215_ACCEPT;
 
         for (i, (msg_hex, pk_hex, sig_hex)) in SPECCHECK_VECTORS.iter().enumerate() {
             let msg = unhex(msg_hex);

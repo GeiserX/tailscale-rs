@@ -24,6 +24,12 @@ import (
 // verdicts this generator emits, so a silent drift between the two vector copies would make
 // the cross-impl proof compare different inputs. Both lists derive from the same upstream
 // cases.json commit above; re-paste from there if regenerating.
+//
+// VERDICT MATRIX: the accept/reject results this program prints are pinned in ts_tka as the
+// SHARED consts `SPECCHECK_STD_ACCEPT` / `SPECCHECK_ZIP215_ACCEPT` (one array asserts BOTH the
+// Rust crates AND these Go verdicts). If a Rust ed25519-dalek/-zebra bump changes a verdict,
+// RE-RUN this generator and confirm Go still agrees before editing those consts — see the
+// "REGENERATION CONTRACT" doc on them. Toolchain: go1.26.4, ed25519consensus v0.2.0.
 var vectors = [12][3]string{
 	{"8c93255d71dcab10e8f379c26200f3c7bd5f09d9bc3068d3ef4edeb4853022b6", "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa", "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a0000000000000000000000000000000000000000000000000000000000000000"},
 	{"9bd9f44f4dcc75bd531b56b2cd280b0bb38fc1cd6d1230e14861d861de092e79", "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa", "f7badec5b8abeaf699583992219b7b223f1df3fbbea919844e3f7c554a43dd43a5bb704786be79fc476f91d3f3f89b03984d8068dcf1bb7dfc6637b45450ac04"},
