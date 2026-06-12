@@ -135,7 +135,12 @@ impl<D: RealDialer> Forwarder<D> {
                     let channel = self.channel.clone();
                     let routes = self.routes_rx.clone();
                     let dialer = self.dialer.clone();
-                    tasks.spawn(async move { run_tcp_port(channel, port, routes, dialer).await });
+                    // Explicit-port mode: no global cap. The port set is operator-configured and
+                    // bounded, so the per-port caps suffice; a global cap could wrongly throttle a
+                    // legitimately busy multi-port config. (All-port mode passes `Some(..)`.)
+                    tasks.spawn(
+                        async move { run_tcp_port(channel, port, routes, dialer, None).await },
+                    );
                 }
             }
             PortSpec::All => {
@@ -152,7 +157,11 @@ impl<D: RealDialer> Forwarder<D> {
                     let channel = self.channel.clone();
                     let routes = self.routes_rx.clone();
                     let dialer = self.dialer.clone();
-                    tasks.spawn(async move { run_udp_port(channel, port, routes, dialer).await });
+                    // Explicit-port mode: no global cap (bounded, operator-chosen port set; the
+                    // per-port caps suffice). All-port mode passes `Some(..)`.
+                    tasks.spawn(
+                        async move { run_udp_port(channel, port, routes, dialer, None).await },
+                    );
                 }
             }
             PortSpec::All => {

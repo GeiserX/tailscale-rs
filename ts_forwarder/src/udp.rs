@@ -7,7 +7,10 @@ use std::{
     time::Duration,
 };
 
-use tokio::time::Instant;
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore},
+    time::Instant,
+};
 use ts_netstack_smoltcp::{CreateSocket, netcore::Channel, netsock::UdpSocket as OverlayUdpSocket};
 
 use crate::{class::RouteTable, dialer::RealDialer};
@@ -31,13 +34,20 @@ const MAX_DATAGRAM: usize = 65_535;
 /// exhaustion. At the cap a datagram that would open a *new* flow is dropped (fail-closed, never
 /// dialed), so existing flows keep working and the reaper frees slots as flows idle out. Mirrors
 /// the TCP path's `MAX_INFLIGHT_SPLICES`; comparable to Go's bounded UDP conntrack table.
-const MAX_UDP_FLOWS: usize = 512;
+///
+/// `pub(crate)` so the all-port manager's global-cap sizing invariant can be asserted in tests.
+pub(crate) const MAX_UDP_FLOWS: usize = 512;
 
 /// State for one active UDP flow, keyed by `(peer, dst)`.
 struct FlowState {
     real: Arc<tokio::net::UdpSocket>,
     pump: tokio::task::AbortHandle,
     last: Instant,
+    /// Owned permit from the optional process-wide (cross-port) flow semaphore, held for the
+    /// flow's lifetime: it is released when this `FlowState` is dropped (i.e. when the flow is
+    /// reaped for idleness or removed on a send error), freeing a slot in the global budget.
+    /// `None` when no global cap is configured (the explicit-port path).
+    _global_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl Drop for FlowState {
@@ -53,12 +63,20 @@ impl Drop for FlowState {
 /// a real OS UDP socket; replies are sent back with the source spoofed as the original
 /// destination so the peer sees answers from the address it targeted.
 ///
+/// `global_flows` is an optional process-wide flow semaphore shared across *all* port relays of
+/// an all-port forwarder. When `Some`, opening a NEW flow must acquire a global permit (in
+/// addition to this relay's per-port [`MAX_UDP_FLOWS`] bound); at the global cap the datagram is
+/// dropped (fail-closed). The permit is stored in the flow's [`FlowState`] and released when the
+/// flow ends, so it bounds the *aggregate* flow count across the up-to-`MAX_PORTS` relays
+/// all-port mode can spawn. When `None` (the explicit-port path) only the per-port cap applies.
+///
 /// Loops until the netstack channel closes.
 pub(crate) async fn run_udp_port<D: RealDialer>(
     channel: Channel,
     port: u16,
     routes: tokio::sync::watch::Receiver<RouteTable>,
     dialer: Arc<D>,
+    global_flows: Option<Arc<Semaphore>>,
 ) -> Result<(), ts_netstack_smoltcp::netcore::Error> {
     let bind_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), port);
     let overlay = Arc::new(channel.udp_bind(bind_addr).await?);
@@ -90,6 +108,26 @@ pub(crate) async fn run_udp_port<D: RealDialer>(
                             );
                             continue;
                         }
+                        // Then, if a global (cross-port) cap is configured, reserve a global slot
+                        // for this new flow. Non-blocking `try_acquire_owned` so the recv loop is
+                        // never stalled; at the global cap we DROP the datagram (fail-closed, no
+                        // dial/socket), exactly like the per-port drop. The permit is held in the
+                        // flow's `FlowState` and released when the flow ends. `None` => no global
+                        // gate (behaves as before). Acquired before the dial so an over-cap flow
+                        // opens no real socket.
+                        let global_permit = match &global_flows {
+                            Some(sem) => {
+                                let Ok(gp) = sem.clone().try_acquire_owned() else {
+                                    tracing::warn!(
+                                        %dst, %peer,
+                                        "drop: at max GLOBAL udp flows"
+                                    );
+                                    continue;
+                                };
+                                Some(gp)
+                            }
+                            None => None,
+                        };
                         let Some(class) = routes.borrow().classify(dst.ip()) else {
                             tracing::warn!(%dst, %peer, "drop: destination not advertised");
                             continue;
@@ -119,7 +157,12 @@ pub(crate) async fn run_udp_port<D: RealDialer>(
                         );
                         flows.insert(
                             (peer, dst),
-                            FlowState { real: real.clone(), pump, last: Instant::now() },
+                            FlowState {
+                                real: real.clone(),
+                                pump,
+                                last: Instant::now(),
+                                _global_permit: global_permit,
+                            },
                         );
                         real
                     }
