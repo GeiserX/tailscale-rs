@@ -198,7 +198,13 @@ impl DataPlane {
                             ipv6.header().destination_addr().into(),
                         ),
                         _ => {
-                            unreachable!("unexpected packet kind");
+                            // A packet that parsed as IP but is neither IPv4 nor IPv6 (e.g. a
+                            // future/odd `NetSlice` shape). These bytes are attacker-controlled
+                            // post-decrypt, so fail closed — drop it — rather than `unreachable!`,
+                            // which would panic the single-threaded dataplane on a crafted packet.
+                            // Go's filter `pre()` likewise returns Drop/"not-ip" here, never panics.
+                            tracing::trace!("parsed packet is neither IPv4 nor IPv6; dropping");
+                            return false;
                         }
                     };
 

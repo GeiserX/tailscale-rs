@@ -161,25 +161,57 @@ impl DstMatchLookup {
     }
 
     pub fn lookup(&self, dst: &IpAddr, port: u16) -> DynBitset {
-        let mut port_matches = self
-            .ports
+        let mut port_matches = self.port_bitset(port);
+        let dst_matches = self.dst_bitset(dst);
+
+        port_matches.intersect_inplace(&dst_matches);
+
+        self.resolve_rule_ids(&port_matches)
+    }
+
+    /// Resolve the rules whose `DstMatch` covers `dst`, **ignoring ports** — the destination side of
+    /// Go's IPs-only match for ICMP/ICMPv6 ("if any port is open to an IP, allow ICMP to it"). Used
+    /// for protocols whose packets carry no L4 port (see [`ts_packetfilter::IpProto::is_port_ful`]).
+    pub fn lookup_ips_only(&self, dst: &IpAddr) -> DynBitset {
+        let dst_matches = self.dst_bitset(dst);
+        self.resolve_rule_ids(&dst_matches)
+    }
+
+    /// Resolve the rules whose `DstMatch` covers `dst` **and opens all ports** (`0..=65535`) — Go's
+    /// `matchProtoAndIPsOnlyIfAllPorts`, used for non-ICMP "portless" protocols. A `DstMatch` opens
+    /// all ports iff its port range contains both `0` and `65535`, which (for a contiguous range)
+    /// is true only for the full `0..=65535` range; intersecting the port-trie lookups at both
+    /// extremes therefore yields exactly the all-ports `DstMatch`es.
+    pub fn lookup_all_ports_ips(&self, dst: &IpAddr) -> DynBitset {
+        let mut all_ports = self.port_bitset(0);
+        all_ports.intersect_inplace(&self.port_bitset(u16::MAX));
+        all_ports.intersect_inplace(&self.dst_bitset(dst));
+        self.resolve_rule_ids(&all_ports)
+    }
+
+    /// The `DstMatchId` set whose port range covers `port`.
+    fn port_bitset(&self, port: u16) -> DynBitset {
+        self.ports
             .lookup(port)
             .fold(DynBitset::default(), |mut acc, x| {
                 acc.union_inplace(x);
                 acc
-            });
+            })
+    }
 
-        let dst_matches = self
-            .dsts
+    /// The `DstMatchId` set whose IP prefixes cover `dst`.
+    fn dst_bitset(&self, dst: &IpAddr) -> DynBitset {
+        self.dsts
             .lookup_all(*dst)
             .fold(DynBitset::default(), |mut acc, x| {
                 acc.union_inplace(x);
                 acc
-            });
+            })
+    }
 
-        port_matches.intersect_inplace(&dst_matches);
-
-        port_matches
+    /// Map a set of matched `DstMatchId`s to their `RuleId`s.
+    fn resolve_rule_ids(&self, dstmatch_ids: &DynBitset) -> DynBitset {
+        dstmatch_ids
             .bits()
             .filter_map(|x| self.dstmatch_id_to_rule_id[x])
             .collect()

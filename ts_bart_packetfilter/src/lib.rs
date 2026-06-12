@@ -215,8 +215,19 @@ impl BartFilter {
             return all_matches;
         }
 
-        let dstport_matches = self.dsts.lookup(&info.dst, info.port);
-        all_matches.intersect_inplace(&dstport_matches);
+        // Destination match, with the port test applied per-protocol exactly as the reference
+        // `Rule::matches`/`DstMatch::matches` path does (Go `runIn4`/`runIn6`): TCP/UDP/SCTP check
+        // the port; ICMP/ICMPv6 match IPs only; any other portless protocol matches IPs only but
+        // only against all-ports `DstMatch`es. Keeping this in lockstep with the map filter is
+        // required — `CheckingFilter` runs both and flags any divergence.
+        let dst_matches = if info.ip_proto.is_port_ful() {
+            self.dsts.lookup(&info.dst, info.port)
+        } else if info.ip_proto == IpProto::ICMP || info.ip_proto == IpProto::ICMPV6 {
+            self.dsts.lookup_ips_only(&info.dst)
+        } else {
+            self.dsts.lookup_all_ports_ips(&info.dst)
+        };
+        all_matches.intersect_inplace(&dst_matches);
 
         all_matches
     }
@@ -293,7 +304,10 @@ mod test {
                     pfxs: vec!["0.0.0.0/0".parse().unwrap()],
                     caps: vec![String::new()],
                 },
-                protos: vec![IpProto::new(0)],
+                // TCP (a port-ful proto) so the `0..=0` rule matches the port-0 probe below: a
+                // bare `IpProto::new(0)` is now treated as an "other" protocol that only matches an
+                // all-ports rule (Go `matchProtoAndIPsOnlyIfAllPorts`), so it would not match here.
+                protos: vec![IpProto::TCP],
                 dst: vec![pf::DstMatch {
                     ips: vec!["0.0.0.0/0".parse().unwrap()],
                     ports: 0..=0,
@@ -307,7 +321,7 @@ mod test {
                 src: "1.2.3.4".parse().unwrap(),
                 dst: "5.6.7.8".parse().unwrap(),
                 port: 0,
-                ip_proto: IpProto::new(0),
+                ip_proto: IpProto::TCP,
             },
             []
         ));
@@ -465,6 +479,223 @@ mod test {
         }
     }
 
+    /// A rule that grants the source `0.0.0.0/0` access to `dst_ip` on the given protos + port
+    /// range — the shape of a typical `tailscale up` ACL ("these peers may reach me on tcp/22").
+    fn rule(protos: &[IpProto], dst_ip: &str, ports: core::ops::RangeInclusive<u16>) -> Rule {
+        Rule {
+            src: pf::SrcMatch {
+                pfxs: vec!["0.0.0.0/0".parse().unwrap()],
+                // An (empty-string) cap entry so every rule registers in BOTH the src-ip and cap
+                // bookkeeping — `BartFilter::verify_integrity` asserts `src <-> cap` parity, matching
+                // the convention of the other tests in this module.
+                caps: vec![String::new()],
+            },
+            protos: protos.to_vec(),
+            dst: vec![pf::DstMatch {
+                ports,
+                ips: vec![dst_ip.parse().unwrap()],
+            }],
+        }
+    }
+
+    fn info(proto: IpProto, dst: &str, port: u16) -> PacketInfo {
+        PacketInfo {
+            src: "1.2.3.4".parse().unwrap(),
+            dst: dst.parse().unwrap(),
+            ip_proto: proto,
+            port,
+        }
+    }
+
+    /// The iter44 fix: a rule that opens a narrow TCP port to an IP also allows ICMP to that IP
+    /// (Go `runIn4`/`runIn6` route ICMP through an IPs-only match — "if any port is open to an IP,
+    /// allow ICMP to it"). Before the fix, ICMP (port 0) failed the `22..=22` port test and was
+    /// dropped, silently breaking ping to a peer that only opens tcp/22 under a restrictive ACL.
+    #[test]
+    fn icmp_allowed_by_a_port_scoped_tcp_rule_to_the_same_ip() {
+        let mut filter = BartFilter::default();
+        // The default protos a portless ACL compiles to include ICMP + TCP (control sends them).
+        filter.insert(
+            "acl",
+            vec![rule(
+                &[IpProto::ICMP, IpProto::ICMPV6, IpProto::TCP, IpProto::UDP],
+                "5.6.7.8/32",
+                22..=22,
+            )],
+        );
+        filter.verify_integrity();
+
+        // ICMP to the granted IP: allowed (IPs-only — the 22..=22 range is ignored for ICMP).
+        assert!(
+            filter.can_access(&info(IpProto::ICMP, "5.6.7.8", 0), []),
+            "ICMP to a granted IP must be allowed regardless of the rule's port range"
+        );
+        // ICMP to a DIFFERENT IP: still denied (IPs-only does not mean all-IPs).
+        assert!(
+            !filter.can_access(&info(IpProto::ICMP, "9.9.9.9", 0), []),
+            "ICMP to a non-granted IP stays denied"
+        );
+        // TCP is still port-gated: 22 allowed, 443 denied.
+        assert!(filter.can_access(&info(IpProto::TCP, "5.6.7.8", 22), []));
+        assert!(
+            !filter.can_access(&info(IpProto::TCP, "5.6.7.8", 443), []),
+            "TCP must still honor the rule's port range"
+        );
+    }
+
+    /// A non-ICMP "portless" protocol matches IPs-only ONLY when the rule opens all ports (Go
+    /// `matchProtoAndIPsOnlyIfAllPorts`); a narrow port range never opens such a protocol.
+    #[test]
+    fn other_portless_proto_matches_only_under_an_all_ports_rule() {
+        let gre = IpProto::new(47); // GRE: portless, not ICMP.
+
+        // Narrow-port rule: GRE is NOT allowed (the rule doesn't open all ports).
+        let mut narrow = BartFilter::default();
+        narrow.insert("acl", vec![rule(&[gre], "5.6.7.8/32", 22..=22)]);
+        assert!(
+            !narrow.can_access(&info(gre, "5.6.7.8", 0), []),
+            "a portless non-ICMP proto is not opened by a narrow-port rule"
+        );
+
+        // A range that CONTAINS port 0 but is NOT all-ports must also NOT open GRE — guards against a
+        // naive `ports.start() == 0` or single-`lookup(0)` regression (the discriminating case for
+        // "contains 0 isn't enough; the range must be exactly 0..=65535").
+        let mut contains_zero = BartFilter::default();
+        contains_zero.insert("acl", vec![rule(&[gre], "5.6.7.8/32", 0..=1024)]);
+        assert!(
+            !contains_zero.can_access(&info(gre, "5.6.7.8", 0), []),
+            "a range containing port 0 but not all ports must not open a portless proto"
+        );
+
+        // All-ports rule: GRE IS allowed (IPs-only under all-ports).
+        let mut all_ports = BartFilter::default();
+        all_ports.insert("acl", vec![rule(&[gre], "5.6.7.8/32", 0..=u16::MAX)]);
+        assert!(
+            all_ports.can_access(&info(gre, "5.6.7.8", 0), []),
+            "an all-ports rule opens a portless non-ICMP proto to the granted IP"
+        );
+    }
+
+    /// The load-bearing invariant behind the bart `lookup_all_ports_ips` trick (`lookup(0) ∩
+    /// lookup(65535)`): two PARTIAL-range `DstMatch`es of the SAME rule that together cover both port
+    /// extremes — but where no single `DstMatch` is all-ports — must NOT be treated as all-ports.
+    /// The intersection runs at the `DstMatchId` level before resolving to rule ids, so the two
+    /// distinct DstMatchIds (`0..=0` in `lookup(0)`, `60000..=65535` in `lookup(65535)`) never
+    /// collapse into a false all-ports match. Without this, a portless proto (GRE) would be wrongly
+    /// ALLOWED — a silent ACL bypass — so this test guards both the bart trick and the map path's
+    /// exact `ports == ALL_PORTS` check, and confirms the two agree.
+    #[test]
+    fn split_range_dstmatches_do_not_count_as_all_ports() {
+        use pf::FilterExt;
+        let gre = IpProto::new(47);
+        let rules = vec![Rule {
+            src: pf::SrcMatch {
+                pfxs: vec!["0.0.0.0/0".parse().unwrap()],
+                caps: vec![String::new()],
+            },
+            protos: vec![gre],
+            // Two partial ranges covering port 0 and port 65535 separately — neither is all-ports.
+            dst: vec![
+                pf::DstMatch {
+                    ports: 0..=0,
+                    ips: vec!["5.6.7.8/32".parse().unwrap()],
+                },
+                pf::DstMatch {
+                    ports: 60000..=u16::MAX,
+                    ips: vec!["5.6.7.8/32".parse().unwrap()],
+                },
+            ],
+        }];
+
+        let mut bart = BartFilter::default();
+        bart.insert("acl", rules.clone());
+        bart.verify_integrity();
+        let mut map = pf::HashbrownFilter::default();
+        map.insert("acl".to_string(), rules);
+
+        let probe = info(gre, "5.6.7.8", 0);
+        assert!(
+            !bart.can_access(&probe, []),
+            "split partial ranges must not be treated as all-ports (bart)"
+        );
+        assert!(
+            !map.can_access(&probe, []),
+            "split partial ranges must not be treated as all-ports (map)"
+        );
+        assert_eq!(
+            bart.can_access(&probe, []),
+            map.can_access(&probe, []),
+            "bart and map must agree on the split-range non-all-ports verdict"
+        );
+    }
+
+    /// ICMPv6 takes the same IPs-only path as ICMP and must be exercised distinctly over an IPv6
+    /// address (it carries Neighbor Discovery — a regression here breaks v6 connectivity). A port-80
+    /// rule over a v6 prefix allows ICMPv6 to a covered address (IPs-only) and denies it elsewhere.
+    #[test]
+    fn icmpv6_matches_ips_only_over_a_v6_prefix() {
+        use pf::FilterExt;
+        let rules = vec![rule(
+            &[IpProto::ICMPV6, IpProto::TCP],
+            "2001:db8::/32",
+            80..=80,
+        )];
+
+        let mut bart = BartFilter::default();
+        bart.insert("acl", rules.clone());
+        let mut map = pf::HashbrownFilter::default();
+        map.insert("acl".to_string(), rules);
+
+        for probe in [
+            info(IpProto::ICMPV6, "2001:db8::1", 0), // granted v6 prefix -> allow (IPs-only)
+            info(IpProto::ICMPV6, "2001:dead::1", 0), // other v6 prefix  -> deny
+            info(IpProto::TCP, "2001:db8::1", 80),   // TCP in range      -> allow
+            info(IpProto::TCP, "2001:db8::1", 443),  // TCP out of range  -> deny
+        ] {
+            assert_eq!(
+                bart.can_access(&probe, []),
+                map.can_access(&probe, []),
+                "bart and map must agree on the ICMPv6/v6 verdict for {probe:?}"
+            );
+        }
+        assert!(bart.can_access(&info(IpProto::ICMPV6, "2001:db8::1", 0), []));
+        assert!(!bart.can_access(&info(IpProto::ICMPV6, "2001:dead::1", 0), []));
+    }
+
+    /// The production `BartFilter` and the reference map `Rule::matches` path must agree for every
+    /// protocol/port combination — `CheckingFilter` runs both and flags divergence, so the iter44
+    /// fix had to land in lockstep. This drives a shared rule set through both and asserts identical
+    /// verdicts across ICMP, TCP (in/out of range), and a portless non-ICMP proto.
+    #[test]
+    fn bart_and_map_agree_on_icmp_and_port_modes() {
+        use pf::FilterExt;
+        let rules = vec![rule(
+            &[IpProto::ICMP, IpProto::TCP, IpProto::UDP],
+            "5.6.7.8/32",
+            22..=22,
+        )];
+
+        let mut bart = BartFilter::default();
+        bart.insert("acl", rules.clone());
+        let mut map = pf::HashbrownFilter::default();
+        map.insert("acl".to_string(), rules);
+
+        for probe in [
+            info(IpProto::ICMP, "5.6.7.8", 0),  // ICMP granted IP -> both allow
+            info(IpProto::ICMP, "9.9.9.9", 0),  // ICMP other IP   -> both deny
+            info(IpProto::TCP, "5.6.7.8", 22),  // TCP in range    -> both allow
+            info(IpProto::TCP, "5.6.7.8", 443), // TCP out of range-> both deny
+            info(IpProto::UDP, "5.6.7.8", 22),  // UDP in range    -> both allow
+            info(IpProto::new(47), "5.6.7.8", 0), // GRE narrow port -> both deny
+        ] {
+            assert_eq!(
+                bart.can_access(&probe, []),
+                map.can_access(&probe, []),
+                "bart and map filters must agree for {probe:?}"
+            );
+        }
+    }
+
     prop_compose! {
         fn any_rule()(
             protos in proptest::collection::vec(any::<i64>(), 1..25),
@@ -486,21 +717,28 @@ mod test {
     proptest::proptest! {
         #[test]
         fn prop_basic(name: String, rule in any_rule()) {
-            let mut filter = BartFilter::default();
+            // Add TCP (a port-ful proto) to the rule's proto set so the self-match probe below can
+            // use the port-ful match path: a packet at the rule's port-range start self-matches. A
+            // random `any::<i64>()` proto from `any_rule` is usually an "other" protocol, which now
+            // matches IPs-only and only under an all-ports rule (Go `matchProtoAndIPsOnlyIfAllPorts`),
+            // so probing with the raw generated proto would no longer self-match a narrow-port rule.
+            // TCP exercises the same dst/src/proto bookkeeping while keeping the self-match valid.
+            let mut rule = rule;
+            rule.protos.push(IpProto::TCP);
 
+            let mut filter = BartFilter::default();
             filter.insert(&name, vec![rule.clone()]);
             filter.verify_integrity();
 
             if let Some(dst) = rule.dst.first() &&
             let Some(dst_pfx) = dst.ips.first() &&
-            let Some(src_pfx) = rule.src.pfxs.first() &&
-            let Some(proto) = rule.protos.first()
+            let Some(src_pfx) = rule.src.pfxs.first()
             {
                 let packet_info = PacketInfo {
                     dst: dst_pfx.addr(),
                     port: *dst.ports.start(),
                     src: src_pfx.addr(),
-                    ip_proto: *proto,
+                    ip_proto: IpProto::TCP,
                 };
                 let cap = rule.src.caps.iter().map(|cap| cap.as_str()).take(1).collect::<Vec<_>>();
 
