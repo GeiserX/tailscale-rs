@@ -104,6 +104,11 @@ pub struct Runtime {
     /// as [`exit_node_tx`](Self::exit_node_tx)) so that only [`Runtime::set_accept_routes`] can
     /// toggle it; the route updater and source filter re-read it via [`Env::accept_routes`].
     accept_routes_tx: watch::Sender<bool>,
+    /// Sender side of the accept-dns preference `watch` cell. Held privately here (same rationale as
+    /// [`accept_routes_tx`](Self::accept_routes_tx)) so that only [`Runtime::set_accept_dns`] can
+    /// toggle it; the MagicDNS responder re-reads it via [`Env::accept_dns`] when it rebuilds its
+    /// view (the republish that `set_accept_dns` triggers).
+    accept_dns_tx: watch::Sender<bool>,
     /// Receiver mirroring the *active* (resolved + fail-closed) exit node's stable id, fed by the
     /// route updater. Read by [`Runtime::status`] / [`Runtime::active_exit_node`] to report which
     /// exit node traffic is actually egressing through (vs. the merely-configured selector).
@@ -129,12 +134,12 @@ impl Runtime {
     ) -> Result<Self, Error> {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        // The exit-node selector and accept-routes preference are live `watch` cells so
-        // `Device::set_exit_node` / `set_accept_routes` can change them at runtime.
-        // `new_with_runtime_txs` returns each `Sender` (mutation capability) separately so they are
-        // retained privately on the `Runtime`, while only the `Receiver`s (the readers' contract)
-        // live on the cloned `Env`. Initial values come from `ForwarderConfig`.
-        let (env, exit_node_tx, accept_routes_tx) = Env::new_with_runtime_txs(
+        // The exit-node selector, accept-routes, and accept-dns preferences are live `watch` cells so
+        // `Device::set_exit_node` / `set_accept_routes` / `set_accept_dns` can change them at runtime.
+        // `new_with_runtime_txs` returns each `Sender` (mutation capability) grouped in `pref_cells`
+        // so they are retained privately on the `Runtime`, while only the `Receiver`s (the readers'
+        // contract) live on the cloned `Env`. Initial values come from `ForwarderConfig`.
+        let (env, pref_cells) = Env::new_with_runtime_txs(
             keys,
             shutdown_rx,
             env::ForwarderConfig::from_control_config(&config),
@@ -310,8 +315,9 @@ impl Runtime {
             netstack,
             env,
             shutdown: shutdown_tx,
-            exit_node_tx,
-            accept_routes_tx,
+            exit_node_tx: pref_cells.exit_node,
+            accept_routes_tx: pref_cells.accept_routes,
+            accept_dns_tx: pref_cells.accept_dns,
             active_exit_rx,
             state_rx,
             cap_grants_rx,
@@ -820,6 +826,44 @@ impl Runtime {
     /// Whether this node currently accepts peer-advertised subnet routes (`--accept-routes`).
     pub fn accept_routes(&self) -> bool {
         self.env.accept_routes()
+    }
+
+    /// Toggle whether this node accepts the tailnet's DNS configuration at runtime (the equivalent of
+    /// Go `tsnet`'s `LocalClient.EditPrefs(CorpDNS)` / `tailscale set --accept-dns`), without
+    /// recreating the device.
+    ///
+    /// Like [`set_accept_routes`](Self::set_accept_routes), `accept-dns` is a purely **local**
+    /// preference — it is never reported to control (no `Hostinfo` / MapRequest side), so this only
+    /// re-runs the local MagicDNS view rebuild. Updates the live cell, then asks the peer tracker to
+    /// re-broadcast the current peer set; the resulting `PeerState` rebuild re-applies the gate on the
+    /// MagicDNS responder (and the peerAPI DoH server that shares its view). When `false`, the
+    /// responder ignores the control-pushed DNS config and answers every query `REFUSED`, mirroring Go
+    /// applying an empty `dns.Config` when `CorpDNS` is off; flipping it back to `true` restores
+    /// serving from the still-current config (the real config is never destroyed — only gated at the
+    /// read site), so the OFF→ON restore is automatic.
+    pub async fn set_accept_dns(&self, accept: bool) -> Result<(), Error> {
+        // Update the live cell every reader borrows from (same primitive/rationale as set_accept_routes).
+        self.accept_dns_tx.send_replace(accept);
+
+        // Trigger an immediate view rebuild: the MagicDNS responder re-reads `Env::accept_dns()` when
+        // it handles a `PeerState`, so a re-broadcast re-applies the gate on both the netstack
+        // responder and the peerAPI DoH server (which share the view) without waiting for the next
+        // control/peer update. Mirrors `set_accept_routes`'s republish.
+        self.peer_tracker
+            .upgrade()
+            .ok_or(Error {
+                kind: ErrorKind::ActorGone,
+                target_actor: None,
+                message_ty: None,
+            })?
+            .ask(peer_tracker::RepublishState)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Whether this node currently accepts the tailnet's DNS configuration (`--accept-dns` / `CorpDNS`).
+    pub fn accept_dns(&self) -> bool {
+        self.env.accept_dns()
     }
 
     /// Change the set of subnet routes this node advertises at runtime (Go `tailscale set

@@ -21,7 +21,10 @@
 //! overlay data (the v6 overlay addr), as historically. AAAA for tailnet names is never forwarded
 //! to a recursive upstream regardless of the gate.
 //!
-//! - MagicDNS disabled (`dns_config == None` or `magic_dns == false`) => `REFUSED` for every query.
+//! - MagicDNS disabled (`dns_config == None` or `magic_dns == false`), OR the node does not accept
+//!   the tailnet DNS config ([`DnsView::accept_dns`] is `false`, i.e. `--accept-dns` / `CorpDNS`
+//!   off) => `REFUSED` for every query (the responder serves nothing, mirroring Go applying an empty
+//!   `dns.Config` when `CorpDNS` is off).
 //! - Unsupported qtype => `REFUSED` (never forwarded).
 //! - Malformed query => dropped (no response).
 
@@ -86,6 +89,16 @@ pub(crate) struct DnsView {
     /// overlay v6 address; with it ON, AAAA is answered from overlay data as historically. Set once
     /// from the runtime `Env` when the actor starts; never changes for the life of the runtime.
     pub(crate) enable_ipv6: bool,
+    /// Whether the tailnet's DNS configuration is accepted (`--accept-dns` / `CorpDNS`, from
+    /// [`Env::accept_dns`]). When `false`, [`decide`] refuses every query (the responder serves
+    /// nothing), mirroring Go applying an empty `dns.Config` when `CorpDNS` is off — so a node can
+    /// join for connectivity without taking over DNS.
+    ///
+    /// Unlike [`enable_ipv6`](DnsView::enable_ipv6) (snapshotted once at actor spawn), this is
+    /// runtime-settable via `Device::set_accept_dns`, so it is re-read from the live
+    /// [`Env::accept_dns`] cell on **every** view rebuild (the `StateUpdate` and `PeerState`
+    /// handlers), not just at spawn — otherwise a runtime toggle would never reach the served view.
+    pub(crate) accept_dns: bool,
 }
 
 impl DnsView {
@@ -289,8 +302,12 @@ pub(crate) fn decide(view: &DnsView, buf: &[u8]) -> Option<Decision> {
 
     let reply = |rcode, answers: &[RData]| Decision::Reply(encode_response(id, q, rcode, answers));
 
-    // Fail closed: MagicDNS off => serve nothing.
-    if !view.cfg.magic_dns {
+    // Fail closed: MagicDNS off, or the node doesn't accept the tailnet's DNS config
+    // (`--accept-dns` / `CorpDNS` is false) => serve nothing. The `accept_dns` gate mirrors Go
+    // applying an empty `dns.Config` when `CorpDNS` is off: the node ignores the control-pushed DNS
+    // config and refuses every query. This one read site covers the netstack responder, the peerAPI
+    // DoH server that shares the view, and (via `tun_actor::plan_intercept`) the TUN query path.
+    if !view.cfg.magic_dns || !view.accept_dns {
         return Some(reply(Rcode::Refused, &[]));
     }
 
@@ -642,6 +659,11 @@ pub struct MagicDnsActor {
     _joinset: JoinSet<()>,
     /// The latest view, shared with the answer loop.
     view_tx: watch::Sender<Arc<DnsView>>,
+    /// The runtime [`Env`], retained so each view rebuild (the `StateUpdate` / `PeerState` handlers)
+    /// can re-read the live [`Env::accept_dns`] cell. Unlike `enable_ipv6` (snapshotted once at
+    /// spawn), `accept_dns` is runtime-settable via `Device::set_accept_dns`, so it must be read at
+    /// rebuild time — not captured once — for a toggle to reach the served view.
+    env: Env,
 }
 
 impl kameo::Actor for MagicDnsActor {
@@ -657,11 +679,14 @@ impl kameo::Actor for MagicDnsActor {
         env.subscribe::<crate::route_updater::ActiveExitNode>(&slf)
             .await?;
 
-        // Seed the view with the runtime's IPv6 gate (default off). Subsequent control/peer updates
-        // clone-and-modify this view, so the flag — set once here from `Env` — is preserved for the
-        // life of the runtime and read by the AAAA answer path in `decide`.
+        // Seed the view with the runtime's IPv6 gate (default off) and the current accept-dns value.
+        // Subsequent control/peer updates clone-and-modify this view: `enable_ipv6` (set once here)
+        // is preserved, while `accept_dns` is re-read live from `Env` on every rebuild (it is
+        // runtime-settable). The seed value is moot — no query is served before the first
+        // StateUpdate — but seeding it keeps the pre-update view internally consistent.
         let (view_tx, view_rx) = watch::channel(Arc::new(DnsView {
             enable_ipv6: env.enable_ipv6,
+            accept_dns: env.accept_dns(),
             ..DnsView::default()
         }));
 
@@ -703,6 +728,7 @@ impl kameo::Actor for MagicDnsActor {
         Ok(Self {
             _joinset: joinset,
             view_tx,
+            env,
         })
     }
 }
@@ -715,10 +741,14 @@ impl Message<Arc<ts_control::StateUpdate>> for MagicDnsActor {
         update: Arc<ts_control::StateUpdate>,
         _ctx: &mut Context<Self, Self::Reply>,
     ) {
+        // Re-read the live accept-dns cell on every rebuild (it is runtime-settable via
+        // `Device::set_accept_dns`); `enable_ipv6` is preserved from the seed (set once at spawn).
+        let accept_dns = self.env.accept_dns();
         self.view_tx.send_modify(|view| {
             let mut next = (**view).clone();
             next.cfg = update.dns_config.clone().unwrap_or_default();
             next.self_node = update.node.clone();
+            next.accept_dns = accept_dns;
             *view = Arc::new(next);
         });
     }
@@ -728,9 +758,14 @@ impl Message<Arc<PeerState>> for MagicDnsActor {
     type Reply = ();
 
     async fn handle(&mut self, state: Arc<PeerState>, _ctx: &mut Context<Self, Self::Reply>) {
+        // Re-read the live accept-dns cell on every rebuild: `Device::set_accept_dns` triggers a
+        // `RepublishState` that lands here, so this is the path that re-applies the gate after a
+        // runtime toggle (covers the netstack responder AND the peerAPI DoH server sharing the view).
+        let accept_dns = self.env.accept_dns();
         self.view_tx.send_modify(|view| {
             let mut next = (**view).clone();
             next.peers = Some(state.peers.clone());
+            next.accept_dns = accept_dns;
             *view = Arc::new(next);
         });
     }
@@ -822,6 +857,7 @@ mod tests {
             self_node: None,
             exit_doh: None,
             enable_ipv6: false,
+            accept_dns: true,
         }
     }
 
@@ -936,6 +972,7 @@ mod tests {
             self_node: None,
             exit_doh: None,
             enable_ipv6: false,
+            accept_dns: true,
         };
         let buf = build_query(0x5A, &["ghost", "user", "ts", "net"], 28, 1);
 
@@ -982,6 +1019,32 @@ mod tests {
         let (_, rcode, ancount) = parse_header(&resp);
         assert_eq!(rcode, 5, "Refused");
         assert_eq!(ancount, 0);
+    }
+
+    #[test]
+    fn accept_dns_false_refuses_otherwise_answerable_query() {
+        // The accept-dns gate (Go `CorpDNS`): with `accept_dns == false` the node ignores the
+        // tailnet DNS config, so even a known peer name that would normally answer authoritatively is
+        // REFUSED (the responder serves nothing) — mirroring Go applying an empty `dns.Config`.
+        let mut view = view_with_peer();
+        assert!(view.cfg.magic_dns, "MagicDNS itself is on");
+        view.accept_dns = false;
+        let buf = build_query(0xDD, &["host", "user", "ts", "net"], 1, 1);
+
+        let resp = answer(&view, &buf).expect("answers");
+        let (_, rcode, ancount) = parse_header(&resp);
+        assert_eq!(rcode, 5, "Refused: accept_dns off ⇒ serve nothing");
+        assert_eq!(ancount, 0);
+
+        // Flip accept_dns back ON (the config was never destroyed, only gated): the same query now
+        // answers authoritatively — proving the OFF→ON restore is automatic.
+        view.accept_dns = true;
+        let resp = answer(&view, &buf).expect("answers");
+        let (_, rcode, ancount) = parse_header(&resp);
+        assert_eq!(rcode, 0, "NoError: accept_dns on ⇒ the known peer answers");
+        assert_eq!(ancount, 1);
+        let tail = &resp[resp.len() - 4..];
+        assert_eq!(tail, &[100, 64, 0, 1], "the peer's tailnet v4 is served");
     }
 
     #[test]
@@ -1071,6 +1134,7 @@ mod tests {
             self_node: None,
             exit_doh: None,
             enable_ipv6: false,
+            accept_dns: true,
         };
 
         // 100.64.0.9 is in CGNAT range but owned by no peer => NXDOMAIN, never a Forward.
@@ -1135,6 +1199,7 @@ mod tests {
             self_node: Some(test_node()),
             exit_doh: None,
             enable_ipv6: false,
+            accept_dns: true,
         };
         let buf = build_query(0x44, &["host", "user", "ts", "net"], 1, 1);
 
@@ -1281,6 +1346,7 @@ mod tests {
             self_node: None,
             exit_doh: None,
             enable_ipv6: false,
+            accept_dns: true,
         }
     }
 
@@ -1434,6 +1500,7 @@ mod tests {
             self_node: None,
             exit_doh: None,
             enable_ipv6: false,
+            accept_dns: true,
         };
         let buf = build_query(0x107, &["host", "user", "ts", "net"], 1, 1);
 

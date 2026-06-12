@@ -288,6 +288,7 @@ mod tests {
     fn cfg(forward_all_ports: bool, forward_exit_egress: bool) -> ForwarderConfig {
         ForwarderConfig {
             accept_routes: false,
+            accept_dns: true,
             exit_node: None,
             forward_routes: vec![],
             forward_tcp_ports: vec![],
