@@ -3,6 +3,7 @@ module tsr19kgen
 go 1.26.4
 
 require (
+	github.com/flynn/noise v1.1.0
 	github.com/fxamacker/cbor/v2 v2.9.0
 	github.com/hdevalence/ed25519consensus v0.2.0
 	golang.org/x/crypto v0.52.0

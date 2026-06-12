@@ -1,0 +1,22 @@
+{
+  "desc": "Noise_IK control transcript, fixed statics/ephemerals, empty payloads, fixed prologue",
+  "protocol_name": "Noise_IK_25519_ChaChaPoly_BLAKE2s",
+  "prologue_ascii": "Tailscale Control Protocol v109",
+  "prologue_hex": "5461696c7363616c6520436f6e74726f6c2050726f746f636f6c2076313039",
+  "init_static_priv_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+  "init_static_pub_hex": "a4e09292b651c278b9772c569f5fa9bb13d906b46ab68c9df9dc2b4409f8a209",
+  "resp_static_priv_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+  "resp_static_pub_hex": "ce8d3ad1ccb633ec7b70c17814a5c76ecd029685050d344745ba05870e587d59",
+  "init_ephem_priv_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+  "init_ephem_pub_hex": "5dfedd3b6bd47f6fa28ee15d969d5bb0ea53774d488bdaf9df1c6e0124b3ef22",
+  "resp_ephem_priv_hex": "0404040404040404040404040404040404040404040404040404040404040404",
+  "resp_ephem_pub_hex": "ac01b2209e86354fb853237b5de0f4fab13c7fcbf433a61c019369617fecf10b",
+  "msg1_hex": "5dfedd3b6bd47f6fa28ee15d969d5bb0ea53774d488bdaf9df1c6e0124b3ef224391bcfef3f1b0f051873c2103356110f8056ef928c4354783347c74dc7b71b745b99ea89a2aca15a0393bb6ae570a1fcd6a61036e3b5681526d01585d5c52bf",
+  "msg2_hex": "ac01b2209e86354fb853237b5de0f4fab13c7fcbf433a61c019369617fecf10bed19a2c480c9b718cd8af4020b0154b7",
+  "probe_ascii": "control-noise-probe",
+  "probe_hex": "636f6e74726f6c2d6e6f6973652d70726f6265",
+  "probe_ad_hex": "",
+  "tx_probe_sealed_hex": "75900508cbf6b97737f3ecde187ac64c8e6901ee7e514cf29af708c3bdb75335cc4a6e",
+  "rx_probe_sealed_hex": "19d2652f5998c738c1cd1038d4635d0ed39148f761e48a8f5d1224cc0aa5d0cd594bc9",
+  "handshake_hash_hex": "444c0e5610855da6fcc5feb9ba12daad9f452d802ca40628249b2fba7286ee1c"
+}
