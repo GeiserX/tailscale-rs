@@ -2,6 +2,24 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.29.0](https://github.com/GeiserX/tailscale-rs/compare/v0.28.3...v0.29.0) (2026-06-12)
+
+
+### Features
+
+* **runtime:** add accept_dns client preference gating the MagicDNS responder ([#124](https://github.com/GeiserX/tailscale-rs/issues/124)) ([427d5e0](https://github.com/GeiserX/tailscale-rs/commit/427d5e06d3b3cfdc1f755484cc330c5559b5a214))
+* **runtime:** add Device::cert_pair — export the ACME leaf+chain + key as PEM ([#129](https://github.com/GeiserX/tailscale-rs/issues/129)) ([b66eb5a](https://github.com/GeiserX/tailscale-rs/commit/b66eb5a01fdbe6ac91225b8a6a02fa1ae0c5af98))
+* **tunnel:** zero-pad transport payloads to a 16-byte boundary before sealing ([#122](https://github.com/GeiserX/tailscale-rs/issues/122)) ([db0a1fa](https://github.com/GeiserX/tailscale-rs/commit/db0a1fa4701514395de7fc200407d7ce327468cd))
+
+
+### Bug Fixes
+
+* **forwarder:** complete the exit SSRF guard (multicast/class-E) and cap concurrent UDP flows ([#117](https://github.com/GeiserX/tailscale-rs/issues/117)) ([a6c1f22](https://github.com/GeiserX/tailscale-rs/commit/a6c1f22b98021a65e7d4eb69698951a434ad679d))
+* **netstack:** propagate TCP half-close via a ShutdownWrite command ([#120](https://github.com/GeiserX/tailscale-rs/issues/120)) ([ba306d9](https://github.com/GeiserX/tailscale-rs/commit/ba306d9c90494f112242170126301b3a27c96d76))
+* **runtime:** route the union of peer AllowedIPs into the TUN host FIB ([#127](https://github.com/GeiserX/tailscale-rs/issues/127)) ([1ed5303](https://github.com/GeiserX/tailscale-rs/commit/1ed53036594c130e691c7a2dd7bbf43d38552b71))
+* **tunnel:** jitter handshake-initiation retransmits like wireguard-go ([#123](https://github.com/GeiserX/tailscale-rs/issues/123)) ([c7d27b4](https://github.com/GeiserX/tailscale-rs/commit/c7d27b45e431208bc9220cf7b28561d8c1fccd38))
+* **tunnel:** match wireguard-go anti-replay window and message-count ceilings ([#121](https://github.com/GeiserX/tailscale-rs/issues/121)) ([9b5a858](https://github.com/GeiserX/tailscale-rs/commit/9b5a8588698b7fa92b16c5e890044b13e9d2aad4))
+
 ## [0.28.3](https://github.com/GeiserX/tailscale-rs/compare/v0.28.2...v0.28.3) (2026-06-12)
 
 
