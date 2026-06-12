@@ -192,7 +192,16 @@ where
                     tracing::trace!(payload = ?pong.payload, "pong");
                 }
                 FrameType::PeerGone => {
-                    let (gone, _rest) = frame.as_type::<PeerGone>().unwrap();
+                    // The body is server-originated and only length-capped (no minimum), so a
+                    // malicious/buggy/MITM server can send a body shorter than `PeerGone` (33 bytes:
+                    // 32-byte key + 1-byte reason). `as_type` returns `None` then; a raw `.unwrap()`
+                    // would panic and unwind the DERP region task, severing the relay for DERP-only
+                    // peers. Drop the short frame and keep reading, exactly as Go's `derp_client`
+                    // does (`if n < keyLen { logf; continue }`) and as the `Ping` arm above.
+                    let Some((gone, _rest)) = frame.as_type::<PeerGone>() else {
+                        tracing::warn!("dropping short derp peer-gone frame");
+                        continue;
+                    };
 
                     tracing::debug!(
                         peer = %gone.key,
@@ -232,7 +241,14 @@ where
                     }
                 }
                 FrameType::RecvPacket => {
-                    let (recv, payload) = frame.as_type::<frame::RecvPacket>().unwrap();
+                    // Server-originated, length-capped but with no minimum, so a body shorter than
+                    // the 32-byte source `NodePublicKey` makes `as_type` return `None`. A raw
+                    // `.unwrap()` would panic and unwind the DERP region task; instead drop the
+                    // short packet and keep reading, mirroring Go's `if n < keyLen { logf; continue }`.
+                    let Some((recv, payload)) = frame.as_type::<frame::RecvPacket>() else {
+                        tracing::warn!("dropping short derp recv-packet frame");
+                        continue;
+                    };
 
                     return Ok((recv.src, payload.into()));
                 }
@@ -477,6 +493,45 @@ mod tests {
             b"hello-derp",
             "delivered packet carries the payload"
         );
+    }
+
+    /// Regression (tsr-8w0): a `RecvPacket` frame whose body is shorter than the 32-byte source key
+    /// must be DROPPED, not panic the recv loop. The body is server-originated and only length-
+    /// capped (no minimum), so a malicious/buggy/MITM DERP server can send a 0–31-byte RecvPacket;
+    /// the old `as_type().unwrap()` panicked and unwound the DERP region task (severing the relay for
+    /// DERP-only peers). The loop must skip it and keep reading — here a valid packet follows and is
+    /// delivered, proving skip-then-continue (Go's `if n < keyLen { logf; continue }`).
+    #[tokio::test]
+    async fn short_recv_packet_is_dropped_then_following_packet_delivered() {
+        let src: NodePublicKey = [9u8; 32].into();
+        let mut good = Vec::new();
+        good.extend_from_slice(&src.to_bytes());
+        good.extend_from_slice(b"after-short");
+        let client = client_fed(&[
+            // 5-byte body: far shorter than the 32-byte src key → as_type None.
+            (FrameType::RecvPacket, &[1u8, 2, 3, 4, 5]),
+            (FrameType::RecvPacket, &good),
+        ])
+        .await;
+        let (got_src, pkt) = client
+            .recv_one()
+            .await
+            .expect("a valid packet after a short one must still be delivered");
+        assert_eq!(got_src, src);
+        assert_eq!(pkt.as_ref(), b"after-short");
+    }
+
+    /// Regression (tsr-8w0): a `PeerGone` frame shorter than its 33-byte body (32-byte key + 1-byte
+    /// reason) must be dropped, not panic. Feed a too-short PeerGone then EOF: the loop must skip it
+    /// and surface the EOF (`UnexpectedEof`), proving the short PeerGone was not fatal.
+    #[tokio::test]
+    async fn short_peer_gone_is_dropped_not_fatal() {
+        // 10-byte body: shorter than the 33-byte PeerGone → as_type None.
+        let client = client_fed(&[(FrameType::PeerGone, &[0u8; 10])]).await;
+        match client.recv_one().await {
+            Err(Error::IoFailure(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+            other => panic!("expected EOF after a skipped short PeerGone frame, got {other:?}"),
+        }
     }
 
     /// A region whose only server has both IP families disabled: `dial_region_tls` returns
