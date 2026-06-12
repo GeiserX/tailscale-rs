@@ -44,7 +44,11 @@ use kameo::{
     message::{Context, Message},
 };
 use netstack::{CreateSocket, netcore::Channel};
-use tokio::{sync::watch, task::JoinSet, time::timeout};
+use tokio::{
+    sync::{Semaphore, watch},
+    task::JoinSet,
+    time::timeout,
+};
 use ts_control::{DnsConfig, DnsResolver, Node};
 use ts_dns_wire::{Name, QType, RData, Rcode, decode_query, encode_response};
 
@@ -56,6 +60,17 @@ use crate::{
 
 /// How long to wait for an upstream resolver to answer a forwarded query before giving up.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
+/// Cap on concurrent in-flight forwarded queries on the local `100.100.100.100:53` responder.
+///
+/// Each forward is spawned onto a task that holds an overlay UDP socket until the upstream answers
+/// or [`UPSTREAM_TIMEOUT`] elapses. Without a cap, a local/tailnet client spraying distinct
+/// forwardable names opens unbounded concurrent overlay sockets + tasks (a resource-exhaustion DoS
+/// on a slow/black-holed upstream, since each lingers for the full timeout). Bound it the same way
+/// the peerAPI DoH server bounds its request handlers ([`crate::peerapi`]'s `MAX_INFLIGHT`): acquire
+/// a permit before spawning and drop the query fail-closed when saturated. A dropped DNS query is a
+/// benign outcome — the stub resolver simply retries or times out — and Go's resolver likewise
+/// bounds outstanding forwards rather than spawning without limit.
+const MAX_INFLIGHT_FORWARDS: usize = 512;
 /// Cap on a forwarded upstream response we read into memory (a single UDP datagram).
 ///
 /// Matches Go's forwarder read buffer (`maxResponseBytes`, ~4 KiB). The client's query is forwarded
@@ -658,6 +673,9 @@ async fn serve(
 ) {
     let socket = Arc::new(socket);
     let mut forwards = JoinSet::new();
+    // Bounds concurrent in-flight forwards (see `MAX_INFLIGHT_FORWARDS`); a permit is held for the
+    // lifetime of each spawned forward task and released on completion.
+    let inflight = Arc::new(Semaphore::new(MAX_INFLIGHT_FORWARDS));
     loop {
         let (src, buf) = match socket.recv_from_bytes().await {
             Ok(pkt) => pkt,
@@ -692,9 +710,23 @@ async fn serve(
                 } else {
                     RecursivePlan::Udp(upstreams)
                 };
+                // Fail closed at the in-flight cap: drop the query (the stub resolver retries or
+                // times out) rather than spawn an unbounded task that pins an overlay socket for up
+                // to UPSTREAM_TIMEOUT. The permit is moved into the task as a named `_permit` binding
+                // (NOT `let _ =`, which would drop it immediately) so it is released only when the
+                // task body completes.
+                let Ok(permit) = inflight.clone().try_acquire_owned() else {
+                    tracing::warn!(
+                        %src,
+                        max = MAX_INFLIGHT_FORWARDS,
+                        "magic dns drop: at max in-flight forwarded queries"
+                    );
+                    continue;
+                };
                 let socket = socket.clone();
                 let channel = channel.clone();
                 forwards.spawn(async move {
+                    let _permit = permit;
                     let resp = match plan {
                         RecursivePlan::Udp(upstreams) => {
                             forward_query(&channel, &upstreams, &query, nxdomain).await
@@ -711,7 +743,9 @@ async fn serve(
             }
         }
 
-        // Reap finished forward tasks without blocking.
+        // Reap finished forward tasks without blocking. The unreaped completed-handle backlog is
+        // bounded by MAX_INFLIGHT_FORWARDS (a task spawns only after acquiring a permit, and there
+        // are at most that many), so this bounds JoinSet memory too — not just the reap cadence.
         while forwards.try_join_next().is_some() {}
     }
 }
@@ -1587,6 +1621,92 @@ mod tests {
                 panic!("an off-tailnet non-IN-class query must forward, not reply")
             }
         }
+    }
+
+    /// The local responder bounds concurrent in-flight forwards: `serve` acquires one
+    /// `MAX_INFLIGHT_FORWARDS` permit per spawned forward task and drops the query fail-closed when
+    /// the pool is exhausted (a client spraying forwardable names can't open unbounded overlay
+    /// sockets). This pins the gating semantics `serve` relies on — drained pool refuses a new
+    /// permit; releasing one restores capacity — and the cap constant itself. (The async `serve`
+    /// loop has no netstack-free test seam, so the semaphore behavior is exercised directly here, the
+    /// same `Arc<Semaphore>::try_acquire_owned` the loop uses.)
+    #[test]
+    fn forward_inflight_cap_fails_closed_when_saturated() {
+        use std::sync::Arc;
+
+        use tokio::sync::Semaphore;
+
+        let inflight = Arc::new(Semaphore::new(MAX_INFLIGHT_FORWARDS));
+
+        // Drain every permit (one per concurrently in-flight forward).
+        let mut held = Vec::with_capacity(MAX_INFLIGHT_FORWARDS);
+        for _ in 0..MAX_INFLIGHT_FORWARDS {
+            held.push(
+                inflight
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("permits available below the cap"),
+            );
+        }
+
+        // At the cap, the next forward is refused — `serve` would drop the query, not spawn.
+        assert!(
+            inflight.clone().try_acquire_owned().is_err(),
+            "a saturated forward pool must refuse a new permit (fail closed)"
+        );
+
+        // Completing an in-flight forward releases its permit and restores capacity.
+        drop(held.pop());
+        assert!(
+            inflight.clone().try_acquire_owned().is_ok(),
+            "releasing a permit must let the next forward proceed"
+        );
+    }
+
+    /// A permit moved into a spawned forward task (the `let _permit = permit;` shape `serve` uses)
+    /// must stay held for the *whole* task body — across the `.await` on the upstream — and release
+    /// only when the task completes. This guards the regression the saturation test above can't see:
+    /// "tidying" `let _permit = permit;` to `let _ = permit;` would drop the permit immediately,
+    /// re-opening unbounded concurrency while leaving the synchronous drain/restore test green. Here a
+    /// 1-permit pool is consumed by a task that holds it across a yield; the pool must read empty
+    /// while the task runs and refill once it finishes.
+    #[tokio::test]
+    async fn forward_permit_is_held_for_the_task_lifetime_not_dropped_early() {
+        use std::sync::Arc;
+
+        use tokio::sync::Semaphore;
+
+        let inflight = Arc::new(Semaphore::new(1));
+        let permit = inflight
+            .clone()
+            .try_acquire_owned()
+            .expect("the sole permit is available");
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            // Same shape as `serve`'s spawned forward: the permit is a named binding moved into the
+            // task, so it lives until the body ends — not dropped at the `let`.
+            let _permit = permit;
+            started_tx.send(()).unwrap();
+            // Stand in for the `.await` on the upstream forward.
+            release_rx.await.unwrap();
+        });
+
+        started_rx.await.unwrap();
+        // While the task runs, the permit it moved in is still held — the pool is empty.
+        assert!(
+            inflight.clone().try_acquire_owned().is_err(),
+            "a permit moved into a running task must stay held across its await"
+        );
+
+        // Let the task finish; its permit drops with the body and capacity returns.
+        release_tx.send(()).unwrap();
+        task.await.unwrap();
+        assert!(
+            inflight.clone().try_acquire_owned().is_ok(),
+            "the permit must be released once the task body completes"
+        );
     }
 
     #[test]
