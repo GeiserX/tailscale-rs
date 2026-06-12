@@ -31,3 +31,8 @@ tailscale.h
 # Cross-lane working docs — intentionally untracked (never commit; they carry working state)
 docs/COORDINATE.md
 docs/GOAL.md
+
+# Local research working docs — deviation-hunt notes, never committed
+docs/research/
+docs/AUTOPILOT-WORKLOG.md
+docs/DEFERRED-QUESTIONS.md
