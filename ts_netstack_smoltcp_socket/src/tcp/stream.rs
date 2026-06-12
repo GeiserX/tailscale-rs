@@ -245,6 +245,20 @@ impl TcpStream {
                             )
                             .await?;
 
+                        // A reaped socket (tsr-9ue: the netstack autonomously closed + freed an
+                        // idle/dead accepted stream) answers a first-touch `Recv` with
+                        // `missing_socket`. Surface it as a clean end-of-stream — an empty `Bytes`,
+                        // exactly like `Finished` — so it reads as a normal `Ok(0)` EOF rather than
+                        // a confusing generic internal `io::Error`.
+                        if matches!(
+                            resp,
+                            netcore::Response::Error(netcore::Error::Internal(
+                                netcore::InternalErrorKind::BadSocketHandle
+                            ))
+                        ) {
+                            return Ok(Bytes::new());
+                        }
+
                         match resp.try_into()? {
                             tcp::stream::Response::Recv { buf } => Ok(buf),
                             tcp::stream::Response::Finished => Ok(Bytes::new()),
@@ -293,6 +307,20 @@ impl TcpStream {
                         let resp = sender
                             .request(Some(handle), tcp::stream::Command::Send { buf: b })
                             .await?;
+
+                        // A reaped socket (tsr-9ue) answers a first-touch `Send` with
+                        // `missing_socket`. Writing to a torn-down connection is POSIX
+                        // `ECONNRESET`, so remap to `ConnectionReset` — `From<Error> for
+                        // io::Error` then yields `ErrorKind::ConnectionReset` — instead of letting
+                        // it fall through `try_response_as!` as a generic internal error.
+                        if matches!(
+                            resp,
+                            netcore::Response::Error(netcore::Error::Internal(
+                                netcore::InternalErrorKind::BadSocketHandle
+                            ))
+                        ) {
+                            return Err(netcore::Error::ConnectionReset);
+                        }
 
                         netcore::try_response_as!(resp, tcp::stream::Response::Sent { n });
                         Ok(n)
@@ -393,6 +421,94 @@ impl tokio::io::AsyncWrite for TcpStream {
     ) -> core::task::Poll<std::io::Result<()>> {
         self.shutdown_write();
         core::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(feature = "tokio")]
+#[cfg(test)]
+mod reaped_socket_mapping_tests {
+    use core::net::SocketAddr;
+
+    use netcore::{HasChannel, Netstack, smoltcp::iface::SocketHandle, udp};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::TcpStream;
+
+    /// Spawn a real netstack on a background thread that continuously processes commands, and return
+    /// a `TcpStream` wired to a freed `SocketHandle`. The handle comes from a UDP bind that is then
+    /// closed, so its slot is empty: every TCP command the stream issues for it hits
+    /// `get_socket_mut!`'s existence check (which fails) and is answered `missing_socket` — exactly
+    /// the post-reap (tsr-9ue) state seen from the consumer's side. The driver thread answers the
+    /// stream's async `Recv`/`Send` so the awaited future actually resolves.
+    fn stream_over_reaped_handle() -> TcpStream {
+        let mut stack = Netstack::new(
+            netcore::Config::default(),
+            netcore::smoltcp::time::Instant::ZERO,
+        );
+        let chan = stack.command_channel();
+
+        // Drive the stack from a background thread so EVERY command (the setup bind/close AND the
+        // stream's later async `Recv`/`Send`) is answered. `request_blocking` below blocks on its
+        // response, so the driver must already be running or it would deadlock.
+        std::thread::spawn(move || {
+            while let Ok(cmd) = stack.wait_for_cmd_blocking(None) {
+                stack.process_one_cmd(cmd);
+            }
+        });
+
+        // A real handle value from a UDP bind (answered by the driver thread)...
+        let handle: SocketHandle = match chan
+            .request_blocking(
+                None,
+                udp::Command::Bind {
+                    endpoint: SocketAddr::from(([127, 0, 0, 1], 9200)),
+                },
+            )
+            .expect("channel open")
+        {
+            netcore::Response::Udp(udp::Response::Bound { handle, .. }) => handle,
+            other => panic!("expected Bound, got {other:?}"),
+        };
+        // ...then close it so the slot is freed: the handle now refers to nothing — the reaped state
+        // a first-touch TCP command then sees as `missing_socket`.
+        assert!(matches!(
+            chan.request_blocking(Some(handle), udp::Command::Close)
+                .expect("channel open"),
+            netcore::Response::Ok
+        ));
+
+        let local = SocketAddr::from(([127, 0, 0, 1], 50100));
+        let remote = SocketAddr::from(([127, 0, 0, 1], 9200));
+        TcpStream::new(chan, handle, remote, local)
+    }
+
+    /// Part 3: a reaped socket's `Recv` resolves to `missing_socket`, which `poll_read` maps to a
+    /// clean end-of-stream — `Ok(0)` — not a generic internal `io::Error`.
+    #[tokio::test]
+    async fn poll_read_on_reaped_socket_is_eof() {
+        let mut stream = stream_over_reaped_handle();
+        let mut buf = [0u8; 64];
+        let n = stream
+            .read(&mut buf)
+            .await
+            .expect("read on a reaped socket must be Ok(0), not an error");
+        assert_eq!(n, 0, "a reaped socket must read as EOF (Ok(0))");
+    }
+
+    /// Part 3: a reaped socket's `Send` resolves to `missing_socket`, which `poll_write` maps to
+    /// `ErrorKind::ConnectionReset` (POSIX `ECONNRESET` for writing to a torn-down connection).
+    #[tokio::test]
+    async fn poll_write_on_reaped_socket_is_connection_reset() {
+        let mut stream = stream_over_reaped_handle();
+        let err = stream
+            .write(b"payload")
+            .await
+            .expect_err("write to a reaped socket must error");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::ConnectionReset,
+            "writing to a reaped socket must surface as ConnectionReset"
+        );
     }
 }
 

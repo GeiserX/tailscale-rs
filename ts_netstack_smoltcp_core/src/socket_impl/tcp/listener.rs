@@ -45,7 +45,10 @@ pub struct TcpListenerState {
     local_endpoint: SocketAddr,
 
     /// Socket currently in listening state and waiting for a new connection.
-    current_socket_handle: SocketHandle,
+    ///
+    /// `pub(super)` so the sibling `stream` module's `reap_orphaned_closed_tcp` (tsr-9ue) can read
+    /// the listener-owned handles it must exclude from the orphan reap.
+    pub(super) current_socket_handle: SocketHandle,
 
     /// Sockets which have transitioned from `LISTEN` to `SYN-RECEIVED` (half-open) and are waiting
     /// to become `ESTABLISHED`; in other words, the socket received a `SYN` and replied with a
@@ -55,7 +58,9 @@ pub struct TcpListenerState {
     /// replies with a `RST` rather than an `ACK`](https://www.rfc-editor.org/rfc/rfc793#page-70).
     /// Sockets that return to `LISTEN` should be removed from this queue/dropped (not `close()`d);
     /// the listener has already opened a new socket in the `LISTEN` state.
-    half_open_queue: VecDeque<SocketHandle>,
+    ///
+    /// `pub(super)`: see [`Self::current_socket_handle`] (excluded from the tsr-9ue orphan reap).
+    pub(super) half_open_queue: VecDeque<SocketHandle>,
 
     /// Sockets which have transitioned from `SYN-RECEIVED` (half-open) to `ESTABLISHED`
     /// (full-open); in other words, the socket has received an `ACK` from the remote completing the
@@ -64,7 +69,9 @@ pub struct TcpListenerState {
     /// dequeue a socket and return it to become a [`TcpStream`].
     ///
     /// [`TcpStream`]: [::ts_netstack_smoltcp_socket::tcp::stream::TcpStream]
-    accept_queue: VecDeque<SocketHandle>,
+    ///
+    /// `pub(super)`: see [`Self::current_socket_handle`] (excluded from the tsr-9ue orphan reap).
+    pub(super) accept_queue: VecDeque<SocketHandle>,
 }
 
 impl Netstack {
