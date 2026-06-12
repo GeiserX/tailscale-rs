@@ -2,7 +2,7 @@ use alloc::{collections::BTreeMap, sync::Arc};
 
 use futures_util::{Stream, StreamExt};
 use tokio::{
-    sync::{broadcast, mpsc},
+    sync::{broadcast, mpsc, watch},
     task::JoinSet,
 };
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
@@ -53,11 +53,20 @@ impl AsyncControlClient {
     ///
     /// The second element of the return value is a netmap stream which started listening
     /// _before_ the client connected, i.e. it will not miss any updates from control.
+    ///
+    /// `auth_url_tx` is the embedder-owned "current pending re-auth URL" cell: if the live
+    /// map-poll loop hits a mid-session re-auth (control returns
+    /// [`MachineNotAuthorized`](crate::Error::MachineNotAuthorized) on a re-register because the
+    /// node key expired or was revoked), [`run`] publishes that URL here without tearing the loop
+    /// down, so the embedder can prompt the user to re-authorize while registration keeps retrying.
+    /// The caller creates the channel and keeps the [`Receiver`](watch::Receiver) (this crate must
+    /// not depend on the embedder's device-state types, so the cell carries a bare `Option<Url>`).
     #[tracing::instrument(skip_all, fields(control_url = %config.server_url))]
     pub async fn connect(
         config: &crate::Config,
         node_keys: &ts_keys::NodeState,
         auth_key: Option<&str>,
+        auth_url_tx: watch::Sender<Option<Url>>,
     ) -> Result<
         (
             Self,
@@ -98,6 +107,7 @@ impl AsyncControlClient {
                     node_keys.clone(),
                     auth_key,
                     config,
+                    auth_url_tx,
                 )
                 .await
             }
@@ -348,6 +358,54 @@ fn reconnect_delay_after_poll(
     backoff.next_delay(rng)
 }
 
+/// Surface a mid-session re-auth URL to the embedder without disturbing the retry loop.
+///
+/// On a live map-poll re-register, control returning [`Error::MachineNotAuthorized`] means the
+/// node key lapsed (expiry/revoke) and the user must re-authorize at the carried URL. Unlike the
+/// initial-registration path (which the runtime's `check_auth` loop already surfaces), the live
+/// [`run`] loop only logs and backs off, dropping the URL — so we publish it into the
+/// embedder-owned `auth_url_tx` cell here (→ the runtime maps it to its "needs login" state). The
+/// caller still propagates the error so [`run`] backs off and retries; a later successful
+/// re-register clears the state for free (Go's `authRoutine` keeps `urlToVisit` and keeps polling).
+///
+/// **Only `MachineNotAuthorized` sets the cell.** `MachineNotAuthorized(None)` (no auth URL on
+/// offer) maps upstream to [`Error::Internal`]`(MachineAuthorization, _)`, not this variant, so it
+/// correctly does *not* set a (nonexistent) URL. The write is sticky via
+/// [`send_if_modified`](watch::Sender::send_if_modified): the cell is updated only when the URL
+/// actually differs from its current value, so a re-auth URL that persists across several failed
+/// re-register attempts does not thrash the cell or wake the runtime's bridge spuriously.
+///
+/// Factored out of [`run_once`] so this classify-then-surface decision is unit-testable against a
+/// plain `watch` channel without the real network round-trip [`crate::tokio::register`] performs.
+fn surface_reauth_url(err: &Error, auth_url_tx: &watch::Sender<Option<Url>>) {
+    if let Error::MachineNotAuthorized(url) = err {
+        auth_url_tx.send_if_modified(|current| {
+            if current.as_ref() == Some(url) {
+                false
+            } else {
+                *current = Some(url.clone());
+                true
+            }
+        });
+    }
+}
+
+/// Clear any pending re-auth URL (set the cell back to `None`), used when a re-register succeeds or
+/// a poll delivers a frame — both prove the node is authorized again so the surfaced URL is stale.
+/// Sticky `send_if_modified` so an already-`None` cell never wakes the runtime bridge. Clearing at
+/// register-success (rather than only at stream end) is what prevents a recovering poll from leaving
+/// a stale `Some(url)` for the bridge to re-read and clobber the netmap's `Running` flip with.
+fn clear_reauth_url(auth_url_tx: &watch::Sender<Option<Url>>) {
+    auth_url_tx.send_if_modified(|current| {
+        if current.is_some() {
+            *current = None;
+            true
+        } else {
+            false
+        }
+    });
+}
+
 pub async fn run(
     state_tx: broadcast::Sender<Arc<StateUpdate>>,
     mut command_rx: mpsc::Receiver<Command>,
@@ -355,6 +413,7 @@ pub async fn run(
     node_keys: ts_keys::NodeState,
     auth_key: Option<String>,
     config: crate::Config,
+    auth_url_tx: watch::Sender<Option<Url>>,
 ) {
     let mut dialer = ControlDialer::default();
     let mut session = MapSession::default();
@@ -375,8 +434,19 @@ pub async fn run(
             &mut dialer,
             &mut session,
             &mut received_frame,
+            &auth_url_tx,
         )
         .await;
+
+        // A poll that delivered any frame proves the connect→register→poll path works again, so a
+        // re-auth URL surfaced by an earlier failed re-register is stale: clear the cell. The
+        // primary clear is at register-success above (so the cell empties before the bridge can
+        // re-read a stale `Some(url)` on recovery); this is a secondary clear for the case where the
+        // stream itself delivered frames after a register that did not need re-auth. Sticky
+        // `send_if_modified` so we never wake the bridge unless the cell actually changes.
+        if received_frame {
+            clear_reauth_url(&auth_url_tx);
+        }
 
         // Back off before every reconnect, on BOTH the clean-EOF and error paths — Go's
         // `mapRoutine` runs `bo.BackOff(ctx, err)` after every poll regardless of how it ended.
@@ -420,6 +490,7 @@ async fn run_once(
     control_dialer: &mut ControlDialer,
     session: &mut MapSession,
     received_frame: &mut bool,
+    auth_url_tx: &watch::Sender<Option<Url>>,
 ) -> Result<(), Error> {
     let h2_client = control_dialer
         .full_connect_next(
@@ -429,7 +500,25 @@ async fn run_once(
         )
         .await?;
 
-    crate::tokio::register(config, control_url, auth_key, node_keys, &h2_client).await?;
+    // Re-register on every reconnect. On a mid-session re-auth (key expiry/revoke) control answers
+    // `MachineNotAuthorized(Some(url))`: surface that URL to the embedder (→ "needs login") via
+    // `surface_reauth_url`, then still propagate the error so `run` backs off and retries — Go's
+    // `authRoutine` keeps the URL and keeps polling, and a later successful re-register recovers.
+    match crate::tokio::register(config, control_url, auth_key, node_keys, &h2_client).await {
+        Ok(()) => {
+            // Re-register succeeded — clear any pending re-auth URL NOW (not at stream end), so a
+            // recovering poll empties the cell BEFORE the runtime bridge can wake and re-read a
+            // stale `Some(url)`. Without this, the bridge could clobber the netmap's `Running` flip
+            // back to `NeedsLogin` on recovery (a recovered node would show "needs login" until the
+            // next keep-alive).
+            clear_reauth_url(auth_url_tx);
+        }
+        Err(e) => {
+            let err = Error::from(e);
+            surface_reauth_url(&err, auth_url_tx);
+            return Err(err);
+        }
+    }
 
     let client_name = config.format_client_name();
     // Advertise-side VIP services: hash the validated hosted-service set into
@@ -800,5 +889,94 @@ mod tests {
             "a poll that delivered a frame resets to the immediate (n=0) reconnect"
         );
         assert_eq!(backoff.n, 1, "reset then one draw leaves the counter at 1");
+    }
+
+    fn auth_url() -> Url {
+        "https://login.example/a/abc123".parse().unwrap()
+    }
+
+    /// A mid-session `MachineNotAuthorized(url)` sets the re-auth cell to `Some(url)` — the exact
+    /// drop the bug fixes (the live `run` loop used to discard this URL and only log+backoff).
+    #[test]
+    fn mid_session_machine_not_authorized_sets_auth_url_cell() {
+        let (tx, rx) = watch::channel(None);
+        let url = auth_url();
+
+        surface_reauth_url(&Error::MachineNotAuthorized(url.clone()), &tx);
+
+        assert_eq!(*rx.borrow(), Some(url));
+    }
+
+    /// `MachineNotAuthorized(None)` (control offered no auth URL) maps upstream to
+    /// `Error::Internal(MachineAuthorization, _)`, NOT `Error::MachineNotAuthorized`, so the helper
+    /// must leave the cell untouched. Built from the *exact* upstream mapping (register.rs
+    /// `From<RegistrationError> for Error`) so this stays honest if that mapping ever changes.
+    #[test]
+    fn machine_not_authorized_none_does_not_set_url_cell() {
+        let (tx, rx) = watch::channel(None);
+        let err =
+            Error::from(crate::tokio::register::RegistrationError::MachineNotAuthorized(None));
+        // Confirm the mapping is the non-URL internal variant (the precondition for the assertion).
+        assert!(matches!(
+            err,
+            Error::Internal(crate::InternalErrorKind::MachineAuthorization, _)
+        ));
+
+        surface_reauth_url(&err, &tx);
+
+        assert_eq!(
+            *rx.borrow(),
+            None,
+            "no auth URL on offer must not set the cell"
+        );
+    }
+
+    /// A non-auth error (e.g. a transient network failure) must never set the cell either — only
+    /// `MachineNotAuthorized` is a re-auth signal.
+    #[test]
+    fn non_auth_error_does_not_set_url_cell() {
+        let (tx, rx) = watch::channel(None);
+
+        surface_reauth_url(&Error::NetworkError(crate::Operation::Registration), &tx);
+
+        assert_eq!(*rx.borrow(), None);
+    }
+
+    /// The clear path: a re-register success (or a poll that delivered a frame) means a
+    /// previously-surfaced re-auth URL is stale, so `clear_reauth_url` resets the cell to `None`.
+    /// This is the recovery half of the fix — clearing at register-success (run_once's `Ok` arm)
+    /// empties the cell before the runtime bridge can re-read a stale `Some(url)` and clobber the
+    /// netmap's `Running` flip back to `NeedsLogin` (the review's recovery-race finding).
+    #[test]
+    fn clear_reauth_url_resets_a_pending_url() {
+        let (tx, rx) = watch::channel(Some(auth_url()));
+        clear_reauth_url(&tx);
+        assert_eq!(*rx.borrow(), None);
+    }
+
+    /// Clearing an already-`None` cell is a no-op that does NOT notify (so the runtime bridge isn't
+    /// woken spuriously on every frame of a healthy, never-deauthorized session).
+    #[test]
+    fn clear_reauth_url_on_empty_cell_does_not_notify() {
+        let (tx, rx) = watch::channel::<Option<Url>>(None);
+        clear_reauth_url(&tx);
+        // No change was published, so the receiver sees nothing new.
+        assert!(!rx.has_changed().unwrap());
+        assert_eq!(*rx.borrow(), None);
+    }
+
+    /// Recovery sequence at the cell level: surface a URL (failed re-register), then clear it
+    /// (the next re-register succeeds). The terminal cell state is `None`, so when the bridge next
+    /// reads it there is no stale `Some(url)` to re-assert `NeedsLogin` from.
+    #[test]
+    fn surface_then_clear_leaves_cell_empty() {
+        let (tx, rx) = watch::channel(None);
+        let url = auth_url();
+
+        surface_reauth_url(&Error::MachineNotAuthorized(url.clone()), &tx);
+        assert_eq!(*rx.borrow(), Some(url));
+
+        clear_reauth_url(&tx); // models run_once's `Ok(())` arm on the recovering poll
+        assert_eq!(*rx.borrow(), None);
     }
 }

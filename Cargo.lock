@@ -6524,10 +6524,12 @@ dependencies = [
  "geiserx_ts_control",
  "geiserx_ts_derp",
  "geiserx_ts_netcheck",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "tracing-tracy",
  "tracy-client",
+ "url",
 ]
 
 [[package]]

@@ -794,6 +794,46 @@ mod tests {
         drop((state_tx, peer_tx, shutdown_tx));
     }
 
+    /// Mid-session re-auth, end to end through the bus: control returns `MachineNotAuthorized` on a
+    /// live re-register, the control client surfaces the URL, the runtime bridge sets
+    /// [`DeviceState::NeedsLogin`] — which the bus turns into a `browse_to_url` event — and then a
+    /// successful re-register flips the device back to `Running`, clearing `browse_to_url`. This is
+    /// the user-visible contract of the fix (the dropped re-auth URL now reaches the embedder, and
+    /// goes away once the node recovers), exercised over the same `state_tx` the bridge writes.
+    #[tokio::test]
+    async fn mid_session_reauth_surfaces_browse_to_url_then_clears() {
+        // Subscribe with INITIAL_STATE so the first `next()` (the snapshot) is the barrier proving
+        // the bus task is in its streaming loop before we drive transitions.
+        let (state_tx, _p, _b, _sd, mut w) = harness(
+            NotifyWatchOpt::INITIAL_STATE,
+            DeviceState::Running,
+            Vec::new(),
+        );
+        let snap = w.next().await.expect("initial snapshot");
+        assert_eq!(snap.state, Some(DeviceState::Running));
+        assert_eq!(snap.browse_to_url, None);
+
+        // Mid-session re-auth: the bridge sets NeedsLogin(url) on the state cell.
+        state_tx.send_replace(DeviceState::NeedsLogin(login_url()));
+        let n = w.next().await.expect("needs-login event");
+        assert_eq!(n.state, Some(DeviceState::NeedsLogin(login_url())));
+        assert_eq!(
+            n.browse_to_url,
+            Some(login_url()),
+            "the re-auth URL must reach the embedder as browse_to_url"
+        );
+
+        // A later successful re-register: the netmap self-node handler flips back to Running, and
+        // the bus reports the state change with browse_to_url cleared.
+        state_tx.send_replace(DeviceState::Running);
+        let n = w.next().await.expect("recovery event");
+        assert_eq!(n.state, Some(DeviceState::Running));
+        assert_eq!(
+            n.browse_to_url, None,
+            "recovering to Running clears the browse_to_url"
+        );
+    }
+
     /// Two distinct consent URLs in sequence stream as two `browse_to_url` events.
     #[tokio::test]
     async fn sequential_browser_urls_stream_each() {
