@@ -2,6 +2,16 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.29.1](https://github.com/GeiserX/tailscale-rs/compare/v0.29.0...v0.29.1) (2026-06-12)
+
+
+### Bug Fixes
+
+* **control-serde:** decode Go-faithful EnvType, TpmInfo, MapResponse health/messages ([#131](https://github.com/GeiserX/tailscale-rs/issues/131)) ([0d9654b](https://github.com/GeiserX/tailscale-rs/commit/0d9654b22ec4580a1cf9ec45b37378fbe46a2772))
+* **control-serde:** use Cow for escape-prone text fields so JSON escapes decode ([#132](https://github.com/GeiserX/tailscale-rs/issues/132)) ([3c0f47d](https://github.com/GeiserX/tailscale-rs/commit/3c0f47def8565abb9ad912a4ba1864da28517f96))
+* **control:** surface mid-session re-auth URL instead of dropping it ([#134](https://github.com/GeiserX/tailscale-rs/issues/134)) ([a2a34d1](https://github.com/GeiserX/tailscale-rs/commit/a2a34d1f40b815f221ca6b2209be953b926b6999))
+* **magicsock:** add best-addr hysteresis to stop direct-path flapping ([#135](https://github.com/GeiserX/tailscale-rs/issues/135)) ([6866f3c](https://github.com/GeiserX/tailscale-rs/commit/6866f3c217494cd06a3d89d008b87870840f8f73))
+
 ## [0.29.0](https://github.com/GeiserX/tailscale-rs/compare/v0.28.3...v0.29.0) (2026-06-12)
 
 
