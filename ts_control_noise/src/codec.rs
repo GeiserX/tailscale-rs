@@ -122,15 +122,15 @@ where
         };
         let len = header.len.get() as usize;
 
-        // A frame's declared body length must fit one Noise message (Go `controlbase` rejects
-        // `length > maxMessageSize`). The encoder never emits a chunk larger than this, so a bigger
-        // `len` is a malformed/hostile frame — reject it rather than `split_to` a 64 KiB-capable body.
-        if len > MAX_MESSAGE_SIZE {
-            tracing::error!(
-                len,
-                max = MAX_MESSAGE_SIZE,
-                "control message frame too large"
-            );
+        // A frame's declared body length must fit one Noise message. Go `controlbase` rejects
+        // `headerLen + length > maxMessageSize` (i.e. body `> maxMessageSize - 3 = maxCiphertextSize
+        // = 4093`), since its cap counts the 3-byte header. Match that exactly: the body alone must
+        // be `<= MAX_MESSAGE_SIZE - size_of::<Header>()`. The encoder never emits a chunk larger than
+        // this (`max_data_chunk` above subtracts the header + tag), so a bigger `len` is a
+        // malformed/hostile frame — reject it rather than `split_to` a large body.
+        const MAX_BODY_LEN: usize = MAX_MESSAGE_SIZE - size_of::<Header>();
+        if len > MAX_BODY_LEN {
+            tracing::error!(len, max = MAX_BODY_LEN, "control message frame too large");
             return Err(ErrorKind::InvalidData.into());
         }
 

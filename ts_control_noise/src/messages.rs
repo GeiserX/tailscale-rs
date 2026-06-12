@@ -44,6 +44,14 @@ pub struct Initiation {
     pub payload: [u8; Self::PAYLOAD_LEN],
 }
 
+/// The fixed length of a control-server handshake **response** (Noise IK message 2) body, in bytes:
+/// the responder ephemeral `e` (32) + the `ee`/`se` AEAD tag (16) = 48. Mirrors Go's
+/// `responseMessage` payload length (`control/controlbase`: a fixed 51-byte `responseMessage` =
+/// 3-byte header + 48-byte payload). Used to bound the handshake-response read so a malicious/buggy
+/// control server cannot make the client allocate on an attacker-controlled `Header::len` before the
+/// type/length are validated.
+pub const RESPONSE_PAYLOAD_LEN: usize = 48;
+
 impl Initiation {
     /// The fixed length of an [`Initiation`] payload, in bytes.
     pub const PAYLOAD_LEN: usize = 96;
