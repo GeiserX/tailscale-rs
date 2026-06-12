@@ -110,6 +110,20 @@ impl Netstack {
 
                 Response::Ok
             }
+            TcpStreamCommand::ShutdownWrite => {
+                let handle = handle.unwrap();
+
+                // smoltcp's `close()` is a write-half close: it sends a FIN and moves the socket to
+                // `FinWait1`/`CloseWait`, but the receive side stays open until the peer FINs. This
+                // is exactly `shutdown(SHUT_WR)`. Crucially we do NOT push to `pending_tcp_closes`
+                // here (unlike `Close`): the socket must live on so the caller can keep reading the
+                // peer's remaining data. It is reaped later by the consumer's `Close` (on `Drop`) or
+                // by the idle/keep-alive timeout once both sides are done.
+                let sock = self.socket_set.get_mut::<tcp::Socket>(handle);
+                sock.close();
+
+                Response::Ok
+            }
         }
     }
 
