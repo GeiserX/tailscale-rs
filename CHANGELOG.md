@@ -2,6 +2,21 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.29.3](https://github.com/GeiserX/tailscale-rs/compare/v0.29.2...v0.29.3) (2026-06-12)
+
+
+### Bug Fixes
+
+* **bart:** correct lookup_prefix_lpm leaf match (was a self-comparison) ([#147](https://github.com/GeiserX/tailscale-rs/issues/147)) ([a397cf6](https://github.com/GeiserX/tailscale-rs/commit/a397cf68cbdec05eaf4f07fed447d47ef052ddc2))
+* **control-noise:** bound the handshake-response read; exact record cap ([#145](https://github.com/GeiserX/tailscale-rs/issues/145)) ([0fb48c1](https://github.com/GeiserX/tailscale-rs/commit/0fb48c1520e25343c9f85bb1fdd89074b76ba374))
+* **derp:** drop short PeerGone/RecvPacket frames instead of panicking ([#143](https://github.com/GeiserX/tailscale-rs/issues/143)) ([09f747d](https://github.com/GeiserX/tailscale-rs/commit/09f747d65d8cae3e24966a7e007982ea37099d1b))
+* **disco:** per-type version handling instead of whole-packet reject ([#144](https://github.com/GeiserX/tailscale-rs/issues/144)) ([5728c82](https://github.com/GeiserX/tailscale-rs/commit/5728c828fa3750c45f735ae1fa3e54a8f7ec2af1))
+* **forwarder:** add global cross-port concurrent-flow cap (all-port mode) ([#140](https://github.com/GeiserX/tailscale-rs/issues/140)) ([7deaf87](https://github.com/GeiserX/tailscale-rs/commit/7deaf870ffb87f755fe92921624df8a49fedbea3))
+* **netcheck:** map dropped STUN transaction to TimedOut instead of panic ([#146](https://github.com/GeiserX/tailscale-rs/issues/146)) ([fdfc199](https://github.com/GeiserX/tailscale-rs/commit/fdfc1996b36cc59752e47201ccac997aab37d902))
+* **netstack:** guard handle recycling (ABA) on blocked-command replay ([#138](https://github.com/GeiserX/tailscale-rs/issues/138)) ([a617deb](https://github.com/GeiserX/tailscale-rs/commit/a617deb5b7a45e11fb255b7c9a3aa2d0da502e1e))
+* **netstack:** make drain_tcp_closes dedup-safe (no panic on a repeated handle) ([#142](https://github.com/GeiserX/tailscale-rs/issues/142)) ([e9d0e09](https://github.com/GeiserX/tailscale-rs/commit/e9d0e09d0bf38e81fb1eb916c2414fe5e09b0324))
+* **netstack:** reclaim autonomously-Closed accepted sockets (tsr-9ue) ([#141](https://github.com/GeiserX/tailscale-rs/issues/141)) ([5eeb11a](https://github.com/GeiserX/tailscale-rs/commit/5eeb11ae5a7f3adc16369d4782648c509aa878aa))
+
 ## [0.29.2](https://github.com/GeiserX/tailscale-rs/compare/v0.29.1...v0.29.2) (2026-06-12)
 
 
