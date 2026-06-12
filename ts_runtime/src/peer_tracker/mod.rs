@@ -882,6 +882,7 @@ mod tka_tests {
             shutdown_rx,
             crate::env::ForwarderConfig {
                 accept_routes: false,
+                accept_dns: true,
                 exit_node: None,
                 forward_routes: Vec::new(),
                 forward_tcp_ports: Vec::new(),

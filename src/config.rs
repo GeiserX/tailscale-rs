@@ -65,6 +65,17 @@ pub struct Config {
     /// routers, so traffic destined for an advertised subnet egresses via the advertising peer.
     pub accept_routes: bool,
 
+    /// Whether to accept the tailnet's DNS configuration (MagicDNS + pushed resolvers/search
+    /// domains).
+    ///
+    /// This is the equivalent of `tailscale up --accept-dns` (the `CorpDNS` pref). **Defaults to
+    /// `true`**, matching Go's `NewPrefs()`. When `true`, the MagicDNS responder serves the
+    /// control-pushed DNS config. When `false`, the node ignores the pushed DNS config and the
+    /// responder answers every query `REFUSED` — so a node can join the tailnet for connectivity
+    /// without taking over its DNS. Runtime-settable via
+    /// [`Device::set_accept_dns`](crate::Device::set_accept_dns).
+    pub accept_dns: bool,
+
     /// The peer to route internet-bound traffic through (exit node).
     ///
     /// This is the equivalent of `tailscale up --exit-node`. The peer may be named by stable node
@@ -461,6 +472,7 @@ impl From<&Config> for ts_control::Config {
             tags: value.requested_tags.clone(),
             ephemeral: value.ephemeral,
             accept_routes: value.accept_routes,
+            accept_dns: value.accept_dns,
             exit_node: value.exit_node.clone(),
             advertise_routes: value.advertise_routes.clone(),
             advertise_exit_node: value.advertise_exit_node,
@@ -497,6 +509,7 @@ impl Default for Config {
             requested_tags: vec![],
             ephemeral: true,
             accept_routes: false,
+            accept_dns: true,
             exit_node: None,
             advertise_routes: vec![],
             advertise_exit_node: false,
@@ -534,6 +547,8 @@ mod tests {
     fn from_config_threads_all_dataplane_fields() {
         let cfg = Config {
             accept_routes: true,
+            // Set to the non-default (`false`) so its crossing is observable (default is `true`).
+            accept_dns: false,
             advertise_exit_node: true,
             forward_all_ports: true,
             forward_exit_egress: true,
@@ -563,6 +578,10 @@ mod tests {
         let control: ts_control::Config = (&cfg).into();
 
         assert!(control.accept_routes);
+        assert!(
+            !control.accept_dns,
+            "accept_dns crosses the boundary (set false)"
+        );
         assert!(control.advertise_exit_node);
         assert!(control.forward_all_ports);
         assert!(control.forward_exit_egress);

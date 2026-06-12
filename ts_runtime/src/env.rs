@@ -27,6 +27,15 @@ pub struct ForwarderConfig {
     /// traffic from subnets we actually route to it.
     pub accept_routes: bool,
 
+    /// Whether to accept the tailnet's DNS configuration (`--accept-dns` / `CorpDNS`).
+    ///
+    /// The initial value seeds a live `watch` cell (mirroring [`accept_routes`](ForwarderConfig::accept_routes)):
+    /// `Device::set_accept_dns` toggles it at runtime and the MagicDNS responder re-reads it via
+    /// [`Env::accept_dns`](Env::accept_dns) on every view rebuild. When `false`, the responder ignores
+    /// the control-pushed DNS config and serves nothing (`REFUSED`), mirroring Go applying an empty
+    /// `dns.Config` when `CorpDNS` is off. See [`ts_control::Config::accept_dns`].
+    pub accept_dns: bool,
+
     /// Which peer (if any) is selected as this node's exit node (`ExitNodeID`).
     ///
     /// Fixed for the life of the runtime, but the selector is *unresolved*: the route updater and
@@ -139,6 +148,7 @@ impl ForwarderConfig {
     pub fn from_control_config(config: &ts_control::Config) -> Self {
         Self {
             accept_routes: config.accept_routes,
+            accept_dns: config.accept_dns,
             exit_node: config.exit_node.clone(),
             forward_routes: config.advertised_routes(),
             forward_tcp_ports: config.forward_tcp_ports.clone(),
@@ -170,6 +180,24 @@ fn exit_proxy_to_forwarder(cfg: &ts_control::ExitProxyConfig) -> ts_forwarder::P
     }
 }
 
+/// The sender (mutation) halves of the runtime-mutable preference `watch` cells, returned by
+/// [`Env::new_with_runtime_txs`] grouped in one named struct.
+///
+/// Each `Sender` is the *mutation capability* for a live preference the runtime can change without
+/// recreating the device; it is retained privately on the `Runtime` while only the matching
+/// `Receiver` is cloned into the `Env` the actors hold (the readers' contract). Grouping them as a
+/// named-field struct (rather than a positional tuple) means adding a new preference cell is an
+/// additive field, and the two same-typed `bool` senders ([`accept_routes`](RuntimePrefCells::accept_routes)
+/// and [`accept_dns`](RuntimePrefCells::accept_dns)) cannot be silently transposed at the call site.
+pub struct RuntimePrefCells {
+    /// Sender for the exit-node selector cell; mutated by `Device::set_exit_node`.
+    pub exit_node: watch::Sender<Option<ts_control::ExitNodeSelector>>,
+    /// Sender for the accept-routes preference cell; toggled by `Device::set_accept_routes`.
+    pub accept_routes: watch::Sender<bool>,
+    /// Sender for the accept-dns preference cell; toggled by `Device::set_accept_dns`.
+    pub accept_dns: watch::Sender<bool>,
+}
+
 #[derive(Clone)]
 pub struct Env {
     pub bus: ActorRef<MessageBus>,
@@ -185,6 +213,16 @@ pub struct Env {
     /// preference (unlike advertised routes it is never reported to control), so flipping it only
     /// re-runs the local route/source-filter recompute. See [`ForwarderConfig::accept_routes`].
     pub accept_routes_rx: watch::Receiver<bool>,
+
+    /// Whether to accept the tailnet's DNS configuration (`--accept-dns` / `CorpDNS`).
+    ///
+    /// A live cell rather than a snapshot (mirroring [`accept_routes_rx`](Env::accept_routes_rx)):
+    /// `Device::set_accept_dns` updates the backing [`watch::Sender`] (held privately on the runtime,
+    /// not here) at runtime, and the MagicDNS responder re-reads it via [`Env::accept_dns`](Env::accept_dns)
+    /// on every view rebuild, so the preference can change without recreating the device. Like
+    /// `accept-routes` it is a purely *local* preference (never reported to control): flipping it only
+    /// re-runs the local view rebuild that re-applies the gate. See [`ForwarderConfig::accept_dns`].
+    pub accept_dns_rx: watch::Receiver<bool>,
 
     /// Which peer (if any) is selected as this node's exit node (`ExitNodeID`).
     ///
@@ -297,28 +335,40 @@ impl Env {
         *self.accept_routes_rx.borrow()
     }
 
+    /// Whether the tailnet's DNS configuration is currently accepted (`--accept-dns` / `CorpDNS`),
+    /// re-read live (it can change at runtime via `Device::set_accept_dns`). The MagicDNS responder
+    /// calls this when it rebuilds its [`DnsView`](crate::magic_dns) on each control/peer update, so a
+    /// runtime toggle takes effect on the next view rebuild (driven by the `set_accept_dns` republish).
+    pub fn accept_dns(&self) -> bool {
+        // `bool` is `Copy`, so deref the borrow guard rather than cloning.
+        *self.accept_dns_rx.borrow()
+    }
+
     /// Build an [`Env`] and the runtime-mutable preference [`watch::Sender`]s separately, so each
     /// `Sender` (the mutation capability) can be retained privately by the runtime while only the
-    /// read sides (`exit_node_rx`, `accept_routes_rx`) are cloned into the many actors that subscribe
-    /// to `Env`. The senders are seeded from [`ForwarderConfig::exit_node`] /
-    /// [`ForwarderConfig::accept_routes`]. The runtime uses this; callers that never mutate these
-    /// (e.g. tests) use [`Env::new`], which discards the senders.
+    /// read sides (`exit_node_rx`, `accept_routes_rx`, `accept_dns_rx`) are cloned into the many
+    /// actors that subscribe to `Env`. The senders are seeded from [`ForwarderConfig::exit_node`] /
+    /// [`ForwarderConfig::accept_routes`] / [`ForwarderConfig::accept_dns`] and returned grouped in a
+    /// [`RuntimePrefCells`] (a named struct rather than a positional tuple, so adding a future
+    /// preference cell is an additive field and the same-typed `bool` senders can't be transposed).
+    /// The runtime uses this; callers that never mutate these (e.g. tests) use [`Env::new`], which
+    /// discards the senders.
     pub fn new_with_runtime_txs(
         keys: ts_keys::NodeState,
         shutdown: watch::Receiver<bool>,
         forwarding: ForwarderConfig,
-    ) -> (
-        Self,
-        watch::Sender<Option<ts_control::ExitNodeSelector>>,
-        watch::Sender<bool>,
-    ) {
+    ) -> (Self, RuntimePrefCells) {
         let (exit_node_tx, exit_node_rx) = watch::channel(forwarding.exit_node.clone());
         let (accept_routes_tx, accept_routes_rx) = watch::channel(forwarding.accept_routes);
+        let (accept_dns_tx, accept_dns_rx) = watch::channel(forwarding.accept_dns);
 
         let ForwarderConfig {
             // Already consumed above to seed the `watch` channel; the `Sender` is returned so the
             // runtime can hold it privately, narrowing mutation away from the cloned `Env`.
             accept_routes: _,
+            // Already consumed above to seed the `watch` channel; the `Sender` is returned so the
+            // runtime can hold it privately, narrowing mutation away from the cloned `Env`.
+            accept_dns: _,
             // Already consumed above to seed the `watch` channel; the `Sender` is returned so the
             // runtime can hold it privately, narrowing mutation away from the cloned `Env`.
             exit_node: _,
@@ -355,6 +405,7 @@ impl Env {
             keys: Arc::new(keys),
             shutdown,
             accept_routes_rx,
+            accept_dns_rx,
             exit_node_rx,
             forward_routes: Arc::new(forward_routes),
             forward_tcp_ports: Arc::new(forward_tcp_ports),
@@ -371,7 +422,14 @@ impl Env {
             funnel_ingress: Arc::new(std::sync::Mutex::new(None)),
         };
 
-        (env, exit_node_tx, accept_routes_tx)
+        (
+            env,
+            RuntimePrefCells {
+                exit_node: exit_node_tx,
+                accept_routes: accept_routes_tx,
+                accept_dns: accept_dns_tx,
+            },
+        )
     }
 
     /// Build an [`Env`] without retaining the runtime-mutable preference [`watch::Sender`]s — for
@@ -418,6 +476,7 @@ mod tests {
     fn cfg(accept_routes: bool) -> ForwarderConfig {
         ForwarderConfig {
             accept_routes,
+            accept_dns: true,
             exit_node: None,
             forward_routes: vec![],
             forward_tcp_ports: vec![],
@@ -436,12 +495,12 @@ mod tests {
 
     fn env_with(accept_routes: bool) -> (Env, watch::Sender<bool>) {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (env, _exit_tx, accept_tx) = Env::new_with_runtime_txs(
+        let (env, cells) = Env::new_with_runtime_txs(
             ts_keys::NodeState::generate(),
             shutdown_rx,
             cfg(accept_routes),
         );
-        (env, accept_tx)
+        (env, cells.accept_routes)
     }
 
     /// `Env::accept_routes()` reflects the `ForwarderConfig` seed.

@@ -94,6 +94,11 @@ fn default_ephemeral() -> bool {
     true
 }
 
+/// Default for [`Config::accept_dns`]: `true`, matching Go's `NewPrefs()` (`CorpDNS: true`).
+fn default_true() -> bool {
+    true
+}
+
 /// Default WireGuard persistent-keepalive interval: 25s.
 ///
 /// Matches Tailscale, which sets `PersistentKeepalive = 25` on a peer when control marks it
@@ -154,6 +159,23 @@ pub struct Config {
     /// be threaded through to the runtime's route filter.
     #[serde(default)]
     pub accept_routes: bool,
+
+    /// Whether to accept the tailnet's DNS configuration (MagicDNS + the pushed resolvers/search
+    /// domains) — `--accept-dns` / the `CorpDNS` pref in the Go client. **Defaults to `true`**, matching
+    /// Go's `NewPrefs()` (`CorpDNS: true`).
+    ///
+    /// When `true`, the MagicDNS responder serves the control-pushed [`DnsConfig`](crate::DnsConfig)
+    /// (overlay-name answers + split-DNS routes + recursive forwarding). When `false`, the node
+    /// **ignores the pushed DNS config** and the responder serves nothing (every query is `REFUSED`),
+    /// mirroring Go applying an essentially-empty `dns.Config` when `CorpDNS` is off — so a node can
+    /// join the tailnet for connectivity without taking over its DNS.
+    ///
+    /// Like [`accept_routes`](Config::accept_routes), this is a client-side preference not read inside
+    /// `ts_control` (control always pushes the full `DNSConfig`; the runtime decides whether to honor
+    /// it); it is carried here only to be threaded through to the runtime's MagicDNS responder, and is
+    /// runtime-settable via `Device::set_accept_dns` (the analog of `tailscale set --accept-dns`).
+    #[serde(default = "default_true")]
+    pub accept_dns: bool,
 
     /// Which peer (if any) to use as an exit node (`--exit-node` / `ExitNodeID` in the Go client).
     ///
@@ -583,6 +605,7 @@ impl Default for Config {
             tags: Default::default(),
             ephemeral: default_ephemeral(),
             accept_routes: false,
+            accept_dns: default_true(),
             exit_node: None,
             advertise_routes: Vec::new(),
             advertise_exit_node: false,

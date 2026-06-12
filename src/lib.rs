@@ -1256,6 +1256,34 @@ impl Device {
         self.runtime.accept_routes()
     }
 
+    /// Toggle whether this node accepts the tailnet's DNS configuration at runtime, without
+    /// recreating the [`Device`] — the equivalent of Go `tsnet`'s `LocalClient.EditPrefs(CorpDNS)` /
+    /// `tailscale set --accept-dns`.
+    ///
+    /// Like [`set_accept_routes`](Self::set_accept_routes) this is a purely **local** preference,
+    /// never reported to control. When `false`, the MagicDNS responder ignores the control-pushed DNS
+    /// configuration and answers every query `REFUSED` (mirroring Go applying an empty `dns.Config`
+    /// when `CorpDNS` is off), so the node can join the tailnet for connectivity without taking over
+    /// its DNS. The change is applied immediately to the netstack responder and the peerAPI DoH server
+    /// that shares its view; flipping it back to `true` restores serving from the still-current config
+    /// (the config is only gated at the read site, never destroyed), so the OFF→ON restore is
+    /// automatic.
+    ///
+    /// In TUN transport mode the in-datapath responder honors the toggle immediately, but the host
+    /// resolver/route programming (which points the host at `100.100.100.100`) is applied once at
+    /// device build and is not re-steered until the device is rebuilt.
+    pub async fn set_accept_dns(&self, accept: bool) -> Result<(), Error> {
+        self.runtime
+            .set_accept_dns(accept)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Whether this node currently accepts the tailnet's DNS configuration (`--accept-dns` / `CorpDNS`).
+    pub fn accept_dns(&self) -> bool {
+        self.runtime.accept_dns()
+    }
+
     /// Change the subnet routes this node advertises at runtime — Go `tailscale set
     /// --advertise-routes`. This is the runtime equivalent of
     /// [`Config::advertise_routes`](crate::Config::advertise_routes): the node re-advertises the

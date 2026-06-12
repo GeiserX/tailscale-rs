@@ -600,6 +600,9 @@ mod tests {
                 exit_node_filtered_set: filtered.iter().map(|s| s.to_string()).collect(),
                 ..Default::default()
             },
+            // The accept-dns gate defaults to `false` (Default); set it true so these DoH tests
+            // exercise the serving/forwarding path, not the gated-off REFUSED path.
+            accept_dns: true,
             ..Default::default()
         }
     }

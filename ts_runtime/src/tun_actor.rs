@@ -217,12 +217,18 @@ pub(crate) fn host_routes_from_node(
 /// no-op in both the macOS and Linux `apply_dns` impls) so we never point the resolver at a dead
 /// address — fail-closed.
 ///
-/// `match_domains` carries the search domains only when MagicDNS is enabled in the control config.
+/// `accept_dns` (`--accept-dns` / `CorpDNS`) gates this exactly like `magic_dns`: when `false` the
+/// node ignores the tailnet DNS config, so the host resolver is NOT pointed at quad-100 (the
+/// responder would `REFUSED` every query anyway) and no search domains are programmed — fail-closed,
+/// the same empty-config behavior as MagicDNS off.
+///
+/// `match_domains` carries the search domains only when MagicDNS is enabled **and** accepted.
 pub(crate) fn host_dns_from_dns_config(
     dns: Option<&ts_control::DnsConfig>,
     if_name: String,
+    accept_dns: bool,
 ) -> ts_host_net::HostDns {
-    let magic_dns = matches!(dns, Some(d) if d.magic_dns);
+    let magic_dns = accept_dns && matches!(dns, Some(d) if d.magic_dns);
     let match_domains = if magic_dns {
         // `dns` is `Some(_)` here by construction of `magic_dns`.
         dns.map(|d| d.search_domains.clone()).unwrap_or_default()
@@ -350,6 +356,10 @@ fn build_dns_view(
         self_node: update.node.clone(),
         exit_doh,
         enable_ipv6,
+        // Re-read the live accept-dns cell on every view rebuild (it is runtime-settable via
+        // `Device::set_accept_dns`); the in-datapath responder's `decide` gate refuses every query
+        // when false. Same trap as the netstack `PeerState` site — read at rebuild, never snapshot.
+        accept_dns: env.accept_dns(),
     }
 }
 
@@ -629,10 +639,13 @@ impl kameo::Actor for TunActor {
         // authoritatively — mirrors `MagicDnsActor`'s `PeerState` subscription.
         env.subscribe::<Arc<PeerState>>(&slf).await?;
 
-        // Seed the MagicDNS view with the runtime IPv6 gate (default off); control/peer updates
-        // clone-and-modify it. Mirrors `MagicDnsActor::on_start`.
+        // Seed the MagicDNS view with the runtime IPv6 gate (default off) + the current accept-dns
+        // value; control/peer updates clone-and-modify it (re-reading accept-dns live each time).
+        // Mirrors `MagicDnsActor::on_start`. The seed is moot (no query served before the first
+        // StateUpdate) but keeps the pre-update view internally consistent.
         let (dns_view, _) = watch::channel(Arc::new(DnsView {
             enable_ipv6: env.enable_ipv6,
+            accept_dns: env.accept_dns(),
             ..DnsView::default()
         }));
 
@@ -716,17 +729,23 @@ impl Message<Arc<ts_control::StateUpdate>> for TunActor {
                 return;
             }
         };
-        // Whether MagicDNS is enabled drives both the `100.100.100.100/32` route (so quad-100
-        // queries enter the TUN) and pointing the host resolver at the MagicDNS IP.
-        let magic_dns = msg.dns_config.as_ref().is_some_and(|d| d.magic_dns);
+        // Whether MagicDNS is enabled AND accepted drives both the `100.100.100.100/32` route (so
+        // quad-100 queries enter the TUN) and pointing the host resolver at the MagicDNS IP. With
+        // `--accept-dns` off, the node ignores the tailnet DNS config: neither is programmed (the
+        // responder would `REFUSED` every query anyway), mirroring Go's empty-config behavior.
+        let accept_dns = self.env.accept_dns();
+        let magic_dns = accept_dns && msg.dns_config.as_ref().is_some_and(|d| d.magic_dns);
         let routes = host_routes_from_node(self_node, if_name.clone(), self.gating, magic_dns);
         if let Err(e) = host.apply_routes(&routes) {
             tracing::error!(error = %e, "host route programming failed; TUN idle (fail-closed)");
             host.teardown();
             return; // device drops here -> interface torn down; overlay halves already taken -> idle.
         }
-        if let Err(e) = host.apply_dns(&host_dns_from_dns_config(msg.dns_config.as_ref(), if_name))
-        {
+        if let Err(e) = host.apply_dns(&host_dns_from_dns_config(
+            msg.dns_config.as_ref(),
+            if_name,
+            accept_dns,
+        )) {
             // Best-effort: routes are already up. With MagicDNS on, the resolver now points at
             // `100.100.100.100` (intercepted in the UP pump below); with it off, nameservers are
             // empty (no-op).
@@ -779,10 +798,14 @@ impl Message<Arc<PeerState>> for TunActor {
                 .find(|peer| peer.stable_id == id)
                 .and_then(|n| n.peerapi_doh_addr())
         });
+        // Re-read the live accept-dns cell on this rebuild (it is runtime-settable): a
+        // `Device::set_accept_dns` republish lands here, re-applying the in-datapath `decide` gate.
+        let accept_dns = self.env.accept_dns();
         self.dns_view.send_modify(|view| {
             let mut next = (**view).clone();
             next.peers = Some(state.peers.clone());
             next.exit_doh = exit_doh;
+            next.accept_dns = accept_dns;
             *view = Arc::new(next);
         });
     }
@@ -816,12 +839,14 @@ mod tests {
             shutdown_rx,
             ForwarderConfig {
                 accept_routes: false,
+                accept_dns: true,
                 exit_node,
                 forward_routes: Vec::new(),
                 forward_tcp_ports: Vec::new(),
                 forward_udp_ports: Vec::new(),
                 forward_all_ports: false,
                 forward_exit_egress: false,
+                block_incoming: false,
                 exit_proxy: None,
                 peerapi_port: None,
                 taildrop_dir: None,
@@ -864,6 +889,8 @@ mod tests {
             exit_node_dns_resolvers: vec![],
             peer_relay: false,
             service_vips: Default::default(),
+            online: None,
+            last_seen: None,
         }
     }
 
@@ -952,6 +979,8 @@ mod tests {
             exit_node_dns_resolvers: vec![],
             peer_relay: false,
             service_vips: Default::default(),
+            online: None,
+            last_seen: None,
         }
     }
 
@@ -1040,8 +1069,9 @@ mod tests {
     /// map through; with it disabled both stay empty (fail-closed no-op).
     #[test]
     fn host_dns_nameservers_point_at_magic_dns_when_enabled() {
-        // No DNS config ⇒ empty everything (MagicDNS not enabled).
-        let none = host_dns_from_dns_config(None, "utun9".to_owned());
+        // No DNS config ⇒ empty everything (MagicDNS not enabled). (accept_dns true throughout
+        // unless noted — it only ever further restricts.)
+        let none = host_dns_from_dns_config(None, "utun9".to_owned(), true);
         assert!(none.nameservers.is_empty());
         assert!(none.match_domains.is_empty());
 
@@ -1051,7 +1081,7 @@ mod tests {
             search_domains: vec!["user.ts.net.".to_owned()],
             ..Default::default()
         };
-        let dns_on = host_dns_from_dns_config(Some(&on), "utun9".to_owned());
+        let dns_on = host_dns_from_dns_config(Some(&on), "utun9".to_owned(), true);
         assert_eq!(
             dns_on.nameservers,
             vec![Ipv4Addr::new(100, 100, 100, 100)],
@@ -1059,13 +1089,26 @@ mod tests {
         );
         assert_eq!(dns_on.match_domains, vec!["user.ts.net.".to_owned()]);
 
+        // accept_dns OFF ⇒ even with MagicDNS on, the host resolver is NOT pointed at quad-100 and
+        // no search domains are programmed (the node ignores the tailnet DNS config — fail-closed,
+        // same as MagicDNS off).
+        let dns_no_accept = host_dns_from_dns_config(Some(&on), "utun9".to_owned(), false);
+        assert!(
+            dns_no_accept.nameservers.is_empty(),
+            "accept_dns off must not point the resolver at the MagicDNS IP"
+        );
+        assert!(
+            dns_no_accept.match_domains.is_empty(),
+            "accept_dns off must program no search domains"
+        );
+
         // MagicDNS off ⇒ empty nameservers (no dead address) AND no search domains.
         let off = ts_control::DnsConfig {
             magic_dns: false,
             search_domains: vec!["user.ts.net.".to_owned()],
             ..Default::default()
         };
-        let dns_off = host_dns_from_dns_config(Some(&off), "utun9".to_owned());
+        let dns_off = host_dns_from_dns_config(Some(&off), "utun9".to_owned(), true);
         assert!(
             dns_off.nameservers.is_empty(),
             "nameservers must stay empty when MagicDNS is disabled"
@@ -1227,6 +1270,8 @@ mod tests {
             }),
             ssh_policy: None,
             tka: None,
+            online_change: Default::default(),
+            peer_seen_change: Default::default(),
         }
     }
 

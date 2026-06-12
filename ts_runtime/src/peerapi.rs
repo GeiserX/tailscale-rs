@@ -749,6 +749,9 @@ mod tests {
         DnsView {
             self_node: Some(self_node),
             peers: Some(Arc::new(db)),
+            // The accept-dns gate defaults to `false` (Default); set it true so these peerAPI tests
+            // exercise the serving path, not the gated-off REFUSED path.
+            accept_dns: true,
             ..Default::default()
         }
     }
