@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use alloc::{borrow::Cow, vec::Vec};
 use core::net::{IpAddr, SocketAddr};
 
 use chrono::{DateTime, Utc};
@@ -67,7 +67,7 @@ pub struct Node<'a> {
     /// The fully-qualified domain name (FQDN) of this node, as well as the MagicDNS name for the
     /// node. Ends with a trailing dot, e.g. "host.tail-scale.ts.net."
     #[serde(borrow)]
-    pub name: &'a str,
+    pub name: Cow<'a, str>,
 
     /// Unique ID of the [`User`][crate::User] who created the node.
     ///

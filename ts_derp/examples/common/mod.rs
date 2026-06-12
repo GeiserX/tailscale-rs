@@ -27,13 +27,13 @@ pub async fn load_derp_map() -> BTreeMap<RegionId, Vec<ServerConnInfo>> {
                 .map(|server| ServerConnInfo {
                     tls_validation_config: TlsValidationConfig::from_str(
                         server.cert_name.unwrap_or_default(),
-                        server.hostname,
+                        &server.hostname,
                     ),
 
                     supports_port_80: server.can_port_80,
                     ipv4: convert_ip_usage(server.ipv4),
                     ipv6: convert_ip_usage(server.ipv6),
-                    hostname: server.hostname.to_owned(),
+                    hostname: server.hostname.to_string(),
                     https_port: if server.derp_port == 0 {
                         443
                     } else {

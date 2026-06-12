@@ -1,3 +1,5 @@
+use alloc::borrow::Cow;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use ts_keys::{NetworkLockPublicKey, NodePublicKey};
@@ -159,13 +161,13 @@ pub struct RegisterResponse<'a> {
     /// registered and the control plane will send another [`RegisterResponse`] where
     /// `machine_authorized` is `true`.
     #[serde(rename = "AuthURL", borrow)]
-    pub auth_url: &'a str,
+    pub auth_url: Cow<'a, str>,
     /// If set, this is the current node key signature that needs to be re-signed for the node's new
     /// node key.
     pub node_key_signature: Option<&'a str>,
     /// If populated, indicates that authorization failed; all other fields must be ignored.
     #[serde(borrow)]
-    pub error: &'a str,
+    pub error: Cow<'a, str>,
 }
 
 #[cfg(test)]
@@ -214,5 +216,43 @@ mod tests {
             !obj.contains_key("OldNodeKey"),
             "OldNodeKey must be omitted when None, got: {obj:?}"
         );
+    }
+
+    /// `RegisterResponse::error` is a control-authored failure message typed `Cow<'a, str>`. A
+    /// rejection message containing a newline/quote (escaped on the wire) decodes and unescapes; a
+    /// bare `&'a str` would fail the whole `RegisterResponse` decode (`expected a borrowed string`),
+    /// masking the rejection reason behind a parse error.
+    #[test]
+    fn register_response_error_with_escape_sequence_decodes() {
+        const TEST: &str = r#"{
+            "User": { "ID": 1 },
+            "Login": { "ID": 2, "Provider": "google", "LoginName": "alice@example.com" },
+            "NodeKeyExpired": false,
+            "MachineAuthorized": false,
+            "AuthURL": "",
+            "Error": "denied:\n\"node not permitted\"\\see logs"
+        }"#;
+        let resp = serde_json::from_str::<RegisterResponse>(TEST)
+            .expect("RegisterResponse with an escaped Error must decode");
+        assert_eq!(resp.error, "denied:\n\"node not permitted\"\\see logs");
+        assert!(!resp.machine_authorized);
+    }
+
+    /// The no-escape fast path still decodes: a plain `AuthURL` yields its value unchanged (and
+    /// borrows zero-copy, though that is not observable from outside).
+    #[test]
+    fn register_response_auth_url_without_escape_decodes() {
+        const TEST: &str = r#"{
+            "User": { "ID": 1 },
+            "Login": { "ID": 2, "Provider": "google", "LoginName": "alice@example.com" },
+            "NodeKeyExpired": false,
+            "MachineAuthorized": false,
+            "AuthURL": "https://login.example.com/a/abc123",
+            "Error": ""
+        }"#;
+        let resp = serde_json::from_str::<RegisterResponse>(TEST)
+            .expect("RegisterResponse with a plain AuthURL must decode");
+        assert_eq!(resp.auth_url, "https://login.example.com/a/abc123");
+        assert!(resp.error.is_empty());
     }
 }

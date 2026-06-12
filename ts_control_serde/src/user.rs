@@ -1,3 +1,5 @@
+use alloc::borrow::Cow;
+
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use url::Url;
@@ -24,11 +26,11 @@ pub struct Login<'a> {
     /// An email address or "email-ish" string (e.g. "alice@github") associated with this Tailscale
     /// user, according to the IdP.
     #[serde(borrow)]
-    pub login_name: &'a str,
+    pub login_name: Cow<'a, str>,
     /// If populated, the display name of this Tailscale user, according to the IdP. Can be
     /// overridden by a value in the [`User::display_name`] field.
     #[serde(borrow, default)]
-    pub display_name: Option<&'a str>,
+    pub display_name: Option<Cow<'a, str>>,
     /// If populated, a URL to a profile picture representing this Tailscale user, according to the
     /// IdP. Can be overridden by a value in the [`User::profile_pic_url`] field.
     #[serde(
@@ -55,7 +57,7 @@ pub struct User<'a> {
     /// If populated, the display name of this Tailscale user. Overrides the value in any IdP-
     /// provided [`Login::display_name`] field.
     #[serde(borrow, default)]
-    pub display_name: Option<&'a str>,
+    pub display_name: Option<Cow<'a, str>>,
     /// If populated, a URL to a profile picture representing this Tailscale user. Overrides the
     /// IdP-provided value in any [`Login::profile_pic_url`] field.
     #[serde(
@@ -81,11 +83,11 @@ pub struct UserProfile<'a> {
     /// An email address or "email-ish" string (e.g. "alice@github") associated with this Tailscale
     /// user's [`UserProfile`], according to the IdP. For display purposes only.
     #[serde(borrow, default)]
-    pub login_name: &'a str,
+    pub login_name: Cow<'a, str>,
     /// If populated, the display name of this Tailscale user (e.g. "Alice Smith"), according to
     /// the IdP.
     #[serde(borrow, default)]
-    pub display_name: Option<&'a str>,
+    pub display_name: Option<Cow<'a, str>>,
     /// If populated, a URL to a profile picture representing this Tailscale user.
     #[serde(
         rename = "ProfilePicURL",
@@ -93,4 +95,72 @@ pub struct UserProfile<'a> {
         default
     )]
     pub profile_pic_url: Option<Url>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Login::login_name` and `Login::display_name` are IdP-authored human text typed
+    /// `Cow<'a, str>` / `Option<Cow<'a, str>>` so they tolerate JSON escapes. Go's `json.Marshal`
+    /// HTML-escapes `&` → `&` by default, so a display name like `Tom & Jerry` arrives on the
+    /// wire as `Tom & Jerry`. A bare `&'a str` cannot zero-copy-borrow a string serde must
+    /// unescape and fails the WHOLE `Login` decode (`invalid type: string "...", expected a borrowed
+    /// string`) — which silently drops the enclosing struct (the user, the netmap). With `Cow`,
+    /// serde owns the unescaped value and the decode succeeds.
+    #[test]
+    fn login_with_go_html_escaped_display_name_decodes() {
+        // Exactly what Go emits for `Tom & Jerry` (SetEscapeHTML(true) is the Marshal default).
+        const TEST: &str = r#"{ "ID": 1, "Provider": "google", "LoginName": "a@b.com", "DisplayName": "Tom & Jerry" }"#;
+        let login = serde_json::from_str::<Login>(TEST)
+            .expect("Login with a Go-HTML-escaped DisplayName must decode");
+        assert_eq!(login.login_name, "a@b.com");
+        assert_eq!(login.display_name.as_deref(), Some("Tom & Jerry"));
+    }
+
+    /// The other escape forms (`\n`, `\"`, `\\`) on both the bare `login_name` and the
+    /// `Option<Cow>` `display_name` decode and unescape too.
+    #[test]
+    fn login_with_control_escapes_decodes() {
+        const TEST: &str = r#"{
+            "ID": 1,
+            "Provider": "google",
+            "LoginName": "a\nb@\"c\\d.com",
+            "DisplayName": "line1\nline2\"q\\z"
+        }"#;
+        let login = serde_json::from_str::<Login>(TEST)
+            .expect("Login with control-character escapes must decode");
+        assert_eq!(login.login_name, "a\nb@\"c\\d.com");
+        assert_eq!(login.display_name.as_deref(), Some("line1\nline2\"q\\z"));
+    }
+
+    /// `UserProfile::login_name` (bare `Cow`) and `UserProfile::display_name` (`Option<Cow>`) — the
+    /// display-facing identity joined onto a peer — also decode with a Go-HTML-escaped `&` and the
+    /// control escapes. A failure here would drop the owning user's profile.
+    #[test]
+    fn user_profile_with_escaped_fields_decodes() {
+        const TEST: &str = r#"{ "ID": 7, "LoginName": "a@b.com", "DisplayName": "Tom & Jerry" }"#;
+        let profile = serde_json::from_str::<UserProfile>(TEST)
+            .expect("UserProfile with an escaped DisplayName must decode");
+        assert_eq!(profile.login_name, "a@b.com");
+        assert_eq!(profile.display_name.as_deref(), Some("Tom & Jerry"));
+
+        const TEST_CTRL: &str =
+            r#"{ "ID": 7, "LoginName": "a\nb@c.com", "DisplayName": "x\"y\\z" }"#;
+        let profile = serde_json::from_str::<UserProfile>(TEST_CTRL)
+            .expect("UserProfile with control escapes must decode");
+        assert_eq!(profile.login_name, "a\nb@c.com");
+        assert_eq!(profile.display_name.as_deref(), Some("x\"y\\z"));
+    }
+
+    /// The no-escape fast path still decodes (and borrows zero-copy, though that is not observable
+    /// from outside): plain values pass through unchanged.
+    #[test]
+    fn login_without_escape_decodes() {
+        const TEST: &str = r#"{ "ID": 1, "Provider": "google", "LoginName": "alice@example.com", "DisplayName": "Alice Smith" }"#;
+        let login =
+            serde_json::from_str::<Login>(TEST).expect("Login with plain fields must decode");
+        assert_eq!(login.login_name, "alice@example.com");
+        assert_eq!(login.display_name.as_deref(), Some("Alice Smith"));
+    }
 }

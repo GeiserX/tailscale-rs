@@ -196,7 +196,7 @@ pub(crate) async fn logout_with(
         nl_key: Some(node_keystate.network_lock_keys.public),
         expiry: Some(past_expiry()),
         hostinfo: HostInfo {
-            hostname: config.hostname.as_deref(),
+            hostname: config.hostname.as_deref().map(std::borrow::Cow::Borrowed),
             app: &config.format_client_name(),
             ipn_version: crate::PKG_VERSION,
             ..Default::default()

@@ -1,4 +1,4 @@
-use alloc::{collections::BTreeMap, vec::Vec};
+use alloc::{borrow::Cow, collections::BTreeMap, vec::Vec};
 use core::net::SocketAddr;
 
 use chrono::{DateTime, Utc};
@@ -98,7 +98,7 @@ pub struct SSHPrincipal<'a> {
 pub struct SSHAction<'a> {
     /// An optional message to show to the user when this action is applied.
     #[serde(default, borrow, rename = "message")]
-    pub message: &'a str,
+    pub message: Cow<'a, str>,
 
     /// If `true`, the connection is rejected.
     #[serde(default, rename = "reject")]
@@ -149,15 +149,15 @@ pub struct SSHAction<'a> {
 pub struct SSHRecorderFailureAction<'a> {
     /// If non-empty, the session is rejected with this message when recording cannot start.
     #[serde(default, borrow, rename = "rejectSessionWithMessage")]
-    pub reject_session_with_message: &'a str,
+    pub reject_session_with_message: Cow<'a, str>,
 
     /// If non-empty, an in-progress session is terminated with this message when recording fails.
     #[serde(default, borrow, rename = "terminateSessionWithMessage")]
-    pub terminate_session_with_message: &'a str,
+    pub terminate_session_with_message: Cow<'a, str>,
 
     /// If non-empty, a URL to notify (out of band) when recording fails.
     #[serde(default, borrow, rename = "notifyURL")]
-    pub notify_url: &'a str,
+    pub notify_url: Cow<'a, str>,
 }
 
 #[cfg(test)]
@@ -264,5 +264,18 @@ mod test {
         let principal = serde_json::from_str::<SSHPrincipal>(r#"{ "any": true, "pubKeys": null }"#)
             .expect("SSHPrincipal with null pubKeys must decode");
         assert!(principal.unused_pub_keys.is_empty());
+    }
+
+    /// `SSHAction::message` is admin-authored prose typed `Cow<'a, str>`, so a message containing
+    /// newlines/quotes/backslashes (escaped on the wire) decodes and unescapes. A bare `&'a str`
+    /// would fail the whole `SSHAction` decode (`expected a borrowed string`), silently dropping the
+    /// SSH policy from the netmap.
+    #[test]
+    fn ssh_action_message_with_escape_sequence_decodes() {
+        const TEST: &str = r#"{ "accept": true, "message": "line1\nline2 \"q\" \\done" }"#;
+        let action = serde_json::from_str::<SSHAction>(TEST)
+            .expect("SSHAction with an escaped message must decode");
+        assert_eq!(action.message, "line1\nline2 \"q\" \\done");
+        assert!(action.accept);
     }
 }

@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use alloc::{borrow::Cow, vec::Vec};
 
 use serde::{Deserialize, Serialize};
 
@@ -67,7 +67,15 @@ pub struct HostInfo<'a> {
     /// Notifications (APNs) on iOS/macOS; will be used for Android in the future.
     pub push_device_token: &'a str,
     /// Hostname of this Tailscale node's host.
-    pub hostname: Option<&'a str>,
+    ///
+    /// A user-set machine name (e.g. macOS ComputerName) is free-form text that can contain a JSON
+    /// escape (a literal `"`, a `\`, or — since Go's `json.Marshal` escapes `&`/`<`/`>` by default —
+    /// an `&` in a name like `Tom & Jerry's Mac`). A borrowed `&str` cannot decode an escaped string,
+    /// which would fail the whole `HostInfo`/peer decode; `Cow` borrows on the fast path and owns
+    /// only when unescaping. `#[serde(borrow)]` is explicit here because the struct-level `apply`
+    /// rule for `&str` does not match `Option<Cow<'a, str>>`.
+    #[serde(borrow)]
+    pub hostname: Option<Cow<'a, str>>,
 
     /// Indicates whether or not this Tailscale node's host is blocking incoming connections.
     pub shields_up: bool,
@@ -166,6 +174,29 @@ mod tests {
         let json = r#"{"PeerRelay":true}"#;
         let host_info: HostInfo = serde_json::from_str(json).unwrap();
         assert!(host_info.peer_relay);
+    }
+
+    #[test]
+    fn hostname_with_escape_sequence_decodes() {
+        // A user-set machine name can contain a JSON escape: `&` (Go's default `SetEscapeHTML`
+        // marshals `&`→`&`), a literal `"`, or `\`. A borrowed `&str` could not decode the
+        // escaped form and would fail the whole `HostInfo`/peer decode, silently dropping the peer.
+        // `Cow` must decode it and yield the unescaped value.
+        let json = r#"{"Hostname":"Tom & Jerry's \"Mac\\Book\""}"#;
+        let host_info: HostInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            host_info.hostname.as_deref(),
+            Some(r#"Tom & Jerry's "Mac\Book""#)
+        );
+    }
+
+    #[test]
+    fn hostname_without_escape_decodes() {
+        // Fast path: a plain hostname decodes (borrows zero-copy, though that is not observable
+        // from outside).
+        let json = r#"{"Hostname":"my-host.local"}"#;
+        let host_info: HostInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(host_info.hostname.as_deref(), Some("my-host.local"));
     }
 
     #[test]

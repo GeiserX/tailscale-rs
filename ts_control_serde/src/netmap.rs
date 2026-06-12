@@ -1,4 +1,4 @@
-use alloc::{collections::BTreeMap, vec::Vec};
+use alloc::{borrow::Cow, collections::BTreeMap, vec::Vec};
 use core::net::SocketAddr;
 
 use chrono::{DateTime, Utc};
@@ -288,7 +288,12 @@ pub struct MapResponse<'a> {
     pub ping_request: Option<PingRequest>,
     /// If non-`None`, a URL for the client to open to complete an action. The client should
     /// debounce identical URLs and only open it once for the same URL.
-    pub pop_browser_url: Option<&'a str>,
+    ///
+    /// A `Cow` because a URL legitimately carries `&` in its query string, which Go's `json.Marshal`
+    /// escapes to `&` by default — a borrowed `&str` cannot decode that escaped form and would
+    /// fail the whole `MapResponse` decode.
+    #[serde(borrow)]
+    pub pop_browser_url: Option<Cow<'a, str>>,
 
     /// Describes the Tailscale node making the map request (ie, the "self" node). Starting with
     /// capability version 18, a value of `None` means unchanged.
@@ -352,7 +357,8 @@ pub struct MapResponse<'a> {
     ///
     /// Do not depend on the exact format of this field; more forms will be added in the future. If
     /// empty, the value is unchanged.
-    pub domain: &'a str,
+    #[serde(borrow)]
+    pub domain: Cow<'a, str>,
 
     /// Indicates whether this node's tailnet has requested that info about services be included in
     /// [`Node::host_info`]. If `None`, the most recent non-empty MapResponse value in the HTTP
@@ -487,16 +493,21 @@ pub struct MapResponse<'a> {
 #[serde(rename_all = "PascalCase", default)]
 pub struct DisplayMessage<'a> {
     /// Short, human-readable title summarizing the message.
+    ///
+    /// `Cow` because admin/control-authored prose can contain a JSON escape (a literal `"`, `\`, or
+    /// — since Go's `json.Marshal` escapes `&`/`<`/`>` by default — an `&`); a borrowed `&str`
+    /// cannot decode an escaped string and would fail the whole `MapResponse` decode.
     #[serde(borrow)]
-    pub title: &'a str,
-    /// Longer, human-readable body text describing the message.
+    pub title: Cow<'a, str>,
+    /// Longer, human-readable body text describing the message. `Cow` for the same escape-tolerance
+    /// reason as [`title`][Self::title] (and body prose is the most likely to contain a newline).
     #[serde(borrow)]
-    pub text: &'a str,
+    pub text: Cow<'a, str>,
     /// Severity of the message. Go's `DisplayMessageSeverity` is a string with known values
-    /// `"high"`, `"medium"`, and `"low"`; this is kept as a borrowed `&str` (rather than a closed
-    /// enum) so an unrecognized future severity decodes rather than failing the netmap.
+    /// `"high"`, `"medium"`, and `"low"`; this is kept as an open `Cow<'a, str>` (rather than a
+    /// closed enum) so an unrecognized future severity decodes rather than failing the netmap.
     #[serde(borrow)]
-    pub severity: &'a str,
+    pub severity: Cow<'a, str>,
     /// Whether the condition this message describes impacts the node's connectivity.
     pub impacts_connectivity: bool,
     /// Optional primary call-to-action (e.g. a "learn more"/"fix it" link) for this message.
@@ -509,12 +520,14 @@ pub struct DisplayMessage<'a> {
 #[derive(Default, Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct DisplayMessageAction<'a> {
-    /// The URL to open when the user activates the action.
+    /// The URL to open when the user activates the action. `Cow` because a URL's query string
+    /// carries `&` (which Go's `json.Marshal` escapes to `&`), which a borrowed `&str` cannot
+    /// decode.
     #[serde(borrow, rename = "URL")]
-    pub url: &'a str,
-    /// The human-readable label for the action (e.g. button text).
+    pub url: Cow<'a, str>,
+    /// The human-readable label for the action (e.g. button text). `Cow` for escape tolerance.
     #[serde(borrow)]
-    pub label: &'a str,
+    pub label: Cow<'a, str>,
 }
 
 /// An update to a node.
@@ -807,6 +820,42 @@ mod test {
         assert_eq!(future.severity, "low");
     }
 
+    /// A `DisplayMessage` whose admin-authored `Title`/`Text` and the action `URL`/`Label` contain
+    /// JSON escapes must decode (the fields are `Cow<'a, str>`). A borrowed `&str` could not decode
+    /// the escaped form and would fail the whole `MapResponse` decode, dropping the netmap. Covers
+    /// the Go-default HTML escaping (`&`→`&`) in the URL query string, plus `\n`/`\"`/`\\` in the
+    /// body prose.
+    #[test]
+    fn display_message_with_escapes_decodes() {
+        const TEST: &str = r#"{
+            "Seq": 1,
+            "DisplayMessages": {
+                "warn": {
+                    "Title": "Update \"now\"",
+                    "Text": "Line1\nLine2: A & B \\ C",
+                    "Severity": "high",
+                    "PrimaryAction": {
+                        "URL": "https://example.com/fix?a=1&b=2",
+                        "Label": "Fix & continue"
+                    }
+                }
+            }
+        }"#;
+        let resp = serde_json::from_str::<MapResponse>(TEST)
+            .expect("DisplayMessage with escaped text/url must decode");
+        let msg = resp
+            .display_messages
+            .get("warn")
+            .expect("present")
+            .as_ref()
+            .expect("has body");
+        assert_eq!(msg.title, r#"Update "now""#);
+        assert_eq!(msg.text, "Line1\nLine2: A & B \\ C");
+        let action = msg.primary_action.as_ref().expect("action present");
+        assert_eq!(action.url, "https://example.com/fix?a=1&b=2");
+        assert_eq!(action.label, "Fix & continue");
+    }
+
     /// `null`/absent `Health` and `DisplayMessages` decode as empty (the struct-level `apply` block
     /// extends the existing null-slice/map tolerance to the new fields), not as a parse error.
     #[test]
@@ -819,5 +868,65 @@ mod test {
         let resp = serde_json::from_str::<MapResponse>(TEST).expect("null must decode as empty");
         assert!(resp.health.is_empty());
         assert!(resp.display_messages.is_empty());
+    }
+
+    /// `MapResponse::domain` is admin/tenant-authored text typed `Cow<'a, str>` so it tolerates JSON
+    /// escapes. A bare `&'a str` cannot zero-copy-borrow a string serde must unescape and fails the
+    /// WHOLE `MapResponse` decode (`invalid type: string "...", expected a borrowed string`) — which
+    /// silently drops the netmap. With `Cow`, serde owns the unescaped value and the decode succeeds.
+    #[test]
+    fn domain_with_escape_sequence_decodes() {
+        const TEST: &str = r#"{ "Seq": 1, "Domain": "ex\n\"a\\mple.com" }"#;
+        let resp = serde_json::from_str::<MapResponse>(TEST)
+            .expect("MapResponse with an escaped Domain must decode");
+        assert_eq!(resp.domain, "ex\n\"a\\mple.com");
+    }
+
+    /// The no-escape fast path still decodes (and borrows zero-copy, though that is not observable
+    /// from outside): a plain `Domain` yields its value unchanged.
+    #[test]
+    fn domain_without_escape_decodes() {
+        const TEST: &str = r#"{ "Seq": 1, "Domain": "example.com" }"#;
+        let resp = serde_json::from_str::<MapResponse>(TEST)
+            .expect("MapResponse with a plain Domain must decode");
+        assert_eq!(resp.domain, "example.com");
+    }
+
+    /// A single peer whose `Node::name` carries a JSON escape must NOT drop the whole netmap.
+    /// `Node::name` is `Cow<'a, str>`, so an escaped peer name (here `ho\nst`, i.e. a control name
+    /// arriving with a newline) is owned-and-unescaped by serde rather than failing the peer's
+    /// `Node` decode. Before the `Cow` conversion a bare `&'a str` failed that decode with `invalid
+    /// type: string "...", expected a borrowed string`, which bubbled up and silently dropped the
+    /// ENTIRE `MapResponse` (and thus every peer) from the netmap. This proves one escaped name no
+    /// longer poisons the whole map. The peer `Node` shape mirrors `null_sequences_decode_as_empty`.
+    #[test]
+    fn peer_name_with_escape_does_not_drop_netmap() {
+        const TEST: &str = r#"{
+            "Seq": 1,
+            "Peers": [
+                {
+                    "ID": 2,
+                    "StableID": "n2",
+                    "Name": "ho\nst.tail.ts.net.",
+                    "User": 1,
+                    "Addresses": ["100.64.0.2/32"],
+                    "AllowedIPs": null,
+                    "Endpoints": null,
+                    "PrimaryRoutes": null,
+                    "Capabilities": null,
+                    "CapMap": null,
+                    "Tags": null,
+                    "ExitNodeDNSResolvers": null,
+                    "Key": "nodekey:0000000000000000000000000000000000000000000000000000000000000000"
+                }
+            ]
+        }"#;
+        let resp = serde_json::from_str::<MapResponse>(TEST)
+            .expect("MapResponse with an escaped peer Name must decode (not drop the netmap)");
+        let peers = resp
+            .peers
+            .expect("peers present — the escaped name must not drop the netmap");
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].name, "ho\nst.tail.ts.net.");
     }
 }

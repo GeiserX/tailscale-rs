@@ -1,3 +1,5 @@
+use alloc::borrow::Cow;
+
 use serde::Deserialize;
 use url::Url;
 
@@ -35,5 +37,51 @@ pub struct ClientVersion<'a> {
     /// The text to show in the notification. Only populated when [`ClientVersion::notify`] is
     /// `true`.
     #[serde(borrow)]
-    pub notify_text: Option<&'a str>,
+    pub notify_text: Option<Cow<'a, str>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `ClientVersion::notify_text` is the human-facing notification body typed `Option<Cow<'a,
+    /// str>>` so it tolerates JSON escapes. Go's `json.Marshal` HTML-escapes `&` → `&` by
+    /// default, and the prose can carry a newline/quote; a bare `Option<&'a str>` cannot zero-copy-
+    /// borrow a string serde must unescape and fails the WHOLE `ClientVersion` decode (`invalid
+    /// type: string "...", expected a borrowed string`), masking the upgrade notice. With `Cow`,
+    /// serde owns the unescaped value and the decode succeeds.
+    #[test]
+    fn notify_text_with_escape_sequence_decodes() {
+        const TEST: &str = r#"{
+            "RunningLatest": false,
+            "LatestVersion": "1.84.0",
+            "Notify": true,
+            "NotifyText": "Update now:\n\"security & stability\" fixes\\n"
+        }"#;
+        let cv = serde_json::from_str::<ClientVersion>(TEST)
+            .expect("ClientVersion with an escaped NotifyText must decode");
+        assert_eq!(
+            cv.notify_text.as_deref(),
+            Some("Update now:\n\"security & stability\" fixes\\n")
+        );
+        assert!(cv.notify);
+    }
+
+    /// The no-escape fast path still decodes (and borrows zero-copy, though that is not observable
+    /// from outside): a plain `NotifyText` yields its value unchanged.
+    #[test]
+    fn notify_text_without_escape_decodes() {
+        const TEST: &str = r#"{
+            "RunningLatest": false,
+            "LatestVersion": "1.84.0",
+            "Notify": true,
+            "NotifyText": "A new version is available"
+        }"#;
+        let cv = serde_json::from_str::<ClientVersion>(TEST)
+            .expect("ClientVersion with a plain NotifyText must decode");
+        assert_eq!(
+            cv.notify_text.as_deref(),
+            Some("A new version is available")
+        );
+    }
 }

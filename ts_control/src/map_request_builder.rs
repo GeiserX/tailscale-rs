@@ -61,7 +61,7 @@ impl<'a> MapRequestBuilder<'a> {
 
     /// Set the [`HostInfo::hostname`] field.
     pub fn hostname(mut self, hostname: &'a str) -> Self {
-        self.host_info_mut().hostname = Some(hostname);
+        self.host_info_mut().hostname = Some(hostname.into());
         self
     }
 
@@ -241,7 +241,10 @@ mod tests {
             .hostname("my-new-host")
             .build();
 
-        assert_eq!(req.host_info.unwrap().hostname, Some("my-new-host"));
+        assert_eq!(
+            req.host_info.unwrap().hostname.as_deref(),
+            Some("my-new-host")
+        );
     }
 
     #[test]

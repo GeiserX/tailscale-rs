@@ -505,13 +505,13 @@ impl Config {
             Service {
                 proto: ServiceProto::PeerApi4,
                 port,
-                description: "tailscale-rs",
+                description: "tailscale-rs".into(),
             },
             Service {
                 // Go quirk: the peerapi-dns-proxy service always advertises port 1.
                 proto: ServiceProto::PeerApiDnsProxy,
                 port: 1,
-                description: "tailscale-rs",
+                description: "tailscale-rs".into(),
             },
         ]
     }
