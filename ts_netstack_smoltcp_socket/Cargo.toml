@@ -29,3 +29,9 @@ futures-io = { version = "0.3", optional = true }
 tokio = ["dep:tokio", "std"]
 futures-io = ["dep:futures-io", "std"]
 std = ["ts_netstack_smoltcp_core/std"]
+
+[dev-dependencies]
+# Test-only: drive the async `TcpStream` read/write paths against a live in-process netstack to
+# prove the tsr-9ue reaped-socket mappings (poll_read → EOF, poll_write → ConnectionReset). Uses a
+# full runtime so the `AsyncRead`/`AsyncWrite` futures can be awaited with a background driver thread.
+tokio = { workspace = true, features = ["rt", "macros", "io-util", "time"] }
