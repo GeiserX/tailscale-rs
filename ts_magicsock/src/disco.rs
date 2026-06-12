@@ -181,7 +181,11 @@ pub fn open(our_disco: &DiscoPrivateKey, buf: &mut [u8]) -> Result<Inbound, Disc
             })
         }
         Some(MessageType::Pong) => {
-            let pong = plain.as_msg::<Pong>().ok_or(DiscoError::Malformed)?;
+            // Lax parse (Go `parsePong` is "deliberately lax on longer-than-expected messages"):
+            // take the fixed Pong prefix and ignore any trailing forward-compat bytes, so a future
+            // peer that appends to a Pong still gets its path confirmed instead of falling back to
+            // DERP. The strict exact-size parse would drop such a Pong entirely.
+            let pong = plain.as_msg_lax::<Pong>().ok_or(DiscoError::Malformed)?;
             Ok(Inbound::Pong {
                 sender,
                 tx_id: pong.tx_id,
@@ -189,12 +193,13 @@ pub fn open(our_disco: &DiscoPrivateKey, buf: &mut [u8]) -> Result<Inbound, Disc
             })
         }
         Some(MessageType::CallMeMaybe) => {
-            let cmm = plain.as_msg::<CallMeMaybe>().ok_or(DiscoError::Malformed)?;
-            // Cap the endpoints we accept from one message (anti-amplification — see
-            // [`MAX_INBOUND_CALLMEMAYBE_ENDPOINTS`]). Keep the first N the peer listed.
-            let endpoints = cmm
-                .endpoints
-                .iter()
+            // Lax parse (Go `parseCallMeMaybe`): take the whole 18-byte endpoints and ignore a
+            // trailing partial/extension tail, rather than dropping the entire message when the body
+            // isn't an exact multiple of the endpoint size. Still capped per message
+            // (anti-amplification — [`MAX_INBOUND_CALLMEMAYBE_ENDPOINTS`]); keep the first N listed.
+            let endpoints = plain
+                .call_me_maybe_endpoints()
+                .ok_or(DiscoError::Malformed)?
                 .take(MAX_INBOUND_CALLMEMAYBE_ENDPOINTS)
                 .map(|e| e.socket_addr())
                 .collect();
@@ -375,6 +380,210 @@ mod tests {
             Inbound::CallMeMaybe { endpoints, .. } => assert_eq!(endpoints, eps),
             other => panic!("expected call-me-maybe, got {other:?}"),
         }
+    }
+
+    /// Interop (Go `parsePong` is "deliberately lax on longer-than-expected messages"): an
+    /// over-length Pong — a forward-compatible peer appending trailing bytes after the 30-byte body
+    /// — must still parse (its `tx_id`/`src` taken from the prefix, the tail ignored), so the path
+    /// gets confirmed instead of falling back to DERP. The pre-fix exact-size parse dropped it.
+    #[test]
+    fn over_length_pong_is_accepted_lax() {
+        let (a_sk, _a_pk) = keypair();
+        let (b_sk, b_pk) = keypair();
+        let tx = random_tx_id();
+        let src: SocketAddr = "203.0.113.7:41641".parse().unwrap();
+
+        // Seal a normal pong, then re-seal the same plaintext with 7 trailing bytes appended to the
+        // message body (simulating a future peer's extension).
+        let mut wire = seal_pong_with_trailing(&a_sk, &b_pk, tx, src, 7);
+
+        match open(&b_sk, &mut wire).unwrap() {
+            Inbound::Pong {
+                sender,
+                tx_id,
+                src: got,
+            } => {
+                assert_eq!(sender, a_sk.public_key());
+                assert_eq!(tx_id, tx, "tx_id taken from the prefix");
+                assert_eq!(
+                    got, src,
+                    "src taken from the prefix; trailing bytes ignored"
+                );
+            }
+            other => panic!("expected pong, got {other:?}"),
+        }
+    }
+
+    /// Interop (Go `parseCallMeMaybe`): a `CallMeMaybe` whose body is NOT an exact multiple of the
+    /// 18-byte endpoint size must yield its whole leading endpoints (the trailing partial/extension
+    /// bytes ignored), not be dropped entirely. The pre-fix exact-multiple parse dropped the whole
+    /// message on any trailing bytes.
+    #[test]
+    fn call_me_maybe_with_trailing_partial_endpoint_keeps_whole_ones() {
+        let (a_sk, _a_pk) = keypair();
+        let (b_sk, b_pk) = keypair();
+        let eps: Vec<SocketAddr> = vec![
+            "203.0.113.7:41641".parse().unwrap(),
+            "198.51.100.2:3478".parse().unwrap(),
+        ];
+
+        // Two whole 18-byte endpoints + 5 trailing bytes (a partial third endpoint / extension).
+        let mut wire = seal_call_me_maybe_with_trailing(&a_sk, &b_pk, &eps, 5);
+
+        match open(&b_sk, &mut wire).unwrap() {
+            Inbound::CallMeMaybe { sender, endpoints } => {
+                assert_eq!(sender, a_sk.public_key());
+                assert_eq!(
+                    endpoints, eps,
+                    "the two whole endpoints are parsed; the trailing partial is ignored"
+                );
+            }
+            other => panic!("expected call-me-maybe, got {other:?}"),
+        }
+    }
+
+    /// Floor guard (the inverse of the lax-tail tests): lax must mean "ignore EXTRA", NEVER "accept
+    /// LESS". A Pong whose body is shorter than the canonical 30 bytes must still be rejected —
+    /// `as_msg_lax::<Pong>` requires the full fixed prefix, so a truncated Pong is `Malformed`, not
+    /// silently read with uninitialized/attacker-truncated `src`/`tx_id`.
+    #[test]
+    fn truncated_pong_is_rejected_not_read_short() {
+        let (a_sk, _a_pk) = keypair();
+        let (b_sk, b_pk) = keypair();
+        let tx = random_tx_id();
+
+        // 29-byte body (one short of Pong's 30): just the tx_id (12) + a partial Endpoint (17).
+        let mut body = Vec::new();
+        body.extend_from_slice(&tx);
+        body.extend_from_slice(&[0u8; 17]);
+        assert_eq!(body.len(), 29);
+        let mut wire = seal_raw(&a_sk, &b_pk, MessageType::Pong, &body, 0);
+
+        assert!(
+            matches!(open(&b_sk, &mut wire), Err(DiscoError::Malformed)),
+            "a Pong shorter than its fixed size must be rejected, not read short"
+        );
+    }
+
+    /// A `CallMeMaybe` body shorter than one 18-byte endpoint (here 5 bytes, and the empty case)
+    /// yields NO endpoints rather than an error — Go's "soft-empty" CallMeMaybe parity, and the
+    /// deliberate opposite of Pong's reject-on-short floor. Pinning the asymmetry so a future change
+    /// can't silently flip either floor.
+    #[test]
+    fn short_call_me_maybe_yields_empty_not_error() {
+        let (a_sk, _a_pk) = keypair();
+        let (b_sk, b_pk) = keypair();
+
+        for body_len in [0usize, 5, 17] {
+            let mut wire = seal_raw(
+                &a_sk,
+                &b_pk,
+                MessageType::CallMeMaybe,
+                &vec![0u8; body_len],
+                0,
+            );
+            match open(&b_sk, &mut wire) {
+                Ok(Inbound::CallMeMaybe { endpoints, .. }) => assert!(
+                    endpoints.is_empty(),
+                    "a sub-endpoint-length CallMeMaybe ({body_len}B) must yield no endpoints"
+                ),
+                other => panic!("expected empty call-me-maybe for {body_len}B, got {other:?}"),
+            }
+        }
+    }
+
+    /// The cross-type guard is load-bearing: lax parsing must not let a packet of one type be read
+    /// as another. A `CallMeMaybe`-typed packet must NOT parse as a `Pong` via the lax path (and
+    /// vice-versa) — the `pt.ty()` check in each parser is what prevents a wrong-typed body being
+    /// misread. `open()` dispatches on the type, so we assert it returns the matching `Inbound`.
+    #[test]
+    fn lax_parsers_keep_the_type_guard() {
+        let (a_sk, _a_pk) = keypair();
+        let (b_sk, b_pk) = keypair();
+
+        // A CallMeMaybe must open as CallMeMaybe (never as a Pong), even though its body length
+        // could be mistaken for a padded Pong.
+        let eps: Vec<SocketAddr> = vec!["203.0.113.7:41641".parse().unwrap()];
+        let mut cmm = seal_call_me_maybe(&a_sk, &b_pk, &eps).unwrap();
+        assert!(
+            matches!(open(&b_sk, &mut cmm).unwrap(), Inbound::CallMeMaybe { .. }),
+            "a CallMeMaybe-typed packet must open as CallMeMaybe, not be misread as a Pong"
+        );
+
+        // A Pong must open as Pong (never as CallMeMaybe).
+        let mut pong = seal_pong(
+            &a_sk,
+            &b_pk,
+            random_tx_id(),
+            "198.51.100.2:3478".parse().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            matches!(open(&b_sk, &mut pong).unwrap(), Inbound::Pong { .. }),
+            "a Pong-typed packet must open as Pong, not be misread as a CallMeMaybe"
+        );
+    }
+
+    /// Seal a disco message of `ty` from `message` bytes with `trailing` extra **non-zero** bytes
+    /// appended to the body (so the on-wire message is longer than the canonical size). The trailing
+    /// fill is `0xAB`, not zero, so an over-length test strictly proves the tail is *ignored* rather
+    /// than coincidentally tolerated because it was zero. Builds the plaintext buffer directly
+    /// because the typed `seal_*` helpers produce exact-size bodies.
+    fn seal_raw(
+        our_disco: &DiscoPrivateKey,
+        receiver: &DiscoPublicKey,
+        ty: MessageType,
+        message: &[u8],
+        trailing: usize,
+    ) -> Vec<u8> {
+        use ts_disco_protocol::Packet;
+        let body_len = message.len() + trailing;
+        let mut buf = vec![0u8; Packet::size_for_message(body_len)];
+        // Plaintext layout inside the packet payload is `ty:u8, version:u8, message:[u8]`; write it
+        // via the raw-message initializer so we control the exact (over-long) body.
+        let pkt = Packet::init_raw_message(&mut buf, ty, |msg| {
+            msg[..message.len()].copy_from_slice(message);
+            // Trailing bytes are a recognizable non-zero pattern, so the lax parsers must actively
+            // ignore them (a zero fill could pass even if the tail were wrongly read).
+            msg[message.len()..].fill(0xAB);
+        })
+        .expect("init raw disco message");
+        pkt.encrypt_in_place(our_disco, receiver, random_nonce())
+            .expect("encrypt");
+        buf
+    }
+
+    fn seal_pong_with_trailing(
+        our_disco: &DiscoPrivateKey,
+        receiver: &DiscoPublicKey,
+        tx_id: TxId,
+        src: SocketAddr,
+        trailing: usize,
+    ) -> Vec<u8> {
+        // Canonical 30-byte Pong body: tx_id(12) + Endpoint(18).
+        let mut body = Vec::new();
+        body.extend_from_slice(&tx_id);
+        body.extend_from_slice(Endpoint::from(src).as_bytes());
+        seal_raw(our_disco, receiver, MessageType::Pong, &body, trailing)
+    }
+
+    fn seal_call_me_maybe_with_trailing(
+        our_disco: &DiscoPrivateKey,
+        receiver: &DiscoPublicKey,
+        endpoints: &[SocketAddr],
+        trailing: usize,
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        for ep in endpoints {
+            body.extend_from_slice(Endpoint::from(*ep).as_bytes());
+        }
+        seal_raw(
+            our_disco,
+            receiver,
+            MessageType::CallMeMaybe,
+            &body,
+            trailing,
+        )
     }
 
     #[test]
