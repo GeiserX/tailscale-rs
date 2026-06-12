@@ -160,7 +160,7 @@ pub async fn register(
         node_key: node_public_key,
         old_node_key: node_keystate.old_node_key,
         hostinfo: HostInfo {
-            hostname: config.hostname.as_deref(),
+            hostname: config.hostname.as_deref().map(std::borrow::Cow::Borrowed),
             app: &config.format_client_name(),
             ipn_version: crate::PKG_VERSION,
             routable_ips: {

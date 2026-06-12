@@ -288,7 +288,12 @@ pub struct MapResponse<'a> {
     pub ping_request: Option<PingRequest>,
     /// If non-`None`, a URL for the client to open to complete an action. The client should
     /// debounce identical URLs and only open it once for the same URL.
-    pub pop_browser_url: Option<&'a str>,
+    ///
+    /// A `Cow` because a URL legitimately carries `&` in its query string, which Go's `json.Marshal`
+    /// escapes to `&` by default — a borrowed `&str` cannot decode that escaped form and would
+    /// fail the whole `MapResponse` decode.
+    #[serde(borrow)]
+    pub pop_browser_url: Option<Cow<'a, str>>,
 
     /// Describes the Tailscale node making the map request (ie, the "self" node). Starting with
     /// capability version 18, a value of `None` means unchanged.
