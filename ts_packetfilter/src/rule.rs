@@ -31,11 +31,44 @@ impl Rule {
         info: &PacketInfo,
         caps: impl IntoIterator<Item = &'cap str>,
     ) -> bool {
+        // Whether the destination port participates in the match, mirroring Go's `runIn4`/`runIn6`:
+        // TCP/UDP/SCTP match against the rule's port range; ICMP/ICMPv6 match IPs-only (ports are
+        // ignored — a portless packet surfaces as port 0, which must not be tested against a
+        // `1..=65535`-style range); any other ("portless") protocol matches IPs-only too but only
+        // when the rule opens *all* ports (Go's `matchProtoAndIPsOnlyIfAllPorts`).
+        let port_mode = PortMode::for_proto(info.ip_proto);
         self.protos.contains(&info.ip_proto)
             && self.src.matches(info, caps)
-            && self.dst.iter().any(|dst| dst.matches(info))
+            && self.dst.iter().any(|dst| dst.matches(info, port_mode))
     }
 }
+
+/// How a [`DstMatch`]'s port range participates in a match for a given protocol — the fork's
+/// equivalent of Go's per-protocol dispatch in `wgengine/filter`'s `runIn4`/`runIn6`.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum PortMode {
+    /// The packet carries an L4 port (TCP/UDP/SCTP): the rule's port range is checked normally.
+    Check,
+    /// ICMP/ICMPv6: match IPs only, ignoring the rule's port range entirely.
+    IpsOnly,
+    /// Any other protocol: match IPs only, but *only* if the rule opens all ports (`0..=65535`).
+    IpsOnlyIfAllPorts,
+}
+
+impl PortMode {
+    fn for_proto(proto: IpProto) -> Self {
+        if proto.is_port_ful() {
+            PortMode::Check
+        } else if proto == IpProto::ICMP || proto == IpProto::ICMPV6 {
+            PortMode::IpsOnly
+        } else {
+            PortMode::IpsOnlyIfAllPorts
+        }
+    }
+}
+
+/// The inclusive port range that means "all ports" (Go `filtertype.AllPorts` = `{0, 0xffff}`).
+const ALL_PORTS: RangeInclusive<u16> = 0..=u16::MAX;
 
 /// Matcher for the source of a given packet.
 ///
@@ -81,8 +114,17 @@ pub struct DstMatch {
 }
 
 impl DstMatch {
-    /// Report whether this matcher matches the given [`PacketInfo`].
-    pub fn matches(&self, info: &PacketInfo) -> bool {
-        self.ports.contains(&info.port) && self.ips.iter().any(|pfx| pfx.contains(&info.dst))
+    /// Report whether this matcher matches the given [`PacketInfo`], with the port test applied
+    /// according to `port_mode` (see [`PortMode`] — the per-protocol port semantics from Go's
+    /// `runIn4`/`runIn6`).
+    fn matches(&self, info: &PacketInfo, port_mode: PortMode) -> bool {
+        let port_ok = match port_mode {
+            PortMode::Check => self.ports.contains(&info.port),
+            PortMode::IpsOnly => true,
+            // Go `matchProtoAndIPsOnlyIfAllPorts`: an "other" protocol matches only when the rule
+            // grants all ports; a narrower port range never opens a portless non-ICMP protocol.
+            PortMode::IpsOnlyIfAllPorts => self.ports == ALL_PORTS,
+        };
+        port_ok && self.ips.iter().any(|pfx| pfx.contains(&info.dst))
     }
 }

@@ -14,10 +14,23 @@ impl IpProto {
     pub const TCP: Self = Self(6);
     /// Protocol number for UDP.
     pub const UDP: Self = Self(17);
+    /// Protocol number for SCTP.
+    pub const SCTP: Self = Self(132);
 
     /// Construct a new [`IpProto`] of the given value.
     pub const fn new(value: i64) -> Self {
         Self(value)
+    }
+
+    /// Whether this protocol carries L4 ports, so a packet-filter rule's port range applies to it.
+    ///
+    /// Go's `wgengine/filter` matches TCP/UDP/SCTP against a rule's port range (`match`), but routes
+    /// ICMP/ICMPv6 — and every other "portless" protocol — through an IPs-only match that ignores
+    /// ports entirely ("if any port is open to an IP, allow ICMP to it"). Mirroring that split is
+    /// load-bearing: a packet with no L4 port surfaces as port `0`, which would spuriously fail a
+    /// rule's `1..=65535`-style port range if it were port-checked like TCP/UDP.
+    pub const fn is_port_ful(self) -> bool {
+        matches!(self, Self::TCP | Self::UDP | Self::SCTP)
     }
 }
 
