@@ -278,7 +278,7 @@ impl PeerPaths {
         let cand = self.candidates.entry(to).or_default();
         cand.latency = Some(latency);
 
-        self.recompute_best(now);
+        self.recompute_best(now, to);
         Some(latency)
     }
 
@@ -326,7 +326,10 @@ impl PeerPaths {
         self.in_flight.len()
     }
 
-    fn recompute_best(&mut self, now: Instant) {
+    /// Recompute the best path after a pong confirmed `confirmed` (the address whose latency was
+    /// just updated). `confirmed` is used to decide whether a *hold* (keeping the current best
+    /// against a near-equal challenger) may also refresh the held best's trust window — see below.
+    fn recompute_best(&mut self, now: Instant, confirmed: SocketAddr) {
         // Lowest latency wins; IPv6 breaks ties (Go parity). Only confirmed candidates
         // (those with a measured latency) are eligible.
         let challenger = self
@@ -348,17 +351,28 @@ impl PeerPaths {
         // Hysteresis: if the current best is still trusted AND still a confirmed candidate, only
         // switch to a different challenger when it is more than `BETTER_ADDR_IMPROVEMENT` faster
         // (Go `betterAddr`). This stops `best` from flapping between near-equal endpoints on RTT
-        // jitter. A pong for the *current* best (or a challenger that doesn't clear the band) still
-        // refreshes `trust_until` so the held path doesn't go dark.
+        // jitter.
         if let (Some(current), Some(until)) = (self.best, self.trust_until)
             && now < until
             && current != challenger_addr
             && let Some(current_lat) = self.candidates.get(&current).and_then(|c| c.latency)
         {
+            // Switch only when the challenger is *strictly* more than 1% faster. The
+            // `current_lat > ZERO` guard means a (degenerate) 0-latency best is never pinned
+            // un-switchably: with a 0 threshold every challenger would otherwise read as "not
+            // faster enough" and the best could never be displaced.
             let threshold = current_lat.mul_f64(1.0 - BETTER_ADDR_IMPROVEMENT);
-            if challenger_lat >= threshold {
-                // Challenger isn't decisively faster — keep the current best, just refresh trust.
-                self.trust_until = Some(now + TRUST_DURATION);
+            let challenger_wins = current_lat > Duration::ZERO && challenger_lat < threshold;
+            if !challenger_wins {
+                // Keep the current best. Only refresh its trust window if the pong that triggered
+                // this recompute was *for the best itself* — a pong for a rival proves some path
+                // works but does NOT prove the best is still alive, so refreshing on a rival's pong
+                // could keep a silently-dead best trusted up to a full `TRUST_DURATION` longer. The
+                // best is independently re-pinged every refresh cycle (`send_pings` pings all
+                // candidates), so its own pong is what legitimately extends trust here.
+                if confirmed == current {
+                    self.trust_until = Some(now + TRUST_DURATION);
+                }
                 return;
             }
         }
@@ -755,6 +769,73 @@ mod tests {
             p.best_addr(near_second_expiry),
             Some(a),
             "a re-pong for the current best must refresh its trust window"
+        );
+    }
+
+    /// When the current best's trust has EXPIRED, the hysteresis hold does not apply: a faster
+    /// confirmed candidate is taken immediately (the `now < until` conjunct gates the hold, so an
+    /// untrusted best never blocks a switch). Selection is still strict-min over confirmed
+    /// candidates, so the faster `b` wins here regardless.
+    #[test]
+    fn expired_best_does_not_block_switch_to_faster_candidate() {
+        let mut p = PeerPaths::default();
+        let a: SocketAddr = "203.0.113.1:41641".parse().unwrap();
+        let b: SocketAddr = "203.0.113.2:41641".parse().unwrap();
+        p.add_netmap_candidates([a, b]);
+
+        let now = Instant::now();
+        p.note_ping_sent(tx(1), a, now);
+        p.note_pong(tx(1), a, now + Duration::from_millis(10)); // a best @10ms
+
+        // Let a's trust fully lapse, then b confirms at 5ms (faster than a). Even though the
+        // improvement is well past the 1% band, this asserts the EXPIRY path specifically: with a
+        // untrusted, the hold branch is skipped entirely (not merely overridden by the band).
+        let t1 = now + TRUST_DURATION + Duration::from_secs(1);
+        p.note_ping_sent(tx(2), b, t1);
+        p.note_pong(tx(2), b, t1 + Duration::from_millis(5));
+        assert_eq!(
+            p.best_addr(t1 + Duration::from_millis(6)),
+            Some(b),
+            "a faster candidate must win once the prior best's trust has expired"
+        );
+    }
+
+    /// A near-equal *rival's* pong must NOT refresh the held best's trust window — only a pong for
+    /// the best itself does. This stops a silently-dead best from being kept trusted by a rival that
+    /// keeps answering within the 1% band. Here `a` is best, then only `b` (a near-equal rival)
+    /// keeps ponging; `a`'s trust must still expire on schedule.
+    #[test]
+    fn rival_pong_does_not_refresh_held_best_trust() {
+        let mut p = PeerPaths::default();
+        let a: SocketAddr = "203.0.113.1:41641".parse().unwrap();
+        let b: SocketAddr = "203.0.113.2:41641".parse().unwrap();
+        p.add_netmap_candidates([a, b]);
+
+        let now = Instant::now();
+        // a's pong arrives at `a_confirmed`, so a's trust runs until `a_confirmed + TRUST_DURATION`.
+        let a_confirmed = now + Duration::from_millis(10);
+        p.note_ping_sent(tx(1), a, now);
+        p.note_pong(tx(1), a, a_confirmed);
+
+        // A near-equal rival `b` pongs partway through a's window (9.95ms, within the 1% band → hold,
+        // and confirmed != current so trust is NOT refreshed).
+        let t1 = now + Duration::from_millis(20);
+        p.note_ping_sent(tx(2), b, t1);
+        p.note_pong(tx(2), b, t1 + Duration::from_micros(9_950));
+        assert_eq!(
+            p.best_addr(t1 + Duration::from_millis(10)),
+            Some(a),
+            "near-equal rival must not steal best"
+        );
+
+        // a's trust runs until `a_confirmed + TRUST_DURATION`; just AFTER that it must have lapsed —
+        // the rival's later pong did not extend it. (If the rival had wrongly refreshed trust, a
+        // would still be reported as best here.)
+        let just_after_a_expiry = a_confirmed + TRUST_DURATION + Duration::from_millis(1);
+        assert_eq!(
+            p.best_addr(just_after_a_expiry),
+            None,
+            "a rival's pong must not extend the held best's trust window"
         );
     }
 }
