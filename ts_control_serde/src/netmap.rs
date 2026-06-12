@@ -229,7 +229,6 @@ mod endpoint_serde {
     }
 }
 
-// TODO (dylan): MapResponse: add missing fields
 /// The response to a [`MapRequest`]. It describes the state of the local Tailscale node, the peer
 /// nodes in the Tailnet, the DNS configuration, the packet filter, and more. A [`MapRequest`],
 /// depending on its parameters, may result in the control plane coordination server sending 0, 1,
@@ -399,34 +398,35 @@ pub struct MapResponse<'a> {
     pub user_profiles: Vec<UserProfile<'a>>,
 
     // --------------------------------------------------------------------------------------------
-    // Health, if non-nil, sets the health state of the node from the control
-    // plane's perspective. A nil value means no change from the previous
-    // MapResponse. A non-nil 0-length slice restores the health to good (no
-    // known problems). A non-zero length slice are the list of problems that
-    // the control plane sees.
-    //
-    // Either this will be set, or DisplayMessages will be set, but not both.
-    //
-    // Note that this package's type, due its use of a slice and omitempty, is
-    // unable to marshal a zero-length non-nil slice. The control server needs
-    // to marshal this type using a separate type. See MapResponse docs.
-    //Health []string `json:",omitempty"`
+    /// Sets the health state of the node from the control plane's perspective (Go capver 24).
+    ///
+    /// In Go, a `nil` slice means "no change from the previous `MapResponse`", a non-`nil`
+    /// zero-length slice restores health to good (no known problems), and a non-empty slice is the
+    /// list of problems the control plane sees. Either this or
+    /// [`display_messages`][MapResponse::display_messages] is set, but not both.
+    ///
+    /// This fork decodes the wire value into a `Vec` (the struct-level `apply` block tolerates a
+    /// wire `null`, mapping it to an empty `Vec`); it does not currently distinguish "no change"
+    /// (`nil`) from "all good" (empty) downstream — the field is carried so health warnings are no
+    /// longer silently dropped.
+    pub health: Vec<&'a str>,
 
-    // DisplayMessages sets the health state of the node from the control
-    // plane's perspective.
-    //
-    // Either this will be set, or Health will be set, but not both.
-    //
-    // The map keys are IDs that uniquely identify the type of health issue. The
-    // map values are the messages. If the server sends down a map with entries,
-    // the client treats it as a patch: new entries are added, keys with a value
-    // of nil are deleted, existing entries with new values are updated. A nil
-    // map and an empty map both mean no change has occurred since the last
-    // update.
-    //
-    // As a special case, the map key "*" with a value of nil means to clear all
-    // prior display messages before processing the other map entries.
-    //DisplayMessages map[DisplayMessageID]*DisplayMessage `json:",omitempty"`
+    /// Structured health/display messages from the control plane (Go capver 117).
+    ///
+    /// The map keys are opaque `DisplayMessageID` strings; a value of `None` (Go `nil`, JSON
+    /// `null`) deletes that id. Go treats a populated map as a PATCH: new entries are added, `null`
+    /// values delete, and existing entries with new values are updated. As a special case, the key
+    /// `"*"` with a `None` value clears all prior display messages before the other entries are
+    /// processed. A `nil`/absent map (and, in Go, an empty map) means no change.
+    ///
+    /// Either this or [`health`][MapResponse::health] is set, but not both.
+    ///
+    /// This fork decodes-and-carries the map (the struct-level `apply` block tolerates a wire
+    /// `null`); the PATCH/`"*"`-clear/`null`-delete semantics are not yet applied downstream (see
+    /// the map-stream consumer). Decoding it here is what stops control-pushed display messages
+    /// from being silently dropped. TODO: wire the patch semantics into the map stream.
+    pub display_messages: BTreeMap<&'a str, Option<DisplayMessage<'a>>>,
+
     /// If non-`None`, updates the SSH policy for how incoming SSH connections should be handled.
     /// A `None` value means no change from the previous value.
     #[serde(default, rename = "SSHPolicy")]
@@ -474,6 +474,47 @@ pub struct MapResponse<'a> {
     /// control; the auto-update setting doesn't change if the tailnet admin flips the default
     /// after the node registered.
     pub default_auto_update: Option<bool>,
+}
+
+/// A structured health/display message pushed by the control plane (Go `tailcfg.DisplayMessage`,
+/// capver 117), surfaced to the user as a warning/notice about node or tailnet state.
+///
+/// `#[serde(default)]` makes every field optional (Go marshals `Title`/`Text`/`Severity` with no
+/// `omitempty`, but a tolerant decode shouldn't fail on a sparse message), and there is
+/// deliberately no `deny_unknown_fields`: Go adds fields to this struct over time, and an unknown
+/// field must not fail the whole netmap decode.
+#[derive(Default, Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct DisplayMessage<'a> {
+    /// Short, human-readable title summarizing the message.
+    #[serde(borrow)]
+    pub title: &'a str,
+    /// Longer, human-readable body text describing the message.
+    #[serde(borrow)]
+    pub text: &'a str,
+    /// Severity of the message. Go's `DisplayMessageSeverity` is a string with known values
+    /// `"high"`, `"medium"`, and `"low"`; this is kept as a borrowed `&str` (rather than a closed
+    /// enum) so an unrecognized future severity decodes rather than failing the netmap.
+    #[serde(borrow)]
+    pub severity: &'a str,
+    /// Whether the condition this message describes impacts the node's connectivity.
+    pub impacts_connectivity: bool,
+    /// Optional primary call-to-action (e.g. a "learn more"/"fix it" link) for this message.
+    #[serde(borrow)]
+    pub primary_action: Option<DisplayMessageAction<'a>>,
+}
+
+/// A call-to-action attached to a [`DisplayMessage`] (Go `tailcfg.DisplayMessageAction`): a label
+/// and a URL the client may surface as a button/link.
+#[derive(Default, Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct DisplayMessageAction<'a> {
+    /// The URL to open when the user activates the action.
+    #[serde(borrow, rename = "URL")]
+    pub url: &'a str,
+    /// The human-readable label for the action (e.g. button text).
+    #[serde(borrow)]
+    pub label: &'a str,
 }
 
 /// An update to a node.
@@ -662,5 +703,121 @@ mod test {
         assert_eq!(dns.resolvers.len(), 1);
         let resolver = dns.resolvers[0].as_ref().expect("resolver present");
         assert!(resolver.bootstrap_resolution.is_empty());
+    }
+
+    /// `MapResponse.Health` (Go capver 24) must decode into the `health` vec. Control sends this as
+    /// a JSON array of strings; previously the field didn't exist and the warnings were dropped.
+    #[test]
+    fn health_decodes() {
+        const TEST: &str = r#"{
+            "Seq": 1,
+            "Health": ["control says hello", "second warning"]
+        }"#;
+        let resp = serde_json::from_str::<MapResponse>(TEST).expect("must decode");
+        assert_eq!(resp.health, ["control says hello", "second warning"]);
+    }
+
+    /// `MapResponse.DisplayMessages` (Go capver 117) must decode into the typed map without error,
+    /// retaining the typed `DisplayMessage` values, the `null`-valued delete sentinel, and the
+    /// `"*"` clear-all key.
+    #[test]
+    fn display_messages_decode() {
+        const TEST: &str = r#"{
+            "Seq": 1,
+            "DisplayMessages": {
+                "warning-id": {
+                    "Title": "Update available",
+                    "Text": "A new version is available.",
+                    "Severity": "high",
+                    "ImpactsConnectivity": true,
+                    "PrimaryAction": {
+                        "URL": "https://example.com/update",
+                        "Label": "Update now"
+                    }
+                },
+                "stale-id": null,
+                "*": null
+            }
+        }"#;
+        let resp = serde_json::from_str::<MapResponse>(TEST).expect("must decode");
+        assert_eq!(resp.display_messages.len(), 3);
+
+        // The typed message is retained with all fields.
+        let msg = resp
+            .display_messages
+            .get("warning-id")
+            .expect("warning-id present")
+            .as_ref()
+            .expect("warning-id has a message body");
+        assert_eq!(msg.title, "Update available");
+        assert_eq!(msg.text, "A new version is available.");
+        assert_eq!(msg.severity, "high");
+        assert!(msg.impacts_connectivity);
+        let action = msg.primary_action.as_ref().expect("primary action present");
+        assert_eq!(action.url, "https://example.com/update");
+        assert_eq!(action.label, "Update now");
+
+        // The `null` value (Go's `nil` *DisplayMessage`) is the delete sentinel and decodes to
+        // `None`, not an error.
+        assert!(
+            resp.display_messages
+                .get("stale-id")
+                .expect("present")
+                .is_none()
+        );
+        // The `"*"` clear-all key is carried (its patch semantics are applied downstream later).
+        assert!(resp.display_messages.contains_key("*"));
+        assert!(resp.display_messages.get("*").expect("present").is_none());
+    }
+
+    /// A sparse `DisplayMessage` (only some fields) and one carrying an unknown field must both
+    /// decode — Go marshals `Title`/`Text`/`Severity` unconditionally but adds fields over time, so
+    /// the struct is `default` + has no `deny_unknown_fields`.
+    #[test]
+    fn display_message_tolerant_of_sparse_and_unknown_fields() {
+        const TEST: &str = r#"{
+            "Seq": 1,
+            "DisplayMessages": {
+                "sparse": { "Title": "Just a title" },
+                "future": {
+                    "Title": "t",
+                    "Text": "x",
+                    "Severity": "low",
+                    "SomeFutureFieldGoAdded": { "nested": true }
+                }
+            }
+        }"#;
+        let resp = serde_json::from_str::<MapResponse>(TEST).expect("must decode");
+        let sparse = resp
+            .display_messages
+            .get("sparse")
+            .expect("sparse present")
+            .as_ref()
+            .expect("has body");
+        assert_eq!(sparse.title, "Just a title");
+        assert_eq!(sparse.text, "");
+        assert!(sparse.primary_action.is_none());
+
+        let future = resp
+            .display_messages
+            .get("future")
+            .expect("future present")
+            .as_ref()
+            .expect("has body");
+        assert_eq!(future.severity, "low");
+    }
+
+    /// `null`/absent `Health` and `DisplayMessages` decode as empty (the struct-level `apply` block
+    /// extends the existing null-slice/map tolerance to the new fields), not as a parse error.
+    #[test]
+    fn health_and_display_messages_null_decode_as_empty() {
+        const TEST: &str = r#"{
+            "Seq": 1,
+            "Health": null,
+            "DisplayMessages": null
+        }"#;
+        let resp = serde_json::from_str::<MapResponse>(TEST).expect("null must decode as empty");
+        assert!(resp.health.is_empty());
+        assert!(resp.display_messages.is_empty());
     }
 }
