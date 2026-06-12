@@ -31,6 +31,9 @@ url.workspace = true
 [dev-dependencies]
 reqwest.workspace = true
 serde_json.workspace = true
+# `test-util` provides the paused virtual clock (`#[tokio::test(start_paused = true)]`) the
+# report/probe-deadline tests use to fire the timeouts in virtual time; `macros` for `#[tokio::test]`.
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
 tracing-test.workspace = true
 ts_control_serde.workspace = true
 ts_test_util.workspace = true
