@@ -51,18 +51,19 @@ pub(crate) const REKEY_AFTER_TIME_RECEIVING: Duration = Duration::from_secs(165)
 pub(crate) const REJECT_AFTER_TIME_RECV: Duration = REJECT_AFTER_TIME;
 
 /// Hard message-count ceiling for a keypair: no transport message may be sent with a nonce at or
-/// beyond this. Matches wireguard-go `device/constants.go` `RejectAfterMessages = MaxUint64 - 2^13 - 1`
-/// (the whitepaper's "2^60" is a looser conceptual bound; this is the value Go/boringtun actually
-/// enforce, so we match it byte-for-byte for parity). Time-based rekey/expiry (120s/180s) makes this
-/// physically unreachable on any real link, but enforcing it removes the only `panic!` on the send
-/// path and makes rotation volume-aware exactly like Go.
-pub(crate) const REJECT_AFTER_MESSAGES: u64 = u64::MAX - (1 << 13) - 1;
+/// beyond this. Matches wireguard-go `device/constants.go` `RejectAfterMessages = (1 << 64) - (1 << 13) - 1`.
+/// Since `u64::MAX == (1 << 64) - 1`, that equals `u64::MAX - (1 << 13)` — NOT `u64::MAX - (1 << 13) - 1`,
+/// which is one short (a prior off-by-one this corrects). Time-based rekey/expiry (120s/180s) makes
+/// this physically unreachable on any real link, but enforcing it removes the only `panic!` on the
+/// send path and makes rotation volume-aware exactly like Go.
+pub(crate) const REJECT_AFTER_MESSAGES: u64 = u64::MAX - (1 << 13);
 
 /// Message count past which a key rotation (rehandshake) should be initiated — the volume analog of
-/// [`REKEY_AFTER_TIME`]. Matches wireguard-go `RekeyAfterMessages = MaxUint64 - 2^16 - 1`: an
+/// [`REKEY_AFTER_TIME`]. Matches wireguard-go `device/constants.go` `RekeyAfterMessages = (1 << 60)`
+/// (NOT `MaxUint64 - 2^16 - 1`, which a prior comment fabricated; Go uses the whitepaper's 2^60). An
 /// actively-sending peer rekeys on whichever of time-or-volume it reaches first, so the nonce never
 /// approaches [`REJECT_AFTER_MESSAGES`].
-pub(crate) const REKEY_AFTER_MESSAGES: u64 = u64::MAX - (1 << 16) - 1;
+pub(crate) const REKEY_AFTER_MESSAGES: u64 = 1 << 60;
 
 /// A generator of monotonically increasing 64-bit nonces.
 #[derive(Default)]
