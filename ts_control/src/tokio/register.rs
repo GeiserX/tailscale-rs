@@ -218,7 +218,10 @@ pub async fn register(
 
     if !status.is_success() {
         // Attempt to collect the body to log the error, truncating to prevent spamming the logs.
-        let mut body = response.collect_bytes().await.unwrap_or_default();
+        let mut body = response
+            .collect_bytes_limited(crate::MAX_CONTROL_RESPONSE)
+            .await
+            .unwrap_or_default();
         body.truncate(512);
         let body = core::str::from_utf8(&body).unwrap_or("<invalid utf8>");
         tracing::error!(%body, %status, "registration failed");
@@ -226,7 +229,9 @@ pub async fn register(
         return Err(RegistrationError::Internal(InternalErrorKind::Http));
     }
 
-    let body = response.collect_bytes().await?;
+    let body = response
+        .collect_bytes_limited(crate::MAX_CONTROL_RESPONSE)
+        .await?;
     let body = core::str::from_utf8(&body)?;
 
     tracing::trace!(registration_response_body = %body);

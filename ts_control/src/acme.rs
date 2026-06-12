@@ -272,7 +272,10 @@ where
 {
     let status = resp.status();
     let headers = resp.headers().clone();
-    let body = resp.collect_bytes().await.map_err(http_err)?;
+    let body = resp
+        .collect_bytes_limited(ACME_MAX_RESPONSE)
+        .await
+        .map_err(http_err)?;
     check_body_size(body.len())?;
     Ok(Parts {
         status,

@@ -42,7 +42,7 @@ pub async fn do_upgrade(resp: Response<Incoming>) -> hyper::Result<Upgraded> {
 
 mod sealed {
     use futures::TryStreamExt;
-    use http_body_util::BodyExt;
+    use http_body_util::{BodyExt, Limited};
     use tokio::io::AsyncRead;
     use tokio_util::io::StreamReader;
 
@@ -50,8 +50,28 @@ mod sealed {
 
     /// Helper methods for [`http::Response`].
     pub trait ResponseExt {
-        /// Collect the response body into a [`bytes::Bytes`].
+        /// Collect the response body into a [`bytes::Bytes`] with **no size limit**.
+        ///
+        /// Use this only when the body is locally generated or otherwise trusted to be small. For
+        /// any body read from a network peer (a control/DERP/upstream server response — all of which
+        /// this fork treats as hostile-capable), prefer
+        /// [`collect_bytes_limited`][Self::collect_bytes_limited]: `collect()` here buffers the
+        /// *entire* body into memory before returning, so a malicious or MITM'd server answering a
+        /// short request with a multi-gigabyte streamed body would OOM the client (a length check
+        /// *after* `collect_bytes` is too late — the allocation already happened).
         fn collect_bytes(self) -> impl Future<Output = Result<bytes::Bytes, Error>> + Send;
+        /// Collect the response body into a [`bytes::Bytes`], failing if it exceeds `max` bytes.
+        ///
+        /// The body is wrapped in [`http_body_util::Limited`], which aborts collection as soon as
+        /// more than `max` bytes arrive — so the allocation is bounded *during* the read, mirroring
+        /// Go's `io.LimitedReader`-bounded body reads. An over-limit body yields
+        /// [`Error::BodyTooLarge`] (distinct from a transient [`Error::Io`], so callers can treat it
+        /// as terminal). This is the body reader every network-response caller should use; pick `max`
+        /// to comfortably fit the largest legitimate response for that endpoint.
+        fn collect_bytes_limited(
+            self,
+            max: usize,
+        ) -> impl Future<Output = Result<bytes::Bytes, Error>> + Send;
         /// Convert the response body into an [`AsyncRead`].
         fn into_read(self) -> impl AsyncRead + Send + Unpin + 'static;
     }
@@ -70,6 +90,32 @@ mod sealed {
                 .map_err(|e| {
                     tracing::error!(error = %e, "collecting response body");
                     Error::Io
+                })?
+                .to_bytes();
+
+            Ok(buf)
+        }
+
+        async fn collect_bytes_limited(self, max: usize) -> Result<bytes::Bytes, Error> {
+            // `Limited` errors (with a boxed `LengthLimitError`) once the body exceeds `max`, so
+            // collection stops there instead of buffering an unbounded body — the cap binds the
+            // allocation, not just a post-hoc length check.
+            let buf = Limited::new(self.into_body(), max)
+                .collect()
+                .await
+                .map_err(|e| {
+                    // Distinguish "the peer exceeded the cap" (terminal — an attack/misconfig signal,
+                    // not worth retrying) from a transient mid-read I/O failure. `Limited` boxes a
+                    // `LengthLimitError` for the former.
+                    if e.downcast_ref::<http_body_util::LengthLimitError>()
+                        .is_some()
+                    {
+                        tracing::error!(max, "response body exceeded the size limit");
+                        Error::BodyTooLarge
+                    } else {
+                        tracing::error!(error = %e, max, "collecting response body (limited)");
+                        Error::Io
+                    }
                 })?
                 .to_bytes();
 
@@ -199,5 +245,41 @@ mod tests {
         let (name, value) = host_header(&url("https://localhost:14000/")).unwrap();
         assert_eq!(name, HOST);
         assert_eq!(value, "localhost:14000");
+    }
+
+    /// `collect_bytes_limited` must accept a body up to and including `max` bytes and reject anything
+    /// larger, bounding the allocation during the read (a control/DERP/upstream server can't OOM the
+    /// client by streaming an oversized body to a small request). Pins the boundary: `< max` and
+    /// `== max` succeed, `max + 1` errors.
+    #[tokio::test]
+    async fn collect_bytes_limited_caps_the_body() {
+        use http_body_util::Full;
+
+        async fn collect(len: usize, max: usize) -> Result<bytes::Bytes, Error> {
+            let body = Full::new(Bytes::from(vec![0u8; len]));
+            Response::new(body).collect_bytes_limited(max).await
+        }
+
+        const MAX: usize = 1024;
+
+        // Below the cap: ok, full body returned.
+        let under = collect(MAX - 1, MAX)
+            .await
+            .expect("a body under the cap is collected");
+        assert_eq!(under.len(), MAX - 1);
+
+        // Exactly at the cap: ok (Limited allows == max, rejects only > max).
+        let at = collect(MAX, MAX)
+            .await
+            .expect("a body exactly at the cap is collected");
+        assert_eq!(at.len(), MAX);
+
+        // Over the cap: rejected with the distinct BodyTooLarge (not a generic Io), allocation
+        // bounded — never buffers the whole oversized body.
+        let over = collect(MAX + 1, MAX).await;
+        assert!(
+            matches!(over, Err(Error::BodyTooLarge)),
+            "a body over the cap must be rejected as BodyTooLarge, got {over:?}"
+        );
     }
 }

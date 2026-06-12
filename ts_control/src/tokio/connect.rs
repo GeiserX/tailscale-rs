@@ -241,7 +241,11 @@ pub async fn fetch_control_key(
         return Err(ConnectionError::Internal(InternalErrorKind::Http));
     }
 
-    let control_keys: ControlPublicKeys = serde_json::from_slice(&response.collect_bytes().await?)?;
+    let control_keys: ControlPublicKeys = serde_json::from_slice(
+        &response
+            .collect_bytes_limited(crate::MAX_CONTROL_RESPONSE)
+            .await?,
+    )?;
     let control_public_key = control_keys.public_key;
 
     Ok(control_public_key)

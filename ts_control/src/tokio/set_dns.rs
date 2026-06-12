@@ -203,7 +203,9 @@ pub(crate) async fn set_dns_with(
         .await?;
 
     let status = response.status();
-    let body = response.collect_bytes().await?;
+    let body = response
+        .collect_bytes_limited(crate::MAX_CONTROL_RESPONSE)
+        .await?;
     check_set_dns_status(status, &body)
 }
 

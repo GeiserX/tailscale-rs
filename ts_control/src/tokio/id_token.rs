@@ -186,7 +186,9 @@ pub(crate) async fn fetch_id_token_with(
         .await?;
 
     let status = response.status();
-    let body = response.collect_bytes().await?;
+    let body = response
+        .collect_bytes_limited(crate::MAX_CONTROL_RESPONSE)
+        .await?;
     parse_token_response(status, &body)
 }
 

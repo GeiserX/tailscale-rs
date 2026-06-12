@@ -284,7 +284,9 @@ async fn post_form_tls(
 
     let response = client.post(url, headers, Bytes::from(body).into()).await?;
     let status = response.status();
-    let body = response.collect_bytes().await?;
+    let body = response
+        .collect_bytes_limited(crate::MAX_CONTROL_RESPONSE)
+        .await?;
     check_status(status, body)
 }
 
@@ -328,7 +330,9 @@ async fn create_key(
     ];
     let response = client.post(&url, headers, Bytes::from(body).into()).await?;
     let status = response.status();
-    let body = response.collect_bytes().await?;
+    let body = response
+        .collect_bytes_limited(crate::MAX_CONTROL_RESPONSE)
+        .await?;
     let body = check_status(status, body)?;
     parse_create_key_response(&body)
 }
@@ -380,7 +384,9 @@ async fn obtain_ambient_id_token(audience: &str) -> Result<String, WifError> {
         ];
         let response = client.get(&url, headers).await?;
         let status = response.status();
-        let body = response.collect_bytes().await?;
+        let body = response
+            .collect_bytes_limited(crate::MAX_CONTROL_RESPONSE)
+            .await?;
         let body = check_status(status, body)?;
         return parse_github_token(&body);
     }
@@ -414,7 +420,9 @@ async fn obtain_gcp_id_token(audience: &str) -> Result<String, WifError> {
     )];
     let response = client.get(&url, headers).await?;
     let status = response.status();
-    let body = response.collect_bytes().await?;
+    let body = response
+        .collect_bytes_limited(crate::MAX_CONTROL_RESPONSE)
+        .await?;
     let body = check_status(status, body)?;
     let token = core::str::from_utf8(&body)
         .map_err(|e| WifError::Parse(format!("gcp id token utf8: {e}")))?;

@@ -221,7 +221,10 @@ pub(crate) async fn logout_with(
         .await?;
 
     let status = response.status();
-    let body = response.collect_bytes().await.unwrap_or_default();
+    let body = response
+        .collect_bytes_limited(crate::MAX_CONTROL_RESPONSE)
+        .await
+        .unwrap_or_default();
     classify_logout_response(status, &body)
 }
 

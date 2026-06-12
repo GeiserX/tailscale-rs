@@ -11,6 +11,17 @@ const PKG_VERSION: &str = if let Some(version) = option_env!("CARGO_PKG_VERSION"
     ""
 };
 
+/// Maximum size of a control-plane RPC response body read into memory.
+///
+/// The control server is the identity trust root, but a buggy/compromised/MITM'd-past-Noise server
+/// must not be able to OOM the client by answering a small request with an unbounded streamed body.
+/// Every control RPC response (register, key-fetch, id-token, set-dns, logout, WIF) carries a small
+/// JSON payload, so 1 MiB is comfortably generous; reads use
+/// [`ResponseExt::collect_bytes_limited`](ts_http_util::ResponseExt::collect_bytes_limited) with this
+/// cap so the allocation is bounded *during* the read. (TKA-sync keeps its own larger 10 MiB bound;
+/// ACME its own 256 KiB bound — those payloads are differently sized.)
+pub(crate) const MAX_CONTROL_RESPONSE: usize = 1024 * 1024;
+
 /// Client-side ACME (Let's Encrypt) DNS-01 cert issuance engine (`acme` feature, SaaS-only).
 #[cfg(feature = "acme")]
 pub mod acme;
@@ -237,7 +248,10 @@ fn http_error_is_recoverable(error: ts_http_util::Error) -> bool {
         // A TCP timeout (recoverable) should get classed as an IO error, so any other kind of
         // timeout is probably not.
         | ts_http_util::Error::Timeout
-        | ts_http_util::Error::InvalidResponse => false,
+        | ts_http_util::Error::InvalidResponse
+        // A peer that streamed an over-cap body is an attack/misconfig signal, not a transient
+        // blip — terminal, do not retry.
+        | ts_http_util::Error::BodyTooLarge => false,
         // In the future, this might be recoverable with a reset.
         ts_http_util::Error::ConnectionClosed => false,
     }
