@@ -390,6 +390,22 @@ fn surface_reauth_url(err: &Error, auth_url_tx: &watch::Sender<Option<Url>>) {
     }
 }
 
+/// Clear any pending re-auth URL (set the cell back to `None`), used when a re-register succeeds or
+/// a poll delivers a frame — both prove the node is authorized again so the surfaced URL is stale.
+/// Sticky `send_if_modified` so an already-`None` cell never wakes the runtime bridge. Clearing at
+/// register-success (rather than only at stream end) is what prevents a recovering poll from leaving
+/// a stale `Some(url)` for the bridge to re-read and clobber the netmap's `Running` flip with.
+fn clear_reauth_url(auth_url_tx: &watch::Sender<Option<Url>>) {
+    auth_url_tx.send_if_modified(|current| {
+        if current.is_some() {
+            *current = None;
+            true
+        } else {
+            false
+        }
+    });
+}
+
 pub async fn run(
     state_tx: broadcast::Sender<Arc<StateUpdate>>,
     mut command_rx: mpsc::Receiver<Command>,
@@ -423,20 +439,13 @@ pub async fn run(
         .await;
 
         // A poll that delivered any frame proves the connect→register→poll path works again, so a
-        // re-auth URL surfaced by an earlier failed re-register is stale: clear the cell as hygiene.
-        // This is a belt-and-suspenders clear — the runtime's own `Running` flip (driven by the next
-        // good self-node on the netmap stream) is the primary path back from "needs login" — but it
-        // keeps the cell honest if the runtime ever observes it directly. Sticky `send_if_modified`
-        // so we never wake the bridge unless the cell actually changes.
+        // re-auth URL surfaced by an earlier failed re-register is stale: clear the cell. The
+        // primary clear is at register-success above (so the cell empties before the bridge can
+        // re-read a stale `Some(url)` on recovery); this is a secondary clear for the case where the
+        // stream itself delivered frames after a register that did not need re-auth. Sticky
+        // `send_if_modified` so we never wake the bridge unless the cell actually changes.
         if received_frame {
-            auth_url_tx.send_if_modified(|current| {
-                if current.is_some() {
-                    *current = None;
-                    true
-                } else {
-                    false
-                }
-            });
+            clear_reauth_url(&auth_url_tx);
         }
 
         // Back off before every reconnect, on BOTH the clean-EOF and error paths — Go's
@@ -496,7 +505,14 @@ async fn run_once(
     // `surface_reauth_url`, then still propagate the error so `run` backs off and retries — Go's
     // `authRoutine` keeps the URL and keeps polling, and a later successful re-register recovers.
     match crate::tokio::register(config, control_url, auth_key, node_keys, &h2_client).await {
-        Ok(()) => {}
+        Ok(()) => {
+            // Re-register succeeded — clear any pending re-auth URL NOW (not at stream end), so a
+            // recovering poll empties the cell BEFORE the runtime bridge can wake and re-read a
+            // stale `Some(url)`. Without this, the bridge could clobber the netmap's `Running` flip
+            // back to `NeedsLogin` on recovery (a recovered node would show "needs login" until the
+            // next keep-alive).
+            clear_reauth_url(auth_url_tx);
+        }
         Err(e) => {
             let err = Error::from(e);
             surface_reauth_url(&err, auth_url_tx);
@@ -926,23 +942,41 @@ mod tests {
         assert_eq!(*rx.borrow(), None);
     }
 
-    /// The progress-clear hygiene: once a poll delivers a frame, a previously-surfaced re-auth URL
-    /// is stale, so the `received_frame` branch in `run` clears the cell back to `None`. This pins
-    /// the clear logic (the same `send_if_modified` the loop runs) independent of the network loop.
+    /// The clear path: a re-register success (or a poll that delivered a frame) means a
+    /// previously-surfaced re-auth URL is stale, so `clear_reauth_url` resets the cell to `None`.
+    /// This is the recovery half of the fix — clearing at register-success (run_once's `Ok` arm)
+    /// empties the cell before the runtime bridge can re-read a stale `Some(url)` and clobber the
+    /// netmap's `Running` flip back to `NeedsLogin` (the review's recovery-race finding).
     #[test]
-    fn progress_clears_auth_url_cell() {
+    fn clear_reauth_url_resets_a_pending_url() {
         let (tx, rx) = watch::channel(Some(auth_url()));
+        clear_reauth_url(&tx);
+        assert_eq!(*rx.borrow(), None);
+    }
 
-        // Mirror the `received_frame == true` clear in `run`.
-        tx.send_if_modified(|current| {
-            if current.is_some() {
-                *current = None;
-                true
-            } else {
-                false
-            }
-        });
+    /// Clearing an already-`None` cell is a no-op that does NOT notify (so the runtime bridge isn't
+    /// woken spuriously on every frame of a healthy, never-deauthorized session).
+    #[test]
+    fn clear_reauth_url_on_empty_cell_does_not_notify() {
+        let (tx, rx) = watch::channel::<Option<Url>>(None);
+        clear_reauth_url(&tx);
+        // No change was published, so the receiver sees nothing new.
+        assert!(!rx.has_changed().unwrap());
+        assert_eq!(*rx.borrow(), None);
+    }
 
+    /// Recovery sequence at the cell level: surface a URL (failed re-register), then clear it
+    /// (the next re-register succeeds). The terminal cell state is `None`, so when the bridge next
+    /// reads it there is no stale `Some(url)` to re-assert `NeedsLogin` from.
+    #[test]
+    fn surface_then_clear_leaves_cell_empty() {
+        let (tx, rx) = watch::channel(None);
+        let url = auth_url();
+
+        surface_reauth_url(&Error::MachineNotAuthorized(url.clone()), &tx);
+        assert_eq!(*rx.borrow(), Some(url));
+
+        clear_reauth_url(&tx); // models run_once's `Ok(())` arm on the recovering poll
         assert_eq!(*rx.borrow(), None);
     }
 }
