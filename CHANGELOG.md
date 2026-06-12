@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.29.2](https://github.com/GeiserX/tailscale-rs/compare/v0.29.1...v0.29.2) (2026-06-12)
+
+
+### Bug Fixes
+
+* **magicdns:** forward non-A/AAAA/PTR qtypes + non-IN class instead of REFUSED ([#136](https://github.com/GeiserX/tailscale-rs/issues/136)) ([b08ef4a](https://github.com/GeiserX/tailscale-rs/commit/b08ef4aecb2f6a5f72827fd445e3500c465bbdf2))
+
 ## [0.29.1](https://github.com/GeiserX/tailscale-rs/compare/v0.29.0...v0.29.1) (2026-06-12)
 
 
