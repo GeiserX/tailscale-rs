@@ -36,6 +36,20 @@ pub const TRUST_DURATION: Duration = Duration::from_millis(6500);
 /// the peer flapped direct↔DERP every ~6s.
 const REFRESH_BEFORE_EXPIRY: Duration = Duration::from_millis(3500);
 
+/// Hysteresis for switching the trusted best path to a different confirmed candidate: a challenger
+/// must be at least this much faster than the *current* trusted best before we switch to it.
+///
+/// Mirrors Go magicsock `betterAddr`, which keeps the current best unless the latency improvement
+/// clears a band (it treats an improvement below ~1% as not better). Without this, `recompute_best`
+/// picked the strict latency minimum on every pong, so with two viable public endpoints to a peer
+/// (common once a CallMeMaybe address and a netmap address both confirm) sub-millisecond RTT jitter
+/// made `best` ping-pong between them on every pong — churning the WireGuard send 5-tuple
+/// (`MagicSock` sends to `best_addr`) and resetting `trust_until` to a different endpoint each time.
+/// This is the spatial (which-address) analog of the temporal (when-to-reping) flap that
+/// [`REFRESH_BEFORE_EXPIRY`] fixed. The fork is IPv4-public / ring-only with no MTU/Geneve/private-IP
+/// scoring, so only Go's latency-percentage branch of `betterAddr` is in scope here.
+const BETTER_ADDR_IMPROVEMENT: f64 = 0.01;
+
 /// A ping with no pong after this long is presumed lost; its in-flight record is pruned so the
 /// `in_flight` map cannot grow unbounded for a peer whose paths never confirm (it would otherwise
 /// gain an entry per candidate every `PING_INTERVAL`, forever). Mirrors the STUN in-flight TTL
@@ -315,7 +329,7 @@ impl PeerPaths {
     fn recompute_best(&mut self, now: Instant) {
         // Lowest latency wins; IPv6 breaks ties (Go parity). Only confirmed candidates
         // (those with a measured latency) are eligible.
-        let best = self
+        let challenger = self
             .candidates
             .iter()
             .filter_map(|(addr, c)| c.latency.map(|l| (*addr, l)))
@@ -323,13 +337,34 @@ impl PeerPaths {
                 a_lat
                     .cmp(b_lat)
                     .then_with(|| b_addr.is_ipv6().cmp(&a_addr.is_ipv6()))
-            })
-            .map(|(addr, _)| addr);
+            });
 
-        if let Some(addr) = best {
-            self.best = Some(addr);
-            self.trust_until = Some(now + TRUST_DURATION);
+        let Some((challenger_addr, challenger_lat)) = challenger else {
+            // No confirmed candidate — nothing to trust. Leave `best`/`trust_until` as-is (an
+            // expired best is reported as untrusted by `best_addr`; a rebind clears them).
+            return;
+        };
+
+        // Hysteresis: if the current best is still trusted AND still a confirmed candidate, only
+        // switch to a different challenger when it is more than `BETTER_ADDR_IMPROVEMENT` faster
+        // (Go `betterAddr`). This stops `best` from flapping between near-equal endpoints on RTT
+        // jitter. A pong for the *current* best (or a challenger that doesn't clear the band) still
+        // refreshes `trust_until` so the held path doesn't go dark.
+        if let (Some(current), Some(until)) = (self.best, self.trust_until)
+            && now < until
+            && current != challenger_addr
+            && let Some(current_lat) = self.candidates.get(&current).and_then(|c| c.latency)
+        {
+            let threshold = current_lat.mul_f64(1.0 - BETTER_ADDR_IMPROVEMENT);
+            if challenger_lat >= threshold {
+                // Challenger isn't decisively faster — keep the current best, just refresh trust.
+                self.trust_until = Some(now + TRUST_DURATION);
+                return;
+            }
         }
+
+        self.best = Some(challenger_addr);
+        self.trust_until = Some(now + TRUST_DURATION);
     }
 }
 
@@ -638,6 +673,88 @@ mod tests {
         assert!(
             p.candidate_addrs().contains(&netmap_ep),
             "netmap (control-authoritative) candidates must not be capped by the learned limit"
+        );
+    }
+
+    /// Hysteresis: once a best path is confirmed and trusted, a *second* confirmed candidate that is
+    /// only marginally faster (within `BETTER_ADDR_IMPROVEMENT`) must NOT steal `best` — otherwise
+    /// RTT jitter flaps the WireGuard send 5-tuple between two near-equal public endpoints. Mirrors
+    /// Go `betterAddr`.
+    #[test]
+    fn near_equal_challenger_does_not_steal_trusted_best() {
+        let mut p = PeerPaths::default();
+        let a: SocketAddr = "203.0.113.1:41641".parse().unwrap();
+        let b: SocketAddr = "203.0.113.2:41641".parse().unwrap();
+        p.add_netmap_candidates([a, b]);
+
+        let now = Instant::now();
+        // `a` confirms first at 10ms → becomes the trusted best.
+        p.note_ping_sent(tx(1), a, now);
+        p.note_pong(tx(1), a, now + Duration::from_millis(10));
+        assert_eq!(p.best_addr(now + Duration::from_millis(11)), Some(a));
+
+        // `b` confirms at 9.95ms — faster, but by <1% → must NOT switch (best stays `a`).
+        let t1 = now + Duration::from_millis(20);
+        p.note_ping_sent(tx(2), b, t1);
+        p.note_pong(tx(2), b, t1 + Duration::from_micros(9_950));
+        assert_eq!(
+            p.best_addr(t1 + Duration::from_millis(10)),
+            Some(a),
+            "a near-equal challenger must not steal the trusted best"
+        );
+    }
+
+    /// The flip side: a challenger that IS decisively faster (clears the band) DOES become the new
+    /// best, so the hysteresis doesn't pin a genuinely worse path.
+    #[test]
+    fn decisively_faster_challenger_takes_best() {
+        let mut p = PeerPaths::default();
+        let a: SocketAddr = "203.0.113.1:41641".parse().unwrap();
+        let b: SocketAddr = "203.0.113.2:41641".parse().unwrap();
+        p.add_netmap_candidates([a, b]);
+
+        let now = Instant::now();
+        // `a` confirms first at 50ms → trusted best.
+        p.note_ping_sent(tx(1), a, now);
+        p.note_pong(tx(1), a, now + Duration::from_millis(50));
+        assert_eq!(p.best_addr(now + Duration::from_millis(51)), Some(a));
+
+        // `b` confirms at 10ms — far below the 1% band of 50ms → must switch.
+        let t1 = now + Duration::from_millis(60);
+        p.note_ping_sent(tx(2), b, t1);
+        p.note_pong(tx(2), b, t1 + Duration::from_millis(10));
+        assert_eq!(
+            p.best_addr(t1 + Duration::from_millis(11)),
+            Some(b),
+            "a decisively faster challenger must take the best path"
+        );
+    }
+
+    /// A pong for the *current* best (no rival) still refreshes trust — the hysteresis branch must
+    /// not accidentally stop the held path from re-confirming and going dark.
+    #[test]
+    fn pong_for_current_best_refreshes_trust() {
+        let mut p = PeerPaths::default();
+        let a: SocketAddr = "203.0.113.1:41641".parse().unwrap();
+        p.add_netmap_candidates([a]);
+
+        let now = Instant::now();
+        p.note_ping_sent(tx(1), a, now);
+        p.note_pong(tx(1), a, now + Duration::from_millis(10));
+
+        // Re-ping/re-pong `a` later; trust must extend to the new `now + TRUST_DURATION`.
+        let t1 = now + Duration::from_millis(20);
+        p.note_ping_sent(tx(2), a, t1);
+        p.note_pong(tx(2), a, t1 + Duration::from_millis(10));
+
+        // Just before the SECOND confirmation's trust window closes, the path is still trusted —
+        // proving the re-pong refreshed trust (the first window would have closed earlier).
+        let near_second_expiry =
+            t1 + Duration::from_millis(10) + TRUST_DURATION - Duration::from_millis(1);
+        assert_eq!(
+            p.best_addr(near_second_expiry),
+            Some(a),
+            "a re-pong for the current best must refresh its trust window"
         );
     }
 }
