@@ -72,13 +72,31 @@ pub struct TunActor {
     /// task at that point so the device is built exactly once.
     overlay_from_dataplane: Option<OverlayFromDataplane>,
 
-    /// Host-route gating (accept-routes / exit-node), derived from [`Env`] at the spawn site and
-    /// consumed by [`host_routes_from_node`] when the device is built.
-    gating: HostRouteGating,
-
     /// Reverses host route/DNS programming on drop. `Some` once the device is built and the host
     /// has been programmed; shares the actor's lifetime with the pump tasks in `_joinset`.
     host_guard: Option<HostGuard>,
+
+    /// The latest peer database, fed from the [`PeerState`] subscription. Retained so the host-FIB
+    /// peer-route fold ([`host_routes_from_node`]) can be recomputed on every peer change (the fix
+    /// for the consumer-blocking bug: without the peer fold the OS had no route to any peer). `None`
+    /// until the first [`PeerState`].
+    peers: Option<Arc<crate::peer_tracker::PeerDb>>,
+
+    /// The self node from the most recent control `StateUpdate` that carried one. Stored once the
+    /// device is built so the [`PeerState`] re-apply path can rebuild the host route set (self fold
+    /// + peer fold) without a fresh `StateUpdate`. `None` until the device is built.
+    self_node: Option<Arc<ts_control::Node>>,
+
+    /// The built device's interface name. Stored so the [`PeerState`] re-apply path re-applies
+    /// routes under the SAME `if_name` the device was built with (the host-net `apply_routes`
+    /// `debug_assert`s a stable interface name across applies). `None` until the device is built.
+    if_name: Option<String>,
+
+    /// Whether MagicDNS was enabled (`--accept-dns` AND the control DNS config's `magic_dns`) as of
+    /// the last build/StateUpdate. Stored so the [`PeerState`] re-apply path keeps the
+    /// `100.100.100.100/32` route present/absent consistently with the resolver programming, without
+    /// a fresh `StateUpdate`. `false` until the first StateUpdate sets it.
+    last_magic_dns: bool,
 
     /// The latest MagicDNS view, shared with the UP pump's in-datapath responder. Built here from
     /// the same control `StateUpdate` / peer `PeerState` the actor already subscribes to, mirroring
@@ -94,29 +112,26 @@ pub struct TunActor {
     channel: Channel,
 }
 
-/// Gating inputs for host-route programming, derived from [`Env`] at the spawn site. A named
-/// carrier rather than two positional `bool`s: the two flags are same-typed and adjacent, so a
-/// positional pair is a silent transposition hazard whose blast radius is a routing/leak
-/// correctness bug (subnet gate vs `/0`-default gate) — exactly the class the fork's fail-closed
-/// posture exists to prevent. A struct makes a swap a compile error and the next gating flag an
-/// additive field.
-// `pub` (not `pub(crate)`) because it surfaces through `Actor::Args`, a public trait associated
-// type — a crate-private type there is an E0446 leak. The enclosing `tun_actor` module is private,
-// so this stays crate-internal in practice.
-#[derive(Clone, Copy, Debug)]
-pub struct HostRouteGating {
-    /// Whether the embedder set `--accept-routes`. Gates whether advertised subnet routes are
-    /// steered into the TUN by [`host_routes_from_node`].
-    pub accept_routes: bool,
-    /// Whether the embedder configured an exit node (`env.exit_node.is_some()`). Gates whether the
-    /// host `/0` default route is steered into the TUN by [`host_routes_from_node`].
-    pub exit_node_configured: bool,
-}
-
 /// RAII wrapper that reverses host route/DNS programming when the actor dies. Held in
 /// [`TunActor::host_guard`] alongside the device pump tasks in `_joinset`, so when the actor is
 /// dropped the interface is torn down and its host-FIB/resolver state is reversed together.
 struct HostGuard(Box<dyn ts_host_net::HostNet>);
+
+impl HostGuard {
+    /// Re-program the host FIB to `routes` against the already-built device, delegating to the inner
+    /// [`HostNet::apply_routes`]. `apply_routes` is an idempotent add-new/remove-gone diff with
+    /// per-call rollback, so re-applying with a fresh set is safe, non-flapping, and fail-closed; it
+    /// `debug_assert`s the interface name is stable across applies, so callers MUST re-apply under
+    /// the same `if_name` the device was built with. Used by the [`PeerState`] handler to re-steer
+    /// the host routing table when the peer set (or a runtime accept-routes / exit-node toggle)
+    /// changes, without rebuilding the device. RAII teardown ([`Drop`]) is unaffected.
+    fn apply_routes(
+        &mut self,
+        routes: &ts_host_net::HostRoutes,
+    ) -> Result<(), ts_host_net::HostNetError> {
+        self.0.apply_routes(routes)
+    }
+}
 
 impl Drop for HostGuard {
     fn drop(&mut self) {
@@ -144,60 +159,92 @@ pub(crate) fn tun_config_from_control(
     }
 }
 
-/// Translate the self-node's accepted routes into the host-FIB route set to steer into the TUN
-/// (the `ts_runtime` boundary, mirroring [`tun_config_from_control`]).
+/// Translate the self-node's accepted routes **and the union of every peer's AllowedIPs** into the
+/// host-FIB route set to steer into the TUN (the `ts_runtime` boundary, mirroring
+/// [`tun_config_from_control`]).
 ///
-/// IPv4-only by construction: every IPv6 prefix in `accepted_routes` is dropped here, enforcing the
-/// fork's v4-only invariant (v6 on the tailnet is gated off) without a separate `enable_ipv6` flag.
+/// IPv4-only by construction: every IPv6 prefix is dropped here (both from the self node and from
+/// each peer), enforcing the fork's v4-only invariant (v6 on the tailnet is gated off) without a
+/// separate `enable_ipv6` flag.
 ///
-/// The filter mirrors the spirit of [`ts_control::Node::routes_to_install`] but keys the `/0`
-/// default route on `exit_node_configured` rather than peer StableId resolution. ASYMMETRY: the
-/// TunActor only ever sees the **self** node, so it cannot resolve *which peer* is the exit node
-/// (that is the overlay router / route_updater's job, which enforces the actual leak-free egress).
-/// We only decide whether a host-side `/0` belongs in the route set at all — the self-node's
-/// `accepted_routes` may echo a `/0`, but a host `/0` should only be installed when the embedder
-/// actually configured an exit node. The Linux impl expands `/0` into the split-default pair;
-/// macOS installs `/0` directly.
+/// PEER FOLD (the fix for the consumer-blocking bug: a TUN node reached MagicDNS but not its peers
+/// because the OS had no route to any peer). Go's `tailscaled` feeds the host router
+/// `Config.Routes = union of every peer's AllowedIPs`; we mirror that by extending the routed set
+/// with, for every peer, `peer.routes_to_install(accept_routes, exit_id)` — the SAME Go-faithful
+/// per-peer filter the netstack [`RouteUpdater`](crate::route_updater) already uses for the overlay
+/// route table and the source filter. It yields the peer's own host `/32` always, advertised subnet
+/// routes gated on `accept_routes`, and the peer's `/0` ONLY when that peer is the selected
+/// `exit_id`. Using the same filter keeps the host FIB coupled to the overlay route table + source
+/// filter (the anti-leak cryptokey-routing coupling — we do NOT hand-roll a different filter).
+///
+/// The host `/0` is therefore now keyed on the **selected exit peer** (per-peer, via
+/// `routes_to_install`), not a standalone `exit_node_configured` bool — eliminating the former
+/// self-node-`/0` asymmetry (the self node's `accepted_routes` may echo a `/0`, but only the
+/// selected exit peer's `/0` belongs in the host FIB). The self node still contributes its own
+/// non-`/0` accepted routes (subnet routes gated on `accept_routes`); its `/0` is never installed
+/// here (only a peer's, and only the exit peer's). The Linux impl expands `/0` into the
+/// split-default pair; macOS installs `/0` directly.
+///
+/// `accept_routes` and `exit_id` are read live by the caller (from [`Env`]) on every apply — both
+/// the build path and the [`PeerState`] re-apply path — so a runtime `set_accept_routes` /
+/// `set_exit_node` toggle re-steers the host FIB on the next peer republish.
 pub(crate) fn host_routes_from_node(
     node: &ts_control::Node,
+    peers: Option<&crate::peer_tracker::PeerDb>,
     if_name: String,
-    gating: HostRouteGating,
+    accept_routes: bool,
+    exit_id: Option<&ts_control::StableNodeId>,
     magic_dns: bool,
 ) -> ts_host_net::HostRoutes {
     let self_v4 = node.tailnet_address.ipv4;
 
-    let mut routed: Vec<ipnet::Ipv4Net> = node
-        .accepted_routes
-        .iter()
-        .filter_map(|route| match route {
-            // IPv4-only by construction: drop every v6 prefix unconditionally.
-            ipnet::IpNet::V4(v4) => Some(*v4),
-            ipnet::IpNet::V6(_) => None,
-        })
-        .filter(|v4| {
-            // The device builder already owns the on-link self `/32`; never re-route it.
-            if *v4 == self_v4 {
-                return false;
+    // Push `net` into `routed` iff it is not the on-link self `/32` and is not already present
+    // (dedup: a prefix advertised by multiple peers, or by both the self node and a peer, installs
+    // exactly once).
+    let push_v4 = |routed: &mut Vec<ipnet::Ipv4Net>, net: ipnet::Ipv4Net| {
+        if net != self_v4 && !routed.contains(&net) {
+            routed.push(net);
+        }
+    };
+
+    // Self-node fold: its own non-`/0` accepted routes. Subnet routes are gated on
+    // `--accept-routes`; non-self host routes (e.g. additional tailnet addrs) are always installed.
+    // Mirrors `routes_to_install`. A self-node `/0` is NOT installed here — only the selected exit
+    // peer's `/0` is (in the peer fold below), so the host default route is keyed on the exit peer.
+    let mut routed: Vec<ipnet::Ipv4Net> = Vec::new();
+    for route in &node.accepted_routes {
+        // IPv4-only by construction: drop every v6 prefix unconditionally.
+        let ipnet::IpNet::V4(v4) = route else {
+            continue;
+        };
+        if v4.prefix_len() == 0 {
+            continue;
+        }
+        if accept_routes || !node.is_subnet_route(route) {
+            push_v4(&mut routed, *v4);
+        }
+    }
+
+    // Peer fold: the union of every peer's AllowedIPs, filtered by the SAME per-peer
+    // `routes_to_install` the overlay route table + source filter use (anti-leak coupling). v4-only;
+    // dedup via `push_v4`. The peer's `/0` lands ONLY when it is the selected `exit_id`.
+    if let Some(peers) = peers {
+        for peer in peers.peers().values() {
+            for route in peer.routes_to_install(accept_routes, exit_id) {
+                if let ipnet::IpNet::V4(v4) = route {
+                    push_v4(&mut routed, *v4);
+                }
             }
-            if v4.prefix_len() == 0 {
-                // Host-side `/0` only when the embedder configured an exit node (see fn doc).
-                return gating.exit_node_configured;
-            }
-            // Other prefixes: subnet routes are gated on `--accept-routes`; non-self host routes
-            // (e.g. additional tailnet addrs) are always installed. Mirrors `routes_to_install`.
-            gating.accept_routes || !node.is_subnet_route(&ipnet::IpNet::V4(*v4))
-        })
-        .collect();
+        }
+    }
 
     // Steer the MagicDNS service IP `100.100.100.100/32` into the TUN so the host's quad-100 DNS
-    // queries enter the datapath where the UP pump intercepts them ([`intercept_magic_dns`]). Added
+    // queries enter the datapath where the UP pump intercepts them ([`plan_intercept`]). Added
     // unconditionally when MagicDNS is enabled — it's the device's own service IP, always
     // routed-to-self — unless control somehow advertised it as the self `/32` (it never is).
     if magic_dns {
         let magic_dns_net = ipnet::Ipv4Net::new(MAGIC_DNS_IP, 32).expect("/32 is a valid prefix");
-        if magic_dns_net != self_v4 && !routed.contains(&magic_dns_net) {
-            routed.push(magic_dns_net);
-        }
+        push_v4(&mut routed, magic_dns_net);
     }
 
     ts_host_net::HostRoutes {
@@ -619,17 +666,14 @@ impl kameo::Actor for TunActor {
         ts_control::TunConfig,
         OverlayToDataplane,
         OverlayFromDataplane,
-        // Host-route gating, derived from `Env` at the spawn site. v6 needs no flag:
-        // `host_routes_from_node` drops it by construction.
-        HostRouteGating,
         // The overlay netstack `Channel` (the forwarder netstack's, reused) used by
-        // `intercept_magic_dns` to forward recursive / split-DNS queries over the overlay.
+        // `plan_intercept`/`run_forward` to forward recursive / split-DNS queries over the overlay.
         Channel,
     );
     type Error = Error;
 
     async fn on_start(
-        (env, tun_config, overlay_to_dataplane, overlay_from_dataplane, gating, channel): Self::Args,
+        (env, tun_config, overlay_to_dataplane, overlay_from_dataplane, channel): Self::Args,
         slf: ActorRef<Self>,
     ) -> Result<Self, Self::Error> {
         // We need the tailnet /32 prefix to build the device, which control only assigns at
@@ -655,8 +699,11 @@ impl kameo::Actor for TunActor {
             tun_config,
             overlay_to_dataplane: Some(overlay_to_dataplane),
             overlay_from_dataplane: Some(overlay_from_dataplane),
-            gating,
             host_guard: None,
+            peers: None,
+            self_node: None,
+            if_name: None,
+            last_magic_dns: false,
             dns_view,
             channel,
         })
@@ -735,12 +782,38 @@ impl Message<Arc<ts_control::StateUpdate>> for TunActor {
         // responder would `REFUSED` every query anyway), mirroring Go's empty-config behavior.
         let accept_dns = self.env.accept_dns();
         let magic_dns = accept_dns && msg.dns_config.as_ref().is_some_and(|d| d.magic_dns);
-        let routes = host_routes_from_node(self_node, if_name.clone(), self.gating, magic_dns);
+
+        // Host-route gating read LIVE from `Env` (not a frozen spawn-time snapshot): subnet routes
+        // are gated on `--accept-routes`, and the host `/0` comes only from the selected exit peer.
+        // The exit-node selector is resolved against the live peer set to a stable id, exactly as
+        // the route updater does (`route_updater.rs:219-222`) and the `build_dns_view`/`PeerState`
+        // exit_doh resolution above — so the host FIB picks the SAME exit peer as the overlay route
+        // table + source filter (anti-leak coupling). `None` (no exit node, or an unmatched
+        // selector) ⇒ no peer receives a host `/0` (fail-closed).
+        let accept_routes = self.env.accept_routes();
+        let exit_id = self.env.exit_node().as_ref().and_then(|sel| {
+            self.peers
+                .as_ref()
+                .and_then(|peers| sel.resolve(peers.peers().values()))
+        });
+        let routes = host_routes_from_node(
+            self_node,
+            self.peers.as_deref(),
+            if_name.clone(),
+            accept_routes,
+            exit_id.as_ref(),
+            magic_dns,
+        );
         if let Err(e) = host.apply_routes(&routes) {
             tracing::error!(error = %e, "host route programming failed; TUN idle (fail-closed)");
             host.teardown();
             return; // device drops here -> interface torn down; overlay halves already taken -> idle.
         }
+        // Store the bits the `PeerState` re-apply path needs to rebuild the route set without a
+        // fresh `StateUpdate`: the self node, the (stable) interface name, and the MagicDNS bool.
+        self.self_node = Some(Arc::new(self_node.clone()));
+        self.if_name = Some(if_name.clone());
+        self.last_magic_dns = magic_dns;
         if let Err(e) = host.apply_dns(&host_dns_from_dns_config(
             msg.dns_config.as_ref(),
             if_name,
@@ -783,19 +856,31 @@ impl Message<Arc<PeerState>> for TunActor {
     type Reply = ();
 
     async fn handle(&mut self, state: Arc<PeerState>, _ctx: &mut Context<Self, Self::Reply>) {
+        // Store the latest peer db so the host-FIB peer-route fold can be (re)computed: on the next
+        // device build (if the device isn't up yet) and on this re-apply path (if it is).
+        self.peers = Some(state.peers.clone());
+
+        // Resolve the configured exit node to a stable id ONCE against this peer set, reused for both
+        // the `exit_doh` (MagicDNS) and the host `/0` (route fold) below so they can't disagree within
+        // one handler — mirroring `route_updater.rs:219-222`'s single per-rebuild resolution. The
+        // netstack path learns the active exit node from a separate route-updater-published
+        // `ActiveExitNode` message; the TunActor has no such subscription, so it resolves the selector
+        // against the peer db here (and on every StateUpdate). Fail-closed `None` if unmatched.
+        let exit_id = self
+            .env
+            .exit_node()
+            .as_ref()
+            .and_then(|sel| sel.resolve(state.peers.peers().values()));
+
         // Feed the peer database into the MagicDNS view so the in-datapath responder resolves peer
-        // names authoritatively. Mirrors `MagicDnsActor`'s `PeerState` handler. Also re-resolve
-        // `exit_doh` against the new peer set: the netstack path learns the active exit node from a
-        // separate `ActiveExitNode` message (route-updater-published), but the TunActor has no such
-        // subscription, so it tracks the exit node by resolving the selector against the peer db
-        // here (and on every StateUpdate) — fail-closed `None` if unmatched / can't proxy DNS.
-        let exit_doh = self.env.exit_node().as_ref().and_then(|sel| {
-            let id = sel.resolve(state.peers.peers().values())?;
+        // names authoritatively. Mirrors `MagicDnsActor`'s `PeerState` handler. `exit_doh` is the
+        // resolved exit peer's peerAPI DoH endpoint (fail-closed `None` if it can't proxy DNS).
+        let exit_doh = exit_id.as_ref().and_then(|id| {
             state
                 .peers
                 .peers()
                 .values()
-                .find(|peer| peer.stable_id == id)
+                .find(|peer| &peer.stable_id == id)
                 .and_then(|n| n.peerapi_doh_addr())
         });
         // Re-read the live accept-dns cell on this rebuild (it is runtime-settable): a
@@ -808,6 +893,45 @@ impl Message<Arc<PeerState>> for TunActor {
             next.accept_dns = accept_dns;
             *view = Arc::new(next);
         });
+
+        // Re-steer the host FIB to reflect the new peer set / a runtime accept-routes / exit-node
+        // toggle (closes the host-FIB re-steer follow-up). Only when the device is already built —
+        // before that, the build path will fold the now-stored peers itself. `set_accept_routes` /
+        // `set_exit_node` re-broadcast `Arc<PeerState>` (via `RepublishState`), so a runtime toggle
+        // lands here too, re-applying with the live `accept_routes`/`exit_id`.
+        if let (Some(guard), Some(self_node), Some(if_name)) = (
+            self.host_guard.as_mut(),
+            self.self_node.as_ref(),
+            self.if_name.as_ref(),
+        ) {
+            // `apply_routes` is an idempotent add-new/remove-gone diff with per-call rollback, so
+            // re-applying a fresh set is safe and non-flapping; re-apply under the SAME `if_name` the
+            // device was built with (the host-net `debug_assert`). `accept_routes` is read live.
+            let routes = host_routes_from_node(
+                self_node,
+                Some(&state.peers),
+                if_name.clone(),
+                self.env.accept_routes(),
+                exit_id.as_ref(),
+                self.last_magic_dns,
+            );
+            if let Err(e) = guard.apply_routes(&routes) {
+                // FAIL-CLOSED, exactly like the build path: drop the host guard so its `Drop`
+                // reverses all host route/DNS state (no half-configured FIB can leak or black-hole);
+                // the actor stays up but the TUN is now unrouted — idle. A subsequent peer/control
+                // update will not re-program (the guard is gone), so this is a terminal idle, the
+                // host-side analogue of the build path's `teardown(); return`.
+                //
+                // Unlike the build path (which returns before the pumps are spawned, so the device
+                // Arc drops and the interface goes fully down), here the pump tasks keep the
+                // interface UP with only its on-link self `/32`. That is still fail-closed: with
+                // every peer/exit/subnet route removed from the host FIB, the OS steers no
+                // peer/internet traffic into the TUN — the surviving on-link `/32` is just the
+                // node's own address. Routes torn down ⟹ no leak, even though the iface lingers.
+                tracing::error!(error = %e, "host route re-steer failed; tearing down host FIB (fail-closed)");
+                self.host_guard = None;
+            }
+        }
     }
 }
 
@@ -821,8 +945,8 @@ mod tests {
     use ts_control::TunConfig;
 
     use super::{
-        HostRouteGating, Intercept, build_dns_view, host_dns_from_dns_config,
-        host_routes_from_node, plan_intercept, tun_config_from_control,
+        Intercept, build_dns_view, host_dns_from_dns_config, host_routes_from_node, plan_intercept,
+        tun_config_from_control,
     };
     use crate::{
         env::{Env, ForwarderConfig},
@@ -928,12 +1052,57 @@ mod tests {
         buf
     }
 
-    /// Both gates on — the common exit-node + accept-routes case.
-    fn gating_all() -> HostRouteGating {
-        HostRouteGating {
-            accept_routes: true,
-            exit_node_configured: true,
+    /// A plain tailnet peer: its own host `/32` at `ipv4`, plus any `subnets` it advertises
+    /// (e.g. a `/24`). No peerAPI / exit-node attributes — used to exercise the host-FIB peer fold
+    /// in [`host_routes_from_node`] (the peer's `/32` is always installed; subnets gate on
+    /// `accept_routes`; the peer gets a `/0` only when selected as the exit). `stable_id` is
+    /// caller-supplied so a selector can target it as the exit node.
+    fn tailnet_peer(stable_id: &str, id: u32, ipv4: &str, subnets: &[&str]) -> ts_control::Node {
+        use ts_control::{Node, StableNodeId, TailnetAddress};
+        let mut accepted_routes: Vec<ipnet::IpNet> =
+            vec![format!("{ipv4}/32").parse::<ipnet::IpNet>().unwrap()];
+        for s in subnets {
+            accepted_routes.push(s.parse().unwrap());
         }
+        Node {
+            id: id as i64,
+            user_id: 0,
+            stable_id: StableNodeId(stable_id.to_string()),
+            hostname: stable_id.to_string(),
+            tailnet: Some("ts.net".to_string()),
+            tags: vec![],
+            tailnet_address: TailnetAddress {
+                ipv4: format!("{ipv4}/32").parse().unwrap(),
+                ipv6: format!("fd7a::{id}/128").parse().unwrap(),
+            },
+            node_key: [id as u8; 32].into(),
+            node_key_expiry: None,
+            key_signature: vec![],
+            machine_key: None,
+            disco_key: None,
+            accepted_routes,
+            underlay_addresses: vec![],
+            derp_region: None,
+            cap: Default::default(),
+            cap_map: Default::default(),
+            peerapi_port: None,
+            peerapi_dns_proxy: false,
+            is_wireguard_only: false,
+            exit_node_dns_resolvers: vec![],
+            peer_relay: false,
+            service_vips: Default::default(),
+            online: None,
+            last_seen: None,
+        }
+    }
+
+    /// A `PeerDb` containing the given peers.
+    fn peer_db_from(peers: &[&ts_control::Node]) -> PeerDb {
+        let mut db = PeerDb::default();
+        for p in peers {
+            db.upsert(p);
+        }
+        db
     }
 
     fn prefix() -> Ipv4Net {
@@ -984,22 +1153,26 @@ mod tests {
         }
     }
 
-    /// With `accept_routes` and an exit node configured, the routed set carries the subnet `/24`
-    /// and the default `/0`, but never the self `/32` (the device builder owns the on-link prefix).
+    /// With `accept_routes` set, the routed set carries the self node's advertised subnet `/24` but
+    /// never the self `/32` (the device builder owns the on-link prefix) and never the self node's
+    /// own `/0` (the host `/0` is now keyed on the selected exit PEER, not the self node — see the
+    /// per-peer-`/0` tests below). This is the post-fix asymmetry fix: a self-node `/0` echo is
+    /// ignored.
     #[test]
-    fn host_routes_includes_subnet_and_default_excludes_self() {
+    fn host_routes_includes_self_subnet_excludes_self_and_self_default() {
         let node = fixture_node();
-        let routes = host_routes_from_node(&node, "utun9".to_owned(), gating_all(), false);
+        // No peers, no exit node: only the self node's own non-`/0` routes contribute.
+        let routes = host_routes_from_node(&node, None, "utun9".to_owned(), true, None, false);
 
         assert_eq!(routes.if_name, "utun9");
         assert_eq!(routes.self_v4, "100.64.0.1/32".parse::<Ipv4Net>().unwrap());
         assert!(
             routes.routed.contains(&"192.168.1.0/24".parse().unwrap()),
-            "subnet /24 must be routed when accept_routes is set"
+            "self-advertised subnet /24 must be routed when accept_routes is set"
         );
         assert!(
-            routes.routed.contains(&"0.0.0.0/0".parse().unwrap()),
-            "default /0 must be routed when an exit node is configured"
+            !routes.routed.contains(&"0.0.0.0/0".parse().unwrap()),
+            "the self node's own /0 echo must NOT be installed (host /0 is per-exit-peer)"
         );
         assert!(
             !routes.routed.contains(&"100.64.0.1/32".parse().unwrap()),
@@ -1007,61 +1180,222 @@ mod tests {
         );
     }
 
-    /// `accept_routes = false` drops advertised subnet routes (fail-closed).
+    /// `accept_routes = false` drops advertised subnet routes (fail-closed), for both the self node
+    /// and the peer fold.
     #[test]
     fn host_routes_excludes_subnet_without_accept_routes() {
         let node = fixture_node();
-        let routes = host_routes_from_node(
-            &node,
-            "utun9".to_owned(),
-            HostRouteGating {
-                accept_routes: false,
-                exit_node_configured: true,
-            },
-            false,
-        );
+        let peer = tailnet_peer("p", 2, "100.64.0.2", &["10.0.0.0/24"]);
+        let db = peer_db_from(&[&peer]);
+        let routes =
+            host_routes_from_node(&node, Some(&db), "utun9".to_owned(), false, None, false);
         assert!(
             !routes.routed.contains(&"192.168.1.0/24".parse().unwrap()),
-            "subnet /24 must be excluded when accept_routes is false"
-        );
-    }
-
-    /// `exit_node_configured = false` drops the host `/0` (no exit node ⇒ no host default route).
-    #[test]
-    fn host_routes_excludes_default_without_exit_node() {
-        let node = fixture_node();
-        let routes = host_routes_from_node(
-            &node,
-            "utun9".to_owned(),
-            HostRouteGating {
-                accept_routes: true,
-                exit_node_configured: false,
-            },
-            false,
+            "self subnet /24 must be excluded when accept_routes is false"
         );
         assert!(
-            !routes.routed.contains(&"0.0.0.0/0".parse().unwrap()),
-            "default /0 must be excluded when no exit node is configured"
+            !routes.routed.contains(&"10.0.0.0/24".parse().unwrap()),
+            "peer subnet /24 must be excluded when accept_routes is false"
+        );
+        // The peer's own host /32 is ALWAYS installed regardless of accept_routes (so the peer stays
+        // reachable) — this is the core of the consumer-blocking-bug fix.
+        assert!(
+            routes.routed.contains(&"100.64.0.2/32".parse().unwrap()),
+            "peer /32 must always be routed even with accept_routes false"
         );
     }
 
-    /// IPv6 prefixes in `accepted_routes` are dropped by construction (v4-only invariant).
+    /// IPv6 prefixes are dropped by construction (v4-only invariant), from both the self node and
+    /// any peer.
     #[test]
     fn host_routes_drops_ipv6() {
         // `HostRoutes.routed` is `Vec<Ipv4Net>`, so v6 cannot even be represented; assert
-        // behaviorally that adding a v6 subnet route leaves the v4-only routed set unchanged.
+        // behaviorally that a v6 subnet route — on the self node OR on a peer — leaves the v4-only
+        // routed set unchanged.
         let baseline =
-            host_routes_from_node(&fixture_node(), "utun9".to_owned(), gating_all(), false);
+            host_routes_from_node(&fixture_node(), None, "utun9".to_owned(), true, None, false);
 
         let mut node_v6 = fixture_node();
         node_v6
             .accepted_routes
             .push("2001:db8::/32".parse().unwrap());
-        let routes_v6 = host_routes_from_node(&node_v6, "utun9".to_owned(), gating_all(), false);
-
+        let routes_v6 =
+            host_routes_from_node(&node_v6, None, "utun9".to_owned(), true, None, false);
         assert_eq!(
             routes_v6.routed, baseline.routed,
-            "adding a v6 subnet must not change the v4-only routed set"
+            "adding a v6 subnet to the self node must not change the v4-only routed set"
+        );
+
+        // A peer whose only routes are v6 (beyond its v4 /32) contributes only its v4 /32.
+        let mut v6_peer = tailnet_peer("v6p", 3, "100.64.0.3", &[]);
+        v6_peer
+            .accepted_routes
+            .push("2001:db8:1::/48".parse().unwrap());
+        let db = peer_db_from(&[&v6_peer]);
+        let routes_peer_v6 = host_routes_from_node(
+            &fixture_node(),
+            Some(&db),
+            "utun9".to_owned(),
+            true,
+            None,
+            false,
+        );
+        assert!(
+            routes_peer_v6
+                .routed
+                .contains(&"100.64.0.3/32".parse().unwrap()),
+            "the peer's v4 /32 is installed"
+        );
+        assert!(
+            !routes_peer_v6
+                .routed
+                .iter()
+                .any(|n| n.to_string().contains("2001")),
+            "no v6 prefix can appear in the v4-only routed set"
+        );
+    }
+
+    /// PEER FOLD (the core regression guard for the consumer-blocking bug + the per-peer anti-leak
+    /// `/0` gate): with a self node and a `PeerDb` of multiple peers, the routed set contains EACH
+    /// peer's `/32` (so the OS can route to every peer), an advertised peer subnet ONLY when
+    /// `accept_routes`, the self `/32` excluded, the MagicDNS `/32` present when `magic_dns`, and a
+    /// peer `/0` ONLY when that peer is the resolved `exit_id` (never otherwise).
+    #[test]
+    fn host_routes_folds_peer_allowed_ips_and_gates_default_on_exit() {
+        use ts_control::StableNodeId;
+
+        let node = fixture_node();
+        let p1 = tailnet_peer("p1", 2, "100.64.0.2", &[]); // plain peer, /32 only
+        let p2 = tailnet_peer("p2", 3, "100.64.0.3", &["10.1.0.0/24"]); // advertises a subnet
+        let exit = tailnet_peer("exit", 4, "100.64.0.4", &["0.0.0.0/0"]); // advertises default
+        let db = peer_db_from(&[&p1, &p2, &exit]);
+
+        let p1_32: Ipv4Net = "100.64.0.2/32".parse().unwrap();
+        let p2_32: Ipv4Net = "100.64.0.3/32".parse().unwrap();
+        let exit_32: Ipv4Net = "100.64.0.4/32".parse().unwrap();
+        let p2_subnet: Ipv4Net = "10.1.0.0/24".parse().unwrap();
+        let default: Ipv4Net = "0.0.0.0/0".parse().unwrap();
+        let magic: Ipv4Net = "100.100.100.100/32".parse().unwrap();
+
+        // accept_routes = true, NO exit node selected, MagicDNS on.
+        let routes = host_routes_from_node(&node, Some(&db), "utun9".to_owned(), true, None, true);
+        // Every peer's /32 is present (the bug fix: the OS now has a route to each peer).
+        assert!(routes.routed.contains(&p1_32), "peer p1 /32 must be routed");
+        assert!(routes.routed.contains(&p2_32), "peer p2 /32 must be routed");
+        assert!(
+            routes.routed.contains(&exit_32),
+            "peer exit /32 must be routed"
+        );
+        // The advertised subnet is present because accept_routes is true.
+        assert!(
+            routes.routed.contains(&p2_subnet),
+            "peer-advertised subnet must be routed when accept_routes is true"
+        );
+        // The self /32 is never re-routed.
+        assert!(!routes.routed.contains(&"100.64.0.1/32".parse().unwrap()));
+        // MagicDNS /32 present.
+        assert!(
+            routes.routed.contains(&magic),
+            "MagicDNS /32 must be present when magic_dns"
+        );
+        // No exit selected ⇒ NO /0 at all (fail-closed; the exit peer's /0 is gated out).
+        assert!(
+            !routes.routed.contains(&default),
+            "no /0 may appear when no exit peer is selected (anti-leak)"
+        );
+
+        // accept_routes = false ⇒ the advertised subnet drops, but every peer /32 stays.
+        let no_accept =
+            host_routes_from_node(&node, Some(&db), "utun9".to_owned(), false, None, true);
+        assert!(no_accept.routed.contains(&p1_32));
+        assert!(no_accept.routed.contains(&p2_32));
+        assert!(no_accept.routed.contains(&exit_32));
+        assert!(
+            !no_accept.routed.contains(&p2_subnet),
+            "peer subnet must drop when accept_routes is false"
+        );
+
+        // Select `exit` as the exit node ⇒ ITS /0 (and only its) appears.
+        let exit_id = StableNodeId("exit".to_owned());
+        let with_exit = host_routes_from_node(
+            &node,
+            Some(&db),
+            "utun9".to_owned(),
+            true,
+            Some(&exit_id),
+            true,
+        );
+        assert!(
+            with_exit.routed.contains(&default),
+            "the selected exit peer's /0 must be installed"
+        );
+        assert!(
+            with_exit.routed.contains(&exit_32),
+            "the exit peer's /32 stays routed"
+        );
+
+        // Select a NON-exit-advertising peer (p1, which has no /0) as the exit ⇒ still no /0 (it
+        // advertises none), proving the /0 comes strictly from the chosen peer's AllowedIPs.
+        let p1_id = StableNodeId("p1".to_owned());
+        let wrong_exit = host_routes_from_node(
+            &node,
+            Some(&db),
+            "utun9".to_owned(),
+            true,
+            Some(&p1_id),
+            true,
+        );
+        assert!(
+            !wrong_exit.routed.contains(&default),
+            "a selected peer that advertises no /0 contributes no host /0"
+        );
+
+        // The load-bearing anti-leak gate: the `/0`-advertising peer (`exit`) IS in the db, but a
+        // DIFFERENT peer (`p2`) is the selected exit. `exit`'s advertised `/0` must be gated out —
+        // the host default route is keyed on WHICH peer is selected, never on "some peer advertises
+        // /0 and an exit is configured". A regression here would route all internet traffic through
+        // a non-selected peer = a real egress leak.
+        let p2_id = StableNodeId("p2".to_owned());
+        let other_exit = host_routes_from_node(
+            &node,
+            Some(&db),
+            "utun9".to_owned(),
+            true,
+            Some(&p2_id),
+            true,
+        );
+        assert!(
+            !other_exit.routed.contains(&default),
+            "the /0 advertised by `exit` must NOT be installed when a different peer (p2) is the \
+             selected exit — the default route is keyed on the selected peer only (anti-leak)"
+        );
+        // p2 (the selected exit) advertises no /0, so still none; its own /32 + subnet stay.
+        assert!(other_exit.routed.contains(&p2_32));
+        assert!(other_exit.routed.contains(&p2_subnet));
+    }
+
+    /// DEDUP: two peers advertising the SAME subnet (and a subnet also advertised by the self node)
+    /// install that prefix exactly once.
+    #[test]
+    fn host_routes_dedups_overlapping_peer_subnets() {
+        let node = fixture_node(); // advertises 192.168.1.0/24
+        let a = tailnet_peer("a", 2, "100.64.0.2", &["10.9.0.0/24"]);
+        let b = tailnet_peer("b", 3, "100.64.0.3", &["10.9.0.0/24", "192.168.1.0/24"]);
+        let db = peer_db_from(&[&a, &b]);
+
+        let routes = host_routes_from_node(&node, Some(&db), "utun9".to_owned(), true, None, false);
+
+        let shared: Ipv4Net = "10.9.0.0/24".parse().unwrap();
+        let self_subnet: Ipv4Net = "192.168.1.0/24".parse().unwrap();
+        assert_eq!(
+            routes.routed.iter().filter(|n| **n == shared).count(),
+            1,
+            "a subnet advertised by two peers must be installed exactly once"
+        );
+        assert_eq!(
+            routes.routed.iter().filter(|n| **n == self_subnet).count(),
+            1,
+            "a subnet advertised by both the self node and a peer must be installed exactly once"
         );
     }
 
@@ -1123,13 +1457,13 @@ mod tests {
         let node = fixture_node();
         let magic_dns_net: Ipv4Net = "100.100.100.100/32".parse().unwrap();
 
-        let with = host_routes_from_node(&node, "utun9".to_owned(), gating_all(), true);
+        let with = host_routes_from_node(&node, None, "utun9".to_owned(), true, None, true);
         assert!(
             with.routed.contains(&magic_dns_net),
             "100.100.100.100/32 must be routed when MagicDNS is enabled"
         );
 
-        let without = host_routes_from_node(&node, "utun9".to_owned(), gating_all(), false);
+        let without = host_routes_from_node(&node, None, "utun9".to_owned(), true, None, false);
         assert!(
             !without.routed.contains(&magic_dns_net),
             "100.100.100.100/32 must not be routed when MagicDNS is disabled"
