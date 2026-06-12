@@ -37,7 +37,7 @@ impl Netstack {
                     );
                 }
 
-                let mut sock = tcp::Socket::new(self.tcp_buffer(), self.tcp_buffer());
+                let mut sock = self.new_tcp_socket();
 
                 if let Err(e) = sock.connect(self.iface.context(), remote_endpoint, local_endpoint)
                 {
