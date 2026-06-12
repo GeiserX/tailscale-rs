@@ -2,6 +2,15 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.28.2](https://github.com/GeiserX/tailscale-rs/compare/v0.28.1...v0.28.2) (2026-06-12)
+
+
+### Bug Fixes
+
+* **control:** back off map-poll reconnects and watchdog the long-poll read ([#109](https://github.com/GeiserX/tailscale-rs/issues/109)) ([96f9d9f](https://github.com/GeiserX/tailscale-rs/commit/96f9d9f4c192ffee91d31847d60a31f830e8a2ea))
+* **netcheck:** bound the derp-map measurement with a report deadline and per-probe timeout ([#112](https://github.com/GeiserX/tailscale-rs/issues/112)) ([9cb2bce](https://github.com/GeiserX/tailscale-rs/commit/9cb2bceaa2809772f3eb969f3527930b65313649))
+* **netstack:** reap idle/half-open TCP sockets and bound the accept backlog ([#111](https://github.com/GeiserX/tailscale-rs/issues/111)) ([555ee11](https://github.com/GeiserX/tailscale-rs/commit/555ee11ec7e4baab6b79d9745616acdfb400cd20))
+
 ## [0.28.1](https://github.com/GeiserX/tailscale-rs/compare/v0.28.0...v0.28.1) (2026-06-11)
 
 
