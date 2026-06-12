@@ -1387,19 +1387,33 @@ impl MemAumStore {
         let Some(mut curs) = self.aum(&oldest) else {
             return Err(TkaError::BadChain);
         };
+        // Fold the chain into a live `ReplayState` as we walk, so a fork is resolved against the
+        // REAL trusted-key weights at the fork point — exactly as Go's `advanceByPrimary` folds
+        // state before each `pickNextAUM`. Resolving with an empty (zero-key) state would make every
+        // candidate's weight 0, collapsing the tiebreak to the lowest-hash rule; a genuinely
+        // weight-decided fork (signed competing branches with different vote totals) would then pick
+        // a *different* branch than a Go node — an accept-direction consensus split.
+        //
+        // This store is UNVERIFIED (signatures/structure are `verify`'s job, not ours), so a fold can
+        // fail on a malformed AUM. We tolerate that best-effort: stop advancing the weight state but
+        // keep ordering the chain, because the authoritative `VerifiedAumChain::verify` runs on the
+        // result and will reject a malformed chain anyway. We never abort the walk on a fold error.
+        let mut state = ReplayState::default();
         for _ in 0..MAX_SYNC_ITER {
+            // Apply the current AUM before resolving its children (so the weight at a fork below
+            // includes every AUM up to and including this one). Best-effort: a fold failure on this
+            // unverified store leaves `state` as-is rather than aborting the ordering walk.
+            let _ = state.apply_verified_aum(&curs);
+
             out.push(curs.clone());
             let children = self.child_aums(&curs.hash());
             if children.is_empty() {
                 return Ok(out);
             }
-            // Deterministic branch choice at a fork (weight → RemoveKey → lowest-hash). For a linear
-            // chain there is exactly one child; `pick_next_aum` returns it. We don't have a replayed
-            // `ReplayState` here, so use a default (empty-key) state — at a genuine fork that means
-            // the weight term is 0 for both and the tiebreak falls through to the lowest-hash rule,
-            // which is still deterministic and matches what a fresh verifier would pick before any
-            // keys are trusted. (Sync stores are linear in practice; forks are the rare case.)
-            let next = pick_next_aum(&ReplayState::default(), &children).clone();
+            // Deterministic branch choice at a fork (weight → RemoveKey → lowest-hash), now against
+            // the real replayed state. For a linear chain there is exactly one child and the state is
+            // irrelevant; at a fork the weight term is correct.
+            let next = pick_next_aum(&state, &children).clone();
             curs = next;
         }
         Err(TkaError::BadChain) // iteration cap: cycle or over-long chain
@@ -5406,5 +5420,205 @@ mod tests {
         let ordered = store.linear_chain_from(g.hash()).expect("walk");
         assert_eq!(ordered.len(), 1);
         assert_eq!(ordered[0].hash(), g.hash());
+    }
+
+    /// Consensus regression (tsr-3x4): at a genuine **weight-decided** fork, `linear_chain_from` must
+    /// pick the branch with the higher signing weight — the branch a Go node picks (Go folds the real
+    /// trusted-key state before each `pickNextAUM`). The previous code resolved the fork against an
+    /// empty (zero-key) `ReplayState`, so every candidate scored weight 0 and the tiebreak collapsed
+    /// to lowest-hash; on a fork where the lowest-hash branch is NOT the highest-weight branch, that
+    /// diverged from Go = an accept-direction consensus split. This test constructs exactly that
+    /// adversarial shape (the low-weight branch has the lower hash) and asserts weight wins.
+    #[test]
+    fn linear_chain_from_resolves_fork_by_real_weight_not_empty_state() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        // Two trusted keys with very different vote weights, established by a checkpoint genesis.
+        let key_light = test_aum_key(0x10, 1); // votes = 1
+        let key_heavy = test_aum_key(0x20, 100); // votes = 100
+        let signer_light = SigningKey::from_bytes(&[0x10; 32]);
+        let signer_heavy = SigningKey::from_bytes(&[0x20; 32]);
+
+        let genesis = Aum {
+            message_kind: AumKind::Checkpoint,
+            prev_aum_hash: None,
+            key: None,
+            key_id: Vec::new(),
+            state: Some(AumState {
+                last_aum_hash: None,
+                disablement_values: Some(alloc::vec![alloc::vec![0x33u8; DISABLEMENT_LENGTH]]),
+                keys: Some(alloc::vec![key_light.clone(), key_heavy.clone()]),
+                state_id1: 0,
+                state_id2: 0,
+            }),
+            votes: None,
+            meta: Vec::new(),
+            signatures: Vec::new(),
+        };
+        let gh = genesis.hash();
+
+        // Build a child NoOp signed by the given key. `salt` perturbs the AUM bytes (via meta) so we
+        // can search for the hash ordering we need without changing which key signs it.
+        let child_signed_by = |signer: &SigningKey, key: &AumKey, salt: u8| -> Aum {
+            let mut aum = Aum {
+                message_kind: AumKind::NoOp,
+                prev_aum_hash: Some(gh),
+                key: None,
+                key_id: Vec::new(),
+                state: None,
+                votes: None,
+                meta: alloc::vec![("s".to_string(), alloc::format!("{salt}"))],
+                signatures: Vec::new(),
+            };
+            let sh = aum.sig_hash();
+            aum.signatures = alloc::vec![AumSignature {
+                key_id: key.id().to_vec(),
+                signature: signer.sign(&sh).to_bytes().to_vec(),
+            }];
+            aum
+        };
+
+        // Find a salt pair where the LIGHT-weight branch has the LOWER hash (the adversarial case:
+        // lowest-hash != highest-weight). With content-derived hashes this is found by probing salts.
+        let (light_child, heavy_child) = (0u8..64)
+            .flat_map(|ls| (0u8..64).map(move |hs| (ls, hs)))
+            .find_map(|(ls, hs)| {
+                let light = child_signed_by(&signer_light, &key_light, ls);
+                let heavy = child_signed_by(&signer_heavy, &key_heavy, hs);
+                (light.hash().0 < heavy.hash().0).then_some((light, heavy))
+            })
+            .expect("a salt pair where the light branch sorts lower must exist");
+
+        // Sanity: the adversarial precondition actually holds.
+        assert!(
+            light_child.hash().0 < heavy_child.hash().0,
+            "test setup: light (low-weight) branch must have the lower hash"
+        );
+
+        let store =
+            MemAumStore::from_aums([genesis.clone(), light_child.clone(), heavy_child.clone()]);
+        let ordered = store.linear_chain_from(gh).expect("walk");
+
+        // The walk must pick the HEAVY (weight-100) branch as the genesis's successor — matching Go —
+        // NOT the light/low-hash branch the old empty-state code would have chosen.
+        assert_eq!(ordered.len(), 2, "genesis + the chosen branch head");
+        assert_eq!(ordered[0].hash(), gh);
+        assert_eq!(
+            ordered[1].hash(),
+            heavy_child.hash(),
+            "fork must resolve to the higher-WEIGHT branch (Go parity), not the lower-HASH one"
+        );
+        assert_ne!(
+            ordered[1].hash(),
+            light_child.hash(),
+            "the lower-hash low-weight branch must NOT be chosen (the pre-fix empty-state bug)"
+        );
+    }
+
+    /// Consensus regression (tsr-3x4), the state-ACCUMULATION case: the fork is resolved by a key
+    /// that was added by a **mid-chain `AddKey`**, not by the genesis. This is the scenario that
+    /// distinguishes a walk that folds *every AUM up to the fork* (correct, Go `advanceByPrimary`)
+    /// from one that only ever reflects the genesis state — the genesis-only test above would pass
+    /// even if `state` failed to advance past the genesis, so this fork lives two AUMs deep and its
+    /// weight winner depends on the intervening `AddKey` having been folded in.
+    #[test]
+    fn linear_chain_from_resolves_deep_fork_using_mid_chain_added_key_weight() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        // Genesis trusts only a bootstrap key (votes 1). A mid-chain AddKey then introduces the
+        // heavy key (votes 100). The fork below the AddKey is decided by that heavy key's weight —
+        // so it can only resolve correctly if the AddKey was folded into the walk's state.
+        let key_boot = test_aum_key(0x40, 1);
+        let key_heavy = test_aum_key(0x50, 100);
+        let signer_boot = SigningKey::from_bytes(&[0x40; 32]);
+        let signer_heavy = SigningKey::from_bytes(&[0x50; 32]);
+
+        let genesis = Aum {
+            message_kind: AumKind::Checkpoint,
+            prev_aum_hash: None,
+            key: None,
+            key_id: Vec::new(),
+            state: Some(AumState {
+                last_aum_hash: None,
+                disablement_values: Some(alloc::vec![alloc::vec![0x44u8; DISABLEMENT_LENGTH]]),
+                keys: Some(alloc::vec![key_boot.clone()]),
+                state_id1: 0,
+                state_id2: 0,
+            }),
+            votes: None,
+            meta: Vec::new(),
+            signatures: Vec::new(),
+        };
+        let gh = genesis.hash();
+
+        // Mid-chain AddKey introducing the heavy key, signed by the bootstrap key (the only trusted
+        // key at this point). prev = genesis.
+        let mut add_heavy = Aum {
+            message_kind: AumKind::AddKey,
+            prev_aum_hash: Some(gh),
+            key: Some(key_heavy.clone()),
+            key_id: Vec::new(),
+            state: None,
+            votes: None,
+            meta: Vec::new(),
+            signatures: Vec::new(),
+        };
+        let ah_sh = add_heavy.sig_hash();
+        add_heavy.signatures = alloc::vec![AumSignature {
+            key_id: key_boot.id().to_vec(),
+            signature: signer_boot.sign(&ah_sh).to_bytes().to_vec(),
+        }];
+        let ah = add_heavy.hash();
+
+        // Two competing children of the AddKey: one signed by the heavy key (weight 100), one by the
+        // bootstrap key (weight 1). Arrange (via salt) so the LIGHT (boot-signed) branch sorts lower.
+        let child_signed_by = |signer: &SigningKey, key: &AumKey, salt: u8| -> Aum {
+            let mut aum = Aum {
+                message_kind: AumKind::NoOp,
+                prev_aum_hash: Some(ah),
+                key: None,
+                key_id: Vec::new(),
+                state: None,
+                votes: None,
+                meta: alloc::vec![("s".to_string(), alloc::format!("{salt}"))],
+                signatures: Vec::new(),
+            };
+            let sh = aum.sig_hash();
+            aum.signatures = alloc::vec![AumSignature {
+                key_id: key.id().to_vec(),
+                signature: signer.sign(&sh).to_bytes().to_vec(),
+            }];
+            aum
+        };
+        let (light_child, heavy_child) = (0u8..64)
+            .flat_map(|ls| (0u8..64).map(move |hs| (ls, hs)))
+            .find_map(|(ls, hs)| {
+                let light = child_signed_by(&signer_boot, &key_boot, ls);
+                let heavy = child_signed_by(&signer_heavy, &key_heavy, hs);
+                (light.hash().0 < heavy.hash().0).then_some((light, heavy))
+            })
+            .expect("a salt pair where the light branch sorts lower must exist");
+
+        let store = MemAumStore::from_aums([
+            genesis.clone(),
+            add_heavy.clone(),
+            light_child.clone(),
+            heavy_child.clone(),
+        ]);
+        let ordered = store.linear_chain_from(gh).expect("walk");
+
+        // genesis → AddKey → the HEAVY branch (resolved by the mid-chain-added key's weight).
+        assert_eq!(
+            ordered.len(),
+            3,
+            "genesis + AddKey + the chosen branch head"
+        );
+        assert_eq!(ordered[0].hash(), gh);
+        assert_eq!(ordered[1].hash(), ah, "the AddKey is on the walked chain");
+        assert_eq!(
+            ordered[2].hash(),
+            heavy_child.hash(),
+            "the deep fork must resolve by the mid-chain-added key's weight (state was accumulated past genesis)"
+        );
     }
 }
