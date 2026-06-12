@@ -155,14 +155,42 @@ impl PublishTxt for SetDnsPublisher<'_> {
 }
 
 /// Issue a real certificate for `name` via the client-side ACME DNS-01 engine, publishing the
-/// challenge TXT through the node's `POST /machine/set-dns` RPC.
+/// challenge TXT through the node's `POST /machine/set-dns` RPC, returning the full
+/// [`IssuedCert`](crate::acme::IssuedCert) (the [`CertifiedKey`] **plus** the chain + leaf-key PEMs).
+///
+/// This is the single issuance entry point: [`issue_certificate_via_setdns`] (which needs only the
+/// [`CertifiedKey`] for the `get_certificate` / `ListenTLS` path) delegates here and drops the PEMs,
+/// while a caller needing the on-disk `.crt`/`.key` pair (the daemon's `tnet cert`, Go's
+/// `LocalClient.CertPair`) keeps them — one ACME order, two consumers.
 ///
 /// `account_key` is the ACME account identity (persist its PKCS#8 DER across renewals — see the
 /// runtime caller); `directory_url` selects the ACME CA (production is
 /// [`crate::acme::LETS_ENCRYPT_PRODUCTION_DIRECTORY`]). Rejects non-tailnet names up front (anti-leak)
 /// before any network I/O. SaaS-only: against a self-hosted control plane the set-dns publish typically 501s, surfaced as
-/// [`CertError::Acme`]. Fail-closed: returns a [`CertifiedKey`] only when the LE order reached
-/// `valid` and the chain assembled.
+/// [`CertError::Acme`]. Fail-closed: returns an [`IssuedCert`](crate::acme::IssuedCert) only when the
+/// LE order reached `valid` and the chain assembled. The leaf private key
+/// ([`IssuedCert::key_pem`](crate::acme::IssuedCert::key_pem)) is never logged.
+#[cfg(feature = "acme")]
+pub async fn issue_cert_pair_via_setdns(
+    config: &crate::Config,
+    node_keystate: &ts_keys::NodeState,
+    name: &str,
+    account_key: &crate::acme::AcmeAccountKey,
+    directory_url: &url::Url,
+) -> Result<crate::acme::IssuedCert, CertError> {
+    if !is_tailnet_name(name) {
+        return Err(CertError::NotTailnetName(name.to_string()));
+    }
+    let publisher = SetDnsPublisher::new(config, node_keystate);
+    crate::acme::issue_certificate(name, directory_url, account_key, &publisher).await
+}
+
+/// Issue a real certificate for `name` via the client-side ACME DNS-01 engine, returning just the
+/// ready-to-serve [`CertifiedKey`] (the `get_certificate` / `ListenTLS` path).
+///
+/// Thin wrapper over [`issue_cert_pair_via_setdns`] that discards the raw PEMs — one issuance, the
+/// caller here just doesn't need the on-disk pair. See that function for the full contract
+/// (anti-leak name check, SaaS-only set-dns, fail-closed).
 #[cfg(feature = "acme")]
 pub async fn issue_certificate_via_setdns(
     config: &crate::Config,
@@ -171,11 +199,9 @@ pub async fn issue_certificate_via_setdns(
     account_key: &crate::acme::AcmeAccountKey,
     directory_url: &url::Url,
 ) -> Result<CertifiedKey, CertError> {
-    if !is_tailnet_name(name) {
-        return Err(CertError::NotTailnetName(name.to_string()));
-    }
-    let publisher = SetDnsPublisher::new(config, node_keystate);
-    crate::acme::issue_certificate(name, directory_url, account_key, &publisher).await
+    issue_cert_pair_via_setdns(config, node_keystate, name, account_key, directory_url)
+        .await
+        .map(|issued| issued.certified)
 }
 
 /// Names exactly what this fork is missing to issue a real cert, surfaced
@@ -408,5 +434,78 @@ mod tests {
     fn set_dns_publisher_is_publish_txt() {
         fn assert_publish_txt<T: PublishTxt>() {}
         assert_publish_txt::<SetDnsPublisher<'_>>();
+    }
+
+    /// Offline round-trip of the [`crate::acme::IssuedCert`] PEM contract — the data
+    /// `Device::cert_pair` surfaces — WITHOUT a network/ACME server. `issue_certificate` ends by
+    /// feeding a chain PEM + a leaf-key PEM into [`certified_key_from_pem`] and keeping those same
+    /// two PEMs on the `IssuedCert`; this proves that exact assembly with a known cert+key pair
+    /// (generated here with `rcgen`, as the live engine does), so the plumbing is covered even when
+    /// the Pebble integration test cannot run.
+    ///
+    /// Asserts: the leaf-key PEM parses as a private key (`rustls_pemfile::private_key` → `Some`),
+    /// the cert PEM parses as ≥1 certificate, and the matched pair builds a `CertifiedKey` (which
+    /// runs `keys_match()` internally — the key-matches-leaf verification is exercised, NOT skipped).
+    #[cfg(feature = "acme")]
+    #[test]
+    fn issued_cert_pem_pair_round_trips_and_key_matches_leaf() {
+        // A self-signed cert + its key — the same `(chain_pem, key_pem)` shape `issue_certificate`
+        // holds at its final `certified_key_from_pem` call (there the chain is LE's; here it is a
+        // single self-signed leaf — identical for the parse/match contract under test).
+        let cert = rcgen::generate_simple_self_signed(vec!["host.tail1234.ts.net".into()])
+            .expect("generate self-signed cert");
+        let cert_chain_pem = cert.cert.pem();
+        let key_pem = cert.key_pair.serialize_pem();
+
+        // The leaf-key PEM parses as a private key (the "PEM already in hand, no opaque-key export"
+        // fact the whole change rests on). Never logged.
+        let parsed_key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+            .expect("key_pem must parse as PEM")
+            .expect("key_pem must contain a private key");
+        assert!(
+            !parsed_key.secret_der().is_empty(),
+            "parsed leaf private key DER is empty"
+        );
+
+        // The cert PEM parses to ≥1 certificate.
+        let chain: Vec<CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut cert_chain_pem.as_bytes())
+                .collect::<Result<_, _>>()
+                .expect("cert_chain_pem must parse as PEM certificates");
+        assert!(
+            !chain.is_empty(),
+            "cert_chain_pem parsed to ZERO certificates"
+        );
+
+        // The matched pair assembles — `certified_key_from_pem` runs `keys_match()` internally, so
+        // this is the key-matches-leaf check (the production verifier, reused, never weakened).
+        let ck = certified_key_from_pem(cert_chain_pem.as_bytes(), key_pem.as_bytes())
+            .expect("matched cert_chain_pem + key_pem must build a CertifiedKey");
+        assert!(
+            !ck.cert.is_empty(),
+            "assembled CertifiedKey has an empty chain"
+        );
+    }
+
+    /// The key-matches-leaf verification is real: a cert paired with a *different* key's PEM must be
+    /// REJECTED by [`certified_key_from_pem`]. This guards against any future weakening of the
+    /// matched-pair guarantee `IssuedCert` (and `Device::cert_pair`) depend on.
+    #[cfg(feature = "acme")]
+    #[test]
+    fn certified_key_from_pem_rejects_mismatched_key() {
+        let cert_a = rcgen::generate_simple_self_signed(vec!["host.tail1234.ts.net".into()])
+            .expect("generate cert A");
+        let cert_b = rcgen::generate_simple_self_signed(vec!["other.tail1234.ts.net".into()])
+            .expect("generate cert B");
+        // Cert A's chain with cert B's (non-matching) private key.
+        let err = certified_key_from_pem(
+            cert_a.cert.pem().as_bytes(),
+            cert_b.key_pair.serialize_pem().as_bytes(),
+        )
+        .expect_err("a cert paired with the wrong key must be rejected (keys_match)");
+        assert!(
+            matches!(err, CertError::Rustls(_)),
+            "mismatch must surface as a rustls error, got {err:?}"
+        );
     }
 }

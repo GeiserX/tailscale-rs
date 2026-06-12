@@ -24,8 +24,8 @@
 //! authorization + TXT digest ([RFC 8555] §8.1/§8.4, [RFC 7638] §3) and publish it via the
 //! [`crate::cert::PublishTxt`] seam (control's `set-dns`), 7. signal the challenge ready, poll the
 //! authorization to `valid`, 8. finalize with a fresh-cert-key CSR, poll the order to `valid`,
-//! 9. download the PEM chain and assemble a [`CertifiedKey`] via
-//! [`crate::cert::certified_key_from_pem`].
+//! 9. download the PEM chain and assemble an [`IssuedCert`] (the chain + leaf-key PEMs and a
+//! [`CertifiedKey`] built from them via [`crate::cert::certified_key_from_pem`]).
 //!
 //! Every ACME POST body is a flattened JWS (`{"protected","payload","signature"}`,
 //! `application/jose+json`); `base64url` is **always unpadded**.
@@ -417,13 +417,44 @@ async fn signed_post(
     Ok(parts)
 }
 
+/// The product of one successful ACME issuance: the ready-to-serve [`CertifiedKey`] **plus** the
+/// raw PEM pair it was assembled from, so a caller that needs the on-disk `.crt` + `.key` (the
+/// daemon's `tnet cert`, Go's `LocalClient.CertPair`) gets them from the *same* issuance without a
+/// second order or any attempt to export the key out of the opaque `CertifiedKey`.
+///
+/// The two PEMs are exactly the bytes [`crate::cert::certified_key_from_pem`] consumed to build
+/// [`certified`](Self::certified): [`cert_chain_pem`](Self::cert_chain_pem) is the leaf+intermediate
+/// chain Let's Encrypt returned, and [`key_pem`](Self::key_pem) is the freshly generated leaf
+/// private key (PKCS#8 PEM). They are guaranteed to match (the key matches the leaf), because
+/// `certified_key_from_pem` verifies that before this value is returned.
+///
+/// # Secret handling
+///
+/// [`key_pem`](Self::key_pem) is **private key material**. It is never logged anywhere in this
+/// crate; a holder must treat it the same way (persist to a `0600` file, never trace it). Only the
+/// cert chain / name / success are safe to log.
+pub struct IssuedCert {
+    /// The ready-to-serve rustls cert+signing-key, built from the two PEMs below (key-matches-leaf
+    /// already verified).
+    pub certified: CertifiedKey,
+    /// The leaf+chain certificate PEM exactly as Let's Encrypt returned it (safe to log/persist).
+    pub cert_chain_pem: String,
+    /// The leaf **private key** PEM (PKCS#8). Secret — never log it; persist to a `0600` file.
+    pub key_pem: String,
+}
+
 /// Issue a real certificate for `name` via the full RFC 8555 DNS-01 flow against `directory_url`.
 ///
 /// `account_key` is the persisted ACME account key (see [`AcmeAccountKey::generate`]); `publisher`
 /// is the control-plane seam ([`PublishTxt`]) that publishes the `_acme-challenge.<name>` TXT.
-/// Returns the assembled [`CertifiedKey`] (leaf+chain from Let's Encrypt plus a freshly generated
-/// cert key) ready to serve, or [`CertError`] on any ACME/HTTP failure (fail-closed: no cert is
-/// returned unless the order reached `valid` and the chain assembled).
+/// Returns an [`IssuedCert`] — the assembled [`CertifiedKey`] (leaf+chain from Let's Encrypt plus a
+/// freshly generated cert key) ready to serve, **plus** the raw chain + leaf-key PEMs it was built
+/// from (so a caller needing the on-disk `.crt`/`.key` pair gets them from this same issuance) — or
+/// [`CertError`] on any ACME/HTTP failure (fail-closed: no cert is returned unless the order reached
+/// `valid` and the chain assembled).
+///
+/// The leaf private key is generated fresh here and surfaced only as [`IssuedCert::key_pem`]; it is
+/// never logged.
 ///
 /// `directory_url` lets tests point at Pebble/staging; production is
 /// [`LETS_ENCRYPT_PRODUCTION_DIRECTORY`].
@@ -432,7 +463,7 @@ pub async fn issue_certificate(
     directory_url: &Url,
     account_key: &AcmeAccountKey,
     publisher: &(impl PublishTxt + Sync),
-) -> Result<CertifiedKey, CertError> {
+) -> Result<IssuedCert, CertError> {
     // 1. Directory.
     let dir = acme_get(directory_url).await?;
     let directory = parse_directory(&dir.body)?;
@@ -593,7 +624,19 @@ pub async fn issue_certificate(
         return Err(status_err("certificate-download", &cert_resp));
     }
 
-    certified_key_from_pem(&cert_resp.body, cert_key_pem.as_bytes())
+    // Assemble the ready-to-serve `CertifiedKey` from the LE chain + the leaf key generated above,
+    // and surface those SAME PEMs (one issuance, two consumers). `certified_key_from_pem` verifies
+    // the key matches the leaf, so `IssuedCert` always carries a matched pair.
+    let certified = certified_key_from_pem(&cert_resp.body, cert_key_pem.as_bytes())?;
+    // The chain is bytes; LE returns ASCII PEM, but handle a non-UTF8 body as an ACME error rather
+    // than assuming. (The leaf key PEM is already a `String` from `rcgen`.)
+    let cert_chain_pem = String::from_utf8(cert_resp.body.to_vec())
+        .map_err(|_| CertError::Acme("certificate chain PEM was not valid UTF-8".into()))?;
+    Ok(IssuedCert {
+        certified,
+        cert_chain_pem,
+        key_pem: cert_key_pem,
+    })
 }
 
 /// Poll `url` (POST-as-GET) until its JSON `status` is `valid`, returning the final JSON.
