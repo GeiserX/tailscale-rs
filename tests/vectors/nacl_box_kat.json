@@ -1,0 +1,32 @@
+[
+  {
+    "desc": "empty plaintext (tag-only), all-0x11 sender / 0x22 recipient",
+    "sender_priv_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+    "sender_pub_hex": "7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13",
+    "recipient_priv_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+    "recipient_pub_hex": "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20",
+    "nonce_hex": "000102030405060708090a0b0c0d0e0f1011121314151617",
+    "pt_hex": "",
+    "sealed_hex": "67021af553ef442bf090cb131f43c15a"
+  },
+  {
+    "desc": "short disco-like plaintext",
+    "sender_priv_hex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+    "sender_pub_hex": "07a37cbc142093c8b755dc1b10e86cb426374ad16aa853ed0bdfc0b2b86d1c7c",
+    "recipient_priv_hex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+    "recipient_pub_hex": "358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd166254",
+    "nonce_hex": "fedcba9876543210fedcba9876543210fedcba9876543210",
+    "pt_hex": "78797a7a79",
+    "sealed_hex": "c3fd88f61be3a3aa81d7e9cd6add0920be9a157b95"
+  },
+  {
+    "desc": "longer plaintext (DERP client-info-like JSON blob)",
+    "sender_priv_hex": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    "sender_pub_hex": "4844118db6d430d139e75e2be57a9d6829ff70f7addb5ef56e72127717e1024d",
+    "recipient_priv_hex": "cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe",
+    "recipient_pub_hex": "c9c39e59eb2703ab4067b2c8306b1d3fd3e55e0ac662dd5652817dbfe361c051",
+    "nonce_hex": "0000000000000000000000000000000000000000deadbeef",
+    "pt_hex": "7b2276657273696f6e223a322c226d65736853657373696f6e223a747275657d",
+    "sealed_hex": "d1cbf633e31ab0e376138e0c250bfc1419037c86bc9fd5c5ba83113f8125a1edd1bec2210d75db66004e214be16a14b1"
+  }
+]
