@@ -130,11 +130,28 @@ impl Packet<Plaintext> {
         ty: MessageType,
         init_msg: impl FnOnce(&mut [u8]),
     ) -> Result<&mut Self, Error> {
+        Self::init_raw_message_versioned(b, ty, Plaintext::VERSION, init_msg)
+    }
+
+    /// Like [`init_raw_message`](Self::init_raw_message) but with an explicit `version` byte, to
+    /// exercise the per-type version laxity (Go's `disco.Parse` ignores the version for Ping/Pong
+    /// and soft-empties CallMeMaybe when it isn't 0). A future-version message must still parse
+    /// (Ping/Pong) or soft-empty (CallMeMaybe), never be rejected wholesale.
+    ///
+    /// **Unstable test/fuzz seam** — `#[doc(hidden)]`, no semver guarantee; `pub` only because its
+    /// consumer is a `#[cfg(test)]` helper in a different crate.
+    #[doc(hidden)]
+    pub fn init_raw_message_versioned(
+        b: &mut [u8],
+        ty: MessageType,
+        version: u8,
+        init_msg: impl FnOnce(&mut [u8]),
+    ) -> Result<&mut Self, Error> {
         let s = Self::try_mut_from_bytes(b)?;
 
         let pt = Plaintext::mut_from_bytes(&mut s.payload.payload)?;
         pt.ty = ty as _;
-        pt.version = 0;
+        pt.version = version;
         init_msg(&mut pt.message);
 
         s.validate()?;
@@ -248,16 +265,26 @@ impl Packet<Plaintext> {
     /// rejects a too-short Pong), and matches Go's "soft-empty" CallMeMaybe behavior. The strict
     /// [`as_msg::<CallMeMaybe>`](Self::as_msg) instead requires an exact multiple, so it would drop
     /// the *entire* message on any trailing/extension bytes a forward-compatible peer might append.
-    /// Returns `None` only if the message type doesn't match (the version is already validated when
-    /// the packet is decrypted).
+    /// Returns `None` only if the message type doesn't match. A `version != 0` `CallMeMaybe` yields
+    /// **no** endpoints (an empty iterator), matching Go's `parseCallMeMaybe`, which returns an empty
+    /// message when `ver != 0` (it only parses endpoints for the version it understands) rather than
+    /// erroring — so a future-version CallMeMaybe is tolerated, just carries no endpoints here.
     pub fn call_me_maybe_endpoints(&self) -> Option<impl Iterator<Item = &crate::Endpoint>> {
         let pt = self.plaintext()?;
         if pt.ty() != Some(crate::CallMeMaybe::TYPE) {
             return None;
         }
+        // Go `parseCallMeMaybe`: `if len(p)%epLength != 0 || ver != 0 || len(p) == 0 { return m, nil }`
+        // — a non-zero version produces an empty (not errored) message. Match that by parsing no
+        // endpoints when the version isn't the one we understand.
+        let message: &[u8] = if pt.version == Plaintext::VERSION {
+            &pt.message
+        } else {
+            &[]
+        };
         let ep_size = core::mem::size_of::<crate::Endpoint>();
         Some(
-            pt.message
+            message
                 .chunks_exact(ep_size)
                 .filter_map(|chunk| crate::Endpoint::ref_from_bytes(chunk).ok()),
         )
@@ -303,16 +330,21 @@ impl Packet<Plaintext> {
         Self::vec_for_message(message_size).into_boxed_slice()
     }
 
-    /// Check that this is a valid packet: the inner plaintext is the right size and has
-    /// a known version.
+    /// Check that this is a valid packet: the inner plaintext is well-formed (parses to at least
+    /// the fixed header — version byte + message-type byte).
     ///
-    /// Unknown message types do not fail validation.
+    /// The version byte is deliberately NOT rejected here. Go's `disco.Parse` (`disco/disco.go`)
+    /// treats the version as a per-message-type advisory, not a packet-wide gate: `parsePing` /
+    /// `parsePong` ignore it entirely (accept any version), and `parseCallMeMaybe` soft-empties when
+    /// `version != 0`. So a future disco protocol bump that stays wire-compatible for Ping/Pong keeps
+    /// working. Rejecting the whole datagram on a non-zero version (the old behavior) would drop a
+    /// real Go peer's Ping/Pong after such a bump, silently forcing that peer permanently onto DERP.
+    /// Per-type version handling lives in the typed accessors / the consumer instead. Unknown message
+    /// types likewise do not fail here.
     pub fn validate(&self) -> Result<(), Error> {
-        let pt = Plaintext::ref_from_bytes(&self.payload.payload)?;
-
-        if pt.version != Plaintext::VERSION {
-            return Err(Error::UnknownVersion);
-        }
+        // Still require the plaintext to be at least the fixed header (version + type) so the typed
+        // accessors can read the type byte; `ref_from_bytes` enforces that minimum size.
+        Plaintext::ref_from_bytes(&self.payload.payload)?;
 
         Ok(())
     }

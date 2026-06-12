@@ -10,6 +10,11 @@ pub enum Error {
     WrongMagic,
 
     /// The version number of a decrypted message was incorrect.
+    ///
+    /// Retained for API stability; **no longer produced**. The disco version byte is now a
+    /// per-message-type advisory (matching Go's `disco.Parse`): Ping/Pong ignore it and CallMeMaybe
+    /// soft-empties on a non-zero version, rather than the whole packet being rejected. See
+    /// [`Packet::validate`][crate::Packet::validate].
     #[error("disco version other than 0")]
     UnknownVersion,
 
