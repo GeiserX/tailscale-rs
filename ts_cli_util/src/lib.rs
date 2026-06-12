@@ -55,10 +55,15 @@ impl CommonArgs {
     )> {
         let config: tailscale::Config = self.config().await?;
 
+        // This CLI helper does not surface a mid-session re-auth URL (that is a runtime/embedder
+        // concern — see `ControlRunner`), so it passes a sender whose receiver is immediately
+        // dropped: `run`'s sticky `send_if_modified` writes to it are harmless no-ops.
+        let (auth_url_tx, _auth_url_rx) = tokio::sync::watch::channel::<Option<url::Url>>(None);
         let (client, stream) = ts_control::AsyncControlClient::connect(
             &(&config).into(),
             &(&config.key_state).into(),
             self.auth_key.as_deref(),
+            auth_url_tx,
         )
         .await?;
         tracing::info!("connected to control");

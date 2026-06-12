@@ -74,6 +74,18 @@ pub struct ControlRunner {
     /// time the DERP-latency measurer reports in. The facade reads this for `Device::netcheck` (the
     /// daemon's `tnet netcheck`). Empty until the first measurement.
     netcheck: watch::Sender<crate::status::NetcheckReport>,
+    /// Background task that bridges the control client's mid-session re-auth URL cell onto
+    /// [`Self::params`]'s device-state cell (sets [`DeviceState::NeedsLogin`] when control returns
+    /// `MachineNotAuthorized` on a live re-register — see [`bridge_reauth_url_to_state`]). Aborted on
+    /// [`Drop`] so it cannot outlive the actor (the [`DataplaneActor`](crate::dataplane) pattern).
+    reauth_bridge: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ControlRunner {
+    fn drop(&mut self) {
+        // Stop the re-auth bridge so it does not outlive the actor (mirrors `DataplaneActor`).
+        self.reauth_bridge.abort();
+    }
 }
 
 /// Control runner args.
@@ -149,11 +161,18 @@ impl kameo::Actor for ControlRunner {
         // resolves `Ok` for a device whose stream connect failed (which would leave a stopped actor
         // behind). If the connect/subscribe steps fail, publish a transient `Failed` first so the
         // waiter sees an actionable reason instead of the opaque post-mortem `Internal(Actor)`.
+        // The control client's live map-poll loop publishes a mid-session re-auth URL here (set when
+        // a re-register returns `MachineNotAuthorized` because the node key expired/was revoked). The
+        // runtime owns the receiver; `connect` takes the sender. Created before `connect` so the
+        // sender is in place for the very first poll, and so the receiver outlives `bring_up`.
+        let (auth_url_tx, auth_url_rx) = watch::channel::<Option<url::Url>>(None);
+
         let bring_up = async {
             let (client, stream) = AsyncControlClient::connect(
                 &params.config,
                 &params.env.keys,
                 params.auth_key.as_deref(),
+                auth_url_tx,
             )
             .await?;
 
@@ -183,6 +202,24 @@ impl kameo::Actor for ControlRunner {
         // current (and flips to `Expired` if the self-node's key lapses).
         params.state_tx.send_replace(crate::DeviceState::Running);
 
+        // Bridge the control client's mid-session re-auth URL cell onto the device-state cell: a
+        // `Some(url)` (control returned `MachineNotAuthorized` on a live re-register) becomes
+        // `DeviceState::NeedsLogin(url)` so the IPN bus surfaces `browse_to_url` and the embedder can
+        // prompt the user — the live-session analogue of the initial `check_auth` loop above. The
+        // recovery to `Running` is the netmap self-node handler's job (next good self-node), so this
+        // bridge only forwards `Some`. The task ends when the sender drops (the client's `run` task
+        // ended) and is aborted on actor `Drop`, so it cannot leak past the actor.
+        let reauth_bridge = {
+            let state_tx = params.state_tx.clone();
+            let mut auth_url_rx = auth_url_rx;
+            tokio::spawn(async move {
+                while auth_url_rx.changed().await.is_ok() {
+                    let url = auth_url_rx.borrow_and_update().clone();
+                    bridge_reauth_url_to_state(&state_tx, url.as_ref());
+                }
+            })
+        };
+
         Ok(Self {
             client,
             params,
@@ -196,6 +233,7 @@ impl kameo::Actor for ControlRunner {
             dns_config: Default::default(),
             pop_browser_url: Default::default(),
             netcheck: Default::default(),
+            reauth_bridge,
         })
     }
 }
@@ -338,6 +376,43 @@ fn sticky_update_pop_browser_url(
                 false
             } else {
                 *current = Some(url.clone());
+                true
+            }
+        });
+    }
+}
+
+/// Map a mid-session re-auth URL surfaced by the control client onto the device-state cell.
+///
+/// The control client's live map-poll loop publishes an `Option<url::Url>` into a `watch` cell when
+/// a re-register hits `MachineNotAuthorized` (the node key expired/was revoked mid-session — see
+/// [`ts_control::AsyncControlClient::connect`]'s `auth_url_tx`). `ts_control` cannot name
+/// [`DeviceState`] (it must not depend on this crate), so this bridge fn does the translation:
+/// a `Some(url)` sets [`DeviceState::NeedsLogin`]`(url)` so the IPN bus derives `browse_to_url` and
+/// the embedder can prompt the user, exactly like the initial-registration `check_auth` path.
+///
+/// **Only `Some` drives a transition; `None` is ignored here.** The clear back to
+/// [`DeviceState::Running`] is owned by the netmap self-node handler (the next good self-node flips
+/// it — see the `StreamMessage::Next` arm), which is the authoritative "we are up again" signal; an
+/// independent `None`-clear in this bridge could race that and is unnecessary. The
+/// [`send_if_modified`](watch::Sender::send_if_modified) guard fires the watch only on a genuine
+/// state change (it is a no-op when the cell already holds `NeedsLogin(url)` for the same URL), so a
+/// re-auth URL re-surfaced across retries does not thrash the cell — mirroring the device-state
+/// dedupe in the netmap handler.
+///
+/// Factored out so the (regress-prone) map-and-guard is unit-testable against a plain `watch`
+/// channel without standing up the actor (mirrors [`sticky_update_pop_browser_url`]).
+pub(crate) fn bridge_reauth_url_to_state(
+    state_tx: &watch::Sender<crate::DeviceState>,
+    incoming: Option<&url::Url>,
+) {
+    if let Some(url) = incoming {
+        let next = crate::DeviceState::NeedsLogin(url.clone());
+        state_tx.send_if_modified(|current| {
+            if *current == next {
+                false
+            } else {
+                *current = next.clone();
                 true
             }
         });
@@ -909,6 +984,90 @@ impl Message<SetHostname> for ControlRunner {
     async fn handle(&mut self, msg: SetHostname, _ctx: &mut Context<Self, Self::Reply>) {
         tracing::debug!("updating hostname at control");
         self.client.set_hostname(msg.hostname).await;
+    }
+}
+
+#[cfg(test)]
+mod reauth_bridge_tests {
+    use tokio::sync::watch;
+
+    use super::bridge_reauth_url_to_state;
+    use crate::DeviceState;
+
+    fn url(s: &str) -> url::Url {
+        s.parse().unwrap()
+    }
+
+    /// The bridge maps a surfaced re-auth URL onto `DeviceState::NeedsLogin(url)` — the fix's core:
+    /// a mid-session `MachineNotAuthorized` (forwarded by the control client as `Some(url)`) becomes
+    /// the "needs login" state the IPN bus turns into `browse_to_url`.
+    #[test]
+    fn bridge_maps_auth_url_to_needs_login() {
+        let u = url("https://login.example/auth");
+        let (tx, rx) = watch::channel(DeviceState::Running);
+
+        bridge_reauth_url_to_state(&tx, Some(&u));
+
+        assert_eq!(*rx.borrow(), DeviceState::NeedsLogin(u));
+    }
+
+    /// `None` never drives a transition — the recovery to `Running` is the netmap self-node
+    /// handler's job, so the bridge ignores a `None` and leaves the state untouched.
+    #[test]
+    fn bridge_none_leaves_state_unchanged() {
+        let (tx, rx) = watch::channel(DeviceState::Running);
+
+        bridge_reauth_url_to_state(&tx, None);
+
+        assert_eq!(*rx.borrow(), DeviceState::Running);
+    }
+
+    /// Re-surfacing the same URL across retries does not re-fire the watch (`send_if_modified`
+    /// dedupe against the cell's current value), so a stuck re-auth does not thrash subscribers.
+    #[test]
+    fn bridge_same_url_does_not_refire() {
+        let u = url("https://login.example/auth");
+        let (tx, mut rx) = watch::channel(DeviceState::Running);
+
+        bridge_reauth_url_to_state(&tx, Some(&u)); // first: fires
+        assert!(rx.has_changed().unwrap(), "first NeedsLogin fires");
+        rx.mark_unchanged();
+        bridge_reauth_url_to_state(&tx, Some(&u)); // same URL: deduped
+        assert!(
+            !rx.has_changed().unwrap(),
+            "the same re-auth URL must not re-fire the state watch"
+        );
+    }
+
+    /// A genuinely different re-auth URL after a prior one fires again (the dedupe tracks changes,
+    /// it does not pin the first URL forever).
+    #[test]
+    fn bridge_new_url_after_prior_fires() {
+        let a = url("https://login.example/a");
+        let b = url("https://login.example/b");
+        let (tx, rx) = watch::channel(DeviceState::Running);
+
+        bridge_reauth_url_to_state(&tx, Some(&a));
+        bridge_reauth_url_to_state(&tx, Some(&b));
+
+        assert_eq!(*rx.borrow(), DeviceState::NeedsLogin(b));
+    }
+
+    /// End-to-end of the *clear* contract: after the bridge sets `NeedsLogin`, the netmap self-node
+    /// path (modeled here as a direct `send_replace(Running)`, the exact transition the
+    /// `StreamMessage::Next` handler performs on the next good self-node) flips back to `Running`.
+    /// This pins that the bridge does NOT need a `None`-clear arm — recovery is owned elsewhere.
+    #[test]
+    fn running_netmap_clears_needs_login() {
+        let u = url("https://login.example/auth");
+        let (tx, rx) = watch::channel(DeviceState::Running);
+
+        bridge_reauth_url_to_state(&tx, Some(&u));
+        assert_eq!(*rx.borrow(), DeviceState::NeedsLogin(u));
+
+        // The self-node handler's recovery transition (next good netmap self-node → Running).
+        tx.send_replace(DeviceState::Running);
+        assert_eq!(*rx.borrow(), DeviceState::Running);
     }
 }
 
