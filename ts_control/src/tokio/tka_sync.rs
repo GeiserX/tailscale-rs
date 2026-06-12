@@ -184,7 +184,9 @@ pub(crate) async fn tka_sync_offer_with(
         )
         .await?;
     let status = response.status();
-    let body = response.collect_bytes().await?;
+    let body = response
+        .collect_bytes_limited(MAX_TKA_SYNC_RESPONSE)
+        .await?;
     parse_offer_response(status, &body)
 }
 
@@ -237,7 +239,9 @@ pub(crate) async fn tka_sync_send_with(
         )
         .await?;
     let status = response.status();
-    let body = response.collect_bytes().await?;
+    let body = response
+        .collect_bytes_limited(MAX_TKA_SYNC_RESPONSE)
+        .await?;
     parse_send_response(status, &body)
 }
 
@@ -294,7 +298,9 @@ pub(crate) async fn tka_bootstrap_with(
         )
         .await?;
     let status = response.status();
-    let body = response.collect_bytes().await?;
+    let body = response
+        .collect_bytes_limited(MAX_TKA_SYNC_RESPONSE)
+        .await?;
     parse_bootstrap_response(status, &body)
 }
 
@@ -333,6 +339,10 @@ fn parse_offer_response(
     if let Some(err) = classify_status(status, body) {
         return Err(err);
     }
+    // Defense-in-depth: the network read now uses `collect_bytes_limited(MAX_TKA_SYNC_RESPONSE)`, so
+    // an over-cap body is already rejected (as `BodyTooLarge`) before reaching here. This length
+    // guard still covers the pure-`&[u8]` parse path (e.g. unit tests, or any future non-limited
+    // caller) and keeps the typed `TooLarge` outcome for it.
     if body.len() > MAX_TKA_SYNC_RESPONSE {
         return Err(TkaSyncError::Internal(TkaSyncInternalErrorKind::TooLarge));
     }

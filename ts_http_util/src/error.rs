@@ -25,6 +25,15 @@ pub enum Error {
     /// An invalid status code or HTTP 2 message where HTTP 1 was expected.
     #[error("received a response which was invalid in some way")]
     InvalidResponse,
+
+    /// The response body exceeded the caller's size limit (see
+    /// [`ResponseExt::collect_bytes_limited`](crate::ResponseExt::collect_bytes_limited)).
+    ///
+    /// Distinct from [`Io`](Self::Io) so a caller can tell "the peer streamed an over-cap body" (an
+    /// attack/misconfiguration signal — terminal, not worth retrying) apart from a transient I/O
+    /// failure mid-read.
+    #[error("response body exceeded the size limit")]
+    BodyTooLarge,
 }
 
 impl From<hyper::Error> for Error {
