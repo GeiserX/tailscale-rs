@@ -111,6 +111,37 @@ impl Packet<Plaintext> {
         Ok(s)
     }
 
+    /// Initialize a packet with a raw, untyped message body of whatever length `b` was sized for
+    /// (use [`Packet::size_for_message`] with the desired body length). Sets the given message
+    /// `ty` + version 0 and hands the message bytes to `init_msg` to fill.
+    ///
+    /// Unlike [`init_from_bytes`](Self::init_from_bytes), this does not constrain the body to a
+    /// typed message's exact layout — it is for constructing bodies that a strict typed parse would
+    /// reject (e.g. an over-length fixed message, or a non-multiple variable message) to exercise
+    /// the lax inbound parsers.
+    ///
+    /// **Unstable test/fuzz seam** — `#[doc(hidden)]`, no semver guarantee. It must be `pub` only
+    /// because its sole consumer is a `#[cfg(test)]` helper in a *different* crate (cfg(test) does
+    /// not cross crate boundaries); it is not part of the supported public surface. `init_msg` must
+    /// not index beyond the provided slice (its length is whatever `b` was sized for).
+    #[doc(hidden)]
+    pub fn init_raw_message(
+        b: &mut [u8],
+        ty: MessageType,
+        init_msg: impl FnOnce(&mut [u8]),
+    ) -> Result<&mut Self, Error> {
+        let s = Self::try_mut_from_bytes(b)?;
+
+        let pt = Plaintext::mut_from_bytes(&mut s.payload.payload)?;
+        pt.ty = ty as _;
+        pt.version = 0;
+        init_msg(&mut pt.message);
+
+        s.validate()?;
+
+        Ok(s)
+    }
+
     /// Cast the slice to a plaintext packet.
     ///
     /// # Note
@@ -184,6 +215,52 @@ impl Packet<Plaintext> {
         }
 
         T::ref_from_bytes(&pt.message).ok()
+    }
+
+    /// Convert the payload to a **sized** message type, parsing only its fixed prefix and ignoring
+    /// any trailing bytes — Go's disco parser is "deliberately lax on longer-than-expected messages,
+    /// for future compatibility" (`disco.Parse`). The strict [`as_msg`](Self::as_msg) requires the
+    /// body to be *exactly* the message size, so a forward-compatible peer that appends bytes to a
+    /// (e.g.) `Pong` would have its message dropped; this accepts it by taking the prefix.
+    ///
+    /// Only valid for fixed-size `T` (it uses `ref_from_prefix`); a dynamically-sized message like
+    /// `CallMeMaybe` must be parsed with its own length-aware logic, not this.
+    pub fn as_msg_lax<T>(&self) -> Option<&T>
+    where
+        T: Message + Sized + zerocopy::Immutable + zerocopy::KnownLayout + zerocopy::FromBytes,
+    {
+        let pt = self.plaintext()?;
+
+        if pt.ty() != Some(T::TYPE) {
+            return None;
+        }
+
+        // `ref_from_prefix` parses the first `size_of::<T>()` bytes and returns the rest; we ignore
+        // the rest (forward-compat trailing bytes), mirroring Go's lax fixed-message parse.
+        T::ref_from_prefix(&pt.message).ok().map(|(msg, _rest)| msg)
+    }
+
+    /// Parse a `CallMeMaybe` payload into its whole endpoints, **ignoring a trailing partial
+    /// endpoint** — Go's `parseCallMeMaybe` is lax: a body that is not an exact multiple of the
+    /// 18-byte endpoint size yields the whole leading endpoints, never an error. A short body
+    /// (`< 18` bytes, including empty) therefore yields **no** endpoints rather than an error — note
+    /// this is the *opposite* of the fixed messages' floor (e.g. [`as_msg_lax::<Pong>`](Self::as_msg_lax)
+    /// rejects a too-short Pong), and matches Go's "soft-empty" CallMeMaybe behavior. The strict
+    /// [`as_msg::<CallMeMaybe>`](Self::as_msg) instead requires an exact multiple, so it would drop
+    /// the *entire* message on any trailing/extension bytes a forward-compatible peer might append.
+    /// Returns `None` only if the message type doesn't match (the version is already validated when
+    /// the packet is decrypted).
+    pub fn call_me_maybe_endpoints(&self) -> Option<impl Iterator<Item = &crate::Endpoint>> {
+        let pt = self.plaintext()?;
+        if pt.ty() != Some(crate::CallMeMaybe::TYPE) {
+            return None;
+        }
+        let ep_size = core::mem::size_of::<crate::Endpoint>();
+        Some(
+            pt.message
+                .chunks_exact(ep_size)
+                .filter_map(|chunk| crate::Endpoint::ref_from_bytes(chunk).ok()),
+        )
     }
 
     /// Convert the payload of this packet to a mutable reference to the given message type.
