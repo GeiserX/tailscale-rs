@@ -178,8 +178,8 @@ pub use ts_runtime::fallback_tcp::{
 pub use ts_runtime::taildrop::WaitingFile;
 #[doc(inline)]
 pub use ts_runtime::{
-    DeviceState, FileTarget, IpnBusWatcher, NetcheckReport, Notify, NotifyWatchOpt, RegionLatency,
-    RegistrationError, Status, StatusNode, WhoIs,
+    DeviceState, DnsQueryResult, FileTarget, IpnBusWatcher, NetcheckReport, Notify, NotifyWatchOpt,
+    RegionLatency, RegistrationError, Status, StatusNode, WhoIs,
 };
 /// The interactive-login URL type returned by [`Device::pop_browser_url`].
 #[doc(inline)]
@@ -509,6 +509,31 @@ impl Device {
         }
 
         Ok(None)
+    }
+
+    /// Run a real DNS query through the tailnet's MagicDNS responder (the `100.100.100.100`
+    /// forward path), returning the raw response, RCODE, and resolver(s) consulted — the analogue of
+    /// Go `LocalClient.QueryDNS`.
+    ///
+    /// Unlike [`resolve`](Self::resolve) (an in-memory netmap lookup that answers only MagicDNS
+    /// A-records), this issues an actual query of any [`qtype`] and runs it through the live
+    /// responder: an authoritative tailnet name is answered locally, anything else is forwarded to
+    /// the configured split-DNS / recursive upstreams (or delegated to the active exit node's DoH).
+    /// The response is returned as raw bytes (matching Go's `QueryDNS`), since this fork's DNS wire
+    /// codec has no answer-record decoder; the caller parses records itself if needed.
+    ///
+    /// `qtype` is the raw RFC 1035 TYPE value (`1`=A, `28`=AAAA, `12`=PTR, `16`=TXT, `33`=SRV,
+    /// `65`=HTTPS/SVCB, …). Anti-leak is inherited from the responder: a tailnet-suffix name never
+    /// egresses, recursive forwards delegate to the exit node when one is active, and only IPv4
+    /// upstreams are dialed.
+    ///
+    /// Returns [`ErrorKind::UnsupportedInTunMode`](crate::ErrorKind::UnsupportedInTunMode) in TUN
+    /// transport mode (MagicDNS there is an in-packet intercept, not a queryable responder).
+    pub async fn query_dns(&self, name: &str, qtype: u16) -> Result<DnsQueryResult, Error> {
+        self.runtime
+            .query_dns(name, qtype)
+            .await
+            .map_err(Into::into)
     }
 
     /// Connect to a tailnet peer by MagicDNS name and port over TCP.

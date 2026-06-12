@@ -144,6 +144,8 @@ pub enum Rcode {
     NoError,
     /// Format error (RCODE 1).
     FormErr,
+    /// Server failure — the server could not process the query (RCODE 2).
+    ServFail,
     /// Name does not exist (RCODE 3).
     NxDomain,
     /// Query refused (RCODE 5).
@@ -158,6 +160,7 @@ impl Rcode {
         match self {
             Rcode::NoError => 0,
             Rcode::FormErr => 1,
+            Rcode::ServFail => 2,
             Rcode::NxDomain => 3,
             Rcode::NotImpl => 4,
             Rcode::Refused => 5,
@@ -322,6 +325,14 @@ fn rdata_type(rdata: &RData) -> u16 {
 fn encode_name(out: &mut Vec<u8>, name: &Name) {
     for label in &name.0 {
         let bytes = label.as_bytes();
+        // Skip empty labels: a zero-length label encodes as a lone `0x00`, which is identical to the
+        // QNAME root terminator — it would truncate the name mid-encode and corrupt whatever follows
+        // (QTYPE/QCLASS in a query, the next record in a response). Callers normalize names, but skip
+        // here too so a stray empty label (e.g. from a trailing/doubled dot) can never desync the wire
+        // form. The decoder never produces empty labels, so a decode→encode round trip is unaffected.
+        if bytes.is_empty() {
+            continue;
+        }
         // Labels longer than 63 bytes are clamped to stay wire-legal; names
         // produced by this crate's decoder never exceed the limit.
         let len = bytes.len().min(MAX_LABEL_LEN);
@@ -490,6 +501,23 @@ mod tests {
         let q = decode_query(&buf).expect("encode_query output is a valid query");
         assert_eq!(q.id, 0xBEEF);
         assert_eq!(q.question.name.to_canon(), "example.com");
+        assert!(matches!(q.question.qtype, QType::Other(16)));
+        assert_eq!(q.question.qclass, 1);
+    }
+
+    #[test]
+    fn encode_query_skips_empty_labels_no_premature_terminator() {
+        // A stray empty label (from a trailing/doubled dot in the source name) must NOT emit a lone
+        // 0x00 that truncates the QNAME before its QTYPE/QCLASS. encode_name skips empties, so the
+        // query still decodes to the non-empty labels with the correct qtype/class.
+        let name = Name(vec![
+            String::from("foo"),
+            String::new(), // would be a premature root terminator if not skipped
+            String::from("com"),
+        ]);
+        let buf = encode_query(0x1, &name, &QType::Other(16), 1);
+        let q = decode_query(&buf).expect("decodes despite the empty label");
+        assert_eq!(q.question.name.to_canon(), "foo.com");
         assert!(matches!(q.question.qtype, QType::Other(16)));
         assert_eq!(q.question.qclass, 1);
     }
