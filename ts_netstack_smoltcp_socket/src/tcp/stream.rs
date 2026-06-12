@@ -77,6 +77,30 @@ impl TcpStream {
         self.remote
     }
 
+    /// Half-close the write side: send a FIN to the peer (`shutdown(SHUT_WR)` / `CloseWrite`) while
+    /// keeping the read side open so the peer's remaining data can still be received. Fire-and-forget
+    /// (non-blocking, like the `Drop`-time `Close`): the FIN is emitted by the netstack in the
+    /// background, so this returns immediately and a caller using shutdown for signaling (e.g. a
+    /// bidirectional splice half-closing one direction) no longer hangs waiting for a FIN that was
+    /// never sent.
+    ///
+    /// After this, **writes fail** (`InvalidState`): the socket has left the sendable state — this is
+    /// the intended `shutdown(SHUT_WR)` POSIX behavior (previously, when this was a no-op, a write
+    /// after shutdown still succeeded). Reads continue until the peer's FIN.
+    ///
+    /// Best-effort delivery: `request_nonblocking` treats a *full* command channel as success and
+    /// drops the command, so under channel saturation the FIN may not be sent — the socket then
+    /// teardown-degrades to the idle/keep-alive timeout reaper instead of a prompt FIN (never a hard
+    /// leak). A channel-*closed* error means the netstack is gone; the socket is already moot.
+    pub fn shutdown_write(&self) {
+        if let Err(e) = self
+            .sender
+            .request_nonblocking(Some(self.handle), tcp::stream::Command::ShutdownWrite)
+        {
+            tracing::debug!(err = %e, "shutdown_write: netstack channel closed");
+        }
+    }
+
     /// Send bytes to the remote.
     ///
     /// Blocks until at least one byte can be queued. The return value is the number of
@@ -367,11 +391,7 @@ impl tokio::io::AsyncWrite for TcpStream {
         self: core::pin::Pin<&mut Self>,
         _cx: &mut core::task::Context<'_>,
     ) -> core::task::Poll<std::io::Result<()>> {
-        // NOTE(npry): explicit shutdown semantics don't make sense for us because we have to
-        // support closing the socket out-of-band anyway, since we can't rely on an async runtime
-        // driving us. This creates this unfortunate situation where calling shutdown doesn't
-        // actually confirm that we're closed, so any dependents using close for signaling (before
-        // dropping the socket) could hang here.
+        self.shutdown_write();
         core::task::Poll::Ready(Ok(()))
     }
 }
@@ -408,7 +428,7 @@ impl futures_io::AsyncWrite for TcpStream {
         self: core::pin::Pin<&mut Self>,
         _cx: &mut core::task::Context<'_>,
     ) -> core::task::Poll<std::io::Result<()>> {
-        // See note above in poll_shutdown.
+        self.shutdown_write();
         core::task::Poll::Ready(Ok(()))
     }
 }

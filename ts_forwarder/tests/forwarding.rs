@@ -51,6 +51,43 @@ async fn spawn_echo() -> SocketAddr {
     echo_addr
 }
 
+/// Spawn a loopback TCP server that, on each connection, reads the request, writes a fixed reply,
+/// then **half-closes its write side** (`shutdown(SHUT_WR)`) and holds the read side open. Models a
+/// real backend that finishes responding and signals "I'm done sending" with a FIN while still
+/// willing to read — the pattern that exposes whether the forwarder propagates a backend EOF to the
+/// overlay peer (the iter48 / tsr-syf half-close fix). Before that fix the peer never saw this FIN.
+async fn spawn_respond_then_half_close(reply: &'static [u8]) -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                // Read the request (one read is enough for the small test payload).
+                let _n = sock.read(&mut buf).await;
+                // Respond, then half-close the write side: the peer must observe EOF after `reply`.
+                if sock.write_all(reply).await.is_err() {
+                    return;
+                }
+                let _shut = sock.shutdown().await; // shutdown(SHUT_WR): FIN, read side stays open
+                // Hold the connection open (read side) so teardown is driven by the half-close
+                // propagating to the peer, not by us dropping the socket.
+                let mut drain = [0u8; 64];
+                loop {
+                    match sock.read(&mut drain).await {
+                        Ok(0) | Err(_) => return, // peer eventually closed its side
+                        Ok(_) => {}
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
 /// Spawn a loopback TCP server that counts accepted connections (then drains them), returning
 /// `(addr, accept_count)`. Used by the fail-closed drop tests to assert deterministically that the
 /// forwarder dialed the real socket **zero** times — distinguishing "correctly refused at dial
@@ -255,6 +292,58 @@ async fn forwarder_splices_subnet_route_to_real_socket() {
         .unwrap();
 
     assert_eq!(&buf[..n], b"hello forwarder");
+}
+
+/// Regression for tsr-syf (half-close): when the real backend finishes responding and half-closes
+/// its write side (`shutdown(SHUT_WR)` -> FIN), that EOF must propagate back through the forwarder
+/// splice to the overlay peer — the peer's `read` must return `Ok(0)`. Before the fix the overlay
+/// `poll_shutdown`/`poll_close` were no-ops, so `copy_bidirectional`'s shutdown of the overlay
+/// direction sent no FIN and the peer hung on this final read until the idle reaper. The finite read
+/// deadline turns that hang into a failure, so this is a real regression guard.
+#[tokio::test]
+async fn forwarder_propagates_backend_half_close_eof_to_peer() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let backend_addr = spawn_respond_then_half_close(b"resp-then-fin").await;
+    let (peer_ch, fwd_ch) = spawn_pair().await;
+
+    let routes = RouteTable::new(["127.0.0.0/8".parse().unwrap()]);
+    let forwarder = Forwarder::new(
+        fwd_ch,
+        routes,
+        DirectDialer,
+        vec![backend_addr.port()],
+        vec![],
+    );
+    tokio::spawn(async move {
+        let _ = forwarder.run().await;
+    });
+
+    let peer_local = SocketAddr::new(PEER_IP.into(), PEER_PORT);
+    let mut client = connect_with_retry(&peer_ch, peer_local, backend_addr).await;
+
+    client.write_all(b"req").await.unwrap();
+
+    // Read the reply, then keep reading until EOF. The SECOND read (after the reply) must return
+    // Ok(0) — the backend's FIN propagated through the splice. Without the half-close fix this read
+    // never completes and the timeout fires (test failure).
+    let mut got = Vec::new();
+    let deadline = Duration::from_secs(60);
+    loop {
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(deadline, client.read(&mut buf))
+            .await
+            .expect("read timed out waiting for backend half-close EOF to propagate")
+            .unwrap();
+        if n == 0 {
+            break; // EOF — the backend's FIN reached the peer through the splice.
+        }
+        got.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(
+        got, b"resp-then-fin",
+        "the reply must arrive before the propagated EOF"
+    );
 }
 
 /// Requirement (1): a node may advertise a route yet forward nothing. With no forward ports

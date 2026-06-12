@@ -64,6 +64,14 @@ pub enum Command {
     /// immediately -- the netstack does not wait to respond until the state machine
     /// finishes closing gracefully (this occurs in the background).
     Close,
+
+    /// Half-close the **write** side of this connection (send a FIN), leaving the read side open
+    /// so the peer's remaining data can still be received -- the `shutdown(SHUT_WR)` / `CloseWrite`
+    /// semantics RFC 9293 §3.5 requires. Unlike [`Close`](Self::Close), the socket is NOT queued for
+    /// removal: it lives on until the peer also closes (or it is dropped), so a forwarder splice that
+    /// half-closes one direction still drains the other. Responds immediately; the FIN is emitted by
+    /// the state machine in the background.
+    ShutdownWrite,
 }
 
 impl Debug for Command {
@@ -80,6 +88,7 @@ impl Debug for Command {
             Self::Recv { max_len } => f.debug_struct("Recv").field("max_len", max_len).finish(),
             Self::Send { buf } => f.debug_struct("Send").field("buf_len", &buf.len()).finish(),
             Self::Close => f.write_str("Close"),
+            Self::ShutdownWrite => f.write_str("ShutdownWrite"),
         }
     }
 }
