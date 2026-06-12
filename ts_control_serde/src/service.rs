@@ -1,3 +1,5 @@
+use alloc::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 /// The protocol that a running service uses to communicate. Most services use the
@@ -35,5 +37,5 @@ pub struct Service<'a> {
     /// Free-form textual description of the running service. Typically this is the name of the
     /// running service process.
     #[serde(borrow)]
-    pub description: &'a str,
+    pub description: Cow<'a, str>,
 }

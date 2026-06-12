@@ -710,7 +710,7 @@ impl TailnetAddress {
 
 impl From<&ts_control_serde::Node<'_>> for Node {
     fn from(value: &ts_control_serde::Node) -> Self {
-        let fqdn_without_trailing_dot = value.name.strip_suffix('.').unwrap_or(value.name);
+        let fqdn_without_trailing_dot = value.name.strip_suffix('.').unwrap_or(&value.name);
 
         let (hostname, tailnet) = match fqdn_without_trailing_dot.split_once('.') {
             Some((hostname, tailnet)) => (hostname, Some(tailnet.to_owned())),
@@ -913,7 +913,7 @@ mod tests {
             user: 4242,
             ..Default::default()
         };
-        wire.name = "host.tail.ts.net.";
+        wire.name = "host.tail.ts.net.".into();
         let domain: Node = (&wire).into();
         assert_eq!(domain.user_id, 4242);
 
@@ -1429,17 +1429,17 @@ mod tests {
             Service {
                 proto: ServiceProto::PeerApi4,
                 port: 8080,
-                description: "peerapi",
+                description: "peerapi".into(),
             },
             Service {
                 proto: ServiceProto::PeerApi6,
                 port: 9090,
-                description: "peerapi6",
+                description: "peerapi6".into(),
             },
             Service {
                 proto: ServiceProto::PeerApiDnsProxy,
                 port: 1,
-                description: "dns",
+                description: "dns".into(),
             },
         ];
         let (port, dns_proxy) = peerapi_from_services(Some(&services));

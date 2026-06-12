@@ -1,4 +1,4 @@
-use alloc::{collections::BTreeMap, vec::Vec};
+use alloc::{borrow::Cow, collections::BTreeMap, vec::Vec};
 use core::{
     fmt,
     fmt::Display,
@@ -52,7 +52,7 @@ pub struct DerpServer<'a> {
     /// A unique server name (across all regions). It is NOT a host name. Typically of the form
     /// `<region ID><suffix>`, e.g. "1b", "2a", "3b".
     #[serde(borrow)]
-    pub name: &'a str,
+    pub name: Cow<'a, str>,
     /// The [`RegionId`] of the [`Region`] that this [`DerpServer`] is running in.
     #[serde(rename = "RegionID")]
     pub region_id: RegionId,
@@ -60,7 +60,7 @@ pub struct DerpServer<'a> {
     /// unique; multiple servers may have the same [`DerpServer::hostname`] but otherwise vary in
     /// configuration.
     #[serde(rename = "HostName", borrow)]
-    pub hostname: &'a str,
+    pub hostname: Cow<'a, str>,
 
     /// If populated, specifies this [`DerpServer`]'s expected TLS certificate common name. When
     /// populated, a Tailscale node should use this field to validate the DERP server's TLS
@@ -272,7 +272,7 @@ pub struct Region<'a> {
     /// A long English name for the region: "New York City", "San Francisco", "Singapore",
     /// "Frankfurt", etc.
     #[serde(rename = "RegionName", borrow)]
-    pub name: &'a str,
+    pub name: Cow<'a, str>,
 
     /// The geographical latitude coordinate of the DERP region's city center, in degrees. Note
     /// that this is the rough center of the city, not the datacenter.

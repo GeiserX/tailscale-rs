@@ -55,7 +55,7 @@ fn server(server: &ts_control_serde::DerpServer) -> ts_derp::ServerConnInfo {
 
     #[cfg_attr(not(feature = "insecure-derp"), allow(unused_mut))]
     let mut tls_config =
-        TlsValidationConfig::from_str(server.cert_name.unwrap_or_default(), server.hostname);
+        TlsValidationConfig::from_str(server.cert_name.unwrap_or_default(), &server.hostname);
 
     #[cfg(feature = "insecure-derp")]
     if server.insecure_for_tests {
