@@ -25,7 +25,12 @@
 //!   the tailnet DNS config ([`DnsView::accept_dns`] is `false`, i.e. `--accept-dns` / `CorpDNS`
 //!   off) => `REFUSED` for every query (the responder serves nothing, mirroring Go applying an empty
 //!   `dns.Config` when `CorpDNS` is off).
-//! - Unsupported qtype => `REFUSED` (never forwarded).
+//! - A qtype/class we don't serve authoritatively (anything but IN-class A/AAAA/PTR — TXT, SRV, MX,
+//!   HTTPS/SVCB, a CHAOS-class query, …) => NODATA (empty NOERROR) for a tailnet-authoritative name,
+//!   forwarded verbatim to upstream for an off-tailnet name — exactly like Go's resolver, NOT
+//!   `REFUSED` (a stub reads REFUSED as "won't serve me" and abandons the resolver). Tailnet reverse
+//!   zones (CGNAT `in-addr.arpa` / any `ip6.arpa`) still fail closed to NXDOMAIN for every qtype
+//!   (never forwarded — anti-leak).
 //! - Malformed query => dropped (no response).
 
 use std::{
@@ -52,7 +57,13 @@ use crate::{
 /// How long to wait for an upstream resolver to answer a forwarded query before giving up.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
 /// Cap on a forwarded upstream response we read into memory (a single UDP datagram).
-const MAX_UPSTREAM_RESPONSE: usize = 1232;
+///
+/// Matches Go's forwarder read buffer (`maxResponseBytes`, ~4 KiB). The client's query is forwarded
+/// verbatim, so a client advertising a large EDNS UDP size can elicit a legitimately large
+/// (1300–4096 byte) UDP answer (big TXT sets, DNSSEC, many-record round-robins). Capping at the old
+/// 1232 truncated those and set TC, forcing a TCP retry this fork's UDP-only forwarder can't serve —
+/// so the large answer became unreachable. 4096 relays them intact.
+const MAX_UPSTREAM_RESPONSE: usize = 4096;
 
 /// The MagicDNS service IP. The netstack interface owns this address, so a `udp_bind` here
 /// receives the tailnet's DNS traffic.
@@ -311,13 +322,17 @@ pub(crate) fn decide(view: &DnsView, buf: &[u8]) -> Option<Decision> {
         return Some(reply(Rcode::Refused, &[]));
     }
 
-    // We only serve the internet (IN) class. Anything else (CHAOS, HESIOD, ...) is refused.
+    let canon = q.name.to_canon();
+
+    // We only serve the internet (IN) class authoritatively. A non-IN class (CHAOS, HESIOD, the
+    // ANY/255 class, ...) is NOT refused outright: Go's local resolver does no class check and
+    // forwards such a query like any other name. Treat it as an unsupported authoritative type —
+    // NODATA for a tailnet name, forward for an off-tailnet name — so a `CH TXT version.bind`
+    // diagnostic or a `qclass=ANY` probe reaches upstream instead of getting REFUSED.
     const CLASS_IN: u16 = 1;
     if q.qclass != CLASS_IN {
-        return Some(reply(Rcode::Refused, &[]));
+        return Some(forward_or_nodata(view, &canon, buf, id, q));
     }
-
-    let canon = q.name.to_canon();
 
     Some(match &q.qtype {
         QType::A => match view.resolve_addr(&canon, true) {
@@ -364,9 +379,13 @@ pub(crate) fn decide(view: &DnsView, buf: &[u8]) -> Option<Decision> {
             None if is_ip6_arpa(&canon) => reply(Rcode::NxDomain, &[]),
             None => forward_or_nxdomain(view, &canon, buf, id, q),
         },
-        // Anything else (TXT, SRV, ...) is refused: we only serve MagicDNS host records and
-        // forward A/AAAA/PTR. We never forward arbitrary qtypes.
-        QType::Other(_) => reply(Rcode::Refused, &[]),
+        // Anything else (TXT, SRV, MX, HTTPS/SVCB, CNAME, ...): we hold no authoritative record of
+        // that type, so — like Go's resolver — forward it to upstream for an off-tailnet name and
+        // return NODATA (empty NOERROR) for a tailnet-authoritative name. NOT REFUSED: a stub reads
+        // REFUSED as "this server won't serve me" and abandons the resolver, which would break
+        // ordinary client lookups (notably HTTPS/SVCB type 65, issued routinely by browsers for
+        // HTTP/3 + ECH) for the same off-tailnet names whose A/AAAA already forward.
+        QType::Other(_) => forward_or_nodata(view, &canon, buf, id, q),
     })
 }
 
@@ -411,6 +430,53 @@ fn forward_or_nxdomain(
             recursive,
         }
     }
+}
+
+/// For a query whose *qtype/qclass* we don't serve authoritatively (anything other than an IN-class
+/// A/AAAA/PTR — e.g. TXT, SRV, MX, HTTPS/SVCB, or a CHAOS-class query): forward it to upstream like
+/// any other name, but for a tailnet-authoritative name return an empty NOERROR (NODATA) instead of
+/// NXDOMAIN.
+///
+/// This mirrors Go's resolver: an authoritative name with no record of the requested type returns
+/// `RCodeSuccess` with no answers ("the name exists, but no records of that type"), NOT NXDOMAIN and
+/// NOT REFUSED; a non-authoritative name is forwarded verbatim regardless of qtype. The fork
+/// previously REFUSED every non-A/AAAA/PTR qtype (and every non-IN class) for *all* names, which a
+/// stub resolver reads as "this server won't serve me" — so it would abandon the resolver, breaking
+/// ordinary client lookups (HTTPS/SVCB type 65 issued routinely by browsers for HTTP/3 + ECH, plus
+/// MX/TXT/SRV) for off-tailnet names that A/AAAA queries already forward. Refusing these was never an
+/// anti-leak measure (the same name's A/AAAA already egresses); it was just broken interop.
+///
+/// Anti-leak is preserved: a tailnet-suffix name still never leaves this node (NODATA, not forward),
+/// exactly as the A/AAAA path keeps a positive overlay match authoritative.
+fn forward_or_nodata(
+    view: &DnsView,
+    canon: &str,
+    buf: &[u8],
+    id: u16,
+    q: &ts_dns_wire::Question,
+) -> Decision {
+    // Authoritative tailnet name: NODATA (empty NOERROR), not NXDOMAIN — the name exists.
+    if is_tailnet_name(view, canon) {
+        return Decision::Reply(encode_response(id, q, Rcode::NoError, &[]));
+    }
+    // Anti-leak parity with the `QType::Ptr` arm: a reverse query for a tailnet CGNAT IPv4
+    // (100.64.0.0/10) or ANY `ip6.arpa` name must NEVER egress to an upstream resolver, regardless
+    // of qtype/class — forwarding it would reveal that a specific tailnet IP was probed. The PTR arm
+    // enforces this (NXDOMAIN) but its guards live only inside that arm; without re-checking here, an
+    // exotic-qtype (TXT/ANY/…) or non-IN-class query for a tailnet reverse name would slip through to
+    // the forward path below. Fail closed to NXDOMAIN, matching the PTR arm's disposition.
+    if is_ip6_arpa(canon) {
+        return Decision::Reply(encode_response(id, q, Rcode::NxDomain, &[]));
+    }
+    if let Some(octets) = q.name.ptr_to_ipv4()
+        && is_tailnet_cgnat(octets.into())
+    {
+        return Decision::Reply(encode_response(id, q, Rcode::NxDomain, &[]));
+    }
+    // Off-tailnet, non-reverse-zone: forward verbatim. `forward_or_nxdomain` already forwards
+    // non-tailnet names and fails closed (NXDOMAIN) when no upstream is configured/routable; reuse it
+    // (the tailnet branch above is already handled, so its tailnet→NXDOMAIN path is unreachable here).
+    forward_or_nxdomain(view, canon, buf, id, q)
 }
 
 /// Client-side plan for a *recursive* forward: keep resolving over local UDP upstreams, or delegate
@@ -1059,14 +1125,34 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_qtype_is_refused() {
+    fn unsupported_qtype_on_tailnet_name_is_nodata_not_refused() {
+        // TXT (type 16) for a tailnet-authoritative name: the name exists but we hold no TXT, so —
+        // like Go — return NODATA (empty NOERROR), NOT REFUSED (which would make a stub abandon the
+        // resolver) and NOT NXDOMAIN (the name exists). The name is never forwarded (anti-leak).
         let view = view_with_peer();
-        // TXT (type 16) is unsupported.
         let buf = build_query(0x1, &["host", "user", "ts", "net"], 16, 1);
 
         let resp = answer(&view, &buf).expect("answers");
+        let (_, rcode, ancount) = parse_header(&resp);
+        assert_eq!(rcode, 0, "NoError (NODATA), not Refused");
+        assert_eq!(ancount, 0, "no answer records (NODATA)");
+    }
+
+    #[test]
+    fn unsupported_qtype_off_tailnet_forwards_or_nxdomains() {
+        // A non-A/AAAA/PTR qtype for an OFF-tailnet name must be forwardable like A/AAAA — never
+        // REFUSED. With no upstream configured in this view it fails closed to NXDOMAIN (the same
+        // disposition an off-tailnet A query gets here), proving the qtype no longer short-circuits
+        // to REFUSED. HTTPS/SVCB is type 65 (the browser HTTP/3 + ECH case the old REFUSED broke).
+        let view = view_with_peer();
+        let buf = build_query(0x1, &["example", "com"], 65, 1);
+
+        let resp = answer(&view, &buf).expect("answers");
         let (_, rcode, _) = parse_header(&resp);
-        assert_eq!(rcode, 5, "Refused");
+        assert_eq!(
+            rcode, 3,
+            "off-tailnet, no upstream -> NXDOMAIN (forwardable, not Refused)"
+        );
     }
 
     #[test]
@@ -1147,6 +1233,72 @@ mod tests {
             Decision::Forward { .. } => {
                 panic!("tailnet CGNAT PTR must never be forwarded upstream")
             }
+        }
+    }
+
+    /// Anti-leak regression for the exotic-qtype forward path: a NON-PTR query (TXT, type 16) for a
+    /// tailnet CGNAT reverse name, with an upstream configured, must STILL fail closed to NXDOMAIN —
+    /// never forward. The PTR arm guards this, but the `QType::Other` path routes through
+    /// `forward_or_nodata`, which must re-apply the reverse-zone guard or the tailnet IP leaks.
+    #[test]
+    fn exotic_qtype_for_tailnet_cgnat_reverse_is_nxdomain_not_forwarded() {
+        let mut db = PeerDb::default();
+        db.upsert(&test_node());
+        let view = DnsView {
+            cfg: DnsConfig {
+                magic_dns: true,
+                search_domains: vec!["user.ts.net".to_string()],
+                fallback_resolvers: vec![DnsResolver {
+                    transport: ts_control::ResolverTransport::Udp("9.9.9.9:53".parse().unwrap()),
+                    use_with_exit_node: false,
+                }],
+                ..Default::default()
+            },
+            peers: Some(Arc::new(db)),
+            self_node: None,
+            exit_doh: None,
+            enable_ipv6: false,
+            accept_dns: true,
+        };
+
+        // TXT (16) for a CGNAT reverse name => NXDOMAIN, never a Forward (no tailnet-IP leak).
+        let buf = build_query(0x36, &["9", "0", "64", "100", "in-addr", "arpa"], 16, 1);
+        match decide(&view, &buf).expect("decides") {
+            Decision::Reply(resp) => {
+                let (_, rcode, _) = parse_header(&resp);
+                assert_eq!(rcode, 3, "NxDomain");
+            }
+            Decision::Forward { .. } => {
+                panic!("a non-PTR query for a tailnet CGNAT reverse name must never forward")
+            }
+        }
+    }
+
+    /// Same anti-leak guard for an `ip6.arpa` reverse name under an exotic qtype: must NXDOMAIN, not
+    /// forward (revealing a tailnet ULA was probed).
+    #[test]
+    fn exotic_qtype_for_ip6_arpa_is_nxdomain_not_forwarded() {
+        let view = view_with_routes(
+            std::collections::BTreeMap::new(),
+            vec![udp("9.9.9.9:53")],
+            vec![],
+        );
+        // An ip6.arpa reverse name with a TXT (16) qtype must fail closed.
+        let buf = build_query(
+            0x37,
+            &[
+                "1", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0",
+                "a", "7", "d", "f", "ip6", "arpa",
+            ],
+            16,
+            1,
+        );
+        match decide(&view, &buf).expect("decides") {
+            Decision::Reply(resp) => {
+                let (_, rcode, _) = parse_header(&resp);
+                assert_eq!(rcode, 3, "NxDomain");
+            }
+            Decision::Forward { .. } => panic!("an ip6.arpa exotic-qtype query must never forward"),
         }
     }
 
@@ -1315,15 +1467,38 @@ mod tests {
     }
 
     #[test]
-    fn non_in_class_is_refused() {
-        // A CHAOS-class (3) query for a known name must be refused, not answered as IN.
+    fn non_in_class_on_tailnet_name_is_nodata_not_answered_as_in() {
+        // A CHAOS-class (3) query for a tailnet name must NOT be answered as IN (no overlay A), and
+        // must NOT be REFUSED (Go does no class check on the local path). It's an unsupported
+        // authoritative class -> NODATA (empty NOERROR), and never forwarded (tailnet name).
         let view = view_with_peer();
         let buf = build_query(0x66, &["host", "user", "ts", "net"], 1, 3);
 
         let resp = answer(&view, &buf).expect("answers");
         let (_, rcode, ancount) = parse_header(&resp);
-        assert_eq!(rcode, 5, "Refused");
-        assert_eq!(ancount, 0);
+        assert_eq!(
+            rcode, 0,
+            "NoError (NODATA), not Refused and not an IN answer"
+        );
+        assert_eq!(
+            ancount, 0,
+            "must not hand out the overlay A for a non-IN class"
+        );
+    }
+
+    #[test]
+    fn non_in_class_off_tailnet_forwards_or_nxdomains() {
+        // A non-IN class for an OFF-tailnet name is forwardable (Go forwards it), never REFUSED.
+        // No upstream here -> NXDOMAIN, proving the class gate no longer short-circuits to Refused.
+        let view = view_with_peer();
+        let buf = build_query(0x66, &["example", "com"], 1, 3);
+
+        let resp = answer(&view, &buf).expect("answers");
+        let (_, rcode, _) = parse_header(&resp);
+        assert_eq!(
+            rcode, 3,
+            "off-tailnet non-IN class, no upstream -> NXDOMAIN, not Refused"
+        );
     }
 
     /// A view with MagicDNS on, the `user.ts.net` search domain, and the given split-DNS routes
@@ -1369,6 +1544,48 @@ mod tests {
                 assert_eq!(upstreams, vec!["10.0.0.53:53".parse().unwrap()]);
             }
             Decision::Reply(_) => panic!("expected forward to the split-DNS upstream"),
+        }
+    }
+
+    #[test]
+    fn exotic_qtype_off_tailnet_forwards_to_upstream() {
+        // The core of the fix: an HTTPS/SVCB (type 65) query for an off-tailnet name with a matching
+        // route must FORWARD to the upstream (verbatim), exactly like an A query would — not REFUSE
+        // and not NXDOMAIN. This is the browser HTTP/3 + ECH case the old blanket-REFUSE broke.
+        let mut routes = std::collections::BTreeMap::new();
+        routes.insert("corp.example".to_string(), vec![udp("10.0.0.53:53")]);
+        let view = view_with_routes(routes, vec![], vec![]);
+        let buf = build_query(0x102, &["api", "corp", "example"], 65, 1);
+
+        match decide(&view, &buf).expect("decides") {
+            Decision::Forward {
+                upstreams, query, ..
+            } => {
+                assert_eq!(upstreams, vec!["10.0.0.53:53".parse().unwrap()]);
+                assert_eq!(query, buf, "the exotic-qtype query is forwarded verbatim");
+            }
+            Decision::Reply(_) => {
+                panic!("an off-tailnet HTTPS-record query must forward, not reply")
+            }
+        }
+    }
+
+    #[test]
+    fn non_in_class_off_tailnet_forwards_to_upstream() {
+        // A non-IN class for an off-tailnet routed name forwards too (Go does no class check on the
+        // local path). Proves the class gate no longer short-circuits to REFUSED before routing.
+        let mut routes = std::collections::BTreeMap::new();
+        routes.insert("corp.example".to_string(), vec![udp("10.0.0.53:53")]);
+        let view = view_with_routes(routes, vec![], vec![]);
+        let buf = build_query(0x103, &["api", "corp", "example"], 1, 3);
+
+        match decide(&view, &buf).expect("decides") {
+            Decision::Forward { upstreams, .. } => {
+                assert_eq!(upstreams, vec!["10.0.0.53:53".parse().unwrap()]);
+            }
+            Decision::Reply(_) => {
+                panic!("an off-tailnet non-IN-class query must forward, not reply")
+            }
         }
     }
 
