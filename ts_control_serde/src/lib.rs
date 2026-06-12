@@ -43,7 +43,10 @@ pub use dns::{
 pub use host_info::HostInfo;
 pub use id_token::{TokenRequest, TokenResponse};
 pub use net_info::{DerpLatencyMap, LinkType, NetInfo};
-pub use netmap::{Endpoint, EndpointType, MapRequest, MapResponse, PeerChange};
+pub use netmap::{
+    DisplayMessage, DisplayMessageAction, Endpoint, EndpointType, MapRequest, MapResponse,
+    PeerChange,
+};
 pub use node::{MarshaledSignature, Node, NodeId, StableNodeId};
 pub use ping::{PingRequest, PingResponse, PingType};
 pub use register::{RegisterAuth, RegisterRequest, RegisterResponse, SignatureType};
