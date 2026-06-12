@@ -65,6 +65,40 @@ pub(crate) const REJECT_AFTER_MESSAGES: u64 = u64::MAX - (1 << 13);
 /// approaches [`REJECT_AFTER_MESSAGES`].
 pub(crate) const REKEY_AFTER_MESSAGES: u64 = 1 << 60;
 
+/// Every transport payload is zero-padded up to a multiple of this many bytes *before* it is
+/// AEAD-sealed. Matches wireguard-go `device/constants.go` `PaddingMultiple = 16`. Padding the
+/// plaintext rounds the on-the-wire ciphertext length to a 16-byte multiple, so a passive observer
+/// cannot read the exact inner-packet length off the encrypted frame — and, just as importantly for
+/// this fork, it makes our transport frames length-indistinguishable from real WireGuard/wireguard-go
+/// (an unpadded sender is a trivial fingerprint). The receiver recovers the true packet from the
+/// inner IP header's total-length field and ignores the trailing pad, so over-padding is harmless.
+pub(crate) const PADDING_MULTIPLE: usize = 16;
+
+/// The number of zero bytes to append to a `len`-byte transport payload so the padded length is the
+/// next multiple of [`PADDING_MULTIPLE`]: `((len + m - 1) & !(m - 1)) - len`. An empty payload (a
+/// keepalive) rounds to 0, so keepalives stay empty.
+///
+/// Relationship to wireguard-go `device/send.go` `calculatePaddingSize(packetSize, mtu)`: Go's
+/// *production* send path passes the live TUN MTU, taking the MTU-aware branch (reduce
+/// `lastUnit %= mtu` for over-MTU packets, then cap `paddedSize` at `mtu`). This is the plain
+/// round-up — equivalent to Go's `mtu == 0` early-return, NOT to the branch Go actually runs. The
+/// two are nevertheless **byte-identical for this layer's contract**: the payloads reaching
+/// [`TransmitSession::encrypt`] are single IP packets already bounded to the tunnel MTU by the
+/// netstack/TUN, and whenever that MTU is a multiple of `PADDING_MULTIPLE` (the default tunnel MTU,
+/// 1280 = 80·16, is) a `<= mtu` payload rounds up to `<= mtu`, so Go's cap never fires and its
+/// `%= mtu` branch is never reached. The forms diverge only at a non-16-aligned MTU (e.g. 1500),
+/// which this crate never configures; making the padding MTU-aware for that case is a tracked
+/// follow-up. So this is faithful for every MTU the fork actually uses, but it is deliberately the
+/// round-up form, not a transcription of Go's MTU-aware function.
+const fn padding_size(len: usize) -> usize {
+    let m = PADDING_MULTIPLE;
+    ((len + m - 1) & !(m - 1)) - len
+}
+
+// `padding_size`'s `& !(m - 1)` round-up is only a valid "round up to a multiple of m" when m is a
+// power of two; guard that invariant at compile time (mirrors the message-count ordering assert).
+const _: () = assert!(PADDING_MULTIPLE.is_power_of_two());
+
 /// A generator of monotonically increasing 64-bit nonces.
 #[derive(Default)]
 struct NonceGenerator {
@@ -194,6 +228,17 @@ impl TransmitSession {
         let packets = packets.into_iter();
         let nonce = self.nonce.batch(packets.len());
         for (packet, nonce) in packets.zip(nonce) {
+            // Zero-pad the plaintext up to a PADDING_MULTIPLE boundary BEFORE sealing, so the pad is
+            // inside the AEAD-authenticated region (wireguard-go `device/send.go`: append
+            // `paddingZeros` then `Seal`). This hides the exact inner-packet length and keeps our
+            // frames length-indistinguishable from real WireGuard. A keepalive (empty payload) pads
+            // by 0, staying empty. The receiver recovers the true packet from the inner IP header and
+            // ignores the trailing pad.
+            let pad = padding_size(packet.len());
+            if pad != 0 {
+                // Appending may reallocate; PacketMut (BytesMut) grows as needed.
+                packet.extend_from_slice(&[0u8; PADDING_MULTIPLE][..pad]);
+            }
             // Session encryption only fails if the provided packet can't grow, which ours can.
             self.cipher
                 .encrypt_in_place(nonce.as_ref(), &[], packet)
@@ -390,24 +435,119 @@ mod tests {
                 TransmitSession::new(key_bytes.into(), SessionId::from(0), Instant::now());
             let _ = session.nonce.batch(*counter as usize);
 
-            let mut pkt = [PacketMut::from(pt.as_slice())];
-            session.encrypt(&mut pkt);
+            // This KAT pins the transport nonce PACKING and the raw ChaCha20Poly1305 seal against
+            // Go's reference vectors, which seal the EXACT (unpadded) plaintext. The send path
+            // (`TransmitSession::encrypt`) additionally zero-pads to PADDING_MULTIPLE before sealing
+            // (see `transport_send_path_pads_to_multiple_of_16`), so this test drives the cipher +
+            // `Nonce` directly rather than through `encrypt` — keeping the comparison against Go's
+            // unpadded ct_hex exact and isolating the nonce-packing primitive from the padding layer.
+            let nonce = Nonce::from(U64::from(*counter));
 
-            // After encrypt: packet = TransportDataHeader(16) || ciphertext || tag(16).
-            let hdr_len = size_of::<TransportDataHeader>();
-            let (header, body) = pkt[0].as_ref().split_at(hdr_len);
-
-            // Sanity: the header carries the LE counter we expect.
-            let parsed = TransportDataHeader::try_ref_from_prefix(header).unwrap().0;
+            // (a) The nonce struct packs to Go's 12-byte `[0,0,0,0] || counter_LE` exactly.
+            let mut expected_nonce = [0u8; 12];
+            expected_nonce[4..].copy_from_slice(&counter.to_le_bytes());
             assert_eq!(
-                u64::from(parsed.nonce),
-                *counter,
-                "vector {i}: header nonce mismatch"
+                nonce.as_bytes(),
+                expected_nonce,
+                "vector {i}: nonce packing diverges from Go"
             );
 
+            // (b) Sealing the raw plaintext under that nonce matches Go's reference ciphertext||tag.
+            let cipher = ChaCha20Poly1305::new(&key_bytes.into());
+            let mut body = pt.clone();
+            cipher
+                .encrypt_in_place(nonce.as_ref(), &[], &mut body)
+                .unwrap();
             assert_eq!(
                 body, expected,
                 "vector {i}: ciphertext||tag diverges from Go reference"
+            );
+        }
+    }
+
+    /// The send path zero-pads each transport payload up to a [`PADDING_MULTIPLE`] (16-byte) boundary
+    /// before sealing, matching wireguard-go `device/send.go` (`calculatePaddingSize` + append then
+    /// `Seal`). This hides the exact inner-packet length and keeps our frames length-indistinguishable
+    /// from real WireGuard. Verified by comparing the sealed body length against a direct seal of the
+    /// explicitly-padded plaintext, for representative lengths incl. the 16-aligned and empty cases.
+    #[test]
+    fn transport_send_path_pads_to_multiple_of_16() {
+        let key: [u8; 32] = rand::random();
+        let hdr_len = size_of::<TransportDataHeader>();
+        const TAG: usize = 16;
+
+        // (input length, expected padded plaintext length).
+        let cases = [
+            (0usize, 0usize), // keepalive: empty stays empty (Go pads a 0-len packet by 0)
+            (1, 16),          // rounds up to the first multiple
+            (5, 16),
+            (15, 16),
+            (16, 16), // already aligned: no padding
+            (17, 32),
+            (1440, 1440), // a full-MTU-ish IPv4 payload is already 16-aligned
+            (1441, 1456),
+        ];
+
+        for (in_len, padded_len) in cases {
+            let session = TransmitSession::new(key.into(), SessionId::from(0), Instant::now());
+            let mut pkt = [PacketMut::from(vec![0xABu8; in_len].as_slice())];
+            session.encrypt(&mut pkt);
+
+            // Frame = TransportDataHeader(16) || ciphertext(padded_len) || tag(16).
+            assert_eq!(
+                pkt[0].len(),
+                hdr_len + padded_len + TAG,
+                "input {in_len}: padded sealed frame length"
+            );
+
+            // And it must still decrypt back to the padded plaintext on a matching receive session.
+            let mut recv = ReceiveSession::new(key.into(), SessionId::from(0), Instant::now());
+            assert!(
+                recv.decrypt_one(&mut pkt[0]),
+                "input {in_len}: must decrypt"
+            );
+            // The decrypted plaintext is exactly the original bytes followed by zero padding.
+            let mut expected_plaintext = vec![0xABu8; in_len];
+            expected_plaintext.resize(padded_len, 0);
+            assert_eq!(
+                pkt[0].as_ref(),
+                expected_plaintext.as_slice(),
+                "input {in_len}: decrypted plaintext is the original bytes + zero pad (receiver trims via inner IP len)"
+            );
+        }
+    }
+
+    /// Byte-level cross-check that the send path seals the *padded* plaintext correctly: it must
+    /// produce exactly `header || ChaCha20Poly1305_seal(nonce, payload || zero_pad) ` for a fixed
+    /// key and counter. This is the Go-interop guarantee the nonce KAT used to cover before it was
+    /// narrowed to the unpadded primitive — a refactor that sealed before padding, used the wrong
+    /// nonce, or added AAD would pass the length/round-trip checks but fail here.
+    #[test]
+    fn transport_send_path_seals_padded_plaintext_byte_exact() {
+        let key: [u8; 32] = [0x11; 32];
+        let payload = b"deadbeef-payload"; // 16 bytes -> +0 pad
+        let short = b"short"; // 5 bytes -> +11 zero pad
+
+        for input in [&payload[..], &short[..]] {
+            let session = TransmitSession::new(key.into(), SessionId::from(7), Instant::now());
+            let mut pkt = [PacketMut::from(input)];
+            session.encrypt(&mut pkt);
+
+            // The first emitted nonce is counter 0.
+            let nonce = Nonce::from(U64::from(0u64));
+            let mut padded = input.to_vec();
+            padded.resize(input.len().next_multiple_of(16), 0);
+            let cipher = ChaCha20Poly1305::new(&key.into());
+            let mut expected_body = padded.clone();
+            cipher
+                .encrypt_in_place(nonce.as_ref(), &[], &mut expected_body)
+                .unwrap();
+
+            let hdr_len = size_of::<TransportDataHeader>();
+            assert_eq!(
+                &pkt[0].as_ref()[hdr_len..],
+                expected_body.as_slice(),
+                "send-path body must equal a direct seal of the zero-padded plaintext"
             );
         }
     }
@@ -420,11 +560,16 @@ mod tests {
         let send = TransmitSession::new(k.into(), session, now);
         let mut recv = ReceiveSession::new(k.into(), session, now);
 
+        // "foobar" (6 bytes) is zero-padded up to PADDING_MULTIPLE (16) before sealing, so the frame
+        // is TransportDataHeader(16) || ciphertext(16) || tag(16) = 48 bytes, and decrypt yields the
+        // 16-byte padded plaintext (the receiver recovers the true packet from the inner IP length).
         const CLEARTEXT: &[u8] = b"foobar";
+        let mut padded = CLEARTEXT.to_vec();
+        padded.resize(16, 0);
         let mut pkt = [PacketMut::from(CLEARTEXT)];
 
         send.encrypt(&mut pkt);
-        assert_eq!(pkt[0].len(), 38);
+        assert_eq!(pkt[0].len(), 48);
         let Ok(Message::TransportDataHeader(msg)) = Message::try_from(pkt[0].as_ref()) else {
             panic!("packet is not a valid TransportData message");
         };
@@ -432,10 +577,10 @@ mod tests {
         assert_eq!(u64::from(msg.nonce), 0);
 
         assert!(recv.decrypt_one(&mut pkt[0]));
-        assert_eq!(pkt[0].as_ref(), CLEARTEXT);
+        assert_eq!(pkt[0].as_ref(), padded.as_slice());
 
         send.encrypt(&mut pkt);
-        assert_eq!(pkt[0].len(), 38);
+        assert_eq!(pkt[0].len(), 48);
         let Ok(Message::TransportDataHeader(msg)) = Message::try_from(pkt[0].as_ref()) else {
             panic!("packet is not a valid TransportData message");
         };
@@ -443,7 +588,7 @@ mod tests {
         assert_eq!(u64::from(msg.nonce), 1);
 
         assert!(recv.decrypt_one(&mut pkt[0]));
-        assert_eq!(pkt[0].as_ref(), CLEARTEXT);
+        assert_eq!(pkt[0].as_ref(), padded.as_slice());
     }
 
     #[test]
