@@ -168,12 +168,27 @@ where
 
         match child {
             Child::Path(n) => node = n,
-            Child::Leaf { prefix, value } => {
-                if prefix.prefix_len() > prefix.prefix_len() || !prefix.contains(&prefix.addr()) {
+            Child::Leaf {
+                prefix: leaf_prefix,
+                value,
+            } => {
+                // The match arm binding `leaf_prefix` is the stored leaf's route; `prefix` is the
+                // query. A path-compressed leaf is the LPM only when it actually covers the query: it
+                // must be no more specific than the query (`leaf_prefix.len <= prefix.len`) AND
+                // contain the query address. A leaf more specific than the query, or one that doesn't
+                // contain it, is not a match — fall through to the ancestor stack-walk below (which
+                // finds the longest covering prefix among the strided ancestors). This mirrors the
+                // `Child::Fringe` arm just below, which likewise skips a fringe more specific than the
+                // query. (Previously this binding shadowed `prefix`, making the comparison `leaf vs
+                // leaf` — always a no-op — so any leaf reached in descent was returned unconditionally,
+                // even when more specific than or not covering the query.)
+                if leaf_prefix.prefix_len() > prefix.prefix_len()
+                    || !leaf_prefix.contains(&prefix.addr())
+                {
                     break;
                 }
 
-                return Some((prefix, value));
+                return Some((leaf_prefix, value));
             }
             Child::Fringe(val) => {
                 let fringe_prefix_len = (depth + 1) << 3;
@@ -232,6 +247,43 @@ mod test {
         assert_eq!(
             alloc::vec![1, 2],
             matches.copied().collect::<alloc::vec::Vec<_>>()
+        );
+    }
+
+    /// A path-compressed leaf MORE SPECIFIC than the query prefix must NOT be returned as the LPM:
+    /// the query `10.20.0.0/16` is not covered by the stored `10.20.30.0/24`, so the lookup must
+    /// yield `None`. This is the case the prior shadowing bug got wrong — it returned the first leaf
+    /// reached in descent unconditionally (the self-comparison `leaf > leaf` never broke), so it
+    /// would have answered `Some((10.20.30.0/24, _))` here.
+    #[test]
+    fn lpm_does_not_return_a_more_specific_leaf() {
+        let mut node = DefaultNode::EMPTY;
+        // A single multi-stride insert into an empty trie path-compresses into a `Child::Leaf` at the
+        // root's child for the first octet, so the descent reaches it directly.
+        iptrie::insert(&mut node, crate::pfx!("10.20.30.0/24"), 24u32);
+
+        assert_eq!(None, lookup_prefix_lpm(&node, crate::pfx!("10.20.0.0/16")));
+    }
+
+    /// The positive direction (and the documented `lookup_prefix_lpm` contract): a leaf
+    /// LESS-specific than the query DOES cover it and is the LPM. A `/24` query against a stored
+    /// `/16` returns the `/16`; and an exact `/16` query against the stored `/16` returns it too
+    /// (equal length, contains its own address). Both pass before and after the fix — they pin the
+    /// behavior the fix must preserve while it removes the false positive above.
+    #[test]
+    fn lpm_returns_a_covering_less_specific_or_equal_leaf() {
+        let mut node = DefaultNode::EMPTY;
+        iptrie::insert(&mut node, crate::pfx!("10.20.0.0/16"), 16u32);
+
+        assert_eq!(
+            Some((crate::pfx!("10.20.0.0/16"), &16u32)),
+            lookup_prefix_lpm(&node, crate::pfx!("10.20.30.0/24")),
+            "a less-specific leaf must cover a more-specific query"
+        );
+        assert_eq!(
+            Some((crate::pfx!("10.20.0.0/16"), &16u32)),
+            lookup_prefix_lpm(&node, crate::pfx!("10.20.0.0/16")),
+            "an equal-length leaf containing the query address is the LPM"
         );
     }
 }
