@@ -253,22 +253,17 @@ impl Runtime {
                     tun_cfg.clone(),
                     netstack_up,
                     netstack_down,
-                    // Host-route gating inputs read from `Env`'s live cells: subnet routes are only
-                    // steered into the TUN when `--accept-routes` is set, and the host `/0` only when
-                    // the embedder configured an exit node. See `tun_actor::host_routes_from_node`.
-                    // NOTE: TUN mode programs the host FIB once at device build; a runtime
-                    // `set_accept_routes` / `set_exit_node` toggle is honored by the netstack data
-                    // path immediately, but does not re-steer the host routing table until the device
-                    // is (re)built — re-steering is tracked as a follow-up. Reading the live cells
-                    // here (rather than a frozen config snapshot) keeps this gating correct as of
-                    // whenever the device is actually built.
-                    tun_actor::HostRouteGating {
-                        accept_routes: env.accept_routes(),
-                        exit_node_configured: env.exit_node().is_some(),
-                    },
                     // Reuse the forwarder netstack's overlay `Channel` for recursive / exit-node-DoH
                     // MagicDNS forwarding in the TUN datapath (TUN mode has no application netstack
                     // Channel of its own). Egresses over the overlay — anti-leak preserved.
+                    //
+                    // Host-route gating (subnet routes gated on `--accept-routes`, the host `/0` from
+                    // the selected exit peer) is no longer snapshotted here: `TunActor` reads the live
+                    // `Env` cells (`accept_routes`/`exit_node`) on every host-FIB apply — both the
+                    // device-build path and the `PeerState` re-apply path — and folds the union of
+                    // peers' AllowedIPs (see `tun_actor::host_routes_from_node`). A runtime
+                    // `set_accept_routes` / `set_exit_node` toggle re-broadcasts the peer state, so the
+                    // host routing table is re-steered live (no device rebuild needed).
                     forwarder_channel.clone(),
                 ));
 
@@ -801,8 +796,11 @@ impl Runtime {
     /// Self routes and the exit-node default `/0` are unaffected (the latter is gated by the exit-node
     /// selection, not this flag).
     ///
-    /// In TUN transport mode the netstack data path honors the toggle immediately, but the host
-    /// routing table (programmed once at device build) is not re-steered until the device is rebuilt.
+    /// In TUN transport mode the host routing table is also re-steered live: the `RepublishState`
+    /// kicked below re-broadcasts the peer set to the `TunActor`, whose `PeerState` handler re-reads
+    /// `accept_routes` (and the exit selection) from `Env` and re-applies the host routes — so the
+    /// toggle takes effect without rebuilding the device (the apply is an idempotent add-new/
+    /// remove-gone diff). The exit-node default `/0` is still keyed on the exit selection, not this flag.
     pub async fn set_accept_routes(&self, accept: bool) -> Result<(), Error> {
         // Update the live cell every reader borrows from (same primitive/rationale as set_exit_node).
         self.accept_routes_tx.send_replace(accept);
