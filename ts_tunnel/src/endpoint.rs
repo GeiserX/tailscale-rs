@@ -1106,6 +1106,19 @@ mod tests {
     use super::*;
     use crate::{config::PeerConfig, session::ReceiveSession};
 
+    /// The transport send path zero-pads each payload up to a 16-byte boundary before sealing
+    /// (wireguard-go parity — see `session::PADDING_MULTIPLE`), and the receiver delivers the
+    /// decrypted payload with that padding intact (the real packet length is recovered downstream
+    /// from the inner IP header). So a payload sent through a full handshake+transport roundtrip is
+    /// delivered as `payload || zeros` up to the next multiple of 16. Test helper to build that
+    /// expected delivered form.
+    fn pad16(payload: &[u8]) -> PacketMut {
+        let mut v = payload.to_vec();
+        let padded_len = payload.len().next_multiple_of(16);
+        v.resize(padded_len, 0);
+        PacketMut::from(v.as_slice())
+    }
+
     /// A bare [`EndpointState`] with an empty [`IdMap`] for unit-testing the session-state helpers
     /// (`get_recv`, `encrypt_or_queue`) directly, without standing up a full handshake.
     fn bare_endpoint_state() -> EndpointState {
@@ -1382,7 +1395,12 @@ mod tests {
             .to_local
             .get(&b_peer)
             .expect("should have packets from B's peer");
-        assert_eq!(packets, &a_to_b_packets, "wrong packets received from A",);
+        // Each payload is zero-padded to a 16-byte boundary on the send path (wireguard-go parity).
+        assert_eq!(
+            packets,
+            &[pad16(&[1, 2, 3, 4]), pad16(&[5, 6, 7, 8])],
+            "wrong packets received from A",
+        );
         assert_eq!(b_acts.to_peers.len(), 0, "unexpected sent message");
 
         // B sends transport message
@@ -1409,7 +1427,7 @@ mod tests {
             .expect("should have packets from A's peer");
         assert_eq!(
             packets,
-            &[b_to_a_packet],
+            &[pad16(&[9, 10, 11, 12])],
             "wrong packets received from A's peer"
         );
         assert_eq!(a_acts.to_peers.len(), 0, "unexpected sent message");
@@ -1461,7 +1479,7 @@ mod tests {
         let delivered = b_ep.recv(data);
         assert_eq!(
             delivered.to_local.get(&b_peer).map(|p| p.as_slice()),
-            Some([PacketMut::from(payload)].as_slice()),
+            Some([pad16(payload)].as_slice()),
             "payload should be delivered to B after handshake"
         );
 
@@ -1630,7 +1648,7 @@ mod tests {
             let delivered = remote.recv(data);
             assert_eq!(
                 delivered.to_local.get(&remote_peer).map(|p| p.as_slice()),
-                Some([PacketMut::from(payload)].as_slice()),
+                Some([pad16(payload)].as_slice()),
                 "payload should be delivered after handshake"
             );
         };
@@ -1918,13 +1936,13 @@ mod tests {
         let delivered_to_b = b_ep.recv(data_from_a);
         assert_eq!(
             delivered_to_b.to_local.get(&b_peer).map(|p| p.as_slice()),
-            Some([PacketMut::from(&b"a-first"[..])].as_slice()),
+            Some([pad16(b"a-first")].as_slice()),
             "A's primed payload must reach B (no 'session not found' wedge)"
         );
         let delivered_to_a = a_ep.recv(data_from_b);
         assert_eq!(
             delivered_to_a.to_local.get(&a_peer).map(|p| p.as_slice()),
-            Some([PacketMut::from(&b"b-first"[..])].as_slice()),
+            Some([pad16(b"b-first")].as_slice()),
             "B's primed payload must reach A (no 'session not found' wedge)"
         );
 
@@ -1939,7 +1957,7 @@ mod tests {
         let got_b = b_ep.recv(to_b);
         assert_eq!(
             got_b.to_local.get(&b_peer).map(|p| p.as_slice()),
-            Some([PacketMut::from(&a_payload[..])].as_slice()),
+            Some([pad16(a_payload)].as_slice()),
             "fresh A->B data must flow on the converged session"
         );
 
@@ -1952,7 +1970,7 @@ mod tests {
         let got_a = a_ep.recv(to_a);
         assert_eq!(
             got_a.to_local.get(&a_peer).map(|p| p.as_slice()),
-            Some([PacketMut::from(&b_payload[..])].as_slice()),
+            Some([pad16(b_payload)].as_slice()),
             "fresh B->A data must flow on the converged session"
         );
 
@@ -2126,7 +2144,7 @@ mod tests {
         let delivered = a_ep.recv(confirm);
         assert_eq!(
             delivered.to_local.get(&a_peer).map(|p| p.as_slice()),
-            Some([PacketMut::from(&payload[..])].as_slice()),
+            Some([pad16(payload)].as_slice()),
             "A must converge on the replacement responder session and deliver C's payload"
         );
 
@@ -2442,7 +2460,7 @@ mod tests {
         let delivered_to_b = b_ep.recv(data_from_a);
         assert_eq!(
             delivered_to_b.to_local.get(&b_peer).map(|p| p.as_slice()),
-            Some([PacketMut::from(&b"a-first"[..])].as_slice()),
+            Some([pad16(b"a-first")].as_slice()),
             "A's primed payload must reach B on the converged session"
         );
 
@@ -2455,7 +2473,7 @@ mod tests {
         let to_b = only_to_peer(&to_b.to_peers, a_peer, "A->B live data");
         assert_eq!(
             b_ep.recv(to_b).to_local.get(&b_peer).map(|p| p.as_slice()),
-            Some([PacketMut::from(&a_payload[..])].as_slice()),
+            Some([pad16(a_payload)].as_slice()),
             "fresh A->B data must flow even though A holds an orphaned responder session"
         );
         let b_payload = b"b->a-live";
@@ -2466,7 +2484,7 @@ mod tests {
         let to_a = only_to_peer(&to_a.to_peers, b_peer, "B->A live data");
         assert_eq!(
             a_ep.recv(to_a).to_local.get(&a_peer).map(|p| p.as_slice()),
-            Some([PacketMut::from(&b_payload[..])].as_slice()),
+            Some([pad16(b_payload)].as_slice()),
             "fresh B->A data must flow on the converged session (no wedge)"
         );
 

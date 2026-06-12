@@ -559,6 +559,16 @@ mod tests {
     use super::*;
     use crate::session::REJECT_AFTER_TIME_RECV;
 
+    /// The transport send path zero-pads each payload up to a 16-byte boundary before sealing
+    /// (wireguard-go parity — see `session::PADDING_MULTIPLE`); the receiver delivers the decrypted
+    /// payload with that padding intact. So a payload that round-trips through encrypt/decrypt comes
+    /// back as `payload || zeros` up to the next multiple of 16. Helper to build that expected form.
+    fn pad16(payload: &[u8]) -> Vec<PacketMut> {
+        let mut v = payload.to_vec();
+        v.resize(payload.len().next_multiple_of(16), 0);
+        vec![PacketMut::from(v.as_slice())]
+    }
+
     fn fixed_static(b: u8) -> x25519_dalek::StaticSecret {
         x25519_dalek::StaticSecret::from([b; 32])
     }
@@ -759,15 +769,15 @@ mod tests {
         );
 
         // A real first transport packet from A under the new keys: NOW the responder confirms.
-        let plaintext = vec![PacketMut::from("confirm-me".as_bytes())];
-        let mut first = plaintext.clone();
+        let mut first = vec![PacketMut::from("confirm-me".as_bytes())];
         a_sessions.send.encrypt(first.iter_mut());
         let (b_sessions, decrypted) = b_handshake
             .confirm(b_session, first, Instant::now())
             .expect("first AEAD-verifying transport packet confirms the responder");
         assert_eq!(
-            decrypted, plaintext,
-            "confirmed packet must decrypt to plaintext"
+            decrypted,
+            pad16(b"confirm-me"),
+            "confirmed packet must decrypt to the (padded) plaintext"
         );
 
         // ASSERT: confirmation consumed the tentative state — the handshake is now idle/live.
@@ -777,10 +787,9 @@ mod tests {
         );
 
         // And the now-live responder session round-trips in both directions.
-        let reply = vec![PacketMut::from("ack".as_bytes())];
-        let mut reply_pkt = reply.clone();
+        let mut reply_pkt = vec![PacketMut::from("ack".as_bytes())];
         b_sessions.send.encrypt(&mut reply_pkt);
-        assert_eq!(a_sessions.recv.decrypt(reply_pkt), reply);
+        assert_eq!(a_sessions.recv.decrypt(reply_pkt), pad16(b"ack"));
     }
 
     /// Build a tentative responder `Handshake` and the initiator's live [`SessionPair`] from one
@@ -941,16 +950,14 @@ mod tests {
         };
 
         // They can now communicate
-        let a_plaintext = vec![PacketMut::from("xyzzy".as_bytes())];
-        let mut packets = a_plaintext.clone();
+        let mut packets = vec![PacketMut::from("xyzzy".as_bytes())];
         a_session.send.encrypt(packets.iter_mut());
         let b_received = b_session.recv.decrypt(packets);
-        assert_eq!(b_received, a_plaintext);
+        assert_eq!(b_received, pad16(b"xyzzy"));
 
-        let b_plaintext = vec![PacketMut::from("plover".as_bytes())];
-        packets = b_plaintext.clone();
+        let mut packets = vec![PacketMut::from("plover".as_bytes())];
         b_session.send.encrypt(&mut packets);
         let a_received = a_session.recv.decrypt(packets);
-        assert_eq!(a_received, b_plaintext);
+        assert_eq!(a_received, pad16(b"plover"));
     }
 }
