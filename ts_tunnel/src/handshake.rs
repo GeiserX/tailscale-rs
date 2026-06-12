@@ -365,7 +365,7 @@ pub struct SessionPair {
 /// used by boringtun, wireguard-go, and the Linux kernel.
 pub(crate) struct Handshake {
     /// Initiator role: we sent a [`HandshakeInitiation`] and are awaiting a [`HandshakeResponse`]
-    /// (msg2). Holds the in-progress [`SentHandshake`], the `HANDSHAKE_TIMEOUT` handle (on expiry the
+    /// (msg2). Holds the in-progress [`SentHandshake`], the `REKEY_TIMEOUT` handle (on expiry the
     /// stale initiation is abandoned and a *fresh* handshake is started — not a retransmit of this
     /// one), and our mac1 (needed to authenticate a cookie reply).
     initiated: Option<(SentHandshake, Handle<Event>, Mac)>,

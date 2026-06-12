@@ -343,10 +343,10 @@ struct Peer {
     /// [`PeerConfig::persistent_keepalive_interval`].
     persistent_keepalive: Option<Handle<Event>>,
     /// Consecutive failed handshake-initiation retransmits for the current attempt (Go wireguard-go
-    /// `peer.timers.handshakeAttempts`). Incremented each time `HANDSHAKE_TIMEOUT` fires with no
+    /// `peer.timers.handshakeAttempts`). Incremented each time `REKEY_TIMEOUT` fires with no
     /// response; reset to 0 when a *fresh* (non-retry) handshake is started or a handshake completes.
     /// Once it exceeds [`MAX_TIMER_HANDSHAKES`] the peer gives up retransmitting (see
-    /// [`Peer::handshake_timeout`]) rather than re-initiating every `HANDSHAKE_TIMEOUT` forever.
+    /// [`Peer::handshake_timeout`]) rather than re-initiating every `REKEY_TIMEOUT` forever.
     handshake_attempts: u32,
 }
 
@@ -634,7 +634,7 @@ impl Peer {
 
         // Give-up bound (Go wireguard-go `expiredRetransmitHandshake`): after
         // `MAX_TIMER_HANDSHAKES` consecutive failed retransmits stop retransmitting rather than
-        // re-initiating every `HANDSHAKE_TIMEOUT` forever to an unreachable peer. On give-up, tear
+        // re-initiating every `REKEY_TIMEOUT` forever to an unreachable peer. On give-up, tear
         // the session down: `deactivate` frees the recv ids of any live keypair AND drops the staged
         // outbound queue (a peer with no reachable path shouldn't accumulate a queue indefinitely) —
         // Go's `FlushStagedPackets`. We do NOT re-arm: the next outbound packet re-triggers a fresh
@@ -756,10 +756,13 @@ impl Peer {
         tracing::debug!(peer_id = ?self.id, ?session_id, "enqueue handshake start");
 
         out.queue_to_peer(self.id).push(packet);
-        let tr = TimeRange::new_around(
-            Instant::now() + HANDSHAKE_TIMEOUT,
-            Duration::from_millis(500),
-        );
+        // Arm the retransmit timer at REKEY_TIMEOUT + upward jitter (wireguard-go
+        // `timersHandshakeInitiated`). The range is anchored at the jittered target and only extends
+        // *forward* (a small coalescing tail), so the timer never fires before Go's 5s floor — a
+        // symmetric `new_around` window would let it fire early and erase the jitter's desync/anti-
+        // fingerprint effect.
+        let target = Instant::now() + rekey_retransmit_delay();
+        let tr = TimeRange::new(target, target + HANDSHAKE_RETRANSMIT_COALESCE);
 
         let timeout = endpoint.scheduler.add(tr, Event::HandshakeTimeout(self.id));
         // Set (not replace) the initiator slot: a tentative responder session from a simultaneous
@@ -1082,7 +1085,41 @@ pub enum Event {
     PersistentKeepalive(PeerId),
 }
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Base interval between handshake-initiation retransmits, `REKEY_TIMEOUT` from wireguard-go
+/// `device/constants.go` (`RekeyTimeout = 5s`). The actual scheduled delay adds upward jitter — see
+/// [`rekey_retransmit_delay`].
+const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum random jitter added to each handshake-retransmit interval, in milliseconds —
+/// wireguard-go `device/constants.go` `RekeyTimeoutJitterMaxMs = 334`. Go arms the retransmit timer
+/// at `RekeyTimeout + fastrandn(RekeyTimeoutJitterMaxMs) ms` (`device/timers.go`
+/// `timersHandshakeInitiated`): the jitter is **upward-only** (never fires before `REKEY_TIMEOUT`)
+/// and bounds the delay to `[5.000s, 5.334s)`. The jitter desynchronizes peers that lost
+/// connectivity simultaneously (so they don't re-initiate in a 5s-periodic thundering herd) and
+/// removes the perfectly-periodic 5.000s retransmit cadence that would otherwise fingerprint us
+/// against real WireGuard.
+const REKEY_TIMEOUT_JITTER_MAX_MS: u64 = 334;
+
+/// The delay until the next handshake-initiation retransmit: `REKEY_TIMEOUT` plus uniform random
+/// jitter in `[0, REKEY_TIMEOUT_JITTER_MAX_MS)` milliseconds, matching wireguard-go
+/// `timersHandshakeInitiated` (`RekeyTimeout + fastrandn(RekeyTimeoutJitterMaxMs)`). Upward-only:
+/// the result is always `>= REKEY_TIMEOUT`, so we never retransmit before Go's 5s floor.
+///
+/// The `% REKEY_TIMEOUT_JITTER_MAX_MS` introduces modulo bias of at most
+/// `REKEY_TIMEOUT_JITTER_MAX_MS / 2^64 ≈ 1.8e-17` — sub-femtosecond skew over a 334 ms span,
+/// physically irrelevant for a desync/anti-fingerprint timer. Go's `fastrandn` is itself a biased
+/// multiply-shift, so a perfectly-uniform sample here would diverge from the parity target rather
+/// than match it; the simple modulo is both faithful and sufficient.
+fn rekey_retransmit_delay() -> Duration {
+    let jitter_ms = rand::random::<u64>() % REKEY_TIMEOUT_JITTER_MAX_MS;
+    REKEY_TIMEOUT + Duration::from_millis(jitter_ms)
+}
+
+/// Forward-only coalescing tail for the handshake-retransmit timer: the scheduler may fire the
+/// event anywhere in `[target, target + this]` so it can batch nearby wakeups, but never *before*
+/// `target` (which already carries Go's upward jitter). Kept small so the effective retransmit
+/// window stays within a few tens of ms of Go's `[5.000s, 5.334s)`.
+const HANDSHAKE_RETRANSMIT_COALESCE: Duration = Duration::from_millis(50);
 
 /// Max consecutive handshake-initiation retransmits before giving up (Go wireguard-go
 /// `MaxTimerHandshakes = RekeyAttemptTime / RekeyTimeout = 90s / 5s = 18`). After this many failed
@@ -1117,6 +1154,34 @@ mod tests {
         let padded_len = payload.len().next_multiple_of(16);
         v.resize(padded_len, 0);
         PacketMut::from(v.as_slice())
+    }
+
+    /// The handshake-retransmit delay is `REKEY_TIMEOUT` plus upward-only jitter in
+    /// `[0, REKEY_TIMEOUT_JITTER_MAX_MS)` ms, matching wireguard-go `timersHandshakeInitiated`. It is
+    /// never below the 5s floor (Go never retransmits early) and never reaches `5s + 334ms`. Sampled
+    /// many times to exercise the random range; also asserts the jitter is not degenerate (we do see
+    /// more than one distinct value), so a future change that drops the randomness would be caught.
+    #[test]
+    fn rekey_retransmit_delay_is_jittered_upward_within_go_bounds() {
+        let lo = REKEY_TIMEOUT;
+        let hi = REKEY_TIMEOUT + Duration::from_millis(REKEY_TIMEOUT_JITTER_MAX_MS);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let d = rekey_retransmit_delay();
+            assert!(
+                d >= lo,
+                "retransmit delay {d:?} must be >= the 5s floor {lo:?}"
+            );
+            assert!(
+                d < hi,
+                "retransmit delay {d:?} must be < 5s + {REKEY_TIMEOUT_JITTER_MAX_MS}ms ({hi:?})"
+            );
+            seen.insert(d.as_millis());
+        }
+        assert!(
+            seen.len() > 1,
+            "the delay must actually be jittered, not a constant"
+        );
     }
 
     /// A bare [`EndpointState`] with an empty [`IdMap`] for unit-testing the session-state helpers
@@ -1997,7 +2062,7 @@ mod tests {
     /// responder's reply and converge) alongside the wire packet to feed into the responder's
     /// `recv`. Each call uses a *fresh random ephemeral* (it's a distinct handshake), so two calls
     /// produce two genuinely different initiations. `scheduler` owns the (unused-in-this-path)
-    /// `HANDSHAKE_TIMEOUT` handle, mirroring the existing handshake-module unit tests.
+    /// `REKEY_TIMEOUT` handle, mirroring the existing handshake-module unit tests.
     fn build_initiation(
         from: &NodeKeyPair,
         to: &NodeKeyPair,
@@ -2011,11 +2076,9 @@ mod tests {
         // The initiation's mac1 must verify against the *recipient's* key (responder); the returned
         // mac1 is what an initiator keeps to authenticate a cookie reply.
         let mac1 = MACSender::new(&to.public).write_macs(pkt.as_mut());
+        let target = Instant::now() + rekey_retransmit_delay();
         let timeout = scheduler.add(
-            TimeRange::new_around(
-                Instant::now() + HANDSHAKE_TIMEOUT,
-                Duration::from_millis(500),
-            ),
+            TimeRange::new(target, target + HANDSHAKE_RETRANSMIT_COALESCE),
             Event::HandshakeTimeout(PeerId(0)),
         );
         let mut handshake = Handshake::none();
@@ -2176,7 +2239,7 @@ mod tests {
 
     /// Regression for the WG handshake give-up bound (Go wireguard-go `expiredRetransmitHandshake` /
     /// `MaxTimerHandshakes`): the initiator must stop retransmitting after [`MAX_TIMER_HANDSHAKES`]
-    /// failed attempts instead of re-initiating every `HANDSHAKE_TIMEOUT` forever to an unreachable
+    /// failed attempts instead of re-initiating every `REKEY_TIMEOUT` forever to an unreachable
     /// peer, and the next outbound packet must re-trigger exactly one fresh handshake.
     ///
     /// A is the initiator; its peer B never answers (no `recv` is fed back). We `send` once to kick
@@ -2213,7 +2276,7 @@ mod tests {
         // direction — a regression that gave up too early or too late would change this total).
         let mut now = Instant::now();
         for _ in 0..(MAX_TIMER_HANDSHAKES + 5) {
-            now += HANDSHAKE_TIMEOUT * 2; // well past the (jittered) timeout window
+            now += REKEY_TIMEOUT * 2; // well past the (jittered) timeout window
             total_initiations += count_initiations(&a_ep.dispatch_events(now).to_peers, b_peer);
         }
         assert_eq!(
@@ -2272,7 +2335,7 @@ mod tests {
         // B is unreachable: drive the rekey's HandshakeTimeout past the cap so it gives up.
         let mut now = Instant::now();
         for _ in 0..(MAX_TIMER_HANDSHAKES + 5) {
-            now += HANDSHAKE_TIMEOUT * 2;
+            now += REKEY_TIMEOUT * 2;
             a_ep.dispatch_events(now);
         }
 
