@@ -3,15 +3,36 @@
 //! This is the analog of Go `tsnet.Server.HTTPClient`, whose entire mechanism is
 //! `&http.Client{Transport: &http.Transport{DialContext: s.Dial}}` — a bare dialer injection with no
 //! extra client defaults. [`TailnetConnector`] is that injection for the Rust `hyper` ecosystem:
-//! given a request [`Uri`], it resolves the host as a MagicDNS name (or IPv4 literal) and dials it
-//! into the overlay (default port 80 for `http`, 443 for `https`), so the request egresses over the
-//! tailnet rather than the host's network. TLS, redirects, pooling, and timeouts are the hyper
-//! client's concern — the connector only supplies the transport, exactly like Go's `DialContext`.
+//! given an `http://` request [`Uri`], it resolves the host as a MagicDNS name (or IPv4 literal) and
+//! dials it into the overlay (default port 80), so the request egresses over the tailnet rather than
+//! the host's network. Redirects, pooling, and timeouts are the hyper client's concern — the
+//! connector only supplies the transport, exactly like Go's `DialContext`.
 //!
 //! Obtain one from [`Device::http_connector`](crate::Device::http_connector) and hand it to
 //! `hyper_util::client::legacy::Client::builder(...).build(connector)`.
 //!
 //! Available only with the **`hyper`** crate feature.
+//!
+//! # TLS — this is a PLAINTEXT connector
+//!
+//! [`TailnetConnector`] yields a **plain** overlay TCP stream and performs **no TLS**. Unlike Go's
+//! `http.Transport` (which wraps the `DialContext` conn in TLS for `https://` itself), hyper's legacy
+//! `Client` does no TLS — it speaks HTTP directly over whatever stream the connector returns. So an
+//! `https://` request through a bare `TailnetConnector` would be sent **cleartext onto port 443**;
+//! this connector therefore **rejects** `https`/`wss` URIs (with `BadRequest`) rather than dial them
+//! into a silent plaintext-on-TLS-port failure. Traffic over the tailnet is still WireGuard-encrypted
+//! hop-to-hop (the host's origin IP never leaks), but there is no end-to-end TLS / peer-certificate
+//! validation.
+//!
+//! For real HTTPS over the tailnet, wrap this connector in a TLS connector — e.g.
+//! `hyper_rustls::HttpsConnectorBuilder::new().with_native_roots()?.https_or_http().enable_http1().wrap_connector(connector)`
+//! — which performs the TLS handshake over the tailnet stream this connector supplies.
+//!
+//! # IPv4-only
+//!
+//! Like the rest of this fork's tailnet surface, the connector is IPv4-only: hosts resolve to a
+//! tailnet IPv4 (or are dialed as an IPv4 literal). An IPv6-only destination is not reachable even
+//! with [`Config::enable_ipv6`](crate::Config), unlike [`Device::dial`](crate::Device::dial).
 //!
 //! # Example
 //!
@@ -19,8 +40,6 @@
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn core::error::Error>> {
 //! # use tailscale::{Config, Device};
-//! use http_body_util::Empty;
-//! use hyper::body::Bytes;
 //! use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 //!
 //! let dev = Device::new(
@@ -28,10 +47,11 @@
 //!     Some("YOUR_AUTH_KEY".to_owned()),
 //! ).await?;
 //!
-//! // A hyper client that dials every request over the tailnet (Go `tsnet.Server.HTTPClient`).
+//! // A hyper client that dials every (http://) request over the tailnet — the analog of Go
+//! // `tsnet.Server.HTTPClient`. (Body type `String` here just to name the generic; use whatever
+//! // `http_body::Body` your requests carry. For https, wrap `connector` in a TLS connector first.)
 //! let connector = dev.http_connector().await?;
-//! let client: Client<_, Empty<Bytes>> =
-//!     Client::builder(TokioExecutor::new()).build(connector);
+//! let client: Client<_, String> = Client::builder(TokioExecutor::new()).build(connector);
 //!
 //! let resp = client.get("http://my-peer:8080/".parse()?).await?;
 //! println!("status: {}", resp.status());
@@ -107,8 +127,9 @@ impl hyper::rt::Write for TailnetStream {
 
 impl Connection for TailnetStream {
     fn connected(&self) -> Connected {
-        // A plain overlay TCP connection — no proxy, no ALPN negotiated here (HTTPS ALPN is the
-        // hyper TLS layer's concern, layered above this transport).
+        // A plain overlay TCP connection: no proxy, and no ALPN to advertise (this connector does no
+        // TLS — if a caller wraps it in a TLS connector for https, that wrapper reports its own
+        // negotiated ALPN). `Connected::new()` is the correct unremarkable default.
         Connected::new()
     }
 }
@@ -135,11 +156,27 @@ impl Service<Uri> for TailnetConnector {
     }
 }
 
-/// Extract the `(host, port)` to dial from a request [`Uri`], applying the scheme's default port
-/// (`http` → 80, `https` → 443) when none is given — mirroring what Go's `http.Transport` computes
-/// before calling `DialContext`. The host has any IPv6 brackets stripped (the overlay is IPv4-only,
-/// but a literal `[::1]`-style authority must not reach the resolver with its brackets).
+/// Extract the `(host, port)` to dial from an **`http://`** request [`Uri`], defaulting the port to
+/// 80 when none is given. The host has any IPv6 brackets stripped (a literal `[::1]`-style authority
+/// must not reach the resolver with its brackets).
+///
+/// This connector is **plaintext-only** (it yields a bare overlay TCP stream and does no TLS — see
+/// [`TailnetConnector`]). A secure scheme (`https`/`wss`) is therefore **rejected** with
+/// [`InternalErrorKind::BadRequest`] rather than dialed: hyper's legacy `Client` does not wrap the
+/// returned stream in TLS, so honoring `https` here would send a cleartext request onto port 443 and
+/// silently fail. For HTTPS over the tailnet, wrap this connector in a TLS connector (see the module
+/// docs). The scheme is validated even when an explicit port is present, so `https://peer:443` /
+/// `wss://peer:443` cannot slip a plaintext dial onto a TLS port.
+///
+/// Distinct from [`crate::dial`]'s `split_host_port`: a `Uri` arrives already split into host + port,
+/// and HTTP supplies a scheme-default port (which the string dialer deliberately does not).
 fn host_port(uri: &Uri) -> Result<(String, u16), Error> {
+    // Plaintext connector: only the cleartext HTTP scheme (or a scheme-less authority, treated as
+    // http) is dialable. Reject https/wss (would be cleartext-on-TLS-port) and anything unknown.
+    match uri.scheme_str() {
+        Some("http") | None => {}
+        _ => return Err(Error::Internal(InternalErrorKind::BadRequest)),
+    }
     let host = uri
         .host()
         .ok_or(Error::Internal(InternalErrorKind::BadRequest))?;
@@ -150,16 +187,9 @@ fn host_port(uri: &Uri) -> Result<(String, u16), Error> {
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host)
         .to_string();
-    let port = match uri.port_u16() {
-        Some(p) => p,
-        None => match uri.scheme_str() {
-            Some("http") | None => 80,
-            Some("https") => 443,
-            // An unknown scheme with no explicit port is ambiguous — Go would not know how to dial
-            // it either. Reject rather than guess.
-            Some(_) => return Err(Error::Internal(InternalErrorKind::BadRequest)),
-        },
-    };
+    // Default the cleartext-HTTP port to 80 when unspecified (what Go's `http.Transport` computes
+    // before calling `DialContext`).
+    let port = uri.port_u16().unwrap_or(80);
     Ok((host, port))
 }
 
@@ -174,9 +204,29 @@ mod tests {
     }
 
     #[test]
-    fn host_port_defaults_https_to_443() {
-        let (h, p) = host_port(&"https://peer.tailnet.ts.net/".parse().unwrap()).unwrap();
-        assert_eq!((h.as_str(), p), ("peer.tailnet.ts.net", 443));
+    fn host_port_rejects_https() {
+        // Plaintext connector: https must be rejected (not dialed cleartext onto 443), even with an
+        // explicit port, so it can't slip a plaintext dial onto a TLS port.
+        for uri in [
+            "https://peer.tailnet.ts.net/",
+            "https://peer:443/",
+            "https://peer:8443/",
+        ] {
+            assert!(
+                matches!(
+                    host_port(&uri.parse().unwrap()).unwrap_err(),
+                    Error::Internal(InternalErrorKind::BadRequest)
+                ),
+                "https must be rejected: {uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_port_rejects_wss_even_with_explicit_port() {
+        // wss with an explicit port must NOT bypass scheme validation into a plaintext dial.
+        let err = host_port(&"wss://peer:443/".parse().unwrap()).unwrap_err();
+        assert!(matches!(err, Error::Internal(InternalErrorKind::BadRequest)));
     }
 
     #[test]
