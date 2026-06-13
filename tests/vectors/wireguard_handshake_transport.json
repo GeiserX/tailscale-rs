@@ -41,6 +41,11 @@
     "resp_ephem_pub_hex": "ac01b2209e86354fb853237b5de0f4fab13c7fcbf433a61c019369617fecf10b",
     "resp_empty_sealed_hex": "dad1dbbeb72c29c492bd43373a62c58b",
     "send_key_i2r_hex": "a18cc809fd05b6b5f99644cf506f89dce368c2f54a9dbeb9a384f36c274317ef",
-    "recv_key_r2i_hex": "b1aa1b797d3a45da97552b8084ade493aa767f15af95854bc86557f6dacd851d"
+    "recv_key_r2i_hex": "b1aa1b797d3a45da97552b8084ade493aa767f15af95854bc86557f6dacd851d",
+    "init_sender_index": 286331153,
+    "resp_sender_index": 572662306,
+    "resp_receiver_index": 286331153,
+    "init_frame_no_mac_hex": "01000000111111115dfedd3b6bd47f6fa28ee15d969d5bb0ea53774d488bdaf9df1c6e0124b3ef220a26599fb2188bb723276fc173af67616c817fc32fd04d686d87ec152fac10eed2bda3bb3b6f1eded6977684082284d850fc41b4cbcf9deeba2039d1c21710e7081f158a3f5bb6ceb5c344e3",
+    "resp_frame_no_mac_hex": "020000002222222211111111ac01b2209e86354fb853237b5de0f4fab13c7fcbf433a61c019369617fecf10bdad1dbbeb72c29c492bd43373a62c58b"
   }
 }

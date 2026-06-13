@@ -708,6 +708,51 @@ mod tests {
             unhex("dad1dbbeb72c29c492bd43373a62c58b").as_slice(),
             "response `empty` payload auth tag (sealed) diverges from Go reference"
         );
+
+        // Finally, pin the ASSEMBLED on-wire frame byte layout (everything except mac1/mac2) against
+        // a Go-emitted frame. The sealed-value asserts above prove each field's *contents*; this
+        // proves the `#[repr(C)]` struct serializes to the exact WireGuard wire order + offsets
+        // (msg_type, little-endian sender/receiver indices, field sequence) Go produces — catching a
+        // layout/endianness/padding divergence that field-content asserts can't. The Go vector uses
+        // fixed indices (init sender = 0x11111111, resp sender = 0x22222222, resp receiver = init
+        // sender); build the structs with the same and compare `as_bytes()` minus the trailing 32
+        // mac bytes (mac1+mac2, a separate keyed-hash concern out of scope here). Closes tsr-dtr.
+        use crate::messages::{HandshakeResponse, MessageType};
+        const MAC_BYTES: usize = 32; // mac1[16] + mac2[16]
+
+        let init_frame = HandshakeInitiation {
+            msg_type: MessageType::HandshakeInitiation,
+            _reserved: [0; 3],
+            sender_id: SessionId::from(0x1111_1111u32),
+            ephemeral_pub: init_ephem_pub.to_bytes(),
+            static_pub_sealed: static_sealed,
+            timestamp_sealed: ts_sealed,
+            mac1: [0; 16],
+            mac2: [0; 16],
+        };
+        let init_bytes = init_frame.as_bytes();
+        assert_eq!(
+            &init_bytes[..init_bytes.len() - MAC_BYTES],
+            unhex("01000000111111115dfedd3b6bd47f6fa28ee15d969d5bb0ea53774d488bdaf9df1c6e0124b3ef220a26599fb2188bb723276fc173af67616c817fc32fd04d686d87ec152fac10eed2bda3bb3b6f1eded6977684082284d850fc41b4cbcf9deeba2039d1c21710e7081f158a3f5bb6ceb5c344e3").as_slice(),
+            "HandshakeInitiation wire layout (pre-mac) diverges from the Go-emitted frame"
+        );
+
+        let resp_frame = HandshakeResponse {
+            msg_type: MessageType::HandshakeResponse,
+            _reserved: [0; 3],
+            sender_id: SessionId::from(0x2222_2222u32),
+            receiver_id: SessionId::from(0x1111_1111u32),
+            ephemeral_pub: resp_ephem_pub.to_bytes(),
+            auth_tag,
+            mac1: [0; 16],
+            mac2: [0; 16],
+        };
+        let resp_bytes = resp_frame.as_bytes();
+        assert_eq!(
+            &resp_bytes[..resp_bytes.len() - MAC_BYTES],
+            unhex("020000002222222211111111ac01b2209e86354fb853237b5de0f4fab13c7fcbf433a61c019369617fecf10bdad1dbbeb72c29c492bd43373a62c58b").as_slice(),
+            "HandshakeResponse wire layout (pre-mac) diverges from the Go-emitted frame"
+        );
     }
 
     /// Key-confirmation conformance (Dowling–Paterson, IACR 2018/080, Theorem 1, eCK-PFS-PSK).

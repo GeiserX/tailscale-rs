@@ -187,6 +187,15 @@ type handshakeVec struct {
 	RespEmptySealedHex  string `json:"resp_empty_sealed_hex"`  // encrypted empty payload (auth tag)
 	SendKeyHex          string `json:"send_key_i2r_hex"`       // initiator->responder transport key
 	RecvKeyHex          string `json:"recv_key_r2i_hex"`       // responder->initiator transport key
+
+	// Assembled on-wire frames with mac1/mac2 ZEROED (we pin the byte layout + sealed fields; the
+	// macs are a separate keyed-hash concern out of scope here). Sender/receiver indices are fixed
+	// (set in main) for determinism.
+	InitSenderIndex   uint32 `json:"init_sender_index"`     // initiation sender index (little-endian on wire)
+	RespSenderIndex   uint32 `json:"resp_sender_index"`     // response sender index
+	RespReceiverIndex uint32 `json:"resp_receiver_index"`   // response receiver index (== init sender)
+	InitFrameNoMacHex string `json:"init_frame_no_mac_hex"` // HandshakeInitiation bytes through timestamp (116 B, pre-mac)
+	RespFrameNoMacHex string `json:"resp_frame_no_mac_hex"` // HandshakeResponse bytes through auth_tag (60 B, pre-mac)
 }
 
 func main() {
@@ -274,6 +283,30 @@ func main() {
 	// split: sendKey (i2r), recvKey (r2i) = kdf2(ck, empty)
 	sendKey, recvKey := kdf2(ck[:], nil)
 
+	// --- Assemble the on-wire frames (mac1/mac2 zeroed; layout mirrors ts_tunnel's #[repr(C)]
+	// HandshakeInitiation / HandshakeResponse). Indices are little-endian (WireGuard wire format).
+	// Fixed indices for determinism: the Rust KAT builds with the same values.
+	const initSenderIdx uint32 = 0x11111111
+	const respSenderIdx uint32 = 0x22222222
+	// HandshakeInitiation: msg_type(1=0x01) + reserved(3×0) + sender_index(4, LE) + ephemeral(32)
+	//   + static_pub_sealed(48) + timestamp_sealed(28). 116 bytes, pre-mac.
+	var idx4 [4]byte
+	initFrame := []byte{0x01, 0x00, 0x00, 0x00}
+	binary.LittleEndian.PutUint32(idx4[:], initSenderIdx)
+	initFrame = append(initFrame, idx4[:]...)
+	initFrame = append(initFrame, initEphemPub...)
+	initFrame = append(initFrame, initStaticSealed...)
+	initFrame = append(initFrame, initTsSealed...)
+	// HandshakeResponse: msg_type(2=0x02) + reserved(3) + sender_index(4, LE) + receiver_index(4, LE,
+	//   == init sender) + ephemeral(32) + auth_tag(16). 60 bytes, pre-mac.
+	respFrame := []byte{0x02, 0x00, 0x00, 0x00}
+	binary.LittleEndian.PutUint32(idx4[:], respSenderIdx)
+	respFrame = append(respFrame, idx4[:]...)
+	binary.LittleEndian.PutUint32(idx4[:], initSenderIdx) // responder's receiver == initiator's sender
+	respFrame = append(respFrame, idx4[:]...)
+	respFrame = append(respFrame, respEphemPub...)
+	respFrame = append(respFrame, respEmptySealed...)
+
 	hv := handshakeVec{
 		Desc:                "Noise_IKpsk2 transcript, fixed ephemerals/statics",
 		InitStaticPrivHex:   hexstr(initStaticPriv),
@@ -291,6 +324,11 @@ func main() {
 		RespEmptySealedHex:  hexstr(respEmptySealed),
 		SendKeyHex:          hexstr(sendKey[:]),
 		RecvKeyHex:          hexstr(recvKey[:]),
+		InitSenderIndex:     initSenderIdx,
+		RespSenderIndex:     respSenderIdx,
+		RespReceiverIndex:   initSenderIdx,
+		InitFrameNoMacHex:   hexstr(initFrame),
+		RespFrameNoMacHex:   hexstr(respFrame),
 	}
 
 	enc := json.NewEncoder(os.Stdout)
