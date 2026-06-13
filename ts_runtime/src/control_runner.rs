@@ -250,11 +250,22 @@ impl ControlRunner {
     /// `tkaSyncIfNeeded`: a no-op when our head already matches.
     fn maybe_sync_tka(&mut self, tka: &TkaStatus, self_ref: ActorRef<Self>) {
         if !tka.is_enabled() {
-            // Lock disabled (or never enabled): drop any synced state and stop publishing an
-            // Authority. Never an error; peers are unaffected.
+            // Lock disabled (or never enabled): drop any synced state and clear enforcement. Only
+            // act on a real transition (we had synced state) — and crucially publish a `None` on the
+            // bus so the peer tracker stops enforcing a now-defunct authority (else a once-synced
+            // lock would keep dropping unsigned peers forever). Never an error; peers are unaffected.
             if self.tka_synced.is_some() {
                 self.tka_synced = None;
                 self.tka_authority.send_replace(None);
+                let env = self.params.env.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = env
+                        .publish(crate::peer_tracker::TkaAuthorityUpdate(None))
+                        .await
+                    {
+                        tracing::warn!(error = %e, "publishing TKA disable (clear enforcement) failed");
+                    }
+                });
             }
             return;
         }
@@ -300,18 +311,19 @@ impl ControlRunner {
             Ok(Some(synced)) => {
                 tracing::info!(
                     head = %synced.authority.head().to_base32(),
-                    "TKA sync succeeded; publishing verified Authority (observe-only)"
+                    "TKA sync succeeded; publishing verified Authority (enforcing)"
                 );
                 self.tka_authority
                     .send_replace(Some(synced.authority.clone()));
-                // Deliver the verified Authority to the peer tracker's observe-only verify-and-log
-                // seam (#136) over the bus. Re-published on every successful sync (no bus replay).
+                // Deliver the verified Authority to the peer tracker, which ENFORCES it (Go
+                // tkaFilterNetmapLocked — drops unauthorized peers). Re-published on every successful
+                // sync (no bus replay). `Some(..)` = enforce; a `None` is published on disable.
                 if let Err(e) = self
                     .params
                     .env
-                    .publish(crate::peer_tracker::TkaAuthorityUpdate(
+                    .publish(crate::peer_tracker::TkaAuthorityUpdate(Some(
                         synced.authority.clone(),
-                    ))
+                    )))
                     .await
                 {
                     tracing::warn!(error = %e, "publishing TKA authority to peer tracker failed");
