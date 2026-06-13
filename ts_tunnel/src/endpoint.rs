@@ -1366,7 +1366,7 @@ mod tests {
     #[test]
     fn test_one_peer() {
         let (a_static, b_static) = (NodeKeyPair::new(), NodeKeyPair::new());
-        let psk = rand::random();
+        let psk = rand::random::<crate::config::Psk>();
 
         let (mut a_ep, mut b_ep) = (
             Endpoint::new(a_static.clone()),
@@ -1381,7 +1381,7 @@ mod tests {
                 a_peer,
                 PeerConfig {
                     key: b_static.public,
-                    psk,
+                    psk: psk.clone(),
                     persistent_keepalive_interval: None,
                 },
             )
@@ -1393,7 +1393,7 @@ mod tests {
                 b_peer,
                 PeerConfig {
                     key: a_static.public,
-                    psk,
+                    psk: psk.clone(),
                     persistent_keepalive_interval: None,
                 },
             )
@@ -1507,7 +1507,7 @@ mod tests {
         payload: &[u8],
     ) -> (Endpoint, Endpoint, PeerId, PeerId) {
         let (a_static, b_static) = (NodeKeyPair::new(), NodeKeyPair::new());
-        let psk = rand::random();
+        let psk = rand::random::<crate::config::Psk>();
         let (mut a_ep, mut b_ep) = (
             Endpoint::new(a_static.clone()),
             Endpoint::new(b_static.clone()),
@@ -1518,7 +1518,7 @@ mod tests {
             a_peer,
             PeerConfig {
                 key: b_static.public,
-                psk,
+                psk: psk.clone(),
                 persistent_keepalive_interval: a_keepalive,
             },
         );
@@ -1526,7 +1526,7 @@ mod tests {
             b_peer,
             PeerConfig {
                 key: a_static.public,
-                psk,
+                psk: psk.clone(),
                 persistent_keepalive_interval: None,
             },
         );
@@ -1681,13 +1681,13 @@ mod tests {
             let remote_static = NodeKeyPair::new();
             let mut remote = Endpoint::new(remote_static.clone());
             let remote_peer = PeerId(1);
-            let psk = rand::random();
+            let psk = rand::random::<crate::config::Psk>();
 
             a_ep.upsert_peer(
                 a_peer,
                 PeerConfig {
                     key: remote_static.public,
-                    psk,
+                    psk: psk.clone(),
                     persistent_keepalive_interval: keepalive,
                 },
             );
@@ -1695,7 +1695,7 @@ mod tests {
                 remote_peer,
                 PeerConfig {
                     key: a_static.public,
-                    psk,
+                    psk: psk.clone(),
                     persistent_keepalive_interval: None,
                 },
             );
@@ -1796,14 +1796,14 @@ mod tests {
         // Start with a live session that has a persistent keepalive armed.
         let (mut a_ep, _b_ep, a_peer, _b_peer) = establish_session(Some(interval), b"hello");
         let peer_key = a_ep.peer_key(a_peer).expect("peer key");
-        let psk = rand::random();
+        let psk = rand::random::<crate::config::Psk>();
 
         // Some -> None on the live peer must CANCEL the timer.
         a_ep.upsert_peer(
             a_peer,
             PeerConfig {
                 key: peer_key,
-                psk,
+                psk: psk.clone(),
                 persistent_keepalive_interval: None,
             },
         );
@@ -1824,7 +1824,7 @@ mod tests {
             a_peer,
             PeerConfig {
                 key: peer_key,
-                psk,
+                psk: psk.clone(),
                 persistent_keepalive_interval: Some(interval),
             },
         );
@@ -1925,7 +1925,7 @@ mod tests {
     #[test]
     fn simultaneous_initiation_converges_without_wedge() {
         let (a_static, b_static) = (NodeKeyPair::new(), NodeKeyPair::new());
-        let psk = rand::random();
+        let psk = rand::random::<crate::config::Psk>();
         let (mut a_ep, mut b_ep) = (
             Endpoint::new(a_static.clone()),
             Endpoint::new(b_static.clone()),
@@ -1936,7 +1936,7 @@ mod tests {
             a_peer,
             PeerConfig {
                 key: b_static.public,
-                psk,
+                psk: psk.clone(),
                 persistent_keepalive_interval: None,
             },
         );
@@ -1944,7 +1944,7 @@ mod tests {
             b_peer,
             PeerConfig {
                 key: a_static.public,
-                psk,
+                psk: psk.clone(),
                 persistent_keepalive_interval: None,
             },
         );
@@ -2119,7 +2119,7 @@ mod tests {
     #[test]
     fn fresh_initiation_frees_displaced_responder_id() {
         let (a_static, c_static) = (NodeKeyPair::new(), NodeKeyPair::new());
-        let psk = rand::random();
+        let psk = rand::random::<crate::config::Psk>();
         let mut a_ep = Endpoint::new(a_static.clone());
         let a_peer = PeerId(1);
 
@@ -2128,7 +2128,7 @@ mod tests {
             a_peer,
             PeerConfig {
                 key: c_static.public,
-                psk,
+                psk: psk.clone(),
                 persistent_keepalive_interval: None,
             },
         );
@@ -2369,7 +2369,7 @@ mod tests {
     #[test]
     fn equal_timestamp_initiation_is_rejected_as_replay() {
         let (a_static, c_static) = (NodeKeyPair::new(), NodeKeyPair::new());
-        let psk = rand::random();
+        let psk = rand::random::<crate::config::Psk>();
         let mut a_ep = Endpoint::new(a_static.clone());
         let a_peer = PeerId(1);
 
@@ -2377,7 +2377,7 @@ mod tests {
             a_peer,
             PeerConfig {
                 key: c_static.public,
-                psk,
+                psk: psk.clone(),
                 persistent_keepalive_interval: None,
             },
         );
@@ -2463,7 +2463,7 @@ mod tests {
     #[test]
     fn asymmetric_simultaneous_initiation_orphans_responder_without_wedge() {
         let (a_static, b_static) = (NodeKeyPair::new(), NodeKeyPair::new());
-        let psk = rand::random();
+        let psk = rand::random::<crate::config::Psk>();
         let (mut a_ep, mut b_ep) = (
             Endpoint::new(a_static.clone()),
             Endpoint::new(b_static.clone()),
@@ -2474,7 +2474,7 @@ mod tests {
             a_peer,
             PeerConfig {
                 key: b_static.public,
-                psk,
+                psk: psk.clone(),
                 persistent_keepalive_interval: None,
             },
         );
@@ -2482,7 +2482,7 @@ mod tests {
             b_peer,
             PeerConfig {
                 key: a_static.public,
-                psk,
+                psk: psk.clone(),
                 persistent_keepalive_interval: None,
             },
         );

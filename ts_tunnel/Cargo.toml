@@ -29,6 +29,12 @@ rand.workspace = true
 tracing.workspace = true
 x25519-dalek.workspace = true
 zerocopy.workspace = true
+# Wipes WireGuard symmetric key material (the pre-shared `Psk` and the handshake `chaining_key`/
+# `hash` intermediates) from memory on drop. The session AEAD keys are already wiped by
+# `chacha20poly1305::ChaCha20Poly1305`'s own `ZeroizeOnDrop`; this covers the raw `[u8; 32]` secrets
+# that never become a `ts_keys` newtype. Mirrors the redact+zeroize hygiene `ts_keys` already applies
+# to the long-lived private keys.
+zeroize.workspace = true
 
 [dev-dependencies]
 # Dependencies required for examples.

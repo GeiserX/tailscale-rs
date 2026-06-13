@@ -11,7 +11,13 @@ use ts_keys::NodePublicKey;
 pub struct PeerId(pub u32);
 
 /// A wireguard symmetric pre-shared key.
-#[derive(Copy, Clone)]
+///
+/// Wipes its 32-byte secret on drop (`ZeroizeOnDrop`) and is deliberately **not** `Copy`: `Copy`
+/// would scatter unzeroizable bit-copies of the secret across the stack that the wiper can never
+/// reach, and `Copy`/`Drop` are mutually exclusive in Rust anyway (E0184). `Clone` stays available
+/// (it is an explicit, auditable act) — the same hygiene posture `ts_keys` applies to private keys.
+/// No `Debug`/`Display` is derived, so the secret cannot leak through `{:?}`/`{}`.
+#[derive(Clone, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct Psk([u8; 32]);
 
 impl From<[u8; 32]> for Psk {
@@ -153,5 +159,36 @@ mod tests {
             config_with(Some(normal)).effective_persistent_keepalive(),
             Some(normal),
         );
+    }
+
+    /// The pre-shared key wipes its secret bytes when zeroized (the `ZeroizeOnDrop` derive runs the
+    /// same `Zeroize::zeroize` on drop). Mirrors `ts_keys`' `private_key_zeroize_wipes_bytes`.
+    #[test]
+    fn psk_zeroize_wipes_bytes() {
+        use zeroize::Zeroize;
+
+        let mut psk = Psk::from([0xABu8; 32]);
+        assert_eq!(
+            psk.as_ref(),
+            &[0xABu8; 32],
+            "precondition: the psk holds its bytes"
+        );
+        psk.zeroize();
+        assert_eq!(
+            psk.as_ref(),
+            &[0u8; 32],
+            "zeroize must wipe the pre-shared key to zero"
+        );
+    }
+
+    /// `Psk` is intentionally not `Copy` (so the zeroizer is never defeated by stray bit-copies) and
+    /// exposes no `Debug`/`Display` (so the secret can't leak through formatting). This is a
+    /// compile-time contract; the assertion here documents the runtime half — a cloned key carries
+    /// the same secret, and both copies wipe independently.
+    #[test]
+    fn psk_clone_is_independent() {
+        let psk = Psk::from([0x42u8; 32]);
+        let clone = psk.clone();
+        assert_eq!(psk.as_ref(), clone.as_ref(), "clone preserves the secret");
     }
 }

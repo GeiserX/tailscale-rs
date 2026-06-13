@@ -2529,6 +2529,7 @@ dependencies = [
  "wycheproof",
  "x25519-dalek 3.0.0-rc.0",
  "zerocopy",
+ "zeroize",
 ]
 
 [[package]]
