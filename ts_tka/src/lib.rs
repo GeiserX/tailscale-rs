@@ -3547,6 +3547,12 @@ mod tests {
     ///
     /// Goes through `VerifiedAumChain::verify` (the trust boundary), NOT the structural-only
     /// `from_chain` — `from_chain` never inspects signatures, so it could not witness `Aum::sign`.
+    ///
+    /// The negative assertions here are public-API **smoke-checks**: they prove `Aum::sign`'s output
+    /// is gated fail-closed by the real verifier. The canonical, exhaustive error-path coverage lives
+    /// in the dedicated `verified_chain_rejects_*` tests (tampered / forged-untrusted / mis-linked)
+    /// and in the raw-verifier KATs (`ed25519_speccheck_dual_verifier_kat`, the wycheproof suite);
+    /// this test is the production-signer↔production-verifier drift pin, not a replacement for those.
     #[test]
     fn aum_sign_round_trips_through_verified_chain() {
         use ed25519_dalek::SigningKey;
@@ -3588,12 +3594,40 @@ mod tests {
 
         // A genesis AddKey(k0) signed by k1 (a key it does not seed) is untrusted: the signer's
         // key_id is absent from the state the AUM establishes.
-        let mut wrong_signer = genesis_add(k0);
+        let mut wrong_signer = genesis_add(k0.clone());
         wrong_signer.sign(&sk1);
         assert_eq!(
             VerifiedAumChain::verify(&[wrong_signer]).unwrap_err(),
             TkaError::UntrustedKey,
             "a genesis AddKey signed by a key it does not seed is untrusted"
+        );
+
+        // Pin the two classic adversarial signature SHAPES at the AUM layer (not just at the
+        // raw-verifier KATs), so a future refactor of `verify_aum_signatures`/`static_validate` can't
+        // silently weaken the trust boundary. A hand-forged signature with the right key_id but a
+        // 64-byte all-zero body passes the length gate and fails closed in the ZIP-215 verifier.
+        let mut zero_sig = genesis_add(k0.clone());
+        zero_sig.signatures.push(AumSignature {
+            key_id: k0.public.clone(),
+            signature: alloc::vec![0u8; 64],
+        });
+        assert_eq!(
+            VerifiedAumChain::verify(&[zero_sig]).unwrap_err(),
+            TkaError::BadSignature,
+            "an all-zero 64-byte signature must not verify"
+        );
+        // A wrong-length signature is rejected structurally (static_validate) before any crypto.
+        let mut short_sig = genesis_add(k0.clone());
+        short_sig.signatures.push(AumSignature {
+            key_id: k0.public.clone(),
+            signature: alloc::vec![0u8; 63],
+        });
+        assert!(
+            matches!(
+                VerifiedAumChain::verify(&[short_sig]).unwrap_err(),
+                TkaError::Decode(_)
+            ),
+            "a malformed (non-64-byte) signature is rejected by static_validate"
         );
     }
 
@@ -4252,14 +4286,12 @@ mod tests {
     /// The signer's public key is `test_aum_key(seed, _).public`, so signing with `seed` produces a
     /// signature that a state trusting `test_aum_key(seed, _)` will accept.
     fn sign_aum(aum: &mut Aum, seeds: &[u8]) {
-        use ed25519_dalek::Signer;
-        let sig_hash = aum.sig_hash();
+        // Delegate to the production `Aum::sign` so this helper and the public signer can never
+        // drift. `Aum::sign` recomputes `sig_hash()` per call, which is identical for every signer
+        // because the preimage omits ALL signatures (CBOR key 23) — appending one signer's signature
+        // never perturbs the next signer's preimage. Behaviourally identical to the old inline loop.
         for &seed in seeds {
-            let signer = signer_for(seed);
-            aum.signatures.push(AumSignature {
-                key_id: signer.verifying_key().to_bytes().to_vec(),
-                signature: signer.sign(&sig_hash).to_bytes().to_vec(),
-            });
+            aum.sign(&signer_for(seed));
         }
     }
 
