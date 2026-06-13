@@ -23,7 +23,7 @@ flowchart LR
         CtrlNoise["Control plane (TS2021 Noise)<br/>hand-implemented"]
         DataNoise["Data plane (WireGuard Noise_IKpsk2)<br/>hand-implemented"]
         Acme["ACME / JWS (RFC 8555)<br/>hand-implemented"]
-        TKA["Tailnet Lock verify<br/>wired, ENFORCEMENT INERT"]
+        TKA["Tailnet Lock verify<br/>wired, ENFORCING on a verified chain"]
         Dialer["RealDialer chokepoint<br/>fail-closed, IPv4-only"]
     end
 
@@ -35,13 +35,15 @@ flowchart LR
     CtrlNoise <--> Control
     DataNoise <--> Peers
     Acme <--> Control
-    TKA -. "cannot yet block<br/>compromised control" .-> Control
+    TKA -. "drops forge-injected<br/>peer keys" .-> Control
     Dialer --> Upstream
 ```
 
-The control plane is trusted today: Tailnet Lock, the mechanism that would let a client reject
-peer node-keys injected by a malicious or compromised control plane, is wired but **not yet
-enforcing** (see below).
+The control plane is trusted today for the lock *toggle*: it can enable or disable Tailnet Lock. Once
+a verified lock has been synced, the client rejects peer node-keys that lack a signature from a key in
+the cryptographically verified chain — so a malicious or compromised control plane **cannot** forge a
+trusted key to admit an unauthorized peer. It can still *disable* the lock (downgrade to admit-all),
+and disablement-secret verification is not yet implemented (see below).
 
 ## Unaudited cryptography
 
@@ -64,23 +66,37 @@ library for data privacy until the audit is complete.
 
 ## Tailnet Lock (TKA) status
 
-Per-peer key-signature verification is **wired and unit-tested** at the peer-trust chokepoint
-(`ts_runtime`'s `peer_tracker`). When an `Authority` carrying a non-empty trusted-key state is
-supplied, the chokepoint fails **closed**: a peer with a bad signature is rejected, and a peer that
-presents no signature under an active lock is also rejected. Neither is upserted into the peer
-database.
+Per-peer key-signature verification is **wired, unit-tested, and actively enforcing** at the
+peer-trust chokepoint (`ts_runtime`'s `peer_tracker`), matching Go's `tkaFilterNetmapLocked`. Once a
+verified lock `Authority` has been synced from control, the chokepoint fails **closed**: a peer
+presenting a missing or unauthorized `key_signature` is **dropped** at the peer-db upsert path —
+neither is admitted into the peer database. With no lock synced, every peer is admitted (identical to
+Go's `b.tka == nil` early return / pre-TKA behavior); when the lock is disabled, enforcement clears
+and all peers are admitted again.
 
-However, **live enforcement is currently INERT.** No `Authority` is ever constructed at runtime,
-because the AUM-chain sync RPC family (`/machine/tka/sync/*`) that would fetch the trusted-key set
-from the control plane is **not yet implemented** in this fork. `MapResponse` only carries the AUM
-*head* hash and the per-peer signature to be verified — never the trusted keys to verify against —
-so the trusted-key `Authority` cannot be derived from data the client already receives.
+The authority only ever reaches the enforcement path **after** `VerifiedAumChain::verify` — a
+cryptographically verified AUM chain. Enforcement never engages on an unverified chain; the verified
+authority is delivered from the control runner to the peer tracker over an internal watch channel.
+**Self is structurally never filtered** — the self node never enters the peer database, so a node
+cannot lock itself out of its own netmap via this path.
 
-**Consequence:** until the AUM-sync RPC and chain replayer are built and an `Authority` is supplied,
-**do not rely on Tailnet Lock for control-plane-compromise protection.** A malicious or compromised
-control plane can inject peer node-keys and the client will accept them. The enforcement code is
-present and gated; it flips on the instant an `Authority` is supplied, with no further peer-trust
-changes. Tracked as deferred work in [`docs/PARITY_ROADMAP.md`](docs/PARITY_ROADMAP.md).
+**Threat model.** Control is trusted for the enable/disable *toggle* only. A malicious or compromised
+control plane can **disable** the lock (downgrade to admit-all), but it **cannot** forge a trusted
+key to admit a specific unauthorized peer: admission still requires a signature from a key in the
+cryptographically verified chain. Two caveats remain, tracked as deferred work in
+[`docs/PARITY_ROADMAP.md`](docs/PARITY_ROADMAP.md):
+
+- **Disablement-secret verification is deferred.** The cryptographic proof that a given disable is
+  authorized is not yet checked, so a disable is currently taken at face value.
+- **Known under-enforcement gaps versus Go** — both make us *more permissive* or are
+  connectivity-only; neither opens a new attack surface, but document them honestly:
+  - **No rotation-obsolete dropping.** Go's `rotationTracker` drops a peer whose key was rotated away
+    even if the old signature still validates (clone/replay defense); we currently admit such a key.
+    This is genuine *under*-enforcement (more permissive than Go) and is not structurally closeable
+    yet — it needs a `node_key_authorized_with_details` path plus a whole-netmap rotation pass.
+  - **No `UnsignedPeerAPIOnly` exemption.** Go admits such peers unsigned; we drop them (*more*
+    restrictive — a connectivity gap, the safe direction), which would only surface if the node model
+    ever ingests that field.
 
 ## peerAPI capability gap
 

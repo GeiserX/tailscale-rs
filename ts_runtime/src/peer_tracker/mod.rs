@@ -37,19 +37,26 @@ pub struct PeerTracker {
     /// earlier one.
     user_profiles: HashMap<UserId, UserProfile>,
     /// Tailnet-Lock (TKA) authority enforced at the peer-trust chokepoint, matching Go
-    /// `tkaFilterNetmapLocked`. When `Some` (a verified lock has been synced from control via
-    /// [`TkaAuthorityUpdate`]), enforcement is **active**: every upserted peer must present a
-    /// `key_signature` this authority authorizes, or it is dropped (fail-closed) — exactly as Go
-    /// drops peers with a missing or failing signature. When `None` (no lock, or the lock was
-    /// disabled) enforcement is **inactive** and every peer is upserted, identical to pre-TKA
-    /// behavior and to Go's `b.tka == nil` early return.
+    /// `tkaFilterNetmapLocked`. Read on demand from a [`watch`] cell the control runner owns: when it
+    /// holds `Some` (a verified lock has been synced from control), enforcement is **active** — every
+    /// upserted peer must present a `key_signature` this authority authorizes, or it is dropped
+    /// (fail-closed), exactly as Go drops peers with a missing or failing signature. When it holds
+    /// `None` (no lock, or the lock was disabled) enforcement is **inactive** and every peer is
+    /// upserted, identical to pre-TKA behavior and to Go's `b.tka == nil` early return.
     ///
-    /// The authority always passes through `VerifiedAumChain::verify` before it reaches this field,
-    /// so enforcement only engages on a chain we have cryptographically verified. Connectivity now
-    /// depends on `ts_tka` verifying genuinely-good signatures correctly (see SECURITY.md). Self is
-    /// structurally never filtered here (the self node never enters `peer_db` — it is routed to the
-    /// control runner's `self_node` cell), so a node cannot lock itself out of its own netmap.
-    tka_authority: Option<ts_tka::Authority>,
+    /// A `watch::Receiver` (not the bus) is the transport on purpose: the authority is a single
+    /// security-critical state cell, and `watch` is last-write-wins, never-dropped, and ordered by
+    /// the control runner's own writes — so a disable (`None`) can never be reordered behind or
+    /// silently dropped before a stale `Some` (which a best-effort broadcast bus could do, leaving a
+    /// defunct lock enforcing forever). The control runner is the sole writer; we only ever read.
+    ///
+    /// The authority always passes through `VerifiedAumChain::verify` before the control runner
+    /// publishes it, so enforcement only engages on a chain we have cryptographically verified.
+    /// Connectivity now depends on `ts_tka` verifying genuinely-good signatures correctly (see
+    /// SECURITY.md). Self is structurally never filtered here (the self node never enters `peer_db` —
+    /// it is routed to the control runner's `self_node` cell), so a node cannot lock itself out of
+    /// its own netmap.
+    tka_authority: watch::Receiver<Option<Arc<ts_tka::Authority>>>,
     env: Env,
 }
 
@@ -107,32 +114,59 @@ impl PeerTracker {
     /// Whether `node` may be admitted to the peer db under Tailnet Lock, matching Go
     /// `tkaFilterNetmapLocked`'s per-peer verdict (drop unsigned / failed-signature peers).
     ///
+    /// This consults the live [`tka_authority`](Self::tka_authority) cell on each call (one `borrow`,
+    /// held only for the duration of the verdict). For a `Full` resync — which checks every peer —
+    /// prefer [`tka_authority_snapshot`](Self::tka_authority_snapshot) +
+    /// [`tka_snapshot_admits`](Self::tka_snapshot_admits) to borrow once and verify each peer a single
+    /// time; this method is the convenience wrapper for the single-peer (`Delta`/patch) sites.
+    ///
     /// Fail-closed and gated:
-    /// - No [`tka_authority`](Self::tka_authority) ⇒ no lock synced ⇒ always admit (Go's
-    ///   `b.tka == nil` early return; identical to pre-TKA behavior).
-    /// - **Empty trusted-key state** ⇒ always admit. A valid genesis always carries ≥1 trusted key,
-    ///   so this never weakens a real lock; it is a brick-guard against a degenerate/empty authority
-    ///   (a replayer edge or future bug) enforcing an empty key set and dropping the *entire* netmap.
+    /// - No authority ⇒ no lock synced ⇒ always admit (Go's `b.tka == nil` early return; identical to
+    ///   pre-TKA behavior).
+    /// - **Empty trusted-key state** ⇒ always admit (logged at `error!` — see
+    ///   [`tka_snapshot_admits`](Self::tka_snapshot_admits) for the full rationale).
     /// - Authority present + peer carries a `key_signature` the authority authorizes for the peer's
-    ///   node key ⇒ admit (logged at debug).
+    ///   node key ⇒ admit.
     /// - Authority present + signature missing or unauthorized/invalid ⇒ **drop** (Go drops peers
     ///   with a missing signature or failed `NodeKeyAuthorized` under tailnet lock).
+    fn tka_admits(&self, node: &Node) -> bool {
+        Self::tka_snapshot_admits(self.tka_authority.borrow().as_deref(), node)
+    }
+
+    /// Borrow the current TKA authority once (cloning the cheap `Arc`) for a batch verdict. Returns
+    /// `None` when no lock is synced (admit-all). Used by the `Full` path so a netmap of N peers
+    /// reads the cell once and runs at most one signature verify per peer (not two).
+    fn tka_authority_snapshot(&self) -> Option<Arc<ts_tka::Authority>> {
+        self.tka_authority.borrow().clone()
+    }
+
+    /// The per-peer Tailnet-Lock verdict against an already-borrowed `authority` snapshot. Factored
+    /// out so both the single-peer [`tka_admits`](Self::tka_admits) and the `Full` batch path share
+    /// one verdict implementation (no divergence) while the batch path verifies each peer exactly
+    /// once.
     ///
     /// Never logs key/signature bytes — only the `stable_id` and the `TkaError` Display (static
     /// descriptors). Known parity gaps vs Go (both *under*-enforcement, documented in PARITY_ROADMAP):
     /// no `UnsignedPeerAPIOnly` exemption (our model lacks the field), and no cross-peer
-    /// rotation-obsolete dropping (a rotated-away but still-validly-signed key is admitted).
-    fn tka_admits(&self, node: &Node) -> bool {
-        let Some(auth) = &self.tka_authority else {
+    /// rotation-obsolete dropping (a rotated-away but still-validly-signed key is admitted — see the
+    /// roadmap; closing it needs a details-returning verify + a whole-netmap rotation pass).
+    fn tka_snapshot_admits(authority: Option<&ts_tka::Authority>, node: &Node) -> bool {
+        let Some(auth) = authority else {
             return true;
         };
 
-        // Brick-guard: an authority with no trusted keys would drop every peer. A real lock genesis
-        // always has ≥1 key, so this only fires on a degenerate/empty authority — admit rather than
-        // black-hole the whole netmap.
+        // Brick-guard: an authority with no trusted keys would drop every peer. A verified chain is
+        // structurally guaranteed ≥1 key (genesis rejects an empty key set, and the last key cannot
+        // be removed), so reaching here means a `ts_tka` invariant was violated — admit rather than
+        // black-hole the whole netmap, and log at `error!` because it signals a real bug, not an
+        // expected runtime input. This is OUR fail-safe, not a Go behavior. NOTE: it only catches the
+        // empty-keyset shape; a non-empty authority that authorizes none of the offered peers still
+        // (correctly) drops them — that is what a lock that revoked everyone means. The
+        // "authorized-zero-peers" isolation case is surfaced separately by the caller.
         if auth.state().keys.is_empty() {
-            tracing::warn!(
-                "TKA: authority has an empty trusted-key set; not enforcing (admitting)"
+            tracing::error!(
+                "TKA: authority has an empty trusted-key set (verified chains never do — likely a \
+                 ts_tka bug); not enforcing (admitting all) to avoid isolating the node"
             );
             return true;
         }
@@ -163,15 +197,19 @@ impl PeerTracker {
 }
 
 impl kameo::Actor for PeerTracker {
-    type Args = Env;
+    /// `(env, tka_authority)`: the bus/keys env, plus the read end of the control runner's TKA
+    /// enforcement-authority cell (Go `tkaFilterNetmapLocked`). The control runner is the sole
+    /// writer; it publishes the verified `Authority` after a successful `/machine/tka/sync` and
+    /// `None` when the lock is disabled. A `watch` cell (not a bus message) so the latest value is
+    /// always readable on demand, never dropped, and never reordered (see [`tka_authority`]).
+    type Args = (Env, watch::Receiver<Option<Arc<ts_tka::Authority>>>);
     type Error = Error;
 
-    async fn on_start(env: Self::Args, slf: ActorRef<Self>) -> Result<Self, Self::Error> {
+    async fn on_start(
+        (env, tka_authority): Self::Args,
+        slf: ActorRef<Self>,
+    ) -> Result<Self, Self::Error> {
         env.subscribe::<Arc<ts_control::StateUpdate>>(&slf).await?;
-        // TKA enforcement (Go `tkaFilterNetmapLocked`): the control runner publishes the verified
-        // `Authority` here after a successful `/machine/tka/sync` (and a `None` when the lock is
-        // disabled). The bus has no replay, so the control runner re-publishes on every sync.
-        env.subscribe::<TkaAuthorityUpdate>(&slf).await?;
 
         let (peer_watch, _) = watch::channel(Vec::new());
 
@@ -181,8 +219,9 @@ impl kameo::Actor for PeerTracker {
             seen_state_update: false,
             peer_watch,
             user_profiles: HashMap::new(),
-            // No lock synced yet ⇒ enforcement inactive (admit all), matching Go's `b.tka == nil`.
-            tka_authority: None,
+            // The cell starts `None` (no lock synced ⇒ enforcement inactive, admit all, matching
+            // Go's `b.tka == nil`); the control runner flips it to `Some` on the first sync.
+            tka_authority,
             env,
         })
     }
@@ -493,48 +532,6 @@ impl Message<Arc<ts_control::StateUpdate>> for PeerTracker {
     }
 }
 
-/// Bus message delivering the current verified Tailnet-Lock [`Authority`](ts_tka::Authority) from the
-/// control runner to the peer tracker, which **enforces** it (Go `tkaFilterNetmapLocked`).
-///
-/// `Some(authority)` after a successful `/machine/tka/sync` ⇒ enforcement engages (unsigned/failed
-/// peers are dropped at upsert). `None` when the lock is disabled (or control reports no lock) ⇒
-/// enforcement is cleared and all peers are admitted again. The control runner re-publishes on every
-/// successful sync since the bus has no replay for a late subscriber; the `None` is published when
-/// the lock transitions to disabled so a once-synced authority does not keep enforcing forever.
-#[derive(Clone)]
-pub struct TkaAuthorityUpdate(pub Option<Arc<ts_tka::Authority>>);
-
-impl Message<TkaAuthorityUpdate> for PeerTracker {
-    type Reply = ();
-
-    async fn handle(&mut self, msg: TkaAuthorityUpdate, _ctx: &mut Context<Self, Self::Reply>) {
-        self.apply_tka_authority_update(msg.0);
-    }
-}
-
-impl PeerTracker {
-    /// Apply a [`TkaAuthorityUpdate`]: `Some(auth)` engages enforcement (the verified lock authority
-    /// from control), `None` clears it (lock disabled). Factored off the `Context`-taking handler so
-    /// the store/clear logic is unit-testable without constructing a kameo `Context`.
-    fn apply_tka_authority_update(&mut self, auth: Option<Arc<ts_tka::Authority>>) {
-        match auth {
-            Some(auth) => {
-                tracing::info!(
-                    head = %auth.head().to_base32(),
-                    "TKA enforcement authority updated (lock active; dropping unauthorized peers)"
-                );
-                self.tka_authority = Some((*auth).clone());
-            }
-            None => {
-                if self.tka_authority.is_some() {
-                    tracing::info!("TKA lock disabled; clearing enforcement (admitting all peers)");
-                }
-                self.tka_authority = None;
-            }
-        }
-    }
-}
-
 /// Ask the peer tracker to re-broadcast its current peer snapshot on the bus, without any peer
 /// change. Sent after a runtime preference change so the route updater and source filter (both
 /// `Arc<PeerState>` subscribers) re-resolve against the new value immediately, rather than waiting
@@ -584,18 +581,35 @@ impl PeerTracker {
             ts_control::PeerUpdate::Full(new_nodes) => {
                 tracing::trace!("full peer update");
 
-                // Only stable_ids that PASS the Tailnet-Lock gate survive a full re-sync. This makes
-                // revocation evict: if a peer is re-included with a now-invalid (or missing)
-                // signature under an active authority, it is excluded from `retained_ids`, so
-                // `retain` drops the stale (previously-admitted) entry rather than leaving it in the
-                // db unverified. With no authority, `tka_admits` is always `true`, so `retained_ids`
-                // is exactly the set of re-included stable_ids — the inactive path is byte-for-byte
-                // the pre-TKA behavior (no regression).
+                // Borrow the authority ONCE for the whole batch and verify each peer a single time
+                // (Go runs `tkaFilterNetmapLocked` once over the assembled netmap; an earlier draft
+                // verified every peer twice — once for `retained_ids`, once in the upsert loop —
+                // doubling the ed25519 cost on the hot resync path). `retained_ids` is exactly the set
+                // of stable_ids that PASS the gate, so it drives BOTH the `retain` (evict revoked
+                // peers) and the upsert loop (skip rejected peers) with no second verify.
+                //
+                // Revocation evicts: a peer re-included with a now-invalid/missing signature under an
+                // active authority is excluded from `retained_ids`, so `retain` drops the stale
+                // (previously-admitted) entry. With no authority the snapshot is `None`, so every peer
+                // passes — byte-for-byte the pre-TKA behavior (no regression).
+                let authority = self.tka_authority_snapshot();
                 let retained_ids = new_nodes
                     .iter()
-                    .filter(|node| self.tka_admits(node))
+                    .filter(|node| Self::tka_snapshot_admits(authority.as_deref(), node))
                     .map(|x| &x.stable_id)
                     .collect::<HashSet<_>>();
+
+                // Isolation diagnostic: an ACTIVE lock that authorized none of the offered peers
+                // leaves this node with no peers — surface it loudly so a self-lockout (vs an attack)
+                // is diagnosable. `authority.is_some()` means a real keyed lock (the empty-keyset
+                // brick-guard admits-all, so it never reaches here with zero retained).
+                if authority.is_some() && !new_nodes.is_empty() && retained_ids.is_empty() {
+                    tracing::error!(
+                        offered = new_nodes.len(),
+                        "TKA: active lock authorized ZERO of the offered peers; node is isolated \
+                         (verify the lock state, or disable tailnet lock to recover)"
+                    );
+                }
 
                 self.peer_db.retain(|id, peer| {
                     let retain = retained_ids.contains(&peer.stable_id);
@@ -608,8 +622,8 @@ impl PeerTracker {
                 });
 
                 for node in new_nodes {
-                    if !self.tka_admits(node) {
-                        continue; // fail-CLOSED: do not upsert a peer rejected by tailnet lock
+                    if !retained_ids.contains(&node.stable_id) {
+                        continue; // fail-CLOSED: peer rejected by tailnet lock (verified once, above)
                     }
                     let peer_id = self.peer_db.upsert(node);
                     upserts.insert(peer_id);
@@ -621,7 +635,19 @@ impl PeerTracker {
 
                 for peer in upsert {
                     if !self.tka_admits(peer) {
-                        continue; // fail-CLOSED: do not upsert a peer rejected by tailnet lock
+                        // fail-CLOSED: do not upsert a peer rejected by tailnet lock. If the peer is
+                        // ALREADY in the db (a delta re-upserting an existing peer whose signature is
+                        // now invalid — e.g. revoked between syncs), evict the stale entry rather than
+                        // leaving an unverified peer admitted; Go re-filters the whole netmap each map
+                        // response, so a now-unsigned peer would not survive there either.
+                        if let Some((id, _)) = self.peer_db.remove(&peer.stable_id) {
+                            tracing::warn!(
+                                stable_id = ?peer.stable_id,
+                                "TKA: delta re-upsert rejected; evicting now-unauthorized peer"
+                            );
+                            deletions.insert(id);
+                        }
+                        continue;
                     }
                     let id = self.peer_db.upsert(peer);
 
@@ -780,21 +806,30 @@ impl PeerTracker {
         changed
     }
 
-    /// Test-only constructor: build a [`PeerTracker`] with a chosen TKA authority without going
-    /// through the actor `on_start` path. `Some` exercises the fail-closed enforcement chokepoint
-    /// ([`tka_admits`](Self::tka_admits)); `None` is the no-lock admit-all path.
+    /// Test-only constructor: build a [`PeerTracker`] with a chosen initial TKA authority without
+    /// going through the actor `on_start` path. Returns the tracker plus the **`watch::Sender`** for
+    /// its enforcement-authority cell, so a test can drive the exact enable/disable transitions the
+    /// control runner drives at runtime (`tx.send_replace(Some(..))` ⇒ enforce, `tx.send_replace(None)`
+    /// ⇒ clear). The initial `Some` exercises the fail-closed chokepoint
+    /// ([`tka_admits`](Self::tka_admits)); `None` is the no-lock admit-all path. The returned sender
+    /// must be kept alive for the tracker to read updated values.
     #[cfg(test)]
-    fn for_test(env: Env, tka_authority: Option<ts_tka::Authority>) -> Self {
+    fn for_test(
+        env: Env,
+        tka_authority: Option<ts_tka::Authority>,
+    ) -> (Self, watch::Sender<Option<Arc<ts_tka::Authority>>>) {
         let (peer_watch, _) = watch::channel(Vec::new());
-        Self {
+        let (tka_tx, tka_rx) = watch::channel(tka_authority.map(Arc::new));
+        let tracker = Self {
             peer_db: PeerDb::default(),
             seen_state_update: false,
             pending_requests: Vec::new(),
             peer_watch,
             user_profiles: HashMap::new(),
-            tka_authority,
+            tka_authority: tka_rx,
             env,
-        }
+        };
+        (tracker, tka_tx)
     }
 
     fn service_pending_requests(&mut self) {
@@ -982,7 +1017,7 @@ mod tka_tests {
     #[tokio::test]
     async fn tka_inactive_upserts_all_peers() {
         // No authority ⇒ enforcement inactive ⇒ both a signed and an unsigned peer are admitted.
-        let mut tracker = PeerTracker::for_test(test_env(), None);
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
 
         let signed = peer_node("signed", [1u8; 32], vec![0xde, 0xad, 0xbe, 0xef]);
         let unsigned = peer_node("unsigned", [2u8; 32], vec![]);
@@ -999,7 +1034,7 @@ mod tka_tests {
     async fn tka_active_rejects_unsigned_peer() {
         // Authority present + peer presents no signature ⇒ rejected (fail-closed), not in peer_db.
         let (authority, _sig) = authority_and_valid_sig();
-        let mut tracker = PeerTracker::for_test(test_env(), Some(authority));
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), Some(authority));
 
         let unsigned = peer_node("unsigned", NODE_KEY_BYTES, vec![]);
         assert!(!tracker.tka_admits(&unsigned));
@@ -1020,7 +1055,7 @@ mod tka_tests {
         let last = sig.len() - 1;
         sig[last] ^= 0xff;
 
-        let mut tracker = PeerTracker::for_test(test_env(), Some(authority));
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), Some(authority));
         let bad = peer_node("bad", NODE_KEY_BYTES, sig);
         assert!(!tracker.tka_admits(&bad));
 
@@ -1034,7 +1069,7 @@ mod tka_tests {
     async fn tka_active_admits_authorized_peer() {
         // Authority present + correctly-signed node key ⇒ admitted and upserted.
         let (authority, sig) = authority_and_valid_sig();
-        let mut tracker = PeerTracker::for_test(test_env(), Some(authority));
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), Some(authority));
 
         let good = peer_node("good", NODE_KEY_BYTES, sig);
         assert!(tracker.tka_admits(&good));
@@ -1058,7 +1093,7 @@ mod tka_tests {
         // Drive a real `Delta { upsert }` whose peer carries no signature. The Delta upsert site
         // must reject it under an active authority ⇒ not present in peer_db after the handler runs.
         let (authority, _sig) = authority_and_valid_sig();
-        let mut tracker = PeerTracker::for_test(test_env(), Some(authority));
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), Some(authority));
 
         let unsigned = peer_node("unsigned", NODE_KEY_BYTES, vec![]);
         let update = ts_control::PeerUpdate::Delta {
@@ -1076,7 +1111,7 @@ mod tka_tests {
     async fn tka_active_delta_upsert_admits_authorized() {
         // Drive a real `Delta { upsert }` with a correctly-signed peer ⇒ present in peer_db.
         let (authority, sig) = authority_and_valid_sig();
-        let mut tracker = PeerTracker::for_test(test_env(), Some(authority));
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), Some(authority));
 
         let good = peer_node("good", NODE_KEY_BYTES, sig);
         let update = ts_control::PeerUpdate::Delta {
@@ -1101,7 +1136,7 @@ mod tka_tests {
         let last = bad_sig.len() - 1;
         bad_sig[last] ^= 0xff;
 
-        let mut tracker = PeerTracker::for_test(test_env(), Some(authority));
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), Some(authority));
 
         // Only the authorized peer carries NODE_KEY_BYTES (the key the authority signed); the
         // rejected peers use distinct node keys so the survivor is unambiguous.
@@ -1120,19 +1155,20 @@ mod tka_tests {
         assert!(tracker.peer_db.get(&bad.node_key).is_none());
     }
 
-    /// End-to-end through the REAL `TkaAuthorityUpdate` bus handler (not `for_test`): delivering a
-    /// `Some(authority)` flips enforcement on so a mixed batch drops the unsigned/bad peers, and a
-    /// subsequent `None` (lock disabled) clears enforcement so they are admitted again. This is the
-    /// path no `for_test`-based test exercises — a wrong handler wiring (storing nowhere, or never
-    /// clearing) would pass every other test but fail here.
+    /// End-to-end through the REAL enforcement-authority transport (the `watch` cell the control
+    /// runner writes), not a direct field poke: writing `Some(authority)` flips enforcement on so a
+    /// mixed batch drops the unsigned/bad peers, and a subsequent `None` (lock disabled) clears
+    /// enforcement so a peer DROPPED while enforced is re-admitted. Exercises the exact `borrow`-based
+    /// read path `tka_admits` uses — a broken receiver wiring would pass every for_test-field test but
+    /// fail here.
     #[tokio::test]
-    async fn tka_authority_bus_update_enables_then_clears_enforcement() {
+    async fn tka_authority_watch_enables_then_clears_enforcement() {
         let (authority, sig) = authority_and_valid_sig();
         let mut bad_sig = sig.clone();
         let last = bad_sig.len() - 1;
         bad_sig[last] ^= 0xff;
 
-        let mut tracker = PeerTracker::for_test(test_env(), None);
+        let (mut tracker, tka_tx) = PeerTracker::for_test(test_env(), None);
 
         // 1) No authority yet ⇒ admit-all (Go b.tka == nil).
         let good = peer_node("good", NODE_KEY_BYTES, sig.clone());
@@ -1142,9 +1178,9 @@ mod tka_tests {
         tracker.apply_peer_update(&batch);
         assert_eq!(tracker.peer_db.peers().len(), 3, "no lock ⇒ admit all");
 
-        // 2) Deliver the verified authority (the exact value the bus handler stores) ⇒ enforcement
-        //    ON. A re-applied Full batch now drops the unsigned + bad peers (Go tkaFilterNetmapLocked).
-        tracker.apply_tka_authority_update(Some(Arc::new(authority)));
+        // 2) Publish the verified authority over the watch cell (exactly what the control runner does
+        //    on a successful sync) ⇒ enforcement ON. A re-applied Full now drops unsigned + bad.
+        tka_tx.send_replace(Some(Arc::new(authority)));
         tracker.apply_peer_update(&batch);
         assert_eq!(
             tracker.peer_db.peers().len(),
@@ -1155,30 +1191,132 @@ mod tka_tests {
         assert!(tracker.peer_db.get(&unsigned.node_key).is_none());
         assert!(tracker.peer_db.get(&bad.node_key).is_none());
 
-        // 3) Lock disabled (None) ⇒ enforcement cleared ⇒ the mixed batch is admitted in full again.
-        tracker.apply_tka_authority_update(None);
+        // 3) Lock disabled (None) ⇒ enforcement cleared ⇒ a peer that was DROPPED while enforced is
+        //    re-admitted by a fresh netmap. Assert the specific previously-dropped key returns (not
+        //    merely a count), so this proves the drop→clear→re-admit transition, not "admit-all-fresh".
+        tka_tx.send_replace(None);
         tracker.apply_peer_update(&batch);
         assert_eq!(
             tracker.peer_db.peers().len(),
             3,
             "lock disabled ⇒ admit all again"
         );
+        assert!(
+            tracker.peer_db.get(&unsigned.node_key).is_some(),
+            "the peer dropped under enforcement must come back once the lock is cleared"
+        );
+        assert!(tracker.peer_db.get(&bad.node_key).is_some());
     }
 
     /// The empty-trusted-key-state brick-guard: an authority with no keys must NOT drop the whole
-    /// netmap (a degenerate/replayer edge). A real lock always has ≥1 key, so this never weakens a
-    /// genuine lock — it only prevents a black-hole.
+    /// netmap (a `ts_tka` invariant violation / replayer edge). A verified chain always carries ≥1
+    /// key, so this never weakens a genuine lock — it only prevents a black-hole. Uses ≥2 peers
+    /// (one signed, one unsigned) to prove it admits **all**, not accidentally just one.
     #[tokio::test]
     async fn tka_empty_keyset_authority_admits_all() {
         use ts_tka::{AumHash, Authority, State};
         let empty_auth = Authority::from_state(AumHash([0u8; 32]), State { keys: Vec::new() });
-        let mut tracker = PeerTracker::for_test(test_env(), Some(empty_auth));
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), Some(empty_auth));
+        let signed = peer_node("signed", [7u8; 32], vec![0xde, 0xad]);
         let unsigned = peer_node("unsigned", [8u8; 32], vec![]);
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![unsigned.clone()]));
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![
+            signed.clone(),
+            unsigned.clone(),
+        ]));
         assert_eq!(
             tracker.peer_db.peers().len(),
-            1,
-            "an empty-keyset authority must not enforce (brick-guard)"
+            2,
+            "an empty-keyset authority must admit ALL peers (brick-guard), not enforce"
+        );
+    }
+
+    /// Signature-replay / `NodeKeyMismatch`: a structurally-valid signature that authorizes
+    /// `NODE_KEY_BYTES` must NOT admit a DIFFERENT node key carrying that same signature blob. This is
+    /// the highest-value bypass — if the sig↔node-key binding in `verify_signature` were dropped, this
+    /// is the only test that would catch it (the other "bad" peers only flip a byte ⇒ `BadSignature`).
+    #[tokio::test]
+    async fn tka_active_rejects_valid_sig_for_wrong_node_key() {
+        let (authority, sig) = authority_and_valid_sig();
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), Some(authority));
+
+        // The signature authorizes NODE_KEY_BYTES; attach it to an imposter with a different key.
+        let imposter = peer_node("imposter", [0x55u8; 32], sig);
+        assert!(
+            !tracker.tka_admits(&imposter),
+            "a signature bound to one node key must not authorize a different node key"
+        );
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![imposter.clone()]));
+        assert!(tracker.peer_db.get(&imposter.node_key).is_none());
+    }
+
+    /// `UntrustedKey`: a signature produced by a well-formed Ed25519 key that is NOT in the
+    /// authority's trusted-key state must be rejected — distinct from a tampered-byte `BadSignature`.
+    #[tokio::test]
+    async fn tka_active_rejects_sig_from_untrusted_key() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let (authority, _sig) = authority_and_valid_sig();
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), Some(authority));
+
+        // Sign a valid CBOR with a DIFFERENT key (not the one the authority trusts). The key_id in
+        // the signature names this untrusted key, so `get_key` misses ⇒ UntrustedKey.
+        let rogue = SigningKey::from_bytes(&[99u8; 32]);
+        let rogue_pub = rogue.verifying_key().to_bytes().to_vec();
+        let preimage = direct_sig_cbor(&NODE_KEY_BYTES, &rogue_pub, None);
+        let sig_hash = ts_tka::aum_hash(&preimage).0;
+        let signature = rogue.sign(&sig_hash).to_bytes().to_vec();
+        let rogue_cbor = direct_sig_cbor(&NODE_KEY_BYTES, &rogue_pub, Some(&signature));
+
+        let peer = peer_node("rogue-signed", NODE_KEY_BYTES, rogue_cbor);
+        assert!(
+            !tracker.tka_admits(&peer),
+            "a signature from a key outside the trusted set must be rejected"
+        );
+    }
+
+    /// Bus-enable analogue for `Delta`: enforcement engaged via the watch cell must also gate a
+    /// `Delta { upsert }` (not only `Full`). Closes the "authority arrived over the transport AND the
+    /// next update is a Delta" combination.
+    #[tokio::test]
+    async fn tka_watch_enable_enforces_delta_upsert() {
+        let (authority, sig) = authority_and_valid_sig();
+        let (mut tracker, tka_tx) = PeerTracker::for_test(test_env(), None);
+        tka_tx.send_replace(Some(Arc::new(authority)));
+
+        let good = peer_node("good", NODE_KEY_BYTES, sig);
+        let unsigned = peer_node("unsigned", [8u8; 32], vec![]);
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Delta {
+            remove: vec![],
+            upsert: vec![good.clone(), unsigned.clone()],
+        });
+        assert!(tracker.peer_db.get(&good.node_key).is_some());
+        assert!(
+            tracker.peer_db.get(&unsigned.node_key).is_none(),
+            "delta upsert under an active lock must drop the unsigned peer"
+        );
+    }
+
+    /// A `Delta` re-upsert of an ALREADY-ADMITTED peer whose signature is now invalid must EVICT the
+    /// stale entry (revocation-via-delta), not leave it admitted. Go re-filters the whole netmap each
+    /// response, so a now-unsigned peer would not survive there either.
+    #[tokio::test]
+    async fn tka_delta_reupsert_with_invalid_sig_evicts_existing() {
+        let (authority, sig) = authority_and_valid_sig();
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), Some(authority));
+
+        // Admit the signed peer.
+        let good = peer_node("good", NODE_KEY_BYTES, sig.clone());
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![good.clone()]));
+        assert!(tracker.peer_db.get(&good.node_key).is_some());
+
+        // Re-upsert the SAME stable_id (now with no signature) via a delta ⇒ evicted, not retained.
+        let revoked = peer_node("good", NODE_KEY_BYTES, vec![]);
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Delta {
+            remove: vec![],
+            upsert: vec![revoked],
+        });
+        assert!(
+            tracker.peer_db.get(&good.node_key).is_none(),
+            "a delta re-upsert that fails the lock must evict the previously-admitted peer"
         );
     }
 
@@ -1194,7 +1332,7 @@ mod tka_tests {
         // provably unchanged — `tka_admits` always returns `true` there, so the retained set equals
         // the set of re-included stable_ids exactly (see `tka_inactive_full_resync_keeps_*`).
         let (authority, sig) = authority_and_valid_sig();
-        let mut tracker = PeerTracker::for_test(test_env(), Some(authority));
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), Some(authority));
 
         // 1) Admit the peer with a valid signature via a real `Full`.
         let good = peer_node("revoked", NODE_KEY_BYTES, sig.clone());
@@ -1220,7 +1358,7 @@ mod tka_tests {
         // a peer re-included in a `Full` survives regardless of its signature bytes — byte-for-byte
         // pre-TKA behavior, proving the `Full` `retain` change does not regress the always-taken
         // branch this wave.
-        let mut tracker = PeerTracker::for_test(test_env(), None);
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
 
         let peer = peer_node("p", NODE_KEY_BYTES, vec![0xde, 0xad]);
         tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer.clone()]));
@@ -1239,7 +1377,7 @@ mod tka_tests {
     /// never re-handshake after it moves.
     #[tokio::test]
     async fn patch_merges_endpoints_and_derp_into_existing_peer() {
-        let mut tracker = PeerTracker::for_test(test_env(), None);
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
 
         // Seed a peer (id == 1, per `peer_node`) with no endpoints / no DERP.
         let peer = peer_node("mover", [1u8; 32], vec![]);
@@ -1285,7 +1423,7 @@ mod tka_tests {
     /// in by the delta kept stale (empty) reachability.
     #[tokio::test]
     async fn patch_applies_on_top_of_co_occurring_delta() {
-        let mut tracker = PeerTracker::for_test(test_env(), None);
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
 
         // The whole-node delta upserts a brand-new peer (id == 1) with no reachability.
         let peer = peer_node("mover", [1u8; 32], vec![]);
@@ -1333,7 +1471,7 @@ mod tka_tests {
     /// never creates a node). No upsert, no deletion, peer set unchanged.
     #[tokio::test]
     async fn patch_for_unknown_node_is_ignored() {
-        let mut tracker = PeerTracker::for_test(test_env(), None);
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
         let known = peer_node("known", [1u8; 32], vec![]); // id == 1
         tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![known]));
 
@@ -1362,7 +1500,7 @@ mod tka_tests {
     /// `PeerChange.KeyExpiry`), rather than being silently dropped until the next full resync.
     #[tokio::test]
     async fn patch_updates_node_key_expiry() {
-        let mut tracker = PeerTracker::for_test(test_env(), None);
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
         let peer = peer_node("expiring", [1u8; 32], vec![]); // id == 1, node_key_expiry: None
         tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer]));
 
@@ -1391,7 +1529,7 @@ mod tka_tests {
     /// Channel B: a `PeerChange.online` patch flips a peer's online state without a full node.
     #[tokio::test]
     async fn patch_updates_online() {
-        let mut tracker = PeerTracker::for_test(test_env(), None);
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
         let peer = peer_node("p", [1u8; 32], vec![]); // id == 1, online: None
         tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer]));
         assert_eq!(
@@ -1448,7 +1586,7 @@ mod tka_tests {
     /// ignore unknown ids.
     #[tokio::test]
     async fn liveness_change_maps_apply_online() {
-        let mut tracker = PeerTracker::for_test(test_env(), None);
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
         let peer = peer_node("p", [1u8; 32], vec![]); // id == 1
         tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer]));
 
@@ -1500,7 +1638,7 @@ mod tka_tests {
     #[tokio::test]
     async fn patch_key_rotation_failing_tka_evicts_peer() {
         let (authority, sig) = authority_and_valid_sig();
-        let mut tracker = PeerTracker::for_test(test_env(), Some(authority));
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), Some(authority));
 
         // Admit a correctly-signed peer (id == 1).
         let good = peer_node("rotator", NODE_KEY_BYTES, sig.clone());
@@ -1542,7 +1680,7 @@ mod tka_tests {
 
     #[tokio::test]
     async fn whois_resolves_user_from_accumulated_profiles() {
-        let mut tracker = PeerTracker::for_test(test_env(), None);
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
 
         // A peer owned by user id 42 at 100.64.0.1 (the peer_node fixture's address).
         let mut peer = peer_node("p", NODE_KEY_BYTES, Vec::new());

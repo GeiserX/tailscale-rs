@@ -23,11 +23,14 @@ The consumer-facing tsnet gaps the embedders actually hit are now closed and liv
 - **`russh` 0.61.2 security bump** (GHSA-wwx6-x28x-8259), ssh-feature-only; ring-only invariant
   preserved. v0.6.5.
 
-Still open (tracked): **live Tailnet-Lock (TKA) enforcement** — verification is wired but the
-AUM-sync RPC + chain replayer aren't, so enforcement stays inert. The next step is **verify-and-log**
-(observe-only), not fail-closed enforcement, because the current both-ends-owned deployments treat
-control as trusted and the `ts_tka` crypto is unaudited — fail-closed on unaudited verification would
-risk a self-inflicted outage guarding an out-of-model threat. See issue #7.
+Recently landed (tracked): **live Tailnet-Lock (TKA) enforcement** — per-peer key-signature
+verification is now **active and fail-closed** at the peer-trust chokepoint, matching Go's
+`tkaFilterNetmapLocked`. Once a verified `Authority` has been synced from control (over the internal
+watch channel, only after `VerifiedAumChain::verify`), peers with a missing or unauthorized signature
+are dropped; with no lock synced every peer is admitted, and a disabled lock clears enforcement. The
+remaining TKA parity items are narrower: disablement-secret verification, the two known
+under-enforcement gaps (rotation-obsolete dropping, `UnsignedPeerAPIOnly`), and surfacing a
+self-locked-out health warning — see the deferred list below and issue #7.
 
 ## Where we are (v0.8.1 — near-complete tsnet parity)
 
@@ -70,24 +73,37 @@ Most recent wave:
   non-tailnet names recursively (previously inert in TUN mode), reusing the forwarder netstack's
   overlay-backed `Channel` and the same `decide`/`recursive_plan` path as netstack mode, so the
   IPv4-only egress filter and fail-closed NXDOMAIN default are inherited.
-- **Tailnet Lock peer-key enforcement (partial)** — per-peer node-key signature verification is
-  threaded through the domain `Node` and wired at the `ts_runtime` peer-trust chokepoint, gated
-  behind an optional `ts_tka::Authority` and unit-tested. With no `Authority` (always, today)
-  behavior is unchanged; when one is supplied the chokepoint fails closed on bad/missing signatures.
-  Live `Authority` construction is **deferred** — see the deferred list below and
+- **Tailnet Lock peer-key enforcement (active)** — per-peer node-key signature verification is
+  threaded through the domain `Node` and **enforcing** at the `ts_runtime` peer-trust chokepoint,
+  matching Go's `tkaFilterNetmapLocked`. A verified `ts_tka::Authority` is delivered from the control
+  runner over an internal watch channel — only after `VerifiedAumChain::verify` — and the chokepoint
+  then fails closed on missing/unauthorized signatures (self is structurally never filtered). With no
+  lock synced, behavior is unchanged (admit-all); a disabled lock clears enforcement. The narrower
+  remaining items (disablement-secret verification, the rotation-obsolete and `UnsignedPeerAPIOnly`
+  under-enforcement gaps, self-locked-out health warning) are in the deferred list below and
   [SECURITY.md](../SECURITY.md).
 
 ### Deferred (in-scope eventually, not blocked externally — with reasons)
-- **AUM-sync RPC + live TKA `Authority`** — the `/machine/tka/sync/*` Noise RPC family plus the
-  AUM-chain replayer that folds `AddKey`/`RemoveKey`/`UpdateKey`/`Checkpoint` into a trusted-key
-  `State`. `MapResponse` carries only the AUM head hash and the per-peer signature, never the
-  trusted keys, so the `Authority` cannot be derived from data the client already receives. Until
-  this lands, the wired TKA enforcement is inert (see [SECURITY.md](../SECURITY.md)).
+- **TKA disablement-secret verification** — the cryptographic proof that a given lock *disable* is
+  authorized is not yet checked, so a disable is currently taken at face value. Control is already
+  trusted for the enable/disable toggle (it cannot forge-admit a peer either way — admission still
+  requires a key in the verified chain), so this is a hardening item, not an open admit-all hole (see
+  [SECURITY.md](../SECURITY.md)).
+- **Rotation-obsolete peer dropping** — Go's `rotationTracker` drops a peer whose key was rotated
+  away even when the old signature still validates (clone/replay defense); we currently admit such a
+  key. This is genuine *under*-enforcement (more permissive than Go) and is not structurally
+  closeable yet — it needs a `node_key_authorized_with_details` path plus a whole-netmap rotation
+  pass.
+- **Self-locked-out health warning** — Go surfaces a health warning when the node's own key is not
+  authorized under an active lock. Self is structurally never filtered here (the self node never
+  enters the peer db), so there is no lockout risk, but the advisory warning is not yet surfaced.
 - **`ts_tka` CTAP2-CBOR cross-validation against Go test vectors** — byte-for-byte wire
   compatibility is asserted by construction, not proven; a *successful* TKA verification should be
   treated as advisory until vectors land.
 - **`UnsignedPeerAPIOnly`** — the peerAPI-only network-access carve-out for unsigned peers under
-  tailnet lock; today an active lock rejects unsigned peers outright.
+  tailnet lock; Go admits such peers unsigned, whereas an active lock here rejects unsigned peers
+  outright (*more* restrictive — a connectivity gap in the safe direction, surfacing only if the node
+  model ever ingests that field).
 - **DERP mesh / private DERP server** — running our own DERP relay mesh (consuming public relays as
   a fallback path is implemented).
 - **TKA signing** — initiating/mutating tailnet-lock state (only client-side *verification* is in
@@ -150,10 +166,12 @@ sense, while keeping the anti-leak/egress posture (see `AGENTS.md`).
 - **Netstack sharding** (was Tier-3 #9; bead `tsr-4pp`) — the one fully-unbuilt numbered item. One
   shared smoltcp poll loop serves all flows; shard per ~50–100 sessions. smoltcp has no SACK/auto-tune,
   so **benchmark over a real exit before committing the dataplane** (deliberately gated, not neglected).
-- **Live Tailnet-Lock (TKA) enforcement** (part of old #20; issue #7) — the `ts_tka::Authority` exists
-  but is wired inert (`peer_tracker tka_authority: None` in prod). Needs the `/machine/tka/sync/*`
-  AUM-sync RPC + chain replayer. Next step is **verify-and-log**, not fail-closed (the `ts_tka` crypto
-  is unaudited and current deployments trust control — see "Invariants").
+- **Tailnet-Lock (TKA) enforcement hardening** (part of old #20; issue #7) — core enforcement now
+  **ships active and fail-closed**, matching Go's `tkaFilterNetmapLocked`: a verified `Authority`
+  reaches the `peer_tracker` over an internal watch channel (only after `VerifiedAumChain::verify`)
+  and drops peers with a missing/unauthorized signature. What remains is narrower: disablement-secret
+  verification, rotation-obsolete dropping, the `UnsignedPeerAPIOnly` carve-out, and a self-locked-out
+  health warning (see the deferred list and "Invariants").
 - **Own/private DERP server** (part of old #20) — `ts_derp` is client + mesh-frame types only (no
   server accept loop). Consuming public relays as fallback already works; running our own mesh is the
   open piece. Low priority for the egress use case.
@@ -194,7 +212,8 @@ Tier 5 — ~~IPv6 on the tailnet (flag-gated)~~ (`Config::enable_ipv6`), ~~full 
 - ~~Clarify `fallback_resolvers`~~ — **done.** The README states fail-closed NXDOMAIN is the
   *default* and that configuring a resolver opts in to forwarding query names upstream.
 - Security posture is now documented in full in [SECURITY.md](../SECURITY.md) (unaudited crypto, the
-  inert TKA enforcement, peerAPI capability gap, at-rest key handling, anti-leak posture).
+  active TKA enforcement and its remaining gaps, peerAPI capability gap, at-rest key handling,
+  anti-leak posture).
 
 ## Invariants that must never regress
 - Real origin IP must never leak; no silent direct-dial fallback (fail-closed is sacred).

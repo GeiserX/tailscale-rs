@@ -41,14 +41,24 @@ pub struct ControlRunner {
     /// triggers resync. Mutated only on the actor thread (the netmap handler spawns the sync RPC and
     /// the result returns via the [`TkaSynced`] self-message).
     tka_synced: Option<crate::tka_sync::SyncedTka>,
-    /// Published copy of the synced TKA [`Authority`](ts_tka::Authority) for the verify-and-log
-    /// consumer. `None` until the first successful sync. Observe-only: a reader uses it to *log*
-    /// whether a peer's node-key signature verifies, never to drop a peer (enforcement is a separate
-    /// gated decision).
+    /// The verified TKA [`Authority`](ts_tka::Authority) the peer tracker **enforces** (Go
+    /// `tkaFilterNetmapLocked`). `None` until the first successful sync, and reset to `None` when the
+    /// lock is disabled. This is the SOLE delivery channel to the peer tracker (which holds the
+    /// matching `Receiver` and reads it on every peer upsert): a `watch` cell, not a bus message, so
+    /// the latest value is always readable, never dropped under load, and writes are strictly ordered
+    /// by this actor — a disable (`None`) can never be reordered behind or dropped before a stale
+    /// `Some`. Written only from [`apply_tka_synced`] (enable) and [`maybe_sync_tka`] (disable), both
+    /// on the actor thread. The published `Authority` has always passed `VerifiedAumChain::verify`.
     tka_authority: watch::Sender<Option<Arc<ts_tka::Authority>>>,
     /// In-flight guard: `true` while a sync RPC task is running, so a burst of netmap updates does
     /// not spawn overlapping syncs (Go serializes sync under `b.mu`).
     tka_syncing: bool,
+    /// Monotonic generation stamped when a disable (or a fresh sync) supersedes any in-flight sync.
+    /// `maybe_sync_tka` bumps this on a disable transition and captures it into each spawned sync;
+    /// [`apply_tka_synced`] discards a sync result whose captured generation is stale, so a lock
+    /// disabled *while a sync was in flight* is never re-enabled by that sync's late `Ok(Some)`
+    /// (the in-flight window the `tka_synced.is_some()` disable guard alone does not cover).
+    tka_generation: u64,
     /// Latest cert-domain list from control's netmap DNS config (Go `nm.DNS.CertDomains`), or empty
     /// until control sends a DNS config carrying one. The facade reads this for `Device::cert_domains`.
     cert_domains: watch::Sender<Vec<String>>,
@@ -105,6 +115,13 @@ pub struct Params {
     /// return `Err`, before `Self` exists). The runtime keeps the matching `Receiver` for
     /// [`watch_state`](crate::Runtime::watch_state) / [`wait_until_running`](crate::Runtime::wait_until_running).
     pub(crate) state_tx: watch::Sender<crate::DeviceState>,
+
+    /// Sender for the TKA enforcement-authority cell the peer tracker reads (Go
+    /// `tkaFilterNetmapLocked`). Created in [`Runtime::spawn`](crate::Runtime) and threaded into BOTH
+    /// the peer tracker (the `Receiver`) and this runner (the `Sender`), so the runner is the sole
+    /// writer and the tracker reads the latest verified `Authority` on demand. `None` = no lock /
+    /// disabled (admit all).
+    pub(crate) tka_authority: watch::Sender<Option<Arc<ts_tka::Authority>>>,
 }
 
 #[doc(hidden)]
@@ -221,6 +238,11 @@ impl kameo::Actor for ControlRunner {
             })
         };
 
+        // Clone the TKA authority publisher before `params` moves into `Self` below. The matching
+        // `Receiver` lives on the peer tracker; this sender is the sole writer (enforce on sync,
+        // clear on disable).
+        let tka_authority = params.tka_authority.clone();
+
         Ok(Self {
             client,
             params,
@@ -228,8 +250,9 @@ impl kameo::Actor for ControlRunner {
             ssh_policy: Default::default(),
             tka: Default::default(),
             tka_synced: None,
-            tka_authority: Default::default(),
+            tka_authority,
             tka_syncing: false,
+            tka_generation: 0,
             cert_domains: Default::default(),
             dns_config: Default::default(),
             pop_browser_url: Default::default(),
@@ -250,23 +273,20 @@ impl ControlRunner {
     /// `tkaSyncIfNeeded`: a no-op when our head already matches.
     fn maybe_sync_tka(&mut self, tka: &TkaStatus, self_ref: ActorRef<Self>) {
         if !tka.is_enabled() {
-            // Lock disabled (or never enabled): drop any synced state and clear enforcement. Only
-            // act on a real transition (we had synced state) — and crucially publish a `None` on the
-            // bus so the peer tracker stops enforcing a now-defunct authority (else a once-synced
-            // lock would keep dropping unsigned peers forever). Never an error; peers are unaffected.
+            // Lock disabled (or never enabled): clear enforcement by writing `None` to the authority
+            // cell the peer tracker reads — synchronously, so it can never be reordered behind or
+            // dropped before a stale `Some` (the failure a best-effort broadcast had). Always bump the
+            // generation so ANY sync currently in flight is invalidated: without this, a disable that
+            // races an in-flight sync (whose `take()` already cleared `tka_synced`) would be a no-op
+            // here, and the sync's late `Ok(Some)` would silently re-enable a lock control just turned
+            // off (the in-flight window the `tka_synced.is_some()` guard alone misses). Cheap and
+            // idempotent: clearing an already-`None` cell and bumping the generation are harmless.
+            self.tka_generation = self.tka_generation.wrapping_add(1);
             if self.tka_synced.is_some() {
+                tracing::info!("TKA lock disabled; clearing enforcement (admitting all peers)");
                 self.tka_synced = None;
-                self.tka_authority.send_replace(None);
-                let env = self.params.env.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = env
-                        .publish(crate::peer_tracker::TkaAuthorityUpdate(None))
-                        .await
-                    {
-                        tracing::warn!(error = %e, "publishing TKA disable (clear enforcement) failed");
-                    }
-                });
             }
+            self.tka_authority.send_replace(None);
             return;
         }
         if self.tka_syncing {
@@ -284,8 +304,11 @@ impl ControlRunner {
 
         // Spawn the sync. Move the current synced state out (the driver takes it by value and returns
         // the advanced state); `tka_synced` stays `None` until the result lands, guarded by
-        // `tka_syncing` so we don't spawn a second concurrent sync.
+        // `tka_syncing` so we don't spawn a second concurrent sync. Capture the current generation so
+        // `apply_tka_synced` can discard this result if a disable bumped the generation while the sync
+        // was in flight (H1: don't re-enable a lock that was disabled mid-sync).
         self.tka_syncing = true;
+        let generation = self.tka_generation;
         let current = self.tka_synced.take();
         let config = self.params.config.clone();
         let keys = self.params.env.keys.clone();
@@ -293,51 +316,65 @@ impl ControlRunner {
             let result = crate::tka_sync::sync_tka(&config, &keys, current).await;
             // Hand the outcome back to the actor thread to apply (mutating actor state off-thread is
             // not allowed). A send failure just means the actor is gone — nothing to do.
-            if let Err(e) = self_ref.tell(TkaSynced { result }).await {
+            if let Err(e) = self_ref.tell(TkaSynced { result, generation }).await {
                 tracing::debug!(error = ?e, "TKA sync result not delivered (actor gone)");
             }
         });
     }
 
     /// Apply the outcome of a spawned [`maybe_sync_tka`] task on the actor thread: store the advanced
-    /// state + publish the `Authority` (or, on inert/failed sync, leave peers unaffected). Always
-    /// clears the in-flight guard.
+    /// state + publish the `Authority` to the peer tracker's enforcement cell (or, on inert/failed
+    /// sync, leave peers unaffected). Always clears the in-flight guard.
+    ///
+    /// `generation` is the value captured when the sync was spawned. If it no longer matches
+    /// `self.tka_generation`, the lock was disabled (or re-synced) while this sync was in flight, so
+    /// the result is discarded — never re-enabling an authority control has since turned off.
     async fn apply_tka_synced(
         &mut self,
         result: Result<Option<crate::tka_sync::SyncedTka>, crate::tka_sync::TkaSyncDriverError>,
+        generation: u64,
     ) {
         self.tka_syncing = false;
+
+        // H1 guard: a disable (or a superseding sync) bumped the generation while this sync ran. Drop
+        // the stale result — `maybe_sync_tka`'s disable branch already cleared enforcement to `None`,
+        // and re-applying this `Some` would re-enforce a lock that is no longer active.
+        if generation != self.tka_generation {
+            tracing::info!(
+                "TKA sync result superseded (lock disabled or re-synced mid-flight); discarding"
+            );
+            return;
+        }
+
         match result {
             Ok(Some(synced)) => {
                 tracing::info!(
                     head = %synced.authority.head().to_base32(),
-                    "TKA sync succeeded; publishing verified Authority (enforcing)"
+                    "TKA sync succeeded; enforcing verified Authority (Go tkaFilterNetmapLocked)"
                 );
+                // Deliver the verified Authority to the peer tracker's enforcement cell. The tracker
+                // reads it on every peer upsert and drops unauthorized peers. `Some(..)` = enforce; a
+                // `None` is written on disable. `watch` is the sole channel (last-write-wins, never
+                // dropped, ordered by this actor) — no bus, no re-publish-for-replay needed.
                 self.tka_authority
                     .send_replace(Some(synced.authority.clone()));
-                // Deliver the verified Authority to the peer tracker, which ENFORCES it (Go
-                // tkaFilterNetmapLocked — drops unauthorized peers). Re-published on every successful
-                // sync (no bus replay). `Some(..)` = enforce; a `None` is published on disable.
-                if let Err(e) = self
-                    .params
-                    .env
-                    .publish(crate::peer_tracker::TkaAuthorityUpdate(Some(
-                        synced.authority.clone(),
-                    )))
-                    .await
-                {
-                    tracing::warn!(error = %e, "publishing TKA authority to peer tracker failed");
-                }
                 self.tka_synced = Some(synced);
             }
             Ok(None) => {
-                // Control has no lock for us (no genesis / disabled): stay inert. Not an error.
-                tracing::debug!("TKA sync: control reported no lock for this node (inert)");
+                // Control has no lock for us (no genesis / disabled). Clear any authority we were
+                // previously enforcing — symmetric with the disable path — so a transition to
+                // "no lock" stops dropping peers. Not an error.
+                if self.tka_synced.is_some() {
+                    tracing::info!("TKA sync: control reports no lock; clearing enforcement");
+                    self.tka_synced = None;
+                }
+                self.tka_authority.send_replace(None);
             }
             Err(e) => {
-                // Transport or verify failure: log and stay inert. NEVER errors the netmap or drops a
-                // peer. The next netmap update re-triggers a sync attempt.
-                tracing::warn!(error = %e, "TKA sync failed; staying inert (no peer impact)");
+                // Transport or verify failure: log and leave the prior authority in place (a failed
+                // sync must not drop enforcement — that would fail OPEN). NEVER errors the netmap.
+                // The next netmap update re-triggers a sync attempt.
+                tracing::warn!(error = %e, "TKA sync failed; keeping prior enforcement state");
             }
         }
     }
@@ -1105,13 +1142,16 @@ impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
 pub struct TkaSynced {
     pub(crate) result:
         Result<Option<crate::tka_sync::SyncedTka>, crate::tka_sync::TkaSyncDriverError>,
+    /// The [`ControlRunner::tka_generation`] captured when this sync was spawned; the handler
+    /// discards the result if it no longer matches (the lock was disabled/re-synced mid-flight).
+    pub(crate) generation: u64,
 }
 
 impl Message<TkaSynced> for ControlRunner {
     type Reply = ();
 
     async fn handle(&mut self, msg: TkaSynced, _ctx: &mut Context<Self, Self::Reply>) {
-        self.apply_tka_synced(msg.result).await;
+        self.apply_tka_synced(msg.result, msg.generation).await;
     }
 }
 

@@ -470,8 +470,17 @@ pub struct Authority {
 }
 
 impl Authority {
-    /// Construct an authority directly from a known `head` and trusted-key `state` (e.g. a
-    /// control-provided checkpoint the client already trusts).
+    /// Construct an authority directly from a known `head` and trusted-key `state`.
+    ///
+    /// # This is NOT a trust boundary
+    /// `from_state` performs **no** signature or chain verification — it stores whatever `State`
+    /// (trusted-key set) it is handed. It is safe only for state whose authenticity is already
+    /// established by other means: test fixtures, or a checkpoint the caller has itself verified.
+    /// For any state derived from an untrusted source (the control plane / `/machine/tka/*` sync
+    /// RPC) use [`VerifiedAumChain::verify`] + [`Authority::from_verified_chain`], which the type
+    /// system makes impossible to bypass. (A caller that fed attacker-controlled `State` here could
+    /// trust forged keys and silently defeat tailnet lock — the exact threat TKA exists to stop.)
+    #[doc(hidden)]
     pub fn from_state(head: AumHash, state: State) -> Authority {
         Authority { head, state }
     }
