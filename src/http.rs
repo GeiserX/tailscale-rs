@@ -149,9 +149,10 @@ impl Service<Uri> for TailnetConnector {
         let dialer = self.dialer.clone();
         Box::pin(async move {
             let (host, port) = host_port(&uri)?;
-            dialer.dial_host_port(&host, port).await.map(|stream| {
-                TailnetStream(TokioIo::new(stream))
-            })
+            dialer
+                .dial_host_port(&host, port)
+                .await
+                .map(|stream| TailnetStream(TokioIo::new(stream)))
         })
     }
 }
@@ -226,7 +227,10 @@ mod tests {
     fn host_port_rejects_wss_even_with_explicit_port() {
         // wss with an explicit port must NOT bypass scheme validation into a plaintext dial.
         let err = host_port(&"wss://peer:443/".parse().unwrap()).unwrap_err();
-        assert!(matches!(err, Error::Internal(InternalErrorKind::BadRequest)));
+        assert!(matches!(
+            err,
+            Error::Internal(InternalErrorKind::BadRequest)
+        ));
     }
 
     #[test]
