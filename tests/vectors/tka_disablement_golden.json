@@ -1,0 +1,22 @@
+[
+  {
+    "desc": "all-0xA5 (the tka-package test-helper secret)",
+    "secret_hex": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+    "value_hex": "c3fea8a0d70ede2555990ca60d70a8a03cbe627d2c9f3cb0e2ba7093d0884e2f"
+  },
+  {
+    "desc": "all-zero 32B secret",
+    "secret_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+    "value_hex": "f56df7e85d257a51c0aa17d2600502182359a1224b892ff4667002a7bc71aa56"
+  },
+  {
+    "desc": "all-0xFF 32B secret",
+    "secret_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "value_hex": "fe74d82e0971202e69143984381f1834f0f3364e61e239a7d935c218e321811f"
+  },
+  {
+    "desc": "short secret (5 bytes, KDF accepts any length)",
+    "secret_hex": "68656c6c6f",
+    "value_hex": "61d3beb9f247d9bc31a677599a919e67332af3cced412722256d6f1cf2adbf8d"
+  }
+]

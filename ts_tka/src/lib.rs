@@ -66,14 +66,55 @@ const MAX_DISABLEMENT_VALUES: usize = 32;
 /// t=4, m=16*1024 KiB, p=4, len=32)` (`tka/state.go`; `x/crypto` `argon2.Key` is Argon2**i**, not
 /// Argon2id). BLAKE2s-256 is the digest for AUM `Hash`/`SigHash` (the [`AumHash`] type), a separate
 /// concern — both happen to be 32 bytes. This crate currently only length-validates the stored
-/// values as opaque 32-byte blobs (Go validates the same way); a future `disablement_value(secret)`
-/// helper for `tka_init` MUST use Argon2i (RustCrypto's `argon2` defaults to Argon2id — the
-/// `Algorithm::Argon2i` override is mandatory, or the lock can never be disabled).
+/// values as opaque 32-byte blobs (Go validates the same way). [`disablement_value`] derives one
+/// with Argon2i (RustCrypto's `argon2` defaults to Argon2id — the `Algorithm::Argon2i` override is
+/// mandatory, or a lock created with the wrong digest can never be disabled).
 const DISABLEMENT_LENGTH: usize = 32;
 /// Max total bytes of a key's metadata map, summed over keys+values (Go `maxMetaBytes`).
 const MAX_META_BYTES: usize = 512;
 /// Max key voting weight (Go `Key.StaticValidate`: `Votes > 4096` is "excessive key weight").
 const MAX_KEY_VOTES: u32 = 4096;
+
+/// The exact domain-separation salt Go `tka.DisablementKDF` feeds Argon2 (`tka/state.go`,
+/// `disablementSalt`). 40 ASCII bytes; passed as the Argon2 *salt* argument (NOT prepended to the
+/// secret). Byte-for-byte load-bearing — a different salt yields a different digest.
+const DISABLEMENT_SALT: &[u8] = b"tailscale network-lock disablement salt";
+
+/// Derive the public **disablement value** stored in a TKA genesis from a disablement `secret`, the
+/// exact analog of Go `tka.DisablementKDF` (`tka/state.go`, v1.100.0):
+///
+/// ```text
+/// DisablementKDF(secret) = argon2.Key(secret, "tailscale network-lock disablement salt",
+///                                     time=4, memory=16*1024 KiB, threads=4, keyLen=32)
+/// ```
+///
+/// Go's `x/crypto` `argon2.Key` is **Argon2i** (its `IDKey` is Argon2id) — the two variants produce
+/// different digests, so byte-parity REQUIRES Argon2i. The value is irreversible: it goes into a
+/// checkpoint's `DisablementValues`, and presenting the matching `secret` to
+/// `Authority::ValidDisablement` (Go `State.checkDisablement` does a constant-time compare of
+/// `DisablementKDF(secret)` against each stored value) disables the lock.
+///
+/// Pinned byte-for-byte against Go via `disablement_value_matches_go_golden` (the
+/// `tka_disablement_golden.json` vectors emitted by `tests/vectors/gen/tka` from the real
+/// `tailscale.com/tka.DisablementKDF`).
+///
+/// # Panics
+/// Does not panic for any input: the cost parameters are compile-time-valid and Argon2i accepts a
+/// secret of any length (Go feeds 32-byte secrets; the KDF itself imposes no length bound).
+pub fn disablement_value(secret: &[u8]) -> [u8; DISABLEMENT_LENGTH] {
+    use argon2::{Algorithm, Argon2, Params, Version};
+    // Go argon2.Key(..., 4, 16*1024, 4, 32): time=4, memory=16384 KiB, parallelism=4, out=32.
+    // RustCrypto Params::new is (m_cost_kib, t_cost, p_cost, output_len).
+    let params = Params::new(16 * 1024, 4, 4, Some(DISABLEMENT_LENGTH))
+        .expect("static Argon2 params are valid");
+    // Argon2i (NOT the RustCrypto Argon2id default), version 0x13 (Argon2 v1.3, matching x/crypto).
+    let argon2 = Argon2::new(Algorithm::Argon2i, Version::V0x13, params);
+    let mut out = [0u8; DISABLEMENT_LENGTH];
+    argon2
+        .hash_password_into(secret, DISABLEMENT_SALT, &mut out)
+        .expect("Argon2i derivation into a 32-byte buffer cannot fail with static valid params");
+    out
+}
 
 /// A BLAKE2s-256 hash of an AUM's canonical serialization. Identifies an AUM and links the chain
 /// (`PrevAUMHash`). Text form is RFC4648 standard base32, no padding (Go `AUMHash.MarshalText`).
@@ -786,6 +827,54 @@ impl Aum {
     /// `AUM.SigHash`).
     pub fn sig_hash(&self) -> [u8; AUM_HASH_LEN] {
         blake2s_256(&self.to_cbor(/* include_signatures = */ false).to_vec())
+    }
+
+    /// Build a **genesis `Checkpoint` AUM** establishing a new tailnet lock with the given trusted
+    /// `keys` and `disablement_values` — the AUM a node signs and submits as the `GenesisAUM` of
+    /// `/machine/tka/init/begin` (Go `tka.UpdateBuilder`'s checkpoint that `NetworkLockInit` seeds).
+    ///
+    /// The result is a `Checkpoint` with **no parent** (`prev_aum_hash: None`, the genesis), an
+    /// [`AumState`] carrying the keys + disablement values and a **nil** `last_aum_hash` (a checkpoint
+    /// roots a state; Go requires `State.LastAUMHash == nil` for a genesis checkpoint), and the
+    /// per-kind-forbidden fields (`key`/`key_id`/`votes`/`meta`) left empty. `state_id` is left 0 (Go
+    /// seeds random StateIDs for a *fresh* authority, but they are not consensus-load-bearing for the
+    /// genesis a node proposes — control assigns the authoritative chain; a 0 StateID encodes as the
+    /// omitted CBOR field, the same as any unset checkpoint StateID).
+    ///
+    /// `disablement_values` must each be a [`disablement_value`] output (a 32-byte Argon2i digest);
+    /// the caller derives them from the operator's disablement secret(s). The returned AUM is **not**
+    /// signed — the caller signs it with [`Aum::sign`] using the network-lock key (which must be one
+    /// of `keys` for the genesis to self-certify under [`VerifiedAumChain::verify`]).
+    ///
+    /// # Errors
+    /// [`Aum::static_validate`]'s checkpoint rules: ≥1 trusted key (each valid: `Key25519`, votes
+    /// 1..=4096), ≥1 disablement value each exactly 32 bytes (no dups, ≤ max), and the checkpoint
+    /// field allow-list. Returns the structural error rather than producing an AUM control would
+    /// reject.
+    pub fn new_genesis_checkpoint(
+        keys: Vec<AumKey>,
+        disablement_values: Vec<Vec<u8>>,
+    ) -> Result<Aum, TkaError> {
+        let aum = Aum {
+            message_kind: AumKind::Checkpoint,
+            prev_aum_hash: None,
+            key: None,
+            key_id: Vec::new(),
+            state: Some(AumState {
+                last_aum_hash: None,
+                disablement_values: Some(disablement_values),
+                keys: Some(keys),
+                state_id1: 0,
+                state_id2: 0,
+            }),
+            votes: None,
+            meta: Vec::new(),
+            signatures: Vec::new(),
+        };
+        // Validate the genesis structure up front (Go's builder StaticValidates before signing) so a
+        // caller can't sign + submit a checkpoint control would reject.
+        aum.static_validate()?;
+        Ok(aum)
     }
 
     /// Sign this AUM with a network-lock private key, appending the signature to [`Aum::signatures`]
@@ -4380,6 +4469,115 @@ mod tests {
     /// interop bug (Rust forced an empty array `0x80` where Go emits CBOR null `0xf6`) and is now
     /// FIXED by making `AumState.{disablement_values,keys}` `Option` (None = Go nil = `0xf6`).
     ///
+    /// [`disablement_value`] (Go `tka.DisablementKDF`, Argon2i) byte-for-byte vs the authoritative Go
+    /// goldens emitted from the real `tailscale.com/tka.DisablementKDF` (v1.100.0). The same values are
+    /// committed for provenance at `tests/vectors/tka_disablement_golden.json`. A divergence means a
+    /// lock this node creates via `tka_init` could never be disabled (the operator's secret would
+    /// hash to a value not in the stored `DisablementValues`) — so this is the load-bearing parity
+    /// guard for the disablement KDF. Notably proves we use Argon2**i** (RustCrypto defaults to
+    /// Argon2id, which would produce entirely different digests).
+    #[test]
+    fn disablement_value_matches_go_golden() {
+        let check = |label: &str, secret: &[u8], want_hex: &str| {
+            assert_eq!(
+                hex(&disablement_value(secret)),
+                want_hex,
+                "{label}: disablement_value diverged from Go tka.DisablementKDF v1.100.0"
+            );
+        };
+        // Goldens straight from `tka.DisablementKDF` (tests/vectors/gen/tka → tka_disablement_golden.json).
+        check(
+            "all-0xA5 (tka test-helper secret)",
+            &[0xA5u8; 32],
+            "c3fea8a0d70ede2555990ca60d70a8a03cbe627d2c9f3cb0e2ba7093d0884e2f",
+        );
+        check(
+            "all-zero 32B",
+            &[0u8; 32],
+            "f56df7e85d257a51c0aa17d2600502182359a1224b892ff4667002a7bc71aa56",
+        );
+        check(
+            "all-0xFF 32B",
+            &[0xFFu8; 32],
+            "fe74d82e0971202e69143984381f1834f0f3364e61e239a7d935c218e321811f",
+        );
+        // Short secret — the KDF accepts any length (Go feeds 32B but imposes no bound).
+        check(
+            "short secret \"hello\"",
+            b"hello",
+            "61d3beb9f247d9bc31a677599a919e67332af3cced412722256d6f1cf2adbf8d",
+        );
+        // The derived value is exactly DISABLEMENT_LENGTH (32) bytes — the checkpoint validator's
+        // per-value length requirement is satisfied by construction.
+        assert_eq!(disablement_value(b"x").len(), DISABLEMENT_LENGTH);
+    }
+
+    /// [`Aum::new_genesis_checkpoint`] builds a valid genesis Checkpoint that, signed by a key it
+    /// contains (the "lock yourself in" case `tka_init` uses), self-certifies through the trust
+    /// boundary [`VerifiedAumChain::verify`] — and folds to an authority trusting that key. Also
+    /// pins the structural guards: empty keys / a wrong-length disablement value are rejected by the
+    /// builder (it static_validates before returning), and a genesis signed by a key it does NOT
+    /// contain is UntrustedKey.
+    #[test]
+    fn genesis_checkpoint_builds_signs_and_self_certifies() {
+        use ed25519_dalek::SigningKey;
+
+        let sk = SigningKey::from_bytes(&[1u8; 32]);
+        let pubk = sk.verifying_key().to_bytes().to_vec();
+        let key = AumKey {
+            kind: KeyKind::Ed25519,
+            votes: 1,
+            public: pubk.clone(),
+            meta: Vec::new(),
+        };
+        let dval = disablement_value(b"the-operator-disablement-secret").to_vec();
+
+        // Build + self-sign the genesis with the key it establishes.
+        let mut genesis =
+            Aum::new_genesis_checkpoint(alloc::vec![key.clone()], alloc::vec![dval.clone()])
+                .expect("a 1-key, 1-disablement-value checkpoint is valid");
+        assert_eq!(genesis.message_kind, AumKind::Checkpoint);
+        assert!(genesis.prev_aum_hash.is_none(), "genesis has no parent");
+        genesis.sign(&sk);
+
+        // Self-certifies through the trust boundary (genesis Checkpoint is verified against the keys
+        // it embeds), folding to an authority that trusts the key.
+        let chain = VerifiedAumChain::verify(&[genesis.clone()])
+            .expect("a genesis checkpoint self-signed by an embedded key must verify");
+        let auth = Authority::from_verified_chain(chain);
+        assert_eq!(auth.head(), genesis.hash());
+        assert!(auth.key_trusted(&pubk), "the seeded key is trusted");
+
+        // A genesis signed by a key it does NOT establish is untrusted.
+        let other = SigningKey::from_bytes(&[2u8; 32]);
+        let mut wrong = Aum::new_genesis_checkpoint(alloc::vec![key], alloc::vec![dval]).unwrap();
+        wrong.sign(&other);
+        assert_eq!(
+            VerifiedAumChain::verify(&[wrong]).unwrap_err(),
+            TkaError::UntrustedKey
+        );
+
+        // Builder rejects structurally-invalid genesis up front (static_validate).
+        assert!(
+            Aum::new_genesis_checkpoint(Vec::new(), alloc::vec![disablement_value(b"s").to_vec()])
+                .is_err(),
+            "a checkpoint with no trusted keys is rejected"
+        );
+        assert!(
+            Aum::new_genesis_checkpoint(
+                alloc::vec![AumKey {
+                    kind: KeyKind::Ed25519,
+                    votes: 1,
+                    public: alloc::vec![9u8; 32],
+                    meta: Vec::new(),
+                }],
+                alloc::vec![alloc::vec![0u8; 31]] // 31 bytes ≠ DISABLEMENT_LENGTH
+            )
+            .is_err(),
+            "a wrong-length disablement value is rejected"
+        );
+    }
+
     /// When an `AUMCheckpoint`'s embedded `State` has a **nil** `DisablementValues` (Go's zero value,
     /// the overwhelmingly common case), Go's `fxamacker/cbor` CTAP2 encoder emits the field as
     /// **CBOR null `0xf6`**; a populated slice encodes as an array (proven by the populated case in
