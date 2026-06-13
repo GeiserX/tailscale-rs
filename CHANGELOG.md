@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.34.2](https://github.com/GeiserX/tailscale-rs/compare/v0.34.1...v0.34.2) (2026-06-13)
+
+
+### Bug Fixes
+
+* **taildrop:** verify full length before finalize; bound and truncate resume ([#182](https://github.com/GeiserX/tailscale-rs/issues/182)) ([440bb57](https://github.com/GeiserX/tailscale-rs/commit/440bb57f9d8c820aea20e2592055487f67b244df))
+
 ## [0.34.1](https://github.com/GeiserX/tailscale-rs/compare/v0.34.0...v0.34.1) (2026-06-13)
 
 
