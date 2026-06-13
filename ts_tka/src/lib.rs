@@ -264,6 +264,41 @@ impl NodeKeySignature {
         ])
     }
 
+    /// Build a **`Direct`** [`NodeKeySignature`] that authorizes `node_key`, signed by the trusted
+    /// network-lock key `signing_key` (Go `tka.signNodeKey` for the direct case / `NLPrivate.SignNKS`
+    /// over a `NodeKeySignature{SigKind: SigKindDirect}`).
+    ///
+    /// The signature is over [`NodeKeySignature::sig_hash`] (the CBOR with the `Signature` field
+    /// nil'd), and `key_id` is recorded as the signer's 32-byte ed25519 public key verbatim (Go's
+    /// `Key25519`/`NLKey` id *is* its public key). The signature is plain RFC 8032 ed25519
+    /// (`ed25519.Sign`); a `Direct` leaf is verified cofactored under ZIP-215 (`ed25519consensus` /
+    /// our [`verify_ed25519_zip215`]), which accepts a standard dalek signature — the same valid
+    /// sign-dalek / verify-zip215 relationship [`Authority::node_key_authorized`]'s tests rely on.
+    /// Takes a raw [`ed25519_dalek::SigningKey`] so this crate stays free of a key-wrapper dependency;
+    /// the caller holds the `NetworkLockPrivateKey` and passes its inner signing key.
+    ///
+    /// The resulting signature authorizes exactly `node_key`: [`Authority::node_key_authorized`]
+    /// accepts it for that node key (when the signer is trusted) and rejects it for any other
+    /// ([`TkaError::NodeKeyMismatch`]). `nested`/`wrapping_pubkey` are empty — those are for
+    /// [`SigKind::Rotation`], not a direct signature.
+    pub fn sign_direct(
+        node_key: &[u8],
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> NodeKeySignature {
+        use ed25519_dalek::Signer;
+        let mut sig = NodeKeySignature {
+            sig_kind: SigKind::Direct,
+            pubkey: node_key.to_vec(),
+            key_id: signing_key.verifying_key().to_bytes().to_vec(),
+            signature: Vec::new(),
+            nested: None,
+            wrapping_pubkey: Vec::new(),
+        };
+        let sig_hash = sig.sig_hash();
+        sig.signature = signing_key.sign(&sig_hash).to_bytes().to_vec();
+        sig
+    }
+
     /// The key id that ultimately roots this signature in a trusted key (Go `authorizingKeyID`):
     /// for a rotation, recurse into the nested signature; otherwise this signature's `key_id`.
     fn authorizing_key_id(&self) -> Result<&[u8], TkaError> {
@@ -2441,6 +2476,74 @@ mod tests {
         assert_eq!(
             auth.node_key_authorized(&other, &cbor).unwrap_err(),
             TkaError::NodeKeyMismatch
+        );
+    }
+
+    /// Round-trips the public [`NodeKeySignature::sign_direct`] through our own verify path
+    /// ([`Authority::node_key_authorized`]): a Direct signature produced by the signer is accepted for
+    /// the node key it authorizes, rejected for any other (`NodeKeyMismatch`), and rejected when the
+    /// signer is not a trusted key (`UntrustedKey`). This is the production-signer ↔ production-verifier
+    /// drift pin for node-key signatures — the counterpart of `direct_signature_verifies_end_to_end`,
+    /// which builds the signature by hand; here the signer builds it.
+    #[test]
+    fn sign_direct_round_trips_through_node_key_authorized() {
+        use ed25519_dalek::SigningKey;
+
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let trusted_pub = signing.verifying_key().to_bytes().to_vec();
+        let node_key = alloc::vec![7u8; 32];
+
+        let auth = Authority::from_state(
+            AumHash([0; 32]),
+            State {
+                keys: alloc::vec![Key {
+                    kind: KeyKind::Ed25519,
+                    votes: 1,
+                    public: trusted_pub.clone(),
+                }],
+            },
+        );
+
+        // The signer builds the whole signature (Direct kind, pubkey = node_key, key_id = signer pub).
+        let sig = NodeKeySignature::sign_direct(&node_key, &signing);
+        assert_eq!(sig.sig_kind, SigKind::Direct);
+        assert_eq!(sig.pubkey, node_key, "authorizes the given node key");
+        assert_eq!(
+            sig.key_id, trusted_pub,
+            "key_id is the signer's pubkey verbatim"
+        );
+        assert_eq!(sig.signature.len(), 64, "ed25519 signature is 64 bytes");
+        assert!(
+            sig.nested.is_none() && sig.wrapping_pubkey.is_empty(),
+            "no rotation fields"
+        );
+
+        let cbor = sig.to_cbor(true).to_vec();
+        // Accepted for the node key it authorizes (dalek signature verified cofactored under ZIP-215).
+        assert!(auth.node_key_authorized(&node_key, &cbor).is_ok());
+        // Rejected for a different node key.
+        assert_eq!(
+            auth.node_key_authorized(&alloc::vec![8u8; 32], &cbor)
+                .unwrap_err(),
+            TkaError::NodeKeyMismatch
+        );
+
+        // Signed by a key the authority does not trust → UntrustedKey.
+        let untrusted = SigningKey::from_bytes(&[99u8; 32]);
+        let untrusted_sig = NodeKeySignature::sign_direct(&node_key, &untrusted);
+        assert_eq!(
+            auth.node_key_authorized(&node_key, &untrusted_sig.to_cbor(true).to_vec())
+                .unwrap_err(),
+            TkaError::UntrustedKey
+        );
+
+        // Fail-closed: flip a signature byte → BadSignature.
+        let mut tampered = NodeKeySignature::sign_direct(&node_key, &signing);
+        tampered.signature[0] ^= 0x01;
+        assert_eq!(
+            auth.node_key_authorized(&node_key, &tampered.to_cbor(true).to_vec())
+                .unwrap_err(),
+            TkaError::BadSignature
         );
     }
 
