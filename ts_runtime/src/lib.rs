@@ -310,13 +310,30 @@ impl Runtime {
             exit_node: config.advertise_exit_node,
         });
 
-        let control = ControlRunner::spawn(control_runner::Params {
-            config,
-            auth_key,
-            env: env.clone(),
-            state_tx,
-            tka_authority: tka_authority_tx,
-        });
+        // Unbounded mailbox (not the default bounded-64): the control runner SELF-messages — a
+        // spawned TKA sync task delivers its result back via `self_ref.tell(TkaSynced)`, and the
+        // netmap stream pump tells `StreamMessage::Next` onto the same mailbox. The stall path: the
+        // netmap handler ends by parking on `env.publish().await` into the bounded-64 *bus* (a slow
+        // bus subscriber, e.g. a busy TKA-enforcing peer tracker, holds the bus full); while it is
+        // parked, a concurrently-finishing sync task's `TkaSynced` self-tell queues behind a full
+        // *ControlRunner* mailbox and blocks waiting for capacity, delaying the verified-authority
+        // (or lock-disable) write to the enforcement cell — i.e. stale TKA enforcement under churn.
+        // kameo gates its self-tell deadlock warning on `is_current()`, which is false for the
+        // detached sync task, so the stall is silent. An unbounded mailbox lets the self-tell and the
+        // stream pump enqueue without ever awaiting capacity (kameo's documented choice for a
+        // self-messaging actor); the runner's inputs are control-paced (the netmap stream + a few RPC
+        // replies; the bus delivers best-effort and never backpressures this mailbox), not an attacker
+        // flood, so unbounded growth is not a practical exposure.
+        let control = ControlRunner::spawn_with_mailbox(
+            control_runner::Params {
+                config,
+                auth_key,
+                env: env.clone(),
+                state_tx,
+                tka_authority: tka_authority_tx,
+            },
+            kameo::mailbox::unbounded(),
+        );
 
         Ok(Self {
             control,
