@@ -113,7 +113,21 @@ jobs:
           # cross-container build-script GLIBC mismatch (see the note on `musl_static`).
           cache-key: hosted-test
       - name: Install clippy + rustfmt
-        run: rustup component add clippy rustfmt
+        # Pin the component add to the EXACT toolchain `cargo fmt`/`cargo clippy` will resolve (the
+        # repo's `rust-toolchain.toml` channel), not rustup's ambient default. The persistent
+        # self-hosted runner restores a `components=none` toolchain from the setup-rust cache (its
+        # cache key carries `components=none` for this lane), so on a cache hit setup-rust SKIPS the
+        # component install and a bare `rustup component add` against the default toolchain left
+        # `cargo fmt` reporting "the 'cargo-fmt' binary ... is not applicable to the '<ver>'
+        # toolchain". `--force` re-fetches a component that a partial cache recorded as present but
+        # whose binary is missing; the verify line then fails the job loudly rather than letting a
+        # broken-rustfmt runner silently red the lane.
+        run: |
+          ver="$(rustup show active-toolchain | awk '{print $1}')"
+          echo "active toolchain: ${ver}"
+          rustup component add --toolchain "${ver}" --force clippy rustfmt
+          cargo +"${ver}" fmt --version
+          cargo +"${ver}" clippy --version
       - name: Check formatting (cargo fmt)
         run: cargo fmt --all -- --check
       - name: Lint lib targets (cargo clippy)
