@@ -249,6 +249,80 @@ pub struct NodeKeySignature {
     pub wrapping_pubkey: Vec<u8>,
 }
 
+/// Details extracted from a successfully-verified [`SigKind::Rotation`] signature chain, mirroring
+/// Go `tka.RotationDetails`. Returned by
+/// [`Authority::node_key_authorized_with_details`](Authority::node_key_authorized_with_details) and
+/// consumed by a netmap-wide rotation filter (Go's `rotationTracker`) to drop peers still presenting
+/// a node key that a newer rotation has superseded — the clone/replay defense.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RotationDetails {
+    /// The prior node keys this rotation chain has rotated away from, in outer→inner order (Go
+    /// `RotationDetails.PrevNodeKeys`). Any peer still presenting one of these is obsolete.
+    pub prev_node_keys: Vec<Vec<u8>>,
+    /// The [`SigKind`] of the innermost (initial) signature in the chain (Go
+    /// `RotationDetails.InitialSig.SigKind`). Only `Direct`-rooted chains enforce clone-uniqueness;
+    /// `Credential`-rooted chains may legitimately share a wrapping key (e.g. several nodes joining
+    /// via one reusable auth key), so the rotation filter exempts them from the uniqueness rule.
+    pub initial_sig_kind: SigKind,
+    /// The wrapping public key carried *directly* on the innermost signature (Go reads
+    /// `RotationDetails.InitialSig.WrappingPubkey` as a plain field — NOT the recursive
+    /// [`wrapping_public`](NodeKeySignature::wrapping_public) resolver). Empty if the initial
+    /// signature carries none. Used as the grouping key for the clone-uniqueness rule.
+    pub initial_wrapping_pubkey: Vec<u8>,
+}
+
+impl NodeKeySignature {
+    /// Extract [`RotationDetails`] from this signature, mirroring Go `NodeKeySignature.rotationDetails`.
+    ///
+    /// Returns `Ok(None)` for any non-[`SigKind::Rotation`] signature. For a rotation, walks the
+    /// nested chain collecting each nested signature's `pubkey` into `prev_node_keys` (appended
+    /// *before* the per-level kind check, matching Go) until the innermost non-rotation signature,
+    /// whose `sig_kind` and (plain) `wrapping_pubkey` field become `initial_sig_kind` /
+    /// `initial_wrapping_pubkey`.
+    ///
+    /// Fallible to match Go `rotationDetails`, which `UnmarshalBinary`s each nested pubkey into a
+    /// `key.NodePublic` and returns an error on a malformed one (which then drops the peer). A
+    /// `NodePublic` is a fixed 32-byte key, so a nested `pubkey` of any other non-empty length is
+    /// rejected here as [`TkaError::Decode`] — fail-closed, so a crafted nested layer with a
+    /// bad-length pubkey (e.g. an unconstrained nested-credential `pubkey` the verify path does not
+    /// bind) cannot be silently admitted. Verification has already succeeded by the time this runs;
+    /// on a normally-signed chain every nested pubkey is a verified 32-byte node key, so this never
+    /// fires.
+    fn rotation_details(&self) -> Result<Option<RotationDetails>, TkaError> {
+        if self.sig_kind != SigKind::Rotation {
+            return Ok(None);
+        }
+        let mut prev_node_keys = Vec::new();
+        // `initial` tracks the innermost signature seen so far (the loop-exit value of `nested` in
+        // Go); for a verified rotation the nested chain is always present.
+        let mut initial: Option<&NodeKeySignature> = None;
+        let mut nested = self.nested.as_deref();
+        while let Some(n) = nested {
+            initial = Some(n);
+            if !n.pubkey.is_empty() {
+                // A node public key is exactly 32 bytes; Go's `nestedPub.UnmarshalBinary` rejects any
+                // other length. Mirror that (fail-closed) rather than collecting raw bytes.
+                if n.pubkey.len() != 32 {
+                    return Err(TkaError::Decode("nested rotation pubkey wrong length"));
+                }
+                prev_node_keys.push(n.pubkey.clone());
+            }
+            if n.sig_kind != SigKind::Rotation {
+                break;
+            }
+            nested = n.nested.as_deref();
+        }
+        let Some(initial) = initial else {
+            return Ok(None);
+        };
+        Ok(Some(RotationDetails {
+            prev_node_keys,
+            initial_sig_kind: initial.sig_kind,
+            initial_wrapping_pubkey: initial.wrapping_pubkey.clone(),
+        }))
+    }
+}
+
 /// Errors from TKA verification.
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum TkaError {
@@ -532,6 +606,32 @@ impl Authority {
         node_key: &[u8],
         signature_cbor: &[u8],
     ) -> Result<(), TkaError> {
+        // Go `Authority.NodeKeyAuthorized` is `NodeKeyAuthorizedWithDetails` with the details
+        // discarded; keep a single verify path so the two can never diverge.
+        self.node_key_authorized_with_details(node_key, signature_cbor)
+            .map(|_details| ())
+    }
+
+    /// As [`node_key_authorized`](Authority::node_key_authorized), but on success also returns the
+    /// [`RotationDetails`] of the signature — `Some` iff it is a [`SigKind::Rotation`] chain, `None`
+    /// otherwise. Mirrors Go `Authority.NodeKeyAuthorizedWithDetails`.
+    ///
+    /// The verification performed is byte-identical to [`node_key_authorized`](Authority::node_key_authorized)
+    /// (same decode → credential-reject → trusted-key lookup → signature check); the details are a
+    /// pure post-success walk of the already-decoded nested chain, never an extra cryptographic
+    /// operation. A netmap-wide rotation filter feeds these details to drop peers presenting a
+    /// rotated-away node key.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`node_key_authorized`](Authority::node_key_authorized): [`TkaError::Decode`],
+    /// [`TkaError::CredentialCannotAuthorize`], [`TkaError::UntrustedKey`],
+    /// [`TkaError::NodeKeyMismatch`], or [`TkaError::BadSignature`].
+    pub fn node_key_authorized_with_details(
+        &self,
+        node_key: &[u8],
+        signature_cbor: &[u8],
+    ) -> Result<Option<RotationDetails>, TkaError> {
         let sig = decode_node_key_signature(signature_cbor)?;
         // A credential signature can never authorize a node on its own.
         if sig.sig_kind == SigKind::Credential {
@@ -539,7 +639,8 @@ impl Authority {
         }
         let key_id = sig.authorizing_key_id()?;
         let key = self.state.get_key(key_id).ok_or(TkaError::UntrustedKey)?;
-        sig.verify_signature(node_key, key)
+        sig.verify_signature(node_key, key)?;
+        sig.rotation_details()
     }
 }
 
@@ -6180,6 +6281,236 @@ mod tests {
             ordered[2].hash(),
             heavy_child.hash(),
             "the deep fork must resolve by the mid-chain-added key's weight (state was accumulated past genesis)"
+        );
+    }
+
+    // ----- tsr-jo1: RotationDetails extraction (Go `NodeKeySignature.rotationDetails`) -----
+
+    /// Build a verified rotation chain: a trusted key signs an inner `Direct` over `wrapping_pub`,
+    /// then `rotations` successive `Rotation` layers each re-wrap, the outermost authorizing
+    /// `node_key`. Returns `(authority, node_key, signed_cbor, wrapping_pub)`. Every layer's pivot is
+    /// the same `wrapping` keypair (the simplest chain that still has `prev_node_keys` entries).
+    #[cfg(test)]
+    fn rotation_chain(
+        rotations: usize,
+        inner_kind: SigKind,
+    ) -> (Authority, Vec<u8>, Vec<u8>, Vec<u8>) {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let trusted = SigningKey::from_bytes(&[7u8; 32]);
+        let trusted_pub = trusted.verifying_key().to_bytes().to_vec();
+        let wrapping = SigningKey::from_bytes(&[9u8; 32]);
+        let wrapping_pub = wrapping.verifying_key().to_bytes().to_vec();
+        let node_key = alloc::vec![5u8; 32];
+
+        let auth = Authority::from_state(
+            AumHash([0; 32]),
+            State {
+                keys: alloc::vec![Key {
+                    kind: KeyKind::Ed25519,
+                    votes: 1,
+                    public: trusted_pub.clone(),
+                }],
+            },
+        );
+
+        // Inner signature: the trusted key signs over `wrapping_pub`. A `Credential` inner is
+        // exercised by `initial_sig_kind` tests; it still verifies (security is the two signatures,
+        // not the kind).
+        let mut inner = NodeKeySignature {
+            sig_kind: inner_kind,
+            pubkey: wrapping_pub.clone(),
+            key_id: trusted_pub.clone(),
+            signature: Vec::new(),
+            nested: None,
+            wrapping_pubkey: wrapping_pub.clone(),
+        };
+        let inner_hash = inner.sig_hash();
+        inner.signature = trusted.sign(&inner_hash).to_bytes().to_vec();
+
+        // Successive Rotation layers, each wrapping the previous and signed by the wrapping key.
+        let mut current = inner;
+        for _ in 0..rotations {
+            let mut outer = NodeKeySignature {
+                sig_kind: SigKind::Rotation,
+                pubkey: node_key.clone(),
+                key_id: Vec::new(),
+                signature: Vec::new(),
+                nested: Some(alloc::boxed::Box::new(current)),
+                wrapping_pubkey: Vec::new(),
+            };
+            let h = outer.sig_hash();
+            outer.signature = wrapping.sign(&h).to_bytes().to_vec();
+            current = outer;
+        }
+        let cbor = current.to_cbor(true).to_vec();
+        (auth, node_key, cbor, wrapping_pub)
+    }
+
+    /// A single-level rotation (Direct inner) yields `Some` details: one prior node key (the inner's
+    /// `pubkey` = the wrapping pubkey), `initial_sig_kind == Direct`, and the initial wrapping pubkey.
+    #[test]
+    fn rotation_details_extracts_prev_node_keys() {
+        let (auth, node_key, cbor, wrapping_pub) = rotation_chain(1, SigKind::Direct);
+        let details = auth
+            .node_key_authorized_with_details(&node_key, &cbor)
+            .expect("must verify")
+            .expect("rotation sig yields details");
+        assert_eq!(details.prev_node_keys, alloc::vec![wrapping_pub.clone()]);
+        assert_eq!(details.initial_sig_kind, SigKind::Direct);
+        assert_eq!(details.initial_wrapping_pubkey, wrapping_pub);
+    }
+
+    /// A plain `Direct` signature (no rotation) yields `None` details (and still authorizes).
+    #[test]
+    fn rotation_details_none_for_direct() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let trusted = SigningKey::from_bytes(&[7u8; 32]);
+        let trusted_pub = trusted.verifying_key().to_bytes().to_vec();
+        let node_key = alloc::vec![5u8; 32];
+        let auth = Authority::from_state(
+            AumHash([0; 32]),
+            State {
+                keys: alloc::vec![Key {
+                    kind: KeyKind::Ed25519,
+                    votes: 1,
+                    public: trusted_pub.clone(),
+                }],
+            },
+        );
+        let mut direct = NodeKeySignature {
+            sig_kind: SigKind::Direct,
+            pubkey: node_key.clone(),
+            key_id: trusted_pub.clone(),
+            signature: Vec::new(),
+            nested: None,
+            wrapping_pubkey: node_key.clone(),
+        };
+        let h = direct.sig_hash();
+        direct.signature = trusted.sign(&h).to_bytes().to_vec();
+        let cbor = direct.to_cbor(true).to_vec();
+        let details = auth
+            .node_key_authorized_with_details(&node_key, &cbor)
+            .expect("must verify");
+        assert_eq!(details, None, "a Direct sig has no rotation details");
+    }
+
+    /// A multi-level rotation collects every nested pubkey in outer→inner order, and the innermost
+    /// (Direct) signature determines `initial_sig_kind`. Here both rotation layers share the same
+    /// wrapping pivot, so both prior-key entries equal the wrapping pubkey.
+    #[test]
+    fn rotation_details_multi_level_order() {
+        let (auth, node_key, cbor, wrapping_pub) = rotation_chain(2, SigKind::Direct);
+        let details = auth
+            .node_key_authorized_with_details(&node_key, &cbor)
+            .expect("must verify")
+            .expect("rotation yields details");
+        // Two rotation layers ⇒ two nested signatures walked (the inner Rotation's pubkey = node_key
+        // pivot is its own; the innermost Direct's pubkey = wrapping_pub). Both nested `pubkey`s are
+        // collected; the innermost is the Direct over `wrapping_pub`.
+        assert_eq!(
+            details.prev_node_keys.len(),
+            2,
+            "both nested layers contribute a prior key"
+        );
+        assert_eq!(details.initial_sig_kind, SigKind::Direct);
+        assert_eq!(details.initial_wrapping_pubkey, wrapping_pub);
+    }
+
+    /// A `Credential`-rooted rotation chain reports `initial_sig_kind == Credential`, so the netmap
+    /// rotation filter will exempt it from the clone-uniqueness rule (reusable-authkey carve-out).
+    #[test]
+    fn rotation_details_credential_root_kind() {
+        let (auth, node_key, cbor, _wrapping_pub) = rotation_chain(1, SigKind::Credential);
+        let details = auth
+            .node_key_authorized_with_details(&node_key, &cbor)
+            .expect("must verify")
+            .expect("rotation yields details");
+        assert_eq!(
+            details.initial_sig_kind,
+            SigKind::Credential,
+            "a credential-rooted chain is reported so the uniqueness rule can exempt it"
+        );
+    }
+
+    /// Fail-closed parity with Go `rotationDetails` (which errors when a nested pubkey fails
+    /// `NodePublic.UnmarshalBinary`): a rotation chain whose nested signature carries a pubkey of the
+    /// wrong length must be REJECTED, not admitted with a junk prior-key entry. The crafted case is a
+    /// nested **Credential** layer — the verify path does not bind a credential's `pubkey` to a node
+    /// key, so without this check a bad-length credential pubkey would slip through (fail-open).
+    #[test]
+    fn rotation_details_rejects_malformed_nested_pubkey() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let trusted = SigningKey::from_bytes(&[7u8; 32]);
+        let trusted_pub = trusted.verifying_key().to_bytes().to_vec();
+        let wrapping = SigningKey::from_bytes(&[9u8; 32]);
+        let wrapping_pub = wrapping.verifying_key().to_bytes().to_vec();
+        let node_key = alloc::vec![5u8; 32];
+        let auth = Authority::from_state(
+            AumHash([0; 32]),
+            State {
+                keys: alloc::vec![Key {
+                    kind: KeyKind::Ed25519,
+                    votes: 1,
+                    public: trusted_pub.clone(),
+                }],
+            },
+        );
+
+        // Inner Credential with a deliberately MALFORMED (3-byte) pubkey. The credential is signed by
+        // the trusted key over the wrapping pubkey; the verify path does not constrain its `pubkey`.
+        let mut inner = NodeKeySignature {
+            sig_kind: SigKind::Credential,
+            pubkey: alloc::vec![1u8, 2u8, 3u8], // wrong length (not 32)
+            key_id: trusted_pub.clone(),
+            signature: Vec::new(),
+            nested: None,
+            wrapping_pubkey: wrapping_pub.clone(),
+        };
+        let inner_hash = inner.sig_hash();
+        inner.signature = trusted.sign(&inner_hash).to_bytes().to_vec();
+
+        let mut outer = NodeKeySignature {
+            sig_kind: SigKind::Rotation,
+            pubkey: node_key.clone(),
+            key_id: Vec::new(),
+            signature: Vec::new(),
+            nested: Some(alloc::boxed::Box::new(inner)),
+            wrapping_pubkey: Vec::new(),
+        };
+        let outer_hash = outer.sig_hash();
+        outer.signature = wrapping.sign(&outer_hash).to_bytes().to_vec();
+        let cbor = outer.to_cbor(true).to_vec();
+
+        // The signatures themselves verify, but details extraction rejects the bad-length nested
+        // pubkey fail-closed (Go drops the peer here).
+        let err = auth
+            .node_key_authorized_with_details(&node_key, &cbor)
+            .unwrap_err();
+        assert_eq!(err, TkaError::Decode("nested rotation pubkey wrong length"));
+        // And the bool authorize path rejects identically (no fail-open).
+        assert!(auth.node_key_authorized(&node_key, &cbor).is_err());
+    }
+
+    /// The verify verdict of `node_key_authorized` is byte-identical to the details path across the
+    /// good rotation case and the bad (tampered) case — the refactor that made the former a wrapper
+    /// of the latter must not change a single verdict.
+    #[test]
+    fn node_key_authorized_matches_details_path() {
+        let (auth, node_key, cbor, _wp) = rotation_chain(1, SigKind::Direct);
+        assert_eq!(
+            auth.node_key_authorized(&node_key, &cbor).is_ok(),
+            auth.node_key_authorized_with_details(&node_key, &cbor)
+                .is_ok(),
+        );
+        // Tamper a byte of the CBOR so verification fails; both paths must reject identically.
+        let mut bad = cbor.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 0xff;
+        assert_eq!(
+            auth.node_key_authorized(&node_key, &bad).is_err(),
+            auth.node_key_authorized_with_details(&node_key, &bad)
+                .is_err(),
         );
     }
 }
