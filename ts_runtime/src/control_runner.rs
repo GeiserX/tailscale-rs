@@ -14,7 +14,7 @@ use tokio::sync::watch;
 use ts_control::{
     AsyncControlClient, Endpoint, EndpointType, Error as ControlError, IdTokenError, LogoutError,
     Node, SetDnsError, SshPolicy, StateUpdate, TkaStatus, TkaSyncError, tka_disable,
-    tka_submit_signature,
+    tka_init_begin, tka_init_finish, tka_submit_signature,
 };
 use ts_magicsock::SelfEndpointType;
 
@@ -614,6 +614,45 @@ mod msg_impl {
             deleg
         }
 
+        /// Initialize Tailnet Lock with this node as the sole initial trusted key, gated by
+        /// `disablement_secret` (Go `LocalClient.NetworkLockInit` — the "lock yourself in" case).
+        ///
+        /// Builds + signs a genesis Checkpoint AUM whose only trusted key is this node's network-lock
+        /// public key (votes 1) and whose single DisablementValue is `disablement_value(secret)`, then
+        /// drives the two-phase init: `tka/init/begin` (submit the genesis) → if control needs no
+        /// further node signatures (`NeedSignatures` empty, the case when this node is the only key) →
+        /// `tka/init/finish` carrying the raw `disablement_secret` as `SupportDisablement`. Mirrors
+        /// `tka_sign`/`tka_disable`: cloned config + keys into a spawned task (delegated reply).
+        ///
+        /// If control returns a non-empty `NeedSignatures` (other nodes must be re-signed under the new
+        /// lock — a multi-node tailnet), this returns [`TkaSyncError::Unsupported`]: re-signing each
+        /// listed node (incl. the Rotation-key case) is a larger flow deferred to a fuller
+        /// `tka_init(keys, secrets)` — the single-node lock-init is the shipped subset.
+        ///
+        /// **Submit-only**, like `tka_sign`/`tka_disable`: this creates the lock at control and does
+        /// NOT seed the local [`Authority`](ts_tka::Authority) — the node picks up the new lock through
+        /// the existing verified netmap-sync (control pushes a `TKAInfo`, `maybe_sync_tka` bootstraps
+        /// the genesis through `VerifiedAumChain::verify`). Verify-and-log posture unchanged.
+        #[message(ctx)]
+        pub fn tka_init(
+            &self,
+            ctx: &mut Context<Self, DelegatedReply<Result<(), TkaSyncError>>>,
+            disablement_secret: Vec<u8>,
+        ) -> DelegatedReply<Result<(), TkaSyncError>> {
+            let (deleg, replier) = ctx.reply_sender();
+
+            if let Some(replier) = replier {
+                let config = self.params.config.clone();
+                let keys = self.params.env.keys.clone();
+                tokio::spawn(async move {
+                    let result = tka_init_run(&config, &keys, disablement_secret).await;
+                    replier.send(result);
+                });
+            }
+
+            deleg
+        }
+
         /// The cert-eligible DNS names from control's netmap DNS config (Go `nm.DNS.CertDomains`).
         ///
         /// Returns an empty `Vec` when control has sent no DNS config, or one carrying no cert
@@ -824,6 +863,75 @@ mod msg_impl {
             deleg
         }
     }
+}
+
+/// The `tka_init` body (the genesis-build + two-phase init/begin→init/finish choreography),
+/// factored out of the actor handler so it runs in the spawned task. See [`ControlRunner::tka_init`].
+///
+/// "Lock yourself in": the genesis trusts only this node's network-lock key (votes 1) and stores one
+/// DisablementValue = `disablement_value(secret)`. On a non-empty `NeedSignatures` (multi-node
+/// tailnet needing re-signs) it returns [`TkaSyncError::Unsupported`] — the single-node subset.
+async fn tka_init_run(
+    config: &ts_control::Config,
+    keys: &ts_keys::NodeState,
+    disablement_secret: Vec<u8>,
+) -> Result<(), TkaSyncError> {
+    // Build the genesis: this node's NL public key as the sole trusted key, one disablement value.
+    let nl_public = keys.network_lock_keys.public.to_bytes().to_vec();
+    let genesis_key = ts_tka::AumKey {
+        kind: ts_tka::KeyKind::Ed25519,
+        votes: 1,
+        public: nl_public,
+        meta: Vec::new(),
+    };
+    let dvalue = ts_tka::disablement_value(&disablement_secret).to_vec();
+    let mut genesis = ts_tka::Aum::new_genesis_checkpoint(vec![genesis_key], vec![dvalue])
+        // A malformed genesis is a local construction bug, not a transient RPC failure — surface it as a
+        // coarse internal error rather than NetworkError (which would invite a pointless retry).
+        .map_err(|_| TkaSyncError::Internal(ts_control::TkaSyncInternalErrorKind::SerDe))?;
+    genesis.sign(&keys.network_lock_keys.private.signing_key());
+
+    // Phase 1: submit the genesis. node_key + version are stamped by the RPC client from `keys`.
+    let begin_req = ts_control::TkaInitBeginRequest {
+        version: Default::default(),
+        node_key: keys.node_keys.public,
+        genesis_aum: genesis.serialize(),
+    };
+    let begin_resp = tka_init_begin(
+        &config.server_url,
+        keys,
+        begin_req,
+        config.allow_http_key_fetch,
+    )
+    .await?;
+
+    // Single-node case only: control must need no further node signatures. A non-empty
+    // NeedSignatures means other nodes must be re-signed under the new lock — deferred.
+    if !begin_resp.need_signatures.is_empty() {
+        tracing::warn!(
+            need = begin_resp.need_signatures.len(),
+            "tka_init: control requires re-signing other nodes; the multi-node init is not yet \
+             implemented (single-node lock-init only)"
+        );
+        return Err(TkaSyncError::Unsupported);
+    }
+
+    // Phase 2: finish, carrying the raw disablement secret as SupportDisablement (Go sends the raw
+    // secret here; only the genesis stores its Argon2i hash).
+    let finish_req = ts_control::TkaInitFinishRequest {
+        version: Default::default(),
+        node_key: keys.node_keys.public,
+        signatures: std::collections::BTreeMap::new(),
+        support_disablement: disablement_secret,
+    };
+    tka_init_finish(
+        &config.server_url,
+        keys,
+        finish_req,
+        config.allow_http_key_fetch,
+    )
+    .await
+    .map(|_response| ())
 }
 
 /// Load or generate the ACME account key, then issue a cert for `name` via set-dns DNS-01,

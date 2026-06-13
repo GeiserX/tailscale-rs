@@ -678,6 +678,24 @@ impl Runtime {
             .map_err(flatten_tka_send_err)
     }
 
+    /// Initialize Tailnet Lock with this node as the sole initial trusted key, gated by
+    /// `disablement_secret` (Go `tka` init → `/machine/tka/init/{begin,finish}`).
+    ///
+    /// Submits only — does not seed the local [`Authority`](ts_tka::Authority); the node picks up the
+    /// new lock via the existing verified netmap-sync. A handler error carries the real
+    /// [`ts_control::TkaSyncError`] ([`Unsupported`] if control needs other nodes re-signed — the
+    /// single-node "lock yourself in" subset only); any other send failure collapses to
+    /// [`NetworkError`](ts_control::TkaSyncError::NetworkError).
+    pub async fn tka_init(
+        &self,
+        disablement_secret: Vec<u8>,
+    ) -> Result<(), ts_control::TkaSyncError> {
+        self.control
+            .ask(control_runner::TkaInit { disablement_secret })
+            .await
+            .map_err(flatten_tka_send_err)
+    }
+
     /// Issue a real Let's Encrypt certificate for this node's MagicDNS `name` (`acme` feature).
     ///
     /// Mirrors `fetch_id_token`: forwards to the control runner, which runs
