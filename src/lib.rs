@@ -190,6 +190,8 @@ pub mod axum;
 pub mod config;
 mod dial;
 mod error;
+#[cfg(feature = "hyper")]
+pub mod http;
 mod loopback;
 #[cfg(feature = "ssh")]
 pub mod ssh;
@@ -767,10 +769,19 @@ impl Device {
     ///
     /// Returns an error in TUN transport mode (no application netstack to dial from).
     pub async fn loopback(&self) -> Result<(std::net::SocketAddr, String, LoopbackHandle), Error> {
-        // Capture only cloneable pieces — never `&self` — for the spawned accept loop: a clone of the
-        // netstack command channel, this device's own overlay IPv4 (fetched once), and a boxed
-        // resolver closure over clones of the control + peer-tracker actor refs. The resolver
-        // replicates `Device::resolve` (peer-by-name, falling back to this node's own name).
+        loopback::start(self.overlay_dialer().await?).await
+    }
+
+    /// Build an [`OverlayDialer`](loopback::OverlayDialer): the cloneable, `&Device`-free dialer that
+    /// resolves a MagicDNS name (or takes an IPv4 literal) and `tcp_connect`s it into the overlay,
+    /// reused by [`Device::loopback`] (SOCKS5) and the `hyper` [`http_connector`](Device::http_connector).
+    ///
+    /// Captures only cloneable pieces — never `&self` — so the dialer (and anything built on it, like a
+    /// spawned accept loop or an HTTP connector) carries no borrow of the `Device`: a clone of the
+    /// netstack command channel, this device's own overlay IPv4 (fetched once), and a boxed resolver
+    /// closure over clones of the control + peer-tracker actor refs. The resolver replicates
+    /// [`Device::resolve`] (peer-by-name, falling back to this node's own name).
+    async fn overlay_dialer(&self) -> Result<loopback::OverlayDialer, Error> {
         let channel = self.channel()?.clone();
         let self_ipv4 = self.ipv4_addr().await?;
 
@@ -804,8 +815,27 @@ impl Device {
             }) as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
         });
 
-        let dialer = loopback::OverlayDialer::new(channel, self_ipv4, resolve);
-        loopback::start(dialer).await
+        Ok(loopback::OverlayDialer::new(channel, self_ipv4, resolve))
+    }
+
+    /// Build a [`hyper`-compatible connector](crate::http::TailnetConnector) that routes outbound HTTP
+    /// requests over the tailnet — the analog of Go `tsnet.Server.HTTPClient`, whose mechanism is
+    /// simply `http.Transport{DialContext: s.Dial}`.
+    ///
+    /// Hand the returned connector to `hyper_util::client::legacy::Client::builder(...).build(conn)`;
+    /// each request's `Uri` host is resolved as a MagicDNS name (or IPv4 literal) and dialed into the
+    /// overlay (default port 80 for `http`, 443 for `https`), so the request egresses over the tailnet
+    /// rather than the host's network. TLS, redirects, and pooling are the hyper client's concern — the
+    /// connector only supplies the transport, exactly like Go's bare `DialContext` injection.
+    ///
+    /// Available only with the **`hyper`** crate feature.
+    ///
+    /// # Errors
+    /// Fails for the same reasons as [`Device::loopback`]'s setup: TUN transport mode (no application
+    /// netstack) or the node not yet having an overlay IPv4.
+    #[cfg(feature = "hyper")]
+    pub async fn http_connector(&self) -> Result<crate::http::TailnetConnector, Error> {
+        Ok(crate::http::TailnetConnector::new(self.overlay_dialer().await?))
     }
 
     /// Get our node info.

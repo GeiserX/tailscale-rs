@@ -107,6 +107,10 @@ smoltcp = { version = "0.13", default-features = false }
 thiserror = { version = "2", default-features = false }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros"] }
 tokio-util = { version = "0.7", default-features = false }
+# The standalone `Service` trait crate (NOT full `tower`) — used only by the facade's optional
+# `hyper` feature so the tailnet HTTP connector can implement `Service<Uri>` (hyper-util's sealed
+# `Connect` is granted via its blanket impl over `Service<Uri>`). Pure-Rust, ring-clean.
+tower-service = "0.3"
 tracing = { version = "0.1", default-features = false, features = ["attributes"] }
 tracing-test = "0.2"
 url = { version = "2", default-features = false }
@@ -239,6 +243,14 @@ ts_keys.workspace = true
 
 axum = { version = "0.8", optional = true }
 bytes = { workspace = true, optional = true }
+# `hyper` feature: a ready-made HTTP connector that dials over the tailnet (the analog of Go
+# `tsnet.Server.HTTPClient`'s `http.Transport{DialContext: s.Dial}`). Off by default — the default
+# facade build stays HTTP-stack-free. `hyper` provides the `rt::{Read,Write}` IO traits, `hyper-util`
+# the `client-legacy` `Connect`/`Connection` glue + `TokioIo`, and `tower-service` the `Service<Uri>`
+# trait the connector implements (the blanket impl grants the sealed `Connect`).
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true, features = ["client-legacy", "tokio"] }
+tower-service = { workspace = true, optional = true }
 ipnet.workspace = true
 nix = { version = "0.30", optional = true, features = ["user", "process", "term", "signal"] }
 pty-process = { version = "0.5", optional = true, features = ["async"] }
@@ -276,6 +288,10 @@ workspace = true
 # Enable the `axum` module, which enables you to run an `axum` HTTP server on top of a tailscale TCP
 # listener.
 axum = ["dep:axum"]
+# Enable the `http` module: a ready-made hyper connector (`Device::http_connector`) that routes
+# outbound HTTP requests over the tailnet, the analog of Go `tsnet.Server.HTTPClient`. Off by default
+# so the default build pulls no HTTP client stack.
+hyper = ["dep:hyper", "dep:hyper-util", "dep:tower-service"]
 ssh = ["dep:russh", "dep:bytes", "dep:ratatui", "dep:pty-process", "dep:nix"]
 tun = ["ts_runtime/tun"]
 # Workload-identity federation (SaaS-only): enables the `ts_control` exchange subsystem that

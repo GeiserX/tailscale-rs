@@ -178,6 +178,21 @@ impl OverlayDialer {
             Target::Domain(host, port) => self.dial_name(host, *port).await,
         }
     }
+
+    /// Dial a `host`/`port` into the overlay, where `host` is either an IPv4 literal or a MagicDNS
+    /// name. The crate-visible entry point used by the `hyper` HTTP connector (which parses the
+    /// request `Uri` into host + port); an IPv4 literal skips the resolver, a name goes through it.
+    #[cfg(feature = "hyper")]
+    pub(crate) async fn dial_host_port(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<crate::netstack::TcpStream, Error> {
+        match host.parse::<Ipv4Addr>() {
+            Ok(addr) => self.dial_ipv4(addr, port).await,
+            Err(_) => self.dial_name(host, port).await,
+        }
+    }
 }
 
 /// RAII handle for a running loopback SOCKS5 proxy (mirrors `tsnet`'s loopback teardown).
