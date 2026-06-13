@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.35.2](https://github.com/GeiserX/tailscale-rs/compare/v0.35.1...v0.35.2) (2026-06-13)
+
+
+### Bug Fixes
+
+* **tunnel:** do not arm the reactive keepalive on a received keepalive ([#190](https://github.com/GeiserX/tailscale-rs/issues/190)) ([6dbe36b](https://github.com/GeiserX/tailscale-rs/commit/6dbe36bf8cec715916db45c6933eadba8edd667c))
+
 ## [0.35.1](https://github.com/GeiserX/tailscale-rs/compare/v0.35.0...v0.35.1) (2026-06-13)
 
 
