@@ -126,8 +126,13 @@ pub unsafe extern "C" fn ts_tcp_send(
     len: usize,
 ) -> ffi::c_int {
     ffi_guard(move || {
-        // SAFETY: ensured by function precondition
-        let b = unsafe { core::slice::from_raw_parts(buf, len) };
+        // SAFETY: ensured by function precondition. `util::slice` rejects a null buffer with a
+        // non-zero length (a caller error) and maps null+len0 to an empty slice, avoiding the
+        // `from_raw_parts(null, ..)` UB the guard cannot catch.
+        let Some(b) = (unsafe { crate::util::slice(buf, len) }) else {
+            tracing::error!("null buffer with non-zero len");
+            return -1;
+        };
 
         match stream.0.send_blocking(b) {
             Err(e) => {
@@ -151,8 +156,12 @@ pub unsafe extern "C" fn ts_tcp_send(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ts_tcp_recv(stream: &tcp_stream, buf: *mut u8, len: usize) -> ffi::c_int {
     ffi_guard(move || {
-        // SAFETY: ensured by function precondition
-        let b = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+        // SAFETY: ensured by function precondition. See `ts_tcp_send` — `util::slice_mut` is the
+        // null-safe counterpart, rejecting null+len>0 and mapping null+len0 to an empty slice.
+        let Some(b) = (unsafe { crate::util::slice_mut(buf, len) }) else {
+            tracing::error!("null buffer with non-zero len");
+            return -1;
+        };
 
         match stream.0.recv_blocking(b) {
             Err(e) => {
