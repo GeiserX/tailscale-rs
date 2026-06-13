@@ -619,7 +619,7 @@ impl Runtime {
     /// fresh Noise channel. This is a control-plane state change only — it does NOT shut the runtime
     /// down (the caller follows with [`graceful_shutdown`](Self::graceful_shutdown)) and does not
     /// touch the on-disk node key. The kameo delegated-reply send error is flattened the same way as
-    /// [`fetch_id_token`](Self::fetch_id_token): a handler error carries the real
+    /// `fetch_id_token`: a handler error carries the real
     /// [`ts_control::LogoutError`]; any other send failure (actor shutdown / mailbox closed) is
     /// surfaced as [`ts_control::LogoutError::NetworkError`].
     pub async fn logout(&self) -> Result<(), ts_control::LogoutError> {
@@ -633,7 +633,7 @@ impl Runtime {
     /// `LocalClient.SetDNS`).
     ///
     /// Forwards to the control runner, which POSTs the record over a fresh Noise channel. The kameo
-    /// delegated-reply send error is flattened the same way as [`fetch_id_token`](Self::fetch_id_token):
+    /// delegated-reply send error is flattened the same way as `fetch_id_token`:
     /// a handler error carries the real [`ts_control::SetDnsError`]; any other send failure (actor
     /// shutdown / mailbox closed) is surfaced as [`ts_control::SetDnsError::NetworkError`].
     pub async fn set_dns(
@@ -649,7 +649,7 @@ impl Runtime {
 
     /// Issue a real Let's Encrypt certificate for this node's MagicDNS `name` (`acme` feature).
     ///
-    /// Mirrors [`fetch_id_token`](Self::fetch_id_token): forwards to the control runner, which runs
+    /// Mirrors `fetch_id_token`: forwards to the control runner, which runs
     /// the client-side ACME DNS-01 flow on a spawned task and publishes the challenge TXT via the
     /// node's set-dns RPC. The kameo delegated-reply send error is flattened — a handler error
     /// carries the real [`ts_control::CertError`]; any other send failure (actor shutdown / mailbox
@@ -1058,7 +1058,7 @@ impl Runtime {
     ///
     /// Resolves `Ok(())` once the device reaches [`DeviceState::Running`]. Returns a typed
     /// [`RegistrationError`] otherwise — the actionable distinction between "retry", "re-pair", and
-    /// "drive interactive login" that replaces polling [`ipv4_addr`](Self::ipv4_addr) in a loop:
+    /// "drive interactive login" that replaces polling the device's `ipv4_addr` in a loop:
     /// - `AuthRejected` — bad/expired/unknown auth key. **Permanent** (re-pair).
     /// - `NeedsLogin(url)` — interactive authorization required (no usable auth key). **Not
     ///   permanent**: the runtime keeps retrying and will reach `Running` once the user authorizes

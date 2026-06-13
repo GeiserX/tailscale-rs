@@ -168,8 +168,8 @@ impl PeerPaths {
     }
 
     /// Add candidate endpoints learned from authenticated disco traffic, returning the addresses
-    /// actually accepted (those not dropped at [`MAX_LEARNED_CANDIDATES_PER_PEER`]). The caller
-    /// ([`MagicSock::add_peer_endpoints`]) inserts only the accepted addresses into the reverse
+    /// actually accepted (those not dropped at `MAX_LEARNED_CANDIDATES_PER_PEER`). The caller
+    /// (`MagicSock::add_peer_endpoints`) inserts only the accepted addresses into the reverse
     /// `addr -> disco` map, keeping it bounded in lockstep with the capped candidate set — so a flood
     /// of over-cap learned addresses can't grow the attribution map with entries the path set
     /// dropped. (Not `#[must_use]`: the lone production caller consumes the return, and the test
@@ -182,7 +182,7 @@ impl PeerPaths {
     }
 
     /// Drop the confirmed best path and its trust, **keeping the candidate set**. Used on a socket
-    /// rebind ([`MagicSock::rebind`]): the local NAT mapping changed, so any previously-confirmed
+    /// rebind (`MagicSock::rebind`): the local NAT mapping changed, so any previously-confirmed
     /// direct `best` is stale and must be re-validated by a fresh pong — but the candidate endpoints
     /// (where the peer *might* be reachable) are still valid and should be re-probed, not forgotten.
     /// The peer fails closed back to DERP (best `None`) until a candidate re-confirms over the new
@@ -247,7 +247,7 @@ impl PeerPaths {
 
     /// Record that we sent a ping with `tx_id` to `to` at time `sent`.
     ///
-    /// First prunes any in-flight probe older than [`PING_TIMEOUT`] (presumed lost — its pong will
+    /// First prunes any in-flight probe older than `PING_TIMEOUT` (presumed lost — its pong will
     /// never arrive, or arrived from the wrong source and was dropped). Without this the map grows
     /// unbounded for a peer whose candidates never pong: it would gain an entry per candidate every
     /// ping cycle, forever. A genuinely-late pong for a pruned tx_id is simply treated as
@@ -309,7 +309,7 @@ impl PeerPaths {
     }
 
     /// Whether the best path warrants a re-ping. Fires once the path is within
-    /// [`REFRESH_BEFORE_EXPIRY`] of its `trust_until` — *proactively, before* trust lapses — so a
+    /// `REFRESH_BEFORE_EXPIRY` of its `trust_until` — *proactively, before* trust lapses — so a
     /// fresh pong re-confirms the path inside the current trust window and `best_addr` never goes
     /// dark for an active peer (Go magicsock's heartbeat-before-expiry behavior). Always `true` when
     /// there is no trusted path yet (nothing to lose by probing).

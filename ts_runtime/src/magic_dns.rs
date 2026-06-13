@@ -781,9 +781,12 @@ pub struct Query {
     pub qtype: u16,
 }
 
-/// The outcome of a [`Query`]: the raw DNS response bytes, the RCODE, and which upstream resolvers
+/// The outcome of a `Query`: the raw DNS response bytes, the RCODE, and which upstream resolvers
 /// (if any) were consulted. The response is returned as raw bytes (matching Go `LocalClient.QueryDNS`)
 /// rather than parsed records — this fork's wire codec has no answer-record decoder.
+///
+/// (`Query` is the crate-internal actor message; not linked here as it is a private item — a
+/// `pub` doc cannot intra-doc-link to it without erroring under the doc-lint gate.)
 #[derive(Debug, Clone, kameo::Reply)]
 pub struct DnsQueryResult {
     /// The raw DNS response datagram (header + question + any answer records).

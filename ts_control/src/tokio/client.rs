@@ -57,7 +57,7 @@ impl AsyncControlClient {
     /// `auth_url_tx` is the embedder-owned "current pending re-auth URL" cell: if the live
     /// map-poll loop hits a mid-session re-auth (control returns
     /// [`MachineNotAuthorized`](crate::Error::MachineNotAuthorized) on a re-register because the
-    /// node key expired or was revoked), [`run`] publishes that URL here without tearing the loop
+    /// node key expired or was revoked), `run` publishes that URL here without tearing the loop
     /// down, so the embedder can prompt the user to re-authorize while registration keeps retrying.
     /// The caller creates the channel and keeps the [`Receiver`](watch::Receiver) (this crate must
     /// not depend on the embedder's device-state types, so the cell carries a bare `Option<Url>`).
@@ -363,9 +363,9 @@ fn reconnect_delay_after_poll(
 /// On a live map-poll re-register, control returning [`Error::MachineNotAuthorized`] means the
 /// node key lapsed (expiry/revoke) and the user must re-authorize at the carried URL. Unlike the
 /// initial-registration path (which the runtime's `check_auth` loop already surfaces), the live
-/// [`run`] loop only logs and backs off, dropping the URL — so we publish it into the
+/// `run` loop only logs and backs off, dropping the URL — so we publish it into the
 /// embedder-owned `auth_url_tx` cell here (→ the runtime maps it to its "needs login" state). The
-/// caller still propagates the error so [`run`] backs off and retries; a later successful
+/// caller still propagates the error so `run` backs off and retries; a later successful
 /// re-register clears the state for free (Go's `authRoutine` keeps `urlToVisit` and keeps polling).
 ///
 /// **Only `MachineNotAuthorized` sets the cell.** `MachineNotAuthorized(None)` (no auth URL on

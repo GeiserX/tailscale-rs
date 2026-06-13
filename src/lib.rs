@@ -516,7 +516,7 @@ impl Device {
     /// Go `LocalClient.QueryDNS`.
     ///
     /// Unlike [`resolve`](Self::resolve) (an in-memory netmap lookup that answers only MagicDNS
-    /// A-records), this issues an actual query of any [`qtype`] and runs it through the live
+    /// A-records), this issues an actual query of any `qtype` and runs it through the live
     /// responder: an authoritative tailnet name is answered locally, anything else is forwarded to
     /// the configured split-DNS / recursive upstreams (or delegated to the active exit node's DoH).
     /// The response is returned as raw bytes (matching Go's `QueryDNS`), since this fork's DNS wire
@@ -527,7 +527,7 @@ impl Device {
     /// egresses, recursive forwards delegate to the exit node when one is active, and only IPv4
     /// upstreams are dialed.
     ///
-    /// Returns [`ErrorKind::UnsupportedInTunMode`](crate::ErrorKind::UnsupportedInTunMode) in TUN
+    /// Returns an [`Error::Internal`] with `InternalErrorKind::UnsupportedInTunMode` in TUN
     /// transport mode (MagicDNS there is an in-packet intercept, not a queryable responder).
     pub async fn query_dns(&self, name: &str, qtype: u16) -> Result<DnsQueryResult, Error> {
         self.runtime

@@ -23,6 +23,19 @@
 //!   recursion, and that recursion goes out over the **overlay** netstack (same as MagicDNS), never
 //!   a bare host socket.
 //!
+//! ## Two paths for a forwarded client's DNS (tsr-c39)
+//!
+//! Exit-node DNS for a routed client is **client-side** in Go, and there are exactly two paths — we
+//! implement both, neither requiring exit-side DNS interception:
+//! 1. **DoH delegation (this server).** A modern client redirects its catch-all resolver to this
+//!    node's `/dns-query` (Go `dnsConfigForNetmap`/`exitNodeCanProxyDNS`); we answer here.
+//! 2. **Raw UDP:53 forwarding.** If the client instead emits a plain DNS datagram to a public
+//!    resolver, it is just part of the `0.0.0.0/0` traffic the [`crate::forwarder`] forwards — the
+//!    forwarder does **not** special-case port 53, so it egresses via the same dialer (host IP, or a
+//!    residential proxy) as all other forwarded traffic, fail-closed under `DirectDialer`. So a
+//!    forwarded client's DNS always shares the forwarded-traffic egress; there is no separate DNS
+//!    egress that could leak the origin IP (asserted by `ts_forwarder`'s antileak_runtime tests).
+//!
 //! ## Anti-leak / IPv6-off
 //!
 //! The listener binds the overlay IPv4 only. Recursive forwarding reuses [`forward_query`], which

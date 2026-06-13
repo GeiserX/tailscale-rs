@@ -126,7 +126,7 @@ impl From<ConnectionError> for SetDnsError {
 /// challenge. Opens a fresh Noise channel and POSTs the request. Returns `Ok(())` on a 2xx
 /// (the response body is an empty [`SetDnsResponse`]).
 ///
-/// The whole connect + POST + response read is bounded by [`SET_DNS_TIMEOUT`]: a hung control
+/// The whole connect + POST + response read is bounded by `SET_DNS_TIMEOUT`: a hung control
 /// plane is abandoned and reported as [`SetDnsError::NetworkError`] rather than pinning a
 /// half-open connection.
 pub async fn set_dns(

@@ -49,8 +49,9 @@
 //! # Lossy by design
 //!
 //! Like Go's bus (a bounded 128-deep channel drained with a non-blocking `select { case ch<-n:
-//! default: drop }`), delivery is best-effort: the per-watcher [`mpsc`] is bounded at
-//! [`NOTIFY_BUFFER`] and a notification for a watcher whose buffer is full is **dropped**, never
+//! default: drop }`), delivery is best-effort: the per-watcher [`mpsc`](tokio::sync::mpsc) channel
+//! is bounded at [`NOTIFY_BUFFER`](crate::ipn_bus::NOTIFY_BUFFER) and a notification for a watcher
+//! whose buffer is full is **dropped**, never
 //! blocking the producer. The underlying `watch` cells are themselves coalescing, so a slow consumer
 //! observes the latest state, not every intermediate — the right semantics for state/netmap
 //! snapshots (and the reason this bus is not used for any at-least-once delivery).

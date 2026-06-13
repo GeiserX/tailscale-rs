@@ -50,7 +50,7 @@ pub enum TkaSyncInternalErrorKind {
     Http,
     /// The response body was not valid UTF-8.
     Utf8,
-    /// The response body exceeded [`MAX_TKA_SYNC_RESPONSE`].
+    /// The response body exceeded `MAX_TKA_SYNC_RESPONSE`.
     TooLarge,
 }
 
@@ -133,7 +133,7 @@ impl From<ConnectionError> for TkaSyncError {
 }
 
 /// Send a TKA `sync/offer` to control: our chain `offer`, returning control's response (its own
-/// offer + the AUMs we are missing). Opens a fresh Noise channel, bounded by [`TKA_SYNC_TIMEOUT`].
+/// offer + the AUMs we are missing). Opens a fresh Noise channel, bounded by `TKA_SYNC_TIMEOUT`.
 pub async fn tka_sync_offer(
     control_url: &Url,
     node_keystate: &ts_keys::NodeState,
@@ -191,7 +191,7 @@ pub(crate) async fn tka_sync_offer_with(
 }
 
 /// Send a TKA `sync/send` to control: our (post-Inform) `send` request with the AUMs control is
-/// missing, returning control's resulting head. Fresh Noise channel, bounded by [`TKA_SYNC_TIMEOUT`].
+/// missing, returning control's resulting head. Fresh Noise channel, bounded by `TKA_SYNC_TIMEOUT`.
 pub async fn tka_sync_send(
     control_url: &Url,
     node_keystate: &ts_keys::NodeState,
@@ -248,7 +248,7 @@ pub(crate) async fn tka_sync_send_with(
 /// Fetch the TKA bootstrap (genesis AUM) from control: the entry point that gives a node with no
 /// chain yet the initial AUM to build its `Authority` from, before the offer/send catch-up
 /// (Go `tkaFetchBootstrap`). `head` is the node's current known head (empty when it has none).
-/// Fresh Noise channel, bounded by [`TKA_SYNC_TIMEOUT`].
+/// Fresh Noise channel, bounded by `TKA_SYNC_TIMEOUT`.
 pub async fn tka_bootstrap(
     control_url: &Url,
     node_keystate: &ts_keys::NodeState,

@@ -144,7 +144,7 @@ impl From<ConnectionError> for LogoutError {
 ///
 /// Opens a fresh Noise channel and re-`POST`s `/machine/register` with the node's current node key
 /// and a past [`expiry`](RegisterRequest::expiry), which control honors by expiring the node now.
-/// The whole connect + POST + response read is bounded by [`LOGOUT_TIMEOUT`]; a hung control plane
+/// The whole connect + POST + response read is bounded by `LOGOUT_TIMEOUT`; a hung control plane
 /// is abandoned and reported as [`LogoutError::NetworkError`].
 ///
 /// Idempotent: logging out an already-expired/unknown node is a no-op as far as the caller is
