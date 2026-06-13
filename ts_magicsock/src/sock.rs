@@ -1173,10 +1173,15 @@ impl MagicSock {
                 let latency = {
                     let mut paths = lock(&self.paths);
                     match paths.get_mut(&sender) {
-                        // Bind the pong to the address it arrived from (`from`): a pong only
-                        // confirms a path (and only counts as solicited) if it came from the
-                        // address we pinged for this tx_id. `note_pong` returns `Some(rtt)` exactly
-                        // when the `(tx_id, from)` pair matched an outstanding ping we sent.
+                        // A pong confirms the address we PINGED for this `tx_id`, regardless of the
+                        // UDP source it arrived from (matching Go magicsock — see `note_pong`). The
+                        // anti-spoof binding is the disco-key seal (already opened above with the
+                        // authenticated sender's key) + the single-use `tx_id`; the source is not
+                        // load-bearing, and requiring `from == to` would drop legitimate
+                        // cross-mapping pongs (our hard-NAT `Stun4LocalPort` guess, asymmetric reply
+                        // routing). `note_pong` returns `Some(rtt)` exactly when `tx_id` matched an
+                        // outstanding ping we sent. `from` is passed for the recv contract but not
+                        // used for selection.
                         Some(pp) => pp.note_pong(tx_id, from, Instant::now()),
                         None => None,
                     }
@@ -1199,8 +1204,10 @@ impl MagicSock {
                 //      member (a Pong carries no node key, so the verifier is queried with `None`,
                 //      exactly like CallMeMaybe). A non-member's `src` is never learned.
                 //   2. solicited — the pong matched an outstanding ping we actually sent for this
-                //      `(tx_id, from)` (`note_pong` returned `Some(_)`). An unsolicited or
-                //      wrong-source pong learns nothing even from a member.
+                //      `tx_id` (`note_pong` returned `Some(_)`). An unsolicited pong (unknown/replayed
+                //      tx_id) learns nothing even from a member. (Source is not part of this gate:
+                //      `src` is the peer-claimed reflexive field and is independent of the pong's UDP
+                //      source, so a `from == to` check never protected it — the member gate does.)
                 // A real peer's solicited pong from a netmap member still harvests its reflexive
                 // `src` — this is how the fork learns its public address; the legitimate
                 // NAT-traversal path is unchanged. Locked disjointly from `paths` above (never
