@@ -38,6 +38,7 @@ pub mod funnel;
 /// Go `ipn` `LocalBackend.WatchNotifications` / the `WatchIPNBus` LocalAPI.
 pub mod ipn_bus;
 mod magic_dns;
+pub use magic_dns::DnsQueryResult;
 mod multiderp;
 mod netstack_actor;
 mod packetfilter;
@@ -84,6 +85,10 @@ pub struct Runtime {
     /// Fallback TCP handler registry, bound to the application netstack. `None` in TUN transport
     /// mode (no application netstack exists to attach it to).
     fallback_tcp: Option<fallback_tcp::FallbackTcpManager>,
+    /// Reference to the MagicDNS responder, retained so [`Runtime::query_dns`] can run a query
+    /// through the live `100.100.100.100` forward path. `None` in TUN transport mode (no
+    /// `MagicDnsActor` is spawned there — TUN-mode MagicDNS is an in-packet intercept, not an actor).
+    magic_dns: Option<ActorRef<magic_dns::MagicDnsActor>>,
     /// Reference to the forwarder actor, retained so [`Runtime::set_advertise_routes`] can push a
     /// new accept/dial route table onto the running forwarder (the local half of advertising
     /// routes). Without this the strong ref would drop after the startup `GetChannel` and the
@@ -221,7 +226,7 @@ impl Runtime {
         //   no MagicDNS responder exist, and `netstack`/`fallback_tcp` are `None`.
         // - Tun requested but built without the `tun` feature: hard-error (a config/build
         //   mismatch knowable at spawn time). NEVER silently fall back to netstack.
-        let (netstack, fallback_tcp) = match &config.transport_mode {
+        let (netstack, fallback_tcp, magic_dns) = match &config.transport_mode {
             ts_control::TransportMode::Netstack => {
                 let netstack = NetstackActor::spawn((
                     env.clone(),
@@ -231,16 +236,21 @@ impl Runtime {
                 ));
 
                 // Fetch the netstack channel while we still hold the strong ActorRef, then spawn
-                // the MagicDNS responder on it. Fire-and-forget: like src_filter/route_updater,
-                // it's owned by the message bus and isn't stored on `Runtime`.
+                // the MagicDNS responder on it. Its ActorRef is retained on `Runtime` so
+                // `query_dns` can drive the live forward path; the serve loop itself is owned by the
+                // actor's internal JoinSet.
                 let (channel,) = netstack.ask(netstack_actor::GetChannel).await?;
                 // The fallback-TCP registry attaches to the application netstack — the same one
                 // that carries the embedder's explicit `Device::tcp_listen` sockets — so a
                 // fallback handler sees exactly the inbound flows no explicit listener matched.
                 let fallback_tcp = fallback_tcp::FallbackTcpManager::new(channel.clone());
-                magic_dns::MagicDnsActor::spawn((env.clone(), channel));
+                let magic_dns = magic_dns::MagicDnsActor::spawn((env.clone(), channel));
 
-                (Some(netstack.downgrade()), Some(fallback_tcp))
+                (
+                    Some(netstack.downgrade()),
+                    Some(fallback_tcp),
+                    Some(magic_dns),
+                )
             }
 
             #[cfg(feature = "tun")]
@@ -267,7 +277,7 @@ impl Runtime {
                     forwarder_channel.clone(),
                 ));
 
-                (None, None)
+                (None, None, None)
             }
 
             #[cfg(not(feature = "tun"))]
@@ -305,6 +315,7 @@ impl Runtime {
             direct,
             peer_tracker,
             fallback_tcp,
+            magic_dns,
             forwarder,
             multiderp,
             netstack,
@@ -370,6 +381,41 @@ impl Runtime {
             .await?;
 
         Ok(channel)
+    }
+
+    /// Resolve `name` for `qtype` through the live MagicDNS responder (the `100.100.100.100`
+    /// forward path), returning the raw DNS response, its RCODE, and the upstream resolver(s)
+    /// consulted (analogue of Go `LocalClient.QueryDNS`).
+    ///
+    /// This drives the *real* responder — the same `decide`/forward logic an on-the-wire query
+    /// hits — so the answer and its anti-leak posture (a tailnet-suffix name never egresses; a
+    /// recursive forward delegates to the active exit node's DoH; only IPv4 upstreams are dialed)
+    /// match exactly what a tailnet client observes. `qtype` is the raw RFC 1035 TYPE (`1`=A,
+    /// `28`=AAAA, `12`=PTR, or any other).
+    ///
+    /// Returns [`ErrorKind::UnsupportedInTunMode`] in TUN transport mode, where MagicDNS is an
+    /// in-packet intercept on the host's own resolver rather than an actor that can be queried, and
+    /// [`ErrorKind::ActorGone`] if the responder has shut down.
+    pub async fn query_dns(
+        &self,
+        name: &str,
+        qtype: u16,
+    ) -> Result<magic_dns::DnsQueryResult, Error> {
+        let result = self
+            .magic_dns
+            .as_ref()
+            .ok_or(Error {
+                kind: ErrorKind::UnsupportedInTunMode,
+                target_actor: None,
+                message_ty: None,
+            })?
+            .ask(magic_dns::Query {
+                name: name.to_owned(),
+                qtype,
+            })
+            .await?;
+
+        Ok(result)
     }
 
     /// The Taildrop file store, if Taildrop is enabled (`taildrop_dir` configured and the store

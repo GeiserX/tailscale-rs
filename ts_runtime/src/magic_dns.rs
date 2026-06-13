@@ -764,6 +764,38 @@ pub struct MagicDnsActor {
     /// spawn), `accept_dns` is runtime-settable via `Device::set_accept_dns`, so it must be read at
     /// rebuild time — not captured once — for a toggle to reach the served view.
     env: Env,
+    /// The overlay channel, retained so the [`Query`] handler can run a query through the same
+    /// forward path the serve loop uses ([`forward_query`] / [`forward_doh`], both binding
+    /// `0.0.0.0:0` on this channel — never a host socket).
+    channel: Channel,
+}
+
+/// A programmatic DNS query routed through the live MagicDNS responder (the `100.100.100.100` path),
+/// for [`Device::query_dns`](crate::Device::query_dns). The handler synthesizes a query packet and
+/// drives it through the exact same [`decide`]/forward logic as an on-the-wire query, so the result
+/// (and its anti-leak posture) matches what a tailnet client would observe.
+pub struct Query {
+    /// The canonical name to resolve (e.g. `example.com`, no trailing dot).
+    pub name: String,
+    /// The DNS query type (`1`=A, `28`=AAAA, `12`=PTR, or any other RFC 1035 TYPE).
+    pub qtype: u16,
+}
+
+/// The outcome of a [`Query`]: the raw DNS response bytes, the RCODE, and which upstream resolvers
+/// (if any) were consulted. The response is returned as raw bytes (matching Go `LocalClient.QueryDNS`)
+/// rather than parsed records — this fork's wire codec has no answer-record decoder.
+#[derive(Debug, Clone, kameo::Reply)]
+pub struct DnsQueryResult {
+    /// The raw DNS response datagram (header + question + any answer records).
+    pub response: Vec<u8>,
+    /// The RCODE from the response header's low 4 bits (`0`=NoError, `2`=SERVFAIL, `3`=NXDOMAIN,
+    /// `5`=Refused, …).
+    pub rcode: u8,
+    /// The upstream resolver(s) the query was forwarded to. For a UDP forward this is the candidate
+    /// list tried in order (the forwarder returns on the first that answers); for an exit-node DoH
+    /// forward it is the single DoH endpoint. Empty for a locally-answered query (an authoritative
+    /// tailnet name, a NODATA, or a fail-closed NXDOMAIN — nothing egressed).
+    pub resolvers_consulted: Vec<SocketAddr>,
 }
 
 impl kameo::Actor for MagicDnsActor {
@@ -829,7 +861,105 @@ impl kameo::Actor for MagicDnsActor {
             _joinset: joinset,
             view_tx,
             env,
+            channel,
         })
+    }
+}
+
+/// A bare SERVFAIL response header for a [`Query`] whose name could not be encoded into a
+/// well-formed query (a non-ASCII label or an over-255-byte name). A 12-byte header with QR=1 (this
+/// is a response) and RCODE=2 (server failure); no question or answer section (we never produced a
+/// parseable question). Lets `query_dns` return a definite, honest RCODE instead of an empty buffer
+/// that would read back as a fabricated NoError.
+fn servfail_response() -> Vec<u8> {
+    let mut resp = vec![0u8; 12];
+    // Flags: QR=1 (byte 2, 0x80) + RCODE=2 (low nibble of byte 3). All other bits clear.
+    resp[2] = 0x80;
+    resp[3] = 0x02;
+    resp
+}
+
+impl Message<Query> for MagicDnsActor {
+    type Reply = DnsQueryResult;
+
+    async fn handle(&mut self, query: Query, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+        // Synthesize a query packet and drive it through the SAME decide/forward path the serve loop
+        // uses, against the freshest view — so the result and its anti-leak posture exactly match an
+        // on-the-wire query. The id is fixed (0): a programmatic query has no concurrent-demux need,
+        // and `response_matches_query` validates the echoed id against this same buffer.
+        //
+        // Normalize the name into labels: strip a single trailing dot (an FQDN's root marker — Go's
+        // `dnsname.ToFQDN` does the same) and drop empty labels. An empty label would otherwise encode
+        // as a lone `0x00`, identical to the QNAME root terminator, truncating the wire query and
+        // corrupting the QTYPE/QCLASS that follow.
+        let trimmed = query.name.strip_suffix('.').unwrap_or(&query.name);
+        let labels: Vec<String> = trimmed
+            .split('.')
+            .filter(|label| !label.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let qtype = match query.qtype {
+            1 => ts_dns_wire::QType::A,
+            28 => ts_dns_wire::QType::Aaaa,
+            12 => ts_dns_wire::QType::Ptr,
+            other => ts_dns_wire::QType::Other(other),
+        };
+        // Class IN (1) — the only class the responder serves authoritatively (a non-IN class still
+        // forwards via `forward_or_nodata`, matching the on-the-wire path).
+        let buf = ts_dns_wire::encode_query(0, &ts_dns_wire::Name(labels), &qtype, 1);
+
+        let view = self.view_tx.borrow().clone();
+
+        let (response, resolvers_consulted) = match decide(&view, &buf) {
+            // `decide` returns `None` only when `decode_query` rejects the buffer we just built. With
+            // the name normalized above that can still happen for a name `encode_query` accepts but
+            // `decode_query` rejects — a non-ASCII/IDN label (the caller must pass punycode) or a name
+            // whose wire form exceeds 255 bytes. Surface a SERVFAIL (RCODE 2: "could not process")
+            // rather than an empty buffer that would read back as a fabricated NoError. The serve loop
+            // silently drops here (the on-wire client times out); a programmatic caller gets a
+            // definite, honest error instead.
+            None => (servfail_response(), Vec::new()),
+            Some(Decision::Reply(resp)) => (resp, Vec::new()),
+            Some(Decision::Forward {
+                upstreams,
+                query,
+                nxdomain,
+                recursive,
+            }) => {
+                let plan = if recursive {
+                    recursive_plan(&view, upstreams)
+                } else {
+                    RecursivePlan::Udp(upstreams)
+                };
+                match plan {
+                    RecursivePlan::Udp(upstreams) => {
+                        let resp = forward_query(&self.channel, &upstreams, &query, nxdomain).await;
+                        (resp, upstreams)
+                    }
+                    RecursivePlan::Doh(doh_addr) => {
+                        let resp = crate::peerapi_doh::forward_doh(
+                            &self.channel,
+                            doh_addr,
+                            &query,
+                            nxdomain,
+                        )
+                        .await;
+                        // The query egressed via the exit node's DoH endpoint, not a local UDP
+                        // upstream — report the DoH address as the resolver consulted.
+                        (resp, vec![doh_addr])
+                    }
+                }
+            }
+        };
+
+        // RCODE is the low 4 bits of the second flags byte (header byte 3).
+        let rcode = response.get(3).map(|b| b & 0x0F).unwrap_or(0);
+
+        DnsQueryResult {
+            response,
+            rcode,
+            resolvers_consulted,
+        }
     }
 }
 

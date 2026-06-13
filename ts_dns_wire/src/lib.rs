@@ -144,6 +144,8 @@ pub enum Rcode {
     NoError,
     /// Format error (RCODE 1).
     FormErr,
+    /// Server failure — the server could not process the query (RCODE 2).
+    ServFail,
     /// Name does not exist (RCODE 3).
     NxDomain,
     /// Query refused (RCODE 5).
@@ -158,6 +160,7 @@ impl Rcode {
         match self {
             Rcode::NoError => 0,
             Rcode::FormErr => 1,
+            Rcode::ServFail => 2,
             Rcode::NxDomain => 3,
             Rcode::NotImpl => 4,
             Rcode::Refused => 5,
@@ -214,6 +217,32 @@ pub fn decode_query(buf: &[u8]) -> Result<Query, DecodeError> {
             qclass,
         },
     })
+}
+
+/// Encode a single-question DNS query (the inverse of [`decode_query`]).
+///
+/// Produces a standard recursion-desired query: a 12-byte header (`id`; flags `RD=1` with QR/opcode/
+/// AA/TC/RA/Z/RCODE all clear; `QDCOUNT=1`; `ANCOUNT`/`NSCOUNT`/`ARCOUNT=0`) followed by the question
+/// section (QNAME as length-prefixed labels + terminating zero, then `qtype` and `qclass`, both
+/// big-endian). No EDNS(0) OPT record is added, matching the rest of this fork's UDP-only,
+/// classic-512 DNS path. The result round-trips through [`decode_query`].
+pub fn encode_query(id: u16, name: &Name, qtype: &QType, qclass: u16) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+
+    // Header. RD (recursion desired) is the only set flag bit (byte 2, 0x01); QR stays 0 (query).
+    out.extend_from_slice(&id.to_be_bytes());
+    out.extend_from_slice(&0x0100u16.to_be_bytes()); // flags: RD=1
+    out.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+    out.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+    out.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+    out.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+
+    // Question: QNAME + QTYPE + QCLASS.
+    encode_name(&mut out, name);
+    out.extend_from_slice(&qtype_value(qtype).to_be_bytes());
+    out.extend_from_slice(&qclass.to_be_bytes());
+
+    out
 }
 
 /// Decode a length-prefixed QNAME starting at `off`, advancing `off` past the
@@ -296,6 +325,14 @@ fn rdata_type(rdata: &RData) -> u16 {
 fn encode_name(out: &mut Vec<u8>, name: &Name) {
     for label in &name.0 {
         let bytes = label.as_bytes();
+        // Skip empty labels: a zero-length label encodes as a lone `0x00`, which is identical to the
+        // QNAME root terminator — it would truncate the name mid-encode and corrupt whatever follows
+        // (QTYPE/QCLASS in a query, the next record in a response). Callers normalize names, but skip
+        // here too so a stray empty label (e.g. from a trailing/doubled dot) can never desync the wire
+        // form. The decoder never produces empty labels, so a decode→encode round trip is unaffected.
+        if bytes.is_empty() {
+            continue;
+        }
         // Labels longer than 63 bytes are clamped to stay wire-legal; names
         // produced by this crate's decoder never exceed the limit.
         let len = bytes.len().min(MAX_LABEL_LEN);
@@ -445,6 +482,62 @@ mod tests {
         let buf = build_query(0x1, &["HOST", "User", "TS", "NET"], 1, 1);
         let q = decode_query(&buf).expect("decodes");
         assert_eq!(q.question.name.to_canon(), "host.user.ts.net");
+    }
+
+    #[test]
+    fn encode_query_round_trips_through_decode() {
+        // An arbitrary (non-A/AAAA/PTR) qtype must be preserved verbatim — query_dns issues these.
+        let name = Name(vec![String::from("example"), String::from("com")]);
+        let buf = encode_query(0xBEEF, &name, &QType::Other(16 /* TXT */), 1);
+
+        // Header: RD=1, QR=0 (a query), QDCOUNT=1, ANCOUNT=0.
+        let flags = u16::from_be_bytes([buf[2], buf[3]]);
+        assert_eq!(flags & 0x8000, 0, "QR=0 (this is a query)");
+        assert_eq!(flags & 0x0100, 0x0100, "RD=1 (recursion desired)");
+        assert_eq!(u16::from_be_bytes([buf[4], buf[5]]), 1, "QDCOUNT=1");
+        assert_eq!(u16::from_be_bytes([buf[6], buf[7]]), 0, "ANCOUNT=0");
+
+        // The query decodes back to the same id, name, qtype, and class.
+        let q = decode_query(&buf).expect("encode_query output is a valid query");
+        assert_eq!(q.id, 0xBEEF);
+        assert_eq!(q.question.name.to_canon(), "example.com");
+        assert!(matches!(q.question.qtype, QType::Other(16)));
+        assert_eq!(q.question.qclass, 1);
+    }
+
+    #[test]
+    fn encode_query_skips_empty_labels_no_premature_terminator() {
+        // A stray empty label (from a trailing/doubled dot in the source name) must NOT emit a lone
+        // 0x00 that truncates the QNAME before its QTYPE/QCLASS. encode_name skips empties, so the
+        // query still decodes to the non-empty labels with the correct qtype/class.
+        let name = Name(vec![
+            String::from("foo"),
+            String::new(), // would be a premature root terminator if not skipped
+            String::from("com"),
+        ]);
+        let buf = encode_query(0x1, &name, &QType::Other(16), 1);
+        let q = decode_query(&buf).expect("decodes despite the empty label");
+        assert_eq!(q.question.name.to_canon(), "foo.com");
+        assert!(matches!(q.question.qtype, QType::Other(16)));
+        assert_eq!(q.question.qclass, 1);
+    }
+
+    #[test]
+    fn encode_query_preserves_named_qtypes() {
+        for (qt, raw) in [(QType::A, 1u16), (QType::Aaaa, 28), (QType::Ptr, 12)] {
+            let name = Name(vec![
+                String::from("host"),
+                String::from("ts"),
+                String::from("net"),
+            ]);
+            let buf = encode_query(0x1, &name, &qt, 1);
+            let q = decode_query(&buf).expect("decodes");
+            assert_eq!(
+                qtype_value(&q.question.qtype),
+                raw,
+                "qtype {raw} round-trips"
+            );
+        }
     }
 
     #[test]
