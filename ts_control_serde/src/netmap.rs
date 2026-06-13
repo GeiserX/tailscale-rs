@@ -336,10 +336,12 @@ pub struct MapResponse<'a> {
     #[serde(borrow)]
     pub peers_changed_patch: Vec<Option<PeerChange<'a>>>,
 
-    /// How to update peers' [`last_seen`][crate::Node::last_seen] times.
+    /// How to update peers' [`last_seen`][crate::Node::last_seen] times (Go `PeerSeenChange`).
     ///
-    /// If the value for a peer is false, the peer is gone. If true, update `last_seen` to
-    /// now.
+    /// This is the SOLE driver of `last_seen`, and it never touches `online`: `true` ⇒ set
+    /// `last_seen` to now; `false` ⇒ clear `last_seen` (its value is unknown), NOT "mark offline".
+    /// A peer's online state is driven exclusively by [`online_change`](Self::online_change) —
+    /// conflating the two wrongly reports a peer offline merely because its last-seen is unknown.
     pub peer_seen_change: BTreeMap<NodeId, bool>,
 
     /// Updates to peers' [`online`][crate::Node::online] states.
