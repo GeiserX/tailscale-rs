@@ -61,18 +61,26 @@ impl AsyncTunTransport {
 
     async fn recv_many(&self) -> impl Iterator<Item = Result<PacketMut, Error>> {
         let mut ret = Some(self.device.readable().await);
-        let mut buf = BytesMut::new();
+        let mtu = self.mtu;
 
         core::iter::from_fn(move || {
             if let Some(Err(e)) = ret.take() {
                 return Some(Err(e.into()));
             }
 
-            buf.reserve(self.mtu.saturating_sub(buf.len()));
+            // The read must target a slice whose LENGTH is the MTU, not merely its capacity:
+            // `BytesMut::as_mut` yields a slice of `len` (a `reserve`d-but-empty buffer is a
+            // zero-length slice), so reading into a freshly `reserve`d buffer would read 0 bytes and
+            // silently drop every inbound packet. Allocate an MTU-sized zeroed buffer per read, then
+            // `split_to(n)` to return exactly the `n` bytes the device wrote — mirroring Go
+            // `net/tstun`, which reads into a sized buffer and reslices to the returned length.
+            let mut buf = BytesMut::zeroed(mtu);
 
-            match self.device.try_recv(buf.as_mut()) {
+            match self.device.try_recv(&mut buf[..]) {
+                // A zero-length read carries no packet; end the batch rather than emit an empty one.
+                Ok(0) => None,
                 Ok(n) => {
-                    let pkt = buf.split_off(n);
+                    let pkt = buf.split_to(n);
                     Some(Ok(pkt.into()))
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => None,
@@ -110,5 +118,57 @@ impl ts_transport::OverlayTransport for AsyncTunTransport {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::BytesMut;
+
+    /// Pins the buffer-sizing invariant the TUN read depends on, without a (privileged) device.
+    ///
+    /// The read targets `&mut buf[..]`, whose length is what the OS `read`/`readv` is allowed to
+    /// fill. The fixed code allocates an MTU-sized **zeroed** buffer (length == MTU), so the device
+    /// can write up to MTU bytes; `split_to(n)` then yields exactly the `n` written bytes. The prior
+    /// code used `BytesMut::new()` + `reserve(mtu)`, which grows *capacity* but leaves *length* 0 —
+    /// so the read slice was zero-length and every inbound packet was silently dropped. This test
+    /// fails on the old pattern (asserts the read slice is full-length) and passes on the new one.
+    #[test]
+    fn recv_buffer_is_mtu_sized_then_split_to_n() {
+        const MTU: usize = 1280;
+
+        // The broken pattern: reserve only grows capacity, the readable slice stays zero-length.
+        let mut reserved = BytesMut::new();
+        reserved.reserve(MTU);
+        assert_eq!(
+            reserved.as_mut().len(),
+            0,
+            "reserve grows capacity, not length — a read into this slice would read 0 bytes"
+        );
+
+        // The fixed pattern: an MTU-sized zeroed buffer is a full-length read target.
+        let mut buf = BytesMut::zeroed(MTU);
+        assert_eq!(
+            buf.len(),
+            MTU,
+            "the read target must be MTU bytes long, not merely MTU capacity"
+        );
+
+        // Simulate the device writing an `n`-byte packet into the head of the buffer, then split.
+        let packet = [0x45u8, 0x00, 0x00, 0x1c, 0xde, 0xad, 0xbe, 0xef];
+        let n = packet.len();
+        buf[..n].copy_from_slice(&packet);
+        let pkt = buf.split_to(n);
+
+        assert_eq!(
+            pkt.len(),
+            n,
+            "split_to(n) must return exactly the n written bytes"
+        );
+        assert_eq!(
+            pkt.as_ref(),
+            &packet,
+            "the returned packet must preserve the written bytes"
+        );
     }
 }
