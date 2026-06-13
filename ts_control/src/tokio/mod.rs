@@ -11,6 +11,7 @@ use register::register;
 // surfaces it as `Device::set_dns` (Go `LocalClient.SetDNS`), independent of the `acme` feature;
 // the (feature-gated) ACME DNS-01 engine is a second caller, not the only one.
 pub use set_dns::{SetDnsError, SetDnsInternalErrorKind, set_dns};
+pub use tka_mutation::{tka_disable, tka_init_begin, tka_init_finish, tka_submit_signature};
 pub use tka_sync::{
     TkaSyncError, TkaSyncInternalErrorKind, tka_bootstrap, tka_sync_offer, tka_sync_send,
 };
@@ -24,4 +25,5 @@ mod ping;
 mod prefixed_reader;
 mod register;
 mod set_dns;
+mod tka_mutation;
 mod tka_sync;

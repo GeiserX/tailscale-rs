@@ -835,7 +835,9 @@ impl Device {
     /// netstack) or the node not yet having an overlay IPv4.
     #[cfg(feature = "hyper")]
     pub async fn http_connector(&self) -> Result<crate::http::TailnetConnector, Error> {
-        Ok(crate::http::TailnetConnector::new(self.overlay_dialer().await?))
+        Ok(crate::http::TailnetConnector::new(
+            self.overlay_dialer().await?,
+        ))
     }
 
     /// Get our node info.

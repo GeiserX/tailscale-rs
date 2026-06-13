@@ -98,8 +98,8 @@ pub mod tls {
 pub use crate::tokio::{
     AsyncControlClient, FilterUpdate, IdTokenError, LogoutError, LogoutInternalErrorKind,
     PeerUpdate, SetDnsError, SetDnsInternalErrorKind, StateUpdate, TkaSyncError,
-    TkaSyncInternalErrorKind, fetch_id_token, logout, set_dns, tka_bootstrap, tka_sync_offer,
-    tka_sync_send,
+    TkaSyncInternalErrorKind, fetch_id_token, logout, set_dns, tka_bootstrap, tka_disable,
+    tka_init_begin, tka_init_finish, tka_submit_signature, tka_sync_offer, tka_sync_send,
 };
 
 /// An error which occurred while connecting to the control server or control plane.
