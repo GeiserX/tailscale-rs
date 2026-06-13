@@ -581,22 +581,31 @@ impl PeerTracker {
             ts_control::PeerUpdate::Full(new_nodes) => {
                 tracing::trace!("full peer update");
 
-                // Borrow the authority ONCE for the whole batch and verify each peer a single time
+                // Borrow the authority ONCE for the whole batch and verify each peer EXACTLY once
                 // (Go runs `tkaFilterNetmapLocked` once over the assembled netmap; an earlier draft
                 // verified every peer twice — once for `retained_ids`, once in the upsert loop —
-                // doubling the ed25519 cost on the hot resync path). `retained_ids` is exactly the set
-                // of stable_ids that PASS the gate, so it drives BOTH the `retain` (evict revoked
-                // peers) and the upsert loop (skip rejected peers) with no second verify.
+                // doubling the ed25519 cost on the hot resync path). The per-node verdict vector
+                // `admits` is computed once and drives both the `retain` (evict revoked peers, keyed
+                // by stable_id) and the upsert loop (skip rejected peers, by the node's OWN verdict).
+                // Keeping a per-node verdict (not just a stable_id set) means a node whose own
+                // signature fails is never admitted on the strength of a different node that happens
+                // to share its stable_id — matching the old per-node re-verify for that degenerate
+                // (malformed-control) input.
                 //
                 // Revocation evicts: a peer re-included with a now-invalid/missing signature under an
-                // active authority is excluded from `retained_ids`, so `retain` drops the stale
-                // (previously-admitted) entry. With no authority the snapshot is `None`, so every peer
-                // passes — byte-for-byte the pre-TKA behavior (no regression).
+                // active authority fails its verdict, so it is excluded from `retained_ids` and
+                // `retain` drops the stale (previously-admitted) entry. With no authority the snapshot
+                // is `None`, so every node passes — byte-for-byte the pre-TKA behavior (no regression).
                 let authority = self.tka_authority_snapshot();
+                let admits = new_nodes
+                    .iter()
+                    .map(|node| Self::tka_snapshot_admits(authority.as_deref(), node))
+                    .collect::<Vec<_>>();
                 let retained_ids = new_nodes
                     .iter()
-                    .filter(|node| Self::tka_snapshot_admits(authority.as_deref(), node))
-                    .map(|x| &x.stable_id)
+                    .zip(admits.iter().copied())
+                    .filter(|(_, ok)| *ok)
+                    .map(|(node, _)| &node.stable_id)
                     .collect::<HashSet<_>>();
 
                 // Isolation diagnostic: an ACTIVE lock that authorized none of the offered peers
@@ -621,8 +630,8 @@ impl PeerTracker {
                     retain
                 });
 
-                for node in new_nodes {
-                    if !retained_ids.contains(&node.stable_id) {
+                for (node, ok) in new_nodes.iter().zip(admits.iter().copied()) {
+                    if !ok {
                         continue; // fail-CLOSED: peer rejected by tailnet lock (verified once, above)
                     }
                     let peer_id = self.peer_db.upsert(node);
@@ -1208,6 +1217,36 @@ mod tka_tests {
         assert!(tracker.peer_db.get(&bad.node_key).is_some());
     }
 
+    /// Degenerate input: two DISTINCT nodes sharing one `stable_id` in a single `Full`, one with a
+    /// valid signature and one unsigned, under an active lock. Each node is judged by its OWN verdict
+    /// (the per-node `admits` vector), so the unsigned node is never admitted on the strength of its
+    /// signed twin. The single-verify `Full` refactor keeps this per-node semantics (a stable_id-set
+    /// alone would have admitted whichever node was upserted last). Malformed control input; asserted
+    /// only to lock the verdict-per-node behavior against regression.
+    #[tokio::test]
+    async fn tka_full_duplicate_stable_id_judges_each_node_on_its_own_signature() {
+        let (authority, sig) = authority_and_valid_sig();
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), Some(authority));
+
+        // Both carry stable_id "dup"; the signed one authorizes NODE_KEY_BYTES, the other is unsigned
+        // and uses a different node key. Order them unsigned-last so a last-writer-wins stable_id set
+        // would (wrongly) leave the unsigned node's key in the db.
+        let signed = peer_node("dup", NODE_KEY_BYTES, sig);
+        let unsigned = peer_node("dup", [8u8; 32], vec![]);
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![
+            signed.clone(),
+            unsigned.clone(),
+        ]));
+
+        // The unsigned node's own verdict failed, so its key must NOT be present, regardless of the
+        // shared stable_id. (The signed twin retained the stable_id; the db holds the signed key.)
+        assert!(
+            tracker.peer_db.get(&unsigned.node_key).is_none(),
+            "a node whose own signature fails must not be admitted via a stable_id twin"
+        );
+        assert!(tracker.peer_db.get(&signed.node_key).is_some());
+    }
+
     /// The empty-trusted-key-state brick-guard: an authority with no keys must NOT drop the whole
     /// netmap (a `ts_tka` invariant violation / replayer edge). A verified chain always carries ≥1
     /// key, so this never weakens a genuine lock — it only prevents a black-hole. Uses ≥2 peers
@@ -1271,6 +1310,10 @@ mod tka_tests {
             !tracker.tka_admits(&peer),
             "a signature from a key outside the trusted set must be rejected"
         );
+        // Drive the real upsert path too (match the sibling replay test's depth): an untrusted-key
+        // signature must keep the peer out of the db, not merely fail the verdict in isolation.
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer.clone()]));
+        assert!(tracker.peer_db.get(&peer.node_key).is_none());
     }
 
     /// Bus-enable analogue for `Delta`: enforcement engaged via the watch cell must also gate a
