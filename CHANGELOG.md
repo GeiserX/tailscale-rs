@@ -2,6 +2,24 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.31.0](https://github.com/GeiserX/tailscale-rs/compare/v0.30.1...v0.31.0) (2026-06-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* **ts_tunnel:** zeroize WireGuard symmetric key material on drop (tsr-9nu) ([#164](https://github.com/GeiserX/tailscale-rs/issues/164))
+
+### Features
+
+* **tka:** add Aum::sign + pin the sign-&gt;verify round-trip KAT (tsr-cfw) ([#163](https://github.com/GeiserX/tailscale-rs/issues/163)) ([5ea65e1](https://github.com/GeiserX/tailscale-rs/commit/5ea65e194a694c308237f75a651be33e1bdaaf39))
+* **ts_tunnel:** zeroize WireGuard symmetric key material on drop (tsr-9nu) ([#164](https://github.com/GeiserX/tailscale-rs/issues/164)) ([93f804d](https://github.com/GeiserX/tailscale-rs/commit/93f804d13735a17e2972e78380ac4779fecb727d))
+
+
+### Bug Fixes
+
+* **docs:** repair broken intra-doc links across the workspace; add exit-DNS antileak test ([#158](https://github.com/GeiserX/tailscale-rs/issues/158)) ([f43c51a](https://github.com/GeiserX/tailscale-rs/commit/f43c51ab8253fa4b95fdad0df78c52a63c5a9aef))
+* **magicsock:** confirm the pinged path on any pong source (match Go; tsr-ugm) ([#160](https://github.com/GeiserX/tailscale-rs/issues/160)) ([3adbe4c](https://github.com/GeiserX/tailscale-rs/commit/3adbe4c2826e39483c2cc6a03b91171b297368d4))
+
 ## [0.30.1](https://github.com/GeiserX/tailscale-rs/compare/v0.30.0...v0.30.1) (2026-06-13)
 
 
