@@ -259,20 +259,26 @@ impl PeerPaths {
     }
 
     /// Record a pong for `tx_id` received from `from`. Returns the measured latency if the tx id
-    /// was in flight *and* the pong arrived from the address we pinged.
+    /// was in flight (a matching, single-use transaction id).
     ///
-    /// The `from == to` check binds the pong to the path it confirms: a pong is only meaningful as
-    /// proof that the address we pinged answered, so a pong arriving from a different source (a
-    /// peer echoing a tx_id from an address we never probed) must not confirm a path. Without this
-    /// a malicious-but-authenticated peer could confirm `best_addr` for an address that never
-    /// actually responded. Updates the candidate's latency and recomputes the best address.
+    /// We confirm the address we **pinged** (`to`), never the pong's UDP source `from` — mirroring
+    /// Go magicsock `handlePongConnLocked`, which promotes the pinged `sentPing.to` and uses the
+    /// pong source only for logging / peer-attribution, not path selection. The anti-spoof
+    /// primitives are the disco-key seal (the frame is opened with an authenticated peer's shared
+    /// key before this is reached) plus the single-use 96-bit `tx_id` (consumed on use → no replay);
+    /// a source match adds nothing over them, since `best_addr` is keyed on `to` (a candidate *we*
+    /// selected from the netmap / CallMeMaybe), not on `from`. Requiring `to == from` would instead
+    /// drop legitimate cross-mapping pongs — our own hard-NAT `Stun4LocalPort` guess (the peer
+    /// replies from its real mapped port, not the local port we targeted) and asymmetric-NAT reply
+    /// routing — forcing those peers onto DERP where Go connects directly. So accept any source for a
+    /// matched tx_id and confirm the pinged path. (See tsr-ugm.) Updates the pinged candidate's
+    /// latency and recomputes the best address.
     pub fn note_pong(&mut self, tx_id: TxId, from: SocketAddr, now: Instant) -> Option<Duration> {
+        // `from` is intentionally not used for path selection (see the doc above): a matched tx_id
+        // confirms the address we pinged. Kept in the signature for the caller's recv path, and so
+        // the deliberate non-use is documented at the boundary rather than silently dropped.
+        let _ = from;
         let InFlight { to, sent } = self.in_flight.remove(&tx_id)?;
-        if to != from {
-            // Pong came from an address other than the one we pinged for this tx_id: drop it. The
-            // in-flight entry is already consumed, so a replayed/forged tx_id can't be reused.
-            return None;
-        }
         let latency = now.saturating_duration_since(sent);
 
         let cand = self.candidates.entry(to).or_default();
@@ -607,36 +613,59 @@ mod tests {
     }
 
     /// A pong that echoes a tx_id we have in flight but arrives from a *different* source address
-    /// than the one we pinged must not confirm the path (anti-spoofing: the pong only proves the
-    /// pinged address answered). The in-flight entry is still consumed so the tx_id can't be reused.
+    /// than the one we pinged still confirms the **pinged** path — matching Go magicsock, which keys
+    /// on `sentPing.to`, not the pong source. The anti-spoof binding is the (authenticated) disco
+    /// seal + single-use tx_id, not a source match; and `best_addr` is the address *we* pinged, never
+    /// the source. This is exactly the cross-mapping case our hard-NAT `Stun4LocalPort` guess relies
+    /// on (the peer replies from its real mapped port, not the local port we targeted): the old
+    /// `to == from` drop forced those peers to DERP. (tsr-ugm)
     #[test]
-    fn pong_from_wrong_source_is_ignored() {
+    fn pong_from_different_source_confirms_pinged_path() {
         let mut p = PeerPaths::default();
+        // We pinged the peer's hard-NAT local-port guess; the pong egresses its real mapped port —
+        // same IP, different port (the common `Stun4LocalPort` traversal shape).
         let pinged: SocketAddr = "203.0.113.1:41641".parse().unwrap();
-        let attacker: SocketAddr = "203.0.113.99:41641".parse().unwrap();
+        let reply_source: SocketAddr = "203.0.113.1:51820".parse().unwrap();
         p.add_netmap_candidates([pinged]);
 
         let now = Instant::now();
         p.note_ping_sent(tx(1), pinged, now);
 
-        // Pong for our tx_id, but from an address we never pinged: rejected.
+        // A matched tx_id from a different source still measures latency and confirms the path.
+        let lat = p.note_pong(tx(1), reply_source, now + Duration::from_millis(5));
         assert_eq!(
-            p.note_pong(tx(1), attacker, now + Duration::from_millis(5)),
-            None
+            lat,
+            Some(Duration::from_millis(5)),
+            "matched tx_id must confirm regardless of source"
         );
         assert_eq!(
             p.best_addr(now + Duration::from_millis(6)),
-            None,
-            "a pong from the wrong source must not confirm a path"
+            Some(pinged),
+            "best_addr must be the address we PINGED, never the pong's source"
         );
+    }
 
-        // The tx_id was consumed by the first (rejected) pong, so the legitimate address can no
-        // longer be confirmed by replaying that tx_id — the peer must ping afresh.
+    /// The tx_id is the single-use anti-replay token: it is consumed on the first matching pong, so a
+    /// second pong with the same tx_id (a replay) finds no in-flight entry and confirms nothing.
+    #[test]
+    fn pong_tx_id_is_single_use() {
+        let mut p = PeerPaths::default();
+        let pinged: SocketAddr = "203.0.113.1:41641".parse().unwrap();
+        p.add_netmap_candidates([pinged]);
+
+        let now = Instant::now();
+        p.note_ping_sent(tx(1), pinged, now);
+
+        // First pong confirms.
+        assert!(
+            p.note_pong(tx(1), pinged, now + Duration::from_millis(5))
+                .is_some()
+        );
+        // Replaying the same tx_id finds no in-flight entry → None (no second confirmation).
         assert_eq!(
             p.note_pong(tx(1), pinged, now + Duration::from_millis(7)),
             None
         );
-        assert_eq!(p.best_addr(now + Duration::from_millis(8)), None);
     }
 
     /// Anti-amplification: learned candidates per peer are bounded by
