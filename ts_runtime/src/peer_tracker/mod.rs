@@ -754,6 +754,14 @@ impl PeerTracker {
                         v.admitted && !obsolete.contains(&node.node_key.to_bytes()[..])
                     })
                     .collect::<Vec<bool>>();
+
+                // `retained_ids` is the set of stable_ids that survive (drives `retain` to evict the
+                // rest). It must agree with what the upsert loop below will leave in the db. Control
+                // should never send two distinct nodes with the same `stable_id` in one `Full`, but if
+                // it does, `peer_db.upsert` is last-writer-wins on `stable_id`, so the db ends holding
+                // the LAST kept node for that id. Build `retained_ids` from kept nodes only — a
+                // stable_id is retained iff at least one of its (possibly duplicate) nodes is kept, so
+                // the upsert loop's last-kept node lands and `retain` never evicts a just-upserted id.
                 let retained_ids = new_nodes
                     .iter()
                     .zip(keep.iter().copied())
@@ -818,7 +826,15 @@ impl PeerTracker {
 
                 for peer in remove {
                     let Some((id, _node)) = self.peer_db.remove(peer) else {
-                        tracing::error!(control_node_id = peer, "removed peer was unknown");
+                        // A benign, expected race: the peer may already be gone (dropped in a prior
+                        // `Full`, or fail-closed by TKA — whose now-"unknown" ids commonly reappear in
+                        // a trailing `peers_removed`). Go treats an unknown removal as a no-op; log at
+                        // debug, not error, to avoid false-alarm noise on a healthy node (matches the
+                        // unknown-node handling in `apply_peer_patches`).
+                        tracing::debug!(
+                            control_node_id = peer,
+                            "removed peer was unknown; ignoring"
+                        );
                         continue;
                     };
 
@@ -1400,6 +1416,92 @@ mod tka_tests {
             "a node whose own signature fails must not be admitted via a stable_id twin"
         );
         assert!(tracker.peer_db.get(&signed.node_key).is_some());
+    }
+
+    /// Full-path consistency under two KEPT nodes sharing a `stable_id`: `peer_db.upsert` is
+    /// last-writer-wins on `stable_id`, so the db ends holding exactly one node for that id (the last
+    /// kept), and `retain` never evicts that just-upserted id (`retained_ids` contains the shared id
+    /// because at least one of its nodes was kept). No lock here, so both nodes are "kept". This pins
+    /// the published-state invariant the whole-surface audit flagged: `retain` and the upsert loop
+    /// agree on the surviving stable_id. Malformed control input; asserted for robustness.
+    #[tokio::test]
+    async fn tka_full_duplicate_stable_id_both_kept_is_consistent() {
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
+        let first = peer_node("dup", [1u8; 32], vec![]);
+        let last = peer_node("dup", [2u8; 32], vec![]);
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![
+            first.clone(),
+            last.clone(),
+        ]));
+
+        // Exactly one db entry for the shared stable_id, holding the LAST node (upsert is
+        // last-writer-wins on stable_id); the first node's key was transparently superseded.
+        assert_eq!(
+            tracker.peer_db.peers().len(),
+            1,
+            "one entry for the shared stable_id"
+        );
+        assert!(
+            tracker.peer_db.get(&last.node_key).is_some(),
+            "the db holds the last-upserted node for the shared id"
+        );
+        assert!(
+            tracker.peer_db.get(&first.node_key).is_none(),
+            "the first node's key was superseded by the last at the shared id"
+        );
+    }
+
+    /// A peer admitted in one `Full`, then in a later `Full` presenting a key that a co-resident
+    /// peer's rotation chain has rotated away, is EVICTED — the cross-peer rotation filter applies on
+    /// every resync, not only at first admission. Exercises the rotation filter through two
+    /// sequential `Full` updates with real signing.
+    #[tokio::test]
+    async fn tka_full_rotation_obsolete_evicts_on_resync() {
+        use ed25519_dalek::SigningKey;
+        use ts_tka::NodeKeySignature;
+
+        let trusted = SigningKey::from_bytes(&[42u8; 32]);
+        let trusted_pub = trusted.verifying_key().to_bytes().to_vec();
+        let authority = Authority::from_state(
+            AumHash([0; 32]),
+            State {
+                keys: vec![Key {
+                    kind: KeyKind::Ed25519,
+                    votes: 1,
+                    public: trusted_pub.clone(),
+                }],
+            },
+        );
+        let pivot = SigningKey::from_bytes(&[9u8; 32]);
+        let pivot_pub: [u8; 32] = pivot.verifying_key().to_bytes();
+
+        // First Full: the soon-to-be-stale peer presents the pivot key with a valid Direct sig.
+        let stale_sig = NodeKeySignature::sign_direct(&pivot_pub, &trusted).serialize();
+        let stale_peer = peer_node("stale", pivot_pub, stale_sig);
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), Some(authority));
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![stale_peer.clone()]));
+        assert!(
+            tracker.peer_db.get(&stale_peer.node_key).is_some(),
+            "the stale peer is admitted while no rotation has superseded it yet"
+        );
+
+        // Second Full: a freshly-rotated peer (whose chain rotated AWAY the pivot key) joins, and the
+        // stale peer is re-included. The rotation filter now obsoletes the pivot key ⇒ stale evicted.
+        let new_key = [4u8; 32];
+        let new_sig = NodeKeySignature::sign_rotation(&new_key, &trusted, &pivot).serialize();
+        let new_peer = peer_node("rotated", new_key, new_sig);
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![
+            new_peer.clone(),
+            stale_peer.clone(),
+        ]));
+        assert!(
+            tracker.peer_db.get(&new_peer.node_key).is_some(),
+            "the freshly-rotated peer is admitted"
+        );
+        assert!(
+            tracker.peer_db.get(&stale_peer.node_key).is_none(),
+            "the stale peer is EVICTED on the resync once a rotation supersedes its key"
+        );
     }
 
     /// The empty-trusted-key-state brick-guard: an authority with no keys must NOT drop the whole

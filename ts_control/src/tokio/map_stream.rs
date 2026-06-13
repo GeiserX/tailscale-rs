@@ -139,8 +139,9 @@ pub struct StateUpdate {
     /// value; empty when this response carried none.
     pub online_change: alloc::collections::BTreeMap<crate::NodeId, bool>,
     /// Per-peer last-seen flips (`MapResponse.PeerSeenChange`), keyed by control node [`NodeId`](crate::NodeId).
-    /// `true` ⇒ the peer was just seen (update last-seen to now); `false` ⇒ the peer is gone
-    /// (mark offline). Empty when this response carried none.
+    /// `true` ⇒ the peer was just seen (set last-seen to now); `false` ⇒ clear last-seen (unknown).
+    /// This drives ONLY `last_seen`, never `online` — online is driven solely by `online_change`
+    /// (conflating them re-introduces a fixed bug). Empty when this response carried none.
     pub peer_seen_change: alloc::collections::BTreeMap<crate::NodeId, bool>,
 }
 
