@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.34.0](https://github.com/GeiserX/tailscale-rs/compare/v0.33.0...v0.34.0) (2026-06-13)
+
+
+### Features
+
+* **tka:** enforce Tailnet Lock at the peer-trust chokepoint ([#176](https://github.com/GeiserX/tailscale-rs/issues/176)) ([2e581ac](https://github.com/GeiserX/tailscale-rs/commit/2e581ace187a27cde2f2d230d86a3b231d94499f))
+
 ## [0.33.0](https://github.com/GeiserX/tailscale-rs/compare/v0.32.0...v0.33.0) (2026-06-13)
 
 
