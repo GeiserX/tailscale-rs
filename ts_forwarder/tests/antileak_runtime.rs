@@ -72,6 +72,31 @@ async fn direct_dialer_refuses_exit_egress_to_public_dst() {
     );
 }
 
+/// Case 1a-DNS (tsr-c39) — a forwarded client's UDP **port-53 (DNS)** datagram is exit egress like
+/// any other UDP, NOT a special DNS path that could leak the origin IP.
+///
+/// The forwarder deliberately does **not** special-case port 53: a forwarded client's DNS query to
+/// a public resolver (`8.8.8.8:53`) is classified and dialed exactly like every other `ExitNode`
+/// UDP flow, so it shares the forwarded-traffic egress (host IP, or a configured residential proxy)
+/// — never a separate DNS egress. Under the default `DirectDialer` that means it is structurally
+/// **refused** (`ExitEgressRefused`), fail-closed, identical to non-DNS exit UDP. This pins the
+/// anti-leak invariant the exit-node-client-DNS analysis (tsr-c39) relies on: matching Go, exit-node
+/// DNS for forwarded clients is the client's DoH redirect + raw forwarding, with no exit-side DNS
+/// interception that could bypass the dialer's fail-closed gate.
+#[tokio::test]
+async fn direct_dialer_refuses_exit_dns_udp_no_special_case() {
+    // Two public DNS resolvers on port 53; both must be refused as ordinary ExitNode UDP egress.
+    for dst in ["8.8.8.8:53", "1.1.1.1:53"] {
+        let dst: SocketAddr = dst.parse().unwrap();
+        let err = DirectDialer.dial_udp(FlowClass::ExitNode, dst).await.err();
+        assert!(
+            matches!(err, Some(DialError::ExitEgressRefused)),
+            "DirectDialer must refuse exit-node UDP:53 (DNS) exactly like any other UDP egress \
+             (no DNS special-case bypass), got {err:?} for {dst}"
+        );
+    }
+}
+
 /// Case 1b — non-exit (`Subnet`) flows are NOT caught by the exit refusal.
 ///
 /// A `Subnet`-class dial takes the legitimate egress path (it is a routed subnet, not the open

@@ -584,7 +584,7 @@ mod msg_impl {
 
         /// Log this node out of the tailnet: deregister it by expiring its current node key.
         ///
-        /// Mirrors [`fetch_id_token`](Self::fetch_id_token): clones the control config + node keys
+        /// Mirrors `fetch_id_token`: clones the control config + node keys
         /// into a spawned task (delegated reply, so the round-trip doesn't block the mailbox) and
         /// re-POSTs `/machine/register` with a past expiry over a fresh Noise channel. This is a
         /// control-plane state change only — it does NOT stop this actor or tear down the datapath
@@ -612,7 +612,7 @@ mod msg_impl {
         /// Publish a DNS record for this node via control's `/machine/set-dns` (Go
         /// `LocalClient.SetDNS`).
         ///
-        /// Mirrors [`fetch_id_token`](Self::fetch_id_token): clones the control config + node keys
+        /// Mirrors `fetch_id_token`: clones the control config + node keys
         /// into a spawned task (delegated reply, so the round-trip doesn't block the mailbox) and
         /// POSTs the record over a fresh Noise channel. Go's `SetDNS` is `TXT`-only (its sole use is
         /// the ACME DNS-01 `_acme-challenge` record); the record type is fixed to `"TXT"` here to
@@ -657,7 +657,7 @@ mod msg_impl {
         /// Issue a real Let's Encrypt certificate for this node's MagicDNS `name` via the
         /// client-side ACME DNS-01 engine (`acme` feature).
         ///
-        /// Mirrors [`fetch_id_token`](Self::fetch_id_token): clones the control config + node keys
+        /// Mirrors `fetch_id_token`: clones the control config + node keys
         /// into a spawned task (delegated reply, so the round-trip doesn't block the mailbox), loads
         /// or generates the ACME account key, and runs issuance against Let's Encrypt production,
         /// publishing the DNS-01 challenge TXT through the node's `POST /machine/set-dns` RPC.

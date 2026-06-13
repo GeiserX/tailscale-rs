@@ -807,10 +807,10 @@ impl From<&ts_control_serde::Node<'_>> for Node {
 /// [`MapResponse::peers_changed_patch`][ts_control_serde::MapResponse::peers_changed_patch].
 ///
 /// Control sends a patch (rather than a full node in `peers_changed`) when only a peer's
-/// reachability changes mid-session — most importantly its UDP [`endpoints`][PeerChange::endpoints]
+/// reachability changes mid-session — most importantly its UDP `endpoints`
 /// and home [`derp_region`][PeerChange::derp_region] when an idle peer re-establishes connectivity.
 /// Every field is `Option`: a patch sets only the fields it carries and leaves the rest of the
-/// target node unchanged (see [`PeerTracker::apply_peer_update`] for the merge). Owned counterpart
+/// target node unchanged (see `PeerTracker::apply_peer_update` for the merge). Owned counterpart
 /// of the borrow-bound [`ts_control_serde::PeerChange`]; the fields that map onto a domain
 /// [`Node`] field are retained, including control's `online`/`last_seen` liveness deltas — the
 /// dominant channel by which peer online transitions are delivered (see [`Node::online`]).

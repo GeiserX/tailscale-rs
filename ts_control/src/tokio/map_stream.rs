@@ -116,8 +116,8 @@ pub struct StateUpdate {
     /// Update to the packet filter.
     pub packetfilter: Option<FilterUpdate>,
     /// The peer-capability grants retained from this response's packet-filter application rules
-    /// (Go `tailcfg.FilterRule` cap-grants), which the network-rule compile in [`packetfilter`] drops.
-    /// `Some` exactly when [`packetfilter`] is `Some` (the same source rules); the consumer keeps
+    /// (Go `tailcfg.FilterRule` cap-grants), which the network-rule compile in `packetfilter` drops.
+    /// `Some` exactly when `packetfilter` is `Some` (the same source rules); the consumer keeps
     /// these for flow-scoped WhoIs (`apitype.WhoIsResponse.CapMap`). Empty `Vec` when the response's
     /// rules carried no application/cap-grant rule.
     pub cap_grants: Option<Vec<ts_packetfilter_state::CapGrant>>,

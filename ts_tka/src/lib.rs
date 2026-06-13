@@ -70,7 +70,7 @@ const MAX_KEY_VOTES: u32 = 4096;
 /// (`PrevAUMHash`). Text form is RFC4648 standard base32, no padding (Go `AUMHash.MarshalText`).
 ///
 /// `Ord`/`PartialOrd` order by the raw 32 bytes — used to key the sync store (a `BTreeMap`, since the
-/// crate is `no_std`) and already relied on by [`pick_next_aum`]'s lowest-hash fork tiebreak.
+/// crate is `no_std`) and already relied on by `pick_next_aum`'s lowest-hash fork tiebreak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AumHash(pub [u8; AUM_HASH_LEN]);
 
@@ -459,7 +459,7 @@ impl AumKey {
 
     /// Validate this key's well-formedness, mirroring Go `Key.StaticValidate` (`tka/key.go`,
     /// v1.100.0). A trusted key folded into the state with an out-of-range `votes` would contribute
-    /// the wrong weight to [`pick_next_aum`] fork resolution, so a node that accepts it diverges from
+    /// the wrong weight to `pick_next_aum` fork resolution, so a node that accepts it diverges from
     /// one that rejects it — a consensus split. Checked at decode/fold time.
     ///
     /// Rules (exact Go parity): `votes` must be `1..=4096` (`0` → "key votes must be non-zero",
@@ -1106,7 +1106,7 @@ impl VerifiedAumChain {
     /// # Errors
     /// [`TkaError::UnsignedAum`] for an AUM with no signatures; [`TkaError::UntrustedKey`] if a
     /// signature names a key not trusted at that point; [`TkaError::BadSignature`] on a failed
-    /// cryptographic check; plus every structural error of [`ReplayState::apply_verified_aum`]
+    /// cryptographic check; plus every structural error of `ReplayState::apply_verified_aum`
     /// ([`TkaError::BadChain`]/[`BadParent`](TkaError::BadParent)/[`BadKeyState`](TkaError::BadKeyState)/[`Decode`](TkaError::Decode)).
     pub fn verify(aums: &[Aum]) -> Result<VerifiedAumChain, TkaError> {
         let last = aums.last().ok_or(TkaError::BadChain)?;
@@ -1232,7 +1232,7 @@ impl Authority {
 
     /// Resolve a **single fork point**: a shared linear `prefix` (genesis→fork point, parent-ordered)
     /// followed by `branches`, the competing children of the fork point. The active child is chosen by
-    /// [`pick_next_aum`]'s deterministic rules (weight → `RemoveKey` preference → lowest hash),
+    /// `pick_next_aum`'s deterministic rules (weight → `RemoveKey` preference → lowest hash),
     /// evaluated against the state at the fork point, and applied. This is the consensus-critical
     /// selection every node must make identically; the linear [`Authority::from_chain`] is the common
     /// (no-fork) case.
@@ -1371,12 +1371,12 @@ impl MemAumStore {
 
     /// Walk the chain from `oldest` (the genesis) forward to the head, returning the AUMs in
     /// parent→child order — the linear form [`VerifiedAumChain::verify`] / [`Authority::from_chain`]
-    /// expect. At a fork (a parent with more than one child) the deterministic [`pick_next_aum`] rule
+    /// expect. At a fork (a parent with more than one child) the deterministic `pick_next_aum` rule
     /// chooses the branch, so the result is the active chain (matching how the chain is replayed).
     ///
     /// Used by the runtime sync driver to turn the AUMs accumulated in the store (genesis +
     /// sync-received) into the ordered chain it re-verifies into an [`Authority`]. Bounded by
-    /// [`MAX_SYNC_ITER`] so a malformed/cyclic store cannot loop forever.
+    /// `MAX_SYNC_ITER` so a malformed/cyclic store cannot loop forever.
     ///
     /// # Errors
     /// [`TkaError::BadChain`] if `oldest` is not in the store, or the walk exceeds the iteration cap
@@ -2007,7 +2007,7 @@ impl AumSignature {
 
 impl Aum {
     /// Decode an [`Aum`] from its canonical CBOR serialization (the inverse of [`Aum::serialize`] /
-    /// [`Aum::to_cbor`]). This is the acquisition primitive a sync/bootstrap path uses to turn the
+    /// `Aum::to_cbor`). This is the acquisition primitive a sync/bootstrap path uses to turn the
     /// raw `MarshaledAUM` bytes control sends into an [`Aum`] before it is verified and replayed
     /// (Go `tka.AUM` CBOR unmarshal).
     ///
