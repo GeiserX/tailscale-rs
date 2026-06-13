@@ -647,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "checks"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "clap 4.6.1",
  "globwalk",
@@ -1889,7 +1889,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_tailscale"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "axum",
  "bytes",
@@ -1928,7 +1928,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_array256"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "geiserx_ts_bitset",
  "heapless",
@@ -1940,7 +1940,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_bart"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "cfg-if",
  "divan",
@@ -1959,7 +1959,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_bart_packetfilter"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "geiserx_ts_array256",
  "geiserx_ts_bart",
@@ -1974,7 +1974,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_bitset"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "cfg-if",
  "divan",
@@ -1984,14 +1984,14 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_capabilityversion"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "geiserx_ts_control"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2032,7 +2032,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_control_noise"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2057,7 +2057,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_control_serde"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2075,7 +2075,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_dataplane"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "etherparse",
  "geiserx_ts_bart",
@@ -2092,7 +2092,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_derp"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "bytes",
  "crypto_box",
@@ -2120,7 +2120,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_disco_protocol"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "aead 0.5.2",
  "crypto_box",
@@ -2134,11 +2134,11 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_dns_wire"
-version = "0.30.1"
+version = "0.31.0"
 
 [[package]]
 name = "geiserx_ts_dynbitset"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "geiserx_ts_bitset",
  "proptest",
@@ -2147,7 +2147,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_elixir"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "geiserx_tailscale",
  "geiserx_ts_control",
@@ -2158,7 +2158,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_ffi"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "cbindgen",
  "geiserx_tailscale",
@@ -2170,7 +2170,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_forwarder"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "bytes",
  "geiserx_ts_netstack_smoltcp",
@@ -2182,14 +2182,14 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_hexdump"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "heapless",
 ]
 
 [[package]]
 name = "geiserx_ts_host_net"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "ipnet",
  "thiserror 2.0.18",
@@ -2198,7 +2198,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_http_util"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "bytes",
  "futures",
@@ -2219,7 +2219,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_keys"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "crypto_box",
  "ed25519-dalek 2.2.0",
@@ -2235,7 +2235,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_magicsock"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "geiserx_ts_disco_protocol",
  "geiserx_ts_keys",
@@ -2253,11 +2253,11 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_metrics"
-version = "0.30.1"
+version = "0.31.0"
 
 [[package]]
 name = "geiserx_ts_netcheck"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "bytes",
  "dashmap",
@@ -2278,7 +2278,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_netstack_smoltcp"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "axum",
  "bytes",
@@ -2299,7 +2299,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_netstack_smoltcp_core"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "bytes",
  "flume",
@@ -2313,7 +2313,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_netstack_smoltcp_socket"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "bytes",
  "futures-io",
@@ -2324,7 +2324,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_nodecapability"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "cfg-if",
  "serde",
@@ -2333,7 +2333,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_overlay_router"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "geiserx_ts_bart",
  "geiserx_ts_packet",
@@ -2344,7 +2344,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_packet"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "bytes",
  "crypto_box",
@@ -2353,7 +2353,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_packetfilter"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "hashbrown 0.17.1",
  "ipnet",
@@ -2363,7 +2363,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_packetfilter_serde"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "geiserx_ts_nodecapability",
  "geiserx_ts_peercapability",
@@ -2376,7 +2376,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_packetfilter_state"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "divan",
  "geiserx_ts_bart_packetfilter",
@@ -2389,7 +2389,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_peercapability"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "serde",
  "url",
@@ -2397,7 +2397,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_python"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "geiserx_tailscale",
  "geiserx_ts_control",
@@ -2410,7 +2410,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_runtime"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2453,14 +2453,14 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_time"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "geiserx_ts_tka"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "blake2 0.10.6",
  "ed25519-dalek 2.2.0",
@@ -2471,7 +2471,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_tls_util"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "rcgen",
  "ring",
@@ -2486,14 +2486,14 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_transport"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "geiserx_ts_packet",
 ]
 
 [[package]]
 name = "geiserx_ts_transport_tun"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "bytes",
  "geiserx_ts_hexdump",
@@ -2509,7 +2509,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_tunnel"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "aead 0.5.2",
  "base64 0.22.1",
@@ -2537,7 +2537,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_underlay_router"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "geiserx_ts_packet",
  "geiserx_ts_transport",
@@ -4521,9 +4521,9 @@ dependencies = [
 
 [[package]]
 name = "pyo3"
-version = "0.28.3"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91fd8e38a3b50ed1167fb981cd6fd60147e091784c427b8f7183a7ee32c31c12"
+checksum = "cd274650b21d4bfc26a0a47587962c1edb425f69287324355cd040c3ea66071c"
 dependencies = [
  "bytes",
  "libc",
@@ -4536,9 +4536,9 @@ dependencies = [
 
 [[package]]
 name = "pyo3-async-runtimes"
-version = "0.28.0"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e7364a95bf00e8377bbf9b0f09d7ff9715a29d8fcf93b47d1a967363b973178"
+checksum = "b3ef68daa7316a3fac65e5e18b2203f010346de1c1c53456811a2624673ab046"
 dependencies = [
  "futures-channel",
  "futures-util",
@@ -4551,9 +4551,9 @@ dependencies = [
 
 [[package]]
 name = "pyo3-async-runtimes-macros"
-version = "0.28.0"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c23399970eea9c31d0ac84cee4a9d8dd05f89b1da2f4dd5bb44b32a3f66db4f8"
+checksum = "faf75ff3922e6830adcaa30f3a359ce861326f6161f16a13d97adb40ba6a744a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4562,18 +4562,18 @@ dependencies = [
 
 [[package]]
 name = "pyo3-build-config"
-version = "0.28.3"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e368e7ddfdeb98c9bca7f8383be1648fd84ab466bf2bc015e94008db6d35611e"
+checksum = "c5e2a7d2f0d013342f295c048ad19237add5154a55b1c5a254c0ec93d4109078"
 dependencies = [
  "target-lexicon",
 ]
 
 [[package]]
 name = "pyo3-ffi"
-version = "0.28.3"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f29e10af80b1f7ccaf7f69eace800a03ecd13e883acfacc1e5d0988605f651e"
+checksum = "ca85c467da1bbc8d866eea5deff9cf29ea5f7785054a17da36e65bda9c05845b"
 dependencies = [
  "libc",
  "pyo3-build-config",
@@ -4581,9 +4581,9 @@ dependencies = [
 
 [[package]]
 name = "pyo3-macros"
-version = "0.28.3"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df6e520eff47c45997d2fc7dd8214b25dd1310918bbb2642156ef66a67f29813"
+checksum = "9ac53762fd065daa3194dd09337a38bd793a188100fd1a9304c4ab312d901771"
 dependencies = [
  "proc-macro2",
  "pyo3-macros-backend",
@@ -4593,13 +4593,12 @@ dependencies = [
 
 [[package]]
 name = "pyo3-macros-backend"
-version = "0.28.3"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4cdc218d835738f81c2338f822078af45b4afdf8b2e33cbb5916f108b813acb"
+checksum = "4ca3a1557399783172dc5bf39cfca835157732532cba56b71d2292161e53b362"
 dependencies = [
  "heck",
  "proc-macro2",
- "pyo3-build-config",
  "quote",
  "syn 2.0.117",
 ]
@@ -6519,7 +6518,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "ts_cli_util"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "cfg-if",
  "clap 4.6.1",
@@ -6538,7 +6537,7 @@ dependencies = [
 
 [[package]]
 name = "ts_devtools"
-version = "0.30.1"
+version = "0.31.0"
 dependencies = [
  "bytes",
  "clap 4.6.1",
@@ -6554,7 +6553,7 @@ dependencies = [
 
 [[package]]
 name = "ts_test_util"
-version = "0.30.1"
+version = "0.31.0"
 
 [[package]]
 name = "tun-rs"
