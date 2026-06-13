@@ -1240,6 +1240,37 @@ impl Device {
         self.runtime.tka_disable(disablement_secret).await
     }
 
+    /// Initialize Tailnet Lock for this tailnet with this node as the sole initial trusted key — the
+    /// Rust analog of Go `LocalClient.NetworkLockInit` for the single-node "lock yourself in" case.
+    ///
+    /// Builds and signs a genesis Checkpoint AUM trusting only this node's network-lock key and
+    /// gated by `disablement_secret` (stored as its Argon2i [`disablement_value`][ts_tka::disablement_value]
+    /// in the lock; the raw secret is the operator-held capability that later disables it via
+    /// [`tka_disable`](Device::tka_disable)), then drives control's two-phase
+    /// `/machine/tka/init/{begin,finish}`.
+    ///
+    /// **Single-node only (for now):** if control reports that other nodes must be (re)signed under
+    /// the new lock (a multi-node tailnet), this returns [`ts_control::TkaSyncError::Unsupported`] —
+    /// the multi-node init (re-signing each node, incl. rotation keys) is a deferred follow-up.
+    ///
+    /// **Submit-only:** this creates the lock at control and does not seed this node's local
+    /// [`Authority`][ts_tka::Authority]; the lock is reflected locally through the verified
+    /// netmap-driven sync (every applied AUM passes
+    /// [`VerifiedAumChain::verify`][ts_tka::VerifiedAumChain::verify]). Verify-and-log posture is
+    /// unchanged.
+    ///
+    /// # Errors
+    /// [`ts_control::TkaSyncError::Unsupported`] if control has no TKA endpoint or requires re-signing
+    /// other nodes; [`ts_control::TkaSyncError::NetworkError`] on a transient failure; a coarse
+    /// `Internal` for a malformed genesis or other RPC failure (incl. control rejecting the init,
+    /// e.g. a lock already exists).
+    pub async fn tka_init(
+        &self,
+        disablement_secret: Vec<u8>,
+    ) -> Result<(), ts_control::TkaSyncError> {
+        self.runtime.tka_init(disablement_secret).await
+    }
+
     /// Request an OIDC **ID token** from control for this node, scoped to `audience` (workload-
     /// identity federation, like `tailscale`'s `id-token` LocalAPI).
     ///
