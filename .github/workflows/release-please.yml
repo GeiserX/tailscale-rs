@@ -5,12 +5,33 @@
 #   2. release-please maintains a standing "release PR" that bumps the single
 #      workspace version (`[workspace.package].version` in Cargo.toml, which all 43
 #      crates inherit via `version.workspace = true`) and rewrites CHANGELOG.md.
-#   3. Merging that PR makes release-please create the GitHub Release + push tag
-#      `v{version}`.
+#   3. That PR is merged — by a human, or automatically (see "Auto-merge" below) —
+#      which makes release-please create the GitHub Release + push tag `v{version}`.
 #   4. This workflow then dispatches `release.yml` for that tag (the crates.io
-#      publish + binaries). It must dispatch explicitly: the tag is pushed with
-#      GITHUB_TOKEN, and GitHub's recursion guard means a GITHUB_TOKEN tag push does
-#      NOT trigger `release.yml`'s `on: push: tags`, so the publish would never fire.
+#      publish + binaries). It must dispatch explicitly: the tag is pushed with the
+#      runner token, and GitHub's recursion guard means a token tag push does NOT
+#      trigger `release.yml`'s `on: push: tags`, so the publish would never fire.
+#      (An explicit `workflow_dispatch` via the API is exempt from that guard, so the
+#      dispatch below DOES start the publish — proven by the v0.31–v0.34 releases.)
+#
+# Auto-merge (opt-in, requires a PAT):
+#   release-please does NOT merge its own release PR — by design, the merge is the
+#   "ship it" trigger. To make releases fully hands-off, this workflow enables GitHub
+#   native auto-merge on the release PR. THE CATCH: the same recursion guard means a
+#   release-PR merge completed by the built-in GITHUB_TOKEN would NOT re-trigger this
+#   workflow, so step 3's release/tag would never be cut — the PR would merge into a
+#   dead end. So auto-merge is wired to a Personal Access Token (or GitHub App token)
+#   stored as the `RELEASE_PLEASE_TOKEN` secret: the action runs as that identity AND
+#   completes the merge as that identity, whose push DOES re-trigger the release cut.
+#   The auto-merge step is GATED on that secret being present — when it is absent the
+#   workflow behaves exactly as before (the release PR waits for a manual merge), so
+#   this can never land in a "merged but never released" state. To go hands-off:
+#   create a fine-grained PAT for this repo with `contents: write` + `pull-requests:
+#   write` (or a classic PAT with `repo` + `workflow`), add it as the repo secret
+#   `RELEASE_PLEASE_TOKEN`, and ensure "Allow auto-merge" is enabled in repo settings.
+#   (With no branch protection the PR is immediately mergeable, so auto-merge merges
+#   as soon as it is enabled; add branch protection on the fast, reliable CI lanes —
+#   NOT the flaky self-hosted `hosted test` lane — if you want a green-CI gate.)
 #
 # Version-bump mechanics (see release-please-config.json): release-type `simple`
 # (CHANGELOG + manifest + tag only — it does NOT edit Cargo.toml, so it can't break
@@ -36,19 +57,43 @@ jobs:
   release-please:
     name: maintain release PR · cut release on merge
     runs-on: ubuntu-latest
+    # Surface whether the hands-off PAT is configured, so the auto-merge step can be
+    # gated on it (a secret cannot be referenced directly in a step-level `if:`).
+    env:
+      HAS_RELEASE_PAT: ${{ secrets.RELEASE_PLEASE_TOKEN != '' }}
     steps:
       - uses: googleapis/release-please-action@a02a34c4d625f9be7cb89156071d8567266a2445 # v4.2.0
         id: release
         with:
+          # Prefer the PAT so a release-PR merge (manual OR auto) is attributed to a
+          # real identity whose push re-triggers this workflow to cut the release.
+          # Falls back to the built-in token when the secret is absent (status quo:
+          # a manual merge by a human still works and still triggers the release cut).
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
+      # Hands-off: enable auto-merge on the standing release PR. Gated on the PAT
+      # secret (see the header) so it never enables a merge the release cut can't
+      # follow. `--auto` turns on GitHub native auto-merge (merges when the PR's merge
+      # requirements are met; immediately if none are configured). Idempotent — safe to
+      # run every time the release PR is opened or updated.
+      - name: Enable auto-merge on the release PR
+        if: ${{ env.HAS_RELEASE_PAT == 'true' && steps.release.outputs.pr }}
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          PR_JSON: ${{ steps.release.outputs.pr }}
+        run: |
+          pr_number=$(printf '%s' "$PR_JSON" | jq -r '.number')
+          echo "Enabling auto-merge on release PR #${pr_number}"
+          gh pr merge --squash --auto --repo "${GITHUB_REPOSITORY}" "${pr_number}"
+
       # Kick off the crates.io publish + binary build for the freshly-pushed tag.
       # (Why dispatch instead of relying on release.yml's own `on: push: tags`: the
-      # release-please tag push uses GITHUB_TOKEN, which GitHub deliberately does not
-      # let trigger further workflow runs — the recursion guard. release.yml keeps its
-      # tag trigger for manual/CLI tag pushes, but a release-please release reaches it
-      # only via this explicit dispatch.)
+      # release-please tag push uses the runner token, which GitHub deliberately does
+      # not let trigger further workflow runs — the recursion guard. release.yml keeps
+      # its tag trigger for manual/CLI tag pushes, but a release-please release reaches
+      # it only via this explicit dispatch.)
       - name: Dispatch publish for the new tag
         if: ${{ steps.release.outputs.release_created }}
         env:
