@@ -456,8 +456,16 @@ impl Message<Arc<ts_control::StateUpdate>> for PeerTracker {
         // carries NO `peer_update` (a bare online flip is the common case), so they must be applied
         // *before* the no-peer-update early return — otherwise online status freezes at the last
         // full-node/patch value. Each entry only ever *sets* a value (never back to unknown).
+        // Wall clock for a `PeerSeenChange: true` (Go uses `clock.Now()`). chrono is built without
+        // its `clock` feature in this workspace, so derive it from `SystemTime` the same way the
+        // control runner / ssh-policy paths do (unix secs → `DateTime::from_timestamp`).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| chrono::DateTime::from_timestamp(d.as_secs() as i64, d.subsec_nanos()))
+            .unwrap_or_default();
         let liveness_changed =
-            self.apply_liveness_changes(&msg.online_change, &msg.peer_seen_change);
+            self.apply_liveness_changes(&msg.online_change, &msg.peer_seen_change, now);
 
         if msg.peer_update.is_none() && msg.peer_patches.is_empty() {
             // No peer set or patch this response. If a liveness delta still mutated the netmap,
@@ -769,22 +777,26 @@ impl PeerTracker {
     /// `PeerSeenChange`, channels C/D) onto the retained netmap. Returns `true` if any node was
     /// actually mutated (so the caller knows whether to re-publish).
     ///
-    /// Mirrors Go's post-`peers*` application of these maps. Each entry is keyed by control node id
-    /// and only ever *sets* a value (never back to unknown). An entry for an unknown node id is
-    /// ignored (like a patch — these maps never create a node). `peer_seen_change`'s `false` ("the
-    /// peer is gone") is applied as `online = Some(false)` — the node stays in the netmap, it is
-    /// merely marked offline; the `last_seen = now` update for the `true` case is intentionally not
-    /// performed here (it needs a wall clock this actor does not hold, and `last_seen` is the
-    /// low-value half — `online` is the `tailscale status` column that matters; see the iter-5
-    /// research note §5.5).
+    /// Mirrors Go `controlclient/map.go:updatePeersStateFromResponse` (the two channels are
+    /// semantically DISTINCT and must not be conflated):
+    /// - `OnlineChange` (channel C) is the sole driver of a peer's `online` flag (`mut.Online = v`).
+    /// - `PeerSeenChange` (channel D) is the sole driver of `last_seen`: `true ⇒ LastSeen = now`,
+    ///   `false ⇒ LastSeen = nil` (cleared). It NEVER touches `online` — "not seen recently" is not
+    ///   the same as "offline", which only `OnlineChange` asserts.
+    ///
+    /// Each entry is keyed by control node id and applies to a peer already in the netmap; an unknown
+    /// node id is ignored (these maps never create a node). `now` is the wall-clock timestamp for a
+    /// `PeerSeenChange: true` (Go uses `clock.Now()`); the caller passes it so this stays a pure
+    /// function of its inputs. Returns `true` if any node was actually mutated.
     fn apply_liveness_changes(
         &mut self,
         online_change: &std::collections::BTreeMap<ts_control::NodeId, bool>,
         peer_seen_change: &std::collections::BTreeMap<ts_control::NodeId, bool>,
+        now: chrono::DateTime<chrono::Utc>,
     ) -> bool {
         let mut changed = false;
 
-        // Channel C — direct online flips.
+        // Channel C — direct online flips (the only writer of `online`).
         for (&node_id, &online) in online_change {
             if let Some((_pid, existing)) = self.peer_db.get(&node_id)
                 && existing.online != Some(online)
@@ -796,17 +808,15 @@ impl PeerTracker {
             }
         }
 
-        // Channel D — peer-seen flips. `false` ⇒ "the peer is gone" ⇒ mark offline (the node is
-        // retained, not removed). `true` ⇒ "seen just now"; the online half is unknown from this
-        // signal alone, so we leave `online` untouched (a `true` here does not assert connectivity to
-        // control, only recent contact) and defer the `last_seen = now` timestamp (no clock here).
+        // Channel D — peer-seen flips (the only writer of `last_seen`; never touches `online`).
+        // `true` ⇒ last-seen is now; `false` ⇒ last-seen cleared (Go map.go:820-830).
         for (&node_id, &seen) in peer_seen_change {
-            if !seen
-                && let Some((_pid, existing)) = self.peer_db.get(&node_id)
-                && existing.online != Some(false)
+            let new_last_seen = if seen { Some(now) } else { None };
+            if let Some((_pid, existing)) = self.peer_db.get(&node_id)
+                && existing.last_seen != new_last_seen
             {
                 let mut node = existing.clone();
-                node.online = Some(false);
+                node.last_seen = new_last_seen;
                 self.peer_db.upsert(&node);
                 changed = true;
             }
@@ -1624,20 +1634,24 @@ mod tka_tests {
         );
     }
 
-    /// Channel C/D: the `online_change` map flips online directly; `peer_seen_change: false`
-    /// ("the peer is gone") marks the peer offline. Both apply to a peer already in the netmap and
-    /// ignore unknown ids.
+    /// Channel C/D (Go `map.go:updatePeersStateFromResponse`): `online_change` is the sole driver of
+    /// `online`; `peer_seen_change` is the sole driver of `last_seen` (true ⇒ now, false ⇒ cleared)
+    /// and must NEVER touch `online`. Both apply to a peer already in the netmap and ignore unknown
+    /// ids. This pins the fix for the prior bug where channel D wrote `online=false` (conflating
+    /// "not seen recently" with "offline" — distinct signals in Go).
     #[tokio::test]
     async fn liveness_change_maps_apply_online() {
         let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
         let peer = peer_node("p", [1u8; 32], vec![]); // id == 1
         tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer]));
+        // A fixed timestamp (chrono is built without its `clock` feature, so no `Utc::now()`).
+        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
 
         // Channel C: online_change sets online=true.
         let mut online_change = std::collections::BTreeMap::new();
         online_change.insert(1 as ts_control::NodeId, true);
         online_change.insert(999 as ts_control::NodeId, true); // unknown id — ignored
-        let changed = tracker.apply_liveness_changes(&online_change, &Default::default());
+        let changed = tracker.apply_liveness_changes(&online_change, &Default::default(), now);
         assert!(changed);
         assert_eq!(
             tracker
@@ -1649,21 +1663,38 @@ mod tka_tests {
             Some(true)
         );
 
-        // Channel D: peer_seen_change=false marks the peer offline (gone), node retained.
-        let mut peer_seen_change = std::collections::BTreeMap::new();
-        peer_seen_change.insert(1 as ts_control::NodeId, false);
-        let changed = tracker.apply_liveness_changes(&Default::default(), &peer_seen_change);
+        // Channel D: peer_seen_change=true sets last_seen=now and leaves online UNTOUCHED.
+        let mut seen_true = std::collections::BTreeMap::new();
+        seen_true.insert(1 as ts_control::NodeId, true);
+        let changed = tracker.apply_liveness_changes(&Default::default(), &seen_true, now);
         assert!(changed);
-        assert_eq!(
-            tracker
-                .peer_db
-                .get(&(1 as ts_control::NodeId))
-                .unwrap()
-                .1
-                .online,
-            Some(false),
-            "peer_seen_change=false marks offline (the node stays in the netmap)"
-        );
+        {
+            let (_id, node) = tracker.peer_db.get(&(1 as ts_control::NodeId)).unwrap();
+            assert_eq!(
+                node.last_seen,
+                Some(now),
+                "peer_seen_change=true sets last_seen=now"
+            );
+            assert_eq!(
+                node.online,
+                Some(true),
+                "channel D must NOT touch online (still true from channel C)"
+            );
+        }
+
+        // Channel D: peer_seen_change=false clears last_seen, still leaving online untouched.
+        let mut seen_false = std::collections::BTreeMap::new();
+        seen_false.insert(1 as ts_control::NodeId, false);
+        let changed = tracker.apply_liveness_changes(&Default::default(), &seen_false, now);
+        assert!(changed);
+        {
+            let (_id, node) = tracker.peer_db.get(&(1 as ts_control::NodeId)).unwrap();
+            assert_eq!(
+                node.last_seen, None,
+                "peer_seen_change=false clears last_seen"
+            );
+            assert_eq!(node.online, Some(true), "channel D must NOT mark offline");
+        }
         assert_eq!(
             tracker.peer_db.peers().len(),
             1,
@@ -1671,7 +1702,7 @@ mod tka_tests {
         );
 
         // No-op when nothing matches / changes.
-        assert!(!tracker.apply_liveness_changes(&Default::default(), &Default::default()));
+        assert!(!tracker.apply_liveness_changes(&Default::default(), &Default::default(), now));
     }
 
     /// Security: a `Patch` that rotates the node key must re-satisfy the tailnet-lock authority,

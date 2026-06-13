@@ -547,7 +547,11 @@ pub struct PeerChange<'a> {
     )]
     pub derp_region: Option<DerpRegionId>,
 
-    /// If present, the node's capability version is the new value.
+    /// If present (non-zero), the node's capability version is the new value. A wire `Cap` of `0`
+    /// deserializes to `None` ("no change") via `cap_version`, matching Go's `if pc.Cap != 0` guard
+    /// (`control/controlclient/map.go`); without it a `0` would clobber the peer's real capability
+    /// version. Mirrors the `DERPRegion` zero-is-absent treatment above.
+    #[serde(deserialize_with = "crate::util::cap_version")]
     pub cap: Option<CapabilityVersion>,
 
     /// If present, the node's capability map has changed.
@@ -928,5 +932,27 @@ mod test {
             .expect("peers present — the escaped name must not drop the netmap");
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].name, "ho\nst.tail.ts.net.");
+    }
+
+    /// `PeerChange.Cap` must follow Go's `if pc.Cap != 0` semantics: a wire `Cap` of `0` means "no
+    /// change" and MUST decode to `None`, not `Some(CapabilityVersion(0))` — otherwise it would
+    /// clobber the peer's real capability version. A non-zero `Cap` decodes to that version, and an
+    /// absent `Cap` is `None`. Mirrors the established `DERPRegion` zero-is-absent treatment.
+    #[test]
+    fn peer_change_cap_zero_is_no_change() {
+        // Cap: 0 ⇒ None (the bug this guards: 0 used to decode as Some(0) and clobber the version).
+        let zero = serde_json::from_str::<PeerChange>(r#"{ "NodeID": 1, "Cap": 0 }"#)
+            .expect("PeerChange with Cap:0 must decode");
+        assert_eq!(zero.cap, None, "Cap:0 must be treated as no-change (None)");
+
+        // A defined non-zero Cap decodes to that version.
+        let some = serde_json::from_str::<PeerChange>(r#"{ "NodeID": 1, "Cap": 90 }"#)
+            .expect("PeerChange with Cap:90 must decode");
+        assert_eq!(some.cap, ts_capabilityversion::CapabilityVersion::new(90));
+
+        // Absent Cap is None (container `default`).
+        let absent = serde_json::from_str::<PeerChange>(r#"{ "NodeID": 1 }"#)
+            .expect("PeerChange without Cap must decode");
+        assert_eq!(absent.cap, None);
     }
 }
