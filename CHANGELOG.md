@@ -2,6 +2,14 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.30.1](https://github.com/GeiserX/tailscale-rs/compare/v0.30.0...v0.30.1) (2026-06-13)
+
+
+### Bug Fixes
+
+* **ffi:** null-check the parse entry points, fix IPv6 scope_id + recursion landmine ([#155](https://github.com/GeiserX/tailscale-rs/issues/155)) ([193e522](https://github.com/GeiserX/tailscale-rs/commit/193e5227cce97de8894802a0e28e1db71b546e26))
+* **ffi:** null-safe slice conversion in tcp/udp send/recv ([#157](https://github.com/GeiserX/tailscale-rs/issues/157)) ([5545c2a](https://github.com/GeiserX/tailscale-rs/commit/5545c2a81e1f15b54caf57618b626b5991fd77e7))
+
 ## [0.30.0](https://github.com/GeiserX/tailscale-rs/compare/v0.29.3...v0.30.0) (2026-06-13)
 
 
