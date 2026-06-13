@@ -202,7 +202,11 @@ flowchart LR
   `Rotation` **wrapping** signature uses **standard** Ed25519 (`ed25519-dalek` ≡ Go
   `crypto/ed25519`). See §5.
 - **Serialization:** CTAP2-canonical CBOR (must byte-match Go's `fxamacker/cbor` CTAP2 mode). See §5.
-- **Disablement:** ten Argon2id-hashed disablement secrets; any one disables the lock.
+- **Disablement:** one or more (up to `maxDisablementValues`) **Argon2i**-hashed disablement
+  secrets; any one disables the lock. Go `tka.DisablementKDF` = `argon2.Key(secret, "tailscale
+  network-lock disablement salt", t=4, m=16384 KiB, p=4, len=32)` — note Argon2**i** (`x/crypto`
+  `argon2.Key`), not Argon2id (`argon2.IDKey`); the two produce different digests, so byte-parity
+  requires the `i` variant.
 - **Acquisition (sync):** the chain is fetched from control over Noise — `/machine/tka/bootstrap`
   (genesis AUM) then the `/machine/tka/sync/{offer,send}` offer/send handshake (`ts_control`
   transport; `ts_runtime::tka_sync` driver). A control-supplied chain becomes an `Authority` **only**
