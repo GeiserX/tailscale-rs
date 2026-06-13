@@ -1216,6 +1216,30 @@ impl Device {
         self.runtime.tka_sign(node_key.to_bytes()).await
     }
 
+    /// Disable Tailnet Lock by presenting the `disablement_secret` to control — the Rust analog of
+    /// Go `LocalClient.NetworkLockDisable`.
+    ///
+    /// Targets this node's current authority head (from the cached [`tka_status`](Device::tka_status));
+    /// the `disablement_secret` is the operator-held capability (one of the lock's
+    /// `DisablementValues`) that authorizes turning the lock off. Control verifies the secret against
+    /// the authority's disablement set and, if valid, disables the lock for the tailnet.
+    ///
+    /// **Submit-only:** this POSTs the disablement; it does not mutate this node's local
+    /// [`Authority`][ts_tka::Authority]. The disablement is reflected locally through the existing
+    /// verified netmap-driven sync. Verify-and-log posture is unchanged.
+    ///
+    /// # Errors
+    /// [`ts_control::TkaSyncError::Unsupported`] when there is no known TKA head to disable (lock not
+    /// in use / control hasn't pushed a status) or control has no TKA endpoint;
+    /// [`ts_control::TkaSyncError::NetworkError`] on a transient failure; a coarse `Internal` for
+    /// other RPC failures (incl. control rejecting an invalid secret).
+    pub async fn tka_disable(
+        &self,
+        disablement_secret: Vec<u8>,
+    ) -> Result<(), ts_control::TkaSyncError> {
+        self.runtime.tka_disable(disablement_secret).await
+    }
+
     /// Request an OIDC **ID token** from control for this node, scoped to `audience` (workload-
     /// identity federation, like `tailscale`'s `id-token` LocalAPI).
     ///
