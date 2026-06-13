@@ -85,6 +85,12 @@ pub struct ControlRunner {
     /// time the DERP-latency measurer reports in. The facade reads this for `Device::netcheck` (the
     /// daemon's `tnet netcheck`). Empty until the first measurement.
     netcheck: watch::Sender<crate::status::NetcheckReport>,
+    /// The DERP home region currently selected, with the latency measured for it at selection time.
+    /// `None` until the first home region is chosen. Used to apply selection **hysteresis** (Go
+    /// `netcheck.addReportHistoryAndSetPreferredDERP`): the home region is only switched when a new
+    /// region is *meaningfully* lower-latency than the current one, so jitter between near-equal
+    /// regions does not flap the home relay (which would cause repeated reconnects + brief loss).
+    home_region: Option<(ts_derp::RegionId, core::time::Duration)>,
     /// Background task that bridges the control client's mid-session re-auth URL cell onto
     /// [`Self::params`]'s device-state cell (sets [`DeviceState::NeedsLogin`] when control returns
     /// `MachineNotAuthorized` on a live re-register — see [`bridge_reauth_url_to_state`]). Aborted on
@@ -257,6 +263,7 @@ impl kameo::Actor for ControlRunner {
             dns_config: Default::default(),
             pop_browser_url: Default::default(),
             netcheck: Default::default(),
+            home_region: None,
             reauth_bridge,
         })
     }
@@ -1169,9 +1176,18 @@ impl Message<DerpLatencyMeasurement> for ControlRunner {
                 &measurements,
             ));
 
-        let Some(result) = measurements.first() else {
+        if measurements.is_empty() {
             tracing::debug!("derp latency measurements empty");
             return;
+        };
+
+        // Apply selection hysteresis (the pure decision lives in `select_home_region` for testability)
+        // so jitter between near-equal regions does not flap the home relay. Copy the chosen id +
+        // latency out of the borrowed result so nothing borrows `measurements` across the `.await`.
+        let (selected_id, selected_latency) = {
+            let selected = select_home_region(self.home_region.map(|(id, _)| id), &measurements)
+                .expect("non-empty measurements always yield a selection");
+            (selected.id, selected.latency)
         };
 
         let iter = measurements.iter().map(|result| {
@@ -1181,9 +1197,49 @@ impl Message<DerpLatencyMeasurement> for ControlRunner {
             )
         });
 
-        tracing::debug!(selected_region_id = ?result.id, "updating home region");
+        if self.home_region.map(|(id, _)| id) != Some(selected_id) {
+            tracing::debug!(selected_region_id = ?selected_id, "updating home region");
+        }
+        self.home_region = Some((selected_id, selected_latency));
+        self.client.set_home_region(selected_id, iter).await;
+    }
+}
 
-        self.client.set_home_region(result.id, iter).await;
+/// Choose the DERP home region from `measurements` (expected sorted by latency ascending, so
+/// `measurements[0]` is the lowest-latency "best"), applying Go's selection hysteresis
+/// (`netcheck.addReportHistoryAndSetPreferredDERP`). Pure so the decision is unit-testable.
+///
+/// Keeps the `current` home region (when it is still present in `measurements`) unless the new best
+/// is *meaningfully* lower-latency — switching only when BOTH: the current region's fresh latency
+/// exceeds the best by at least `PREFERRED_DERP_ABSOLUTE_DIFF` (10ms), AND the best is at most
+/// two-thirds of the current region's latency (a >~33% improvement). This avoids flapping the home
+/// relay between regions whose latencies jitter within ~10ms. On the first selection (`current` is
+/// `None`), when the best already IS the current region, or when the current region dropped out of
+/// the measurements, returns the best directly. `None` only if `measurements` is empty.
+fn select_home_region(
+    current: Option<ts_derp::RegionId>,
+    measurements: &[ts_netcheck::RegionResult],
+) -> Option<&ts_netcheck::RegionResult> {
+    /// Go `netcheck.preferredDERPAbsoluteDiff`.
+    const PREFERRED_DERP_ABSOLUTE_DIFF: core::time::Duration =
+        core::time::Duration::from_millis(10);
+
+    let best = measurements.first()?;
+
+    let Some(old_id) = current.filter(|id| *id != best.id) else {
+        // First selection, or the best already is the current home region.
+        return Some(best);
+    };
+
+    // Compare against the current region's FRESH latency (not a stale one), if it is still present.
+    match measurements.iter().find(|m| m.id == old_id) {
+        Some(old) => {
+            let keep_old = old.latency.saturating_sub(best.latency) < PREFERRED_DERP_ABSOLUTE_DIFF
+                || best.latency.as_secs_f64() > old.latency.as_secs_f64() * 2.0 / 3.0;
+            Some(if keep_old { old } else { best })
+        }
+        // The current region is no longer reachable this cycle: take the new best.
+        None => Some(best),
     }
 }
 
@@ -1459,5 +1515,101 @@ mod sticky_pop_browser_url_tests {
             assert_eq!(v, Some(u.clone()), "the surviving change carries the URL");
         }
         assert_eq!(changes, 1, "exactly one change survives the None thrash");
+    }
+}
+
+#[cfg(test)]
+mod home_region_hysteresis_tests {
+    use core::time::Duration;
+
+    use ts_derp::RegionId;
+    use ts_netcheck::RegionResult;
+
+    use super::select_home_region;
+
+    fn region(id: u32, latency_ms: u64) -> RegionResult {
+        RegionResult {
+            latency: Duration::from_millis(latency_ms),
+            id: RegionId(core::num::NonZeroU32::new(id).unwrap()),
+            latency_map_key: format!("region-{id}"),
+            connected_remote: "127.0.0.1:0".parse().unwrap(),
+        }
+    }
+
+    fn rid(id: u32) -> RegionId {
+        RegionId(core::num::NonZeroU32::new(id).unwrap())
+    }
+
+    /// Empty measurements yield no selection.
+    #[test]
+    fn empty_measurements_select_none() {
+        assert!(select_home_region(Some(rid(1)), &[]).is_none());
+        assert!(select_home_region(None, &[]).is_none());
+    }
+
+    /// First selection (no current home region) takes the best (lowest-latency) region directly.
+    #[test]
+    fn first_selection_takes_best() {
+        let m = [region(1, 20), region(2, 50)];
+        assert_eq!(select_home_region(None, &m).unwrap().id, rid(1));
+    }
+
+    /// Jitter within the 10ms absolute-diff band keeps the current region (no flap). Current=region 2
+    /// at 25ms; new best=region 1 at 20ms (only 5ms better) -> keep region 2.
+    #[test]
+    fn keeps_current_when_within_absolute_diff() {
+        let m = [region(1, 20), region(2, 25)];
+        let sel = select_home_region(Some(rid(2)), &m).unwrap();
+        assert_eq!(
+            sel.id,
+            rid(2),
+            "a 5ms improvement (< 10ms) must not flap the home region"
+        );
+    }
+
+    /// A meaningful improvement (>10ms AND best <= 2/3 of current) switches. Current=region 2 at
+    /// 100ms; new best=region 1 at 20ms -> switch to region 1.
+    #[test]
+    fn switches_on_meaningful_improvement() {
+        let m = [region(1, 20), region(2, 100)];
+        assert_eq!(
+            select_home_region(Some(rid(2)), &m).unwrap().id,
+            rid(1),
+            "a large improvement must switch the home region"
+        );
+    }
+
+    /// The two-thirds rule: even past the 10ms absolute diff, an improvement that does not beat 2/3
+    /// of the current latency keeps the current region. Current=region 2 at 30ms; best=region 1 at
+    /// 21ms: diff is 9ms (< 10ms keeps anyway) — use 30 vs 21 where diff=9ms. To isolate the 2/3 rule,
+    /// use current=60ms, best=45ms: diff=15ms (>10ms, so the absolute test alone would switch), but
+    /// 45 > 60*2/3=40, so keep.
+    #[test]
+    fn keeps_current_when_two_thirds_rule_not_met() {
+        let m = [region(1, 45), region(2, 60)];
+        let sel = select_home_region(Some(rid(2)), &m).unwrap();
+        assert_eq!(
+            sel.id,
+            rid(2),
+            "best (45ms) is not <= 2/3 of current (40ms), so keep current despite >10ms diff"
+        );
+    }
+
+    /// When the current home region is no longer present in the measurements, take the new best.
+    #[test]
+    fn switches_when_current_region_absent() {
+        let m = [region(1, 20), region(3, 25)];
+        assert_eq!(
+            select_home_region(Some(rid(2)), &m).unwrap().id,
+            rid(1),
+            "a current region absent from the measurements falls through to the best"
+        );
+    }
+
+    /// When the best already IS the current home region, it is kept (no spurious change).
+    #[test]
+    fn keeps_current_when_it_is_already_best() {
+        let m = [region(2, 20), region(1, 50)];
+        assert_eq!(select_home_region(Some(rid(2)), &m).unwrap().id, rid(2));
     }
 }
