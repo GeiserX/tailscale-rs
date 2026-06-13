@@ -434,6 +434,19 @@ impl Authority {
         &self.head == head
     }
 
+    /// Whether a key with the given `key_id` is currently trusted by this authority (Go
+    /// `Authority.KeyTrusted` / a `State.GetKey(keyID) != nil` check).
+    ///
+    /// `key_id` is the 32-byte ed25519 public key (Go `Key25519`/`NLKey` id *is* the pubkey). This is
+    /// the gate a mutation caller uses before attempting to sign: a node whose network-lock key is not
+    /// trusted cannot produce a signature the authority would accept (see
+    /// [`NodeKeySignature::sign_direct`] / [`Aum::sign`]), so the builder checks this first rather than
+    /// submitting a doomed signature. Verify-and-log posture is unchanged — this only *reads* the
+    /// trusted-key set.
+    pub fn key_trusted(&self, key_id: &[u8]) -> bool {
+        self.state.get_key(key_id).is_some()
+    }
+
     /// Verify that `node_key` is authorized under the current authority state by the given
     /// node-key-signature CBOR blob (Go `Authority.NodeKeyAuthorized`).
     ///
@@ -2431,6 +2444,30 @@ mod tests {
         let cbor = sig.to_cbor(true).to_vec();
         let err = auth.node_key_authorized(&[9; 32], &cbor).unwrap_err();
         assert_eq!(err, TkaError::UntrustedKey);
+    }
+
+    #[test]
+    fn key_trusted_reflects_state() {
+        let trusted_id = alloc::vec![5u8; 32];
+        let auth = Authority::from_state(
+            AumHash([0; 32]),
+            State {
+                keys: alloc::vec![Key {
+                    kind: KeyKind::Ed25519,
+                    votes: 1,
+                    public: trusted_id.clone(),
+                }],
+            },
+        );
+        assert!(auth.key_trusted(&trusted_id), "the seeded key is trusted");
+        assert!(
+            !auth.key_trusted(&[9u8; 32]),
+            "an unknown key id is not trusted"
+        );
+        // An empty-state authority trusts nothing.
+        assert!(
+            !Authority::from_state(AumHash([0; 32]), State::default()).key_trusted(&trusted_id)
+        );
     }
 
     #[test]
