@@ -647,6 +647,20 @@ impl Runtime {
             .map_err(flatten_set_dns_send_err)
     }
 
+    /// Sign `node_key` with this node's network-lock key and submit the signature to control
+    /// (Go `tka.sign` Direct case → `/machine/tka/sign`).
+    ///
+    /// Submits only — the local [`Authority`](ts_tka::Authority) is **not** mutated here; it advances
+    /// via the existing verified-sync path. A handler error carries the real [`ts_control::TkaSyncError`];
+    /// any other send failure (actor shutdown / mailbox closed) is surfaced as
+    /// [`ts_control::TkaSyncError::NetworkError`].
+    pub async fn tka_sign(&self, node_key: [u8; 32]) -> Result<(), ts_control::TkaSyncError> {
+        self.control
+            .ask(control_runner::TkaSign { node_key })
+            .await
+            .map_err(flatten_tka_sign_send_err)
+    }
+
     /// Issue a real Let's Encrypt certificate for this node's MagicDNS `name` (`acme` feature).
     ///
     /// Mirrors `fetch_id_token`: forwards to the control runner, which runs
@@ -1306,6 +1320,18 @@ fn flatten_set_dns_send_err<M>(
     }
 }
 
+/// Flatten a kameo `SendError` from the `TkaSign` ask into a [`ts_control::TkaSyncError`]. A
+/// `HandlerError` carries the real RPC error; any other send failure (actor shutdown / mailbox
+/// closed) is surfaced as the transient [`ts_control::TkaSyncError::NetworkError`].
+fn flatten_tka_sign_send_err<M>(
+    e: kameo::error::SendError<M, ts_control::TkaSyncError>,
+) -> ts_control::TkaSyncError {
+    match e {
+        kameo::error::SendError::HandlerError(err) => err,
+        _ => ts_control::TkaSyncError::NetworkError,
+    }
+}
+
 /// Flatten a kameo `SendError` from the `GetCertificate` / `GetCertPair` ask into a
 /// [`ts_control::CertError`].
 ///
@@ -1500,6 +1526,30 @@ mod tests {
         assert_eq!(
             flatten_set_dns_send_err(e),
             ts_control::SetDnsError::NetworkError
+        );
+    }
+
+    /// A `HandlerError` from the tka-sign RPC carries the real `TkaSyncError` and must pass through
+    /// verbatim (an `Unsupported` payload makes the passthrough observable, distinct from the
+    /// `_ => NetworkError` fallback).
+    #[test]
+    fn flatten_tka_sign_send_err_handler_error_passes_through() {
+        let e: kameo::error::SendError<control_runner::TkaSign, ts_control::TkaSyncError> =
+            kameo::error::SendError::HandlerError(ts_control::TkaSyncError::Unsupported);
+        assert_eq!(
+            flatten_tka_sign_send_err(e),
+            ts_control::TkaSyncError::Unsupported
+        );
+    }
+
+    /// A non-handler send failure (actor stopped) collapses to a transient `NetworkError`.
+    #[test]
+    fn flatten_tka_sign_send_err_actor_stopped_is_network_error() {
+        let e: kameo::error::SendError<control_runner::TkaSign, ts_control::TkaSyncError> =
+            kameo::error::SendError::ActorStopped;
+        assert_eq!(
+            flatten_tka_sign_send_err(e),
+            ts_control::TkaSyncError::NetworkError
         );
     }
 }
