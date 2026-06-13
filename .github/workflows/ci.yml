@@ -79,6 +79,14 @@ jobs:
       COMMON_FLAGS: --workspace
       # Incremental artifacts roughly double `target/` size for no benefit in a cold CI build.
       CARGO_INCREMENTAL: 0
+      # Cap codegen parallelism on the memory-constrained self-hosted runner. With unbounded jobs,
+      # several heavy rustc invocations link concurrently and the heaviest — `ts_python`'s pyo3
+      # cdylib — gets OOM-killed (SIGKILL / signal 9) mid-link, flaking the build for reasons
+      # unrelated to the change under test. 4 keeps enough parallelism for throughput while bounding
+      # peak memory below the runner's ceiling. (RUST_TEST_THREADS similarly bounds the test phase so
+      # 20 cores × unbounded test threads don't OOM rustc-spawned test binaries.)
+      CARGO_BUILD_JOBS: 4
+      RUST_TEST_THREADS: 4
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
