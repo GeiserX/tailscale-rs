@@ -544,13 +544,28 @@ impl Peer {
         if let Some(session) = self.session.get_recv(session_id) {
             packets = session.decrypt(packets);
             if !packets.is_empty() {
+                // A keepalive decrypts to an empty payload but is still retained here (AEAD verified,
+                // header+tag stripped). Distinguish *data* packets from keepalives: only a real data
+                // packet arms the reactive keepalive, mirroring wireguard-go's `dataPacketReceived`
+                // gate (`device/receive.go` skips a `len==0` packet via `continue` before
+                // `timersDataReceived`, which is what arms `sendKeepalive`). Without this, a received
+                // keepalive would arm a keepalive in reply, and two peers settle into a perpetual
+                // ~1-packet-per-`KEEPALIVE_TIMEOUT` idle ping-pong that real WireGuard lets go silent.
+                let data_received = packets.iter().any(|p| !p.as_ref().is_empty());
+
                 out.queue_to_local(self.id).append(&mut packets);
-                self.schedule_keepalive(&mut endpoint.scheduler);
+
+                if data_received {
+                    self.schedule_keepalive(&mut endpoint.scheduler);
+                }
+
                 // Receive-triggered rekey (Go `keepKeyFreshReceiving`): a packet authenticated on
-                // this keypair; if we initiated it and it is past the receive rekey threshold,
-                // enqueue a fresh handshake so the keys refresh before they hard-expire at
-                // REJECT_AFTER_TIME — keeping a mostly-inbound, send-idle session alive. One-shot per
-                // keypair (the guard lives in `keep_key_fresh_receiving`); initiator-only.
+                // this keypair — a keepalive counts, since it proves the peer is live on this keypair
+                // — so this is gated on any authenticated packet, NOT on `data_received`. If we
+                // initiated the session and it is past the receive rekey threshold, enqueue a fresh
+                // handshake so the keys refresh before they hard-expire at REJECT_AFTER_TIME, keeping
+                // a mostly-inbound, send-idle session alive. One-shot per keypair (the guard lives in
+                // `keep_key_fresh_receiving`); initiator-only.
                 if self.session.keep_key_fresh_receiving(Instant::now()) {
                     // Receive-triggered rekey is a fresh handshake (resets the give-up counter).
                     self.start_handshake(endpoint, out, false);
@@ -1651,6 +1666,91 @@ mod tests {
         assert!(
             out.to_peers.get(&a_peer).is_none_or(|p| p.is_empty()),
             "no keepalive should fire when persistent keepalive is disabled"
+        );
+    }
+
+    /// Reactive (§6.5) keepalive is armed by inbound DATA, never by an inbound keepalive — mirroring
+    /// wireguard-go's `dataPacketReceived` gate. Receiving an empty keepalive must NOT cause this
+    /// endpoint to schedule a keepalive in reply; receiving a data packet must. Without the gate, two
+    /// peers settle into a perpetual idle keepalive ping-pong real WireGuard lets go silent.
+    #[test]
+    fn received_keepalive_does_not_arm_reactive_keepalive() {
+        // A has no persistent keepalive, so the ONLY thing that could schedule an outbound keepalive
+        // on A is the reactive §6.5 arming on inbound traffic.
+        let (mut a_ep, mut b_ep, a_peer, b_peer) = establish_session(None, b"hello");
+
+        // Get a genuine keepalive FROM B: send data A->B (which arms B's reactive keepalive), then
+        // dispatch B's timer past KEEPALIVE_TIMEOUT so B emits exactly one empty keepalive.
+        let a_data = a_ep.send(HashMap::from([(
+            a_peer,
+            vec![PacketMut::from(&b"ping"[..])],
+        )]));
+        let to_b = a_data.to_peers.get(&a_peer).expect("data to B").clone();
+        drop(b_ep.recv(to_b)); // B receives data -> arms B's reactive keepalive
+        let now = Instant::now();
+        let b_out = b_ep.dispatch_events(now + KEEPALIVE_TIMEOUT + Duration::from_secs(2));
+        let ka = b_out
+            .to_peers
+            .get(&b_peer)
+            .expect("B emits a reactive keepalive after receiving data")
+            .clone();
+        assert_eq!(ka.len(), 1);
+        assert_eq!(
+            ka[0].len(),
+            KEEPALIVE_LEN,
+            "B's packet is an empty keepalive"
+        );
+
+        // Drain any reactive keepalive A may have armed from the earlier handshake/data so the
+        // assertion below isolates the effect of receiving B's keepalive. (A received only handshake
+        // traffic so far, no data, so it should have nothing armed — but dispatch to be certain.)
+        let now = Instant::now();
+        drop(a_ep.dispatch_events(now + Duration::from_secs(60)));
+
+        let recv = a_ep.recv(ka);
+        // A keepalive carries no usable payload — any packet surfaced to local is empty (the
+        // dataplane's IP src-filter drops it; the endpoint layer does not special-case it).
+        assert!(
+            recv.to_local
+                .get(&a_peer)
+                .is_none_or(|pkts| pkts.iter().all(|p| p.as_ref().is_empty())),
+            "a keepalive delivers no usable (non-empty) local payload"
+        );
+        // ...and must NOT have armed a reactive keepalive: dispatched far forward, A emits nothing.
+        let now = Instant::now();
+        let after_ka = a_ep.dispatch_events(now + Duration::from_secs(60));
+        assert!(
+            after_ka.to_peers.get(&a_peer).is_none_or(|p| p.is_empty()),
+            "receiving a keepalive must NOT arm a reactive keepalive (no idle ping-pong)"
+        );
+
+        // Contrast: a DATA packet from B DOES arm A's reactive keepalive, which then fires once.
+        let b_data = b_ep.send(HashMap::from([(
+            b_peer,
+            vec![PacketMut::from(&b"data"[..])],
+        )]));
+        let data = b_data
+            .to_peers
+            .get(&b_peer)
+            .expect("B emits a data packet")
+            .clone();
+        let recv = a_ep.recv(data);
+        assert_eq!(
+            recv.to_local.get(&a_peer).map(|p| p.as_slice()),
+            Some([pad16(b"data")].as_slice()),
+            "the data payload is delivered to A"
+        );
+        let now = Instant::now();
+        let after_data = a_ep.dispatch_events(now + KEEPALIVE_TIMEOUT + Duration::from_secs(2));
+        assert_eq!(
+            after_data.to_peers.get(&a_peer).map(|p| p.len()),
+            Some(1),
+            "inbound DATA must arm the reactive keepalive, which then fires exactly once"
+        );
+        assert_eq!(
+            after_data.to_peers.get(&a_peer).unwrap()[0].len(),
+            KEEPALIVE_LEN,
+            "the reactive keepalive is an empty data packet"
         );
     }
 
