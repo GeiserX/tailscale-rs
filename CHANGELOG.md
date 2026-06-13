@@ -2,6 +2,14 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.33.0](https://github.com/GeiserX/tailscale-rs/compare/v0.32.0...v0.33.0) (2026-06-13)
+
+
+### Features
+
+* **tka:** genesis-checkpoint builder + Argon2i disablement_value (tsr-cfw) ([#173](https://github.com/GeiserX/tailscale-rs/issues/173)) ([e27a85c](https://github.com/GeiserX/tailscale-rs/commit/e27a85cad6e5d4e50c1577caa67b286911e20b9a))
+* **tsnet:** Device::tka_init — initialize Tailnet Lock (tsr-cfw, epic complete) ([#175](https://github.com/GeiserX/tailscale-rs/issues/175)) ([6c31d8b](https://github.com/GeiserX/tailscale-rs/commit/6c31d8b48e564a05b1a981bb3551973a90157e6d))
+
 ## [0.32.0](https://github.com/GeiserX/tailscale-rs/compare/v0.31.0...v0.32.0) (2026-06-13)
 
 
