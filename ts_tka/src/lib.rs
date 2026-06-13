@@ -4538,6 +4538,29 @@ mod tests {
                 .expect("a 1-key, 1-disablement-value checkpoint is valid");
         assert_eq!(genesis.message_kind, AumKind::Checkpoint);
         assert!(genesis.prev_aum_hash.is_none(), "genesis has no parent");
+        // Parity guard for the secret-vs-hash distinction tka_init relies on: the genesis stores the
+        // Argon2i DISABLEMENT VALUE (the hash), never the raw secret. A swap (storing the raw secret)
+        // would make the lock undisablable; this pins it. The stored value must equal
+        // disablement_value(secret) AND differ from the raw secret bytes.
+        let secret = b"the-operator-disablement-secret";
+        let stored = genesis
+            .state
+            .as_ref()
+            .unwrap()
+            .disablement_values
+            .as_ref()
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            stored[0],
+            disablement_value(secret).to_vec(),
+            "genesis must store the Argon2i disablement VALUE (hash), not the raw secret"
+        );
+        assert_ne!(
+            stored[0].as_slice(),
+            secret.as_slice(),
+            "the stored value must be the hash, never the raw secret"
+        );
         genesis.sign(&sk);
 
         // Self-certifies through the trust boundary (genesis Checkpoint is verified against the keys
