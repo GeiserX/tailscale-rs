@@ -167,17 +167,29 @@ impl TaildropStore {
     /// Receive a file named `name` from `reader`, writing to `<name>.partial` then atomically
     /// renaming to a non-clobbering final name on success. Mirrors Go `manager.PutFile`.
     ///
-    /// `offset` lets a resumed transfer append past already-written bytes (the partial is opened and
-    /// the write starts at `offset`). Returns the total number of bytes in the completed file.
+    /// `offset` lets a resumed transfer append past already-written bytes (the partial is opened, the
+    /// write starts at `offset`, and any bytes already on disk past `offset` are truncated away).
+    /// `expected_len` is the declared total length of the completed file (the request's
+    /// `Content-Length` plus `offset`); the transfer is finalized only if exactly that many bytes are
+    /// present. Returns the total number of bytes in the completed file.
     ///
     /// Fail-closed: an invalid name is rejected before any path is built; an in-progress partial for
-    /// the same name yields [`TaildropError::FileExists`]; an I/O error mid-transfer leaves the
-    /// `.partial` in place (for resume) and the final name is never created.
+    /// the same name yields [`TaildropError::FileExists`]; an out-of-range resume `offset` (past the
+    /// current partial length) is rejected; an I/O error mid-transfer — or a body that ends before
+    /// `expected_len` (a short/interrupted stream) — leaves the `.partial` on disk and the final name
+    /// is never created. This matches Go `feature/taildrop/send.go`, which errors when the copied
+    /// length does not equal the declared length rather than publishing a truncated file.
+    ///
+    /// The retained `.partial` is resumable only by a peer that issues a ranged retry (an `offset > 0`
+    /// PUT); a sender that always restarts at `offset == 0` will instead hit the in-progress-conflict
+    /// path ([`TaildropError::FileExists`]) until the stale partial is cleared. There is no automatic
+    /// reaper for an abandoned partial yet (Go's `fileDeleter` GCs one after ~1h); tracked separately.
     pub async fn put_file<R>(
         &self,
         name: &str,
         mut reader: R,
         offset: u64,
+        expected_len: u64,
     ) -> Result<u64, TaildropError>
     where
         R: AsyncRead + Unpin,
@@ -203,6 +215,19 @@ impl TaildropStore {
             }
         } else {
             let mut f = std::fs::OpenOptions::new().write(true).open(&partial)?;
+            // Bound the resume offset to the current partial length and truncate any bytes past it,
+            // matching Go `feature/taildrop/fileops_fs.go` (`OpenWriter` rejects `offset > curr` and
+            // `Truncate(offset)`s). Without the bound a too-large offset would leave a zero-filled
+            // sparse hole; without the truncate a shorter resumed body would leave a prior attempt's
+            // stale tail past the new end. `metadata().len()` is the partial's current size.
+            let current = f.metadata()?.len();
+            if offset > current {
+                return Err(TaildropError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "taildrop resume offset is past the end of the partial file",
+                )));
+            }
+            f.set_len(offset)?;
             f.seek(io::SeekFrom::Start(offset))?;
             f
         };
@@ -221,6 +246,25 @@ impl TaildropStore {
             file.write_all(&buf[..n])?;
             copied += n as u64;
         }
+
+        // Length check (Go `send.go`: error when `copyLength != length`). A body that ended before the
+        // declared length — an interrupted/short stream — must NOT be finalized as a complete file;
+        // leave the `.partial` on disk (with the bytes received so far) so a Range-capable peer can
+        // resume it. `checked_add` rather than a bare `+`: `offset` is an attacker-supplied header and
+        // the bound above already rejects an `offset` past the (real, on-disk) partial length, so this
+        // cannot overflow in practice — but treat an overflow as a length mismatch rather than a panic.
+        let total = match offset.checked_add(copied) {
+            Some(t) if t == expected_len => t,
+            _ => {
+                return Err(TaildropError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "taildrop body ended early: got {copied} of {expected_len} expected bytes \
+                         at offset {offset}; leaving partial for resume"
+                    ),
+                )));
+            }
+        };
 
         // Finalize off the async runtime: `sync_all` (fsync) and `rename` are the dominant blocking
         // operations, so run them on a blocking thread. The `File` and both paths are owned by the
@@ -249,7 +293,7 @@ impl TaildropStore {
             )))
         })??;
 
-        Ok(offset + copied)
+        Ok(total)
     }
 
     /// List fully-received (non-partial) files, sorted by name (Go `WaitingFiles`).
@@ -359,7 +403,10 @@ mod tests {
         let store = TaildropStore::new(&root).unwrap();
 
         let data = b"hello taildrop";
-        let n = store.put_file("greeting.txt", &data[..], 0).await.unwrap();
+        let n = store
+            .put_file("greeting.txt", &data[..], 0, data.len() as u64)
+            .await
+            .unwrap();
         assert_eq!(n, data.len() as u64);
 
         // The final file exists; no .partial remains.
@@ -390,7 +437,12 @@ mod tests {
         // the prefix, and appends the rest.
         let rest = b"and the second half";
         let total = store
-            .put_file("resume.txt", &rest[..], prefix.len() as u64)
+            .put_file(
+                "resume.txt",
+                &rest[..],
+                prefix.len() as u64,
+                (prefix.len() + rest.len()) as u64,
+            )
             .await
             .unwrap();
 
@@ -407,13 +459,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn put_file_short_body_leaves_partial_not_truncated_final() {
+        // F2: a body that ends before the declared length must NOT be finalized as a complete (but
+        // truncated) file under the real name. Go errors when copyLength != length; we leave the
+        // `.partial` in place for resume.
+        let root = tmp_root();
+        let store = TaildropStore::new(&root).unwrap();
+
+        // Reader yields 5 bytes but we declare 10 expected (a short/interrupted stream).
+        let err = store
+            .put_file("short.txt", &b"world"[..], 0, 10)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, TaildropError::Io(ref e) if e.kind() == io::ErrorKind::UnexpectedEof),
+            "a short body must error, got {err:?}"
+        );
+        // The final name was NEVER created; the partial remains with the bytes received so far.
+        assert!(!root.join("short.txt").exists(), "no truncated final file");
+        let partial = std::fs::read(root.join("short.txt.partial")).unwrap();
+        assert_eq!(
+            partial, b"world",
+            "partial holds the received prefix for resume"
+        );
+        assert!(store.waiting_files().unwrap().is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn put_file_resume_offset_past_end_is_rejected() {
+        // F3: a resume offset beyond the current partial length must be rejected (Go errors
+        // "offset out of range"), not produce a zero-filled sparse hole.
+        let root = tmp_root();
+        let store = TaildropStore::new(&root).unwrap();
+        std::fs::write(root.join("sparse.txt.partial"), b"abc").unwrap(); // 3 bytes on disk
+
+        let err = store
+            .put_file("sparse.txt", &b"xyz"[..], 99, 102)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, TaildropError::Io(ref e) if e.kind() == io::ErrorKind::InvalidInput),
+            "offset past end must be rejected, got {err:?}"
+        );
+        // The partial is untouched (still 3 bytes), no final file.
+        assert_eq!(
+            std::fs::read(root.join("sparse.txt.partial")).unwrap(),
+            b"abc"
+        );
+        assert!(!root.join("sparse.txt").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn put_file_resume_truncates_stale_tail() {
+        // F3: resuming at an offset LESS than the current partial length must truncate the bytes
+        // past the offset (Go `Truncate(offset)`), so a stale tail from a prior attempt cannot
+        // survive past the newly-written end.
+        let root = tmp_root();
+        let store = TaildropStore::new(&root).unwrap();
+        // A prior attempt left 20 bytes; we resume at offset 5 with a 3-byte tail ⇒ final is 8 bytes.
+        std::fs::write(root.join("retry.txt.partial"), b"KEEPme-STALE-TAILxxx").unwrap();
+
+        let total = store
+            .put_file("retry.txt", &b"NEW"[..], 5, 8)
+            .await
+            .unwrap();
+        assert_eq!(total, 8);
+        let body = std::fs::read(root.join("retry.txt")).unwrap();
+        assert_eq!(
+            body, b"KEEPmNEW",
+            "bytes past offset 5 truncated, then NEW appended"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
     async fn put_file_conflict_picks_non_clobbering_name() {
         let root = tmp_root();
         let store = TaildropStore::new(&root).unwrap();
 
-        store.put_file("dup.txt", &b"first"[..], 0).await.unwrap();
-        store.put_file("dup.txt", &b"second"[..], 0).await.unwrap();
-        store.put_file("dup.txt", &b"third"[..], 0).await.unwrap();
+        store
+            .put_file("dup.txt", &b"first"[..], 0, 5)
+            .await
+            .unwrap();
+        store
+            .put_file("dup.txt", &b"second"[..], 0, 6)
+            .await
+            .unwrap();
+        store
+            .put_file("dup.txt", &b"third"[..], 0, 5)
+            .await
+            .unwrap();
 
         // Original plus two non-clobbering renames.
         assert!(root.join("dup.txt").exists());
@@ -434,7 +574,10 @@ mod tests {
         // Simulate an in-flight transfer by pre-creating the .partial file.
         std::fs::write(root.join("busy.txt.partial"), b"partial").unwrap();
 
-        let err = store.put_file("busy.txt", &b"x"[..], 0).await.unwrap_err();
+        let err = store
+            .put_file("busy.txt", &b"x"[..], 0, 1)
+            .await
+            .unwrap_err();
         assert!(matches!(err, TaildropError::FileExists));
 
         std::fs::remove_dir_all(&root).ok();
@@ -445,7 +588,10 @@ mod tests {
         let root = tmp_root();
         let store = TaildropStore::new(&root).unwrap();
 
-        let err = store.put_file("../escape", &b"x"[..], 0).await.unwrap_err();
+        let err = store
+            .put_file("../escape", &b"x"[..], 0, 1)
+            .await
+            .unwrap_err();
         assert!(matches!(err, TaildropError::InvalidFileName));
         // Nothing was written anywhere.
         assert!(store.waiting_files().unwrap().is_empty());
@@ -458,7 +604,7 @@ mod tests {
         let root = tmp_root();
         let store = TaildropStore::new(&root).unwrap();
 
-        store.put_file("doc.bin", &b"abc"[..], 0).await.unwrap();
+        store.put_file("doc.bin", &b"abc"[..], 0, 3).await.unwrap();
         let (_f, size) = store.open_file("doc.bin").unwrap();
         assert_eq!(size, 3);
 

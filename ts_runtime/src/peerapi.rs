@@ -537,11 +537,16 @@ async fn handle_taildrop_put(
 
     // Stream the body to the store: feed the already-read seed body bytes first, then the rest of
     // the stream, capped at exactly `content_length`. `put_file` reads to EOF, so wrap the source in
-    // a reader that yields precisely the declared body length.
+    // a reader that yields precisely the declared body length. The completed file's expected total
+    // length is `offset + content_length` (this request contributes `content_length` bytes starting
+    // at `offset`); `put_file` finalizes only if exactly that many bytes land, so a short/interrupted
+    // body leaves the partial on disk instead of publishing a truncated file (resumable by a ranged
+    // retry; a fresh offset-0 retry hits the in-progress-conflict 409 until the partial is cleared).
     let body_seed = seed[header_end..].to_vec();
     let reader = BodyReader::new(body_seed, &mut stream, content_length);
+    let expected_len = offset.saturating_add(content_length);
 
-    match store.put_file(&name, reader, offset).await {
+    match store.put_file(&name, reader, offset, expected_len).await {
         Ok(_total) => write_taildrop_ok(&mut stream).await,
         Err(TaildropError::InvalidFileName) => write_status(&mut stream, "400 Bad Request").await,
         Err(TaildropError::FileExists) => write_status(&mut stream, "409 Conflict").await,
@@ -944,7 +949,7 @@ mod tests {
                 });
                 let reader = BodyReader::new(Vec::new(), server, content_length);
 
-                match store.put_file(&name, reader, 0).await {
+                match store.put_file(&name, reader, 0, content_length).await {
                     Ok(_) => {
                         let resp = taildrop_ok_response();
                         // Split off the status line + body for the assertions.
