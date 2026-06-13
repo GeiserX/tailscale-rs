@@ -13,7 +13,8 @@ use kameo::{
 use tokio::sync::watch;
 use ts_control::{
     AsyncControlClient, Endpoint, EndpointType, Error as ControlError, IdTokenError, LogoutError,
-    Node, SetDnsError, SshPolicy, StateUpdate, TkaStatus, TkaSyncError, tka_submit_signature,
+    Node, SetDnsError, SshPolicy, StateUpdate, TkaStatus, TkaSyncError, tka_disable,
+    tka_submit_signature,
 };
 use ts_magicsock::SelfEndpointType;
 
@@ -557,6 +558,55 @@ mod msg_impl {
                     )
                     .await
                     .map(|_response| ());
+                    replier.send(result);
+                });
+            }
+
+            deleg
+        }
+
+        /// Disable Tailnet Lock by presenting the disablement secret to control (Go
+        /// `tka.disable` → `/machine/tka/disable`).
+        ///
+        /// Targets the **current** authority head (read from the cached [`TkaStatus`]); the caller
+        /// supplies the `disablement_secret` out of band (it is the operator-held capability that
+        /// authorizes turning the lock off). Mirrors `tka_sign`: clones config + keys into a spawned
+        /// task (delegated reply). Returns [`TkaSyncError::Unsupported`] when there is no known TKA
+        /// head (lock not in use / control hasn't pushed a status), since there is nothing to disable.
+        ///
+        /// **Submit-only, like `tka_sign`:** this POSTs the disablement to control and does NOT mutate
+        /// the local [`Authority`](ts_tka::Authority). Control acts on the disablement; this node
+        /// observes the result through the existing verified-sync path. Verify-and-log unchanged.
+        #[message(ctx)]
+        pub fn tka_disable(
+            &self,
+            ctx: &mut Context<Self, DelegatedReply<Result<(), TkaSyncError>>>,
+            disablement_secret: Vec<u8>,
+        ) -> DelegatedReply<Result<(), TkaSyncError>> {
+            let (deleg, replier) = ctx.reply_sender();
+
+            if let Some(replier) = replier {
+                // Read the current head from the cached status BEFORE the spawn (can't borrow &self
+                // across the await). No head ⇒ no lock to disable ⇒ Unsupported.
+                let head = self.tka.borrow().as_ref().map(|s| s.head.clone());
+                let config = self.params.config.clone();
+                let keys = self.params.env.keys.clone();
+                tokio::spawn(async move {
+                    let result = match head {
+                        Some(head) => {
+                            let req = ts_control::TkaDisableRequest {
+                                // node_key + version are stamped by the RPC client from `keys`.
+                                version: Default::default(),
+                                node_key: keys.node_keys.public,
+                                head,
+                                disablement_secret,
+                            };
+                            tka_disable(&config.server_url, &keys, req, config.allow_http_key_fetch)
+                                .await
+                                .map(|_response| ())
+                        }
+                        None => Err(TkaSyncError::Unsupported),
+                    };
                     replier.send(result);
                 });
             }

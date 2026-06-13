@@ -658,7 +658,24 @@ impl Runtime {
         self.control
             .ask(control_runner::TkaSign { node_key })
             .await
-            .map_err(flatten_tka_sign_send_err)
+            .map_err(flatten_tka_send_err)
+    }
+
+    /// Disable Tailnet Lock by presenting the `disablement_secret` to control (Go `tka.disable` →
+    /// `/machine/tka/disable`), targeting the current authority head.
+    ///
+    /// Submits only — the local [`Authority`](ts_tka::Authority) is **not** mutated here. A handler
+    /// error carries the real [`ts_control::TkaSyncError`] (incl. [`Unsupported`] when there is no
+    /// known TKA head to disable); any other send failure collapses to
+    /// [`NetworkError`](ts_control::TkaSyncError::NetworkError).
+    pub async fn tka_disable(
+        &self,
+        disablement_secret: Vec<u8>,
+    ) -> Result<(), ts_control::TkaSyncError> {
+        self.control
+            .ask(control_runner::TkaDisable { disablement_secret })
+            .await
+            .map_err(flatten_tka_send_err)
     }
 
     /// Issue a real Let's Encrypt certificate for this node's MagicDNS `name` (`acme` feature).
@@ -1320,10 +1337,11 @@ fn flatten_set_dns_send_err<M>(
     }
 }
 
-/// Flatten a kameo `SendError` from the `TkaSign` ask into a [`ts_control::TkaSyncError`]. A
-/// `HandlerError` carries the real RPC error; any other send failure (actor shutdown / mailbox
-/// closed) is surfaced as the transient [`ts_control::TkaSyncError::NetworkError`].
-fn flatten_tka_sign_send_err<M>(
+/// Flatten a kameo `SendError` from a TKA mutation ask (`TkaSign`/`TkaDisable`) into a
+/// [`ts_control::TkaSyncError`]. A `HandlerError` carries the real RPC error; any other send failure
+/// (actor shutdown / mailbox closed) is surfaced as the transient
+/// [`ts_control::TkaSyncError::NetworkError`]. Generic over the message type so both share it.
+fn flatten_tka_send_err<M>(
     e: kameo::error::SendError<M, ts_control::TkaSyncError>,
 ) -> ts_control::TkaSyncError {
     match e {
@@ -1529,27 +1547,38 @@ mod tests {
         );
     }
 
-    /// A `HandlerError` from the tka-sign RPC carries the real `TkaSyncError` and must pass through
+    /// A `HandlerError` from a TKA mutation RPC carries the real `TkaSyncError` and must pass through
     /// verbatim (an `Unsupported` payload makes the passthrough observable, distinct from the
     /// `_ => NetworkError` fallback).
     #[test]
-    fn flatten_tka_sign_send_err_handler_error_passes_through() {
+    fn flatten_tka_send_err_handler_error_passes_through() {
         let e: kameo::error::SendError<control_runner::TkaSign, ts_control::TkaSyncError> =
             kameo::error::SendError::HandlerError(ts_control::TkaSyncError::Unsupported);
         assert_eq!(
-            flatten_tka_sign_send_err(e),
+            flatten_tka_send_err(e),
             ts_control::TkaSyncError::Unsupported
         );
     }
 
     /// A non-handler send failure (actor stopped) collapses to a transient `NetworkError`.
     #[test]
-    fn flatten_tka_sign_send_err_actor_stopped_is_network_error() {
+    fn flatten_tka_send_err_actor_stopped_is_network_error() {
         let e: kameo::error::SendError<control_runner::TkaSign, ts_control::TkaSyncError> =
             kameo::error::SendError::ActorStopped;
         assert_eq!(
-            flatten_tka_sign_send_err(e),
+            flatten_tka_send_err(e),
             ts_control::TkaSyncError::NetworkError
+        );
+    }
+
+    /// The same flatten works for the `TkaDisable` message type (the helper is generic over `M`).
+    #[test]
+    fn flatten_tka_send_err_works_for_disable() {
+        let e: kameo::error::SendError<control_runner::TkaDisable, ts_control::TkaSyncError> =
+            kameo::error::SendError::HandlerError(ts_control::TkaSyncError::Unsupported);
+        assert_eq!(
+            flatten_tka_send_err(e),
+            ts_control::TkaSyncError::Unsupported
         );
     }
 }
