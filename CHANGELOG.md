@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.35.4](https://github.com/GeiserX/tailscale-rs/compare/v0.35.3...v0.35.4) (2026-06-13)
+
+
+### Bug Fixes
+
+* **netcheck:** apply preferred-DERP selection hysteresis to stop home-relay flapping ([#196](https://github.com/GeiserX/tailscale-rs/issues/196)) ([8cc6b4f](https://github.com/GeiserX/tailscale-rs/commit/8cc6b4f51d217bbed4412a3dbef8f2ccacf5553b))
+
 ## [0.35.3](https://github.com/GeiserX/tailscale-rs/compare/v0.35.2...v0.35.3) (2026-06-13)
 
 
