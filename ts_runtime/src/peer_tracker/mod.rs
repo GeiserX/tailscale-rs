@@ -130,7 +130,9 @@ impl PeerTracker {
     /// - Authority present + signature missing or unauthorized/invalid ⇒ **drop** (Go drops peers
     ///   with a missing signature or failed `NodeKeyAuthorized` under tailnet lock).
     fn tka_admits(&self, node: &Node) -> bool {
-        Self::tka_snapshot_admits(self.tka_authority.borrow().as_deref(), node)
+        // Single-peer sites (`Delta`/patch) only need the admit bool; the rotation details are used
+        // exclusively by the cross-peer `Full` filter (rotation obsolescence is whole-netmap).
+        Self::tka_snapshot_admits(self.tka_authority.borrow().as_deref(), node).admitted
     }
 
     /// Borrow the current TKA authority once (cloning the cheap `Arc`) for a batch verdict. Returns
@@ -145,14 +147,17 @@ impl PeerTracker {
     /// one verdict implementation (no divergence) while the batch path verifies each peer exactly
     /// once.
     ///
+    /// Returns whether the peer is admitted AND, for an admitted peer signed by a rotation chain, the
+    /// [`RotationDetails`](ts_tka::RotationDetails) of that chain — so the `Full` path can run the
+    /// cross-peer rotation filter (Go's `rotationTracker`) without a second verify per peer. A peer
+    /// that is dropped, unsigned, or signed by a non-rotation chain carries `rotation == None`.
+    ///
     /// Never logs key/signature bytes — only the `stable_id` and the `TkaError` Display (static
-    /// descriptors). Known parity gaps vs Go (both *under*-enforcement, documented in PARITY_ROADMAP):
-    /// no `UnsignedPeerAPIOnly` exemption (our model lacks the field), and no cross-peer
-    /// rotation-obsolete dropping (a rotated-away but still-validly-signed key is admitted — see the
-    /// roadmap; closing it needs a details-returning verify + a whole-netmap rotation pass).
-    fn tka_snapshot_admits(authority: Option<&ts_tka::Authority>, node: &Node) -> bool {
+    /// descriptors). One documented parity gap remains vs Go (under-enforcement, in PARITY_ROADMAP):
+    /// no `UnsignedPeerAPIOnly` exemption (our node model lacks the field).
+    fn tka_snapshot_admits(authority: Option<&ts_tka::Authority>, node: &Node) -> TkaVerdict {
         let Some(auth) = authority else {
-            return true;
+            return TkaVerdict::admit();
         };
 
         // Brick-guard: an authority with no trusted keys would drop every peer. A verified chain is
@@ -168,7 +173,7 @@ impl PeerTracker {
                 "TKA: authority has an empty trusted-key set (verified chains never do — likely a \
                  ts_tka bug); not enforcing (admitting all) to avoid isolating the node"
             );
-            return true;
+            return TkaVerdict::admit();
         }
 
         if node.key_signature.is_empty() {
@@ -176,13 +181,17 @@ impl PeerTracker {
                 stable_id = ?node.stable_id,
                 "TKA: dropping unsigned peer under tailnet lock"
             );
-            return false;
+            return TkaVerdict::drop();
         }
 
-        match auth.node_key_authorized(&node.node_key.to_bytes(), &node.key_signature) {
-            Ok(()) => {
+        match auth.node_key_authorized_with_details(&node.node_key.to_bytes(), &node.key_signature)
+        {
+            Ok(rotation) => {
                 tracing::debug!(stable_id = ?node.stable_id, "TKA: peer node-key authorized");
-                true
+                TkaVerdict {
+                    admitted: true,
+                    rotation,
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -190,9 +199,117 @@ impl PeerTracker {
                     error = %e,
                     "TKA: dropping peer with unauthorized node key"
                 );
-                false
+                TkaVerdict::drop()
             }
         }
+    }
+}
+
+/// The outcome of a per-peer Tailnet-Lock check: whether the peer is admitted, plus (for an admitted
+/// peer signed by a rotation chain) the chain's [`RotationDetails`](ts_tka::RotationDetails) so the
+/// `Full` path can run the cross-peer rotation filter from the SAME verify pass (no second verify).
+struct TkaVerdict {
+    admitted: bool,
+    rotation: Option<ts_tka::RotationDetails>,
+}
+
+impl TkaVerdict {
+    /// Admitted, no rotation details (no lock / brick-guard / non-rotation signature).
+    fn admit() -> Self {
+        Self {
+            admitted: true,
+            rotation: None,
+        }
+    }
+    /// Dropped.
+    fn drop() -> Self {
+        Self {
+            admitted: false,
+            rotation: None,
+        }
+    }
+}
+
+/// Cross-peer rotation-obsolescence tracker, mirroring Go `ipnlocal.rotationTracker`. Fed the
+/// [`RotationDetails`](ts_tka::RotationDetails) of every admitted, rotation-signed peer in a `Full`
+/// netmap; [`obsolete_keys`](Self::obsolete_keys) then returns the node keys to drop on top of the
+/// per-peer verdict. Two rules (Go `tkaFilterNetmapLocked` + `rotationTracker.obsoleteKeys`):
+///
+/// 1. Every prior node key named in any rotation chain is obsolete (a newer chain rotated it away).
+/// 2. Among `Direct`-rooted chains sharing one wrapping pubkey (a clone signal), only the
+///    longest-chain peer survives; if the two longest are tied, ALL in that group are dropped (we
+///    cannot tell which is the latest, so reject for safety). `Credential`-rooted chains are exempt
+///    from rule 2 — several nodes can legitimately join under one reusable auth key (same wrapping
+///    pubkey), so sharing it is not a clone signal there. (Rule 1 still applies to them.)
+///
+/// Node keys are tracked as raw `Vec<u8>` (the verified 32-byte node-public bytes).
+#[derive(Default)]
+struct RotationTracker {
+    obsolete: HashSet<Vec<u8>>,
+    by_wrapping_key: HashMap<Vec<u8>, Vec<SigRotation>>,
+}
+
+/// One admitted peer's rotation entry within a wrapping-key group.
+struct SigRotation {
+    node_key: Vec<u8>,
+    num_prev_keys: usize,
+}
+
+impl RotationTracker {
+    /// Record an admitted peer `node_key` and its rotation `details` (Go `addRotationDetails`).
+    fn add(&mut self, node_key: Vec<u8>, details: &ts_tka::RotationDetails) {
+        // Rule 1: every prior key is obsolete — applied for ALL chains (incl. credential-rooted),
+        // matching Go's ungated `obsolete.AddSlice(d.PrevNodeKeys)`.
+        self.obsolete.extend(details.prev_node_keys.iter().cloned());
+        // Rule 2 (clone-uniqueness) is gated to Direct-rooted chains only.
+        if details.initial_sig_kind != ts_tka::SigKind::Direct {
+            return;
+        }
+        self.by_wrapping_key
+            .entry(details.initial_wrapping_pubkey.clone())
+            .or_default()
+            .push(SigRotation {
+                node_key,
+                num_prev_keys: details.prev_node_keys.len(),
+            });
+    }
+
+    /// Compute the full obsolete node-key set (Go `rotationTracker.obsoleteKeys`). Processes each
+    /// wrapping-key group, mutating the shared `obsolete` set as it goes (so a key obsoleted by one
+    /// group is seen as obsolete by later groups via the `retain` below — Go's
+    /// `slices.DeleteFunc(... Contains)`). Group iteration order (a `HashMap` drain) is
+    /// nondeterministic, but the result is order-INDEPENDENT: this only ever *inserts* into
+    /// `obsolete` (never removes), and rule 1 already obsoleted every prior key before this loop, so
+    /// the final set is a union that does not depend on which group runs first (as in Go).
+    fn obsolete_keys(mut self) -> HashSet<Vec<u8>> {
+        // Drain only the group map so the loop can mutate `self.obsolete` without aliasing it; the
+        // shared `obsolete` set itself is NOT drained, preserving the cross-group visibility above.
+        let groups: Vec<Vec<SigRotation>> = self.by_wrapping_key.drain().map(|(_k, v)| v).collect();
+        for mut group in groups {
+            // Drop entries already obsoleted (rotated away) by another chain.
+            group.retain(|rd| !self.obsolete.contains(&rd.node_key));
+            if group.is_empty() {
+                continue;
+            }
+            // Longest chain (most prior keys) is the newest ⇒ the survivor; sort decreasing.
+            // `sort_by_key` is stable (like Go's `SortStableFunc`); `Reverse` gives descending order.
+            group.sort_by_key(|rd| core::cmp::Reverse(rd.num_prev_keys));
+            if group.len() >= 2 && group[0].num_prev_keys == group[1].num_prev_keys {
+                // Tie for longest ⇒ cannot disambiguate the latest ⇒ drop the WHOLE group.
+                tracing::warn!(
+                    "TKA: multiple peers share a wrapping key with equal rotation depth; dropping all (cannot determine the latest)"
+                );
+                for rd in &group {
+                    self.obsolete.insert(rd.node_key.clone());
+                }
+            } else {
+                // Only the longest-chain peer survives; the rest are obsolete.
+                for rd in &group[1..] {
+                    self.obsolete.insert(rd.node_key.clone());
+                }
+            }
+        }
+        self.obsolete
     }
 }
 
@@ -605,14 +722,42 @@ impl PeerTracker {
                 // `retain` drops the stale (previously-admitted) entry. With no authority the snapshot
                 // is `None`, so every node passes — byte-for-byte the pre-TKA behavior (no regression).
                 let authority = self.tka_authority_snapshot();
-                let admits = new_nodes
+                let verdicts = new_nodes
                     .iter()
                     .map(|node| Self::tka_snapshot_admits(authority.as_deref(), node))
                     .collect::<Vec<_>>();
+
+                // Cross-peer rotation filter (Go `rotationTracker`): from the SAME verify pass above,
+                // feed every admitted, rotation-signed peer's details to the tracker, then drop any
+                // peer presenting a node key a newer rotation has superseded (or a tied clone). This
+                // is whole-netmap by nature — one peer's chain obsoletes another's key — so it lives
+                // here, not in the per-peer verdict, matching Go's single pass over `nm.Peers`.
+                let mut rotation = RotationTracker::default();
+                for (node, verdict) in new_nodes.iter().zip(&verdicts) {
+                    if verdict.admitted
+                        && let Some(details) = &verdict.rotation
+                    {
+                        rotation.add(node.node_key.to_bytes().to_vec(), details);
+                    }
+                }
+                let obsolete = rotation.obsolete_keys();
+
+                // Final per-node keep verdict: admitted by the per-peer check AND not rotation-obsolete.
+                // Drives both the `retain` (evict) and the upsert loop, so a node whose own signature
+                // fails — or whose key was rotated away — is never admitted on the strength of a
+                // stable_id twin.
+                let keep = new_nodes
+                    .iter()
+                    .zip(&verdicts)
+                    .map(|(node, v)| {
+                        // `contains` takes `&[u8]` (HashSet<Vec<u8>> borrows as a slice) — no alloc.
+                        v.admitted && !obsolete.contains(&node.node_key.to_bytes()[..])
+                    })
+                    .collect::<Vec<bool>>();
                 let retained_ids = new_nodes
                     .iter()
-                    .zip(admits.iter().copied())
-                    .filter(|(_, ok)| *ok)
+                    .zip(keep.iter().copied())
+                    .filter(|(_, k)| *k)
                     .map(|(node, _)| &node.stable_id)
                     .collect::<HashSet<_>>();
 
@@ -638,9 +783,9 @@ impl PeerTracker {
                     retain
                 });
 
-                for (node, ok) in new_nodes.iter().zip(admits.iter().copied()) {
-                    if !ok {
-                        continue; // fail-CLOSED: peer rejected by tailnet lock (verified once, above)
+                for (node, k) in new_nodes.iter().zip(keep.iter().copied()) {
+                    if !k {
+                        continue; // fail-CLOSED: rejected by tailnet lock or rotation-obsolete (above)
                     }
                     let peer_id = self.peer_db.upsert(node);
                     upserts.insert(peer_id);
@@ -1802,5 +1947,221 @@ mod tka_tests {
             display_name: None,
         };
         assert_eq!(empty.best_label(), None);
+    }
+
+    // ----- tsr-jo1: RotationTracker (Go ipnlocal.rotationTracker.obsoleteKeys) -----
+
+    /// A `RotationDetails` for a `Direct`-rooted chain with the given prior keys + wrapping key.
+    fn rot_details(
+        prev: &[&[u8]],
+        wrapping: &[u8],
+        kind: ts_tka::SigKind,
+    ) -> ts_tka::RotationDetails {
+        ts_tka::RotationDetails {
+            prev_node_keys: prev.iter().map(|p| p.to_vec()).collect(),
+            initial_sig_kind: kind,
+            initial_wrapping_pubkey: wrapping.to_vec(),
+        }
+    }
+
+    /// Rule 1: every prior node key named by any rotation chain is obsolete, regardless of the
+    /// chain's root kind (Go's ungated `obsolete.AddSlice(d.PrevNodeKeys)`).
+    #[test]
+    fn rotation_tracker_prev_keys_always_obsolete() {
+        let mut t = RotationTracker::default();
+        // A Direct-rooted chain that rotated away OLD1, and a Credential-rooted one that rotated OLD2.
+        t.add(
+            b"newA".to_vec(),
+            &rot_details(&[b"OLD1"], b"wrapA", ts_tka::SigKind::Direct),
+        );
+        t.add(
+            b"newB".to_vec(),
+            &rot_details(&[b"OLD2"], b"wrapB", ts_tka::SigKind::Credential),
+        );
+        let obsolete = t.obsolete_keys();
+        assert!(
+            obsolete.contains(b"OLD1".as_slice()),
+            "Direct chain's prior key obsolete"
+        );
+        assert!(
+            obsolete.contains(b"OLD2".as_slice()),
+            "Credential chain's prior key obsolete too (rule 1 is ungated)"
+        );
+        // The current keys themselves are not obsolete (only one peer per wrapping key here).
+        assert!(!obsolete.contains(b"newA".as_slice()));
+        assert!(!obsolete.contains(b"newB".as_slice()));
+    }
+
+    /// Rule 2: among `Direct`-rooted chains sharing a wrapping key, only the longest survives; the
+    /// shorter (older) clone's key is obsolete.
+    #[test]
+    fn rotation_tracker_unequal_chain_keeps_longest() {
+        let mut t = RotationTracker::default();
+        // Same wrapping key; "long" has 2 prior keys, "short" has 1 ⇒ "short" is the older clone.
+        t.add(
+            b"long".to_vec(),
+            &rot_details(&[b"p1", b"p2"], b"wrap", ts_tka::SigKind::Direct),
+        );
+        t.add(
+            b"short".to_vec(),
+            &rot_details(&[b"q1"], b"wrap", ts_tka::SigKind::Direct),
+        );
+        let obsolete = t.obsolete_keys();
+        assert!(
+            obsolete.contains(b"short".as_slice()),
+            "the shorter-chain clone is obsolete"
+        );
+        assert!(
+            !obsolete.contains(b"long".as_slice()),
+            "the longest-chain peer survives"
+        );
+    }
+
+    /// Rule 2 tie: two `Direct`-rooted chains sharing a wrapping key with EQUAL chain length cannot
+    /// be disambiguated ⇒ BOTH are dropped (Go's safety branch).
+    #[test]
+    fn rotation_tracker_equal_chain_drops_both() {
+        let mut t = RotationTracker::default();
+        t.add(
+            b"cloneA".to_vec(),
+            &rot_details(&[b"p1"], b"wrap", ts_tka::SigKind::Direct),
+        );
+        t.add(
+            b"cloneB".to_vec(),
+            &rot_details(&[b"p2"], b"wrap", ts_tka::SigKind::Direct),
+        );
+        let obsolete = t.obsolete_keys();
+        assert!(
+            obsolete.contains(b"cloneA".as_slice()),
+            "tied clone A dropped"
+        );
+        assert!(
+            obsolete.contains(b"cloneB".as_slice()),
+            "tied clone B dropped"
+        );
+    }
+
+    /// `Credential`-rooted chains sharing a wrapping key are EXEMPT from rule 2 (reusable-authkey
+    /// carve-out): both are kept even with equal chain length.
+    #[test]
+    fn rotation_tracker_credential_root_clones_both_kept() {
+        let mut t = RotationTracker::default();
+        t.add(
+            b"credA".to_vec(),
+            &rot_details(&[b"p1"], b"wrap", ts_tka::SigKind::Credential),
+        );
+        t.add(
+            b"credB".to_vec(),
+            &rot_details(&[b"p2"], b"wrap", ts_tka::SigKind::Credential),
+        );
+        let obsolete = t.obsolete_keys();
+        assert!(
+            !obsolete.contains(b"credA".as_slice()),
+            "credential-rooted clone A kept"
+        );
+        assert!(
+            !obsolete.contains(b"credB".as_slice()),
+            "credential-rooted clone B kept"
+        );
+    }
+
+    /// A peer that another chain already rotated away does not also act as a surviving clone: it is
+    /// removed from its wrapping-key group before the longest-survivor pick (Go's `DeleteFunc`).
+    #[test]
+    fn rotation_tracker_already_obsolete_peer_not_a_survivor() {
+        let mut t = RotationTracker::default();
+        // "victim" is rotated away by "rotator" (different wrapping key), AND shares wrapping key
+        // "w" with "other". Because "victim" is already obsolete, only "other" is in play for "w" and
+        // survives (no spurious tie-drop of "other").
+        t.add(
+            b"rotator".to_vec(),
+            &rot_details(&[b"victim"], b"wRot", ts_tka::SigKind::Direct),
+        );
+        t.add(
+            b"victim".to_vec(),
+            &rot_details(&[b"x"], b"w", ts_tka::SigKind::Direct),
+        );
+        t.add(
+            b"other".to_vec(),
+            &rot_details(&[b"y"], b"w", ts_tka::SigKind::Direct),
+        );
+        let obsolete = t.obsolete_keys();
+        assert!(
+            obsolete.contains(b"victim".as_slice()),
+            "victim rotated away by rotator"
+        );
+        assert!(
+            !obsolete.contains(b"other".as_slice()),
+            "other survives — victim was removed from the group before the tie check"
+        );
+    }
+
+    /// Empty tracker (no rotation-signed peers) ⇒ no obsolete keys (the non-rotation netmap path).
+    #[test]
+    fn rotation_tracker_empty_is_noop() {
+        let t = RotationTracker::default();
+        assert!(t.obsolete_keys().is_empty());
+    }
+
+    /// End-to-end through the real `Full` path: a peer presenting a freshly-rotated key (a Rotation
+    /// chain) is admitted, while a second peer still presenting the rotated-AWAY pivot key — even with
+    /// that key's own still-valid Direct signature — is DROPPED by the cross-peer rotation filter.
+    /// This is the gap closed here: Go `tkaFilterNetmapLocked` drops the stale clone; we used to admit
+    /// it. Uses real `ts_tka` signing (`sign_direct` + `sign_rotation`) so the whole
+    /// verify → details → filter pipeline runs.
+    ///
+    /// Construction: the trusted key signs an inner `Direct` over the PIVOT keypair's public key; the
+    /// pivot key then signs an outer `Rotation` authorizing `new_key`. That chain's `prev_node_keys`
+    /// names the pivot pubkey — so a peer presenting the pivot pubkey as its node key is the
+    /// rotated-away key the filter must drop.
+    #[tokio::test]
+    async fn tka_full_drops_rotated_away_key_e2e() {
+        use ed25519_dalek::SigningKey;
+        use ts_tka::NodeKeySignature;
+
+        let trusted = SigningKey::from_bytes(&[42u8; 32]);
+        let trusted_pub = trusted.verifying_key().to_bytes().to_vec();
+        let authority = Authority::from_state(
+            AumHash([0; 32]),
+            State {
+                keys: vec![Key {
+                    kind: KeyKind::Ed25519,
+                    votes: 1,
+                    public: trusted_pub.clone(),
+                }],
+            },
+        );
+
+        // The rotation pivot: a keypair whose public key the inner Direct authorizes and whose
+        // private key signs the outer rotation wrap. This pivot pubkey IS the key being rotated away.
+        let pivot = SigningKey::from_bytes(&[9u8; 32]);
+        let pivot_pub: [u8; 32] = pivot.verifying_key().to_bytes();
+
+        let new_key = [4u8; 32]; // the freshly-rotated node key
+
+        // Fresh peer: a Rotation chain authorizing `new_key`, inner Direct over the pivot signed by
+        // trusted, outer wrap signed by the pivot. Its prev_node_keys names `pivot_pub`.
+        let new_sig = NodeKeySignature::sign_rotation(&new_key, &trusted, &pivot).serialize();
+        let new_peer = peer_node("rotated", new_key, new_sig);
+
+        // Stale peer: still presents the pivot pubkey (the rotated-away key) with its own valid
+        // Direct signature — valid in isolation, but obsoleted by the fresh peer's rotation chain.
+        let stale_sig = NodeKeySignature::sign_direct(&pivot_pub, &trusted).serialize();
+        let stale_peer = peer_node("stale", pivot_pub, stale_sig);
+
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), Some(authority));
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![
+            new_peer.clone(),
+            stale_peer.clone(),
+        ]));
+
+        assert!(
+            tracker.peer_db.get(&new_peer.node_key).is_some(),
+            "the freshly-rotated peer is admitted"
+        );
+        assert!(
+            tracker.peer_db.get(&stale_peer.node_key).is_none(),
+            "the peer presenting the rotated-away key is dropped (Go tkaFilterNetmapLocked)"
+        );
     }
 }

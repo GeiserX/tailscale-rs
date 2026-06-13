@@ -431,6 +431,54 @@ impl NodeKeySignature {
         sig
     }
 
+    /// Build a single-level **`Rotation`** chain authorizing `node_key`, rooted in a trusted key
+    /// (Go `tka.signNodeKey` for the rotation case). Constructs the inner `Direct` itself — the
+    /// trusted `inner_signer` signs over the rotation **pivot** (`pivot_key`'s public key), with the
+    /// pivot recorded as the inner's `wrapping_pubkey` (set *before* signing, as Go's rotation-pivot
+    /// inner does) — then the pivot key signs the outer rotation wrap over `node_key`. The outer wrap
+    /// verifies as **standard** ed25519 (not ZIP-215); the inner Direct as ZIP-215. The resulting
+    /// chain's `prev_node_keys` names the pivot pubkey (the key being rotated away).
+    ///
+    /// Symmetric companion to [`sign_direct`](NodeKeySignature::sign_direct) for the rotation case,
+    /// so a caller (and the crate's tests) can construct a genuinely-verifiable rotation chain
+    /// without hand-encoding CBOR. For deeper chains, feed the result back in as a further pivot.
+    pub fn sign_rotation(
+        node_key: &[u8],
+        inner_signer: &ed25519_dalek::SigningKey,
+        pivot_key: &ed25519_dalek::SigningKey,
+    ) -> NodeKeySignature {
+        use ed25519_dalek::Signer;
+        let pivot_pub = pivot_key.verifying_key().to_bytes().to_vec();
+
+        // Inner Direct: the trusted signer authorizes the pivot pubkey, with `wrapping_pubkey` set to
+        // the pivot so the outer wrap's verify (`nested.wrapping_public()`) resolves it. Built and
+        // signed here so the field is part of its signed preimage (mutating it post-sign would break
+        // the inner signature — `wrapping_pubkey` is CBOR key 6, part of the sig_hash).
+        let mut inner = NodeKeySignature {
+            sig_kind: SigKind::Direct,
+            pubkey: pivot_pub.clone(),
+            key_id: inner_signer.verifying_key().to_bytes().to_vec(),
+            signature: Vec::new(),
+            nested: None,
+            wrapping_pubkey: pivot_pub,
+        };
+        let inner_hash = inner.sig_hash();
+        inner.signature = inner_signer.sign(&inner_hash).to_bytes().to_vec();
+
+        // Outer Rotation: the pivot key signs the wrap authorizing `node_key`.
+        let mut sig = NodeKeySignature {
+            sig_kind: SigKind::Rotation,
+            pubkey: node_key.to_vec(),
+            key_id: Vec::new(),
+            signature: Vec::new(),
+            nested: Some(alloc::boxed::Box::new(inner)),
+            wrapping_pubkey: Vec::new(),
+        };
+        let sig_hash = sig.sig_hash();
+        sig.signature = pivot_key.sign(&sig_hash).to_bytes().to_vec();
+        sig
+    }
+
     /// The key id that ultimately roots this signature in a trusted key (Go `authorizingKeyID`):
     /// for a rotation, recurse into the nested signature; otherwise this signature's `key_id`.
     fn authorizing_key_id(&self) -> Result<&[u8], TkaError> {
