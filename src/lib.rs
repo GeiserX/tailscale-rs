@@ -1192,6 +1192,30 @@ impl Device {
             .map_err(Into::into)
     }
 
+    /// Sign a peer's `node_key` with this node's network-lock key and submit the signature to
+    /// control — the Rust analog of Go `LocalClient.NetworkLockSign` for the Direct case.
+    ///
+    /// Builds a `Direct` [`NodeKeySignature`][ts_tka::NodeKeySignature] authorizing `node_key`, signed
+    /// by this node's network-lock private key, and POSTs it to `/machine/tka/sign`. The signing node
+    /// must itself be trusted under the current authority for control to accept the signature.
+    ///
+    /// **This only *submits* the signature; it does not mutate this node's local
+    /// [`Authority`][ts_tka::Authority].** The local trusted-key state advances solely through the
+    /// verified netmap-driven sync path (every applied AUM passes
+    /// [`VerifiedAumChain::verify`][ts_tka::VerifiedAumChain::verify]), so a successful `tka_sign` is
+    /// reflected locally on the next sync — the verify-and-log posture is unchanged.
+    ///
+    /// # Errors
+    /// [`ts_control::TkaSyncError::Unsupported`] if control has no TKA endpoint (no lock / control too
+    /// old), [`ts_control::TkaSyncError::NetworkError`] on a transient failure, or a coarse
+    /// `Internal` for other RPC failures.
+    pub async fn tka_sign(
+        &self,
+        node_key: &ts_keys::NodePublicKey,
+    ) -> Result<(), ts_control::TkaSyncError> {
+        self.runtime.tka_sign(node_key.to_bytes()).await
+    }
+
     /// Request an OIDC **ID token** from control for this node, scoped to `audience` (workload-
     /// identity federation, like `tailscale`'s `id-token` LocalAPI).
     ///

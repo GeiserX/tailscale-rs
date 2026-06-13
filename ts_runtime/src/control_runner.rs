@@ -13,7 +13,7 @@ use kameo::{
 use tokio::sync::watch;
 use ts_control::{
     AsyncControlClient, Endpoint, EndpointType, Error as ControlError, IdTokenError, LogoutError,
-    Node, SetDnsError, SshPolicy, StateUpdate, TkaStatus,
+    Node, SetDnsError, SshPolicy, StateUpdate, TkaStatus, TkaSyncError, tka_submit_signature,
 };
 use ts_magicsock::SelfEndpointType;
 
@@ -509,6 +509,59 @@ mod msg_impl {
         #[message]
         pub fn current_tka_status(&self) -> Option<TkaStatus> {
             self.tka.borrow().clone()
+        }
+
+        /// Sign `node_key` directly with this node's network-lock key and submit the signature to
+        /// control (Go `tka.sign` for the Direct case → `tkaSubmitSignature`).
+        ///
+        /// Builds a `Direct` [`NodeKeySignature`](ts_tka::NodeKeySignature) via
+        /// [`sign_direct`](ts_tka::NodeKeySignature::sign_direct) over this node's inner ed25519
+        /// network-lock signing key, serializes it (raw CBOR), and POSTs it to `/machine/tka/sign`.
+        /// Mirrors `set_dns`/`get_certificate`: clones the control config + node keys into a spawned
+        /// task (delegated reply, so the round-trip doesn't block the mailbox) over a fresh Noise
+        /// channel.
+        ///
+        /// **Posture: this only *submits* a signature to control — it does NOT mutate the local
+        /// [`Authority`](ts_tka::Authority).** The local trusted-key state advances solely through the
+        /// existing verified-sync path (`sync_tka` → `VerifiedAumChain::verify`); a `tka_sign` success
+        /// is acknowledged to the caller, and the resulting AUM is picked up on the next netmap-driven
+        /// sync. Verify-and-log is unchanged.
+        #[message(ctx)]
+        pub fn tka_sign(
+            &self,
+            ctx: &mut Context<Self, DelegatedReply<Result<(), TkaSyncError>>>,
+            node_key: [u8; 32],
+        ) -> DelegatedReply<Result<(), TkaSyncError>> {
+            let (deleg, replier) = ctx.reply_sender();
+
+            if let Some(replier) = replier {
+                let config = self.params.config.clone();
+                let keys = self.params.env.keys.clone();
+                tokio::spawn(async move {
+                    // Sign the node key with our network-lock key, then submit the raw-CBOR NKS.
+                    let nks = ts_tka::NodeKeySignature::sign_direct(
+                        &node_key,
+                        &keys.network_lock_keys.private.signing_key(),
+                    );
+                    let req = ts_control::TkaSubmitSignatureRequest {
+                        // node_key + version are stamped by the RPC client from `keys`.
+                        version: Default::default(),
+                        node_key: keys.node_keys.public,
+                        signature: nks.serialize(),
+                    };
+                    let result = tka_submit_signature(
+                        &config.server_url,
+                        &keys,
+                        req,
+                        config.allow_http_key_fetch,
+                    )
+                    .await
+                    .map(|_response| ());
+                    replier.send(result);
+                });
+            }
+
+            deleg
         }
 
         /// The cert-eligible DNS names from control's netmap DNS config (Go `nm.DNS.CertDomains`).
