@@ -230,6 +230,26 @@ mod tests {
     use super::*;
     use ts_control_serde::TkaSignInfo;
 
+    /// Pin the exact `/machine/tka/*` path each RPC dials (the highest-risk Go-parity property — a
+    /// wrong path silently 404s → looks like "no lock" instead of erroring). These mirror the literals
+    /// the `*_with` fns pass to `control_url.join(...)`; a copy-paste edit to one would be caught here.
+    #[test]
+    fn rpc_paths_match_go() {
+        let base = Url::parse("https://controlplane.tailscale.com/").unwrap();
+        for (segment, expected) in [
+            ("machine/tka/init/begin", "/machine/tka/init/begin"),
+            ("machine/tka/init/finish", "/machine/tka/init/finish"),
+            ("machine/tka/sign", "/machine/tka/sign"),
+            ("machine/tka/disable", "/machine/tka/disable"),
+        ] {
+            assert_eq!(
+                base.join(segment).unwrap().path(),
+                expected,
+                "RPC path for {segment} must match Go tailnet-lock.go"
+            );
+        }
+    }
+
     #[test]
     fn parse_init_begin_response_ok() {
         let json = br#"{"NeedSignatures":[{"NodeID":42,"NodePublic":"nodekey:0707070707070707070707070707070707070707070707070707070707070707","RotationPubkey":"AQID"}]}"#;
