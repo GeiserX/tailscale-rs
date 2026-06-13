@@ -110,6 +110,18 @@ crate::mk_option_deserializer!(
     core::num::NonZeroU32::new(id).map(crate::DerpRegionId::from)
 });
 
+crate::mk_option_deserializer!(
+    /// Deserialize a `PeerChange.Cap` capability version into an optional
+    /// [`CapabilityVersion`][ts_capabilityversion::CapabilityVersion]. A zero value is treated as
+    /// `None` ("no change"), mirroring Go's `if pc.Cap != 0` guard in
+    /// `control/controlclient/map.go` — without this, a wire `"Cap":0` would deserialize to
+    /// `Some(CapabilityVersion(0))` and clobber the peer's real capability version. Reusing
+    /// [`CapabilityVersion::new`][ts_capabilityversion::CapabilityVersion::new] also folds the other
+    /// undefined versions (1, 2, 35) to `None`, which `new` already rejects.
+    pub cap_version, u16, ts_capabilityversion::CapabilityVersion, |v| {
+    ts_capabilityversion::CapabilityVersion::new(v)
+});
+
 /// Report whether the value is the default for its type.
 ///
 /// Avoid using this function to check large types, as it must actually construct the empty
