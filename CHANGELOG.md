@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.35.3](https://github.com/GeiserX/tailscale-rs/compare/v0.35.2...v0.35.3) (2026-06-13)
+
+
+### Bug Fixes
+
+* **derp:** skip unknown frame types instead of tearing down the connection ([#194](https://github.com/GeiserX/tailscale-rs/issues/194)) ([22e4cc0](https://github.com/GeiserX/tailscale-rs/commit/22e4cc0eb3c333cb4f113a531aec71ccf96c6d45))
+
 ## [0.35.2](https://github.com/GeiserX/tailscale-rs/compare/v0.35.1...v0.35.2) (2026-06-13)
 
 
