@@ -28,9 +28,10 @@ verification is now **active and fail-closed** at the peer-trust chokepoint, mat
 `tkaFilterNetmapLocked`. Once a verified `Authority` has been synced from control (over the internal
 watch channel, only after `VerifiedAumChain::verify`), peers with a missing or unauthorized signature
 are dropped; with no lock synced every peer is admitted, and a disabled lock clears enforcement. The
-remaining TKA parity items are narrower: disablement-secret verification, the two known
-under-enforcement gaps (rotation-obsolete dropping, `UnsignedPeerAPIOnly`), and surfacing a
-self-locked-out health warning — see the deferred list below and issue #7.
+cross-peer rotation filter (Go's `rotationTracker`) also drops peers presenting a rotated-away key.
+The remaining TKA parity items are narrower: disablement-secret verification, the `UnsignedPeerAPIOnly`
+under-enforcement gap, and surfacing a self-locked-out health warning — see the deferred list below
+and issue #7.
 
 ## Where we are (v0.8.1 — near-complete tsnet parity)
 
@@ -78,10 +79,11 @@ Most recent wave:
   matching Go's `tkaFilterNetmapLocked`. A verified `ts_tka::Authority` is delivered from the control
   runner over an internal watch channel — only after `VerifiedAumChain::verify` — and the chokepoint
   then fails closed on missing/unauthorized signatures (self is structurally never filtered). With no
-  lock synced, behavior is unchanged (admit-all); a disabled lock clears enforcement. The narrower
-  remaining items (disablement-secret verification, the rotation-obsolete and `UnsignedPeerAPIOnly`
-  under-enforcement gaps, self-locked-out health warning) are in the deferred list below and
-  [SECURITY.md](../SECURITY.md).
+  lock synced, behavior is unchanged (admit-all); a disabled lock clears enforcement. A whole-netmap
+  rotation filter (Go's `rotationTracker`) additionally drops a peer presenting a node key that a
+  newer rotation chain has superseded (clone/replay defense). The narrower remaining items
+  (disablement-secret verification, the `UnsignedPeerAPIOnly` under-enforcement gap, self-locked-out
+  health warning) are in the deferred list below and [SECURITY.md](../SECURITY.md).
 
 ### Deferred (in-scope eventually, not blocked externally — with reasons)
 - **TKA disablement-secret verification** — the cryptographic proof that a given lock *disable* is
@@ -89,11 +91,6 @@ Most recent wave:
   trusted for the enable/disable toggle (it cannot forge-admit a peer either way — admission still
   requires a key in the verified chain), so this is a hardening item, not an open admit-all hole (see
   [SECURITY.md](../SECURITY.md)).
-- **Rotation-obsolete peer dropping** — Go's `rotationTracker` drops a peer whose key was rotated
-  away even when the old signature still validates (clone/replay defense); we currently admit such a
-  key. This is genuine *under*-enforcement (more permissive than Go) and is not structurally
-  closeable yet — it needs a `node_key_authorized_with_details` path plus a whole-netmap rotation
-  pass.
 - **Self-locked-out health warning** — Go surfaces a health warning when the node's own key is not
   authorized under an active lock. Self is structurally never filtered here (the self node never
   enters the peer db), so there is no lockout risk, but the advisory warning is not yet surfaced.
@@ -169,9 +166,10 @@ sense, while keeping the anti-leak/egress posture (see `AGENTS.md`).
 - **Tailnet-Lock (TKA) enforcement hardening** (part of old #20; issue #7) — core enforcement now
   **ships active and fail-closed**, matching Go's `tkaFilterNetmapLocked`: a verified `Authority`
   reaches the `peer_tracker` over an internal watch channel (only after `VerifiedAumChain::verify`)
-  and drops peers with a missing/unauthorized signature. What remains is narrower: disablement-secret
-  verification, rotation-obsolete dropping, the `UnsignedPeerAPIOnly` carve-out, and a self-locked-out
-  health warning (see the deferred list and "Invariants").
+  and drops peers with a missing/unauthorized signature, and a whole-netmap rotation filter (Go's
+  `rotationTracker`) drops peers presenting a rotated-away key. What remains is narrower:
+  disablement-secret verification, the `UnsignedPeerAPIOnly` carve-out, and a self-locked-out health
+  warning (see the deferred list and "Invariants").
 - **Own/private DERP server** (part of old #20) — `ts_derp` is client + mesh-frame types only (no
   server accept loop). Consuming public relays as fallback already works; running our own mesh is the
   open piece. Low priority for the egress use case.
