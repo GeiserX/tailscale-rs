@@ -32,6 +32,14 @@ pub const MAX_PACKET_SIZE: usize = 64 << 10;
 /// key and nonce fields, and any on-wire framing overhead.
 pub const MAX_INFO_LEN: usize = 1 << 20;
 
+/// Upper bound (in bytes) on any frame body the receive codec will read off the wire before
+/// rejecting it as malformed. Matches Go `derp.go` `recvTimeout`'s `1<<20` cap — a generous safety
+/// bound that is **larger** than [`MAX_PACKET_SIZE`] so the codec can read (and, for an unknown
+/// type, skip) a large frame a forward-extended server might emit, rather than tearing the
+/// connection down. Known data frames are still bounded to [`MAX_PACKET_SIZE`] at `Header` build
+/// time; this is only the read/skip ceiling.
+pub const MAX_RECV_FRAME_SIZE: usize = 1 << 20;
+
 /// Minimum frequency (in seconds) at which the DERP server sends [`KeepAlive`] frames to each DERP
 /// client. The server adds some jitter, so this timing is not exact, but 2x this value can be
 /// considered a missed keep-alive.
