@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.34.1](https://github.com/GeiserX/tailscale-rs/compare/v0.34.0...v0.34.1) (2026-06-13)
+
+
+### Bug Fixes
+
+* re-trigger release for the control-plane liveness and Cap parity fixes ([#180](https://github.com/GeiserX/tailscale-rs/issues/180)) ([18da4b8](https://github.com/GeiserX/tailscale-rs/commit/18da4b8f1dc9d99a36cfea06738352d9c7e36870))
+
 ## [0.34.0](https://github.com/GeiserX/tailscale-rs/compare/v0.33.0...v0.34.0) (2026-06-13)
 
 
