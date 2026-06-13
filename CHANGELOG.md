@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.35.1](https://github.com/GeiserX/tailscale-rs/compare/v0.35.0...v0.35.1) (2026-06-13)
+
+
+### Bug Fixes
+
+* **runtime:** give the control runner an unbounded mailbox ([#188](https://github.com/GeiserX/tailscale-rs/issues/188)) ([c16da70](https://github.com/GeiserX/tailscale-rs/commit/c16da701131b677acd2a52db0c0b1bf7b8209a98))
+
 ## [0.35.0](https://github.com/GeiserX/tailscale-rs/compare/v0.34.2...v0.35.0) (2026-06-13)
 
 
