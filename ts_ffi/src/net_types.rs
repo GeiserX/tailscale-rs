@@ -9,7 +9,7 @@
 //! if things diverge.
 
 use std::{
-    ffi::{self, CStr, c_char},
+    ffi::{self, c_char},
     fmt::{Debug, Formatter},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
 };
@@ -155,7 +155,10 @@ impl TryFrom<sockaddr> for SocketAddr {
     type Error = ();
 
     fn try_from(sockaddr: sockaddr) -> Result<Self, Self::Error> {
-        sockaddr.try_into()
+        // Delegate to the by-reference impl. `sockaddr.try_into()` here would re-select THIS
+        // by-value impl (sockaddr is `Copy`), recursing forever → stack-overflow abort (which
+        // `ffi_guard`/`catch_unwind` cannot catch). Borrow to dispatch to `TryFrom<&sockaddr>`.
+        (&sockaddr).try_into()
     }
 }
 
@@ -277,11 +280,15 @@ impl From<SocketAddrV6> for sockaddr_in6 {
 
 impl From<&sockaddr_in6> for SocketAddrV6 {
     fn from(sin6: &sockaddr_in6) -> Self {
+        // `SocketAddrV6::new(addr, port, flowinfo, scope_id)` — the 4th arg is the scope id, NOT a
+        // second flowinfo. Passing `sin6_flowinfo` twice dropped `sin6_scope_id` and corrupted the
+        // scope (matters for IPv6 link-local zones). The symmetric `From<&SocketAddrV6>` above maps
+        // both fields correctly; mirror it.
         SocketAddrV6::new(
             sin6.sin6_addr.into(),
             sin6.sin6_port,
             sin6.sin6_flowinfo,
-            sin6.sin6_flowinfo,
+            sin6.sin6_scope_id,
         )
     }
 }
@@ -299,14 +306,17 @@ impl From<sockaddr_in6> for SocketAddrV6 {
 ///
 /// # Safety
 ///
-/// `s` must be able to be read according to [`CStr`] rules, i.e.
+/// `s` must be able to be read according to [`std::ffi::CStr`] rules, i.e.
 /// it must be NUL-terminated and valid for reading up to and including the NUL.
 #[unsafe(no_mangle)]
-pub extern "C" fn ts_parse_sockaddr(s: *const c_char, addr: &mut sockaddr) -> ffi::c_int {
+pub unsafe extern "C" fn ts_parse_sockaddr(s: *const c_char, addr: &mut sockaddr) -> ffi::c_int {
     ffi_guard(move || {
-        // SAFETY: ensured by function precondition
-        let Ok(s) = (unsafe { CStr::from_ptr(s) }).to_str() else {
-            tracing::error!("bad utf8");
+        // Null-check via the crate `util::str` helper (returns None on null or non-UTF-8) rather than
+        // a bare `CStr::from_ptr`, which is UB on a null `s` and is NOT caught by `ffi_guard` (it is
+        // UB, not a panic). Matches the null-safe convention used by `ts_resolve`/`ts_connect_by_name`.
+        // SAFETY: ensured by function precondition (NUL-terminated / null).
+        let Some(s) = (unsafe { crate::util::str(s) }) else {
+            tracing::error!("null or bad utf8 sockaddr string");
             return -1;
         };
 
@@ -332,14 +342,16 @@ pub extern "C" fn ts_parse_sockaddr(s: *const c_char, addr: &mut sockaddr) -> ff
 ///
 /// # Safety
 ///
-/// `s` must be able to be read according to [`CStr`] rules, i.e.
+/// `s` must be able to be read according to [`std::ffi::CStr`] rules, i.e.
 /// it must be NUL-terminated and valid for reading up to and including the NUL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ts_parse_ip(s: *const c_char, addr: &mut sockaddr) -> ffi::c_int {
     ffi_guard(move || {
-        // SAFETY: ensured by function precondition
-        let Ok(s) = (unsafe { CStr::from_ptr(s) }).to_str() else {
-            tracing::error!("bad utf8");
+        // Null-check via `util::str` (None on null/non-UTF-8) rather than a bare `CStr::from_ptr`,
+        // which is UB on a null `s` and uncatchable by `ffi_guard`.
+        // SAFETY: ensured by function precondition (NUL-terminated / null).
+        let Some(s) = (unsafe { crate::util::str(s) }) else {
+            tracing::error!("null or bad utf8 ip string");
             return -1;
         };
 
@@ -381,4 +393,69 @@ pub extern "C" fn ts_sockaddr_set_port(addr: &mut sockaddr, port: u16) -> ffi::c
             _ => -1,
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The IPv6 sockaddr↔SocketAddrV6 conversion must preserve BOTH `flowinfo` and `scope_id` as
+    /// distinct fields. The decode path previously passed `sin6_flowinfo` for both, dropping the
+    /// scope id (breaks IPv6 link-local zones). Use distinct non-zero values so a duplication bug
+    /// can't pass by coincidence.
+    #[test]
+    fn sockaddr_in6_preserves_flowinfo_and_scope_id() {
+        let sin6 = sockaddr_in6 {
+            sin6_port: 443,
+            sin6_flowinfo: 0x0011_2233,
+            sin6_addr: Ipv6Addr::new(0xfe80, 0, 0, 0, 1, 2, 3, 4).into(),
+            sin6_scope_id: 0x00AA_BBCC,
+        };
+        let addr: SocketAddrV6 = (&sin6).into();
+        assert_eq!(addr.flowinfo(), 0x0011_2233, "flowinfo must round-trip");
+        assert_eq!(
+            addr.scope_id(),
+            0x00AA_BBCC,
+            "scope_id must round-trip (not be a 2nd flowinfo)"
+        );
+        assert_eq!(addr.port(), 443);
+
+        // And back the other way preserves both too (the symmetric impl).
+        let back: sockaddr_in6 = (&addr).into();
+        assert_eq!(back.sin6_flowinfo, 0x0011_2233);
+        assert_eq!(back.sin6_scope_id, 0x00AA_BBCC);
+    }
+
+    /// The by-value `TryFrom<sockaddr>` must dispatch to the by-reference impl, not recurse into
+    /// itself (which would stack-overflow → abort, uncatchable by `ffi_guard`). Exercising it on a
+    /// real AF_INET sockaddr proves it terminates and produces the right address.
+    #[test]
+    fn try_from_owned_sockaddr_does_not_recurse() {
+        let sa: sockaddr = SocketAddr::from((Ipv4Addr::new(100, 64, 0, 1), 8080)).into();
+        let parsed: SocketAddr = sa.try_into().expect("owned sockaddr converts");
+        assert_eq!(
+            parsed,
+            SocketAddr::from((Ipv4Addr::new(100, 64, 0, 1), 8080))
+        );
+    }
+
+    /// A null `*const c_char` passed to the parse entry points must be rejected with -1, NOT
+    /// dereferenced (UB / segfault that `ffi_guard`'s `catch_unwind` cannot save). Pins the
+    /// null-check the bare `CStr::from_ptr` lacked.
+    #[test]
+    fn parse_entry_points_reject_null_pointer() {
+        let mut addr: sockaddr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)).into();
+        // SAFETY: passing a null pointer is exactly the precondition these now guard against.
+        let rc_sockaddr = unsafe { ts_parse_sockaddr(core::ptr::null(), &mut addr) };
+        assert_eq!(
+            rc_sockaddr, -1,
+            "ts_parse_sockaddr(null) must return -1, not deref null"
+        );
+        // SAFETY: same — null is handled, returns -1.
+        let rc_ip = unsafe { ts_parse_ip(core::ptr::null(), &mut addr) };
+        assert_eq!(
+            rc_ip, -1,
+            "ts_parse_ip(null) must return -1, not deref null"
+        );
+    }
 }
