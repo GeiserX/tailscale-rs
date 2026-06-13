@@ -50,8 +50,12 @@ pub unsafe extern "C" fn ts_udp_sendto(
     len: usize,
 ) -> ffi::c_int {
     ffi_guard(move || {
-        // SAFETY: ensured by function precondition
-        let msg = unsafe { core::slice::from_raw_parts(msg, len) };
+        // SAFETY: ensured by function precondition. `util::slice` is null-safe (null+len0 → empty,
+        // null+len>0 → None), avoiding the `from_raw_parts(null, ..)` UB the guard can't catch.
+        let Some(msg) = (unsafe { crate::util::slice(msg, len) }) else {
+            tracing::error!("null msg buffer with non-zero len");
+            return -1;
+        };
 
         let Ok(addr) = addr.try_into() else {
             return -1;
@@ -85,8 +89,12 @@ pub unsafe extern "C" fn ts_udp_recvfrom(
     len: usize,
 ) -> ffi::c_int {
     ffi_guard(move || {
-        // SAFETY: ensured by function precondition
-        let buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+        // SAFETY: ensured by function precondition. `util::slice_mut` is the null-safe counterpart
+        // (null+len0 → empty, null+len>0 → None).
+        let Some(buf) = (unsafe { crate::util::slice_mut(buf, len) }) else {
+            tracing::error!("null recv buffer with non-zero len");
+            return -1;
+        };
 
         match sock.0.recv_from_blocking(buf) {
             Err(e) => {
