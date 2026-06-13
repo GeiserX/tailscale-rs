@@ -264,6 +264,14 @@ impl NodeKeySignature {
         ])
     }
 
+    /// The canonical CBOR serialization of this signature **including** its signature field (Go
+    /// `NodeKeySignature.Serialize` / `tkatype.MarshaledSignature`). This is the raw byte form a node
+    /// submits to control (base64'd on the wire by the `/machine/tka/sign` RPC) and the form
+    /// [`Authority::node_key_authorized`] decodes. The inverse of the crate's NKS decoder.
+    pub fn serialize(&self) -> Vec<u8> {
+        self.to_cbor(/* include_signature = */ true).to_vec()
+    }
+
     /// Build a **`Direct`** [`NodeKeySignature`] that authorizes `node_key`, signed by the trusted
     /// network-lock key `signing_key` (Go `tka.signNodeKey` for the direct case / `NLPrivate.SignNKS`
     /// over a `NodeKeySignature{SigKind: SigKindDirect}`).
@@ -2582,6 +2590,39 @@ mod tests {
                 .unwrap_err(),
             TkaError::BadSignature
         );
+    }
+
+    /// [`NodeKeySignature::serialize`] is the public raw-CBOR form a node submits to control (the
+    /// `/machine/tka/sign` body). It must equal the (private) `to_cbor(true)` serialization and
+    /// round-trip through the decoder back to an equal struct — i.e. it is the decoder's inverse.
+    #[test]
+    fn node_key_signature_serialize_round_trips() {
+        use ed25519_dalek::SigningKey;
+
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let node_key = alloc::vec![7u8; 32];
+        let sig = NodeKeySignature::sign_direct(&node_key, &signing);
+
+        // `serialize()` == `to_cbor(true).to_vec()` (the with-signature form).
+        let bytes = sig.serialize();
+        assert_eq!(bytes, sig.to_cbor(true).to_vec());
+
+        // Round-trips through the decoder to an equal struct (serialize is the decoder's inverse).
+        let decoded = decode_node_key_signature(&bytes).expect("serialize output must decode");
+        assert_eq!(decoded, sig);
+
+        // And the serialized bytes are exactly what a trusted authority accepts for this node key.
+        let auth = Authority::from_state(
+            AumHash([0; 32]),
+            State {
+                keys: alloc::vec![Key {
+                    kind: KeyKind::Ed25519,
+                    votes: 1,
+                    public: signing.verifying_key().to_bytes().to_vec(),
+                }],
+            },
+        );
+        assert!(auth.node_key_authorized(&node_key, &bytes).is_ok());
     }
 
     #[test]
