@@ -32,12 +32,12 @@ const LOAD_BALANCER_HEADER_KEY: &str = "Ts-Lb";
 /// Upper bound on a single TKA-sync RPC (fresh Noise connect + GET + response read). A hung control
 /// plane is abandoned and reported as a transient [`TkaSyncError::NetworkError`] rather than pinning
 /// a half-open connection. Matches the id-token RPC's 30s bound.
-const TKA_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const TKA_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Cap on a TKA-sync response body (Go reads these behind a 10 MiB `io.LimitedReader`). A sync batch
 /// of AUMs is small in practice; the cap stops a hostile/buggy control plane from streaming an
 /// unbounded body into memory.
-const MAX_TKA_SYNC_RESPONSE: usize = 10 * 1024 * 1024;
+pub(crate) const MAX_TKA_SYNC_RESPONSE: usize = 10 * 1024 * 1024;
 
 /// The internal failure kinds a TKA-sync request can surface (kept coarse for the public surface).
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -305,7 +305,7 @@ pub(crate) async fn tka_bootstrap_with(
 }
 
 /// The `Ts-Lb` load-balancer header (the node public key), as every other `/machine/*` RPC sets.
-fn lb_header(
+pub(crate) fn lb_header(
     node_public_key: &NodePublicKey,
 ) -> (ts_http_util::HeaderName, ts_http_util::HeaderValue) {
     (
@@ -317,7 +317,7 @@ fn lb_header(
 /// Map a non-2xx status to the right error: 404/501 ⇒ [`TkaSyncError::Unsupported`] (control has no
 /// TKA endpoint — stay inert), anything else ⇒ a coarse HTTP internal error. Pure (no I/O), so the
 /// status/body branch logic is unit-testable without a live stream.
-fn classify_status(status: StatusCode, body: &[u8]) -> Option<TkaSyncError> {
+pub(crate) fn classify_status(status: StatusCode, body: &[u8]) -> Option<TkaSyncError> {
     if status.is_success() {
         return None;
     }
