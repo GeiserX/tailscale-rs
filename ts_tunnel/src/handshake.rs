@@ -680,6 +680,34 @@ mod tests {
             unhex32("b1aa1b797d3a45da97552b8084ade493aa767f15af95854bc86557f6dacd851d"),
             "responder→initiator transport key diverges from Go reference"
         );
+
+        // Also pin the three INTERMEDIATE sealed values against the Go vector, not just the final
+        // transport keys. The keys transitively cover the chaining-key/hash schedule, but a divergence
+        // in an AEAD seal (wrong nonce, wrong AAD = running hash, wrong key) that still happened to
+        // land on the same final keys would slip past a keys-only assertion. These are the exact
+        // ciphertext+tag bytes that go on the wire in the HandshakeInitiation (`s`, `timestamp`) and
+        // HandshakeResponse (`empty`), so pinning them proves the on-wire sealed fields are
+        // byte-identical to wireguard-go, closing the gap noted in the crypto-validation audit.
+        fn unhex(s: &str) -> Vec<u8> {
+            (0..s.len() / 2)
+                .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).expect("valid hex"))
+                .collect()
+        }
+        assert_eq!(
+            static_sealed.as_slice(),
+            unhex("0a26599fb2188bb723276fc173af67616c817fc32fd04d686d87ec152fac10eed2bda3bb3b6f1eded6977684082284d8").as_slice(),
+            "initiation `s` (init static, sealed) diverges from Go reference"
+        );
+        assert_eq!(
+            ts_sealed.as_slice(),
+            unhex("50fc41b4cbcf9deeba2039d1c21710e7081f158a3f5bb6ceb5c344e3").as_slice(),
+            "initiation `timestamp` (sealed) diverges from Go reference"
+        );
+        assert_eq!(
+            auth_tag.as_slice(),
+            unhex("dad1dbbeb72c29c492bd43373a62c58b").as_slice(),
+            "response `empty` payload auth tag (sealed) diverges from Go reference"
+        );
     }
 
     /// Key-confirmation conformance (Dowling–Paterson, IACR 2018/080, Theorem 1, eCK-PFS-PSK).
