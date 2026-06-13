@@ -14,6 +14,9 @@ rust-version.workspace = true
 [lib]
 name = "ts_tka"
 [dependencies]
+# Argon2i KDF for the TKA disablement value (Go tka.DisablementKDF). See the workspace pin: stable
+# 0.5, pure-Rust (ring-only-clean), shares the workspace blake2 0.10.
+argon2.workspace = true
 blake2.workspace = true
 # Two ed25519 verifiers are intentionally carried — they are NOT redundant, do not collapse them:
 #   ed25519-dalek = standard RFC 8032 verification, used ONLY for the outer rotation-wrap signature

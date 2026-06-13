@@ -92,6 +92,45 @@ func dumpAum(desc string, a tka.AUM) aumGolden {
 	}
 }
 
+// disablementGolden pins tka.DisablementKDF(secret) — the Argon2i digest stored as a
+// DisablementValue in a genesis Checkpoint and matched by Authority.ValidDisablement(secret). The
+// Rust ts_tka disablement_value() (for tka_init) MUST reproduce this byte-for-byte, or a lock it
+// creates can never be disabled. NOTE: this is Argon2i (x/crypto argon2.Key), NOT BLAKE2s — the
+// salt + cost params live inside DisablementKDF (tka/state.go), so we only feed the secret.
+type disablementGolden struct {
+	Desc      string `json:"desc"`
+	SecretHex string `json:"secret_hex"`
+	ValueHex  string `json:"value_hex"` // DisablementKDF(secret): the 32-byte Argon2i digest
+}
+
+func disablementGoldens() []disablementGolden {
+	mk := func(b byte) []byte {
+		s := make([]byte, 32)
+		for i := range s {
+			s[i] = b
+		}
+		return s
+	}
+	cases := []struct {
+		desc   string
+		secret []byte
+	}{
+		{"all-0xA5 (the tka-package test-helper secret)", mk(0xA5)},
+		{"all-zero 32B secret", make([]byte, 32)},
+		{"all-0xFF 32B secret", mk(0xFF)},
+		{"short secret (5 bytes, KDF accepts any length)", []byte("hello")},
+	}
+	out := make([]disablementGolden, 0, len(cases))
+	for _, c := range cases {
+		out = append(out, disablementGolden{
+			Desc:      c.desc,
+			SecretHex: hexstr(c.secret),
+			ValueHex:  hexstr(tka.DisablementKDF(c.secret)),
+		})
+	}
+	return out
+}
+
 func nodeKeySignatureGoldens() []golden {
 	pubkey := make([]byte, 32)
 	for i := range pubkey {
@@ -253,6 +292,20 @@ func main() {
 	fe := json.NewEncoder(f)
 	fe.SetIndent("", "  ")
 	if err := fe.Encode(aumGoldens()); err != nil {
+		panic(err)
+	}
+
+	// Block 3 -> sibling JSON file tests/vectors/tka_disablement_golden.json: the Argon2i
+	// DisablementKDF goldens (backs ts_tka `disablement_value_matches_go_golden`).
+	dPath := filepath.Join(wd, "..", "tka_disablement_golden.json")
+	df, err := os.Create(dPath)
+	if err != nil {
+		panic(err)
+	}
+	defer df.Close()
+	dfe := json.NewEncoder(df)
+	dfe.SetIndent("", "  ")
+	if err := dfe.Encode(disablementGoldens()); err != nil {
 		panic(err)
 	}
 }

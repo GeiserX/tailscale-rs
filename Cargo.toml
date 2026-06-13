@@ -64,6 +64,11 @@ rust-version = "1.94.1"
 
 [workspace.dependencies]
 aead = { version = "0.5", features = ["std"] }
+# Argon2i KDF for TKA disablement values (Go tka.DisablementKDF = argon2.Key, Argon2i). Stable 0.5
+# pulls blake2 ^0.10.6 (matches the workspace blake2 — no second blake2) and is pure-Rust (base64ct/
+# cpufeatures, NO aws-lc/openssl/ring) so it is ring-only-clean. Used by ts_tka (consensus-critical),
+# default-features off (no password-hash; we call the low-level hash_password_into).
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 base64 = "0.22"
 blake2 = "0.10"
 bytes = "1"
