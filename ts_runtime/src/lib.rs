@@ -212,7 +212,15 @@ impl Runtime {
         let (cap_grants_tx, cap_grants_rx) = watch::channel(Default::default());
         packetfilter::PacketfilterUpdater::spawn((env.clone(), cap_grants_tx));
         src_filter::SourceFilterUpdater::spawn(env.clone());
-        let peer_tracker = PeerTracker::spawn(env.clone()).downgrade();
+        // TKA enforcement-authority cell (Go `tkaFilterNetmapLocked`). Created here — before both
+        // actors spawn — so the control runner (sole writer, `Sender`) and the peer tracker (reader,
+        // `Receiver`) share one `watch` cell. A `watch` (not a bus message) is the transport for this
+        // security-critical state: last-write-wins, never dropped under load, ordered by the control
+        // runner's writes, so a disable (`None`) can never be reordered behind or dropped before a
+        // stale `Some`. `None` = no lock synced / disabled (admit all).
+        let (tka_authority_tx, tka_authority_rx) =
+            watch::channel::<Option<std::sync::Arc<ts_tka::Authority>>>(None);
+        let peer_tracker = PeerTracker::spawn((env.clone(), tka_authority_rx)).downgrade();
 
         // Select the application data path from the transport mode. The forwarder/egress path
         // above is UNCHANGED in both modes — TUN mode only swaps the application data path, never
@@ -307,6 +315,7 @@ impl Runtime {
             auth_key,
             env: env.clone(),
             state_tx,
+            tka_authority: tka_authority_tx,
         });
 
         Ok(Self {
