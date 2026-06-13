@@ -416,6 +416,13 @@ impl Netstack {
     ///
     /// When this function returns, it is guaranteed that all packets currently available to
     /// receive from `dev` have been processed.
+    ///
+    /// Unlike the synchronous [`poll_device_io`](Self::poll_device_io), this does **not** call
+    /// `drain_tcp_closes`: the async driver loop (the netstack `Future`'s `poll`) owns that, calling
+    /// it once per poll after both ingress and egress have run (so a socket smoltcp drove to `Closed`
+    /// here — which always reports `Poll::Ready(true)` — is reaped in the same poll cycle). A future
+    /// caller that drives this method outside that loop **must** call `drain_tcp_closes` itself, or
+    /// autonomously-Closed sockets will linger in `pending_tcp_closes` until the next drain.
     #[tracing::instrument(skip_all, fields(%now), ret, level = "trace")]
     pub fn poll_device_ingress_async(
         &mut self,
