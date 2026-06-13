@@ -2,6 +2,14 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.35.0](https://github.com/GeiserX/tailscale-rs/compare/v0.34.2...v0.35.0) (2026-06-13)
+
+
+### Features
+
+* **tka:** cross-peer rotation-obsolete peer dropping ([#186](https://github.com/GeiserX/tailscale-rs/issues/186)) ([c145ddf](https://github.com/GeiserX/tailscale-rs/commit/c145ddf55c00c045c6a4119a0dce197f4554e784))
+* **tka:** RotationDetails extraction for rotation-obsolete peer dropping ([#184](https://github.com/GeiserX/tailscale-rs/issues/184)) ([7c7f4ed](https://github.com/GeiserX/tailscale-rs/commit/7c7f4ed3a43f431744080ddcfd4b36ae81461574))
+
 ## [0.34.2](https://github.com/GeiserX/tailscale-rs/compare/v0.34.1...v0.34.2) (2026-06-13)
 
 
