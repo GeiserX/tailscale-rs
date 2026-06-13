@@ -2,6 +2,20 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.30.0](https://github.com/GeiserX/tailscale-rs/compare/v0.29.3...v0.30.0) (2026-06-13)
+
+
+### Features
+
+* **runtime:** add Device::query_dns through the live MagicDNS forwarder ([#152](https://github.com/GeiserX/tailscale-rs/issues/152)) ([d737e08](https://github.com/GeiserX/tailscale-rs/commit/d737e08301d9af8a2964544cb9608b886c2f2daf))
+
+
+### Bug Fixes
+
+* **control:** bound control-plane response body reads against OOM ([#149](https://github.com/GeiserX/tailscale-rs/issues/149)) ([a4eed0d](https://github.com/GeiserX/tailscale-rs/commit/a4eed0d95cb9579d112e4cb69b6e9b61fb873a0a))
+* **magicdns:** bound concurrent in-flight forwarded queries ([#148](https://github.com/GeiserX/tailscale-rs/issues/148)) ([190b08f](https://github.com/GeiserX/tailscale-rs/commit/190b08f0e3080e650b4cc83c52044f7a6167db2f))
+* **tun:** read into an MTU-sized buffer so inbound packets aren't dropped ([#151](https://github.com/GeiserX/tailscale-rs/issues/151)) ([ef14d15](https://github.com/GeiserX/tailscale-rs/commit/ef14d153fc4c9d440c9a8a04a72d2720d4de24c4))
+
 ## [0.29.3](https://github.com/GeiserX/tailscale-rs/compare/v0.29.2...v0.29.3) (2026-06-12)
 
 
