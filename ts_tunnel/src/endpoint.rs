@@ -553,6 +553,13 @@ impl Peer {
                 // ~1-packet-per-`KEEPALIVE_TIMEOUT` idle ping-pong that real WireGuard lets go silent.
                 let data_received = packets.iter().any(|p| !p.as_ref().is_empty());
 
+                // CROSS-CRATE INVARIANT: a delivered buffer may carry trailing AEAD zero-padding (the
+                // send side rounds each plaintext up to `PADDING_MULTIPLE` before sealing; the receiver
+                // does NOT trim it). A consumer of these `to_local` buffers MUST bound the real packet
+                // by the inner IP header's total-length field, never by `buf.len()` — reading the
+                // buffer length as the packet length would mis-parse padded fork-to-fork traffic.
+                // Today's consumers honor this (smoltcp reads the IP total-length; the fallback-TCP /
+                // src-addr paths use fixed header offsets), so the trailing pad is inert.
                 out.queue_to_local(self.id).append(&mut packets);
 
                 if data_received {
