@@ -116,6 +116,9 @@ x25519-dalek = { version = "3.0.0-rc.0", features = ["getrandom", "reusable_secr
 wycheproof = "0.6"
 yoke = { version = "0.8", default-features = false }
 zerocopy = { version = "0.8", features = ["derive"] }
+# zeroize wipes secret byte buffers on drop. ts_keys / ts_control_noise pin "1.8" directly; this
+# workspace entry lets ts_tunnel (WireGuard symmetric key material) share the same pin. Ring-clean.
+zeroize = { version = "1.8", default-features = false, features = ["derive"] }
 
 # local workspace deps
 tailscale = { path = ".", package = "geiserx_tailscale", version = "0.30.1" } # x-release-please-version

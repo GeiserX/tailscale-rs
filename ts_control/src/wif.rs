@@ -98,7 +98,11 @@ pub struct WifConfig {
 
 /// A parsed OAuth client secret / client ID: the bare `tskey-client-...` value plus the
 /// query-string options that follow it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is hand-written to redact `stripped`: it holds a live `tskey-client-...` bearer secret,
+/// and a derived `Debug` would print it verbatim into any log/trace/panic that formats this struct.
+/// The non-secret options are still shown for debuggability.
+#[derive(Clone, PartialEq, Eq)]
 struct OAuthSecret {
     /// The `tskey-client-...` value with any `?...` query stripped.
     stripped: String,
@@ -108,6 +112,17 @@ struct OAuthSecret {
     preauthorized: bool,
     /// Optional API base URL override (default [`DEFAULT_API_BASE_URL`]).
     base_url: String,
+}
+
+impl core::fmt::Debug for OAuthSecret {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("OAuthSecret")
+            .field("stripped", &"<redacted>")
+            .field("ephemeral", &self.ephemeral)
+            .field("preauthorized", &self.preauthorized)
+            .field("base_url", &self.base_url)
+            .finish()
+    }
 }
 
 impl OAuthSecret {

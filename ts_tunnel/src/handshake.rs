@@ -30,10 +30,18 @@ struct SessionKeys {
 /// as the initiator multiple times, if rogue invalid responses are received. It's
 /// deliberately not Copy, because cloning and allowing potential reuse of the cipher
 /// state is risky and needs to be a deliberate act.
-#[derive(Clone)]
+///
+/// Wipes its secret key-derivation material on drop: each `mix_*` step consumes `self` and produces
+/// a fresh state, so the superseded `chaining_key` (a live HKDF chaining secret) is dropped — and
+/// now zeroized — every step rather than lingering in freed stack memory. `cipher` is skipped
+/// because `ChaCha20Poly1305` is itself `ZeroizeOnDrop` (and not `Zeroize`); it wipes its own key
+/// via drop-glue. `hash` is not secret (it is a public transcript hash) but zeroizes for free as a
+/// fixed array. No `Debug` is derived, so none of this can leak through `{:?}`.
+#[derive(Clone, zeroize::ZeroizeOnDrop)]
 struct HandshakeState {
     hash: [u8; 32],
     chaining_key: [u8; 32],
+    #[zeroize(skip)]
     cipher: Option<ChaCha20Poly1305>,
 }
 
@@ -49,10 +57,13 @@ fn must_cipher(key: &[u8]) -> ChaCha20Poly1305 {
 /// Use HKDF to derive two 32-byte values.
 fn must_hkdf2(chaining_key: &[u8; 32], key: &[u8]) -> ([u8; 32], [u8; 32]) {
     let kdf = SimpleHkdf::<Blake2s256>::new(Some(chaining_key), key);
-    let mut expanded = [0; 64];
+    // `Zeroizing` wipes the derived key material (the next chaining key + an AEAD key) when this
+    // buffer drops, rather than leaving it in freed stack memory. The returned halves flow into a
+    // `ZeroizeOnDrop` `HandshakeState.chaining_key` or a `ZeroizeOnDrop` cipher, which wipe in turn.
+    let mut expanded = zeroize::Zeroizing::new([0u8; 64]);
     // Expansion only fails if you request more bytes than the KDF can provide. This KDF can always
     // provide 64 bytes.
-    kdf.expand(&[], &mut expanded).unwrap();
+    kdf.expand(&[], expanded.as_mut_slice()).unwrap();
     (
         expanded[..32].try_into().unwrap(),
         expanded[32..].try_into().unwrap(),
@@ -62,10 +73,11 @@ fn must_hkdf2(chaining_key: &[u8; 32], key: &[u8]) -> ([u8; 32], [u8; 32]) {
 /// Use HKDF to derive three 32-byte values.
 fn must_hkdf3(chaining_key: &[u8; 32], key: &[u8]) -> ([u8; 32], [u8; 32], [u8; 32]) {
     let kdf = SimpleHkdf::<Blake2s256>::new(Some(chaining_key), key);
-    let mut expanded = [0; 96];
+    // Zeroized on drop — see `must_hkdf2`.
+    let mut expanded = zeroize::Zeroizing::new([0u8; 96]);
     // Expansion only fails if you request more bytes than the KDF can provide. This KDF can always
     // provide 96 bytes.
-    kdf.expand(&[], &mut expanded).unwrap();
+    kdf.expand(&[], expanded.as_mut_slice()).unwrap();
     (
         expanded[..32].try_into().unwrap(),
         expanded[32..64].try_into().unwrap(),
