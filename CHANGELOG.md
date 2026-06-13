@@ -2,6 +2,22 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.32.0](https://github.com/GeiserX/tailscale-rs/compare/v0.31.0...v0.32.0) (2026-06-13)
+
+
+### Features
+
+* **control:** TKA mutation RPC client methods (tsr-cfw) ([#168](https://github.com/GeiserX/tailscale-rs/issues/168)) ([79bb19a](https://github.com/GeiserX/tailscale-rs/commit/79bb19a880f41fb44ad5fd35d00f8b8a63d571f2))
+* **tka:** NodeKeySignature::sign_direct + TKA mutation RPC wire types (tsr-cfw) ([#167](https://github.com/GeiserX/tailscale-rs/issues/167)) ([29fcc27](https://github.com/GeiserX/tailscale-rs/commit/29fcc27a7ec1a7b341586d65d137694fb2b02cae))
+* **tsnet:** add Device::http_connector for HTTP over the tailnet (tsr-6fw) ([#165](https://github.com/GeiserX/tailscale-rs/issues/165)) ([91b6184](https://github.com/GeiserX/tailscale-rs/commit/91b618413c19ec898f4587d3255f57f509f87869))
+* **tsnet:** Device::tka_disable — submit the disablement secret (tsr-cfw) ([#170](https://github.com/GeiserX/tailscale-rs/issues/170)) ([40cc81d](https://github.com/GeiserX/tailscale-rs/commit/40cc81d4084b3c3036e5b2b31cbd985c1ed5e74a))
+* **tsnet:** Device::tka_sign + NodeKeySignature::serialize (tsr-cfw) ([#169](https://github.com/GeiserX/tailscale-rs/issues/169)) ([d3e99cd](https://github.com/GeiserX/tailscale-rs/commit/d3e99cd1d8ee263c8735c7878351da688a22dbac))
+
+
+### Bug Fixes
+
+* **deps:** bump pyo3 0.28 -&gt; 0.29 to clear RUSTSEC-2026-0176/0177 (tsr-s0y) ([#171](https://github.com/GeiserX/tailscale-rs/issues/171)) ([8c10302](https://github.com/GeiserX/tailscale-rs/commit/8c103022202afdc6f94b45edb13bab0c3980b581))
+
 ## [0.31.0](https://github.com/GeiserX/tailscale-rs/compare/v0.30.1...v0.31.0) (2026-06-13)
 
 
