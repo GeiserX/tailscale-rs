@@ -59,7 +59,16 @@ const MAX_SIG_NESTING_DEPTH: usize = 16;
 const MAX_KEYS: usize = 512;
 /// Max disablement values in a checkpoint state (Go `maxDisablementValues`).
 const MAX_DISABLEMENT_VALUES: usize = 32;
-/// Required byte length of each disablement value — a BLAKE2s-256 digest (Go `disablementLength`).
+/// Required byte length of each disablement value (Go `disablementLength`).
+///
+/// A disablement value is an **Argon2i** digest of a disablement secret, NOT a BLAKE2s hash —
+/// Go `tka.DisablementKDF(secret) = argon2.Key(secret, "tailscale network-lock disablement salt",
+/// t=4, m=16*1024 KiB, p=4, len=32)` (`tka/state.go`; `x/crypto` `argon2.Key` is Argon2**i**, not
+/// Argon2id). BLAKE2s-256 is the digest for AUM `Hash`/`SigHash` (the [`AumHash`] type), a separate
+/// concern — both happen to be 32 bytes. This crate currently only length-validates the stored
+/// values as opaque 32-byte blobs (Go validates the same way); a future `disablement_value(secret)`
+/// helper for `tka_init` MUST use Argon2i (RustCrypto's `argon2` defaults to Argon2id — the
+/// `Algorithm::Argon2i` override is mandatory, or the lock can never be disabled).
 const DISABLEMENT_LENGTH: usize = 32;
 /// Max total bytes of a key's metadata map, summed over keys+values (Go `maxMetaBytes`).
 const MAX_META_BYTES: usize = 512;
