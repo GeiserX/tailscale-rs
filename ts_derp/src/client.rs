@@ -309,7 +309,10 @@ fn make_clientinfo(
     let json = serde_json::to_vec(&frame::ClientInfoPayload {
         can_ack_pings: false,
         is_prober: false,
-        mesh_key: "none".to_string(),
+        // A leaf client sends no mesh key; `None` omits the field entirely (Go omits a zero
+        // `DERPMesh`). The old `"none"` sentinel was never a valid Go `DERPMesh` and only happened
+        // to be ignored because the snake_case key never matched anything server-side.
+        mesh_key: None,
         version: 2,
     })?;
     let encrypted = cbox
