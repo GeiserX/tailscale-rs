@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.37.3](https://github.com/GeiserX/tailscale-rs/compare/v0.37.2...v0.37.3) (2026-06-14)
+
+
+### Bug Fixes
+
+* **control:** do not treat an empty Peers array as a full peer reset ([#218](https://github.com/GeiserX/tailscale-rs/issues/218)) ([af61d80](https://github.com/GeiserX/tailscale-rs/commit/af61d80e6b1d2adbceeac35df122ea3bc6ebb6c7))
+
 ## [0.37.2](https://github.com/GeiserX/tailscale-rs/compare/v0.37.1...v0.37.2) (2026-06-14)
 
 
