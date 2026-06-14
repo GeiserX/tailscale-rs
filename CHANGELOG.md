@@ -2,6 +2,15 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.35.6](https://github.com/GeiserX/tailscale-rs/compare/v0.35.5...v0.35.6) (2026-06-14)
+
+
+### Bug Fixes
+
+* **dataplane:** always accept inbound TSMP, bypassing the ACL ([#200](https://github.com/GeiserX/tailscale-rs/issues/200)) ([353e56e](https://github.com/GeiserX/tailscale-rs/commit/353e56ecc9cfe444d2a8f7c98193322b810f961f))
+* **derp:** send ClientInfo with Go's exact JSON wire keys ([#203](https://github.com/GeiserX/tailscale-rs/issues/203)) ([14244a5](https://github.com/GeiserX/tailscale-rs/commit/14244a544eda8646159ee4ee466a664642f2f906))
+* **magicsock:** accept the alternate 0x8020 XOR-MAPPED-ADDRESS in STUN responses ([#202](https://github.com/GeiserX/tailscale-rs/issues/202)) ([d8df398](https://github.com/GeiserX/tailscale-rs/commit/d8df398809ab81ffe0cafa80fa4efff76c979834))
+
 ## [0.35.5](https://github.com/GeiserX/tailscale-rs/compare/v0.35.4...v0.35.5) (2026-06-14)
 
 

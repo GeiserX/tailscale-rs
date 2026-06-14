@@ -53,7 +53,7 @@ members = [
 edition = "2024"
 license = "BSD-3-Clause"
 publish = true
-version = "0.35.5"
+version = "0.35.6"
 repository = "https://github.com/GeiserX/tailscale-rs"
 
 # This disagrees with the README's stated MSRV. That's intentional: this field causes cargo to error
@@ -132,48 +132,48 @@ zerocopy = { version = "0.8", features = ["derive"] }
 zeroize = { version = "1.8", default-features = false, features = ["derive"] }
 
 # local workspace deps
-tailscale = { path = ".", package = "geiserx_tailscale", version = "0.35.5" } # x-release-please-version
-ts_array256 = { path = "ts_array256", package = "geiserx_ts_array256", version = "0.35.5" } # x-release-please-version
-ts_bart = { path = "ts_bart", package = "geiserx_ts_bart", version = "0.35.5" } # x-release-please-version
-ts_bart_packetfilter = { path = "ts_bart_packetfilter", package = "geiserx_ts_bart_packetfilter", version = "0.35.5" } # x-release-please-version
-ts_bitset = { path = "ts_bitset", package = "geiserx_ts_bitset", default-features = false, version = "0.35.5" } # x-release-please-version
-ts_capabilityversion = { path = "ts_capabilityversion", package = "geiserx_ts_capabilityversion", version = "0.35.5" } # x-release-please-version
+tailscale = { path = ".", package = "geiserx_tailscale", version = "0.35.6" } # x-release-please-version
+ts_array256 = { path = "ts_array256", package = "geiserx_ts_array256", version = "0.35.6" } # x-release-please-version
+ts_bart = { path = "ts_bart", package = "geiserx_ts_bart", version = "0.35.6" } # x-release-please-version
+ts_bart_packetfilter = { path = "ts_bart_packetfilter", package = "geiserx_ts_bart_packetfilter", version = "0.35.6" } # x-release-please-version
+ts_bitset = { path = "ts_bitset", package = "geiserx_ts_bitset", default-features = false, version = "0.35.6" } # x-release-please-version
+ts_capabilityversion = { path = "ts_capabilityversion", package = "geiserx_ts_capabilityversion", version = "0.35.6" } # x-release-please-version
 ts_cli_util = { path = "ts_cli_util" }
-ts_control = { path = "ts_control", package = "geiserx_ts_control", version = "0.35.5" } # x-release-please-version
-ts_control_noise = { path = "ts_control_noise", package = "geiserx_ts_control_noise", version = "0.35.5" } # x-release-please-version
-ts_control_serde = { path = "ts_control_serde", package = "geiserx_ts_control_serde", version = "0.35.5" } # x-release-please-version
-ts_dataplane = { path = "ts_dataplane", package = "geiserx_ts_dataplane", version = "0.35.5" } # x-release-please-version
-ts_derp = { path = "ts_derp", package = "geiserx_ts_derp", version = "0.35.5" } # x-release-please-version
-ts_disco_protocol = { path = "ts_disco_protocol", package = "geiserx_ts_disco_protocol", version = "0.35.5" } # x-release-please-version
-ts_dns_wire = { path = "ts_dns_wire", package = "geiserx_ts_dns_wire", version = "0.35.5" } # x-release-please-version
-ts_dynbitset = { path = "ts_dynbitset", package = "geiserx_ts_dynbitset", version = "0.35.5" } # x-release-please-version
-ts_forwarder = { path = "ts_forwarder", package = "geiserx_ts_forwarder", version = "0.35.5" } # x-release-please-version
-ts_hexdump = { path = "ts_hexdump", package = "geiserx_ts_hexdump", version = "0.35.5" } # x-release-please-version
-ts_host_net = { path = "ts_host_net", package = "geiserx_ts_host_net", version = "0.35.5" } # x-release-please-version
-ts_keys = { path = "ts_keys", package = "geiserx_ts_keys", version = "0.35.5" } # x-release-please-version
-ts_magicsock = { path = "ts_magicsock", package = "geiserx_ts_magicsock", version = "0.35.5" } # x-release-please-version
-ts_metrics = { path = "ts_metrics", package = "geiserx_ts_metrics", version = "0.35.5" } # x-release-please-version
-ts_netcheck = { path = "ts_netcheck", package = "geiserx_ts_netcheck", version = "0.35.5" } # x-release-please-version
-ts_netstack_smoltcp = { path = "ts_netstack_smoltcp", package = "geiserx_ts_netstack_smoltcp", version = "0.35.5" } # x-release-please-version
-ts_netstack_smoltcp_core = { path = "ts_netstack_smoltcp_core", package = "geiserx_ts_netstack_smoltcp_core", version = "0.35.5" } # x-release-please-version
-ts_netstack_smoltcp_socket = { path = "ts_netstack_smoltcp_socket", package = "geiserx_ts_netstack_smoltcp_socket", version = "0.35.5" } # x-release-please-version
-ts_nodecapability = { path = "ts_nodecapability", package = "geiserx_ts_nodecapability", version = "0.35.5" } # x-release-please-version
-ts_overlay_router = { path = "ts_overlay_router", package = "geiserx_ts_overlay_router", version = "0.35.5" } # x-release-please-version
-ts_packet = { path = "ts_packet", package = "geiserx_ts_packet", version = "0.35.5" } # x-release-please-version
-ts_packetfilter = { path = "ts_packetfilter", package = "geiserx_ts_packetfilter", version = "0.35.5" } # x-release-please-version
-ts_packetfilter_serde = { path = "ts_packetfilter_serde", package = "geiserx_ts_packetfilter_serde", version = "0.35.5" } # x-release-please-version
-ts_packetfilter_state = { path = "ts_packetfilter_state", package = "geiserx_ts_packetfilter_state", version = "0.35.5" } # x-release-please-version
-ts_peercapability = { path = "ts_peercapability", package = "geiserx_ts_peercapability", version = "0.35.5" } # x-release-please-version
-ts_http_util = { path = "ts_http_util", package = "geiserx_ts_http_util", version = "0.35.5" } # x-release-please-version
-ts_tka = { path = "ts_tka", package = "geiserx_ts_tka", version = "0.35.5" } # x-release-please-version
-ts_tls_util = { path = "ts_tls_util", package = "geiserx_ts_tls_util", version = "0.35.5" } # x-release-please-version
-ts_runtime = { path = "ts_runtime", package = "geiserx_ts_runtime", version = "0.35.5" } # x-release-please-version
+ts_control = { path = "ts_control", package = "geiserx_ts_control", version = "0.35.6" } # x-release-please-version
+ts_control_noise = { path = "ts_control_noise", package = "geiserx_ts_control_noise", version = "0.35.6" } # x-release-please-version
+ts_control_serde = { path = "ts_control_serde", package = "geiserx_ts_control_serde", version = "0.35.6" } # x-release-please-version
+ts_dataplane = { path = "ts_dataplane", package = "geiserx_ts_dataplane", version = "0.35.6" } # x-release-please-version
+ts_derp = { path = "ts_derp", package = "geiserx_ts_derp", version = "0.35.6" } # x-release-please-version
+ts_disco_protocol = { path = "ts_disco_protocol", package = "geiserx_ts_disco_protocol", version = "0.35.6" } # x-release-please-version
+ts_dns_wire = { path = "ts_dns_wire", package = "geiserx_ts_dns_wire", version = "0.35.6" } # x-release-please-version
+ts_dynbitset = { path = "ts_dynbitset", package = "geiserx_ts_dynbitset", version = "0.35.6" } # x-release-please-version
+ts_forwarder = { path = "ts_forwarder", package = "geiserx_ts_forwarder", version = "0.35.6" } # x-release-please-version
+ts_hexdump = { path = "ts_hexdump", package = "geiserx_ts_hexdump", version = "0.35.6" } # x-release-please-version
+ts_host_net = { path = "ts_host_net", package = "geiserx_ts_host_net", version = "0.35.6" } # x-release-please-version
+ts_keys = { path = "ts_keys", package = "geiserx_ts_keys", version = "0.35.6" } # x-release-please-version
+ts_magicsock = { path = "ts_magicsock", package = "geiserx_ts_magicsock", version = "0.35.6" } # x-release-please-version
+ts_metrics = { path = "ts_metrics", package = "geiserx_ts_metrics", version = "0.35.6" } # x-release-please-version
+ts_netcheck = { path = "ts_netcheck", package = "geiserx_ts_netcheck", version = "0.35.6" } # x-release-please-version
+ts_netstack_smoltcp = { path = "ts_netstack_smoltcp", package = "geiserx_ts_netstack_smoltcp", version = "0.35.6" } # x-release-please-version
+ts_netstack_smoltcp_core = { path = "ts_netstack_smoltcp_core", package = "geiserx_ts_netstack_smoltcp_core", version = "0.35.6" } # x-release-please-version
+ts_netstack_smoltcp_socket = { path = "ts_netstack_smoltcp_socket", package = "geiserx_ts_netstack_smoltcp_socket", version = "0.35.6" } # x-release-please-version
+ts_nodecapability = { path = "ts_nodecapability", package = "geiserx_ts_nodecapability", version = "0.35.6" } # x-release-please-version
+ts_overlay_router = { path = "ts_overlay_router", package = "geiserx_ts_overlay_router", version = "0.35.6" } # x-release-please-version
+ts_packet = { path = "ts_packet", package = "geiserx_ts_packet", version = "0.35.6" } # x-release-please-version
+ts_packetfilter = { path = "ts_packetfilter", package = "geiserx_ts_packetfilter", version = "0.35.6" } # x-release-please-version
+ts_packetfilter_serde = { path = "ts_packetfilter_serde", package = "geiserx_ts_packetfilter_serde", version = "0.35.6" } # x-release-please-version
+ts_packetfilter_state = { path = "ts_packetfilter_state", package = "geiserx_ts_packetfilter_state", version = "0.35.6" } # x-release-please-version
+ts_peercapability = { path = "ts_peercapability", package = "geiserx_ts_peercapability", version = "0.35.6" } # x-release-please-version
+ts_http_util = { path = "ts_http_util", package = "geiserx_ts_http_util", version = "0.35.6" } # x-release-please-version
+ts_tka = { path = "ts_tka", package = "geiserx_ts_tka", version = "0.35.6" } # x-release-please-version
+ts_tls_util = { path = "ts_tls_util", package = "geiserx_ts_tls_util", version = "0.35.6" } # x-release-please-version
+ts_runtime = { path = "ts_runtime", package = "geiserx_ts_runtime", version = "0.35.6" } # x-release-please-version
 ts_test_util = { path = "ts_test_util" }
-ts_time = { path = "ts_time", package = "geiserx_ts_time", version = "0.35.5" } # x-release-please-version
-ts_transport = { path = "ts_transport", package = "geiserx_ts_transport", version = "0.35.5" } # x-release-please-version
-ts_transport_tun = { path = "ts_transport_tun", package = "geiserx_ts_transport_tun", version = "0.35.5" } # x-release-please-version
-ts_underlay_router = { path = "ts_underlay_router", package = "geiserx_ts_underlay_router", version = "0.35.5" } # x-release-please-version
-ts_tunnel = { path = "ts_tunnel", package = "geiserx_ts_tunnel", version = "0.35.5" } # x-release-please-version
+ts_time = { path = "ts_time", package = "geiserx_ts_time", version = "0.35.6" } # x-release-please-version
+ts_transport = { path = "ts_transport", package = "geiserx_ts_transport", version = "0.35.6" } # x-release-please-version
+ts_transport_tun = { path = "ts_transport_tun", package = "geiserx_ts_transport_tun", version = "0.35.6" } # x-release-please-version
+ts_underlay_router = { path = "ts_underlay_router", package = "geiserx_ts_underlay_router", version = "0.35.6" } # x-release-please-version
+ts_tunnel = { path = "ts_tunnel", package = "geiserx_ts_tunnel", version = "0.35.6" } # x-release-please-version
 
 [workspace.lints.rust]
 closure_returning_async_block = "warn"
