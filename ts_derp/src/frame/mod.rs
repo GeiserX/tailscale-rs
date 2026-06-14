@@ -37,10 +37,12 @@ pub use raw::RawFrame;
 /// holds **every known frame** to this tighter 64 KiB cap at decode (`Header::new` /
 /// `Header::try_from`) as well, which is *stricter* than Go on the inbound path. This is the safe
 /// direction: it bounds a single inbound frame's allocation to 64 KiB rather than 1 MiB (16× tighter
-/// anti-DoS), and it drops no real traffic — a real DERP server relays WireGuard/disco packets that
-/// are themselves `<= MaxPacketSize`, and a production `ServerInfo` is a few hundred bytes, so the
-/// 64 KiB–1 MiB band is never legitimately used. An unknown (forward-extension) frame is still read
-/// and skipped up to [`MAX_RECV_FRAME_SIZE`] so a newer server is never disconnected.
+/// anti-DoS), and it drops no real traffic — a real DERP server relays WireGuard/disco datagrams
+/// whose payload (plus a `RecvPacket`/`ForwardPacket` frame's 32-byte source-key prefix) stays well
+/// under `MAX_PACKET_SIZE`; Tailscale's tunnel MTU is ~1280 B, so the 64 KiB–1 MiB *frame-body* band
+/// is never legitimately used (a production `ServerInfo` is likewise a few hundred bytes). An unknown
+/// (forward-extension) frame is still read and skipped up to [`MAX_RECV_FRAME_SIZE`] so a newer
+/// server is never disconnected.
 pub const MAX_PACKET_SIZE: usize = 64 << 10;
 
 /// Upper bound (in bytes) on any frame body the receive codec will read off the wire before
