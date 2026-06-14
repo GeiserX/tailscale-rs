@@ -18,6 +18,13 @@ pub enum RegistrationError {
     #[error("control rejected registration: {0}")]
     Rejected(String),
 
+    /// Control rate-limited registration (HTTP 429). The [`Duration`](core::time::Duration) is how
+    /// long to wait before retrying, taken from the server's `Retry-After` header (mirroring Go's
+    /// `parseRateLimitError`); the caller should sleep exactly this before re-registering rather than
+    /// using its own backoff, so we never re-hit control inside the cooldown it asked for.
+    #[error("control rate limited registration; retry after {0:?}")]
+    RateLimited(core::time::Duration),
+
     #[error("Network error")]
     NetworkError,
 
@@ -88,6 +95,7 @@ impl From<RegistrationError> for crate::Error {
                 crate::Operation::Registration,
             ),
             RegistrationError::Rejected(msg) => crate::Error::Registration(msg),
+            RegistrationError::RateLimited(d) => crate::Error::RateLimited(d),
             RegistrationError::Internal(k) => {
                 crate::Error::Internal(k.into(), crate::Operation::Registration)
             }
@@ -216,6 +224,26 @@ pub async fn register(
 
     tracing::debug!(%status, "received registration response");
 
+    // Honor an explicit rate-limit (HTTP 429) the way Go's `doLogin`/`parseRateLimitError` does:
+    // read the server's requested cooldown from `Retry-After` and surface it as a typed
+    // `RateLimited` so the caller waits exactly that long instead of its own backoff. Checked before
+    // the generic non-2xx arm so a 429 never collapses into an opaque `Http` error.
+    if status.as_u16() == 429 {
+        // `HeaderMap::get` accepts a `&str` key (case-insensitive), so we avoid pulling in `http`
+        // directly just for the `RETRY_AFTER` constant.
+        let retry_after = parse_retry_after(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+        );
+        tracing::warn!(
+            ?retry_after,
+            "control rate-limited registration (429); will retry after the server-requested delay"
+        );
+        return Err(RegistrationError::RateLimited(retry_after));
+    }
+
     if !status.is_success() {
         // Attempt to collect the body to log the error, truncating to prevent spamming the logs.
         let mut body = response
@@ -241,9 +269,137 @@ pub async fn register(
     classify_register_response(&register_resp)
 }
 
+/// Upper bound on a `Retry-After` we will honor. A server (or a buggy/hostile one) that asks us to
+/// wait longer than this is clamped to the default, mirroring Go's `parseRateLimitError`
+/// (`retryAfter > time.Hour` → default).
+const MAX_RETRY_AFTER: core::time::Duration = core::time::Duration::from_secs(60 * 60);
+
+/// Parse an HTTP `Retry-After` header value into a wait duration, mirroring Go's
+/// `parseRateLimitError` (`control/controlclient/direct.go`):
+///
+/// 1. an integer number of seconds (`Retry-After: 120`), or
+/// 2. an HTTP-date (`Retry-After: Wed, 21 Oct 2026 07:28:00 GMT`), in which case the wait is the time
+///    until that instant.
+///
+/// If the header is absent, unparseable, non-positive, or longer than [`MAX_RETRY_AFTER`], fall back
+/// to Go's default of `5s + rand[0, 5s)` — a short jittered wait that neither hammers control nor
+/// stalls indefinitely on a bogus value.
+fn parse_retry_after(header: Option<&str>) -> core::time::Duration {
+    let parsed = header.and_then(|raw| {
+        let raw = raw.trim();
+        // Integer seconds — the common case.
+        if let Ok(secs) = raw.parse::<i64>() {
+            return (secs > 0).then(|| core::time::Duration::from_secs(secs as u64));
+        }
+        // Otherwise an HTTP-date: wait until that instant (RFC 1123 / IMF-fixdate, the form servers
+        // actually emit, e.g. `Wed, 21 Oct 2026 07:28:00 GMT`). `chrono`'s `clock` feature is not
+        // enabled in this workspace (no `Utc::now()`), so we take "now" from `SystemTime` and diff
+        // the parsed instant's unix timestamp against it. Only `parse_from_rfc2822` (pure parsing,
+        // no clock) is used from chrono.
+        let when = chrono::DateTime::parse_from_rfc2822(raw).ok()?;
+        let when_unix = when.timestamp();
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs() as i64;
+        let delta_secs = when_unix - now_unix;
+        (delta_secs > 0).then(|| core::time::Duration::from_secs(delta_secs as u64))
+    });
+
+    match parsed {
+        Some(d) if d > core::time::Duration::ZERO && d <= MAX_RETRY_AFTER => d,
+        // Absent / unparseable / non-positive / absurdly large → Go's `5s + rand[0,5s)` default.
+        _ => {
+            use rand::RngExt as _;
+            let jitter_ms = (rand::rng().random::<f64>() * 5000.0) as u64;
+            core::time::Duration::from_secs(5) + core::time::Duration::from_millis(jitter_ms)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The jittered default Go falls back to when `Retry-After` is absent/unusable: `5s + [0,5s)`.
+    const DEFAULT_LO: core::time::Duration = core::time::Duration::from_secs(5);
+    const DEFAULT_HI: core::time::Duration = core::time::Duration::from_secs(10);
+
+    #[test]
+    fn retry_after_integer_seconds_is_honored() {
+        assert_eq!(
+            parse_retry_after(Some("120")),
+            core::time::Duration::from_secs(120)
+        );
+        // Surrounding whitespace is tolerated (header values are trimmed).
+        assert_eq!(
+            parse_retry_after(Some("  30 ")),
+            core::time::Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn retry_after_absent_or_garbage_falls_back_to_jittered_default() {
+        // Each of these is unusable and must yield a value in Go's `5s + [0,5s)` default band.
+        for header in [None, Some("not-a-number"), Some(""), Some("   ")] {
+            let d = parse_retry_after(header);
+            assert!(
+                d >= DEFAULT_LO && d < DEFAULT_HI,
+                "{header:?} must fall back to the [5s,10s) default, got {d:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_after_nonpositive_falls_back_to_default() {
+        // Zero and negative second counts are not positive waits → default band.
+        for header in ["0", "-5"] {
+            let d = parse_retry_after(Some(header));
+            assert!(
+                d >= DEFAULT_LO && d < DEFAULT_HI,
+                "{header:?} must fall back to the default, got {d:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_after_over_one_hour_is_clamped_to_default() {
+        // A server asking for > 1h is clamped to the default (mirrors Go's `> time.Hour` guard), so a
+        // bogus/hostile value can't stall the client for hours.
+        let d = parse_retry_after(Some("7200")); // 2h
+        assert!(
+            d >= DEFAULT_LO && d < DEFAULT_HI,
+            "a >1h Retry-After must clamp to the default, got {d:?}"
+        );
+        // Exactly 1h is the boundary and IS honored (Go clamps only `> time.Hour`).
+        assert_eq!(
+            parse_retry_after(Some("3600")),
+            core::time::Duration::from_secs(3600)
+        );
+    }
+
+    #[test]
+    fn retry_after_http_date_in_the_future_is_honored() {
+        // An HTTP-date (RFC 1123 / IMF-fixdate) far in the future parses to a positive wait. Use a
+        // fixed far-future date so the assertion is stable: the wait must be positive and (being
+        // decades out) clamped to the default by the > 1h guard — proving the date path is exercised
+        // and the clamp protects against an absurd far-future value.
+        let d = parse_retry_after(Some("Wed, 21 Oct 2099 07:28:00 GMT"));
+        assert!(
+            d >= DEFAULT_LO && d < DEFAULT_HI,
+            "a far-future HTTP-date is clamped to the default, got {d:?}"
+        );
+    }
+
+    #[test]
+    fn retry_after_http_date_in_the_past_falls_back_to_default() {
+        // A past HTTP-date yields a non-positive delta → default band (never a zero/negative wait).
+        let d = parse_retry_after(Some("Wed, 21 Oct 1998 07:28:00 GMT"));
+        assert!(
+            d >= DEFAULT_LO && d < DEFAULT_HI,
+            "a past HTTP-date must fall back to the default, got {d:?}"
+        );
+    }
 
     /// A minimal-but-valid `RegisterResponse` wire body. The `MachineAuthorized`/`AuthURL`/`Error`
     /// fields are interpolated so each test can mirror a real control response shape.

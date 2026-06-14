@@ -120,6 +120,12 @@ pub enum Error {
     #[error("control rejected registration: {0}")]
     Registration(String),
 
+    /// Control rate-limited us (HTTP 429). The [`Duration`](core::time::Duration) is the
+    /// server-requested cooldown (from `Retry-After`); the retry loop waits exactly this before the
+    /// next attempt rather than its own backoff, so we never re-hit control inside the cooldown.
+    #[error("control rate limited the request; retry after {0:?}")]
+    RateLimited(core::time::Duration),
+
     /// Some kind of networking error.
     ///
     /// These might be addressed by retrying, or might be an unresolvable error.

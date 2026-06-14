@@ -467,15 +467,21 @@ pub async fn run(
             clear_reauth_url(&auth_url_tx);
         }
 
-        // Back off before every reconnect, on BOTH the clean-EOF and error paths — Go's
-        // `mapRoutine` runs `bo.BackOff(ctx, err)` after every poll regardless of how it ended.
-        // The clean-EOF arm (`Ok(())`) previously reconnected with ZERO delay: a control server
-        // that returns 200 then closes the body (or sends one frame the stream swallows to `None`)
-        // would spin a full-speed connect→TLS→Noise→register loop, hammering control and pinning
-        // CPU. The reset is gated on `received_frame` (see `reconnect_delay_after_poll`), so a
-        // healthy long-lived poll that delivered frames reconnects promptly while a zero-progress
-        // server escalates up the n²·10ms schedule.
-        let delay = reconnect_delay_after_poll(received_frame, &mut backoff, &mut rand::rng());
+        // Decide how long to wait before reconnecting. A control-issued rate-limit (HTTP 429 →
+        // `Error::RateLimited`) overrides the local backoff: wait EXACTLY the server-requested
+        // cooldown and do NOT advance the backoff counter, mirroring Go's `authRoutine`, which sleeps
+        // `time.After(rle.retryAfter)` *instead of* `bo.BackOff`. Otherwise back off before every
+        // reconnect on BOTH the clean-EOF and error paths — Go's `mapRoutine` runs `bo.BackOff` after
+        // every poll regardless of how it ended. The clean-EOF arm (`Ok(())`) previously reconnected
+        // with ZERO delay: a control server that returns 200 then closes the body (or sends one frame
+        // the stream swallows to `None`) would spin a full-speed connect→TLS→Noise→register loop,
+        // hammering control and pinning CPU. The reset is gated on `received_frame` (see
+        // `reconnect_delay_after_poll`), so a healthy long-lived poll that delivered frames reconnects
+        // promptly while a zero-progress server escalates up the n²·10ms schedule.
+        let delay = match &outcome {
+            Err(Error::RateLimited(retry_after)) => *retry_after,
+            _ => reconnect_delay_after_poll(received_frame, &mut backoff, &mut rand::rng()),
+        };
         match outcome {
             Ok(()) => {
                 tracing::warn!(
@@ -483,6 +489,14 @@ pub async fn run(
                     resume_seq = session.seq,
                     backoff_ms = delay.as_millis() as u64,
                     "netmap stream ended without error, attempting restart"
+                );
+            }
+            Err(Error::RateLimited(retry_after)) => {
+                tracing::warn!(
+                    ?retry_after,
+                    resume_handle = %session.handle,
+                    resume_seq = session.seq,
+                    "control rate-limited the map-poll re-register; waiting the server-requested delay"
                 );
             }
             Err(e) => {
