@@ -680,6 +680,13 @@ impl Peer {
         }
         self.last_seen_timestamp = Some(handshake.timestamp);
 
+        // An authenticated handshake INITIATION from the peer is "hearing back" too (Go
+        // `timersAnyAuthenticatedPacketReceived` fires on a verified initiation, not only data /
+        // keepalive / response): the peer is clearly reachable, so cancel any pending "stopped
+        // hearing back" re-initiate. Without this, our timer could fire and start a second
+        // (redundant) handshake racing the one this initiation is establishing.
+        self.cancel_new_handshake();
+
         let session_id = endpoint.ids.allocate_session(self.id);
 
         let (packet, displaced) = self.handshake.respond(
@@ -747,6 +754,11 @@ impl Peer {
             );
             self.session.deactivate(endpoint);
             self.handshake_attempts = 0;
+            // Clear the "stopped hearing back" timer too: having just decided to STOP retrying this
+            // unreachable peer, we must not let a still-pending re-initiate fire and start another
+            // handshake to it (which would partially defeat the give-up bound). The next outbound
+            // packet re-arms it after a fresh send, as intended.
+            self.cancel_new_handshake();
             return;
         }
 
@@ -800,16 +812,31 @@ impl Peer {
         self.arm_persistent_keepalive(scheduler);
     }
 
+    /// Cancel every per-peer scheduled timer (reactive keepalive, persistent keepalive, and the
+    /// "stopped hearing back" re-initiate). A [`Handle`] holds only a `Weak`, so dropping a `Peer`
+    /// does NOT remove its scheduled events from the endpoint's `Scheduler` — a stale timer would
+    /// otherwise survive and later dispatch to this peer id (a no-op if the peer is gone, but a
+    /// SPURIOUS keepalive/handshake if the id is reused, or a wasted re-init right after a give-up
+    /// teardown). Mirrors wireguard-go `timersStop` clearing all of a peer's timers. Idempotent.
+    fn cancel_all_timers(&mut self) {
+        if let Some(handle) = self.keepalive.take() {
+            handle.cancel();
+        }
+        if let Some(handle) = self.persistent_keepalive.take() {
+            handle.cancel();
+        }
+        self.cancel_new_handshake();
+    }
+
     fn shutdown(&mut self, endpoint: &mut EndpointState) {
         self.session.deactivate(endpoint);
 
         endpoint.ids.remove_handshake_session(&self.handshake);
         self.handshake = Handshake::none();
 
-        // Stop keeping a removed peer's path warm.
-        if let Some(handle) = self.persistent_keepalive.take() {
-            handle.cancel();
-        }
+        // Stop every timer for a removed peer: a stale event would otherwise fire on this peer id
+        // later (spurious if the id is reused). Mirrors Go `timersStop` on peer removal.
+        self.cancel_all_timers();
     }
 
     /// (Soft) precondition: `self.handshake == HandshakeState::None` (previous handshake is lost, but
@@ -1806,10 +1833,10 @@ mod tests {
         let (mut a_ep, mut b_ep, a_peer, b_peer) = establish_session(None, b"hello");
 
         // A sends data → arms the new-handshake timer.
-        let _ = a_ep.send(HashMap::from([(
+        drop(a_ep.send(HashMap::from([(
             a_peer,
             vec![PacketMut::from(&b"more"[..])],
-        )]));
+        )])));
 
         // B sends a keepalive-bearing packet back to A (drive B to emit, then deliver to A). The
         // simplest authenticated A-bound packet: have B send data to A over the established session.
@@ -1821,7 +1848,7 @@ mod tests {
             .clone();
         // A receives the authenticated DATA packet — this cancels the new-handshake timer (and, as a
         // side effect, arms A's reactive §6.5 keepalive, since it was a data packet).
-        let _ = a_ep.recv(b_to_a);
+        drop(a_ep.recv(b_to_a));
 
         // Dispatch well past ~15s. Because the new-handshake timer was cancelled, A must NOT
         // re-initiate. A reactive keepalive (a 32-byte empty data packet) IS expected from the data
@@ -1839,6 +1866,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Removing a peer cancels its pending "stopped hearing back" timer (and the other per-peer
+    /// timers): a `Handle` holds only a `Weak`, so without an explicit cancel the scheduled event
+    /// survives the dropped `Peer` and would later dispatch — a no-op for a gone id, but a spurious
+    /// handshake if the id is reused. Here we re-add the SAME peer id after removal and confirm no
+    /// stale re-initiation fires past the old deadline.
+    #[test]
+    fn removing_a_peer_cancels_its_pending_new_handshake() {
+        let (mut a_ep, _b_ep, a_peer, _b_peer) = establish_session(None, b"hello");
+
+        // A sends data → arms the new-handshake timer for a_peer.
+        drop(a_ep.send(HashMap::from([(
+            a_peer,
+            vec![PacketMut::from(&b"more"[..])],
+        )])));
+
+        // Remove the peer (this must cancel the pending timer), then re-add the SAME id fresh with a
+        // brand-new key/config — modeling a remove-then-re-add that reuses the caller-chosen id.
+        assert!(a_ep.remove_peer(a_peer), "the peer existed and was removed");
+        a_ep.upsert_peer(
+            a_peer,
+            PeerConfig {
+                key: NodeKeyPair::new().public,
+                psk: rand::random::<crate::config::Psk>(),
+                persistent_keepalive_interval: None,
+            },
+        );
+
+        // Dispatch past the old ~15s deadline: the freshly re-added peer (which has sent nothing)
+        // must NOT see a stale re-initiation from the removed peer's timer.
+        let now = Instant::now();
+        let after = a_ep.dispatch_events(now + Duration::from_secs(20));
+        assert!(
+            after.to_peers.get(&a_peer).is_none_or(|p| p.is_empty()),
+            "a removed peer's stale new-handshake timer must not fire on the re-added peer id"
+        );
     }
 
     /// With no persistent keepalive configured (`None`), the historical behavior is preserved: once
