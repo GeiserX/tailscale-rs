@@ -172,6 +172,16 @@ impl kameo::Actor for ControlRunner {
                         .send_replace(crate::DeviceState::NeedsLogin(u.clone()));
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
+                Err(ControlError::RateLimited(retry_after)) => {
+                    // Control asked us to slow down (HTTP 429). Wait exactly the server-requested
+                    // cooldown and retry — this is transient, NOT a terminal `Failed`, so we must
+                    // not stop the runner (mirrors Go's `authRoutine` sleeping `rle.retryAfter`).
+                    tracing::warn!(
+                        ?retry_after,
+                        "control rate-limited registration; waiting before retry"
+                    );
+                    tokio::time::sleep(retry_after).await;
+                }
                 Err(e) => {
                     // A hard registration failure (bad/expired/unknown auth key, etc.). Log the
                     // specific reason control gave AND publish it as a typed `Failed` state so
@@ -199,34 +209,53 @@ impl kameo::Actor for ControlRunner {
         // sender is in place for the very first poll, and so the receiver outlives `bring_up`.
         let (auth_url_tx, auth_url_rx) = watch::channel::<Option<url::Url>>(None);
 
-        let bring_up = async {
-            let (client, stream) = AsyncControlClient::connect(
-                &params.config,
-                &params.env.keys,
-                params.auth_key.as_deref(),
-                auth_url_tx,
-            )
-            .await?;
+        // `connect` issues its own `machine/register` POST (a second one after `check_auth`'s), so
+        // it too can hit a 429. Wrap it in the same honor-`Retry-After` retry as the `check_auth`
+        // loop above: a rate-limit is transient — sleeping the server-requested cooldown and
+        // retrying must NOT stop the runtime (a 429 here previously fell into the `Err(e)` arm →
+        // `Failed` → actor stop). `connect` consumes a `watch::Sender` by value (and drops it on a
+        // failed register, before it would be moved into the live-poll task), so we keep the original
+        // `auth_url_tx` alive here across all attempts and hand `connect` a CLONE each time. That
+        // keeps the runtime's `auth_url_rx` (the `reauth_bridge` receiver) paired with a live sender:
+        // recreating a fresh sender per attempt instead would orphan the bridge the moment the
+        // original dropped, silently killing mid-session re-auth-URL delivery.
+        let client = loop {
+            let bring_up = async {
+                let (client, stream) = AsyncControlClient::connect(
+                    &params.config,
+                    &params.env.keys,
+                    params.auth_key.as_deref(),
+                    auth_url_tx.clone(),
+                )
+                .await?;
 
-            DerpLatencyMeasurer::spawn_link(&slf, params.env.clone()).await;
+                DerpLatencyMeasurer::spawn_link(&slf, params.env.clone()).await;
 
-            params.env.subscribe::<DerpLatencyMeasurement>(&slf).await?;
-            params.env.subscribe::<EndpointAdvertisement>(&slf).await?;
-            slf.attach_stream(stream.boxed(), (), ());
-            Ok::<_, ControlRunnerError>(client)
-        };
+                params.env.subscribe::<DerpLatencyMeasurement>(&slf).await?;
+                params.env.subscribe::<EndpointAdvertisement>(&slf).await?;
+                slf.attach_stream(stream.boxed(), (), ());
+                Ok::<_, ControlRunnerError>(client)
+            };
 
-        let client = match bring_up.await {
-            Ok(client) => client,
-            Err(e) => {
-                tracing::error!(error = %e, "bringing up the control session failed");
-                // The control session never came up; surface it as a transient registration
-                // failure (a retry / fresh `Device::new` may succeed) rather than leaving the state
-                // stuck at `Connecting`.
-                params.state_tx.send_replace(crate::DeviceState::Failed(
-                    crate::RegistrationError::NetworkUnreachable,
-                ));
-                return Err(e);
+            match bring_up.await {
+                Ok(client) => break client,
+                Err(ControlRunnerError::Control(ControlError::RateLimited(retry_after))) => {
+                    tracing::warn!(
+                        ?retry_after,
+                        "control rate-limited the session bring-up; waiting before retry"
+                    );
+                    tokio::time::sleep(retry_after).await;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "bringing up the control session failed");
+                    // The control session never came up; surface it as a transient registration
+                    // failure (a retry / fresh `Device::new` may succeed) rather than leaving the
+                    // state stuck at `Connecting`.
+                    params.state_tx.send_replace(crate::DeviceState::Failed(
+                        crate::RegistrationError::NetworkUnreachable,
+                    ));
+                    return Err(e);
+                }
             }
         };
 

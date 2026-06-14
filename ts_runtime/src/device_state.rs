@@ -94,6 +94,12 @@ impl From<&ts_control::Error> for RegistrationError {
                 RegistrationError::AuthRejected(reason.clone())
             }
             ts_control::Error::NetworkError(_) => RegistrationError::NetworkUnreachable,
+            // A 429 rate-limit is **transient** — control is asking us to wait, not rejecting us —
+            // so it must NOT become a permanent `AuthRejected`. The control runner's `check_auth`
+            // loop already intercepts `RateLimited` and sleeps the server delay before this mapping
+            // is reached; classifying it as `NetworkUnreachable` here keeps any other caller of this
+            // conversion on the correct (non-permanent, retry-may-succeed) branch.
+            ts_control::Error::RateLimited(_) => RegistrationError::NetworkUnreachable,
             // InvalidUrl / Internal: not a transient network condition and not an auth decision —
             // treat as a (permanent-ish) auth rejection carrying the display reason so the caller
             // sees something actionable rather than an opaque "timeout".
@@ -181,6 +187,16 @@ mod tests {
                 ts_control::Operation::Registration
             )),
             RegistrationError::NetworkUnreachable
+        );
+        // A 429 rate-limit is TRANSIENT and must map to a non-permanent state, never the
+        // `AuthRejected` catch-all (which would wrongly stop the runtime). This pins the explicit
+        // arm: if a refactor drops it and lets `RateLimited` fall into `other => AuthRejected`, this
+        // assertion fails.
+        let rl = RegistrationError::from(&ts_control::Error::RateLimited(Duration::from_secs(30)));
+        assert_eq!(rl, RegistrationError::NetworkUnreachable);
+        assert!(
+            !rl.is_permanent(),
+            "a rate-limit must be a transient (non-permanent) failure"
         );
     }
 
