@@ -163,14 +163,27 @@ pub async fn register(
     let advertised_vip_services = config.advertised_vip_services();
     let services_hash = crate::services_hash(&advertised_vip_services);
 
+    // Host-environment facts (OS / version / arch / machine / a Tailscale-shaped IPNVersion), so the
+    // advertised Hostinfo matches a genuine Tailscale/tsnet node rather than an empty shell. Bound
+    // before the request so its owned strings outlive the borrowing `HostInfo`.
+    let host = crate::hostinfo::HostInfoData::detect();
+    let client_name = config.format_client_name();
+
     let register_req = RegisterRequest {
         version: CapabilityVersion::CURRENT,
         node_key: node_public_key,
         old_node_key: node_keystate.old_node_key,
         hostinfo: HostInfo {
             hostname: config.hostname.as_deref().map(std::borrow::Cow::Borrowed),
-            app: &config.format_client_name(),
-            ipn_version: crate::PKG_VERSION,
+            app: &client_name,
+            ipn_version: &host.ipn_version,
+            os: &host.os,
+            os_version: &host.os_version,
+            go_arch: &host.go_arch,
+            go_version: &host.go_version,
+            machine: &host.machine,
+            package: crate::hostinfo::PACKAGE_TSNET,
+            userspace: Some(true),
             routable_ips: {
                 let routes = config.advertised_routes();
                 (!routes.is_empty()).then_some(routes)

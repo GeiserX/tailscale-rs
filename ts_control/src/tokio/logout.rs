@@ -190,6 +190,12 @@ pub(crate) async fn logout_with(
     // normal `register()` request shape — same node key, NL key, and HostInfo identity — and only
     // adds the backdated `expiry` that tells control to expire the node now. Auth/ephemeral are
     // omitted: re-authentication is not part of a logout, and the node already exists.
+    // Same Hostinfo identity as a normal register (see `register()`), so the logout request looks
+    // like a genuine node rather than a skeleton. Bound before the request so the owned strings
+    // outlive the borrowing `HostInfo`.
+    let host = crate::hostinfo::HostInfoData::detect();
+    let client_name = config.format_client_name();
+
     let logout_req = RegisterRequest {
         version: CapabilityVersion::CURRENT,
         node_key: node_public_key,
@@ -197,8 +203,15 @@ pub(crate) async fn logout_with(
         expiry: Some(past_expiry()),
         hostinfo: HostInfo {
             hostname: config.hostname.as_deref().map(std::borrow::Cow::Borrowed),
-            app: &config.format_client_name(),
-            ipn_version: crate::PKG_VERSION,
+            app: &client_name,
+            ipn_version: &host.ipn_version,
+            os: &host.os,
+            os_version: &host.os_version,
+            go_arch: &host.go_arch,
+            go_version: &host.go_version,
+            machine: &host.machine,
+            package: crate::hostinfo::PACKAGE_TSNET,
+            userspace: Some(true),
             ..Default::default()
         },
         ..Default::default()

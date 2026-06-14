@@ -120,6 +120,24 @@ impl<'a> MapRequestBuilder<'a> {
         self
     }
 
+    /// Overlay the detected host-environment facts (`HostInfo.OS`/`OSVersion`/`GoArch`/`Machine`,
+    /// plus `Package`/`Userspace`) onto the map request, so every map poll advertises the same dense,
+    /// genuine-looking Hostinfo a Tailscale/tsnet node sends — not an empty `OS` with a crate-version
+    /// `IPNVersion`. `IPNVersion` is also taken from `host` (its `version.Long()`-shaped value)
+    /// rather than the `client_info` arg, so the two stay consistent.
+    pub fn host_environment(mut self, host: &'a crate::hostinfo::HostInfoData) -> Self {
+        let host_info = self.host_info_mut();
+        host_info.ipn_version = &host.ipn_version;
+        host_info.os = &host.os;
+        host_info.os_version = &host.os_version;
+        host_info.go_arch = &host.go_arch;
+        host_info.go_version = &host.go_version;
+        host_info.machine = &host.machine;
+        host_info.package = crate::hostinfo::PACKAGE_TSNET;
+        host_info.userspace = Some(true);
+        self
+    }
+
     /// Advertise the set of ACL tags this node wants to claim (`HostInfo.RequestTags`), so a
     /// tag-keyed control ACL (e.g. a self-hosted control plane's route auto-approver) can match it. When the
     /// iterator yields nothing, the field is left as `None` and omitted from the wire request
