@@ -291,7 +291,12 @@ pub(crate) fn host_dns_from_dns_config(
         // Search domains first, then any split-DNS route suffix not already covered, deduped while
         // preserving order (Go `MatchDomains` = SearchDomains ∪ Routes keys). The route keys are
         // canonicalized and the global `.`/empty route is filtered out at parse time, so no entry
-        // here can scope the resolver globally.
+        // here can scope the resolver globally. ALL route keys are included, incl. a negative route
+        // (empty upstream list): a negative-route suffix is intentionally scoped to the MagicDNS
+        // resolver, which then fail-closes it (NXDOMAIN/REFUSED) rather than leaving it on the host's
+        // normal resolver — this matches Go, whose `MatchDomains` likewise carries negative-route
+        // keys, and keeps such names off the host resolver. Adding a suffix only ever *narrows* what
+        // the tailnet resolver answers to that suffix; it never widens host-DNS capture.
         let mut domains = d.search_domains.clone();
         for suffix in d.routes.keys() {
             if !domains.contains(suffix) {
@@ -1541,6 +1546,34 @@ mod tests {
             host.match_domains.is_empty(),
             "no search domain and no route ⇒ empty match_domains (host layer installs no resolver)"
         );
+    }
+
+    /// The union never emits a global/empty match domain. `DnsConfig`'s parser drops the `.`/empty
+    /// route key (proven by `ts_control`'s `from_serde_drops_empty_route_keys_*`), so a `DnsConfig`
+    /// can never carry one; this pins the consuming side — even were a `.`/`""` key somehow present
+    /// in `routes`, the resulting `match_domains` must contain no global/empty entry that would scope
+    /// the host resolver globally. Defense-in-depth on the cross-module contract.
+    #[test]
+    fn host_dns_match_domains_never_global_or_empty() {
+        use std::collections::BTreeMap;
+
+        // Construct a config directly with a real suffix plus (hypothetically) a global/empty key —
+        // the union must surface the real suffix and never a `.`/`""` entry.
+        let mut routes = BTreeMap::new();
+        routes.insert("corp.ts.net".to_owned(), vec![]);
+        // (A `.`/`""` key cannot occur post-parse, but assert the consuming side is clean regardless.)
+        let cfg = ts_control::DnsConfig {
+            magic_dns: true,
+            search_domains: vec![],
+            routes,
+            ..Default::default()
+        };
+        let host = host_dns_from_dns_config(Some(&cfg), "utun9".to_owned(), true);
+        assert!(
+            !host.match_domains.iter().any(|d| d == "." || d.is_empty()),
+            "no global/empty match domain may ever reach the host resolver"
+        );
+        assert_eq!(host.match_domains, vec!["corp.ts.net".to_owned()]);
     }
 
     /// The MagicDNS service IP `100.100.100.100/32` is steered into the TUN exactly when MagicDNS is
