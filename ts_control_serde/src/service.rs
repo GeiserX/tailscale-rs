@@ -36,6 +36,12 @@ pub struct Service<'a> {
     pub port: u16,
     /// Free-form textual description of the running service. Typically this is the name of the
     /// running service process.
-    #[serde(borrow)]
+    ///
+    /// `#[serde(default)]` because Go `tailcfg.Service.Description` is `json:",omitempty"` — a real
+    /// control plane omits it for peerapi services (`{"Proto":"peerapi4","Port":N}` with no
+    /// `Description`), so without the default the whole `Hostinfo.Services` (and thus the netmap)
+    /// fails to decode. (This was masked until the `Hostinfo` wire-key fix made `Services` actually
+    /// decode.)
+    #[serde(borrow, default)]
     pub description: Cow<'a, str>,
 }

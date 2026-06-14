@@ -141,6 +141,10 @@ pub struct Node<'a> {
     /// A summary of the host that a Tailscale node is running on. Includes information about the
     /// version of Tailscale running on the host, the operating system, running services, and
     /// various diagnostic/logging and configuration values.
+    ///
+    /// Wire key `Hostinfo` — Go names the field `Hostinfo` (lowercase `i`, tailcfg.go:406), so serde
+    /// `PascalCase` (`HostInfo`) is wrong and a strict Go decoder drops it.
+    #[serde(rename = "Hostinfo")]
     #[serde(borrow)]
     pub host_info: HostInfo<'a>,
     /// The date/time this Tailscale node was created (added to the Tailnet for the first time).

@@ -78,6 +78,11 @@ pub struct MapRequest<'a> {
     /// Current information about this Tailscale node's host. Although it is always included in a
     /// [`MapRequest`], a control server may choose to ignore it when [`MapRequest::stream`] is
     /// `true` and [`MapRequest::version`] >= 68.
+    ///
+    /// Wire key `Hostinfo` — Go names the field `Hostinfo` (lowercase `i`), so serde `PascalCase` of
+    /// `host_info` (`HostInfo`, capital `I`) is wrong and a strict Go decoder drops it. Not an acronym
+    /// case, an exact-casing one, but the same silent-drop consequence.
+    #[serde(rename = "Hostinfo")]
     #[serde(borrow)]
     pub host_info: Option<HostInfo<'a>>,
 
@@ -292,6 +297,9 @@ pub struct MapResponse<'a> {
     /// A `Cow` because a URL legitimately carries `&` in its query string, which Go's `json.Marshal`
     /// escapes to `&` by default — a borrowed `&str` cannot decode that escaped form and would
     /// fail the whole `MapResponse` decode.
+    ///
+    /// Wire key `PopBrowserURL` (Go's `URL` acronym), not the `PascalCase` default `PopBrowserUrl`.
+    #[serde(rename = "PopBrowserURL")]
     #[serde(borrow)]
     pub pop_browser_url: Option<Cow<'a, str>>,
 
