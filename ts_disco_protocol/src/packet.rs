@@ -2,10 +2,13 @@ use core::marker::PhantomData;
 
 use aead::{AeadInPlace, generic_array::GenericArray};
 use crypto_box::Tag;
-use ts_keys::{DiscoPrivateKey, DiscoPublicKey};
+use ts_keys::{DiscoPrivateKey, DiscoPublicKey, NodePublicKey};
 use zerocopy::{FromBytes, IntoBytes, KnownLayout, TryFromBytes};
 
 use crate::{Error, Header, Message, message_type::MessageType};
+
+/// The transaction-id length at the head of a Ping body (Go `disco.Ping.TxID` is `[12]byte`).
+const PING_TX_ID_LEN: usize = 12;
 
 /// Marker type indicating that a [`Packet`] is in an encrypted state.
 pub enum Encrypted {}
@@ -255,6 +258,34 @@ impl Packet<Plaintext> {
         // `ref_from_prefix` parses the first `size_of::<T>()` bytes and returns the rest; we ignore
         // the rest (forward-compat trailing bytes), mirroring Go's lax fixed-message parse.
         T::ref_from_prefix(&pt.message).ok().map(|(msg, _rest)| msg)
+    }
+
+    /// Parse a Ping payload laxly, mirroring Go's `disco.parsePing` exactly: a body of at least 12
+    /// bytes yields the transaction id, and the sender's node key is read **only if** at least
+    /// `NodePublicKey::KEY_LEN_BYTES` (32) bytes remain after the tx id. Old clients (~1.16.0 and
+    /// earlier) send a 12-byte Ping with no node key, so the node key is `Option`al; any bytes beyond
+    /// `tx_id + node_key` are padding and ignored ("deliberately lax on longer-than-expected messages,
+    /// for future compatibility"). Returns `None` only when the type byte isn't `Ping` or the body is
+    /// shorter than the 12-byte tx id (Go's `errShort`).
+    ///
+    /// The strict [`as_msg::<Ping>`](Self::as_msg) requires the full fixed layout (12 + 32 + padding),
+    /// so it drops a node-key-less pre-1.16 Ping entirely; this accessor matches Go's parse. (Whether
+    /// such a node-key-less Ping is then *acted on* is a separate consumer-side binding decision.)
+    pub fn ping_lax(&self) -> Option<([u8; PING_TX_ID_LEN], Option<NodePublicKey>)> {
+        let pt = self.plaintext()?;
+        if pt.ty() != Some(MessageType::Ping) {
+            return None;
+        }
+        let body = &pt.message;
+        // Go: `if len(p) < 12 { return nil, errShort }`.
+        let tx_id: [u8; PING_TX_ID_LEN] = body.get(..PING_TX_ID_LEN)?.try_into().ok()?;
+        // Go: `if len(p) >= key.NodePublicRawLen` (evaluated AFTER consuming the 12-byte tx id) read
+        // the node key; otherwise leave it unset. Any trailing bytes are padding.
+        let node_key = body
+            .get(PING_TX_ID_LEN..)
+            .and_then(|rest| NodePublicKey::read_from_prefix(rest).ok())
+            .map(|(k, _rest)| k);
+        Some((tx_id, node_key))
     }
 
     /// Parse a `CallMeMaybe` payload into its whole endpoints, **ignoring a trailing partial

@@ -139,7 +139,14 @@ pub enum Inbound {
         /// (`handle_disco`) via the optional [`crate::BindingVerifier`] the netmap-owning route
         /// layer installs: a ping whose `claimed_node_key` is not bound to its disco key is
         /// dropped fail-closed.
-        claimed_node_key: NodePublicKey,
+        ///
+        /// `None` for a pre-1.16.0 peer that sent a node-key-less Ping (12-byte body; Go `parsePing`
+        /// accepts it, reading the node key only when >=32 bytes follow the tx id). The fork is the
+        /// dialing client against modern (>=1.16) peers, which always embed the key, so `handle_disco`
+        /// drops a `None`-keyed Ping fail-closed — it cannot satisfy the exact disco<->node-key
+        /// binding. This keeps the fork at least as strict as Go (which would still pong it on disco
+        /// membership), never looser.
+        claimed_node_key: Option<NodePublicKey>,
         /// The ping's transaction id, to be echoed in the pong.
         tx_id: TxId,
     },
@@ -173,11 +180,15 @@ pub fn open(our_disco: &DiscoPrivateKey, buf: &mut [u8]) -> Result<Inbound, Disc
 
     match plain.ty() {
         Some(MessageType::Ping) => {
-            let ping = plain.as_msg::<Ping>().ok_or(DiscoError::Malformed)?;
+            // Lax parse (Go `parsePing`): a 12-byte body (tx id only, no node key) from a pre-1.16
+            // peer is accepted, with the node key read only when >=32 bytes follow; trailing bytes
+            // are padding. The strict `as_msg::<Ping>` would drop a node-key-less Ping (its layout
+            // mandates the 32-byte key). `claimed_node_key` is therefore `Option`al here.
+            let (tx_id, claimed_node_key) = plain.ping_lax().ok_or(DiscoError::Malformed)?;
             Ok(Inbound::Ping {
                 sender,
-                claimed_node_key: ping.node_key,
-                tx_id: ping.tx_id,
+                claimed_node_key,
+                tx_id,
             })
         }
         Some(MessageType::Pong) => {
@@ -254,7 +265,7 @@ mod tests {
                 tx_id,
             } => {
                 assert_eq!(sender, a_sk.public_key());
-                assert_eq!(claimed_node_key, node_key);
+                assert_eq!(claimed_node_key, Some(node_key));
                 assert_eq!(tx_id, tx);
             }
             other => panic!("expected ping, got {other:?}"),
@@ -677,7 +688,104 @@ mod tests {
                 tx_id,
                 ..
             } => {
-                assert_eq!(claimed_node_key, node_key);
+                assert_eq!(claimed_node_key, Some(node_key));
+                assert_eq!(tx_id, tx);
+            }
+            other => panic!("expected ping, got {other:?}"),
+        }
+    }
+
+    /// A pre-1.16.0 peer's node-key-less Ping (a 12-byte body: tx id only, no node key) must still
+    /// parse, surfacing `claimed_node_key: None` — Go `parsePing` reads the node key only when >=32
+    /// bytes follow the tx id. The strict `as_msg::<Ping>` would drop it (its layout mandates the
+    /// 32-byte key); the lax `ping_lax` accepts it. (The consumer then drops a `None`-keyed ping
+    /// fail-closed, but that is `handle_disco`'s decision, tested in `sock.rs`.)
+    #[test]
+    fn pre_116_node_keyless_ping_parses_with_none_node_key() {
+        let (a_sk, _a_pk) = keypair();
+        let (b_sk, b_pk) = keypair();
+        let tx = random_tx_id();
+
+        // A 12-byte Ping body: tx id only, no node key, no padding.
+        let mut wire = seal_raw(&a_sk, &b_pk, MessageType::Ping, &tx, 0);
+        match open(&b_sk, &mut wire).expect("a node-key-less ping must still open") {
+            Inbound::Ping {
+                sender,
+                claimed_node_key,
+                tx_id,
+            } => {
+                assert_eq!(sender, a_sk.public_key());
+                assert_eq!(
+                    claimed_node_key, None,
+                    "a 12-byte ping carries no node key (Go parsePing parity)"
+                );
+                assert_eq!(tx_id, tx);
+            }
+            other => panic!("expected ping, got {other:?}"),
+        }
+    }
+
+    /// Boundary: the node key is read only when **at least 32 bytes follow the 12-byte tx id** (Go
+    /// `parsePing`'s `len(p) >= NodePublicRawLen` evaluated after consuming the tx id). A 43-byte body
+    /// (31 bytes after the tx id) is one short, so `claimed_node_key` is `None` — those 31 bytes are
+    /// padding, NOT a truncated key. This pins the gate against a `total >= 44` off-by-one (which would
+    /// agree with the 12- and 44-byte cases but diverge exactly here).
+    #[test]
+    fn ping_one_byte_short_of_node_key_parses_as_none() {
+        let (a_sk, _a_pk) = keypair();
+        let (b_sk, b_pk) = keypair();
+        let tx = random_tx_id();
+
+        // 43-byte body: 12-byte tx id + 31 bytes (one short of a 32-byte node key).
+        let mut body = Vec::new();
+        body.extend_from_slice(&tx);
+        body.extend_from_slice(&[0xAB; 31]);
+        assert_eq!(body.len(), 43);
+        let mut wire = seal_raw(&a_sk, &b_pk, MessageType::Ping, &body, 0);
+        match open(&b_sk, &mut wire).expect("a 43-byte ping must still open") {
+            Inbound::Ping {
+                claimed_node_key,
+                tx_id,
+                ..
+            } => {
+                assert_eq!(
+                    claimed_node_key, None,
+                    "31 bytes after the tx id is < 32, so no node key is read (remaining-length gate)"
+                );
+                assert_eq!(tx_id, tx);
+            }
+            other => panic!("expected ping, got {other:?}"),
+        }
+    }
+
+    /// A Ping with a node key AND trailing padding (body > 44 bytes) parses to `Some(node_key)` with
+    /// the trailing bytes ignored — Go `parsePing` is "deliberately lax on longer-than-expected
+    /// messages". The trailing fill is a recognizable non-zero pattern so the parser must actively
+    /// ignore it (a zero fill could pass even if the tail were wrongly folded into the key).
+    #[test]
+    fn ping_with_node_key_and_trailing_padding_parses_as_some() {
+        let (a_sk, _a_pk) = keypair();
+        let (b_sk, b_pk) = keypair();
+        let tx = random_tx_id();
+        let node_key = ts_keys::NodePrivateKey::random().public_key();
+
+        // 12 tx id + 32 node key + 7 trailing padding bytes = 51-byte body.
+        let mut body = Vec::new();
+        body.extend_from_slice(&tx);
+        body.extend_from_slice(&node_key.to_bytes());
+        body.extend_from_slice(&[0xAB; 7]);
+        let mut wire = seal_raw(&a_sk, &b_pk, MessageType::Ping, &body, 0);
+        match open(&b_sk, &mut wire).expect("an over-length ping must still open") {
+            Inbound::Ping {
+                claimed_node_key,
+                tx_id,
+                ..
+            } => {
+                assert_eq!(
+                    claimed_node_key,
+                    Some(node_key),
+                    "the 32-byte node key is read; the 7 trailing padding bytes are ignored"
+                );
                 assert_eq!(tx_id, tx);
             }
             other => panic!("expected ping, got {other:?}"),
