@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.35.7](https://github.com/GeiserX/tailscale-rs/compare/v0.35.6...v0.35.7) (2026-06-14)
+
+
+### Bug Fixes
+
+* **disco:** parse a pre-1.16 node-key-less Ping, drop it fail-closed ([#204](https://github.com/GeiserX/tailscale-rs/issues/204)) ([615757f](https://github.com/GeiserX/tailscale-rs/commit/615757f1abe4823cd7c4cdec757b770053b18d7a))
+
 ## [0.35.6](https://github.com/GeiserX/tailscale-rs/compare/v0.35.5...v0.35.6) (2026-06-14)
 
 
