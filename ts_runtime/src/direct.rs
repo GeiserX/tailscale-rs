@@ -62,9 +62,14 @@ const STUN_PROBE_INTERVAL_MIN: Duration = Duration::from_secs(20);
 const STUN_PROBE_INTERVAL_MAX: Duration = Duration::from_secs(26);
 
 /// A uniform random delay in `[STUN_PROBE_INTERVAL_MIN, STUN_PROBE_INTERVAL_MAX)`, the analog of Go
-/// `tstime.RandomDurationBetween(min, max)` (`min + rand.N(max-min)`). Uses the same non-crypto
-/// `rand` source as the multiderp reconnect backoff jitter (this is timing jitter, not key material,
-/// so it deliberately does not use the ring/crypto RNG).
+/// `tstime.RandomDurationBetween(min, max)` (`min + rand.N(max-min)`): both are uniform over the
+/// half-open interval. Uses the non-crypto thread RNG (`rand`), like the other timing jitters in this
+/// crate (e.g. the multiderp reconnect backoff) — this is timing jitter, not key material, so it
+/// deliberately does not use the ring/crypto RNG.
+///
+/// `random_range` panics on an empty range, so the bounds must stay ordered `MIN < MAX` (they are
+/// distinct compile-time constants today). If these ever become equal or runtime-configurable, guard
+/// the `MIN == MAX` case first (Go's `RandomDurationBetween` returns `min` there rather than panicking).
 fn stun_probe_delay() -> Duration {
     rand::random_range(STUN_PROBE_INTERVAL_MIN..STUN_PROBE_INTERVAL_MAX)
 }
