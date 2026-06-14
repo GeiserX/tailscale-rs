@@ -1712,6 +1712,7 @@ mod tests {
         ts_control::StateUpdate {
             session_handle: None,
             seq: 0,
+            keep_alive: false,
             derp: None,
             node: Some(fixture_node()),
             peer_update: None,

@@ -278,28 +278,47 @@ fn advance_session(session: &mut MapSession, update: &StateUpdate) {
     }
 }
 
+/// Whether a received [`StateUpdate`] is a **substantive** netmap response (not a bare keep-alive)
+/// and so should reset the reconnect backoff. The discriminator is the `KeepAlive` flag, NOT `seq`:
+/// `seq` is a map-session resume cursor that is only assigned within a named session and is left `0`
+/// on *every* response by a control plane that doesn't implement resumption (e.g. Headscale), so a
+/// substantive netmap can legitimately carry `seq == 0` — gating on `seq` would wrongly withhold the
+/// reset against such a server and let the backoff climb to its cap against a perfectly healthy
+/// control plane. This mirrors Go exactly: its map-poll backoff resets only in `UpdateFullNetmap`
+/// (`controlclient/auto.go`), reached only from `HandleNonKeepAliveMapResponse`, while a keep-alive
+/// is consumed with `metricMapResponseKeepAlives.Add(1); continue` (`direct.go`) and never resets —
+/// classified solely by the `KeepAlive` bool, never by `seq`. So a keep-alive-only-then-close
+/// control server escalates the backoff in both Go and this fork rather than pinning it at the
+/// bottom.
+fn frame_resets_backoff(update: &StateUpdate) -> bool {
+    !update.keep_alive
+}
+
 /// Reconnect backoff for the map-poll loop, mirroring Go's `util/backoff` (the schedule
 /// `controlclient`'s `mapRoutine` uses): the delay grows as `n²·10ms`, is capped at
 /// [`MAP_BACKOFF_MAX`], and is jittered to a uniform `[0.5×, 1.5×)` to avoid a thundering herd of
 /// clients reconnecting in lock-step against a control server that just came back. `n` increments
-/// on each consecutive failed/empty poll and resets to 0 once a poll has actually delivered a
-/// response, so a flaky control plane is retried with increasing spacing instead of a flat 2 Hz
-/// storm (or, on the clean-EOF path, an unthrottled hot loop).
+/// on each consecutive failed poll and resets to 0 once a poll has delivered a **substantive**
+/// (non-keep-alive) netmap response, so a flaky control plane is retried with increasing spacing
+/// instead of a flat 2 Hz storm (or, on the clean-EOF path, an unthrottled hot loop).
 ///
 /// This is the same shape as `ts_runtime`'s `DerpBackoff`; it is duplicated here (rather than
 /// shared) because `ts_control` is an upstream crate that cannot depend on `ts_runtime`, and the
 /// cap differs (Go passes `30*time.Second` to `NewBackoff` for `mapRoutine`, vs `5s` for the DERP
 /// readers).
 ///
-/// Residual (intentional, matches Go): because *any* received frame — including a bare keep-alive
-/// (`seq == 0`) — resets the schedule, a control server that sends one frame then closes the body
-/// can hold the backoff at the bottom and drive a reconnect every cycle. Go's `mapRoutine` has the
-/// identical property (it resets on any received `MapResponse`) and no max-consecutive-reconnect
-/// cap, relying on the fact that the node already has a machine-key relationship with the control
-/// server. The pre-fix behavior was a *busy* spin (zero handshake); the residual is now one full
-/// connect→TLS→Noise→register per cycle, symmetric in cost to the attacker — a large improvement,
-/// and faithful parity rather than a divergence. Gating the reset on `seq != 0` would punish a
-/// healthy keep-alive-only idle poll, so it is deliberately not done.
+/// Reset granularity matches Go: a bare keep-alive does **not** reset the schedule. Go resets its
+/// map-poll backoff only in `UpdateFullNetmap` (`controlclient/auto.go` `bo.Reset()`), which is
+/// reached only from `HandleNonKeepAliveMapResponse`; a keep-alive frame is consumed with
+/// `metricMapResponseKeepAlives.Add(1); continue` (`direct.go`) and never touches the backoff, after
+/// which Go runs `bo.BackOff` on the poll's end (a non-paused poll always backs off). So a control
+/// server that sends only keep-alives then closes the body escalates the `n²·10ms` schedule in both
+/// Go and this fork — it cannot pin the backoff at the bottom. The reset is gated at the receive
+/// site on [`frame_resets_backoff`], i.e. the `KeepAlive` flag — NOT on `seq` (which is a resume
+/// cursor a non-resuming control plane like Headscale leaves `0` on every response, including real
+/// netmaps; gating on `seq` would never reset against such a server). Go relies on the existing
+/// machine-key relationship (no max-consecutive-reconnect cap), and so does this fork: a substantive
+/// netmap resets and reconnects promptly, a keep-alive-only stream escalates.
 #[derive(Debug, Default)]
 struct ControlBackoff {
     n: u32,
@@ -563,14 +582,22 @@ async fn run_once(
                     break;
                 };
 
-                // A frame arrived, so the full connect→register→poll path is demonstrably working:
-                // record it so `run` resets the reconnect backoff (Go resets on a received netmap).
-                // This is what makes the clean-EOF backoff in `run` safe — a server that delivers
-                // frames and later drops reconnects promptly, while one that closes the body with
-                // zero frames never reaches here and keeps escalating. Keep-alives (seq 0) count
-                // too: they prove the long poll is live. The reset decision itself lives in
-                // `reconnect_delay_after_poll` (the single tested gate); here we only flag progress.
-                *received_frame = true;
+                // A *substantive* (non-keep-alive) frame proves the full
+                // connect→register→poll→netmap path works, so record it and `run` resets the
+                // reconnect backoff. This mirrors Go, which resets its map-poll backoff only in
+                // `UpdateFullNetmap` (control/controlclient/auto.go `bo.Reset()`), reached only via
+                // `HandleNonKeepAliveMapResponse`; a bare keep-alive does
+                // `metricMapResponseKeepAlives.Add(1); continue` in Go (direct.go) and never resets.
+                // The discriminator is the `KeepAlive` flag, NOT `seq` (see `frame_resets_backoff`) —
+                // a substantive netmap can carry `seq == 0` on a control plane without map-session
+                // resumption (e.g. Headscale), so gating on `seq` would wrongly withhold the reset.
+                // Gating on `!keep_alive` keeps a keep-alive-only-then-close control server from
+                // pinning the backoff at the bottom while still resetting on every real netmap. The
+                // reset decision itself lives in `reconnect_delay_after_poll` (the single tested
+                // gate); here we only flag substantive progress.
+                if frame_resets_backoff(&state_update) {
+                    *received_frame = true;
+                }
 
                 // Track the session cursor so a reconnect can resume after the last processed
                 // message instead of cold-restarting.
@@ -678,10 +705,17 @@ fn netmap_stream(
 mod tests {
     use super::*;
 
+    /// A substantive (non-keep-alive) response with the given session handle + seq.
     fn update(handle: Option<&str>, seq: i64) -> StateUpdate {
+        update_ka(handle, seq, false)
+    }
+
+    /// A response with an explicit keep-alive flag, for the backoff-reset gate tests.
+    fn update_ka(handle: Option<&str>, seq: i64, keep_alive: bool) -> StateUpdate {
         StateUpdate {
             session_handle: handle.map(ToOwned::to_owned),
             seq,
+            keep_alive,
             derp: None,
             node: None,
             peer_update: None,
@@ -751,6 +785,43 @@ mod tests {
 
         assert_eq!(session.handle, "sess-1");
         assert_eq!(session.seq, 10);
+    }
+
+    /// The backoff-reset gate keys on the `KeepAlive` flag, NOT on `seq`. A bare keep-alive must NOT
+    /// flag progress (else a keep-alive-only-then-close server pins the backoff at the bottom — the
+    /// deviation this fixes). A substantive netmap MUST reset **even when its `seq` is 0** — a
+    /// control plane without map-session resumption (e.g. Headscale) leaves `seq == 0` on every
+    /// response including full netmaps, so gating on `seq` would never reset the backoff against a
+    /// healthy such server (a silent regression worse than the original bug). Mirrors Go, which
+    /// classifies keep-alives solely by the `KeepAlive` bool and resets on every non-keep-alive
+    /// netmap (`UpdateFullNetmap`), never consulting `seq`.
+    #[test]
+    fn backoff_reset_keys_on_keepalive_not_seq() {
+        // Keep-alives never reset, regardless of seq or handle.
+        assert!(
+            !frame_resets_backoff(&update_ka(None, 0, true)),
+            "a keep-alive must not reset the backoff"
+        );
+        assert!(
+            !frame_resets_backoff(&update_ka(Some("sess-1"), 0, true)),
+            "a session-opening keep-alive must not reset the backoff"
+        );
+
+        // Substantive responses reset — INCLUDING seq == 0 (the Headscale / no-resumption case).
+        // This is the regression guard: gating on `seq != 0` would FAIL this assertion.
+        assert!(
+            frame_resets_backoff(&update_ka(None, 0, false)),
+            "a substantive netmap with seq==0 (Headscale-style) MUST reset the backoff"
+        );
+        assert!(
+            frame_resets_backoff(&update_ka(Some("sess-1"), 0, false)),
+            "a session-opening substantive netmap with seq==0 MUST reset the backoff"
+        );
+        // And the seq-bearing (SaaS resume-cursor) case still resets.
+        assert!(
+            frame_resets_backoff(&update_ka(Some("sess-1"), 1, false)),
+            "a substantive response with a resume cursor (seq==1) must reset the backoff"
+        );
     }
 
     #[test]
