@@ -136,6 +136,14 @@ pub struct Params {
     /// writer and the tracker reads the latest verified `Authority` on demand. `None` = no lock /
     /// disabled (admit all).
     pub(crate) tka_authority: watch::Sender<Option<Arc<ts_tka::Authority>>>,
+
+    /// Sender for the selected DERP home region (the **smoothed** `bestRecent` + hysteresis choice,
+    /// Go `report.PreferredDERP`). Created in [`Runtime::spawn`](crate::Runtime); the runner is the
+    /// sole writer and [`Multiderp`](crate::multiderp) holds the `Receiver`, so the local DERP relay
+    /// follows the SAME home the runner advertises to control — not the raw per-cycle latency
+    /// minimum (which would flap on jitter and disagree with the advertised home). `None` until the
+    /// first home is chosen.
+    pub(crate) home_region: watch::Sender<Option<ts_derp::RegionId>>,
 }
 
 #[doc(hidden)]
@@ -1342,7 +1350,13 @@ impl Message<DerpLatencyMeasurement> for ControlRunner {
             tracing::debug!(selected_region_id = ?selected_id, "updating home region");
         }
         self.home_region = Some((selected_id, selected_latency));
+        // Advertise the smoothed home to control AND drive the local DERP relay to the same region
+        // (Go `report.PreferredDERP` feeds both). `send_replace` wakes the watch on every send (it
+        // does NOT coalesce same-value writes), so Multiderp's bridge sees a `SetHomeRegion` each
+        // cycle; the de-dup is one layer down — `home_transition` returns `Unchanged` for a
+        // re-selection of the current home, so the relay only churns on an actual home change.
         self.client.set_home_region(selected_id, iter).await;
+        self.params.home_region.send_replace(Some(selected_id));
     }
 }
 
