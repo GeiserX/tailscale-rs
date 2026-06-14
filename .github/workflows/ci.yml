@@ -119,13 +119,19 @@ jobs:
         # cache key carries `components=none` for this lane), so on a cache hit setup-rust SKIPS the
         # component install and a bare `rustup component add` against the default toolchain left
         # `cargo fmt` reporting "the 'cargo-fmt' binary ... is not applicable to the '<ver>'
-        # toolchain". `--force` re-fetches a component that a partial cache recorded as present but
-        # whose binary is missing; the verify line then fails the job loudly rather than letting a
-        # broken-rustfmt runner silently red the lane.
+        # toolchain". We must re-fetch a component a partial cache recorded as present but whose
+        # binary is missing; `rustup component add` alone is a no-op ("already installed") in that
+        # state and would NOT repair it. `rustup component add --force` did this, but rustup 1.95.0
+        # removed the `--force` flag (`error: unexpected argument '--force'`), which silently red the
+        # whole lane once the runner's rustup self-updated. So remove-then-add instead: the remove
+        # clears any stale/partial record (|| true — absent is fine) and the add re-fetches cleanly.
+        # Version-agnostic (no removed flags). The verify lines then fail the job loudly rather than
+        # letting a broken-rustfmt runner silently red the lane.
         run: |
           ver="$(rustup show active-toolchain | awk '{print $1}')"
           echo "active toolchain: ${ver}"
-          rustup component add --toolchain "${ver}" --force clippy rustfmt
+          rustup component remove --toolchain "${ver}" clippy rustfmt || true
+          rustup component add --toolchain "${ver}" clippy rustfmt
           cargo +"${ver}" fmt --version
           cargo +"${ver}" clippy --version
       - name: Check formatting (cargo fmt)
