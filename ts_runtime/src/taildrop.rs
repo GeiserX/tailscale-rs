@@ -315,6 +315,20 @@ impl TaildropStore {
             if !age_ok {
                 continue;
             }
+            // Final guard against the snapshot TOCTOU: re-check in-flight membership under the lock
+            // immediately before deleting, so a transfer that claimed this base AFTER the upfront
+            // snapshot (the microsecond window between the snapshot and here) still spares its
+            // partial. The mtime check above already makes a wrong delete unreachable in practice (a
+            // live partial is < delete_delay old), but this closes the window completely and cheaply
+            // (one lock per aged candidate, which is rare).
+            if self
+                .in_flight
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains(base)
+            {
+                continue;
+            }
             match std::fs::remove_file(entry.path()) {
                 Ok(()) => {
                     deleted += 1;
@@ -347,8 +361,11 @@ impl TaildropStore {
     ///
     /// The retained `.partial` is resumable only by a peer that issues a ranged retry (an `offset > 0`
     /// PUT); a sender that always restarts at `offset == 0` will instead hit the in-progress-conflict
-    /// path ([`TaildropError::FileExists`]) until the stale partial is cleared. There is no automatic
-    /// reaper for an abandoned partial yet (Go's `fileDeleter` GCs one after ~1h); tracked separately.
+    /// path ([`TaildropError::FileExists`]) until the stale partial is cleared. A permanently-abandoned
+    /// partial is reclaimed by the background reaper after [`DELETE_DELAY`] (Go's `fileDeleter`
+    /// equivalent — see [`reap_abandoned_partials`](Self::reap_abandoned_partials) /
+    /// [`spawn_partial_reaper`]), which also clears that `offset == 0` conflict once the stale partial
+    /// ages out.
     pub async fn put_file<R>(
         &self,
         name: &str,
@@ -1084,6 +1101,58 @@ mod tests {
             "after the claim drops, the aged partial is reaped"
         );
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The background reaper task: (1) does NOT reap at startup, and (2) terminates when shutdown
+    /// flips true. With the real DELETE_DELAY (1h) interval, the first real sweep is an hour out, so
+    /// within this millisecond-scale test no sweep ever fires — which is exactly what proves both
+    /// "the startup tick is skipped" (an aged partial present at start survives) and "the task is
+    /// parked on the interval, woken only by shutdown". (`test-util`/paused-time is intentionally not
+    /// pulled into this crate's deps, so this uses real time and the fact that 1h >> the test.)
+    #[tokio::test]
+    async fn reaper_task_skips_startup_then_terminates_on_shutdown() {
+        let root = tmp_root();
+        let store = Arc::new(TaildropStore::new(&root).unwrap());
+        // A partial present at boot — it must survive (no startup reap fires within the test window).
+        std::fs::write(root.join("boot.bin.partial"), b"x").unwrap();
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let handle = spawn_partial_reaper(store.clone(), rx);
+
+        // Give the task a moment to reach its select!; the first real sweep is DELETE_DELAY (1h) out,
+        // so nothing is reaped here.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            root.join("boot.bin.partial").exists(),
+            "no reap before the first real sweep (startup tick is skipped; first sweep is 1h out)"
+        );
+
+        // Flip shutdown: the task must terminate via its select! shutdown arm, not hang on the 1h
+        // interval. If the shutdown arm were broken this `timeout` would elapse (the next tick is ~1h
+        // away), so the timeout firing IS the regression signal.
+        tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("reaper must terminate on shutdown (not wait for the 1h interval)")
+            .expect("reaper task must not panic");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A reaper spawned when shutdown is ALREADY true terminates on its first loop iteration
+    /// (`watch::Receiver::wait_for` returns immediately when the predicate already holds), rather
+    /// than waiting a full DELETE_DELAY (1h) for the first tick.
+    #[tokio::test]
+    async fn reaper_task_terminates_when_shutdown_already_set() {
+        let root = tmp_root();
+        let store = Arc::new(TaildropStore::new(&root).unwrap());
+        let (_tx, rx) = tokio::sync::watch::channel(true); // already shut down
+        let handle = spawn_partial_reaper(store, rx);
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("a reaper spawned post-shutdown must exit promptly, not wait the 1h interval")
+            .expect("reaper task must not panic");
         std::fs::remove_dir_all(&root).ok();
     }
 }
