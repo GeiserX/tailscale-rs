@@ -16,7 +16,8 @@ use url::Url;
 use crate::{
     Error, ServerConnInfo, frame,
     frame::{
-        ClientInfo, FrameType, Health, PeerGone, Ping, RawFrame, Restarting, ServerInfo, ServerKey,
+        ClientInfo, FrameType, Health, PeerGoneReason, Ping, RawFrame, Restarting, ServerInfo,
+        ServerKey,
     },
 };
 
@@ -192,20 +193,36 @@ where
                     tracing::trace!(payload = ?pong.payload, "pong");
                 }
                 FrameType::PeerGone => {
-                    // The body is server-originated and only length-capped (no minimum), so a
-                    // malicious/buggy/MITM server can send a body shorter than `PeerGone` (33 bytes:
-                    // 32-byte key + 1-byte reason). `as_type` returns `None` then; a raw `.unwrap()`
-                    // would panic and unwind the DERP region task, severing the relay for DERP-only
-                    // peers. Drop the short frame and keep reading, exactly as Go's `derp_client`
-                    // does (`if n < keyLen { logf; continue }`) and as the `Ping` arm above.
-                    let Some((gone, _rest)) = frame.as_type::<PeerGone>() else {
-                        tracing::warn!("dropping short derp peer-gone frame");
+                    // Wire body: a 32-byte peer key, optionally followed by a 1-byte reason code.
+                    // The reason byte is a later protocol addition, so a 32-byte (reason-less) body
+                    // is valid and the reason defaults to `Disconnected` — exactly as Go's
+                    // `derp_client` does: `if n < KeyLen { continue }`, then
+                    // `reason := PeerGoneReasonDisconnected; if n > KeyLen { reason = ..b[KeyLen] }`.
+                    // KeyLen is 32, NOT 33 — an earlier revision wrongly required the full 33-byte
+                    // `PeerGone` struct via `as_type`, silently dropping a legitimate 32-byte
+                    // (reason-less) PeerGone. A body shorter than the 32-byte key is server junk:
+                    // drop it and keep reading rather than panicking and unwinding the DERP region
+                    // task (severing the relay for DERP-only peers).
+                    const KEY_LEN: usize = 32;
+                    let body = frame.raw_body;
+                    let Some(key_bytes) = body.get(..KEY_LEN) else {
+                        tracing::warn!(len = body.len(), "dropping short derp peer-gone frame");
                         continue;
                     };
+                    let key = NodePublicKey::from(
+                        <[u8; KEY_LEN]>::try_from(key_bytes).expect("slice is exactly KEY_LEN"),
+                    );
+                    // Reason byte is optional and parsed totally (any byte maps to a
+                    // `PeerGoneReason`, never an error), so an unknown/future reason code never
+                    // tears down the loop — Go casts the byte unvalidated.
+                    let reason = body
+                        .get(KEY_LEN)
+                        .map(|&b| PeerGoneReason::from(b))
+                        .unwrap_or(PeerGoneReason::Disconnected);
 
                     tracing::debug!(
-                        peer = %gone.key,
-                        reason = %gone.reason()?,
+                        peer = %key,
+                        %reason,
                         "peer gone from derp server"
                     );
                 }
@@ -524,17 +541,62 @@ mod tests {
         assert_eq!(pkt.as_ref(), b"after-short");
     }
 
-    /// Regression (tsr-8w0): a `PeerGone` frame shorter than its 33-byte body (32-byte key + 1-byte
-    /// reason) must be dropped, not panic. Feed a too-short PeerGone then EOF: the loop must skip it
-    /// and surface the EOF (`UnexpectedEof`), proving the short PeerGone was not fatal.
+    /// Regression (tsr-8w0): a `PeerGone` frame shorter than the 32-byte key must be dropped, not
+    /// panic. Feed a too-short PeerGone then EOF: the loop must skip it and surface the EOF
+    /// (`UnexpectedEof`), proving the short PeerGone was not fatal.
     #[tokio::test]
     async fn short_peer_gone_is_dropped_not_fatal() {
-        // 10-byte body: shorter than the 33-byte PeerGone → as_type None.
+        // 10-byte body: shorter than the 32-byte key → dropped.
         let client = client_fed(&[(FrameType::PeerGone, &[0u8; 10])]).await;
         match client.recv_one().await {
             Err(Error::IoFailure(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
             other => panic!("expected EOF after a skipped short PeerGone frame, got {other:?}"),
         }
+    }
+
+    /// A 32-byte (reason-less) PeerGone is the older, valid wire form: Go's `derp_client` accepts it
+    /// (`if n < KeyLen { continue }` with KeyLen=32, reason defaulted). It must NOT be dropped — a
+    /// prior revision required the full 33-byte struct and silently dropped this. Feed a 32-byte
+    /// PeerGone then a valid packet: the packet must be delivered, proving the PeerGone was consumed
+    /// (not dropped, not fatal) and the loop continued.
+    #[tokio::test]
+    async fn reasonless_32_byte_peer_gone_is_accepted_then_continues() {
+        let src: NodePublicKey = [9u8; 32].into();
+        let mut good = Vec::new();
+        good.extend_from_slice(&src.to_bytes());
+        good.extend_from_slice(b"after-gone");
+        let client = client_fed(&[
+            (FrameType::PeerGone, &[0xABu8; 32]), // 32-byte key, no reason byte
+            (FrameType::RecvPacket, &good),
+        ])
+        .await;
+        let (got_src, pkt) = client.recv_one().await.expect(
+            "a 32-byte reason-less PeerGone must be accepted, then the next packet delivered",
+        );
+        assert_eq!(got_src, src);
+        assert_eq!(pkt.as_ref(), b"after-gone");
+    }
+
+    /// A PeerGone carrying an UNKNOWN reason byte (e.g. a future code, or Go's mesh `0xf0`) must NOT
+    /// tear down the recv loop: Go casts the byte unvalidated. A prior revision errored the whole
+    /// loop on any byte other than 0x00/0x01. Feed a 33-byte PeerGone with reason 0xee then a valid
+    /// packet: the packet must be delivered, proving the unknown reason was tolerated.
+    #[tokio::test]
+    async fn peer_gone_with_unknown_reason_is_not_fatal() {
+        let src: NodePublicKey = [9u8; 32].into();
+        let mut gone = vec![0xABu8; 32];
+        gone.push(0xee); // unknown reason byte
+        let mut good = Vec::new();
+        good.extend_from_slice(&src.to_bytes());
+        good.extend_from_slice(b"after-gone");
+        let client =
+            client_fed(&[(FrameType::PeerGone, &gone), (FrameType::RecvPacket, &good)]).await;
+        let (got_src, pkt) = client
+            .recv_one()
+            .await
+            .expect("an unknown PeerGone reason must be tolerated, then the next packet delivered");
+        assert_eq!(got_src, src);
+        assert_eq!(pkt.as_ref(), b"after-gone");
     }
 
     /// A region whose only server has both IP families disabled: `dial_region_tls` returns
