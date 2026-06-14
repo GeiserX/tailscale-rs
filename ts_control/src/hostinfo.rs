@@ -227,18 +227,37 @@ fn uname_field(field: UnameField) -> String {
     }
 }
 
-/// Best-effort `(distro, distro_version, distro_code_name)` from `/etc/os-release`, mirroring the
-/// common path of Go `hostinfo_linux.go` `linuxVersionMeta`: `Distro` = `ID`, `DistroVersion` =
-/// `VERSION_ID`, `DistroCodeName` = `VERSION_CODENAME`. All empty off Linux or when the file is
-/// absent/unreadable (e.g. a container with no os-release). We read the standard `/etc/os-release`
-/// only; Go's special-casing for Synology/OpenWrt/QNAP/Debian-version files is out of scope for the
+/// Best-effort `(distro, distro_version, distro_code_name)` from `/etc/os-release`, mirroring
+/// Go `hostinfo_linux.go` `linuxVersionMeta` for the standard-distro path: `Distro` = `ID`,
+/// `DistroVersion` = `VERSION_ID`, `DistroCodeName` = `VERSION_CODENAME`, plus the **Debian
+/// refinement** (`/etc/debian_version` overriding the bare `VERSION_ID`). All empty off Linux or when
+/// os-release is absent/unreadable (e.g. a container with no os-release). Go's appliance-only
+/// special-casing (Synology/OpenWrt/QNAP/CentOS-6/`PRETTY_NAME` fallback) is out of scope for the
 /// fork's Linux-VPS / container deployment, where os-release is present and authoritative.
 #[cfg(target_os = "linux")]
 fn distro_meta() -> (String, String, String) {
     let Ok(contents) = std::fs::read_to_string("/etc/os-release") else {
         return (String::new(), String::new(), String::new());
     };
-    parse_os_release(&contents)
+    let (distro, mut version, mut code_name) = parse_os_release(&contents);
+
+    // Debian refinement (Go `linuxVersionMeta` `case "debian"`): os-release `VERSION_ID` on Debian is
+    // just the major (e.g. `12`), but a real tailscaled sends the point release from
+    // `/etc/debian_version` (e.g. `12.5`) — sending `12` where Go sends `12.5` is a wire fingerprint.
+    // A digit-leading value is the version; a non-numeric one (e.g. `trixie/sid` on testing) is the
+    // code name when none was set. Debian is a primary VPS target, so this is in scope.
+    if distro == "debian"
+        && let Ok(dv) = std::fs::read_to_string("/etc/debian_version")
+    {
+        let dv = dv.trim();
+        if dv.starts_with(|c: char| c.is_ascii_digit()) {
+            version = dv.to_string();
+        } else if code_name.is_empty() && !dv.is_empty() {
+            code_name = dv.to_string();
+        }
+    }
+
+    (distro, version, code_name)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -261,10 +280,13 @@ fn parse_os_release(contents: &str) -> (String, String, String) {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
+        // Strip optional surrounding quotes. A single `trim_matches` with a char-set closure is the
+        // exact analog of Go's `strings.Trim(v, "\"'")` cutset (removes any `"`/`'` from both ends in
+        // one pass); chaining `trim_matches('"')` then `trim_matches('\'')` would mis-handle a
+        // mixed-nested `'"x"'` (os-release never emits that, but match Go precisely anyway).
         let value = value
             .trim()
-            .trim_matches('"')
-            .trim_matches('\'')
+            .trim_matches(|c| c == '"' || c == '\'')
             .to_string();
         match key.trim() {
             "ID" => id = value,
