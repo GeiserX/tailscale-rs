@@ -128,6 +128,10 @@ pub struct Runtime {
     /// the startup config. [`Runtime::set_advertise_routes`] and [`set_advertise_exit_node`] each
     /// mutate their part under this lock then re-send the composed set, so the two compose.
     advertise: std::sync::Mutex<AdvertiseState>,
+    /// Background task that periodically reaps abandoned taildrop `.partial` files (Go
+    /// `feature/taildrop/delete.go` `fileDeleter`). `None` when no taildrop store is configured.
+    /// Aborted on [`Drop`] so it cannot outlive the runtime (the `reauth_bridge` pattern).
+    taildrop_reaper: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Runtime {
@@ -335,6 +339,12 @@ impl Runtime {
             kameo::mailbox::unbounded(),
         );
 
+        // Spawn the taildrop partial-reaper if a store is configured; it sweeps abandoned `.partial`
+        // files every `DELETE_DELAY` and exits on shutdown (the handle is aborted in `Drop`).
+        let taildrop_reaper = env.taildrop_store.as_ref().map(|store| {
+            crate::taildrop::spawn_partial_reaper(store.clone(), shutdown_tx.subscribe())
+        });
+
         Ok(Self {
             control,
             dataplane,
@@ -354,6 +364,7 @@ impl Runtime {
             state_rx,
             cap_grants_rx,
             advertise,
+            taildrop_reaper,
         })
     }
 
@@ -1232,6 +1243,13 @@ impl Runtime {
 
 impl Drop for Runtime {
     fn drop(&mut self) {
+        // Stop the taildrop reaper so it cannot outlive the runtime (the `reauth_bridge` pattern). It
+        // also self-exits when `shutdown` flips below, but aborting is immediate and covers the
+        // already-shutdown early-return path too.
+        if let Some(reaper) = self.taildrop_reaper.take() {
+            reaper.abort();
+        }
+
         // We must have already run `graceful_shutdown`: on the happy path, this does nothing, but
         // if it timed out, we need to make sure the actors are dead so we don't leak them and their
         // dependents.
