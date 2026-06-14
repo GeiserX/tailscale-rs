@@ -841,7 +841,9 @@ mod tests {
 
     /// `from_serde` must carry `recorders` and `onRecordingFailure` into the domain (the fields
     /// were previously parsed off the wire but DROPPED — the tsr-0h2 bypass). The refusal message
-    /// prefers `rejectSessionWithMessage`.
+    /// prefers `RejectSessionWithMessage`. NB: the `onRecordingFailure` sub-object's fields are
+    /// PascalCase on the wire (Go declares them with empty-name `json:",omitempty"` tags), so this
+    /// fixture uses control's real PascalCase keys.
     #[test]
     fn from_serde_carries_recorders_and_on_recording_failure() {
         let wire = r#"{
@@ -853,8 +855,8 @@ mod tests {
                         "accept": true,
                         "recorders": ["1.2.3.4:5678", "5.6.7.8:9000"],
                         "onRecordingFailure": {
-                            "rejectSessionWithMessage": "recording required by policy",
-                            "notifyURL": "https://example.com/notify"
+                            "RejectSessionWithMessage": "recording required by policy",
+                            "NotifyURL": "https://example.com/notify"
                         }
                     }
                 }
@@ -889,7 +891,7 @@ mod tests {
         }
     }
 
-    /// Refusal-message precedence: with no `rejectSessionWithMessage`, fall back to the action
+    /// Refusal-message precedence: with no `RejectSessionWithMessage`, fall back to the action
     /// `message`.
     #[test]
     fn recording_refusal_message_falls_back_to_action_message() {
@@ -901,7 +903,7 @@ mod tests {
         };
         assert_eq!(action.recording_refusal_message(), "see your admin");
 
-        // An empty rejectSessionWithMessage must NOT mask the action message fallback.
+        // An empty RejectSessionWithMessage must NOT mask the action message fallback.
         let action = SshAction {
             on_recording_failure: Some(SshRecorderFailureAction::default()),
             ..action
