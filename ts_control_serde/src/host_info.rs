@@ -19,12 +19,22 @@ use crate::{
 #[serde(rename_all = "PascalCase")]
 pub struct HostInfo<'a> {
     /// Version of the Tailscale code running on this Tailscale node, in long format.
+    ///
+    /// Wire key is `IPNVersion`, NOT the `rename_all = "PascalCase"` default `IpnVersion`: Go's
+    /// `tailcfg.Hostinfo.IPNVersion` has an empty-name `json:",omitzero"` tag, so it marshals as the
+    /// PascalCase Go field name verbatim — `IPNVersion`, preserving the `IPN` acronym. The serde
+    /// `PascalCase` rule lowercases acronyms (`Ipn`), which a strict Go decoder treats as an unknown
+    /// field and drops — so the explicit `rename` is required for the value to land at all (and an
+    /// `IpnVersion` key is itself a not-Go tell). Same reason `os`/`os_version` are renamed below.
+    #[serde(rename = "IPNVersion")]
     pub ipn_version: &'a str,
     /// Logtail ID of the Tailscale frontend (CLI) instance.
     pub frontend_log_id: &'a str,
     /// Logtail ID of the Tailscale frontend (daemon) instance.
     pub backend_log_id: &'a str,
-    /// A string indicating the operating system running on the Tailscale host.
+    /// A string indicating the operating system running on the Tailscale host. Wire key `OS` (Go
+    /// `tailcfg.Hostinfo.OS`, empty-name tag → verbatim `OS`), not the `PascalCase` default `Os`.
+    #[serde(rename = "OS")]
     pub os: &'a str,
     /// The version of the operating system, if available. The format is highly OS, version, and
     /// Tailscale version-specific.
@@ -36,6 +46,10 @@ pub struct HostInfo<'a> {
     /// - Linux (before Tailscale 1.32): "Debian 10.4; kernel=5.10.0-17-amd64; container; env=kn"
     /// - Linux (Tailscale 1.32+): "5.10.0-17-amd64" (kernel version only)
     /// - Windows: "10.0.19044.1889"
+    ///
+    /// Wire key `OSVersion` (Go `tailcfg.Hostinfo.OSVersion`, empty-name tag → verbatim `OSVersion`),
+    /// not the `PascalCase` default `OsVersion`.
+    #[serde(rename = "OSVersion")]
     pub os_version: &'a str,
 
     /// Indicates whether or not this Tailscale node is running inside a container. Detection is
@@ -206,6 +220,61 @@ mod tests {
         let json = r#"{}"#;
         let host_info: HostInfo = serde_json::from_str(json).unwrap();
         assert!(!host_info.peer_relay);
+    }
+
+    #[test]
+    fn acronym_fields_use_go_wire_keys_not_pascalcase_default() {
+        // Go `tailcfg.Hostinfo` uses empty-name `json:",omitzero"` tags, so these marshal as the
+        // PascalCase Go field name VERBATIM, preserving the acronym: `IPNVersion`, `OS`, `OSVersion`.
+        // The struct's `rename_all = "PascalCase"` would instead lowercase the acronyms to
+        // `IpnVersion`/`Os`/`OsVersion` — keys a strict Go decoder treats as unknown and DROPS, so the
+        // advertised value would never land at control (and the wrong-cased key is itself a not-Go
+        // tell). The per-field `#[serde(rename)]` overrides fix that. Distro* are regular words, so the
+        // PascalCase default is already correct for them.
+        let hi = HostInfo {
+            ipn_version: "1.100.0",
+            os: "linux",
+            os_version: "6.8.0",
+            distro: "ubuntu",
+            distro_version: "24.04",
+            distro_code_name: "noble",
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&hi).unwrap();
+        // The acronym keys must be EXACTLY Go's, and the mangled PascalCase forms must be ABSENT.
+        assert_eq!(
+            v.get("IPNVersion").and_then(|x| x.as_str()),
+            Some("1.100.0")
+        );
+        assert_eq!(v.get("OS").and_then(|x| x.as_str()), Some("linux"));
+        assert_eq!(v.get("OSVersion").and_then(|x| x.as_str()), Some("6.8.0"));
+        assert!(
+            v.get("IpnVersion").is_none(),
+            "wrong-cased IpnVersion must not appear"
+        );
+        assert!(v.get("Os").is_none(), "wrong-cased Os must not appear");
+        assert!(
+            v.get("OsVersion").is_none(),
+            "wrong-cased OsVersion must not appear"
+        );
+        // Distro* (regular words) are correct under the PascalCase default.
+        assert_eq!(v.get("Distro").and_then(|x| x.as_str()), Some("ubuntu"));
+        assert_eq!(
+            v.get("DistroVersion").and_then(|x| x.as_str()),
+            Some("24.04")
+        );
+        assert_eq!(
+            v.get("DistroCodeName").and_then(|x| x.as_str()),
+            Some("noble")
+        );
+
+        // Decode side: control SENDS Go's keys, so we must also read them back (the rename governs
+        // both directions). Round-trip through the real Go key names.
+        let json = r#"{"IPNVersion":"1.100.0","OS":"linux","OSVersion":"6.8.0"}"#;
+        let back: HostInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(back.ipn_version, "1.100.0");
+        assert_eq!(back.os, "linux");
+        assert_eq!(back.os_version, "6.8.0");
     }
 
     #[test]

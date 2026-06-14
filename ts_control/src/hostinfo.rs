@@ -52,12 +52,22 @@ pub struct HostInfoData {
     pub go_version: String,
     /// `uname -m`-style machine (e.g. `x86_64`, `aarch64`).
     pub machine: String,
+    /// Linux distribution id (`HostInfo.Distro`, e.g. `ubuntu`/`debian`), from `/etc/os-release`'s
+    /// `ID`. Empty off Linux or when undetermined.
+    pub distro: String,
+    /// Distribution version (`HostInfo.DistroVersion`, e.g. `24.04`), from `/etc/os-release`'s
+    /// `VERSION_ID`. Empty off Linux or when undetermined.
+    pub distro_version: String,
+    /// Distribution code name (`HostInfo.DistroCodeName`, e.g. `noble`/`jammy`), from
+    /// `/etc/os-release`'s `VERSION_CODENAME`. Empty off Linux or when undetermined.
+    pub distro_code_name: String,
 }
 
 impl HostInfoData {
     /// Detect the host environment, mirroring the subset of Go `hostinfo.New()` we can fill
-    /// truthfully without platform-specific probing beyond `uname`.
+    /// truthfully without platform-specific probing beyond `uname` and `/etc/os-release`.
     pub fn detect() -> Self {
+        let (distro, distro_version, distro_code_name) = distro_meta();
         Self {
             ipn_version: ipn_version_long(),
             os: go_style_os(),
@@ -65,6 +75,9 @@ impl HostInfoData {
             go_arch: go_style_arch(),
             go_version: GO_VERSION.to_string(),
             machine: uname_machine(),
+            distro,
+            distro_version,
+            distro_code_name,
         }
     }
 }
@@ -106,10 +119,21 @@ fn go_style_arch() -> String {
     }
 }
 
-/// Best-effort OS version string. On unix we read `uname` release (`uname -r`-equivalent), matching
-/// Go's "kernel version only" `OSVersion` on Linux (Tailscale 1.32+). Empty when undetermined —
-/// which is still better than the prior always-empty `OS`+`OSVersion` pair.
-#[cfg(unix)]
+/// Best-effort OS version string.
+///
+/// On macOS, Go reports the **marketing/product** version (e.g. `15.6.1`) via
+/// `sysctl kern.osproductversion` (`hostinfo_darwin.go` `osVersionDarwin`), NOT the Darwin kernel
+/// release. The kernel release (`uname -r`, e.g. `24.6.0`) is itself an Apple tell and diverges from
+/// what a real `tailscaled` macOS node sends, so we must read the product version here.
+///
+/// On Linux (and other unix), Go's `OSVersion` is the kernel release (Tailscale 1.32+), which
+/// `uname -r` gives directly. Empty when undetermined — still better than the prior always-empty pair.
+#[cfg(target_os = "macos")]
+fn os_version() -> String {
+    macos_product_version().unwrap_or_else(|| uname_field(UnameField::Release))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 fn os_version() -> String {
     uname_field(UnameField::Release)
 }
@@ -117,6 +141,47 @@ fn os_version() -> String {
 #[cfg(not(unix))]
 fn os_version() -> String {
     String::new()
+}
+
+/// The macOS product (marketing) version from `sysctl kern.osproductversion` (e.g. `15.6.1`), the
+/// same source Go's `osVersionDarwin` uses. `None` on any sysctl error so the caller falls back to
+/// the kernel release rather than reporting an empty `OSVersion`.
+#[cfg(target_os = "macos")]
+fn macos_product_version() -> Option<String> {
+    let name = c"kern.osproductversion";
+    // SAFETY: a sysctl string read. First call with a null `oldp` to learn the buffer size, then a
+    // second call to fill a buffer of exactly that size. `name` is a valid NUL-terminated C string.
+    unsafe {
+        let mut len: libc::size_t = 0;
+        if libc::sysctlbyname(
+            name.as_ptr(),
+            core::ptr::null_mut(),
+            &mut len,
+            core::ptr::null_mut(),
+            0,
+        ) != 0
+            || len == 0
+        {
+            return None;
+        }
+        let mut buf = alloc::vec![0u8; len];
+        if libc::sysctlbyname(
+            name.as_ptr(),
+            buf.as_mut_ptr().cast::<libc::c_void>(),
+            &mut len,
+            core::ptr::null_mut(),
+            0,
+        ) != 0
+        {
+            return None;
+        }
+        // `len` now includes the trailing NUL; trim it (and anything past the first NUL).
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        if end == 0 {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&buf[..end]).into_owned())
+    }
 }
 
 /// `uname -m`-style machine architecture (the kernel's hardware name, e.g. `x86_64`/`aarch64`),
@@ -160,6 +225,77 @@ fn uname_field(field: UnameField) -> String {
         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
         String::from_utf8_lossy(&bytes[..end]).into_owned()
     }
+}
+
+/// Best-effort `(distro, distro_version, distro_code_name)` from `/etc/os-release`, mirroring
+/// Go `hostinfo_linux.go` `linuxVersionMeta` for the standard-distro path: `Distro` = `ID`,
+/// `DistroVersion` = `VERSION_ID`, `DistroCodeName` = `VERSION_CODENAME`, plus the **Debian
+/// refinement** (`/etc/debian_version` overriding the bare `VERSION_ID`). All empty off Linux or when
+/// os-release is absent/unreadable (e.g. a container with no os-release). Go's appliance-only
+/// special-casing (Synology/OpenWrt/QNAP/CentOS-6/`PRETTY_NAME` fallback) is out of scope for the
+/// fork's Linux-VPS / container deployment, where os-release is present and authoritative.
+#[cfg(target_os = "linux")]
+fn distro_meta() -> (String, String, String) {
+    let Ok(contents) = std::fs::read_to_string("/etc/os-release") else {
+        return (String::new(), String::new(), String::new());
+    };
+    let (distro, mut version, mut code_name) = parse_os_release(&contents);
+
+    // Debian refinement (Go `linuxVersionMeta` `case "debian"`): os-release `VERSION_ID` on Debian is
+    // just the major (e.g. `12`), but a real tailscaled sends the point release from
+    // `/etc/debian_version` (e.g. `12.5`) — sending `12` where Go sends `12.5` is a wire fingerprint.
+    // A digit-leading value is the version; a non-numeric one (e.g. `trixie/sid` on testing) is the
+    // code name when none was set. Debian is a primary VPS target, so this is in scope.
+    if distro == "debian"
+        && let Ok(dv) = std::fs::read_to_string("/etc/debian_version")
+    {
+        let dv = dv.trim();
+        if dv.starts_with(|c: char| c.is_ascii_digit()) {
+            version = dv.to_string();
+        } else if code_name.is_empty() && !dv.is_empty() {
+            code_name = dv.to_string();
+        }
+    }
+
+    (distro, version, code_name)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn distro_meta() -> (String, String, String) {
+    (String::new(), String::new(), String::new())
+}
+
+/// Parse the `(ID, VERSION_ID, VERSION_CODENAME)` triple from `/etc/os-release` content. Each line is
+/// `KEY=VALUE`; values may be optionally double- or single-quoted (the os-release spec), so quotes
+/// are stripped. Unknown keys, blanks, and comments are ignored. Factored out so the parsing is
+/// unit-testable without a real `/etc/os-release`.
+#[cfg(target_os = "linux")]
+fn parse_os_release(contents: &str) -> (String, String, String) {
+    let (mut id, mut version_id, mut codename) = (String::new(), String::new(), String::new());
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        // Strip optional surrounding quotes. A single `trim_matches` with a char-set closure is the
+        // exact analog of Go's `strings.Trim(v, "\"'")` cutset (removes any `"`/`'` from both ends in
+        // one pass); chaining `trim_matches('"')` then `trim_matches('\'')` would mis-handle a
+        // mixed-nested `'"x"'` (os-release never emits that, but match Go precisely anyway).
+        let value = value
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .to_string();
+        match key.trim() {
+            "ID" => id = value,
+            "VERSION_ID" => version_id = value,
+            "VERSION_CODENAME" => codename = value,
+            _ => {}
+        }
+    }
+    (id, version_id, codename)
 }
 
 #[cfg(test)]
@@ -232,6 +368,9 @@ mod tests {
             go_arch: &h.go_arch,
             go_version: &h.go_version,
             machine: &h.machine,
+            distro: &h.distro,
+            distro_version: &h.distro_version,
+            distro_code_name: &h.distro_code_name,
             package: PACKAGE_TSNET,
             userspace: Some(true),
             ..Default::default()
@@ -241,7 +380,70 @@ mod tests {
         assert_eq!(hi.go_arch, h.go_arch);
         assert_eq!(hi.go_version, h.go_version);
         assert_eq!(hi.machine, h.machine);
+        assert_eq!(hi.distro, h.distro);
+        assert_eq!(hi.distro_version, h.distro_version);
+        assert_eq!(hi.distro_code_name, h.distro_code_name);
         assert_eq!(hi.package, "tsnet");
         assert_eq!(hi.userspace, Some(true));
+    }
+
+    /// `/etc/os-release` parsing mirrors Go `linuxVersionMeta`: Distro=ID, DistroVersion=VERSION_ID,
+    /// DistroCodeName=VERSION_CODENAME, with quotes stripped and unknown keys/comments/blanks ignored.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_os_release_extracts_id_version_codename() {
+        // A realistic Ubuntu 24.04 os-release (quoted + unquoted values, extra keys, a comment).
+        let sample = r#"
+# /etc/os-release
+PRETTY_NAME="Ubuntu 24.04.1 LTS"
+NAME="Ubuntu"
+ID=ubuntu
+ID_LIKE=debian
+VERSION_ID="24.04"
+VERSION_CODENAME=noble
+HOME_URL="https://www.ubuntu.com/"
+"#;
+        let (id, ver, code) = parse_os_release(sample);
+        assert_eq!(id, "ubuntu");
+        assert_eq!(ver, "24.04");
+        assert_eq!(code, "noble");
+    }
+
+    /// A single-quoted value and a missing VERSION_CODENAME (some distros omit it) parse cleanly:
+    /// quotes stripped, the absent field left empty (so it is omitted from the wire, not sent as "").
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_os_release_handles_single_quotes_and_missing_fields() {
+        let sample = "ID='debian'\nVERSION_ID=\"12\"\n";
+        let (id, ver, code) = parse_os_release(sample);
+        assert_eq!(id, "debian");
+        assert_eq!(ver, "12");
+        assert_eq!(
+            code, "",
+            "absent VERSION_CODENAME stays empty (wire-omitted)"
+        );
+    }
+
+    /// On macOS, `os_version` must be the marketing/product version (e.g. `15.6.1`), NOT the Darwin
+    /// kernel release (`uname -r`, e.g. `24.6.0`) — the kernel release is an Apple tell that diverges
+    /// from what a real tailscaled macOS node sends. The product version never starts with the
+    /// Darwin-era major (>=20 for the modern macOS-11+ line is the kernel; product majors are 10-26).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_os_version_is_product_not_kernel_release() {
+        let product = os_version();
+        assert!(
+            !product.is_empty(),
+            "macOS OSVersion must be populated (sysctl kern.osproductversion)"
+        );
+        // It must equal the sysctl product version, not the uname kernel release.
+        let kernel = uname_field(UnameField::Release);
+        assert_ne!(
+            product, kernel,
+            "OSVersion must be the macOS product version, not the Darwin kernel release"
+        );
+        if let Some(direct) = macos_product_version() {
+            assert_eq!(product, direct);
+        }
     }
 }

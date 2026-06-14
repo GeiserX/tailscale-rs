@@ -133,6 +133,9 @@ impl<'a> MapRequestBuilder<'a> {
         host_info.go_arch = &host.go_arch;
         host_info.go_version = &host.go_version;
         host_info.machine = &host.machine;
+        host_info.distro = &host.distro;
+        host_info.distro_version = &host.distro_version;
+        host_info.distro_code_name = &host.distro_code_name;
         host_info.package = crate::hostinfo::PACKAGE_TSNET;
         host_info.userspace = Some(true);
         self
