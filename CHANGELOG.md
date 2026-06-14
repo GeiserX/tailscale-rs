@@ -2,6 +2,18 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.36.0](https://github.com/GeiserX/tailscale-rs/compare/v0.35.8...v0.36.0) (2026-06-14)
+
+
+### Features
+
+* **runtime:** warn when self is locked out of the active network lock ([#210](https://github.com/GeiserX/tailscale-rs/issues/210)) ([df5c685](https://github.com/GeiserX/tailscale-rs/commit/df5c685f7e6d7652d0389fd20c3f1fe922ab1d62))
+
+
+### Bug Fixes
+
+* **derp:** document the intentional 64KiB inbound frame cap, drop dead const ([#208](https://github.com/GeiserX/tailscale-rs/issues/208)) ([7cbdb6e](https://github.com/GeiserX/tailscale-rs/commit/7cbdb6e1717863f5023e2cc032a28466cfe9dac3))
+
 ## [0.35.8](https://github.com/GeiserX/tailscale-rs/compare/v0.35.7...v0.35.8) (2026-06-14)
 
 
