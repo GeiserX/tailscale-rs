@@ -32,9 +32,6 @@ pub enum Error {
     /// Invalid magic bytes.
     #[error("invalid magic byte sequence in ServerKey frame")]
     InvalidMagic,
-    /// Unknown peer gone reason.
-    #[error("invalid peer gone reason: {0}")]
-    InvalidPeerGoneReason(u8),
     /// Incomplete frame.
     #[error("incomplete frame")]
     IncompleteFrame,
