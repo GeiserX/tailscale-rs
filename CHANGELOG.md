@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.37.1](https://github.com/GeiserX/tailscale-rs/compare/v0.37.0...v0.37.1) (2026-06-14)
+
+
+### Bug Fixes
+
+* **dns:** scope the macOS host resolver to suffixes, never install a global one ([#214](https://github.com/GeiserX/tailscale-rs/issues/214)) ([b6d30a2](https://github.com/GeiserX/tailscale-rs/commit/b6d30a2a728a60ad5c80bfcc70b0b3f8755d749f))
+
 ## [0.37.0](https://github.com/GeiserX/tailscale-rs/compare/v0.36.0...v0.37.0) (2026-06-14)
 
 
