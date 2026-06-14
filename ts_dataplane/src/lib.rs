@@ -22,6 +22,14 @@ const ALLOWED_LINK_LOCAL_V4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(169, 2
 /// unicast destinations that are not the allowlisted cloud-metadata address (`ReasonLinkLocalUnicast`).
 /// Returning `true` means drop. This runs ahead of `can_access` so a permissive ACL cannot admit the
 /// multicast / link-local traffic Go rejects unconditionally.
+///
+/// Go's `isAllowedLinkLocal` is `dst == gcpDNSAddr || any(LinkLocalAllowHooks)`; only the static
+/// `gcpDNSAddr` arm is modeled here. The dynamic `LinkLocalAllowHooks` slice is empty in a plain
+/// engine/tsnet embedding (its only upstream producer is the GCP metadata path), so the omission is
+/// behaviorally equivalent for this fork; a feature that needs a dynamic link-local allowlist would
+/// have to extend this. Like Go's `netip.Addr` predicates, an IPv4-mapped-IPv6 destination (e.g.
+/// `::ffff:224.0.0.1`) matches NEITHER arm and falls through to the ACL — we deliberately do not
+/// canonicalize/unmap, to stay byte-faithful to Go (see the mapped-v6 test cases).
 fn drop_before_rules(dst: std::net::IpAddr) -> bool {
     if dst.is_multicast() {
         return true;
@@ -390,7 +398,26 @@ mod tests {
         );
         assert!(drop_before_rules(ip("ff02::1")), "IPv6 multicast dropped");
         assert!(drop_before_rules(ip("fe80::1")), "IPv6 link-local dropped");
+        assert!(
+            drop_before_rules(ip("febf:ffff::1")),
+            "top of fe80::/10 dropped (locks the 0xffc0/0xfe80 mask)"
+        );
         // Passed through to the rules:
+        assert!(
+            !drop_before_rules(ip("fec0::1")),
+            "just past fe80::/10 passes (locks the 0xffc0/0xfe80 mask)"
+        );
+        // IPv4-mapped-IPv6 destinations match NEITHER arm and fall through to the ACL, exactly as
+        // Go's `netip.Addr` predicates do (no unmap/canonicalize). Pinning this guards against a
+        // future "canonicalize to be safe" refactor silently diverging from Go.
+        assert!(
+            !drop_before_rules(ip("::ffff:224.0.0.1")),
+            "4in6-mapped multicast falls through to the ACL, matching Go"
+        );
+        assert!(
+            !drop_before_rules(ip("::ffff:169.254.1.1")),
+            "4in6-mapped link-local falls through to the ACL, matching Go"
+        );
         assert!(
             !drop_before_rules(ip("100.64.0.5")),
             "ordinary tailnet unicast passes"
