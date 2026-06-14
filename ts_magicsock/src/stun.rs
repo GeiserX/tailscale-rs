@@ -32,6 +32,13 @@ pub(crate) const BINDING_SUCCESS: u16 = 0x0101;
 /// The XOR-MAPPED-ADDRESS attribute type (RFC 5389 §15.2); the reflexive address lives here.
 const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 
+/// The non-standard "alternate" XOR-MAPPED-ADDRESS attribute type (`0x8020`). Not in RFC 5389:
+/// some servers emit the address under this type instead — `0x8020` is the comprehension-optional
+/// shift of `0x0020` (bit 15 set), an easy mistake for a server to make. Go `stun.ParseResponse`
+/// (`attrXorMappedAddressAlt`) accepts it identically to `0x0020`; we alias it the same way so a
+/// peer behind such a buggy STUN server can still learn its reflexive address.
+const ATTR_XOR_MAPPED_ADDRESS_ALT: u16 = 0x8020;
+
 /// Address family byte for IPv4 inside an XOR-MAPPED-ADDRESS attribute.
 const FAMILY_IPV4: u8 = 0x01;
 
@@ -75,12 +82,19 @@ pub(crate) fn looks_like_stun_success(buf: &[u8]) -> bool {
 /// - the message type (`bytes[0..2]`) is [`BINDING_SUCCESS`] (`0x0101`);
 /// - the magic cookie (`bytes[4..8]`) is [`MAGIC_COOKIE`];
 /// - the transaction id (`bytes[8..20]`) equals `expected`;
-/// - the message carries a well-formed XOR-MAPPED-ADDRESS (`0x0020`) attribute with IPv4
-///   family (`0x01`).
+/// - the message carries a well-formed XOR-MAPPED-ADDRESS (`0x0020`, or the non-standard alternate
+///   `0x8020` that some buggy servers emit) attribute with IPv4 family (`0x01`).
 ///
 /// Returns `None` on any mismatch, on an IPv6 family (`0x02`) mapped address, on truncation, or
 /// on a malformed TLV / bad attribute length. Attributes are walked with full bounds checks; a
 /// single malformed attribute aborts the walk (fail closed) rather than guessing.
+///
+/// The walk returns the first XOR-MAPPED-ADDRESS it finds (under either type). Go
+/// `stun.ParseResponse` instead walks all attributes and lets the last XOR-mapped attribute win,
+/// but that only differs for a pathological response carrying *both* `0x0020` and `0x8020` — a real
+/// server sends one or the other (`0x8020` is its misplacement of the same attribute), so
+/// first-match is equivalent in practice and consistent with this parser's minimal fail-closed
+/// posture.
 pub(crate) fn parse_binding_response(buf: &[u8], expected: StunTxId) -> Option<SocketAddrV4> {
     if buf.len() < HEADER_LEN {
         return None;
@@ -117,7 +131,7 @@ pub(crate) fn parse_binding_response(buf: &[u8], expected: StunTxId) -> Option<S
             return None;
         }
 
-        if attr_type == ATTR_XOR_MAPPED_ADDRESS {
+        if attr_type == ATTR_XOR_MAPPED_ADDRESS || attr_type == ATTR_XOR_MAPPED_ADDRESS_ALT {
             return parse_xor_mapped_address(&attrs[value_start..value_end]);
         }
 
@@ -409,6 +423,41 @@ mod tests {
             parse_binding_response(&buf, tx_id),
             None,
             "a response with no XOR-MAPPED-ADDRESS attribute must learn nothing"
+        );
+    }
+
+    /// A server that (incorrectly) reports the reflexive address under the non-standard alternate
+    /// XOR-MAPPED-ADDRESS type `0x8020` is still parsed, matching Go `attrXorMappedAddressAlt`. The
+    /// value bytes are identical to the standard attribute; only the type word differs.
+    #[test]
+    fn alt_xor_mapped_address_type_decodes() {
+        let tx_id: StunTxId = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let expected = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 41641);
+
+        // Start from a standard 0x0020 response, then flip the attribute type word to 0x8020. The
+        // attribute header begins at offset 20 (just after the 20-byte message header); its type is
+        // the first two bytes there.
+        let mut buf = encode_success_ipv4(tx_id, expected);
+        buf[HEADER_LEN..HEADER_LEN + 2].copy_from_slice(&ATTR_XOR_MAPPED_ADDRESS_ALT.to_be_bytes());
+
+        assert_eq!(
+            parse_binding_response(&buf, tx_id),
+            Some(expected),
+            "the address must decode when carried under the alternate 0x8020 type (Go parity)"
+        );
+    }
+
+    /// The alternate `0x8020` type goes through the same fail-closed value decode: an IPv6-family
+    /// address under `0x8020` must still be rejected (the underlay is IPv4-only).
+    #[test]
+    fn alt_xor_mapped_address_ipv6_still_rejected() {
+        let tx_id: StunTxId = [7u8; 12];
+        let mut buf = encode_success_ipv6(tx_id);
+        buf[HEADER_LEN..HEADER_LEN + 2].copy_from_slice(&ATTR_XOR_MAPPED_ADDRESS_ALT.to_be_bytes());
+        assert_eq!(
+            parse_binding_response(&buf, tx_id),
+            None,
+            "an IPv6 mapped address under the alternate type must still be rejected"
         );
     }
 
