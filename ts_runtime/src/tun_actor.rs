@@ -269,16 +269,36 @@ pub(crate) fn host_routes_from_node(
 /// responder would `REFUSED` every query anyway) and no search domains are programmed — fail-closed,
 /// the same empty-config behavior as MagicDNS off.
 ///
-/// `match_domains` carries the search domains only when MagicDNS is enabled **and** accepted.
+/// `match_domains` carries the suffixes the host resolver is **scoped** to when MagicDNS is enabled
+/// **and** accepted: the tailnet search domains UNION the split-DNS route suffixes (Go
+/// `dns.OSConfig.MatchDomains`, which is the search domains plus the non-global `Routes` keys). The
+/// host layer scopes the MagicDNS resolver to exactly these suffixes; a suffix it lists is sent into
+/// the TUN datapath, everything else stays on the host's normal resolver. The route keys are already
+/// canonicalized and the global `.`/empty route is dropped at `DnsConfig` parse time, so this can
+/// never re-introduce a catch-all scope.
+///
+/// When this set is **empty** (MagicDNS on but no search domain and no split-DNS route — a valid
+/// control state), the host layer installs **no** resolver rather than a global one (matching Go
+/// `manager_darwin.go`, which writes zero `/etc/resolver/*` files and never a primary resolver). See
+/// the `match_domains.is_empty()` guard in `ts_host_net`'s macOS `apply_dns`.
 pub(crate) fn host_dns_from_dns_config(
     dns: Option<&ts_control::DnsConfig>,
     if_name: String,
     accept_dns: bool,
 ) -> ts_host_net::HostDns {
     let magic_dns = accept_dns && matches!(dns, Some(d) if d.magic_dns);
-    let match_domains = if magic_dns {
-        // `dns` is `Some(_)` here by construction of `magic_dns`.
-        dns.map(|d| d.search_domains.clone()).unwrap_or_default()
+    let match_domains = if let Some(d) = dns.filter(|_| magic_dns) {
+        // Search domains first, then any split-DNS route suffix not already covered, deduped while
+        // preserving order (Go `MatchDomains` = SearchDomains ∪ Routes keys). The route keys are
+        // canonicalized and the global `.`/empty route is filtered out at parse time, so no entry
+        // here can scope the resolver globally.
+        let mut domains = d.search_domains.clone();
+        for suffix in d.routes.keys() {
+            if !domains.contains(suffix) {
+                domains.push(suffix.clone());
+            }
+        }
+        domains
     } else {
         vec![]
     };
@@ -1448,6 +1468,79 @@ mod tests {
             "nameservers must stay empty when MagicDNS is disabled"
         );
         assert!(dns_off.match_domains.is_empty());
+    }
+
+    /// `match_domains` is the search domains UNION the split-DNS route suffixes (Go
+    /// `OSConfig.MatchDomains`), deduped. This is what scopes the host resolver; a split-DNS route
+    /// with no search domain must still produce a scoped match domain so the macOS host layer never
+    /// falls back to a global resolver.
+    #[test]
+    fn host_dns_match_domains_union_search_and_routes() {
+        use std::collections::BTreeMap;
+
+        // Search domains + two split-DNS routes, one of which overlaps a search domain.
+        let mut routes = BTreeMap::new();
+        routes.insert("corp.example.com".to_owned(), vec![]);
+        routes.insert("user.ts.net".to_owned(), vec![]); // overlaps the search domain below
+        let cfg = ts_control::DnsConfig {
+            magic_dns: true,
+            search_domains: vec!["user.ts.net".to_owned()],
+            routes,
+            ..Default::default()
+        };
+        let host = host_dns_from_dns_config(Some(&cfg), "utun9".to_owned(), true);
+        // Search domain first, then the route suffix not already present; the overlapping route is
+        // deduped (not added twice).
+        assert_eq!(
+            host.match_domains,
+            vec!["user.ts.net".to_owned(), "corp.example.com".to_owned()],
+            "match_domains = search ∪ route suffixes, deduped, search-first"
+        );
+    }
+
+    /// A split-DNS route with NO search domain still yields a scoped match domain (the route suffix),
+    /// so the macOS host layer scopes the resolver instead of installing a global one. This is the
+    /// exact case the global-capture bug hit: MagicDNS on, no search domain.
+    #[test]
+    fn host_dns_route_only_still_scopes() {
+        use std::collections::BTreeMap;
+        let mut routes = BTreeMap::new();
+        routes.insert("internal.corp".to_owned(), vec![]);
+        let cfg = ts_control::DnsConfig {
+            magic_dns: true,
+            search_domains: vec![], // no search domain — previously → empty match_domains → global
+            routes,
+            ..Default::default()
+        };
+        let host = host_dns_from_dns_config(Some(&cfg), "utun9".to_owned(), true);
+        assert_eq!(
+            host.match_domains,
+            vec!["internal.corp".to_owned()],
+            "a route-only config must still scope the resolver to the route suffix"
+        );
+    }
+
+    /// MagicDNS on but NO search domain and NO route → `match_domains` is empty. The host layer then
+    /// installs no resolver at all (macOS) rather than a global one — verified by the
+    /// `match_domains.is_empty()` path; here we just pin that this config yields the empty set so a
+    /// regression that re-introduced a default suffix would be caught.
+    #[test]
+    fn host_dns_no_domains_yields_empty_match_domains() {
+        let cfg = ts_control::DnsConfig {
+            magic_dns: true,
+            search_domains: vec![],
+            ..Default::default()
+        };
+        let host = host_dns_from_dns_config(Some(&cfg), "utun9".to_owned(), true);
+        assert_eq!(
+            host.nameservers,
+            vec![Ipv4Addr::new(100, 100, 100, 100)],
+            "MagicDNS on still points nameservers at quad-100"
+        );
+        assert!(
+            host.match_domains.is_empty(),
+            "no search domain and no route ⇒ empty match_domains (host layer installs no resolver)"
+        );
     }
 
     /// The MagicDNS service IP `100.100.100.100/32` is steered into the TUN exactly when MagicDNS is
