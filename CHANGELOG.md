@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.37.2](https://github.com/GeiserX/tailscale-rs/compare/v0.37.1...v0.37.2) (2026-06-14)
+
+
+### Bug Fixes
+
+* **netcheck:** smooth the home-region best candidate over a 5-min window ([#216](https://github.com/GeiserX/tailscale-rs/issues/216)) ([a433067](https://github.com/GeiserX/tailscale-rs/commit/a433067f848a532cbc4732196509f941e19c2e28))
+
 ## [0.37.1](https://github.com/GeiserX/tailscale-rs/compare/v0.37.0...v0.37.1) (2026-06-14)
 
 
