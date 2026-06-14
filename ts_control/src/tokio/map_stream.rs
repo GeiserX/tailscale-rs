@@ -242,7 +242,17 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
             .map(crate::PeerChange::from)
             .collect();
 
-        let peer_update = if let Some(full_map) = map_response.peers {
+        // A full peer set is signalled by a NON-EMPTY `peers`, matching Go `controlclient`
+        // `updatePeersStateFromResponse` (`if len(resp.Peers) > 0`): Go treats a nil OR zero-length
+        // `Peers` identically as "not a full set" and falls through to delta handling. A
+        // present-but-empty `"Peers": []` (which a non-Go control plane — Headscale, a custom server,
+        // or a `nil`->`[]` re-encoder — can emit, since Go's own `omitempty` never serializes one)
+        // must NOT be read as a full reset: gating on `Some` rather than non-empty here would build a
+        // `PeerUpdate::Full(empty)` and the peer tracker's `Full` path would evict EVERY peer,
+        // blackholing the tailnet datapath until the next full resync. Gate on non-empty so `[]`
+        // becomes a no-op delta instead. (`tailcfg.go`: "Peers, if non-empty, is the complete list".)
+        let peer_update = if nonempty(&map_response.peers) {
+            let full_map = map_response.peers.unwrap_or_default();
             Some(PeerUpdate::Full(full_map.iter().map(Into::into).collect()))
         } else if nonempty(&map_response.peers_removed) || nonempty(&map_response.peers_changed) {
             Some(PeerUpdate::Delta {
@@ -579,5 +589,68 @@ mod tests {
             update.peer_patches[0].derp_region,
             Some(ts_derp::RegionId(core::num::NonZeroU32::new(9).unwrap()))
         );
+    }
+
+    /// Regression for `tsr-x2a`: a present-but-empty `"Peers": []` must NOT be read as a full peer
+    /// reset. Go `controlclient` gates the full set on `len(resp.Peers) > 0`, treating nil and
+    /// zero-length identically as "not a full set"; the pre-fix code gated on `Some`, so `[]` built a
+    /// `PeerUpdate::Full(empty)` and the peer tracker evicted every peer (blackholing the datapath).
+    /// A non-Go control plane (Headscale / custom / a `nil`->`[]` re-encoder) can emit `[]`, so this
+    /// is reachable. With no `PeersChanged`/`PeersRemoved` either, the response is a pure no-op.
+    #[tokio::test]
+    async fn empty_peers_array_is_noop_not_full_wipe() {
+        let buf = frame(&[r#"{ "Seq": 9, "Peers": [] }"#]);
+        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let update = stream.next().await.expect("one update");
+        assert!(
+            update.peer_update.is_none(),
+            "an empty Peers:[] must be a no-op, NOT PeerUpdate::Full(empty) which would wipe all peers"
+        );
+    }
+
+    /// Positive control: a NON-empty `Peers` is still a full reset (`PeerUpdate::Full`), so the
+    /// non-empty gate did not break the real full-resync path.
+    #[tokio::test]
+    async fn nonempty_peers_array_is_full_reset() {
+        let buf = frame(&[r#"{
+            "Seq": 10,
+            "Peers": [
+                { "ID": 1, "StableID": "n1", "Name": "a.ts.net.", "User": 1,
+                  "Key": "nodekey:0000000000000000000000000000000000000000000000000000000000000000" }
+            ]
+        }"#]);
+        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let update = stream.next().await.expect("one update");
+        match update.peer_update {
+            Some(PeerUpdate::Full(peers)) => {
+                assert_eq!(peers.len(), 1, "the one peer is the full set")
+            }
+            other => panic!("a non-empty Peers must be PeerUpdate::Full, got {other:?}"),
+        }
+    }
+
+    /// The subtle fallthrough edge: an empty `"Peers": []` co-present with a delta must produce a
+    /// `Delta`, NOT `None` and NOT `Full`. Go ignores `PeersChanged`/`PeersRemoved` only when `Peers`
+    /// is NON-empty; when `Peers` is empty the delta fields are honored. A future refactor that
+    /// short-circuited `[]`→`None` before checking the delta fields would pass the other two tests
+    /// but silently drop the delta (a netmap-staleness regression) — this pins that it doesn't.
+    #[tokio::test]
+    async fn empty_peers_with_delta_is_delta_not_noop() {
+        let buf = frame(&[r#"{ "Seq": 11, "Peers": [], "PeersRemoved": [42] }"#]);
+        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let update = stream.next().await.expect("one update");
+        match update.peer_update {
+            Some(PeerUpdate::Delta { remove, upsert }) => {
+                assert_eq!(
+                    remove.len(),
+                    1,
+                    "the PeersRemoved entry is honored as a delta removal"
+                );
+                assert!(upsert.is_empty(), "no PeersChanged ⇒ no upserts");
+            }
+            other => {
+                panic!("empty Peers + PeersRemoved must be Delta (delta honored), got {other:?}")
+            }
+        }
     }
 }
