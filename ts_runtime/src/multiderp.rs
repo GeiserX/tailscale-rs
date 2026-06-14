@@ -466,7 +466,13 @@ async fn run_derp_once(
     direct_sock: &RwLock<Option<Arc<MagicSock>>>,
     observed_routes: &RwLock<HashMap<PeerId, RegionId>>,
 ) -> Result<(), ts_derp::Error> {
-    const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(10);
+    // A non-home DERP connection is closed after this long without activity, matching wireguard-go's
+    // `derpInactiveCleanupTime = 60 * time.Second` (wgengine/magicsock/derp.go). A shorter value tears
+    // down + re-dials a non-home relay carrying bursty/intermittent traffic (gaps of 10-60s — idle
+    // SSH, heartbeats, slow interactive sessions), adding reconnect latency on the next packet and a
+    // distinguishable on-wire teardown cadence vs a stock client that holds for 60s. The home region
+    // is never subject to this (the timeout is only armed when `!home_derp`).
+    const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
 
     loop {
         let mut pending = None;
@@ -757,7 +763,7 @@ impl Message<DerpLatencyMeasurement> for Multiderp {
             // Re-selecting the *same* home region is a no-op: the existing always-on connection must
             // stay sticky. (Previously this demoted the current home unconditionally and re-promoted
             // only on change, so a same-region re-measurement — the common case on any mid-session
-            // derp-map re-push — left the home flag `false`, arming the 10s inactivity timeout and
+            // derp-map re-push — left the home flag `false`, arming the inactivity timeout and
             // dropping the home DERP connection. Go's magicsock keeps the selected home connection
             // always-on across re-selection of the same region.)
             HomeTransition::Unchanged => {}
@@ -801,7 +807,7 @@ mod tests {
 
     /// Regression for `tsr-fv5`: re-measuring the *same* closest region must NOT demote the home
     /// DERP. The old code demoted unconditionally and re-promoted only on change, so a same-region
-    /// re-measurement left the home flag `false` → 10s inactivity timeout → idle home disconnect.
+    /// re-measurement left the home flag `false` → inactivity timeout → idle home disconnect.
     #[test]
     fn same_region_remeasurement_keeps_home_sticky() {
         // Re-selecting the current home is a no-op (no demote, no flag churn).
