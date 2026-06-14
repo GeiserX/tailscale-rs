@@ -155,8 +155,17 @@ impl Runtime {
         );
 
         // Both userspace netstacks (application + forwarder) share one netstack config. Honor the
-        // per-deployment TCP buffer knob when set, otherwise fall back to the netstack default.
-        let netstack_config = netstack_config_from(config.tcp_buffer_size);
+        // per-deployment TCP buffer knob, and set the netstack MTU to the overlay/tunnel MTU so the
+        // advertised MSS fits the tunnel — leaving it at the netstack's generic 1500 default would
+        // emit over-1280 segments into the WireGuard path. The MTU comes from a `Tun` transport's
+        // `TunConfig` when one is configured (so the netstack and the TUN agree), else the 1280
+        // overlay default (the `Netstack` userspace mode — the common case — has no per-OS MTU knob,
+        // but the tailnet overlay MTU is still 1280).
+        let configured_mtu = match &config.transport_mode {
+            ts_control::TransportMode::Tun(tun_cfg) => tun_cfg.mtu,
+            ts_control::TransportMode::Netstack => None,
+        };
+        let netstack_config = netstack_config_from(config.tcp_buffer_size, configured_mtu);
 
         let dataplane = DataplaneActor::spawn(env.clone());
 
@@ -1284,18 +1293,51 @@ fn try_shutdown(a: &ActorRef<impl kameo::Actor>) {
     }
 }
 
-/// Build the netstack config shared by both userspace netstacks (application + forwarder) from the
-/// per-deployment `tcp_buffer_size` knob.
+/// Tailscale's overlay MTU. The userspace netstacks MUST advertise an MSS that fits this so they
+/// never hand the WireGuard encrypt path an IP packet larger than the tunnel can carry (the netstack
+/// has no PMTU discovery and nothing re-segments between it and the 1280-MTU TUN). This is the same
+/// default the TUN device uses (`tun_config_from_control`); both are derived from this value so the
+/// netstack and the TUN always agree.
 ///
-/// `None` keeps the netstack default (256 KiB/direction); `Some(n)` overrides it (e.g. a smaller
-/// window on a memory-constrained exit node forwarding many concurrent flows — see
-/// [`netstack::netcore::Config::tcp_buffer_size`]). Factored out of [`Runtime::spawn`] so the
-/// None-default / Some-override mapping is unit-testable without standing up the actor system.
-fn netstack_config_from(tcp_buffer_size: Option<usize>) -> netstack::netcore::Config {
+/// This is the **inner** IP-packet budget. The WireGuard transport header (a 16-byte
+/// `TransportDataHeader` + the 16-byte AEAD tag = 32 bytes) is added by `TransmitSession::encrypt`
+/// *after* the netstack produces the inner packet, and the outer UDP/IP headers ride on top of that.
+/// So do NOT subtract the WireGuard overhead here — that would be a double-subtraction that
+/// under-fills the tunnel and diverges from the TUN's MTU. The assert below documents that the outer
+/// datagram still fits a conventional 1500-byte physical path with margin (1280 + 32 WG + 8 UDP +
+/// 20 outer-IP = 1340).
+const DEFAULT_OVERLAY_MTU: u16 = 1280;
+
+const _: () = assert!(
+    DEFAULT_OVERLAY_MTU as usize + 32 + 8 + 20 <= 1500,
+    "inner overlay MTU + WireGuard(32) + UDP(8) + outer-IP(20) must fit a 1500-byte physical path"
+);
+
+/// Build the netstack config shared by both userspace netstacks (application + forwarder) from the
+/// per-deployment `tcp_buffer_size` and `mtu` knobs.
+///
+/// `tcp_buffer_size`: `None` keeps the netstack default (256 KiB/direction); `Some(n)` overrides it
+/// (e.g. a smaller window on a memory-constrained exit node forwarding many concurrent flows — see
+/// [`netstack::netcore::Config::tcp_buffer_size`]).
+///
+/// `mtu`: the overlay/tunnel MTU. `None` (and a stray `0`) falls back to [`DEFAULT_OVERLAY_MTU`]
+/// (1280), exactly as the TUN device does, so the netstack's advertised MSS fits the tunnel. Leaving
+/// this at the netstack's generic 1500 default (the prior behavior) made smoltcp advertise MSS ~1460
+/// and segment to ~1500 B, which then overflowed the 1280 TUN — a PMTU black-hole / throughput cliff.
+///
+/// Factored out of [`Runtime::spawn`] so the mapping is unit-testable without standing up the actors.
+fn netstack_config_from(
+    tcp_buffer_size: Option<usize>,
+    mtu: Option<u16>,
+) -> netstack::netcore::Config {
     let mut c = netstack::netcore::Config::default();
     if let Some(tcp_buffer_size) = tcp_buffer_size {
         c.tcp_buffer_size = tcp_buffer_size;
     }
+    // `0` is not a usable MTU; treat it like `None` and fall back to the overlay default, mirroring
+    // the TUN's `and_then(NonZeroU16::new).unwrap_or(1280)`.
+    let mtu = mtu.filter(|&m| m != 0).unwrap_or(DEFAULT_OVERLAY_MTU);
+    c.mtu = usize::from(mtu);
     c
 }
 
@@ -1443,10 +1485,44 @@ mod tests {
     #[test]
     fn netstack_config_none_uses_netstack_default() {
         let default = netstack::netcore::Config::default();
-        let built = netstack_config_from(None);
+        let built = netstack_config_from(None, None);
         assert_eq!(
             built.tcp_buffer_size, default.tcp_buffer_size,
             "None must inherit the netstack default TCP buffer size"
+        );
+    }
+
+    #[test]
+    fn netstack_config_mtu_defaults_to_overlay_not_generic_1500() {
+        // The crux of the fix: with no explicit MTU, the netstack must use the 1280 overlay MTU, NOT
+        // smoltcp's generic 1500 default — otherwise it advertises an MSS that overflows the tunnel.
+        let built = netstack_config_from(None, None);
+        assert_eq!(
+            built.mtu,
+            usize::from(DEFAULT_OVERLAY_MTU),
+            "netstack MTU must default to the 1280 overlay MTU, not the 1500 netstack default"
+        );
+        assert_ne!(built.mtu, 1500, "must not leave the generic 1500 default");
+    }
+
+    #[test]
+    fn netstack_config_honors_explicit_mtu_and_rejects_zero() {
+        // An explicit (control-supplied) MTU is honored verbatim.
+        assert_eq!(netstack_config_from(None, Some(1400)).mtu, 1400);
+        // A stray 0 is not a usable MTU; fall back to the overlay default (mirrors the TUN).
+        assert_eq!(
+            netstack_config_from(None, Some(0)).mtu,
+            usize::from(DEFAULT_OVERLAY_MTU)
+        );
+    }
+
+    #[test]
+    fn netstack_config_overlay_mtu_matches_tun_default() {
+        // The netstack MTU default and the TUN MTU default must be the same value, or the two
+        // netstacks and the TUN would disagree on the segment size budget.
+        assert_eq!(
+            DEFAULT_OVERLAY_MTU, 1280,
+            "overlay MTU must match the TUN device default (tun_config_from_control)"
         );
     }
 
@@ -1454,7 +1530,7 @@ mod tests {
     /// reach for), reaching the config that both netstacks are built from.
     #[test]
     fn netstack_config_some_overrides_buffer() {
-        let built = netstack_config_from(Some(64 * 1024));
+        let built = netstack_config_from(Some(64 * 1024), None);
         assert_eq!(
             built.tcp_buffer_size,
             64 * 1024,
