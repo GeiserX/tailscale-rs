@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.37.4](https://github.com/GeiserX/tailscale-rs/compare/v0.37.3...v0.37.4) (2026-06-14)
+
+
+### Bug Fixes
+
+* **tunnel:** re-initiate the handshake when a send hears nothing back (~15s) ([#222](https://github.com/GeiserX/tailscale-rs/issues/222)) ([a9f1936](https://github.com/GeiserX/tailscale-rs/commit/a9f19364ab5e239e5fc9fb2104c400b04bb2fea5))
+
 ## [0.37.3](https://github.com/GeiserX/tailscale-rs/compare/v0.37.2...v0.37.3) (2026-06-14)
 
 
