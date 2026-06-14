@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.35.8](https://github.com/GeiserX/tailscale-rs/compare/v0.35.7...v0.35.8) (2026-06-14)
+
+
+### Bug Fixes
+
+* **taildrop:** serialize same-name transfers and refuse symlinked store paths ([#206](https://github.com/GeiserX/tailscale-rs/issues/206)) ([4064854](https://github.com/GeiserX/tailscale-rs/commit/4064854dad644720b4d66e1202154d0b2031836d))
+
 ## [0.35.7](https://github.com/GeiserX/tailscale-rs/compare/v0.35.6...v0.35.7) (2026-06-14)
 
 
