@@ -266,7 +266,7 @@ pub struct RotationDetails {
     pub initial_sig_kind: SigKind,
     /// The wrapping public key carried *directly* on the innermost signature (Go reads
     /// `RotationDetails.InitialSig.WrappingPubkey` as a plain field — NOT the recursive
-    /// [`wrapping_public`](NodeKeySignature::wrapping_public) resolver). Empty if the initial
+    /// `wrapping_public` resolver). Empty if the initial
     /// signature carries none. Used as the grouping key for the clone-uniqueness rule.
     pub initial_wrapping_pubkey: Vec<u8>,
 }
@@ -400,11 +400,11 @@ impl NodeKeySignature {
     /// network-lock key `signing_key` (Go `tka.signNodeKey` for the direct case / `NLPrivate.SignNKS`
     /// over a `NodeKeySignature{SigKind: SigKindDirect}`).
     ///
-    /// The signature is over [`NodeKeySignature::sig_hash`] (the CBOR with the `Signature` field
+    /// The signature is over the signature hash `sig_hash` (the CBOR with the `Signature` field
     /// nil'd), and `key_id` is recorded as the signer's 32-byte ed25519 public key verbatim (Go's
     /// `Key25519`/`NLKey` id *is* its public key). The signature is plain RFC 8032 ed25519
     /// (`ed25519.Sign`); a `Direct` leaf is verified cofactored under ZIP-215 (`ed25519consensus` /
-    /// our [`verify_ed25519_zip215`]), which accepts a standard dalek signature — the same valid
+    /// our `verify_ed25519_zip215`), which accepts a standard dalek signature — the same valid
     /// sign-dalek / verify-zip215 relationship [`Authority::node_key_authorized`]'s tests rely on.
     /// Takes a raw [`ed25519_dalek::SigningKey`] so this crate stays free of a key-wrapper dependency;
     /// the caller holds the `NetworkLockPrivateKey` and passes its inner signing key.

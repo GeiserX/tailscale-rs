@@ -10,7 +10,30 @@
 //!
 //! The request DNS bytes are fed through the **same** [`decide`] used by the local MagicDNS
 //! responder, so authoritative MagicDNS records (peer names, control-pushed `ExtraRecords`, PTR)
-//! are answered identically. Two server-side rules layer on top:
+//! are answered locally here.
+//!
+//! ### Deliberate divergence from Go (and why blanket forward-only would be unsafe)
+//!
+//! Go's exit-node DNS proxy (`HandlePeerDNSQuery` in `net/dns/resolver/tsdns.go`) is a **pure
+//! recursive forwarder**: after the filtered-set check it forwards every allowed name to the OS
+//! stub resolver and never answers a name authoritatively from MagicDNS. This fork instead reuses
+//! the shared `decide`, so for a routed peer it *does* answer the exit node's own peer
+//! names / `ExtraRecords` / PTR locally. The only observable consequence is that a routed client
+//! asking this exit node's DoH for one of the **exit node's own** tailnet peer names gets a positive
+//! answer where Go would forward it to upstream — a narrow MagicDNS-namespace bleed across the exit
+//! boundary (no leak: the answer comes from local netmap data and never touches a host socket).
+//!
+//! Matching Go by making this path blanket forward-only would be a **regression in the unsafe
+//! direction**: `decide`'s authoritative replies include this fork's anti-leak guards — a PTR for a
+//! tailnet CGNAT IP (`100.64.0.0/10`) that misses the peer set, and any `ip6.arpa` reverse, are
+//! answered `NXDOMAIN` precisely so a probed tailnet address is never relayed to an upstream
+//! resolver. A forward-only rewrite that simply dropped the authoritative step would forward those
+//! tailnet-reverse queries upstream and leak the probed IP. A faithful narrowing must therefore
+//! forward only the *peer-name / ExtraRecord* authoritative cases while keeping the CGNAT/`ip6.arpa`
+//! NXDOMAIN guards — tracked as a follow-up, not the blanket change. (Go's OS-stub-resolver forward
+//! target is also unavailable here; this path forwards to the tailnet's configured resolvers.)
+//!
+//! Two server-side rules layer on top:
 //!
 //! - **Exit-node filtered set** ([`DnsConfig::exit_node_filters`]): a name in control's
 //!   `ExitNodeFilteredSet` is `REFUSED` before anything else (Go `dnsConfigForNetmap`'s filter).
