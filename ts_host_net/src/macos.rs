@@ -241,6 +241,20 @@ impl HostNet for MacOsHostNet {
         if dns.nameservers.is_empty() {
             return Ok(());
         }
+        // Never install a GLOBAL/primary resolver. A `scutil` service-DNS dict with
+        // `ServerAddresses` but no `SupplementalMatchDomains` is treated by macOS configd as the
+        // primary resolver — it would capture ALL host DNS, not just the tailnet suffixes. Go
+        // `manager_darwin.go` only ever writes per-suffix scoped `/etc/resolver/$SUFFIX` files and
+        // writes NOTHING when there are no match domains. Mirror that: with no suffixes to scope to,
+        // skip programming entirely (fail-closed, no global capture) rather than emit a catch-all
+        // dict. This is the host-side anti-leak invariant — the MagicDNS resolver is split-DNS only.
+        if dns.match_domains.is_empty() {
+            tracing::debug!(
+                "macOS host DNS: no match domains to scope to; not installing a resolver (avoiding \
+                 global capture, Go manager_darwin parity)"
+            );
+            return Ok(());
+        }
         let script = scutil_set_script(&dns.nameservers, &dns.match_domains)?;
         run_scutil(&script)?;
         self.dns_set = true;
@@ -330,6 +344,12 @@ mod tests {
         );
     }
 
+    /// The script `scutil_set_script` produces with NO match domains is a `ServerAddresses`-only
+    /// dict — which macOS configd treats as the PRIMARY/GLOBAL resolver (it captures all host DNS).
+    /// `scutil_set_script` still produces it (it is a pure builder), but `apply_dns` now refuses to
+    /// CALL it with empty match domains (see `apply_dns_skips_when_no_match_domains`), so this global
+    /// shape is never installed in production. The test pins the shape so the hazard is documented
+    /// and a future caller that bypasses the guard is reminded what it would emit.
     #[test]
     fn scutil_set_script_no_match_domains_omits_line() {
         let script = scutil_set_script(
@@ -346,6 +366,29 @@ mod tests {
              quit\n"
         );
         assert!(!script.contains("SupplementalMatchDomains"));
+    }
+
+    /// `apply_dns` must NOT install a resolver when there are no match domains: a `ServerAddresses`-
+    /// only dict would be the global/primary resolver (all host DNS captured), so with nothing to
+    /// scope to we install nothing (Go `manager_darwin.go` writes zero resolver files). This is the
+    /// host-side anti-leak invariant — the MagicDNS resolver is split-DNS only. We assert the
+    /// early-return: `dns_set` stays false and no `scutil` is run (the call returns `Ok` without
+    /// touching the system). With nameservers present but match domains empty, `apply_dns` returns
+    /// `Ok(())` and leaves `dns_set == false`.
+    #[test]
+    fn apply_dns_skips_when_no_match_domains() {
+        let dns = HostDns {
+            if_name: "utun9".to_owned(),
+            nameservers: vec![Ipv4Addr::new(100, 100, 100, 100)],
+            match_domains: vec![], // nothing to scope to
+        };
+        let mut host = MacOsHostNet::new();
+        host.apply_dns(&dns)
+            .expect("empty match domains is a clean no-op, not an error");
+        assert!(
+            !host.dns_set,
+            "no resolver installed when there is nothing to scope to (no global capture)"
+        );
     }
 
     #[test]
