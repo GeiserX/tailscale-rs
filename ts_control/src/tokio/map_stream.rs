@@ -87,8 +87,19 @@ pub struct StateUpdate {
     /// responses that don't (re)establish a session.
     pub session_handle: Option<alloc::string::String>,
     /// The sequence number of this [`MapResponse`] within its session, or `0` when control omits
-    /// it (e.g. keep-alives). The last non-zero value is what a reconnect resumes after.
+    /// it (e.g. keep-alives). The last non-zero value is what a reconnect resumes after. NOTE: `seq`
+    /// is only assigned within a *named* map session (one whose first response carried a
+    /// `MapSessionHandle`) and may be `0` on a substantive response — a control plane that does not
+    /// implement map-session resumption (e.g. Headscale) leaves it `0` on *every* response. So `seq`
+    /// is a resume cursor, NOT a keep-alive discriminator; use [`keep_alive`](Self::keep_alive) for
+    /// that.
     pub seq: i64,
+    /// Whether this is a bare keep-alive heartbeat (`MapResponse.KeepAlive`), carrying no netmap
+    /// content. Control sends these periodically to keep the long-poll connection live. This is the
+    /// authoritative "is this a substantive response?" signal (Go's `controlclient` classifies
+    /// keep-alives solely by this flag, never by `seq`): a non-keep-alive response is one that
+    /// (re)establishes or updates the netmap, and is what resets the reconnect backoff.
+    pub keep_alive: bool,
     /// New derp map is available.
     pub derp: Option<crate::DerpMap>,
     /// New self-node.
@@ -273,6 +284,9 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
                 session_handle: (!map_response.map_session_handle.is_empty())
                     .then(|| map_response.map_session_handle.to_owned()),
                 seq: map_response.seq,
+                // `KeepAlive` is `omitempty` on the wire, so an absent value means "not a
+                // keep-alive" (a substantive response). Default `None` to `false` accordingly.
+                keep_alive: map_response.keep_alive.unwrap_or(false),
                 peer_update,
                 peer_patches,
                 user_profiles: map_response
@@ -520,7 +534,8 @@ mod tests {
     #[tokio::test]
     async fn map_stream_empty_handle_maps_to_none() {
         // A keep-alive-style response with no session handle and seq 0 must surface as None/0 so
-        // the resume cursor is left untouched.
+        // the resume cursor is left untouched, and `keep_alive` must surface as `true` so the
+        // backoff-reset gate can tell it apart from a substantive netmap.
         let buf = frame(&[r#"{"KeepAlive":true}"#]);
 
         let mut stream = core::pin::pin!(map_stream(&buf[..]));
@@ -528,6 +543,27 @@ mod tests {
 
         assert_eq!(update.session_handle, None);
         assert_eq!(update.seq, 0);
+        assert!(
+            update.keep_alive,
+            "a KeepAlive response must surface keep_alive=true"
+        );
+    }
+
+    #[tokio::test]
+    async fn map_stream_substantive_response_has_keep_alive_false() {
+        // A response that omits `KeepAlive` (the wire default) is substantive and must surface
+        // `keep_alive == false` even when it carries no `Seq` — this is the Headscale-style case the
+        // backoff-reset gate must treat as progress (gating on `seq` would wrongly skip it).
+        let buf = frame(&[r#"{ "Node": { "Name": "n" } }"#]);
+
+        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let update = stream.next().await.expect("one update");
+
+        assert_eq!(update.seq, 0, "this fixture omits Seq (Headscale-style)");
+        assert!(
+            !update.keep_alive,
+            "a response without KeepAlive must surface keep_alive=false (substantive)"
+        );
     }
 
     #[tokio::test]
