@@ -13,6 +13,36 @@ use ts_underlay_router as ur;
 
 pub mod async_tokio;
 
+/// The single link-local destination Go's filter `pre()` exempts from the link-local drop: the
+/// cloud-metadata address `169.254.169.254` (Go `isAllowedLinkLocal`).
+const ALLOWED_LINK_LOCAL_V4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(169, 254, 169, 254);
+
+/// Whether an inbound packet to destination `dst` must be dropped BEFORE consulting the ACL rules,
+/// mirroring Go's filter `pre()`: drop multicast destinations (`ReasonMulticast`) and link-local
+/// unicast destinations that are not the allowlisted cloud-metadata address (`ReasonLinkLocalUnicast`).
+/// Returning `true` means drop. This runs ahead of `can_access` so a permissive ACL cannot admit the
+/// multicast / link-local traffic Go rejects unconditionally.
+///
+/// Go's `isAllowedLinkLocal` is `dst == gcpDNSAddr || any(LinkLocalAllowHooks)`; only the static
+/// `gcpDNSAddr` arm is modeled here. The dynamic `LinkLocalAllowHooks` slice is empty in a plain
+/// engine/tsnet embedding (its only upstream producer is the GCP metadata path), so the omission is
+/// behaviorally equivalent for this fork; a feature that needs a dynamic link-local allowlist would
+/// have to extend this. Like Go's `netip.Addr` predicates, an IPv4-mapped-IPv6 destination (e.g.
+/// `::ffff:224.0.0.1`) matches NEITHER arm and falls through to the ACL — we deliberately do not
+/// canonicalize/unmap, to stay byte-faithful to Go (see the mapped-v6 test cases).
+fn drop_before_rules(dst: std::net::IpAddr) -> bool {
+    if dst.is_multicast() {
+        return true;
+    }
+    match dst {
+        // IPv4 link-local is 169.254.0.0/16; allow only the cloud-metadata address (Go parity).
+        std::net::IpAddr::V4(v4) => v4.is_link_local() && v4 != ALLOWED_LINK_LOCAL_V4,
+        // IPv6 unicast link-local is fe80::/10. (`Ipv6Addr::is_unicast_link_local` is unstable, so
+        // test the prefix directly.) This fork is IPv4-only by default, but match Go for any v6.
+        std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+    }
+}
+
 /// A data plane subsystem that can be the subject of timer events.
 pub enum Subsystem {
     /// The wireguard component.
@@ -208,6 +238,18 @@ impl DataPlane {
                         }
                     };
 
+                    // Pre-rule destination screen, mirroring Go filter `pre()`'s unconditional drops
+                    // that run BEFORE any ACL rule: a packet to a multicast or (non-allowlisted)
+                    // link-local-unicast destination is dropped regardless of the rules. Without this,
+                    // a permissive ACL (dst `*` / `0.0.0.0/0`) would ACCEPT inbound multicast /
+                    // link-local that Go drops pre-rules — the one ACCEPT-where-Go-DROPS gap. Bounded
+                    // already by the source-attribution filter above (only attributable tailnet peers
+                    // reach here), but matched to Go for correctness.
+                    if drop_before_rules(dst) {
+                        tracing::trace!(?dst, "dropping multicast/link-local dst (pre-rule)");
+                        return false;
+                    }
+
                     let (_src_port, dst_port) = match pkt.transport {
                         Some(etherparse::TransportSlice::Udp(udp)) => {
                             (udp.source_port(), udp.destination_port())
@@ -336,6 +378,62 @@ mod tests {
         assert_eq!(CapturePath::FromPeer.code(), 1);
         assert_eq!(CapturePath::SynthesizedToLocal.code(), 2);
         assert_eq!(CapturePath::SynthesizedToPeer.code(), 3);
+    }
+
+    /// The pre-rule destination screen (Go filter `pre()`): multicast and non-allowlisted link-local
+    /// destinations are dropped before the ACL; ordinary unicast and the cloud-metadata link-local
+    /// exception pass through to the rules.
+    #[test]
+    fn pre_rule_drop_matches_go() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        // Dropped pre-rules:
+        assert!(drop_before_rules(ip("224.0.0.1")), "IPv4 multicast dropped");
+        assert!(
+            drop_before_rules(ip("239.255.255.250")),
+            "IPv4 multicast (SSDP) dropped"
+        );
+        assert!(
+            drop_before_rules(ip("169.254.1.1")),
+            "IPv4 link-local dropped"
+        );
+        assert!(drop_before_rules(ip("ff02::1")), "IPv6 multicast dropped");
+        assert!(drop_before_rules(ip("fe80::1")), "IPv6 link-local dropped");
+        assert!(
+            drop_before_rules(ip("febf:ffff::1")),
+            "top of fe80::/10 dropped (locks the 0xffc0/0xfe80 mask)"
+        );
+        // Passed through to the rules:
+        assert!(
+            !drop_before_rules(ip("fec0::1")),
+            "just past fe80::/10 passes (locks the 0xffc0/0xfe80 mask)"
+        );
+        // IPv4-mapped-IPv6 destinations match NEITHER arm and fall through to the ACL, exactly as
+        // Go's `netip.Addr` predicates do (no unmap/canonicalize). Pinning this guards against a
+        // future "canonicalize to be safe" refactor silently diverging from Go.
+        assert!(
+            !drop_before_rules(ip("::ffff:224.0.0.1")),
+            "4in6-mapped multicast falls through to the ACL, matching Go"
+        );
+        assert!(
+            !drop_before_rules(ip("::ffff:169.254.1.1")),
+            "4in6-mapped link-local falls through to the ACL, matching Go"
+        );
+        assert!(
+            !drop_before_rules(ip("100.64.0.5")),
+            "ordinary tailnet unicast passes"
+        );
+        assert!(
+            !drop_before_rules(ip("8.8.8.8")),
+            "ordinary public unicast passes"
+        );
+        assert!(
+            !drop_before_rules(ip("169.254.169.254")),
+            "the cloud-metadata link-local address is the Go-allowlisted exception"
+        );
+        assert!(
+            !drop_before_rules(ip("fd7a:115c:a1e0::1")),
+            "IPv6 ULA (tailnet) passes"
+        );
     }
 
     /// Behavioral guard: an installed capture hook MUST be invoked with `CapturePath::FromLocal`
