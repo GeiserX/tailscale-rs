@@ -72,6 +72,22 @@ impl<'a> MapRequestBuilder<'a> {
         self
     }
 
+    /// Set the [`NetInfo::working_udp`] field (Go `NetInfo.WorkingUDP`): whether the node has UDP
+    /// internet connectivity, i.e. a STUN reflexive address was learned. A real `tailscaled` reports
+    /// this; omitting it leaves control's NAT picture blank.
+    pub fn working_udp(mut self, value: bool) -> Self {
+        self.net_info_mut().working_udp = Some(value);
+        self
+    }
+
+    /// Set the [`NetInfo::mapping_varies_by_dest_ip`] field (Go `NetInfo.MappingVariesByDestIP`):
+    /// whether the NAT maps the bound socket to different reflexive addr:ports per destination
+    /// (symmetric NAT). Mirrors magicsock's `is_symmetric_nat` determination.
+    pub fn mapping_varies_by_dest_ip(mut self, value: bool) -> Self {
+        self.net_info_mut().mapping_varies_by_dest_ip = Some(value);
+        self
+    }
+
     /// Set the [`NetInfo::derp_latency`] field (inside [`MapRequest::host_info`] ->
     /// [`HostInfo::net_info`]).
     pub fn derp_latencies(mut self, value: impl IntoIterator<Item = (&'a str, f64)>) -> Self {
