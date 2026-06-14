@@ -1,4 +1,7 @@
-use alloc::{collections::BTreeMap, sync::Arc};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use futures_util::{Stream, StreamExt};
 use tokio::{
@@ -485,13 +488,19 @@ fn net_info_working_udp(endpoints: &[ts_control_serde::Endpoint]) -> bool {
 }
 
 /// `NetInfo.MappingVariesByDestIP`: the NAT maps the one bound socket to different reflexive
-/// addr:ports per destination (symmetric NAT) iff at least two DISTINCT STUN reflexive addresses
-/// were observed — the wire-side mirror of magicsock `MagicSock::is_symmetric_nat`
-/// (`v4_reflexive.len() >= 2`). Pure, for unit testing.
+/// addr:ports per destination (symmetric NAT) iff at least two DISTINCT **IPv4** STUN reflexive
+/// addresses were observed — the wire-side mirror of magicsock `MagicSock::is_symmetric_nat`
+/// (`v4_reflexive.len() >= 2`, `sock.rs`).
+///
+/// IPv4-only on purpose: magicsock's symmetric-NAT determinant is v4-only (its test
+/// `stun4localport_ignores_ipv6_reflexive` asserts two IPv6 reflexives must NOT trip it), so counting
+/// v6 reflexives here would make the wire signal disagree with the node's own NAT model — a
+/// cross-component incoherence. The fork is IPv4-only anyway, so v6 reflexives are not expected, but
+/// filtering keeps the two in lockstep regardless. Pure, for unit testing.
 fn net_info_mapping_varies(endpoints: &[ts_control_serde::Endpoint]) -> bool {
-    let mut seen = alloc::collections::BTreeSet::new();
+    let mut seen = BTreeSet::new();
     for e in endpoints {
-        if e.ty == ts_control_serde::EndpointType::Stun {
+        if e.ty == ts_control_serde::EndpointType::Stun && e.endpoint.is_ipv4() {
             seen.insert(e.endpoint);
             if seen.len() >= 2 {
                 return true;
@@ -1212,6 +1221,18 @@ mod tests {
             ep("203.0.113.7:41641", Stun),
             ep("203.0.113.7:50000", Stun4LocalPort),
             ep("192.168.1.2:41641", Local),
+        ]));
+        // IPv4-only, matching magicsock: two DISTINCT IPv6 STUN reflexives must NOT trip it (the
+        // fork's is_symmetric_nat is v4-only; counting v6 would disagree with the node's NAT model).
+        assert!(!net_info_mapping_varies(&[
+            ep("[2001:db8::1]:41641", Stun),
+            ep("[2001:db8::2]:41641", Stun),
+        ]));
+        // A v4 pair still trips it even alongside v6 reflexives (the v6 ones are simply ignored).
+        assert!(net_info_mapping_varies(&[
+            ep("[2001:db8::1]:41641", Stun),
+            ep("203.0.113.7:41641", Stun),
+            ep("198.51.100.9:51000", Stun),
         ]));
     }
 
