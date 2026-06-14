@@ -447,10 +447,19 @@ fn forward_or_nxdomain(
     }
 }
 
+/// The DNS query types Go's resolver explicitly leaves unimplemented for a tailnet-authoritative
+/// name, answering `RCodeNotImplemented` (NOTIMP) rather than NODATA (`net/dns/resolver/tsdns.go`
+/// `resolveLocal`: `case dns.TypeNS, dns.TypeSOA, dns.TypeAXFR, dns.TypeHINFO`). The numeric type
+/// codes: NS=2, SOA=6, HINFO=13, AXFR=252.
+fn is_unimplemented_tailnet_qtype(qtype: &ts_dns_wire::QType) -> bool {
+    matches!(qtype, ts_dns_wire::QType::Other(2 | 6 | 13 | 252))
+}
+
 /// For a query whose *qtype/qclass* we don't serve authoritatively (anything other than an IN-class
 /// A/AAAA/PTR — e.g. TXT, SRV, MX, HTTPS/SVCB, or a CHAOS-class query): forward it to upstream like
 /// any other name, but for a tailnet-authoritative name return an empty NOERROR (NODATA) instead of
-/// NXDOMAIN.
+/// NXDOMAIN — except the NS/SOA/HINFO/AXFR types Go answers NOTIMP for
+/// ([`is_unimplemented_tailnet_qtype`]).
 ///
 /// This mirrors Go's resolver: an authoritative name with no record of the requested type returns
 /// `RCodeSuccess` with no answers ("the name exists, but no records of that type"), NOT NXDOMAIN and
@@ -470,9 +479,21 @@ fn forward_or_nodata(
     id: u16,
     q: &ts_dns_wire::Question,
 ) -> Decision {
-    // Authoritative tailnet name: NODATA (empty NOERROR), not NXDOMAIN — the name exists.
+    // Authoritative tailnet name. For most unsupported types we answer NODATA (empty NOERROR) — the
+    // name exists, we just hold no record of that type. But a small set of types Go's resolver
+    // *explicitly* leaves unimplemented (`net/dns/resolver/tsdns.go` `resolveLocal`:
+    // `case dns.TypeNS, dns.TypeSOA, dns.TypeAXFR, dns.TypeHINFO: return RCodeNotImplemented`) must
+    // answer NOTIMP, not NODATA — a `dig NS`/`SOA`/`HINFO` against the tailnet zone is otherwise a
+    // clean fingerprint distinguishing this fork from real tailscaled. Off-tailnet names are
+    // unaffected (they forward below regardless of type); this NOTIMP applies only to a name we are
+    // authoritative for.
     if is_tailnet_name(view, canon) {
-        return Decision::Reply(encode_response(id, q, Rcode::NoError, &[]));
+        let rcode = if is_unimplemented_tailnet_qtype(&q.qtype) {
+            Rcode::NotImpl
+        } else {
+            Rcode::NoError
+        };
+        return Decision::Reply(encode_response(id, q, rcode, &[]));
     }
     // Anti-leak parity with the `QType::Ptr` arm: a reverse query for a tailnet CGNAT IPv4
     // (100.64.0.0/10) or ANY `ip6.arpa` name must NEVER egress to an upstream resolver, regardless
@@ -1319,6 +1340,38 @@ mod tests {
         assert_eq!(
             rcode, 3,
             "off-tailnet, no upstream -> NXDOMAIN (forwardable, not Refused)"
+        );
+    }
+
+    #[test]
+    fn unimplemented_qtype_on_tailnet_name_is_notimp() {
+        // NS (2), SOA (6), HINFO (13), AXFR (252) for a tailnet-authoritative name must answer NOTIMP
+        // (rcode 4), matching Go `resolveLocal`'s `case dns.TypeNS, dns.TypeSOA, dns.TypeAXFR,
+        // dns.TypeHINFO: return RCodeNotImplemented`. Returning NODATA (rcode 0) here was a clean
+        // fingerprint (a `dig SOA user.ts.net` answer differs from real tailscaled). The name is
+        // still never forwarded (anti-leak).
+        let view = view_with_peer();
+        for qtype in [2u16, 6, 13, 252] {
+            let buf = build_query(0x1, &["host", "user", "ts", "net"], qtype, 1);
+            let resp = answer(&view, &buf).expect("answers");
+            let (_, rcode, ancount) = parse_header(&resp);
+            assert_eq!(rcode, 4, "qtype {qtype} on a tailnet name must be NOTIMP");
+            assert_eq!(ancount, 0, "NOTIMP carries no answer records");
+        }
+    }
+
+    #[test]
+    fn unimplemented_qtype_off_tailnet_still_forwards_not_notimp() {
+        // The NOTIMP disposition is ONLY for a name we are authoritative for. An NS query for an
+        // off-tailnet name must still forward (here: NXDOMAIN, no upstream) — NOT NOTIMP — exactly
+        // like the off-tailnet HTTPS/SVCB case above. Guards the NOTIMP change against over-reach.
+        let view = view_with_peer();
+        let buf = build_query(0x1, &["example", "com"], 2, 1); // NS, off-tailnet
+        let resp = answer(&view, &buf).expect("answers");
+        let (_, rcode, _) = parse_header(&resp);
+        assert_eq!(
+            rcode, 3,
+            "off-tailnet NS -> NXDOMAIN (forwardable), not NOTIMP"
         );
     }
 
