@@ -717,7 +717,11 @@ impl MagicSock {
                 if !pp.needs_refresh(now) {
                     continue;
                 }
-                for addr in pp.candidate_addrs() {
+                // Apply Go's cadence gates (5s discovery floor on non-best candidates, good-enough
+                // quiet-down, 60s upgrade re-probe) so the on-wire ping rate matches a stock client
+                // rather than pinging every candidate every 2s tick. The confirmed best is always
+                // included so its trust still refreshes on the `REFRESH_BEFORE_EXPIRY` schedule.
+                for addr in pp.candidates_to_ping(now) {
                     let tx_id = disco::random_tx_id();
                     pp.note_ping_sent(tx_id, addr, now);
                     to_ping.push((*peer, addr, tx_id));
