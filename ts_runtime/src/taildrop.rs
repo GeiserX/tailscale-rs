@@ -159,10 +159,18 @@ fn path_present(path: &Path) -> bool {
 /// but not a symlink **component already planted in the store root** by a local attacker (e.g.
 /// `root/foo.txt -> /etc/cron.d/x`), which a plain `open`/`rename`/`remove` would follow. Uses
 /// `symlink_metadata` (lstat — does NOT follow the final symlink); a non-existent path is fine
-/// (returns `Ok(())`), only an existing symlink is refused. This is checked under the per-name
-/// in-flight lock, so it cannot race our own operations on the same name; the residual is an
-/// external process mutating the store dir concurrently, which already requires store-dir write
-/// access (the threat bound for this hardening).
+/// (returns `Ok(())`), only an existing symlink is refused.
+///
+/// This is a check-then-act guard, so it is not atomic with the open/rename/remove that follows.
+/// It kills the **persistent-plant** attack (a symlink left in the store root is no longer followed
+/// deterministically), and the per-name in-flight lock serializes our OWN operations on a name, but
+/// it does not close a sub-millisecond race where an external process swaps the path for a symlink
+/// between this lstat and the syscall. That residual requires an external writer who already holds
+/// store-dir write access (the threat bound for this hardening), and is the one axis where this is
+/// weaker than Go's atomic `O_NOFOLLOW`. The `offset == 0` put is additionally protected by
+/// `create_new` (`O_EXCL`, which refuses an existing symlink atomically); the `offset > 0` resume
+/// open is plain `write(true)` and relies on this advisory check until `O_NOFOLLOW` is wired
+/// (tracked as a follow-up — its raw value is arch-dependent, so a portable open flag is deferred).
 fn refuse_symlink(path: &Path) -> Result<(), TaildropError> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => Err(TaildropError::Io(io::Error::new(
@@ -222,13 +230,14 @@ impl TaildropStore {
     /// concurrency analog of the on-disk `.partial` conflict, and it serializes all transfers of one
     /// name so a resume (`offset > 0`) cannot race a concurrent transfer's `set_len`/`seek`/`write`.
     fn claim_in_flight(&self, base: &str) -> Result<InFlightGuard, TaildropError> {
+        let name = base.to_string();
         let mut set = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
-        if !set.insert(base.to_string()) {
+        if !set.insert(name.clone()) {
             return Err(TaildropError::FileExists);
         }
         Ok(InFlightGuard {
             set: self.in_flight.clone(),
-            name: base.to_string(),
+            name,
         })
     }
 
