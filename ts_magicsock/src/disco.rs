@@ -725,6 +725,73 @@ mod tests {
         }
     }
 
+    /// Boundary: the node key is read only when **at least 32 bytes follow the 12-byte tx id** (Go
+    /// `parsePing`'s `len(p) >= NodePublicRawLen` evaluated after consuming the tx id). A 43-byte body
+    /// (31 bytes after the tx id) is one short, so `claimed_node_key` is `None` — those 31 bytes are
+    /// padding, NOT a truncated key. This pins the gate against a `total >= 44` off-by-one (which would
+    /// agree with the 12- and 44-byte cases but diverge exactly here).
+    #[test]
+    fn ping_one_byte_short_of_node_key_parses_as_none() {
+        let (a_sk, _a_pk) = keypair();
+        let (b_sk, b_pk) = keypair();
+        let tx = random_tx_id();
+
+        // 43-byte body: 12-byte tx id + 31 bytes (one short of a 32-byte node key).
+        let mut body = Vec::new();
+        body.extend_from_slice(&tx);
+        body.extend_from_slice(&[0xAB; 31]);
+        assert_eq!(body.len(), 43);
+        let mut wire = seal_raw(&a_sk, &b_pk, MessageType::Ping, &body, 0);
+        match open(&b_sk, &mut wire).expect("a 43-byte ping must still open") {
+            Inbound::Ping {
+                claimed_node_key,
+                tx_id,
+                ..
+            } => {
+                assert_eq!(
+                    claimed_node_key, None,
+                    "31 bytes after the tx id is < 32, so no node key is read (remaining-length gate)"
+                );
+                assert_eq!(tx_id, tx);
+            }
+            other => panic!("expected ping, got {other:?}"),
+        }
+    }
+
+    /// A Ping with a node key AND trailing padding (body > 44 bytes) parses to `Some(node_key)` with
+    /// the trailing bytes ignored — Go `parsePing` is "deliberately lax on longer-than-expected
+    /// messages". The trailing fill is a recognizable non-zero pattern so the parser must actively
+    /// ignore it (a zero fill could pass even if the tail were wrongly folded into the key).
+    #[test]
+    fn ping_with_node_key_and_trailing_padding_parses_as_some() {
+        let (a_sk, _a_pk) = keypair();
+        let (b_sk, b_pk) = keypair();
+        let tx = random_tx_id();
+        let node_key = ts_keys::NodePrivateKey::random().public_key();
+
+        // 12 tx id + 32 node key + 7 trailing padding bytes = 51-byte body.
+        let mut body = Vec::new();
+        body.extend_from_slice(&tx);
+        body.extend_from_slice(&node_key.to_bytes());
+        body.extend_from_slice(&[0xAB; 7]);
+        let mut wire = seal_raw(&a_sk, &b_pk, MessageType::Ping, &body, 0);
+        match open(&b_sk, &mut wire).expect("an over-length ping must still open") {
+            Inbound::Ping {
+                claimed_node_key,
+                tx_id,
+                ..
+            } => {
+                assert_eq!(
+                    claimed_node_key,
+                    Some(node_key),
+                    "the 32-byte node key is read; the 7 trailing padding bytes are ignored"
+                );
+                assert_eq!(tx_id, tx);
+            }
+            other => panic!("expected ping, got {other:?}"),
+        }
+    }
+
     /// A `Pong` with a future version byte must still parse (Go's `parsePong` ignores version),
     /// so a forward-version peer's pong still confirms the path instead of being dropped.
     #[test]
