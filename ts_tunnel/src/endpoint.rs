@@ -342,6 +342,16 @@ struct Peer {
     /// re-arms unconditionally and fires on a totally idle tunnel. See
     /// [`PeerConfig::persistent_keepalive_interval`].
     persistent_keepalive: Option<Handle<Event>>,
+    /// Pending "stopped hearing back" handshake timer (wireguard-go `peer.timers.newHandshake`, armed
+    /// by `timersDataSent`). After we send an authenticated data packet we expect to hear *something*
+    /// authenticated back within `KEEPALIVE_TIMEOUT + REKEY_TIMEOUT` (~15s); if not, the path has
+    /// silently broken (peer reboot / NAT remap / route flap) and we re-initiate a handshake rather
+    /// than waiting out `REJECT_AFTER_TIME` (180s). Cancelled on ANY authenticated packet received
+    /// (the Go `timersAnyAuthenticatedPacketReceived` `Del()`). Distinct from `keepalive` (reactive,
+    /// inbound-armed) and the handshake-retransmit timer (`HandshakeTimeout`, retransmits an
+    /// *in-flight* initiation): this one covers a send-active / receive-silent session that neither
+    /// of those recovers promptly. See [`new_handshake_delay`].
+    new_handshake: Option<Handle<Event>>,
     /// Consecutive failed handshake-initiation retransmits for the current attempt (Go wireguard-go
     /// `peer.timers.handshakeAttempts`). Incremented each time `REKEY_TIMEOUT` fires with no
     /// response; reset to 0 when a *fresh* (non-retry) handshake is started or a handshake completes.
@@ -363,7 +373,34 @@ impl Peer {
             keepalive: None,
             send_another_keepalive: false,
             persistent_keepalive: None,
+            new_handshake: None,
             handshake_attempts: 0,
+        }
+    }
+
+    /// Arm the "stopped hearing back" timer (wireguard-go `timersDataSent`): after an authenticated
+    /// data send, re-initiate a handshake `KEEPALIVE_TIMEOUT + REKEY_TIMEOUT` (+ upward jitter) later
+    /// if no authenticated packet has been received in the meantime. Armed only if NOT already
+    /// pending (Go's `!peer.timers.newHandshake.IsPending()`), so a burst of sends does not keep
+    /// pushing the deadline out. Cancelled by [`Self::cancel_new_handshake`] on any authenticated
+    /// receive.
+    fn arm_new_handshake(&mut self, scheduler: &mut Scheduler<Event>) {
+        if self.new_handshake.is_some() {
+            return; // already pending — don't re-arm (Go !IsPending guard)
+        }
+        // Forward-only window like the retransmit timer: never fire before the jittered target.
+        let target = Instant::now() + new_handshake_delay();
+        let tr = TimeRange::new(target, target + HANDSHAKE_RETRANSMIT_COALESCE);
+        self.new_handshake = Some(scheduler.add(tr, Event::NewHandshakeTimeout(self.id)));
+    }
+
+    /// Cancel the pending "stopped hearing back" timer (wireguard-go
+    /// `timersAnyAuthenticatedPacketReceived` → `newHandshake.Del()`): any authenticated packet
+    /// received — data, keepalive, or a completed handshake — proves the peer is still reachable on
+    /// this path, so the re-initiate is no longer needed.
+    fn cancel_new_handshake(&mut self) {
+        if let Some(handle) = self.new_handshake.take() {
+            handle.cancel();
         }
     }
 
@@ -421,9 +458,12 @@ impl Peer {
         if let Some(mut packets) = self.session.encrypt_or_queue(endpoint, packets) {
             tracing::trace!("enqueueing packets to peer");
             // Outgoing authenticated traffic resets the persistent-keepalive timer: we only need to
-            // emit a persistent keepalive once the tunnel has gone silent for a full interval.
+            // emit a persistent keepalive once the tunnel has gone silent for a full interval. It
+            // also arms the "stopped hearing back" timer (Go `timersDataSent`): if no authenticated
+            // packet comes back within ~15s, re-initiate rather than wait out REJECT_AFTER_TIME.
             if !packets.is_empty() {
                 self.arm_persistent_keepalive(&mut endpoint.scheduler);
+                self.arm_new_handshake(&mut endpoint.scheduler);
             }
             out.queue_to_peer(self.id).append(&mut packets);
             // Fall through to check if the session is in need of rotation.
@@ -515,6 +555,10 @@ impl Peer {
         // `confirm` path never started one.)
         self.handshake_attempts = 0;
 
+        // A completed handshake is an authenticated packet from the peer — cancel any pending
+        // "stopped hearing back" timer (Go `timersAnyAuthenticatedPacketReceived`).
+        self.cancel_new_handshake();
+
         // We sent the initiation and finished on the response: we are the INITIATOR of this keypair.
         let mut packets = self
             .session
@@ -544,6 +588,11 @@ impl Peer {
         if let Some(session) = self.session.get_recv(session_id) {
             packets = session.decrypt(packets);
             if !packets.is_empty() {
+                // Any authenticated packet (data OR keepalive — both decrypt non-empty here, a
+                // keepalive's empty *payload* still arrives as a verified, header-stripped packet)
+                // proves the peer is reachable on this path, so cancel the "stopped hearing back"
+                // re-initiate timer (Go `timersAnyAuthenticatedPacketReceived`).
+                self.cancel_new_handshake();
                 // A keepalive decrypts to an empty payload but is still retained here (AEAD verified,
                 // header+tag stripped). Distinguish *data* packets from keepalives: only a real data
                 // packet arms the reactive keepalive, mirroring wireguard-go's `dataPacketReceived`
@@ -588,6 +637,11 @@ impl Peer {
             return;
         };
 
+        // An authenticated transport packet confirmed a tentative responder session — peer is
+        // reachable, so cancel the "stopped hearing back" re-initiate timer (Go
+        // `timersAnyAuthenticatedPacketReceived`).
+        self.cancel_new_handshake();
+
         out.queue_to_local(self.id).append(&mut packets);
         self.schedule_keepalive(&mut endpoint.scheduler);
 
@@ -626,6 +680,13 @@ impl Peer {
         }
         self.last_seen_timestamp = Some(handshake.timestamp);
 
+        // An authenticated handshake INITIATION from the peer is "hearing back" too (Go
+        // `timersAnyAuthenticatedPacketReceived` fires on a verified initiation, not only data /
+        // keepalive / response): the peer is clearly reachable, so cancel any pending "stopped
+        // hearing back" re-initiate. Without this, our timer could fire and start a second
+        // (redundant) handshake racing the one this initiation is establishing.
+        self.cancel_new_handshake();
+
         let session_id = endpoint.ids.allocate_session(self.id);
 
         let (packet, displaced) = self.handshake.respond(
@@ -641,6 +702,22 @@ impl Peer {
             endpoint.ids.remove_session(old_id);
         }
         out.queue_to_peer(self.id).push(packet);
+    }
+
+    /// Expiry of the "stopped hearing back" timer (wireguard-go `expiredNewHandshake`): we sent data
+    /// and heard nothing authenticated back within `KEEPALIVE_TIMEOUT + REKEY_TIMEOUT`, so the path
+    /// has likely broken silently. Re-initiate a *fresh* handshake (resets the give-up counter, Go's
+    /// `SendHandshakeInitiation(false)`). The handle has already fired, so clear it. Skip if a
+    /// handshake is already in flight (a retransmit is already driving recovery) — mirrors Go, where
+    /// `SendHandshakeInitiation` early-returns while one is pending.
+    fn new_handshake_timeout(&mut self, endpoint: &mut EndpointState, out: &mut EventResult) {
+        self.new_handshake = None; // the timer fired; the handle is spent
+        if self.handshake.is_active() {
+            // A handshake is already in flight (its retransmit timer is recovering the path); don't
+            // start a second one.
+            return;
+        }
+        self.start_handshake(endpoint, out, false);
     }
 
     fn handshake_timeout(&mut self, endpoint: &mut EndpointState, out: &mut EventResult) {
@@ -677,6 +754,11 @@ impl Peer {
             );
             self.session.deactivate(endpoint);
             self.handshake_attempts = 0;
+            // Clear the "stopped hearing back" timer too: having just decided to STOP retrying this
+            // unreachable peer, we must not let a still-pending re-initiate fire and start another
+            // handshake to it (which would partially defeat the give-up bound). The next outbound
+            // packet re-arms it after a fresh send, as intended.
+            self.cancel_new_handshake();
             return;
         }
 
@@ -730,16 +812,31 @@ impl Peer {
         self.arm_persistent_keepalive(scheduler);
     }
 
+    /// Cancel every per-peer scheduled timer (reactive keepalive, persistent keepalive, and the
+    /// "stopped hearing back" re-initiate). A [`Handle`] holds only a `Weak`, so dropping a `Peer`
+    /// does NOT remove its scheduled events from the endpoint's `Scheduler` — a stale timer would
+    /// otherwise survive and later dispatch to this peer id (a no-op if the peer is gone, but a
+    /// SPURIOUS keepalive/handshake if the id is reused, or a wasted re-init right after a give-up
+    /// teardown). Mirrors wireguard-go `timersStop` clearing all of a peer's timers. Idempotent.
+    fn cancel_all_timers(&mut self) {
+        if let Some(handle) = self.keepalive.take() {
+            handle.cancel();
+        }
+        if let Some(handle) = self.persistent_keepalive.take() {
+            handle.cancel();
+        }
+        self.cancel_new_handshake();
+    }
+
     fn shutdown(&mut self, endpoint: &mut EndpointState) {
         self.session.deactivate(endpoint);
 
         endpoint.ids.remove_handshake_session(&self.handshake);
         self.handshake = Handshake::none();
 
-        // Stop keeping a removed peer's path warm.
-        if let Some(handle) = self.persistent_keepalive.take() {
-            handle.cancel();
-        }
+        // Stop every timer for a removed peer: a stale event would otherwise fire on this peer id
+        // later (spurious if the id is reused). Mirrors Go `timersStop` on peer removal.
+        self.cancel_all_timers();
     }
 
     /// (Soft) precondition: `self.handshake == HandshakeState::None` (previous handshake is lost, but
@@ -1009,6 +1106,12 @@ impl Endpoint {
                     };
                     peer.send_persistent_keepalive(&mut self.state.scheduler, &mut out);
                 }
+                Event::NewHandshakeTimeout(peer_id) => {
+                    let Some(peer) = self.peers.get_mut(&peer_id) else {
+                        continue;
+                    };
+                    peer.new_handshake_timeout(&mut self.state, &mut out);
+                }
             }
         }
         out
@@ -1105,6 +1208,9 @@ pub enum Event {
     /// Send a *persistent* keepalive and unconditionally re-arm: keeps a fully-idle tunnel's
     /// NAT/relay path warm (WireGuard `PersistentKeepalive`).
     PersistentKeepalive(PeerId),
+    /// We sent data but heard nothing authenticated back within `KEEPALIVE_TIMEOUT + REKEY_TIMEOUT`;
+    /// re-initiate the handshake (wireguard-go `newHandshake` / `expiredNewHandshake`).
+    NewHandshakeTimeout(PeerId),
 }
 
 /// Base interval between handshake-initiation retransmits, `REKEY_TIMEOUT` from wireguard-go
@@ -1135,6 +1241,18 @@ const REKEY_TIMEOUT_JITTER_MAX_MS: u64 = 334;
 fn rekey_retransmit_delay() -> Duration {
     let jitter_ms = rand::random::<u64>() % REKEY_TIMEOUT_JITTER_MAX_MS;
     REKEY_TIMEOUT + Duration::from_millis(jitter_ms)
+}
+
+/// The delay until the "stopped hearing back" re-initiate fires after an authenticated data send:
+/// `KEEPALIVE_TIMEOUT + REKEY_TIMEOUT` plus uniform random jitter in
+/// `[0, REKEY_TIMEOUT_JITTER_MAX_MS)` ms, byte-faithful to wireguard-go `timersDataSent`
+/// (`newHandshake.Mod(KeepaliveTimeout + RekeyTimeout + fastrandn(RekeyTimeoutJitterMaxMs)*ms)`).
+/// That is `[15.000s, 15.334s)`. The same upward-only jitter as the retransmit timer desynchronizes
+/// peers that lost connectivity together and removes a perfectly-periodic 15s cadence that would
+/// fingerprint us against real WireGuard.
+fn new_handshake_delay() -> Duration {
+    let jitter_ms = rand::random::<u64>() % REKEY_TIMEOUT_JITTER_MAX_MS;
+    KEEPALIVE_TIMEOUT + REKEY_TIMEOUT + Duration::from_millis(jitter_ms)
 }
 
 /// Forward-only coalescing tail for the handshake-retransmit timer: the scheduler may fire the
@@ -1659,6 +1777,134 @@ mod tests {
         );
     }
 
+    /// The "stopped hearing back" timer (Go `timersDataSent` → `newHandshake` → `expiredNewHandshake`):
+    /// after A sends data and hears NOTHING authenticated back within `KEEPALIVE_TIMEOUT +
+    /// REKEY_TIMEOUT` (~15s), A re-initiates a handshake — recovering a silently-broken path in ~15s
+    /// instead of waiting out `REJECT_AFTER_TIME` (180s). We prove the re-init is a real, valid
+    /// handshake initiation by feeding it to B and confirming B produces a handshake response.
+    #[test]
+    fn stopped_hearing_back_reinitiates_handshake() {
+        // No persistent keepalive, so the only timer that can fire here is the new-handshake one.
+        let (mut a_ep, mut b_ep, a_peer, b_peer) = establish_session(None, b"hello");
+
+        // A sends more data — this arms the new-handshake timer (Go `timersDataSent`). B receives
+        // NOTHING back to A afterward (the silent-path-break scenario).
+        let sent = a_ep.send(HashMap::from([(
+            a_peer,
+            vec![PacketMut::from(&b"more"[..])],
+        )]));
+        assert_eq!(
+            sent.to_peers.get(&a_peer).map(|p| p.len()),
+            Some(1),
+            "the data send must produce one transport packet (and arm the new-handshake timer)"
+        );
+
+        // Before ~15s: nothing fires (the timer hasn't elapsed). Dispatch at +10s.
+        let now = Instant::now();
+        let early = a_ep.dispatch_events(now + Duration::from_secs(10));
+        assert!(
+            early.to_peers.get(&a_peer).is_none_or(|p| p.is_empty()),
+            "no re-initiation before KEEPALIVE_TIMEOUT + REKEY_TIMEOUT (~15s)"
+        );
+
+        // Past ~15s with no authenticated receive: A re-initiates a handshake.
+        let now = Instant::now();
+        let fired = a_ep.dispatch_events(now + Duration::from_secs(16));
+        let reinit = fired
+            .to_peers
+            .get(&a_peer)
+            .filter(|p| !p.is_empty())
+            .expect("A must re-initiate a handshake after hearing nothing back for ~15s")
+            .clone();
+
+        // Prove it is a genuine handshake initiation: B accepts it and emits a handshake response.
+        let resp = b_ep.recv(reinit);
+        assert!(
+            resp.to_peers.get(&b_peer).is_some_and(|p| !p.is_empty()),
+            "B must answer the re-initiated handshake with a response — proving it was a valid init"
+        );
+    }
+
+    /// The "stopped hearing back" timer is CANCELLED by an authenticated packet received (Go
+    /// `timersAnyAuthenticatedPacketReceived`): if A sends data and then hears something back (here a
+    /// keepalive from B), A must NOT re-initiate — the path is proven live.
+    #[test]
+    fn authenticated_receive_cancels_stopped_hearing_back() {
+        let (mut a_ep, mut b_ep, a_peer, b_peer) = establish_session(None, b"hello");
+
+        // A sends data → arms the new-handshake timer.
+        drop(a_ep.send(HashMap::from([(
+            a_peer,
+            vec![PacketMut::from(&b"more"[..])],
+        )])));
+
+        // B sends a keepalive-bearing packet back to A (drive B to emit, then deliver to A). The
+        // simplest authenticated A-bound packet: have B send data to A over the established session.
+        let b_to_a = b_ep.send(HashMap::from([(b_peer, vec![PacketMut::from(&b"hi"[..])])]));
+        let b_to_a = b_to_a
+            .to_peers
+            .get(&b_peer)
+            .expect("B sends a transport packet to A")
+            .clone();
+        // A receives the authenticated DATA packet — this cancels the new-handshake timer (and, as a
+        // side effect, arms A's reactive §6.5 keepalive, since it was a data packet).
+        drop(a_ep.recv(b_to_a));
+
+        // Dispatch well past ~15s. Because the new-handshake timer was cancelled, A must NOT
+        // re-initiate. A reactive keepalive (a 32-byte empty data packet) IS expected from the data
+        // recv above — that is fine; what must NOT appear is a (larger) handshake initiation. Assert
+        // no emitted packet is a handshake init: every packet is at most keepalive-sized.
+        let now = Instant::now();
+        let after = a_ep.dispatch_events(now + Duration::from_secs(20));
+        if let Some(pkts) = after.to_peers.get(&a_peer) {
+            for p in pkts {
+                assert!(
+                    p.len() <= KEEPALIVE_LEN,
+                    "no handshake initiation may fire after the timer was cancelled; got a \
+                     {}-byte packet (keepalive is {KEEPALIVE_LEN})",
+                    p.len()
+                );
+            }
+        }
+    }
+
+    /// Removing a peer cancels its pending "stopped hearing back" timer (and the other per-peer
+    /// timers): a `Handle` holds only a `Weak`, so without an explicit cancel the scheduled event
+    /// survives the dropped `Peer` and would later dispatch — a no-op for a gone id, but a spurious
+    /// handshake if the id is reused. Here we re-add the SAME peer id after removal and confirm no
+    /// stale re-initiation fires past the old deadline.
+    #[test]
+    fn removing_a_peer_cancels_its_pending_new_handshake() {
+        let (mut a_ep, _b_ep, a_peer, _b_peer) = establish_session(None, b"hello");
+
+        // A sends data → arms the new-handshake timer for a_peer.
+        drop(a_ep.send(HashMap::from([(
+            a_peer,
+            vec![PacketMut::from(&b"more"[..])],
+        )])));
+
+        // Remove the peer (this must cancel the pending timer), then re-add the SAME id fresh with a
+        // brand-new key/config — modeling a remove-then-re-add that reuses the caller-chosen id.
+        assert!(a_ep.remove_peer(a_peer), "the peer existed and was removed");
+        a_ep.upsert_peer(
+            a_peer,
+            PeerConfig {
+                key: NodeKeyPair::new().public,
+                psk: rand::random::<crate::config::Psk>(),
+                persistent_keepalive_interval: None,
+            },
+        );
+
+        // Dispatch past the old ~15s deadline: the freshly re-added peer (which has sent nothing)
+        // must NOT see a stale re-initiation from the removed peer's timer.
+        let now = Instant::now();
+        let after = a_ep.dispatch_events(now + Duration::from_secs(20));
+        assert!(
+            after.to_peers.get(&a_peer).is_none_or(|p| p.is_empty()),
+            "a removed peer's stale new-handshake timer must not fire on the re-added peer id"
+        );
+    }
+
     /// With no persistent keepalive configured (`None`), the historical behavior is preserved: once
     /// the reactive §6.5 keepalive lapses, an idle endpoint schedules nothing and emits nothing — no
     /// persistent keepalive is ever sent.
@@ -1708,12 +1954,11 @@ mod tests {
             "B's packet is an empty keepalive"
         );
 
-        // Drain any reactive keepalive A may have armed from the earlier handshake/data so the
-        // assertion below isolates the effect of receiving B's keepalive. (A received only handshake
-        // traffic so far, no data, so it should have nothing armed — but dispatch to be certain.)
-        let now = Instant::now();
-        drop(a_ep.dispatch_events(now + Duration::from_secs(60)));
-
+        // Receive B's keepalive. This both (a) is the inbound traffic under test, and (b) cancels
+        // A's "stopped hearing back" timer (armed by A's earlier data send) — an authenticated
+        // receive proves the path live (Go `timersAnyAuthenticatedPacketReceived`). We recv BEFORE
+        // any forward dispatch precisely so that timer is cancelled rather than firing a re-init that
+        // would muddy the reactive-keepalive assertion below.
         let recv = a_ep.recv(ka);
         // A keepalive carries no usable payload — any packet surfaced to local is empty (the
         // dataplane's IP src-filter drops it; the endpoint layer does not special-case it).
