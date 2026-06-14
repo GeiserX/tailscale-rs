@@ -25,19 +25,32 @@ pub use magic::Magic;
 pub use raw::RawFrame;
 
 /// Maximum size (in bytes) of a packet sent via DERP, not including any on-wire framing overhead.
-/// Equivalent to the max payload size of a [SendPacket], [ForwardPacket], or [RecvPacket] frame.
+/// Equivalent to the max payload size of a [SendPacket], [ForwardPacket], or [RecvPacket] frame
+/// (Go `derp.MaxPacketSize = 64 << 10`).
+///
+/// # Intentional divergence from Go on the bound for a *known inbound* frame
+///
+/// Go applies this 64 KiB bound only on the **send** side (`send`/`ForwardPacket`: "packet too
+/// big"); on the **receive** side every frame — including `RecvPacket` and `ServerInfo` — is bounded
+/// only by the wider [`MAX_RECV_FRAME_SIZE`] (`1 << 20`, Go `recvTimeout`), with `ServerInfo`
+/// additionally validated post-parse against Go's `NonceLen + MaxInfoLen`. This fork deliberately
+/// holds **every known frame** to this tighter 64 KiB cap at decode (`Header::new` /
+/// `Header::try_from`) as well, which is *stricter* than Go on the inbound path. This is the safe
+/// direction: it bounds a single inbound frame's allocation to 64 KiB rather than 1 MiB (16× tighter
+/// anti-DoS), and it drops no real traffic — a real DERP server relays WireGuard/disco datagrams
+/// whose payload (plus a `RecvPacket`/`ForwardPacket` frame's 32-byte source-key prefix) stays well
+/// under `MAX_PACKET_SIZE`; Tailscale's tunnel MTU is ~1280 B, so the 64 KiB–1 MiB *frame-body* band
+/// is never legitimately used (a production `ServerInfo` is likewise a few hundred bytes). An unknown
+/// (forward-extension) frame is still read and skipped up to [`MAX_RECV_FRAME_SIZE`] so a newer
+/// server is never disconnected.
 pub const MAX_PACKET_SIZE: usize = 64 << 10;
-
-/// Maximum length (in bytes) of a [ClientInfo] or [ServerInfo] frame's payload, excluding the
-/// key and nonce fields, and any on-wire framing overhead.
-pub const MAX_INFO_LEN: usize = 1 << 20;
 
 /// Upper bound (in bytes) on any frame body the receive codec will read off the wire before
 /// rejecting it as malformed. Matches Go `derp.go` `recvTimeout`'s `1<<20` cap — a generous safety
 /// bound that is **larger** than [`MAX_PACKET_SIZE`] so the codec can read (and, for an unknown
 /// type, skip) a large frame a forward-extended server might emit, rather than tearing the
-/// connection down. Known data frames are still bounded to [`MAX_PACKET_SIZE`] at `Header` build
-/// time; this is only the read/skip ceiling.
+/// connection down. Known frames are still bounded to [`MAX_PACKET_SIZE`] at `Header` build time
+/// (see the divergence note there); this is only the read/skip ceiling for unknown frames.
 pub const MAX_RECV_FRAME_SIZE: usize = 1 << 20;
 
 /// Minimum frequency (in seconds) at which the DERP server sends [`KeepAlive`] frames to each DERP
