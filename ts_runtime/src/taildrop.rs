@@ -20,8 +20,10 @@
 //! root is fixed at construction; all I/O is confined to it by joining only validated base names.
 
 use std::{
+    collections::HashSet,
     io::{self, Seek, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -126,7 +128,7 @@ pub fn validate_base_name(name: &str) -> Option<&str> {
 /// the first candidate (incl. `base` itself) whose path does not yet exist. Bounded to avoid an
 /// unbounded loop on a pathological directory.
 fn next_available_name(dir: &Path, base: &str) -> String {
-    if !dir.join(base).exists() {
+    if !path_present(&dir.join(base)) {
         return base.to_string();
     }
     let (stem, ext) = match base.rsplit_once('.') {
@@ -136,7 +138,7 @@ fn next_available_name(dir: &Path, base: &str) -> String {
     };
     for n in 1..=10_000u32 {
         let candidate = format!("{stem} ({n}){ext}");
-        if !dir.join(&candidate).exists() {
+        if !path_present(&dir.join(&candidate)) {
             return candidate;
         }
     }
@@ -144,11 +146,64 @@ fn next_available_name(dir: &Path, base: &str) -> String {
     format!("{stem} (overflow){ext}")
 }
 
+/// Whether a path is present, treating a symlink (even a dangling one) as present. Unlike
+/// `Path::exists()` (which follows the link and returns `false` for a dangling symlink), this uses
+/// `symlink_metadata` so a planted symlink can never be mistaken for a free name in
+/// [`next_available_name`] — we must not select, then rename onto, a symlink.
+fn path_present(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+/// Reject a path that is (or whose final component is) a symlink, mirroring the intent of Go's
+/// `O_NOFOLLOW` on the taildrop file ops. `validate_base_name` already blocks a traversing *name*,
+/// but not a symlink **component already planted in the store root** by a local attacker (e.g.
+/// `root/foo.txt -> /etc/cron.d/x`), which a plain `open`/`rename`/`remove` would follow. Uses
+/// `symlink_metadata` (lstat — does NOT follow the final symlink); a non-existent path is fine
+/// (returns `Ok(())`), only an existing symlink is refused. This is checked under the per-name
+/// in-flight lock, so it cannot race our own operations on the same name; the residual is an
+/// external process mutating the store dir concurrently, which already requires store-dir write
+/// access (the threat bound for this hardening).
+fn refuse_symlink(path: &Path) -> Result<(), TaildropError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(TaildropError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "taildrop path is a symlink; refusing to follow it",
+        ))),
+        Ok(_) => Ok(()),
+        // Not present yet (the common case for a fresh partial / final name) — nothing to refuse.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// A Taildrop file store rooted at a fixed directory. All operations are confined to this root by
 /// joining only [`validate_base_name`]-validated names.
 #[derive(Debug, Clone)]
 pub struct TaildropStore {
     root: PathBuf,
+    /// Base names with a transfer currently in flight. A `put_file` claims its base name here for
+    /// the whole receive (both a fresh `offset == 0` transfer and a resumed `offset > 0` one), so
+    /// two concurrent PUTs for the same name cannot interleave `set_len`/`seek`/`write_all` and
+    /// corrupt the shared `.partial`. Shared (`Arc`) so it survives `TaildropStore::clone()` — the
+    /// store is handed around as `Arc<TaildropStore>` but cloning it must not fork the guard set.
+    in_flight: Arc<Mutex<HashSet<String>>>,
+}
+
+/// RAII claim on an in-flight transfer name; releasing it (on drop) frees the name for the next
+/// transfer. Holds the shared guard set so the entry is removed even on an early return / error /
+/// panic in `put_file`.
+struct InFlightGuard {
+    set: Arc<Mutex<HashSet<String>>>,
+    name: String,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        // A poisoned lock still lets us recover the set and remove our entry — leaving a stale name
+        // claimed would wedge all future transfers of that name behind a phantom conflict.
+        let mut set = self.set.lock().unwrap_or_else(|p| p.into_inner());
+        set.remove(&self.name);
+    }
 }
 
 impl TaildropStore {
@@ -156,7 +211,25 @@ impl TaildropStore {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, TaildropError> {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            in_flight: Arc::new(Mutex::new(HashSet::new())),
+        })
+    }
+
+    /// Claim `base` as in-flight, returning an RAII guard that frees it on drop. Returns
+    /// [`TaildropError::FileExists`] if another transfer already holds the name — this is the
+    /// concurrency analog of the on-disk `.partial` conflict, and it serializes all transfers of one
+    /// name so a resume (`offset > 0`) cannot race a concurrent transfer's `set_len`/`seek`/`write`.
+    fn claim_in_flight(&self, base: &str) -> Result<InFlightGuard, TaildropError> {
+        let mut set = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        if !set.insert(base.to_string()) {
+            return Err(TaildropError::FileExists);
+        }
+        Ok(InFlightGuard {
+            set: self.in_flight.clone(),
+            name: base.to_string(),
+        })
     }
 
     /// The partial-file path for an already-validated base name.
@@ -196,6 +269,19 @@ impl TaildropStore {
     {
         let base = validate_base_name(name).ok_or(TaildropError::InvalidFileName)?;
         let partial = self.partial_path(base);
+
+        // Claim the name for the whole transfer FIRST, so two concurrent PUTs for the same base name
+        // (especially two resumes, `offset > 0`, which reopen the same `.partial`) cannot interleave
+        // their `set_len`/`seek`/`write_all` and corrupt the shared partial. The fresh-transfer path
+        // is already protected on disk by `create_new`, but the resume path opens with plain
+        // `write(true)` and needs this lock. The guard frees the name on drop (incl. early return /
+        // error / panic). Held across the await — it is a cheap `HashSet` membership marker, not a
+        // lock held during I/O, so it never blocks the runtime.
+        let _claim = self.claim_in_flight(base)?;
+
+        // Refuse to follow a symlink planted in the store root (Go's `O_NOFOLLOW` intent): the
+        // partial must be a regular file we create/own, never a pre-existing symlink to elsewhere.
+        refuse_symlink(&partial)?;
 
         // A fresh transfer (offset 0) must not collide with another in-flight transfer of the same
         // name; a resume (offset > 0) reopens the existing partial. File handles are std (the tokio
@@ -278,9 +364,19 @@ impl TaildropStore {
             file.sync_all()?;
             drop(file);
 
-            // Atomically publish under a non-clobbering final name.
+            // Atomically publish under a non-clobbering final name. `next_available_name` probes
+            // candidates with `symlink_metadata` (not `exists`, which follows symlinks), so it will
+            // not treat a planted symlink as "free" and rename onto it; and we refuse to rename onto
+            // an existing symlink target outright (Go `O_NOFOLLOW` intent). The `_claim` guard (held
+            // by the caller for the whole transfer) keeps this name serialized against other PUTs.
             let final_name = next_available_name(&root, &base);
             let final_path = root.join(&final_name);
+            if let Err(e) = refuse_symlink(&final_path) {
+                return Err(match e {
+                    TaildropError::Io(io_err) => io_err,
+                    other => io::Error::other(other.to_string()),
+                });
+            }
             std::fs::rename(&partial, &final_path)?;
             Ok(())
         })
@@ -306,8 +402,12 @@ impl TaildropStore {
         };
         for entry in entries {
             let entry = entry?;
+            // `entry.metadata()` does NOT follow symlinks (it is `lstat`-based), so a planted
+            // symlink has `is_file() == false` here and is skipped — a symlink in the store root is
+            // never reported as a waiting file (Go `O_NOFOLLOW` intent), even one pointing at a real
+            // regular file elsewhere.
             let meta = entry.metadata()?;
-            if !meta.is_file() {
+            if meta.file_type().is_symlink() || !meta.is_file() {
                 continue;
             }
             let Ok(name) = entry.file_name().into_string() else {
@@ -327,18 +427,25 @@ impl TaildropStore {
     }
 
     /// Delete a fully-received file by base name (Go `DeleteFile`). The name is validated first, so a
-    /// traversal attempt can never escape the store root.
+    /// traversal attempt can never escape the store root, and a symlink at the target is refused (Go
+    /// `O_NOFOLLOW` intent) rather than followed — a planted `root/foo.txt -> /etc/passwd` must not
+    /// let a `delete foo.txt` remove the link's target.
     pub fn delete_file(&self, name: &str) -> Result<(), TaildropError> {
         let base = validate_base_name(name).ok_or(TaildropError::InvalidFileName)?;
-        std::fs::remove_file(self.root.join(base))?;
+        let path = self.root.join(base);
+        refuse_symlink(&path)?;
+        std::fs::remove_file(path)?;
         Ok(())
     }
 
     /// Open a fully-received file by base name for reading, returning the handle and its size (Go
-    /// `OpenFile`). The name is validated first.
+    /// `OpenFile`). The name is validated first, and a symlink at the target is refused (Go
+    /// `O_NOFOLLOW` intent) so a planted symlink cannot redirect the read to an arbitrary file.
     pub fn open_file(&self, name: &str) -> Result<(std::fs::File, u64), TaildropError> {
         let base = validate_base_name(name).ok_or(TaildropError::InvalidFileName)?;
-        let f = std::fs::File::open(self.root.join(base))?;
+        let path = self.root.join(base);
+        refuse_symlink(&path)?;
+        let f = std::fs::File::open(path)?;
         let size = f.metadata()?.len();
         Ok((f, size))
     }
@@ -618,6 +725,151 @@ mod tests {
         ));
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn concurrent_resume_for_same_name_is_serialized() {
+        // The in-flight name guard: while one transfer holds a base name, a second PUT for the SAME
+        // name (the resume-race the lock closes) is rejected with FileExists rather than interleaving
+        // writes into the shared `.partial`. We hold the first transfer open with a reader that never
+        // completes until we let it, then fire the second concurrently.
+        let root = tmp_root();
+        let store = Arc::new(TaildropStore::new(&root).unwrap());
+
+        // A reader that delivers a byte, then blocks until released — keeps transfer #1 in flight
+        // (and thus the name claimed) while we attempt transfer #2.
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        struct BlockingReader {
+            sent: bool,
+            release: Option<tokio::sync::oneshot::Receiver<()>>,
+        }
+        impl AsyncRead for BlockingReader {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                if !self.sent {
+                    buf.put_slice(b"x");
+                    self.sent = true;
+                    return std::task::Poll::Ready(Ok(()));
+                }
+                // After the first byte, park until released, then report EOF.
+                match self.release.as_mut() {
+                    Some(rx) => match std::pin::Pin::new(rx).poll(cx) {
+                        std::task::Poll::Ready(_) => {
+                            self.release = None;
+                            std::task::Poll::Ready(Ok(())) // EOF (no bytes written)
+                        }
+                        std::task::Poll::Pending => std::task::Poll::Pending,
+                    },
+                    None => std::task::Poll::Ready(Ok(())),
+                }
+            }
+        }
+
+        let s1 = store.clone();
+        let t1 = tokio::spawn(async move {
+            let reader = BlockingReader {
+                sent: false,
+                release: Some(release_rx),
+            };
+            // expected_len 1: completes once the single byte is read and the reader returns EOF.
+            s1.put_file("race.bin", reader, 0, 1).await
+        });
+
+        // Wait until transfer #1 has actually claimed the name (its partial exists).
+        let partial = root.join("race.bin.partial");
+        for _ in 0..200 {
+            if partial.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            partial.exists(),
+            "transfer #1 should have created the partial"
+        );
+
+        // Transfer #2 for the SAME name, while #1 still holds the claim → FileExists, no interleave.
+        let err = store
+            .put_file("race.bin", &b"yy"[..], 1, 3)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, TaildropError::FileExists),
+            "a concurrent transfer for an in-flight name must be rejected, got {err:?}"
+        );
+
+        // Release #1 so it finalizes cleanly, and confirm the name frees afterward.
+        release_tx.send(()).unwrap();
+        t1.await.unwrap().unwrap();
+        // Now the name is free: a fresh transfer succeeds (the guard was released on drop).
+        store.put_file("race.bin", &b"z"[..], 0, 1).await.unwrap();
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_in_store_root_is_refused_not_followed() {
+        use std::os::unix::fs::symlink;
+
+        let root = tmp_root();
+        let store = TaildropStore::new(&root).unwrap();
+
+        // An attacker-planted symlink in the store root, pointing at a sensitive file OUTSIDE it.
+        let outside = tmp_root();
+        std::fs::create_dir_all(&outside).unwrap();
+        let secret = outside.join("secret");
+        std::fs::write(&secret, b"TOP SECRET").unwrap();
+
+        // (a) open_file must refuse a symlink target, never read through it.
+        let link = root.join("link.txt");
+        symlink(&secret, &link).unwrap();
+        let open_err = store.open_file("link.txt").unwrap_err();
+        assert!(
+            matches!(open_err, TaildropError::Io(ref e) if e.kind() == io::ErrorKind::InvalidInput),
+            "open_file must refuse a symlink, got {open_err:?}"
+        );
+
+        // (b) delete_file must refuse the symlink, leaving BOTH the link and its target intact.
+        let del_err = store.delete_file("link.txt").unwrap_err();
+        assert!(
+            matches!(del_err, TaildropError::Io(ref e) if e.kind() == io::ErrorKind::InvalidInput),
+            "delete_file must refuse a symlink, got {del_err:?}"
+        );
+        assert!(
+            secret.exists(),
+            "the symlink target must NOT have been deleted"
+        );
+        assert_eq!(std::fs::read(&secret).unwrap(), b"TOP SECRET");
+
+        // (c) waiting_files must not report the symlink as a waiting file.
+        assert!(
+            store.waiting_files().unwrap().is_empty(),
+            "a symlink in the store root must not be listed as a waiting file"
+        );
+
+        // (d) put_file onto a symlinked partial must refuse rather than write through the link.
+        let link_partial = root.join("evil.bin.partial");
+        symlink(&secret, &link_partial).unwrap();
+        let put_err = store
+            .put_file("evil.bin", &b"data"[..], 0, 4)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(put_err, TaildropError::Io(ref e) if e.kind() == io::ErrorKind::InvalidInput),
+            "put_file must refuse a symlinked partial, got {put_err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&secret).unwrap(),
+            b"TOP SECRET",
+            "the symlink target must NOT have been written through"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     #[test]
