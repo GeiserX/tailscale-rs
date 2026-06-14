@@ -383,6 +383,42 @@ mod test {
         );
     }
 
+    /// Symmetric to `last_usable_nonce_encodes_then_next_is_refused`, for the DECODE direction: a
+    /// decoder at counter u64::MAX - 1 decodes one record (advancing to u64::MAX), then refuses the
+    /// next with InvalidData rather than panicking in `decrypt_in_place`'s `checked_add`. Guards
+    /// against a future edit desynchronizing the encode and decode guards. The decode guard fires on
+    /// the counter alone, BEFORE attempting decrypt, so the second frame need only be a
+    /// structurally-valid Record frame (its body's own counter is never reached).
+    #[test]
+    fn last_usable_nonce_decodes_then_next_is_refused() {
+        let key: [u8; 32] = rand::random();
+
+        // Two independent encoders seeded at u64::MAX - 1 each produce one valid Record frame at
+        // counter MAX-1. (Each encoder can emit exactly one before its own guard refuses the next.)
+        let (mut enc_a, mut dec) = init_codec_pair(key, u64::MAX - 1);
+        let mut frame_a = BytesMut::new();
+        enc_a
+            .encode(TEST_PAYLOAD, &mut frame_a)
+            .expect("encode at u64::MAX - 1 must succeed");
+        let (mut enc_b, _d) = init_codec_pair(key, u64::MAX - 1);
+        let mut frame_b = BytesMut::new();
+        enc_b
+            .encode(TEST_PAYLOAD, &mut frame_b)
+            .expect("encode at u64::MAX - 1 must succeed");
+
+        // The decoder (also at u64::MAX - 1) decodes frame_a, advancing its counter to u64::MAX.
+        let decoded = dec.decode(&mut frame_a).unwrap().unwrap();
+        assert_eq!(decoded.as_ref(), TEST_PAYLOAD, "the MAX-1 record decodes");
+
+        // The decoder is now at u64::MAX: it must REFUSE the next (structurally-valid) Record frame
+        // before attempting decrypt (which would otherwise panic in CipherState's checked_add).
+        let got = dec.decode(&mut frame_b);
+        assert!(
+            matches!(&got, Err(e) if e.kind() == ErrorKind::InvalidData),
+            "a decode once the recv counter reaches u64::MAX must be refused, got {got:?}"
+        );
+    }
+
     static RUNTIME: LazyLock<tokio::runtime::Runtime> =
         LazyLock::new(|| tokio::runtime::Runtime::new().unwrap());
 
