@@ -554,6 +554,10 @@ async fn run_once(
     }
 
     let client_name = config.format_client_name();
+    // Host-environment facts advertised on every map poll, so control persistently sees a dense,
+    // genuine-looking Hostinfo (OS / version / arch / machine) rather than an empty shell. Bound here
+    // so its owned strings outlive the borrowing builder.
+    let host = crate::hostinfo::HostInfoData::detect();
     // Advertise-side VIP services: hash the validated hosted-service set into
     // `HostInfo.ServicesHash`. Empty config -> empty hash -> wire field omitted (unchanged behavior).
     let advertised_vip_services = config.advertised_vip_services();
@@ -564,6 +568,7 @@ async fn run_once(
         .stream(true)
         .routable_ips(config.advertised_routes())
         .client_info(&client_name, crate::PKG_VERSION)
+        .host_environment(&host)
         .request_tags(config.tags.iter().map(String::as_str))
         .services(config.advertised_services())
         .services_hash(&services_hash)

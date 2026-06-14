@@ -32,6 +32,7 @@ mod control_dialer;
 mod derp;
 mod dial_plan;
 mod dns;
+mod hostinfo;
 #[cfg_attr(not(feature = "async_tokio"), expect(dead_code))]
 mod map_request_builder;
 mod node;

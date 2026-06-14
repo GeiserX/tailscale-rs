@@ -72,6 +72,12 @@ rand = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"], optional = true }
 
+# Unix-only: `uname(2)` for the `Hostinfo` OS-version + machine fields (Go fills these from
+# `unameMachine` / the kernel release). `std` does not expose `uname`, so it comes from `libc`.
+# Already in the dependency graph transitively, so declaring it directly adds no new crate.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # TEST-ONLY ephemeral self-signed cert to exercise the rustls acceptor wiring in
 # `serve`/`cert` tests. Never a production issuance path.
