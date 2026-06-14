@@ -347,6 +347,13 @@ pub struct DerpMap<'a> {
     /// If there aren't any non-default DERP servers in [`DerpMap::regions`], this field is
     /// ignored. This field is only meaningful if [`DerpMap::regions`] is also populated, which
     /// indicates a change in the set of DERP regions/servers.
+    ///
+    /// Wire key `omitDefaultRegions` — **lowerCamel**: Go gives this field an EXPLICIT
+    /// `json:"omitDefaultRegions,omitempty"` tag (the only non-empty-name tag in `DERPMap`), so it is
+    /// NOT the `PascalCase` default `OmitDefaultRegions`. Without the rename the fork would never read
+    /// a control-sent `omitDefaultRegions:true` and would keep using Tailscale's default DERP servers
+    /// against the operator's intent.
+    #[serde(rename = "omitDefaultRegions")]
     pub omit_default_regions: bool,
 }
 

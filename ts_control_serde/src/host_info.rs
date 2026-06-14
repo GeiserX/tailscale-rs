@@ -28,9 +28,13 @@ pub struct HostInfo<'a> {
     /// `IpnVersion` key is itself a not-Go tell). Same reason `os`/`os_version` are renamed below.
     #[serde(rename = "IPNVersion")]
     pub ipn_version: &'a str,
-    /// Logtail ID of the Tailscale frontend (CLI) instance.
+    /// Logtail ID of the Tailscale frontend (CLI) instance. Wire key `FrontendLogID` (Go's `ID`
+    /// acronym), not the `PascalCase` default `FrontendLogId`.
+    #[serde(rename = "FrontendLogID")]
     pub frontend_log_id: &'a str,
-    /// Logtail ID of the Tailscale frontend (daemon) instance.
+    /// Logtail ID of the Tailscale frontend (daemon) instance. Wire key `BackendLogID`, not
+    /// `BackendLogId`.
+    #[serde(rename = "BackendLogID")]
     pub backend_log_id: &'a str,
     /// A string indicating the operating system running on the Tailscale host. Wire key `OS` (Go
     /// `tailcfg.Hostinfo.OS`, empty-name tag → verbatim `OS`), not the `PascalCase` default `Os`.
@@ -121,12 +125,16 @@ pub struct HostInfo<'a> {
     /// The Go version this Tailscale node's binary was built with.
     pub go_version: &'a str,
 
-    /// The set of IP ranges this Tailscale node can route.
+    /// The set of IP ranges this Tailscale node can route. Wire key `RoutableIPs` (Go's `IPs`
+    /// acronym), not the `PascalCase` default `RoutableIps`.
+    #[serde(rename = "RoutableIPs")]
     pub routable_ips: Option<Vec<ipnet::IpNet>>,
     /// The set of ACL tags this Tailscale node wants to claim.
     pub request_tags: Option<Vec<&'a str>>,
     /// MAC address(es) to send Wake-on-LAN packets to wake this node. Each address is formatted as
-    /// a lowercase hexadecimal string, with each byte of the address separated by colons.
+    /// a lowercase hexadecimal string, with each byte of the address separated by colons. Wire key
+    /// `WoLMACs` — Go's exact casing (`WoL` + `MACs`), not the `PascalCase` default `WolMacs`.
+    #[serde(rename = "WoLMACs")]
     pub wol_macs: Option<Vec<&'a str>>,
     /// Services running on the Tailscale node's host to advertise to the Tailnet.
     pub services: Option<Vec<Service<'a>>>,
@@ -136,7 +144,10 @@ pub struct HostInfo<'a> {
     /// 4 protocols, types of NAT hole-punching available on the LAN, etc.
     pub net_info: Option<NetInfo<'a>>,
 
-    /// The Tailscale node's SSH host public keys, if advertised.
+    /// The Tailscale node's SSH host public keys, if advertised. Wire key `sshHostKeys` —
+    /// **lowerCamel**, the one HostInfo field with an EXPLICIT Go tag (`json:"sshHostKeys,omitempty"`)
+    /// rather than an empty-name tag, so it is NOT PascalCase `SshHostKeys`.
+    #[serde(rename = "sshHostKeys")]
     pub ssh_host_keys: Option<Vec<&'a str>>,
 
     /// If populated, the name of the cloud provider this Tailscale node is running in, such as
@@ -163,13 +174,17 @@ pub struct HostInfo<'a> {
     /// via c2n (control-to-node).
     pub services_hash: &'a str,
 
-    /// The Tailscale node's selected exit node. Empty when unselected.
+    /// The Tailscale node's selected exit node. Empty when unselected. Wire key `ExitNodeID` (Go's
+    /// `ID` acronym), not the `PascalCase` default `ExitNodeId`.
+    #[serde(rename = "ExitNodeID")]
     pub exit_node_id: &'a str,
     /// Geographical location data about a Tailscale host. Location is optional and only set if
     /// explicitly declared by a node.
     pub location: Option<Location<'a>>,
 
-    /// TPM device metadata, if available.
+    /// TPM device metadata, if available. Wire key `TPM` (acronym), not the `PascalCase` default
+    /// `Tpm`.
+    #[serde(rename = "TPM")]
     pub tpm: Option<TpmInfo<'a>>,
     /// Reports whether the node state is stored encrypted on-disk. The actual mechanism is platform-specific:
     /// * Apple nodes use the Keychain

@@ -33,6 +33,9 @@ pub struct ClientVersion<'a> {
     pub notify: bool,
     /// A [`Url`] to open in the platform's web browser when the user clicks on the notification.
     /// Only populated when [`ClientVersion::notify`] is `true`.
+    ///
+    /// Wire key `NotifyURL` (Go's `URL` acronym), not the `PascalCase` default `NotifyUrl`.
+    #[serde(rename = "NotifyURL")]
     pub notify_url: Option<Url>,
     /// The text to show in the notification. Only populated when [`ClientVersion::notify`] is
     /// `true`.
