@@ -365,6 +365,19 @@ impl ControlRunner {
                 // dropped, ordered by this actor) — no bus, no re-publish-for-replay needed.
                 self.tka_authority
                     .send_replace(Some(synced.authority.clone()));
+
+                // Observability (Go `tkaFilterNetmapLocked`'s self check → `LockedOut` health
+                // warning): verify SELF's own node-key signature against the freshly-synced
+                // Authority and warn if self is NOT authorized. We never FILTER self (self never
+                // enters the peer db, so enforcement can't lock us out of our own netmap), but Go
+                // raises an operator-facing warning here because a self that the lock does not
+                // authorize means this node's key-signature is missing/invalid for the current lock
+                // — it will be unable to prove itself to locked peers. This fork has no health
+                // subsystem, so the signal is a `tracing::warn!` (its observability channel).
+                if let Some(self_node) = self.self_node.borrow().as_ref() {
+                    log_self_lockout(self_node, &synced.authority);
+                }
+
                 self.tka_synced = Some(synced);
             }
             Ok(None) => {
@@ -473,6 +486,65 @@ pub(crate) fn bridge_reauth_url_to_state(
                 true
             }
         });
+    }
+}
+
+/// The classification of SELF against the active network lock — the observability analog of Go
+/// `tkaFilterNetmapLocked`'s self check (which raises a `LockedOut` health warning).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SelfLockVerdict {
+    /// Self carries no key-signature at all (empty). The common "not signed yet" case: the node
+    /// simply has not been signed for this lock — not locked out, just unsigned.
+    Unsigned,
+    /// Self's key-signature is authorized by the active lock; nothing to warn about.
+    Authorized,
+    /// Self has a key-signature but the lock does NOT authorize it (the message is the verify
+    /// error). The operator-facing `LockedOut` condition: locked peers will reject this node.
+    LockedOut(String),
+}
+
+/// Classify a node key + its key-signature against `authority` (pure: verify-and-classify, no
+/// logging, no I/O). Takes only the two fields it needs — not the whole `Node` — so the decision is
+/// unit-testable without constructing a full `Node` or standing up the actor.
+fn self_lock_verdict(
+    node_key: &ts_keys::NodePublicKey,
+    key_signature: &[u8],
+    authority: &ts_tka::Authority,
+) -> SelfLockVerdict {
+    if key_signature.is_empty() {
+        return SelfLockVerdict::Unsigned;
+    }
+    match authority.node_key_authorized(&node_key.to_bytes(), key_signature) {
+        Ok(()) => SelfLockVerdict::Authorized,
+        Err(e) => SelfLockVerdict::LockedOut(e.to_string()),
+    }
+}
+
+/// Emit the self-locked-out observability signal (Go `tkaFilterNetmapLocked`'s self check → a
+/// `LockedOut` health warning): classify SELF against the freshly-synced `authority` and log.
+///
+/// This is **observability, not enforcement** — self never enters the peer db, so the lock can never
+/// filter our own node out of the netmap. But a self the lock does not authorize means this node's
+/// key-signature is absent or invalid for the active lock, so it cannot prove itself to locked peers
+/// (they will drop it); surfacing that lets an operator notice and re-sign. A never-signed node
+/// (empty signature) logs at `info`, distinct from a present-but-invalid signature (`warn`), so the
+/// common unsigned case does not spam a warning. This fork has no health subsystem, so the operator
+/// signal is a `tracing` event (its observability channel).
+fn log_self_lockout(self_node: &Node, authority: &ts_tka::Authority) {
+    match self_lock_verdict(&self_node.node_key, &self_node.key_signature, authority) {
+        SelfLockVerdict::Unsigned => tracing::info!(
+            "TKA: this node has no key-signature for the active lock; it cannot prove itself to \
+             locked peers until control signs it (not locked out, just unsigned)"
+        ),
+        SelfLockVerdict::Authorized => {
+            tracing::debug!("TKA: self node-key is authorized by the active lock")
+        }
+        SelfLockVerdict::LockedOut(error) => tracing::warn!(
+            %error,
+            "TKA self locked out: this node's key-signature is not authorized by the active \
+             network lock; locked peers will reject it until control re-signs this node \
+             (Go LockedOut)"
+        ),
     }
 }
 
@@ -1611,5 +1683,42 @@ mod home_region_hysteresis_tests {
     fn keeps_current_when_it_is_already_best() {
         let m = [region(2, 20), region(1, 50)];
         assert_eq!(select_home_region(Some(rid(2)), &m).unwrap().id, rid(2));
+    }
+}
+
+#[cfg(test)]
+mod self_lockout_tests {
+    use ts_tka::{AumHash, Authority, State};
+
+    use super::{SelfLockVerdict, self_lock_verdict};
+
+    fn node_key() -> ts_keys::NodePublicKey {
+        ts_keys::NodePrivateKey::random().public_key()
+    }
+
+    /// An empty key-signature is the "not signed yet" case: `Unsigned`, never a lockout warning —
+    /// so a tailnet that simply has not signed this node does not spam a `warn`.
+    #[test]
+    fn empty_signature_is_unsigned_not_locked_out() {
+        let authority = Authority::from_state(AumHash([0; 32]), State::default());
+        assert_eq!(
+            self_lock_verdict(&node_key(), &[], &authority),
+            SelfLockVerdict::Unsigned
+        );
+    }
+
+    /// A non-empty key-signature that the active lock cannot authorize (here: an empty-state
+    /// Authority trusts no key, so any signature fails to verify) classifies as `LockedOut` — the
+    /// operator-facing condition. The verdict carries the verify error string for the log.
+    #[test]
+    fn unverifiable_signature_is_locked_out() {
+        let authority = Authority::from_state(AumHash([0; 32]), State::default());
+        // A bogus (non-empty) signature blob: it is non-empty so we attempt verification, and the
+        // empty-state Authority rejects it (no trusted key / undecodable), yielding LockedOut.
+        let verdict = self_lock_verdict(&node_key(), &[0x01, 0x02, 0x03], &authority);
+        assert!(
+            matches!(verdict, SelfLockVerdict::LockedOut(_)),
+            "a signature the lock cannot authorize must classify as LockedOut, got {verdict:?}"
+        );
     }
 }
