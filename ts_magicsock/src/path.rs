@@ -56,6 +56,34 @@ const BETTER_ADDR_IMPROVEMENT: f64 = 0.01;
 /// discipline. Sized above any realistic RTT and the re-ping cadence.
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Minimum time between *discovery* pings to a single non-best candidate, matching Go magicsock's
+/// `discoPingInterval` (= `tsconst.DefaultPingInterval`, 5s; applied in `sendDiscoPingsLocked` at
+/// `endpoint.go`). The global pinger runs every 2s (`ts_runtime::direct::PING_INTERVAL`), but a
+/// candidate that is NOT the confirmed best is re-pinged at most once per this interval, so an
+/// unconfirmed/rival path is probed on Go's 5s cadence rather than every 2s tick (a fingerprint).
+///
+/// CRITICAL: this floor applies to discovery only — the confirmed **best** path is exempt and is
+/// still re-pinged on the [`REFRESH_BEFORE_EXPIRY`] schedule (Go heartbeats the best addr with no
+/// interval floor, `endpoint.go`). Flooring the best would delay its re-ping from ~3s to the 6s tick,
+/// leaving < 0.5s before `TRUST_DURATION` lapses — one missed tick would take the path dark, exactly
+/// the flap [`REFRESH_BEFORE_EXPIRY`] was added to fix.
+const DISCO_PING_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Latency at or below which the confirmed best path is "good enough" that we stop full-pinging the
+/// other candidates — Go magicsock `goodEnoughLatency` (5ms), the `wantFullPingLocked` quiet-down.
+/// On a good direct path (e.g. same-DC / LAN <5ms — common for the fork's public-VPS topology) this
+/// reduces steady-state ping volume to just the best-path refresh, matching a stock client. The best
+/// path is still refreshed (so trust never lapses), and the periodic upgrade probe
+/// ([`UPGRADE_UDP_DIRECT_INTERVAL`]) still re-discovers a better path.
+const GOOD_ENOUGH_LATENCY: Duration = Duration::from_millis(5);
+
+/// Even on a good-enough best path, full-ping every candidate this often to discover a better one —
+/// Go magicsock `upgradeUDPDirectInterval` (1 min). This is the escape hatch for the
+/// [`GOOD_ENOUGH_LATENCY`] quiet-down: without it, a peer that confirmed a <5ms path would never
+/// re-probe its other candidates and could be locked onto a no-longer-optimal path. Bounds the quiet
+/// period so path selection stays responsive without per-2s-tick chatter.
+const UPGRADE_UDP_DIRECT_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Maximum number of [`CandidateSource::Learned`] candidate endpoints tracked per peer.
 ///
 /// Anti-amplification (the per-peer accumulation bound complementing the per-message
@@ -88,6 +116,12 @@ struct Candidate {
     latency: Option<Duration>,
     /// How this endpoint was learned (decides reconcile behavior).
     source: CandidateSource,
+    /// When we last *sent* a discovery ping to this endpoint, if ever. Gates the per-candidate
+    /// [`DISCO_PING_INTERVAL`] floor so a non-best candidate is re-probed on Go's 5s cadence rather
+    /// than every 2s pinger tick. Stamped at send time (in [`PeerPaths::note_ping_sent`]) — matching
+    /// Go's `st.lastPing = now` at ping dispatch — so a candidate whose pong is lost still waits the
+    /// full interval before the next probe.
+    last_ping: Option<Instant>,
 }
 
 /// A ping we sent and are awaiting a pong for.
@@ -104,6 +138,10 @@ pub struct PeerPaths {
     in_flight: HashMap<TxId, InFlight>,
     best: Option<SocketAddr>,
     trust_until: Option<Instant>,
+    /// When we last full-pinged *every* candidate (the discovery sweep), if ever. Gates the
+    /// [`UPGRADE_UDP_DIRECT_INTERVAL`] periodic re-probe that overrides the [`GOOD_ENOUGH_LATENCY`]
+    /// quiet-down (Go magicsock's `lastFullPing` feeding `wantFullPingLocked`).
+    last_full_ping: Option<Instant>,
 }
 
 impl PeerPaths {
@@ -245,6 +283,67 @@ impl PeerPaths {
         self.candidates.keys().copied().collect()
     }
 
+    /// The candidate endpoints to disco-ping this cycle, applying Go magicsock's cadence gates so
+    /// the on-wire ping rate matches a stock client instead of pinging every candidate every 2s
+    /// tick. `now` is the pinger tick instant. The caller should already have checked
+    /// [`needs_refresh`](Self::needs_refresh); this method assumes a ping cycle is warranted and
+    /// decides *which* candidates.
+    ///
+    /// The gates (each only ever *reduces* ping volume, so a path is never starved of confirmation):
+    /// - The confirmed **best** path is ALWAYS included (un-floored) — it is the heartbeat refresh
+    ///   that keeps trust alive; flooring it would risk the path going dark (see
+    ///   [`DISCO_PING_INTERVAL`]).
+    /// - A **good-enough** best (latency ≤ [`GOOD_ENOUGH_LATENCY`]) quiets the discovery of the other
+    ///   candidates (Go `wantFullPingLocked` → false), UNLESS the periodic
+    ///   [`UPGRADE_UDP_DIRECT_INTERVAL`] re-probe is due — in which case all candidates are pinged to
+    ///   look for a better path, and `last_full_ping` is stamped.
+    /// - Otherwise (no good-enough best yet, or the upgrade is due) every candidate is eligible, but a
+    ///   non-best candidate is skipped if it was pinged within [`DISCO_PING_INTERVAL`] (the 5s
+    ///   discovery floor).
+    ///
+    /// Stamps `last_full_ping` whenever it returns the full candidate set, so the upgrade interval is
+    /// measured from the last full sweep.
+    pub fn candidates_to_ping(&mut self, now: Instant) -> Vec<SocketAddr> {
+        let best = self.best_addr(now);
+        let best_latency = best.and_then(|b| self.candidates.get(&b).and_then(|c| c.latency));
+        let good_enough = best_latency.is_some_and(|l| l <= GOOD_ENOUGH_LATENCY);
+
+        let upgrade_due = match self.last_full_ping {
+            Some(t) => now.saturating_duration_since(t) >= UPGRADE_UDP_DIRECT_INTERVAL,
+            None => true,
+        };
+
+        // Full sweep when we are NOT quieted by a good-enough best, or when the periodic upgrade
+        // re-probe is due. In a full sweep every candidate is eligible (subject to the per-candidate
+        // discovery floor for the non-best ones); the best is always included regardless.
+        let full_sweep = !good_enough || upgrade_due;
+        if full_sweep {
+            self.last_full_ping = Some(now);
+        }
+
+        let mut out = Vec::new();
+        for (addr, cand) in &self.candidates {
+            let is_best = Some(*addr) == best;
+            if is_best {
+                // The confirmed best is the heartbeat refresh — always pinged, never floored.
+                out.push(*addr);
+                continue;
+            }
+            if !full_sweep {
+                // Quieted by a good-enough best and no upgrade due: skip non-best candidates.
+                continue;
+            }
+            // Non-best discovery ping: honor the per-candidate 5s floor.
+            let floored = cand
+                .last_ping
+                .is_some_and(|t| now.saturating_duration_since(t) < DISCO_PING_INTERVAL);
+            if !floored {
+                out.push(*addr);
+            }
+        }
+        out
+    }
+
     /// Record that we sent a ping with `tx_id` to `to` at time `sent`.
     ///
     /// First prunes any in-flight probe older than `PING_TIMEOUT` (presumed lost — its pong will
@@ -256,6 +355,10 @@ impl PeerPaths {
         self.in_flight
             .retain(|_, inflight| sent.saturating_duration_since(inflight.sent) < PING_TIMEOUT);
         self.in_flight.insert(tx_id, InFlight { to, sent });
+        // Stamp the candidate's last-ping time so the per-candidate `DISCO_PING_INTERVAL` discovery
+        // floor measures from send (matching Go's `st.lastPing = now`). A ping to an address not yet
+        // in the candidate set (shouldn't happen on the discovery path) creates a default entry.
+        self.candidates.entry(to).or_default().last_ping = Some(sent);
     }
 
     /// Record a pong for `tx_id` received from `from`. Returns the measured latency if the tx id
@@ -865,6 +968,131 @@ mod tests {
             p.best_addr(just_after_a_expiry),
             None,
             "a rival's pong must not extend the held best's trust window"
+        );
+    }
+
+    // ---- cadence gates (tsr-7s3, matching Go magicsock) ----
+
+    /// An unconfirmed candidate is pinged at most once per `DISCO_PING_INTERVAL` (5s), not every
+    /// pinger tick — the discovery floor. The first call pings it; a call < 5s later does not; a
+    /// call ≥ 5s later does again.
+    #[test]
+    fn discovery_floor_throttles_unconfirmed_candidate_to_5s() {
+        let mut p = PeerPaths::default();
+        let a: SocketAddr = "203.0.113.1:41641".parse().unwrap();
+        p.add_netmap_candidates([a]);
+        let now = Instant::now();
+
+        // First tick: pinged (never pinged before → no floor).
+        assert_eq!(p.candidates_to_ping(now), vec![a]);
+        p.note_ping_sent(tx(1), a, now);
+
+        // 2s later (next pinger tick): still inside the 5s floor → not pinged.
+        assert!(
+            p.candidates_to_ping(now + Duration::from_secs(2))
+                .is_empty(),
+            "unconfirmed candidate must not be re-pinged within DISCO_PING_INTERVAL"
+        );
+
+        // 5s later: floor elapsed → pinged again.
+        assert_eq!(p.candidates_to_ping(now + Duration::from_secs(5)), vec![a]);
+    }
+
+    /// The confirmed BEST path is EXEMPT from the discovery floor — it is re-pinged whenever a ping
+    /// cycle runs (the heartbeat refresh), even moments after its confirming ping. This is the
+    /// load-bearing regression guard: flooring the best would delay its re-ping past the trust
+    /// window and flap the path to DERP. Removing the best-exemption in `candidates_to_ping` makes
+    /// this assertion fail (the best would be floored for 5s like any other candidate).
+    #[test]
+    fn confirmed_best_is_exempt_from_the_discovery_floor() {
+        let mut p = PeerPaths::default();
+        let a: SocketAddr = "203.0.113.1:41641".parse().unwrap();
+        p.add_netmap_candidates([a]);
+        let now = Instant::now();
+
+        // Confirm `a` as the (sole, trusted) best at a non-good-enough latency (>5ms) so the
+        // good-enough quiet-down does not also apply — we are isolating the floor exemption.
+        p.note_ping_sent(tx(1), a, now);
+        p.note_pong(tx(1), a, now + Duration::from_millis(50)); // 50ms RTT → best, not good-enough
+        assert_eq!(p.best_addr(now + Duration::from_millis(50)), Some(a));
+
+        // Only ~1s after the confirming ping — well inside the 5s discovery floor — the best must
+        // STILL be returned for a re-ping (heartbeat), because the best is exempt from the floor.
+        let soon = now + Duration::from_secs(1);
+        assert_eq!(
+            p.candidates_to_ping(soon),
+            vec![a],
+            "the confirmed best must be re-pinged despite being inside the 5s discovery floor"
+        );
+    }
+
+    /// A good-enough best (≤5ms) quiets discovery of the OTHER candidates (no full-ping), while the
+    /// best itself is still refreshed. The non-best candidate is skipped until the upgrade interval.
+    #[test]
+    fn good_enough_best_quiets_nonbest_candidates() {
+        let mut p = PeerPaths::default();
+        let a: SocketAddr = "203.0.113.1:41641".parse().unwrap();
+        let b: SocketAddr = "203.0.113.2:41641".parse().unwrap();
+        p.add_netmap_candidates([a, b]);
+        let now = Instant::now();
+
+        // Confirm `a` at 3ms (≤ GOOD_ENOUGH_LATENCY) → best + good-enough.
+        p.note_ping_sent(tx(1), a, now);
+        p.note_pong(tx(1), a, now + Duration::from_millis(3));
+        let t = now + Duration::from_millis(3);
+        assert_eq!(p.best_addr(t), Some(a));
+
+        // The FIRST cycle is always a full discovery sweep — Go `wantFullPingLocked` returns true
+        // while `lastFullPing` is zero, regardless of a good-enough best. (In the live pinger this
+        // has long since happened by the time a path is good-enough-confirmed.) It stamps
+        // `last_full_ping`, arming the good-enough quiet-down for subsequent cycles.
+        let first = p.candidates_to_ping(t + Duration::from_millis(1));
+        assert!(
+            first.contains(&a) && first.contains(&b),
+            "first cycle (lastFullPing zero) is a full sweep, matching Go wantFullPingLocked"
+        );
+
+        // The NEXT cycle, still inside the upgrade interval, returns ONLY the best (a); the rival b
+        // is now quieted by the good-enough best.
+        let pinged = p.candidates_to_ping(t + Duration::from_secs(1));
+        assert_eq!(
+            pinged,
+            vec![a],
+            "good-enough best quiets non-best discovery; only the best is refreshed"
+        );
+    }
+
+    /// Even on a good-enough best, the periodic `UPGRADE_UDP_DIRECT_INTERVAL` (60s) re-probe full-
+    /// pings every candidate so a better path can still be discovered (the escape hatch for the
+    /// good-enough quiet-down).
+    #[test]
+    fn upgrade_interval_reprobes_all_candidates_on_good_enough_best() {
+        let mut p = PeerPaths::default();
+        let a: SocketAddr = "203.0.113.1:41641".parse().unwrap();
+        let b: SocketAddr = "203.0.113.2:41641".parse().unwrap();
+        p.add_netmap_candidates([a, b]);
+        let now = Instant::now();
+
+        // Confirm `a` good-enough; the confirming cycle stamps `last_full_ping`.
+        p.note_ping_sent(tx(1), a, now);
+        p.note_pong(tx(1), a, now + Duration::from_millis(3));
+        let t = now + Duration::from_millis(3);
+        // The first cycle is the full sweep that stamps `last_full_ping` (lastFullPing zero ⇒ full
+        // ping), arming the upgrade interval. It pings both candidates.
+        let first = p.candidates_to_ping(t);
+        assert!(
+            first.contains(&a) && first.contains(&b),
+            "first cycle is a full sweep that stamps last_full_ping"
+        );
+
+        // 61s later the upgrade is due → both candidates pinged (a as best, b as the re-probe).
+        let mut pinged = p.candidates_to_ping(t + Duration::from_secs(61));
+        pinged.sort();
+        let mut want = vec![a, b];
+        want.sort();
+        assert_eq!(
+            pinged, want,
+            "after UPGRADE_UDP_DIRECT_INTERVAL, all candidates are re-probed despite good-enough"
         );
     }
 }
