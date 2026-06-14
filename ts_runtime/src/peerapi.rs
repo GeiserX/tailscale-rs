@@ -182,6 +182,22 @@ async fn route_conn(
         }
     }
 
+    // Validate the request as a genuine peerAPI call (no browser Referer/Origin; Host is `peer` or a
+    // self address) BEFORE dispatch, the way Go runs `validatePeerAPIRequest` in `ServeHTTP` ahead of
+    // any route. This single chokepoint protects every route — taildrop, ingress, and DoH — against
+    // DNS-rebinding / cross-origin drive-by, closing a gap where the DoH path in particular had no
+    // such guard. Fail-closed: a request that does not validate gets `403`, never reaching a handler.
+    // The `view` read-guard is confined to this `let` (dropped at the `;`) so it is never held across
+    // the `await` below — the guard is not `Send`, and holding it across an await breaks the spawn.
+    let valid = validate_peerapi_request(&req, &view_rx.borrow());
+    if !valid {
+        tracing::debug!(
+            peer = %stream.remote_addr(),
+            "peerapi: rejecting request that failed origin/host validation"
+        );
+        return write_status(&mut stream, "403 Forbidden").await;
+    }
+
     let method = req.method.unwrap_or("");
     let full_path = req.path.unwrap_or("");
 
@@ -314,6 +330,63 @@ fn header_value<'a>(req: &'a httparse::Request<'_, '_>, name: &str) -> Option<&'
         .iter()
         .find(|h| h.name.eq_ignore_ascii_case(name))
         .and_then(|h| std::str::from_utf8(h.value).ok())
+}
+
+/// Whether `addr` is one of this node's own tailnet addresses, mirroring Go
+/// `peerAPIHandler.isAddressValid` (the `Host`-header destination check). The peerAPI is reachable
+/// only on the node's own overlay IPs, so a request whose `Host` names any other address is not a
+/// genuine peer call to us.
+///
+/// Tracking limitation vs Go: Go's `isAddressValid` first checks the per-peer masquerade addresses
+/// (`SelfNodeV4MasqAddrForThisPeer`/`V6`) and, when set, validates the `Host` against *those* instead
+/// of the node's own addresses. This fork does not thread per-peer masquerade into the runtime
+/// [`Node`][ts_control::Node] (the wire field exists but is unused), so masquerade is not implemented
+/// at all and there is no current divergence. If masquerade is ever added, this check MUST also
+/// accept the masq address, or a masqueraded peer's legitimate request would be wrongly rejected.
+fn is_self_address(view: &DnsView, addr: std::net::IpAddr) -> bool {
+    view.self_node.as_ref().is_some_and(|n| {
+        std::net::IpAddr::from(n.tailnet_address.ipv4.addr()) == addr
+            || std::net::IpAddr::from(n.tailnet_address.ipv6.addr()) == addr
+    })
+}
+
+/// Validate a peerAPI request before dispatch, mirroring Go `peerAPIHandler.validatePeerAPIRequest`
+/// (`ipn/ipnlocal/peerapi.go`). The peerAPI is a private, peer-to-peer surface reachable only over
+/// the tailnet; a browser or cross-origin caller must never be able to drive it (a DNS-rebinding /
+/// CSRF guard). Three checks, all of which a genuine peer call passes and a hijacked browser request
+/// fails:
+///
+/// 1. **No `Referer`** — a browser navigation/fetch sets one; a peer client does not.
+/// 2. **No `Origin`** — likewise set by a browser for cross-origin requests.
+/// 3. **`Host` is `peer` or one of our own tailnet addresses** — Go uses the literal `"peer"`
+///    sentinel or an `addr:port` (`netip.ParseAddrPort`) that resolves to a self address
+///    (`isAddressValid`); a rebinding attack arrives with the attacker's `Host`.
+///
+/// Returns `true` if the request is a legitimate peerAPI call. Applied to *every* route (taildrop,
+/// ingress, DoH) at the single `route_conn` chokepoint, exactly as Go runs it in `ServeHTTP` before
+/// any route dispatch.
+fn validate_peerapi_request(req: &httparse::Request<'_, '_>, view: &DnsView) -> bool {
+    // A browser sets Referer/Origin; a peer API client never does. Reject if either is present
+    // (Go: non-empty Referer or Origin → "invalid peerapi request").
+    if header_value(req, "referer").is_some_and(|v| !v.is_empty()) {
+        return false;
+    }
+    if header_value(req, "origin").is_some_and(|v| !v.is_empty()) {
+        return false;
+    }
+    // Host must be the `peer` sentinel or an `addr:port` whose address is one of ours. We require the
+    // `addr:port` form (parse as `SocketAddr`), exactly as Go's `netip.ParseAddrPort(r.Host)` does —
+    // a bare IP with no port is rejected. Every real caller sends one (our own clients emit
+    // `Host: <ip>:<port>`, and a Go peer dials `http://<ip>:<port>`), so this is strict-but-faithful.
+    match header_value(req, "host") {
+        Some("peer") => true,
+        Some(host) => host
+            .parse::<std::net::SocketAddr>()
+            .is_ok_and(|sa| is_self_address(view, sa.ip())),
+        // A peer client always sends a Host (HTTP/1.1 requires it, and our own peers set it); a
+        // missing Host is not a legitimate peerAPI call.
+        None => false,
+    }
 }
 
 /// The outcome of the Taildrop access gate.
@@ -801,6 +874,68 @@ mod tests {
             gate_taildrop(&v, src("100.64.0.9"), true),
             GateDecision::Allow
         );
+    }
+
+    /// Parse a raw request head and run `validate_peerapi_request` against it. `view`'s self IP is
+    /// `100.64.0.1` (from `view_with`/`node_at`).
+    fn validates(raw: &[u8], view: &DnsView) -> bool {
+        let mut headers = [httparse::EMPTY_HEADER; 32];
+        let mut req = httparse::Request::new(&mut headers);
+        req.parse(raw).expect("parse test request");
+        validate_peerapi_request(&req, view)
+    }
+
+    #[test]
+    fn peerapi_validation_accepts_genuine_peer_calls() {
+        let v = view_with(true, &["100.64.0.9".parse().unwrap()]);
+        // Host == our own tailnet address:port (what the fork's own send + DoH clients emit:
+        // `Host: <dst>` / `Host: <doh_addr>`, both `SocketAddr`), and what a Go peer dials.
+        assert!(validates(
+            b"PUT /v0/put/x HTTP/1.1\r\nHost: 100.64.0.1:443\r\n\r\n",
+            &v
+        ));
+        assert!(validates(
+            b"POST /dns-query HTTP/1.1\r\nHost: 100.64.0.1:8080\r\n\r\n",
+            &v
+        ));
+        // The literal `peer` sentinel (Go's `validateHost` fast path).
+        assert!(validates(
+            b"GET /dns-query HTTP/1.1\r\nHost: peer\r\n\r\n",
+            &v
+        ));
+    }
+
+    #[test]
+    fn peerapi_validation_rejects_browser_and_rebinding() {
+        let v = view_with(true, &["100.64.0.9".parse().unwrap()]);
+        // A browser fetch carries an Origin → reject (CSRF / drive-by guard).
+        assert!(!validates(
+            b"PUT /v0/put/x HTTP/1.1\r\nHost: 100.64.0.1\r\nOrigin: https://evil.example\r\n\r\n",
+            &v
+        ));
+        // A navigation carries a Referer → reject.
+        assert!(!validates(
+            b"PUT /v0/put/x HTTP/1.1\r\nHost: 100.64.0.1\r\nReferer: https://evil.example/\r\n\r\n",
+            &v
+        ));
+        // DNS-rebinding: Host names some other (attacker) address, not one of ours → reject.
+        assert!(!validates(
+            b"POST /dns-query HTTP/1.1\r\nHost: 10.0.0.5:8080\r\n\r\n",
+            &v
+        ));
+        // A non-self public address as Host → reject.
+        assert!(!validates(
+            b"PUT /v0/put/x HTTP/1.1\r\nHost: 198.51.100.7\r\n\r\n",
+            &v
+        ));
+        // A bare self IP with NO port → reject: Go's `netip.ParseAddrPort` requires `addr:port`, and
+        // every real caller sends one. This pins the strict-parse parity (a prior cut accepted it).
+        assert!(!validates(
+            b"POST /dns-query HTTP/1.1\r\nHost: 100.64.0.1\r\n\r\n",
+            &v
+        ));
+        // No Host header at all → reject (not a legitimate peerAPI call).
+        assert!(!validates(b"GET /dns-query HTTP/1.1\r\n\r\n", &v));
     }
 
     #[test]
