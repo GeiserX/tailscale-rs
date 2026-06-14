@@ -148,15 +148,22 @@ pub struct SSHAction<'a> {
 #[derive(Default, Debug, Clone, PartialEq, Deserialize)]
 pub struct SSHRecorderFailureAction<'a> {
     /// If non-empty, the session is rejected with this message when recording cannot start.
-    #[serde(default, borrow, rename = "rejectSessionWithMessage")]
+    ///
+    /// Go `tailcfg.SSHRecorderFailureAction.RejectSessionWithMessage` carries `json:",omitempty"`
+    /// (an EMPTY name), so it marshals as the PascalCase field name — NOT lowerCamel. An earlier
+    /// revision used `rejectSessionWithMessage`, which never matched control's wire key, so this
+    /// field silently stayed empty.
+    #[serde(default, borrow, rename = "RejectSessionWithMessage")]
     pub reject_session_with_message: Cow<'a, str>,
 
     /// If non-empty, an in-progress session is terminated with this message when recording fails.
-    #[serde(default, borrow, rename = "terminateSessionWithMessage")]
+    /// PascalCase on the wire (Go `json:",omitempty"`, empty name); see the field above.
+    #[serde(default, borrow, rename = "TerminateSessionWithMessage")]
     pub terminate_session_with_message: Cow<'a, str>,
 
     /// If non-empty, a URL to notify (out of band) when recording fails.
-    #[serde(default, borrow, rename = "notifyURL")]
+    /// PascalCase on the wire (Go `json:",omitempty"`, empty name); see the fields above.
+    #[serde(default, borrow, rename = "NotifyURL")]
     pub notify_url: Cow<'a, str>,
 }
 
@@ -188,8 +195,8 @@ mod test {
                         "allowAgentForwarding": true,
                         "recorders": ["1.2.3.4:5678"],
                         "onRecordingFailure": {
-                            "rejectSessionWithMessage": "recording required",
-                            "notifyURL": "https://example.com/notify"
+                            "RejectSessionWithMessage": "recording required",
+                            "NotifyURL": "https://example.com/notify"
                         }
                     },
                     "acceptEnv": ["LANG", "TERM"]
@@ -229,6 +236,39 @@ mod test {
         assert_eq!(orf.reject_session_with_message, "recording required");
         assert_eq!(orf.notify_url, "https://example.com/notify");
         assert_eq!(orf.terminate_session_with_message, "");
+    }
+
+    /// `SSHRecorderFailureAction`'s three fields are PascalCase on the wire (Go declares them with
+    /// `json:",omitempty"` — an empty name — so they marshal as the Go field name). This pins that
+    /// keying against a regression: a prior revision used lowerCamel keys, which never matched
+    /// control's PascalCase wire form, so the sub-object silently decoded as all-empty. The fixture
+    /// here uses control's real PascalCase keys; if a future change reverts to lowerCamel, these
+    /// assertions fail (the fields would come back empty).
+    #[test]
+    fn recorder_failure_action_decodes_pascal_case_keys() {
+        const WIRE: &str = r#"{
+            "RejectSessionWithMessage": "reject msg",
+            "TerminateSessionWithMessage": "terminate msg",
+            "NotifyURL": "https://example.com/n"
+        }"#;
+        let orf = serde_json::from_str::<SSHRecorderFailureAction>(WIRE)
+            .expect("SSHRecorderFailureAction must decode control's PascalCase keys");
+        assert_eq!(orf.reject_session_with_message, "reject msg");
+        assert_eq!(orf.terminate_session_with_message, "terminate msg");
+        assert_eq!(orf.notify_url, "https://example.com/n");
+
+        // The old lowerCamel keys must NOT decode (proving the fix, not just accepting both): a body
+        // with the wrong-cased keys leaves every field empty.
+        const WRONG: &str = r#"{
+            "rejectSessionWithMessage": "x",
+            "terminateSessionWithMessage": "y",
+            "notifyURL": "z"
+        }"#;
+        let empty = serde_json::from_str::<SSHRecorderFailureAction>(WRONG)
+            .expect("unknown lowerCamel keys are ignored, not an error");
+        assert_eq!(empty.reject_session_with_message, "");
+        assert_eq!(empty.terminate_session_with_message, "");
+        assert_eq!(empty.notify_url, "");
     }
 
     #[test]
