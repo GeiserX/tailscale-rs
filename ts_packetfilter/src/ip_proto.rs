@@ -16,6 +16,10 @@ impl IpProto {
     pub const UDP: Self = Self(17);
     /// Protocol number for SCTP.
     pub const SCTP: Self = Self(132);
+    /// Protocol number for TSMP, the Tailscale Message Protocol (Go `ipproto.TSMP`). Not an IANA
+    /// protocol; Tailscale uses it for in-band control messages (e.g. RST/“peer closed” pongs)
+    /// between nodes. The inbound filter always accepts it (Go `runIn4`/`runIn6` `case TSMP`).
+    pub const TSMP: Self = Self(99);
 
     /// Construct a new [`IpProto`] of the given value.
     pub const fn new(value: i64) -> Self {
