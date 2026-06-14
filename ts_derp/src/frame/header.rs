@@ -41,7 +41,11 @@ impl Header {
 
     /// Construct a new frame of the specified type and length.
     ///
-    /// May fail if the `len` exceeds `frame::MAX_PACKET_SIZE`.
+    /// May fail if the `len` exceeds [`frame::MAX_PACKET_SIZE`]. This 64 KiB bound is applied to
+    /// every known frame in both directions — on encode (the Go-equivalent send-side "packet too
+    /// big" guard) and on decode, where it is deliberately *stricter* than Go's 1 MiB inbound recv
+    /// ceiling; see the divergence note on [`frame::MAX_PACKET_SIZE`] for why (tighter anti-DoS, no
+    /// real traffic dropped).
     pub const fn new(typ: frame::FrameType, len: u32) -> Result<Self, frame::Error> {
         if len as usize > frame::MAX_PACKET_SIZE {
             return Err(frame::Error::InvalidPacketLength(len as _));
