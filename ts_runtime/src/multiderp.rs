@@ -653,16 +653,45 @@ async fn option_timeout(duration: Option<Instant>) {
 }
 
 impl kameo::Actor for Multiderp {
-    type Args = (Env, ActorRef<DataplaneActor>);
+    // The third arg is the home-region cell the control runner writes (the smoothed
+    // `report.PreferredDERP`). The runner is the single home authority; we react to its selection
+    // rather than picking home off the raw DERP-latency measurement (Go drives both the control
+    // advertisement and the local DERP connection from the same smoothed value).
+    type Args = (
+        Env,
+        ActorRef<DataplaneActor>,
+        watch::Receiver<Option<RegionId>>,
+    );
     type Error = Error;
 
     async fn on_start(
-        (env, dataplane): Self::Args,
+        (env, dataplane, home_region_rx): Self::Args,
         slf: ActorRef<Self>,
     ) -> Result<Self, Self::Error> {
         env.subscribe::<Arc<ts_control::StateUpdate>>(&slf).await?;
         env.subscribe::<Arc<PeerState>>(&slf).await?;
         env.subscribe::<DerpLatencyMeasurement>(&slf).await?;
+
+        // Bridge the home-region watch cell onto a `SetHomeRegion` message. A `watch` carries no
+        // self-delivery, so a small task forwards each change to this actor; it ends when the cell's
+        // sender (the control runner) drops, and is held in `tasks` so it cannot outlive the actor.
+        let mut tasks = JoinSet::new();
+        tasks.spawn({
+            let slf = slf.clone();
+            let mut rx = home_region_rx;
+            async move {
+                // Deliver the initial value, then every subsequent change.
+                loop {
+                    let home = *rx.borrow_and_update();
+                    if slf.tell(SetHomeRegion(home)).await.is_err() {
+                        break; // actor gone
+                    }
+                    if rx.changed().await.is_err() {
+                        break; // control runner (sender) dropped
+                    }
+                }
+            }
+        });
 
         Ok(Self {
             env,
@@ -672,7 +701,7 @@ impl kameo::Actor for Multiderp {
             observed_routes: Default::default(),
             derps: Default::default(),
             regions: Default::default(),
-            tasks: JoinSet::new(),
+            tasks,
             current_home_derp: None,
         })
     }
@@ -726,20 +755,20 @@ impl Message<Arc<PeerState>> for Multiderp {
     }
 }
 
-/// The home-DERP transition implied by a fresh latency measurement, given the current home.
+/// The home-DERP transition implied by a newly-selected home region, given the current home.
 #[derive(Debug, PartialEq, Eq)]
 enum HomeTransition {
-    /// The measurement selected the region that is already home — leave the always-on connection
-    /// untouched (sticky). Demoting and re-promoting here would briefly clear the home flag and arm
-    /// the inactivity timeout.
+    /// The selection is the region that is already home — leave the always-on connection untouched
+    /// (sticky). Demoting and re-promoting here would briefly clear the home flag and arm the
+    /// inactivity timeout.
     Unchanged,
     /// The home region changed. `demote` is the previous home to turn off (`None` on the first
-    /// selection); the new home (the measurement's region) is promoted by the caller.
+    /// selection); the new home is promoted by the caller.
     Changed { demote: Option<RegionId> },
 }
 
-/// Decide the home-DERP transition for a newly-measured closest `selected` region against the
-/// `current` home. Pure (no I/O) so the stickiness rule is unit-testable: a re-measurement of the
+/// Decide the home-DERP transition for a newly-selected `selected` home region against the
+/// `current` home. Pure (no I/O) so the stickiness rule is unit-testable: a re-selection of the
 /// same region must be `Unchanged` (Go magicsock keeps the home connection always-on across
 /// same-region re-selection), and only a genuine change demotes the old home.
 fn home_transition(current: Option<RegionId>, selected: RegionId) -> HomeTransition {
@@ -750,22 +779,30 @@ fn home_transition(current: Option<RegionId>, selected: RegionId) -> HomeTransit
     }
 }
 
-impl Message<DerpLatencyMeasurement> for Multiderp {
+/// Control-runner-selected home DERP region (Go `report.PreferredDERP`). Delivered from the
+/// `home_region` watch cell via the bridge task spawned in [`Multiderp`]'s `on_start`. `None` means
+/// "no home selected yet" (no measurements); `Some(id)` is the smoothed home the control runner also
+/// advertised to the control plane, so the local relay and the advertised home always agree.
+#[derive(Debug, Clone, Copy)]
+struct SetHomeRegion(Option<RegionId>);
+
+impl Message<SetHomeRegion> for Multiderp {
     type Reply = ();
 
-    async fn handle(&mut self, msg: DerpLatencyMeasurement, _ctx: &mut Context<Self, Self::Reply>) {
-        let Some(result) = msg.measurement.as_ref().first() else {
-            tracing::trace!("received home derp measurement message but none was set");
+    async fn handle(&mut self, msg: SetHomeRegion, _ctx: &mut Context<Self, Self::Reply>) {
+        let Some(id) = msg.0 else {
+            // No home selected (e.g. measurements went empty). Leave the current home connection as
+            // it is rather than tearing it down — Go likewise keeps the last home until a new one is
+            // chosen, and a transient empty measurement must not drop the relay.
             return;
         };
 
-        match home_transition(self.current_home_derp, result.id) {
+        match home_transition(self.current_home_derp, id) {
             // Re-selecting the *same* home region is a no-op: the existing always-on connection must
-            // stay sticky. (Previously this demoted the current home unconditionally and re-promoted
-            // only on change, so a same-region re-measurement — the common case on any mid-session
-            // derp-map re-push — left the home flag `false`, arming the inactivity timeout and
-            // dropping the home DERP connection. Go's magicsock keeps the selected home connection
-            // always-on across re-selection of the same region.)
+            // stay sticky. (A same-region re-selection that demoted then re-promoted would leave the
+            // home flag `false` mid-cycle and arm the inactivity timeout — dropping the home DERP
+            // connection. Go's magicsock keeps the selected home connection always-on across
+            // re-selection of the same region.)
             HomeTransition::Unchanged => {}
             HomeTransition::Changed { demote } => {
                 // Demote the previous home (if any) before promoting the new one.
@@ -775,16 +812,46 @@ impl Message<DerpLatencyMeasurement> for Multiderp {
                     derp.home_derp.send_replace(false);
                 }
 
-                self.current_home_derp = Some(result.id);
-                if let Some(derp) = self.derps.get_mut(&result.id) {
+                self.current_home_derp = Some(id);
+                if let Some(derp) = self.derps.get_mut(&id) {
                     derp.home_derp.send_replace(true);
+                } else if let Some(region) = self.regions.get(&id).cloned() {
+                    // The home region has no runner yet (its measurement may not have opened one, or
+                    // the home arrived before the derp map). Open it, then flag it home: a freshly
+                    // `ensure_region`'d runner starts with `home_derp = false` (it does NOT read
+                    // `current_home_derp`), so without this follow-up the new home would arm the
+                    // non-home inactivity timeout and could drop the connection while idle.
+                    self.ensure_region(id, &region, self.env.shutdown.clone())
+                        .await;
+                    if let Some(derp) = self.derps.get_mut(&id) {
+                        derp.home_derp.send_replace(true);
+                    }
                 }
 
-                tracing::info!(
-                    region_id = %result.id,
-                    latency_ms = result.latency.as_secs_f32() * 1000.,
-                    "new home derp region selected"
-                );
+                tracing::info!(region_id = %id, "new home derp region selected (from control runner)");
+            }
+        }
+    }
+}
+
+impl Message<DerpLatencyMeasurement> for Multiderp {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: DerpLatencyMeasurement, _ctx: &mut Context<Self, Self::Reply>) {
+        // The measurement no longer selects the home region — that is the control runner's job (it
+        // applies the netcheck `bestRecent` + hysteresis smoothing and publishes the chosen region
+        // via the `home_region` watch cell, handled by `SetHomeRegion` above). Mirrors Go, where the
+        // single smoothed `report.PreferredDERP` drives BOTH the control advertisement and the local
+        // DERP connection; picking home off the raw per-cycle `measurement.first()` here let the
+        // relay flap on jitter and disagree with the home advertised to control.
+        //
+        // We still ensure a region runner exists for every measured region (cached in `regions` from
+        // the derp map) so a region later selected as home — or needed for a peer — already has, or
+        // can lazily open, its connection.
+        for result in msg.measurement.as_ref() {
+            if let Some(region) = self.regions.get(&result.id).cloned() {
+                self.ensure_region(result.id, &region, self.env.shutdown.clone())
+                    .await;
             }
         }
     }

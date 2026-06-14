@@ -178,7 +178,15 @@ impl Runtime {
         let (forwarder_id, forwarder_up, forwarder_down) =
             dataplane.ask(dataplane::NewOverlayTransport).await?;
 
-        let multiderp = Multiderp::spawn((env.clone(), dataplane.clone()));
+        // The selected DERP home region (Go `report.PreferredDERP`): the control runner is the sole
+        // writer (it applies the netcheck `bestRecent` + hysteresis smoothing), and `Multiderp`
+        // reads it to drive the local home relay — so the relay follows the SAME smoothed home the
+        // runner advertises to control, instead of picking it from the raw per-cycle latency minimum
+        // (which flapped on jitter and could disagree with the advertised home). Created here so it
+        // outlives both actors; `None` until the first home is chosen.
+        let (home_region_tx, home_region_rx) = watch::channel::<Option<ts_derp::RegionId>>(None);
+
+        let multiderp = Multiderp::spawn((env.clone(), dataplane.clone(), home_region_rx));
 
         // Spawn the direct (disco) underlay manager before the route updater. Its `on_start`
         // binds the UDP socket and registers its transport synchronously, so by the time the
@@ -344,6 +352,7 @@ impl Runtime {
                 env: env.clone(),
                 state_tx,
                 tka_authority: tka_authority_tx,
+                home_region: home_region_tx,
             },
             kameo::mailbox::unbounded(),
         );
