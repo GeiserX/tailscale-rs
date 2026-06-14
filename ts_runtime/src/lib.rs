@@ -702,8 +702,9 @@ impl Runtime {
     /// `/machine/tka/disable`), targeting the current authority head.
     ///
     /// Submits only — the local [`Authority`](ts_tka::Authority) is **not** mutated here. A handler
-    /// error carries the real [`ts_control::TkaSyncError`] (incl. [`Unsupported`] when there is no
-    /// known TKA head to disable); any other send failure collapses to
+    /// error carries the real [`ts_control::TkaSyncError`] (incl.
+    /// [`Unsupported`](ts_control::TkaSyncError::Unsupported) when there is no known TKA head to
+    /// disable); any other send failure collapses to
     /// [`NetworkError`](ts_control::TkaSyncError::NetworkError).
     pub async fn tka_disable(
         &self,
@@ -720,9 +721,9 @@ impl Runtime {
     ///
     /// Submits only — does not seed the local [`Authority`](ts_tka::Authority); the node picks up the
     /// new lock via the existing verified netmap-sync. A handler error carries the real
-    /// [`ts_control::TkaSyncError`] ([`Unsupported`] if control needs other nodes re-signed — the
-    /// single-node "lock yourself in" subset only); any other send failure collapses to
-    /// [`NetworkError`](ts_control::TkaSyncError::NetworkError).
+    /// [`ts_control::TkaSyncError`] ([`Unsupported`](ts_control::TkaSyncError::Unsupported) if
+    /// control needs other nodes re-signed — the single-node "lock yourself in" subset only); any
+    /// other send failure collapses to [`NetworkError`](ts_control::TkaSyncError::NetworkError).
     pub async fn tka_init(
         &self,
         disablement_secret: Vec<u8>,

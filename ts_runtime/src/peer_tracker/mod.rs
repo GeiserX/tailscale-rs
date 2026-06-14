@@ -318,7 +318,8 @@ impl kameo::Actor for PeerTracker {
     /// enforcement-authority cell (Go `tkaFilterNetmapLocked`). The control runner is the sole
     /// writer; it publishes the verified `Authority` after a successful `/machine/tka/sync` and
     /// `None` when the lock is disabled. A `watch` cell (not a bus message) so the latest value is
-    /// always readable on demand, never dropped, and never reordered (see [`tka_authority`]).
+    /// always readable on demand, never dropped, and never reordered (see the control runner's
+    /// `tka_authority` cell).
     type Args = (Env, watch::Receiver<Option<Arc<ts_tka::Authority>>>);
     type Error = Error;
 
