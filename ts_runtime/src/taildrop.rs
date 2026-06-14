@@ -161,8 +161,10 @@ fn path_present(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
 }
 
-/// Reject a path that is (or whose final component is) a symlink, mirroring the intent of Go's
-/// `O_NOFOLLOW` on the taildrop file ops. `validate_base_name` already blocks a traversing *name*,
+/// Reject a path that is (or whose final component is) a symlink. This is hardening **beyond**
+/// upstream Go, whose taildrop (`feature/taildrop/fileops_fs.go` at v1.100.0) opens with a plain
+/// `os.OpenFile(O_CREATE|O_RDWR)` / `os.Open` and refuses symlinks nowhere — it relies on name
+/// validation (`joinDir`) alone. `validate_base_name` already blocks a traversing *name*,
 /// but not a symlink **component already planted in the store root** by a local attacker (e.g.
 /// `root/foo.txt -> /etc/cron.d/x`), which a plain `open`/`rename`/`remove` would follow. Uses
 /// `symlink_metadata` (lstat — does NOT follow the final symlink); a non-existent path is fine
@@ -171,13 +173,17 @@ fn path_present(path: &Path) -> bool {
 /// This is a check-then-act guard, so it is not atomic with the open/rename/remove that follows.
 /// It kills the **persistent-plant** attack (a symlink left in the store root is no longer followed
 /// deterministically), and the per-name in-flight lock serializes our OWN operations on a name, but
-/// it does not close a sub-millisecond race where an external process swaps the path for a symlink
-/// between this lstat and the syscall. That residual requires an external writer who already holds
-/// store-dir write access (the threat bound for this hardening), and is the one axis where this is
-/// weaker than Go's atomic `O_NOFOLLOW`. The `offset == 0` put is additionally protected by
-/// `create_new` (`O_EXCL`, which refuses an existing symlink atomically); the `offset > 0` resume
-/// open is plain `write(true)` and relies on this advisory check until `O_NOFOLLOW` is wired
-/// (tracked as a follow-up — its raw value is arch-dependent, so a portable open flag is deferred).
+/// on its own it does not close a sub-millisecond race where an external process swaps the path for
+/// a symlink between this lstat and the syscall. The two paths that actually *open* a store file —
+/// the `offset > 0` resume write-open and the read-open — additionally pass `O_NOFOLLOW`
+/// ([`open_nofollow`]) so the kernel refuses a final-component symlink atomically, closing that
+/// residual race; `refuse_symlink` is retained ahead of them as a
+/// portable defense-in-depth check that also yields a clean typed error. The `offset == 0` put is
+/// atomically protected by `create_new` (`O_EXCL`, which refuses an existing symlink), and the
+/// non-opening ops (`rename`/`remove_file`/`read_dir`) act on the link itself rather than following
+/// it, so the advisory check is sufficient there. The residual external-swap window therefore only
+/// requires an external writer who already holds store-dir write access (the threat bound for this
+/// hardening).
 fn refuse_symlink(path: &Path) -> Result<(), TaildropError> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => Err(TaildropError::Io(io::Error::new(
@@ -189,6 +195,32 @@ fn refuse_symlink(path: &Path) -> Result<(), TaildropError> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Open an existing store file with the given [`OpenOptions`](std::fs::OpenOptions), refusing a
+/// final-component symlink **atomically** in the kernel via `O_NOFOLLOW` on Unix. This is the atomic
+/// counterpart to the advisory [`refuse_symlink`] check: where `refuse_symlink` lstat's the path
+/// first (a check-then-act guard with a sub-millisecond swap window), `O_NOFOLLOW` makes the kernel
+/// fail the `open` itself (`ELOOP`) if the final path component is a symlink, so an external process
+/// cannot win a race by swapping the path for a symlink after the lstat. This is fork hardening with
+/// no upstream-Go equivalent (Go's taildrop opens without `O_NOFOLLOW`).
+///
+/// On non-Unix targets `O_NOFOLLOW` has no portable equivalent, so this is a plain `open` and the
+/// preceding `refuse_symlink` advisory check is the only symlink defense there (Windows does not use
+/// the Unix symlink threat model for this store).
+fn open_nofollow(opts: &mut std::fs::OpenOptions, path: &Path) -> io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // `custom_flags` sets the raw `open(2)` flag set, which `open()` then ORs with the access
+        // mode (`O_RDONLY`/`O_WRONLY`) derived from `.read`/`.write` — so the access mode is
+        // preserved alongside `O_NOFOLLOW`. `O_NOFOLLOW` makes the kernel return `ELOOP` instead of
+        // following a final-component symlink. It does not affect non-final components, but the store
+        // root is fixed and names are validated to a single component, so the final component is the
+        // only attacker-influenceable one.
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    opts.open(path)
 }
 
 /// A Taildrop file store rooted at a fixed directory. All operations are confined to this root by
@@ -388,8 +420,9 @@ impl TaildropStore {
         // lock held during I/O, so it never blocks the runtime.
         let _claim = self.claim_in_flight(base)?;
 
-        // Refuse to follow a symlink planted in the store root (Go's `O_NOFOLLOW` intent): the
-        // partial must be a regular file we create/own, never a pre-existing symlink to elsewhere.
+        // Refuse to follow a symlink planted in the store root (fork hardening, no upstream-Go
+        // equivalent): the partial must be a regular file we create/own, never a pre-existing
+        // symlink to elsewhere.
         refuse_symlink(&partial)?;
 
         // A fresh transfer (offset 0) must not collide with another in-flight transfer of the same
@@ -409,7 +442,9 @@ impl TaildropStore {
                 Err(e) => return Err(e.into()),
             }
         } else {
-            let mut f = std::fs::OpenOptions::new().write(true).open(&partial)?;
+            // Resume open: `O_NOFOLLOW` so a symlink swapped in for the partial after the
+            // `refuse_symlink` lstat above is refused atomically by the kernel rather than followed.
+            let mut f = open_nofollow(std::fs::OpenOptions::new().write(true), &partial)?;
             // Bound the resume offset to the current partial length and truncate any bytes past it,
             // matching Go `feature/taildrop/fileops_fs.go` (`OpenWriter` rejects `offset > curr` and
             // `Truncate(offset)`s). Without the bound a too-large offset would leave a zero-filled
@@ -476,7 +511,7 @@ impl TaildropStore {
             // Atomically publish under a non-clobbering final name. `next_available_name` probes
             // candidates with `symlink_metadata` (not `exists`, which follows symlinks), so it will
             // not treat a planted symlink as "free" and rename onto it; and we refuse to rename onto
-            // an existing symlink target outright (Go `O_NOFOLLOW` intent). The `_claim` guard (held
+            // an existing symlink target outright (fork hardening, beyond Go). The `_claim` guard (held
             // by the caller for the whole transfer) keeps this name serialized against other PUTs.
             let final_name = next_available_name(&root, &base);
             let final_path = root.join(&final_name);
@@ -513,7 +548,7 @@ impl TaildropStore {
             let entry = entry?;
             // `entry.metadata()` does NOT follow symlinks (it is `lstat`-based), so a planted
             // symlink has `is_file() == false` here and is skipped — a symlink in the store root is
-            // never reported as a waiting file (Go `O_NOFOLLOW` intent), even one pointing at a real
+            // never reported as a waiting file (fork hardening, beyond Go), even one pointing at a real
             // regular file elsewhere.
             let meta = entry.metadata()?;
             if meta.file_type().is_symlink() || !meta.is_file() {
@@ -536,9 +571,10 @@ impl TaildropStore {
     }
 
     /// Delete a fully-received file by base name (Go `DeleteFile`). The name is validated first, so a
-    /// traversal attempt can never escape the store root, and a symlink at the target is refused (Go
-    /// `O_NOFOLLOW` intent) rather than followed — a planted `root/foo.txt -> /etc/passwd` must not
-    /// let a `delete foo.txt` remove the link's target.
+    /// traversal attempt can never escape the store root, and a symlink at the target is refused
+    /// (fork hardening, beyond Go) rather than followed — a planted `root/foo.txt -> /etc/passwd`
+    /// must not let a `delete foo.txt` remove the link's target. (`remove_file` unlinks the symlink
+    /// itself rather than its referent, so the advisory `refuse_symlink` is sufficient here.)
     pub fn delete_file(&self, name: &str) -> Result<(), TaildropError> {
         let base = validate_base_name(name).ok_or(TaildropError::InvalidFileName)?;
         let path = self.root.join(base);
@@ -548,13 +584,17 @@ impl TaildropStore {
     }
 
     /// Open a fully-received file by base name for reading, returning the handle and its size (Go
-    /// `OpenFile`). The name is validated first, and a symlink at the target is refused (Go
-    /// `O_NOFOLLOW` intent) so a planted symlink cannot redirect the read to an arbitrary file.
+    /// `OpenFile`). The name is validated first, and a symlink at the target is refused — advisorily
+    /// by `refuse_symlink` and then atomically by `O_NOFOLLOW` on the open itself (fork hardening
+    /// with no upstream-Go equivalent) — so a planted (or race-swapped) symlink cannot redirect the
+    /// read to an arbitrary file.
     pub fn open_file(&self, name: &str) -> Result<(std::fs::File, u64), TaildropError> {
         let base = validate_base_name(name).ok_or(TaildropError::InvalidFileName)?;
         let path = self.root.join(base);
         refuse_symlink(&path)?;
-        let f = std::fs::File::open(path)?;
+        // `O_NOFOLLOW` so a symlink swapped in after the `refuse_symlink` lstat is refused atomically
+        // by the kernel rather than followed, never redirecting the read to an arbitrary file.
+        let f = open_nofollow(std::fs::OpenOptions::new().read(true), &path)?;
         let size = f.metadata()?.len();
         Ok((f, size))
     }
@@ -1011,6 +1051,65 @@ mod tests {
             b"TOP SECRET",
             "the symlink target must NOT have been written through"
         );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// `open_nofollow` must refuse a final-component symlink **atomically in the kernel**, not merely
+    /// via the advisory `refuse_symlink` lstat. This is the property that closes the TOCTOU window an
+    /// external process could otherwise win by swapping the path for a symlink after the lstat: the
+    /// open itself fails (`ELOOP`) on a symlinked final component. The test deliberately bypasses
+    /// `refuse_symlink` and points `open_nofollow` straight at a symlink, so it would PASS-by-reading
+    /// the target if the flag were dropped — i.e. it is a real regression guard for the `O_NOFOLLOW`
+    /// wiring, not just a re-test of the advisory check.
+    #[cfg(unix)]
+    #[test]
+    fn open_nofollow_refuses_a_symlinked_target_atomically() {
+        use std::os::unix::fs::symlink;
+
+        let root = tmp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = tmp_root();
+        std::fs::create_dir_all(&outside).unwrap();
+        let secret = outside.join("secret");
+        std::fs::write(&secret, b"TOP SECRET").unwrap();
+
+        let link = root.join("link.bin");
+        symlink(&secret, &link).unwrap();
+
+        // Read open through the symlink must fail at the kernel (ELOOP), never returning a handle to
+        // the target. `ErrorKind::FilesystemLoop` is the mapped kind on current platforms; assert on
+        // the raw `ELOOP` errno too so the guard holds even if the mapping changes.
+        let read_err =
+            open_nofollow(std::fs::OpenOptions::new().read(true), &link).expect_err("read open");
+        assert_eq!(
+            read_err.raw_os_error(),
+            Some(libc::ELOOP),
+            "O_NOFOLLOW read open of a symlink must fail with ELOOP, got {read_err:?}"
+        );
+
+        // Write open (the resume path) likewise refuses the symlink atomically.
+        let write_err =
+            open_nofollow(std::fs::OpenOptions::new().write(true), &link).expect_err("write open");
+        assert_eq!(
+            write_err.raw_os_error(),
+            Some(libc::ELOOP),
+            "O_NOFOLLOW write open of a symlink must fail with ELOOP, got {write_err:?}"
+        );
+
+        // The target was never opened/written through.
+        assert_eq!(std::fs::read(&secret).unwrap(), b"TOP SECRET");
+
+        // A real (non-symlink) file at the same final name opens fine — O_NOFOLLOW only rejects a
+        // symlinked final component, so the normal store path is unaffected.
+        let regular = root.join("regular.bin");
+        std::fs::write(&regular, b"hello").unwrap();
+        let mut f = open_nofollow(std::fs::OpenOptions::new().read(true), &regular)
+            .expect("O_NOFOLLOW open of a regular file must succeed");
+        let mut got = String::new();
+        std::io::Read::read_to_string(&mut f, &mut got).unwrap();
+        assert_eq!(got, "hello");
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&outside).ok();

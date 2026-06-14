@@ -60,6 +60,14 @@ url.workspace = true
 # magicsock/tunnel crates, so this pulls in nothing new.
 rand.workspace = true
 
+# Unix-only: the `O_NOFOLLOW` open flag for the taildrop file ops, so a final-component symlink is
+# refused atomically by the kernel rather than by an advisory lstat-then-open check. This is fork
+# hardening beyond upstream Go (whose taildrop opens without `O_NOFOLLOW`). `std` does not expose the
+# flag and its value is arch-dependent, so it comes from `libc`. Already in the dependency graph
+# transitively (a normal dep of tokio and others), so declaring it directly here pulls in no new crate.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 # Off by default. Enables the TUN-mode overlay transport (ts_transport_tun) so the runtime can
 # run the application data path over a real OS TUN interface instead of the userspace netstack.
