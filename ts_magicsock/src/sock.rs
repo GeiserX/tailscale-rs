@@ -1137,6 +1137,20 @@ impl MagicSock {
                 // we drop the ping without ponging and without learning the source as a candidate
                 // path. A peer not bound in our netmap must not be able to open a direct path.
                 let m = crate::metrics::metrics();
+                // A pre-1.16 peer can send a node-key-less Ping (`claimed_node_key == None`). Drop it
+                // fail-closed: with no claimed node key there is nothing to bind to the sender's disco
+                // key, so it cannot satisfy the exact disco<->node-key check below. Real (>=1.16) peers
+                // — the only ones the fork dials — always embed the key, so this never drops a
+                // legitimate ping; it keeps the fork at least as strict as Go (which would pong on
+                // disco membership alone). See the `claimed_node_key` doc on `disco::Inbound::Ping`.
+                let Some(claimed_node_key) = claimed_node_key else {
+                    tracing::debug!(
+                        %from,
+                        "dropping disco ping: no claimed node key (pre-1.16 peer); nothing to bind"
+                    );
+                    m.disco_ping_recv_rejected.inc();
+                    return Ok(());
+                };
                 match self.binding_verifier.as_ref() {
                     Some(verify) => {
                         if !verify(&sender, Some(&claimed_node_key)) {
@@ -2234,6 +2248,59 @@ mod tests {
         pump.abort();
     }
 
+    /// A node-key-less Ping (`claimed_node_key == None`, from a pre-1.16 peer) is dropped fail-closed
+    /// by `handle_disco` BEFORE the verifier is consulted: with no claimed node key there is nothing
+    /// to bind, so no pong is emitted and no path is learned. This keeps the fork at least as strict
+    /// as Go (which would pong on disco membership alone) and is the handler half of the parse-layer
+    /// `pre_116_node_keyless_ping_parses_with_none_node_key` test in `disco.rs`. Uses an allow-all
+    /// verifier to prove the drop is the `None` short-circuit, not a binding rejection.
+    #[tokio::test]
+    async fn node_keyless_ping_dropped_before_verifier() {
+        let sender_disco = DiscoPrivateKey::random();
+        let our_disco = DiscoPrivateKey::random();
+        let our_node = ts_keys::NodePrivateKey::random().public_key();
+
+        // allow_all() would accept ANY ping that reaches it — so if the None-keyed ping were ponged,
+        // it'd be because the handler failed to short-circuit, not because the verifier rejected it.
+        let sock = MagicSock::bind(localhost(), our_disco, our_node)
+            .await
+            .unwrap()
+            .with_binding_verifier(allow_all());
+
+        let sink = UdpSocket::bind(localhost()).await.unwrap();
+        let from = sink.local_addr().unwrap();
+
+        let before = CounterSnapshot::take();
+        sock.handle_disco(
+            Inbound::Ping {
+                sender: sender_disco.public_key(),
+                tx_id: disco::random_tx_id(),
+                claimed_node_key: None,
+            },
+            from,
+        )
+        .await
+        .unwrap();
+        let after = CounterSnapshot::take();
+
+        assert!(
+            after.ping_recv_rejected - before.ping_recv_rejected >= 1,
+            "a node-key-less ping increments disco_ping_recv_rejected"
+        );
+        // No pong side effect: the `sink` is private to this test, so a delivered datagram could only
+        // come from this handler running the accepted path on the None-keyed ping.
+        let mut buf = [0u8; 1500];
+        let stray = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            sink.recv_from(&mut buf),
+        )
+        .await;
+        assert!(
+            stray.is_err(),
+            "a node-key-less ping must NOT emit a pong (got {stray:?})"
+        );
+    }
+
     /// A correctly-bound disco ping (the `claimed_node_key` matches the netmap binding) confirms
     /// the path and is ponged, exactly as without a verifier. Mirrors
     /// `direct_path_confirms_and_carries_data` but with a verifier installed on B.
@@ -3241,7 +3308,7 @@ mod tests {
             Inbound::Ping {
                 sender: sender_disco.public_key(),
                 tx_id: disco::random_tx_id(),
-                claimed_node_key: sender_node,
+                claimed_node_key: Some(sender_node),
             },
             from,
         )
@@ -3273,7 +3340,7 @@ mod tests {
             Inbound::Ping {
                 sender: sender_disco.public_key(),
                 tx_id: disco::random_tx_id(),
-                claimed_node_key: ts_keys::NodePrivateKey::random().public_key(),
+                claimed_node_key: Some(ts_keys::NodePrivateKey::random().public_key()),
             },
             from,
         )
