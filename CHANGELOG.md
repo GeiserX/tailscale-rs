@@ -2,6 +2,18 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.37.0](https://github.com/GeiserX/tailscale-rs/compare/v0.36.0...v0.37.0) (2026-06-14)
+
+
+### Features
+
+* **taildrop:** reap abandoned partial files after a delay ([#213](https://github.com/GeiserX/tailscale-rs/issues/213)) ([ade7186](https://github.com/GeiserX/tailscale-rs/commit/ade71864d61aab922203b27f516ec8fc7d9a8d6e))
+
+
+### Bug Fixes
+
+* **control-noise:** refuse an exhausted nonce with a typed error, not a panic ([#211](https://github.com/GeiserX/tailscale-rs/issues/211)) ([d0e228c](https://github.com/GeiserX/tailscale-rs/commit/d0e228cffc74f937a0535c1de5d846c1f7c455fd))
+
 ## [0.36.0](https://github.com/GeiserX/tailscale-rs/compare/v0.35.8...v0.36.0) (2026-06-14)
 
 
