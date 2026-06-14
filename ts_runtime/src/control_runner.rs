@@ -2,7 +2,7 @@ use core::{
     net::{Ipv4Addr, Ipv6Addr},
     time::Duration,
 };
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use futures::StreamExt;
 use kameo::{
@@ -91,6 +91,14 @@ pub struct ControlRunner {
     /// region is *meaningfully* lower-latency than the current one, so jitter between near-equal
     /// regions does not flap the home relay (which would cause repeated reconnects + brief loss).
     home_region: Option<(ts_derp::RegionId, core::time::Duration)>,
+    /// Rolling history of per-cycle DERP-latency reports within the last [`DERP_HISTORY_MAX_AGE`]
+    /// (Go `netcheck` `maxAge = 5 * time.Minute`), each stamped with its arrival `Instant`. Feeds the
+    /// `bestRecent` smoothing (Go `addReportHistoryAndSetPreferredDERP`): the new home candidate is
+    /// chosen by each region's **minimum** latency over this window, not its raw current sample, so a
+    /// best region whose latency oscillates across the switch boundary does not flap the home relay.
+    /// Aged entries are evicted on each measurement; the buffer is therefore bounded by the netcheck
+    /// cadence × the window.
+    derp_report_history: Vec<(Instant, Arc<Vec<ts_netcheck::RegionResult>>)>,
     /// Background task that bridges the control client's mid-session re-auth URL cell onto
     /// [`Self::params`]'s device-state cell (sets [`DeviceState::NeedsLogin`] when control returns
     /// `MachineNotAuthorized` on a live re-register — see [`bridge_reauth_url_to_state`]). Aborted on
@@ -264,6 +272,7 @@ impl kameo::Actor for ControlRunner {
             pop_browser_url: Default::default(),
             netcheck: Default::default(),
             home_region: None,
+            derp_report_history: Vec::new(),
             reauth_bridge,
         })
     }
@@ -1264,14 +1273,34 @@ impl Message<DerpLatencyMeasurement> for ControlRunner {
             return;
         };
 
+        // Record this cycle into the rolling history and evict reports older than the smoothing
+        // window, then compute each region's `bestRecent` (5-min min). `Instant::now()` is the
+        // arrival stamp; `best_recent` takes it as a param so the decision stays unit-testable.
+        let now = Instant::now();
+        self.derp_report_history
+            .push((now, msg.measurement.clone()));
+        self.derp_report_history
+            .retain(|(stamp, _)| now.saturating_duration_since(*stamp) <= DERP_HISTORY_MAX_AGE);
+        let best_recent = best_recent(&self.derp_report_history, now, DERP_HISTORY_MAX_AGE);
+
         // Apply selection hysteresis (the pure decision lives in `select_home_region` for testability)
-        // so jitter between near-equal regions does not flap the home relay. Copy the chosen id +
-        // latency out of the borrowed result so nothing borrows `measurements` across the `.await`.
-        let (selected_id, selected_latency) = {
-            let selected = select_home_region(self.home_region.map(|(id, _)| id), &measurements)
-                .expect("non-empty measurements always yield a selection");
-            (selected.id, selected.latency)
-        };
+        // so jitter between near-equal regions does not flap the home relay. Go's asymmetric
+        // smoothed-best vs raw-old comparison lives in `select_home_region`; here we just resolve the
+        // chosen id back to its current-cycle latency for the home-region record + control update.
+        let selected_id = select_home_region(
+            self.home_region.map(|(id, _)| id),
+            &measurements,
+            &best_recent,
+        )
+        .expect("non-empty measurements always yield a selection");
+        // `select_home_region` only ever returns an id drawn from `measurements`, so this lookup
+        // always succeeds (same invariant the prior impl relied on when it returned the result by
+        // reference). We record the current-cycle (raw) latency for the chosen region.
+        let selected_latency = measurements
+            .iter()
+            .find(|m| m.id == selected_id)
+            .expect("the selected region id is always one of the measurements")
+            .latency;
 
         let iter = measurements.iter().map(|result| {
             (
@@ -1288,41 +1317,90 @@ impl Message<DerpLatencyMeasurement> for ControlRunner {
     }
 }
 
-/// Choose the DERP home region from `measurements` (expected sorted by latency ascending, so
-/// `measurements[0]` is the lowest-latency "best"), applying Go's selection hysteresis
+/// The window over which `best_recent` smooths per-region DERP latency (Go `netcheck` `maxAge`).
+const DERP_HISTORY_MAX_AGE: Duration = Duration::from_secs(5 * 60);
+
+/// Compute each region's `bestRecent` — its **minimum** latency over the reports within
+/// `max_age` of `now` (Go `addReportHistoryAndSetPreferredDERP`'s `bestRecent` map). Reports older
+/// than the window are ignored. `now` and `max_age` are parameters (not clock-read) so this is
+/// deterministically unit-testable. A region absent from every in-window report is absent from the
+/// result.
+fn best_recent(
+    history: &[(Instant, Arc<Vec<ts_netcheck::RegionResult>>)],
+    now: Instant,
+    max_age: Duration,
+) -> HashMap<ts_derp::RegionId, Duration> {
+    let mut best: HashMap<ts_derp::RegionId, Duration> = HashMap::new();
+    for (stamp, report) in history {
+        // Skip reports outside the window. `saturating_duration_since` guards a `stamp` that is
+        // somehow after `now` (clock skew): age 0, always in-window.
+        if now.saturating_duration_since(*stamp) > max_age {
+            continue;
+        }
+        for r in report.iter() {
+            best.entry(r.id)
+                .and_modify(|d| {
+                    if r.latency < *d {
+                        *d = r.latency;
+                    }
+                })
+                .or_insert(r.latency);
+        }
+    }
+    best
+}
+
+/// Choose the DERP home region id, applying Go's selection hysteresis
 /// (`netcheck.addReportHistoryAndSetPreferredDERP`). Pure so the decision is unit-testable.
 ///
-/// Keeps the `current` home region (when it is still present in `measurements`) unless the new best
-/// is *meaningfully* lower-latency — switching only when BOTH: the current region's fresh latency
-/// exceeds the best by at least `PREFERRED_DERP_ABSOLUTE_DIFF` (10ms), AND the best is at most
-/// two-thirds of the current region's latency (a >~33% improvement). This avoids flapping the home
-/// relay between regions whose latencies jitter within ~10ms. On the first selection (`current` is
-/// `None`), when the best already IS the current region, or when the current region dropped out of
-/// the measurements, returns the best directly. `None` only if `measurements` is empty.
+/// `measurements` is the current cycle sorted by latency ascending (so `measurements[0]` is the
+/// raw-current best). `best_recent` is each region's smoothed (5-min-min) latency. Matching Go's
+/// **asymmetric** comparison exactly: the new best candidate is chosen by the *smoothed* `best_recent`
+/// latency (`bestAny`), while the old/home region is compared using its *current-cycle* (raw)
+/// latency (`oldRegionCurLatency`). Smoothing the best damps oscillation of the best region across
+/// the switch boundary that the raw-vs-raw comparison (the prior impl) would still flap on.
+///
+/// Keeps the `current` home region unless the new best is *meaningfully* lower-latency — switching
+/// only when BOTH the current region's raw latency exceeds the smoothed-best by at least
+/// `PREFERRED_DERP_ABSOLUTE_DIFF` (10ms) AND the smoothed-best is at most two-thirds of the current
+/// region's raw latency (a >~33% improvement). On the first selection (`current` is `None`), when the
+/// smoothed-best already IS the current region, or when the current region dropped out of the
+/// measurements, returns the best directly. `None` only if `measurements` is empty.
 fn select_home_region(
     current: Option<ts_derp::RegionId>,
     measurements: &[ts_netcheck::RegionResult],
-) -> Option<&ts_netcheck::RegionResult> {
+    best_recent: &HashMap<ts_derp::RegionId, Duration>,
+) -> Option<ts_derp::RegionId> {
     /// Go `netcheck.preferredDERPAbsoluteDiff`.
-    const PREFERRED_DERP_ABSOLUTE_DIFF: core::time::Duration =
-        core::time::Duration::from_millis(10);
+    const PREFERRED_DERP_ABSOLUTE_DIFF: Duration = Duration::from_millis(10);
 
-    let best = measurements.first()?;
-
-    let Some(old_id) = current.filter(|id| *id != best.id) else {
-        // First selection, or the best already is the current home region.
-        return Some(best);
+    // The smoothed latency for a region: its `best_recent` if present, else its current sample (a
+    // region seen only this cycle has a 1-sample history, so its min == its current latency anyway).
+    let smoothed = |m: &ts_netcheck::RegionResult| -> Duration {
+        best_recent.get(&m.id).copied().unwrap_or(m.latency)
     };
 
-    // Compare against the current region's FRESH latency (not a stale one), if it is still present.
+    // Pick the best candidate by SMOOTHED latency (Go `bestAny = min over regions of bestRecent`).
+    // `measurements` is sorted by raw latency, but smoothing can reorder, so scan for the smoothed
+    // minimum explicitly rather than trusting `measurements[0]`.
+    let best = measurements.iter().min_by_key(|m| smoothed(m))?;
+    let best_any = smoothed(best);
+
+    let Some(old_id) = current.filter(|id| *id != best.id) else {
+        // First selection, or the smoothed-best already is the current home region.
+        return Some(best.id);
+    };
+
+    // Compare against the old region's CURRENT (raw) latency this cycle, if it is still present —
+    // Go's `oldRegionCurLatency`, deliberately unsmoothed (the asymmetry).
     match measurements.iter().find(|m| m.id == old_id) {
         Some(old) => {
-            let keep_old = old.latency.saturating_sub(best.latency) < PREFERRED_DERP_ABSOLUTE_DIFF
-                || best.latency.as_secs_f64() > old.latency.as_secs_f64() * 2.0 / 3.0;
-            Some(if keep_old { old } else { best })
+            let keep_old = old.latency.saturating_sub(best_any) < PREFERRED_DERP_ABSOLUTE_DIFF
+                || best_any.as_secs_f64() > old.latency.as_secs_f64() * 2.0 / 3.0;
+            Some(if keep_old { old.id } else { best.id })
         }
         // The current region is no longer reachable this cycle: take the new best.
-        None => Some(best),
+        None => Some(best.id),
     }
 }
 
@@ -1604,11 +1682,12 @@ mod sticky_pop_browser_url_tests {
 #[cfg(test)]
 mod home_region_hysteresis_tests {
     use core::time::Duration;
+    use std::{collections::HashMap, sync::Arc, time::Instant};
 
     use ts_derp::RegionId;
     use ts_netcheck::RegionResult;
 
-    use super::select_home_region;
+    use super::{DERP_HISTORY_MAX_AGE, best_recent, select_home_region};
 
     fn region(id: u32, latency_ms: u64) -> RegionResult {
         RegionResult {
@@ -1623,18 +1702,25 @@ mod home_region_hysteresis_tests {
         RegionId(core::num::NonZeroU32::new(id).unwrap())
     }
 
+    /// Call `select_home_region` with NO smoothing history — `best_recent` empty, so each region's
+    /// smoothed latency falls back to its current sample, reproducing the original raw-vs-raw
+    /// hysteresis these tests pin. (The smoothing-specific tests below pass a populated map.)
+    fn sel(current: Option<RegionId>, m: &[RegionResult]) -> Option<RegionId> {
+        select_home_region(current, m, &HashMap::new())
+    }
+
     /// Empty measurements yield no selection.
     #[test]
     fn empty_measurements_select_none() {
-        assert!(select_home_region(Some(rid(1)), &[]).is_none());
-        assert!(select_home_region(None, &[]).is_none());
+        assert!(sel(Some(rid(1)), &[]).is_none());
+        assert!(sel(None, &[]).is_none());
     }
 
     /// First selection (no current home region) takes the best (lowest-latency) region directly.
     #[test]
     fn first_selection_takes_best() {
         let m = [region(1, 20), region(2, 50)];
-        assert_eq!(select_home_region(None, &m).unwrap().id, rid(1));
+        assert_eq!(sel(None, &m).unwrap(), rid(1));
     }
 
     /// Jitter within the 10ms absolute-diff band keeps the current region (no flap). Current=region 2
@@ -1642,9 +1728,8 @@ mod home_region_hysteresis_tests {
     #[test]
     fn keeps_current_when_within_absolute_diff() {
         let m = [region(1, 20), region(2, 25)];
-        let sel = select_home_region(Some(rid(2)), &m).unwrap();
         assert_eq!(
-            sel.id,
+            sel(Some(rid(2)), &m).unwrap(),
             rid(2),
             "a 5ms improvement (< 10ms) must not flap the home region"
         );
@@ -1656,23 +1741,20 @@ mod home_region_hysteresis_tests {
     fn switches_on_meaningful_improvement() {
         let m = [region(1, 20), region(2, 100)];
         assert_eq!(
-            select_home_region(Some(rid(2)), &m).unwrap().id,
+            sel(Some(rid(2)), &m).unwrap(),
             rid(1),
             "a large improvement must switch the home region"
         );
     }
 
     /// The two-thirds rule: even past the 10ms absolute diff, an improvement that does not beat 2/3
-    /// of the current latency keeps the current region. Current=region 2 at 30ms; best=region 1 at
-    /// 21ms: diff is 9ms (< 10ms keeps anyway) — use 30 vs 21 where diff=9ms. To isolate the 2/3 rule,
-    /// use current=60ms, best=45ms: diff=15ms (>10ms, so the absolute test alone would switch), but
-    /// 45 > 60*2/3=40, so keep.
+    /// of the current latency keeps the current region. current=60ms, best=45ms: diff=15ms (>10ms,
+    /// so the absolute test alone would switch), but 45 > 60*2/3=40, so keep.
     #[test]
     fn keeps_current_when_two_thirds_rule_not_met() {
         let m = [region(1, 45), region(2, 60)];
-        let sel = select_home_region(Some(rid(2)), &m).unwrap();
         assert_eq!(
-            sel.id,
+            sel(Some(rid(2)), &m).unwrap(),
             rid(2),
             "best (45ms) is not <= 2/3 of current (40ms), so keep current despite >10ms diff"
         );
@@ -1683,7 +1765,7 @@ mod home_region_hysteresis_tests {
     fn switches_when_current_region_absent() {
         let m = [region(1, 20), region(3, 25)];
         assert_eq!(
-            select_home_region(Some(rid(2)), &m).unwrap().id,
+            sel(Some(rid(2)), &m).unwrap(),
             rid(1),
             "a current region absent from the measurements falls through to the best"
         );
@@ -1693,7 +1775,81 @@ mod home_region_hysteresis_tests {
     #[test]
     fn keeps_current_when_it_is_already_best() {
         let m = [region(2, 20), region(1, 50)];
-        assert_eq!(select_home_region(Some(rid(2)), &m).unwrap().id, rid(2));
+        assert_eq!(sel(Some(rid(2)), &m).unwrap(), rid(2));
+    }
+
+    /// `best_recent` is each region's MINIMUM latency over the in-window reports; a report older than
+    /// `max_age` is excluded.
+    #[test]
+    fn best_recent_is_min_over_window_and_evicts_aged() {
+        let now = Instant::now();
+        // Two in-window reports for region 1 (50ms then 20ms) → min 20ms; region 2 once at 30ms.
+        // One aged report (region 1 at 5ms) outside the window must be ignored.
+        let history = vec![
+            (
+                now - Duration::from_secs(10 * 60), // aged out (> 5min)
+                Arc::new(vec![region(1, 5)]),
+            ),
+            (
+                now - Duration::from_secs(60),
+                Arc::new(vec![region(1, 50), region(2, 30)]),
+            ),
+            (now, Arc::new(vec![region(1, 20)])),
+        ];
+        let br = best_recent(&history, now, DERP_HISTORY_MAX_AGE);
+        assert_eq!(
+            br.get(&rid(1)).copied(),
+            Some(Duration::from_millis(20)),
+            "region 1 min over the window is 20ms (the aged 5ms is excluded)"
+        );
+        assert_eq!(br.get(&rid(2)).copied(), Some(Duration::from_millis(30)));
+    }
+
+    /// The asymmetric comparison: the new best is chosen by its SMOOTHED (best_recent) latency while
+    /// the old region is compared on its RAW current latency. A best region whose CURRENT sample
+    /// looks much better but whose 5-min MIN is only marginally better must NOT flap the home region
+    /// — exactly the oscillation the raw-vs-raw comparison would have switched on.
+    #[test]
+    fn smoothed_best_damps_oscillation_across_boundary() {
+        // Current home = region 2, raw 60ms this cycle. Region 1's CURRENT sample is 20ms (a >2/3,
+        // >10ms improvement → raw-vs-raw would SWITCH), but its 5-min MIN (best_recent) is 50ms
+        // (it oscillates). Smoothed-best 50ms vs raw-old 60ms: diff 10ms is NOT < 10ms, but
+        // 50 > 60*2/3=40 → keepOld. So we KEEP region 2, where the raw comparison would have flapped.
+        let m = [region(1, 20), region(2, 60)];
+        let mut br = HashMap::new();
+        br.insert(rid(1), Duration::from_millis(50)); // smoothed best is worse than its raw sample
+        br.insert(rid(2), Duration::from_millis(60));
+        assert_eq!(
+            select_home_region(Some(rid(2)), &m, &br).unwrap(),
+            rid(2),
+            "a best region whose 5-min min is only marginally better must not flap the home region"
+        );
+
+        // Sanity: with NO smoothing (raw 20ms best), the same inputs WOULD switch — proving the
+        // smoothing is what holds it.
+        assert_eq!(
+            select_home_region(Some(rid(2)), &m, &HashMap::new()).unwrap(),
+            rid(1),
+            "raw-vs-raw (no smoothing) switches on the 20ms-vs-60ms current samples"
+        );
+    }
+
+    /// Smoothing can reorder which region is "best": `measurements` is sorted by raw latency, but the
+    /// smoothed minimum may favor a different region. `select_home_region` must pick by smoothed
+    /// latency, not blindly trust `measurements[0]`.
+    #[test]
+    fn smoothed_best_may_differ_from_raw_first() {
+        // Raw order: region 1 (10ms) is first. But region 2's 5-min min is 5ms while region 1's is
+        // 40ms (region 1's 10ms was a lucky low sample). Smoothed-best is region 2. First selection.
+        let m = [region(1, 10), region(2, 12)];
+        let mut br = HashMap::new();
+        br.insert(rid(1), Duration::from_millis(40));
+        br.insert(rid(2), Duration::from_millis(5));
+        assert_eq!(
+            select_home_region(None, &m, &br).unwrap(),
+            rid(2),
+            "the smoothed-best region wins even when it is not the raw-latency first"
+        );
     }
 }
 
