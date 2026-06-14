@@ -374,6 +374,12 @@ impl ControlRunner {
                 // authorize means this node's key-signature is missing/invalid for the current lock
                 // — it will be unable to prove itself to locked peers. This fork has no health
                 // subsystem, so the signal is a `tracing::warn!` (its observability channel).
+                //
+                // `self_node` is a sticky cell set on every netmap carrying a self-node; if a sync
+                // somehow lands before the first self-node ever arrived it is `None`, so we skip the
+                // advisory this cycle and re-evaluate on the next sync — fine for observability-only.
+                // The `borrow()` ref is scoped to this `if let` and dropped before the `&mut self`
+                // write below.
                 if let Some(self_node) = self.self_node.borrow().as_ref() {
                     log_self_lockout(self_node, &synced.authority);
                 }
@@ -511,6 +517,11 @@ fn self_lock_verdict(
     key_signature: &[u8],
     authority: &ts_tka::Authority,
 ) -> SelfLockVerdict {
+    // Mirror the peer path (`peer_tracker` `tka_snapshot_admits`): treat an empty signature as
+    // "unsigned" rather than the `LockedOut` bucket Go's `NodeKeyAuthorized` would put a nil sig in
+    // (it errors at decode). This is a deliberate, narrow divergence from a literal Go port: it
+    // avoids `warn`-spam on a lock that simply has not signed this node yet, and keeps self and peer
+    // classification consistent.
     if key_signature.is_empty() {
         return SelfLockVerdict::Unsigned;
     }
@@ -1707,14 +1718,17 @@ mod self_lockout_tests {
         );
     }
 
-    /// A non-empty key-signature that the active lock cannot authorize (here: an empty-state
-    /// Authority trusts no key, so any signature fails to verify) classifies as `LockedOut` — the
-    /// operator-facing condition. The verdict carries the verify error string for the log.
+    /// A non-empty key-signature that does not authorize self classifies as `LockedOut` — the
+    /// operator-facing condition — and the verdict carries the verify error string for the log. Here
+    /// the blob is non-empty (so we attempt verification rather than short-circuiting to `Unsigned`)
+    /// but is not a valid NodeKeySignature CBOR (`0x01` decodes as a bare uint with trailing bytes),
+    /// so `node_key_authorized` returns a `Decode` error → `LockedOut`. The cryptographic-rejection
+    /// arms (`UntrustedKey` / `BadSignature` for a well-formed-but-untrusted NKS) are covered by
+    /// `ts_tka`'s own `node_key_authorized` tests; this only needs to prove the runtime classifier
+    /// routes a verify `Err` to `LockedOut`.
     #[test]
     fn unverifiable_signature_is_locked_out() {
         let authority = Authority::from_state(AumHash([0; 32]), State::default());
-        // A bogus (non-empty) signature blob: it is non-empty so we attempt verification, and the
-        // empty-state Authority rejects it (no trusted key / undecodable), yielding LockedOut.
         let verdict = self_lock_verdict(&node_key(), &[0x01, 0x02, 0x03], &authority);
         assert!(
             matches!(verdict, SelfLockVerdict::LockedOut(_)),
