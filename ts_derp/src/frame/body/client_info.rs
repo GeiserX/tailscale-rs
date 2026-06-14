@@ -47,7 +47,10 @@ pub struct ClientInfoPayload {
     /// hex string rather than the old `"none"` sentinel, which was never a valid Go `DERPMesh`.
     #[serde(rename = "meshKey", skip_serializing_if = "Option::is_none")]
     pub mesh_key: Option<String>,
-    /// Protocol version the client is using. Go field `Version` with `json:"version,omitempty"`.
+    /// Protocol version the client is using. Go field `Version` with `json:"version,omitempty"`. We
+    /// intentionally do not mirror the `omitempty`: the client always sends a non-zero version (`2`),
+    /// so the wire output is identical to Go, and a hypothetical `version: 0` is not a valid DERP
+    /// protocol version — emitting it is a more honest frame than omitting it would be.
     #[serde(rename = "version")]
     pub version: i32,
 }
