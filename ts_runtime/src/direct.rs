@@ -49,10 +49,30 @@ use crate::{
 /// constants (which carry the reciprocal note).
 const PING_INTERVAL: Duration = Duration::from_secs(2);
 
-/// How often to send active STUN Binding Requests to the derp map's STUN servers, from the one
-/// bound underlay socket, to learn our reflexive (public) address even before any peer pongs.
-/// This complements the pong-harvest path on the same socket without opening a second egress.
-const STUN_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+/// Bounds for the **randomized** delay between periodic STUN Binding Request sweeps to the derp map's
+/// STUN servers (from the one bound underlay socket, to learn our reflexive/public address even
+/// before any peer pongs — complementing the pong-harvest path on the same socket without a second
+/// egress). Each sweep waits a fresh uniform delay in `[MIN, MAX)`, matching Go magicsock which arms
+/// its `periodicReSTUNTimer` with `tstime.RandomDurationBetween(20s, 26s)` per cycle
+/// (`magicsock.go`). The jitter — and the sub-30s ceiling — are deliberate: a fixed 30s beat is a
+/// traffic-analysis fingerprint, and 30s is a common UDP NAT mapping timeout on Linux, so Go keeps
+/// every interval strictly under it. A real `tailscaled` shows a jittered ~23s mean here, not a
+/// deterministic 30.0s tick.
+const STUN_PROBE_INTERVAL_MIN: Duration = Duration::from_secs(20);
+const STUN_PROBE_INTERVAL_MAX: Duration = Duration::from_secs(26);
+
+/// A uniform random delay in `[STUN_PROBE_INTERVAL_MIN, STUN_PROBE_INTERVAL_MAX)`, the analog of Go
+/// `tstime.RandomDurationBetween(min, max)` (`min + rand.N(max-min)`): both are uniform over the
+/// half-open interval. Uses the non-crypto thread RNG (`rand`), like the other timing jitters in this
+/// crate (e.g. the multiderp reconnect backoff) — this is timing jitter, not key material, so it
+/// deliberately does not use the ring/crypto RNG.
+///
+/// `random_range` panics on an empty range, so the bounds must stay ordered `MIN < MAX` (they are
+/// distinct compile-time constants today). If these ever become equal or runtime-configurable, guard
+/// the `MIN == MAX` case first (Go's `RandomDurationBetween` returns `min` there rather than panicking).
+fn stun_probe_delay() -> Duration {
+    rand::random_range(STUN_PROBE_INTERVAL_MIN..STUN_PROBE_INTERVAL_MAX)
+}
 
 /// How often to re-evaluate our own candidate endpoints and (if changed) advertise them to
 /// control. Reflexive addresses accrue asynchronously as disco pongs arrive, so we poll and
@@ -389,13 +409,16 @@ async fn run_stun_prober(
     multiderp: ActorRef<Multiderp>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    let mut interval = tokio::time::interval(STUN_PROBE_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
+    // Re-randomize the delay every cycle (Go re-arms `periodicReSTUNTimer` with a fresh
+    // `RandomDurationBetween(20s, 26s)` each time) rather than using a fixed `interval`, so the
+    // sweep cadence is jittered and never a deterministic beat. No leading immediate sweep: the
+    // disco pong-harvest path already learns reflexives from the first peer ping, so we wait a full
+    // jittered delay before the first active sweep (matching Go, whose periodic timer is armed for a
+    // future instant, not fired immediately).
     while !*shutdown.borrow() {
         tokio::select! {
             _ = shutdown.changed() => break,
-            _ = interval.tick() => {
+            _ = tokio::time::sleep(stun_probe_delay()) => {
                 // Best-effort: if multiderp is unavailable just skip this round (pong-harvest
                 // still runs), matching how the other loops treat multiderp send errors.
                 let servers = match multiderp.ask(multiderp::StunServersV4).await {
@@ -415,9 +438,9 @@ async fn run_stun_prober(
 ///
 /// Each send fails closed inside [`MagicSock::send_stun_request`] (a non-v4 server is refused, the
 /// in-flight set is capped); a transient io error just skips that server for this round rather than
-/// aborting the sweep. Factored out of [`run_stun_prober`]'s interval loop so the per-tick fan-out
+/// aborting the sweep. Factored out of [`run_stun_prober`]'s sweep loop so the per-sweep fan-out
 /// (including the empty-list no-op when the derp map lists no FixedAddr-v4 STUN servers) is
-/// unit-testable without the actor/interval machinery.
+/// unit-testable without the actor/timer machinery.
 async fn probe_stun_servers_once(sock: &MagicSock, servers: &[SocketAddr]) {
     for &s in servers {
         if let Err(e) = sock.send_stun_request(s).await {
@@ -939,5 +962,33 @@ mod tests {
 
         // No servers => no sends, no panic, returns promptly.
         probe_stun_servers_once(&sock, &[]).await;
+    }
+
+    /// The periodic STUN delay is a uniform random value in `[20s, 26s)`, matching Go magicsock's
+    /// `RandomDurationBetween(20s, 26s)` re-arm — never a fixed 30s beat, and always strictly under
+    /// the ~30s UDP-NAT-timeout ceiling. Sampling many draws pins both the bounds and that the value
+    /// actually varies (jitter), so a regression to a constant interval is caught.
+    #[test]
+    fn stun_probe_delay_is_jittered_within_go_bounds() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let d = stun_probe_delay();
+            assert!(
+                d >= STUN_PROBE_INTERVAL_MIN && d < STUN_PROBE_INTERVAL_MAX,
+                "delay {d:?} out of [20s, 26s)"
+            );
+            assert!(
+                d < Duration::from_secs(30),
+                "delay {d:?} must stay under the 30s UDP-NAT-timeout ceiling"
+            );
+            seen.insert(d);
+        }
+        // 1000 draws across a 6s (≈6e9 ns) range must yield many distinct values — a fixed-interval
+        // regression would collapse this to 1.
+        assert!(
+            seen.len() > 100,
+            "expected jittered delays, got only {} distinct value(s)",
+            seen.len()
+        );
     }
 }
