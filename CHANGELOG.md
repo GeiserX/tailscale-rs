@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.35.5](https://github.com/GeiserX/tailscale-rs/compare/v0.35.4...v0.35.5) (2026-06-14)
+
+
+### Bug Fixes
+
+* **dataplane:** drop multicast and link-local destinations before the ACL ([#198](https://github.com/GeiserX/tailscale-rs/issues/198)) ([6e257c8](https://github.com/GeiserX/tailscale-rs/commit/6e257c870eb0d3ab6dde14b81ae924ddcc0be451))
+
 ## [0.35.4](https://github.com/GeiserX/tailscale-rs/compare/v0.35.3...v0.35.4) (2026-06-13)
 
 
