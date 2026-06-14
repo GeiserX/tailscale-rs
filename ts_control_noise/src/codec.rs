@@ -10,6 +10,20 @@ use crate::messages::{Header, MessageType};
 /// The maximum wire size of a message to control over noise.
 pub const MAX_MESSAGE_SIZE: usize = 4096;
 
+/// The Noise per-record nonce counter is a `u64`; counter `2^64 - 1` is never used. Go
+/// `control/controlbase` returns a typed `errCipherExhausted` and refuses to encrypt/decrypt once the
+/// counter would reach `u64::MAX` (so the maximum counter actually used is `2^64 - 2`).
+///
+/// The upstream `noise_protocol::CipherState` instead increments via `self.n.checked_add(1).unwrap()`,
+/// which would (a) still use counter `u64::MAX` for one final record and (b) **panic** on the next
+/// increment rather than returning a clean error. Both terminate the connection, and the exhaustion
+/// is astronomically unreachable (`2^64` control-channel records), so there is no exploit path — but
+/// a panic on the crypto transport is worse than a typed error, and the off-by-one diverges from Go.
+/// We guard the counter here, BEFORE each op, so the fork refuses counter `u64::MAX` with a clean
+/// `InvalidData` error (Go-parity), exactly mirroring the short-frame / over-max guards below that
+/// also turn an upstream-`CipherState` panic into the decode error Go surfaces.
+const MAX_USABLE_NONCE: u64 = u64::MAX - 1;
+
 /// Control noise codec that uses a different cipher state for the up and down directions.
 ///
 /// Just a wrapper containing two [`Codec`]s, one of which provides [`Encoder`] and the
@@ -96,6 +110,15 @@ where
             dst.put(chunk);
             dst.put_bytes(0, C::tag_len());
 
+            // Refuse to encrypt under counter `u64::MAX` (Go `errCipherExhausted`): the next op would
+            // otherwise be the last valid record and the one after it would panic in
+            // `CipherState`'s `checked_add(1).unwrap()`. Return a clean error instead. Unreachable in
+            // practice; this is robustness + Go parity, not a live path.
+            if self.cipher_state.get_next_n() > MAX_USABLE_NONCE {
+                tracing::error!("control noise send cipher exhausted (nonce counter at u64::MAX)");
+                return Err(ErrorKind::InvalidData.into());
+            }
+
             self.cipher_state
                 .encrypt_in_place(&mut dst[data_start..], chunk.len());
         }
@@ -155,6 +178,15 @@ where
                         len,
                         tag_len = C::tag_len(),
                         "control Record frame shorter than the AEAD tag"
+                    );
+                    return Err(ErrorKind::InvalidData.into());
+                }
+                // Refuse to decrypt under counter `u64::MAX` (Go `errCipherExhausted`), for the same
+                // reason as the encode guard: the next op would be the last valid record and the one
+                // after would panic in `CipherState`'s `checked_add(1).unwrap()`. Clean error instead.
+                if self.cipher_state.get_next_n() > MAX_USABLE_NONCE {
+                    tracing::error!(
+                        "control noise recv cipher exhausted (nonce counter at u64::MAX)"
                     );
                     return Err(ErrorKind::InvalidData.into());
                 }
@@ -313,6 +345,77 @@ mod test {
         assert!(
             decoded.is_empty(),
             "an empty record (len == tag_len) must decode to an empty payload, not be rejected"
+        );
+    }
+
+    /// Nonce exhaustion (Go `errCipherExhausted`): a cipher state whose counter has reached
+    /// `u64::MAX` must refuse to encrypt with a clean `InvalidData` error, NOT panic in
+    /// `CipherState`'s `checked_add(1).unwrap()`. Astronomically unreachable in practice; this proves
+    /// the guard turns the upstream panic into the Go-equivalent typed error.
+    #[test]
+    fn encode_at_nonce_exhaustion_is_error_not_panic() {
+        let (mut encrypt_codec, _dec) = init_codec_pair(rand::random(), u64::MAX);
+        let mut buf = BytesMut::new();
+        let got = encrypt_codec.encode(TEST_PAYLOAD, &mut buf);
+        assert!(
+            matches!(&got, Err(e) if e.kind() == ErrorKind::InvalidData),
+            "encrypting at counter u64::MAX must be InvalidData, got {got:?}"
+        );
+    }
+
+    /// The boundary: `u64::MAX - 1` is the last usable counter (Go's max-used is `2^64 - 2`), so an
+    /// encode at `u64::MAX - 1` succeeds and advances the counter to `u64::MAX`; the NEXT encode is
+    /// then refused. Pins the off-by-one against Go (refuse at `u64::MAX`, not at `u64::MAX - 1`).
+    #[test]
+    fn last_usable_nonce_encodes_then_next_is_refused() {
+        let (mut encrypt_codec, _dec) = init_codec_pair(rand::random(), u64::MAX - 1);
+        let mut buf = BytesMut::new();
+        // Counter u64::MAX - 1 is usable: this encode succeeds (and advances the counter to u64::MAX).
+        encrypt_codec
+            .encode(TEST_PAYLOAD, &mut buf)
+            .expect("counter u64::MAX - 1 is the last usable nonce and must encode");
+        // Now the counter is u64::MAX: the next encode is refused (Go errCipherExhausted).
+        let mut buf2 = BytesMut::new();
+        let got = encrypt_codec.encode(TEST_PAYLOAD, &mut buf2);
+        assert!(
+            matches!(&got, Err(e) if e.kind() == ErrorKind::InvalidData),
+            "the encode after counter reaches u64::MAX must be refused, got {got:?}"
+        );
+    }
+
+    /// Symmetric to `last_usable_nonce_encodes_then_next_is_refused`, for the DECODE direction: a
+    /// decoder at counter u64::MAX - 1 decodes one record (advancing to u64::MAX), then refuses the
+    /// next with InvalidData rather than panicking in `decrypt_in_place`'s `checked_add`. Guards
+    /// against a future edit desynchronizing the encode and decode guards. The decode guard fires on
+    /// the counter alone, BEFORE attempting decrypt, so the second frame need only be a
+    /// structurally-valid Record frame (its body's own counter is never reached).
+    #[test]
+    fn last_usable_nonce_decodes_then_next_is_refused() {
+        let key: [u8; 32] = rand::random();
+
+        // Two independent encoders seeded at u64::MAX - 1 each produce one valid Record frame at
+        // counter MAX-1. (Each encoder can emit exactly one before its own guard refuses the next.)
+        let (mut enc_a, mut dec) = init_codec_pair(key, u64::MAX - 1);
+        let mut frame_a = BytesMut::new();
+        enc_a
+            .encode(TEST_PAYLOAD, &mut frame_a)
+            .expect("encode at u64::MAX - 1 must succeed");
+        let (mut enc_b, _d) = init_codec_pair(key, u64::MAX - 1);
+        let mut frame_b = BytesMut::new();
+        enc_b
+            .encode(TEST_PAYLOAD, &mut frame_b)
+            .expect("encode at u64::MAX - 1 must succeed");
+
+        // The decoder (also at u64::MAX - 1) decodes frame_a, advancing its counter to u64::MAX.
+        let decoded = dec.decode(&mut frame_a).unwrap().unwrap();
+        assert_eq!(decoded.as_ref(), TEST_PAYLOAD, "the MAX-1 record decodes");
+
+        // The decoder is now at u64::MAX: it must REFUSE the next (structurally-valid) Record frame
+        // before attempting decrypt (which would otherwise panic in CipherState's checked_add).
+        let got = dec.decode(&mut frame_b);
+        assert!(
+            matches!(&got, Err(e) if e.kind() == ErrorKind::InvalidData),
+            "a decode once the recv counter reaches u64::MAX must be refused, got {got:?}"
         );
     }
 
