@@ -628,4 +628,29 @@ mod tests {
             other => panic!("a non-empty Peers must be PeerUpdate::Full, got {other:?}"),
         }
     }
+
+    /// The subtle fallthrough edge: an empty `"Peers": []` co-present with a delta must produce a
+    /// `Delta`, NOT `None` and NOT `Full`. Go ignores `PeersChanged`/`PeersRemoved` only when `Peers`
+    /// is NON-empty; when `Peers` is empty the delta fields are honored. A future refactor that
+    /// short-circuited `[]`→`None` before checking the delta fields would pass the other two tests
+    /// but silently drop the delta (a netmap-staleness regression) — this pins that it doesn't.
+    #[tokio::test]
+    async fn empty_peers_with_delta_is_delta_not_noop() {
+        let buf = frame(&[r#"{ "Seq": 11, "Peers": [], "PeersRemoved": [42] }"#]);
+        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let update = stream.next().await.expect("one update");
+        match update.peer_update {
+            Some(PeerUpdate::Delta { remove, upsert }) => {
+                assert_eq!(
+                    remove.len(),
+                    1,
+                    "the PeersRemoved entry is honored as a delta removal"
+                );
+                assert!(upsert.is_empty(), "no PeersChanged ⇒ no upserts");
+            }
+            other => {
+                panic!("empty Peers + PeersRemoved must be Delta (delta honored), got {other:?}")
+            }
+        }
+    }
 }
