@@ -41,6 +41,12 @@ use crate::{
 /// How often to (re)ping candidate endpoints. [`MagicSock::send_pings`] only pings paths that
 /// need (re)confirmation, so this interval just bounds how quickly an expired path
 /// (`TRUST_DURATION`) is re-confirmed.
+///
+/// No-flap timing invariant (spans crates): the magicsock best-path refresh lead
+/// `REFRESH_BEFORE_EXPIRY` (3.5s) must exceed this interval plus a realistic best-path RTT, so the
+/// best is re-pinged and re-confirmed before `TRUST_DURATION` (6.5s) lapses and `best_addr` goes
+/// `None`. Raising this interval shrinks that slack; keep it in step with the magicsock `path.rs`
+/// constants (which carry the reciprocal note).
 const PING_INTERVAL: Duration = Duration::from_secs(2);
 
 /// How often to send active STUN Binding Requests to the derp map's STUN servers, from the one
