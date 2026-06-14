@@ -1,88 +1,31 @@
 //! Integration test for overlay ICMPv4 ping over a piped pair of netstacks.
 //!
-//! Stack A pings stack B's tailnet IP. smoltcp's iface does NOT auto-reply to echo requests in
-//! this build (`auto-icmp-echo-reply` is not enabled), so stack B runs a tiny responder task
-//! that raw-opens ICMP, receives the Echo Request, and emits the matching Echo Reply.
+//! Stack A pings stack B's tailnet IP. The netstack is built with smoltcp's `auto-icmp-echo-reply`
+//! feature (matching Go's gVisor `icmp.NewProtocol4`), so stack B's iface answers the Echo Request
+//! for its OWN registered address with no application code — this test asserts that auto-reply
+//! happens (it is the regression guard for the feature). A ping to an address the netstack does NOT
+//! own gets no reply (smoltcp gates the reply behind `has_ip_addr(dst)`), so `ping_times_out_*`
+//! pings an unassigned IP to confirm the scoping.
 
-use core::{net::IpAddr, time::Duration};
+use core::{
+    net::{IpAddr, Ipv4Addr},
+    time::Duration,
+};
 
-use ts_netstack_smoltcp_socket::{CreateSocket, ping};
+use ts_netstack_smoltcp_socket::ping;
 
 extern crate ts_netstack_smoltcp_core as netcore;
 
-use netcore::smoltcp::{
-    phy::ChecksumCapabilities,
-    wire::{IPV4_HEADER_LEN, Icmpv4Packet, Icmpv4Repr, IpProtocol, Ipv4Packet, Ipv4Repr},
-};
-
 #[path = "../examples/common/mod.rs"]
 pub mod common;
-
-/// Run an ICMPv4 echo responder on `chan`: receive Echo Requests and reply with Echo Replies
-/// (swapping src/dst), forever.
-async fn run_responder(chan: netcore::Channel) {
-    let sock = chan.raw_open(true, IpProtocol::Icmp).await.unwrap();
-    let checksum_caps = ChecksumCapabilities::default();
-
-    loop {
-        let bytes = match sock.recv_bytes().await {
-            Ok(b) => b,
-            Err(_) => return,
-        };
-
-        let Ok(ip_packet) = Ipv4Packet::new_checked(&bytes[..]) else {
-            continue;
-        };
-        let Ok(ip_repr) = Ipv4Repr::parse(&ip_packet, &checksum_caps) else {
-            continue;
-        };
-        if ip_repr.next_header != IpProtocol::Icmp {
-            continue;
-        }
-
-        let Ok(icmp_packet) = Icmpv4Packet::new_checked(ip_packet.payload()) else {
-            continue;
-        };
-        let (ident, seq_no) = match Icmpv4Repr::parse(&icmp_packet, &checksum_caps) {
-            Ok(Icmpv4Repr::EchoRequest { ident, seq_no, .. }) => (ident, seq_no),
-            _ => continue,
-        };
-
-        let reply_icmp = Icmpv4Repr::EchoReply {
-            ident,
-            seq_no,
-            data: b"reply",
-        };
-        let reply_ip = Ipv4Repr {
-            src_addr: ip_repr.dst_addr,
-            dst_addr: ip_repr.src_addr,
-            next_header: IpProtocol::Icmp,
-            payload_len: reply_icmp.buffer_len(),
-            hop_limit: 64,
-        };
-
-        let mut out = std::vec![0u8; IPV4_HEADER_LEN + reply_icmp.buffer_len()];
-        {
-            let mut p = Ipv4Packet::new_unchecked(&mut out[..]);
-            reply_ip.emit(&mut p, &checksum_caps);
-        }
-        {
-            let mut p = Icmpv4Packet::new_unchecked(&mut out[IPV4_HEADER_LEN..]);
-            reply_icmp.emit(&mut p, &checksum_caps);
-        }
-
-        sock.send(&out).await.unwrap();
-    }
-}
 
 #[tokio::test]
 async fn ping_peer_returns_rtt() -> common::Result<()> {
     common::init();
 
-    let (stack_a, stack_b) = common::spawn_piped_netstacks(Default::default(), None).await?;
-
-    // stack_b owns NETSTACK_IP2; run its echo responder.
-    tokio::spawn(run_responder(stack_b));
+    // stack_b owns NETSTACK_IP2 and, with `auto-icmp-echo-reply` enabled, answers the Echo Request
+    // for that address itself — no manual responder needed (this is the feature's regression test).
+    let (stack_a, _stack_b) = common::spawn_piped_netstacks(Default::default(), None).await?;
 
     let rtt = ping(
         &stack_a,
@@ -91,7 +34,7 @@ async fn ping_peer_returns_rtt() -> common::Result<()> {
         Duration::from_secs(5),
     )
     .await
-    .expect("ping should succeed");
+    .expect("ping should succeed via smoltcp auto-icmp-echo-reply (Go gVisor parity)");
 
     assert!(rtt <= Duration::from_secs(5), "rtt within timeout: {rtt:?}");
     Ok(())
@@ -120,20 +63,24 @@ async fn ping_rejects_ipv6() -> common::Result<()> {
 }
 
 #[tokio::test]
-async fn ping_times_out_without_responder() -> common::Result<()> {
+async fn ping_times_out_to_unowned_address() -> common::Result<()> {
     common::init();
 
-    // No responder on stack_b -> echo request goes unanswered.
+    // Ping an address NO netstack owns. `auto-icmp-echo-reply` only answers Echo Requests destined
+    // to one of the iface's own registered addresses (smoltcp gates on `has_ip_addr(dst)`), so a
+    // ping to an unassigned IP gets no reply and must time out — confirming the auto-reply is scoped
+    // to the node's own address and does NOT blanket-answer arbitrary destinations.
     let (stack_a, _stack_b) = common::spawn_piped_netstacks(Default::default(), None).await?;
+    let unowned = Ipv4Addr::new(192, 168, 32, 99); // neither NETSTACK_IP nor NETSTACK_IP2
 
     let err = ping(
         &stack_a,
         common::NETSTACK_IP,
-        IpAddr::V4(common::NETSTACK_IP2),
+        IpAddr::V4(unowned),
         Duration::from_millis(300),
     )
     .await
-    .expect_err("ping must time out with no responder");
+    .expect_err("a ping to an address no netstack owns must time out (auto-reply is dst-scoped)");
 
     assert!(matches!(
         err,

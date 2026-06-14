@@ -37,6 +37,14 @@ features = [
     "socket-udp",
     "socket-icmp",
     "socket-raw",
+    # Auto-reply to ICMP Echo Requests addressed to one of the netstack's OWN interface addresses
+    # (the node's overlay IP). Go's netstack registers icmp.NewProtocol4 (gVisor auto-answers echo to
+    # any NIC-registered address with no app code); without this smoltcp feature the echo-reply arm
+    # in process_icmpv4 is compiled out and a ping to the node's own tailnet IP is silently dropped
+    # (a fidelity + anti-detection gap — a real Mac/Go peer answers self-pings). smoltcp gates the
+    # reply behind has_ip_addr(dst), so it only ever answers pings to this node's own address and
+    # never touches forwarded/transit traffic (exit-node/subnet-router behavior is unaffected).
+    "auto-icmp-echo-reply",
     # IPv6-on-overlay (gated, default off) assigns up to 3 interface addresses (v4 /32 + v6 /128,
     # plus headroom). smoltcp defaults to iface-max-addr-count-2, which would silently overflow
     # (direct_set_ips returns false → netstack gets no addresses) the moment the IPv6 gate is on.
@@ -61,6 +69,8 @@ features = [
     "socket-udp",
     "socket-icmp",
     "socket-raw",
+    # Keep in sync with the [dependencies.smoltcp] block above so dev/test builds match production.
+    "auto-icmp-echo-reply",
     "iface-max-addr-count-5",
     "log",
     "verbose",
