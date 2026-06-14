@@ -1395,8 +1395,17 @@ fn select_home_region(
     // Go's `oldRegionCurLatency`, deliberately unsmoothed (the asymmetry).
     match measurements.iter().find(|m| m.id == old_id) {
         Some(old) => {
+            // Byte-faithful to Go: `oldRegionCurLatency - bestAny < 10ms || bestAny >
+            // oldRegionCurLatency/3*2`. `saturating_sub` matches Go's signed subtraction for the
+            // `< 10ms` test (when `old < best_any` Go is negative → `< 10ms` true; saturating_sub
+            // floors to 0 → also true). The two-thirds rule uses INTEGER `Duration` division
+            // `(old/3)*2` — NOT float `* 2.0/3.0`: Go computes the threshold in integer nanoseconds
+            // (`oldNs/3` truncates), and float arithmetic diverges from it at the exact 2/3 boundary
+            // with whole-millisecond inputs (e.g. old=36ms, best=24ms: Go's `24ms > 24ms` is false →
+            // switch, but float `0.024 > 0.0239999997` is true → keep). `Duration / u32` truncates
+            // nanos exactly like Go and `* u32` is exact, reproducing `oldRegionCurLatency/3*2`.
             let keep_old = old.latency.saturating_sub(best_any) < PREFERRED_DERP_ABSOLUTE_DIFF
-                || best_any.as_secs_f64() > old.latency.as_secs_f64() * 2.0 / 3.0;
+                || best_any > (old.latency / 3) * 2;
             Some(if keep_old { old.id } else { best.id })
         }
         // The current region is no longer reachable this cycle: take the new best.
@@ -1849,6 +1858,45 @@ mod home_region_hysteresis_tests {
             select_home_region(None, &m, &br).unwrap(),
             rid(2),
             "the smoothed-best region wins even when it is not the raw-latency first"
+        );
+    }
+
+    /// Byte-faithful integer two-thirds boundary (the float-vs-integer divergence): at exactly
+    /// `best == old * 2/3` (old=36ms, best=24ms), Go's integer `bestAny > old/3*2` = `24ms > 24ms`
+    /// is FALSE, so it does NOT keep on the 2/3 arm; and `cond_a` `36-24=12ms < 10ms` is also false,
+    /// so Go SWITCHES. A float `0.024 > 0.036*2.0/3.0 = 0.0239999997` would wrongly KEEP. This test
+    /// pins the integer math: it must switch to the best.
+    #[test]
+    fn two_thirds_boundary_is_integer_not_float() {
+        let m = [region(1, 24), region(2, 36)];
+        // No smoothing (raw == smoothed): isolates the 2/3 arithmetic at the exact boundary.
+        assert_eq!(
+            sel(Some(rid(2)), &m).unwrap(),
+            rid(1),
+            "at best == old*2/3 the integer rule does NOT keep (Go switches); a float rule would keep"
+        );
+    }
+
+    /// The `cond_a` (absolute-diff) arm via `saturating_sub`: when the old region's RAW current
+    /// latency is FASTER than the smoothed-best (old=20ms raw, smoothed-best=50ms), `old - best_any`
+    /// underflows. Go's signed subtraction is negative (`< 10ms` → keepOld); `saturating_sub` floors
+    /// to 0 (`< 10ms` → keepOld) — same outcome. The old region is kept.
+    #[test]
+    fn old_faster_than_smoothed_best_keeps_via_absolute_diff() {
+        // Current home = region 2, raw 20ms. Region 1 is the raw-best at 15ms but its smoothed min is
+        // 50ms (it oscillates badly). smoothed-best candidate by min = region 2 (raw 20 == smoothed
+        // 20, since br[2]=20) vs region 1 smoothed 50 → best is region 2 itself → already-best path.
+        // To exercise the old<best_any underflow we need best != old: make region 1 the smoothed best
+        // at 18ms but the OLD region's raw 20ms... use: old=region2 raw 20, best=region1 smoothed 18.
+        let m = [region(1, 15), region(2, 20)];
+        let mut br = HashMap::new();
+        br.insert(rid(1), Duration::from_millis(18)); // smoothed-best = region 1 at 18ms
+        br.insert(rid(2), Duration::from_millis(25)); // region 2 smoothed worse than its raw 20ms
+        // best_any = 18ms (region 1). old (region 2) RAW = 20ms. 20 - 18 = 2ms < 10ms → keepOld.
+        assert_eq!(
+            select_home_region(Some(rid(2)), &m, &br).unwrap(),
+            rid(2),
+            "old raw (20ms) within 10ms of smoothed-best (18ms) keeps via the absolute-diff arm"
         );
     }
 }
