@@ -43,6 +43,46 @@ fn drop_before_rules(dst: std::net::IpAddr) -> bool {
     }
 }
 
+/// The inbound packet-filter verdict for an already-parsed packet (`true` = admit). This is the
+/// proto-switch of Go's filter `runIn4`/`runIn6`, applied after `pre()` and after this fork's
+/// source-attribution and local-destination routing (the analogues of Go's `local4`/`local6`
+/// precondition) have run:
+///
+/// 1. `drop_before_rules` — Go `pre()`'s unconditional multicast / link-local-unicast drops.
+/// 2. TSMP (proto 99) is always admitted, bypassing the ACL — Go `case ipproto.TSMP: return Accept`.
+///    TSMP carries in-band control messages between nodes, so it must reach the local stack
+///    regardless of the ACL rules.
+/// 3. Everything else consults the control-derived ACL via `can_access` — Go's `matches4.match`.
+fn inbound_filter_verdict(
+    filter: &(dyn ts_packetfilter::Filter + Send + Sync),
+    proto: IpProto,
+    src: std::net::IpAddr,
+    dst: std::net::IpAddr,
+    dst_port: u16,
+) -> bool {
+    if drop_before_rules(dst) {
+        tracing::trace!(?dst, "dropping multicast/link-local dst (pre-rule)");
+        return false;
+    }
+
+    if proto == IpProto::TSMP {
+        tracing::trace!(?dst, "accepting TSMP inbound (bypasses ACL, Go parity)");
+        return true;
+    }
+
+    let info = ts_packetfilter::PacketInfo {
+        ip_proto: proto,
+        port: dst_port,
+        src,
+        dst,
+    };
+    // TODO(npry): wire in nodecaps
+    let caps = [];
+    let verdict = filter.can_access(&info, caps);
+    tracing::trace!(?info, ?caps, verdict);
+    verdict
+}
+
 /// A data plane subsystem that can be the subject of timer events.
 pub enum Subsystem {
     /// The wireguard component.
@@ -238,18 +278,6 @@ impl DataPlane {
                         }
                     };
 
-                    // Pre-rule destination screen, mirroring Go filter `pre()`'s unconditional drops
-                    // that run BEFORE any ACL rule: a packet to a multicast or (non-allowlisted)
-                    // link-local-unicast destination is dropped regardless of the rules. Without this,
-                    // a permissive ACL (dst `*` / `0.0.0.0/0`) would ACCEPT inbound multicast /
-                    // link-local that Go drops pre-rules — the one ACCEPT-where-Go-DROPS gap. Bounded
-                    // already by the source-attribution filter above (only attributable tailnet peers
-                    // reach here), but matched to Go for correctness.
-                    if drop_before_rules(dst) {
-                        tracing::trace!(?dst, "dropping multicast/link-local dst (pre-rule)");
-                        return false;
-                    }
-
                     let (_src_port, dst_port) = match pkt.transport {
                         Some(etherparse::TransportSlice::Udp(udp)) => {
                             (udp.source_port(), udp.destination_port())
@@ -260,20 +288,11 @@ impl DataPlane {
                         _ => (0, 0),
                     };
 
-                    let info = ts_packetfilter::PacketInfo {
-                        ip_proto: proto,
-                        port: dst_port,
-                        src,
-                        dst,
-                    };
-
-                    // TODO(npry): wire in nodecaps
-                    let caps = [];
-                    let verdict = self.packet_filter.can_access(&info, caps);
-
-                    tracing::trace!(?info, ?caps, verdict);
-
-                    verdict
+                    // The inbound proto-switch (Go `runIn4`/`runIn6`): Go `pre()` multicast/link-local
+                    // drops, then unconditional TSMP accept, then the control-derived ACL. Source
+                    // attribution above and `or_in.route` below bound this to attributable peers and
+                    // local destinations (Go's `local4`/`local6` precondition).
+                    inbound_filter_verdict(self.packet_filter.as_ref(), proto, src, dst, dst_port)
                 });
 
                 v
@@ -434,6 +453,52 @@ mod tests {
             !drop_before_rules(ip("fd7a:115c:a1e0::1")),
             "IPv6 ULA (tailnet) passes"
         );
+    }
+
+    /// A filter that drops everything (returns `None` for every packet). Lets a test prove that TSMP
+    /// is admitted by bypassing the ACL — not by the ACL happening to allow it.
+    struct DenyAll;
+    impl ts_packetfilter::Filter for DenyAll {
+        fn match_for(
+            &self,
+            _info: &ts_packetfilter::PacketInfo,
+            _caps: ts_packetfilter::filter::CapIter,
+        ) -> Option<&str> {
+            None
+        }
+    }
+
+    /// The inbound proto-switch (Go `runIn4`/`runIn6`): TSMP is always admitted, bypassing the ACL;
+    /// `pre()` drops still win over TSMP; non-TSMP defers to the ACL.
+    #[test]
+    fn tsmp_bypasses_acl_matches_go() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        let src = ip("100.64.0.9");
+        let dst = ip("100.64.0.1");
+        let tsmp = IpProto::new(99);
+
+        // TSMP is accepted even though the ACL denies everything — Go `case TSMP: return Accept`.
+        assert!(
+            inbound_filter_verdict(&DenyAll, tsmp, src, dst, 0),
+            "TSMP admitted by bypassing the (deny-all) ACL"
+        );
+        // A non-TSMP proto under the same deny-all ACL is dropped — proves the bypass is TSMP-specific.
+        assert!(
+            !inbound_filter_verdict(&DenyAll, IpProto::TCP, src, dst, 443),
+            "TCP still consults the ACL (deny-all → dropped)"
+        );
+        // `pre()` drops outrank the TSMP accept: TSMP to a multicast/link-local dst is still dropped,
+        // exactly as Go runs `pre()` before the proto switch.
+        assert!(
+            !inbound_filter_verdict(&DenyAll, tsmp, src, ip("224.0.0.1"), 0),
+            "TSMP to a multicast dst is still dropped (pre() before the switch)"
+        );
+        assert!(
+            !inbound_filter_verdict(&DenyAll, tsmp, src, ip("169.254.1.1"), 0),
+            "TSMP to a link-local dst is still dropped (pre() before the switch)"
+        );
+        // IpProto::TSMP is the named constant for proto 99.
+        assert_eq!(IpProto::TSMP, tsmp, "IpProto::TSMP == 99");
     }
 
     /// Behavioral guard: an installed capture hook MUST be invoked with `CapturePath::FromLocal`

@@ -118,4 +118,33 @@ mod tests {
 
         assert_eq!(got, want);
     }
+
+    /// A packet whose destination matches NO route is dropped (the `None => None` arm). This is the
+    /// structural analogue of Go filter's `local4`/`local6` destination-local precondition: only a
+    /// packet whose dst has a local overlay route is delivered. It is what bounds the dataplane's
+    /// unconditional inbound TSMP accept to local destinations — a TSMP packet to an unrouted dst
+    /// still gets dropped here, after the filter admitted it, exactly as Go's `local4` gate runs
+    /// before the `case TSMP: Accept`. (AND is order-independent, so accept-then-route-drop matches
+    /// Go's gate-then-accept.)
+    #[test]
+    fn unrouted_dst_is_dropped() {
+        let mut routes = Table::default();
+        routes.insert(
+            "100.64.0.1/32".parse().unwrap(),
+            RouteAction::ToOverlay(1.into()),
+        );
+        let mut router = Router::default();
+        router.swap(routes);
+
+        // A local dst (has a route) is delivered; an unrouted dst (no route at all) is dropped.
+        let local = v4_packet("100.64.0.1".parse().unwrap(), b"local");
+        let unrouted = v4_packet("8.8.8.8".parse().unwrap(), b"no route");
+        let got = router.route(vec![local.clone(), unrouted]);
+
+        assert_eq!(
+            got,
+            HashMap::from([(1.into(), vec![local])]),
+            "only the routed-local dst is delivered; the unrouted dst is dropped"
+        );
+    }
 }
