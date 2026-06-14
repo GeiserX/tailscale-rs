@@ -24,9 +24,16 @@ use std::{
     io::{self, Seek, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{Duration, SystemTime},
 };
 
 use tokio::io::{AsyncRead, AsyncReadExt};
+
+/// How long an abandoned `.partial` is kept before the reaper deletes it (Go
+/// `feature/taildrop/delete.go` `deleteDelay = time.Hour`). A resume within the window keeps the
+/// partial alive (its mtime advances on every write, and an in-flight transfer is skipped outright),
+/// so this is the grace period for a transfer to be resumed before its leftovers are reclaimed.
+pub const DELETE_DELAY: Duration = Duration::from_secs(60 * 60);
 
 /// Suffix for in-progress transfers. A completed transfer is renamed off this suffix; a name
 /// ending in it is itself never accepted as a base name (Go `partialSuffix`).
@@ -246,6 +253,82 @@ impl TaildropStore {
         self.root.join(format!("{base}{PARTIAL_SUFFIX}"))
     }
 
+    /// Reap abandoned `.partial` files: delete every `<base>.partial` in the store root whose last
+    /// modification is older than `delete_delay` relative to `now` AND whose base name has no
+    /// in-flight transfer. Returns the number deleted. Mirrors Go `feature/taildrop/delete.go`'s
+    /// `fileDeleter`, which GCs a partial `deleteDelay` (1h) after it was last touched, sparing one
+    /// that an active put is still writing.
+    ///
+    /// This fork has no per-file timer queue (the store is a passive `Arc`, not an actor); instead a
+    /// periodic background sweep — see [`spawn_partial_reaper`] — calls this. The two Go cancellation
+    /// signals are both honored: an **active** transfer's base name is in `in_flight` (skipped here,
+    /// the analog of Go's "no active put" check), and a **resumed** transfer advances the partial's
+    /// mtime on every write (so a partial resumed within the window looks recent and is spared). A
+    /// permanently-abandoned partial is neither, so it ages out and is deleted, reclaiming the disk
+    /// and clearing the stale-partial `409` that would otherwise block an `offset == 0` re-send of
+    /// the same name forever.
+    ///
+    /// `now` and `delete_delay` are parameters (not read from the clock here) so the reap logic is
+    /// deterministically testable. A partial whose mtime is unreadable or in the future is treated as
+    /// fresh (kept) — fail-safe toward never deleting a file that might still be live.
+    pub fn reap_abandoned_partials(&self, now: SystemTime, delete_delay: Duration) -> usize {
+        let entries = match std::fs::read_dir(&self.root) {
+            Ok(e) => e,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return 0,
+            Err(e) => {
+                tracing::warn!(error = %e, "taildrop reaper: cannot read store dir");
+                return 0;
+            }
+        };
+        // Snapshot the in-flight names once; an active transfer must never have its partial reaped.
+        let in_flight: HashSet<String> = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+
+        let mut deleted = 0usize;
+        for entry in entries.flatten() {
+            // `metadata()` here is lstat-based (does not follow symlinks); a symlink is never a
+            // partial we created, so `is_file()` is false for it and it is skipped — consistent with
+            // the symlink refusal elsewhere in this store.
+            let Ok(meta) = entry.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            let Some(base) = name.strip_suffix(PARTIAL_SUFFIX) else {
+                continue; // not a partial
+            };
+            if in_flight.contains(base) {
+                continue; // an active transfer owns this partial — never reap it (Go "no active put")
+            }
+            // Age check: keep anything modified within `delete_delay` of `now`. An unreadable or
+            // future mtime is treated as fresh (kept) — fail-safe toward not deleting a live file.
+            let age_ok = meta
+                .modified()
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .is_some_and(|age| age >= delete_delay);
+            if !age_ok {
+                continue;
+            }
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => {
+                    deleted += 1;
+                    tracing::info!(partial = %name, "taildrop reaper: deleted abandoned partial");
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {} // already gone, fine
+                Err(e) => {
+                    tracing::warn!(error = %e, partial = %name, "taildrop reaper: delete failed")
+                }
+            }
+        }
+        deleted
+    }
+
     /// Receive a file named `name` from `reader`, writing to `<name>.partial` then atomically
     /// renaming to a non-clobbering final name on success. Mirrors Go `manager.PutFile`.
     ///
@@ -458,6 +541,41 @@ impl TaildropStore {
         let size = f.metadata()?.len();
         Ok((f, size))
     }
+}
+
+/// Spawn the background reaper that periodically GCs abandoned `.partial` files (Go
+/// `feature/taildrop/delete.go`'s `fileDeleter`). It sweeps every [`DELETE_DELAY`], deleting partials
+/// older than `DELETE_DELAY` that have no in-flight transfer (see
+/// [`TaildropStore::reap_abandoned_partials`]), and exits when `shutdown` flips to `true`.
+///
+/// Returns a [`JoinHandle`](tokio::task::JoinHandle) the caller should abort on drop so the task
+/// never outlives the runtime (the established `reauth_bridge` / `DerpLatencyMeasurer` pattern). An
+/// `Arc<TaildropStore>` is held (cheap clone), so the sweep sees live `in_flight` state.
+///
+/// The first sweep is deferred one full `DELETE_DELAY` (not run at startup): a partial on disk at
+/// boot is by definition at least 0s old, and Go likewise only deletes after the delay elapses, so
+/// waiting one interval avoids reaping a partial a just-restarted node might still resume.
+pub fn spawn_partial_reaper(
+    store: Arc<TaildropStore>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(DELETE_DELAY);
+        // `interval` fires immediately on the first `tick()`; consume that so the first real sweep is
+        // one `DELETE_DELAY` out (no startup reap — a partial must age the full delay first).
+        tick.tick().await;
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    let n = store.reap_abandoned_partials(SystemTime::now(), DELETE_DELAY);
+                    if n > 0 {
+                        tracing::info!(deleted = n, "taildrop reaper: swept abandoned partials");
+                    }
+                }
+                _ = shutdown.wait_for(|x| *x) => break,
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -893,6 +1011,79 @@ mod tests {
         // Dotfile (no real extension) appends at end.
         std::fs::write(root.join(".env"), b"x").unwrap();
         assert_eq!(next_available_name(&root, ".env"), ".env (1)");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The reaper deletes a `.partial` older than `delete_delay` and keeps a fresh one. Aging is
+    /// driven by the passed-in `now` (the partial's real mtime is ~now): `now + 2h` with a 1h delay
+    /// makes an existing partial look 2h old (reaped); `now` with a 1h delay keeps it (~0s old).
+    #[test]
+    fn reaper_deletes_aged_partial_keeps_fresh_and_final() {
+        let root = tmp_root();
+        let store = TaildropStore::new(&root).unwrap();
+
+        std::fs::write(root.join("abandoned.bin.partial"), b"half").unwrap();
+        std::fs::write(root.join("done.bin"), b"complete").unwrap(); // a finished file, not a partial
+
+        let now = SystemTime::now();
+        let delay = Duration::from_secs(3600);
+
+        // Fresh: nothing is older than the delay yet.
+        assert_eq!(
+            store.reap_abandoned_partials(now, delay),
+            0,
+            "nothing aged out"
+        );
+        assert!(root.join("abandoned.bin.partial").exists());
+
+        // Aged: 2h in the future vs a 1h delay → the partial is reaped, the final file is untouched.
+        let reaped = store.reap_abandoned_partials(now + Duration::from_secs(2 * 3600), delay);
+        assert_eq!(reaped, 1, "the aged partial is reaped");
+        assert!(
+            !root.join("abandoned.bin.partial").exists(),
+            "aged partial deleted"
+        );
+        assert!(
+            root.join("done.bin").exists(),
+            "a completed (non-partial) file must never be reaped"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// An in-flight transfer's partial is NEVER reaped, even when aged (Go's "no active put" check):
+    /// while a base name is claimed, the reaper skips its partial regardless of mtime.
+    #[tokio::test]
+    async fn reaper_spares_in_flight_partial() {
+        let root = tmp_root();
+        let store = TaildropStore::new(&root).unwrap();
+
+        // Pre-write an (old) partial and claim its base name as in-flight.
+        std::fs::write(root.join("live.bin.partial"), b"in progress").unwrap();
+        let _claim = store.claim_in_flight("live.bin").expect("claim");
+
+        // Even with a far-future `now` (well past the delay), the in-flight partial is spared.
+        let reaped = store.reap_abandoned_partials(
+            SystemTime::now() + Duration::from_secs(48 * 3600),
+            Duration::from_secs(3600),
+        );
+        assert_eq!(reaped, 0, "an in-flight partial must not be reaped");
+        assert!(
+            root.join("live.bin.partial").exists(),
+            "the in-flight partial survives the sweep"
+        );
+
+        // Once the claim drops, the same aged partial IS reaped.
+        drop(_claim);
+        let reaped = store.reap_abandoned_partials(
+            SystemTime::now() + Duration::from_secs(48 * 3600),
+            Duration::from_secs(3600),
+        );
+        assert_eq!(
+            reaped, 1,
+            "after the claim drops, the aged partial is reaped"
+        );
+
         std::fs::remove_dir_all(&root).ok();
     }
 }
