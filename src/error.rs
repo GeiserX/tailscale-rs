@@ -33,6 +33,15 @@ pub enum Error {
     #[error("the environment variable `{}` was not set", crate::ENV_MAGIC_VAR)]
     UnstableEnvVar,
 
+    /// No exit-node suggestion could be made because this node has no measured preferred DERP
+    /// region yet — the Rust analog of Go's `ErrNoPreferredDERP` ("no preferred DERP, try again
+    /// later"). Returned by [`Device::suggest_exit_node`](crate::Device::suggest_exit_node) before
+    /// the first netcheck has completed; callers should treat it as transient and retry once
+    /// connectivity has been measured. Distinct from a *successful* "no suggestion" (an empty
+    /// candidate set), which is `Ok(None)`.
+    #[error("no preferred DERP, try again later")]
+    NoPreferredDerp,
+
     /// An error occurred which can not be anticipated or handled by a library user.
     ///
     /// This is likely due to a bug in our code or a rare and unexpected error.
@@ -41,6 +50,14 @@ pub enum Error {
     /// in logs or to the end-user), rather then inspected during handling.
     #[error("internal error ({0})")]
     Internal(InternalErrorKind),
+}
+
+impl From<ts_runtime::SuggestExitNodeError> for Error {
+    fn from(value: ts_runtime::SuggestExitNodeError) -> Self {
+        match value {
+            ts_runtime::SuggestExitNodeError::NoPreferredDerp => Error::NoPreferredDerp,
+        }
+    }
 }
 
 /// Informational detail on the kind of internal error.

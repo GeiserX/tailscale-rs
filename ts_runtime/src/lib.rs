@@ -29,6 +29,9 @@ pub mod device_state;
 mod direct;
 mod env;
 mod error;
+/// Exit-node suggestion algorithm (the classic DERP-region-latency path, Go
+/// `suggestExitNodeUsingDERP`) and its result/error types.
+pub mod exit_node_suggest;
 /// Fallback TCP handler registry (`tsnet.Server.RegisterFallbackTCPHandler` parity).
 pub mod fallback_tcp;
 mod forwarder_actor;
@@ -67,6 +70,7 @@ mod tun_actor;
 pub use device_state::{DeviceState, RegistrationError};
 pub(crate) use env::Env;
 pub use error::{Error, ErrorKind};
+pub use exit_node_suggest::{ExitNodeSuggestion, SuggestExitNodeError};
 pub use ipn_bus::{IpnBusWatcher, Notify, NotifyWatchOpt};
 pub use status::{FileTarget, NetcheckReport, RegionLatency, Status, StatusNode, WhoIs};
 pub use ts_dataplane::{CaptureHook, CapturePath};
@@ -132,6 +136,13 @@ pub struct Runtime {
     /// the startup config. [`Runtime::set_advertise_routes`] and [`set_advertise_exit_node`] each
     /// mutate their part under this lock then re-send the composed set, so the two compose.
     advertise: std::sync::Mutex<AdvertiseState>,
+    /// The most recent exit-node suggestion's stable id (Go `LocalBackend.lastSuggestedExitNode`),
+    /// remembered across calls so [`Runtime::suggest_exit_node`] can apply *stickiness* — if the
+    /// previously-suggested node is still an eligible candidate in the winning region it is kept, to
+    /// avoid the suggestion flapping between equally-good ties on each call. `None` until the first
+    /// suggestion. Held behind a `Mutex` (same rationale as [`advertise`](Self::advertise): a
+    /// cheap, infrequently-touched bit of mutable runtime state, not worth an actor round-trip).
+    prev_suggestion: std::sync::Mutex<Option<ts_control::StableNodeId>>,
     /// Background task that periodically reaps abandoned taildrop `.partial` files (Go
     /// `feature/taildrop/delete.go` `fileDeleter`). `None` when no taildrop store is configured.
     /// Aborted on [`Drop`] so it cannot outlive the runtime (the `reauth_bridge` pattern).
@@ -436,6 +447,7 @@ impl Runtime {
             state_rx,
             cap_grants_rx,
             advertise,
+            prev_suggestion: std::sync::Mutex::new(None),
             taildrop_reaper,
             #[cfg(feature = "network-monitor")]
             netmon_supervisor,
@@ -663,6 +675,84 @@ impl Runtime {
             active_exit_node: self.active_exit_node(),
             magic_dns_suffix,
         })
+    }
+
+    /// Suggest a reasonably good exit node to use, from the current netmap + latest netcheck report
+    /// (Go `LocalBackend.SuggestExitNode`). The Phase-1 classic DERP-region-latency path; see the
+    /// [`exit_node_suggest`] module for the algorithm, scope, and the IPv4-only parity deviation.
+    ///
+    /// Gathers the inputs the way [`status`](Self::status) and [`file_targets`](Self::file_targets)
+    /// do — the latest [`NetcheckReport`] from the control runner (an immediate, non-blocking borrow
+    /// of the last DERP-latency measurement) and every peer [`Node`](ts_control::Node) from the peer
+    /// tracker — then runs the pure algorithm with the production uniform-random selectors
+    /// (`random_region` / `random_node`). The returned suggestion's id is remembered in the runtime's
+    /// `prev_suggestion` cell so the next call is *sticky* (Go `lastSuggestedExitNode`).
+    ///
+    /// Returns `Ok(None)` when no peer is an eligible candidate (Go's empty response), and
+    /// `Err(`[`SuggestExitNodeError::NoPreferredDerp`]`)` when there is no netcheck report yet (Go's
+    /// `ErrNoPreferredDERP`, "try again later").
+    pub async fn suggest_exit_node(
+        &self,
+    ) -> Result<Result<Option<ExitNodeSuggestion>, SuggestExitNodeError>, Error> {
+        use ts_control::NODE_ATTR_SUGGEST_EXIT_NODE;
+
+        // The latest netcheck report (Go `MagicConn().GetLastNetcheckReport`): an immediate borrow of
+        // the control runner's published measurement (the same value `Device::netcheck` surfaces).
+        let report = self.control.ask(control_runner::Netcheck).await?;
+
+        // Every known peer (Go reads the netmap peers via `AppendMatchingPeers`); the domain `Node`
+        // retains the cap map, home DERP region, online state, and accepted routes the predicate
+        // needs.
+        let peers = self
+            .peer_tracker
+            .upgrade()
+            .ok_or(Error {
+                kind: ErrorKind::ActorGone,
+                target_actor: None,
+                message_ty: None,
+            })?
+            .ask(peer_tracker::AllPeers)
+            .await?;
+
+        // Project each peer into the algorithm's candidate inputs. The eligibility predicate runs
+        // inside the pure function, so every peer is passed (self is naturally absent from the peer
+        // set). `derp_region`/`online`/`cap_map`/`accepted_routes` map straight off the domain node;
+        // the exit-route check is the fork's family-agnostic `prefix_len == 0` (IPv4-only parity —
+        // see `exit_node_suggest::suggest_exit_node`).
+        let candidates: Vec<exit_node_suggest::ExitNodeCandidate> = peers
+            .iter()
+            .map(|peer| exit_node_suggest::ExitNodeCandidate {
+                stable_id: peer.stable_id.clone(),
+                name: peer
+                    .fqdn_opt(false)
+                    .unwrap_or_else(|| peer.hostname.clone()),
+                derp_region: peer.derp_region,
+                online: peer.online,
+                advertises_exit_route: peer
+                    .accepted_routes
+                    .iter()
+                    .any(|route| route.prefix_len() == 0),
+                has_suggest_cap: peer.has_node_attr(NODE_ATTR_SUGGEST_EXIT_NODE),
+            })
+            .collect();
+
+        // Read the sticky previous suggestion, run the pure algorithm with the production
+        // uniform-random selectors, then update the sticky value to the new result. This mirrors Go
+        // `suggestExitNodeLocked` (`ipn/ipnlocal/local.go`), which assigns `b.lastSuggestedExitNode =
+        // res.ID` on **every** no-error return — INCLUDING the empty/no-candidate result, where it
+        // clears the sticky id to "". So a successful suggestion sets stickiness, an empty result
+        // CLEARS it (a peer that dropped out of candidacy stops being preferred), and only an `Err`
+        // (`NoPreferredDerp` — no netcheck yet) returns before the assignment and leaves it untouched.
+        let prev = self.prev_suggestion.lock().unwrap().clone();
+        let outcome = exit_node_suggest::suggest_exit_node(
+            &report,
+            &candidates,
+            prev.as_ref(),
+            &exit_node_suggest::random_region,
+            &exit_node_suggest::random_node,
+        );
+        *self.prev_suggestion.lock().unwrap() = exit_node_suggest::next_sticky(prev, &outcome);
+        Ok(outcome)
     }
 
     /// List the tailnet peers this node can Taildrop a file *to* (Go LocalAPI `FileTargets`).

@@ -18,6 +18,14 @@ use serde::{Deserialize, Serialize};
 /// to host VIP services. The cap's value deserializes as [`ServiceIpMappings`].
 pub const NODE_ATTR_SERVICE_HOST: &str = "service-host";
 
+/// The node-capability key marking a peer as eligible to be *suggested* as an exit node
+/// (`tailcfg.NodeAttrSuggestExitNode`). Control sets it on the exit-node candidates a client may
+/// auto-pick from; the exit-node suggestion algorithm (`Device::suggest_exit_node`) requires this
+/// cap in a peer's `CapMap` for the peer to be a candidate. The cap's value is empty (the key's
+/// presence is the whole signal), so unlike [`NODE_ATTR_SERVICE_HOST`] it carries no payload to
+/// deserialize — consumers check key presence via `Node::has_node_attr`.
+pub const NODE_ATTR_SUGGEST_EXIT_NODE: &str = "suggest-exit-node";
+
 /// The `svc:` prefix every [`ServiceName`] carries (`tailcfg` `serviceNamePrefix`).
 pub const SERVICE_NAME_PREFIX: &str = "svc:";
 
