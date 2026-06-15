@@ -213,13 +213,19 @@ flowchart LR
   through `VerifiedAumChain::verify` → `Authority::from_verified_chain` (the un-bypassable trust
   boundary — `from_chain` is documented "NOT a trust boundary"), so a malicious control plane cannot
   inject trusted keys here.
-- **Enforcement posture — observe-only (verify-and-LOG), not fail-closed yet.** The synced
-  `Authority` is delivered to the peer tracker, which **logs** each peer's signature verdict
-  (`verified`/`unsigned`/`failed`) but does **not** drop any peer (`tka_observe`, distinct from the
-  gated fail-closed `tka_authority`). This is deliberate while (a) the `ts_tka` crypto is unaudited
-  beyond the KAT in §5 and (b) deployments treat control as trusted; flipping to fail-closed enforce
-  is a separate gated decision. (Distinct from *shields-up*/`block_incoming`, which is an
-  unconditional inbound-connection refusal at the packet filter, unrelated to TKA trust.)
+- **Enforcement posture — actively fail-closed.** The synced `Authority` is delivered to the peer
+  tracker's enforcement cell (`tka_authority`), and the per-peer chokepoint (`tka_snapshot_admits`,
+  matching Go's `tkaFilterNetmapLocked`) **drops** any peer presenting a missing or unauthorized
+  `key_signature` at the peer-db upsert path — it is not merely logged. With no lock synced every peer
+  is admitted (Go's `b.tka == nil` early return); a control-signalled disable clears enforcement back
+  to admit-all. Because the `Authority` only reaches this path after `VerifiedAumChain::verify`, a
+  malicious control plane cannot forge a trusted key to admit a peer — it can only toggle the lock.
+  Self is structurally never filtered (the self node never enters the peer db), so a node cannot lock
+  itself out. Remaining deferred gaps (tracked in `SECURITY.md` / `docs/PARITY_ROADMAP.md`):
+  disablement-secret verification, and Go's rotation-obsolete (clone/replay) peer dropping; both make
+  us *more* permissive than Go, neither opens a new attack surface. (Distinct from
+  *shields-up*/`block_incoming`, which is an unconditional inbound-connection refusal at the packet
+  filter, unrelated to TKA trust.)
 
 ---
 

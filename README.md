@@ -195,11 +195,14 @@ These are features that are currently implemented:
   - Tailscale Serve: `Proxy`, `Text`, `TcpForward`, plus HTTP `Path` (path-prefix mux) and
     `Redirect` (HTTP 3xx) handlers; all TLS-terminating targets are validated and dispatched
     fail-closed (unmatched path → 404, backend dial failure → drop)
-  - Tailnet Lock (TKA), **partial**: per-peer node-key signature verification is wired and
-    unit-tested at the peer-trust chokepoint and fails closed when a trusted-key `Authority` is
-    supplied. Live enforcement is **currently inert** — the AUM-chain sync RPC that would supply the
-    `Authority` is not yet implemented, so a compromised control plane can still inject peer keys.
-    See [SECURITY.md](SECURITY.md) before relying on it.
+  - Tailnet Lock (TKA), **partial**: per-peer node-key signature verification is wired, unit-tested,
+    and **actively enforcing** at the peer-trust chokepoint. The AUM-chain sync RPC that supplies the
+    trusted-key `Authority` is implemented, so once a lock is synced the chokepoint fails **closed** —
+    a peer with a missing or unauthorized `key_signature` is **dropped** (the `Authority` only ever
+    reaches enforcement after `VerifiedAumChain::verify`, so control cannot forge a trusted key to
+    admit a peer; it can only toggle the lock). Remaining deferred gaps: establishing/managing a lock
+    from this node (multi-node `tka/init` enrollment), disablement-secret verification, and Go's
+    rotation-obsolete (clone/replay) peer dropping. See [SECURITY.md](SECURITY.md) before relying on it.
   - Communicate with the Tailscale Go client, `tsnet`, and `libtailscale`
 - Language support
   - Rust API
@@ -253,9 +256,11 @@ Unsupported features
   - Node Sharing
   - Taildrive
   - Taildrop
-  - Tailnet Lock — full enforcement (signature verification is wired, but the AUM-sync RPC that
-    supplies the trusted-key `Authority` is not yet built, so enforcement is inert; see
-    [SECURITY.md](SECURITY.md))
+  - Tailnet Lock — *enforcement is supported* (per-peer key-signature verification is wired and
+    actively fails closed once a lock is synced — an unsigned or unauthorized peer is dropped; see
+    [SECURITY.md](SECURITY.md)). What is **not** yet supported: establishing/managing a lock from this
+    node (multi-node `tka/init` enrollment), disablement-secret verification, and Go's
+    rotation-obsolete (clone/replay) peer dropping.
   - Tailscale Funnel
   - Tailscale Serve — the stored serve-config runtime and accept-loop (the `Path`/`Redirect`/`Proxy`/
     `Text`/`TcpForward` handlers themselves are implemented)

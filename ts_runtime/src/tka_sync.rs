@@ -16,11 +16,30 @@
 //!    tell control the AUMs *it* is missing. The order matches Go exactly — we compute what to *send*
 //!    from the pre-Inform store, then advance.
 //!
-//! **Posture (observe-only, fail-open):** every failure path returns `Ok(None)` or an `Err` that the
-//! caller treats as "no Authority obtained" — it never blocks the netmap, never drops a peer. The
-//! resulting [`Authority`] is published for the verify-and-log consumer (#136); enforcement is a
-//! separate, later, gated decision. The chain always passes through `VerifiedAumChain::verify`, so a
-//! malicious control plane cannot forge trusted keys here.
+//! **Posture (this module fails open; the published `Authority` is then ENFORCED).** This is two
+//! distinct claims, kept distinct:
+//!
+//! - *Sync failure is fail-open here*: every failure path in **this** module (a transport error, a
+//!   malformed AUM, a verify failure) returns `Ok(None)` or an `Err` that the caller treats as "no
+//!   new Authority obtained this round" — a failed *sync* never blocks the netmap and leaves the
+//!   prior enforcement state untouched (see `control_runner`'s apply step). It does NOT mean TKA is
+//!   observe-only.
+//! - *A successfully synced `Authority` is actively enforced*: once this module returns an
+//!   `Authority`, the control runner publishes it to the peer tracker's enforcement cell and the
+//!   peer-trust chokepoint fails **closed** — a peer presenting a missing or unauthorized
+//!   `key_signature` is **dropped** at the peer-db upsert path (`peer_tracker::tka_snapshot_admits`,
+//!   matching Go's `tkaFilterNetmapLocked`). With no lock synced, every peer is admitted (Go's
+//!   `b.tka == nil` early return); a control-signalled *disable* clears enforcement back to admit-all.
+//!
+//! The chain always passes through the **un-bypassable trust boundary** `VerifiedAumChain::verify`
+//! before it can reach enforcement, so a malicious control plane cannot forge a trusted key to admit
+//! an unauthorized peer — it can only toggle the lock's enable/disable state. The authoritative
+//! description of the enforcement posture, threat model, and the remaining deferred gaps
+//! (disablement-secret verification, rotation-obsolete/clone-replay dropping) lives in `SECURITY.md`;
+//! keep this doc consistent with it.
+//!
+//! **Do not "simplify" by removing enforcement to match an outdated "observe-only" reading** — that
+//! would silently downgrade a working, fail-closed security control to verify-only.
 
 use std::sync::Arc;
 
