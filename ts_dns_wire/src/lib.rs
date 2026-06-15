@@ -408,7 +408,11 @@ fn encode_answer(out: &mut Vec<u8>, ans: &RData, compress: bool, qname: &Name) {
 /// (`MAX_UDP_MSG_LEN`); this fork does not implement EDNS(0). If the full
 /// answer set would overflow that limit, the overflowing answers are dropped
 /// and the TC (truncation) bit is set in the header, so the result is always
-/// `<= 512` bytes and never an oversized datagram.
+/// `<= 512` bytes and never an oversized datagram. Note a single answer's size now includes the FULL
+/// uncompressed question name (compression only kicks in for >1 answer), so the 512 cap is reached by
+/// a shorter answer set than when every answer was a 2-byte pointer — only material for a near-maximal
+/// (~240+ wire-byte) name, where even one answer is then dropped + TC set (valid DNS; this fork is
+/// UDP-only).
 pub fn encode_response(
     id: u16,
     q: &Question,
@@ -606,14 +610,14 @@ mod tests {
         // A single answer's NAME is the FULL uncompressed label sequence (Go compresses only for
         // >1 answer), then type=1, class=1, ttl=600, rdlen=4, addr.
         let expected_rr: &[u8] = &[
-            // NAME: "host.user.ts.net." uncompressed.
+            // NAME: "host.user.ts.net." uncompressed (labels + root 0).
             4, b'h', b'o', b's', b't', 4, b'u', b's', b'e', b'r', 2, b't', b's', 3, b'n', b'e',
-            b't', 0, // TYPE = A
+            b't', 0, //
+            0x00, 0x01, // TYPE = A
             0x00, 0x01, // CLASS = IN
-            0x00, 0x01, // TTL = 600
-            0x00, 0x00, 0x02, 0x58, // RDLENGTH = 4
-            0x00, 0x04, // RDATA
-            100, 64, 0, 1,
+            0x00, 0x00, 0x02, 0x58, // TTL = 600
+            0x00, 0x04, // RDLENGTH = 4
+            100, 64, 0, 1, // RDATA = 100.64.0.1
         ];
         let tail = &out[out.len() - expected_rr.len()..];
         assert_eq!(tail, expected_rr);
@@ -650,6 +654,47 @@ mod tests {
             &[0xC0, 0x0C],
             "multi-answer uses a pointer"
         );
+    }
+
+    /// A query with RD=0 (e.g. a non-recursive client) must get RD=0 AND RA=0 back — we ECHO the
+    /// query's RD, never force it. Pins the "echo, don't set unconditionally" semantics against a
+    /// regression that always sets RA.
+    #[test]
+    fn rd_clear_query_yields_rd_ra_clear_response() {
+        // build_query sets RD=1; build a raw RD=0 query by hand (flags word all-zero).
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&0x4242u16.to_be_bytes()); // id
+        buf.extend_from_slice(&0u16.to_be_bytes()); // flags: QR=0, RD=0
+        buf.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+        buf.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // AN/NS/AR count
+        for label in ["h", "ts", "net"] {
+            buf.push(label.len() as u8);
+            buf.extend_from_slice(label.as_bytes());
+        }
+        buf.push(0);
+        buf.extend_from_slice(&1u16.to_be_bytes()); // qtype A
+        buf.extend_from_slice(&1u16.to_be_bytes()); // qclass IN
+        let q = decode_query(&buf).expect("decodes");
+        assert!(!q.recursion_desired, "RD=0 query");
+        let out = encode_response(
+            0x4242,
+            &q.question,
+            q.recursion_desired,
+            Rcode::NoError,
+            &[RData::A([100, 64, 0, 1])],
+        );
+        let flags = u16::from_be_bytes([out[2], out[3]]);
+        assert_eq!(
+            flags & 0x0100,
+            0,
+            "RD must stay clear (echoed from the RD=0 query)"
+        );
+        assert_eq!(
+            flags & 0x0080,
+            0,
+            "RA must stay clear when RD was not requested"
+        );
+        assert_eq!(flags & 0x8000, 0x8000, "QR=1 still set");
     }
 
     #[test]
