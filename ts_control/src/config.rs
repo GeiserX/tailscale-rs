@@ -348,6 +348,18 @@ pub struct Config {
     #[serde(default)]
     pub enable_ipv6: bool,
 
+    /// Whether the runtime runs an internal OS network-link monitor that auto-re-binds + re-probes
+    /// connectivity on a link change (Wi-Fi switch, sleep/wake, default-route change). Defaults to
+    /// `false` (no monitor — the embedder drives `Device::rebind` itself).
+    ///
+    /// Like the other dataplane fields, this is a client-side preference not read inside
+    /// `ts_control`; it is carried here only to be threaded into the runtime, which (when set, and
+    /// when built with the `network-monitor` feature) spawns a `NetmonSupervisor`. It is off by
+    /// default to preserve the fork's pure-engine posture (it is an engine, not a daemon): with it
+    /// off, the runtime starts zero monitor threads/sockets and behaves byte-for-byte as before.
+    #[serde(default)]
+    pub network_monitor: bool,
+
     /// WireGuard persistent-keepalive interval applied to every peer, or `None` to disable persistent
     /// keepalives (`PersistentKeepalive`; Tailscale uses 25s).
     ///
@@ -637,6 +649,7 @@ impl Default for Config {
             taildrop_dir: None,
             tcp_buffer_size: None,
             enable_ipv6: false,
+            network_monitor: false,
             persistent_keepalive_interval: default_persistent_keepalive(),
             transport_mode: TransportMode::default(),
             wire_ingress: false,

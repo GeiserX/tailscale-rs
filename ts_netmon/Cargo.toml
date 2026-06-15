@@ -1,0 +1,31 @@
+[package]
+name = "geiserx_ts_netmon"
+version.workspace = true
+description = "tailscale OS link-change monitor"
+categories = ["network-programming"]
+keywords = ["tailscale", "network", "netmon"]
+
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+
+[lib]
+name = "ts_netmon"
+[dependencies]
+# Deliberately minimal: ONLY tokio + tracing. No netlink/route/netconfig crate. The whole point of
+# this crate is to keep the OS-agnostic core (trait + debouncer + synthetic monitor) off the
+# ring-only egress graph; OS backends (netlink on Linux, PF_ROUTE on macOS) are hand-rolled on
+# `libc` in LATER slices, never via a route crate (which would change the default supply-chain
+# posture scanned by `cargo deny --no-default-features`). See AGENTS.md.
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+tracing.workspace = true
+
+[dev-dependencies]
+# The debouncer tests drive a paused virtual clock (`tokio::time::pause`) so a 250 ms settle window
+# fires in virtual time, and `macros` supplies `#[tokio::test]`.
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
+
+[lints]
+workspace = true

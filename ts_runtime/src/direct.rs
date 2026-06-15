@@ -163,6 +163,11 @@ pub struct DirectManager {
     sock: Option<Arc<MagicSock>>,
     transport_id: Option<UnderlayTransportId>,
     peer_db: Arc<RwLock<Option<Arc<PeerDb>>>>,
+    /// Retained so the `RebindAndReprobe` handler can fetch the current v4 STUN servers
+    /// ([`Multiderp::stun_servers_v4`]) and fire an immediate STUN sweep right after the rebind —
+    /// the same source the periodic [`run_stun_prober`] uses. Held here (not just cloned into the
+    /// prober task) because the on-demand sweep runs inside the actor handler.
+    multiderp: ActorRef<Multiderp>,
     #[allow(dead_code)]
     tasks: JoinSet<()>,
 }
@@ -253,6 +258,64 @@ impl DirectManager {
             Some(sock) => sock.rebind().await,
             None => Ok(()),
         }
+    }
+
+    /// Re-bind the underlay socket AND immediately re-probe connectivity, atomically in the actor —
+    /// the auto-recovery path the [`NetmonSupervisor`](crate::netmon::NetmonSupervisor) fires on a
+    /// coalesced link change. This is the engine half of "react to a network change": after a Wi-Fi
+    /// switch / sleep-wake the old socket's NAT mapping and learned paths are stale, and the bare
+    /// [`rebind`](Self::rebind) only swaps the socket then waits out the periodic ping (2s) / STUN
+    /// (~23s) timers before anything re-confirms. This message collapses that wait:
+    ///
+    /// 1. [`MagicSock::rebind`] — swap the socket; clear reflexive + every confirmed best path
+    ///    (keeping candidates), so peers fail closed to DERP and re-probe over the new socket.
+    /// 2. [`MagicSock::send_pings`] — re-ping all candidates **now** on the freshly-swapped socket,
+    ///    so a still-reachable peer re-confirms its direct path immediately instead of after up to a
+    ///    full `PING_INTERVAL`.
+    /// 3. An immediate STUN sweep to the derp map's v4 STUN servers (same source + gate as the
+    ///    periodic [`run_stun_prober`]): re-learn our reflexive/public address on the new socket
+    ///    now, rather than waiting out the jittered ~23s timer.
+    ///
+    /// Doing all three inside the actor handler keeps them ordered and race-free against the
+    /// periodic pinger/prober (the actor processes one message at a time). A no-op (`Ok`) when the
+    /// underlay bind failed at startup (DERP-only inert mode — there is no socket to rebind/probe).
+    /// The STUN sweep is best-effort and never fails the message: if multiderp is unavailable or the
+    /// peer-count gate is closed it is simply skipped (pong-harvest still re-learns reflexives as
+    /// the re-ping pongs arrive), mirroring how [`run_stun_prober`] treats those cases.
+    ///
+    /// The bare [`rebind`](Self::rebind) message and the `Device::rebind` path are left UNCHANGED so
+    /// a manual embedder's rebind stays a first-class, probe-free socket swap.
+    #[message]
+    pub async fn rebind_and_reprobe(&self) -> Result<(), ts_magicsock::Error> {
+        let Some(sock) = self.sock.as_ref() else {
+            // Inert / DERP-only: nothing to rebind or probe.
+            return Ok(());
+        };
+
+        // 1. Swap the socket + reset stale local mapping (clears best paths, keeps candidates).
+        sock.rebind().await?;
+
+        // 2. Re-ping all candidates now on the new socket (every best is None post-rebind, so this
+        //    re-pings everything under the normal cadence gates). A send error is non-fatal: the
+        //    periodic pinger backstops it.
+        if let Err(e) = sock.send_pings().await {
+            tracing::trace!(error = %e, "rebind-and-reprobe: re-ping after rebind");
+        }
+
+        // 3. Immediate STUN sweep on the new socket, gated exactly like the periodic prober (skip
+        //    while there are no peers — Go's len(peerSet)==0 stop). Best-effort throughout: a stale
+        //    derp/multiderp or empty server list just skips this round; pong-harvest from the
+        //    re-pings above still re-learns reflexives.
+        if stun_probe_should_run(&self.peer_db) {
+            match self.multiderp.ask(multiderp::StunServersV4).await {
+                Ok((servers,)) => probe_stun_servers_once(sock, &servers).await,
+                Err(e) => {
+                    tracing::trace!(error = %e, "rebind-and-reprobe: querying stun servers");
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -681,6 +744,7 @@ impl kameo::Actor for DirectManager {
                     sock: None,
                     transport_id: None,
                     peer_db,
+                    multiderp,
                     tasks,
                 });
             }
@@ -725,6 +789,9 @@ impl kameo::Actor for DirectManager {
             tracing::warn!(error = %e, "could not install direct socket on multiderp");
         }
 
+        // Clone for the struct field (the on-demand STUN sweep in `RebindAndReprobe` needs it)
+        // before `run_call_me_maybe` consumes the original.
+        let multiderp_for_field = multiderp.clone();
         tasks.spawn(run_call_me_maybe(
             sock.clone(),
             peer_db.clone(),
@@ -736,6 +803,7 @@ impl kameo::Actor for DirectManager {
             sock: Some(sock),
             transport_id: Some(transport_id),
             peer_db,
+            multiderp: multiderp_for_field,
             tasks,
         })
     }

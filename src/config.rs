@@ -221,6 +221,22 @@ pub struct Config {
     /// dual-stack overlay bind simply fails and the node stays inert on IPv6 rather than panicking.
     pub enable_ipv6: bool,
 
+    /// Whether to run an internal OS network-link monitor that automatically re-binds the underlay
+    /// socket and re-probes connectivity (re-ping, re-STUN, re-netcheck) on a link change — a Wi-Fi
+    /// switch, sleep/wake, or default-route change. Defaults to `false`.
+    ///
+    /// Off by default to preserve this fork's pure-engine posture (per `AGENTS.md` this is a pure
+    /// engine, not a daemon): the embedder normally owns OS network-monitoring and calls
+    /// [`Device::rebind`](crate::Device::rebind) itself. When `false`, the runtime starts **zero**
+    /// extra monitor threads or sockets and behaves byte-for-byte as before; the manual
+    /// `Device::rebind` path is always available regardless of this flag.
+    ///
+    /// Enabling it requires the crate to be built with the `network-monitor` feature; setting this
+    /// `true` without that feature is a hard error at device startup (never a silent no-op). In this
+    /// slice the monitor has no OS backend wired yet, so enabling it spawns the supervisor against a
+    /// no-op event source (the Linux/macOS backends land in later slices).
+    pub network_monitor: bool,
+
     /// How this node's **application** overlay data path is realized.
     ///
     /// Defaults to [`TransportMode::Netstack`](ts_control::TransportMode::Netstack), the userspace
@@ -501,6 +517,7 @@ impl From<&Config> for ts_control::Config {
             peerapi_port: None,
             taildrop_dir: value.taildrop_dir.clone(),
             enable_ipv6: value.enable_ipv6,
+            network_monitor: value.network_monitor,
             transport_mode: value.transport_mode.clone(),
             wire_ingress: value.wire_ingress,
             // A fresh runtime-local flag (default `false`): the runtime flips it when
@@ -537,6 +554,7 @@ impl Default for Config {
             tcp_buffer_size: None,
             persistent_keepalive_interval: Some(ts_control::DEFAULT_PERSISTENT_KEEPALIVE),
             enable_ipv6: false,
+            network_monitor: false,
             transport_mode: ts_control::TransportMode::default(),
             wire_ingress: false,
             advertise_services: vec![],
@@ -572,6 +590,7 @@ mod tests {
             tcp_buffer_size: Some(1024 * 128),
             persistent_keepalive_interval: Some(std::time::Duration::from_secs(17)),
             enable_ipv6: true,
+            network_monitor: true,
             wire_ingress: true,
             transport_mode: ts_control::TransportMode::Tun(ts_control::TunConfig {
                 name: Some("tailscale0".to_owned()),
@@ -614,6 +633,10 @@ mod tests {
         assert_eq!(proxy.scheme, ts_control::ExitProxyScheme::Socks5);
         assert_eq!(proxy.auth, Some(("u".to_owned(), "p".to_owned())));
         assert!(control.enable_ipv6);
+        assert!(
+            control.network_monitor,
+            "network_monitor crosses the boundary (set true)"
+        );
         assert!(control.wire_ingress);
         assert_eq!(control.advertise_services, vec!["svc:samba".to_owned()]);
         assert_eq!(

@@ -40,6 +40,10 @@ pub mod ipn_bus;
 mod magic_dns;
 pub use magic_dns::DnsQueryResult;
 mod multiderp;
+/// OS network-link-change supervisor (opt-in `network-monitor` feature): re-binds + re-probes
+/// connectivity on a link change. Compiled out entirely when the feature is off.
+#[cfg(feature = "network-monitor")]
+mod netmon;
 mod netstack_actor;
 mod packetfilter;
 pub mod peer_tracker;
@@ -132,6 +136,14 @@ pub struct Runtime {
     /// `feature/taildrop/delete.go` `fileDeleter`). `None` when no taildrop store is configured.
     /// Aborted on [`Drop`] so it cannot outlive the runtime (the `reauth_bridge` pattern).
     taildrop_reaper: Option<tokio::task::JoinHandle<()>>,
+    /// The opt-in OS network-link-change supervisor (`network-monitor` feature + the
+    /// `Config::network_monitor` flag). Retained so the actor — and thus the
+    /// `LinkMonitorHandle` it holds, which aborts the monitor's watcher task on drop — lives for the
+    /// device's life and is torn down when the runtime drops. `None` when the flag is off. Only
+    /// present when built with the `network-monitor` feature.
+    #[cfg(feature = "network-monitor")]
+    #[allow(dead_code)]
+    netmon_supervisor: Option<ActorRef<netmon::NetmonSupervisor>>,
 }
 
 impl Runtime {
@@ -363,6 +375,48 @@ impl Runtime {
             crate::taildrop::spawn_partial_reaper(store.clone(), shutdown_tx.subscribe())
         });
 
+        // Opt-in OS network-link monitor (`Config::network_monitor`, default off). When enabled it
+        // spawns a `NetmonSupervisor` that, on a coalesced link change, asks the direct manager to
+        // rebind + re-probe and republishes `MeasureNow` for a re-netcheck — the auto-recovery a
+        // real `tailscaled` performs and the engine otherwise leaves to the embedder. When the flag
+        // is off this is a complete no-op: zero extra threads/sockets, byte-for-byte today's
+        // behavior. The manual `Device::rebind` path is unchanged either way.
+        //
+        // Feature gating is strict and never silent: with the `network-monitor` feature ON the
+        // supervisor (and its `ts_netmon` dep) compile in and spawn when the flag is set; with the
+        // feature OFF, setting the flag is a HARD error at spawn (mirrors the `TransportMode::Tun`
+        // without-`tun`-feature error above), so a build that cannot honor the request fails loudly
+        // rather than booting a node that silently won't auto-recover.
+        #[cfg(feature = "network-monitor")]
+        let netmon_supervisor = if env.network_monitor {
+            // Slice (a): no OS event-source backend is wired yet (the Linux netlink / macOS
+            // PF_ROUTE backends are later slices), so the supervisor runs against a `NoopLinkMonitor`
+            // — it is live and correctly shaped (it will react the moment a real backend feeds it),
+            // it just never sees a synthetic/OS event in this build. Production end-to-end reaction
+            // is proven in the integration test via a `ManualLinkMonitor`.
+            let monitor: std::sync::Arc<dyn ts_netmon::LinkMonitor> =
+                std::sync::Arc::new(ts_netmon::NoopLinkMonitor);
+            Some(netmon::NetmonSupervisor::spawn(
+                netmon::NetmonSupervisorArgs {
+                    monitor,
+                    direct: direct.clone(),
+                    env: env.clone(),
+                },
+            ))
+        } else {
+            None
+        };
+
+        #[cfg(not(feature = "network-monitor"))]
+        if env.network_monitor {
+            // The flag is set but this build cannot honor it. Fail loudly (never a silent no-op).
+            return Err(Error {
+                kind: ErrorKind::NetworkMonitorUnavailable,
+                target_actor: None,
+                message_ty: None,
+            });
+        }
+
         Ok(Self {
             control,
             dataplane,
@@ -383,6 +437,8 @@ impl Runtime {
             cap_grants_rx,
             advertise,
             taildrop_reaper,
+            #[cfg(feature = "network-monitor")]
+            netmon_supervisor,
         })
     }
 
