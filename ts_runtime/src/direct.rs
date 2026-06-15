@@ -870,9 +870,12 @@ mod tests {
             .expect("a STUN binding request must arrive at the v4 server")
             .unwrap();
 
+        // A STUN Binding Request is 40 bytes: the 20-byte header + SOFTWARE("tailnode") +
+        // FINGERPRINT, matching Go net/stun.Request (a bare header is rejected by Tailscale's DERP
+        // STUN servers as ErrWrongSoftware). See ts_magicsock::stun::encode_binding_request.
         assert_eq!(
-            n, 20,
-            "a STUN Binding Request is exactly the 20-byte header"
+            n, 40,
+            "a STUN Binding Request is the 40-byte SOFTWARE+FINGERPRINT form"
         );
         assert_eq!(
             &buf[0..2],
@@ -880,9 +883,27 @@ mod tests {
             "message type must be Binding Request (0x0001)"
         );
         assert_eq!(
+            &buf[2..4],
+            &0x0014u16.to_be_bytes(),
+            "message length must be 0x0014 (the 20 trailing attribute bytes)"
+        );
+        assert_eq!(
             &buf[4..8],
             &0x2112_A442u32.to_be_bytes(),
             "the STUN magic cookie must be present at bytes[4..8]"
+        );
+        // SOFTWARE attribute: type 0x8022, len 8, value "tailnode".
+        assert_eq!(
+            &buf[20..22],
+            &0x8022u16.to_be_bytes(),
+            "SOFTWARE attribute type"
+        );
+        assert_eq!(&buf[24..32], b"tailnode", "SOFTWARE value must be tailnode");
+        // FINGERPRINT attribute: type 0x8028, len 4.
+        assert_eq!(
+            &buf[32..34],
+            &0x8028u16.to_be_bytes(),
+            "FINGERPRINT attribute type"
         );
     }
 

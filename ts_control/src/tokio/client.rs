@@ -743,7 +743,8 @@ async fn run_once(
                             .keep_alive(false)
                             .omit_peers(true)
                             .stream(false)
-                            .routable_ips(config.advertised_routes());
+                            .routable_ips(config.advertised_routes())
+                            .host_environment(&host);
                         builder = net_info.apply(builder);
 
                         if let Some(hostname) = &config.hostname {
@@ -765,7 +766,8 @@ async fn run_once(
                             .omit_peers(true)
                             .stream(false)
                             .routable_ips(config.advertised_routes())
-                            .endpoints(endpoints);
+                            .endpoints(endpoints)
+                            .host_environment(&host);
                         builder = net_info.apply(builder);
 
                         if let Some(hostname) = &config.hostname {
@@ -783,7 +785,8 @@ async fn run_once(
                             .keep_alive(false)
                             .omit_peers(true)
                             .stream(false)
-                            .routable_ips(routes);
+                            .routable_ips(routes)
+                            .host_environment(&host);
                         // Re-attach the carried NetInfo so a route update doesn't transiently drop
                         // the home region / NAT facets at control (same hazard the hostname arm
                         // guards for routes).
@@ -806,6 +809,7 @@ async fn run_once(
                             .omit_peers(true)
                             .stream(false)
                             .routable_ips(config.advertised_routes())
+                            .host_environment(&host)
                             .hostname(&hostname);
                         // Re-attach the carried NetInfo (same not-dropping-it reasoning as routes).
                         let req = net_info.apply(builder).build();
