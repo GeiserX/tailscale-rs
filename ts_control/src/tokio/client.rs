@@ -1,4 +1,7 @@
-use alloc::{collections::BTreeMap, sync::Arc};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use futures_util::{Stream, StreamExt};
 use tokio::{
@@ -16,6 +19,57 @@ use crate::{
         ping::handle_ping,
     },
 };
+
+/// The owned, run-loop-local mirror of the node's `NetInfo`, carried across every map request the
+/// way Go's `control/controlclient.Direct.netinfo` is.
+///
+/// Go keeps one persistent `c.netinfo`, mutates it incrementally (`SetNetInfo`), and attaches its
+/// **whole** clone to every register/map request (`hostInfoLocked`: `hi.NetInfo = c.netinfo.Clone()`).
+/// The fork instead builds a fresh `MapRequestBuilder` per command, so without a carried mirror each
+/// request would carry only the one NetInfo facet that command knows about — and because every
+/// `NetInfo` field is `skip_serializing_if = "Option::is_none"`, an omitted field is wire-absent and
+/// decodes to its zero value at control. A `SetEndpoints` request carrying only `working_udp` would
+/// therefore arrive with `PreferredDERP` absent → 0, transiently nulling the home region control had
+/// stored. Carrying the full set on every request (this struct) is the only correct, Go-faithful
+/// shape. Owned (not a borrowed `NetInfo<'a>`) so it can outlive a single `run_once` and survive
+/// reconnects, exactly as `c.netinfo` survives Go's poll restarts.
+///
+/// All-`None` (the initial state, before any signal) applies nothing to the builder, so a node that
+/// has not yet learned anything sends no `NetInfo` at all — byte-identical to the prior behavior.
+#[derive(Debug, Clone, Default)]
+struct CarriedNetInfo {
+    /// Smoothed home DERP region (Go `NetInfo.PreferredDERP`), set by `SetDerpHomeRegion`.
+    preferred_derp: Option<ts_derp::RegionId>,
+    /// Per-region DERP latency map (Go `NetInfo.DERPLatency`), set by `SetDerpHomeRegion`.
+    derp_latency: Option<BTreeMap<String, f64>>,
+    /// Whether UDP works (a STUN reflexive was learned) — Go `NetInfo.WorkingUDP`. Set by
+    /// `SetEndpoints` from the advertised endpoint set.
+    working_udp: Option<bool>,
+    /// Whether the NAT maps the socket to different reflexive addr:ports per destination (symmetric
+    /// NAT) — Go `NetInfo.MappingVariesByDestIP`. Set by `SetEndpoints`.
+    mapping_varies_by_dest_ip: Option<bool>,
+}
+
+impl CarriedNetInfo {
+    /// Apply the carried NetInfo to a [`MapRequestBuilder`], setting only the `Some` facets. An
+    /// all-`None` carried state is a no-op (leaves `host_info.net_info == None`, wire-identical to
+    /// sending no NetInfo). Called on EVERY map request so NetInfo is always whole, never partial.
+    fn apply<'a>(&'a self, mut builder: MapRequestBuilder<'a>) -> MapRequestBuilder<'a> {
+        if let Some(derp) = self.preferred_derp {
+            builder = builder.preferred_derp(derp);
+        }
+        if let Some(latencies) = &self.derp_latency {
+            builder = builder.derp_latencies(latencies.iter().map(|(k, v)| (k.as_str(), *v)));
+        }
+        if let Some(working_udp) = self.working_udp {
+            builder = builder.working_udp(working_udp);
+        }
+        if let Some(varies) = self.mapping_varies_by_dest_ip {
+            builder = builder.mapping_varies_by_dest_ip(varies);
+        }
+        builder
+    }
+}
 
 /// A client to communicate with control.
 #[derive(Debug)]
@@ -425,6 +479,37 @@ fn clear_reauth_url(auth_url_tx: &watch::Sender<Option<Url>>) {
     });
 }
 
+/// `NetInfo.WorkingUDP`: UDP works iff the node has learned a STUN reflexive endpoint. Mirrors Go,
+/// where a learned STUN endpoint is the evidence UDP reaches the internet. Pure, for unit testing.
+fn net_info_working_udp(endpoints: &[ts_control_serde::Endpoint]) -> bool {
+    endpoints
+        .iter()
+        .any(|e| e.ty == ts_control_serde::EndpointType::Stun)
+}
+
+/// `NetInfo.MappingVariesByDestIP`: the NAT maps the one bound socket to different reflexive
+/// addr:ports per destination (symmetric NAT) iff at least two DISTINCT **IPv4** STUN reflexive
+/// addresses were observed — the wire-side mirror of magicsock `MagicSock::is_symmetric_nat`
+/// (`v4_reflexive.len() >= 2`, `sock.rs`).
+///
+/// IPv4-only on purpose: magicsock's symmetric-NAT determinant is v4-only (its test
+/// `stun4localport_ignores_ipv6_reflexive` asserts two IPv6 reflexives must NOT trip it), so counting
+/// v6 reflexives here would make the wire signal disagree with the node's own NAT model — a
+/// cross-component incoherence. The fork is IPv4-only anyway, so v6 reflexives are not expected, but
+/// filtering keeps the two in lockstep regardless. Pure, for unit testing.
+fn net_info_mapping_varies(endpoints: &[ts_control_serde::Endpoint]) -> bool {
+    let mut seen = BTreeSet::new();
+    for e in endpoints {
+        if e.ty == ts_control_serde::EndpointType::Stun && e.endpoint.is_ipv4() {
+            seen.insert(e.endpoint);
+            if seen.len() >= 2 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub async fn run(
     state_tx: broadcast::Sender<Arc<StateUpdate>>,
     mut command_rx: mpsc::Receiver<Command>,
@@ -437,6 +522,11 @@ pub async fn run(
     let mut dialer = ControlDialer::default();
     let mut session = MapSession::default();
     let mut backoff = ControlBackoff::default();
+    // The node's NetInfo, carried across reconnects so every map request (including the post-
+    // reconnect streaming re-register) sends the WHOLE current NetInfo — Go's `c.netinfo` invariant.
+    // Mutated by the command arms in `run_once`; persists here so a reconnect re-sends the last
+    // known facets rather than dropping them.
+    let mut net_info = CarriedNetInfo::default();
 
     loop {
         // `run_once` sets this to `true` the moment it receives its first frame on this poll, so
@@ -452,6 +542,7 @@ pub async fn run(
             &config,
             &mut dialer,
             &mut session,
+            &mut net_info,
             &mut received_frame,
             &auth_url_tx,
         )
@@ -522,6 +613,7 @@ async fn run_once(
     config: &crate::Config,
     control_dialer: &mut ControlDialer,
     session: &mut MapSession,
+    net_info: &mut CarriedNetInfo,
     received_frame: &mut bool,
     auth_url_tx: &watch::Sender<Option<Url>>,
 ) -> Result<(), Error> {
@@ -579,6 +671,10 @@ async fn run_once(
                 .load(core::sync::atomic::Ordering::Relaxed),
         )
         .map_session(&session.handle, session.seq);
+    // Carry the whole current NetInfo on the streaming re-register too (Go attaches `c.netinfo` to
+    // every `sendMapRequest`), so a reconnect re-advertises the last-known home/UDP/NAT facets
+    // instead of dropping them until the next side command.
+    let builder = net_info.apply(builder);
 
     let request = if let Some(hostname) = &config.hostname {
         builder.hostname(hostname)
@@ -638,13 +734,17 @@ async fn run_once(
             command = command_rx.recv() => {
                 match command.unwrap() {
                     Command::SetDerpHomeRegion { id, latencies } => {
+                        // Mutate the carried NetInfo, then apply the WHOLE thing below — so this
+                        // request also carries any previously-learned working_udp/mapping_varies
+                        // rather than nulling them at control.
+                        net_info.preferred_derp = Some(id);
+                        net_info.derp_latency = Some(latencies);
                         let mut builder = MapRequestBuilder::new(node_keys)
                             .keep_alive(false)
                             .omit_peers(true)
                             .stream(false)
-                            .routable_ips(config.advertised_routes())
-                            .preferred_derp(id)
-                            .derp_latencies(latencies.iter().map(|(k, v)| (k.as_str(), *v)));
+                            .routable_ips(config.advertised_routes());
+                        builder = net_info.apply(builder);
 
                         if let Some(hostname) = &config.hostname {
                             builder = builder.hostname(hostname);
@@ -654,12 +754,19 @@ async fn run_once(
                         drop(send_map_request(req, &map_url, &h2_client).await?);
                     },
                     Command::SetEndpoints { endpoints } => {
+                        // Derive the NAT facets from the advertised endpoint set, mirroring magicsock:
+                        // working_udp = a STUN reflexive was learned (UDP works); mapping_varies =
+                        // >= 2 DISTINCT reflexive addrs (symmetric NAT, `is_symmetric_nat`). Computed
+                        // before `endpoints` is moved into the builder.
+                        net_info.working_udp = Some(net_info_working_udp(&endpoints));
+                        net_info.mapping_varies_by_dest_ip = Some(net_info_mapping_varies(&endpoints));
                         let mut builder = MapRequestBuilder::new(node_keys)
                             .keep_alive(false)
                             .omit_peers(true)
                             .stream(false)
                             .routable_ips(config.advertised_routes())
                             .endpoints(endpoints);
+                        builder = net_info.apply(builder);
 
                         if let Some(hostname) = &config.hostname {
                             builder = builder.hostname(hostname);
@@ -677,6 +784,10 @@ async fn run_once(
                             .omit_peers(true)
                             .stream(false)
                             .routable_ips(routes);
+                        // Re-attach the carried NetInfo so a route update doesn't transiently drop
+                        // the home region / NAT facets at control (same hazard the hostname arm
+                        // guards for routes).
+                        builder = net_info.apply(builder);
 
                         if let Some(hostname) = &config.hostname {
                             builder = builder.hostname(hostname);
@@ -690,13 +801,14 @@ async fn run_once(
                         // run-loop's `config` is a frozen clone, so a runtime hostname change can only
                         // reach here through the command. Preserve the advertised routes on this
                         // request so a hostname update doesn't transiently withdraw them.
-                        let req = MapRequestBuilder::new(node_keys)
+                        let builder = MapRequestBuilder::new(node_keys)
                             .keep_alive(false)
                             .omit_peers(true)
                             .stream(false)
                             .routable_ips(config.advertised_routes())
-                            .hostname(&hostname)
-                            .build();
+                            .hostname(&hostname);
+                        // Re-attach the carried NetInfo (same not-dropping-it reasoning as routes).
+                        let req = net_info.apply(builder).build();
 
                         drop(send_map_request(req, &map_url, &h2_client).await?);
                     },
@@ -1068,5 +1180,127 @@ mod tests {
 
         clear_reauth_url(&tx); // models run_once's `Ok(())` arm on the recovering poll
         assert_eq!(*rx.borrow(), None);
+    }
+
+    fn ep(addr: &str, ty: ts_control_serde::EndpointType) -> ts_control_serde::Endpoint {
+        ts_control_serde::Endpoint {
+            endpoint: addr.parse().unwrap(),
+            ty,
+        }
+    }
+
+    #[test]
+    fn working_udp_true_iff_a_stun_endpoint_is_present() {
+        use ts_control_serde::EndpointType::{Local, Stun};
+        // A learned STUN reflexive ⇒ UDP works.
+        assert!(net_info_working_udp(&[
+            ep("192.168.1.2:41641", Local),
+            ep("203.0.113.7:41641", Stun),
+        ]));
+        // Only local endpoints ⇒ no evidence UDP reaches the internet.
+        assert!(!net_info_working_udp(&[ep("192.168.1.2:41641", Local)]));
+        // No endpoints at all.
+        assert!(!net_info_working_udp(&[]));
+    }
+
+    #[test]
+    fn mapping_varies_iff_two_distinct_stun_reflexives() {
+        use ts_control_serde::EndpointType::{Local, Stun, Stun4LocalPort};
+        // Two DISTINCT STUN reflexive addrs ⇒ symmetric NAT (mirrors is_symmetric_nat len>=2).
+        assert!(net_info_mapping_varies(&[
+            ep("203.0.113.7:41641", Stun),
+            ep("198.51.100.9:51000", Stun),
+        ]));
+        // Same reflexive addr twice ⇒ NOT varying (distinct count is 1).
+        assert!(!net_info_mapping_varies(&[
+            ep("203.0.113.7:41641", Stun),
+            ep("203.0.113.7:41641", Stun),
+        ]));
+        // One STUN + a non-Stun reflexive guess + a local ⇒ only 1 distinct Stun ⇒ not varying.
+        assert!(!net_info_mapping_varies(&[
+            ep("203.0.113.7:41641", Stun),
+            ep("203.0.113.7:50000", Stun4LocalPort),
+            ep("192.168.1.2:41641", Local),
+        ]));
+        // IPv4-only, matching magicsock: two DISTINCT IPv6 STUN reflexives must NOT trip it (the
+        // fork's is_symmetric_nat is v4-only; counting v6 would disagree with the node's NAT model).
+        assert!(!net_info_mapping_varies(&[
+            ep("[2001:db8::1]:41641", Stun),
+            ep("[2001:db8::2]:41641", Stun),
+        ]));
+        // A v4 pair still trips it even alongside v6 reflexives (the v6 ones are simply ignored).
+        assert!(net_info_mapping_varies(&[
+            ep("[2001:db8::1]:41641", Stun),
+            ep("203.0.113.7:41641", Stun),
+            ep("198.51.100.9:51000", Stun),
+        ]));
+    }
+
+    /// THE load-bearing invariant: carried NetInfo is sent WHOLE on every request, never partial.
+    /// After a `SetDerpHomeRegion` sets the home region, a subsequent `SetEndpoints` (which sets the
+    /// UDP/NAT facets) must STILL carry the home region — otherwise control would see `PreferredDERP`
+    /// absent (→ 0) and flap the node's home relay. Mirror the command-arm mutate-then-build by
+    /// driving `CarriedNetInfo` + the builder directly (no network).
+    // Incremental field mutation is the POINT here: it models the two separate commands
+    // (SetDerpHomeRegion, then SetEndpoints) each mutating the carried state in turn, exactly as the
+    // run-loop arms do. Struct-init syntax would hide that sequential semantics.
+    #[allow(clippy::field_reassign_with_default)]
+    #[test]
+    fn carried_net_info_sends_whole_set_not_partial() {
+        use ts_control_serde::EndpointType::Stun;
+        let node_keys = ts_keys::NodeState::generate();
+        let mut carried = CarriedNetInfo::default();
+
+        // SetDerpHomeRegion: home region 5 + a latency sample.
+        carried.preferred_derp = Some(region(5));
+        carried.derp_latency = Some(BTreeMap::from([("5-v4".to_owned(), 0.012)]));
+
+        // SetEndpoints arrives next: it sets the UDP/NAT facets...
+        let endpoints = [
+            ep("203.0.113.7:41641", Stun),
+            ep("198.51.100.9:51000", Stun),
+        ];
+        carried.working_udp = Some(net_info_working_udp(&endpoints));
+        carried.mapping_varies_by_dest_ip = Some(net_info_mapping_varies(&endpoints));
+
+        // ...and the request it builds must carry the WHOLE NetInfo (home region NOT dropped).
+        let builder = carried.apply(MapRequestBuilder::new(&node_keys));
+        let req = builder.build();
+        let ni = req
+            .host_info
+            .as_ref()
+            .and_then(|h| h.net_info.as_ref())
+            .expect("net_info present");
+        // `preferred_derp` on the wire is the serde `DerpRegionId`, which the builder derives from
+        // the `ts_derp::RegionId` via `.0.into()`. Assert it persisted (region 5), non-None.
+        let want = ts_control_serde::DerpRegionId::from(core::num::NonZeroU32::new(5).unwrap());
+        assert_eq!(
+            ni.preferred_derp,
+            Some(want),
+            "home region must persist across the endpoints request"
+        );
+        assert!(ni.derp_latency.is_some(), "derp latency must persist too");
+        assert_eq!(ni.working_udp, Some(true));
+        assert_eq!(ni.mapping_varies_by_dest_ip, Some(true));
+    }
+
+    /// An all-`None` carried state applies nothing: the builder emits no NetInfo at all (wire-
+    /// identical to a node that has not yet learned anything — preserves the pre-change behavior).
+    #[test]
+    fn empty_carried_net_info_emits_no_net_info() {
+        let node_keys = ts_keys::NodeState::generate();
+        let carried = CarriedNetInfo::default();
+        let req = carried.apply(MapRequestBuilder::new(&node_keys)).build();
+        assert!(
+            req.host_info
+                .as_ref()
+                .and_then(|h| h.net_info.as_ref())
+                .is_none(),
+            "empty carried NetInfo must leave net_info absent on the wire"
+        );
+    }
+
+    fn region(n: u32) -> ts_derp::RegionId {
+        ts_derp::RegionId(core::num::NonZeroU32::new(n).unwrap())
     }
 }
