@@ -36,12 +36,18 @@ pub struct Client<Io> {
     /// Send rate-limiter from the server's `ServerInfo` token-bucket advertisement, or `None` when
     /// the server advertised no limit. Gates the data-packet send path ([`send_one`](Self::send_one))
     /// so we honor the server's `TokenBucketBytesPerSecond` directive — mirroring Go
-    /// `derp.Client.send`'s `rate.AllowN` drop. `Mutex` because [`allow_n`](crate::rate_limit::RateLimiter::allow_n)
-    /// mutates the bucket while the public send API is `&self`; held only across the cheap token
-    /// check, never across the socket write (Go holds one `wmu` for both, but splitting the locks
-    /// keeps the limiter check off the write critical section while preserving correctness — a
+    /// `derp.Client.send`'s `rate.AllowN` drop.
+    ///
+    /// A **`std::sync::Mutex`** (not the async `tokio::Mutex` used for the conns): [`allow_n`] is a
+    /// tiny synchronous float computation with no `.await`, so a blocking mutex is the right tool —
+    /// and crucially its `!Send` guard makes "never held across an await" a *compile-time* guarantee
+    /// rather than a property maintained by hand. Held only across the cheap token check, never the
+    /// socket write (Go holds one `wmu` for both; splitting keeps the limiter check off the write
+    /// critical section while preserving correctness — tokens are debited atomically here and a
     /// dropped packet never reaches the write).
-    rate_limiter: Mutex<Option<RateLimiter>>,
+    ///
+    /// [`allow_n`]: crate::rate_limit::RateLimiter::allow_n
+    rate_limiter: std::sync::Mutex<Option<RateLimiter>>,
 }
 
 /// Establish and upgrade a http connection to the derp region.
@@ -141,7 +147,7 @@ where
         Ok(Self {
             read_conn: Mutex::new(fr),
             write_conn: Mutex::new(fw),
-            rate_limiter: Mutex::new(rate_limiter),
+            rate_limiter: std::sync::Mutex::new(rate_limiter),
         })
     }
 
@@ -158,7 +164,13 @@ where
         // no limiter is set (cheap) so the check is a single branch below.
         let wire_len = crate::rate_limit::send_packet_wire_len(msg.len());
         {
-            let mut limiter = self.rate_limiter.lock().await;
+            // Recover from a poisoned lock rather than propagate: the guarded value is a lone token
+            // bucket with no cross-field invariant, and `allow_n` can't panic, so a poisoned guard
+            // can only come from an unrelated panic elsewhere — `into_inner` keeps the limiter live.
+            let mut limiter = self
+                .rate_limiter
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(limiter) = limiter.as_mut()
                 && !limiter.allow_n(Instant::now(), wire_len)
             {
@@ -477,7 +489,7 @@ mod tests {
             read_conn: Mutex::new(FramedRead::new(read_conn, frame::Codec)),
             write_conn: Mutex::new(FramedWrite::new(write_conn, frame::Codec)),
             // These recv/control-frame tests don't exercise the send rate-limit; no limiter.
-            rate_limiter: Mutex::new(None),
+            rate_limiter: std::sync::Mutex::new(None),
         }
     }
 
@@ -504,7 +516,7 @@ mod tests {
             read_conn: Mutex::new(FramedRead::new(read_conn, frame::Codec)),
             write_conn: Mutex::new(FramedWrite::new(write_conn, frame::Codec)),
             // burst == one packet, rate 1 byte/s (negligible refill across the back-to-back sends).
-            rate_limiter: Mutex::new(Some(RateLimiter::new(1, one_packet))),
+            rate_limiter: std::sync::Mutex::new(Some(RateLimiter::new(1, one_packet))),
         };
 
         let dest = NodePublicKey::from([0x42u8; 32]);
