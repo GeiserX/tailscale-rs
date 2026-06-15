@@ -484,10 +484,11 @@ async fn probe_stun_servers_once(sock: &MagicSock, servers: &[SocketAddr]) {
 ///
 /// Reflexive (STUN-equivalent) endpoints come solely from the disco pong-harvest path on the one
 /// bound socket (peers echo our public `src`); we deliberately do **not** run an active
-/// [`ts_netcheck::StunProber`] for self-endpoint discovery. That prober binds its own sockets
+/// `ts_netcheck` `StunProber` for self-endpoint discovery. That prober binds its own sockets
 /// (including an IPv6 `[::]:0` egress that violates the IPv4-only invariant), so its reflexive
-/// mapping would be both a different NAT path and a potential IPv6 leak. Pong-harvest is the
-/// leak-safe, parity-correct source for Tier 1.
+/// mapping would be both a different NAT path and a potential IPv6 leak — which is why it is now
+/// `#[cfg(test)]`-gated out of the production binary entirely. Pong-harvest is the leak-safe,
+/// parity-correct source for Tier 1.
 async fn run_advertiser(
     sock: Arc<MagicSock>,
     env: Env,

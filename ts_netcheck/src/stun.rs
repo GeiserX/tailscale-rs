@@ -47,9 +47,6 @@ impl Drop for TransactionDropGuard<'_> {
 }
 
 impl StunProber {
-    /// Default port for STUN connections.
-    pub const DEFAULT_STUN_PORT: u16 = 3478;
-
     /// Construct a new prober.
     ///
     /// This binds UDP sockets and spawns tasks.
