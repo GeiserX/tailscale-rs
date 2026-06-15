@@ -796,7 +796,17 @@ mod tests {
             auth: None,
         });
         let dst = "1.2.3.4:443".parse().unwrap();
-        let err = dialer.dial_tcp(FlowClass::ExitNode, dst).await;
+        // Bound the call well under the proxy's 200ms hold: the ATYP guard rejects synchronously
+        // after the 4-byte header read, so this returns near-instantly. If a regression instead
+        // tried to read the (never-sent) 255-byte domain, it would block until the proxy drops the
+        // socket (~200ms → EOF) or the handshake timeout — this 100ms bound makes "reject *before*
+        // the read" independent of the error-type discrimination below (belt-and-suspenders).
+        let err = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            dialer.dial_tcp(FlowClass::ExitNode, dst),
+        )
+        .await
+        .expect("the ATYP guard must reject synchronously, not block on a variable-length read");
         assert!(
             matches!(err, Err(DialError::ProxyHandshake(_))),
             "a non-IPv4 reply ATYP must fail closed at the guard, got {err:?}"
