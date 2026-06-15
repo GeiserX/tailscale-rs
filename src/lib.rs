@@ -178,8 +178,8 @@ pub use ts_runtime::fallback_tcp::{
 pub use ts_runtime::taildrop::WaitingFile;
 #[doc(inline)]
 pub use ts_runtime::{
-    DeviceState, DnsQueryResult, FileTarget, IpnBusWatcher, NetcheckReport, Notify, NotifyWatchOpt,
-    RegionLatency, RegistrationError, Status, StatusNode, WhoIs,
+    DeviceState, DnsQueryResult, ExitNodeSuggestion, FileTarget, IpnBusWatcher, NetcheckReport,
+    Notify, NotifyWatchOpt, RegionLatency, RegistrationError, Status, StatusNode, WhoIs,
 };
 /// The interactive-login URL type returned by [`Device::pop_browser_url`].
 #[doc(inline)]
@@ -922,6 +922,37 @@ impl Device {
             .await
             .map_err(ts_runtime::Error::from)
             .map_err(Into::into)
+    }
+
+    /// Suggest a reasonably good exit node to use, based on this node's current netmap and latest
+    /// network-conditions report — Go `tailscale exit-node suggest` / `LocalBackend.SuggestExitNode`.
+    ///
+    /// Returns the suggested exit node's stable id + name as an [`ExitNodeSuggestion`]; engage it by
+    /// passing the id to [`Config::exit_node`](crate::config::Config) /
+    /// [`Device::set_exit_node`](crate::Device::set_exit_node) as a stable-id selector. The
+    /// suggestion uses the classic DERP-region-latency algorithm: among peers control marked
+    /// suggestable (the `suggest-exit-node` capability) that advertise an exit route and are online,
+    /// it prefers the one whose home DERP region this node measured as lowest-latency, and is
+    /// **sticky** — a prior suggestion that is still a good candidate is kept across calls, so
+    /// repeated calls don't flap between equally-good options.
+    ///
+    /// Outcomes (mirroring Go):
+    /// - `Ok(Some(suggestion))` — a node was suggested.
+    /// - `Ok(None)` — no eligible candidate (no suggestion); **not** an error.
+    /// - `Err(`[`Error::NoPreferredDerp`]`)` — no netcheck has completed yet, so no preferred DERP
+    ///   region is known; retry once connectivity has been measured.
+    ///
+    /// ## Scope (Phase 1)
+    /// This ports Go's classic DERP path only. The traffic-steering path and the Mullvad
+    /// geographic-distance ranking (for exit nodes with no DERP home) are not yet implemented, and
+    /// the suggestion does not carry a `Location` (Go's `omitempty` field) — this fork's peer model
+    /// has none yet. The candidate exit-route check accepts a peer advertising `0.0.0.0/0` (this
+    /// fork is IPv4-only), rather than Go's both-`0.0.0.0/0`-and-`::/0` requirement.
+    pub async fn suggest_exit_node(&self) -> Result<Option<ExitNodeSuggestion>, Error> {
+        // The runtime returns the actor-gather outcome (outer) wrapping the algorithm outcome
+        // (inner: `Ok(None)` empty, or the `NoPreferredDerp` domain error). Flatten both into the
+        // device-facing `Error`.
+        self.runtime.suggest_exit_node().await?.map_err(Into::into)
     }
 
     /// This node's key-expiry instant as Unix seconds (`Node.KeyExpiry` in Go), or `Ok(None)` if

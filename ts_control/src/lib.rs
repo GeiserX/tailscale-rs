@@ -81,10 +81,11 @@ pub use ssh_policy::{
 };
 pub use tka::TkaStatus;
 pub use ts_control_serde::{
-    Endpoint, EndpointType, TkaBootstrapRequest, TkaBootstrapResponse, TkaDisableRequest,
-    TkaDisableResponse, TkaInitBeginRequest, TkaInitBeginResponse, TkaInitFinishRequest,
-    TkaInitFinishResponse, TkaSignInfo, TkaSubmitSignatureRequest, TkaSubmitSignatureResponse,
-    TkaSyncOfferRequest, TkaSyncOfferResponse, TkaSyncSendRequest, TkaSyncSendResponse, UserId,
+    Endpoint, EndpointType, NODE_ATTR_SUGGEST_EXIT_NODE, TkaBootstrapRequest, TkaBootstrapResponse,
+    TkaDisableRequest, TkaDisableResponse, TkaInitBeginRequest, TkaInitBeginResponse,
+    TkaInitFinishRequest, TkaInitFinishResponse, TkaSignInfo, TkaSubmitSignatureRequest,
+    TkaSubmitSignatureResponse, TkaSyncOfferRequest, TkaSyncOfferResponse, TkaSyncSendRequest,
+    TkaSyncSendResponse, UserId,
 };
 #[cfg(feature = "identity-federation")]
 pub use wif::{WifConfig, WifError, resolve_auth_key};
