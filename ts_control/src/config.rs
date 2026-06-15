@@ -441,6 +441,99 @@ pub struct Config {
     #[serde(default)]
     pub advertise_services: Vec<String>,
 
+    /// Whether to advertise this node as an **app connector** (Go `Prefs.AppConnector.Advertise` /
+    /// `tailscale set --advertise-connector`). When `true`, this *is* read inside `ts_control`: it
+    /// sets `HostInfo.AppConnector = Some(true)` on registration and every map request, mirroring Go's
+    /// `applyPrefsToHostinfoLocked` (`hi.AppConnector.Set(prefs.AppConnector().Advertise)`).
+    ///
+    /// Advertising the bool is the **faithful engine minimum** — exactly the boundary Go draws. The
+    /// actual app-connector *data path* (control pushing the connector's domain routes, the 4via6
+    /// domain→route mapping, the per-domain DNS observation that learns target IPs) is a separate
+    /// subsystem this fork does not implement; advertising the capability without that data path is
+    /// identical in effect to Go advertising it before control has assigned any domains. Defaults to
+    /// `false` (fail-closed): a node offers itself as an app connector only when explicitly opted in.
+    #[serde(default)]
+    pub advertise_app_connector: bool,
+
+    /// Whether this node opts in to control-console-triggered auto-updates (Go
+    /// `Prefs.AutoUpdate.Apply` / `tailscale set --auto-update`). When `Some(true)`, this *is* read
+    /// inside `ts_control`: it sets `HostInfo.AllowsUpdate = true` on registration and every map
+    /// request, mirroring Go's `applyPrefsToHostinfoLocked`
+    /// (`hi.AllowsUpdate = … || prefs.AutoUpdate().Apply.EqualBool(true)`), so the admin console knows
+    /// the node accepts remote update triggers.
+    ///
+    /// Advertising the bool is the faithful engine minimum: this fork runs **no updater** (it is an
+    /// embeddable engine, not a packaged daemon), so it never *applies* an update — the actual
+    /// self-update machinery is a daemon/OS-package concern. `Some(false)` and `None` both leave
+    /// `AllowsUpdate` at its default `false` (the node advertises it does not accept remote updates);
+    /// the tri-state mirrors Go's `opt.Bool` (unset vs explicitly-off vs on). Defaults to `None`.
+    #[serde(default)]
+    pub auto_update_apply: Option<bool>,
+
+    /// Whether this node's (hypothetical) background updater should *check* for available updates
+    /// (Go `Prefs.AutoUpdate.Check`). **Carried pref only — not read inside `ts_control` and never
+    /// sent to control.** In Go this gates a purely local background update-check loop in the daemon;
+    /// it is not part of `Hostinfo` and never crosses the control wire, so storing it is the faithful
+    /// mirror of tsnet state. This fork has no updater (engine, not daemon), so the pref is carried
+    /// for a downstream daemon to consult and has no effect inside the engine. Defaults to `false`.
+    #[serde(default)]
+    pub auto_update_check: bool,
+
+    /// The OS username permitted to operate this node over the local API (Go `Prefs.OperatorUser` /
+    /// `tailscale set --operator`). **Carried pref only — not read inside `ts_control` and never sent
+    /// to control.** In Go this is purely a daemon-side LocalAPI authorization check (which Unix uid
+    /// may drive the daemon without root); it never touches the control protocol. Storing it is the
+    /// faithful mirror of tsnet state — a downstream daemon that exposes a local API consults it; the
+    /// engine itself has no local API to gate. Defaults to `None` (no operator delegated).
+    #[serde(default)]
+    pub operator_user: Option<String>,
+
+    /// A local display label for this node's profile (Go `Prefs.ProfileName`, set by
+    /// `tailscale switch`/profile management). **Carried pref only — not read inside `ts_control` and
+    /// never sent to control.** In Go this is a client-local cosmetic name for the login profile; it
+    /// is never advertised in `Hostinfo` (distinct from the `Hostinfo.Hostname` the node requests).
+    /// Storing it faithfully mirrors tsnet state for a downstream daemon's profile UI; the engine
+    /// makes no use of it. Defaults to `None`.
+    #[serde(default)]
+    pub node_nickname: Option<String>,
+
+    /// Whether device posture identity collection is enabled (Go `Prefs.PostureChecking` /
+    /// `tailscale set --posture-checking`). **Carried pref only — not read inside `ts_control` and
+    /// never sent to control.**
+    ///
+    /// There is deliberately **no `Hostinfo.PostureChecking` field to wire it to**: posture is a
+    /// control-to-node (c2n) *pull* mechanism — control requests posture attributes (serial numbers,
+    /// etc.) from the node on demand — which this fork does not implement. Storing the pref is
+    /// therefore the faithful mirror: with no c2n posture responder, control simply never pulls
+    /// posture identity, which is byte-for-byte identical to the posture-disabled case. A downstream
+    /// daemon that implements the c2n posture endpoint consults this pref to decide whether to answer.
+    /// Defaults to `false` (fail-closed: no posture identity collected).
+    #[serde(default)]
+    pub posture_checking: bool,
+
+    /// Whether this node runs a local web client (Go `Prefs.RunWebClient` /
+    /// `tailscale set --webclient`). **Carried pref only — not read inside `ts_control` and never
+    /// sent to control.** In Go this gates a daemon-hosted local web-client HTTP server (the
+    /// device-management web UI on `100.x:5252`); it is a separate subsystem, not advertised in
+    /// `Hostinfo`. This fork has no web-client server, so storing the pref faithfully mirrors tsnet
+    /// state for a downstream daemon that does; the engine never acts on it. Defaults to `false`.
+    #[serde(default)]
+    pub run_web_client: bool,
+
+    /// Whether a peer using this node as an exit node may also reach this node's **local LAN**
+    /// (Go `Prefs.ExitNodeAllowLANAccess` / `tailscale set --exit-node-allow-lan-access`).
+    /// **Carried pref only for now — not read inside `ts_control` and never sent to control.**
+    ///
+    /// In Go this is an **OS-router route-shaping** flag: when acting as an exit node it controls
+    /// whether the host router excludes the local LAN ranges from the routes pulled through the
+    /// tunnel. On a platform with no host router it has "no effect" — and this fork's default data
+    /// path is the userspace netstack with no host-route layer, so there is nothing to shape today.
+    /// The pref is stored so a downstream daemon (or a future host-route layer in this engine) can
+    /// consume it; until such a layer exists it is inert. It is never advertised to control. Defaults
+    /// to `false`.
+    #[serde(default)]
+    pub exit_node_allow_lan_access: bool,
+
     /// Whether to automatically re-authenticate (rotate the node key + re-register with the stored
     /// auth key, Go `doLogin`) when control reports this node's node key has expired, instead of
     /// going terminally offline.
@@ -668,6 +761,14 @@ impl Default for Config {
             wire_ingress: false,
             ingress_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             advertise_services: Vec::new(),
+            advertise_app_connector: false,
+            auto_update_apply: None,
+            auto_update_check: false,
+            operator_user: None,
+            node_nickname: None,
+            posture_checking: false,
+            run_web_client: false,
+            exit_node_allow_lan_access: false,
             reauth_on_expiry: default_true(),
             allow_http_key_fetch: false,
         }
@@ -897,6 +998,122 @@ mod tests {
             hash,
             "9593a969d3df19c81e5c47a5caeca701ab60b732b99004f15aa00384d922c40c"
         );
+    }
+
+    /// All eight up/set pref fields default off/None on a fresh `ts_control::Config`: the two
+    /// advertise-side ones (`advertise_app_connector`, `auto_update_apply`) and the six store-only
+    /// carried prefs. Fail-closed: a default node advertises no app-connector / auto-update and
+    /// carries no operator/nickname/posture/webclient/LAN-access preference.
+    #[test]
+    fn up_set_pref_fields_default_off() {
+        let cfg = Config::default();
+        // Advertise-side.
+        assert!(!cfg.advertise_app_connector);
+        assert_eq!(cfg.auto_update_apply, None);
+        // Store-only carried prefs.
+        assert!(!cfg.auto_update_check);
+        assert_eq!(cfg.operator_user, None);
+        assert_eq!(cfg.node_nickname, None);
+        assert!(!cfg.posture_checking);
+        assert!(!cfg.run_web_client);
+        assert!(!cfg.exit_node_allow_lan_access);
+    }
+
+    /// End-to-end: a `Config` with `advertise_app_connector` / `auto_update_apply` set drives the
+    /// `HostInfo.AppConnector` / `HostInfo.AllowsUpdate` wire fields through the SAME expressions the
+    /// streaming map request (`client.rs`) and registration (`register.rs`) use. Guards that the
+    /// advertise fields reach the wire, and that the default config omits both keys.
+    #[test]
+    fn advertise_prefs_drive_host_info_wire_fields() {
+        use crate::map_request_builder::MapRequestBuilder;
+
+        let node_state = ts_keys::NodeState::generate();
+
+        // Advertising config: mirrors `.app_connector(config.advertise_app_connector)` and
+        // `.allows_update(config.auto_update_apply == Some(true))` from client.rs.
+        let cfg = Config {
+            advertise_app_connector: true,
+            auto_update_apply: Some(true),
+            ..Default::default()
+        };
+        let req = MapRequestBuilder::new(&node_state)
+            .app_connector(cfg.advertise_app_connector)
+            .allows_update(cfg.auto_update_apply == Some(true))
+            .build();
+        let hi = req.host_info.unwrap();
+        assert_eq!(hi.app_connector, Some(true));
+        assert!(hi.allows_update);
+        let v = serde_json::to_value(&hi).unwrap();
+        assert_eq!(
+            v.get("AppConnector").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            v.get("AllowsUpdate").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+
+        // Default config (advertise off): `AppConnector` is sent as `false` (Go calls
+        // `hi.AppConnector.Set(advertise)` unconditionally, and `.Set(false)` marshals to `false`, not
+        // omitted), while `AllowsUpdate` (a plain `omitzero` bool) IS omitted when false. This
+        // asymmetry matches Go's wire bytes exactly: a default node sends `AppConnector:false` but no
+        // `AllowsUpdate` key.
+        let cfg = Config::default();
+        let req = MapRequestBuilder::new(&node_state)
+            .app_connector(cfg.advertise_app_connector)
+            .allows_update(cfg.auto_update_apply == Some(true))
+            .build();
+        let hi = req.host_info.unwrap();
+        assert_eq!(hi.app_connector, Some(false));
+        assert!(!hi.allows_update);
+        let v = serde_json::to_value(&hi).unwrap();
+        assert_eq!(
+            v.get("AppConnector").and_then(serde_json::Value::as_bool),
+            Some(false),
+            "default node sends AppConnector:false (Go .Set(false)), not an omitted key"
+        );
+        assert!(
+            v.get("AllowsUpdate").is_none(),
+            "AllowsUpdate is an omitzero bool, omitted when false"
+        );
+
+        // `auto_update_apply == Some(false)` advertises NO update (AllowsUpdate stays unset),
+        // matching the `== Some(true)` gate.
+        let cfg = Config {
+            auto_update_apply: Some(false),
+            ..Default::default()
+        };
+        let req = MapRequestBuilder::new(&node_state)
+            .allows_update(cfg.auto_update_apply == Some(true))
+            .build();
+        assert!(!req.host_info.unwrap().allows_update);
+    }
+
+    /// The pref fields deserialize from their snake_case keys (a daemon persists the config as JSON)
+    /// and a config that predates the fields still loads with them defaulted off (the `#[serde(default)]`
+    /// on each).
+    #[test]
+    fn up_set_pref_fields_deserialize_and_default_when_absent() {
+        // Absent: defaults apply.
+        let cfg: Config = serde_json::from_str(r#"{"server_url":"https://example.com/"}"#).unwrap();
+        assert!(!cfg.advertise_app_connector);
+        assert_eq!(cfg.auto_update_apply, None);
+        assert!(!cfg.posture_checking);
+        assert_eq!(cfg.operator_user, None);
+
+        // Present: parsed.
+        let cfg: Config = serde_json::from_str(
+            r#"{"server_url":"https://example.com/","advertise_app_connector":true,"auto_update_apply":true,"auto_update_check":true,"operator_user":"alice","node_nickname":"laptop","posture_checking":true,"run_web_client":true,"exit_node_allow_lan_access":true}"#,
+        )
+        .unwrap();
+        assert!(cfg.advertise_app_connector);
+        assert_eq!(cfg.auto_update_apply, Some(true));
+        assert!(cfg.auto_update_check);
+        assert_eq!(cfg.operator_user.as_deref(), Some("alice"));
+        assert_eq!(cfg.node_nickname.as_deref(), Some("laptop"));
+        assert!(cfg.posture_checking);
+        assert!(cfg.run_web_client);
+        assert!(cfg.exit_node_allow_lan_access);
     }
 
     #[test]

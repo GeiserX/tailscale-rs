@@ -202,6 +202,16 @@ pub async fn register(
             // capver-113 Funnel "wire me up server-side" signal. IngressEnabled stays false:
             // listen_funnel is fail-closed in this fork, so no Funnel endpoint ever goes live.
             wire_ingress: config.wire_ingress,
+            // App-connector advertise (Go `Prefs.AppConnector.Advertise` ->
+            // `hi.AppConnector.Set(advertise)`, called UNCONDITIONALLY): always send the key —
+            // `true` -> `AppConnector:true`, `false` (default) -> `AppConnector:false` (Go's `.Set(false)`
+            // is a non-empty `opt.Bool` that marshals to `false`, NOT omitted). `Some(value)` here so a
+            // default node's wire bytes match Go's; omitting it would be a not-tailscaled tell.
+            // Advertise the capability bool only; the data path is separate.
+            app_connector: Some(config.advertise_app_connector),
+            // Auto-update-apply advertise (Go `Prefs.AutoUpdate.Apply` -> `hi.AllowsUpdate`): the node
+            // accepts admin-console remote update triggers. This fork runs no updater; advertise only.
+            allows_update: config.auto_update_apply == Some(true),
             // Advertise-side VIP services hash (empty when no services are advertised).
             services_hash: &services_hash,
             ..Default::default()

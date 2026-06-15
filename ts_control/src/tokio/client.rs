@@ -752,6 +752,12 @@ async fn run_once(
                 .ingress_active
                 .load(core::sync::atomic::Ordering::Relaxed),
         )
+        // App-connector advertise (Go `Prefs.AppConnector.Advertise` -> `Hostinfo.AppConnector`) and
+        // auto-update-apply advertise (Go `Prefs.AutoUpdate.Apply` -> `Hostinfo.AllowsUpdate`). Both
+        // carry on every map poll, like `wire_ingress`, so control persistently sees the advertised
+        // capability rather than only at registration.
+        .app_connector(config.advertise_app_connector)
+        .allows_update(config.auto_update_apply == Some(true))
         .map_session(&session.handle, session.seq);
     // Carry the whole current NetInfo on the streaming re-register too (Go attaches `c.netinfo` to
     // every `sendMapRequest`), so a reconnect re-advertises the last-known home/UDP/NAT facets
