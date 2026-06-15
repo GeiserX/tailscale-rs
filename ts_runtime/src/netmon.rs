@@ -17,9 +17,14 @@
 //!    `ActorRef<DerpLatencyMeasurer>` has to be threaded here.
 //!
 //! Events are processed **serially** (the `ask` completes before the next event is handled) and a
-//! **minimum interval between rebinds** ([`MIN_REBIND_INTERVAL`]) drops any event that arrives too
-//! soon after the last completed rebind, so an event storm (a sleep-wake can emit a long flurry
-//! even after the debouncer) cannot drive a rebind loop. The loop ends on `env.shutdown`, and the
+//! **minimum interval between rebinds** ([`MIN_REBIND_INTERVAL`]) throttles them: an event arriving
+//! too soon after the last completed rebind is **coalesced and deferred**, not dropped — a flag is
+//! set and exactly one rebind runs when the interval elapses, folding any number of within-interval
+//! events into that single deferred rebind. So an event storm (a sleep-wake can emit a long flurry
+//! even after the debouncer) cannot drive a rebind loop, yet a genuinely distinct second link change
+//! within the interval is still honored (bounded to [`MIN_REBIND_INTERVAL`] worst-case latency)
+//! rather than lost until the periodic pinger/STUN eventually catch up. The loop ends on
+//! `env.shutdown` (which wins over a pending deferred rebind), and the
 //! [`LinkMonitorHandle`](ts_netmon::LinkMonitorHandle) (held for the actor's life) aborts the
 //! monitor's watcher task on drop, so no monitor task outlives the device.
 //!
@@ -40,11 +45,13 @@ use crate::direct::{DirectManager, RebindAndReprobe};
 use crate::{Env, Error};
 
 /// Minimum wall-clock interval between two rebinds. An event arriving within this window of the
-/// **last completed** rebind is dropped (logged at trace). This is the event-storm backstop: a
-/// sleep-wake or a flapping link can emit notifications faster than the underlay can usefully be
-/// re-bound, and re-binding mid-recovery would just re-clear paths that are still re-confirming.
-/// 1s is comfortably longer than a rebind+reprobe round-trip yet short enough that a genuine second
-/// change a moment later is still honored on the next event.
+/// **last completed** rebind is **coalesced and deferred** (a pending flag is set, logged at trace);
+/// one rebind then runs when the interval elapses. This is the event-storm backstop: a sleep-wake or
+/// a flapping link can emit notifications faster than the underlay can usefully be re-bound, and
+/// re-binding mid-recovery would just re-clear paths that are still re-confirming. Deferring rather
+/// than dropping means a genuinely distinct second change within the interval still drives a rebind
+/// (bounded to this interval), instead of being lost until the periodic pinger/STUN re-probe. 1s is
+/// comfortably longer than a rebind+reprobe round-trip yet short enough that recovery stays prompt.
 const MIN_REBIND_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Supervises an OS link monitor and fires the engine's re-bind / re-probe / re-netcheck kicks on
@@ -112,9 +119,11 @@ impl kameo::Actor for NetmonSupervisor {
 
 /// The reaction loop, factored out of `on_start` so the success and watch-failure paths share it.
 ///
-/// For each coalesced event: enforce the [`MIN_REBIND_INTERVAL`] backstop, then
-/// `direct.ask(RebindAndReprobe)` (serially) and `env.publish(MeasureNow)`. Exits when the event
-/// stream closes or `env.shutdown` flips to `true`.
+/// For each coalesced event: if within [`MIN_REBIND_INTERVAL`] of the last completed rebind, mark a
+/// deferred rebind (coalescing further within-interval events into it) rather than reacting now;
+/// otherwise `direct.ask(RebindAndReprobe)` (serially) then `env.publish(MeasureNow)`. A deferred
+/// rebind fires once the interval elapses. Exits when the event stream closes or `env.shutdown`
+/// flips to `true` (shutdown wins over a pending deferred rebind).
 ///
 /// Generic over the target actor purely so the unit tests can drive this **exact** production loop
 /// with a lightweight `RebindAndReprobe`-counting stand-in instead of standing up the whole
@@ -126,13 +135,43 @@ async fn run<A>(
 ) where
     A: kameo::Actor + Message<RebindAndReprobe, Reply = Result<(), ts_magicsock::Error>>,
 {
+    // The reaction itself: rebind + re-ping + immediate STUN (atomic in DirectManager, serial), then
+    // re-netcheck via the bus. Shared by the immediate and deferred paths. Returns the completion
+    // instant so the caller can update `last_rebind` (the interval measures quiet-since-done).
+    async fn react<A>(direct: &ActorRef<A>, env: &Env) -> tokio::time::Instant
+    where
+        A: kameo::Actor + Message<RebindAndReprobe, Reply = Result<(), ts_magicsock::Error>>,
+    {
+        tracing::debug!("link change: rebinding + re-probing connectivity");
+        // (1) Rebind + re-ping + immediate STUN, atomically in DirectManager.
+        if let Err(e) = direct.ask(RebindAndReprobe).await {
+            tracing::warn!(error = %e, "rebind-and-reprobe on link change");
+        }
+        // Completion instant, captured AFTER the rebind.
+        let done = tokio::time::Instant::now();
+        // (2) Re-netcheck: ask the derp-latency measurer to re-measure now (it subscribes to
+        //     MeasureNow on the bus). Best-effort.
+        if let Err(e) = env.publish(MeasureNow).await {
+            tracing::warn!(error = %e, "publishing MeasureNow on link change");
+        }
+        done
+    }
+
     let mut shutdown = env.shutdown.clone();
     // `None` until the first rebind completes; then the `Instant` the last rebind finished.
     let mut last_rebind: Option<tokio::time::Instant> = None;
+    // Set when an event lands inside `MIN_REBIND_INTERVAL`: a rebind is owed and runs when the
+    // interval elapses, coalescing any further within-interval events into that one deferred rebind.
+    let mut pending_event = false;
+    // Fires the deferred rebind when the interval elapses. Armed only while `pending_event` (the arm
+    // is gated on it, so the idle already-elapsed timer never busy-spins). Starts disabled.
+    let timer = tokio::time::sleep(Duration::from_secs(0));
+    tokio::pin!(timer);
+    timer.as_mut().await; // consume the initial immediate expiry so idle truly waits.
 
     loop {
         tokio::select! {
-            // Bias toward shutdown so a flip is honored even if events are pending.
+            // Bias toward shutdown so a flip wins even over a pending deferred rebind.
             biased;
 
             _ = shutdown.changed() => {
@@ -144,31 +183,31 @@ async fn run<A>(
             event = events.recv() => {
                 match event {
                     Some(_link_change) => {
-                        // Event-storm backstop: skip an event that lands too soon after the last
-                        // completed rebind. (The debouncer already coalesces a single change's
-                        // burst; this guards against distinct settled events arriving back-to-back,
-                        // e.g. a long sleep-wake sequence.)
-                        if last_rebind.is_some_and(|prev| prev.elapsed() < MIN_REBIND_INTERVAL) {
-                            tracing::trace!("link change within min-rebind interval; skipping");
+                        // Event-storm backstop: an event landing too soon after the last completed
+                        // rebind is DEFERRED, not dropped. (The debouncer already coalesces a single
+                        // change's burst; this guards distinct settled events arriving back-to-back,
+                        // e.g. a long sleep-wake — a genuine second change is still honored, bounded
+                        // to MIN_REBIND_INTERVAL, instead of lost until the periodic re-probe.)
+                        if let Some(prev) = last_rebind
+                            && prev.elapsed() < MIN_REBIND_INTERVAL
+                        {
+                            if !pending_event {
+                                // First within-interval event: owe one deferred rebind and arm the
+                                // timer to the interval boundary. Coalesces later within-interval
+                                // events (the arm only happens on this false->true transition).
+                                pending_event = true;
+                                timer.as_mut().reset(prev + MIN_REBIND_INTERVAL);
+                                tracing::trace!("link change within min-rebind interval; deferring");
+                            } else {
+                                tracing::trace!("link change within min-rebind interval; already deferred");
+                            }
                             continue;
                         }
 
-                        tracing::debug!("link change: rebinding + re-probing connectivity");
-
-                        // (1) Rebind + re-ping + immediate STUN, atomically in DirectManager.
-                        //     Serial: this completes before the next event is processed.
-                        if let Err(e) = direct.ask(RebindAndReprobe).await {
-                            tracing::warn!(error = %e, "rebind-and-reprobe on link change");
-                        }
-
-                        // Mark completion AFTER the rebind so the interval measures quiet-since-done.
-                        last_rebind = Some(tokio::time::Instant::now());
-
-                        // (2) Re-netcheck: ask the derp-latency measurer to re-measure now (it
-                        //     subscribes to MeasureNow on the bus). Best-effort.
-                        if let Err(e) = env.publish(MeasureNow).await {
-                            tracing::warn!(error = %e, "publishing MeasureNow on link change");
-                        }
+                        // Far enough from the last rebind: react now. Any earlier deferral is
+                        // subsumed by this immediate rebind.
+                        pending_event = false;
+                        last_rebind = Some(react(direct, env).await);
                     }
                     None => {
                         // Event stream closed (monitor watcher ended, e.g. handle dropped on actor
@@ -177,6 +216,14 @@ async fn run<A>(
                         break;
                     }
                 }
+            }
+
+            // Deferred rebind: the interval has elapsed and at least one event was coalesced while
+            // throttled. Run exactly one rebind for all of them. Gated by `pending_event` so the
+            // idle timer never fires this arm.
+            _ = &mut timer, if pending_event => {
+                pending_event = false;
+                last_rebind = Some(react(direct, env).await);
             }
         }
     }
@@ -322,14 +369,18 @@ mod tests {
         drop(tokio::time::timeout(Duration::from_secs(1), loop_task).await);
     }
 
-    /// The 1s min-rebind backstop: two coalesced events arriving back-to-back (within 1s) drive
-    /// only ONE rebind; the second is dropped because it lands inside `MIN_REBIND_INTERVAL`. A third
-    /// event after the interval elapses is honored. Driven through a real `ManualLinkMonitor` (so
-    /// `LinkChangeEvent`s are produced by the legitimate event source, not synthesized — the type is
-    /// `#[non_exhaustive]` and can't be constructed outside `ts_netmon`). Uses real (short) time;
-    /// the one unavoidable ~1s wait exercises the real backstop interval.
+    /// The 1s min-rebind backstop now DEFERS (does not drop): a second distinct coalesced event
+    /// arriving within `MIN_REBIND_INTERVAL` of the first rebind is coalesced into a single deferred
+    /// rebind that fires once the interval elapses — WITHOUT any further event being fired. Proves
+    /// Fix 2: a genuine second link change inside the interval still drives a rebind (bounded to the
+    /// interval) instead of being lost until the periodic re-probe. Driven through a real
+    /// `ManualLinkMonitor` (so `LinkChangeEvent`s come from the legitimate event source — the type is
+    /// `#[non_exhaustive]` and can't be constructed outside `ts_netmon`) against the EXACT production
+    /// `run` loop via the generic stand-in. Uses real (short) time — this crate's dev-deps don't
+    /// enable tokio `test-util`, so the existing netmon tests all use real time; the one ~1s wait
+    /// exercises the real backstop interval (as the prior drop-test did).
     #[tokio::test]
-    async fn min_interval_drops_back_to_back_events() {
+    async fn min_interval_defers_within_interval_event() {
         let (_sd_tx, sd_rx) = watch::channel(false);
         let env = test_env(sd_rx);
 
@@ -342,23 +393,84 @@ mod tests {
         let loop_env = env.clone();
         let loop_task = tokio::spawn(async move { run(&mut events, &direct, &loop_env).await });
 
+        // First coalesced event → rebind #1 (completes immediately; nothing pending yet).
+        trigger.trigger();
+        wait_until(&rebinds, 1, "first rebind").await;
+
+        // A second distinct coalesced event lands well inside the 1s backstop. It must be DEFERRED
+        // (pending flag set), not dropped and not run immediately.
+        trigger.trigger();
+        // Advance a fraction of the interval: the deferred rebind must NOT have fired yet, but the
+        // event must NOT have been dropped either — it is owed.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            rebinds.load(Ordering::SeqCst),
+            1,
+            "the within-interval event must be deferred, not run immediately"
+        );
+
+        // WITHOUT firing any further event, once the interval elapses the deferred rebind fires →
+        // rebind #2. (The OLD behavior dropped this event and would stay at 1 forever.)
+        wait_until(
+            &rebinds,
+            2,
+            "deferred rebind fires after the interval elapses",
+        )
+        .await;
+
+        // And it is exactly ONE deferred rebind — no runaway loop (the flag was cleared on fire).
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            rebinds.load(Ordering::SeqCst),
+            2,
+            "exactly one deferred rebind for the within-interval event (no extra)"
+        );
+
+        drop(trigger);
+        drop(tokio::time::timeout(Duration::from_secs(1), loop_task).await);
+    }
+
+    /// Multiple distinct events arriving within `MIN_REBIND_INTERVAL` COALESCE into a single deferred
+    /// rebind (not one per event), bounding storm load to one rebind per interval. Real (short)
+    /// time, same rationale as `min_interval_defers_within_interval_event`.
+    #[tokio::test]
+    async fn min_interval_coalesces_multiple_deferred_into_one() {
+        let (_sd_tx, sd_rx) = watch::channel(false);
+        let env = test_env(sd_rx);
+
+        let rebinds = Arc::new(AtomicUsize::new(0));
+        let direct = RebindCounter::spawn(rebinds.clone());
+
+        let (monitor, trigger) = ManualLinkMonitor::with_settle(Duration::from_millis(30));
+        let (mut events, _handle) = monitor.watch(env.shutdown.clone()).unwrap();
+        let loop_env = env.clone();
+        let loop_task = tokio::spawn(async move { run(&mut events, &direct, &loop_env).await });
+
         // First coalesced event → rebind #1.
         trigger.trigger();
         wait_until(&rebinds, 1, "first rebind").await;
 
-        // A second coalesced event lands ~30ms later, well inside the 1s backstop → dropped.
-        trigger.trigger();
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Three more distinct coalesced events, each comfortably inside the interval (spaced by a
+        // couple of settle windows so each is its OWN coalesced LinkChangeEvent, all still < 1s).
+        for _ in 0..3 {
+            trigger.trigger();
+            tokio::time::sleep(Duration::from_millis(70)).await;
+        }
+        // Still inside the interval: no second rebind yet, all three folded into one pending rebind.
         assert_eq!(
             rebinds.load(Ordering::SeqCst),
             1,
-            "the back-to-back event must be dropped by the min-rebind backstop"
+            "within-interval events must not each trigger a rebind"
         );
 
-        // After the full interval elapses, a third coalesced event is honored → rebind #2.
-        tokio::time::sleep(MIN_REBIND_INTERVAL + Duration::from_millis(100)).await;
-        trigger.trigger();
-        wait_until(&rebinds, 2, "rebind after the interval elapsed").await;
+        // After the interval elapses: exactly ONE deferred rebind for all three.
+        wait_until(&rebinds, 2, "one coalesced deferred rebind").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            rebinds.load(Ordering::SeqCst),
+            2,
+            "three within-interval events coalesce to exactly one deferred rebind"
+        );
 
         drop(trigger);
         drop(tokio::time::timeout(Duration::from_secs(1), loop_task).await);

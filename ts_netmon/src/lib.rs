@@ -16,6 +16,18 @@ use tokio::task::JoinHandle;
 /// immediate.
 pub const DEBOUNCE_SETTLE: Duration = Duration::from_millis(250);
 
+/// Maximum wall-clock time a *single* pending burst may keep deferring its emission. The trailing
+/// settle ([`DEBOUNCE_SETTLE`]) re-arms on every raw event, so a stream that never falls quiet for a
+/// full `DEBOUNCE_SETTLE` would otherwise push the emit out forever and starve the consumer — zero
+/// reactions for the whole storm. This cap bounds that: once a burst has been pending for
+/// `DEBOUNCE_MAX_WAIT`, one [`LinkChangeEvent`] is emitted even though the flurry has not fully
+/// quieted, then a fresh burst begins. Mirrors Go `net/netmon`, which likewise declares a major
+/// change when a flurry runs long rather than waiting for perfect quiet. 1 s matches the
+/// supervisor's 1 s min-rebind backstop, so the cap never out-runs the reaction it feeds; it only
+/// kicks in for a pathological never-quiet stream — a normal quiet-terminated burst still emits on
+/// the trailing settle.
+pub const DEBOUNCE_MAX_WAIT: Duration = Duration::from_secs(1);
+
 /// A coalesced network link-change notification.
 ///
 /// Deliberately **detail-free**: the runtime's reaction (re-bind the underlay socket, re-ping
@@ -85,6 +97,14 @@ impl Drop for LinkMonitorHandle {
 /// OS-agnostic heart of the monitor: every backend feeds its raw notifications through here, so the
 /// supervisor reacts once per *settled* change rather than once per kernel message.
 ///
+/// A [`DEBOUNCE_MAX_WAIT`] ceiling guards against a pathological never-quiet stream: if raw events
+/// keep arriving closer together than `settle` they would re-arm the trailing timer forever and
+/// emit nothing for the whole storm. So the timer is armed at `min(now + settle, first_pending +
+/// DEBOUNCE_MAX_WAIT)`, where `first_pending` is when the current burst first became pending; once a
+/// burst has been pending for `DEBOUNCE_MAX_WAIT` it emits even though the flurry has not quieted,
+/// then a fresh burst begins. The common quiet-terminated burst is unaffected — it still emits on
+/// the trailing settle, well before the cap.
+///
 /// The task ends when the raw-event sender is dropped (the backend stopped) or `shutdown` flips to
 /// `true`; if a settle is pending when the raw stream closes, the final coalesced event is still
 /// flushed so a change that arrived just before shutdown is not silently dropped. Output is best
@@ -95,11 +115,16 @@ pub async fn debounce(
     mut raw: mpsc::Receiver<()>,
     out: mpsc::Sender<LinkChangeEvent>,
     settle: Duration,
+    max_wait: Duration,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    // `None` = idle (no change pending); `Some(deadline)` = a change is pending and will be emitted
-    // when the clock reaches `deadline` unless another raw event pushes it out first.
+    // `false` = idle (no change pending); `true` = a change is pending and will be emitted when the
+    // armed `timer` fires unless another raw event re-arms it first.
     let mut pending = false;
+    // When the current pending burst FIRST became pending. The emit deadline is capped at
+    // `first_pending + max_wait` so a never-quiet stream still emits periodically (see `DEBOUNCE_MAX_WAIT`).
+    // `None` while idle; set on the raw event that starts a burst, cleared on emit.
+    let mut first_pending: Option<tokio::time::Instant> = None;
     // A far-future sleep that we re-arm on each raw event. Pinned so it can be polled in the
     // `select!` arm repeatedly. Starts effectively disabled (idle).
     let timer = tokio::time::sleep(Duration::from_secs(0));
@@ -121,9 +146,16 @@ pub async fn debounce(
             raw_event = raw.recv() => {
                 match raw_event {
                     Some(()) => {
-                        // (Re)arm the trailing settle: push the deadline out to `now + settle`.
+                        let now = tokio::time::Instant::now();
+                        // Start a fresh burst on the first event; remember when it began so the cap
+                        // is measured from the burst's start, not from each re-arm.
+                        let started = *first_pending.get_or_insert(now);
                         pending = true;
-                        timer.as_mut().reset(tokio::time::Instant::now() + settle);
+                        // Trailing settle (`now + settle`) re-arms on every event; the cap
+                        // (`started + max_wait`) does not. Arm at whichever comes first so a
+                        // never-quiet stream still fires at the cap instead of deferring forever.
+                        let deadline = (now + settle).min(started + max_wait);
+                        timer.as_mut().reset(deadline);
                     }
                     None => {
                         // Raw stream closed (backend stopped). Flush a pending change so a burst
@@ -136,10 +168,13 @@ pub async fn debounce(
                 }
             }
 
-            // Fires only while a change is pending (the timer is re-armed into the future on every
-            // raw event; when idle it has already elapsed and this arm is gated by `pending`).
+            // Fires once a change is pending and the armed deadline (trailing settle, or the
+            // `max_wait` cap for a never-quiet stream) is reached. Gated by `pending` so the idle
+            // already-elapsed timer does not busy-spin.
             _ = &mut timer, if pending => {
                 pending = false;
+                // Clear the burst marker so the next raw event starts a fresh `max_wait` window.
+                first_pending = None;
                 if out.send(LinkChangeEvent).await.is_err() {
                     // Consumer (the supervisor) is gone; nothing more to do.
                     tracing::trace!("link-change consumer gone; debouncer exiting");
@@ -169,6 +204,7 @@ const CHANNEL_BOUND: usize = 16;
 pub struct ManualLinkMonitor {
     raw_rx: std::sync::Mutex<Option<mpsc::Receiver<()>>>,
     settle: Duration,
+    max_wait: Duration,
 }
 
 /// The fire handle for a [`ManualLinkMonitor`]: call [`trigger`](ManualTrigger::trigger) to inject
@@ -189,15 +225,21 @@ impl ManualTrigger {
 }
 
 impl ManualLinkMonitor {
-    /// Build a manual monitor with the default [`DEBOUNCE_SETTLE`] window, returning it together
-    /// with the [`ManualTrigger`] used to fire synthetic link changes.
+    /// Build a manual monitor with the default [`DEBOUNCE_SETTLE`] window and [`DEBOUNCE_MAX_WAIT`]
+    /// cap, returning it together with the [`ManualTrigger`] used to fire synthetic link changes.
     pub fn new() -> (Self, ManualTrigger) {
         Self::with_settle(DEBOUNCE_SETTLE)
     }
 
     /// Build a manual monitor with an explicit settle window (tests use a tiny window so the
-    /// coalescing fires quickly on a paused clock).
+    /// coalescing fires quickly on a paused clock). The never-quiet cap stays at [`DEBOUNCE_MAX_WAIT`].
     pub fn with_settle(settle: Duration) -> (Self, ManualTrigger) {
+        Self::with_settle_and_max_wait(settle, DEBOUNCE_MAX_WAIT)
+    }
+
+    /// Build a manual monitor with explicit settle and never-quiet-cap windows. Tests exercising the
+    /// cap use a small `max_wait` proportional to `settle` so it fires quickly on a paused clock.
+    pub fn with_settle_and_max_wait(settle: Duration, max_wait: Duration) -> (Self, ManualTrigger) {
         let (raw_tx, raw_rx) = mpsc::channel(CHANNEL_BOUND);
         // The trigger is the SOLE sender: the monitor keeps only the receiver (consumed by
         // `watch`). So when every `ManualTrigger` clone is dropped, the raw channel closes and the
@@ -208,6 +250,7 @@ impl ManualLinkMonitor {
             Self {
                 raw_rx: std::sync::Mutex::new(Some(raw_rx)),
                 settle,
+                max_wait,
             },
             trigger,
         )
@@ -236,7 +279,8 @@ impl LinkMonitor for ManualLinkMonitor {
 
         let (out_tx, out_rx) = mpsc::channel(CHANNEL_BOUND);
         let settle = self.settle;
-        let task = tokio::spawn(debounce(raw_rx, out_tx, settle, shutdown));
+        let max_wait = self.max_wait;
+        let task = tokio::spawn(debounce(raw_rx, out_tx, settle, max_wait, shutdown));
         Ok((out_rx, LinkMonitorHandle::new(task)))
     }
 }
@@ -278,7 +322,7 @@ mod tests {
         let (out_tx, mut out_rx) = mpsc::channel(64);
         let (_sd_tx, sd_rx) = watch::channel(false);
 
-        let task = tokio::spawn(debounce(raw_rx, out_tx, settle, sd_rx));
+        let task = tokio::spawn(debounce(raw_rx, out_tx, settle, DEBOUNCE_MAX_WAIT, sd_rx));
 
         // Fire 6 raw events spaced 10 ms apart — all well within the 250 ms settle.
         for _ in 0..6 {
@@ -319,7 +363,7 @@ mod tests {
         let (out_tx, mut out_rx) = mpsc::channel(64);
         let (_sd_tx, sd_rx) = watch::channel(false);
 
-        let task = tokio::spawn(debounce(raw_rx, out_tx, settle, sd_rx));
+        let task = tokio::spawn(debounce(raw_rx, out_tx, settle, DEBOUNCE_MAX_WAIT, sd_rx));
 
         // First burst.
         for _ in 0..3 {
@@ -350,6 +394,45 @@ mod tests {
         task.await.expect("debouncer task joins cleanly");
     }
 
+    /// A never-quiet raw stream — events arriving closer together than `settle` forever — must still
+    /// emit periodically via the [`DEBOUNCE_MAX_WAIT`] cap, rather than re-arming the trailing settle
+    /// forever and emitting nothing for the whole storm. Feeds raw events every `settle / 2` for
+    /// longer than `max_wait` and asserts AT LEAST ONE event is emitted DURING the stream (not only
+    /// after it goes quiet), proving the cap fires.
+    #[tokio::test(start_paused = true)]
+    async fn never_quiet_stream_emits_via_max_wait_cap() {
+        let settle = Duration::from_millis(250); // == DEBOUNCE_SETTLE
+        let max_wait = Duration::from_secs(1); // == DEBOUNCE_MAX_WAIT
+        let step = settle / 2; // 125ms: each event re-arms the trailing settle before it can fire.
+        let (raw_tx, raw_rx) = mpsc::channel(64);
+        let (out_tx, mut out_rx) = mpsc::channel(64);
+        let (_sd_tx, sd_rx) = watch::channel(false);
+
+        let task = tokio::spawn(debounce(raw_rx, out_tx, settle, max_wait, sd_rx));
+
+        // Feed for ~1.5× max_wait worth of `step`s (12 * 125ms = 1500ms > 1000ms cap) so the cap
+        // must fire mid-stream if it works. Count emissions seen WHILE still feeding.
+        let mut emitted_during_stream = 0usize;
+        for _ in 0..12 {
+            raw_tx.send(()).await.unwrap();
+            // Each step is < settle, so the trailing timer never fires on its own during the stream;
+            // only the max_wait cap can produce an emission while events keep arriving.
+            tokio::time::sleep(step).await;
+            while out_rx.try_recv().is_ok() {
+                emitted_during_stream += 1;
+            }
+        }
+
+        assert!(
+            emitted_during_stream >= 1,
+            "the never-quiet cap must emit at least once DURING the stream (saw {emitted_during_stream})"
+        );
+
+        // The trailing settle still terminates the final pending burst once the stream goes quiet.
+        drop(raw_tx);
+        task.await.expect("debouncer task joins cleanly");
+    }
+
     /// Dropping the [`LinkMonitorHandle`] aborts the watcher task cleanly (the task stops running
     /// and the join reports cancellation).
     #[tokio::test]
@@ -358,9 +441,8 @@ mod tests {
         let (_sd_tx, sd_rx) = watch::channel(false);
         let (_out_rx, handle) = monitor.watch(sd_rx).expect("first watch succeeds");
 
-        // Reach into the handle to observe the task after we drop the handle. We move the inner
-        // JoinHandle out by constructing an `Option` swap is overkill; instead re-create a handle
-        // to the same task via abort semantics: drop aborts, and a fresh `watch` is refused.
+        // Drop the handle. We do not reach into the (private) task field; instead we prove teardown
+        // indirectly below via the consumed raw receiver. Drop aborts the watcher task.
         drop(handle);
         // Give the runtime a tick to process the abort.
         tokio::task::yield_now().await;
@@ -410,7 +492,7 @@ mod tests {
         let (out_tx, mut out_rx) = mpsc::channel(64);
         let (_sd_tx, sd_rx) = watch::channel(false);
 
-        let task = tokio::spawn(debounce(raw_rx, out_tx, settle, sd_rx));
+        let task = tokio::spawn(debounce(raw_rx, out_tx, settle, DEBOUNCE_MAX_WAIT, sd_rx));
 
         // Fire one raw event, then immediately close the raw stream (before the settle elapses).
         raw_tx.send(()).await.unwrap();
@@ -469,7 +551,13 @@ mod tests {
         let (out_tx, _out_rx) = mpsc::channel(64);
         let (sd_tx, sd_rx) = watch::channel(false);
 
-        let task = tokio::spawn(debounce(raw_rx, out_tx, Duration::from_millis(250), sd_rx));
+        let task = tokio::spawn(debounce(
+            raw_rx,
+            out_tx,
+            Duration::from_millis(250),
+            DEBOUNCE_MAX_WAIT,
+            sd_rx,
+        ));
         sd_tx.send(true).unwrap();
         // The task must end promptly on shutdown.
         tokio::time::timeout(Duration::from_secs(1), task)
