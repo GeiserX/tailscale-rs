@@ -48,20 +48,73 @@ const FAMILY_IPV6: u8 = 0x02;
 /// The fixed 20-byte STUN message header length.
 const HEADER_LEN: usize = 20;
 
+/// SOFTWARE attribute type (RFC 5389 §15.10). Go sends it on every Binding Request; a real Tailscale
+/// STUN server (the DERP-embedded one we probe) REQUIRES it — `stun.ParseBindingRequest` rejects a
+/// request without `SOFTWARE == "tailnode"` as `ErrWrongSoftware` and drops it (no response). So a
+/// bare header gets no reflexive address back from Tailscale infrastructure.
+const ATTR_SOFTWARE: u16 = 0x8022;
+
+/// FINGERPRINT attribute type (RFC 5389 §15.5). Go appends it last; the Tailscale STUN server also
+/// requires it (`ErrNoFingerprint`/`ErrWrongFingerprint`).
+const ATTR_FINGERPRINT: u16 = 0x8028;
+
+/// The SOFTWARE attribute value Go's STUN client sends (`net/stun/stun.go` `software`). Exactly 8
+/// bytes, so it needs no RFC-5389 4-byte padding. This is the genuine Tailscale software string every
+/// real client sends — matching it is parity, not a tell; the *absence* is the tell.
+const SOFTWARE: &[u8] = b"tailnode";
+
+/// FINGERPRINT XOR constant (RFC 5389 §15.5: the attribute value is `crc32(message) XOR 0x5354554e`).
+const FINGERPRINT_XOR: u32 = 0x5354_554E;
+
 /// A 12-byte STUN transaction id, matching the on-wire layout (`bytes[8..20]`).
 pub(crate) type StunTxId = [u8; 12];
 
-/// Encode a 20-byte STUN Binding Request carrying `tx_id`.
+/// CRC-32 (IEEE 802.3, the `crc32.ChecksumIEEE` Go uses for the FINGERPRINT attribute), computed
+/// bit-by-bit so no lookup table or dependency is pulled onto this leak-safe path. Reflected input/
+/// output, init `0xFFFFFFFF`, final XOR `0xFFFFFFFF`, polynomial `0xEDB88320` (the reflected
+/// `0x04C11DB7`) — the standard parameters `ChecksumIEEE` uses.
+fn crc32_ieee(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// Encode a STUN Binding Request carrying `tx_id`, byte-faithful to Go `net/stun.Request`.
 ///
-/// Layout: type = [`BINDING_REQUEST`] (`0x0001`), message length = `0x0000` (no attributes),
-/// magic cookie = [`MAGIC_COOKIE`] big-endian at `bytes[4..8]`, transaction id at
-/// `bytes[8..20]`.
-pub(crate) fn encode_binding_request(tx_id: StunTxId) -> [u8; HEADER_LEN] {
-    let mut buf = [0u8; HEADER_LEN];
-    buf[0..2].copy_from_slice(&BINDING_REQUEST.to_be_bytes());
-    // length stays 0x0000 (no attributes).
-    buf[4..8].copy_from_slice(&MAGIC_COOKIE.to_be_bytes());
-    buf[8..20].copy_from_slice(&tx_id);
+/// Layout (40 bytes): the 20-byte header (type [`BINDING_REQUEST`] `0x0001`, message length `0x0014`
+/// = the 20 trailing attribute bytes, magic cookie [`MAGIC_COOKIE`] big-endian at `bytes[4..8]`,
+/// transaction id at `bytes[8..20]`), then a SOFTWARE attribute (`0x8022`, len 8, [`SOFTWARE`]) and a
+/// FINGERPRINT attribute (`0x8028`, len 4, `crc32_ieee(message_so_far) XOR 0x5354554e`), fingerprint
+/// LAST per RFC 5389. A bare 20-byte header is rejected by the Tailscale DERP STUN server we probe
+/// (`ErrWrongSoftware`), so the SOFTWARE+FINGERPRINT trailer is required for the request to be
+/// answered at all — and its absence is a non-Tailscale fingerprint.
+pub(crate) fn encode_binding_request(tx_id: StunTxId) -> Vec<u8> {
+    // 2-byte type + 2-byte length per attribute; SOFTWARE value is 8 bytes (no padding), FINGERPRINT
+    // value is 4 bytes → trailing attribute bytes = (4 + 8) + (4 + 4) = 20.
+    const TRAILER_LEN: u16 = (4 + 8) + (4 + 4);
+    let mut buf = Vec::with_capacity(HEADER_LEN + TRAILER_LEN as usize);
+    buf.extend_from_slice(&BINDING_REQUEST.to_be_bytes());
+    buf.extend_from_slice(&TRAILER_LEN.to_be_bytes());
+    buf.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+    buf.extend_from_slice(&tx_id);
+
+    // SOFTWARE attribute.
+    buf.extend_from_slice(&ATTR_SOFTWARE.to_be_bytes());
+    buf.extend_from_slice(&(SOFTWARE.len() as u16).to_be_bytes());
+    buf.extend_from_slice(SOFTWARE);
+
+    // FINGERPRINT attribute, computed over everything written so far (RFC 5389: the CRC covers the
+    // message up to but not including the FINGERPRINT TLV, with the length field already counting it).
+    let fp = crc32_ieee(&buf) ^ FINGERPRINT_XOR;
+    buf.extend_from_slice(&ATTR_FINGERPRINT.to_be_bytes());
+    buf.extend_from_slice(&4u16.to_be_bytes());
+    buf.extend_from_slice(&fp.to_be_bytes());
     buf
 }
 
@@ -243,10 +296,35 @@ mod tests {
     fn encode_binding_request_layout() {
         let tx_id: StunTxId = [9u8; 12];
         let req = encode_binding_request(tx_id);
+        // 40 bytes: 20-byte header + SOFTWARE(4+8) + FINGERPRINT(4+4), matching Go net/stun.Request.
+        assert_eq!(req.len(), 40);
         assert_eq!(req[0..2], BINDING_REQUEST.to_be_bytes());
-        assert_eq!(req[2..4], [0, 0], "no attributes => length 0");
+        assert_eq!(
+            req[2..4],
+            0x0014u16.to_be_bytes(),
+            "length = 20 trailing attr bytes"
+        );
         assert_eq!(req[4..8], MAGIC_COOKIE.to_be_bytes());
         assert_eq!(req[8..20], tx_id);
+        // SOFTWARE attribute: type 0x8022, len 8, value "tailnode".
+        assert_eq!(req[20..22], ATTR_SOFTWARE.to_be_bytes());
+        assert_eq!(req[22..24], 8u16.to_be_bytes());
+        assert_eq!(&req[24..32], SOFTWARE);
+        // FINGERPRINT attribute: type 0x8028, len 4, value crc32_ieee(prefix) ^ 0x5354554e, LAST.
+        assert_eq!(req[32..34], ATTR_FINGERPRINT.to_be_bytes());
+        assert_eq!(req[34..36], 4u16.to_be_bytes());
+        let want_fp = crc32_ieee(&req[..32]) ^ FINGERPRINT_XOR;
+        assert_eq!(req[36..40], want_fp.to_be_bytes());
+    }
+
+    /// CRC-32/IEEE known-answer test: `crc32("123456789") == 0xCBF43926` (the canonical check value
+    /// for this CRC variant). Pins our hand-rolled `crc32_ieee` against the algorithm Go's
+    /// `crc32.ChecksumIEEE` implements, so the FINGERPRINT a real Tailscale STUN server validates is
+    /// correct.
+    #[test]
+    fn crc32_ieee_canonical_check_value() {
+        assert_eq!(crc32_ieee(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32_ieee(b""), 0x0000_0000);
     }
 
     #[test]
