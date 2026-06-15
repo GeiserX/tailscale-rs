@@ -3782,7 +3782,13 @@ mod tests {
         assert_eq!(first, 2, "the first periodic sweep pings both candidates");
 
         // A second periodic sweep immediately after is fully floored — both were pinged < 5s ago,
-        // and neither is a confirmed best (no pong arrived), so nothing is re-sent.
+        // and neither is a confirmed best (no pong arrived), so nothing is re-sent. The `0` here is
+        // specifically the per-candidate `DISCO_PING_INTERVAL` floor, NOT a `needs_refresh`
+        // short-circuit: no pong arrived, so `trust_until` is None, so `needs_refresh` is `true`
+        // (the `None => true` arm) and `send_pings` *does* reach `candidates_to_ping` — where the
+        // floor (not the heartbeat gate) returns the empty set. If a future refactor made
+        // `needs_refresh` false for an unconfirmed peer, this `0` would be vacuous, so that
+        // reachability is the load-bearing precondition of this assertion.
         let floored = sock.send_pings().await.unwrap();
         assert_eq!(
             floored, 0,
@@ -3811,5 +3817,114 @@ mod tests {
         let unknown = DiscoPrivateKey::random().public_key();
         let sent = sock.send_pings_to_peer_now(&unknown).await.unwrap();
         assert_eq!(sent, 0, "pinging an unknown peer sends nothing");
+    }
+
+    /// End-to-end wiring guard for the **direct-UDP** CallMeMaybe path: receiving a member's
+    /// CallMeMaybe via `handle_disco` must kick the immediate force-ping (the whole point of the
+    /// PR), and a *non-member*'s must not. This locks the `send_pings_to_peer_now` call site in
+    /// `handle_disco` against silent deletion — without it, removing that call leaves every other
+    /// test green.
+    ///
+    /// The detector is the per-candidate discovery floor, not a socket capture: the socket is bound
+    /// to loopback, so a ping to a public candidate cannot actually be delivered — but
+    /// `send_pings_to_peer_now` stamps `note_ping_sent` (which records `last_ping`) under the lock
+    /// *before* the send is attempted. So if the kick fired, a subsequent periodic `send_pings`
+    /// finds the candidate floored and re-pings nothing (0); if the kick were removed, the candidate
+    /// is unstamped and `send_pings` would ping it (1). This is deterministic (return counts, no
+    /// timing, no shared global counter).
+    #[tokio::test]
+    async fn direct_call_me_maybe_kicks_immediate_ping() {
+        let member_disco = DiscoPrivateKey::random();
+        let stranger_disco = DiscoPrivateKey::random();
+        let recv_disco = DiscoPrivateKey::random();
+        let recv_node = ts_keys::NodePrivateKey::random().public_key();
+
+        // Only `member_disco` is a netmap member; CallMeMaybe carries no node key (claimed=None).
+        let member_pub = member_disco.public_key();
+        let verifier: BindingVerifier = Arc::new(
+            move |disco: &DiscoPublicKey, claimed: Option<&NodePublicKey>| {
+                claimed.is_none() && *disco == member_pub
+            },
+        );
+        let recv = MagicSock::bind(localhost(), recv_disco, recv_node)
+            .await
+            .unwrap()
+            .with_binding_verifier(verifier);
+
+        // A public (pingable) candidate — loopback would be dropped by `is_pingable_candidate`.
+        let public_ep: SocketAddr = "203.0.113.40:41641".parse().unwrap();
+        let from: SocketAddr = "198.51.100.7:41641".parse().unwrap();
+
+        // Member CallMeMaybe → endpoint learned AND immediately pinged (floor now stamped).
+        recv.handle_disco(
+            Inbound::CallMeMaybe {
+                sender: member_pub,
+                endpoints: vec![public_ep],
+            },
+            from,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recv.candidate_addrs(&member_pub),
+            vec![public_ep],
+            "the member CallMeMaybe's endpoint must be learned"
+        );
+        // The immediate kick stamped `last_ping`, so the periodic prober floors it: 0 re-pings.
+        // If the `send_pings_to_peer_now` call were deleted, this candidate would be unstamped and
+        // `send_pings` would ping it (1) — which is exactly the regression this asserts against.
+        assert_eq!(
+            recv.send_pings().await.unwrap(),
+            0,
+            "the CallMeMaybe already force-pinged the candidate, so the periodic sweep floors it"
+        );
+
+        // Stranger CallMeMaybe → rejected: nothing learned, nothing to ping.
+        recv.handle_disco(
+            Inbound::CallMeMaybe {
+                sender: stranger_disco.public_key(),
+                endpoints: vec!["203.0.113.41:41641".parse().unwrap()],
+            },
+            from,
+        )
+        .await
+        .unwrap();
+        assert!(
+            recv.candidate_addrs(&stranger_disco.public_key())
+                .is_empty(),
+            "a non-member CallMeMaybe is rejected — no candidate, no kick"
+        );
+    }
+
+    /// End-to-end wiring guard for the **relayed-over-DERP** CallMeMaybe path
+    /// (`handle_relayed_call_me_maybe`): the canonical hard-NAT hole-punch must kick the immediate
+    /// force-ping. Same deterministic floor-based detector as the direct test. Locks the
+    /// `send_pings_to_peer_now` call site in `handle_relayed_call_me_maybe` against silent deletion.
+    #[tokio::test]
+    async fn relayed_call_me_maybe_kicks_immediate_ping() {
+        let our_disco = DiscoPrivateKey::random();
+        let our_node = ts_keys::NodePrivateKey::random().public_key();
+        let recv = MagicSock::bind(localhost(), our_disco.clone(), our_node)
+            .await
+            .unwrap()
+            .with_binding_verifier(allow_all());
+
+        let peer_disco = DiscoPrivateKey::random();
+        let public_ep: SocketAddr = "203.0.113.60:41641".parse().unwrap();
+        let mut frame =
+            disco::seal_call_me_maybe(&peer_disco, &our_disco.public_key(), &[public_ep]).unwrap();
+
+        let consumed = recv.handle_relayed_call_me_maybe(&mut frame).await;
+        assert!(consumed, "the relayed CallMeMaybe is consumed");
+        assert_eq!(
+            recv.candidate_addrs(&peer_disco.public_key()),
+            vec![public_ep],
+            "the relayed CallMeMaybe's endpoint must be learned"
+        );
+        assert_eq!(
+            recv.send_pings().await.unwrap(),
+            0,
+            "the relayed CallMeMaybe already force-pinged the candidate, so the sweep floors it"
+        );
     }
 }

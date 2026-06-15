@@ -415,6 +415,18 @@ impl PeerPaths {
     /// caller stamps each returned address via [`note_ping_sent`] as it sends, so the per-candidate
     /// floor is re-established from this send (a periodic [`candidates_to_ping`] in the same window
     /// will then correctly skip them rather than double-ping).
+    ///
+    /// Mechanism note: Go zeroes each `st.lastPing` and lets `sendDiscoPingsLocked` re-send (the
+    /// `!st.lastPing.IsZero()` floor check is bypassed because the value is now zero); this fork
+    /// instead enumerates every candidate here and floors via the caller's `note_ping_sent` stamp.
+    /// The on-wire effect is identical: one ping per candidate now, with the 5s floor restarting
+    /// from this send. Note this is deliberately **not** coalesced across repeated `CallMeMaybe`s —
+    /// that, too, is Go-faithful: Go re-zeroes `lastPing` on *every* `handleCallMeMaybe`, so each
+    /// `CallMeMaybe` re-pings the full candidate set with no per-event rate limit (the
+    /// [`DISCO_PING_INTERVAL`] floor exists only to pace the *unsolicited* periodic prober, and an
+    /// explicit "ping me now" solicitation is exactly the case it yields to). The fan-out is bounded
+    /// by `MAX_LEARNED_CANDIDATES_PER_PEER` and the sender's netmap-membership gate; the pings are
+    /// self-targeted (the soliciting peer's own advertised, sanitized endpoints), never a reflector.
     pub fn force_ping_sweep(&mut self, now: Instant) -> Vec<SocketAddr> {
         self.last_full_ping = Some(now);
         self.candidates.keys().copied().collect()
