@@ -2,6 +2,25 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.39.0](https://github.com/GeiserX/tailscale-rs/compare/v0.38.0...v0.39.0) (2026-06-15)
+
+
+### Features
+
+* **derp:** honor the server's advertised send rate-limit ([#249](https://github.com/GeiserX/tailscale-rs/issues/249)) ([c04e70c](https://github.com/GeiserX/tailscale-rs/commit/c04e70cfb1fa5ce9c0fd35b3b34606d3e199db4c))
+* **magicsock:** ping immediately on CallMeMaybe, bypassing the discovery floor ([#246](https://github.com/GeiserX/tailscale-rs/issues/246)) ([cd4beb4](https://github.com/GeiserX/tailscale-rs/commit/cd4beb47d2c2604201c47ab1e4a289a22838cd35))
+* **runtime:** stop the periodic STUN sweep while there are no peers ([#247](https://github.com/GeiserX/tailscale-rs/issues/247)) ([e2eaf0f](https://github.com/GeiserX/tailscale-rs/commit/e2eaf0f4bfcaf24f394379bd6450e9f1d3f25107))
+
+
+### Bug Fixes
+
+* **control-serde:** serialize ProtoPortRange as Go's TextMarshaler string ([#245](https://github.com/GeiserX/tailscale-rs/issues/245)) ([753de69](https://github.com/GeiserX/tailscale-rs/commit/753de697c4f713f92787a4747a5242fb29345176))
+* **control:** full Hostinfo on side-command requests + fix stale STUN test ([#244](https://github.com/GeiserX/tailscale-rs/issues/244)) ([1b8917e](https://github.com/GeiserX/tailscale-rs/commit/1b8917e2da8bd0fae4d655ec2b015b4ab456ba43))
+* **dataplane:** handle IPv4 fragments like Go decode4 + filter pre() ([#253](https://github.com/GeiserX/tailscale-rs/issues/253)) ([a2fd8fa](https://github.com/GeiserX/tailscale-rs/commit/a2fd8fa4048f802964f4af3975c8428848a9c4d6))
+* **dns:** echo RD + set RA and only compress multi-answer names, matching Go ([#242](https://github.com/GeiserX/tailscale-rs/issues/242)) ([59bc54c](https://github.com/GeiserX/tailscale-rs/commit/59bc54cc89d81e6a52a09df07fcf1a5405da0930))
+* **magic-dns:** SERVFAIL not NXDOMAIN when an off-tailnet name can't be forwarded ([#248](https://github.com/GeiserX/tailscale-rs/issues/248)) ([a8efb90](https://github.com/GeiserX/tailscale-rs/commit/a8efb90ad513a18b1816d0fdd4b1ded9672f08ac))
+* **magicsock:** send SOFTWARE+FINGERPRINT on STUN binding request to match Go ([#241](https://github.com/GeiserX/tailscale-rs/issues/241)) ([d970570](https://github.com/GeiserX/tailscale-rs/commit/d9705704cb39261854a4e79b02ffeadf1ddcf9dd))
+
 ## [0.38.0](https://github.com/GeiserX/tailscale-rs/compare/v0.37.4...v0.38.0) (2026-06-15)
 
 
