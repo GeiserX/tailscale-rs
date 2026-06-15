@@ -406,6 +406,7 @@ async fn run_pinger(sock: Arc<MagicSock>, mut shutdown: tokio::sync::watch::Rece
 /// no v4 STUN servers the request list is empty and we simply fall back to pong-harvest.
 async fn run_stun_prober(
     sock: Arc<MagicSock>,
+    peer_db: Arc<RwLock<Option<Arc<PeerDb>>>>,
     multiderp: ActorRef<Multiderp>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -419,6 +420,13 @@ async fn run_stun_prober(
         tokio::select! {
             _ = shutdown.changed() => break,
             _ = tokio::time::sleep(stun_probe_delay()) => {
+                // Skip the sweep while we have no peers (Go's peer-count stop condition — see
+                // [`stun_probe_should_run`]). On-wire-equivalent to Go stopping its periodic timer,
+                // and auto-resumes the moment a peer appears.
+                if !stun_probe_should_run(&peer_db) {
+                    continue;
+                }
+
                 // Best-effort: if multiderp is unavailable just skip this round (pong-harvest
                 // still runs), matching how the other loops treat multiderp send errors.
                 let servers = match multiderp.ask(multiderp::StunServersV4).await {
@@ -432,6 +440,27 @@ async fn run_stun_prober(
             }
         }
     }
+}
+
+/// Whether the periodic STUN sweep should run this round — the fork's analog of Go magicsock's
+/// `shouldDoPeriodicReSTUNLocked` peer-count gate (`len(c.peerSet) == 0` → don't STUN).
+///
+/// Returns `true` only when a netmap is loaded *and* it has at least one peer. STUN exists to keep
+/// our NAT mapping open so peers can reach us directly; with no configured peer there is nobody to
+/// reach, so the sweep is pure waste — and, more importantly for parity, a real `tailscaled` falls
+/// quiet on STUN in that state (Go stops its `periodicReSTUNTimer`). A node that keeps emitting
+/// Binding Requests every ~23s with no peer is a visible "no peer traffic but steady STUN"
+/// fingerprint. This is the single highest-signal stop condition; Go's other three (idle past
+/// `sessionActiveTimeout`, network-down/homeless, zero private key) need activity/network-state
+/// plumbing the runtime does not have yet — and the zero-key case is structurally impossible here
+/// (the socket is always bound with a real key before the prober is spawned).
+///
+/// Factored out of [`run_stun_prober`]'s loop so the gate is unit-testable without the actor/timer
+/// machinery, mirroring [`probe_stun_servers_once`]. Uses the same `peer_db` snapshot discipline as
+/// [`run_call_me_maybe`] (`poisoned_read`, fail-quiet when no netmap is loaded).
+fn stun_probe_should_run(peer_db: &RwLock<Option<Arc<PeerDb>>>) -> bool {
+    let db = poisoned_read(peer_db);
+    db.as_ref().is_some_and(|db| !db.peers().is_empty())
 }
 
 /// Send one STUN Binding Request to each server in `servers` from the one bound socket.
@@ -675,9 +704,11 @@ impl kameo::Actor for DirectManager {
             env.shutdown.clone(),
         ));
         // Active STUN probing shares the one bound socket; clone the multiderp ref before it is
-        // moved into run_call_me_maybe below.
+        // moved into run_call_me_maybe below. `peer_db` is cloned so the prober can skip the sweep
+        // while there are no peers (Go's `shouldDoPeriodicReSTUNLocked` peer-count stop condition).
         tasks.spawn(run_stun_prober(
             sock.clone(),
+            peer_db.clone(),
             multiderp.clone(),
             env.shutdown.clone(),
         ));
@@ -983,6 +1014,37 @@ mod tests {
 
         // No servers => no sends, no panic, returns promptly.
         probe_stun_servers_once(&sock, &[]).await;
+    }
+
+    /// The periodic STUN sweep is gated on having at least one peer — Go magicsock's
+    /// `shouldDoPeriodicReSTUNLocked` `len(c.peerSet) == 0` stop condition. With no netmap loaded,
+    /// or a netmap with zero peers, the gate is closed (no STUN, so no "peerless but steady STUN"
+    /// fingerprint); once a peer is present it opens.
+    #[test]
+    fn stun_probe_gated_on_peer_presence() {
+        // No netmap loaded yet → fail-quiet (closed), like `verify_binding`'s empty case.
+        let empty: Arc<RwLock<Option<Arc<PeerDb>>>> = Default::default();
+        assert!(
+            !stun_probe_should_run(&empty),
+            "with no netmap loaded the prober must not STUN"
+        );
+
+        // A netmap with zero peers → still closed.
+        let no_peers: Arc<RwLock<Option<Arc<PeerDb>>>> =
+            Arc::new(RwLock::new(Some(Arc::new(PeerDb::default()))));
+        assert!(
+            !stun_probe_should_run(&no_peers),
+            "an empty peer set must not STUN (Go's len(peerSet)==0 stop)"
+        );
+
+        // One peer present → open.
+        let disco = DiscoPrivateKey::random().public_key();
+        let node_key = NodePrivateKey::random().public_key();
+        let with_peer = db_with(node_with_keys(disco, node_key, "n1"));
+        assert!(
+            stun_probe_should_run(&with_peer),
+            "with a peer present the prober resumes STUN"
+        );
     }
 
     /// The periodic STUN delay is a uniform random value in `[20s, 26s)`, matching Go magicsock's
