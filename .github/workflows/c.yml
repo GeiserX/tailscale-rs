@@ -14,6 +14,13 @@ permissions:
 jobs:
   build_test:
     name: build (rust ${{ matrix.rust_toolchain.label }}, ${{ matrix.build.runner }})
+    # This matrix targets runner labels (linux-x86_64-16cpu, linux-arm64-16cpu, windows-8vcpu) that
+    # only exist in the upstream tailscale/tailscale-rs org. On this fork they do not exist, so the
+    # jobs would queue forever and never report (clogging the Actions tab + blocking nothing). Skip the
+    # whole job off-upstream — the C-FFI examples are built locally. This mirrors the same owner guard
+    # on `ci.yml`'s `build_test`/`arch_independent`, `elixir.yml`, and `python.yml`. Delete this guard
+    # if/when the fork provisions its own runners with these labels.
+    if: ${{ github.repository_owner == 'tailscale' }}
     runs-on: ${{ matrix.build.runner }}
 
     strategy:
