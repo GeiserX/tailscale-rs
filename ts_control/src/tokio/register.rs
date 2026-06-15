@@ -90,10 +90,13 @@ impl From<RegistrationError> for crate::Error {
             RegistrationError::MachineNotAuthorized(Some(u)) => {
                 crate::Error::MachineNotAuthorized(u)
             }
-            RegistrationError::MachineNotAuthorized(None) => crate::Error::Internal(
-                crate::InternalErrorKind::MachineAuthorization,
-                crate::Operation::Registration,
-            ),
+            // "Not authorized, no URL, no error" = awaiting admin approval on an approval-gated
+            // tailnet (a TRANSIENT state — the node holds a valid key and must poll until approved,
+            // then comes up with no re-registration; Go's `NeedsMachineAuth`). Surface it as the
+            // distinct `NeedsMachineAuth` so the control runner polls instead of stopping, rather
+            // than collapsing it into the generic `Internal(MachineAuthorization, _)` (which the
+            // runner treats as a hard failure → terminal `Failed`).
+            RegistrationError::MachineNotAuthorized(None) => crate::Error::NeedsMachineAuth,
             RegistrationError::Rejected(msg) => crate::Error::Registration(msg),
             RegistrationError::RateLimited(d) => crate::Error::RateLimited(d),
             RegistrationError::Internal(k) => {
@@ -477,5 +480,50 @@ mod tests {
         let resp: RegisterResponse = serde_json::from_str(&body).unwrap();
 
         assert!(classify_register_response(&resp).is_ok());
+    }
+
+    /// `MachineNotAuthorized(None)` — the await-admin-approval case — must map to the DISTINCT
+    /// `crate::Error::NeedsMachineAuth`, NOT the generic `Internal(MachineAuthorization, _)` (tsr-dvu).
+    /// This is what lets the control runner tell "awaiting approval, poll" apart from a hard internal
+    /// failure: the runner matches `NeedsMachineAuth` as a transient poll arm, while `Internal` would
+    /// fall into its terminal `Failed` arm and permanently stop the runner.
+    #[test]
+    fn machine_not_authorized_none_maps_to_needs_machine_auth() {
+        let err = crate::Error::from(RegistrationError::MachineNotAuthorized(None));
+        assert!(
+            matches!(err, crate::Error::NeedsMachineAuth),
+            "MachineNotAuthorized(None) must map to the distinct NeedsMachineAuth, got {err:?}"
+        );
+        // Specifically NOT the generic internal machine-auth error (the pre-tsr-dvu mapping that the
+        // runner treated as a hard failure).
+        assert!(!matches!(
+            err,
+            crate::Error::Internal(crate::InternalErrorKind::MachineAuthorization, _)
+        ));
+    }
+
+    /// `MachineNotAuthorized(Some(url))` — the interactive-login case — is UNCHANGED by tsr-dvu: it
+    /// still maps to the URL-carrying `crate::Error::MachineNotAuthorized(url)` (the runner surfaces
+    /// `NeedsLogin`).
+    #[test]
+    fn machine_not_authorized_some_maps_to_machine_not_authorized_url() {
+        let url: Url = "https://login.example.com/a/abc123".parse().unwrap();
+        let err = crate::Error::from(RegistrationError::MachineNotAuthorized(Some(url.clone())));
+        assert_eq!(err, crate::Error::MachineNotAuthorized(url));
+    }
+
+    /// Regression: a hard `Rejected(msg)` (bad/expired/unknown key — what `classify_register_response`
+    /// returns for not-authorized WITH an error reason) maps to `crate::Error::Registration(msg)`,
+    /// which is DISTINCT from the transient `NeedsMachineAuth`. The runner routes `Registration` to
+    /// its terminal `Failed` arm, so a genuine auth failure still terminates — tsr-dvu must NOT turn
+    /// real rejections into infinite polls.
+    #[test]
+    fn rejected_maps_to_registration_not_needs_machine_auth() {
+        let err = crate::Error::from(RegistrationError::Rejected("invalid key".to_string()));
+        assert_eq!(err, crate::Error::Registration("invalid key".to_string()));
+        assert!(
+            !matches!(err, crate::Error::NeedsMachineAuth),
+            "a hard rejection must NOT be the transient await-approval variant"
+        );
     }
 }

@@ -30,6 +30,15 @@ pub enum DeviceState {
     /// Control requires interactive authentication (no usable auth key): the node is waiting for a
     /// human to authorize it at the carried URL. Transient — registration retries until authorized.
     NeedsLogin(url::Url),
+    /// The node is registered with a valid key but awaiting **admin approval** on an approval-gated
+    /// tailnet, and control offered **no** interactive auth URL (so, unlike
+    /// [`NeedsLogin`](Self::NeedsLogin), there is nothing for a human to open — an admin must approve
+    /// the node out of band). **Transient** — treated like [`Connecting`](Self::Connecting) by the
+    /// waiters ([`wait_until_running`](crate::Runtime::wait_until_running) keeps waiting, never
+    /// settling on it); the runtime polls registration and, once an admin approves, auto-transitions
+    /// to [`Running`](Self::Running) with no re-registration (Go's `ipn.State::NeedsMachineAuth` →
+    /// `Starting`). No `browse_to_url` is derived from it (there is no URL).
+    NeedsMachineAuth,
     /// The node key expired and an automatic, non-interactive re-authentication is in progress: the
     /// runtime is rotating the node key and re-registering with the stored auth key (Go `doLogin`).
     /// **Transient** — treated like [`Connecting`](Self::Connecting) by the waiters
@@ -116,6 +125,13 @@ impl From<&ts_control::Error> for RegistrationError {
             // is reached; classifying it as `NetworkUnreachable` here keeps any other caller of this
             // conversion on the correct (non-permanent, retry-may-succeed) branch.
             ts_control::Error::RateLimited(_) => RegistrationError::NetworkUnreachable,
+            // "Awaiting admin approval, no URL" is **transient** — the node holds a valid key and the
+            // runtime polls until an admin approves, then comes up (Go `NeedsMachineAuth → Starting`),
+            // so it must NOT become a permanent `AuthRejected`. The control runner's `check_auth` and
+            // `connect` loops already intercept `NeedsMachineAuth` and poll before this mapping is
+            // reached; classifying it as `NetworkUnreachable` here keeps any other caller of this
+            // conversion on the correct (non-permanent, retry-may-succeed) branch.
+            ts_control::Error::NeedsMachineAuth => RegistrationError::NetworkUnreachable,
             // InvalidUrl / Internal: not a transient network condition and not an auth decision —
             // treat as a (permanent-ish) auth rejection carrying the display reason so the caller
             // sees something actionable rather than an opaque "timeout".
@@ -143,9 +159,13 @@ pub(crate) async fn wait_for_running(
                 DeviceState::Failed(e) => Some(Err(e.clone())),
                 DeviceState::Expired => Some(Err(RegistrationError::KeyExpired)),
                 DeviceState::NeedsLogin(u) => Some(Err(RegistrationError::NeedsLogin(u.clone()))),
-                // Transient, like `Connecting`: an auto-reauth is in flight and the next good
-                // self-node flips back to `Running`, so keep waiting rather than settling.
-                DeviceState::Connecting | DeviceState::Reauthenticating => None,
+                // Transient, like `Connecting`: keep waiting rather than settling. `Reauthenticating`
+                // — an auto-reauth is in flight and the next good self-node flips back to `Running`.
+                // `NeedsMachineAuth` — awaiting admin approval (no URL); the runtime polls and
+                // auto-transitions to `Running` once approved (Go `NeedsMachineAuth → Starting`).
+                DeviceState::Connecting
+                | DeviceState::Reauthenticating
+                | DeviceState::NeedsMachineAuth => None,
             };
             if let Some(result) = settled {
                 return result;
@@ -215,6 +235,16 @@ mod tests {
         assert!(
             !rl.is_permanent(),
             "a rate-limit must be a transient (non-permanent) failure"
+        );
+        // "Awaiting admin approval, no URL" (tsr-dvu) is TRANSIENT and must map to a non-permanent
+        // state, never the `AuthRejected` catch-all (which would wrongly mark an approval-gated node
+        // as a hard failure). Pins the explicit arm: if a refactor drops it and lets `NeedsMachineAuth`
+        // fall into `other => AuthRejected`, this fails.
+        let nma = RegistrationError::from(&ts_control::Error::NeedsMachineAuth);
+        assert_eq!(nma, RegistrationError::NetworkUnreachable);
+        assert!(
+            !nma.is_permanent(),
+            "awaiting admin approval must be a transient (non-permanent) failure"
         );
     }
 
@@ -298,6 +328,38 @@ mod tests {
     #[tokio::test]
     async fn wait_resolves_on_reauthenticating_then_running() {
         let (tx, rx) = watch::channel(DeviceState::Reauthenticating);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            tx.send_replace(DeviceState::Running);
+        });
+        assert_eq!(
+            wait_for_running(rx, Some(Duration::from_secs(1))).await,
+            Ok(())
+        );
+    }
+
+    /// `NeedsMachineAuth` is transient (a waiter never settles on it): like `Connecting`, it times
+    /// out rather than resolving to a terminal error, because the runtime polls registration and the
+    /// next good self-node flips the state back to `Running` once an admin approves. This is the
+    /// behavioral guard for tsr-dvu: an approval-gated node awaiting admin approval never surfaces as
+    /// a permanent failure (the bug was it dying terminally instead of polling).
+    #[tokio::test]
+    async fn wait_does_not_settle_on_needs_machine_auth() {
+        let (_tx, rx) = watch::channel(DeviceState::NeedsMachineAuth);
+        assert_eq!(
+            wait_for_running(rx, Some(Duration::from_millis(30))).await,
+            Err(RegistrationError::Timeout),
+            "NeedsMachineAuth is transient — a waiter keeps waiting, it does not settle"
+        );
+    }
+
+    /// The full await-approval recovery as a waiter sees it: `NeedsMachineAuth` (awaiting admin
+    /// approval) → `Running` (the admin approved; `check_auth` returned `Ok`, the netmap self-node
+    /// arrived) resolves `Ok(())`. Proves the transient state is observed and then recovered with no
+    /// re-registration — Go's `NeedsMachineAuth → Starting → Running` auto-transition.
+    #[tokio::test]
+    async fn wait_resolves_on_needs_machine_auth_then_running() {
+        let (tx, rx) = watch::channel(DeviceState::NeedsMachineAuth);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
             tx.send_replace(DeviceState::Running);

@@ -204,6 +204,23 @@ impl kameo::Actor for ControlRunner {
                         .send_replace(crate::DeviceState::NeedsLogin(u.clone()));
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
+                Err(ControlError::NeedsMachineAuth) => {
+                    // The node is registered with a valid key but awaiting ADMIN APPROVAL on an
+                    // approval-gated tailnet, and control offered NO interactive URL. This is
+                    // TRANSIENT (Go's `NeedsMachineAuth`): poll registration until an admin approves,
+                    // then `check_auth` returns `Ok(())` → the loop breaks and the node comes up with
+                    // no re-registration. Publishing the (no-URL) `NeedsMachineAuth` state — NOT a
+                    // terminal `Failed` and NOT `NeedsLogin` (there is no URL to open) — lets a
+                    // watcher / `wait_until_running` see "awaiting approval" instead of an opaque
+                    // timeout. Same 5s poll cadence as the `MachineNotAuthorized(url)` arm.
+                    tracing::info!(
+                        "machine awaiting admin approval to join the tailnet; polling until approved"
+                    );
+                    params
+                        .state_tx
+                        .send_replace(crate::DeviceState::NeedsMachineAuth);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
                 Err(ControlError::RateLimited(retry_after)) => {
                     // Control asked us to slow down (HTTP 429). Wait exactly the server-requested
                     // cooldown and retry — this is transient, NOT a terminal `Failed`, so we must
@@ -277,6 +294,25 @@ impl kameo::Actor for ControlRunner {
                         "control rate-limited the session bring-up; waiting before retry"
                     );
                     tokio::time::sleep(retry_after).await;
+                }
+                Err(ControlRunnerError::Control(ControlError::NeedsMachineAuth)) => {
+                    // `connect` issues its OWN `machine/register` POST (a second one after
+                    // `check_auth`'s), so it too can come back "awaiting admin approval, no URL". In
+                    // the normal flow the `check_auth` loop above already gated this (it only breaks
+                    // once registration returns `Ok`, and approval is monotonic), so this arm is the
+                    // defensive twin for a node de-authorized in the race window between the two POSTs:
+                    // treat it as TRANSIENT exactly like the `check_auth` arm — publish the (no-URL)
+                    // `NeedsMachineAuth` state, poll the same 5s, and retry the bring-up — rather than
+                    // collapsing into the terminal `Failed` arm below (which would permanently stop
+                    // the runner on a recoverable await-approval). Mirrors Go's `NeedsMachineAuth`.
+                    tracing::info!(
+                        "machine awaiting admin approval during session bring-up; polling until \
+                         approved"
+                    );
+                    params
+                        .state_tx
+                        .send_replace(crate::DeviceState::NeedsMachineAuth);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "bringing up the control session failed");

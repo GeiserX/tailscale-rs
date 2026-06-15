@@ -112,6 +112,16 @@ pub enum Error {
     #[error("machine was not authorized by control to join tailnet, authorize at {0}")]
     MachineNotAuthorized(url::Url),
 
+    /// A machine is not yet authorized and control offered **no** interactive auth URL — it is
+    /// awaiting admin approval on an approval-gated tailnet. **Transient and recoverable**: the node
+    /// holds a valid key and must poll-and-retry registration until an admin approves, then it comes
+    /// up with no re-registration (Go's `ipn.State::NeedsMachineAuth` → `Starting` auto-transition).
+    /// Distinct from [`Internal`](Self::Internal)`(MachineAuthorization, _)` so the control runner can
+    /// tell "awaiting approval" (poll) apart from a hard internal failure (stop), and from
+    /// [`MachineNotAuthorized`](Self::MachineNotAuthorized) which carries a URL for interactive login.
+    #[error("machine awaiting admin approval to join tailnet (no interactive auth URL)")]
+    NeedsMachineAuth,
+
     /// The user supplied an invalid URL.
     #[error("invalid URL: {0}")]
     InvalidUrl(url::Url),
