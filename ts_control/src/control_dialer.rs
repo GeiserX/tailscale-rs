@@ -95,7 +95,16 @@ impl TcpDialer for ControlTcpDialer<'_> {
                             .await?
                     }
                     DialMode::Ace { .. } => {
-                        unimplemented!()
+                        // ACE (CONNECT-proxy) dial mode is not implemented. `next_dialer` skips every
+                        // `Ace` candidate before it can reach here, so this arm is unreachable today —
+                        // but `candidate.mode` is control-supplied wire data, so return a typed error
+                        // rather than `unimplemented!()`: a future change that wires Ace dialing
+                        // without re-checking the skip must NOT be able to panic the reconnect path on
+                        // a hostile/MITM control dial plan (which would drop the node off control).
+                        Err(tokio::io::Error::new(
+                            tokio::io::ErrorKind::Unsupported,
+                            "control dial plan: ACE dial mode is unsupported",
+                        ))
                     }
                 }
             }
