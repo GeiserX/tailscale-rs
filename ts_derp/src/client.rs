@@ -13,12 +13,15 @@ use ts_packet::PacketMut;
 use ts_transport::{BatchRecvIter, BatchSendIter, UnderlayTransport};
 use url::Url;
 
+use std::time::Instant;
+
 use crate::{
     Error, ServerConnInfo, frame,
     frame::{
         ClientInfo, FrameType, Health, PeerGoneReason, Ping, RawFrame, Restarting, ServerInfo,
         ServerKey,
     },
+    rate_limit::RateLimiter,
 };
 
 type DefaultIo = ts_http_util::Upgraded;
@@ -30,6 +33,15 @@ pub type DefaultClient = Client<DefaultIo>;
 pub struct Client<Io> {
     read_conn: Mutex<FramedRead<ReadHalf<Io>, frame::Codec>>,
     write_conn: Mutex<FramedWrite<WriteHalf<Io>, frame::Codec>>,
+    /// Send rate-limiter from the server's `ServerInfo` token-bucket advertisement, or `None` when
+    /// the server advertised no limit. Gates the data-packet send path ([`send_one`](Self::send_one))
+    /// so we honor the server's `TokenBucketBytesPerSecond` directive — mirroring Go
+    /// `derp.Client.send`'s `rate.AllowN` drop. `Mutex` because [`allow_n`](crate::rate_limit::RateLimiter::allow_n)
+    /// mutates the bucket while the public send API is `&self`; held only across the cheap token
+    /// check, never across the socket write (Go holds one `wmu` for both, but splitting the locks
+    /// keeps the limiter check off the write critical section while preserving correctness — a
+    /// dropped packet never reaches the write).
+    rate_limiter: Mutex<Option<RateLimiter>>,
 }
 
 /// Establish and upgrade a http connection to the derp region.
@@ -117,14 +129,44 @@ where
         let info = decrypt_server_info(node_keypair, sk, si, payload)?;
         tracing::trace!(server_info = ?info);
 
+        // Honor the server's advertised send rate-limit (Go `setSendRateLimiter`): a zero/absent
+        // `TokenBucketBytesPerSecond` means no limiter, otherwise a token bucket the data-packet
+        // send path gates on. Previously this decoded payload was dropped on the floor, so the
+        // client sent at full rate regardless of the server's directive.
+        let rate_limiter = RateLimiter::from_server_info(
+            info.token_bucket_bytes_per_second(),
+            info.token_bucket_bytes_burst(),
+        );
+
         Ok(Self {
             read_conn: Mutex::new(fr),
             write_conn: Mutex::new(fw),
+            rate_limiter: Mutex::new(rate_limiter),
         })
     }
 
-    /// Send a message to a nodekey on the derp server.
+    /// Send a data packet to a nodekey on the derp server.
+    ///
+    /// Gated by the server-advertised send rate-limit (if any): when over the limit the packet is
+    /// **dropped silently** (`Ok(())`, no frame written) — matching Go `derp.Client.send`'s
+    /// `if !c.rate.AllowN(...) { return nil }`. A drop is not an error: the data plane retransmits,
+    /// and surfacing it as `Err` would tear down the region task. Only data packets are rate-limited;
+    /// control frames ([`send_frame`](Self::send_frame), e.g. Pong) bypass the limiter, exactly as Go
+    /// rate-limits only `Send` and not `SendPing`/`SendPong`.
     pub async fn send_one(&self, node_key: NodePublicKey, msg: &[u8]) -> Result<(), Error> {
+        // The wire size Go feeds to `AllowN`: frame header + dest key + payload. Computed even when
+        // no limiter is set (cheap) so the check is a single branch below.
+        let wire_len = crate::rate_limit::send_packet_wire_len(msg.len());
+        {
+            let mut limiter = self.rate_limiter.lock().await;
+            if let Some(limiter) = limiter.as_mut()
+                && !limiter.allow_n(Instant::now(), wire_len)
+            {
+                // Over the server's advertised rate: drop the packet (fail-open, like Go).
+                tracing::trace!(%node_key, wire_len, "derp send over rate limit, dropping packet");
+                return Ok(());
+            }
+        }
         self.send_frame_with_extra(&frame::SendPacket { dest: node_key }, msg)
             .await
     }
@@ -434,7 +476,65 @@ mod tests {
         Client {
             read_conn: Mutex::new(FramedRead::new(read_conn, frame::Codec)),
             write_conn: Mutex::new(FramedWrite::new(write_conn, frame::Codec)),
+            // These recv/control-frame tests don't exercise the send rate-limit; no limiter.
+            rate_limiter: Mutex::new(None),
         }
+    }
+
+    /// Wiring guard for the server-advertised send rate-limit: `send_one` must DROP (silently, as
+    /// `Ok`) a data packet that would exceed the limiter, writing nothing to the wire — and a
+    /// `send_one` that fits must reach the server. This locks the rate-limit gate in `send_one`
+    /// against silent removal; without it, deleting the `allow_n` check leaves every other test green.
+    ///
+    /// We build a `Client` whose write half is a duplex we read back: a tiny burst admits the first
+    /// packet, the second (same instant, over the drained bucket) is dropped, so exactly one
+    /// `FrameSendPacket` lands on the wire.
+    #[tokio::test]
+    async fn send_one_honors_server_rate_limit() {
+        use crate::rate_limit::{RateLimiter, send_packet_wire_len};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (read_conn, write_conn) = tokio::io::split(client_io);
+
+        // A 4-byte payload's wire size, and a burst that admits exactly ONE such packet (rate 0 so
+        // no refill within the test — `from_server_info` rejects rate 0, so build directly).
+        let payload = [1u8, 2, 3, 4];
+        let one_packet = send_packet_wire_len(payload.len());
+        let client = Client {
+            read_conn: Mutex::new(FramedRead::new(read_conn, frame::Codec)),
+            write_conn: Mutex::new(FramedWrite::new(write_conn, frame::Codec)),
+            // burst == one packet, rate 1 byte/s (negligible refill across the back-to-back sends).
+            rate_limiter: Mutex::new(Some(RateLimiter::new(1, one_packet))),
+        };
+
+        let dest = NodePublicKey::from([0x42u8; 32]);
+        // First send fits the full burst → delivered. Second (same instant, bucket drained) → dropped.
+        client
+            .send_one(dest, &payload)
+            .await
+            .expect("first send ok");
+        client
+            .send_one(dest, &payload)
+            .await
+            .expect("second send (dropped) is still Ok");
+
+        // Drop the client so its write half closes, giving the reader an EOF after the delivered
+        // frame(s) — otherwise `next()` would block waiting for more.
+        drop(client);
+
+        // Read back what actually reached the server: exactly one SendPacket frame.
+        let mut server_rd = FramedRead::new(server_io, frame::Codec);
+        let mut delivered = 0usize;
+        while let Some(frame) = server_rd.next().await {
+            let frame = frame.expect("decode client→server frame");
+            if frame.get().as_type::<frame::SendPacket>().is_some() {
+                delivered += 1;
+            }
+        }
+        assert_eq!(
+            delivered, 1,
+            "only the in-budget packet reaches the wire; the over-limit one is dropped"
+        );
     }
 
     /// Regression: a `Health` frame (0x14) must be consumed in-band, NOT treated as a fatal
