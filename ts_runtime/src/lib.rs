@@ -578,6 +578,16 @@ impl Runtime {
         self.direct.ask(direct::Rebind).await.map_err(Error::from)
     }
 
+    /// Force an immediate STUN / endpoint re-probe **without** rebinding the underlay socket —
+    /// Go magicsock's `Conn.ReSTUN`. Asks the `DirectManager` to run one STUN sweep now (re-learn
+    /// our reflexive/public address) while leaving the socket, its NAT mapping, learned paths, peers,
+    /// control, and DERP untouched. Lighter than [`rebind`](Self::rebind): no socket swap, no
+    /// re-ping. A no-op when the underlay is inert (bind failed at startup, DERP-only). No control
+    /// round-trip.
+    pub async fn re_stun(&self) -> Result<(), Error> {
+        self.direct.ask(direct::ReStun).await.map_err(Error::from)
+    }
+
     /// A snapshot of the local netmap: this node plus every known peer.
     ///
     /// Combines the self node held by the control runner with the peer set held by the peer

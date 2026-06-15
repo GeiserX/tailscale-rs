@@ -175,6 +175,13 @@ pub struct Node {
     /// The underlay addresses this node is reachable on (`Endpoints` in Go).
     pub underlay_addresses: Vec<SocketAddr>,
 
+    /// The node's advertised SSH host public keys, in known_hosts format (Go
+    /// `tailcfg.Hostinfo.SSHHostKeys`, surfaced by tsnet as `ipnstate.PeerStatus.SSH_HostKeys`).
+    /// Used by `tailscale ssh` to pin a peer's host key (TOFU). Empty when control advertised none
+    /// (the wire `Hostinfo.sshHostKeys` was absent), never fabricated. Projected from
+    /// [`ts_control_serde::HostInfo::ssh_host_keys`].
+    pub ssh_host_keys: Vec<String>,
+
     /// The DERP region for this node, if known.
     pub derp_region: Option<ts_derp::RegionId>,
 
@@ -798,6 +805,15 @@ impl From<&ts_control_serde::Node<'_>> for Node {
                 .filter_map(Resolver::from_serde)
                 .collect(),
             peer_relay: value.host_info.peer_relay,
+            // Project the advertised SSH host keys (Go `Hostinfo.SSHHostKeys`), mapping the
+            // borrowed `Option<Vec<&str>>` to owned `Vec<String>`; absent ⇒ empty (never
+            // fabricated), matching how `services`/`peer_relay` above are projected from host_info.
+            ssh_host_keys: value
+                .host_info
+                .ssh_host_keys
+                .as_ref()
+                .map(|keys| keys.iter().map(|k| k.to_string()).collect())
+                .unwrap_or_default(),
             service_vips,
         }
     }
@@ -920,6 +936,35 @@ mod tests {
         // Default (no owner / tagged node) stays 0.
         let tagged = ts_control_serde::Node::default();
         assert_eq!(Node::from(&tagged).user_id, 0);
+    }
+
+    /// The wire `Hostinfo.sshHostKeys` must be projected onto the domain `Node.ssh_host_keys`
+    /// (the field `tailscale ssh` reads via `StatusNode` to pin a peer's host key). Present →
+    /// carried verbatim; absent → empty (never fabricated).
+    #[test]
+    fn from_wire_node_carries_ssh_host_keys() {
+        let wire = ts_control_serde::Node {
+            host_info: ts_control_serde::HostInfo {
+                ssh_host_keys: Some(vec![
+                    "ssh-ed25519 AAAAC3Nz host",
+                    "ecdsa-sha2-nistp256 AAAAE2Vj host",
+                ]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let domain: Node = (&wire).into();
+        assert_eq!(
+            domain.ssh_host_keys,
+            vec![
+                "ssh-ed25519 AAAAC3Nz host".to_string(),
+                "ecdsa-sha2-nistp256 AAAAE2Vj host".to_string(),
+            ]
+        );
+
+        // Absent on the wire → empty Vec, not fabricated.
+        let bare = ts_control_serde::Node::default();
+        assert!(Node::from(&bare).ssh_host_keys.is_empty());
     }
 
     /// A node from an **IPv4-only** tailnet (IPv6-off control plane / Headscale) carries a
@@ -1102,6 +1147,7 @@ mod tests {
             is_wireguard_only: false,
             exit_node_dns_resolvers: vec![],
             peer_relay: false,
+            ssh_host_keys: vec![],
             service_vips: Default::default(),
         }
     }

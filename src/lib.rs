@@ -1490,6 +1490,23 @@ impl Device {
         self.runtime.rebind().await.map_err(Into::into)
     }
 
+    /// Force an immediate STUN re-probe / endpoint re-derivation **without** rebinding the underlay
+    /// socket — the Rust analog of Go magicsock's `Conn.ReSTUN("debug")` (what `tailscale debug
+    /// restun` triggers).
+    ///
+    /// Unlike [`rebind`](Self::rebind), this does **not** swap the socket or disturb any learned
+    /// path: it keeps the existing UDP socket and its NAT mapping and only re-runs the STUN sweep
+    /// now (re-learning this node's reflexive/public address) instead of waiting out the periodic
+    /// (~23s, jittered) prober. Use it when this node's public endpoint may have changed (e.g. a NAT
+    /// rebinding) but the socket itself is still fine — it is strictly lighter than a rebind.
+    ///
+    /// Peers, control, the netmap, disco keys, and DERP are untouched, and there is **no control
+    /// round-trip**. A no-op if the underlay socket failed to bind at startup (the device is
+    /// DERP-only) or while no peer is configured (matching the periodic prober's gate).
+    pub async fn re_stun(&self) -> Result<(), Error> {
+        self.runtime.re_stun().await.map_err(Into::into)
+    }
+
     /// The stable id of the exit node traffic is **currently** egressing through, or `None` if none
     /// is engaged (the equivalent of Go `tsnet`'s `Status.ExitNodeStatus.ID`).
     ///

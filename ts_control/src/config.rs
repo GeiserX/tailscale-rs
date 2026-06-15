@@ -360,6 +360,18 @@ pub struct Config {
     #[serde(default)]
     pub network_monitor: bool,
 
+    /// The fixed UDP port magicsock binds for WireGuard + disco, or `None` for an OS-chosen
+    /// ephemeral port (Go `tailscaled --port` / `ListenPort`). Defaults to `None`.
+    ///
+    /// Like the other dataplane fields, this is a client-side preference not read inside
+    /// `ts_control`; it is carried here only to be threaded into the runtime's *initial* underlay
+    /// socket bind. `None` binds `0.0.0.0:0` (ephemeral, today's behavior); `Some(p)` pins port `p`
+    /// with an ephemeral fallback if it is already taken (a port collision never fails bring-up).
+    /// Governs only the bound port, never the bind family — the IPv4-only-by-default, fail-closed
+    /// underlay posture is unchanged.
+    #[serde(default)]
+    pub wireguard_listen_port: Option<u16>,
+
     /// WireGuard persistent-keepalive interval applied to every peer, or `None` to disable persistent
     /// keepalives (`PersistentKeepalive`; Tailscale uses 25s).
     ///
@@ -650,6 +662,7 @@ impl Default for Config {
             tcp_buffer_size: None,
             enable_ipv6: false,
             network_monitor: false,
+            wireguard_listen_port: None,
             persistent_keepalive_interval: default_persistent_keepalive(),
             transport_mode: TransportMode::default(),
             wire_ingress: false,

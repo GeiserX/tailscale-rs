@@ -543,6 +543,7 @@ mod tests {
             is_wireguard_only: false,
             exit_node_dns_resolvers: vec![],
             peer_relay: false,
+            ssh_host_keys: vec![],
             service_vips: Default::default(),
         }
     }
