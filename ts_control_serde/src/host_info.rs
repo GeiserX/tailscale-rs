@@ -58,6 +58,13 @@ pub struct HostInfo<'a> {
 
     /// Indicates whether or not this Tailscale node is running inside a container. Detection is
     /// best-effort only, and may not be accurate.
+    ///
+    /// Wire parity with Go `tailcfg.Hostinfo.Container` (`opt.Bool json:",omitzero"`): `Some(true)`/
+    /// `Some(false)` marshal as the JSON bools `true`/`false` (Go's `opt.Bool.MarshalJSON`), and
+    /// `None` is **omitted** by the struct-level `apply(Option => skip_serializing_if =
+    /// Option::is_none)` rule above — Go's `omitzero` likewise drops an unset `opt.Bool` rather than
+    /// sending `"Container":null`, so a non-container host sends no `Container` key at all (sending
+    /// `null` would itself be a tell).
     pub container: Option<bool>,
     /// Represents the type of runtime environment that this Tailscale node is running in.
     #[serde(skip_serializing_if = "crate::util::is_default")]
@@ -312,5 +319,59 @@ mod tests {
         assert!(value.get("PeerRelay").is_none());
         // Sanity-check the shared bool behavior on a sibling bool field.
         assert!(value.get("ShieldsUp").is_none());
+    }
+
+    /// `Container` and `Env` wire-parity with Go `tailcfg.Hostinfo` (`Container opt.Bool` and
+    /// `Env string`, both `json:",omitzero"`): a populated container marshals as the JSON bool
+    /// `true`/`false` under the key `Container`, a known env as its short code under `Env`; and an
+    /// unset container (`None`) / unknown env are BOTH omitted — Go's `omitzero` never sends
+    /// `"Container":null` or `"Env":""`, and sending either would be a non-Go tell.
+    #[test]
+    fn container_and_env_wire_parity_with_go() {
+        // Populated: Container=true (JSON bool), Env="k8s".
+        let hi = HostInfo {
+            container: Some(true),
+            env: crate::EnvType::Kubernetes,
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&hi).unwrap();
+        assert_eq!(
+            v.get("Container").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "Container is a JSON bool under the Go key `Container`"
+        );
+        assert_eq!(
+            v.get("Env").and_then(|x| x.as_str()),
+            Some("k8s"),
+            "Env is the short code under the Go key `Env`"
+        );
+
+        // Container=false also serializes (it's a real, distinct signal, not the zero value).
+        let hi_false = HostInfo {
+            container: Some(false),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&hi_false).unwrap();
+        assert_eq!(
+            v.get("Container").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+
+        // Unset: None container + Unknown env are BOTH omitted (Go `omitzero`), never `null`/`""`.
+        let hi_unset = HostInfo::default();
+        let v = serde_json::to_value(&hi_unset).unwrap();
+        assert!(
+            v.get("Container").is_none(),
+            "an unset Container is omitted, not sent as null"
+        );
+        assert!(
+            v.get("Env").is_none(),
+            "an Unknown Env is omitted, not sent as an empty string"
+        );
+
+        // Decode side: control sends these keys; read them back.
+        let back: HostInfo = serde_json::from_str(r#"{"Container":true,"Env":"k8s"}"#).unwrap();
+        assert_eq!(back.container, Some(true));
+        assert_eq!(back.env, crate::EnvType::Kubernetes);
     }
 }

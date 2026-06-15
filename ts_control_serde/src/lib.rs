@@ -41,6 +41,7 @@ pub use dns::{
     Config as DnsConfig, Record as DnsRecord, Resolver as DnsResolver,
     ResolverAddr as DnsResolverAddr,
 };
+pub use env_type::EnvType;
 pub use host_info::HostInfo;
 pub use id_token::{TokenRequest, TokenResponse};
 pub use net_info::{DerpLatencyMap, LinkType, NetInfo};

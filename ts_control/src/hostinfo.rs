@@ -61,6 +61,14 @@ pub struct HostInfoData {
     /// Distribution code name (`HostInfo.DistroCodeName`, e.g. `noble`/`jammy`), from
     /// `/etc/os-release`'s `VERSION_CODENAME`. Empty off Linux or when undetermined.
     pub distro_code_name: String,
+    /// Whether this node runs in a container (`HostInfo.Container`), mirroring Go `inContainer()`.
+    /// `Some(true)`/`Some(false)` on Linux from best-effort file/cgroup signals; `None` off Linux
+    /// (Go returns the empty `opt.Bool` there, which omits the wire field).
+    pub container: Option<bool>,
+    /// The known managed runtime environment (`HostInfo.Env`), mirroring Go `GetEnvType()`: a short
+    /// code like `k8s`/`lm`/`fly` detected from environment variables, or [`EnvType::Unknown`] when
+    /// none matches (the common case for a plain host, which omits the wire field).
+    pub env: ts_control_serde::EnvType,
 }
 
 impl HostInfoData {
@@ -78,8 +86,107 @@ impl HostInfoData {
             distro,
             distro_version,
             distro_code_name,
+            container: in_container(),
+            env: env_type(),
         }
     }
+}
+
+/// Whether this node runs in a container, mirroring Go `hostinfo.inContainer()` (best-effort, no
+/// foolproof signal). Linux-only: Go returns the empty `opt.Bool` (→ wire field omitted) off Linux,
+/// so we return `None` there. On Linux it is `Some(false)` unless a container signal is present:
+/// `/.dockerenv` (Docker) or `/run/.containerenv` (CRI-O/Podman) exists, `/proc/1/cgroup` mentions
+/// `/docker/` or `/lxc/`, or `/proc/mounts` carries the lxcfs cpuinfo bind. (Go's `ts_package_container`
+/// build-tag fast-path has no analogue here — this fork isn't built with Go build tags — so we rely on
+/// the runtime signals, which Go also checks.)
+fn in_container() -> Option<bool> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    if std::path::Path::new("/.dockerenv").exists()
+        || std::path::Path::new("/run/.containerenv").exists()
+    {
+        return Some(true);
+    }
+    if let Ok(cgroup) = std::fs::read_to_string("/proc/1/cgroup")
+        && cgroup
+            .lines()
+            .any(|l| l.contains("/docker/") || l.contains("/lxc/"))
+    {
+        return Some(true);
+    }
+    if let Ok(mounts) = std::fs::read_to_string("/proc/mounts")
+        && mounts
+            .lines()
+            .any(|l| l.contains("lxcfs /proc/cpuinfo fuse.lxcfs"))
+    {
+        return Some(true);
+    }
+    Some(false)
+}
+
+/// The known managed runtime environment, mirroring Go `hostinfo.getEnvType()`: a first-match cascade
+/// of environment-variable probes (no network), in Go's exact order. Returns [`EnvType::Unknown`]
+/// (the wire-omitted zero value) when none matches — the common case for a plain host. Reads the real
+/// process environment via [`env_type_from`].
+fn env_type() -> ts_control_serde::EnvType {
+    env_type_from(|k| std::env::var(k).ok())
+}
+
+/// The pure core of [`env_type`]: the Go `getEnvType()` cascade against an arbitrary environment
+/// lookup `get` (`name -> Option<value>`), so it is unit-testable without mutating the racy,
+/// process-global real environment (`std::env::set_var` is `unsafe` and not test-isolated).
+fn env_type_from(get: impl Fn(&str) -> Option<alloc::string::String>) -> ts_control_serde::EnvType {
+    use ts_control_serde::EnvType;
+
+    let set = |k: &str| get(k).is_some_and(|v| !v.is_empty());
+    let eq = |k: &str, want: &str| get(k).as_deref() == Some(want);
+
+    // Knative (Cloud Run): K_REVISION + K_CONFIGURATION + K_SERVICE + PORT.
+    if set("K_REVISION") && set("K_CONFIGURATION") && set("K_SERVICE") && set("PORT") {
+        return EnvType::KNative;
+    }
+    // AWS Lambda: the four AWS_LAMBDA_* vars.
+    if set("AWS_LAMBDA_FUNCTION_NAME")
+        && set("AWS_LAMBDA_FUNCTION_VERSION")
+        && set("AWS_LAMBDA_INITIALIZATION_TYPE")
+        && set("AWS_LAMBDA_RUNTIME_API")
+    {
+        return EnvType::AWSLambda;
+    }
+    // Heroku dyno: PORT + DYNO.
+    if set("PORT") && set("DYNO") {
+        return EnvType::Heroku;
+    }
+    // Azure App Service: APPSVC_RUN_ZIP + WEBSITE_STACK + WEBSITE_AUTH_AUTO_AAD.
+    if set("APPSVC_RUN_ZIP") && set("WEBSITE_STACK") && set("WEBSITE_AUTH_AUTO_AAD") {
+        return EnvType::AzureAppService;
+    }
+    // AWS Fargate: AWS_EXECUTION_ENV == "AWS_ECS_FARGATE".
+    if eq("AWS_EXECUTION_ENV", "AWS_ECS_FARGATE") {
+        return EnvType::AWSFargate;
+    }
+    // fly.io: FLY_APP_NAME + FLY_REGION.
+    if set("FLY_APP_NAME") && set("FLY_REGION") {
+        return EnvType::FlyDotIo;
+    }
+    // Kubernetes: KUBERNETES_SERVICE_HOST + KUBERNETES_SERVICE_PORT.
+    if set("KUBERNETES_SERVICE_HOST") && set("KUBERNETES_SERVICE_PORT") {
+        return EnvType::Kubernetes;
+    }
+    // Docker Desktop: TS_HOST_ENV == "dde".
+    if eq("TS_HOST_ENV", "dde") {
+        return EnvType::DockerDesktop;
+    }
+    // repl.it: REPL_OWNER + REPL_SLUG.
+    if set("REPL_OWNER") && set("REPL_SLUG") {
+        return EnvType::Replit;
+    }
+    // Home Assistant addon: SUPERVISOR_TOKEN or HASSIO_TOKEN.
+    if set("SUPERVISOR_TOKEN") || set("HASSIO_TOKEN") {
+        return EnvType::HomeAssistantAddOn;
+    }
+    EnvType::Unknown
 }
 
 /// The `HostInfo.Package` value a node embedding a Tailscale engine reports. tsnet sets this via
@@ -355,6 +462,98 @@ mod tests {
         // `machine` is uname-derived on unix (always available there); on non-unix it falls back to
         // the Go-arch spelling, so it is non-empty on every platform.
         assert!(!h.machine.is_empty());
+    }
+
+    /// `env_type_from` mirrors Go `getEnvType()`: each known managed environment maps to its Go code,
+    /// the cascade is first-match (in Go's order), and an unrecognized/plain environment is `Unknown`.
+    #[test]
+    fn env_type_detects_known_environments() {
+        use alloc::{collections::BTreeMap, string::ToString};
+
+        use ts_control_serde::EnvType;
+
+        let env = |pairs: &[(&str, &str)]| {
+            let map: BTreeMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            move |k: &str| map.get(k).cloned()
+        };
+
+        // Empty environment → Unknown (the common plain-host case).
+        assert_eq!(env_type_from(env(&[])), EnvType::Unknown);
+
+        // Each managed environment, by its Go env-var signature.
+        assert_eq!(
+            env_type_from(env(&[
+                ("K_REVISION", "r"),
+                ("K_CONFIGURATION", "c"),
+                ("K_SERVICE", "s"),
+                ("PORT", "8080"),
+            ])),
+            EnvType::KNative,
+        );
+        assert_eq!(
+            env_type_from(env(&[
+                ("AWS_LAMBDA_FUNCTION_NAME", "f"),
+                ("AWS_LAMBDA_FUNCTION_VERSION", "1"),
+                ("AWS_LAMBDA_INITIALIZATION_TYPE", "on-demand"),
+                ("AWS_LAMBDA_RUNTIME_API", "127.0.0.1:9001"),
+            ])),
+            EnvType::AWSLambda,
+        );
+        assert_eq!(
+            env_type_from(env(&[("PORT", "5000"), ("DYNO", "web.1")])),
+            EnvType::Heroku,
+        );
+        assert_eq!(
+            env_type_from(env(&[("AWS_EXECUTION_ENV", "AWS_ECS_FARGATE")])),
+            EnvType::AWSFargate,
+        );
+        assert_eq!(
+            env_type_from(env(&[("FLY_APP_NAME", "a"), ("FLY_REGION", "iad")])),
+            EnvType::FlyDotIo,
+        );
+        assert_eq!(
+            env_type_from(env(&[
+                ("KUBERNETES_SERVICE_HOST", "10.0.0.1"),
+                ("KUBERNETES_SERVICE_PORT", "443"),
+            ])),
+            EnvType::Kubernetes,
+        );
+        assert_eq!(
+            env_type_from(env(&[("TS_HOST_ENV", "dde")])),
+            EnvType::DockerDesktop,
+        );
+        assert_eq!(
+            env_type_from(env(&[("REPL_OWNER", "o"), ("REPL_SLUG", "s")])),
+            EnvType::Replit,
+        );
+        assert_eq!(
+            env_type_from(env(&[("SUPERVISOR_TOKEN", "t")])),
+            EnvType::HomeAssistantAddOn,
+        );
+
+        // First-match order (Go's cascade): Knative outranks Heroku even though PORT alone would also
+        // satisfy Heroku's PORT+DYNO once DYNO is present — here the full Knative set wins first.
+        assert_eq!(
+            env_type_from(env(&[
+                ("K_REVISION", "r"),
+                ("K_CONFIGURATION", "c"),
+                ("K_SERVICE", "s"),
+                ("PORT", "8080"),
+                ("DYNO", "web.1"),
+            ])),
+            EnvType::KNative,
+            "Knative is checked before Heroku in Go's cascade",
+        );
+
+        // An empty-valued var does not count as set (Go's `os.Getenv(k) != ""`).
+        assert_eq!(
+            env_type_from(env(&[("FLY_APP_NAME", ""), ("FLY_REGION", "iad")])),
+            EnvType::Unknown,
+            "an empty FLY_APP_NAME is not 'set'",
+        );
     }
 
     #[test]
