@@ -156,15 +156,34 @@ pub struct StateUpdate {
     pub peer_seen_change: alloc::collections::BTreeMap<crate::NodeId, bool>,
 }
 
-/// Upper bound on a single netmap frame, checked before allocating the read buffer.
+/// Upper bound on a single netmap frame as read off the wire, checked before allocating the read
+/// buffer.
 ///
 /// The frame length is a `u32` read straight off the (authenticated, ts2021-Noise) control stream;
 /// without a cap, `PacketMut::new(msg_len)` eagerly zero-allocates up to ~4 GiB, so a malformed or
 /// hostile control frame OOMs the client. Every other framed path in the fork bounds before
 /// allocating (DERP 64 KiB, TKA-sync 10 MiB, control-noise `MAX_MESSAGE_SIZE`); this matches that
-/// discipline. 16 MiB is comfortably above any real netmap (Go bounds this similarly) and `compress`
-/// is sent empty, so the on-wire length equals the buffer size with no decompression amplification.
+/// discipline. Since we advertise `Compress = "zstd"` (see [`MapRequestBuilder`][crate::MapRequestBuilder]),
+/// this length is the *compressed* frame size; compressed JSON is strictly smaller than its
+/// expansion, so 16 MiB stays comfortably above any real netmap's on-wire size. The decompressed
+/// size is bounded separately by [`MAX_DECODED_NETMAP`] (the decompression-amplification / zip-bomb
+/// guard).
 const MAX_NETMAP_FRAME: u32 = 16 * 1024 * 1024;
+
+/// Upper bound on a single netmap frame *after* zstd decompression — the zip-bomb / decompression-
+/// amplification guard.
+///
+/// Control answers every streaming map poll `Compress = "zstd"` framed (Go
+/// `control/controlclient/direct.go`), so each frame is decompressed before it is deserialized. A
+/// small compressed frame can expand enormously (a zstd bomb), so the decompressed output is bounded
+/// independently of the on-wire [`MAX_NETMAP_FRAME`]: the reader decompresses at most this many bytes
+/// and ends the stream if a frame would exceed it, rather than letting a hostile (or buggy) control
+/// frame drive an unbounded allocation. 64 MiB matches the default decoder memory ceiling Go's zstd
+/// decoder runs under (`klauspost/compress` `WithDecoderMaxMemory` default) and is far above any real
+/// netmap's decoded size, so it never rejects legitimate traffic. ruzstd additionally rejects an
+/// over-large declared *window* at frame-init, so neither the window header nor the output can drive
+/// an unbounded allocation.
+const MAX_DECODED_NETMAP: u64 = 64 * 1024 * 1024;
 
 /// Long-poll read watchdog: if no frame (not even a keep-alive) arrives within this window, end the
 /// stream so the caller reconnects. Control sends a keep-alive roughly every minute on a streaming
@@ -174,6 +193,61 @@ const MAX_NETMAP_FRAME: u32 = 16 * 1024 * 1024;
 /// node silently stops receiving netmap updates (missed peer/DERP/key-expiry/ACL/TKA changes) with
 /// no reconnect ever attempted. Mirrors Go `controlclient` `direct.go`'s `watchdogTimeout = 120s`.
 const MAP_READ_WATCHDOG: core::time::Duration = core::time::Duration::from_secs(120);
+
+/// The 4-byte zstd frame magic (`0xFD2FB528`, little-endian on the wire). Used to distinguish a
+/// `Compress = "zstd"` framed response from an uncompressed one, so a control plane that ignored the
+/// `Compress` request (and replied in plain JSON) still decodes instead of wedging the poll.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+
+/// Decompress one raw map-poll frame into the JSON bytes to deserialize.
+///
+/// Control answers every streaming map poll `Compress = "zstd"` framed (we advertise it on every
+/// request, like Go), so the common path is: recognize the zstd magic, then stream-decompress the
+/// frame while bounding the decompressed size to [`MAX_DECODED_NETMAP`] (the zip-bomb guard — a tiny
+/// frame can otherwise expand to gigabytes). To bound it, we read **one byte past** the limit and
+/// reject if that many bytes were produced.
+///
+/// A frame that does *not* begin with the zstd magic is returned verbatim: a control plane may ignore
+/// the `Compress` request and reply uncompressed (Go's own `decodeMsg` keeps a keep-alive fast-path
+/// and otherwise always decodes, but tolerating plain JSON here costs nothing on the wire and avoids
+/// a silent stall against a non-Go control plane). JSON never begins with `0x28`, so the two forms
+/// are unambiguous.
+///
+/// Returns `None` on a malformed or oversized zstd frame, which the caller turns into "end the stream
+/// and reconnect" — the same recovery as every other frame-read failure in [`map_stream`].
+fn decompress_frame(frame: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+    use std::io::Read as _;
+
+    // Not zstd-framed: a control plane that replied uncompressed. Return the bytes as-is.
+    if frame.len() < ZSTD_MAGIC.len() || frame[..ZSTD_MAGIC.len()] != ZSTD_MAGIC {
+        return Some(frame.to_vec());
+    }
+
+    let mut decoder = ruzstd::decoding::StreamingDecoder::new(frame)
+        .inspect_err(|e| tracing::error!(error = %e, "initializing zstd decoder for netmap frame"))
+        .ok()?;
+
+    // Read at most `MAX_DECODED_NETMAP + 1` bytes: if the decoder yields that many, the frame
+    // decompresses to more than the bound and is rejected (zip-bomb guard) rather than allowed to
+    // drive an unbounded allocation.
+    let mut decoded = alloc::vec::Vec::new();
+    decoder
+        .by_ref()
+        .take(MAX_DECODED_NETMAP + 1)
+        .read_to_end(&mut decoded)
+        .inspect_err(|e| tracing::error!(error = %e, "decompressing netmap frame"))
+        .ok()?;
+
+    if decoded.len() as u64 > MAX_DECODED_NETMAP {
+        tracing::error!(
+            max = MAX_DECODED_NETMAP,
+            "decompressed netmap frame exceeds bound; ending stream"
+        );
+        return None;
+    }
+
+    Some(decoded)
+}
 
 pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpdate> {
     futures_util::stream::unfold(reader, async |mut reader| {
@@ -225,7 +299,17 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
             }
         };
 
-        let map_response: MapResponse = serde_json::from_slice(buf.as_ref())
+        // We advertise `Compress = "zstd"` on every map request, so control frames each `MapResponse`
+        // as an independent zstd frame (Go `control/controlclient/direct.go` does the same and
+        // unconditionally `zstdframe.AppendDecode`s the reply). Decompress before deserializing,
+        // bounding the decompressed size against a zstd bomb. A frame that is NOT zstd-framed (a
+        // control plane that ignored our `Compress` request and replied uncompressed) is parsed
+        // as-is — graceful degradation, never a silent stall, at no wire-fingerprint cost (the
+        // request is byte-identical to Go's either way). A malformed/oversized zstd frame ends the
+        // stream (`None`) so the caller reconnects, mirroring the other frame-read failure paths.
+        let decoded = decompress_frame(buf.as_ref())?;
+
+        let map_response: MapResponse = serde_json::from_slice(&decoded)
             .inspect_err(|e| {
                 tracing::error!(error = %e, "deserializing netmap");
             })
@@ -421,9 +505,29 @@ mod tests {
 
     use super::*;
 
-    /// Frame each JSON body the way control does: a little-endian u32 length prefix followed by the
-    /// JSON bytes. Returns a single buffer the `map_stream` reader can consume.
+    /// Frame each JSON body the way control does on a real map poll: zstd-compress the body, then
+    /// prefix it with a little-endian u32 length (of the *compressed* bytes). Because we advertise
+    /// `Compress = "zstd"`, this is what control sends, so the tests exercise the production
+    /// decompression path in `decompress_frame` rather than a bypassed plain-JSON one. Returns a
+    /// single buffer the `map_stream` reader can consume.
     fn frame(bodies: &[&str]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for body in bodies {
+            let compressed = ruzstd::encoding::compress_to_vec(
+                body.as_bytes(),
+                ruzstd::encoding::CompressionLevel::Fastest,
+            );
+            buf.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&compressed);
+        }
+        buf
+    }
+
+    /// Like [`frame`], but leaves each body uncompressed (plain JSON, length-prefixed). Models a
+    /// control plane that ignored our `Compress = "zstd"` request and replied uncompressed; the
+    /// reader must still decode it (graceful degradation) via the non-zstd-magic branch of
+    /// `decompress_frame`.
+    fn frame_uncompressed(bodies: &[&str]) -> Vec<u8> {
         let mut buf = Vec::new();
         for body in bodies {
             buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
@@ -688,5 +792,112 @@ mod tests {
                 panic!("empty Peers + PeersRemoved must be Delta (delta honored), got {other:?}")
             }
         }
+    }
+
+    /// Cross-implementation interop KAT: a zstd frame produced by a FOREIGN encoder (the reference
+    /// `zstd` CLI v1.5.7, `zstd -c -19`) must decode to the original JSON and drive a `StateUpdate`.
+    /// This is the property that actually matters in production — control (Go's `klauspost/compress`
+    /// zstd encoder) frames each `MapResponse`, and we must decode *its* output, not just frames our
+    /// own `ruzstd` round-trips. A foreign-encoder vector proves real interop. Embedded as a const so
+    /// the test is hermetic (no CLI needed at test time).
+    #[tokio::test]
+    async fn decodes_foreign_zstd_frame_interop_kat() {
+        // zstd frame for {"MapSessionHandle":"sess-golden","Seq":7}
+        // produced by the reference zstd CLI v1.5.7 (`zstd -c -19`) — a FOREIGN encoder, 55 bytes.
+        const GOLDEN_ZSTD_FRAME: &[u8] = &[
+            0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x68, 0x51, 0x01, 0x00, 0x7b, 0x22, 0x4d, 0x61, 0x70,
+            0x53, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x48, 0x61, 0x6e, 0x64, 0x6c, 0x65, 0x22,
+            0x3a, 0x22, 0x73, 0x65, 0x73, 0x73, 0x2d, 0x67, 0x6f, 0x6c, 0x64, 0x65, 0x6e, 0x22,
+            0x2c, 0x22, 0x53, 0x65, 0x71, 0x22, 0x3a, 0x37, 0x7d, 0xaf, 0xf4, 0x50, 0x88,
+        ];
+
+        // Sanity: the embedded vector is a real zstd frame (magic), produced by a different encoder
+        // than the one under test (its content/checksum differs from what `ruzstd` would emit).
+        assert_eq!(&GOLDEN_ZSTD_FRAME[..4], &ZSTD_MAGIC);
+
+        // Length-prefix it as control would on the wire, then feed it through the reader.
+        let mut buf = (GOLDEN_ZSTD_FRAME.len() as u32).to_le_bytes().to_vec();
+        buf.extend_from_slice(GOLDEN_ZSTD_FRAME);
+
+        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let update = stream.next().await.expect("one update from the foreign zstd frame");
+        assert_eq!(update.session_handle.as_deref(), Some("sess-golden"));
+        assert_eq!(update.seq, 7);
+    }
+
+    /// Graceful degradation: a control plane that ignores our `Compress = "zstd"` request and replies
+    /// with an uncompressed (plain-JSON) frame must STILL decode — `decompress_frame` recognizes the
+    /// absence of the zstd magic and parses the body verbatim. Without this tolerance such a control
+    /// plane would wedge the poll (every frame failing to "decompress"). Costs nothing on the wire:
+    /// our request is byte-identical either way.
+    #[tokio::test]
+    async fn decodes_uncompressed_frame_when_control_ignores_compress() {
+        let buf = frame_uncompressed(&[r#"{"MapSessionHandle":"sess-plain","Seq":3}"#]);
+
+        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let update = stream.next().await.expect("uncompressed frame must still decode");
+        assert_eq!(update.session_handle.as_deref(), Some("sess-plain"));
+        assert_eq!(update.seq, 3);
+    }
+
+    /// A round-trip through our own `frame()` helper (which now zstd-compresses, like control) must
+    /// decode — the baseline that every other content test in this module implicitly relies on, made
+    /// explicit. Pairs with the foreign-encoder KAT above (encode-side ⊕ decode-side coverage).
+    #[tokio::test]
+    async fn decodes_self_compressed_zstd_frame() {
+        let buf = frame(&[r#"{"MapSessionHandle":"sess-self","Seq":9}"#]);
+        // The helper really did compress (zstd magic present after the 4-byte length prefix).
+        assert_eq!(&buf[4..8], &ZSTD_MAGIC);
+
+        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let update = stream.next().await.expect("self-compressed frame must decode");
+        assert_eq!(update.session_handle.as_deref(), Some("sess-self"));
+        assert_eq!(update.seq, 9);
+    }
+
+    /// Zip-bomb guard: a small zstd frame that decompresses to MORE than `MAX_DECODED_NETMAP` must be
+    /// rejected (the stream ends, `None`) rather than driving an unbounded allocation. We build a
+    /// frame whose decompressed size is just over the bound; `decompress_frame` reads one byte past
+    /// the limit, sees it exceeded, and bails. This is the decompression-amplification defense that
+    /// the on-wire `MAX_NETMAP_FRAME` (compressed-size) bound cannot provide.
+    #[tokio::test]
+    async fn rejects_zstd_bomb_exceeding_decoded_bound() {
+        // Highly compressible payload (all zero bytes) just over the decoded bound. It is NOT valid
+        // JSON, but the size guard fires during decompression, before any deserialize is attempted.
+        let oversized = alloc::vec![0u8; (MAX_DECODED_NETMAP + 1) as usize];
+        let compressed = ruzstd::encoding::compress_to_vec(
+            oversized.as_slice(),
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        // The bomb is tiny on the wire (well under the compressed-frame cap) yet expands past the
+        // decoded cap — exactly the amplification the guard exists for.
+        assert!((compressed.len() as u32) < MAX_NETMAP_FRAME);
+
+        let mut buf = (compressed.len() as u32).to_le_bytes().to_vec();
+        buf.extend_from_slice(&compressed);
+
+        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        assert!(
+            stream.next().await.is_none(),
+            "a frame decompressing past MAX_DECODED_NETMAP must end the stream, not allocate it"
+        );
+    }
+
+    /// A frame that begins with the zstd magic but is then truncated/garbage must end the stream
+    /// (`None`) — a decode error is treated as a torn connection (reconnect), never a panic or hang.
+    #[tokio::test]
+    async fn rejects_malformed_zstd_frame() {
+        // zstd magic followed by junk that is not a valid frame body.
+        let mut body = ZSTD_MAGIC.to_vec();
+        body.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0x00]);
+
+        let mut buf = (body.len() as u32).to_le_bytes().to_vec();
+        buf.extend_from_slice(&body);
+
+        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        assert!(
+            stream.next().await.is_none(),
+            "a malformed zstd frame must end the stream cleanly"
+        );
     }
 }

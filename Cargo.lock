@@ -491,12 +491,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bounded-integer"
-version = "0.5.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "102dbef1187b1893e6dfe05a774e79fd52265f49f214f6879c8ff49f52c8188b"
-
-[[package]]
 name = "bs58"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -659,7 +653,7 @@ dependencies = [
 
 [[package]]
 name = "checks"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "clap 4.6.1",
  "globwalk",
@@ -932,21 +926,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crc"
-version = "3.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5eb8a2a1cd12ab0d987a5d5e825195d372001a4094a0376319d5a0ad71c1ba0d"
-dependencies = [
- "crc-catalog",
-]
-
-[[package]]
-name = "crc-catalog"
-version = "2.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
-
-[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1208,20 +1187,6 @@ dependencies = [
  "darling_core",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "dashmap"
-version = "6.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5041cc499144891f3790297212f32a74fb938e5136a14943f338ef9e0ae276cf"
-dependencies = [
- "cfg-if",
- "crossbeam-utils",
- "hashbrown 0.14.5",
- "lock_api",
- "once_cell",
- "parking_lot_core",
 ]
 
 [[package]]
@@ -1596,26 +1561,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "enumflags2"
-version = "0.7.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1027f7680c853e056ebcec683615fb6fbbc07dbaa13b4d5d9442b146ded4ecef"
-dependencies = [
- "enumflags2_derive",
-]
-
-[[package]]
-name = "enumflags2_derive"
-version = "0.7.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67c78a4d8fdf9953a5c9d458f9efe940fd97a0cab0941c075a813ac594733827"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1669,12 +1614,6 @@ dependencies = [
  "event-listener",
  "pin-project-lite",
 ]
-
-[[package]]
-name = "fallible-iterator"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
 
 [[package]]
 name = "fancy-regex"
@@ -1901,7 +1840,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_tailscale"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "axum",
  "bytes",
@@ -1940,7 +1879,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_array256"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "geiserx_ts_bitset",
  "heapless",
@@ -1952,7 +1891,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_bart"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "cfg-if",
  "divan",
@@ -1971,7 +1910,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_bart_packetfilter"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "geiserx_ts_array256",
  "geiserx_ts_bart",
@@ -1986,7 +1925,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_bitset"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "cfg-if",
  "divan",
@@ -1996,14 +1935,14 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_capabilityversion"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "geiserx_ts_control"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2025,11 +1964,13 @@ dependencies = [
  "gethostname",
  "ipnet",
  "lazy_static",
+ "libc",
  "pin-project-lite",
  "rand 0.10.1",
  "rcgen",
  "ring",
  "rustls-pemfile",
+ "ruzstd",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2044,7 +1985,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_control_noise"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2069,7 +2010,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_control_serde"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2087,7 +2028,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_dataplane"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "etherparse",
  "geiserx_ts_bart",
@@ -2104,7 +2045,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_derp"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "bytes",
  "crypto_box",
@@ -2132,7 +2073,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_disco_protocol"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "aead 0.5.2",
  "crypto_box",
@@ -2146,11 +2087,11 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_dns_wire"
-version = "0.32.0"
+version = "0.39.0"
 
 [[package]]
 name = "geiserx_ts_dynbitset"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "geiserx_ts_bitset",
  "proptest",
@@ -2159,7 +2100,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_elixir"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "geiserx_tailscale",
  "geiserx_ts_control",
@@ -2170,7 +2111,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_ffi"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "cbindgen",
  "geiserx_tailscale",
@@ -2182,7 +2123,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_forwarder"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "bytes",
  "geiserx_ts_netstack_smoltcp",
@@ -2194,14 +2135,14 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_hexdump"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "heapless",
 ]
 
 [[package]]
 name = "geiserx_ts_host_net"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "ipnet",
  "thiserror 2.0.18",
@@ -2210,7 +2151,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_http_util"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "bytes",
  "futures",
@@ -2231,7 +2172,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_keys"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "crypto_box",
  "ed25519-dalek 2.2.0",
@@ -2247,7 +2188,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_magicsock"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "geiserx_ts_disco_protocol",
  "geiserx_ts_keys",
@@ -2265,21 +2206,18 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_metrics"
-version = "0.32.0"
+version = "0.39.0"
 
 [[package]]
 name = "geiserx_ts_netcheck"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
- "bytes",
- "dashmap",
  "geiserx_ts_control",
  "geiserx_ts_control_serde",
  "geiserx_ts_derp",
  "geiserx_ts_http_util",
  "reqwest",
  "serde_json",
- "stun-rs",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2290,7 +2228,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_netstack_smoltcp"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "axum",
  "bytes",
@@ -2311,7 +2249,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_netstack_smoltcp_core"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "bytes",
  "flume",
@@ -2325,7 +2263,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_netstack_smoltcp_socket"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "bytes",
  "futures-io",
@@ -2336,7 +2274,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_nodecapability"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "cfg-if",
  "serde",
@@ -2345,7 +2283,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_overlay_router"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "geiserx_ts_bart",
  "geiserx_ts_packet",
@@ -2356,7 +2294,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_packet"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "bytes",
  "crypto_box",
@@ -2365,7 +2303,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_packetfilter"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "hashbrown 0.17.1",
  "ipnet",
@@ -2375,7 +2313,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_packetfilter_serde"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "geiserx_ts_nodecapability",
  "geiserx_ts_peercapability",
@@ -2388,7 +2326,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_packetfilter_state"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "divan",
  "geiserx_ts_bart_packetfilter",
@@ -2401,7 +2339,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_peercapability"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "serde",
  "url",
@@ -2409,7 +2347,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_python"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "geiserx_tailscale",
  "geiserx_ts_control",
@@ -2422,7 +2360,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_runtime"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2454,6 +2392,7 @@ dependencies = [
  "itertools",
  "kameo",
  "kameo_actors",
+ "libc",
  "proptest",
  "rand 0.10.1",
  "smallvec",
@@ -2465,14 +2404,14 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_time"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "geiserx_ts_tka"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "argon2 0.5.3",
  "blake2 0.10.6",
@@ -2484,7 +2423,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_tls_util"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "rcgen",
  "ring",
@@ -2499,14 +2438,14 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_transport"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "geiserx_ts_packet",
 ]
 
 [[package]]
 name = "geiserx_ts_transport_tun"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "bytes",
  "geiserx_ts_hexdump",
@@ -2522,7 +2461,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_tunnel"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "aead 0.5.2",
  "base64 0.22.1",
@@ -2550,7 +2489,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_underlay_router"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "geiserx_ts_packet",
  "geiserx_ts_transport",
@@ -2753,12 +2692,6 @@ checksum = "8a9ee70c43aaf417c914396645a0fa852624801b24ebb7ae78fe8272889ac888"
 
 [[package]]
 name = "hashbrown"
-version = "0.14.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
-
-[[package]]
-name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
@@ -2873,28 +2806,6 @@ checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
 dependencies = [
  "digest 0.11.3",
 ]
-
-[[package]]
-name = "hmac-sha1"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b05da5b9e5d4720bfb691eebb2b9d42da3570745da71eac8a1f5bb7e59aab88"
-dependencies = [
- "hmac 0.12.1",
- "sha1 0.10.6",
-]
-
-[[package]]
-name = "hmac-sha256"
-version = "1.1.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec9d92d097f4749b64e8cc33d924d9f40a2d4eb91402b458014b781f5733d60f"
-
-[[package]]
-name = "hostname-validator"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f558a64ac9af88b5ba400d99b579451af0d39c6d360980045b91aac966d705e2"
 
 [[package]]
 name = "http"
@@ -3609,12 +3520,6 @@ name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
-
-[[package]]
-name = "md5"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
 
 [[package]]
 name = "md5"
@@ -4385,40 +4290,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "precis-core"
-version = "0.1.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c2e7b31f132e0c6f8682cfb7bf4a5340dbe925b7986618d0826a56dfe0c8e56"
-dependencies = [
- "precis-tools",
- "ucd-parse",
- "unicode-normalization",
-]
-
-[[package]]
-name = "precis-profiles"
-version = "0.1.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31e2768890a47af73a032af9f0cedbddce3c9d06cf8de201d5b8f2436ded7674"
-dependencies = [
- "lazy_static",
- "precis-core",
- "precis-tools",
- "unicode-normalization",
-]
-
-[[package]]
-name = "precis-tools"
-version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cc1eb2d5887ac7bfd2c0b745764db89edb84b856e4214e204ef48ef96d10c4a"
-dependencies = [
- "lazy_static",
- "regex",
- "ucd-parse",
-]
-
-[[package]]
 name = "prettyplease"
 version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4696,16 +4567,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "41f2619966050689382d2b44f664f4bc593e129785a36d6ee376ddf37259b924"
 dependencies = [
  "proc-macro2",
-]
-
-[[package]]
-name = "quoted-string-parser"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0dc75379cdb451d001f1cb667a9f74e8b355e9df84cc5193513cbe62b96fc5e9"
-dependencies = [
- "pest",
- "pest_derive",
 ]
 
 [[package]]
@@ -5089,7 +4950,7 @@ dependencies = [
  "internal-russh-num-bigint",
  "keccak",
  "log",
- "md5 0.8.0",
+ "md5",
  "ml-kem",
  "module-lattice",
  "num-bigint",
@@ -5108,7 +4969,7 @@ dependencies = [
  "salsa20 0.11.0",
  "scrypt",
  "sec1",
- "sha1 0.11.0",
+ "sha1",
  "sha2 0.11.0",
  "sha3",
  "signature 3.0.0",
@@ -5301,6 +5162,15 @@ dependencies = [
  "quick-error",
  "tempfile",
  "wait-timeout",
+]
+
+[[package]]
+name = "ruzstd"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7c1c839d570d835527c9a5e4db7cb2198683a988cb9d7293fc8674e6bd58fc8"
+dependencies = [
+ "twox-hash",
 ]
 
 [[package]]
@@ -5576,17 +5446,6 @@ dependencies = [
 
 [[package]]
 name = "sha1"
-version = "0.10.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.2.17",
- "digest 0.10.7",
-]
-
-[[package]]
-name = "sha1"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
@@ -5838,7 +5697,7 @@ dependencies = [
  "p521",
  "rand_core 0.10.1",
  "sec1",
- "sha1 0.11.0",
+ "sha1",
  "sha2 0.11.0",
  "signature 3.0.0",
  "ssh-cipher",
@@ -5889,30 +5748,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "stun-rs"
-version = "0.1.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb921f10397d5669e1af6455e9e2d367bf1f9cebcd6b1dd1dc50e19f6a9ac2ac"
-dependencies = [
- "base64 0.22.1",
- "bounded-integer",
- "byteorder",
- "crc",
- "enumflags2",
- "fallible-iterator",
- "hmac-sha1",
- "hmac-sha256",
- "hostname-validator",
- "lazy_static",
- "md5 0.7.0",
- "paste",
- "precis-core",
- "precis-profiles",
- "quoted-string-parser",
- "rand 0.9.4",
 ]
 
 [[package]]
@@ -6542,7 +6377,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "ts_cli_util"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "cfg-if",
  "clap 4.6.1",
@@ -6561,7 +6396,7 @@ dependencies = [
 
 [[package]]
 name = "ts_devtools"
-version = "0.32.0"
+version = "0.39.0"
 dependencies = [
  "bytes",
  "clap 4.6.1",
@@ -6577,7 +6412,7 @@ dependencies = [
 
 [[package]]
 name = "ts_test_util"
-version = "0.32.0"
+version = "0.39.0"
 
 [[package]]
 name = "tun-rs"
@@ -6608,19 +6443,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "twox-hash"
+version = "2.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ea3136b675547379c4bd395ca6b938e5ad3c3d20fad76e7fe85f9e0d011419c"
+
+[[package]]
 name = "typenum"
 version = "1.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40ce102ab67701b8526c123c1bab5cbe42d7040ccfd0f64af1a385808d2f43de"
-
-[[package]]
-name = "ucd-parse"
-version = "0.1.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c06ff81122fcbf4df4c1660b15f7e3336058e7aec14437c9f85c6b31a0f279b9"
-dependencies = [
- "regex-lite",
-]
 
 [[package]]
 name = "ucd-trie"
@@ -6645,15 +6477,6 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
-
-[[package]]
-name = "unicode-normalization"
-version = "0.1.25"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
-dependencies = [
- "tinyvec",
-]
 
 [[package]]
 name = "unicode-segmentation"

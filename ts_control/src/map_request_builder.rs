@@ -22,6 +22,14 @@ impl<'a> MapRequestBuilder<'a> {
             req: MapRequest {
                 version: CapabilityVersion::CURRENT,
 
+                // Advertise zstd response compression on every map request, matching Go
+                // (`control/controlclient/direct.go` sets `request.Compress = "zstd"` unconditionally
+                // for all client builds). Control then frames each `MapResponse` as an independent
+                // zstd frame, which the map-poll reader (`tokio::map_stream`) decompresses. An empty
+                // `Compress` (no compression) is itself an observable not-Go tell; "zstd" is what a
+                // real `tailscaled`/`tsnet` node sends.
+                compress: "zstd",
+
                 keep_alive: false,
                 omit_peers: true,
                 stream: false,
@@ -227,6 +235,26 @@ mod tests {
     use ts_control_serde::EndpointType;
 
     use super::*;
+
+    /// Every map request must advertise `Compress = "zstd"` (Go sets `request.Compress = "zstd"`
+    /// unconditionally in `control/controlclient/direct.go`). An empty `Compress` is an observable
+    /// not-Go tell, and control would then reply uncompressed while our reader expects zstd frames.
+    /// Pinned on the freshly-built request (the default the streaming poll and every side command
+    /// inherit).
+    #[test]
+    fn new_advertises_zstd_compression() {
+        let node_state = ts_keys::NodeState::generate();
+        let req = MapRequestBuilder::new(&node_state).build();
+        assert_eq!(req.compress, "zstd");
+
+        // And it survives serialization as the Go wire key `Compress` (not omitted): a real
+        // `tailscaled`/`tsnet` node always sends it.
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value.get("Compress").and_then(serde_json::Value::as_str),
+            Some("zstd"),
+        );
+    }
 
     #[test]
     fn endpoints_setter_populates_request() {
