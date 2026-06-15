@@ -2,6 +2,19 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.41.0](https://github.com/GeiserX/tailscale-rs/compare/v0.40.0...v0.41.0) (2026-06-15)
+
+
+### Features
+
+* add Device::suggest_exit_node mirroring Go SuggestExitNode ([#267](https://github.com/GeiserX/tailscale-rs/issues/267)) ([73f56b1](https://github.com/GeiserX/tailscale-rs/commit/73f56b1ef06f2ae3587f731609fd25a0db5a9884))
+* add up/set pref Config fields — app-connector advertise, auto-update, operator, nickname, posture, webclient ([#268](https://github.com/GeiserX/tailscale-rs/issues/268)) ([8e207af](https://github.com/GeiserX/tailscale-rs/commit/8e207afab4c870c9ecf1d6178abdd85e2ad81539))
+
+
+### Bug Fixes
+
+* publish ts_netmon crate so the workspace release completes ([#264](https://github.com/GeiserX/tailscale-rs/issues/264)) ([2871446](https://github.com/GeiserX/tailscale-rs/commit/2871446b62745ce98b4c120c1f3d3b5bffa8a877))
+
 ## [0.40.0](https://github.com/GeiserX/tailscale-rs/compare/v0.39.0...v0.40.0) (2026-06-15)
 
 
