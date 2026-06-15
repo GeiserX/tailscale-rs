@@ -2,6 +2,14 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.40.0](https://github.com/GeiserX/tailscale-rs/compare/v0.39.0...v0.40.0) (2026-06-15)
+
+
+### Features
+
+* **control:** advertise and decode zstd-compressed map responses ([#257](https://github.com/GeiserX/tailscale-rs/issues/257)) ([cc51772](https://github.com/GeiserX/tailscale-rs/commit/cc517725d29daf8ce36b1ec62068ff2251c7e55e))
+* **hostinfo:** detect Container + Env to match Go hostinfo.New ([#255](https://github.com/GeiserX/tailscale-rs/issues/255)) ([26d5abc](https://github.com/GeiserX/tailscale-rs/commit/26d5abc3959a412b571d8185bb0b477eb5890487))
+
 ## [0.39.0](https://github.com/GeiserX/tailscale-rs/compare/v0.38.0...v0.39.0) (2026-06-15)
 
 
