@@ -108,6 +108,13 @@ impl core::str::FromStr for ProtoPortRange {
     /// Parse Go's text form `[<proto>:]<ports>` (the inverse of [`Display`]). `<proto>` is a
     /// `preferredNames` name (case-insensitive) or a decimal `u8`; absent means proto 0. `<ports>` is
     /// `*` (the any span), a single port, or `low-high`.
+    ///
+    /// Proto names are resolved against [`PROTO_NAMES`] (Go's `ipproto.preferredNames`, the *marshal*
+    /// set). Go's `ipproto.UnmarshalText` accepts a slightly larger `acceptedNames` alias set
+    /// (`icmpv4`, `icmpv6`, `ip-in-ip`, `tsmp`) that we deliberately do NOT — a real control plane
+    /// only ever *emits* the `preferredNames` form (`icmp`/`ipv6-icmp`/`ipv4`/the decimal), so the
+    /// aliases appear only in hand-authored configs, never on control traffic. Decimal numbers and
+    /// `*` are accepted exactly as Go does.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if s.is_empty() {
             return Err(String::from("empty ProtoPortRange"));

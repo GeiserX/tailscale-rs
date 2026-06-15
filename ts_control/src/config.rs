@@ -826,13 +826,20 @@ mod tests {
     #[test]
     fn services_hash_known_answer() {
         // KAT: pin the hash of a single all-ports `svc:samba` so a future serialization change
-        // (field order, whitespace) that would silently break control's change-detection fails
-        // this test. The hash is over the JSON of the VIPService list, matching Go `vipServiceHash`
-        // (`json.NewEncoder(sha256).Encode(services)`). The `Ports` entry serializes as Go's
-        // TextMarshaler string (`"*"` for the all-protocols/all-ports default), NOT a `{Proto,First,
-        // Last}` object — see `ProtoPortRange`. This value was re-pinned when ProtoPortRange moved to
-        // the text form (it now matches Go's serialization shape, so control sees no spurious hash
-        // mismatch).
+        // (field order, whitespace) that would silently break the node's own change-detection fails
+        // this test. The hash is a SELF-CONSISTENCY TOKEN: this node computes it, sends it in
+        // `HostInfo.ServicesHash`, and echoes the same value in `C2NVIPServicesResponse.ServicesHash`;
+        // control treats it as opaque and only refetches when it CHANGES — control never recomputes
+        // it, so the node only needs to be internally consistent (it is — one `services_hash`).
+        //
+        // It is NOT byte-equal to Go `vipServiceHash` and is not meant to be: Go does
+        // `json.NewEncoder(sha256).Encode(services)` which (a) appends a trailing `\n` that
+        // `serde_json::to_vec` here does not, and (b) Go's advertise path (`vipServicesFromPrefsLocked`)
+        // leaves `Ports` nil → `"Ports":null`, whereas this fork injects an explicit all-ports
+        // `ProtoPortRange` → `"Ports":["*"]`. (The element form IS now Go-correct — `ProtoPortRange`
+        // serializes as the TextMarshaler string `"*"`, not a `{Proto,First,Last}` object — which is
+        // what moved this value from the old object-form hash.) Full Go-faithful ServicesHash is
+        // tracked separately; benign because the token is opaque to control.
         let cfg = Config {
             advertise_services: vec!["svc:samba".to_owned()],
             ..Default::default()
