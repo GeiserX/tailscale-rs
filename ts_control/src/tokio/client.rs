@@ -471,8 +471,8 @@ fn reconnect_delay_after_poll(
 /// re-register clears the state for free (Go's `authRoutine` keeps `urlToVisit` and keeps polling).
 ///
 /// **Only `MachineNotAuthorized` sets the cell.** `MachineNotAuthorized(None)` (no auth URL on
-/// offer) maps upstream to [`Error::Internal`]`(MachineAuthorization, _)`, not this variant, so it
-/// correctly does *not* set a (nonexistent) URL. The write is sticky via
+/// offer) maps upstream to [`Error::NeedsMachineAuth`], not this variant, so it correctly does
+/// *not* set a (nonexistent) URL. The write is sticky via
 /// [`send_if_modified`](watch::Sender::send_if_modified): the cell is updated only when the URL
 /// actually differs from its current value, so a re-auth URL that persists across several failed
 /// re-register attempts does not thrash the cell or wake the runtime's bridge spuriously.
@@ -1207,19 +1207,18 @@ mod tests {
     }
 
     /// `MachineNotAuthorized(None)` (control offered no auth URL) maps upstream to
-    /// `Error::Internal(MachineAuthorization, _)`, NOT `Error::MachineNotAuthorized`, so the helper
-    /// must leave the cell untouched. Built from the *exact* upstream mapping (register.rs
-    /// `From<RegistrationError> for Error`) so this stays honest if that mapping ever changes.
+    /// `Error::NeedsMachineAuth`, NOT `Error::MachineNotAuthorized`, so the helper must leave the
+    /// cell untouched (there is no URL to surface). Built from the *exact* upstream mapping
+    /// (register.rs `From<RegistrationError> for Error`) so this stays honest if that mapping ever
+    /// changes.
     #[test]
     fn machine_not_authorized_none_does_not_set_url_cell() {
         let (tx, rx) = watch::channel(None);
         let err =
             Error::from(crate::tokio::register::RegistrationError::MachineNotAuthorized(None));
-        // Confirm the mapping is the non-URL internal variant (the precondition for the assertion).
-        assert!(matches!(
-            err,
-            Error::Internal(crate::InternalErrorKind::MachineAuthorization, _)
-        ));
+        // Confirm the mapping is the no-URL await-approval variant (the precondition for the
+        // assertion): it is the distinct `NeedsMachineAuth`, not a URL-carrying re-auth signal.
+        assert!(matches!(err, Error::NeedsMachineAuth));
 
         surface_reauth_url(&err, &tx);
 
