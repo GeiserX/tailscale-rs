@@ -28,6 +28,17 @@ host's real IP never appears upstream.
   rejects forbidden exit destinations (loopback / link-local / unspecified). Proxy credentials
   are redacted from `Debug`. The default `DirectDialer` structurally refuses exit egress, so the
   real origin IP can never leak by accident.
+- **Deployer note — the SSRF guard is scoped to `ExitNode` flows by design.** The
+  forbidden-destination check (`exit_dst_is_forbidden`) gates only the `0.0.0.0/0` exit class; a
+  `Subnet` flow (a destination covered by a *narrower* advertised route) skips it, because a subnet
+  route legitimately targets a private range — that private range **is** the routed subnet. This is
+  **not** an attacker-controllable SSRF: the flow class is derived from the operator's **own
+  `advertised_routes`**, never from the peer. But it does mean that **if an operator advertises a
+  sensitive internal range as a forwarded subnet route, the forwarder will dial into it.** Do not
+  advertise ranges you don't intend peers to reach — in particular never advertise the host's
+  link-local (`169.254.0.0/16`), the tailnet CGNAT range (`100.64.0.0/10`), or loopback as a
+  forwardable subnet. (Advertising `0.0.0.0/0` as an exit node is the normal case and stays behind
+  the SSRF guard.)
 
 ## Exit-node memory: `tcp_buffer_size` at scale
 
