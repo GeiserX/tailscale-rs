@@ -88,31 +88,65 @@ pub struct EndpointAdvertisement {
     pub endpoints: Arc<Vec<SelfEndpoint>>,
 }
 
-/// The IPv4 bind address for the direct underlay socket.
+/// The IPv4 bind address for the direct underlay socket (unit tests).
 ///
-/// IPv4-only and ephemeral-port: per the anti-leak rules this socket is the only egress path
-/// for the direct underlay, and IPv6 is disabled in our default deployment. This is the historical
-/// (and `enable_ipv6 == false`) bind — byte-for-byte the original behavior.
+/// IPv4-only and ephemeral-port: per the anti-leak rules this socket is the only egress path for
+/// the direct underlay, and IPv6 is disabled in our default deployment. The production bind no
+/// longer parses this string (it constructs the address from
+/// [`Ipv4Addr::UNSPECIFIED`](core::net::Ipv4Addr) and the resolved port in [`bind_underlay_addr`]);
+/// the constant is retained as the canonical `0.0.0.0:0` literal the socket tests bind directly.
+#[cfg(test)]
 const BIND_ADDR: &str = "0.0.0.0:0";
 
-/// The dual-stack bind address used only when `Env::enable_ipv6` is `true`.
+/// Bind a [`MagicSock`] to the given UNSPECIFIED-address family at `listen_port`, falling back to an
+/// OS-chosen ephemeral port (`:0`) if `listen_port` is non-zero and already taken.
 ///
-/// Binding `[::]:0` yields one socket that serves both native IPv6 and IPv4-mapped traffic when
-/// the kernel's `IPV6_V6ONLY` is off (the Linux default on a typical cloud VPS, where
-/// `/proc/sys/net/ipv6/bindv6only` is `0`). See [`bind_underlay_addr`] for the inert-fallback
-/// posture when the host has IPv6 disabled at the kernel.
-const BIND_ADDR_V6: &str = "[::]:0";
+/// The single port-collision fallback the initial bind shares with [`rebind_socket`]'s
+/// `Err(_) if prefer_port != 0 => bind(0)`: a pinned [`Config::wireguard_listen_port`] that happens
+/// to be taken must not fail bring-up. `listen_port == 0` (ephemeral) needs no fallback — there is
+/// nothing more permissive to retry — so its error propagates unchanged. `our_disco` is cloned per
+/// attempt because [`MagicSock::bind`] consumes it (it is no longer `Copy`); `our_node_key` is a
+/// `Copy` public key.
+async fn bind_unspecified_with_fallback(
+    ip: core::net::IpAddr,
+    listen_port: u16,
+    our_disco: &ts_keys::DiscoPrivateKey,
+    our_node_key: NodePublicKey,
+) -> Result<MagicSock, ts_magicsock::Error> {
+    let pinned = SocketAddr::new(ip, listen_port);
+    match MagicSock::bind(pinned, our_disco.clone(), our_node_key).await {
+        Ok(sock) => Ok(sock),
+        // Pinned port taken (or otherwise unbindable): fall back to an ephemeral port so a port
+        // collision never takes the node down. Only when a port was actually pinned.
+        Err(_) if listen_port != 0 => {
+            tracing::warn!(
+                %pinned,
+                "underlay bind on pinned port failed; falling back to an ephemeral port",
+            );
+            MagicSock::bind(SocketAddr::new(ip, 0), our_disco.clone(), our_node_key).await
+        }
+        Err(e) => Err(e),
+    }
+}
 
 /// Choose the underlay UDP socket and the address it bound to, honoring the (default-off)
-/// `enable_ipv6` overlay gate.
+/// `enable_ipv6` overlay gate and the (default-ephemeral) `listen_port` pin.
 ///
-/// - `enable_ipv6 == false` (default): bind exactly [`BIND_ADDR`] (`0.0.0.0:0`) — byte-for-byte the
-///   historical IPv4-only path, no new syscalls. This upholds the sacred IPv4-only invariant of the
+/// `listen_port` is [`Config::wireguard_listen_port`](ts_control::Config::wireguard_listen_port)
+/// resolved to a `u16` (`0` = OS-chosen ephemeral, today's behavior; non-zero = pin that port with
+/// an ephemeral fallback if it is taken — see [`bind_unspecified_with_fallback`]). It governs only
+/// the bound port; the bind *family* still follows `enable_ipv6`:
+///
+/// - `enable_ipv6 == false` (default): bind `0.0.0.0:listen_port` (`0.0.0.0:0` = byte-for-byte the
+///   historical IPv4-only ephemeral path). This upholds the sacred IPv4-only invariant of the
 ///   privacy-proxy deployment.
-/// - `enable_ipv6 == true`: attempt a dual-stack bind on [`BIND_ADDR_V6`] (`[::]:0`) so a single
-///   socket serves both native v6 and v4-mapped traffic. **Fail inert, never panic**: if the v6
-///   bind fails (e.g. a host with `net.ipv6.conf.all.disable_ipv6=1`), warn and fall back to the
-///   IPv4 bind so the node still comes up — protective if the gate is mis-flagged on a hardened box.
+/// - `enable_ipv6 == true`: attempt a dual-stack bind on `[::]:listen_port` so a single socket
+///   serves both native v6 and v4-mapped traffic. **Fail inert, never panic**: if the v6 bind fails
+///   (e.g. a host with `net.ipv6.conf.all.disable_ipv6=1`), warn and fall back to the IPv4 bind so
+///   the node still comes up — protective if the gate is mis-flagged on a hardened box.
+///
+/// A successful pinned port carries across a later [`MagicSock::rebind`], which re-prefers the
+/// socket's current local port.
 ///
 /// NOTE (dep gap reported to the architect): [`MagicSock::bind`] takes only a [`SocketAddr`] and
 /// constructs the `tokio::net::UdpSocket` itself, so this site cannot set `IPV6_V6ONLY` explicitly
@@ -123,32 +157,49 @@ const BIND_ADDR_V6: &str = "[::]:0";
 /// must expose a bind that accepts a pre-configured socket.
 async fn bind_underlay_addr(
     enable_ipv6: bool,
+    listen_port: u16,
     our_disco: ts_keys::DiscoPrivateKey,
     our_node_key: NodePublicKey,
 ) -> Result<MagicSock, ts_magicsock::Error> {
-    // IPv4-only default: the historical path, unchanged.
+    use core::net::{Ipv4Addr, Ipv6Addr};
+
+    // IPv4-only default: the historical family, now honoring the pinned port (`0` = ephemeral, i.e.
+    // byte-for-byte the original `0.0.0.0:0`).
     if !enable_ipv6 {
-        let v4: SocketAddr = BIND_ADDR.parse().expect("valid bind address");
-        return MagicSock::bind(v4, our_disco, our_node_key).await;
+        return bind_unspecified_with_fallback(
+            Ipv4Addr::UNSPECIFIED.into(),
+            listen_port,
+            &our_disco,
+            our_node_key,
+        )
+        .await;
     }
 
-    // Overlay IPv6 enabled: try the dual-stack bind first.
-    let v6: SocketAddr = BIND_ADDR_V6.parse().expect("valid bind address");
-    // Clone the disco key for the v6 attempt: `MagicSock::bind` consumes it (it is no longer
-    // `Copy`), and the IPv4 fallback below needs its own copy. `our_node_key` is a public key
-    // (still `Copy`), so it needs no clone.
-    match MagicSock::bind(v6, our_disco.clone(), our_node_key).await {
+    // Overlay IPv6 enabled: try the dual-stack bind (same port pin + ephemeral fallback) first.
+    match bind_unspecified_with_fallback(
+        Ipv6Addr::UNSPECIFIED.into(),
+        listen_port,
+        &our_disco,
+        our_node_key,
+    )
+    .await
+    {
         Ok(sock) => Ok(sock),
         Err(e) => {
             // Inert fallback: the host likely has IPv6 disabled at the kernel. Come up IPv4-only
-            // rather than crash — protective on a hardened proxy box even if the gate is set.
+            // (still honoring the pinned port) rather than crash — protective on a hardened proxy
+            // box even if the gate is set.
             tracing::warn!(
                 error = %e,
-                %v6,
                 "dual-stack underlay bind failed (host IPv6 disabled?); falling back to IPv4-only",
             );
-            let v4: SocketAddr = BIND_ADDR.parse().expect("valid bind address");
-            MagicSock::bind(v4, our_disco, our_node_key).await
+            bind_unspecified_with_fallback(
+                Ipv4Addr::UNSPECIFIED.into(),
+                listen_port,
+                &our_disco,
+                our_node_key,
+            )
+            .await
         }
     }
 }
@@ -306,16 +357,49 @@ impl DirectManager {
         //    while there are no peers — Go's len(peerSet)==0 stop). Best-effort throughout: a stale
         //    derp/multiderp or empty server list just skips this round; pong-harvest from the
         //    re-pings above still re-learns reflexives.
+        self.stun_sweep_once(sock).await;
+
+        Ok(())
+    }
+
+    /// Force an immediate STUN/endpoint re-probe **without** rebinding the underlay socket — the
+    /// engine half of `Device::re_stun` (Go magicsock's `Conn.ReSTUN`). This is the STUN sweep of
+    /// [`rebind_and_reprobe`](Self::rebind_and_reprobe) (step 3) on its own: it does NOT swap the
+    /// socket and does NOT re-ping peers, so the existing socket, its NAT mapping, and every learned
+    /// path are preserved — it only re-learns our reflexive (public) address right now instead of
+    /// waiting out the jittered ~23s periodic [`run_stun_prober`] timer.
+    ///
+    /// Lighter than [`rebind`](Self::rebind)/[`rebind_and_reprobe`](Self::rebind_and_reprobe): use it
+    /// when our public endpoint may have changed (e.g. a NAT rebinding) but the socket itself is
+    /// fine. A no-op (`Ok`) when the underlay bind failed at startup (DERP-only inert mode — no
+    /// socket to probe from). Best-effort and gated exactly like the periodic prober (skipped while
+    /// there are no peers — Go's `len(peerSet)==0` stop): a stale derp/multiderp or empty server list
+    /// simply skips this round.
+    #[message]
+    pub async fn re_stun(&self) -> Result<(), ts_magicsock::Error> {
+        let Some(sock) = self.sock.as_ref() else {
+            // Inert / DERP-only: no socket to STUN from.
+            return Ok(());
+        };
+        self.stun_sweep_once(sock).await;
+        Ok(())
+    }
+
+    /// One immediate STUN sweep from the bound socket, gated like the periodic prober (skip while
+    /// there are no peers — Go's `len(peerSet)==0` stop). Best-effort: a stale/unavailable multiderp
+    /// or an empty v4-STUN-server list just skips this round (pong-harvest still re-learns
+    /// reflexives). Shared by [`rebind_and_reprobe`](Self::rebind_and_reprobe) (after the rebind +
+    /// re-ping) and [`re_stun`](Self::re_stun) (on its own, no rebind), so the gate + server fetch +
+    /// per-server fan-out live in one place.
+    async fn stun_sweep_once(&self, sock: &MagicSock) {
         if stun_probe_should_run(&self.peer_db) {
             match self.multiderp.ask(multiderp::StunServersV4).await {
                 Ok((servers,)) => probe_stun_servers_once(sock, &servers).await,
                 Err(e) => {
-                    tracing::trace!(error = %e, "rebind-and-reprobe: querying stun servers");
+                    tracing::trace!(error = %e, "stun sweep: querying stun servers");
                 }
             }
         }
-
-        Ok(())
     }
 }
 
@@ -723,6 +807,10 @@ impl kameo::Actor for DirectManager {
         // [`bind_underlay_addr`].
         let sock = match bind_underlay_addr(
             env.enable_ipv6,
+            // The pinned WireGuard/disco port (`Config::wireguard_listen_port`), or `0` for an
+            // OS-chosen ephemeral port (today's default). A pinned-but-taken port falls back to
+            // ephemeral inside `bind_underlay_addr` so a collision never fails bring-up.
+            env.wireguard_listen_port.unwrap_or(0),
             // `.clone()`: the disco private key is no longer `Copy` and `env` is shared (`Arc`),
             // so clone it out for the bind. `node_keys.public` is a `Copy` public key.
             env.keys.disco_keys.private.clone(),
@@ -877,6 +965,7 @@ mod tests {
             is_wireguard_only: false,
             exit_node_dns_resolvers: vec![],
             peer_relay: false,
+            ssh_host_keys: vec![],
             service_vips: Default::default(),
         }
     }
@@ -1014,6 +1103,7 @@ mod tests {
     async fn bind_underlay_addr_v4_default_is_unchanged() {
         let sock = bind_underlay_addr(
             false,
+            0,
             DiscoPrivateKey::random(),
             NodePrivateKey::random().public_key(),
         )
@@ -1032,6 +1122,64 @@ mod tests {
         );
     }
 
+    /// A pinned `wireguard_listen_port` (Go `--port`) binds exactly that UDP port when it is free —
+    /// the stable-endpoint behavior an operator behind a fixed-pinhole firewall needs. Uses a port
+    /// the OS just handed out (then released) to avoid colliding with anything already bound.
+    #[tokio::test]
+    async fn bind_underlay_addr_pins_requested_port_when_free() {
+        // Grab an OS-assigned port, then release it so we can pin it deterministically.
+        let probe = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let want = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let sock = bind_underlay_addr(
+            false,
+            want,
+            DiscoPrivateKey::random(),
+            NodePrivateKey::random().public_key(),
+        )
+        .await
+        .expect("pinned-port underlay bind must succeed");
+
+        let local = sock.local_addr().expect("a bound socket has a local addr");
+        assert!(local.is_ipv4(), "still the v4 family, got {local}");
+        assert_eq!(
+            local.port(),
+            want,
+            "a free pinned port must be bound exactly (got {local})"
+        );
+    }
+
+    /// A pinned port that is already taken must NOT fail bring-up: the bind falls back to an
+    /// OS-chosen ephemeral port (mirroring `rebind_socket`'s `Err(_) if prefer_port != 0 => bind(0)`
+    /// fallback), so a port collision can never take the node down. The bound port ends up different
+    /// from the (occupied) pinned one.
+    #[tokio::test]
+    async fn bind_underlay_addr_falls_back_to_ephemeral_when_port_taken() {
+        // Occupy a port for the whole test so the pinned bind below must collide.
+        let occupier = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let taken = occupier.local_addr().unwrap().port();
+
+        let sock = bind_underlay_addr(
+            false,
+            taken,
+            DiscoPrivateKey::random(),
+            NodePrivateKey::random().public_key(),
+        )
+        .await
+        .expect("a taken pinned port must fall back to ephemeral, never error");
+
+        let local = sock.local_addr().expect("a bound socket has a local addr");
+        assert!(local.is_ipv4(), "still the v4 family, got {local}");
+        assert_ne!(
+            local.port(),
+            taken,
+            "the occupied port must not be bound; an ephemeral port is used instead"
+        );
+        assert_ne!(local.port(), 0, "a real ephemeral port must be assigned");
+        drop(occupier);
+    }
+
     /// With `enable_ipv6 == true` a dual-stack bind on `[::]:0` is attempted. On a normal dev host
     /// that yields a v6-family socket; if this environment cannot bind v6 at all, the documented
     /// inert fallback returns a v4 socket instead (never a panic, never an error). Either outcome is
@@ -1042,6 +1190,7 @@ mod tests {
     async fn bind_underlay_addr_v6_attempts_dual_stack_or_falls_back() {
         let sock = bind_underlay_addr(
             true,
+            0,
             DiscoPrivateKey::random(),
             NodePrivateKey::random().public_key(),
         )
@@ -1114,6 +1263,45 @@ mod tests {
             stun_probe_should_run(&with_peer),
             "with a peer present the prober resumes STUN"
         );
+    }
+
+    /// `re_stun` (Go `Conn.ReSTUN`) is the STUN sweep WITHOUT a rebind: its body is exactly the
+    /// shared [`DirectManager::stun_sweep_once`] gate — skip while there are no peers (Go's
+    /// `len(peerSet)==0` stop), otherwise fetch the v4 STUN servers and probe each. This pins the two
+    /// gate decisions `re_stun` makes (the peer-presence gate it shares with the periodic prober, and
+    /// the empty-server-list no-op), independent of the actor machinery — the same way the periodic
+    /// prober's per-tick fan-out is pinned by [`probe_stun_servers_once_*`]. The inert (no-socket,
+    /// DERP-only) path is the `self.sock.is_none()` early-return, structurally identical to
+    /// [`DirectManager::rebind`]'s inert no-op.
+    #[tokio::test]
+    async fn re_stun_sweep_gate_matches_periodic_prober() {
+        // No peers (and no netmap) → the sweep is gated closed, so re_stun probes nothing.
+        let no_peers: Arc<RwLock<Option<Arc<PeerDb>>>> = Default::default();
+        assert!(
+            !stun_probe_should_run(&no_peers),
+            "re_stun must skip the sweep with no peers, like the periodic prober"
+        );
+
+        // With a peer present the gate opens; an empty derp v4-STUN list is then a clean no-op
+        // (probing must never require a STUN server — pong-harvest backstops it).
+        let disco = DiscoPrivateKey::random().public_key();
+        let node_key = NodePrivateKey::random().public_key();
+        let with_peer = db_with(node_with_keys(disco, node_key, "n1"));
+        assert!(
+            stun_probe_should_run(&with_peer),
+            "re_stun sweeps once a peer is present"
+        );
+        let sock = Arc::new(
+            MagicSock::bind(
+                BIND_ADDR.parse().unwrap(),
+                DiscoPrivateKey::random(),
+                NodePrivateKey::random().public_key(),
+            )
+            .await
+            .unwrap(),
+        );
+        // Empty server list (what an unavailable/stale derp map yields) → no sends, returns promptly.
+        probe_stun_servers_once(&sock, &[]).await;
     }
 
     /// The periodic STUN delay is a uniform random value in `[20s, 26s)`, matching Go magicsock's

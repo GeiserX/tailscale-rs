@@ -237,6 +237,22 @@ pub struct Config {
     /// no-op event source (the Linux/macOS backends land in later slices).
     pub network_monitor: bool,
 
+    /// The fixed UDP port magicsock binds for WireGuard + disco, or `None` for an OS-chosen
+    /// ephemeral port (Go `tailscaled --port`; Go's `ListenPort`). Defaults to `None`.
+    ///
+    /// `None` (the default) preserves the historical behavior: the underlay socket binds `0.0.0.0:0`
+    /// and the OS picks an ephemeral port (Go's port `0`). `Some(p)` pins the bind to port `p` so the
+    /// node's UDP endpoint is stable across restarts — what an operator behind a fixed-pinhole
+    /// firewall needs (Go's daemon defaults this to `41641`, but the engine default stays `None` to
+    /// keep today's behavior). If `p` is already taken at startup the bind **falls back to an
+    /// ephemeral port** rather than failing bring-up (mirroring magicsock's rebind fallback): a port
+    /// collision must not take the node down. A later [`Device::rebind`](crate::Device::rebind)
+    /// re-prefers whatever port is currently bound, so a successful pin carries across rebinds.
+    ///
+    /// Governs **only** the bound port — never the bind family: the IPv4-only-by-default,
+    /// fail-closed underlay posture (`enable_ipv6` alone widens the family) is unchanged.
+    pub wireguard_listen_port: Option<u16>,
+
     /// How this node's **application** overlay data path is realized.
     ///
     /// Defaults to [`TransportMode::Netstack`](ts_control::TransportMode::Netstack), the userspace
@@ -518,6 +534,7 @@ impl From<&Config> for ts_control::Config {
             taildrop_dir: value.taildrop_dir.clone(),
             enable_ipv6: value.enable_ipv6,
             network_monitor: value.network_monitor,
+            wireguard_listen_port: value.wireguard_listen_port,
             transport_mode: value.transport_mode.clone(),
             wire_ingress: value.wire_ingress,
             // A fresh runtime-local flag (default `false`): the runtime flips it when
@@ -555,6 +572,7 @@ impl Default for Config {
             persistent_keepalive_interval: Some(ts_control::DEFAULT_PERSISTENT_KEEPALIVE),
             enable_ipv6: false,
             network_monitor: false,
+            wireguard_listen_port: None,
             transport_mode: ts_control::TransportMode::default(),
             wire_ingress: false,
             advertise_services: vec![],
@@ -591,6 +609,7 @@ mod tests {
             persistent_keepalive_interval: Some(std::time::Duration::from_secs(17)),
             enable_ipv6: true,
             network_monitor: true,
+            wireguard_listen_port: Some(41641),
             wire_ingress: true,
             transport_mode: ts_control::TransportMode::Tun(ts_control::TunConfig {
                 name: Some("tailscale0".to_owned()),
@@ -637,6 +656,11 @@ mod tests {
             control.network_monitor,
             "network_monitor crosses the boundary (set true)"
         );
+        assert_eq!(
+            control.wireguard_listen_port,
+            Some(41641),
+            "wireguard_listen_port crosses the boundary"
+        );
         assert!(control.wire_ingress);
         assert_eq!(control.advertise_services, vec!["svc:samba".to_owned()]);
         assert_eq!(
@@ -658,6 +682,17 @@ mod tests {
         // interface (which needs root) must be explicit.
         let control: ts_control::Config = (&Config::default()).into();
         assert_eq!(control.transport_mode, ts_control::TransportMode::Netstack);
+    }
+
+    /// The WireGuard listen port defaults to `None` (OS-chosen ephemeral, today's behavior) and
+    /// crosses the control boundary unchanged. A daemon that wants Go's `--port 41641` sets it
+    /// explicitly; the engine never pins a port by default.
+    #[test]
+    fn from_config_default_wireguard_listen_port_is_none() {
+        let cfg = Config::default();
+        assert_eq!(cfg.wireguard_listen_port, None);
+        let control: ts_control::Config = (&cfg).into();
+        assert_eq!(control.wireguard_listen_port, None);
     }
 
     #[test]

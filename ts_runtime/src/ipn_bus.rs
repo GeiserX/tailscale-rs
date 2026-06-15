@@ -386,6 +386,7 @@ mod tests {
             is_exit_node: false,
             cur_addr: None,
             relay: None,
+            ssh_host_keys: Vec::new(),
         }
     }
 

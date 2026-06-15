@@ -1101,6 +1101,7 @@ mod tka_tests {
                 peerapi_port: None,
                 taildrop_dir: None,
                 enable_ipv6: false,
+                wireguard_listen_port: None,
                 network_monitor: false,
                 persistent_keepalive_interval: None,
                 ingress_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1138,6 +1139,7 @@ mod tka_tests {
             is_wireguard_only: false,
             exit_node_dns_resolvers: Vec::new(),
             peer_relay: false,
+            ssh_host_keys: Vec::new(),
             service_vips: Default::default(),
         }
     }

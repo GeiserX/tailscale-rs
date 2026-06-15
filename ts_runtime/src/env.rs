@@ -122,6 +122,15 @@ pub struct ForwarderConfig {
     /// regardless to uphold the real-origin-IP isolation invariant.
     pub enable_ipv6: bool,
 
+    /// The fixed UDP port to bind the underlay socket on (WireGuard + disco), or `None` for an
+    /// OS-chosen ephemeral port. Defaults to `None`.
+    ///
+    /// See [`Config::wireguard_listen_port`](ts_control::Config::wireguard_listen_port). Read once at
+    /// `Runtime::spawn` to choose the *initial* underlay bind port: `Some(p)` pins port `p` (with an
+    /// ephemeral fallback if taken), `None` binds `0`. Governs only the port — never the bind family
+    /// (the IPv4-only-by-default posture is unchanged).
+    pub wireguard_listen_port: Option<u16>,
+
     /// Whether to run the internal OS network-link monitor (`NetmonSupervisor`). Defaults to
     /// `false`.
     ///
@@ -169,6 +178,7 @@ impl ForwarderConfig {
             peerapi_port: config.peerapi_port,
             taildrop_dir: config.taildrop_dir.clone(),
             enable_ipv6: config.enable_ipv6,
+            wireguard_listen_port: config.wireguard_listen_port,
             network_monitor: config.network_monitor,
             persistent_keepalive_interval: config.persistent_keepalive_interval,
             ingress_active: config.ingress_active.clone(),
@@ -293,6 +303,13 @@ pub struct Env {
     /// netstack address assignment, and MagicDNS; never by the forwarder egress path.
     pub enable_ipv6: bool,
 
+    /// The fixed UDP port to bind the underlay socket on, or `None` for an OS-chosen ephemeral port
+    /// (default `None`).
+    ///
+    /// See [`ForwarderConfig::wireguard_listen_port`]. Read once by the direct manager at startup to
+    /// choose the initial underlay bind port; never re-read at runtime.
+    pub wireguard_listen_port: Option<u16>,
+
     /// Whether the internal OS network-link monitor (`NetmonSupervisor`) is enabled (default
     /// `false`).
     ///
@@ -399,6 +416,7 @@ impl Env {
             peerapi_port,
             taildrop_dir,
             enable_ipv6,
+            wireguard_listen_port,
             network_monitor,
             persistent_keepalive_interval,
             ingress_active,
@@ -435,6 +453,7 @@ impl Env {
             peerapi_port,
             taildrop_store,
             enable_ipv6,
+            wireguard_listen_port,
             network_monitor,
             persistent_keepalive_interval,
             ingress_active,
@@ -507,6 +526,7 @@ mod tests {
             peerapi_port: None,
             taildrop_dir: None,
             enable_ipv6: false,
+            wireguard_listen_port: None,
             network_monitor: false,
             persistent_keepalive_interval: None,
             ingress_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -521,6 +541,31 @@ mod tests {
             cfg(accept_routes),
         );
         (env, cells.accept_routes)
+    }
+
+    /// The WireGuard listen port threads from `ForwarderConfig` onto the `Env` the direct manager
+    /// reads at its initial bind: `None` (the default) stays `None` (ephemeral bind), and a pinned
+    /// `Some(p)` is carried verbatim. `Env::new_with_runtime_txs` spawns the `MessageBus` actor,
+    /// which needs a Tokio reactor.
+    #[tokio::test]
+    async fn wireguard_listen_port_threads_to_env() {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        // Default: None (ephemeral).
+        let env_none = Env::new(
+            ts_keys::NodeState::generate(),
+            shutdown_rx.clone(),
+            cfg(false),
+        );
+        assert_eq!(env_none.wireguard_listen_port, None);
+
+        // Pinned: Some(p) carried verbatim onto the Env.
+        let pinned = ForwarderConfig {
+            wireguard_listen_port: Some(41641),
+            ..cfg(false)
+        };
+        let env_pinned = Env::new(ts_keys::NodeState::generate(), shutdown_rx, pinned);
+        assert_eq!(env_pinned.wireguard_listen_port, Some(41641));
     }
 
     /// `Env::accept_routes()` reflects the `ForwarderConfig` seed.

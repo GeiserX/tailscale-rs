@@ -91,6 +91,11 @@ pub struct StatusNode {
     /// and the peer's home DERP region is known; `None` when a direct path is confirmed, or the
     /// region code is unknown. Carries the region **code**, not its numeric id.
     pub relay: Option<String>,
+    /// The node's advertised SSH host public keys in known_hosts format (Go
+    /// `ipnstate.PeerStatus.SSH_HostKeys`), used by `tailscale ssh` to pin the peer's host key.
+    /// Mirrors the domain [`Node::ssh_host_keys`](ts_control::Node::ssh_host_keys); empty when
+    /// control advertised none (never fabricated).
+    pub ssh_host_keys: Vec<String>,
 }
 
 impl StatusNode {
@@ -117,6 +122,7 @@ impl StatusNode {
             // self node and whois lookups (which also use `from_node`) correctly keep `None`.
             cur_addr: None,
             relay: None,
+            ssh_host_keys: node.ssh_host_keys.clone(),
         }
     }
 }
@@ -313,6 +319,7 @@ mod tests {
             is_wireguard_only: false,
             exit_node_dns_resolvers: vec![],
             peer_relay: false,
+            ssh_host_keys: vec![],
             service_vips: Default::default(),
         }
     }
@@ -349,6 +356,21 @@ mod tests {
         let mut offline = node("n3", "down", Some("ts.net"), "100.64.0.9");
         offline.online = Some(false);
         assert_eq!(StatusNode::from_node(&offline).online, Some(false));
+    }
+
+    #[test]
+    fn status_node_carries_ssh_host_keys() {
+        // Absent on the domain node → empty on StatusNode (never fabricated).
+        let bare = node("n1", "host", Some("ts.net"), "100.64.0.1");
+        assert!(StatusNode::from_node(&bare).ssh_host_keys.is_empty());
+
+        // Present → mirrored verbatim (the keys `tailscale ssh` pins).
+        let mut with_keys = node("n2", "host", Some("ts.net"), "100.64.0.2");
+        with_keys.ssh_host_keys = vec!["ssh-ed25519 AAAAC3Nz host".to_string()];
+        assert_eq!(
+            StatusNode::from_node(&with_keys).ssh_host_keys,
+            vec!["ssh-ed25519 AAAAC3Nz host".to_string()]
+        );
     }
 
     #[test]
