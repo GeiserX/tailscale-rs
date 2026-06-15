@@ -12,6 +12,7 @@ mod client;
 pub mod dial;
 mod error;
 pub mod frame;
+mod rate_limit;
 
 pub use client::{Client, DefaultClient};
 pub use error::Error;
