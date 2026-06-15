@@ -827,7 +827,12 @@ mod tests {
     fn services_hash_known_answer() {
         // KAT: pin the hash of a single all-ports `svc:samba` so a future serialization change
         // (field order, whitespace) that would silently break control's change-detection fails
-        // this test. Computed once from this very implementation.
+        // this test. The hash is over the JSON of the VIPService list, matching Go `vipServiceHash`
+        // (`json.NewEncoder(sha256).Encode(services)`). The `Ports` entry serializes as Go's
+        // TextMarshaler string (`"*"` for the all-protocols/all-ports default), NOT a `{Proto,First,
+        // Last}` object — see `ProtoPortRange`. This value was re-pinned when ProtoPortRange moved to
+        // the text form (it now matches Go's serialization shape, so control sees no spurious hash
+        // mismatch).
         let cfg = Config {
             advertise_services: vec!["svc:samba".to_owned()],
             ..Default::default()
@@ -838,7 +843,7 @@ mod tests {
         assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()));
         assert_eq!(
             hash,
-            "f96574bfe9f637164f5d7fff37ea169b3aa86b12e25d98f5c3b7fd049839f4e9"
+            "9593a969d3df19c81e5c47a5caeca701ab60b732b99004f15aa00384d922c40c"
         );
     }
 
