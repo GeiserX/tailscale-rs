@@ -100,7 +100,12 @@ impl IpRange {
                 (IpAddr::V6(start), IpAddr::V6(end)) => {
                     Box::new(ipnet::Ipv6Subnets::new(start, end, 0).map(IpNet::from))
                 }
-                _ => unreachable!(),
+                // A mixed-family range (one v4 endpoint, one v6) is impossible from the wire: the
+                // only deserialize constructor (`parse_range`) rejects mismatched families. Return an
+                // empty iterator rather than `unreachable!()` so this stays a total, panic-free
+                // function even if a future internal caller builds an `IpRange::Range` by hand —
+                // packet-filter compile data must never be able to panic the netmap-apply path.
+                _ => Box::new(core::iter::empty()),
             }),
         }
     }
