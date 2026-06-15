@@ -664,6 +664,23 @@ mod tests {
             inbound_filter_verdict(&DenyAll, IpProto::TSMP, src, dst, 0, frag(0, false)),
             "a non-fragmented TSMP (offset 0, MF clear) still bypasses the ACL"
         );
+
+        // A *later* TSMP fragment (offset >= MIN_FRAG_BLKS) is accepted via the offset-based
+        // fragment pass-through, NOT dropped by the fragmented-TSMP rule — that rule is offset-0
+        // only (a first fragment with MF). This proves the later-fragment branch is proto-independent
+        // and wins over the TSMP-specific logic (Go maps any offset>=minFragBlks to ipproto.Fragment
+        // regardless of the L4 proto byte), locking the branch ordering against regression.
+        assert!(
+            inbound_filter_verdict(
+                &DenyAll,
+                IpProto::TSMP,
+                src,
+                dst,
+                0,
+                frag(MIN_FRAG_BLKS, true)
+            ),
+            "a later TSMP fragment is accepted via the fragment path (proto-independent)"
+        );
     }
 
     /// Behavioral guard: an installed capture hook MUST be invoked with `CapturePath::FromLocal`
