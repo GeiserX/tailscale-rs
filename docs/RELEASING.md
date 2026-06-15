@@ -68,6 +68,31 @@ publisher with:
 Until a crate has its trusted publisher configured, `release.yml`'s publish step fails *for that
 crate only*; the version-bump + tag + GitHub-Release half (release-please.yml) works regardless.
 
+### Adding a NEW `geiserx_*` crate (token bootstrap REQUIRED)
+
+A brand-new crate cannot be created by OIDC trusted publishing — crates.io rejects it with
+`403 Forbidden: Trusted Publishing tokens do not support creating new crates. Publish the crate
+manually, first`. So the **first** version of any new crate needs a one-time token bootstrap, in
+addition to the usual checklist. When you add a new `ts_*` crate, do ALL of:
+
+1. Add it to the workspace `members` + `[workspace.dependencies]` (with `version = "X.Y.Z"
+   # x-release-please-version`).
+2. **Add it to `scripts/publish-crates.sh`'s `CRATES=(…)` array in leaf-first order**, BEFORE any
+   crate that depends on it (omitting it breaks the whole publish at the first dependent — e.g.
+   `ts_netmon` missing broke `ts_runtime`'s publish), and bump the `43`→`N` count strings in both
+   `scripts/publish-crates.sh` and `.github/workflows/release.yml` (incl. the job name).
+3. **Token bootstrap (one-time, needs a crates.io token):**
+   ```sh
+   export CARGO_REGISTRY_TOKEN=<a crates.io API token with "publish" scope>
+   cargo publish -p geiserx_<new_crate>            # creates the crate + its first version
+   ./scripts/setup-trusted-publishing.sh           # registers GeiserX/tailscale-rs as its trusted publisher (idempotent; derives the list from cargo metadata, so it picks up the new crate)
+   ```
+   After that, CI's OIDC trusted publishing handles the crate on every future release.
+4. If a release already published the rest of the workspace but failed at the new crate, finish it:
+   bootstrap the crate (step 3), then re-dispatch the `Release` workflow for the same tag
+   (`gh workflow run Release --ref main`; `SKIP_PUBLISHED=1` resumes past the already-published
+   versions).
+
 > **Bulk option (recommended over 43 web forms):** `scripts/setup-trusted-publishing.sh` registers
 > the trusted publisher on every publishable crate in one pass via the crates.io API. It is
 > idempotent (skips crates already configured) and derives the crate list from `cargo metadata`, so
