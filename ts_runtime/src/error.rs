@@ -172,6 +172,12 @@ pub enum ErrorKind {
     /// TUN transport mode was requested but the TUN device could not be created (e.g. missing
     /// root/CAP_NET_ADMIN), or the runtime was built without the `tun` feature.
     TunUnavailable,
+
+    /// The network monitor was requested (`Config::network_monitor == true`) but the runtime was
+    /// built without the `network-monitor` feature, so the supervisor could not be spawned. A
+    /// config/build mismatch knowable at spawn time; never silently ignored (mirrors
+    /// [`TunUnavailable`](Self::TunUnavailable)).
+    NetworkMonitorUnavailable,
 }
 
 impl core::fmt::Display for ErrorKind {
@@ -185,6 +191,10 @@ impl core::fmt::Display for ErrorKind {
                 write!(f, "netstack operation unsupported in TUN transport mode")
             }
             Self::TunUnavailable => write!(f, "TUN transport unavailable"),
+            Self::NetworkMonitorUnavailable => write!(
+                f,
+                "network monitor requested but the `network-monitor` feature is not enabled"
+            ),
         }
     }
 }

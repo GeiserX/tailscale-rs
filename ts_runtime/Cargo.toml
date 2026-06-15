@@ -27,6 +27,11 @@ ts_forwarder.workspace = true
 ts_keys.workspace = true
 ts_magicsock.workspace = true
 ts_netcheck.workspace = true
+# Optional: the OS link-change monitor core (trait + debouncer + synthetic/no-op monitors). Pulled
+# in ONLY behind the `network-monitor` feature so the default ring-only graph stays free of it (it
+# itself depends on nothing but tokio + tracing; the OS backends in later slices stay hand-rolled on
+# libc, never a route crate). See the `network-monitor` feature below.
+ts_netmon = { workspace = true, optional = true }
 ts_netstack_smoltcp = { workspace = true, features = ["tokio"] }
 ts_overlay_router.workspace = true
 ts_packet.workspace = true
@@ -73,6 +78,13 @@ libc = "0.2"
 # run the application data path over a real OS TUN interface instead of the userspace netstack.
 # TUN device creation needs root/CAP_NET_ADMIN; off the ring-only egress path.
 tun = ["dep:ts_transport_tun", "dep:ts_host_net", "dep:etherparse"]
+# Off by default. Enables the internal OS network-link monitor: the `NetmonSupervisor` actor that,
+# on a link change (Wi-Fi switch, sleep/wake, default-route change), re-binds the underlay socket
+# and re-probes connectivity (re-ping, immediate STUN, re-netcheck). Gated behind both this feature
+# AND the runtime `Config::network_monitor` flag (default off); with the feature off the supervisor
+# and its dependency compile out entirely, preserving the pure-engine posture. The OS event-source
+# backends (Linux netlink, macOS PF_ROUTE) are later slices; this slice ships the OS-free core.
+network-monitor = ["dep:ts_netmon"]
 # Client-side ACME (Let's Encrypt) cert issuance via the node's set-dns RPC. Off by default and
 # SaaS-only (forwards to `ts_control/acme`). Enables `Runtime::get_certificate` + the ControlRunner
 # `GetCertificate` message; a self-hosted control plane 501s on set-dns so issuance is

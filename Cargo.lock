@@ -2227,6 +2227,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "geiserx_ts_netmon"
+version = "0.39.0"
+dependencies = [
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "geiserx_ts_netstack_smoltcp"
 version = "0.39.0"
 dependencies = [
@@ -2378,6 +2386,7 @@ dependencies = [
  "geiserx_ts_keys",
  "geiserx_ts_magicsock",
  "geiserx_ts_netcheck",
+ "geiserx_ts_netmon",
  "geiserx_ts_netstack_smoltcp",
  "geiserx_ts_overlay_router",
  "geiserx_ts_packet",

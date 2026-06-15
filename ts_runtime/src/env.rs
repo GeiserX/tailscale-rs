@@ -122,6 +122,15 @@ pub struct ForwarderConfig {
     /// regardless to uphold the real-origin-IP isolation invariant.
     pub enable_ipv6: bool,
 
+    /// Whether to run the internal OS network-link monitor (`NetmonSupervisor`). Defaults to
+    /// `false`.
+    ///
+    /// See [`Config::network_monitor`](ts_control::Config::network_monitor). Read once at
+    /// `Runtime::spawn`: when `true` (and the `network-monitor` feature is enabled) the runtime
+    /// spawns a supervisor that re-binds + re-probes on a link change; when `false` no monitor is
+    /// spawned (byte-for-byte today's behavior). Fixed for the life of the runtime.
+    pub network_monitor: bool,
+
     /// The WireGuard persistent-keepalive interval applied to every peer, or `None` to disable.
     ///
     /// See [`Config::persistent_keepalive_interval`](ts_control::Config::persistent_keepalive_interval).
@@ -160,6 +169,7 @@ impl ForwarderConfig {
             peerapi_port: config.peerapi_port,
             taildrop_dir: config.taildrop_dir.clone(),
             enable_ipv6: config.enable_ipv6,
+            network_monitor: config.network_monitor,
             persistent_keepalive_interval: config.persistent_keepalive_interval,
             ingress_active: config.ingress_active.clone(),
         }
@@ -283,6 +293,13 @@ pub struct Env {
     /// netstack address assignment, and MagicDNS; never by the forwarder egress path.
     pub enable_ipv6: bool,
 
+    /// Whether the internal OS network-link monitor (`NetmonSupervisor`) is enabled (default
+    /// `false`).
+    ///
+    /// See [`ForwarderConfig::network_monitor`]. Read once at `Runtime::spawn` to decide whether to
+    /// spawn the supervisor; not consulted again at runtime.
+    pub network_monitor: bool,
+
     /// The WireGuard persistent-keepalive interval applied to every peer, or `None` to disable.
     ///
     /// See [`ForwarderConfig::persistent_keepalive_interval`]. Read by the dataplane actor when it
@@ -382,6 +399,7 @@ impl Env {
             peerapi_port,
             taildrop_dir,
             enable_ipv6,
+            network_monitor,
             persistent_keepalive_interval,
             ingress_active,
         } = forwarding;
@@ -417,6 +435,7 @@ impl Env {
             peerapi_port,
             taildrop_store,
             enable_ipv6,
+            network_monitor,
             persistent_keepalive_interval,
             ingress_active,
             funnel_ingress: Arc::new(std::sync::Mutex::new(None)),
@@ -488,6 +507,7 @@ mod tests {
             peerapi_port: None,
             taildrop_dir: None,
             enable_ipv6: false,
+            network_monitor: false,
             persistent_keepalive_interval: None,
             ingress_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }

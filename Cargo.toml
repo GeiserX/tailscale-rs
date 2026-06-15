@@ -27,6 +27,7 @@ members = [
     "ts_magicsock",
     "ts_metrics",
     "ts_netcheck",
+    "ts_netmon",
     "ts_netstack_smoltcp",
     "ts_netstack_smoltcp_core",
     "ts_netstack_smoltcp_socket",
@@ -161,6 +162,7 @@ ts_keys = { path = "ts_keys", package = "geiserx_ts_keys", version = "0.39.0" } 
 ts_magicsock = { path = "ts_magicsock", package = "geiserx_ts_magicsock", version = "0.39.0" } # x-release-please-version
 ts_metrics = { path = "ts_metrics", package = "geiserx_ts_metrics", version = "0.39.0" } # x-release-please-version
 ts_netcheck = { path = "ts_netcheck", package = "geiserx_ts_netcheck", version = "0.39.0" } # x-release-please-version
+ts_netmon = { path = "ts_netmon", package = "geiserx_ts_netmon", version = "0.39.0" } # x-release-please-version
 ts_netstack_smoltcp = { path = "ts_netstack_smoltcp", package = "geiserx_ts_netstack_smoltcp", version = "0.39.0" } # x-release-please-version
 ts_netstack_smoltcp_core = { path = "ts_netstack_smoltcp_core", package = "geiserx_ts_netstack_smoltcp_core", version = "0.39.0" } # x-release-please-version
 ts_netstack_smoltcp_socket = { path = "ts_netstack_smoltcp_socket", package = "geiserx_ts_netstack_smoltcp_socket", version = "0.39.0" } # x-release-please-version
@@ -308,6 +310,11 @@ axum = ["dep:axum"]
 hyper = ["dep:hyper", "dep:hyper-util", "dep:tower-service"]
 ssh = ["dep:russh", "dep:bytes", "dep:ratatui", "dep:pty-process", "dep:nix"]
 tun = ["ts_runtime/tun"]
+# Enables the internal OS network-link monitor (`Config::network_monitor`): on a link change the
+# runtime re-binds the underlay socket and re-probes connectivity (re-ping, immediate STUN,
+# re-netcheck). Off by default (pure-engine posture); setting `Config::network_monitor` without this
+# feature is a hard error at `Device::new`. Forwards to `ts_runtime/network-monitor`.
+network-monitor = ["ts_runtime/network-monitor"]
 # Workload-identity federation (SaaS-only): enables the `ts_control` exchange subsystem that
 # trades an OAuth client secret or IdP-issued OIDC token for a Tailscale auth key. Off by default.
 identity-federation = ["ts_control/identity-federation"]

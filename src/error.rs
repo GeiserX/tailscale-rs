@@ -67,6 +67,11 @@ pub enum InternalErrorKind {
     /// TUN mode was requested but is unavailable (no device, or the `tun`
     /// feature is disabled in this build).
     UnsupportedInTunMode,
+    /// The internal OS network monitor was requested (`Config::network_monitor`)
+    /// but this build was compiled without the `network-monitor` feature, so the
+    /// supervisor could not be started. Rebuild with the feature enabled, or leave
+    /// `network_monitor` off and drive `Device::rebind` from your own link monitor.
+    NetworkMonitorUnavailable,
     /// The requested resource (e.g. a Taildrop file) does not exist.
     NotFound,
     /// The resource already exists (e.g. a Taildrop transfer for the same file is in progress).
@@ -90,6 +95,12 @@ impl fmt::Display for InternalErrorKind {
             InternalErrorKind::Actor => write!(f, "actor missing or shutdown"),
             InternalErrorKind::UnsupportedInTunMode => {
                 write!(f, "operation unsupported in TUN transport mode")
+            }
+            InternalErrorKind::NetworkMonitorUnavailable => {
+                write!(
+                    f,
+                    "network monitor requested but the `network-monitor` feature is disabled"
+                )
             }
             InternalErrorKind::NotFound => write!(f, "resource not found"),
             InternalErrorKind::AlreadyExists => write!(f, "resource already exists"),
@@ -133,6 +144,10 @@ impl From<ts_runtime::Error> for Error {
             // (no device / `tun` feature off).
             ts_runtime::ErrorKind::UnsupportedInTunMode | ts_runtime::ErrorKind::TunUnavailable => {
                 Error::Internal(InternalErrorKind::UnsupportedInTunMode)
+            }
+            // The network monitor was requested but this build lacks the `network-monitor` feature.
+            ts_runtime::ErrorKind::NetworkMonitorUnavailable => {
+                Error::Internal(InternalErrorKind::NetworkMonitorUnavailable)
             }
         }
     }
