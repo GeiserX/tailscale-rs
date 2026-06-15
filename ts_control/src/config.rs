@@ -826,8 +826,20 @@ mod tests {
     #[test]
     fn services_hash_known_answer() {
         // KAT: pin the hash of a single all-ports `svc:samba` so a future serialization change
-        // (field order, whitespace) that would silently break control's change-detection fails
-        // this test. Computed once from this very implementation.
+        // (field order, whitespace) that would silently break the node's own change-detection fails
+        // this test. The hash is a SELF-CONSISTENCY TOKEN: this node computes it, sends it in
+        // `HostInfo.ServicesHash`, and echoes the same value in `C2NVIPServicesResponse.ServicesHash`;
+        // control treats it as opaque and only refetches when it CHANGES — control never recomputes
+        // it, so the node only needs to be internally consistent (it is — one `services_hash`).
+        //
+        // It is NOT byte-equal to Go `vipServiceHash` and is not meant to be: Go does
+        // `json.NewEncoder(sha256).Encode(services)` which (a) appends a trailing `\n` that
+        // `serde_json::to_vec` here does not, and (b) Go's advertise path (`vipServicesFromPrefsLocked`)
+        // leaves `Ports` nil → `"Ports":null`, whereas this fork injects an explicit all-ports
+        // `ProtoPortRange` → `"Ports":["*"]`. (The element form IS now Go-correct — `ProtoPortRange`
+        // serializes as the TextMarshaler string `"*"`, not a `{Proto,First,Last}` object — which is
+        // what moved this value from the old object-form hash.) Full Go-faithful ServicesHash is
+        // tracked separately; benign because the token is opaque to control.
         let cfg = Config {
             advertise_services: vec!["svc:samba".to_owned()],
             ..Default::default()
@@ -838,7 +850,7 @@ mod tests {
         assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()));
         assert_eq!(
             hash,
-            "f96574bfe9f637164f5d7fff37ea169b3aa86b12e25d98f5c3b7fd049839f4e9"
+            "9593a969d3df19c81e5c47a5caeca701ab60b732b99004f15aa00384d922c40c"
         );
     }
 

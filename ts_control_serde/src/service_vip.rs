@@ -32,18 +32,145 @@ pub struct ServiceName<'a>(#[serde(borrow)] pub &'a str);
 /// A protocol + inclusive port range (`tailcfg.ProtoPortRange`). `proto == 0` means "all protocols"
 /// in Go (`int(0)`); otherwise it is an IP protocol number (6 = TCP, 17 = UDP). A `first..=last`
 /// span of `0..=65535` means "all ports".
-#[derive(Default, Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "PascalCase")]
+///
+/// **Wire form is a STRING, not a JSON object.** Go's `tailcfg.ProtoPortRange` implements
+/// `encoding.TextMarshaler`/`TextUnmarshaler` (`tailcfg/proto_port_range.go`), so it serializes as
+/// `"[<proto>:]<ports>"` (e.g. `"tcp:443"`, `"udp:1-100"`, `"443"`, `"*"`), NOT
+/// `{"Proto":6,"First":443,"Last":443}`. We hand-roll the same text codec below so a real
+/// `tailscale serve`/VIP-service `ServiceConfig` round-trips; emitting the object form was
+/// wire-incompatible with a genuine control plane. The `<proto>` token uses Go `ipproto`'s
+/// `preferredNames` (tcp/udp/icmp/igmp/sctp/dccp/gre/ah/esp/egp/igp/ipv4/ipv6-icmp) or a decimal
+/// number; `<ports>` is `first` when `first == last`, `*` for the full `0..=65535` span, else
+/// `first-last`.
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct ProtoPortRange {
     /// IP protocol number (`Proto` in Go). `0` = all protocols.
-    #[serde(default)]
     pub proto: u8,
     /// Inclusive first port (`Ports.First`).
-    #[serde(default)]
     pub first: u16,
     /// Inclusive last port (`Ports.Last`).
-    #[serde(default)]
     pub last: u16,
+}
+
+/// Go `ipproto.preferredNames` — the protocol-number → name table `ipproto.Proto.MarshalText` uses
+/// (and `UnmarshalText` accepts, case-insensitively). Mirrored exactly so our `<proto>` token matches
+/// Go's wire bytes. Numbers not in this table marshal as their decimal value.
+const PROTO_NAMES: &[(u8, &str)] = &[
+    (51, "ah"),
+    (33, "dccp"),
+    (8, "egp"),
+    (50, "esp"),
+    (47, "gre"),
+    (1, "icmp"),
+    (2, "igmp"),
+    (9, "igp"),
+    (4, "ipv4"),
+    (58, "ipv6-icmp"),
+    (132, "sctp"),
+    (6, "tcp"),
+    (17, "udp"),
+];
+
+impl ProtoPortRange {
+    /// The full `0..=65535` "all ports" span (Go `PortRangeAny`).
+    fn ports_is_any(&self) -> bool {
+        self.first == 0 && self.last == 65535
+    }
+}
+
+impl core::fmt::Display for ProtoPortRange {
+    /// Mirrors Go `ProtoPortRange.String()`: `"*"` for all-protocols+all-ports; otherwise
+    /// `[<proto>:]<ports>` where the proto token is present only when `proto != 0`.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.proto == 0 && self.ports_is_any() {
+            return f.write_str("*");
+        }
+        if self.proto != 0 {
+            match PROTO_NAMES.iter().find(|(n, _)| *n == self.proto) {
+                Some((_, name)) => write!(f, "{name}:")?,
+                None => write!(f, "{}:", self.proto)?,
+            }
+        }
+        // Ports (Go `PortRange.String`): single port, `*` for the any span, else `first-last`.
+        if self.ports_is_any() {
+            f.write_str("*")
+        } else if self.first == self.last {
+            write!(f, "{}", self.first)
+        } else {
+            write!(f, "{}-{}", self.first, self.last)
+        }
+    }
+}
+
+impl core::str::FromStr for ProtoPortRange {
+    type Err = alloc::string::String;
+
+    /// Parse Go's text form `[<proto>:]<ports>` (the inverse of [`Display`]). `<proto>` is a
+    /// `preferredNames` name (case-insensitive) or a decimal `u8`; absent means proto 0. `<ports>` is
+    /// `*` (the any span), a single port, or `low-high`.
+    ///
+    /// Proto names are resolved against [`PROTO_NAMES`] (Go's `ipproto.preferredNames`, the *marshal*
+    /// set). Go's `ipproto.UnmarshalText` accepts a slightly larger `acceptedNames` alias set
+    /// (`icmpv4`, `icmpv6`, `ip-in-ip`, `tsmp`) that we deliberately do NOT — a real control plane
+    /// only ever *emits* the `preferredNames` form (`icmp`/`ipv6-icmp`/`ipv4`/the decimal), so the
+    /// aliases appear only in hand-authored configs, never on control traffic. Decimal numbers and
+    /// `*` are accepted exactly as Go does.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.is_empty() {
+            return Err(String::from("empty ProtoPortRange"));
+        }
+        // Bare "*" = all protocols + all ports.
+        if s == "*" {
+            return Ok(ProtoPortRange {
+                proto: 0,
+                first: 0,
+                last: 65535,
+            });
+        }
+        let (proto, ports) = match s.split_once(':') {
+            Some((p, ports)) => {
+                let lower = p.to_ascii_lowercase();
+                let proto = match PROTO_NAMES.iter().find(|(_, name)| *name == lower) {
+                    Some((num, _)) => *num,
+                    None => p
+                        .parse::<u8>()
+                        .map_err(|_| alloc::format!("invalid protocol {p:?}"))?,
+                };
+                (proto, ports)
+            }
+            None => (0, s),
+        };
+        let (first, last) = if ports == "*" {
+            (0u16, 65535u16)
+        } else if let Some((lo, hi)) = ports.split_once('-') {
+            (
+                lo.parse::<u16>()
+                    .map_err(|_| alloc::format!("invalid first port {lo:?}"))?,
+                hi.parse::<u16>()
+                    .map_err(|_| alloc::format!("invalid last port {hi:?}"))?,
+            )
+        } else {
+            let p = ports
+                .parse::<u16>()
+                .map_err(|_| alloc::format!("invalid port {ports:?}"))?;
+            (p, p)
+        };
+        Ok(ProtoPortRange { proto, first, last })
+    }
+}
+
+impl Serialize for ProtoPortRange {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // `collect_str` formats via `Display` without an intermediate `String` allocation.
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProtoPortRange {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = <&str>::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
 }
 
 /// A Tailscale VIP service definition as fetched from control (`tailcfg.VIPService`).
@@ -151,9 +278,10 @@ mod tests {
 
     #[test]
     fn vip_service_parses() {
+        // Ports are Go TextMarshaler STRINGS ("tcp:445"), not objects.
         let wire = r#"{
             "Name": "svc:samba",
-            "Ports": [{ "Proto": 6, "First": 445, "Last": 445 }],
+            "Ports": ["tcp:445"],
             "Active": true
         }"#;
         let svc: VipService = serde_json::from_str(wire).unwrap();
@@ -192,9 +320,8 @@ mod tests {
         // PascalCase wire names, including the all-caps `VIPServices`.
         let svc = &value["VIPServices"][0];
         assert_eq!(svc["Name"], "svc:samba");
-        assert_eq!(svc["Ports"][0]["Proto"], 6);
-        assert_eq!(svc["Ports"][0]["First"], 445);
-        assert_eq!(svc["Ports"][0]["Last"], 445);
+        // Ports serialize as Go TextMarshaler STRINGS ("tcp:445"), not objects.
+        assert_eq!(svc["Ports"][0], "tcp:445");
         assert_eq!(svc["Active"], true);
         assert_eq!(value["ServicesHash"], "abc123");
     }
@@ -213,5 +340,77 @@ mod tests {
         let json = serde_json::to_string(&svc).unwrap();
         let back: VipService = serde_json::from_str(&json).unwrap();
         assert_eq!(svc, back);
+    }
+
+    /// ProtoPortRange serializes to Go's exact TextMarshaler form, and parses it back. Each KAT is the
+    /// string a real Go `tailcfg.ProtoPortRange` emits for the given (proto, first, last).
+    #[test]
+    fn proto_port_range_text_form_matches_go() {
+        use core::str::FromStr;
+        let cases: &[(ProtoPortRange, &str)] = &[
+            // all protocols + all ports => "*"
+            (ppr(0, 0, 65535), "*"),
+            // tcp single port
+            (ppr(6, 443, 443), "tcp:443"),
+            // udp range
+            (ppr(17, 1, 100), "udp:1-100"),
+            // proto 0 (any) with a single port => bare port
+            (ppr(0, 53, 53), "53"),
+            // proto 0 with a range
+            (ppr(0, 80, 90), "80-90"),
+            // a named proto with the all-ports span => "<proto>:*"
+            (ppr(6, 0, 65535), "tcp:*"),
+            // a proto number with NO preferred name => decimal
+            (ppr(99, 1, 1), "99:1"),
+            // icmp / sctp names
+            (ppr(1, 8, 8), "icmp:8"),
+            (ppr(132, 9, 9), "sctp:9"),
+        ];
+        for (range, text) in cases {
+            // Serialize: the JSON value is exactly the text string.
+            let v = serde_json::to_value(range).unwrap();
+            assert_eq!(
+                v,
+                serde_json::Value::String((*text).into()),
+                "serialize {range:?}"
+            );
+            // Display matches too.
+            assert_eq!(alloc::format!("{range}"), *text);
+            // Parse round-trips back to the same struct.
+            assert_eq!(
+                ProtoPortRange::from_str(text).unwrap(),
+                *range,
+                "parse {text:?}"
+            );
+            // Full serde round-trip.
+            let json = serde_json::to_string(range).unwrap();
+            let back: ProtoPortRange = serde_json::from_str(&json).unwrap();
+            assert_eq!(&back, range);
+        }
+    }
+
+    /// Case-insensitive proto names + the `*` wildcard parse (Go `UnmarshalText` accepts these).
+    #[test]
+    fn proto_port_range_parse_accepts_case_and_wildcards() {
+        use core::str::FromStr;
+        assert_eq!(
+            ProtoPortRange::from_str("TCP:443").unwrap(),
+            ppr(6, 443, 443)
+        );
+        assert_eq!(
+            ProtoPortRange::from_str("Udp:*").unwrap(),
+            ppr(17, 0, 65535)
+        );
+        assert_eq!(ProtoPortRange::from_str("*").unwrap(), ppr(0, 0, 65535));
+        // A bare proto-number prefix.
+        assert_eq!(ProtoPortRange::from_str("6:443").unwrap(), ppr(6, 443, 443));
+        // Malformed inputs are rejected, not panicked.
+        assert!(ProtoPortRange::from_str("").is_err());
+        assert!(ProtoPortRange::from_str("tcp:nope").is_err());
+        assert!(ProtoPortRange::from_str("999999:1").is_err()); // proto > u8
+    }
+
+    fn ppr(proto: u8, first: u16, last: u16) -> ProtoPortRange {
+        ProtoPortRange { proto, first, last }
     }
 }
