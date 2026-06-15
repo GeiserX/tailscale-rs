@@ -541,6 +541,54 @@ pub(crate) fn bridge_reauth_url_to_state(
     }
 }
 
+/// What to do when control delivers a self-node whose node-key expiry has passed — the decision
+/// behind the [`StreamMessage::Next`] handler's expiry branch, factored into a pure function so the
+/// full input matrix is unit-testable (mirrors [`bridge_reauth_url_to_state`] being pure).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExpiryAction {
+    /// The key is not expired — the node is up. (`→ DeviceState::Running`.)
+    Running,
+    /// The key expired and auto-reauth is permitted (auth key retained, reauth enabled, TKA NOT
+    /// enforcing): rotate the node key + re-register (`→ DeviceState::Reauthenticating` +
+    /// `Command::Reauth`).
+    Reauthenticate,
+    /// The key expired and auto-reauth is NOT permitted (no auth key, reauth disabled, or TKA
+    /// enforcing): fall back to today's terminal behavior (`→ DeviceState::Expired`).
+    Expired,
+}
+
+/// Decide the action for an expired-or-not self node (pure; the live handler at
+/// [`StreamMessage::Next`] applies it). Go's `ipnlocal` runs `doLogin` (rotate the node key +
+/// re-register with the stored auth key) when an auth-key node's key expires; this fork does the
+/// same, gated by three safety conditions:
+///
+/// - `key_expired` — control reported the self-node's key expiry is in the past.
+/// - `has_auth_key` — a usable auth key is retained for a non-interactive re-register (without one
+///   there is nothing to re-register with → fall back to `Expired`, today's behavior).
+/// - `reauth_enabled` — the `reauth_on_expiry` config opt-out is on (default true).
+/// - `tka_active` — Tailnet Lock enforcement is currently active. **Hard safety gate:** a node-key
+///   rotation on a locked tailnet would install an UNSIGNED key, locking the node out of locked
+///   peers (the TKA re-sign is a separate follow-up — see `keystate.rs` `rotate_node_key`). So when
+///   the lock is enforcing, never rotate — fall back to `Expired`.
+///
+/// Truth table: not expired → `Running`; expired AND auth-key AND reauth-enabled AND NOT TKA →
+/// `Reauthenticate`; otherwise → `Expired`.
+pub(crate) fn expiry_action(
+    key_expired: bool,
+    has_auth_key: bool,
+    reauth_enabled: bool,
+    tka_active: bool,
+) -> ExpiryAction {
+    if !key_expired {
+        return ExpiryAction::Running;
+    }
+    if has_auth_key && reauth_enabled && !tka_active {
+        ExpiryAction::Reauthenticate
+    } else {
+        ExpiryAction::Expired
+    }
+}
+
 /// The classification of SELF against the active network lock — the observability analog of Go
 /// `tkaFilterNetmapLocked`'s self check (which raises a `LockedOut` health warning).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1202,22 +1250,39 @@ impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
 
             StreamMessage::Next(msg) => {
                 if let Some(node) = msg.node.as_ref() {
-                    // Reflect node-key expiry into the device state: control delivering a self-node
-                    // whose key is in the past means the node must re-authenticate. Otherwise the
-                    // arrival of a fresh self-node confirms we are Running (recovers the state if a
-                    // prior update had flipped it to Expired).
+                    // Reflect node-key expiry into the device state. Control delivering a self-node
+                    // whose key is in the past means the node must re-authenticate; the arrival of a
+                    // fresh (non-expired) self-node confirms we are Running (recovering the state if a
+                    // prior update had flipped it to Expired/Reauthenticating). On expiry, decide
+                    // between an automatic re-auth (Go `doLogin`: rotate key + re-register with the
+                    // stored auth key) and the terminal Expired state via the pure `expiry_action`:
+                    //   - auth key retained, reauth enabled, and TKA NOT enforcing → Reauthenticate.
+                    //   - otherwise → Expired (no auth key / reauth disabled / TKA-locked).
+                    // The TKA gate is a hard safety constraint: rotating on a locked tailnet would
+                    // install an unsigned key and lock this node out of locked peers (the TKA re-sign
+                    // is a separate follow-up). Recovery from Reauthenticating is automatic — the next
+                    // good self-node flips back to Running at this same handler.
                     let now_unix = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs() as i64)
                         .unwrap_or(0);
-                    let next = if node.key_expired_at_unix(now_unix) {
-                        crate::DeviceState::Expired
-                    } else {
-                        crate::DeviceState::Running
+                    let action = expiry_action(
+                        node.key_expired_at_unix(now_unix),
+                        self.params.auth_key.is_some(),
+                        self.params.config.reauth_on_expiry,
+                        self.tka_authority.borrow().is_some(),
+                    );
+                    let next = match action {
+                        ExpiryAction::Running => crate::DeviceState::Running,
+                        ExpiryAction::Reauthenticate => crate::DeviceState::Reauthenticating,
+                        ExpiryAction::Expired => crate::DeviceState::Expired,
                     };
                     // `send_if_modified` avoids waking watchers when the state is unchanged (a fresh
-                    // self-node arrives on every netmap update).
-                    self.params.state_tx.send_if_modified(|s| {
+                    // self-node arrives on every netmap update). Returns whether the state changed, so
+                    // we only fire the one-shot `Command::Reauth` on the transition INTO
+                    // Reauthenticating (not on every subsequent expired self-node while the re-auth is
+                    // already in flight).
+                    let changed = self.params.state_tx.send_if_modified(|s| {
                         if *s != next {
                             *s = next.clone();
                             true
@@ -1225,6 +1290,14 @@ impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
                             false
                         }
                     });
+
+                    if changed && action == ExpiryAction::Reauthenticate {
+                        tracing::info!(
+                            "self node-key expired; starting automatic re-auth (rotate node key + \
+                             re-register with stored auth key)"
+                        );
+                        self.client.reauth().await;
+                    }
 
                     self.self_node.send_replace(Some(node.clone()));
                 }
@@ -1940,6 +2013,96 @@ mod home_region_hysteresis_tests {
             select_home_region(Some(rid(2)), &m, &br).unwrap(),
             rid(2),
             "old raw (20ms) within 10ms of smoothed-best (18ms) keeps via the absolute-diff arm"
+        );
+    }
+}
+
+#[cfg(test)]
+mod expiry_action_tests {
+    use super::{ExpiryAction, expiry_action};
+
+    /// Not expired → `Running`, regardless of the other inputs (the gate fields are only consulted
+    /// once the key is expired).
+    #[test]
+    fn not_expired_is_always_running() {
+        for has_auth_key in [false, true] {
+            for reauth_enabled in [false, true] {
+                for tka_active in [false, true] {
+                    assert_eq!(
+                        expiry_action(false, has_auth_key, reauth_enabled, tka_active),
+                        ExpiryAction::Running,
+                        "a non-expired key is Running for any gate combination"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The ONLY input combination that auto-reauths: expired AND auth key retained AND reauth enabled
+    /// AND TKA not enforcing.
+    #[test]
+    fn expired_with_authkey_reauth_enabled_and_no_tka_reauthenticates() {
+        assert_eq!(
+            expiry_action(true, true, true, false),
+            ExpiryAction::Reauthenticate
+        );
+    }
+
+    /// Every other expired combination falls back to the terminal `Expired` (today's behavior, no
+    /// regression): no auth key, reauth disabled, or TKA enforcing each independently forces Expired.
+    #[test]
+    fn expired_falls_back_to_expired_for_every_other_combination() {
+        // The full expired-input matrix minus the single Reauthenticate cell above.
+        for has_auth_key in [false, true] {
+            for reauth_enabled in [false, true] {
+                for tka_active in [false, true] {
+                    let action = expiry_action(true, has_auth_key, reauth_enabled, tka_active);
+                    if has_auth_key && reauth_enabled && !tka_active {
+                        // The one Reauthenticate cell, asserted above.
+                        assert_eq!(action, ExpiryAction::Reauthenticate);
+                    } else {
+                        assert_eq!(
+                            action,
+                            ExpiryAction::Expired,
+                            "expired with has_auth_key={has_auth_key}, \
+                             reauth_enabled={reauth_enabled}, tka_active={tka_active} must be Expired"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The TKA safety gate in isolation: even with an auth key and reauth enabled, an ACTIVE lock
+    /// forces `Expired` (never rotate an unsigned key on a locked tailnet). This is the hard
+    /// constraint from the design — pinned as its own test so a regression that drops the `!tka_active`
+    /// term is caught explicitly.
+    #[test]
+    fn tka_active_forces_expired_even_when_reauth_would_otherwise_fire() {
+        assert_eq!(
+            expiry_action(true, true, true, true),
+            ExpiryAction::Expired,
+            "an enforcing Tailnet Lock must veto auto-reauth (unsigned-key lockout safety gate)"
+        );
+    }
+
+    /// No auth key forces `Expired`: there is nothing to non-interactively re-register with, so even
+    /// with reauth enabled and no lock the node goes terminal (unchanged from today).
+    #[test]
+    fn no_auth_key_forces_expired() {
+        assert_eq!(
+            expiry_action(true, false, true, false),
+            ExpiryAction::Expired
+        );
+    }
+
+    /// The config opt-out: `reauth_on_expiry=false` forces `Expired` even with an auth key and no
+    /// lock (the conservative posture / historical behavior).
+    #[test]
+    fn reauth_disabled_forces_expired() {
+        assert_eq!(
+            expiry_action(true, true, false, false),
+            ExpiryAction::Expired
         );
     }
 }

@@ -24,6 +24,16 @@ pub enum DeviceState {
     /// Control requires interactive authentication (no usable auth key): the node is waiting for a
     /// human to authorize it at the carried URL. Transient — registration retries until authorized.
     NeedsLogin(url::Url),
+    /// The node key expired and an automatic, non-interactive re-authentication is in progress: the
+    /// runtime is rotating the node key and re-registering with the stored auth key (Go `doLogin`).
+    /// **Transient** — treated like [`Connecting`](Self::Connecting) by the waiters
+    /// ([`wait_until_running`](crate::Runtime::wait_until_running) keeps waiting, never settling on
+    /// it), and the next good self-node flips the state back to [`Running`](Self::Running). No
+    /// `browse_to_url` is derived from it (the recovery is non-interactive, unlike
+    /// [`NeedsLogin`](Self::NeedsLogin)). Entered only when an auth key is retained, auto-reauth is
+    /// enabled, and Tailnet Lock enforcement is NOT active; otherwise the runtime falls through to
+    /// [`Expired`](Self::Expired). See the runtime's `expiry_action` for the decision matrix.
+    Reauthenticating,
     /// The node key has expired (control reported the self-node's key expiry is in the past). The
     /// node must re-authenticate to continue. Surfaced from the netmap self-node, not registration.
     Expired,
@@ -127,7 +137,9 @@ pub(crate) async fn wait_for_running(
                 DeviceState::Failed(e) => Some(Err(e.clone())),
                 DeviceState::Expired => Some(Err(RegistrationError::KeyExpired)),
                 DeviceState::NeedsLogin(u) => Some(Err(RegistrationError::NeedsLogin(u.clone()))),
-                DeviceState::Connecting => None,
+                // Transient, like `Connecting`: an auto-reauth is in flight and the next good
+                // self-node flips back to `Running`, so keep waiting rather than settling.
+                DeviceState::Connecting | DeviceState::Reauthenticating => None,
             };
             if let Some(result) = settled {
                 return result;
@@ -257,6 +269,36 @@ mod tests {
         assert_eq!(
             wait_for_running(rx, Some(Duration::from_millis(30))).await,
             Err(RegistrationError::Timeout)
+        );
+    }
+
+    /// `Reauthenticating` is transient (the auto-reauth analogue of `is_permanent() == false`): a
+    /// waiter must NOT settle on it — like `Connecting`, it times out rather than resolving to a
+    /// terminal error, because the next good self-node flips the state back to `Running`. This is the
+    /// behavioral guard that an in-flight auto-reauth never surfaces as a permanent failure.
+    #[tokio::test]
+    async fn wait_does_not_settle_on_reauthenticating() {
+        let (_tx, rx) = watch::channel(DeviceState::Reauthenticating);
+        assert_eq!(
+            wait_for_running(rx, Some(Duration::from_millis(30))).await,
+            Err(RegistrationError::Timeout),
+            "Reauthenticating is transient — a waiter keeps waiting, it does not settle"
+        );
+    }
+
+    /// The full auto-reauth recovery as a waiter sees it: `Reauthenticating` (in flight) → `Running`
+    /// (the next good self-node) resolves `Ok(())`. Proves the transient state is observed and then
+    /// recovered, never surfaced as a failure.
+    #[tokio::test]
+    async fn wait_resolves_on_reauthenticating_then_running() {
+        let (tx, rx) = watch::channel(DeviceState::Reauthenticating);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            tx.send_replace(DeviceState::Running);
+        });
+        assert_eq!(
+            wait_for_running(rx, Some(Duration::from_secs(1))).await,
+            Ok(())
         );
     }
 

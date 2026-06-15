@@ -160,6 +160,30 @@ impl NodeState {
     pub fn generate() -> Self {
         Default::default()
     }
+
+    /// Rotate the node key for re-registration, the runtime twin of
+    /// [`PersistState::rotate_node_key`]: record the current node public key as
+    /// [`old_node_key`](NodeState::old_node_key) and replace the [`node_keys`](NodeState::node_keys)
+    /// pair with a freshly-generated one. The next registration built from this state sends the prior
+    /// key as `RegisterRequest.OldNodeKey`, so control links the new node key to the node's existing
+    /// identity instead of treating it as a brand-new node (Go's `regen`/`doLogin` flow).
+    ///
+    /// Only the **node key** rotates. The disco and machine keys are deliberately left untouched: the
+    /// data plane (magicsock/WireGuard sessions, disco) keys on those and on per-peer keys, never on
+    /// the self node key, so a node-key rotation does not re-key or flap an established tunnel. The
+    /// node key is a control-plane identity. (The disco ping packet does carry the self node key as a
+    /// claimed-sender identity — a caller that rotates at runtime should refresh magicsock's copy so
+    /// outbound pings advertise the new key, but that is a magicsock concern, not a key-state one.)
+    ///
+    // TODO(TKA): on a tailnet-lock-enabled tailnet, a node-key rotation must also re-sign the new node
+    // key with the network-lock key and send the new `RegisterRequest.NodeKeySignature`. This
+    // primitive covers the non-TKA path; the TKA re-sign is a separate follow-up, so an auto-reauth
+    // caller must gate rotation OFF while lock enforcement is active (else the node locks itself out
+    // of locked peers with an unsigned key).
+    pub fn rotate_node_key(&mut self) {
+        self.old_node_key = Some(self.node_keys.public);
+        self.node_keys = NodeKeyPair::new();
+    }
 }
 
 impl From<&PersistState> for NodeState {
@@ -197,6 +221,45 @@ mod tests {
 
         assert_eq!(state.old_node_key, Some(before_pub));
         assert_ne!(state.node_key.public_key(), before_pub);
+    }
+
+    #[test]
+    fn node_state_rotate_node_key_sets_old_and_fresh() {
+        let mut state = NodeState::generate();
+        let before_pub = state.node_keys.public;
+        // The other key roles must be preserved across a node-key rotation (only the node key
+        // rotates — disco/machine/network-lock are unchanged, which is what keeps tunnels from
+        // flapping and keeps a locked-tailnet re-sign possible).
+        let disco_before = state.disco_keys.public;
+        let machine_before = state.machine_keys.public;
+        let lock_before = state.network_lock_keys.public;
+
+        state.rotate_node_key();
+
+        // Old key recorded, node key replaced with a fresh one.
+        assert_eq!(state.old_node_key, Some(before_pub));
+        assert_ne!(state.node_keys.public, before_pub);
+        // The fresh keypair's public matches its private (it's a real, consistent pair).
+        assert_eq!(
+            state.node_keys.public,
+            NodePublicKey::from(&state.node_keys.private)
+        );
+        // Every other key role is untouched.
+        assert_eq!(state.disco_keys.public, disco_before);
+        assert_eq!(state.machine_keys.public, machine_before);
+        assert_eq!(state.network_lock_keys.public, lock_before);
+    }
+
+    #[test]
+    fn node_state_rotate_threads_to_persist_old_node_key() {
+        // After a runtime rotation, converting back to a PersistState carries the prior public key as
+        // old_node_key (so an embedder persisting the rotated state keeps the OldNodeKey linkage).
+        let mut state = NodeState::generate();
+        let before_pub = state.node_keys.public;
+        state.rotate_node_key();
+        let persist = PersistState::from(&state);
+        assert_eq!(persist.old_node_key, Some(before_pub));
+        assert_eq!(persist.node_key.public_key(), state.node_keys.public);
     }
 
     #[test]
