@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.42.0](https://github.com/GeiserX/tailscale-rs/compare/v0.41.0...v0.42.0) (2026-06-15)
+
+
+### Features
+
+* add Device::tka_log for the tailnet-lock AUM history ([#269](https://github.com/GeiserX/tailscale-rs/issues/269)) ([0bc6f2f](https://github.com/GeiserX/tailscale-rs/commit/0bc6f2f1d5f27814d559f92d1664f897c8ab4df9))
+
 ## [0.41.0](https://github.com/GeiserX/tailscale-rs/compare/v0.40.0...v0.41.0) (2026-06-15)
 
 
