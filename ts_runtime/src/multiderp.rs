@@ -560,7 +560,7 @@ async fn run_derp_once(
                             tracing::trace!(parent: &span, %peer_id, region_id = %id, "learned observed derp route for peer");
                         }
 
-                        let data = demux_relayed_disco(pkts, sock.as_deref());
+                        let data = demux_relayed_disco(pkts, sock.as_deref()).await;
                         if data.is_empty() {
                             continue;
                         }
@@ -627,7 +627,7 @@ async fn run_derp_once(
 /// Anti-leak: a relayed frame has no real UDP source, so only `CallMeMaybe` is acted on; relayed
 /// Pings/Pongs are dropped by `handle_relayed_call_me_maybe` rather than producing a pong to a
 /// bogus address.
-fn demux_relayed_disco(
+async fn demux_relayed_disco(
     pkts: impl IntoIterator<Item = ts_packet::PacketMut>,
     sock: Option<&MagicSock>,
 ) -> Vec<ts_packet::PacketMut> {
@@ -635,7 +635,7 @@ fn demux_relayed_disco(
     for mut pkt in pkts {
         if ts_magicsock::looks_like_disco(pkt.as_ref())
             && let Some(sock) = sock
-            && sock.handle_relayed_call_me_maybe(pkt.as_mut())
+            && sock.handle_relayed_call_me_maybe(pkt.as_mut()).await
         {
             // Consumed as a relayed disco frame; keep it off the dataplane.
             continue;
@@ -932,7 +932,7 @@ mod tests {
         let wg = PacketMut::from(&[0x04u8, 0, 0, 0, 1, 2, 3, 4][..]);
 
         let batch = vec![PacketMut::from(&cmm[..]), wg];
-        let to_dataplane = demux_relayed_disco(batch, Some(&sock));
+        let to_dataplane = demux_relayed_disco(batch, Some(&sock)).await;
 
         // The CallMeMaybe was consumed; only the data frame is forwarded.
         assert_eq!(
@@ -965,7 +965,7 @@ mod tests {
         let wg = PacketMut::from(&[0x04u8, 9, 9][..]);
 
         let batch = vec![PacketMut::from(&cmm[..]), wg];
-        let out = demux_relayed_disco(batch, None);
+        let out = demux_relayed_disco(batch, None).await;
 
         assert_eq!(
             out.len(),
@@ -993,7 +993,7 @@ mod tests {
         let ping =
             ts_magicsock::seal_ping(&peer_disco, peer_node, &our_disco.public_key(), tx).unwrap();
 
-        let out = demux_relayed_disco(vec![PacketMut::from(&ping[..])], Some(&sock));
+        let out = demux_relayed_disco(vec![PacketMut::from(&ping[..])], Some(&sock)).await;
 
         assert!(
             out.is_empty(),
@@ -1028,7 +1028,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = demux_relayed_disco(vec![PacketMut::from(&cmm[..])], Some(&sock));
+        let out = demux_relayed_disco(vec![PacketMut::from(&cmm[..])], Some(&sock)).await;
         assert!(out.is_empty(), "the CallMeMaybe is consumed, not forwarded");
 
         assert_eq!(
