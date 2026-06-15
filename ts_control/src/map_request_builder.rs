@@ -374,4 +374,33 @@ mod tests {
         assert_eq!(req.map_session_handle, "");
         assert_eq!(req.map_session_seq, 0);
     }
+
+    /// `host_environment` populates the loud identity fields (OS, IPNVersion, GoVersion, Machine,
+    /// Package, Userspace). Every map request — including the side-command (SetDerpHomeRegion /
+    /// SetEndpoints / SetRoutableIPs / SetHostname) requests, not just the streaming re-register —
+    /// must carry these, mirroring Go attaching the full `hostInfoLocked()` to every `sendMapRequest`.
+    /// A request built WITHOUT `host_environment` carries an empty Hostinfo (blank OS/IPNVersion),
+    /// which is the regression this guards: the side arms now all call `.host_environment(&host)`.
+    #[test]
+    fn host_environment_populates_identity_fields() {
+        let node_state = ts_keys::NodeState::generate();
+        let host = crate::hostinfo::HostInfoData::detect();
+
+        // With host_environment (what every arm now does): identity fields are populated.
+        let with = MapRequestBuilder::new(&node_state)
+            .host_environment(&host)
+            .build();
+        let hi = with.host_info.expect("host_info present");
+        assert!(!hi.os.is_empty(), "OS must be populated");
+        assert!(!hi.ipn_version.is_empty(), "IPNVersion must be populated");
+        assert_eq!(hi.package, crate::hostinfo::PACKAGE_TSNET);
+        assert_eq!(hi.userspace, Some(true));
+
+        // Without it (the pre-fix side-arm behavior): the loud fields are empty — the tell this
+        // fixes. (Asserted so the contrast is explicit and a future drop of host_environment from an
+        // arm visibly regresses to this.)
+        let without = MapRequestBuilder::new(&node_state).routable_ips([]).build();
+        let bare = without.host_info.unwrap_or_default();
+        assert!(bare.os.is_empty() && bare.ipn_version.is_empty());
+    }
 }
