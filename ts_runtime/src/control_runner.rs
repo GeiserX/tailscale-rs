@@ -905,6 +905,21 @@ mod msg_impl {
             self.tka.borrow().clone()
         }
 
+        /// Read up to `limit` entries of the Tailnet-Lock update-chain log, **head-first** (newest →
+        /// oldest), from the locally-synced AUM chain (Go `NetworkLockLog`).
+        ///
+        /// A **pure local read** — no crypto, no mutation, no control round-trip: it walks the
+        /// already-verified `SyncedTka` store this actor owns. Returns an empty `Vec` when no lock is
+        /// synced (Go's `b.tka == nil`). Synchronous (no spawn), like `current_tka_status` — the
+        /// chain is in memory.
+        #[message]
+        pub fn tka_log(&self, limit: usize) -> Vec<crate::tka_sync::TkaLogEntry> {
+            let Some(synced) = self.tka_synced.as_ref() else {
+                return Vec::new();
+            };
+            crate::tka_sync::tka_log_entries(&synced.store, synced.oldest, limit)
+        }
+
         /// Sign `node_key` directly with this node's network-lock key and submit the signature to
         /// control (Go `tka.sign` for the Direct case → `tkaSubmitSignature`).
         ///
