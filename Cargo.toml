@@ -100,6 +100,13 @@ proptest = "1"
 itertools = "0.14"
 rand = "0.10"
 reqwest = "0.13"
+# Pure-Rust zstd decoder for the `Compress = "zstd"` map-poll responses Go control sends on every
+# streaming map poll: Go's `control/controlclient/direct.go` sets `request.Compress = "zstd"`
+# unconditionally, then per-frame `zstdframe.AppendDecode`s the response. `ruzstd` is pure-Rust (no
+# C `zstd-sys`, no `aws-lc`/openssl/ring), so it keeps the ring-only / musl-static egress posture
+# intact. We use only `decoding::StreamingDecoder` (decode-only — a request body is never
+# compressed); the default `std` feature supplies its `io::Read` impl.
+ruzstd = "0.8"
 # Pure-Rust secret wrapper (zeroize-on-drop, redacted Debug). Used by the facade's
 # `Device::new_with_secret` so callers can pass the registration auth key as `SecretString`
 # without materializing a plain `String` at the engine boundary. Ring-clean: pulls only `zeroize`
