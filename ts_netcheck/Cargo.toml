@@ -26,12 +26,6 @@ tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
-# `bytes`, `dashmap`, and `stun-rs` are used ONLY by the `#[cfg(test)]`-gated `stun` module (the
-# `StunProber`, which is never on a live path — see lib.rs). Keeping them here drops them from the
-# production dependency graph entirely, alongside the second-egress/IPv6 prober they back.
-bytes.workspace = true
-dashmap = "6.1"
-stun-rs = "0.1"
 reqwest.workspace = true
 serde_json.workspace = true
 # `test-util` provides the paused virtual clock (`#[tokio::test(start_paused = true)]`) the
