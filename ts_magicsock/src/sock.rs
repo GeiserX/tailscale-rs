@@ -733,7 +733,7 @@ impl MagicSock {
     }
 
     /// Force an immediate disco ping to **every** candidate endpoint of one peer, bypassing the
-    /// per-candidate [`DISCO_PING_INTERVAL`] discovery floor. Returns the number of pings sent.
+    /// per-candidate `DISCO_PING_INTERVAL` discovery floor. Returns the number of pings sent.
     ///
     /// This is the event-driven hole-punch trigger: it is called on receipt of a `CallMeMaybe` from
     /// `peer` (whether direct on the UDP socket or relayed over DERP), mirroring Go magicsock

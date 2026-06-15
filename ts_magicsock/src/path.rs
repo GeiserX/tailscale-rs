@@ -87,7 +87,7 @@ const DISCO_PING_INTERVAL: Duration = Duration::from_secs(5);
 /// reduces steady-state ping volume to just the best-path refresh, matching a stock client.
 ///
 /// Matching Go's `wantFullPingLocked` precedence ladder exactly: once the best is good-enough, Go
-/// returns `false` and **short-circuits before** the [`UPGRADE_UDP_DIRECT_INTERVAL`] rung — so a
+/// returns `false` and **short-circuits before** the `UPGRADE_UDP_DIRECT_INTERVAL` rung — so a
 /// good-enough best is quieted *indefinitely* (no periodic re-probe of the other candidates) until
 /// either its trust lapses or its measured latency rises above this threshold. The best path itself
 /// is still refreshed every cycle, so trust never lapses while it stays good. (A newly-learned
@@ -98,7 +98,7 @@ const GOOD_ENOUGH_LATENCY: Duration = Duration::from_millis(5);
 /// How often to full-ping every candidate to discover a better path when the best is *working but
 /// mediocre* — Go magicsock `upgradeUDPDirectInterval` (1 min), the final rung of
 /// `wantFullPingLocked`. This rung is reached **only when the best's latency is above**
-/// [`GOOD_ENOUGH_LATENCY`] (the good-enough rung short-circuits first), so it does NOT re-probe a
+/// `GOOD_ENOUGH_LATENCY` (the good-enough rung short-circuits first), so it does NOT re-probe a
 /// good-enough (≤5ms) path — it periodically looks for an upgrade away from a usable-but-slow direct
 /// path without per-2s-tick chatter.
 const UPGRADE_UDP_DIRECT_INTERVAL: Duration = Duration::from_secs(60);
@@ -136,7 +136,7 @@ struct Candidate {
     /// How this endpoint was learned (decides reconcile behavior).
     source: CandidateSource,
     /// When we last *sent* a discovery ping to this endpoint, if ever. Gates the per-candidate
-    /// [`DISCO_PING_INTERVAL`] floor so a non-best candidate is re-probed on Go's 5s cadence rather
+    /// `DISCO_PING_INTERVAL` floor so a non-best candidate is re-probed on Go's 5s cadence rather
     /// than every 2s pinger tick. Stamped at send time (in [`PeerPaths::note_ping_sent`]) — matching
     /// Go's `st.lastPing = now` at ping dispatch — so a candidate whose pong is lost still waits the
     /// full interval before the next probe.
@@ -158,7 +158,7 @@ pub struct PeerPaths {
     best: Option<SocketAddr>,
     trust_until: Option<Instant>,
     /// When we last full-pinged *every* candidate (the discovery sweep), if ever. Gates the
-    /// [`UPGRADE_UDP_DIRECT_INTERVAL`] periodic re-probe that overrides the [`GOOD_ENOUGH_LATENCY`]
+    /// `UPGRADE_UDP_DIRECT_INTERVAL` periodic re-probe that overrides the `GOOD_ENOUGH_LATENCY`
     /// quiet-down (Go magicsock's `lastFullPing` feeding `wantFullPingLocked`).
     last_full_ping: Option<Instant>,
 }
@@ -313,11 +313,11 @@ impl PeerPaths {
     ///    returns `None` once trust lapses);
     /// 2. `last_full_ping` never stamped → **full** (Go `lastFullPing.IsZero()`: the first cycle is
     ///    always a full sweep, even with a good-enough best);
-    /// 3. best latency ≤ [`GOOD_ENOUGH_LATENCY`] → **quiet** (Go short-circuits here and *never*
+    /// 3. best latency ≤ `GOOD_ENOUGH_LATENCY` → **quiet** (Go short-circuits here and *never*
     ///    consults the upgrade interval for a good-enough path — a ≤5ms best is left alone until
     ///    trust lapses or its latency rises);
     /// 4. best is working-but-mediocre (> good-enough) and the last full sweep was ≥
-    ///    [`UPGRADE_UDP_DIRECT_INTERVAL`] ago → **full** (periodically look for a better path);
+    ///    `UPGRADE_UDP_DIRECT_INTERVAL` ago → **full** (periodically look for a better path);
     /// 5. otherwise → **quiet**.
     fn want_full_ping(&self, now: Instant) -> bool {
         // Rung 1: no trusted direct best (no path yet, or trust expired).
@@ -346,7 +346,7 @@ impl PeerPaths {
     /// `now` is the pinger tick instant. The caller should already have checked
     /// [`needs_refresh`](Self::needs_refresh); this decides *which* candidates.
     ///
-    /// **Decision-and-mark:** when it commits to a full sweep ([`want_full_ping`](Self::want_full_ping))
+    /// **Decision-and-mark:** when it commits to a full sweep (`want_full_ping`)
     /// it stamps `last_full_ping`, mirroring Go `sendDiscoPingsLocked` setting `lastFullPing = now` on
     /// entry. Call it exactly once per pinger tick (a second call in the same tick would advance the
     /// upgrade clock). The stamp tracks sweep *intent*, not emission — like Go it is set even if every
@@ -357,7 +357,7 @@ impl PeerPaths {
     ///   un-floored `pingHeartbeat` in `heartbeat` (`endpoint.go`), independent of `wantFullPingLocked`
     ///   and of the per-candidate floor that `sendDiscoPingsLocked` applies uniformly to all
     ///   candidates; this method folds that into one place via the explicit best-exemption. Flooring
-    ///   the best would risk the path going dark (see [`DISCO_PING_INTERVAL`]).
+    ///   the best would risk the path going dark (see `DISCO_PING_INTERVAL`).
     /// - On a **quiet** cycle (good-enough best, no full sweep due) non-best candidates are skipped —
     ///   EXCEPT a candidate never yet pinged (`last_ping == None`), which gets one prompt probe. Go
     ///   pings a freshly-learned endpoint immediately via the event-driven `CallMeMaybe`
@@ -365,7 +365,7 @@ impl PeerPaths {
     ///   exemption stands in for that trigger and keeps a new (possibly better) candidate from being
     ///   starved while a good-enough best holds.
     /// - On a **full** cycle every non-best candidate is eligible but skipped if pinged within
-    ///   [`DISCO_PING_INTERVAL`] (the 5s discovery floor). A never-pinged candidate has no `last_ping`,
+    ///   `DISCO_PING_INTERVAL` (the 5s discovery floor). A never-pinged candidate has no `last_ping`,
     ///   so it is never floored — it is always probed promptly.
     pub fn candidates_to_ping(&mut self, now: Instant) -> Vec<SocketAddr> {
         let best = self.best_addr(now);
@@ -399,7 +399,7 @@ impl PeerPaths {
     }
 
     /// Force an immediate discovery sweep of **every** candidate, bypassing the per-candidate
-    /// [`DISCO_PING_INTERVAL`] floor, and return the addresses to ping now.
+    /// `DISCO_PING_INTERVAL` floor, and return the addresses to ping now.
     ///
     /// This is the event-driven counterpart to [`candidates_to_ping`](Self::candidates_to_ping)'s
     /// periodic gating. It mirrors Go magicsock `endpoint.handleCallMeMaybe`, which on receipt of a
@@ -411,10 +411,11 @@ impl PeerPaths {
     ///
     /// Stamps `last_full_ping = now` — this *is* a full sweep, matching Go's unconditional
     /// `de.lastFullPing = now` at the top of `sendDiscoPingsLocked`, which arms the
-    /// [`GOOD_ENOUGH_LATENCY`] quiet-down / [`UPGRADE_UDP_DIRECT_INTERVAL`] re-probe schedule. The
-    /// caller stamps each returned address via [`note_ping_sent`] as it sends, so the per-candidate
-    /// floor is re-established from this send (a periodic [`candidates_to_ping`] in the same window
-    /// will then correctly skip them rather than double-ping).
+    /// `GOOD_ENOUGH_LATENCY` quiet-down / `UPGRADE_UDP_DIRECT_INTERVAL` re-probe schedule. The
+    /// caller stamps each returned address via [`note_ping_sent`](Self::note_ping_sent) as it sends,
+    /// so the per-candidate floor is re-established from this send (a periodic
+    /// [`candidates_to_ping`](Self::candidates_to_ping) in the same window will then correctly skip
+    /// them rather than double-ping).
     ///
     /// Mechanism note: Go zeroes each `st.lastPing` and lets `sendDiscoPingsLocked` re-send (the
     /// `!st.lastPing.IsZero()` floor check is bypassed because the value is now zero); this fork
@@ -423,7 +424,7 @@ impl PeerPaths {
     /// from this send. Note this is deliberately **not** coalesced across repeated `CallMeMaybe`s —
     /// that, too, is Go-faithful: Go re-zeroes `lastPing` on *every* `handleCallMeMaybe`, so each
     /// `CallMeMaybe` re-pings the full candidate set with no per-event rate limit (the
-    /// [`DISCO_PING_INTERVAL`] floor exists only to pace the *unsolicited* periodic prober, and an
+    /// `DISCO_PING_INTERVAL` floor exists only to pace the *unsolicited* periodic prober, and an
     /// explicit "ping me now" solicitation is exactly the case it yields to). The fan-out is bounded
     /// by `MAX_LEARNED_CANDIDATES_PER_PEER` and the sender's netmap-membership gate; the pings are
     /// self-targeted (the soliciting peer's own advertised, sanitized endpoints), never a reflector.
