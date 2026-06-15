@@ -43,26 +43,82 @@ fn drop_before_rules(dst: std::net::IpAddr) -> bool {
     }
 }
 
+/// IPv4 fragment state read from the base header (Go `net/packet.decode4` reads `b[6:8]`): the
+/// fragment offset in 8-byte blocks and the more-fragments flag. A non-first fragment carries no L4
+/// header, so it needs its own verdict path rather than the (always-port-0) ACL match.
+#[derive(Debug, Clone, Copy)]
+struct Ipv4Fragment {
+    /// Fragment offset in 8-byte blocks (the 13-bit IPv4 field), 0 for the first/only fragment.
+    offset_blocks: u16,
+    /// The "more fragments" (MF) flag.
+    more_fragments: bool,
+}
+
+/// Minimum fragment offset (in 8-byte blocks) Go permits for a non-first fragment — Go
+/// `net/packet.minFragBlks = (60 + 20) / 8 = 10` (max IPv4 header + a basic TCP header). A later
+/// fragment starting before this could overlap a transport header (the RFC 1858 overlapping-fragment
+/// evasion), so Go demotes it to `unknown` and drops it; only fragments at or beyond this offset are
+/// allowed to "slide through".
+const MIN_FRAG_BLKS: u16 = (60 + 20) / 8;
+
 /// The inbound packet-filter verdict for an already-parsed packet (`true` = admit). This is the
 /// proto-switch of Go's filter `runIn4`/`runIn6`, applied after `pre()` and after this fork's
 /// source-attribution and local-destination routing (the analogues of Go's `local4`/`local6`
 /// precondition) have run:
 ///
 /// 1. `drop_before_rules` — Go `pre()`'s unconditional multicast / link-local-unicast drops.
-/// 2. TSMP (proto 99) is always admitted, bypassing the ACL — Go `case ipproto.TSMP: return Accept`.
+/// 2. **Fragment classification** (Go `net/packet.decode4` + filter `pre()`): a non-first IPv4
+///    fragment carries no L4 header, so it cannot be port-matched. Go classifies it by offset — a
+///    fragment at offset `>= MIN_FRAG_BLKS` is mapped to `ipproto.Fragment` and `pre()` **accepts**
+///    it (stateless pass-through; the receiver's kernel discards it if the head fragment was
+///    dropped), while a fragment at a smaller offset is dropped (RFC 1858). A *fragmented* TSMP is
+///    disallowed (`moreFrags` on a first TSMP fragment → drop). Without this, etherparse leaves the
+///    transport `None` and the port reads as 0, so a normal ACL rule would silently drop every valid
+///    later fragment — breaking large/fragmented inbound traffic on the 1280-MTU overlay.
+/// 3. TSMP (proto 99) is always admitted, bypassing the ACL — Go `case ipproto.TSMP: return Accept`.
 ///    TSMP carries in-band control messages between nodes, so it must reach the local stack
 ///    regardless of the ACL rules.
-/// 3. Everything else consults the control-derived ACL via `can_access` — Go's `matches4.match`.
+/// 4. Everything else consults the control-derived ACL via `can_access` — Go's `matches4.match`.
 fn inbound_filter_verdict(
     filter: &(dyn ts_packetfilter::Filter + Send + Sync),
     proto: IpProto,
     src: std::net::IpAddr,
     dst: std::net::IpAddr,
     dst_port: u16,
+    frag: Option<Ipv4Fragment>,
 ) -> bool {
     if drop_before_rules(dst) {
         tracing::trace!(?dst, "dropping multicast/link-local dst (pre-rule)");
         return false;
+    }
+
+    if let Some(frag) = frag {
+        if frag.offset_blocks > 0 {
+            // A non-first fragment (Go `decode4`'s `fragOfs != 0` branch). It has no transport
+            // header to match, so the verdict is decided purely by offset:
+            if frag.offset_blocks < MIN_FRAG_BLKS {
+                // Potentially overlaps a transport header (RFC 1858); Go demotes to `unknown` → drop.
+                tracing::trace!(?dst, "dropping low-offset IPv4 fragment (RFC 1858)");
+                return false;
+            }
+            // A valid later fragment — Go maps it to `ipproto.Fragment`, which `pre()` accepts
+            // ahead of the ACL. Stateless: if the head fragment was filtered the receiver's kernel
+            // drops this on reassembly timeout. Accepting here is what large fragmented inbound
+            // traffic relies on.
+            tracing::trace!(
+                ?dst,
+                "accepting later IPv4 fragment (Go pre() pass-through)"
+            );
+            return true;
+        }
+        // `frag.offset_blocks == 0`: the first fragment (or an unfragmented packet). Go disallows a
+        // *fragmented* TSMP (a first fragment with MF set) — without the whole message it can't be a
+        // valid inter-node control packet. Fall through to the normal proto-switch for everything
+        // else; the first fragment of TCP/UDP carries its L4 header, so `dst_port` was parsed above.
+        if proto == IpProto::TSMP && frag.more_fragments {
+            tracing::trace!(?dst, "dropping fragmented TSMP (Go parity)");
+            return false;
+        }
     }
 
     if proto == IpProto::TSMP {
@@ -256,16 +312,36 @@ impl DataPlane {
                         return false;
                     };
 
-                    let (proto, src, dst) = match pkt.net {
-                        Some(etherparse::NetSlice::Ipv4(ipv4)) => (
-                            IpProto::new(ipv4.payload().ip_number.0 as _),
-                            ipv4.header().source_addr().into(),
-                            ipv4.header().destination_addr().into(),
-                        ),
+                    let (proto, src, dst, frag) = match pkt.net {
+                        Some(etherparse::NetSlice::Ipv4(ipv4)) => {
+                            // IPv4 fragment state (Go `net/packet.decode4` reads `b[6:8]`): a
+                            // non-first fragment carries no L4 header, so etherparse leaves
+                            // `transport == None` and the port would read as 0 below — which a normal
+                            // ACL rule never admits. Without classifying the fragment that silently
+                            // drops valid later fragments Go *accepts* (breaking large/fragmented
+                            // inbound traffic on the 1280-MTU overlay). Capture the offset (in 8-byte
+                            // blocks) + the more-fragments bit so the verdict can mirror Go's
+                            // `decode4`/`pre()` fragment handling.
+                            let hdr = ipv4.header();
+                            (
+                                IpProto::new(ipv4.payload().ip_number.0 as _),
+                                hdr.source_addr().into(),
+                                hdr.destination_addr().into(),
+                                Some(Ipv4Fragment {
+                                    offset_blocks: hdr.fragments_offset().value(),
+                                    more_fragments: hdr.more_fragments(),
+                                }),
+                            )
+                        }
                         Some(etherparse::NetSlice::Ipv6(ipv6)) => (
                             IpProto::new(ipv6.payload().ip_number.0 as _),
                             ipv6.header().source_addr().into(),
                             ipv6.header().destination_addr().into(),
+                            // IPv6 fragmentation is carried in a Fragment extension header, not the
+                            // base header; the tailnet is IPv4-only by default so a v6 fragment can't
+                            // reach here on the live path. Treat v6 as non-fragment (the existing
+                            // behavior) — full v6 fragment parity is tracked separately.
+                            None,
                         ),
                         _ => {
                             // A packet that parsed as IP but is neither IPv4 nor IPv6 (e.g. a
@@ -289,10 +365,18 @@ impl DataPlane {
                     };
 
                     // The inbound proto-switch (Go `runIn4`/`runIn6`): Go `pre()` multicast/link-local
-                    // drops, then unconditional TSMP accept, then the control-derived ACL. Source
-                    // attribution above and `or_in.route` below bound this to attributable peers and
-                    // local destinations (Go's `local4`/`local6` precondition).
-                    inbound_filter_verdict(self.packet_filter.as_ref(), proto, src, dst, dst_port)
+                    // drops, then the fragment classification (Go `decode4` + `pre()`), then
+                    // unconditional TSMP accept, then the control-derived ACL. Source attribution above
+                    // and `or_in.route` below bound this to attributable peers and local destinations
+                    // (Go's `local4`/`local6` precondition).
+                    inbound_filter_verdict(
+                        self.packet_filter.as_ref(),
+                        proto,
+                        src,
+                        dst,
+                        dst_port,
+                        frag,
+                    )
                 });
 
                 v
@@ -479,26 +563,107 @@ mod tests {
 
         // TSMP is accepted even though the ACL denies everything — Go `case TSMP: return Accept`.
         assert!(
-            inbound_filter_verdict(&DenyAll, tsmp, src, dst, 0),
+            inbound_filter_verdict(&DenyAll, tsmp, src, dst, 0, None),
             "TSMP admitted by bypassing the (deny-all) ACL"
         );
         // A non-TSMP proto under the same deny-all ACL is dropped — proves the bypass is TSMP-specific.
         assert!(
-            !inbound_filter_verdict(&DenyAll, IpProto::TCP, src, dst, 443),
+            !inbound_filter_verdict(&DenyAll, IpProto::TCP, src, dst, 443, None),
             "TCP still consults the ACL (deny-all → dropped)"
         );
         // `pre()` drops outrank the TSMP accept: TSMP to a multicast/link-local dst is still dropped,
         // exactly as Go runs `pre()` before the proto switch.
         assert!(
-            !inbound_filter_verdict(&DenyAll, tsmp, src, ip("224.0.0.1"), 0),
+            !inbound_filter_verdict(&DenyAll, tsmp, src, ip("224.0.0.1"), 0, None),
             "TSMP to a multicast dst is still dropped (pre() before the switch)"
         );
         assert!(
-            !inbound_filter_verdict(&DenyAll, tsmp, src, ip("169.254.1.1"), 0),
+            !inbound_filter_verdict(&DenyAll, tsmp, src, ip("169.254.1.1"), 0, None),
             "TSMP to a link-local dst is still dropped (pre() before the switch)"
         );
         // IpProto::TSMP is the named constant for proto 99.
         assert_eq!(IpProto::TSMP, tsmp, "IpProto::TSMP == 99");
+    }
+
+    /// IPv4 fragment handling, mirroring Go `net/packet.decode4` + filter `pre()`:
+    /// - a valid later fragment (offset ≥ `MIN_FRAG_BLKS`) is ACCEPTED ahead of the ACL (Go maps it
+    ///   to `ipproto.Fragment`, which `pre()` admits) — even under a deny-all ACL and even though its
+    ///   parsed port is 0, which a normal rule would never match;
+    /// - a low-offset later fragment (offset < `MIN_FRAG_BLKS`) is DROPPED (RFC 1858);
+    /// - a first fragment (offset 0) defers to the normal proto-switch/ACL on its real port;
+    /// - a *fragmented* TSMP first fragment (offset 0, MF set) is DROPPED (Go disallows it), unlike a
+    ///   non-fragmented TSMP which bypasses the ACL.
+    #[test]
+    fn ipv4_fragment_handling_matches_go_decode4() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        let src = ip("100.64.0.9");
+        let dst = ip("100.64.0.1");
+        let frag = |offset_blocks: u16, more_fragments: bool| {
+            Some(Ipv4Fragment {
+                offset_blocks,
+                more_fragments,
+            })
+        };
+
+        // A valid later fragment is accepted under a DENY-ALL ACL with port 0 — proves the accept is
+        // the Go `pre()` Fragment pass-through, not the ACL happening to allow it.
+        assert!(
+            inbound_filter_verdict(
+                &DenyAll,
+                IpProto::TCP,
+                src,
+                dst,
+                0,
+                frag(MIN_FRAG_BLKS, false)
+            ),
+            "a valid later fragment (offset >= MIN_FRAG_BLKS) is accepted ahead of the ACL"
+        );
+        assert!(
+            inbound_filter_verdict(
+                &DenyAll,
+                IpProto::UDP,
+                src,
+                dst,
+                0,
+                frag(MIN_FRAG_BLKS + 50, true)
+            ),
+            "a later fragment well past the floor (MF set) is also accepted"
+        );
+
+        // A low-offset later fragment (could overlap a transport header) is dropped — RFC 1858.
+        assert!(
+            !inbound_filter_verdict(
+                &DenyAll,
+                IpProto::TCP,
+                src,
+                dst,
+                0,
+                frag(MIN_FRAG_BLKS - 1, false)
+            ),
+            "a low-offset later fragment is dropped (RFC 1858)"
+        );
+        assert!(
+            !inbound_filter_verdict(&DenyAll, IpProto::TCP, src, dst, 0, frag(1, false)),
+            "the smallest non-zero offset is dropped"
+        );
+
+        // A first fragment (offset 0) defers to the normal ACL on its real port: deny-all drops a
+        // TCP first fragment, exactly as it drops a non-fragmented TCP packet.
+        assert!(
+            !inbound_filter_verdict(&DenyAll, IpProto::TCP, src, dst, 443, frag(0, true)),
+            "a first fragment defers to the ACL (deny-all -> dropped) on its parsed port"
+        );
+
+        // A fragmented TSMP first fragment (offset 0, MF set) is dropped — Go disallows it — even
+        // though a non-fragmented TSMP bypasses the ACL.
+        assert!(
+            !inbound_filter_verdict(&DenyAll, IpProto::TSMP, src, dst, 0, frag(0, true)),
+            "a fragmented TSMP first fragment is dropped (Go parity)"
+        );
+        assert!(
+            inbound_filter_verdict(&DenyAll, IpProto::TSMP, src, dst, 0, frag(0, false)),
+            "a non-fragmented TSMP (offset 0, MF clear) still bypasses the ACL"
+        );
     }
 
     /// Behavioral guard: an installed capture hook MUST be invoked with `CapturePath::FromLocal`
