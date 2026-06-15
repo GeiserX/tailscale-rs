@@ -98,11 +98,12 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CLIENT_RESPONSE: usize = 64 * 1024;
 
 /// Delegate a recursive DNS `query` to an exit node's peerAPI DoH endpoint at `doh_addr`, over the
-/// overlay netstack `channel`. Returns the exit node's DNS answer bytes, or `nxdomain` on any
-/// failure (connect, write, malformed HTTP, timeout) — **fail-closed, never a fallback to a local
-/// resolver**: when an exit node is selected, recursive DNS must egress from the exit node, so a
-/// failure here resolves to NXDOMAIN rather than silently leaking the query (and this host's real
-/// IP) to a local upstream.
+/// overlay netstack `channel`. Returns the exit node's DNS answer bytes, or the caller-supplied
+/// `fallback` buffer on any failure (connect, write, malformed HTTP, timeout) — **fail-closed,
+/// never a fallback to a local resolver**: when an exit node is selected, recursive DNS must egress
+/// from the exit node, so a failure here resolves to the `fallback` rather than silently leaking the
+/// query (and this host's real IP) to a local upstream. The caller supplies the rcode: the client
+/// recursive path passes a SERVFAIL (a forward failure is soft, not a cacheable non-existence).
 ///
 /// Anti-leak: the connection is made over the overlay (`channel.tcp_connect(0.0.0.0:0, doh_addr)`),
 /// so it rides the encrypted WireGuard tunnel to the peer — never a host socket. IPv4-only:
@@ -111,23 +112,23 @@ pub(crate) async fn forward_doh(
     channel: &Channel,
     doh_addr: SocketAddr,
     query: &[u8],
-    nxdomain: Vec<u8>,
+    fallback: Vec<u8>,
 ) -> Vec<u8> {
     match timeout(CLIENT_TIMEOUT, doh_round_trip(channel, doh_addr, query)).await {
         Ok(Ok(resp)) if !resp.is_empty() => resp,
         Ok(Ok(_)) => {
-            // A broken exit-node recursive resolver silently NXDOMAINs every delegated query, so
+            // A broken exit-node recursive resolver silently fails every delegated query, so
             // surface delegation failures at warn (default level) — the operator needs the signal.
             tracing::warn!(%doh_addr, "peerapi doh client: empty response from exit node");
-            nxdomain
+            fallback
         }
         Ok(Err(e)) => {
             tracing::warn!(error = %e, %doh_addr, "peerapi doh client: delegation failed");
-            nxdomain
+            fallback
         }
         Err(_) => {
             tracing::warn!(%doh_addr, "peerapi doh client: delegation timed out");
-            nxdomain
+            fallback
         }
     }
 }
@@ -311,8 +312,8 @@ async fn resolve(
         ServerDecision::Forward {
             upstreams,
             query,
-            nxdomain,
-        } => forward_query(channel, &upstreams, &query, nxdomain).await,
+            servfail,
+        } => forward_query(channel, &upstreams, &query, servfail).await,
     }
 }
 
@@ -327,7 +328,10 @@ enum ServerDecision {
     Forward {
         upstreams: Vec<SocketAddr>,
         query: Vec<u8>,
-        nxdomain: Vec<u8>,
+        /// Fallback response if every upstream fails — a SERVFAIL, carried over from the shared
+        /// [`Decision::Forward`]: an off-tailnet name the exit-node DoH server couldn't forward is a
+        /// soft failure, not a cacheable non-existence.
+        servfail: Vec<u8>,
     },
 }
 
@@ -363,7 +367,7 @@ fn server_decide(view: &DnsView, query: &[u8], forward_exit_egress: bool) -> Ser
         Some(Decision::Forward {
             upstreams,
             query,
-            nxdomain,
+            servfail,
             // The exit-node DNS proxy resolves recursively itself; it never re-delegates to its own
             // exit node, so the client-side recursive flag is irrelevant here.
             recursive: _,
@@ -383,7 +387,7 @@ fn server_decide(view: &DnsView, query: &[u8], forward_exit_egress: bool) -> Ser
             ServerDecision::Forward {
                 upstreams,
                 query,
-                nxdomain,
+                servfail,
             }
         }
     }

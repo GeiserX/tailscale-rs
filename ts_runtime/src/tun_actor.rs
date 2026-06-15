@@ -457,8 +457,8 @@ enum Intercept {
     /// A [`Decision::Forward`] (recursive / split-DNS). The slow overlay round-trip must be SPAWNED
     /// by the pump rather than awaited inline (anti-HOL-blocking). Carries the already-resolved
     /// [`RecursivePlan`] (computed while the view borrow was held), the original query bytes, the
-    /// fail-closed `nxdomain` fallback, and the reply destination `src`. The pump must NOT forward
-    /// the packet to the overlay.
+    /// `servfail` fallback, and the reply destination `src`. The pump must NOT forward the packet to
+    /// the overlay.
     Forward {
         /// The resolved forwarding plan (UDP upstreams vs exit-node DoH over the overlay). The
         /// upstream `SocketAddr`s come only from `decide`/`recursive_plan`, which already
@@ -467,8 +467,10 @@ enum Intercept {
         plan: RecursivePlan,
         /// The original query bytes to forward verbatim.
         query: Vec<u8>,
-        /// Fail-closed NXDOMAIN response written back if every upstream fails.
-        nxdomain: Vec<u8>,
+        /// SERVFAIL response written back if every upstream fails — an off-tailnet name the
+        /// forwarder couldn't reach is a soft failure, not a cacheable non-existence (carried over
+        /// from [`Decision::Forward`]; matches Go forwarder.go:1297-1307).
+        servfail: Vec<u8>,
         /// The reply's destination (the host stub resolver) — the query's source endpoint.
         src: SocketAddrV4,
     },
@@ -494,9 +496,9 @@ enum Intercept {
 ///
 /// The plan (UDP upstreams vs exit-node DoH) is computed here from the current view; both branches
 /// route through `recursive_plan`/the `decide`-built upstreams, so the IPv4-only filter at
-/// `magic_dns.rs:385,429` is inherited (we never build a `SocketAddr` here). The fail-closed
-/// `nxdomain` fallback is carried into the spawned task and written on forward failure — same as
-/// before, just from the spawned task rather than inline.
+/// `magic_dns.rs:385,429` is inherited (we never build a `SocketAddr` here). The `servfail` fallback
+/// is carried into the spawned task and written on forward failure — same as before, just from the
+/// spawned task rather than inline.
 fn plan_intercept(view: &DnsView, pkt: &[u8]) -> Intercept {
     let Some(query) = classify_magic_dns(pkt) else {
         return Intercept::NotIntercepted;
@@ -518,7 +520,7 @@ fn plan_intercept(view: &DnsView, pkt: &[u8]) -> Intercept {
         Some(Decision::Forward {
             upstreams,
             query,
-            nxdomain,
+            servfail,
             recursive,
         }) => {
             let plan = if recursive {
@@ -529,7 +531,7 @@ fn plan_intercept(view: &DnsView, pkt: &[u8]) -> Intercept {
             Intercept::Forward {
                 plan,
                 query,
-                nxdomain,
+                servfail,
                 src,
             }
         }
@@ -553,7 +555,8 @@ async fn send_dns_reply(device: &Arc<AsyncTunTransport>, src: SocketAddrV4, resp
 /// into the TUN. Spawned onto the pump's `JoinSet` so it never blocks the uplink (see
 /// [`plan_intercept`] / the UP pump). Mirrors the spawned forward in the netstack serve loop
 /// (`magic_dns.rs:614-627`): forward over the overlay (anti-leak: never a host socket), falling back
-/// to the pre-built `nxdomain` on failure (fail-closed), then write the reply packet into the TUN.
+/// to the pre-built `servfail` on failure (a soft failure for an off-tailnet name we couldn't
+/// forward), then write the reply packet into the TUN.
 /// The upstreams are carried in `plan` (from `decide`/`recursive_plan`, already v4-only filtered);
 /// this fn never constructs an upstream `SocketAddr`, so the IPv4-only egress invariant is inherited.
 /// The TUN uplink pump: the highest-traffic datapath, run as a task spawned onto the actor's
@@ -626,11 +629,11 @@ async fn up_pump(
                             send_dns_reply(&dev_up, src, &response).await;
                         }
                         // Spawn the slow overlay round-trip; it writes the reply (or the
-                        // fail-closed nxdomain) back into the TUN when it completes.
+                        // servfail fallback) back into the TUN when it completes.
                         Intercept::Forward {
                             plan,
                             query,
-                            nxdomain,
+                            servfail,
                             src,
                         } => {
                             // Bound in-flight forwards: reap one completed task at the cap
@@ -648,7 +651,7 @@ async fn up_pump(
                                 dns_channel.clone(),
                                 plan,
                                 query,
-                                nxdomain,
+                                servfail,
                                 src,
                             ));
                         }
@@ -667,13 +670,13 @@ async fn run_forward(
     channel: Channel,
     plan: RecursivePlan,
     query: Vec<u8>,
-    nxdomain: Vec<u8>,
+    servfail: Vec<u8>,
     src: SocketAddrV4,
 ) {
     let response = match plan {
-        RecursivePlan::Udp(ups) => forward_query(&channel, &ups, &query, nxdomain).await,
+        RecursivePlan::Udp(ups) => forward_query(&channel, &ups, &query, servfail).await,
         RecursivePlan::Doh(addr) => {
-            crate::peerapi_doh::forward_doh(&channel, addr, &query, nxdomain).await
+            crate::peerapi_doh::forward_doh(&channel, addr, &query, servfail).await
         }
     };
     let reply_pkt = build_dns_response(src, &response);

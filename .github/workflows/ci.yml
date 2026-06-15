@@ -144,6 +144,16 @@ jobs:
         run: cargo build $COMMON_FLAGS --all-targets
       - name: Test (cargo test)
         run: cargo test $COMMON_FLAGS
+      # Compile + lint the optional `tun` feature on the lib it gates (ts_runtime's TUN-mode
+      # datapath). `COMMON_FLAGS` is default-features-only, so `mod tun_actor`
+      # (`#[cfg(feature = "tun")]`) is otherwise NEVER built on a fork — a shape change to a type it
+      # shares with the default graph (e.g. a `Decision::Forward` field) would compile-break only
+      # here and ship false-green. The `tun` feature pulls no aws-lc (ts_transport_tun/ts_host_net/
+      # etherparse are ring-only), so this stays on the ring-only supply-chain graph this lane guards.
+      - name: Build + lint the `tun` feature (cargo check/clippy --features tun)
+        run: |
+          cargo check -p geiserx_ts_runtime --features tun --all-targets
+          cargo clippy -p geiserx_ts_runtime --features tun --no-deps --all-targets -- -D warnings -A missing_docs
       - name: Anti-leak firewall checks (cargo run -p checks)
         run: cargo run -p checks
       - name: binstall

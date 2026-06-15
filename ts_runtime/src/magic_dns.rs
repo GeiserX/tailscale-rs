@@ -256,14 +256,16 @@ pub(crate) enum Decision {
     /// A fully-formed response is ready to send.
     Reply(Vec<u8>),
     /// Forward the original query datagram to one of these upstream UDP resolvers; on success
-    /// relay the upstream answer, on failure/timeout answer NXDOMAIN with the given id+question.
+    /// relay the upstream answer, on failure/timeout answer with the prebuilt `servfail` buffer
+    /// (an off-tailnet name we failed to forward is a soft failure, not a cacheable non-existence —
+    /// Go forwarder.go:1297-1307).
     Forward {
         /// UDP upstreams to try, in order.
         upstreams: Vec<SocketAddr>,
         /// The original query bytes to forward verbatim.
         query: Vec<u8>,
-        /// Fallback NXDOMAIN response if every upstream fails.
-        nxdomain: Vec<u8>,
+        /// Fallback SERVFAIL response if every upstream fails or times out.
+        servfail: Vec<u8>,
         /// Whether this is a *recursive* (catch-all fallback/global resolver) forward, as opposed
         /// to a deliberately-configured split-DNS route. Only recursive forwards are eligible for
         /// exit-node DoH delegation in the client serve loop (see [`DnsView::exit_doh`]); split-DNS
@@ -409,10 +411,23 @@ pub(crate) fn decide(view: &DnsView, buf: &[u8]) -> Option<Decision> {
 }
 
 /// For a name with no overlay answer, consult the split-DNS routes + recursive resolvers and
-/// either forward (to UDP upstreams) or fail closed with NXDOMAIN.
+/// either forward (to UDP upstreams), answer authoritatively absent (NXDOMAIN), or fail soft
+/// (SERVFAIL) when an off-tailnet name simply can't be forwarded.
 ///
-/// Anti-leak: a name under a tailnet search domain is authoritative and is never forwarded — it
-/// fails closed to NXDOMAIN so neither the name nor the query leaks to a third-party resolver.
+/// Rcode parity with Go's resolver (`net/dns/resolver/tsdns.go` resolution order + `forwarder.go`):
+/// - A **tailnet-authoritative** name (search-domain suffix) or a **negative split-DNS route**
+///   (`Upstreams::Block` — a route configured with no resolvers, which Go answers authoritatively
+///   from Hosts, so an unmatched name under it is authoritatively absent) → **NXDOMAIN**.
+/// - An **off-tailnet** name we cannot forward — no route and no resolver configured
+///   (`Upstreams::None`), or a route whose resolvers are all filtered out (IPv6-only under the
+///   IPv4-only egress) → **SERVFAIL**, matching Go forwarder.go:1207 ("no upstream resolvers set,
+///   returning SERVFAIL"). A cacheable NXDOMAIN on a transient/structural inability to forward would
+///   make a downstream stub cache the *non-existence* of a real name; SERVFAIL is a soft failure the
+///   stub retries.
+///
+/// Anti-leak: a tailnet-suffix name is authoritative and is never forwarded — neither the name nor
+/// the query leaks to a third-party resolver. (The CGNAT `in-addr.arpa` / `ip6.arpa` reverse-zone
+/// NXDOMAIN guards live in the PTR arm of [`decide`] and are likewise unaffected.)
 fn forward_or_nxdomain(
     view: &DnsView,
     canon: &str,
@@ -421,7 +436,9 @@ fn forward_or_nxdomain(
     q: &ts_dns_wire::Question,
     rd: bool,
 ) -> Decision {
+    // NXDOMAIN for authoritative-absent names; SERVFAIL for an off-tailnet name we can't forward.
     let nxdomain = encode_response(id, q, rd, Rcode::NxDomain, &[]);
+    let servfail = encode_response(id, q, rd, Rcode::ServFail, &[]);
 
     if is_tailnet_name(view, canon) {
         return Decision::Reply(nxdomain);
@@ -430,8 +447,11 @@ fn forward_or_nxdomain(
     let (resolvers, recursive) = match view.route_for(canon) {
         Upstreams::Route(resolvers) => (resolvers, false),
         Upstreams::Recursive(resolvers) => (resolvers, true),
-        // Negative route or nothing configured: fail closed.
-        Upstreams::Block | Upstreams::None => return Decision::Reply(nxdomain),
+        // A negative split-DNS route is authoritative-absent (Go answers it from Hosts): NXDOMAIN.
+        Upstreams::Block => return Decision::Reply(nxdomain),
+        // No route and no resolver: an off-tailnet name we have nowhere to forward — SERVFAIL, not
+        // a cacheable non-existence (Go forwarder.go:1207).
+        Upstreams::None => return Decision::Reply(servfail),
     };
 
     let upstreams: Vec<SocketAddr> = resolvers
@@ -441,12 +461,16 @@ fn forward_or_nxdomain(
         .filter(SocketAddr::is_ipv4)
         .collect();
     if upstreams.is_empty() {
-        Decision::Reply(nxdomain)
+        // We had a route but every resolver was filtered out (IPv6-only): we cannot forward this
+        // off-tailnet name, so soft-fail rather than assert non-existence.
+        Decision::Reply(servfail)
     } else {
         Decision::Forward {
             upstreams,
             query: buf.to_vec(),
-            nxdomain,
+            // All upstreams failing at runtime is also an inability to forward, not a non-existence
+            // (Go forwarder.go:1297-1307): hand the forwarder a SERVFAIL fallback, not NXDOMAIN.
+            servfail,
             recursive,
         }
     }
@@ -516,8 +540,9 @@ fn forward_or_nodata(
         return Decision::Reply(encode_response(id, q, rd, Rcode::NxDomain, &[]));
     }
     // Off-tailnet, non-reverse-zone: forward verbatim. `forward_or_nxdomain` already forwards
-    // non-tailnet names and fails closed (NXDOMAIN) when no upstream is configured/routable; reuse it
-    // (the tailnet branch above is already handled, so its tailnet→NXDOMAIN path is unreachable here).
+    // non-tailnet names and soft-fails (SERVFAIL) when no upstream is configured/routable; reuse it
+    // (the tailnet branch above is already handled, so its tailnet→NXDOMAIN and negative-route paths
+    // are unreachable here — this only exercises its off-tailnet forward / SERVFAIL dispositions).
     forward_or_nxdomain(view, canon, buf, id, q, rd)
 }
 
@@ -634,7 +659,11 @@ fn response_matches_query(query: &[u8], resp: &[u8]) -> bool {
 }
 
 /// Forward `query` to each upstream in order over the **overlay** netstack, returning the first
-/// well-formed response, or `nxdomain` if every upstream times out or errors.
+/// well-formed response, or the prebuilt `fallback` buffer if every upstream times out or errors.
+///
+/// The caller supplies `fallback` (a SERVFAIL response for a forwarded off-tailnet name — an
+/// all-upstream failure is a soft "couldn't resolve", not a cacheable non-existence, matching Go
+/// forwarder.go:1297-1307). Keeping it caller-supplied means this fn is rcode-agnostic.
 ///
 /// Anti-leak: forwarding goes through the overlay netstack `channel` (a fresh `0.0.0.0:0` overlay
 /// UDP socket per query), NEVER a host socket — so the real origin IP can't leak to the resolver,
@@ -644,7 +673,7 @@ pub(crate) async fn forward_query(
     channel: &Channel,
     upstreams: &[SocketAddr],
     query: &[u8],
-    nxdomain: Vec<u8>,
+    fallback: Vec<u8>,
 ) -> Vec<u8> {
     for upstream in upstreams {
         let socket = match channel
@@ -686,7 +715,7 @@ pub(crate) async fn forward_query(
             }
         }
     }
-    nxdomain
+    fallback
 }
 
 /// Run the receive/answer loop for the bound socket until it (or the netstack) goes away.
@@ -726,7 +755,7 @@ async fn serve(
             Some(Decision::Forward {
                 upstreams,
                 query,
-                nxdomain,
+                servfail,
                 recursive,
             }) => {
                 // A recursive forward is eligible for exit-node DoH delegation; a split-DNS route
@@ -756,10 +785,10 @@ async fn serve(
                     let _permit = permit;
                     let resp = match plan {
                         RecursivePlan::Udp(upstreams) => {
-                            forward_query(&channel, &upstreams, &query, nxdomain).await
+                            forward_query(&channel, &upstreams, &query, servfail).await
                         }
                         RecursivePlan::Doh(doh_addr) => {
-                            crate::peerapi_doh::forward_doh(&channel, doh_addr, &query, nxdomain)
+                            crate::peerapi_doh::forward_doh(&channel, doh_addr, &query, servfail)
                                 .await
                         }
                     };
@@ -953,7 +982,7 @@ impl Message<Query> for MagicDnsActor {
             Some(Decision::Forward {
                 upstreams,
                 query,
-                nxdomain,
+                servfail,
                 recursive,
             }) => {
                 let plan = if recursive {
@@ -963,7 +992,7 @@ impl Message<Query> for MagicDnsActor {
                 };
                 match plan {
                     RecursivePlan::Udp(upstreams) => {
-                        let resp = forward_query(&self.channel, &upstreams, &query, nxdomain).await;
+                        let resp = forward_query(&self.channel, &upstreams, &query, servfail).await;
                         (resp, upstreams)
                     }
                     RecursivePlan::Doh(doh_addr) => {
@@ -971,7 +1000,7 @@ impl Message<Query> for MagicDnsActor {
                             &self.channel,
                             doh_addr,
                             &query,
-                            nxdomain,
+                            servfail,
                         )
                         .await;
                         // The query egressed via the exit node's DoH endpoint, not a local UDP
@@ -1258,13 +1287,21 @@ mod tests {
     }
 
     #[test]
-    fn unknown_name_is_nxdomain() {
+    fn unknown_off_tailnet_name_with_no_upstream_is_servfail() {
+        // An off-tailnet name with no resolver configured cannot be forwarded. Go answers SERVFAIL
+        // (a soft "couldn't resolve"), not NXDOMAIN — asserting non-existence of a real name we
+        // simply have no upstream for would poison a downstream stub's negative cache. (A *tailnet*
+        // name with no overlay match stays NXDOMAIN — see `tailnet_name_is_never_forwarded` — and a
+        // negative split-DNS route stays NXDOMAIN — see `negative_route_is_nxdomain_not_forwarded`.)
         let view = view_with_peer();
         let buf = build_query(0x9, &["nope", "example", "com"], 1, 1);
 
         let resp = answer(&view, &buf).expect("answers");
         let (_, rcode, ancount) = parse_header(&resp);
-        assert_eq!(rcode, 3, "NxDomain");
+        assert_eq!(
+            rcode, 2,
+            "ServFail: off-tailnet name, nothing to forward to"
+        );
         assert_eq!(ancount, 0);
     }
 
@@ -1333,9 +1370,9 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_qtype_off_tailnet_forwards_or_nxdomains() {
+    fn unsupported_qtype_off_tailnet_forwards_or_servfails() {
         // A non-A/AAAA/PTR qtype for an OFF-tailnet name must be forwardable like A/AAAA — never
-        // REFUSED. With no upstream configured in this view it fails closed to NXDOMAIN (the same
+        // REFUSED. With no upstream configured in this view it soft-fails to SERVFAIL (the same
         // disposition an off-tailnet A query gets here), proving the qtype no longer short-circuits
         // to REFUSED. HTTPS/SVCB is type 65 (the browser HTTP/3 + ECH case the old REFUSED broke).
         let view = view_with_peer();
@@ -1344,8 +1381,8 @@ mod tests {
         let resp = answer(&view, &buf).expect("answers");
         let (_, rcode, _) = parse_header(&resp);
         assert_eq!(
-            rcode, 3,
-            "off-tailnet, no upstream -> NXDOMAIN (forwardable, not Refused)"
+            rcode, 2,
+            "off-tailnet, no upstream -> SERVFAIL (forwardable, not Refused)"
         );
     }
 
@@ -1369,15 +1406,15 @@ mod tests {
     #[test]
     fn unimplemented_qtype_off_tailnet_still_forwards_not_notimp() {
         // The NOTIMP disposition is ONLY for a name we are authoritative for. An NS query for an
-        // off-tailnet name must still forward (here: NXDOMAIN, no upstream) — NOT NOTIMP — exactly
+        // off-tailnet name must still forward (here: SERVFAIL, no upstream) — NOT NOTIMP — exactly
         // like the off-tailnet HTTPS/SVCB case above. Guards the NOTIMP change against over-reach.
         let view = view_with_peer();
         let buf = build_query(0x1, &["example", "com"], 2, 1); // NS, off-tailnet
         let resp = answer(&view, &buf).expect("answers");
         let (_, rcode, _) = parse_header(&resp);
         assert_eq!(
-            rcode, 3,
-            "off-tailnet NS -> NXDOMAIN (forwardable), not NOTIMP"
+            rcode, 2,
+            "off-tailnet NS -> SERVFAIL (forwardable), not NOTIMP"
         );
     }
 
@@ -1415,14 +1452,20 @@ mod tests {
     }
 
     #[test]
-    fn ptr_for_unknown_ip_is_nxdomain() {
+    fn ptr_for_unknown_public_ip_off_tailnet_is_servfail() {
         let view = view_with_peer();
-        // 9.9.9.9 is not a known tailnet IP.
+        // 9.9.9.9 is a public IP, not a known tailnet IP and not in the CGNAT reverse zone — so its
+        // reverse query is an ordinary off-tailnet name. With no upstream to forward it to, that is
+        // SERVFAIL (soft), not NXDOMAIN. (A CGNAT/ip6.arpa reverse for an unmatched tailnet IP still
+        // fails closed to NXDOMAIN as an anti-leak guard — see `ptr_for_unknown_tailnet_ip_*`.)
         let buf = build_query(0x34, &["9", "9", "9", "9", "in-addr", "arpa"], 12, 1);
 
         let resp = answer(&view, &buf).expect("answers");
         let (_, rcode, _) = parse_header(&resp);
-        assert_eq!(rcode, 3, "NxDomain");
+        assert_eq!(
+            rcode, 2,
+            "ServFail: off-tailnet public-IP reverse, no upstream"
+        );
     }
 
     #[test]
@@ -1658,7 +1701,13 @@ mod tests {
 
         let resp = answer(&view, &buf).expect("answers");
         let (_, rcode, _) = parse_header(&resp);
-        assert_eq!(rcode, 3, "NxDomain: extra records are not search-expanded");
+        // Not search-expanded → treated as the bare off-tailnet name "static", which has no upstream
+        // here, so SERVFAIL (soft). The point of the test — that the extra record is NOT reachable
+        // via search expansion — holds regardless of the failure rcode.
+        assert_eq!(
+            rcode, 2,
+            "ServFail: bare 'static' is not search-expanded to the extra record"
+        );
     }
 
     #[test]
@@ -1713,17 +1762,17 @@ mod tests {
     }
 
     #[test]
-    fn non_in_class_off_tailnet_forwards_or_nxdomains() {
+    fn non_in_class_off_tailnet_forwards_or_servfails() {
         // A non-IN class for an OFF-tailnet name is forwardable (Go forwards it), never REFUSED.
-        // No upstream here -> NXDOMAIN, proving the class gate no longer short-circuits to Refused.
+        // No upstream here -> SERVFAIL, proving the class gate no longer short-circuits to Refused.
         let view = view_with_peer();
         let buf = build_query(0x66, &["example", "com"], 1, 3);
 
         let resp = answer(&view, &buf).expect("answers");
         let (_, rcode, _) = parse_header(&resp);
         assert_eq!(
-            rcode, 3,
-            "off-tailnet non-IN class, no upstream -> NXDOMAIN, not Refused"
+            rcode, 2,
+            "off-tailnet non-IN class, no upstream -> SERVFAIL, not Refused"
         );
     }
 
@@ -1999,17 +2048,45 @@ mod tests {
     }
 
     #[test]
-    fn no_resolvers_fails_closed() {
-        // No route, no resolvers: an unknown name is NXDOMAIN, not forwarded.
+    fn no_resolvers_off_tailnet_is_servfail_not_nxdomain() {
+        // No route, no resolvers: an OFF-tailnet name cannot be forwarded. Go answers SERVFAIL
+        // (forwarder.go:1207 "no upstream resolvers set, returning SERVFAIL"), NOT NXDOMAIN — a
+        // cacheable non-existence for a real name we merely couldn't forward would poison downstream
+        // stub caches. We still never forward (the name does not leak); we just soft-fail.
         let view = view_with_routes(std::collections::BTreeMap::new(), vec![], vec![]);
         let buf = build_query(0x106, &["example", "com"], 1, 1);
 
         match decide(&view, &buf).expect("decides") {
             Decision::Reply(resp) => {
                 let (_, rcode, _) = parse_header(&resp);
-                assert_eq!(rcode, 3, "NxDomain");
+                assert_eq!(
+                    rcode, 2,
+                    "ServFail: off-tailnet name with no upstream to forward to"
+                );
             }
             Decision::Forward { .. } => panic!("must not forward with no resolvers"),
+        }
+    }
+
+    #[test]
+    fn route_with_only_ipv6_upstreams_off_tailnet_is_servfail() {
+        // A split-DNS route exists but every resolver is IPv6 (filtered out under the IPv4-only
+        // egress): we have a route yet nowhere to forward. That is an inability to forward an
+        // off-tailnet name, so SERVFAIL (soft), not a fabricated NXDOMAIN.
+        let mut routes = std::collections::BTreeMap::new();
+        routes.insert("corp.example".to_string(), vec![udp("[2001:db8::53]:53")]);
+        let view = view_with_routes(routes, vec![], vec![]);
+        let buf = build_query(0x108, &["host", "corp", "example"], 1, 1);
+
+        match decide(&view, &buf).expect("decides") {
+            Decision::Reply(resp) => {
+                let (_, rcode, _) = parse_header(&resp);
+                assert_eq!(
+                    rcode, 2,
+                    "ServFail: route's resolvers all filtered out (IPv6-only), cannot forward"
+                );
+            }
+            Decision::Forward { .. } => panic!("must not forward when all upstreams are filtered"),
         }
     }
 
