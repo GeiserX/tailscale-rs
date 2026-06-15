@@ -177,6 +177,21 @@ impl AumKind {
             _ => return None,
         })
     }
+
+    /// The human-readable change string, byte-for-byte Go `AUMKind.String()` (`tka/aum.go`,
+    /// v1.100.0): the `Change` field of an `ipnstate.NetworkLockUpdate` row (`tailscale lock log`).
+    /// All six values are confirmed verbatim against Go's `switch` (Go's `default`,
+    /// `AUM?<n>`, is unreachable here — this enum has no unknown variant).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AumKind::AddKey => "add-key",
+            AumKind::RemoveKey => "remove-key",
+            AumKind::UpdateKey => "update-key",
+            AumKind::Checkpoint => "checkpoint",
+            AumKind::NoOp => "no-op",
+            AumKind::Invalid => "invalid",
+        }
+    }
 }
 
 /// The kind of a TKA [`Key`] (Go `KeyKind`).
@@ -6130,6 +6145,24 @@ mod tests {
         let ordered = store.linear_chain_from(g.hash()).expect("walk");
         assert_eq!(ordered.len(), 1);
         assert_eq!(ordered[0].hash(), g.hash());
+    }
+
+    /// `AumKind::as_str` must return the exact Go `AUMKind.String()` strings (`tka/aum.go`,
+    /// v1.100.0) — these are the `Change` values rendered by `tailscale lock log`, so a drift would
+    /// silently produce a non-Go log row. Freeze every variant→string pair.
+    #[test]
+    fn aum_kind_as_str_matches_go() {
+        let cases = [
+            (AumKind::AddKey, "add-key"),
+            (AumKind::RemoveKey, "remove-key"),
+            (AumKind::UpdateKey, "update-key"),
+            (AumKind::Checkpoint, "checkpoint"),
+            (AumKind::NoOp, "no-op"),
+            (AumKind::Invalid, "invalid"),
+        ];
+        for (kind, want) in cases {
+            assert_eq!(kind.as_str(), want, "as_str for {kind:?}");
+        }
     }
 
     /// Consensus regression (tsr-3x4): at a genuine **weight-decided** fork, `linear_chain_from` must

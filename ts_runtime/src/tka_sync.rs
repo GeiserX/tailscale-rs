@@ -59,6 +59,60 @@ pub(crate) struct SyncedTka {
     pub oldest: AumHash,
 }
 
+/// One entry of the Tailnet-Lock update-chain log, mirroring Go `ipnstate.NetworkLockUpdate` (the
+/// rows `tailscale lock log` prints). Produced by [`Device::tka_log`](crate::Runtime::tka_log) from
+/// the locally-synced AUM chain — a pure local read, no control round-trip.
+///
+/// `aum_hash` + `change` + `raw` are the exact Go `NetworkLockUpdate` fields (`Hash`, `Change`,
+/// `Raw`). `signer_key_ids` is an extra convenience this engine extracts from the decoded AUM —
+/// Go's struct has no `Signatures` field and recovers the signer only by decoding `Raw`; we surface
+/// the signer key ids directly so a daemon need not re-decode, while still carrying `raw` for a
+/// faithful full decode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TkaLogEntry {
+    /// The AUM's chain-link hash (Go `NetworkLockUpdate.Hash`): `BLAKE2s-256` of its serialization.
+    pub aum_hash: [u8; 32],
+    /// The human-readable change kind (Go `NetworkLockUpdate.Change`), e.g. `"add-key"` /
+    /// `"remove-key"` / `"checkpoint"` — [`AumKind::as_str`](ts_tka::AumKind::as_str).
+    pub change: String,
+    /// The id of each trusted key that signed this AUM (each
+    /// [`AumSignature::key_id`](ts_tka::AumSignature::key_id), the signer's 32-byte ed25519 public
+    /// key for an Ed25519 key). Convenience extraction; absent from Go's struct.
+    pub signer_key_ids: Vec<Vec<u8>>,
+    /// The AUM's canonical CBOR serialization (Go `NetworkLockUpdate.Raw` = `AUM.Serialize()`), so a
+    /// consumer can decode the full AUM (incl. signatures) faithfully.
+    pub raw: Vec<u8>,
+}
+
+/// Read up to `limit` entries of the TKA update-chain log from a synced AUM `store`, **head-first**
+/// (newest → oldest), mirroring Go `NetworkLockLog` which walks `Head` back toward genesis.
+///
+/// The store holds the chain genesis→head; [`MemAumStore::linear_chain_from`] yields that
+/// genesis→head order, which we **reverse** to match Go's head→genesis walk before truncating to
+/// `limit`. A pure function over the synced state (no crypto, no mutation, no RPC) so it is unit
+/// testable without standing up an actor. An unwalkable store (genesis missing / cycle) yields an
+/// empty log rather than erroring — the caller's "no readable chain" is an empty history, matching
+/// the no-lock-synced case.
+pub(crate) fn tka_log_entries(
+    store: &MemAumStore,
+    oldest: AumHash,
+    limit: usize,
+) -> Vec<TkaLogEntry> {
+    // genesis→head; an unwalkable store (missing genesis / cycle) → empty log.
+    let chain = store.linear_chain_from(oldest).unwrap_or_default();
+    chain
+        .iter()
+        .rev() // Go walks head→genesis; the store walk is genesis→head.
+        .take(limit)
+        .map(|aum| TkaLogEntry {
+            aum_hash: aum.hash().0,
+            change: aum.message_kind.as_str().to_string(),
+            signer_key_ids: aum.signatures.iter().map(|s| s.key_id.clone()).collect(),
+            raw: aum.serialize(),
+        })
+        .collect()
+}
+
 /// Errors internal to the sync driver. All map to "no Authority obtained" at the caller — the netmap
 /// is never errored and peers are never dropped on any of these.
 #[derive(Debug, thiserror::Error)]
@@ -234,5 +288,155 @@ mod tests {
         assert_eq!(decoded[0].hash(), aum.hash());
         // One garbage blob alongside a good one → the whole batch errors.
         assert!(decode_aums(&[good, vec![0xff, 0x00, 0x13]]).is_err());
+    }
+
+    // ---- tka_log_entries (PR-A) ----------------------------------------------------------------
+
+    /// A test [`AumKey`](ts_tka::AumKey) from a seed byte (deterministic public key + given votes).
+    fn test_aum_key(seed: u8, votes: u32) -> ts_tka::AumKey {
+        use ed25519_dalek::SigningKey;
+        ts_tka::AumKey {
+            kind: ts_tka::KeyKind::Ed25519,
+            votes,
+            public: SigningKey::from_bytes(&[seed; 32])
+                .verifying_key()
+                .to_bytes()
+                .to_vec(),
+            meta: Vec::new(),
+        }
+    }
+
+    /// A genesis `Checkpoint` AUM trusting `key` (no parent). Mirrors the on-wire genesis a node
+    /// syncs; built directly (not via `new_genesis_checkpoint`) so the test stays a pure
+    /// ordering/mapping check independent of disablement-value construction.
+    fn genesis_checkpoint(key: ts_tka::AumKey) -> Aum {
+        Aum {
+            message_kind: ts_tka::AumKind::Checkpoint,
+            prev_aum_hash: None,
+            key: None,
+            key_id: Vec::new(),
+            state: Some(ts_tka::AumState {
+                last_aum_hash: None,
+                disablement_values: Some(vec![vec![0x11; 32]]),
+                keys: Some(vec![key]),
+                state_id1: 0,
+                state_id2: 0,
+            }),
+            votes: None,
+            meta: Vec::new(),
+            signatures: Vec::new(),
+        }
+    }
+
+    /// An `AddKey` child of `parent` adding `key`.
+    fn add_key_child(parent: &Aum, key: ts_tka::AumKey) -> Aum {
+        Aum {
+            message_kind: ts_tka::AumKind::AddKey,
+            prev_aum_hash: Some(parent.hash()),
+            key: Some(key),
+            key_id: Vec::new(),
+            state: None,
+            votes: None,
+            meta: Vec::new(),
+            signatures: Vec::new(),
+        }
+    }
+
+    /// `tka_log_entries` returns the chain **head-first** (Go `NetworkLockLog` walks head→genesis,
+    /// the opposite of the store's genesis→head order), with the correct `change` strings, an
+    /// `aum_hash` matching `Aum::hash`, and a `raw` that round-trips through the AUM decoder.
+    #[test]
+    fn tka_log_entries_head_first_with_fields() {
+        let g = genesis_checkpoint(test_aum_key(1, 1));
+        let a1 = add_key_child(&g, test_aum_key(2, 1));
+        let a2 = add_key_child(&a1, test_aum_key(3, 1));
+        // Insert in a scrambled order to prove ordering is by chain links, not insert order.
+        let mut store = MemAumStore::new();
+        store.insert(a1.clone());
+        store.insert(a2.clone());
+        store.insert(g.clone());
+
+        let log = tka_log_entries(&store, g.hash(), 100);
+
+        // (a) head-first: newest (a2) → genesis (g).
+        let got_hashes: Vec<[u8; 32]> = log.iter().map(|e| e.aum_hash).collect();
+        assert_eq!(
+            got_hashes,
+            vec![a2.hash().0, a1.hash().0, g.hash().0],
+            "log must be head-first (a2, a1, genesis)"
+        );
+        // (b) change strings.
+        let changes: Vec<&str> = log.iter().map(|e| e.change.as_str()).collect();
+        assert_eq!(changes, vec!["add-key", "add-key", "checkpoint"]);
+        // (c) aum_hash == Aum::hash().0 (re-checked against the genesis explicitly).
+        assert_eq!(log[2].aum_hash, g.hash().0);
+        // (d) raw round-trips through the AUM decoder back to the same AUM.
+        for (entry, aum) in log.iter().zip([&a2, &a1, &g]) {
+            let decoded = Aum::from_cbor(&entry.raw).expect("raw is canonical AUM CBOR");
+            assert_eq!(&decoded, aum, "raw must decode back to the source AUM");
+        }
+    }
+
+    /// `limit` truncates from the head (the most recent `limit` entries).
+    #[test]
+    fn tka_log_entries_limit_truncates_from_head() {
+        let g = genesis_checkpoint(test_aum_key(1, 1));
+        let a1 = add_key_child(&g, test_aum_key(2, 1));
+        let a2 = add_key_child(&a1, test_aum_key(3, 1));
+        let store = MemAumStore::from_aums([g.clone(), a1.clone(), a2.clone()]);
+
+        let log = tka_log_entries(&store, g.hash(), 2);
+        assert_eq!(log.len(), 2, "limit caps the row count");
+        assert_eq!(
+            log.iter().map(|e| e.aum_hash).collect::<Vec<_>>(),
+            vec![a2.hash().0, a1.hash().0],
+            "limit keeps the newest entries (head-first)"
+        );
+        // limit 0 → empty.
+        assert!(tka_log_entries(&store, g.hash(), 0).is_empty());
+    }
+
+    /// `signer_key_ids` is the `key_id` of each [`AumSignature`](ts_tka::AumSignature) on the AUM,
+    /// in order — what a daemon renders without re-decoding `raw`.
+    #[test]
+    fn tka_log_entries_extracts_signer_key_ids() {
+        use ed25519_dalek::SigningKey;
+        let mut g = genesis_checkpoint(test_aum_key(1, 1));
+        // Sign the genesis with the key it seeds (exactly what `Aum::sign` records: key_id = the
+        // signer's verifying-key bytes).
+        let sk = SigningKey::from_bytes(&[1u8; 32]);
+        g.sign(&sk);
+        let signer_id = sk.verifying_key().to_bytes().to_vec();
+        let store = MemAumStore::from_aums([g.clone()]);
+
+        let log = tka_log_entries(&store, g.hash(), 100);
+        assert_eq!(log.len(), 1);
+        assert_eq!(
+            log[0].signer_key_ids,
+            vec![signer_id],
+            "signer_key_ids carries each signature's key_id"
+        );
+        // An unsigned AUM yields no signer ids.
+        let unsigned = genesis_checkpoint(test_aum_key(2, 1));
+        let store2 = MemAumStore::from_aums([unsigned.clone()]);
+        assert!(
+            tka_log_entries(&store2, unsigned.hash(), 100)[0]
+                .signer_key_ids
+                .is_empty()
+        );
+    }
+
+    /// An empty / unwalkable store yields an empty log (mirrors the no-lock-synced case the actor
+    /// short-circuits before ever calling this): a missing genesis is an empty history, never an
+    /// error.
+    #[test]
+    fn tka_log_entries_unwalkable_store_is_empty() {
+        // Empty store: any `oldest` is absent → BadChain inside, mapped to an empty Vec.
+        let empty = MemAumStore::new();
+        assert!(tka_log_entries(&empty, AumHash([0u8; 32]), 100).is_empty());
+        // Non-empty store but `oldest` not present → still empty (not a panic / error).
+        let g = genesis_checkpoint(test_aum_key(1, 1));
+        let store = MemAumStore::from_aums([g]);
+        assert!(tka_log_entries(&store, AumHash([0xEE; 32]), 100).is_empty());
     }
 }

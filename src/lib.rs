@@ -179,7 +179,8 @@ pub use ts_runtime::taildrop::WaitingFile;
 #[doc(inline)]
 pub use ts_runtime::{
     DeviceState, DnsQueryResult, ExitNodeSuggestion, FileTarget, IpnBusWatcher, NetcheckReport,
-    Notify, NotifyWatchOpt, RegionLatency, RegistrationError, Status, StatusNode, WhoIs,
+    Notify, NotifyWatchOpt, RegionLatency, RegistrationError, Status, StatusNode, TkaLogEntry,
+    WhoIs,
 };
 /// The interactive-login URL type returned by [`Device::pop_browser_url`].
 #[doc(inline)]
@@ -1221,6 +1222,19 @@ impl Device {
             .await
             .map_err(ts_runtime::Error::from)
             .map_err(Into::into)
+    }
+
+    /// Read the Tailnet Lock update-chain history — the Rust analog of Go
+    /// `LocalClient.NetworkLockLog`.
+    ///
+    /// Returns up to `limit` [`TkaLogEntry`] rows of the AUM chain **head-first** (newest first,
+    /// walking back toward the genesis), read **locally** from this node's synced + verified chain —
+    /// a pure read with no control round-trip. The list is empty when no lock is synced (lock not in
+    /// use, or control hasn't pushed a chain yet). Each entry carries the AUM's chain-link hash, its
+    /// change kind (`"add-key"` / `"remove-key"` / `"checkpoint"` / …), the ids of the keys that
+    /// signed it, and the raw CBOR (Go `NetworkLockUpdate.Raw`) for a faithful full decode.
+    pub async fn tka_log(&self, limit: usize) -> Result<Vec<TkaLogEntry>, Error> {
+        self.runtime.tka_log(limit).await.map_err(Into::into)
     }
 
     /// Sign a peer's `node_key` with this node's network-lock key and submit the signature to

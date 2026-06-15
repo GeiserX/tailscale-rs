@@ -73,6 +73,7 @@ pub use error::{Error, ErrorKind};
 pub use exit_node_suggest::{ExitNodeSuggestion, SuggestExitNodeError};
 pub use ipn_bus::{IpnBusWatcher, Notify, NotifyWatchOpt};
 pub use status::{FileTarget, NetcheckReport, RegionLatency, Status, StatusNode, WhoIs};
+pub use tka_sync::TkaLogEntry;
 pub use ts_dataplane::{CaptureHook, CapturePath};
 
 use crate::peer_tracker::PeerTracker;
@@ -906,6 +907,18 @@ impl Runtime {
             .ask(control_runner::TkaInit { disablement_secret })
             .await
             .map_err(flatten_tka_send_err)
+    }
+
+    /// Read up to `limit` entries of the Tailnet-Lock update-chain log, head-first (Go
+    /// `NetworkLockLog`). A **pure local read** of the synced AUM chain — no control round-trip — so
+    /// the only failure is a kameo send error (actor gone / mailbox), surfaced as a coarse [`Error`]
+    /// like the other local-read paths (`status`/`tka_status`), not a [`ts_control::TkaSyncError`].
+    /// Returns an empty `Vec` when no lock is synced.
+    pub async fn tka_log(&self, limit: usize) -> Result<Vec<TkaLogEntry>, Error> {
+        self.control
+            .ask(control_runner::TkaLog { limit })
+            .await
+            .map_err(Error::from)
     }
 
     /// Issue a real Let's Encrypt certificate for this node's MagicDNS `name` (`acme` feature).
