@@ -502,7 +502,7 @@ mod msg_impl {
         /// [`WhoIs`](crate::WhoIs). The port is ignored (a tailnet IP uniquely identifies a node).
         ///
         /// The resulting [`WhoIs`](crate::WhoIs) carries no user/login or capability data: this
-        /// fork's domain [`Node`](ts_control::Node) does not retain those wire fields. See the
+        /// fork's domain [`Node`] does not retain those wire fields. See the
         /// [`status`](crate::status) module docs for the gap.
         ///
         /// Waits until we've received at least one peer update from control.

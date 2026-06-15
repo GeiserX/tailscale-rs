@@ -1182,7 +1182,7 @@ impl Device {
     /// observed yet). The returned [`TkaStatus`][ts_control::TkaStatus] carries the authority head
     /// (a base32 `AUMHash`, decode with [`tka::AumHash::from_base32`][ts_tka::AumHash::from_base32])
     /// and the disablement signal. Signature verification of a peer's node-key signature against the
-    /// authority is performed with the [`tka`] module's [`tka::Authority`][ts_tka::Authority].
+    /// authority is performed with the [`tka`] module's [`tka::Authority`].
     pub async fn tka_status(&self) -> Result<Option<ts_control::TkaStatus>, Error> {
         self.runtime
             .control
@@ -1203,7 +1203,7 @@ impl Device {
     /// [`Authority`][ts_tka::Authority].** The local trusted-key state advances solely through the
     /// verified netmap-driven sync path (every applied AUM passes
     /// [`VerifiedAumChain::verify`][ts_tka::VerifiedAumChain::verify]), so a successful `tka_sign` is
-    /// reflected locally on the next sync — the verify-and-log posture is unchanged.
+    /// reflected locally on the next sync — the active fail-closed enforcement posture is unchanged.
     ///
     /// # Errors
     /// [`ts_control::TkaSyncError::Unsupported`] if control has no TKA endpoint (no lock / control too
@@ -1226,7 +1226,8 @@ impl Device {
     ///
     /// **Submit-only:** this POSTs the disablement; it does not mutate this node's local
     /// [`Authority`][ts_tka::Authority]. The disablement is reflected locally through the existing
-    /// verified netmap-driven sync. Verify-and-log posture is unchanged.
+    /// verified netmap-driven sync — which then clears enforcement to admit-all. The active
+    /// fail-closed enforcement posture (until that sync lands) is unchanged.
     ///
     /// # Errors
     /// [`ts_control::TkaSyncError::Unsupported`] when there is no known TKA head to disable (lock not

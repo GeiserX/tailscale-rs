@@ -131,12 +131,12 @@ pub struct WhoIs {
     pub node: Node,
     /// The login/email of the user that owns the node, if known.
     ///
-    /// Always `None` in this fork: the domain [`Node`](ts_control::Node) does not retain the
+    /// Always `None` in this fork: the domain [`Node`] does not retain the
     /// wire-level user/login mapping (see the module-level capability/user gap note).
     pub user: Option<String>,
     /// The node's **node-level** capability map (Go `Node.CapMap` — node attributes like
     /// `can-funnel`), as `(capability, args)` pairs, populated from the domain
-    /// [`Node`](ts_control::Node)'s `cap_map`, sorted by capability name. Distinct from
+    /// [`Node`]'s `cap_map`, sorted by capability name. Distinct from
     /// [`cap_map`](Self::cap_map), which is the flow-scoped *peer-capability* grants.
     pub capabilities: Vec<(String, Vec<String>)>,
     /// The **flow-scoped** peer-capability grants for the queried `src -> dst` flow — Go
