@@ -729,6 +729,56 @@ impl MagicSock {
             }
         }
 
+        self.emit_disco_pings(to_ping).await
+    }
+
+    /// Force an immediate disco ping to **every** candidate endpoint of one peer, bypassing the
+    /// per-candidate [`DISCO_PING_INTERVAL`] discovery floor. Returns the number of pings sent.
+    ///
+    /// This is the event-driven hole-punch trigger: it is called on receipt of a `CallMeMaybe` from
+    /// `peer` (whether direct on the UDP socket or relayed over DERP), mirroring Go magicsock
+    /// `endpoint.handleCallMeMaybe`, which zeroes every endpoint's `lastPing` and immediately calls
+    /// `sendDiscoPingsLocked`. A `CallMeMaybe` means the peer just opened its firewall and wants us
+    /// to ping *now*, so waiting up to the next periodic 2s tick — or being silenced by the 5s
+    /// per-candidate floor — would needlessly delay (or stall) the direct path coming up. The 5s
+    /// floor exists only to rate-limit the *unsolicited* periodic prober; an explicit solicitation
+    /// is exactly the case it must yield to.
+    ///
+    /// The candidate set has already been updated from the `CallMeMaybe`'s endpoints (via
+    /// [`add_peer_endpoints`](Self::add_peer_endpoints)) before this is called, so this pings the
+    /// freshly-learned addresses too. Each ping is stamped via [`PeerPaths::note_ping_sent`] under
+    /// the same lock, so a periodic [`send_pings`](Self::send_pings) in the same window will floor
+    /// them rather than double-probe. Pinging an unknown peer (no path entry) is a no-op.
+    pub async fn send_pings_to_peer_now(&self, peer: &DiscoPublicKey) -> Result<usize, Error> {
+        let now = Instant::now();
+
+        let to_ping: Vec<(DiscoPublicKey, SocketAddr, disco::TxId)> = {
+            let mut paths = lock(&self.paths);
+            let Some(pp) = paths.get_mut(peer) else {
+                return Ok(0);
+            };
+            pp.force_ping_sweep(now)
+                .into_iter()
+                .map(|addr| {
+                    let tx_id = disco::random_tx_id();
+                    pp.note_ping_sent(tx_id, addr, now);
+                    (*peer, addr, tx_id)
+                })
+                .collect()
+        };
+
+        self.emit_disco_pings(to_ping).await
+    }
+
+    /// Seal and send one disco ping per `(peer, addr, tx_id)` entry from the bound underlay socket,
+    /// returning the count sent. Shared by the periodic [`send_pings`](Self::send_pings) and the
+    /// event-driven [`send_pings_to_peer_now`](Self::send_pings_to_peer_now): both snapshot the work
+    /// to do under the `paths` lock (stamping each via [`PeerPaths::note_ping_sent`]), then release
+    /// the lock and emit here so no lock is held across the socket `await`.
+    async fn emit_disco_pings(
+        &self,
+        to_ping: Vec<(DiscoPublicKey, SocketAddr, disco::TxId)>,
+    ) -> Result<usize, Error> {
         let mut sent = 0;
         let m = crate::metrics::metrics();
         for (peer, addr, tx_id) in to_ping {
@@ -921,10 +971,12 @@ impl MagicSock {
     /// of `MagicSock::handle_disco` that pong (a Ping reply) or learn a source address from
     /// `from` — doing so would emit a host-sourced probe to a bogus/unsanitized address. We
     /// therefore decode the frame and act on **only** [`Inbound::CallMeMaybe`], whose handling is
-    /// purely `add_peer_endpoints` (peer-supplied candidate endpoints, each sanitized by
-    /// `is_pingable_candidate` before it can become a ping target). Relayed Pings and Pongs are
-    /// dropped: a Ping would require a pong to a non-existent source, and a Pong has no meaning
-    /// without a matching ping we sent on this path.
+    /// [`add_peer_endpoints`](Self::add_peer_endpoints) (peer-supplied candidate endpoints, each
+    /// sanitized by `is_pingable_candidate` before it can become a ping target) followed by an
+    /// immediate [`send_pings_to_peer_now`](Self::send_pings_to_peer_now) — those pings go to the
+    /// sanitized candidate set over the real UDP socket (the proper hole-punch target), never to the
+    /// nonexistent relay source. Relayed Pings and Pongs are dropped: a Ping would require a pong to
+    /// a non-existent source, and a Pong has no meaning without a matching ping we sent on this path.
     ///
     /// `frame` is decrypted in place. Returns `true` if the frame was a disco frame we consumed
     /// (whether or not it was actionable), so the caller does not also forward it to the
@@ -936,11 +988,19 @@ impl MagicSock {
     /// without it, anyone who learns a victim disco key could relay a CallMeMaybe over DERP and
     /// steer the victim's host socket to disco-ping attacker-chosen public addresses every cadence.
     /// With no verifier installed we fail closed (drop), mirroring `MagicSock::handle_disco`.
-    pub fn handle_relayed_call_me_maybe(&self, frame: &mut [u8]) -> bool {
+    pub async fn handle_relayed_call_me_maybe(&self, frame: &mut [u8]) -> bool {
         match disco::open(&self.our_disco, frame) {
             Ok(Inbound::CallMeMaybe { sender, endpoints }) => {
                 if self.call_me_maybe_sender_allowed(&sender) {
                     self.add_peer_endpoints(sender, endpoints);
+                    // Force an immediate ping of every candidate, bypassing the 5s discovery floor.
+                    // The relayed CallMeMaybe is the canonical hard-NAT hole-punch: both peers are
+                    // behind NAT, so this "ping me now" signal arriving over DERP is precisely when
+                    // a prompt simultaneous-open matters most. Non-fatal on send error (the periodic
+                    // prober retries); the frame is still consumed either way.
+                    if let Err(e) = self.send_pings_to_peer_now(&sender).await {
+                        tracing::debug!(error = %e, "relayed call-me-maybe immediate ping failed");
+                    }
                 }
                 true
             }
@@ -1247,6 +1307,13 @@ impl MagicSock {
                 if self.call_me_maybe_sender_allowed(&sender) {
                     m.disco_call_me_maybe_recv.inc();
                     self.add_peer_endpoints(sender, endpoints);
+                    // Immediately ping every candidate, bypassing the 5s discovery floor — the peer
+                    // just told us its firewall is open (Go `endpoint.handleCallMeMaybe` zeroes
+                    // `lastPing` then `sendDiscoPingsLocked`). Non-fatal: a send error here must not
+                    // drop the inbound batch, so log and continue (the periodic prober retries).
+                    if let Err(e) = self.send_pings_to_peer_now(&sender).await {
+                        tracing::debug!(error = %e, "call-me-maybe immediate ping failed");
+                    }
                 } else {
                     m.disco_call_me_maybe_recv_rejected.inc();
                 }
@@ -2788,7 +2855,7 @@ mod tests {
         let mut stranger_frame =
             disco::seal_call_me_maybe(&stranger_disco, &recv_disco.public_key(), &[public_ep])
                 .unwrap();
-        let consumed = recv.handle_relayed_call_me_maybe(&mut stranger_frame);
+        let consumed = recv.handle_relayed_call_me_maybe(&mut stranger_frame).await;
         assert!(consumed, "frame is disco, must be consumed");
         assert!(
             recv.candidate_addrs(&stranger_disco.public_key())
@@ -2800,7 +2867,7 @@ mod tests {
         let mut member_frame =
             disco::seal_call_me_maybe(&member_disco, &recv_disco.public_key(), &[public_ep])
                 .unwrap();
-        let consumed = recv.handle_relayed_call_me_maybe(&mut member_frame);
+        let consumed = recv.handle_relayed_call_me_maybe(&mut member_frame).await;
         assert!(consumed, "frame is disco, must be consumed");
         assert_eq!(
             recv.candidate_addrs(&member_disco.public_key()),
@@ -2832,7 +2899,7 @@ mod tests {
         let mut ping =
             disco::seal_ping(&sender_disco, sender_node, &recv_disco.public_key(), tx).unwrap();
 
-        let consumed = recv.handle_relayed_call_me_maybe(&mut ping);
+        let consumed = recv.handle_relayed_call_me_maybe(&mut ping).await;
         assert!(
             consumed,
             "a relayed disco frame is consumed (kept off dataplane)"
@@ -3688,5 +3755,176 @@ mod tests {
         // (Not asserted as an equality because the OS may reassign; we only require a valid bind,
         // already proven above. `port_before` is captured to document the intent.)
         let _ = port_before;
+    }
+
+    /// `send_pings_to_peer_now` pings **every** candidate immediately, bypassing the per-candidate
+    /// `DISCO_PING_INTERVAL` (5s) discovery floor that the periodic `send_pings` honors. This is the
+    /// event-driven `CallMeMaybe` hole-punch trigger (Go `endpoint.handleCallMeMaybe` zeroes
+    /// `lastPing` then `sendDiscoPingsLocked`). The floor is proven first (a second `send_pings`
+    /// right after the first sends nothing), then the forced sweep is shown to ignore it.
+    #[tokio::test]
+    async fn send_pings_to_peer_now_bypasses_discovery_floor() {
+        let our_disco = DiscoPrivateKey::random();
+        let our_node = ts_keys::NodePrivateKey::random().public_key();
+        let sock = MagicSock::bind(localhost(), our_disco, our_node)
+            .await
+            .unwrap();
+
+        // Two pingable candidates for one peer; a real sink absorbs the pings.
+        let sink = UdpSocket::bind(localhost()).await.unwrap();
+        let target = sink.local_addr().unwrap();
+        let other = SocketAddr::new(target.ip(), target.port().wrapping_add(1).max(1));
+        let peer = DiscoPrivateKey::random().public_key();
+        sock.add_peer_endpoints_unfiltered(peer, [target, other]);
+
+        // First periodic sweep pings both candidates and stamps their `last_ping`.
+        let first = sock.send_pings().await.unwrap();
+        assert_eq!(first, 2, "the first periodic sweep pings both candidates");
+
+        // A second periodic sweep immediately after is fully floored — both were pinged < 5s ago,
+        // and neither is a confirmed best (no pong arrived), so nothing is re-sent. The `0` here is
+        // specifically the per-candidate `DISCO_PING_INTERVAL` floor, NOT a `needs_refresh`
+        // short-circuit: no pong arrived, so `trust_until` is None, so `needs_refresh` is `true`
+        // (the `None => true` arm) and `send_pings` *does* reach `candidates_to_ping` — where the
+        // floor (not the heartbeat gate) returns the empty set. If a future refactor made
+        // `needs_refresh` false for an unconfirmed peer, this `0` would be vacuous, so that
+        // reachability is the load-bearing precondition of this assertion.
+        let floored = sock.send_pings().await.unwrap();
+        assert_eq!(
+            floored, 0,
+            "the periodic sweep honors the 5s per-candidate floor"
+        );
+
+        // The forced sweep ignores that floor: a CallMeMaybe just told us to ping NOW, so both
+        // candidates are re-pinged despite having been pinged moments ago.
+        let forced = sock.send_pings_to_peer_now(&peer).await.unwrap();
+        assert_eq!(
+            forced, 2,
+            "send_pings_to_peer_now re-pings every candidate, bypassing the discovery floor"
+        );
+    }
+
+    /// `send_pings_to_peer_now` for a peer with no path entry is a harmless no-op (zero pings, no
+    /// panic) — a CallMeMaybe whose endpoints were all filtered out leaves no candidates to ping.
+    #[tokio::test]
+    async fn send_pings_to_peer_now_unknown_peer_is_noop() {
+        let our_disco = DiscoPrivateKey::random();
+        let our_node = ts_keys::NodePrivateKey::random().public_key();
+        let sock = MagicSock::bind(localhost(), our_disco, our_node)
+            .await
+            .unwrap();
+
+        let unknown = DiscoPrivateKey::random().public_key();
+        let sent = sock.send_pings_to_peer_now(&unknown).await.unwrap();
+        assert_eq!(sent, 0, "pinging an unknown peer sends nothing");
+    }
+
+    /// End-to-end wiring guard for the **direct-UDP** CallMeMaybe path: receiving a member's
+    /// CallMeMaybe via `handle_disco` must kick the immediate force-ping (the whole point of the
+    /// PR), and a *non-member*'s must not. This locks the `send_pings_to_peer_now` call site in
+    /// `handle_disco` against silent deletion — without it, removing that call leaves every other
+    /// test green.
+    ///
+    /// The detector is the per-candidate discovery floor, not a socket capture: the socket is bound
+    /// to loopback, so a ping to a public candidate cannot actually be delivered — but
+    /// `send_pings_to_peer_now` stamps `note_ping_sent` (which records `last_ping`) under the lock
+    /// *before* the send is attempted. So if the kick fired, a subsequent periodic `send_pings`
+    /// finds the candidate floored and re-pings nothing (0); if the kick were removed, the candidate
+    /// is unstamped and `send_pings` would ping it (1). This is deterministic (return counts, no
+    /// timing, no shared global counter).
+    #[tokio::test]
+    async fn direct_call_me_maybe_kicks_immediate_ping() {
+        let member_disco = DiscoPrivateKey::random();
+        let stranger_disco = DiscoPrivateKey::random();
+        let recv_disco = DiscoPrivateKey::random();
+        let recv_node = ts_keys::NodePrivateKey::random().public_key();
+
+        // Only `member_disco` is a netmap member; CallMeMaybe carries no node key (claimed=None).
+        let member_pub = member_disco.public_key();
+        let verifier: BindingVerifier = Arc::new(
+            move |disco: &DiscoPublicKey, claimed: Option<&NodePublicKey>| {
+                claimed.is_none() && *disco == member_pub
+            },
+        );
+        let recv = MagicSock::bind(localhost(), recv_disco, recv_node)
+            .await
+            .unwrap()
+            .with_binding_verifier(verifier);
+
+        // A public (pingable) candidate — loopback would be dropped by `is_pingable_candidate`.
+        let public_ep: SocketAddr = "203.0.113.40:41641".parse().unwrap();
+        let from: SocketAddr = "198.51.100.7:41641".parse().unwrap();
+
+        // Member CallMeMaybe → endpoint learned AND immediately pinged (floor now stamped).
+        recv.handle_disco(
+            Inbound::CallMeMaybe {
+                sender: member_pub,
+                endpoints: vec![public_ep],
+            },
+            from,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recv.candidate_addrs(&member_pub),
+            vec![public_ep],
+            "the member CallMeMaybe's endpoint must be learned"
+        );
+        // The immediate kick stamped `last_ping`, so the periodic prober floors it: 0 re-pings.
+        // If the `send_pings_to_peer_now` call were deleted, this candidate would be unstamped and
+        // `send_pings` would ping it (1) — which is exactly the regression this asserts against.
+        assert_eq!(
+            recv.send_pings().await.unwrap(),
+            0,
+            "the CallMeMaybe already force-pinged the candidate, so the periodic sweep floors it"
+        );
+
+        // Stranger CallMeMaybe → rejected: nothing learned, nothing to ping.
+        recv.handle_disco(
+            Inbound::CallMeMaybe {
+                sender: stranger_disco.public_key(),
+                endpoints: vec!["203.0.113.41:41641".parse().unwrap()],
+            },
+            from,
+        )
+        .await
+        .unwrap();
+        assert!(
+            recv.candidate_addrs(&stranger_disco.public_key())
+                .is_empty(),
+            "a non-member CallMeMaybe is rejected — no candidate, no kick"
+        );
+    }
+
+    /// End-to-end wiring guard for the **relayed-over-DERP** CallMeMaybe path
+    /// (`handle_relayed_call_me_maybe`): the canonical hard-NAT hole-punch must kick the immediate
+    /// force-ping. Same deterministic floor-based detector as the direct test. Locks the
+    /// `send_pings_to_peer_now` call site in `handle_relayed_call_me_maybe` against silent deletion.
+    #[tokio::test]
+    async fn relayed_call_me_maybe_kicks_immediate_ping() {
+        let our_disco = DiscoPrivateKey::random();
+        let our_node = ts_keys::NodePrivateKey::random().public_key();
+        let recv = MagicSock::bind(localhost(), our_disco.clone(), our_node)
+            .await
+            .unwrap()
+            .with_binding_verifier(allow_all());
+
+        let peer_disco = DiscoPrivateKey::random();
+        let public_ep: SocketAddr = "203.0.113.60:41641".parse().unwrap();
+        let mut frame =
+            disco::seal_call_me_maybe(&peer_disco, &our_disco.public_key(), &[public_ep]).unwrap();
+
+        let consumed = recv.handle_relayed_call_me_maybe(&mut frame).await;
+        assert!(consumed, "the relayed CallMeMaybe is consumed");
+        assert_eq!(
+            recv.candidate_addrs(&peer_disco.public_key()),
+            vec![public_ep],
+            "the relayed CallMeMaybe's endpoint must be learned"
+        );
+        assert_eq!(
+            recv.send_pings().await.unwrap(),
+            0,
+            "the relayed CallMeMaybe already force-pinged the candidate, so the sweep floors it"
+        );
     }
 }

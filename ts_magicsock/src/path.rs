@@ -398,6 +398,40 @@ impl PeerPaths {
         out
     }
 
+    /// Force an immediate discovery sweep of **every** candidate, bypassing the per-candidate
+    /// [`DISCO_PING_INTERVAL`] floor, and return the addresses to ping now.
+    ///
+    /// This is the event-driven counterpart to [`candidates_to_ping`](Self::candidates_to_ping)'s
+    /// periodic gating. It mirrors Go magicsock `endpoint.handleCallMeMaybe`, which on receipt of a
+    /// `CallMeMaybe` zeroes `st.lastPing` for every endpoint and then calls `sendDiscoPingsLocked`
+    /// "to force sendPingsLocked to send new ones, even if it's been less than 5 seconds ago"
+    /// (`endpoint.go`). A `CallMeMaybe` is the peer's explicit "I just opened my firewall, ping me
+    /// now" signal, so the 5s discovery floor (which exists only to bound the *unsolicited*
+    /// periodic probe rate) must not delay the hole-punch.
+    ///
+    /// Stamps `last_full_ping = now` — this *is* a full sweep, matching Go's unconditional
+    /// `de.lastFullPing = now` at the top of `sendDiscoPingsLocked`, which arms the
+    /// [`GOOD_ENOUGH_LATENCY`] quiet-down / [`UPGRADE_UDP_DIRECT_INTERVAL`] re-probe schedule. The
+    /// caller stamps each returned address via [`note_ping_sent`] as it sends, so the per-candidate
+    /// floor is re-established from this send (a periodic [`candidates_to_ping`] in the same window
+    /// will then correctly skip them rather than double-ping).
+    ///
+    /// Mechanism note: Go zeroes each `st.lastPing` and lets `sendDiscoPingsLocked` re-send (the
+    /// `!st.lastPing.IsZero()` floor check is bypassed because the value is now zero); this fork
+    /// instead enumerates every candidate here and floors via the caller's `note_ping_sent` stamp.
+    /// The on-wire effect is identical: one ping per candidate now, with the 5s floor restarting
+    /// from this send. Note this is deliberately **not** coalesced across repeated `CallMeMaybe`s —
+    /// that, too, is Go-faithful: Go re-zeroes `lastPing` on *every* `handleCallMeMaybe`, so each
+    /// `CallMeMaybe` re-pings the full candidate set with no per-event rate limit (the
+    /// [`DISCO_PING_INTERVAL`] floor exists only to pace the *unsolicited* periodic prober, and an
+    /// explicit "ping me now" solicitation is exactly the case it yields to). The fan-out is bounded
+    /// by `MAX_LEARNED_CANDIDATES_PER_PEER` and the sender's netmap-membership gate; the pings are
+    /// self-targeted (the soliciting peer's own advertised, sanitized endpoints), never a reflector.
+    pub fn force_ping_sweep(&mut self, now: Instant) -> Vec<SocketAddr> {
+        self.last_full_ping = Some(now);
+        self.candidates.keys().copied().collect()
+    }
+
     /// Record that we sent a ping with `tx_id` to `to` at time `sent`.
     ///
     /// First prunes any in-flight probe older than `PING_TIMEOUT` (presumed lost — its pong will
