@@ -758,6 +758,51 @@ mod tests {
         assert!(matches!(err, Err(DialError::ProxyHandshake(_))));
     }
 
+    /// A hostile SOCKS5 reply with a non-IPv4 bound-address type (here `ATYP=0x03` domain, plus an
+    /// attacker-chosen huge length byte) must be REJECTED at the ATYP check, *before* any
+    /// variable-length read — so a malicious proxy can't drive an unbounded/oversized read off the
+    /// length field. The connect reply code is success (`0x00`), so the only thing standing between
+    /// the proxy and a length-driven read is the `head[3] != 0x01` IPv4-only guard. We assert it
+    /// fails closed with `ProxyHandshake` (no tunnel) rather than attempting to consume the
+    /// advertised domain length. The fake proxy deliberately sends ONLY the 4-byte reply header and
+    /// then nothing more: if the dialer tried to read the (non-existent) 255-byte domain it would
+    /// block until `PROXY_HANDSHAKE_TIMEOUT` and surface a timeout `ProxyHandshake` instead — either
+    /// way it fails closed, but the fast reject (no further read) is what this locks in.
+    #[tokio::test]
+    async fn proxy_dialer_socks5_rejects_non_ipv4_reply_atyp_before_unbounded_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut c, _) = listener.accept().await.unwrap();
+            // Complete the greeting + method selection.
+            let mut g = [0u8; 2];
+            c.read_exact(&mut g).await.unwrap();
+            let mut methods = vec![0u8; g[1] as usize];
+            c.read_exact(&mut methods).await.unwrap();
+            c.write_all(&[0x05, 0x00]).await.unwrap(); // no-auth
+            // Consume the CONNECT request (VER CMD RSV ATYP DST.ADDR(4) DST.PORT(2)).
+            let mut req = [0u8; 10];
+            c.read_exact(&mut req).await.unwrap();
+            // Hostile reply: VER=5, REP=0x00 (success), RSV=0, ATYP=0x03 (DOMAINNAME), then a length
+            // byte of 0xFF claiming a 255-byte hostname — but send NOTHING after the header. A parser
+            // that trusted ATYP/length would try to read 1 + 255 + 2 bytes that never arrive.
+            let _written = c.write_all(&[0x05, 0x00, 0x00, 0x03, 0xff]).await;
+            // Hold the connection open briefly so a (wrongly) reading dialer would block, not EOF.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+        let dialer = ProxyExitDialer::new(ProxyConfig {
+            addr: proxy,
+            scheme: ProxyScheme::Socks5,
+            auth: None,
+        });
+        let dst = "1.2.3.4:443".parse().unwrap();
+        let err = dialer.dial_tcp(FlowClass::ExitNode, dst).await;
+        assert!(
+            matches!(err, Err(DialError::ProxyHandshake(_))),
+            "a non-IPv4 reply ATYP must fail closed at the guard, got {err:?}"
+        );
+    }
+
     /// Connecting to a dead proxy address surfaces an error — no direct fallback.
     #[tokio::test]
     async fn proxy_dialer_fails_closed_when_proxy_unreachable() {
