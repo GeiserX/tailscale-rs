@@ -175,14 +175,44 @@ impl NodeState {
     /// claimed-sender identity — a caller that rotates at runtime should refresh magicsock's copy so
     /// outbound pings advertise the new key, but that is a magicsock concern, not a key-state one.)
     ///
+    /// **`old_node_key` anchor lifecycle.** This records the prior key as `old_node_key` **only if no
+    /// rotation anchor is already held** ([`old_node_key`](NodeState::old_node_key) is currently
+    /// `None`). A second rotation *before* a successful re-register therefore preserves the
+    /// **original** pre-expiry key as the anchor, rather than overwriting it with the intermediate
+    /// rotated key — control links a rotation against the key it already knows, so the anchor must
+    /// stay pinned to the last *registered* key, not a transient one. The anchor is released back to
+    /// `None` by [`clear_old_node_key`](NodeState::clear_old_node_key), which the re-register path
+    /// calls on a **successful** register: once control has accepted the rotated key, that key is now
+    /// the node's known identity, so a subsequent genuine expiry cycle correctly captures it as the
+    /// new anchor. (A runtime caller that drives repeated rotations is additionally expected not to
+    /// rotate again while a re-register is unconfirmed; this guard is the belt-and-suspenders.)
+    ///
     // TODO(TKA): on a tailnet-lock-enabled tailnet, a node-key rotation must also re-sign the new node
     // key with the network-lock key and send the new `RegisterRequest.NodeKeySignature`. This
     // primitive covers the non-TKA path; the TKA re-sign is a separate follow-up, so an auto-reauth
     // caller must gate rotation OFF while lock enforcement is active (else the node locks itself out
     // of locked peers with an unsigned key).
     pub fn rotate_node_key(&mut self) {
-        self.old_node_key = Some(self.node_keys.public);
+        // Preserve an existing anchor: only capture the current key as `old_node_key` when none is
+        // held, so two rotations before a successful register keep the ORIGINAL pre-expiry key as the
+        // linkage anchor control expects (see the lifecycle note above).
+        if self.old_node_key.is_none() {
+            self.old_node_key = Some(self.node_keys.public);
+        }
         self.node_keys = NodeKeyPair::new();
+    }
+
+    /// Release the rotation anchor: drop any [`old_node_key`](NodeState::old_node_key) back to `None`.
+    ///
+    /// Called by the re-register path on a **successful** register. After control accepts a rotated
+    /// node key, that key is the node's known identity, so the next genuine node-key rotation should
+    /// anchor on *it* (capture it fresh as `old_node_key`) rather than re-sending a now-stale prior
+    /// key. Paired with [`rotate_node_key`](NodeState::rotate_node_key)'s preserve-if-`Some` guard:
+    /// the anchor is captured once per rotation episode and cleared once the episode is confirmed.
+    /// A no-op when no anchor is held (the steady-state case — every successful map-poll re-register
+    /// calls this and it harmlessly does nothing while `old_node_key` is already `None`).
+    pub fn clear_old_node_key(&mut self) {
+        self.old_node_key = None;
     }
 }
 
@@ -248,6 +278,86 @@ mod tests {
         assert_eq!(state.disco_keys.public, disco_before);
         assert_eq!(state.machine_keys.public, machine_before);
         assert_eq!(state.network_lock_keys.public, lock_before);
+    }
+
+    #[test]
+    fn node_state_two_rotations_without_success_preserve_original_anchor() {
+        // Two rotations WITHOUT an intervening successful register (no `clear_old_node_key`) must keep
+        // the ORIGINAL pre-expiry key as `old_node_key`, never overwrite it with the intermediate
+        // rotated key. Control links a rotation against the key it already knows (the last registered
+        // one), so a second rotation before recovery must not lose that anchor — the core of the
+        // "preserve the original OldNodeKey anchor" fix.
+        let mut state = NodeState::generate();
+        let original = state.node_keys.public;
+
+        state.rotate_node_key();
+        let intermediate = state.node_keys.public;
+        assert_eq!(
+            state.old_node_key,
+            Some(original),
+            "first rotation anchors on the original key"
+        );
+        assert_ne!(intermediate, original);
+
+        state.rotate_node_key();
+        assert_eq!(
+            state.old_node_key,
+            Some(original),
+            "a SECOND rotation before a successful register must preserve the ORIGINAL anchor, not \
+             overwrite it with the intermediate key"
+        );
+        assert_ne!(
+            state.node_keys.public, intermediate,
+            "the node key still rotates fresh on the second rotation"
+        );
+        assert_ne!(state.node_keys.public, original);
+    }
+
+    #[test]
+    fn node_state_rotation_after_clear_captures_new_current_key() {
+        // After a successful register clears the anchor (`clear_old_node_key`), the NEXT genuine
+        // rotation must capture the now-current (already-registered) key as the fresh anchor — not the
+        // long-gone original. This is the other half of the anchor lifecycle: clear-on-success lets a
+        // later expiry cycle re-anchor correctly.
+        let mut state = NodeState::generate();
+        let original = state.node_keys.public;
+
+        state.rotate_node_key();
+        let current = state.node_keys.public;
+        assert_eq!(state.old_node_key, Some(original));
+
+        // A successful register confirms `current` as the node's known identity at control.
+        state.clear_old_node_key();
+        assert_eq!(
+            state.old_node_key, None,
+            "a successful register releases the anchor"
+        );
+
+        // The next genuine expiry cycle rotates again — now anchoring on `current`, not `original`.
+        state.rotate_node_key();
+        assert_eq!(
+            state.old_node_key,
+            Some(current),
+            "a rotation AFTER a success captures the new current (registered) key as the anchor"
+        );
+        assert_ne!(state.node_keys.public, current);
+    }
+
+    #[test]
+    fn node_state_clear_old_node_key_is_noop_when_none() {
+        // The steady-state call: every successful map-poll re-register calls `clear_old_node_key`, and
+        // it must harmlessly do nothing while no anchor is held (and leave the live keys untouched).
+        let mut state = NodeState::generate();
+        let node_before = state.node_keys.public;
+        assert_eq!(state.old_node_key, None);
+
+        state.clear_old_node_key();
+
+        assert_eq!(state.old_node_key, None);
+        assert_eq!(
+            state.node_keys.public, node_before,
+            "clearing the anchor must not touch live keys"
+        );
     }
 
     #[test]

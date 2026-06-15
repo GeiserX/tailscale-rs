@@ -14,7 +14,13 @@
 /// Published by the control runner as it brings the node up and maintains the netmap stream. A
 /// consumer watches this to drive UI ("connecting…", "needs login", "expired") and to distinguish a
 /// permanent failure from a transient one without inspecting logs.
+///
+/// `#[non_exhaustive]`: more lifecycle states may be added (as `Reauthenticating` was), so an
+/// embedder matching on this must include a wildcard arm and treat an unknown state conservatively
+/// (e.g. as "still coming up") rather than failing to compile on a fork upgrade. (Same-crate matches
+/// are unaffected — `#[non_exhaustive]` only forces the wildcard on out-of-crate consumers.)
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DeviceState {
     /// The runtime has spawned and is registering / establishing the control session. The initial
     /// state of every device.
@@ -272,10 +278,10 @@ mod tests {
         );
     }
 
-    /// `Reauthenticating` is transient (the auto-reauth analogue of `is_permanent() == false`): a
-    /// waiter must NOT settle on it — like `Connecting`, it times out rather than resolving to a
-    /// terminal error, because the next good self-node flips the state back to `Running`. This is the
-    /// behavioral guard that an in-flight auto-reauth never surfaces as a permanent failure.
+    /// `Reauthenticating` is transient (a waiter never settles on it): a waiter must NOT resolve on
+    /// it — like `Connecting`, it times out rather than resolving to a terminal error, because the
+    /// next good self-node flips the state back to `Running`. This is the behavioral guard that an
+    /// in-flight auto-reauth never surfaces as a permanent failure.
     #[tokio::test]
     async fn wait_does_not_settle_on_reauthenticating() {
         let (_tx, rx) = watch::channel(DeviceState::Reauthenticating);

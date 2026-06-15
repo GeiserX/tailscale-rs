@@ -264,7 +264,10 @@ impl AsyncControlClient {
         tracing::info!("requesting node-key reauth on the live map-poll loop");
 
         if let Err(e) = self.command_tx.send(Command::Reauth).await {
-            tracing::error!(error = %e, "requesting reauth");
+            // A closed channel here is a benign teardown race (the run loop already ended), so the
+            // error is logged and dropped — the runtime's terminal-state handling owns the final
+            // outcome. `debug!`, not `error!`: this is expected at shutdown, not a fault.
+            tracing::debug!(error = %e, "requesting reauth");
         }
     }
 
@@ -564,6 +567,13 @@ pub async fn run(
         // true we rotate + reconnect IMMEDIATELY, skipping the backoff sleep — an intentional
         // re-register (Go `doLogin`), not a failure retry.
         let mut reauth_requested = false;
+        // Set by `run_once` when its re-register SUCCEEDS. `run` owns `node_keys`, so the
+        // `old_node_key` rotation-anchor lifecycle is managed HERE: a successful register confirms the
+        // (possibly rotated) node key as control's known identity, so the anchor is released
+        // (`clear_old_node_key`) — the next genuine rotation then re-anchors on the now-current key.
+        // Paired with `rotate_node_key`'s preserve-if-`Some` guard, this keeps the ORIGINAL pre-expiry
+        // key pinned across repeated rotations *before* a success, and re-anchors correctly *after* one.
+        let mut register_succeeded = false;
         let outcome = run_once(
             &state_tx,
             &mut command_rx,
@@ -576,9 +586,20 @@ pub async fn run(
             &mut net_info,
             &mut received_frame,
             &mut reauth_requested,
+            &mut register_succeeded,
             &auth_url_tx,
         )
         .await;
+
+        // Release the rotation anchor on a successful re-register (before the reauth/backoff branches
+        // below): once control accepts the node key, that key IS the node's identity, so a later
+        // rotation must capture it fresh rather than re-send a stale prior key. Done before the
+        // `reauth_requested` rotation just below so the FIRST rotation of an episode still captures the
+        // pre-rotation key as its anchor (the clear is a no-op when no anchor is held — the steady
+        // state — so this does not disturb a normal map-poll re-register).
+        if register_succeeded {
+            node_keys.clear_old_node_key();
+        }
 
         // A `Command::Reauth` was received mid-poll: rotate the node key (recording the prior key as
         // `OldNodeKey`) and reconnect at once so the next `run_once` re-registers with the rotated key
@@ -671,6 +692,7 @@ async fn run_once(
     net_info: &mut CarriedNetInfo,
     received_frame: &mut bool,
     reauth_requested: &mut bool,
+    register_succeeded: &mut bool,
     auth_url_tx: &watch::Sender<Option<Url>>,
 ) -> Result<(), Error> {
     let h2_client = control_dialer
@@ -693,6 +715,10 @@ async fn run_once(
             // back to `NeedsLogin` on recovery (a recovered node would show "needs login" until the
             // next keep-alive).
             clear_reauth_url(auth_url_tx);
+            // Signal `run` to release the node-key rotation anchor (`old_node_key`): control has
+            // accepted this node key, so it is now the node's known identity. `run` owns `node_keys`
+            // (this fn only borrows `&`), so the actual `clear_old_node_key` happens there.
+            *register_succeeded = true;
         }
         Err(e) => {
             let err = Error::from(e);
