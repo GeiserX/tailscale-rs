@@ -2,6 +2,32 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.38.0](https://github.com/GeiserX/tailscale-rs/compare/v0.37.4...v0.38.0) (2026-06-15)
+
+
+### Features
+
+* advertise a genuine-looking Hostinfo to control ([#234](https://github.com/GeiserX/tailscale-rs/issues/234)) ([fd66c5d](https://github.com/GeiserX/tailscale-rs/commit/fd66c5d1a2f75df6d4c604ebaa169a173aa2fb14))
+* **control:** carry NetInfo whole across every map request (working_udp + mapping_varies) ([#240](https://github.com/GeiserX/tailscale-rs/issues/240)) ([4759ccb](https://github.com/GeiserX/tailscale-rs/commit/4759ccbbc80ab61f4a1abad564568fd87402163b))
+* **magicsock:** match Go disco ping cadence to quiet steady-state probing ([#236](https://github.com/GeiserX/tailscale-rs/issues/236)) ([0e2cecd](https://github.com/GeiserX/tailscale-rs/commit/0e2cecd03c0769c9410b7bf30146ffa07b15dbd9))
+
+
+### Bug Fixes
+
+* accept a reason-less PeerGone and tolerate unknown reason bytes ([#230](https://github.com/GeiserX/tailscale-rs/issues/230)) ([d2dc7b1](https://github.com/GeiserX/tailscale-rs/commit/d2dc7b1f4851dd592db3c578f005c94c1f2c1254))
+* answer NOTIMP for NS/SOA/HINFO/AXFR on tailnet names ([#229](https://github.com/GeiserX/tailscale-rs/issues/229)) ([e789c79](https://github.com/GeiserX/tailscale-rs/commit/e789c7936418161c6aca1276be161e7e2061f9a5))
+* **control-serde:** send all Hostinfo/NetInfo wire keys under Go's exact casing ([#239](https://github.com/GeiserX/tailscale-rs/issues/239)) ([da10905](https://github.com/GeiserX/tailscale-rs/commit/da1090540c942371e11976cee9f28068eb315b80))
+* **control:** macOS product OSVersion + Linux Distro hostinfo + IPNVersion/OS wire-key fix ([#238](https://github.com/GeiserX/tailscale-rs/issues/238)) ([daeafdf](https://github.com/GeiserX/tailscale-rs/commit/daeafdf7df277ba52ac79cb0e117e82e74af6209))
+* decode SSHRecorderFailureAction wire keys as PascalCase ([#231](https://github.com/GeiserX/tailscale-rs/issues/231)) ([a900522](https://github.com/GeiserX/tailscale-rs/commit/a900522091f26b0a564db96fffe664b99488933b))
+* hold an idle non-home DERP connection for 60s to match wireguard-go ([#233](https://github.com/GeiserX/tailscale-rs/issues/233)) ([fb80a12](https://github.com/GeiserX/tailscale-rs/commit/fb80a12406a42e2302cffd259a7c23e3e49f2c16))
+* honor HTTP 429 Retry-After on register instead of a local retry schedule ([#227](https://github.com/GeiserX/tailscale-rs/issues/227)) ([f01c44d](https://github.com/GeiserX/tailscale-rs/commit/f01c44d345e50a19b7ad7d6fa454445762d58658))
+* **magicsock:** jitter periodic STUN re-probe to match Go cadence ([#237](https://github.com/GeiserX/tailscale-rs/issues/237)) ([fd6d174](https://github.com/GeiserX/tailscale-rs/commit/fd6d174bd9260d96aad24e5ecda4fd9e722063cd))
+* make the control runner the single DERP home-region authority ([#235](https://github.com/GeiserX/tailscale-rs/issues/235)) ([a4803ea](https://github.com/GeiserX/tailscale-rs/commit/a4803eac8a1f03bb6b9527eb9bca57a5036b4394))
+* refuse final-component symlinks atomically on taildrop opens ([#224](https://github.com/GeiserX/tailscale-rs/issues/224)) ([df00b72](https://github.com/GeiserX/tailscale-rs/commit/df00b7237cc8ab4f495066b8c73921e871d47e33))
+* reset map-poll backoff on a substantive netmap, not on keep-alives ([#226](https://github.com/GeiserX/tailscale-rs/issues/226)) ([57f381f](https://github.com/GeiserX/tailscale-rs/commit/57f381f05624673a38b63a95e71beba2b5ba9ff8))
+* set the netstack MTU to the overlay MTU so MSS fits the tunnel ([#232](https://github.com/GeiserX/tailscale-rs/issues/232)) ([f3fa8d9](https://github.com/GeiserX/tailscale-rs/commit/f3fa8d91ffac3d01ff472fddc51db85a064b0c31))
+* validate peerAPI requests against Host/Origin/Referer before dispatch ([#228](https://github.com/GeiserX/tailscale-rs/issues/228)) ([9d58d4f](https://github.com/GeiserX/tailscale-rs/commit/9d58d4f446906d05390252ec2ac006241a4c763b))
+
 ## [0.37.4](https://github.com/GeiserX/tailscale-rs/compare/v0.37.3...v0.37.4) (2026-06-14)
 
 
