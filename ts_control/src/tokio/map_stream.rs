@@ -180,9 +180,17 @@ const MAX_NETMAP_FRAME: u32 = 16 * 1024 * 1024;
 /// and ends the stream if a frame would exceed it, rather than letting a hostile (or buggy) control
 /// frame drive an unbounded allocation. 64 MiB matches the default decoder memory ceiling Go's zstd
 /// decoder runs under (`klauspost/compress` `WithDecoderMaxMemory` default) and is far above any real
-/// netmap's decoded size, so it never rejects legitimate traffic. ruzstd additionally rejects an
-/// over-large declared *window* at frame-init, so neither the window header nor the output can drive
-/// an unbounded allocation.
+/// netmap's decoded size, so it never rejects legitimate traffic.
+///
+/// This output cap is the *binding* allocation bound. ruzstd allocates its decode buffer lazily —
+/// `RingBuffer::new()` starts at zero capacity and grows only as decoded bytes are produced — so a
+/// frame's declared *window* / content-size header drives no eager allocation (a frame declaring a
+/// multi-terabyte window with a tiny body decompresses with only kilobytes of working set). Because
+/// the [`decompress_frame`] reader reads through a [`std::io::Read::take`] of `MAX_DECODED_NETMAP + 1`,
+/// the output `Vec` (and with it ruzstd's window) cannot grow past the cap. Peak *transient*
+/// allocation is a small constant multiple of the cap (the output `Vec`'s amortized-doubling growth
+/// plus ruzstd's internal window/block buffers), all bounded by the cap, freed when the frame is
+/// dropped, and non-stacking (the map poll drives a single frame reader per node).
 const MAX_DECODED_NETMAP: u64 = 64 * 1024 * 1024;
 
 /// Long-poll read watchdog: if no frame (not even a keep-alive) arrives within this window, end the
@@ -229,7 +237,12 @@ fn decompress_frame(frame: &[u8]) -> Option<alloc::vec::Vec<u8>> {
 
     // Read at most `MAX_DECODED_NETMAP + 1` bytes: if the decoder yields that many, the frame
     // decompresses to more than the bound and is rejected (zip-bomb guard) rather than allowed to
-    // drive an unbounded allocation.
+    // drive an unbounded allocation. The output `Vec` grows on demand (it is NOT pre-reserved to the
+    // cap: pre-reserving would force a 64 MiB allocation on every keep-alive and small netmap — the
+    // overwhelmingly common case — to bound an overshoot that only occurs for a frame decompressing
+    // *near* the cap, which is either nonexistent for a real netmap or an attack frame we reject on
+    // the next line anyway). The amortized-doubling growth therefore peaks at a small constant
+    // multiple of the actual decoded size, bounded by the cap and freed when the frame is dropped.
     let mut decoded = alloc::vec::Vec::new();
     decoder
         .by_ref()
@@ -820,7 +833,10 @@ mod tests {
         buf.extend_from_slice(GOLDEN_ZSTD_FRAME);
 
         let mut stream = core::pin::pin!(map_stream(&buf[..]));
-        let update = stream.next().await.expect("one update from the foreign zstd frame");
+        let update = stream
+            .next()
+            .await
+            .expect("one update from the foreign zstd frame");
         assert_eq!(update.session_handle.as_deref(), Some("sess-golden"));
         assert_eq!(update.seq, 7);
     }
@@ -835,7 +851,10 @@ mod tests {
         let buf = frame_uncompressed(&[r#"{"MapSessionHandle":"sess-plain","Seq":3}"#]);
 
         let mut stream = core::pin::pin!(map_stream(&buf[..]));
-        let update = stream.next().await.expect("uncompressed frame must still decode");
+        let update = stream
+            .next()
+            .await
+            .expect("uncompressed frame must still decode");
         assert_eq!(update.session_handle.as_deref(), Some("sess-plain"));
         assert_eq!(update.seq, 3);
     }
@@ -850,7 +869,10 @@ mod tests {
         assert_eq!(&buf[4..8], &ZSTD_MAGIC);
 
         let mut stream = core::pin::pin!(map_stream(&buf[..]));
-        let update = stream.next().await.expect("self-compressed frame must decode");
+        let update = stream
+            .next()
+            .await
+            .expect("self-compressed frame must decode");
         assert_eq!(update.session_handle.as_deref(), Some("sess-self"));
         assert_eq!(update.seq, 9);
     }
@@ -880,6 +902,54 @@ mod tests {
         assert!(
             stream.next().await.is_none(),
             "a frame decompressing past MAX_DECODED_NETMAP must end the stream, not allocate it"
+        );
+    }
+
+    /// Accept-side of the decoded-size bound: a frame that decompresses to a LARGE but in-bounds body
+    /// (here ~1 MiB of valid JSON, well under the 64 MiB cap) must be accepted, not rejected. This
+    /// pins that the `take(MAX + 1)` + `len > MAX` guard does not have an off-by-one that would
+    /// wrongly reject a legitimately large netmap (the silent-regression-on-big-tailnets hazard). The
+    /// body is real JSON padded with an ignored field so it both decompresses big AND deserializes.
+    #[tokio::test]
+    async fn accepts_large_in_bounds_decoded_frame() {
+        // ~1 MiB of filler in an unknown field (serde ignores it), plus the fields we assert on.
+        let filler = "a".repeat(1024 * 1024);
+        let body = alloc::format!(r#"{{"Pad":"{filler}","MapSessionHandle":"sess-big","Seq":5}}"#);
+        let buf = frame(&[&body]);
+        // Sanity: the decompressed body really is ~1 MiB (far above a keep-alive, far below the cap).
+        assert!(body.len() as u64 > 1_000_000 && (body.len() as u64) < MAX_DECODED_NETMAP);
+
+        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let update = stream
+            .next()
+            .await
+            .expect("a large in-bounds frame must be accepted");
+        assert_eq!(update.session_handle.as_deref(), Some("sess-big"));
+        assert_eq!(update.seq, 5);
+    }
+
+    /// A bad frame in the MIDDLE of a stream must end the stream cleanly after the earlier good frames
+    /// were delivered — not panic, and not retroactively drop the good frames. Proves the per-frame
+    /// failure recovery is uniform regardless of position (first good frame yields a `StateUpdate`,
+    /// the following malformed frame ends the stream).
+    #[tokio::test]
+    async fn good_frame_then_malformed_ends_stream_after_first() {
+        // Frame 1: a valid (zstd-compressed) substantive response. Frame 2: zstd magic + junk.
+        let mut buf = frame(&[r#"{"MapSessionHandle":"sess-1","Seq":1}"#]);
+        let mut bad = ZSTD_MAGIC.to_vec();
+        bad.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0x00]);
+        buf.extend_from_slice(&(bad.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&bad);
+
+        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let first = stream
+            .next()
+            .await
+            .expect("the first good frame must be delivered");
+        assert_eq!(first.seq, 1);
+        assert!(
+            stream.next().await.is_none(),
+            "the malformed second frame must end the stream after the first was delivered"
         );
     }
 
