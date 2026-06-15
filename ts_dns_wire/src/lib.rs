@@ -122,6 +122,12 @@ pub struct Query {
     pub id: u16,
     /// The first (and only decoded) question.
     pub question: Question,
+    /// The query's Recursion-Desired (RD) bit. A response must echo RD and, when it is set, also set
+    /// Recursion-Available (RA) — Go derives the response header from the parsed query header
+    /// (`net/dns/resolver` `marshalResponse`), so a real MagicDNS reply to a stub resolver (which
+    /// always sets RD=1) has RD=1+RA=1. Captured here so [`encode_response`] can mirror it instead of
+    /// clearing both (which is a 2-bit fingerprint on every response).
+    pub recursion_desired: bool,
 }
 
 /// Reasons a query buffer could not be decoded.
@@ -216,6 +222,8 @@ pub fn decode_query(buf: &[u8]) -> Result<Query, DecodeError> {
             qtype,
             qclass,
         },
+        // RD is bit 8 (0x0100) of the flags word.
+        recursion_desired: flags & 0x0100 != 0,
     })
 }
 
@@ -344,12 +352,19 @@ fn encode_name(out: &mut Vec<u8>, name: &Name) {
 
 /// Encode a single answer resource record onto `out`.
 ///
-/// The NAME is a compression pointer (`0xC0 0x0C`) back to the question name
-/// at offset 12. Records use class IN and a TTL of [`ANSWER_TTL`] seconds.
-fn encode_answer(out: &mut Vec<u8>, ans: &RData) {
-    // NAME: compression pointer to the question name at offset 12.
-    out.push(0xC0);
-    out.push(0x0C);
+/// The NAME is either a compression pointer (`0xC0 0x0C`) back to the question name at offset 12
+/// (when `compress` is set — i.e. there is more than one answer) or the full uncompressed label
+/// sequence of `qname` (the single-answer case). Go only enables compression for `len(IPs) > 1`, so a
+/// single-answer reply carries the full name; always emitting a pointer is a fingerprint. Records use
+/// class IN and a TTL of [`ANSWER_TTL`] seconds.
+fn encode_answer(out: &mut Vec<u8>, ans: &RData, compress: bool, qname: &Name) {
+    // NAME: a pointer to the question name (offset 12) when compressing; otherwise the full name.
+    if compress {
+        out.push(0xC0);
+        out.push(0x0C);
+    } else {
+        encode_name(out, qname);
+    }
     // TYPE.
     out.extend_from_slice(&rdata_type(ans).to_be_bytes());
     // CLASS = IN.
@@ -378,20 +393,33 @@ fn encode_answer(out: &mut Vec<u8>, ans: &RData) {
 
 /// Encode a DNS response.
 ///
-/// The header echoes `id`, sets QR=1 (response) and AA=1 (authoritative),
-/// clears RD/RA/Z and the opcode, and places `rcode` in the low 4 bits.
-/// `QDCOUNT` is 1, `ANCOUNT` is the number of answers actually included, and
-/// `NSCOUNT`/`ARCOUNT` are 0. The question `q` is echoed in the question
-/// section, and each answer is appended using a compression pointer
-/// (`0xC0 0x0C`) back to the question name. Answer records use class IN and a
-/// TTL of 600 seconds.
+/// The header echoes `id`, sets QR=1 (response) and AA=1 (authoritative), echoes the query's
+/// Recursion-Desired bit (`recursion_desired`) and — when RD is set — also sets Recursion-Available
+/// (RA), matching Go `net/dns/resolver` `marshalResponse`, which derives the response header from the
+/// parsed query header (so a reply to a stub resolver, which always sets RD=1, has RD=1+RA=1). It
+/// places `rcode` in the low 4 bits; Z and the opcode stay clear (MagicDNS answers standard opcode-0
+/// queries). `QDCOUNT` is 1, `ANCOUNT` is the number of answers actually included, and
+/// `NSCOUNT`/`ARCOUNT` are 0. The question `q` is echoed in the question section. A single answer's
+/// NAME is written uncompressed (full label sequence); compression pointers (`0xC0 0x0C` back to the
+/// question name) are used only when there is more than one answer — matching Go, which calls
+/// `EnableCompression` only for `len(IPs) > 1`. Answer records use class IN and a TTL of 600 seconds.
 ///
 /// The encoded datagram is capped at the classic 512-byte UDP limit
 /// (`MAX_UDP_MSG_LEN`); this fork does not implement EDNS(0). If the full
 /// answer set would overflow that limit, the overflowing answers are dropped
 /// and the TC (truncation) bit is set in the header, so the result is always
-/// `<= 512` bytes and never an oversized datagram.
-pub fn encode_response(id: u16, q: &Question, rcode: Rcode, answers: &[RData]) -> Vec<u8> {
+/// `<= 512` bytes and never an oversized datagram. Note a single answer's size now includes the FULL
+/// uncompressed question name (compression only kicks in for >1 answer), so the 512 cap is reached by
+/// a shorter answer set than when every answer was a 2-byte pointer — only material for a near-maximal
+/// (~240+ wire-byte) name, where even one answer is then dropped + TC set (valid DNS; this fork is
+/// UDP-only).
+pub fn encode_response(
+    id: u16,
+    q: &Question,
+    recursion_desired: bool,
+    rcode: Rcode,
+    answers: &[RData],
+) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
 
     // Header. The flags word is finalized after the answer loop so we can set
@@ -415,11 +443,17 @@ pub fn encode_response(id: u16, q: &Question, rcode: Rcode, answers: &[RData]) -
 
     // Answer section. Append answers only while they fit within the 512-byte
     // UDP limit. If any answer would overflow, stop and set TC.
+    //
+    // Compression: only when there is more than one answer (Go calls `EnableCompression` solely for
+    // `len(IPs) > 1`). A single answer's NAME is written in full (uncompressed) label form; with >1,
+    // each answer NAME is a `0xC0 0x0C` pointer back to the question name. This matches Go's answer-
+    // section byte layout instead of always emitting a pointer (a fingerprint on every reply).
+    let compress = answers.len() > 1;
     let mut ancount: u16 = 0;
     let mut truncated = false;
     for ans in answers {
         let mut rr: Vec<u8> = Vec::new();
-        encode_answer(&mut rr, ans);
+        encode_answer(&mut rr, ans, compress, &q.name);
         if out.len() + rr.len() > MAX_UDP_MSG_LEN {
             // This answer (and any after it) does not fit. Drop the rest and
             // mark the response truncated.
@@ -430,9 +464,14 @@ pub fn encode_response(id: u16, q: &Question, rcode: Rcode, answers: &[RData]) -
         ancount += 1;
     }
 
-    // Finalize the flags word: QR=1 (bit15), AA=1 (bit10), TC (bit9) if any
-    // answers were dropped, and the low 4 RCODE bits.
+    // Finalize the flags word: QR=1 (bit15), AA=1 (bit10); echo RD (bit8) from the query and set RA
+    // (bit7) when RD is set (Go derives the response header from the query header — a stub resolver's
+    // RD=1 query gets RD=1+RA=1 back); TC (bit9) if any answers were dropped; low 4 RCODE bits.
     let mut flags: u16 = 0x8000 | 0x0400 | (rcode.value() as u16);
+    if recursion_desired {
+        flags |= 0x0100; // RD (echoed from the query)
+        flags |= 0x0080; // RA (we set it whenever RD was requested, matching Go)
+    }
     if truncated {
         flags |= 0x0200; // TC
     }
@@ -452,7 +491,9 @@ mod tests {
     fn build_query(id: u16, labels: &[&str], qtype: u16, qclass: u16) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::new();
         buf.extend_from_slice(&id.to_be_bytes());
-        buf.extend_from_slice(&0u16.to_be_bytes()); // flags: QR=0
+        // flags: QR=0, RD=1 — every real stub resolver sets RD, so the test fixtures match it (and
+        // exercise the RD-echo / RA path in `encode_response`).
+        buf.extend_from_slice(&0x0100u16.to_be_bytes());
         buf.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
         buf.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
         buf.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
@@ -544,9 +585,11 @@ mod tests {
     fn round_trip_a_response() {
         let buf = build_query(0x1234, &["host", "user", "ts", "net"], 1, 1);
         let q = decode_query(&buf).expect("decodes");
+        assert!(q.recursion_desired, "build_query sets RD=1");
         let out = encode_response(
             0x1234,
             &q.question,
+            q.recursion_desired,
             Rcode::NoError,
             &[RData::A([100, 64, 0, 1])],
         );
@@ -559,21 +602,99 @@ mod tests {
         assert_eq!(id, 0x1234);
         assert_eq!(flags & 0x8000, 0x8000, "QR=1");
         assert_eq!(flags & 0x0400, 0x0400, "AA=1");
+        assert_eq!(flags & 0x0100, 0x0100, "RD echoed from the query");
+        assert_eq!(flags & 0x0080, 0x0080, "RA set because RD was requested");
         assert_eq!(flags & 0x000F, 0, "rcode=0");
         assert_eq!(ancount, 1);
 
-        // The A record should appear: compression pointer, type=1, class=1,
-        // ttl=600, rdlen=4, addr.
-        let expected_rr: [u8; 16] = [
-            0xC0, 0x0C, // NAME pointer
+        // A single answer's NAME is the FULL uncompressed label sequence (Go compresses only for
+        // >1 answer), then type=1, class=1, ttl=600, rdlen=4, addr.
+        let expected_rr: &[u8] = &[
+            // NAME: "host.user.ts.net." uncompressed (labels + root 0).
+            4, b'h', b'o', b's', b't', 4, b'u', b's', b'e', b'r', 2, b't', b's', 3, b'n', b'e',
+            b't', 0, //
             0x00, 0x01, // TYPE = A
             0x00, 0x01, // CLASS = IN
             0x00, 0x00, 0x02, 0x58, // TTL = 600
             0x00, 0x04, // RDLENGTH = 4
-            100, 64, 0, 1, // RDATA
+            100, 64, 0, 1, // RDATA = 100.64.0.1
         ];
         let tail = &out[out.len() - expected_rr.len()..];
         assert_eq!(tail, expected_rr);
+        // And no compression pointer anywhere in a single-answer response.
+        assert!(
+            !out[HEADER_LEN..].windows(2).any(|w| w[0] == 0xC0),
+            "single-answer response must not use a compression pointer"
+        );
+    }
+
+    /// A response with MORE than one answer DOES use a `0xC0 0x0C` pointer for each answer NAME (Go
+    /// `EnableCompression` for `len(IPs) > 1`).
+    #[test]
+    fn multi_answer_response_uses_compression_pointers() {
+        let buf = build_query(0x5555, &["h", "ts", "net"], 1, 1);
+        let q = decode_query(&buf).expect("decodes");
+        let out = encode_response(
+            0x5555,
+            &q.question,
+            q.recursion_desired,
+            Rcode::NoError,
+            &[RData::A([100, 64, 0, 1]), RData::A([100, 64, 0, 2])],
+        );
+        let ancount = u16::from_be_bytes([out[6], out[7]]);
+        assert_eq!(ancount, 2);
+        // Each answer NAME is a pointer 0xC0 0x0C; the answer section begins right after the question.
+        // The first answer RR starts with the pointer.
+        let q_end = HEADER_LEN
+            + // question name "h.ts.net." = 1+1 +2+1 +3+1 +1 = 10 bytes, +4 (qtype+qclass)
+            (1 + 1 + 2 + 1 + 3 + 1 + 1)
+            + 4;
+        assert_eq!(
+            &out[q_end..q_end + 2],
+            &[0xC0, 0x0C],
+            "multi-answer uses a pointer"
+        );
+    }
+
+    /// A query with RD=0 (e.g. a non-recursive client) must get RD=0 AND RA=0 back — we ECHO the
+    /// query's RD, never force it. Pins the "echo, don't set unconditionally" semantics against a
+    /// regression that always sets RA.
+    #[test]
+    fn rd_clear_query_yields_rd_ra_clear_response() {
+        // build_query sets RD=1; build a raw RD=0 query by hand (flags word all-zero).
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&0x4242u16.to_be_bytes()); // id
+        buf.extend_from_slice(&0u16.to_be_bytes()); // flags: QR=0, RD=0
+        buf.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+        buf.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // AN/NS/AR count
+        for label in ["h", "ts", "net"] {
+            buf.push(label.len() as u8);
+            buf.extend_from_slice(label.as_bytes());
+        }
+        buf.push(0);
+        buf.extend_from_slice(&1u16.to_be_bytes()); // qtype A
+        buf.extend_from_slice(&1u16.to_be_bytes()); // qclass IN
+        let q = decode_query(&buf).expect("decodes");
+        assert!(!q.recursion_desired, "RD=0 query");
+        let out = encode_response(
+            0x4242,
+            &q.question,
+            q.recursion_desired,
+            Rcode::NoError,
+            &[RData::A([100, 64, 0, 1])],
+        );
+        let flags = u16::from_be_bytes([out[2], out[3]]);
+        assert_eq!(
+            flags & 0x0100,
+            0,
+            "RD must stay clear (echoed from the RD=0 query)"
+        );
+        assert_eq!(
+            flags & 0x0080,
+            0,
+            "RA must stay clear when RD was not requested"
+        );
+        assert_eq!(flags & 0x8000, 0x8000, "QR=1 still set");
     }
 
     #[test]
@@ -670,7 +791,13 @@ mod tests {
         let q = decode_query(&buf).expect("decodes");
 
         let answers: Vec<RData> = (0..64u8).map(|i| RData::Aaaa([i; 16])).collect();
-        let out = encode_response(0xABCD, &q.question, Rcode::NoError, &answers);
+        let out = encode_response(
+            0xABCD,
+            &q.question,
+            q.recursion_desired,
+            Rcode::NoError,
+            &answers,
+        );
 
         assert!(
             out.len() <= MAX_UDP_MSG_LEN,
@@ -693,6 +820,7 @@ mod tests {
         let out = encode_response(
             0xABCD,
             &q.question,
+            q.recursion_desired,
             Rcode::NoError,
             &[RData::A([100, 64, 0, 1])],
         );

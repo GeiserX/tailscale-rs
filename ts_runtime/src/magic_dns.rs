@@ -325,8 +325,12 @@ pub(crate) fn decide(view: &DnsView, buf: &[u8]) -> Option<Decision> {
     let query = decode_query(buf).ok()?;
     let q = &query.question;
     let id = query.id;
+    // Echo the query's RD bit (and set RA when set) on the response — Go derives the response header
+    // from the query header.
+    let rd = query.recursion_desired;
 
-    let reply = |rcode, answers: &[RData]| Decision::Reply(encode_response(id, q, rcode, answers));
+    let reply =
+        |rcode, answers: &[RData]| Decision::Reply(encode_response(id, q, rd, rcode, answers));
 
     // Fail closed: MagicDNS off, or the node doesn't accept the tailnet's DNS config
     // (`--accept-dns` / `CorpDNS` is false) => serve nothing. The `accept_dns` gate mirrors Go
@@ -346,14 +350,14 @@ pub(crate) fn decide(view: &DnsView, buf: &[u8]) -> Option<Decision> {
     // diagnostic or a `qclass=ANY` probe reaches upstream instead of getting REFUSED.
     const CLASS_IN: u16 = 1;
     if q.qclass != CLASS_IN {
-        return Some(forward_or_nodata(view, &canon, buf, id, q));
+        return Some(forward_or_nodata(view, &canon, buf, id, q, rd));
     }
 
     Some(match &q.qtype {
         QType::A => match view.resolve_addr(&canon, true) {
             Some(IpAddr::V4(v4)) => reply(Rcode::NoError, &[RData::A(v4.octets())]),
             // No overlay/extra-record answer: try split-DNS / recursive upstreams.
-            _ => forward_or_nxdomain(view, &canon, buf, id, q),
+            _ => forward_or_nxdomain(view, &canon, buf, id, q, rd),
         },
         QType::Aaaa => match view.resolve_addr(&canon, false) {
             // A tailnet/overlay/self (or extra-record) AAAA match. Gate on IPv6: with IPv6 OFF
@@ -368,7 +372,7 @@ pub(crate) fn decide(view: &DnsView, buf: &[u8]) -> Option<Decision> {
             Some(IpAddr::V6(_)) => reply(Rcode::NoError, &[]),
             // No overlay/extra-record answer: split-DNS / recursive upstreams (off-tailnet names);
             // tailnet names fail closed to NXDOMAIN inside `forward_or_nxdomain`.
-            _ => forward_or_nxdomain(view, &canon, buf, id, q),
+            _ => forward_or_nxdomain(view, &canon, buf, id, q, rd),
         },
         QType::Ptr => match q.name.ptr_to_ipv4() {
             Some(octets) => {
@@ -385,14 +389,14 @@ pub(crate) fn decide(view: &DnsView, buf: &[u8]) -> Option<Decision> {
                     // closed to NXDOMAIN rather than leaking the probed tailnet IP upstream. Only
                     // genuinely off-tailnet reverse queries are forwarded.
                     None if is_tailnet_cgnat(v4) => reply(Rcode::NxDomain, &[]),
-                    None => forward_or_nxdomain(view, &canon, buf, id, q),
+                    None => forward_or_nxdomain(view, &canon, buf, id, q, rd),
                 }
             }
             // Anti-leak / IPv4-only-tailnet: an IPv6 reverse (`ip6.arpa`) PTR must never be
             // forwarded — relaying it would reveal that a tailnet v6 address (e.g. a ULA `fd7a:…`)
             // was probed. Fail closed to NXDOMAIN, exactly like the IPv4 CGNAT guard above.
             None if is_ip6_arpa(&canon) => reply(Rcode::NxDomain, &[]),
-            None => forward_or_nxdomain(view, &canon, buf, id, q),
+            None => forward_or_nxdomain(view, &canon, buf, id, q, rd),
         },
         // Anything else (TXT, SRV, MX, HTTPS/SVCB, CNAME, ...): we hold no authoritative record of
         // that type, so — like Go's resolver — forward it to upstream for an off-tailnet name and
@@ -400,7 +404,7 @@ pub(crate) fn decide(view: &DnsView, buf: &[u8]) -> Option<Decision> {
         // REFUSED as "this server won't serve me" and abandons the resolver, which would break
         // ordinary client lookups (notably HTTPS/SVCB type 65, issued routinely by browsers for
         // HTTP/3 + ECH) for the same off-tailnet names whose A/AAAA already forward.
-        QType::Other(_) => forward_or_nodata(view, &canon, buf, id, q),
+        QType::Other(_) => forward_or_nodata(view, &canon, buf, id, q, rd),
     })
 }
 
@@ -415,8 +419,9 @@ fn forward_or_nxdomain(
     buf: &[u8],
     id: u16,
     q: &ts_dns_wire::Question,
+    rd: bool,
 ) -> Decision {
-    let nxdomain = encode_response(id, q, Rcode::NxDomain, &[]);
+    let nxdomain = encode_response(id, q, rd, Rcode::NxDomain, &[]);
 
     if is_tailnet_name(view, canon) {
         return Decision::Reply(nxdomain);
@@ -478,6 +483,7 @@ fn forward_or_nodata(
     buf: &[u8],
     id: u16,
     q: &ts_dns_wire::Question,
+    rd: bool,
 ) -> Decision {
     // Authoritative tailnet name. For most unsupported types we answer NODATA (empty NOERROR) — the
     // name exists, we just hold no record of that type. But a small set of types Go's resolver
@@ -493,7 +499,7 @@ fn forward_or_nodata(
         } else {
             Rcode::NoError
         };
-        return Decision::Reply(encode_response(id, q, rcode, &[]));
+        return Decision::Reply(encode_response(id, q, rd, rcode, &[]));
     }
     // Anti-leak parity with the `QType::Ptr` arm: a reverse query for a tailnet CGNAT IPv4
     // (100.64.0.0/10) or ANY `ip6.arpa` name must NEVER egress to an upstream resolver, regardless
@@ -502,17 +508,17 @@ fn forward_or_nodata(
     // exotic-qtype (TXT/ANY/…) or non-IN-class query for a tailnet reverse name would slip through to
     // the forward path below. Fail closed to NXDOMAIN, matching the PTR arm's disposition.
     if is_ip6_arpa(canon) {
-        return Decision::Reply(encode_response(id, q, Rcode::NxDomain, &[]));
+        return Decision::Reply(encode_response(id, q, rd, Rcode::NxDomain, &[]));
     }
     if let Some(octets) = q.name.ptr_to_ipv4()
         && is_tailnet_cgnat(octets.into())
     {
-        return Decision::Reply(encode_response(id, q, Rcode::NxDomain, &[]));
+        return Decision::Reply(encode_response(id, q, rd, Rcode::NxDomain, &[]));
     }
     // Off-tailnet, non-reverse-zone: forward verbatim. `forward_or_nxdomain` already forwards
     // non-tailnet names and fails closed (NXDOMAIN) when no upstream is configured/routable; reuse it
     // (the tailnet branch above is already handled, so its tailnet→NXDOMAIN path is unreachable here).
-    forward_or_nxdomain(view, canon, buf, id, q)
+    forward_or_nxdomain(view, canon, buf, id, q, rd)
 }
 
 /// Client-side plan for a *recursive* forward: keep resolving over local UDP upstreams, or delegate
