@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Publish all 43 geiserx_* workspace crates to crates.io in leaf-first dependency order.
+# Publish all 44 geiserx_* workspace crates to crates.io in leaf-first dependency order.
 #
 # Names on crates.io are GLOBAL and PERMANENT — once published they cannot be deleted (only
 # yanked) or reused. Run this only when you are sure.
@@ -62,7 +62,7 @@ else
   echo "Inter-crate pins now at $WS_VERSION."
 fi
 
-# Leaf-first publish order (topologically sorted; facade at #40, bindings last).
+# Leaf-first publish order (topologically sorted; facade at #41, bindings last).
 CRATES=(
   geiserx_ts_bitset
   geiserx_ts_capabilityversion
@@ -102,6 +102,7 @@ CRATES=(
   geiserx_ts_dataplane
   geiserx_ts_control
   geiserx_ts_netcheck
+  geiserx_ts_netmon
   geiserx_ts_runtime
   geiserx_tailscale
   geiserx_ts_elixir
@@ -112,7 +113,7 @@ CRATES=(
 total=${#CRATES[@]}
 i=0
 # crates.io heavily rate-limits NEW crate names (~1 new crate per 10 min after a small burst).
-# On a 429 we parse its "try again after <RFC2822>" and sleep until then, so a 43-new-crate split
+# On a 429 we parse its "try again after <RFC2822>" and sleep until then, so a 44-new-crate split
 # publishes unattended (it just takes hours). Publishing new *versions* of existing crates is not
 # limited, so a resume after the burst flies through already-published ones via SKIP_PUBLISHED.
 # Max attempts to wait out a crates.io index-propagation lag for a single crate before giving up
