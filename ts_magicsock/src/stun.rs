@@ -3,7 +3,7 @@
 //! This is **not** a general STUN implementation. It encodes exactly the one
 //! Binding Request we send, and decodes exactly the one Binding Success Response we expect,
 //! on the single bound underlay UDP socket. We deliberately do **not** pull in a STUN crate
-//! (e.g. `stun-rs`) or [`ts_netcheck::StunProber`]: that prober binds its own sockets
+//! (e.g. `stun-rs`) or a netcheck-style multi-socket prober: such a prober binds its own sockets
 //! (including an IPv6 `[::]:0` egress) which would be a second egress and an IPv6 leak. By
 //! sending the request *from* the one [`crate::MagicSock`] socket and demuxing the response
 //! *on* that same socket, the reflexive address we learn is the mapping of the only egress
