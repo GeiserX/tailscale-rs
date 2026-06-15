@@ -350,6 +350,7 @@ fn server_decide(view: &DnsView, query: &[u8], forward_exit_egress: bool) -> Ser
         return ServerDecision::Reply(encode_response(
             decoded.id,
             &decoded.question,
+            decoded.recursion_desired,
             Rcode::Refused,
             &[],
         ));
@@ -374,6 +375,7 @@ fn server_decide(view: &DnsView, query: &[u8], forward_exit_egress: bool) -> Ser
                 return ServerDecision::Reply(encode_response(
                     decoded.id,
                     &decoded.question,
+                    decoded.recursion_desired,
                     Rcode::Refused,
                     &[],
                 ));
