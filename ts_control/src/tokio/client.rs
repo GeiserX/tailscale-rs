@@ -251,6 +251,26 @@ impl AsyncControlClient {
         }
     }
 
+    /// Request a node-key re-authentication on the live map-poll loop (Go `doLogin`): the loop
+    /// rotates its node key (recording the prior key as `OldNodeKey`) and re-registers with the
+    /// stored auth key, recovering a node whose key expired without tearing down the connection.
+    ///
+    /// Send this when control reports the self-node's key has expired (the runtime's
+    /// `Reauthenticating` decision; `ts_control` cannot name the runtime's `DeviceState`). Best-effort
+    /// like the `set_*` commands: if the channel is closed (the run loop ended) the error is logged
+    /// and dropped — the runtime's terminal-state handling owns the final outcome.
+    #[tracing::instrument(skip_all, fields(map_url = %self.map_url()))]
+    pub async fn reauth(&mut self) {
+        tracing::info!("requesting node-key reauth on the live map-poll loop");
+
+        if let Err(e) = self.command_tx.send(Command::Reauth).await {
+            // A closed channel here is a benign teardown race (the run loop already ended), so the
+            // error is logged and dropped — the runtime's terminal-state handling owns the final
+            // outcome. `debug!`, not `error!`: this is expected at shutdown, not a fault.
+            tracing::debug!(error = %e, "requesting reauth");
+        }
+    }
+
     /// Construct the URL that should be used to fetch the netmap.
     pub fn map_url(&self) -> Url {
         self.base_url
@@ -264,11 +284,11 @@ impl AsyncControlClient {
     }
 }
 
-// Every variant is a "set X on the next map request" command, so they all legitimately share the
-// `Set` prefix (each mirrors a control-side field a side MapRequest carries). The shared prefix is
-// the point, not an accident — silence the variant-name lint rather than rename to something less
-// clear.
-#[allow(clippy::enum_variant_names)]
+/// A command sent to the live map-poll [`run`] loop over the [`AsyncControlClient`] command
+/// channel. Most variants are a "set X on the next map request" mutation (each mirrors a
+/// control-side field a side MapRequest carries); [`Reauth`](Command::Reauth) is the exception — it
+/// drives a node-key rotation + re-register (Go `doLogin`), so it cannot be a side request and is
+/// propagated up to [`run`] (which owns the key state) instead of handled in `run_once`.
 #[derive(Debug)]
 pub enum Command {
     SetDerpHomeRegion {
@@ -288,6 +308,15 @@ pub enum Command {
     /// so a runtime change can only reach here through the command). Hostname is display-only, so
     /// there is no local/dataplane half; control reflects the new name on the next netmap.
     SetHostname { hostname: String },
+    /// Re-authenticate after a node-key expiry: rotate the node key (recording the prior key as
+    /// `OldNodeKey`) and re-register over the live connection, mirroring Go's `doLogin` (a fresh node
+    /// key re-registered against `/machine/register` with the stored auth key). Carries no fields —
+    /// the rotation acts on the loop's owned key state. Unlike the `Set*` variants this cannot be
+    /// applied as a side MapRequest in `run_once` (which only borrows the keys `&`): `run_once` breaks
+    /// its poll loop and signals reauth back to [`run`], which owns the `NodeState` and performs the
+    /// rotation, then reconnects immediately (skipping the backoff, as this is an intentional
+    /// re-register).
+    Reauth,
 }
 
 /// Identifies a map-poll session so a reconnect can resume the delta stream instead of
@@ -514,7 +543,7 @@ pub async fn run(
     state_tx: broadcast::Sender<Arc<StateUpdate>>,
     mut command_rx: mpsc::Receiver<Command>,
     control_url: Url,
-    node_keys: ts_keys::NodeState,
+    mut node_keys: ts_keys::NodeState,
     auth_key: Option<String>,
     config: crate::Config,
     auth_url_tx: watch::Sender<Option<Url>>,
@@ -533,6 +562,18 @@ pub async fn run(
         // the flag survives an error that occurs *after* frames flowed (a poll that worked then
         // dropped still counts as progress and reconnects promptly).
         let mut received_frame = false;
+        // Set by `run_once` when a `Command::Reauth` breaks the poll loop: `run` owns `node_keys`,
+        // so the node-key rotation must happen HERE (the poll loop only borrows the keys `&`). When
+        // true we rotate + reconnect IMMEDIATELY, skipping the backoff sleep — an intentional
+        // re-register (Go `doLogin`), not a failure retry.
+        let mut reauth_requested = false;
+        // Set by `run_once` when its re-register SUCCEEDS. `run` owns `node_keys`, so the
+        // `old_node_key` rotation-anchor lifecycle is managed HERE: a successful register confirms the
+        // (possibly rotated) node key as control's known identity, so the anchor is released
+        // (`clear_old_node_key`) — the next genuine rotation then re-anchors on the now-current key.
+        // Paired with `rotate_node_key`'s preserve-if-`Some` guard, this keeps the ORIGINAL pre-expiry
+        // key pinned across repeated rotations *before* a success, and re-anchors correctly *after* one.
+        let mut register_succeeded = false;
         let outcome = run_once(
             &state_tx,
             &mut command_rx,
@@ -544,9 +585,44 @@ pub async fn run(
             &mut session,
             &mut net_info,
             &mut received_frame,
+            &mut reauth_requested,
+            &mut register_succeeded,
             &auth_url_tx,
         )
         .await;
+
+        // Release the rotation anchor on a successful re-register (before the reauth/backoff branches
+        // below): once control accepts the node key, that key IS the node's identity, so a later
+        // rotation must capture it fresh rather than re-send a stale prior key. Done before the
+        // `reauth_requested` rotation just below so the FIRST rotation of an episode still captures the
+        // pre-rotation key as its anchor (the clear is a no-op when no anchor is held — the steady
+        // state — so this does not disturb a normal map-poll re-register).
+        if register_succeeded {
+            node_keys.clear_old_node_key();
+        }
+
+        // A `Command::Reauth` was received mid-poll: rotate the node key (recording the prior key as
+        // `OldNodeKey`) and reconnect at once so the next `run_once` re-registers with the rotated key
+        // + `OldNodeKey` (Go `doLogin` links the new key to the existing node identity). Only the node
+        // key rotates — disco/machine keys are untouched, so established tunnels do not flap. This is
+        // checked BEFORE the backoff decision so the re-register is immediate, not delayed by the
+        // n²·10ms schedule. `run_once` always returns `Ok(())` when it breaks for reauth (the command
+        // arm `break`s the poll loop), so no error is dropped here.
+        if reauth_requested {
+            node_keys.rotate_node_key();
+            tracing::info!("rotated node key for reauth; reconnecting to re-register (Go doLogin)");
+            // TODO(tsr-ajvm): refresh magicsock our_node_key after rotation. magicsock embeds the
+            // (now-stale) old node key as the claimed-sender identity inside outbound disco pings
+            // (ts_magicsock seal_ping), so until the next netmap re-syncs peers a peer may reject a
+            // ping whose claimed node key no longer matches its netmap — a brief path-rediscovery
+            // hiccup, NOT a tunnel teardown (established WG sessions key on disco/machine/per-peer
+            // keys, which do not rotate, so they persist). Self-healing either way. Wiring a refresh
+            // is a cross-actor change (ControlRunner rotates here; the DataplaneActor owns the
+            // Arc<MagicSock>, whose our_node_key is an immutable field) plus an interior-mutable
+            // our_node_key + an update path on MagicSock — deferred as a follow-up rather than
+            // bolting on a fragile cross-actor channel for a self-healing transient.
+            continue;
+        }
 
         // A poll that delivered any frame proves the connect→register→poll path works again, so a
         // re-auth URL surfaced by an earlier failed re-register is stale: clear the cell. The
@@ -615,6 +691,8 @@ async fn run_once(
     session: &mut MapSession,
     net_info: &mut CarriedNetInfo,
     received_frame: &mut bool,
+    reauth_requested: &mut bool,
+    register_succeeded: &mut bool,
     auth_url_tx: &watch::Sender<Option<Url>>,
 ) -> Result<(), Error> {
     let h2_client = control_dialer
@@ -637,6 +715,10 @@ async fn run_once(
             // back to `NeedsLogin` on recovery (a recovered node would show "needs login" until the
             // next keep-alive).
             clear_reauth_url(auth_url_tx);
+            // Signal `run` to release the node-key rotation anchor (`old_node_key`): control has
+            // accepted this node key, so it is now the node's known identity. `run` owns `node_keys`
+            // (this fn only borrows `&`), so the actual `clear_old_node_key` happens there.
+            *register_succeeded = true;
         }
         Err(e) => {
             let err = Error::from(e);
@@ -815,6 +897,17 @@ async fn run_once(
                         let req = net_info.apply(builder).build();
 
                         drop(send_map_request(req, &map_url, &h2_client).await?);
+                    },
+                    Command::Reauth => {
+                        // A node-key rotation cannot be applied here: `run_once` only borrows
+                        // `node_keys` `&`, while a rotation mutates it. Signal `run` (which OWNS the
+                        // key state) to rotate + reconnect, and break the poll loop so the next
+                        // `run_once` re-registers with the rotated key + `OldNodeKey` (Go `doLogin`).
+                        // Return `Ok(())` (via the post-loop return) so `run` takes the immediate
+                        // reauth reconnect path, not the error/backoff path.
+                        tracing::info!("reauth requested; breaking poll loop to rotate node key");
+                        *reauth_requested = true;
+                        break;
                     },
                 }
             }
@@ -1306,5 +1399,58 @@ mod tests {
 
     fn region(n: u32) -> ts_derp::RegionId {
         ts_derp::RegionId(core::num::NonZeroU32::new(n).unwrap())
+    }
+
+    /// The rotation `run` performs when a `Reauth` breaks the poll loop: rotating the loop's owned
+    /// `NodeState` records the PRIOR node public key as `old_node_key` and installs a fresh node key,
+    /// so the next `register` sends new+`OldNodeKey` (Go `doLogin`). Only the node key changes —
+    /// disco/machine keys are preserved, which is why an established tunnel does not flap. This pins
+    /// the exact mutation in `run`'s `if reauth_requested` arm.
+    #[test]
+    fn reauth_rotation_records_old_node_key_and_preserves_other_keys() {
+        let mut node_keys = ts_keys::NodeState::generate();
+        let prior_node = node_keys.node_keys.public;
+        let disco_before = node_keys.disco_keys.public;
+        let machine_before = node_keys.machine_keys.public;
+
+        // The exact call `run` makes on the reauth path.
+        node_keys.rotate_node_key();
+
+        assert_eq!(
+            node_keys.old_node_key,
+            Some(prior_node),
+            "the prior node key must be recorded as OldNodeKey for the re-register"
+        );
+        assert_ne!(
+            node_keys.node_keys.public, prior_node,
+            "a fresh node key must replace the expired one"
+        );
+        // Disco + machine keys are NOT rotated — the no-flap guarantee.
+        assert_eq!(node_keys.disco_keys.public, disco_before);
+        assert_eq!(node_keys.machine_keys.public, machine_before);
+    }
+
+    /// `AsyncControlClient::reauth` enqueues a `Command::Reauth` on the command channel — the wire
+    /// that carries the runtime's reauth decision to the live `run` loop (where `run_once`'s select
+    /// arm turns it into the break-for-reauth). Drive the public method against the raw receiver so
+    /// the test exercises the exact send path the runtime uses, without a control server.
+    #[tokio::test]
+    async fn reauth_enqueues_reauth_command() {
+        let (command_tx, mut command_rx) = mpsc::channel(4);
+        let (state_tx, _state_rx) = broadcast::channel(4);
+        let mut client = AsyncControlClient {
+            base_url: "https://control.example/".parse().unwrap(),
+            state_tx,
+            command_tx,
+            _tasks: JoinSet::new(),
+        };
+
+        client.reauth().await;
+
+        let cmd = command_rx.try_recv().expect("a command was enqueued");
+        assert!(
+            matches!(cmd, Command::Reauth),
+            "reauth() must enqueue Command::Reauth, got {cmd:?}"
+        );
     }
 }

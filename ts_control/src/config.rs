@@ -417,6 +417,24 @@ pub struct Config {
     #[serde(default)]
     pub advertise_services: Vec<String>,
 
+    /// Whether to automatically re-authenticate (rotate the node key + re-register with the stored
+    /// auth key, Go `doLogin`) when control reports this node's node key has expired, instead of
+    /// going terminally offline.
+    ///
+    /// Defaults to `true`: an auth-key-registered node whose key expires recovers itself without
+    /// human intervention — the common reusable-auth-key case (a persistent exit node / subnet
+    /// router) self-heals. Set to `false` for the most conservative posture (the historical behavior:
+    /// an expired key surfaces the terminal "expired" state and the node stays offline until
+    /// re-paired). Auto-reauth is additionally gated at runtime on a usable auth key being retained
+    /// and Tailnet Lock NOT being enforced (a rotation on a locked tailnet would install an unsigned
+    /// key); see the runtime's `expiry_action`. A one-shot auth key (already consumed by the first
+    /// registration) cannot re-register and degrades to the terminal state regardless of this flag.
+    ///
+    /// Like the client-preference fields, this is **not read inside `ts_control`**: it is carried for
+    /// transport only and consulted by the runtime's self-node expiry handler.
+    #[serde(default = "default_true")]
+    pub reauth_on_expiry: bool,
+
     /// Allow fetching the control server's machine public key (`GET /key`) over plain **http** when
     /// the [`server_url`](Config::server_url) is itself `http://`.
     ///
@@ -624,6 +642,7 @@ impl Default for Config {
             wire_ingress: false,
             ingress_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             advertise_services: Vec::new(),
+            reauth_on_expiry: default_true(),
             allow_http_key_fetch: false,
         }
     }

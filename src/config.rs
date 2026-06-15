@@ -58,6 +58,19 @@ pub struct Config {
     /// will GC it out of the tailnet while it is momentarily offline. Defaults to `true`.
     pub ephemeral: bool,
 
+    /// Whether to automatically re-authenticate when this node's node key expires (rotate the node
+    /// key + re-register with the stored auth key, Go `doLogin`) instead of going terminally offline.
+    ///
+    /// Defaults to `true`: an auth-key-registered node whose key expires recovers itself
+    /// automatically — the common reusable-auth-key deployment (a persistent exit node / subnet
+    /// router) self-heals rather than requiring manual re-pairing. Set to `false` for the historical,
+    /// most conservative behavior (an expired key surfaces
+    /// [`DeviceState::Expired`](ts_runtime::DeviceState::Expired) and the node stays offline until
+    /// re-paired). Even when `true`, auto-reauth is gated on a usable auth key being retained and
+    /// Tailnet Lock NOT being enforced; a one-shot auth key that was already consumed cannot
+    /// re-register and degrades to the terminal state.
+    pub reauth_on_expiry: bool,
+
     /// Whether to accept (and route traffic to) subnet routes advertised by peers.
     ///
     /// This is the equivalent of `tailscale up --accept-routes`. Defaults to `false`: only each
@@ -471,6 +484,7 @@ impl From<&Config> for ts_control::Config {
             server_url: value.control_server_url.clone(),
             tags: value.requested_tags.clone(),
             ephemeral: value.ephemeral,
+            reauth_on_expiry: value.reauth_on_expiry,
             accept_routes: value.accept_routes,
             accept_dns: value.accept_dns,
             exit_node: value.exit_node.clone(),
@@ -508,6 +522,7 @@ impl Default for Config {
             requested_hostname: None,
             requested_tags: vec![],
             ephemeral: true,
+            reauth_on_expiry: true,
             accept_routes: false,
             accept_dns: true,
             exit_node: None,

@@ -99,12 +99,36 @@ pub struct ControlRunner {
     /// Aged entries are evicted on each measurement; the buffer is therefore bounded by the netcheck
     /// cadence × the window.
     derp_report_history: Vec<(Instant, Arc<Vec<ts_netcheck::RegionResult>>)>,
+    /// Consecutive automatic-reauth attempts that have NOT yet recovered the node to a good (non-
+    /// expired) self-node. The circuit breaker for [`expiry_action`]'s `Reauthenticate` path: a
+    /// one-shot / already-consumed auth key cannot re-register, so without a bound an expired node
+    /// would sit in [`DeviceState::Reauthenticating`] indefinitely (the rotated re-register keeps
+    /// failing or control keeps returning a still-expired self-node).
+    ///
+    /// Incremented once per expired self-node seen while *already* `Reauthenticating` (each such
+    /// arrival is evidence the prior reauth did not recover); reset to `0` whenever a good
+    /// (non-expired) self-node arrives (the node recovered) — see the [`StreamMessage::Next`] handler.
+    /// At [`MAX_REAUTH_ATTEMPTS`] the runner stops re-arming reauth and flips the cell to the terminal
+    /// [`DeviceState::Expired`], giving the cell a stable terminal state (a genuinely good self-node
+    /// can still recover it later). The one-shot `Command::Reauth` is fired ONLY on the transition
+    /// INTO `Reauthenticating`, never re-fired while already reauthenticating, so the node key is
+    /// rotated at most once per episode (a second rotation would lose the original `OldNodeKey`
+    /// anchor control needs to link the rotation).
+    reauth_attempts: u32,
     /// Background task that bridges the control client's mid-session re-auth URL cell onto
     /// [`Self::params`]'s device-state cell (sets [`DeviceState::NeedsLogin`] when control returns
     /// `MachineNotAuthorized` on a live re-register — see [`bridge_reauth_url_to_state`]). Aborted on
     /// [`Drop`] so it cannot outlive the actor (the [`DataplaneActor`](crate::dataplane) pattern).
     reauth_bridge: tokio::task::JoinHandle<()>,
 }
+
+/// The number of consecutive failed automatic-reauth attempts after which the runner gives up
+/// re-arming reauth and flips the device to the terminal [`DeviceState::Expired`] (the circuit
+/// breaker from the design's deferred-question Q1). A one-shot auth key was consumed by the first
+/// registration, so an auto re-register with it cannot succeed; this bounds that case to today's
+/// terminal behavior instead of an indefinite `Reauthenticating` spell. The first arrival fires the
+/// reauth; each subsequent expired self-node while still reauthenticating counts toward this cap.
+const MAX_REAUTH_ATTEMPTS: u32 = 3;
 
 impl Drop for ControlRunner {
     fn drop(&mut self) {
@@ -310,6 +334,7 @@ impl kameo::Actor for ControlRunner {
             netcheck: Default::default(),
             home_region: None,
             derp_report_history: Vec::new(),
+            reauth_attempts: 0,
             reauth_bridge,
         })
     }
@@ -524,6 +549,15 @@ fn sticky_update_pop_browser_url(
 ///
 /// Factored out so the (regress-prone) map-and-guard is unit-testable against a plain `watch`
 /// channel without standing up the actor (mirrors [`sticky_update_pop_browser_url`]).
+/// **Auto-reauth ownership.** While an automatic re-auth is in flight (the cell holds
+/// [`DeviceState::Reauthenticating`]), this bridge must NOT downgrade it to `NeedsLogin`. An
+/// auto-reauth's rotated re-register surfaces an auth URL through the SAME `auth_url_tx` cell this
+/// bridge watches, but on a headless / auth-key node there is no human to visit it — flipping to
+/// `NeedsLogin` would surface a misleading `browse_to_url` AND, by moving the cell off
+/// `Reauthenticating`, let the next expired self-node re-fire reauth (a second node-key rotation that
+/// loses the original `OldNodeKey` anchor). The auto-reauth path owns the cell until it recovers to
+/// `Running` (the netmap self-node handler) or its circuit breaker trips it to `Expired`; this bridge
+/// stands down for the duration.
 pub(crate) fn bridge_reauth_url_to_state(
     state_tx: &watch::Sender<crate::DeviceState>,
     incoming: Option<&url::Url>,
@@ -531,13 +565,151 @@ pub(crate) fn bridge_reauth_url_to_state(
     if let Some(url) = incoming {
         let next = crate::DeviceState::NeedsLogin(url.clone());
         state_tx.send_if_modified(|current| {
-            if *current == next {
+            // Do not clobber an in-flight automatic re-auth (see the ownership note above): leave
+            // `Reauthenticating` untouched so it can recover to `Running` or trip to `Expired` on its
+            // own terms.
+            if *current == crate::DeviceState::Reauthenticating || *current == next {
                 false
             } else {
                 *current = next.clone();
                 true
             }
         });
+    }
+}
+
+/// What to do when control delivers a self-node whose node-key expiry has passed — the decision
+/// behind the [`StreamMessage::Next`] handler's expiry branch, factored into a pure function so the
+/// full input matrix is unit-testable (mirrors [`bridge_reauth_url_to_state`] being pure).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExpiryAction {
+    /// The key is not expired — the node is up. (`→ DeviceState::Running`.)
+    Running,
+    /// The key expired and auto-reauth is permitted (auth key retained, reauth enabled, TKA NOT
+    /// enforcing): rotate the node key + re-register (`→ DeviceState::Reauthenticating` +
+    /// `Command::Reauth`).
+    Reauthenticate,
+    /// The key expired and auto-reauth is NOT permitted (no auth key, reauth disabled, or TKA
+    /// enforcing): fall back to today's terminal behavior (`→ DeviceState::Expired`).
+    Expired,
+}
+
+/// Decide the action for an expired-or-not self node (pure; the live handler at
+/// [`StreamMessage::Next`] applies it). Go's `ipnlocal` runs `doLogin` (rotate the node key +
+/// re-register with the stored auth key) when an auth-key node's key expires; this fork does the
+/// same, gated by three safety conditions:
+///
+/// - `key_expired` — control reported the self-node's key expiry is in the past.
+/// - `has_auth_key` — a usable auth key is retained for a non-interactive re-register (without one
+///   there is nothing to re-register with → fall back to `Expired`, today's behavior).
+/// - `reauth_enabled` — the `reauth_on_expiry` config opt-out is on (default true).
+/// - `tka_active` — Tailnet Lock enforcement is currently active. **Hard safety gate:** a node-key
+///   rotation on a locked tailnet would install an UNSIGNED key, locking the node out of locked
+///   peers (the TKA re-sign is a separate follow-up — see `keystate.rs` `rotate_node_key`). So when
+///   the lock is enforcing, never rotate — fall back to `Expired`.
+///
+/// Truth table: not expired → `Running`; expired AND auth-key AND reauth-enabled AND NOT TKA →
+/// `Reauthenticate`; otherwise → `Expired`.
+pub(crate) fn expiry_action(
+    key_expired: bool,
+    has_auth_key: bool,
+    reauth_enabled: bool,
+    tka_active: bool,
+) -> ExpiryAction {
+    if !key_expired {
+        return ExpiryAction::Running;
+    }
+    if has_auth_key && reauth_enabled && !tka_active {
+        ExpiryAction::Reauthenticate
+    } else {
+        ExpiryAction::Expired
+    }
+}
+
+/// The outcome of one step of the bounded reauth sub-state-machine: the device state to publish, the
+/// updated consecutive-attempt counter, and whether to fire the one-shot `Command::Reauth` this step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReauthStep {
+    /// The device state to publish for this self-node.
+    pub next: ReauthState,
+    /// The consecutive-failed-reauth counter after this step (the caller stores it back).
+    pub attempts: u32,
+    /// Whether to fire the one-shot `Command::Reauth` (rotate + re-register) this step. Set ONLY on
+    /// the transition INTO reauthenticating, so the node key rotates at most once per episode.
+    pub fire_reauth: bool,
+}
+
+/// The device state a [`ReauthStep`] resolves to — the subset of [`DeviceState`](crate::DeviceState)
+/// the circuit breaker can produce. Kept as its own enum so the breaker stays pure (no dependency on
+/// the URL-carrying `DeviceState` variants) and the truth table is exhaustively testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReauthState {
+    /// The node is up — `→ DeviceState::Running`.
+    Running,
+    /// An automatic re-auth is in flight — `→ DeviceState::Reauthenticating`.
+    Reauthenticating,
+    /// Terminal expiry — `→ DeviceState::Expired` (either the non-reauth path or the breaker tripped).
+    Expired,
+}
+
+/// One step of the bounded reauth sub-state-machine (pure; the [`StreamMessage::Next`] handler stores
+/// the result back into [`ControlRunner::reauth_attempts`] and publishes [`ReauthStep::next`]). This
+/// is the circuit breaker for the design's deferred-question Q1: a one-shot / already-consumed auth
+/// key cannot re-register, so the `Reauthenticate` path must settle rather than loop forever.
+///
+/// Inputs:
+/// - `action` — the [`expiry_action`] verdict for this self-node.
+/// - `already_reauthing` — whether the published state is currently
+///   [`DeviceState::Reauthenticating`](crate::DeviceState::Reauthenticating) (the prior reauth has
+///   not yet recovered the node).
+/// - `attempts` — the current consecutive-failed-reauth counter.
+///
+/// Rules:
+/// - `Running` → reset the counter to `0` (the node recovered) and report `Running`.
+/// - `Reauthenticate` while NOT already reauthing → ENTER reauthenticating: counter `= 1`, fire the
+///   one-shot reauth.
+/// - `Reauthenticate` while ALREADY reauthing → the prior reauth did not recover; COUNT it (counter
+///   `+= 1`) and do NOT re-fire (a second rotation would lose the original `OldNodeKey` anchor). At
+///   [`MAX_REAUTH_ATTEMPTS`] the breaker trips to terminal `Expired`; below the cap, stay reauthing.
+/// - `Expired` → terminal; the counter is irrelevant (this path never armed the reauth machine), so
+///   it is reset to `0`.
+pub(crate) fn reauth_circuit_step(
+    action: ExpiryAction,
+    already_reauthing: bool,
+    attempts: u32,
+) -> ReauthStep {
+    match action {
+        ExpiryAction::Running => ReauthStep {
+            next: ReauthState::Running,
+            attempts: 0,
+            fire_reauth: false,
+        },
+        ExpiryAction::Reauthenticate if !already_reauthing => ReauthStep {
+            next: ReauthState::Reauthenticating,
+            attempts: 1,
+            fire_reauth: true,
+        },
+        ExpiryAction::Reauthenticate => {
+            let attempts = attempts.saturating_add(1);
+            if attempts >= MAX_REAUTH_ATTEMPTS {
+                ReauthStep {
+                    next: ReauthState::Expired,
+                    attempts,
+                    fire_reauth: false,
+                }
+            } else {
+                ReauthStep {
+                    next: ReauthState::Reauthenticating,
+                    attempts,
+                    fire_reauth: false,
+                }
+            }
+        }
+        ExpiryAction::Expired => ReauthStep {
+            next: ReauthState::Expired,
+            attempts: 0,
+            fire_reauth: false,
+        },
     }
 }
 
@@ -1202,22 +1374,70 @@ impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
 
             StreamMessage::Next(msg) => {
                 if let Some(node) = msg.node.as_ref() {
-                    // Reflect node-key expiry into the device state: control delivering a self-node
-                    // whose key is in the past means the node must re-authenticate. Otherwise the
-                    // arrival of a fresh self-node confirms we are Running (recovers the state if a
-                    // prior update had flipped it to Expired).
+                    // Reflect node-key expiry into the device state. Control delivering a self-node
+                    // whose key is in the past means the node must re-authenticate; the arrival of a
+                    // fresh (non-expired) self-node confirms we are Running (recovering the state if a
+                    // prior update had flipped it to Expired/Reauthenticating). On expiry, decide
+                    // between an automatic re-auth (Go `doLogin`: rotate key + re-register with the
+                    // stored auth key) and the terminal Expired state via the pure `expiry_action`:
+                    //   - auth key retained, reauth enabled, and TKA NOT enforcing → Reauthenticate.
+                    //   - otherwise → Expired (no auth key / reauth disabled / TKA-locked).
+                    // The TKA gate is a hard safety constraint: rotating on a locked tailnet would
+                    // install an unsigned key and lock this node out of locked peers (the TKA re-sign
+                    // is a separate follow-up). Recovery from Reauthenticating is automatic — the next
+                    // good self-node flips back to Running at this same handler.
                     let now_unix = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs() as i64)
                         .unwrap_or(0);
-                    let next = if node.key_expired_at_unix(now_unix) {
-                        crate::DeviceState::Expired
-                    } else {
-                        crate::DeviceState::Running
+                    let action = expiry_action(
+                        node.key_expired_at_unix(now_unix),
+                        self.params.auth_key.is_some(),
+                        self.params.config.reauth_on_expiry,
+                        self.tka_authority.borrow().is_some(),
+                    );
+
+                    // Bounded reauth sub-state-machine (circuit breaker), evaluated by the pure
+                    // `reauth_circuit_step`. The `Reauthenticate` path must settle — a one-shot /
+                    // already-consumed auth key cannot re-register, so an unbounded reauth would sit in
+                    // `Reauthenticating` forever. The step takes the `expiry_action` verdict, whether we
+                    // are ALREADY reauthenticating (i.e. the prior reauth has not recovered), and the
+                    // current attempt counter, and returns the target state, the new counter, and
+                    // whether to fire the one-shot reauth (fired ONLY on entry, so the node key rotates
+                    // at most once per episode — a second rotation would lose the original `OldNodeKey`
+                    // anchor). At `MAX_REAUTH_ATTEMPTS` it trips to terminal `Expired`.
+                    //
+                    // NOTE: we may act (count, and eventually flip to `Expired`) even when the published
+                    // state does NOT change — a repeated `Reauthenticating` self-node is exactly the
+                    // "prior reauth didn't recover" signal we must tally, so the counting reads the
+                    // pre-step state directly here and `send_if_modified`'s `changed` only gates the
+                    // log/firing below, never the counting.
+                    let already_reauthing = matches!(
+                        &*self.params.state_tx.borrow(),
+                        crate::DeviceState::Reauthenticating
+                    );
+                    let step = reauth_circuit_step(action, already_reauthing, self.reauth_attempts);
+                    self.reauth_attempts = step.attempts;
+                    if step.next == ReauthState::Expired
+                        && action == ExpiryAction::Reauthenticate
+                        && already_reauthing
+                    {
+                        tracing::warn!(
+                            attempts = step.attempts,
+                            "automatic re-auth did not recover the node after {MAX_REAUTH_ATTEMPTS} \
+                             attempts (auth key likely one-shot / consumed); falling back to terminal \
+                             Expired"
+                        );
+                    }
+                    let next = match step.next {
+                        ReauthState::Running => crate::DeviceState::Running,
+                        ReauthState::Reauthenticating => crate::DeviceState::Reauthenticating,
+                        ReauthState::Expired => crate::DeviceState::Expired,
                     };
+
                     // `send_if_modified` avoids waking watchers when the state is unchanged (a fresh
-                    // self-node arrives on every netmap update).
-                    self.params.state_tx.send_if_modified(|s| {
+                    // self-node arrives on every netmap update). Returns whether the state changed.
+                    let changed = self.params.state_tx.send_if_modified(|s| {
                         if *s != next {
                             *s = next.clone();
                             true
@@ -1225,6 +1445,14 @@ impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
                             false
                         }
                     });
+
+                    if changed && step.fire_reauth {
+                        tracing::info!(
+                            "self node-key expired; starting automatic re-auth (rotate node key + \
+                             re-register with stored auth key)"
+                        );
+                        self.client.reauth().await;
+                    }
 
                     self.self_node.send_replace(Some(node.clone()));
                 }
@@ -1601,6 +1829,44 @@ mod reauth_bridge_tests {
         tx.send_replace(DeviceState::Running);
         assert_eq!(*rx.borrow(), DeviceState::Running);
     }
+
+    /// Fix 2 — the bridge must NOT clobber an in-flight automatic re-auth. While the cell holds
+    /// `Reauthenticating`, an auth URL surfaced by the rotated re-register (over the same
+    /// `auth_url_tx` cell) must leave the state UNTOUCHED: flipping to `NeedsLogin` would surface a
+    /// misleading `browse_to_url` on a headless node and, by moving the cell off `Reauthenticating`,
+    /// re-arm a second node-key rotation that loses the original `OldNodeKey` anchor. The auto-reauth
+    /// path owns the cell until it recovers to `Running` or trips to `Expired`.
+    #[test]
+    fn bridge_does_not_clobber_reauthenticating() {
+        let u = url("https://login.example/auth");
+        let (tx, rx) = watch::channel(DeviceState::Reauthenticating);
+
+        bridge_reauth_url_to_state(&tx, Some(&u));
+
+        assert_eq!(
+            *rx.borrow(),
+            DeviceState::Reauthenticating,
+            "a surfaced auth URL must not downgrade an in-flight auto-reauth to NeedsLogin"
+        );
+    }
+
+    /// The no-clobber guard is scoped to `Reauthenticating` only — it does not change the bridge's
+    /// behavior in any other state. From `Running` (and likewise `Connecting`/`NeedsLogin`) a
+    /// surfaced URL still drives `NeedsLogin` as before, so an ordinary interactive re-auth is
+    /// unaffected.
+    #[test]
+    fn bridge_still_sets_needs_login_from_non_reauthenticating() {
+        let u = url("https://login.example/auth");
+        for start in [
+            DeviceState::Running,
+            DeviceState::Connecting,
+            DeviceState::Expired,
+        ] {
+            let (tx, rx) = watch::channel(start);
+            bridge_reauth_url_to_state(&tx, Some(&u));
+            assert_eq!(*rx.borrow(), DeviceState::NeedsLogin(u.clone()));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1940,6 +2206,238 @@ mod home_region_hysteresis_tests {
             select_home_region(Some(rid(2)), &m, &br).unwrap(),
             rid(2),
             "old raw (20ms) within 10ms of smoothed-best (18ms) keeps via the absolute-diff arm"
+        );
+    }
+}
+
+#[cfg(test)]
+mod expiry_action_tests {
+    use super::{ExpiryAction, expiry_action};
+
+    /// Not expired → `Running`, regardless of the other inputs (the gate fields are only consulted
+    /// once the key is expired).
+    #[test]
+    fn not_expired_is_always_running() {
+        for has_auth_key in [false, true] {
+            for reauth_enabled in [false, true] {
+                for tka_active in [false, true] {
+                    assert_eq!(
+                        expiry_action(false, has_auth_key, reauth_enabled, tka_active),
+                        ExpiryAction::Running,
+                        "a non-expired key is Running for any gate combination"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The ONLY input combination that auto-reauths: expired AND auth key retained AND reauth enabled
+    /// AND TKA not enforcing.
+    #[test]
+    fn expired_with_authkey_reauth_enabled_and_no_tka_reauthenticates() {
+        assert_eq!(
+            expiry_action(true, true, true, false),
+            ExpiryAction::Reauthenticate
+        );
+    }
+
+    /// Every other expired combination falls back to the terminal `Expired` (today's behavior, no
+    /// regression): no auth key, reauth disabled, or TKA enforcing each independently forces Expired.
+    #[test]
+    fn expired_falls_back_to_expired_for_every_other_combination() {
+        // The full expired-input matrix minus the single Reauthenticate cell above.
+        for has_auth_key in [false, true] {
+            for reauth_enabled in [false, true] {
+                for tka_active in [false, true] {
+                    let action = expiry_action(true, has_auth_key, reauth_enabled, tka_active);
+                    if has_auth_key && reauth_enabled && !tka_active {
+                        // The one Reauthenticate cell, asserted above.
+                        assert_eq!(action, ExpiryAction::Reauthenticate);
+                    } else {
+                        assert_eq!(
+                            action,
+                            ExpiryAction::Expired,
+                            "expired with has_auth_key={has_auth_key}, \
+                             reauth_enabled={reauth_enabled}, tka_active={tka_active} must be Expired"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The TKA safety gate in isolation: even with an auth key and reauth enabled, an ACTIVE lock
+    /// forces `Expired` (never rotate an unsigned key on a locked tailnet). This is the hard
+    /// constraint from the design — pinned as its own test so a regression that drops the `!tka_active`
+    /// term is caught explicitly.
+    #[test]
+    fn tka_active_forces_expired_even_when_reauth_would_otherwise_fire() {
+        assert_eq!(
+            expiry_action(true, true, true, true),
+            ExpiryAction::Expired,
+            "an enforcing Tailnet Lock must veto auto-reauth (unsigned-key lockout safety gate)"
+        );
+    }
+
+    /// No auth key forces `Expired`: there is nothing to non-interactively re-register with, so even
+    /// with reauth enabled and no lock the node goes terminal (unchanged from today).
+    #[test]
+    fn no_auth_key_forces_expired() {
+        assert_eq!(
+            expiry_action(true, false, true, false),
+            ExpiryAction::Expired
+        );
+    }
+
+    /// The config opt-out: `reauth_on_expiry=false` forces `Expired` even with an auth key and no
+    /// lock (the conservative posture / historical behavior).
+    #[test]
+    fn reauth_disabled_forces_expired() {
+        assert_eq!(
+            expiry_action(true, true, false, false),
+            ExpiryAction::Expired
+        );
+    }
+}
+
+#[cfg(test)]
+mod reauth_circuit_tests {
+    use super::{ExpiryAction, MAX_REAUTH_ATTEMPTS, ReauthState, reauth_circuit_step};
+
+    /// Entering reauth (a `Reauthenticate` verdict while NOT already reauthenticating) fires the
+    /// one-shot reauth and starts the counter at 1.
+    #[test]
+    fn enter_reauth_fires_once_and_starts_counter() {
+        let step = reauth_circuit_step(ExpiryAction::Reauthenticate, false, 0);
+        assert_eq!(step.next, ReauthState::Reauthenticating);
+        assert_eq!(
+            step.attempts, 1,
+            "the entering attempt starts the counter at 1"
+        );
+        assert!(step.fire_reauth, "entry fires the one-shot Command::Reauth");
+    }
+
+    /// A subsequent expired self-node while ALREADY reauthenticating (prior reauth not recovered)
+    /// counts up but does NOT re-fire — re-firing would rotate the node key a second time and lose the
+    /// original `OldNodeKey` anchor.
+    #[test]
+    fn still_reauthing_counts_but_does_not_refire() {
+        let step = reauth_circuit_step(ExpiryAction::Reauthenticate, true, 1);
+        assert_eq!(step.next, ReauthState::Reauthenticating);
+        assert_eq!(
+            step.attempts, 2,
+            "a non-recovering reauth increments the counter"
+        );
+        assert!(
+            !step.fire_reauth,
+            "must NOT re-fire reauth while already reauthenticating (no second rotation)"
+        );
+    }
+
+    /// At `MAX_REAUTH_ATTEMPTS` consecutive non-recovering reauths, the breaker trips to the terminal
+    /// `Expired` and stops re-arming reauth (the one-shot auth-key case settles instead of looping).
+    #[test]
+    fn trips_to_expired_at_cap() {
+        // One step below the cap still stays reauthenticating.
+        let below =
+            reauth_circuit_step(ExpiryAction::Reauthenticate, true, MAX_REAUTH_ATTEMPTS - 2);
+        assert_eq!(below.next, ReauthState::Reauthenticating);
+        assert!(!below.fire_reauth);
+
+        // The step that reaches the cap flips to terminal Expired and does not fire.
+        let at_cap =
+            reauth_circuit_step(ExpiryAction::Reauthenticate, true, MAX_REAUTH_ATTEMPTS - 1);
+        assert_eq!(at_cap.attempts, MAX_REAUTH_ATTEMPTS);
+        assert_eq!(
+            at_cap.next,
+            ReauthState::Expired,
+            "at the cap the circuit breaker trips to terminal Expired"
+        );
+        assert!(
+            !at_cap.fire_reauth,
+            "a tripped breaker never fires another reauth"
+        );
+    }
+
+    /// A good (non-expired) self-node resets the counter to 0 (the node recovered) — so a later,
+    /// genuine expiry cycle gets a fresh full budget of attempts, never a stale leftover count.
+    #[test]
+    fn running_resets_counter() {
+        let step = reauth_circuit_step(ExpiryAction::Running, true, MAX_REAUTH_ATTEMPTS);
+        assert_eq!(step.next, ReauthState::Running);
+        assert_eq!(
+            step.attempts, 0,
+            "recovery to Running resets the attempt counter"
+        );
+        assert!(!step.fire_reauth);
+    }
+
+    /// The non-reauth terminal path (`expiry_action` → `Expired`: no auth key / reauth disabled /
+    /// TKA-locked) reports `Expired` and never fires reauth; the counter is irrelevant (this path
+    /// never armed the machine), so it resets to 0.
+    #[test]
+    fn expired_action_is_terminal_without_firing() {
+        let step = reauth_circuit_step(ExpiryAction::Expired, false, 0);
+        assert_eq!(step.next, ReauthState::Expired);
+        assert!(!step.fire_reauth);
+        assert_eq!(step.attempts, 0);
+    }
+
+    /// The full episode as the handler drives it, feeding each step's `attempts` into the next: a
+    /// one-shot auth key that never recovers fires reauth exactly ONCE, counts each repeated expired
+    /// self-node, and settles on terminal `Expired` at the cap — never an indefinite `Reauthenticating`
+    /// spell and never a second rotation.
+    #[test]
+    fn full_episode_one_shot_key_settles_at_expired_after_one_fire() {
+        // Step 1: first expired self-node (state was Running → not already reauthing): enter + fire.
+        let s1 = reauth_circuit_step(ExpiryAction::Reauthenticate, false, 0);
+        assert_eq!(s1.next, ReauthState::Reauthenticating);
+        assert!(s1.fire_reauth);
+        let mut attempts = s1.attempts;
+        let mut fires = 1; // counted the one fire
+
+        // Steps 2..: still expired while reauthenticating — count only, never re-fire — until the cap.
+        loop {
+            let s = reauth_circuit_step(ExpiryAction::Reauthenticate, true, attempts);
+            if s.fire_reauth {
+                fires += 1;
+            }
+            attempts = s.attempts;
+            if s.next == ReauthState::Expired {
+                break;
+            }
+            assert_eq!(s.next, ReauthState::Reauthenticating);
+            assert!(attempts < MAX_REAUTH_ATTEMPTS);
+        }
+
+        assert_eq!(attempts, MAX_REAUTH_ATTEMPTS, "settles exactly at the cap");
+        assert_eq!(
+            fires, 1,
+            "reauth (and thus a node-key rotation) fires exactly once across the whole episode"
+        );
+    }
+
+    /// Recovery then a fresh failing episode: `Reauthenticating → Running` (reset) → a later expiry
+    /// re-enters and re-fires. Proves the reset gives the next episode a full attempt budget rather
+    /// than carrying a stale count that would trip the breaker early.
+    #[test]
+    fn recovery_then_new_episode_re_fires() {
+        // Episode 1 entry.
+        let e1 = reauth_circuit_step(ExpiryAction::Reauthenticate, false, 0);
+        assert!(e1.fire_reauth);
+        // A non-recovering step, then recovery to Running resets.
+        let mid = reauth_circuit_step(ExpiryAction::Reauthenticate, true, e1.attempts);
+        assert_eq!(mid.attempts, 2);
+        let recovered = reauth_circuit_step(ExpiryAction::Running, true, mid.attempts);
+        assert_eq!(recovered.attempts, 0);
+
+        // Episode 2: a fresh expiry (state is Running again → not already reauthing) re-enters + fires.
+        let e2 = reauth_circuit_step(ExpiryAction::Reauthenticate, false, recovered.attempts);
+        assert_eq!(e2.next, ReauthState::Reauthenticating);
+        assert_eq!(e2.attempts, 1, "the new episode starts fresh at 1");
+        assert!(
+            e2.fire_reauth,
+            "a new episode after recovery fires reauth again"
         );
     }
 }
