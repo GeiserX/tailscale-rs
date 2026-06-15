@@ -210,6 +210,34 @@ impl<'a> MapRequestBuilder<'a> {
         self
     }
 
+    /// Advertise whether this node is acting as an **app connector** (`HostInfo.AppConnector`),
+    /// mirroring Go's `applyPrefsToHostinfoLocked` (`hi.AppConnector.Set(prefs.AppConnector().Advertise)`).
+    /// Go calls `.Set(advertise)` **unconditionally**, so a default Go/tsnet node always sends the key:
+    /// `true` → `AppConnector:true`, and `false` (the default) → `AppConnector:false` — NOT omitted.
+    /// Go's `opt.Bool` `omitzero` only drops the key when it was never `Set` (the empty string); a
+    /// `.Set(false)` is a non-empty value that marshals to `false`. So we set `Some(value)` (never
+    /// `None` on this path): `false` serializes to `"AppConnector":false` to match Go's wire bytes
+    /// byte-for-byte — omitting it would be a not-tailscaled fingerprint tell (a default node that
+    /// advertises a dense Hostinfo but is *missing* `AppConnector` where Go always has it). Same
+    /// `Some(false)`-is-a-real-signal reasoning as [`HostInfo::container`][ts_control_serde::HostInfo].
+    /// This advertises only the capability bool — the app-connector data path (domain routes / 4via6)
+    /// is a separate subsystem.
+    pub fn app_connector(mut self, value: bool) -> Self {
+        self.host_info_mut().app_connector = Some(value);
+        self
+    }
+
+    /// Advertise that this node accepts admin-console-triggered remote updates
+    /// (`HostInfo.AllowsUpdate`), mirroring Go's `applyPrefsToHostinfoLocked`
+    /// (`hi.AllowsUpdate = … || prefs.AutoUpdate().Apply.EqualBool(true)`). `false` (the default)
+    /// leaves the bool unset and the field is omitted from the wire request (the crate's
+    /// `skip_serializing_if = is_default` rule for bools). This fork runs no updater; the flag only
+    /// advertises that the node *would* accept a remote update trigger.
+    pub fn allows_update(mut self, value: bool) -> Self {
+        self.host_info_mut().allows_update = value;
+        self
+    }
+
     /// Set the opaque VIP-services hash this node advertises (`HostInfo.ServicesHash`), the
     /// advertise-side signal that tells control to (re)fetch the node's hosted VIP-service list via
     /// the c2n `GET /vip-services` endpoint when it changes. Compute it with
@@ -358,6 +386,96 @@ mod tests {
 
         let req = MapRequestBuilder::new(&node_state).build();
         assert!(!req.host_info.unwrap().wire_ingress);
+    }
+
+    /// `app_connector(true)` sets `HostInfo.AppConnector = Some(true)`, mirroring Go's
+    /// `hi.AppConnector.Set(prefs.AppConnector().Advertise)`. The serialized wire key is `AppConnector`
+    /// carrying the JSON bool `true`.
+    #[test]
+    fn app_connector_setter_populates_host_info_and_wire_key() {
+        let node_state = ts_keys::NodeState::generate();
+
+        let req = MapRequestBuilder::new(&node_state)
+            .app_connector(true)
+            .build();
+        let hi = req.host_info.unwrap();
+        assert_eq!(hi.app_connector, Some(true));
+
+        let v = serde_json::to_value(&hi).unwrap();
+        assert_eq!(
+            v.get("AppConnector").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "AppConnector is a JSON bool under the Go wire key `AppConnector`"
+        );
+    }
+
+    /// `app_connector(false)` sends `AppConnector:false` — NOT omitted. Go calls
+    /// `hi.AppConnector.Set(advertise)` unconditionally, and `.Set(false)` is a non-empty `opt.Bool`
+    /// that marshals to `false` (only a never-`Set` `opt.Bool` is `omitzero`-dropped). So a default Go
+    /// node always sends the key; a fork node that omitted it would be a not-tailscaled tell. The
+    /// register + streaming-map paths always call `.app_connector(...)`, so the wire always carries it.
+    #[test]
+    fn app_connector_false_sends_false_wire_key() {
+        let node_state = ts_keys::NodeState::generate();
+
+        // Explicit false -> Some(false) -> "AppConnector":false on the wire (matches Go .Set(false)).
+        let req = MapRequestBuilder::new(&node_state)
+            .app_connector(false)
+            .build();
+        let hi = req.host_info.unwrap();
+        assert_eq!(hi.app_connector, Some(false));
+        let v = serde_json::to_value(&hi).unwrap();
+        assert_eq!(
+            v.get("AppConnector").and_then(serde_json::Value::as_bool),
+            Some(false),
+            "a non-advertising node sends AppConnector:false (Go .Set(false)), not an omitted key"
+        );
+
+        // The bare builder default (setter never called) leaves it None — but the actual register and
+        // map-poll paths always call `.app_connector(config.advertise_app_connector)`, so this
+        // never-set state is not what reaches control.
+        let req = MapRequestBuilder::new(&node_state).build();
+        assert_eq!(req.host_info.unwrap().app_connector, None);
+    }
+
+    /// `allows_update(true)` sets `HostInfo.AllowsUpdate = true`, mirroring Go's
+    /// `hi.AllowsUpdate = … || prefs.AutoUpdate().Apply.EqualBool(true)`. The serialized wire key is
+    /// `AllowsUpdate` carrying the JSON bool `true`.
+    #[test]
+    fn allows_update_setter_populates_host_info_and_wire_key() {
+        let node_state = ts_keys::NodeState::generate();
+
+        let req = MapRequestBuilder::new(&node_state)
+            .allows_update(true)
+            .build();
+        let hi = req.host_info.unwrap();
+        assert!(hi.allows_update);
+
+        let v = serde_json::to_value(&hi).unwrap();
+        assert_eq!(
+            v.get("AllowsUpdate").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "AllowsUpdate is a JSON bool under the Go wire key `AllowsUpdate`"
+        );
+    }
+
+    /// `allows_update(false)` (and the default) leaves the bool unset, so it is omitted from the wire
+    /// request (the crate's `skip_serializing_if = is_default` rule for bools).
+    #[test]
+    fn allows_update_false_omits_wire_key() {
+        let node_state = ts_keys::NodeState::generate();
+
+        let req = MapRequestBuilder::new(&node_state)
+            .allows_update(false)
+            .build();
+        let hi = req.host_info.unwrap();
+        assert!(!hi.allows_update);
+        let v = serde_json::to_value(&hi).unwrap();
+        assert!(v.get("AllowsUpdate").is_none());
+
+        // Default (setter never called) is also false.
+        let req = MapRequestBuilder::new(&node_state).build();
+        assert!(!req.host_info.unwrap().allows_update);
     }
 
     #[test]

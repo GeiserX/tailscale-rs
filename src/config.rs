@@ -292,6 +292,97 @@ pub struct Config {
     /// requires control to assign it a VIP and the node to be tagged.
     pub advertise_services: Vec<String>,
 
+    /// Whether to advertise this node as an **app connector** (`tailscale set --advertise-connector`,
+    /// Go `Prefs.AppConnector.Advertise`). Defaults to `false`.
+    ///
+    /// When `true`, registration and every map request set `HostInfo.AppConnector = Some(true)`,
+    /// mirroring Go's `applyPrefsToHostinfoLocked` (`hi.AppConnector.Set(prefs.AppConnector().Advertise)`).
+    /// This advertises only the *capability* to control — the faithful engine minimum, exactly the
+    /// boundary Go draws between advertising and the data path. The app-connector data path itself
+    /// (control-pushed connector domain routes, the 4via6 domain→route mapping, the per-domain DNS
+    /// observation that learns target IPs) is a separate subsystem this fork does not implement, so a
+    /// node advertising this serves no connector traffic until that layer exists — identical in effect
+    /// to Go advertising the bool before control has assigned any domains.
+    pub advertise_app_connector: bool,
+
+    /// Whether this node opts in to admin-console-triggered auto-updates
+    /// (`tailscale set --auto-update`, Go `Prefs.AutoUpdate.Apply`). Defaults to `None`.
+    ///
+    /// When `Some(true)`, registration and every map request set `HostInfo.AllowsUpdate = true`,
+    /// mirroring Go's `applyPrefsToHostinfoLocked`
+    /// (`hi.AllowsUpdate = … || prefs.AutoUpdate().Apply.EqualBool(true)`), so the admin console knows
+    /// the node accepts remote update triggers. This advertises the bool only: **this fork runs no
+    /// updater** (it is an embeddable engine, not a packaged daemon), so it never *applies* an update —
+    /// the self-update machinery is a daemon / OS-package concern. `Some(false)` and `None` both leave
+    /// `AllowsUpdate` unset (advertise that the node does not accept remote updates); the tri-state
+    /// mirrors Go's `opt.Bool` (unset vs explicitly-off vs on).
+    pub auto_update_apply: Option<bool>,
+
+    /// Whether a background updater should *check* for available updates (Go `Prefs.AutoUpdate.Check`).
+    /// Defaults to `false`.
+    ///
+    /// **Carried pref only — the engine never acts on it and it is never sent to control.** In Go this
+    /// gates a purely local background update-check loop in the daemon; it is not part of `Hostinfo`
+    /// and never crosses the control wire. This fork has no updater (engine, not daemon), so the value
+    /// is stored and threaded through to [`ts_control::Config`] solely so a downstream daemon can carry
+    /// the pref. Storing it (rather than dropping it) is the faithful mirror of tsnet's pref state.
+    pub auto_update_check: bool,
+
+    /// The OS username permitted to operate this node over a local management API
+    /// (`tailscale set --operator`, Go `Prefs.OperatorUser`). Defaults to `None`.
+    ///
+    /// **Carried pref only — the engine never acts on it and it is never sent to control.** In Go this
+    /// is purely a daemon-side LocalAPI authorization check (which Unix uid may drive the daemon
+    /// without root); it never touches the control protocol. This fork is a pure engine with no local
+    /// API to gate, so the value is stored and threaded through to [`ts_control::Config`] solely for a
+    /// downstream daemon that exposes a local API to consult. Faithful mirror of tsnet pref state.
+    pub operator_user: Option<String>,
+
+    /// A local display label for this node's login profile (Go `Prefs.ProfileName`, set via
+    /// `tailscale switch` / profile management). Defaults to `None`.
+    ///
+    /// **Carried pref only — the engine never acts on it and it is never sent to control.** In Go this
+    /// is a client-local cosmetic name for the login profile; it is never advertised in `Hostinfo`
+    /// (distinct from the [`requested_hostname`](Config::requested_hostname) the node requests). The
+    /// value is stored and threaded through to [`ts_control::Config`] solely for a downstream daemon's
+    /// profile UI. Faithful mirror of tsnet pref state.
+    pub node_nickname: Option<String>,
+
+    /// Whether device-posture identity collection is enabled (`tailscale set --posture-checking`,
+    /// Go `Prefs.PostureChecking`). Defaults to `false`.
+    ///
+    /// **Carried pref only — the engine never acts on it and it is never sent to control.** There is
+    /// deliberately **no `Hostinfo.PostureChecking` field** to wire it to: posture is a
+    /// control-to-node (c2n) *pull* mechanism — control requests posture attributes (serial numbers,
+    /// etc.) from the node on demand — which this fork does not implement. With no c2n posture
+    /// responder, control simply never pulls posture identity, byte-for-byte identical to the
+    /// posture-disabled case, so storing the pref is the faithful mirror. The value is threaded through
+    /// to [`ts_control::Config`] for a downstream daemon that implements the c2n posture endpoint.
+    pub posture_checking: bool,
+
+    /// Whether this node runs a local web client (`tailscale set --webclient`,
+    /// Go `Prefs.RunWebClient`). Defaults to `false`.
+    ///
+    /// **Carried pref only — the engine never acts on it and it is never sent to control.** In Go this
+    /// gates a daemon-hosted local web-client HTTP server (the device-management web UI on
+    /// `100.x:5252`); it is a separate subsystem, not advertised in `Hostinfo`. This fork has no
+    /// web-client server, so the value is stored and threaded through to [`ts_control::Config`] solely
+    /// for a downstream daemon that does. Faithful mirror of tsnet pref state.
+    pub run_web_client: bool,
+
+    /// Whether a peer using this node as an exit node may also reach this node's **local LAN**
+    /// (`tailscale set --exit-node-allow-lan-access`, Go `Prefs.ExitNodeAllowLANAccess`). Defaults to
+    /// `false`.
+    ///
+    /// **Carried pref only for now — the engine does not yet act on it and it is never sent to
+    /// control.** In Go this is an **OS-router route-shaping** flag: when acting as an exit node it
+    /// controls whether the host router excludes the local LAN ranges from the routes pulled through
+    /// the tunnel. On a platform with no host router it has "no effect" — and this fork's default data
+    /// path is the userspace netstack, which has no host-route layer to shape. The value is stored and
+    /// threaded through to [`ts_control::Config`] so a downstream daemon (or a future host-route layer
+    /// in this engine) can consume it; until such a layer exists it is inert. Never advertised.
+    pub exit_node_allow_lan_access: bool,
+
     /// Filesystem directory that received Taildrop files land in, or `None` to disable Taildrop
     /// (the default, fail-closed).
     ///
@@ -541,6 +632,14 @@ impl From<&Config> for ts_control::Config {
             // `Device::listen_funnel` starts a listener. Not derived from the embedder config.
             ingress_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             advertise_services: value.advertise_services.clone(),
+            advertise_app_connector: value.advertise_app_connector,
+            auto_update_apply: value.auto_update_apply,
+            auto_update_check: value.auto_update_check,
+            operator_user: value.operator_user.clone(),
+            node_nickname: value.node_nickname.clone(),
+            posture_checking: value.posture_checking,
+            run_web_client: value.run_web_client,
+            exit_node_allow_lan_access: value.exit_node_allow_lan_access,
             allow_http_key_fetch: value.allow_http_key_fetch,
         }
     }
@@ -576,6 +675,14 @@ impl Default for Config {
             transport_mode: ts_control::TransportMode::default(),
             wire_ingress: false,
             advertise_services: vec![],
+            advertise_app_connector: false,
+            auto_update_apply: None,
+            auto_update_check: false,
+            operator_user: None,
+            node_nickname: None,
+            posture_checking: false,
+            run_web_client: false,
+            exit_node_allow_lan_access: false,
             taildrop_dir: None,
             auth_key: None,
             client_id: None,
@@ -618,6 +725,14 @@ mod tests {
             advertise_routes: vec!["10.0.0.0/24".parse().unwrap()],
             requested_tags: vec!["tag:exit".to_owned()],
             advertise_services: vec!["svc:samba".to_owned()],
+            advertise_app_connector: true,
+            auto_update_apply: Some(true),
+            auto_update_check: true,
+            operator_user: Some("alice".to_owned()),
+            node_nickname: Some("laptop".to_owned()),
+            posture_checking: true,
+            run_web_client: true,
+            exit_node_allow_lan_access: true,
             ephemeral: false,
             exit_proxy: Some(ExitProxyConfig {
                 addr: "198.51.100.9:8080".parse().unwrap(),
@@ -674,6 +789,43 @@ mod tests {
                 mtu: Some(1280),
             })
         );
+        // up/set pref fields cross the boundary: two advertise-side, six store-only carried prefs.
+        assert!(control.advertise_app_connector);
+        assert_eq!(control.auto_update_apply, Some(true));
+        assert!(control.auto_update_check);
+        assert_eq!(control.operator_user.as_deref(), Some("alice"));
+        assert_eq!(control.node_nickname.as_deref(), Some("laptop"));
+        assert!(control.posture_checking);
+        assert!(control.run_web_client);
+        assert!(control.exit_node_allow_lan_access);
+    }
+
+    /// All eight up/set pref fields default off/None on a fresh top-level `Config`, and the defaults
+    /// cross the `From<&Config>` boundary unchanged. Fail-closed: a default node advertises no
+    /// app-connector / auto-update and carries no operator/nickname/posture/webclient/LAN-access pref.
+    #[test]
+    fn from_config_default_up_set_pref_fields_off() {
+        let cfg = Config::default();
+        // Defaults on the top-level config.
+        assert!(!cfg.advertise_app_connector);
+        assert_eq!(cfg.auto_update_apply, None);
+        assert!(!cfg.auto_update_check);
+        assert_eq!(cfg.operator_user, None);
+        assert_eq!(cfg.node_nickname, None);
+        assert!(!cfg.posture_checking);
+        assert!(!cfg.run_web_client);
+        assert!(!cfg.exit_node_allow_lan_access);
+
+        // And they cross the boundary defaulted off.
+        let control: ts_control::Config = (&cfg).into();
+        assert!(!control.advertise_app_connector);
+        assert_eq!(control.auto_update_apply, None);
+        assert!(!control.auto_update_check);
+        assert_eq!(control.operator_user, None);
+        assert_eq!(control.node_nickname, None);
+        assert!(!control.posture_checking);
+        assert!(!control.run_web_client);
+        assert!(!control.exit_node_allow_lan_access);
     }
 
     #[test]
