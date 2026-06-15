@@ -9,6 +9,10 @@ on:
 jobs:
   check:
     name: nix flake check
+    # `linux-x86_64-16cpu` only exists in the upstream tailscale/tailscale-rs org; on this fork the
+    # job would queue forever and never report. Skip off-upstream (mirrors the owner guard on
+    # `ci.yml`/`c.yml`/`elixir.yml`/`python.yml`). Delete if/when the fork provisions these runners.
+    if: ${{ github.repository_owner == 'tailscale' }}
     runs-on: linux-x86_64-16cpu
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -16,6 +20,9 @@ jobs:
       - run: nix flake check -L
 
   build:
+    # `linux-x86_64-16cpu`/`linux-arm64-16cpu` only exist upstream; skip off-upstream so these don't
+    # queue forever on the fork (same owner guard as the `check` job above and the sibling workflows).
+    if: ${{ github.repository_owner == 'tailscale' }}
     strategy:
       matrix:
         include:
