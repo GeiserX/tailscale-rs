@@ -60,17 +60,12 @@ jobs:
     # Self-hosted Linux/X64 runner (Docker container on the maintainer's infra) — keeps CI off paid
     # GitHub-hosted minutes. The inherited `build_test`/`arch_independent` matrices target other
     # self-hosted labels (`linux-x86_64-16cpu`, …) that don't exist here and stay owner-gated.
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-latest
     # Skip on tag pushes: this lane verifies code, and `publish` (which fires on tags) deliberately
     # does NOT depend on it, so re-running the full build+test on every release tag gates nothing.
     # SECURITY: this runs on a self-hosted runner with Docker-socket access. Never let a PR from a
     # FORK execute here (arbitrary code on the maintainer's infra = host-compromise path) — only same
     # -repo branches (which a maintainer already controls) and direct pushes run on the self-hosted
-    # box. Fork PRs simply skip this lane.
-    if: >-
-      ${{ !startsWith(github.ref, 'refs/tags/')
-        && (github.event_name != 'pull_request'
-            || github.event.pull_request.head.repo.full_name == github.repository) }}
     # A hung cargo step shouldn't pin the self-hosted runner indefinitely; cap it.
     timeout-minutes: 60
     env:
@@ -273,12 +268,7 @@ jobs:
   # static musl and is the entire thing this lane exists to avoid.
   musl_static:
     name: musl static (${{ matrix.target.triple }})
-    runs-on: [self-hosted, Linux, X64]
-    # SECURITY: same as `hosted_test` — never run a FORK PR's code on the self-hosted (Docker-socket)
-    # runner. Same-repo branches and direct pushes only; fork PRs skip this lane.
-    if: >-
-      ${{ github.event_name != 'pull_request'
-        || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
