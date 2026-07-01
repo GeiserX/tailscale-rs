@@ -84,7 +84,7 @@ jobs:
       RUST_TEST_THREADS: 4
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           # Don't leave the GITHUB_TOKEN persisted in .git/config on the persistent self-hosted
           # runner (the checkout default) — these jobs never push, so the token is pure exposure.
@@ -152,7 +152,7 @@ jobs:
       - name: Anti-leak firewall checks (cargo run -p checks)
         run: cargo run -p checks
       - name: binstall
-        uses: cargo-bins/cargo-binstall@aaa84a43aec4955a42c5ffc65d258961e39f276e #v1.19.1
+        uses: cargo-bins/cargo-binstall@732870f031d2fb36309d0deaf36abcc704a7be65 #v1.20.1
       - name: Install cargo-deny
         run: command -v cargo-deny || cargo binstall --no-confirm cargo-deny
       # Machine-enforce the ring-only / no-aws-lc supply-chain invariant on every push, on the
@@ -210,7 +210,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Setup rust
         id: setup-rust
         uses: ./.github/actions/setup-rust
@@ -286,7 +286,7 @@ jobs:
       MUSL_FLAGS: -p geiserx_tailscale --no-default-features
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           # See hosted_test: don't persist the token on the self-hosted runner (this lane won't push).
           persist-credentials: false
@@ -311,7 +311,7 @@ jobs:
           # while preventing the cross-container artifact collision.
           cache-key: musl-${{ matrix.target.triple }}
       - name: Install cross
-        uses: cargo-bins/cargo-binstall@aaa84a43aec4955a42c5ffc65d258961e39f276e #v1.19.1
+        uses: cargo-bins/cargo-binstall@732870f031d2fb36309d0deaf36abcc704a7be65 #v1.20.1
       - name: Install cross (binary)
         run: command -v cross || cargo binstall --no-confirm cross
       - name: Build static musl (cross build --no-default-features)
@@ -336,7 +336,7 @@ jobs:
     runs-on: linux-x86_64-16cpu
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Setup rust
         id: setup-rust
         uses: ./.github/actions/setup-rust
@@ -346,7 +346,7 @@ jobs:
           components: rustfmt
       - &binstall
         name: binstall
-        uses: cargo-bins/cargo-binstall@aaa84a43aec4955a42c5ffc65d258961e39f276e #v1.19.1
+        uses: cargo-bins/cargo-binstall@732870f031d2fb36309d0deaf36abcc704a7be65 #v1.20.1
       - name: Install cargo-deny
         run: command -v cargo-deny || cargo binstall --no-confirm cargo-deny
       - &cargo_ws
@@ -385,9 +385,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      - uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         id: auth
         with:
           url: ${{ case(inputs.crates_repo == 'prod', 'https://crates.io', startsWith(github.ref, 'refs/tags/'), 'https://crates.io', 'https://staging.crates.io') }}
