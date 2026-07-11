@@ -87,6 +87,7 @@ impl AsyncControlClient {
         config: &crate::Config,
         node_keys: &ts_keys::NodeState,
         auth_key: Option<&str>,
+        followup: Option<&Url>,
     ) -> Result<(), Error> {
         let control_url = &config.server_url;
 
@@ -97,7 +98,15 @@ impl AsyncControlClient {
         )
         .await?;
 
-        crate::tokio::register(config, control_url, auth_key, node_keys, &h2_client).await?;
+        crate::tokio::register(
+            config,
+            control_url,
+            auth_key,
+            followup,
+            node_keys,
+            &h2_client,
+        )
+        .await?;
 
         Ok(())
     }
@@ -139,7 +148,7 @@ impl AsyncControlClient {
         .await?;
         tracing::info!("connected to control, registering");
 
-        crate::tokio::register(config, control_url, auth_key, node_keys, &h2_client).await?;
+        crate::tokio::register(config, control_url, auth_key, None, node_keys, &h2_client).await?;
 
         tracing::info!("registered, starting netmap stream");
 
@@ -707,7 +716,7 @@ async fn run_once(
     // `MachineNotAuthorized(Some(url))`: surface that URL to the embedder (→ "needs login") via
     // `surface_reauth_url`, then still propagate the error so `run` backs off and retries — Go's
     // `authRoutine` keeps the URL and keeps polling, and a later successful re-register recovers.
-    match crate::tokio::register(config, control_url, auth_key, node_keys, &h2_client).await {
+    match crate::tokio::register(config, control_url, auth_key, None, node_keys, &h2_client).await {
         Ok(()) => {
             // Re-register succeeded — clear any pending re-auth URL NOW (not at stream end), so a
             // recovering poll empties the cell BEFORE the runtime bridge can wake and re-read a

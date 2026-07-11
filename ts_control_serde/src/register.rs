@@ -218,6 +218,46 @@ mod tests {
         );
     }
 
+    /// A followup registration MUST serialize the pending `AuthURL` under the wire name `Followup`
+    /// (PascalCase). Control long-polls this URL until it is visited instead of minting a fresh one
+    /// each poll; if the field is dropped or misnamed, interactive login churns a new URL every
+    /// retry and never completes.
+    #[test]
+    fn register_request_serializes_followup() {
+        let url = Url::parse("https://login.tailscale.com/a/abc123").unwrap();
+        let req = RegisterRequest {
+            followup: Some(url.clone()),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&req).unwrap();
+        let obj = value.as_object().expect("serializes to a JSON object");
+
+        let wire = obj
+            .get("Followup")
+            .expect("Followup key present on the wire");
+        assert_eq!(wire.as_str().unwrap(), url.as_str());
+    }
+
+    /// When there is no pending login, `followup` is `None` and MUST be omitted entirely — a fresh
+    /// registration is not a followup. Emitting an empty/`null` `Followup` would make control
+    /// long-poll a nonexistent URL.
+    #[test]
+    fn register_request_omits_followup_when_none() {
+        let req = RegisterRequest {
+            followup: None,
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&req).unwrap();
+        let obj = value.as_object().expect("serializes to a JSON object");
+
+        assert!(
+            !obj.contains_key("Followup"),
+            "Followup must be omitted when None, got: {obj:?}"
+        );
+    }
+
     /// `RegisterResponse::error` is a control-authored failure message typed `Cow<'a, str>`. A
     /// rejection message containing a newline/quote (escaped on the wire) decodes and unescapes; a
     /// bare `&'a str` would fail the whole `RegisterResponse` decode (`expected a borrowed string`),

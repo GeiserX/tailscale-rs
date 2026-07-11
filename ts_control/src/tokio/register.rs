@@ -150,6 +150,7 @@ pub async fn register(
     config: &crate::Config,
     control_url: &Url,
     auth_key: Option<&str>,
+    followup: Option<&Url>,
     node_keystate: &ts_keys::NodeState,
     http2_conn: &Http2<BytesBody>,
 ) -> Result<(), RegistrationError> {
@@ -218,6 +219,9 @@ pub async fn register(
         },
         nl_key: Some(network_lock_public_key),
         auth: auth_key.map(RegisterAuth::from),
+        // When set, control long-polls this registration until the AuthURL is visited, instead of
+        // returning a fresh AuthURL each call. This is what makes an interactive login URL stable.
+        followup: followup.cloned(),
         ephemeral: config.ephemeral,
         ..Default::default()
     };

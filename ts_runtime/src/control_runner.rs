@@ -185,24 +185,42 @@ impl kameo::Actor for ControlRunner {
     type Error = ControlRunnerError;
 
     async fn on_start(params: Params, slf: ActorRef<Self>) -> Result<Self, Self::Error> {
+        // The interactive AuthURL, captured on the first unauthorized reply and reused as the
+        // `followup` on every subsequent poll so control long-polls ONE stable URL (rather than
+        // minting a fresh, racing URL each retry) until the user visits it.
+        let mut login_url: Option<url::Url> = None;
         loop {
             match AsyncControlClient::check_auth(
                 &params.config,
                 &params.env.keys,
                 params.auth_key.as_deref(),
+                login_url.as_ref(),
             )
             .await
             {
                 Ok(()) => break,
                 Err(ControlError::MachineNotAuthorized(u)) => {
-                    tracing::info!(auth_url = %u, "please authorize this machine or pass an auth key");
-                    // Surface "interactive login required" so a watcher / `wait_until_running` can
-                    // tell the user to authorize, instead of seeing an opaque timeout. Registration
-                    // keeps retrying (transient), so this is not a terminal `Failed`.
-                    params
-                        .state_tx
-                        .send_replace(crate::DeviceState::NeedsLogin(u.clone()));
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    // Capture the FIRST url and keep showing/following-up on it, so the link the
+                    // user opened stays valid instead of being superseded by the next poll.
+                    let url = login_url.get_or_insert(u).clone();
+                    tracing::info!(auth_url = %url, "please authorize this machine or pass an auth key");
+                    // Publish `NeedsLogin(url)` only when it actually changes the cell. With `followup`
+                    // set, the SAME URL is re-affirmed on every long-poll timeout; a bare `send_replace`
+                    // re-notifies `state_rx` each cycle, so the bus re-emits `browse_to_url` for a link
+                    // the user already has — reopening it repeatedly. `send_if_modified` dedups the
+                    // no-op, mirroring `bridge_reauth_url_to_state` (the mid-session re-auth path).
+                    let next = crate::DeviceState::NeedsLogin(url);
+                    params.state_tx.send_if_modified(|current| {
+                        if *current == next {
+                            false
+                        } else {
+                            *current = next.clone();
+                            true
+                        }
+                    });
+                    // With followup set, check_auth long-polls until the URL is visited; this short
+                    // sleep only applies if control times the poll out, and we re-followup the SAME url.
+                    tokio::time::sleep(Duration::from_secs(2)).await;
                 }
                 Err(ControlError::NeedsMachineAuth) => {
                     // The node is registered with a valid key but awaiting ADMIN APPROVAL on an
@@ -232,6 +250,30 @@ impl kameo::Actor for ControlRunner {
                     tokio::time::sleep(retry_after).await;
                 }
                 Err(e) => {
+                    // Followup auth path gone: while long-polling a STABLE AuthURL, control returns
+                    // an HTTP registration error (410 "auth path not found") once the path is either
+                    // VISITED + approved (consumed) or expired. This is NOT terminal — drop the
+                    // followup and re-register ONCE: an approved node key comes back `MachineAuthorized`
+                    // (`Ok(())` → login completes), an expired one comes back with a fresh AuthURL.
+                    // Without this, the user's own approval (which consumes the path → 410) kills the
+                    // runner. Bounded: on re-register `login_url` is None, so a repeat HTTP error falls
+                    // through to the terminal handling below (no infinite loop).
+                    if login_url.is_some()
+                        && matches!(
+                            e,
+                            ControlError::Internal(
+                                ts_control::InternalErrorKind::Http,
+                                ts_control::Operation::Registration,
+                            )
+                        )
+                    {
+                        tracing::info!(
+                            "followup auth path gone (approved or expired); re-registering"
+                        );
+                        login_url = None;
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
                     // A hard registration failure (bad/expired/unknown auth key, etc.). Log the
                     // specific reason control gave AND publish it as a typed `Failed` state so
                     // `Device::wait_until_running` returns the actionable reason (tsr-kqj) instead
