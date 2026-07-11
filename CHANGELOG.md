@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.42.1](https://github.com/GeiserX/tailscale-rs/compare/v0.42.0...v0.42.1) (2026-07-11)
+
+
+### Bug Fixes
+
+* **control:** stable interactive login via Followup long-poll ([#278](https://github.com/GeiserX/tailscale-rs/issues/278)) ([5340d8d](https://github.com/GeiserX/tailscale-rs/commit/5340d8d72d4547a9a772016619815181c61d3ca6))
+
 ## [0.42.0](https://github.com/GeiserX/tailscale-rs/compare/v0.41.0...v0.42.0) (2026-06-15)
 
 
