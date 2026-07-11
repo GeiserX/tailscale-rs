@@ -14,6 +14,8 @@ rust-version.workspace = true
 [lib]
 name = "ts_metrics"
 [dependencies]
+# 32-bit targets (e.g. mipsel routers) lack a native `AtomicU64`; portable-atomic provides it.
+portable-atomic.workspace = true
 
 [lints]
 workspace = true
