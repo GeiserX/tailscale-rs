@@ -204,9 +204,20 @@ impl kameo::Actor for ControlRunner {
                     // user opened stays valid instead of being superseded by the next poll.
                     let url = login_url.get_or_insert(u).clone();
                     tracing::info!(auth_url = %url, "please authorize this machine or pass an auth key");
-                    params
-                        .state_tx
-                        .send_replace(crate::DeviceState::NeedsLogin(url));
+                    // Publish `NeedsLogin(url)` only when it actually changes the cell. With `followup`
+                    // set, the SAME URL is re-affirmed on every long-poll timeout; a bare `send_replace`
+                    // re-notifies `state_rx` each cycle, so the bus re-emits `browse_to_url` for a link
+                    // the user already has — reopening it repeatedly. `send_if_modified` dedups the
+                    // no-op, mirroring `bridge_reauth_url_to_state` (the mid-session re-auth path).
+                    let next = crate::DeviceState::NeedsLogin(url);
+                    params.state_tx.send_if_modified(|current| {
+                        if *current == next {
+                            false
+                        } else {
+                            *current = next.clone();
+                            true
+                        }
+                    });
                     // With followup set, check_auth long-polls until the URL is visited; this short
                     // sleep only applies if control times the poll out, and we re-followup the SAME url.
                     tokio::time::sleep(Duration::from_secs(2)).await;
