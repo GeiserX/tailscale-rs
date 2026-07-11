@@ -80,6 +80,9 @@ chacha20poly1305 = "0.10"
 chrono = { version = "0.4", default-features = false }
 clap = { version = "4", features = ["derive"] }
 crypto_box = "0.9"
+# Kernel-WireGuard backend (optional, `kernel-wg` feature): configures the OS kernel wg interface
+# via netlink for the hybrid data plane. Cross-compiles to mipsel (verified). Off by default.
+defguard_wireguard_rs = "0.7"
 divan = "0.1"
 flume = "0.12"
 futures = { version = "0.3", default-features = false }
@@ -329,6 +332,10 @@ axum = ["dep:axum"]
 hyper = ["dep:hyper", "dep:hyper-util", "dep:tower-service"]
 ssh = ["dep:russh", "dep:bytes", "dep:ratatui", "dep:pty-process", "dep:nix"]
 tun = ["ts_runtime/tun"]
+# Kernel-WireGuard hybrid data plane (KERNEL_WG_DESIGN.md): mirrors direct-endpoint peers into a
+# kernel wg interface via netlink for kernel-speed crypto on weak CPUs (e.g. mipsel routers).
+# Off by default; forwards to `ts_runtime/kernel-wg`. Needs root + kmod-wireguard on-device.
+kernel-wg = ["ts_runtime/kernel-wg"]
 # Enables the internal OS network-link monitor (`Config::network_monitor`): on a link change the
 # runtime re-binds the underlay socket and re-probes connectivity (re-ping, immediate STUN,
 # re-netcheck). Off by default (pure-engine posture); setting `Config::network_monitor` without this
@@ -349,6 +356,9 @@ required-features = ["axum"]
 
 [[example]]
 name = "peer_ping"
+
+[[example]]
+name = "glinet_tsd"
 
 [[example]]
 name = "tcp_echo"

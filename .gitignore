@@ -36,3 +36,6 @@ docs/GOAL.md
 docs/research/
 docs/AUTOPILOT-WORKLOG.md
 docs/DEFERRED-QUESTIONS.md
+
+# mipsel cross-build CARGO_HOME cache (scripts/build-mipsel.sh)
+.cargo-home-mipsel/

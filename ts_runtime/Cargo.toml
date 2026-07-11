@@ -17,6 +17,8 @@ name = "ts_runtime"
 # `StatusNode.last_seen` exposes a `chrono::DateTime<Utc>` on a public field (mirrors
 # `ts_control::Node.last_seen` / Go `PeerStatus.LastSeen`). Already a transitive dep via `ts_control`.
 chrono = { workspace = true }
+# Optional: kernel-WireGuard backend, pulled in only behind the `kernel-wg` feature (see below).
+defguard_wireguard_rs = { workspace = true, optional = true }
 # Our crates.
 ts_bart.workspace = true
 ts_bart_packetfilter.workspace = true
@@ -90,6 +92,10 @@ network-monitor = ["dep:ts_netmon"]
 # `GetCertificate` message; a self-hosted control plane 501s on set-dns so issuance is
 # non-functional there.
 acme = ["ts_control/acme"]
+# Kernel-WireGuard hybrid data plane (KERNEL_WG_DESIGN.md seam #1). Mirrors direct-endpoint peers
+# into a kernel wg interface via netlink (defguard); relay-only peers stay on userspace+DERP. Needs
+# root + kmod-wireguard on-device. Off by default; cross-compiles to mipsel.
+kernel-wg = ["dep:defguard_wireguard_rs"]
 
 [dev-dependencies]
 proptest = "1.11"

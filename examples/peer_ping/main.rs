@@ -57,6 +57,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         config.control_server_url = url;
     }
 
+    // Allow the plaintext `GET /key` bootstrap when targeting a self-hosted control plane over
+    // http:// (e.g. a dev Headscale on a trusted LAN). No effect for the default https Tailscale
+    // control plane, where the key fetch is always https regardless.
+    if config.control_server_url.scheme() == "http" {
+        config.allow_http_key_fetch = true;
+    }
+
     let dev = Device::new(&config, args.auth_key).await?;
 
     let sock = dev.udp_bind((dev.ipv4_addr().await?, 1234).into()).await?;

@@ -196,6 +196,67 @@ impl Message<Arc<PeerState>> for DataplaneActor {
             }
         }
 
+        // Hybrid data plane (KERNEL_WG_DESIGN.md seam #1): mirror peers that have a direct underlay
+        // endpoint into the kernel WireGuard interface so the kernel does their crypto + sends UDP
+        // direct (much cheaper on 32-bit MIPS). Relay-only / not-yet-direct peers are excluded by
+        // `kernel_wg::sync` and stay on the userspace ts_tunnel + DERP path above. First cut: the
+        // local interface name/key/port come from env (TS_KERNEL_WG_{IFNAME,KEYFILE,PORT}); the full
+        // integration threads the node's own WG key from config (see KERNEL_WG_DESIGN.md).
+        #[cfg(all(feature = "kernel-wg", target_os = "linux"))]
+        {
+            use defguard_wireguard_rs::net::IpAddrMask;
+
+            use crate::kernel_wg::{self, KernelPeer};
+
+            let ifname =
+                std::env::var("TS_KERNEL_WG_IFNAME").unwrap_or_else(|_| "wg-ts".to_string());
+            let port: u32 = std::env::var("TS_KERNEL_WG_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(51820);
+            let privkey: [u8; 32] = std::env::var("TS_KERNEL_WG_KEYFILE")
+                .ok()
+                .and_then(|p| std::fs::read(p).ok())
+                .filter(|b| b.len() == 32)
+                .map(|b| {
+                    let mut k = [0u8; 32];
+                    k.copy_from_slice(&b);
+                    k
+                })
+                .unwrap_or([0u8; 32]);
+
+            let mut peers = Vec::new();
+            for &upsert in &msg.upserts {
+                let Some((_, node)) = msg.peers.get(&upsert) else {
+                    continue;
+                };
+                let mut allowed = vec![
+                    IpAddrMask::new(
+                        node.tailnet_address.ipv4.addr().into(),
+                        node.tailnet_address.ipv4.prefix_len(),
+                    ),
+                    IpAddrMask::new(
+                        node.tailnet_address.ipv6.addr().into(),
+                        node.tailnet_address.ipv6.prefix_len(),
+                    ),
+                ];
+                for r in &node.accepted_routes {
+                    allowed.push(IpAddrMask::new(r.addr(), r.prefix_len()));
+                }
+                peers.push(KernelPeer {
+                    public_key: node.node_key.to_bytes(),
+                    allowed_ips: allowed,
+                    // best_addr (disco-verified, seam #2) is not plumbed to this synchronous seam
+                    // yet, so pass None and use the control-distributed underlay candidate. The
+                    // periodic seam-#2 task (KERNEL_WG_DESIGN.md) will supply the live best_addr.
+                    endpoint: kernel_wg::select_endpoint(None, &node.underlay_addresses),
+                });
+            }
+            if let Err(e) = kernel_wg::sync(&ifname, privkey, port, &peers) {
+                tracing::warn!(error = %e, "kernel-wg: sync failed (needs root + kmod-wireguard)");
+            }
+        }
+
         tracing::trace!("applied new peer state");
     }
 }

@@ -23,6 +23,9 @@ pub mod capture;
 pub mod control_runner;
 mod dataplane;
 mod derp_latency;
+// Kernel-WireGuard backend is Linux-only (it configures a kernel wg interface via netlink), so gate
+// on target_os as well: `--features kernel-wg` is a clean no-op on non-Linux hosts and fully active
+// on the mipsel router target.
 /// Device connection-state tracking ([`DeviceState`]) and typed registration outcome
 /// ([`RegistrationError`]).
 pub mod device_state;
@@ -40,6 +43,8 @@ pub mod funnel;
 /// Unified IPN notification bus ([`Notify`] / [`watch_ipn_bus`](Runtime::watch_ipn_bus)), mirroring
 /// Go `ipn` `LocalBackend.WatchNotifications` / the `WatchIPNBus` LocalAPI.
 pub mod ipn_bus;
+#[cfg(all(feature = "kernel-wg", target_os = "linux"))]
+pub mod kernel_wg;
 mod magic_dns;
 pub use magic_dns::DnsQueryResult;
 mod multiderp;
