@@ -97,6 +97,14 @@ hyper-util = { version = "0.1", default-features = false, features = ["http1"] }
 ipnet = { version = "2.12", default-features = false }
 lazy_static = "1.5"
 pin-project-lite = "0.2"
+# Drop-in 64-bit atomics for targets without native 64-bit atomic instructions (e.g. 32-bit
+# mipsel-unknown-linux-musl and other 32-bit routers/embedded targets). On such targets
+# `core::sync::atomic` has no `AtomicU64`/`AtomicI64`; portable-atomic supplies them via a
+# lock-based fallback over the native pointer-width CAS, and compiles down to the native atomics
+# on 64-bit hosts (zero cost there). Already present transitively (once_cell/futures-core); declared
+# here so `ts_metrics` can depend on it directly. Pure-Rust, ring-clean. Keep default features
+# (the `fallback` feature is what synthesizes `AtomicU64` on 32-bit — do NOT disable it).
+portable-atomic = "1"
 proptest = "1"
 itertools = "0.14"
 rand = "0.10"

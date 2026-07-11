@@ -27,8 +27,13 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
+
+// portable-atomic's `AtomicU64` is a drop-in for `core`'s, with a lock-based fallback on targets
+// (e.g. 32-bit mipsel) that lack native 64-bit atomic instructions. On 64-bit hosts it is the
+// native atomic, so this swap is zero-cost there.
+use portable_atomic::AtomicU64;
 
 /// Whether a [`Metric`] is a monotonically-increasing counter or a free-moving gauge. Mirrors Go
 /// `clientmetric.Type`.
