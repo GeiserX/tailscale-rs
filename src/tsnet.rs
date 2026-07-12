@@ -1861,6 +1861,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn build_config_maps_go_zero_value_defaults() {
+        // The complement of `build_config_maps_every_go_field_onto_config`: a Go zero-value `Server`
+        // (no fields set) must map to the matching `Config` *defaults* — the None/empty passthrough
+        // direction of the §5 table — never a stale or invented value. (`ephemeral` has its own
+        // Go-parity override, asserted separately in `build_config_forces_go_default_ephemeral`.)
+        let cfg = Server::new().build_config().await.unwrap();
+        assert!(cfg.requested_hostname.is_none(), "unset hostname ⇒ None");
+        assert!(cfg.requested_tags.is_empty(), "no advertise_tags ⇒ empty");
+        assert!(cfg.wireguard_listen_port.is_none(), "unset port ⇒ None");
+        assert!(!cfg.run_web_client, "run_web_client defaults off");
+        assert!(cfg.auth_key.is_none(), "unset auth_key ⇒ None");
+        assert!(
+            cfg.client_id.is_none() && cfg.client_secret.is_none(),
+            "unset OAuth/WIF client fields ⇒ None"
+        );
+        assert!(
+            cfg.id_token.is_none() && cfg.audience.is_none(),
+            "unset id_token/audience ⇒ None"
+        );
+        // No `tun` requested ⇒ the default userspace netstack transport.
+        assert_eq!(cfg.transport_mode, crate::TransportMode::Netstack);
+    }
+
+    #[tokio::test]
     async fn build_config_forces_go_default_ephemeral() {
         // Go's zero-value Server is a *persistent* node, yet a bare Config::default() is ephemeral.
         // build_config must force Go's default by always writing config.ephemeral = self.ephemeral.
