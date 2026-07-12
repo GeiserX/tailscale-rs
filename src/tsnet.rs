@@ -926,4 +926,52 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    // --- focused lifecycle tests: start / up / close over
+    //     Device::new → wait_until_running → status → shutdown ---
+    //
+    // The *successful* round-trip needs a live control server, so it stays in integration/e2e. The
+    // hermetic, unit-testable half of the lifecycle is its fail-fast and no-op behavior: the lazy
+    // build shared by `start`/`up` runs `build_config` *before* `Device::new`, so a bad config is
+    // reported without any network I/O; and `close` on a server whose `OnceCell` never initialized
+    // is a clean no-op. (The field→`Config` mapping itself is covered by the tests above.)
+
+    #[tokio::test]
+    async fn close_on_never_started_server_is_clean() {
+        // Go `Close()` before any method call: the `OnceCell` is empty, so there is no `Device` to
+        // `shutdown` and it reports success immediately (the `None => true` arm) — for both an
+        // unbounded and a finite timeout.
+        assert!(Server::new().close(None).await);
+        assert!(Server::new().close(Some(Duration::from_millis(1))).await);
+    }
+
+    #[tokio::test]
+    async fn start_fails_fast_on_bad_config_before_touching_the_network() {
+        // `start` maps the fields onto a `Config` and only then calls `Device::new`; a bad
+        // `control_url` fails in that mapping, so it surfaces as the typed `InvalidControlUrl` with
+        // no network I/O — never a hang, never a panic. (`Config`/`Status` aren't `Debug`, so match
+        // on the result rather than `unwrap`.)
+        let mut s = Server::new();
+        s.control_url = Some("not a url".into());
+        assert!(matches!(s.start().await, Err(Error::InvalidControlUrl(_))));
+    }
+
+    #[tokio::test]
+    async fn up_fails_fast_on_bad_config() {
+        // `up` shares the same lazy-build entrypoint as `start`, so it fails fast on a bad config
+        // instead of blocking in `wait_until_running`.
+        let mut s = Server::new();
+        s.control_url = Some("not a url".into());
+        assert!(matches!(s.up(None).await, Err(Error::InvalidControlUrl(_))));
+    }
+
+    #[tokio::test]
+    async fn close_is_clean_after_a_failed_start() {
+        // A failed lazy start leaves the `OnceCell` uninitialized (`get_or_try_init` stores nothing
+        // on error), so a subsequent `close` still finds no `Device` and returns cleanly.
+        let mut s = Server::new();
+        s.control_url = Some("not a url".into());
+        assert!(matches!(s.start().await, Err(Error::InvalidControlUrl(_))));
+        assert!(s.close(None).await);
+    }
 }
