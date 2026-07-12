@@ -266,6 +266,10 @@ ts_netstack_smoltcp = { workspace = true, features = ["tokio"] }
 ts_keys.workspace = true
 
 axum = { version = "0.8", optional = true }
+# `tsnet` feature: HTTP Basic-auth codec for the in-process LocalAPI HTTP server on the loopback (Go
+# `tsnet.Server.Loopback`'s `localAPICred`). Already in the workspace graph (used pervasively by the
+# control/serde crates), so this adds no new crate — it is only newly referenced here, under `tsnet`.
+base64 = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 # `hyper` feature: a ready-made HTTP connector that dials over the tailnet (the analog of Go
 # `tsnet.Server.HTTPClient`'s `http.Transport{DialContext: s.Dial}`). Off by default — the default
@@ -309,6 +313,13 @@ ts_test_util.workspace = true
 workspace = true
 
 [features]
+# Enable the `tsnet` module: a Go-idiomatic `tsnet.Server`-shaped facade over `Device`/`Config`
+# (settable fields → `Config`, lazy start, `Listen`/`Dial`/`Up`/`Close`/`ListenFunnel`/`ListenService`).
+# A thin ergonomics layer only — no new engine, no new crate. Reuses the crate's existing
+# serde_json/tokio/thiserror/rand; the only pulled-in dep is `base64` (HTTP Basic-auth for the
+# loopback LocalAPI server), already in the workspace graph so no new crate enters it. See
+# `src/tsnet.rs` and `docs/TSNET_FACADE_DESIGN.md`.
+tsnet = ["dep:base64"]
 # Enable the `axum` module, which enables you to run an `axum` HTTP server on top of a tailscale TCP
 # listener.
 axum = ["dep:axum"]
@@ -341,6 +352,10 @@ name = "peer_ping"
 
 [[example]]
 name = "tcp_echo"
+
+[[example]]
+name = "tsnet_echo"
+required-features = ["tsnet"]
 
 [[example]]
 name = "ssh_peer_lookup"

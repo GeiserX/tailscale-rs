@@ -90,6 +90,11 @@
 //!
 //! - `axum`: enables the `axum` module, which enables you to run an `axum` HTTP server on top
 //!   of a [`netstack::TcpListener`].
+//! - `tsnet`: enables the `tsnet` module — a Go-idiomatic `tsnet.Server`-shaped facade over
+//!   [`Device`] and [`Config`]. Set fields, then call `up`/`listen`/`dial`/`loopback`/`close`/…, and
+//!   the wrapped [`Device`] is built and started lazily on the first call (Go's "fields may be
+//!   changed until the first method call"). A thin ergonomics layer only — same engine, same typed
+//!   returns. See the [`tsnet` module docs] for the full Go `tsnet.Server` → Rust API mapping.
 //!
 //! ## Platform Support
 //!
@@ -128,6 +133,7 @@
 //! [`examples/`]: https://github.com/tailscale/tailscale-rs/blob/main/examples/README.md
 //! [open an issue]: https://github.com/tailscale/tailscale-rs/issues
 //! [`axum` HTTP server]: https://docs.rs/axum/latest/axum/
+//! [`tsnet` module docs]: https://docs.rs/geiserx_tailscale/latest/tailscale/tsnet/
 
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -196,6 +202,8 @@ pub mod http;
 mod loopback;
 #[cfg(feature = "ssh")]
 pub mod ssh;
+#[cfg(feature = "tsnet")]
+pub mod tsnet;
 
 #[doc(inline)]
 pub use dial::{ConnectedUdpSocket, DialConn};

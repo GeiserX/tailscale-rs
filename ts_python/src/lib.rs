@@ -2,6 +2,7 @@
 
 use std::{
     net::{IpAddr, SocketAddr},
+    path::PathBuf,
     sync::{Arc, Mutex, Once},
     time::Duration,
 };
@@ -35,7 +36,7 @@ pub mod _internal {
     use super::*;
     #[pymodule_export]
     use crate::{
-        Device, Keystate, LoopbackHandle,
+        Device, Keystate, LocalClient, LoopbackHandle, Server,
         tcp::{TcpListener, TcpStream},
         udp::UdpSocket,
     };
@@ -715,6 +716,132 @@ impl LoopbackHandle {
     /// Stop the proxy when the Python object is garbage-collected. Equivalent to [`stop`][Self::stop].
     pub fn __del__(&self) {
         self.stop();
+    }
+}
+
+/// A `tsnet.Server`-shaped embedded Tailscale node, exposing the two surfaces the plain
+/// [`connect`]-built [`Device`] does not: the **dual-credential loopback** and the **LocalClient**.
+///
+/// Construct it with the Go-`tsnet.Server` fields (all optional keyword arguments); the wrapped node
+/// is built lazily on the first [`loopback`][Self::loopback] / [`local_client`][Self::local_client]
+/// call. Fork config supersets beyond Go `tsnet` parity (exit nodes, forwarding) remain on
+/// [`connect`]/[`Device`]; this is the Go-parity `Server` surface. Cleanup happens on garbage
+/// collection (the loopback listeners and node shut down when the last reference drops).
+#[pyclass(frozen, module = "tailscale")]
+pub struct Server {
+    inner: Arc<ts::tsnet::Server>,
+}
+
+#[pymethods]
+impl Server {
+    /// Create a new server (Go `&tsnet.Server{Hostname, AuthKey, ControlURL, Ephemeral, Dir}`).
+    ///
+    /// All arguments are optional keyword arguments: `hostname`, `auth_key`, `control_url`,
+    /// `ephemeral` (default `False`, matching Go), `dir` (a state directory persisting this node's
+    /// identity keys across runs; `None` gives a fresh ephemeral in-memory identity), and `tags`
+    /// (ACL tags to advertise). No network I/O happens here — the node is built on first use.
+    #[new]
+    #[pyo3(signature = (
+        *, hostname=None, auth_key=None, control_url=None, ephemeral=false, dir=None, tags=None
+    ))]
+    pub fn new(
+        hostname: Option<String>,
+        auth_key: Option<String>,
+        control_url: Option<String>,
+        ephemeral: bool,
+        dir: Option<String>,
+        tags: Option<Vec<String>>,
+    ) -> Self {
+        let mut s = ts::tsnet::Server::new();
+        s.hostname = hostname;
+        s.auth_key = auth_key;
+        s.control_url = control_url;
+        s.ephemeral = ephemeral;
+        s.dir = dir.map(PathBuf::from);
+        if let Some(tags) = tags {
+            s.advertise_tags = tags;
+        }
+        Server { inner: Arc::new(s) }
+    }
+
+    /// Start (once) the loopback surface and return `(socks_addr, proxy_cred, localapi_addr,
+    /// localapi_cred)` (Go `Loopback() (addr, proxyCred, localAPICred, err)`).
+    ///
+    /// `socks_addr` is the SOCKS5 proxy's bound `127.0.0.1:port` (password `proxy_cred`, username
+    /// `tsnet`); `localapi_addr` is the in-process LocalAPI HTTP server's bound `127.0.0.1:port`
+    /// (HTTP Basic-auth password `localapi_cred`). Both listeners live for the server's lifetime, so
+    /// repeated calls return the same addresses and credentials. Raises in TUN transport mode.
+    pub fn loopback<'p>(&self, py: Python<'p>) -> PyFut<'p> {
+        let srv = self.inner.clone();
+
+        future_into_py(py, async move {
+            let lb = srv.loopback().await.map_err(py_value_err)?;
+            Ok((
+                lb.address.to_string(),
+                lb.proxy_cred,
+                lb.local_api_address.to_string(),
+                lb.local_api_cred,
+            ))
+        })
+    }
+
+    /// A [`LocalClient`] for this node's in-process LocalAPI HTTP server (Go
+    /// `tsnet.Server.LocalClient()`), starting the loopback surface if needed.
+    pub fn local_client<'p>(&self, py: Python<'p>) -> PyFut<'p> {
+        let srv = self.inner.clone();
+
+        future_into_py(py, async move {
+            let lc = srv.local_client().await.map_err(py_value_err)?;
+            Ok(LocalClient { inner: lc })
+        })
+    }
+}
+
+/// A minimal client for this node's in-process LocalAPI HTTP server (Go
+/// `tsnet.Server.LocalClient()` → `*local.Client`), obtained from [`Server::local_client`].
+///
+/// It authenticates every request with the loopback's LocalAPI credential and speaks plain HTTP to
+/// `127.0.0.1`. LocalAPI responses are JSON/text, decoded here as UTF-8 `str`.
+#[pyclass(frozen, module = "tailscale")]
+pub struct LocalClient {
+    inner: ts::tsnet::LocalClient,
+}
+
+#[pymethods]
+impl LocalClient {
+    /// `GET /localapi/v0/status` — the node + peer status as a JSON `str` (Go
+    /// `LocalClient().Status`, over the loopback). Raises if the server answers non-`200`.
+    pub fn status<'p>(&self, py: Python<'p>) -> PyFut<'p> {
+        let lc = self.inner.clone();
+
+        future_into_py(py, async move {
+            let body = lc.status().await.map_err(py_value_err)?;
+            Ok(String::from_utf8_lossy(&body).into_owned())
+        })
+    }
+
+    /// Perform an authenticated `GET` against an arbitrary LocalAPI `path` (e.g.
+    /// `"/localapi/v0/status"`), returning `(http_status_code, body)` where `body` is the response
+    /// decoded as a UTF-8 `str`.
+    pub fn get<'p>(&self, py: Python<'p>, path: String) -> PyFut<'p> {
+        let lc = self.inner.clone();
+
+        future_into_py(py, async move {
+            let (code, body) = lc.get(&path).await.map_err(py_value_err)?;
+            Ok((code, String::from_utf8_lossy(&body).into_owned()))
+        })
+    }
+
+    /// The `127.0.0.1:port` address of the LocalAPI HTTP server this client talks to.
+    #[getter]
+    pub fn address(&self) -> String {
+        self.inner.address().to_string()
+    }
+
+    /// The LocalAPI credential (HTTP Basic-auth password) this client sends.
+    #[getter]
+    pub fn credential(&self) -> String {
+        self.inner.credential().to_owned()
     }
 }
 

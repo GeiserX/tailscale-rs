@@ -12,7 +12,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-tailscale.workspace = true
+tailscale = { workspace = true, features = ["tsnet"] }
 ts_keys.workspace = true
 
 tokio = { workspace = true, features = ["full"] }
