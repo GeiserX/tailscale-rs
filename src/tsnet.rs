@@ -48,7 +48,6 @@ use tokio::sync::OnceCell;
 use ts_keys::PersistState;
 
 use crate::config::Config;
-use crate::dial;
 use crate::netstack;
 use crate::{Device, RegistrationError, ServiceError, ServiceMode, Status};
 
@@ -189,6 +188,17 @@ pub enum Error {
     #[error("unsupported network {network:?} (want tcp, tcp4, tcp6, udp, udp4, or udp6)")]
     UnsupportedNetwork {
         /// The offending `network` string.
+        network: String,
+    },
+
+    /// The Go-style `network` string was not one the call accepts. [`Server::listen`] takes a stream
+    /// network (`"tcp"`, `"tcp4"`, `"tcp6"`); [`Server::listen_packet`] a packet network (`"udp"`,
+    /// `"udp4"`, `"udp6"`). An unknown string, or the wrong transport for the call (e.g. `"udp"`
+    /// passed to `listen`), lands here — mirroring Go's `net.Listen`/`net.ListenPacket` rejecting a
+    /// bad network with `net.UnknownNetworkError`.
+    #[error("invalid or unsupported network {network:?}")]
+    InvalidNetwork {
+        /// The offending network string.
         network: String,
     },
 
@@ -519,17 +529,17 @@ impl Server {
     pub async fn dial(&self, network: &str, addr: &str) -> Result<crate::DialConn, Error> {
         // Parse the Go-style network string first: an unknown network is a typed facade error that
         // never starts the device (Go's `Dial` also rejects unknown networks up front).
-        let net = dial::parse_network(network).map_err(|_| Error::UnsupportedNetwork {
+        let net = parse_network(network).map_err(|_| Error::UnsupportedNetwork {
             network: network.to_string(),
         })?;
         let dev = self.started().await?;
         Ok(match (net.transport, net.family) {
             // Unsuffixed tcp/udp: the family follows the resolved address, so these are exactly the
             // transport-specific typed Device calls — route over them and wrap into `DialConn`.
-            (dial::Transport::Tcp, dial::Family::Any) => {
+            (Transport::Tcp, Family::Any) => {
                 crate::DialConn::Tcp(dev.dial_tcp(addr).await?)
             }
-            (dial::Transport::Udp, dial::Family::Any) => {
+            (Transport::Udp, Family::Any) => {
                 crate::DialConn::Udp(dev.dial_udp(addr).await?)
             }
             // Family-pinned (tcp4/tcp6/udp4/udp6): forward the whole network string so the engine
@@ -556,20 +566,48 @@ impl Server {
         Ok(self.started().await?.dial_udp(addr).await?)
     }
 
-    /// Listen for inbound TCP on the tailnet (Go `Listen`). `addr` may be `":80"` (any host) or
-    /// `"100.x.y.z:80"`.
-    pub async fn listen(&self, _network: &str, addr: &str) -> Result<netstack::TcpListener, Error> {
-        let sa = parse_socket_addr(addr)?;
+    /// Listen for inbound TCP on the tailnet (Go `Listen`).
+    ///
+    /// `network` is a **stream** network — `"tcp"`, `"tcp4"`, or `"tcp6"`; a `"udp*"` or unknown
+    /// value is [`Error::InvalidNetwork`] (Go's `net.Listen` likewise rejects a packet network).
+    /// `addr` may be a bare `":80"` — the wildcard host, `0.0.0.0` for `tcp`/`tcp4` and `[::]` for
+    /// `tcp6` — or a full `"100.x.y.z:80"`. Returns the std::net-style overlay
+    /// [`netstack::TcpListener`] (backed by `ts_netstack_smoltcp`): `.accept()` it for inbound
+    /// streams, exactly as Go `.Accept()`s the returned `net.Listener`.
+    pub async fn listen(&self, network: &str, addr: &str) -> Result<netstack::TcpListener, Error> {
+        let net = parse_network(network)?;
+        if net.transport != Transport::Tcp {
+            return Err(Error::InvalidNetwork {
+                network: network.to_string(),
+            });
+        }
+        let sa = parse_listen_addr(addr, net.family)?;
         Ok(self.started().await?.tcp_listen(sa).await?)
     }
 
     /// Listen for inbound UDP on the tailnet (Go `ListenPacket`).
+    ///
+    /// `network` is a **packet** network — `"udp"`, `"udp4"`, or `"udp6"`; a `"tcp*"` or unknown
+    /// value is [`Error::InvalidNetwork`]. `addr` is a `host:port` **IP literal** (a bare `":0"` is
+    /// filled with the family's wildcard host); like Go's `ListenPacket` — and unlike
+    /// [`Server::listen`] — a MagicDNS name is not accepted here. An unspecified host binds this
+    /// node's tailnet address. Returns the std::net-style overlay [`netstack::UdpSocket`] (backed by
+    /// `ts_netstack_smoltcp`), a `net.PacketConn` analog (`recv_from`/`send_to`).
     pub async fn listen_packet(
         &self,
         network: &str,
         addr: &str,
     ) -> Result<netstack::UdpSocket, Error> {
-        Ok(self.started().await?.listen_packet(network, addr).await?)
+        let net = parse_network(network)?;
+        if net.transport != Transport::Udp {
+            return Err(Error::InvalidNetwork {
+                network: network.to_string(),
+            });
+        }
+        // Fill a bare `":0"` with the family wildcard, then let the engine do the family-aware bind
+        // (unspecified host ⇒ this node's tailnet address, IPv6 gating, name rejection).
+        let addr = normalize_listen_addr(addr, net.family);
+        Ok(self.started().await?.listen_packet(network, &addr).await?)
     }
 
     /// Expose a tailnet TLS service to the public internet via Tailscale Funnel (Go `ListenFunnel`).
@@ -656,41 +694,199 @@ impl Server {
     }
 }
 
-/// Parse a Go-style listen address (`":80"` ⇒ `0.0.0.0:80`, or a full `ip:port`).
-fn parse_socket_addr(addr: &str) -> Result<SocketAddr, Error> {
-    let normalized = if addr.starts_with(':') {
-        format!("0.0.0.0{addr}")
+// ---------------------------------------------------------------------------------------------
+// Go-style `network` / `addr` string parsing — the `"tcp"`/`"udp"` + `":80"` surface.
+//
+// The facade owns this (like every string→typed step): it turns Go's loose `net.Listen`/
+// `net.ListenPacket` strings into the typed values the engine wants and into the facade's *own*
+// typed [`Error`], rather than leaking the engine's opaque `BadRequest`. The accepted network set
+// mirrors the engine's own [`Device::dial`](crate::Device::dial) so `listen`/`listen_packet`
+// accept exactly what `dial` does.
+// ---------------------------------------------------------------------------------------------
+
+/// The transport a Go `network` string selects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Transport {
+    Tcp,
+    Udp,
+}
+
+/// The address family a Go `network` suffix forces (`…4`/`…6`), or [`Family::Any`] for the bare
+/// `"tcp"`/`"udp"`. It picks the wildcard host a bare `":port"` binds on (v4 vs v6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Family {
+    Any,
+    V4,
+    V6,
+}
+
+/// A parsed Go `network` string: its transport and address family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Network {
+    transport: Transport,
+    family: Family,
+}
+
+/// Parse a Go-style `network` string (the first argument of `net.Listen`/`net.ListenPacket`) into a
+/// typed [`Network`]. Accepts exactly the tsnet set — `"tcp"`, `"tcp4"`, `"tcp6"`, `"udp"`,
+/// `"udp4"`, `"udp6"` — matching the engine's own [`Device::dial`](crate::Device::dial); anything
+/// else (including the empty string) is [`Error::InvalidNetwork`].
+fn parse_network(network: &str) -> Result<Network, Error> {
+    let (transport, family) = match network {
+        "tcp" => (Transport::Tcp, Family::Any),
+        "tcp4" => (Transport::Tcp, Family::V4),
+        "tcp6" => (Transport::Tcp, Family::V6),
+        "udp" => (Transport::Udp, Family::Any),
+        "udp4" => (Transport::Udp, Family::V4),
+        "udp6" => (Transport::Udp, Family::V6),
+        _ => {
+            return Err(Error::InvalidNetwork {
+                network: network.to_string(),
+            });
+        }
+    };
+    Ok(Network { transport, family })
+}
+
+/// Normalize a Go-style listen `addr`: a bare `":port"` gets the wildcard host for `family`
+/// (`0.0.0.0` for v4/any, `[::]` for v6 — matching Go's `net.Listen("tcp6", ":80")` ⇒ `[::]:80`).
+/// An `addr` with an explicit host (an IP literal or a name) is returned unchanged.
+fn normalize_listen_addr(addr: &str, family: Family) -> String {
+    if addr.starts_with(':') {
+        match family {
+            Family::V6 => format!("[::]{addr}"),
+            Family::Any | Family::V4 => format!("0.0.0.0{addr}"),
+        }
     } else {
         addr.to_string()
-    };
-    normalized.parse().map_err(|source| Error::InvalidAddr {
-        addr: addr.to_string(),
-        source,
-    })
+    }
+}
+
+/// Parse a Go-style listen `addr` into a [`SocketAddr`], filling a bare `":port"` with the family's
+/// wildcard host (see [`normalize_listen_addr`]).
+fn parse_listen_addr(addr: &str, family: Family) -> Result<SocketAddr, Error> {
+    normalize_listen_addr(addr, family)
+        .parse()
+        .map_err(|source| Error::InvalidAddr {
+            addr: addr.to_string(),
+            source,
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // --- the `network` string parser (`"tcp"`/`"udp"` + family suffix) ---
+
     #[test]
-    fn parse_colon_port_is_unspecified_host() {
-        let sa = parse_socket_addr(":8080").unwrap();
-        assert!(sa.ip().is_unspecified());
-        assert_eq!(sa.port(), 8080);
+    fn parse_network_accepts_the_tsnet_set() {
+        // Exactly Go's net.Listen/net.ListenPacket set — and the engine's own Device::dial set.
+        assert_eq!(
+            parse_network("tcp").unwrap(),
+            Network {
+                transport: Transport::Tcp,
+                family: Family::Any
+            }
+        );
+        assert_eq!(parse_network("tcp4").unwrap().family, Family::V4);
+        assert_eq!(parse_network("tcp6").unwrap().family, Family::V6);
+        assert_eq!(parse_network("udp").unwrap().transport, Transport::Udp);
+        assert_eq!(parse_network("udp4").unwrap().family, Family::V4);
+        assert_eq!(parse_network("udp6").unwrap().family, Family::V6);
     }
 
     #[test]
-    fn parse_full_addr() {
-        let sa = parse_socket_addr("100.64.0.1:443").unwrap();
+    fn parse_network_rejects_unknown_strings() {
+        // Unknown transports, bad suffixes, the empty string, wrong case, and stray whitespace all
+        // fail as the typed InvalidNetwork (never a silent default).
+        for n in ["", "tcp5", "sctp", "unix", "TCP", "udp7", "ip", "tcp ", "0"] {
+            assert!(
+                matches!(parse_network(n), Err(Error::InvalidNetwork { network }) if network == n),
+                "network {n:?} must be rejected as InvalidNetwork carrying the offending value"
+            );
+        }
+    }
+
+    // --- the listen-address parser (`":80"` ⇒ family wildcard, or a full `ip:port`) ---
+
+    #[test]
+    fn parse_colon_port_is_family_aware_wildcard() {
+        // A bare ":port" binds the wildcard host of the network's family.
+        let v4 = parse_listen_addr(":8080", Family::Any).unwrap();
+        assert!(v4.ip().is_unspecified() && v4.is_ipv4());
+        assert_eq!(v4.port(), 8080);
+        assert!(parse_listen_addr(":80", Family::V4).unwrap().is_ipv4());
+
+        // ...and `tcp6`/`udp6` bind the v6 wildcard `[::]` (Go `net.Listen("tcp6", ":80")`).
+        let v6 = parse_listen_addr(":80", Family::V6).unwrap();
+        assert!(v6.ip().is_unspecified() && v6.is_ipv6());
+        assert_eq!(v6.port(), 80);
+    }
+
+    #[test]
+    fn parse_full_addr_is_used_verbatim() {
+        let sa = parse_listen_addr("100.64.0.1:443", Family::Any).unwrap();
         assert_eq!(sa.port(), 443);
         assert_eq!(sa.ip().to_string(), "100.64.0.1");
     }
 
     #[test]
     fn parse_bad_addr_is_typed_error() {
-        let err = parse_socket_addr("not-an-addr").unwrap_err();
+        let err = parse_listen_addr("not-an-addr", Family::Any).unwrap_err();
         assert!(matches!(err, Error::InvalidAddr { .. }));
+    }
+
+    #[test]
+    fn normalize_listen_addr_only_fills_a_bare_port() {
+        // A bare ":port" is filled with the family wildcard; an explicit host is left untouched
+        // (including a name, which the engine's ListenPacket then rejects — the facade doesn't
+        // pre-judge it).
+        assert_eq!(normalize_listen_addr(":0", Family::Any), "0.0.0.0:0");
+        assert_eq!(normalize_listen_addr(":0", Family::V4), "0.0.0.0:0");
+        assert_eq!(normalize_listen_addr(":0", Family::V6), "[::]:0");
+        assert_eq!(normalize_listen_addr("0.0.0.0:0", Family::V4), "0.0.0.0:0");
+        assert_eq!(normalize_listen_addr("[::]:53", Family::V6), "[::]:53");
+        assert_eq!(normalize_listen_addr("host:53", Family::Any), "host:53");
+    }
+
+    // --- the parser is *wired into* listen()/listen_packet(): a wrong-transport or unknown network,
+    //     and a bad address, are rejected up front — before the lazy Device::new / any network I/O,
+    //     which is what makes these hermetic (they never reach `started()`). ---
+
+    #[tokio::test]
+    async fn listen_rejects_a_non_tcp_network_before_starting() {
+        let s = Server::new();
+        assert!(matches!(
+            s.listen("udp", ":80").await,
+            Err(Error::InvalidNetwork { network }) if network == "udp"
+        ));
+        assert!(matches!(
+            s.listen("sctp", ":80").await,
+            Err(Error::InvalidNetwork { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn listen_reports_a_bad_addr_before_starting() {
+        let s = Server::new();
+        assert!(matches!(
+            s.listen("tcp", "not-an-addr").await,
+            Err(Error::InvalidAddr { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn listen_packet_rejects_a_non_udp_network_before_starting() {
+        let s = Server::new();
+        assert!(matches!(
+            s.listen_packet("tcp", "0.0.0.0:0").await,
+            Err(Error::InvalidNetwork { network }) if network == "tcp"
+        ));
+        assert!(matches!(
+            s.listen_packet("nope", "0.0.0.0:0").await,
+            Err(Error::InvalidNetwork { .. })
+        ));
     }
 
     #[test]
