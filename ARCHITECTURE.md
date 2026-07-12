@@ -42,6 +42,14 @@ Crates/libraries that applications will program against.
 - [`ts_ffi`:](ts_ffi/README.md) C language bindings built on top of the Rust API. This is also commonly referred to as a Foreign Function Interface (FFI).
 - [`ts_python`](ts_python/README.md): Python language bindings built on top of the Rust API.
 
+#### The `tsnet` facade (optional Go-idiomatic surface)
+
+The native embedding surface is `Config` + `Device`: build a `Config`, then `Device::new(&config, auth_key)`. Behind the `tsnet` cargo feature, [`tailscale::tsnet`](src/tsnet.rs) adds a `Server` type shaped like Go's [`tsnet.Server`](https://pkg.go.dev/tailscale.com/tsnet#Server): the Go-parity fields (`Hostname`, `AuthKey`, `ControlURL`, `Dir`/`Store`, …) are settable fields mapped onto `Config`, the wrapped `Device` is built and started lazily on the first method call (Go's "fields may be changed until the first method call"), and the methods keep Go's names in snake_case (`up`, `listen`, `dial`, `listen_packet`, `loopback`, `listen_funnel`, `listen_service`, `close`, …).
+
+It is a **thin ergonomics layer only** — no new engine, no new crate, no data-plane/control/netstack changes. Every method forwards to the same `Device` the native API returns, so it keeps the fork's typed values (e.g. `netstack::TcpListener`, `DialConn`) and fail-closed typed errors (`FunnelError`, `ServiceError`) rather than re-wrapping them into Go-style `net.Conn`/`net.Listener` trait objects. It exists so code and muscle memory written against Go `tsnet` port with minimal change; the lazy-start lifecycle also turns Go's "set fields before the first method call" convention into a borrow-checker guarantee (methods borrow `&self`). Fork capabilities with no Go `tsnet` field are reached via `Server::configure` (an `&mut Config` hook) or `Server::device` (the whole engine surface).
+
+See the runnable [`tsnet_echo` example](examples/tsnet_echo), the module's rustdoc (which carries an at-a-glance Go→Rust mapping table), and [`docs/TSNET_FACADE_DESIGN.md`](docs/TSNET_FACADE_DESIGN.md) for the full field/method mapping and design rationale; [`docs/TSNET_PARITY.md`](docs/TSNET_PARITY.md) is the authoritative parity matrix.
+
 ### Runtime
 
 Crates that tie all the lower level components together, pass communications between components, and provide higher-level abstractions.

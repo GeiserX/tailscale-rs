@@ -1,5 +1,5 @@
 //! A Go-idiomatic [`tsnet.Server`](https://pkg.go.dev/tailscale.com/tsnet#Server)-shaped facade over
-//! [`Device`](crate::Device) and [`Config`](crate::Config), behind the `tsnet` cargo feature.
+//! [`Device`] and [`Config`], behind the `tsnet` cargo feature.
 //!
 //! # Why this exists
 //!
@@ -29,8 +29,8 @@
 //! typed returns. So:
 //!
 //! * inbound/outbound connections keep their engine types ([`DialConn`](crate::DialConn),
-//!   [`netstack::TcpListener`](crate::netstack::TcpListener), …);
-//! * specialized calls keep the fork's **typed** errors ([`ServiceError`](crate::ServiceError),
+//!   [`netstack::TcpListener`], …);
+//! * specialized calls keep the fork's **typed** errors ([`ServiceError`],
 //!   [`FunnelError`](ts_control::FunnelError)); only the *lifecycle* path — which in Go is a single
 //!   opaque `error` — is unified into [`Error`];
 //! * addresses are accepted as Go-style `network, addr` **strings** (`"tcp"`, `":80"`) for
@@ -38,6 +38,58 @@
 //!
 //! See `docs/TSNET_FACADE_DESIGN.md` for the full rationale, the field-by-field mapping table, and
 //! the state-root (`Dir`/`Store`) design over [`Config::key_state`](crate::Config::key_state).
+//!
+//! # Go `tsnet.Server` → `tsnet::Server`, at a glance
+//!
+//! Construct with [`Server::new`], set the public fields where Go sets struct fields, then call a
+//! method — which lazily builds and starts the wrapped [`Device`]. Method names are Go's (in Rust
+//! snake_case); return types stay the fork's typed values (see *What stays Rust-native*, above). Each
+//! item's own rustdoc names its Go equivalent; the full field-by-field mapping with verdicts lives in
+//! `docs/TSNET_FACADE_DESIGN.md`, and the authoritative parity matrix in `docs/TSNET_PARITY.md`.
+//!
+//! ## Fields — set before the first method call
+//!
+//! | Go `tsnet.Server` field | Field on [`Server`] |
+//! |---|---|
+//! | `Hostname` | [`Server::hostname`] |
+//! | `AuthKey` | [`Server::auth_key`] |
+//! | `ControlURL` | [`Server::control_url`] |
+//! | `Ephemeral` | [`Server::ephemeral`] |
+//! | `AdvertiseTags` | [`Server::advertise_tags`] |
+//! | `Port` | [`Server::port`] |
+//! | `Dir` | [`Server::dir`] |
+//! | `Store` | [`Server::store`] (a [`StateStore`]) |
+//! | `Tun` | [`Server::tun`] |
+//! | `RunWebClient` | [`Server::run_web_client`] |
+//! | `ClientID` / `ClientSecret` / `IDToken` / `Audience` | [`Server::client_id`] / [`Server::client_secret`] / [`Server::id_token`] / [`Server::audience`] |
+//! | *(no Go field — fork escape hatch to [`Config`])* | [`Server::configure`] |
+//!
+//! ## Methods — each lazily starts the node on first use
+//!
+//! | Go `tsnet.Server` | Method | Returns |
+//! |---|---|---|
+//! | `Start()` | [`Server::start`] | `()` |
+//! | `Up(ctx)` | [`Server::up`] | [`Status`] |
+//! | `Dial(ctx, network, addr)` | [`Server::dial`] | [`DialConn`](crate::DialConn) |
+//! | *(TCP fast path)* | [`Server::dial_tcp`] | [`netstack::TcpStream`] |
+//! | *(UDP fast path)* | [`Server::dial_udp`] | [`ConnectedUdpSocket`](crate::ConnectedUdpSocket) |
+//! | `Listen(network, addr)` | [`Server::listen`] | [`netstack::TcpListener`] |
+//! | `ListenPacket(network, addr)` | [`Server::listen_packet`] | [`netstack::UdpSocket`] |
+//! | `ListenFunnel(…)` | [`Server::listen_funnel`] | a Funnel accept receiver |
+//! | `ListenService(name, mode)` | [`Server::listen_service`] | [`ServiceListener`] |
+//! | `Loopback()` | [`Server::loopback`] | [`Loopback`] |
+//! | `LocalClient()` | [`Server::local_client`] | [`LocalClient`] |
+//! | `HTTPClient()` | `Server::http_client` (feature `hyper`) | a `hyper` client |
+//! | `TailscaleIPs()` | [`Server::tailscale_ips`] | `(Ipv4Addr, Option<Ipv6Addr>)` |
+//! | `CertDomains()` | [`Server::cert_domains`] | `Vec<String>` |
+//! | `LocalClient().Status` | [`Server::status`] | [`Status`] |
+//! | `LocalClient().Logout` | [`Server::logout`] | `()` |
+//! | `Close()` | [`Server::close`] | `bool` (shut down cleanly within the timeout?) |
+//! | `Sys()` / full `LocalClient()` | [`Server::device`] | [`Device`] reference — the whole engine surface |
+//!
+//! Lifecycle errors unify into the Go-shaped [`Error`]; specialized calls keep their fork-typed
+//! errors ([`Server::listen_funnel`] → [`ts_control::FunnelError`], [`Server::listen_service`] →
+//! [`ServiceError`]).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -349,7 +401,7 @@ pub struct Loopback {
 /// `local_api_cred` (HTTP Basic auth, empty username) and speaks plain HTTP to `127.0.0.1`, so it is
 /// dependency-free (no `hyper`) and needs only the `tsnet` feature.
 ///
-/// The fork's [`Status`](crate::Status) is not a `serde` type, so [`status`](Self::status) returns
+/// The fork's [`Status`] is not a `serde` type, so [`status`](Self::status) returns
 /// the server's raw JSON bytes rather than a deserialized struct; for typed status prefer
 /// [`Server::status`] (the in-process path). For arbitrary endpoints use [`get`](Self::get).
 #[derive(Clone, Debug)]
