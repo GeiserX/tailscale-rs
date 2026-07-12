@@ -31,8 +31,11 @@
 //! * inbound/outbound connections keep their engine types ([`DialConn`](crate::DialConn),
 //!   [`netstack::TcpListener`], …);
 //! * specialized calls keep the fork's **typed** errors ([`ServiceError`],
-//!   [`FunnelError`](ts_control::FunnelError)); only the *lifecycle* path — which in Go is a single
-//!   opaque `error` — is unified into [`Error`];
+//!   [`FunnelError`](ts_control::FunnelError)) — carried unchanged as a variant of a thin wrapper
+//!   ([`ListenFunnelError`] / [`ListenServiceError`]) whose other variant keeps a lazy-start failure
+//!   distinct from the engine's typed error (so a node that never registered is never misreported as
+//!   an access denial); the plain *lifecycle* path — a single opaque `error` in Go — unifies into
+//!   [`Error`];
 //! * addresses are accepted as Go-style `network, addr` **strings** (`"tcp"`, `":80"`) for
 //!   familiarity, and parsed to the typed [`SocketAddr`] the engine wants.
 //!
@@ -87,9 +90,10 @@
 //! | `Close()` | [`Server::close`] | `bool` (shut down cleanly within the timeout?) |
 //! | `Sys()` / full `LocalClient()` | [`Server::device`] | [`Device`] reference — the whole engine surface |
 //!
-//! Lifecycle errors unify into the Go-shaped [`Error`]; specialized calls keep their fork-typed
-//! errors ([`Server::listen_funnel`] → [`ts_control::FunnelError`], [`Server::listen_service`] →
-//! [`ServiceError`]).
+//! Lifecycle errors unify into the Go-shaped [`Error`]; the specialized Funnel/Service calls keep
+//! their fork-typed errors while distinguishing a lazy-start failure from the engine error
+//! ([`Server::listen_funnel`] → [`ListenFunnelError`] over [`ts_control::FunnelError`],
+//! [`Server::listen_service`] → [`ListenServiceError`] over [`ServiceError`]).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -211,8 +215,9 @@ impl StateStore for MemStore {
 ///
 /// Go returns a single opaque `error` everywhere; this fork returns *typed* errors. [`Error`] is the
 /// Go-shaped unification for the lifecycle path only — the specialized calls that already carry rich
-/// typed errors keep them: [`Server::listen_funnel`] → [`ts_control::FunnelError`],
-/// [`Server::listen_service`] → [`ServiceError`].
+/// typed errors keep them, wrapped so a lazy-start failure stays distinct from the engine error:
+/// [`Server::listen_funnel`] → [`ListenFunnelError`] (over [`ts_control::FunnelError`]),
+/// [`Server::listen_service`] → [`ListenServiceError`] (over [`ServiceError`]).
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -329,6 +334,58 @@ impl From<FunnelOptions> for ts_control::FunnelOptions {
             funnel_only: o.funnel_only,
         }
     }
+}
+
+/// Why [`Server::listen_funnel`] failed — a **lifecycle/start** failure kept distinct from the
+/// engine's typed Funnel error.
+///
+/// The wrapper lazily starts the node before it can funnel, so two very different failures are
+/// possible: the node never came up (bad config, registration/`Up` failure — a *lifecycle* error),
+/// or the node is up but the fail-closed Funnel gate denied the request (missing `funnel`/`https`
+/// node attributes, a disallowed port, or a certificate failure). Collapsing the former into
+/// [`ts_control::FunnelError::NotAllowed`] would misreport a startup failure as an *access denial* —
+/// telling the operator to fix their tailnet ACLs when the node simply never registered. This enum
+/// keeps them apart and preserves the real underlying cause on either path.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ListenFunnelError {
+    /// The node could not be lazily built or brought up — a lifecycle failure, *not* a Funnel
+    /// denial. Carries the real underlying [`Error`] (e.g. [`Error::InvalidControlUrl`], a
+    /// [`Error::Registration`], or a device build error) so the true cause is never lost.
+    #[error("failed to start the node before listening on funnel: {0}")]
+    Start(#[from] Error),
+
+    /// The node is up, but the engine's fail-closed Funnel path returned a typed
+    /// [`ts_control::FunnelError`] — the node-attribute/port access gate
+    /// ([`NotAllowed`](ts_control::FunnelError::NotAllowed) /
+    /// [`PortNotAllowed`](ts_control::FunnelError::PortNotAllowed)) or certificate assembly
+    /// ([`Cert`](ts_control::FunnelError::Cert)). Passed through unchanged.
+    #[error(transparent)]
+    Funnel(#[from] ts_control::FunnelError),
+}
+
+/// Why [`Server::listen_service`] failed — a **lifecycle/start** failure kept distinct from the
+/// engine's typed VIP-service error.
+///
+/// As with [`ListenFunnelError`], the wrapper must lazily start the node first, so a startup failure
+/// (bad config, registration/`Up` failure) is a *lifecycle* error — not the same thing as the
+/// engine's [`ServiceError`] (invalid name, untagged host, no assigned VIP, or a listener bind
+/// failure). Collapsing a start failure into [`ServiceError::Listen`] would misreport it as a
+/// bind failure; this enum keeps the two apart and preserves the real underlying cause.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ListenServiceError {
+    /// The node could not be lazily built or brought up — a lifecycle failure, *not* a listener
+    /// bind failure. Carries the real underlying [`Error`] so the true cause is never lost.
+    #[error("failed to start the node before listening on service: {0}")]
+    Start(#[from] Error),
+
+    /// The node is up, but the engine's fail-closed VIP-service path returned a typed
+    /// [`ServiceError`] (invalid name, [`UntaggedHost`](ServiceError::UntaggedHost),
+    /// [`NoAssignedVip`](ServiceError::NoAssignedVip), or a genuine
+    /// [`Listen`](ServiceError::Listen) bind failure). Passed through unchanged.
+    #[error(transparent)]
+    Service(#[from] ServiceError),
 }
 
 /// A listener for a hosted Tailscale VIP service, the Rust analog of Go's `*tsnet.ServiceListener`
@@ -741,32 +798,47 @@ impl Server {
 
     /// Expose a tailnet TLS service to the public internet via Tailscale Funnel (Go `ListenFunnel`).
     ///
-    /// Keeps the fork's typed [`ts_control::FunnelError`] (fail-closed access gate + cert). `cfg`
-    /// names the MagicDNS name + tailnet port; `opts` carries [`FunnelOptions`].
+    /// A thin wrapper over [`Device::listen_funnel`](crate::Device::listen_funnel): it lazily starts
+    /// the node, converts [`FunnelOptions`] into the engine's [`ts_control::FunnelOptions`] serve
+    /// config, and hands `cfg` (the MagicDNS name + tailnet port) straight through. On success it
+    /// yields the engine's [`FunnelAcceptedReceiver`](ts_runtime::funnel::FunnelAcceptedReceiver).
+    ///
+    /// Errors are a [`ListenFunnelError`], which keeps a **lifecycle/start** failure
+    /// ([`Start`](ListenFunnelError::Start)) distinct from the engine's typed Funnel error
+    /// ([`Funnel`](ListenFunnelError::Funnel)): a node that never registered surfaces as a startup
+    /// failure carrying its real cause, never misdiagnosed as a Funnel access denial.
     pub async fn listen_funnel(
         &self,
         cfg: &crate::ServeConfig,
         opts: FunnelOptions,
-    ) -> Result<ts_runtime::funnel::FunnelAcceptedReceiver, ts_control::FunnelError> {
-        let dev = self
-            .started()
-            .await
-            .map_err(|_| ts_control::FunnelError::NotAllowed)?;
-        dev.listen_funnel(cfg, opts.into()).await
+    ) -> Result<ts_runtime::funnel::FunnelAcceptedReceiver, ListenFunnelError> {
+        // `?` maps a lazy-start failure (`Error`) to `ListenFunnelError::Start`, preserving the
+        // real cause — it is NOT flattened to `FunnelError::NotAllowed` (an access denial).
+        let dev = self.started().await?;
+        // `?` maps the engine's typed `FunnelError` to `ListenFunnelError::Funnel`, unchanged.
+        Ok(dev.listen_funnel(cfg, opts.into()).await?)
     }
 
     /// Host a Tailscale VIP service (Go `ListenService`), returning a Go-shaped [`ServiceListener`]
-    /// (overlay listener + resolved FQDN). Keeps the fork's typed [`ServiceError`]
-    /// (`UntaggedHost` == Go `ErrUntaggedServiceHost`).
+    /// (overlay listener + resolved FQDN).
+    ///
+    /// A thin wrapper over [`Device::listen_service`](crate::Device::listen_service): it lazily
+    /// starts the node, passes `name` + the [`ServiceMode`] serve config straight through, and pairs
+    /// the returned overlay listener with the node's resolved service FQDN.
+    ///
+    /// Errors are a [`ListenServiceError`], which keeps a **lifecycle/start** failure
+    /// ([`Start`](ListenServiceError::Start)) distinct from the engine's typed [`ServiceError`]
+    /// ([`Service`](ListenServiceError::Service), whose `UntaggedHost` == Go
+    /// `ErrUntaggedServiceHost`): a node that never registered surfaces as a startup failure
+    /// carrying its real cause, never misdiagnosed as a listener bind failure.
     pub async fn listen_service(
         &self,
         name: &str,
         mode: ServiceMode,
-    ) -> Result<ServiceListener, ServiceError> {
-        let dev = self
-            .started()
-            .await
-            .map_err(|e| ServiceError::Listen(format!("server failed to start: {e}")))?;
+    ) -> Result<ServiceListener, ListenServiceError> {
+        // `?` maps a lazy-start failure (`Error`) to `ListenServiceError::Start`, preserving the
+        // real cause — it is NOT flattened to `ServiceError::Listen` (a bind failure).
+        let dev = self.started().await?;
         let inner = dev.listen_service(name, mode).await?;
         let fqdn = dev
             .self_node()
@@ -1594,6 +1666,115 @@ mod tests {
     fn funnel_options_map_to_engine() {
         let engine: ts_control::FunnelOptions = FunnelOptions::funnel_only().into();
         assert!(engine.funnel_only);
+    }
+
+    #[test]
+    fn funnel_options_default_maps_to_non_funnel_only() {
+        // The zero-value options serve both public Funnel and tailnet-internal ingress (Go's default
+        // when neither `FunnelOnly()` nor a TLS override is passed).
+        let engine: ts_control::FunnelOptions = FunnelOptions::default().into();
+        assert!(!engine.funnel_only);
+    }
+
+    // --- listen_funnel / listen_service: the wrapper's lifecycle-vs-typed error split ---
+    //
+    // A *successful* funnel/service listen needs a live tailnet + Funnel-enabled ACL (kept in
+    // integration/e2e). The hermetic, unit-testable contribution of the facade is the error split:
+    // the wrapper must lazily start the node first, and a start failure must surface as a lifecycle
+    // `Start` error carrying the real cause — never collapsed into the engine's access/bind error.
+    // These lock that contract using the same no-network idiom as the dial/start tests: a bad
+    // `control_url` fails fast at config build (`InvalidControlUrl`) before any I/O.
+
+    /// A `ServeConfig` whose contents are irrelevant here: the lazy start fails before it is ever
+    /// read. Valid-shaped so the call type-checks (`Accept` = hand the stream back, like `ListenTLS`).
+    fn dummy_serve_config() -> crate::ServeConfig {
+        crate::ServeConfig {
+            name: "node.example.ts.net".into(),
+            port: 443,
+            target: crate::ServeTarget::Accept,
+        }
+    }
+
+    #[tokio::test]
+    async fn listen_funnel_reports_a_start_failure_not_a_funnel_denial() {
+        // Regression for the skeleton's lossy `.map_err(|_| FunnelError::NotAllowed)`: a node that
+        // never registered must NOT be reported as lacking the "funnel"/"https" attributes. It must
+        // surface as `ListenFunnelError::Start` carrying the real `InvalidControlUrl` cause.
+        let mut s = Server::new();
+        s.control_url = Some("not a url".into());
+        let cfg = dummy_serve_config();
+        // Bind by-ref so the Display/source asserts can touch the error without needing the Ok type
+        // (`FunnelAcceptedReceiver`) to be `Debug`.
+        let res = s.listen_funnel(&cfg, FunnelOptions::default()).await;
+        match &res {
+            Err(e @ ListenFunnelError::Start(Error::InvalidControlUrl(_))) => {
+                // Non-lossy: the wrapper's message embeds the real cause and its source() chains to it.
+                assert!(
+                    e.to_string().contains("invalid control URL"),
+                    "start error dropped its underlying cause from Display: {e}"
+                );
+                assert!(
+                    std::error::Error::source(e).is_some(),
+                    "start error must expose the underlying Error as its source"
+                );
+            }
+            Err(ListenFunnelError::Start(e)) => panic!("start failed with the wrong cause: {e:?}"),
+            Err(ListenFunnelError::Funnel(f)) => {
+                panic!("a startup failure was misdiagnosed as a Funnel error: {f:?}")
+            }
+            Ok(_) => panic!("a bad control_url must not yield a live funnel listener"),
+        }
+    }
+
+    #[tokio::test]
+    async fn listen_service_reports_a_start_failure_not_a_bind_error() {
+        // Regression sibling for the skeleton's `ServiceError::Listen("server failed to start: …")`:
+        // a lazy-start failure must be a lifecycle `Start` error, not the engine's *bind* failure.
+        let mut s = Server::new();
+        s.control_url = Some("not a url".into());
+        let res = s
+            .listen_service("svc:web", ServiceMode::Tcp { port: 80 })
+            .await;
+        match &res {
+            Err(e @ ListenServiceError::Start(Error::InvalidControlUrl(_))) => {
+                assert!(
+                    e.to_string().contains("invalid control URL"),
+                    "start error dropped its underlying cause from Display: {e}"
+                );
+                assert!(
+                    std::error::Error::source(e).is_some(),
+                    "start error must expose the underlying Error as its source"
+                );
+            }
+            Err(ListenServiceError::Start(e)) => panic!("start failed with the wrong cause: {e:?}"),
+            Err(ListenServiceError::Service(se)) => {
+                panic!("a startup failure was misdiagnosed as a ServiceError: {se:?}")
+            }
+            Ok(_) => panic!("a bad control_url must not yield a live service listener"),
+        }
+    }
+
+    #[test]
+    fn listen_funnel_error_carries_the_engine_funnel_error_unchanged() {
+        // The fix adds a `Start` path WITHOUT swallowing the engine's typed error: a genuine access
+        // denial still arrives fully typed via the `Funnel` variant (the `?`/`From` passthrough).
+        let e: ListenFunnelError = ts_control::FunnelError::PortNotAllowed(8443).into();
+        assert!(
+            matches!(
+                e,
+                ListenFunnelError::Funnel(ts_control::FunnelError::PortNotAllowed(8443))
+            ),
+            "engine FunnelError must pass through as ListenFunnelError::Funnel, unchanged"
+        );
+    }
+
+    #[test]
+    fn listen_service_error_carries_the_engine_service_error_unchanged() {
+        let e: ListenServiceError = ServiceError::UntaggedHost.into();
+        assert!(
+            matches!(e, ListenServiceError::Service(ServiceError::UntaggedHost)),
+            "engine ServiceError must pass through as ListenServiceError::Service, unchanged"
+        );
     }
 
     #[test]

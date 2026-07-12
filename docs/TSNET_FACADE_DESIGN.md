@@ -232,11 +232,18 @@ pub enum Error {
 - `#[from]` conversions make delegation one-liners (`Ok(dev.status().await?)`).
 - `crate::Error` is `Copy` + `std::error::Error`; `RegistrationError`, `LogoutError` are
   `thiserror` enums — all compose cleanly.
-- **Specialized calls keep their engine errors verbatim**, exactly as the engine exposes them:
-  - `listen_funnel` → [`ts_control::FunnelError`] (fail-closed access gate `NotAllowed` /
-    `PortNotAllowed`, plus `Cert`) — never flattened to a string.
-  - `listen_service` → [`ServiceError`], whose `UntaggedHost` variant **is** Go's
-    `ErrUntaggedServiceHost` (§10).
+- **Specialized calls keep their engine errors** as a variant of a thin wrapper that *also* keeps a
+  lazy-start (lifecycle) failure distinct — the wrapper must start the node before it can funnel/serve,
+  and a startup failure is not the same thing as an access/bind refusal, so it is never misreported as
+  one:
+  - `listen_funnel` → [`ListenFunnelError`]: the `Funnel(`[`ts_control::FunnelError`]`)` variant is the
+    engine's fail-closed access gate (`NotAllowed` / `PortNotAllowed`, plus `Cert`) verbatim; the
+    `Start(`[`Error`]`)` variant carries a lazy-start failure with its real cause — never flattened to
+    `FunnelError::NotAllowed` (which would read as an ACL denial for a node that simply never registered).
+  - `listen_service` → [`ListenServiceError`]: the `Service(`[`ServiceError`]`)` variant keeps the
+    engine error (whose `UntaggedHost` variant **is** Go's `ErrUntaggedServiceHost`, §10); the
+    `Start(`[`Error`]`)` variant carries a lazy-start failure — never flattened to `ServiceError::Listen`
+    (a listener-bind failure).
 - `#[non_exhaustive]` so new variants (e.g. when `Logf` or prefs-persistence land) are not a breaking
   change.
 - `impl std::error::Error` means a caller who wants Go's "just an error" can still
