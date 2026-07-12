@@ -309,6 +309,11 @@ ts_test_util.workspace = true
 workspace = true
 
 [features]
+# Enable the `tsnet` module: a Go-idiomatic `tsnet.Server`-shaped facade over `Device`/`Config`
+# (settable fields → `Config`, lazy start, `Listen`/`Dial`/`Up`/`Close`/`ListenFunnel`/`ListenService`).
+# A thin ergonomics layer only — no new engine, no new crate. Pulls no extra dependencies (reuses the
+# crate's existing serde_json/tokio/thiserror). See `src/tsnet.rs` and `docs/TSNET_FACADE_DESIGN.md`.
+tsnet = []
 # Enable the `axum` module, which enables you to run an `axum` HTTP server on top of a tailscale TCP
 # listener.
 axum = ["dep:axum"]

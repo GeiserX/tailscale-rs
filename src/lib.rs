@@ -196,6 +196,8 @@ pub mod http;
 mod loopback;
 #[cfg(feature = "ssh")]
 pub mod ssh;
+#[cfg(feature = "tsnet")]
+pub mod tsnet;
 
 #[doc(inline)]
 pub use dial::{ConnectedUdpSocket, DialConn};
