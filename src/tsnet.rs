@@ -48,6 +48,7 @@ use tokio::sync::OnceCell;
 use ts_keys::PersistState;
 
 use crate::config::Config;
+use crate::dial;
 use crate::netstack;
 use crate::{Device, RegistrationError, ServiceError, ServiceMode, Status};
 
@@ -180,6 +181,15 @@ pub enum Error {
         addr: String,
         /// The parse failure.
         source: std::net::AddrParseError,
+    },
+
+    /// A Go-style dial `network` string was not one of the supported
+    /// `"tcp"`/`"tcp4"`/`"tcp6"`/`"udp"`/`"udp4"`/`"udp6"` (Go's `Dial` likewise rejects an unknown
+    /// network). Reported by [`Server::dial`] at the facade boundary, *before* the device is started.
+    #[error("unsupported network {network:?} (want tcp, tcp4, tcp6, udp, udp4, or udp6)")]
+    UnsupportedNetwork {
+        /// The offending `network` string.
+        network: String,
     },
 
     /// The [`StateStore`] backing [`Server::dir`]/[`Server::store`] failed an I/O operation.
@@ -491,14 +501,59 @@ impl Server {
         self.started().await
     }
 
-    /// Dial a tailnet address (Go `Dial`). `network` is `"tcp"`/`"udp"`; `addr` is `host:port`.
+    /// Dial a tailnet address over TCP or UDP (Go `Dial(ctx, network, address)`), returning the
+    /// tsnet-shaped [`DialConn`](crate::DialConn) whose arm matches the transport.
+    ///
+    /// `network` is one of `"tcp"`, `"tcp4"`, `"tcp6"`, `"udp"`, `"udp4"`, `"udp6"`; `addr` is a
+    /// `host:port` string — a MagicDNS name or an IP literal (bracketed for IPv6,
+    /// `[2001:db8::1]:443`). The network string is parsed at the facade boundary, so an unsupported
+    /// network is a typed [`Error::UnsupportedNetwork`] reported **before** the device is started
+    /// (fail-fast, no network I/O). For the common case, [`Server::dial_tcp`] / [`Server::dial_udp`]
+    /// hand back the transport's stream / socket directly.
+    ///
+    /// Routing: the unsuffixed `"tcp"`/`"udp"` forward to the transport-specific typed accessors
+    /// [`Device::dial_tcp`](crate::Device::dial_tcp) / [`Device::dial_udp`](crate::Device::dial_udp)
+    /// (for `Family::Any` these *are* [`Device::dial`](crate::Device::dial)'s arms); the family-pinned
+    /// `…4`/`…6` forms forward to [`Device::dial`], which enforces the v4/v6 constraint that the
+    /// family-agnostic sub-calls do not.
     pub async fn dial(&self, network: &str, addr: &str) -> Result<crate::DialConn, Error> {
-        Ok(self.started().await?.dial(network, addr).await?)
+        // Parse the Go-style network string first: an unknown network is a typed facade error that
+        // never starts the device (Go's `Dial` also rejects unknown networks up front).
+        let net = dial::parse_network(network).map_err(|_| Error::UnsupportedNetwork {
+            network: network.to_string(),
+        })?;
+        let dev = self.started().await?;
+        Ok(match (net.transport, net.family) {
+            // Unsuffixed tcp/udp: the family follows the resolved address, so these are exactly the
+            // transport-specific typed Device calls — route over them and wrap into `DialConn`.
+            (dial::Transport::Tcp, dial::Family::Any) => {
+                crate::DialConn::Tcp(dev.dial_tcp(addr).await?)
+            }
+            (dial::Transport::Udp, dial::Family::Any) => {
+                crate::DialConn::Udp(dev.dial_udp(addr).await?)
+            }
+            // Family-pinned (tcp4/tcp6/udp4/udp6): forward the whole network string so the engine
+            // enforces the v4/v6 family that the family-agnostic sub-calls above would ignore.
+            _ => dev.dial(network, addr).await?,
+        })
     }
 
-    /// Dial a tailnet TCP address, yielding the overlay stream.
+    /// Dial a tailnet TCP address, yielding the overlay stream directly — the common case of
+    /// [`Server::dial`] for `"tcp"`. This is the building block for HTTP-over-tailnet: a `hyper`/
+    /// `reqwest` connector dials with `dial_tcp(&format!("{host}:{port}"))`, mirroring Go
+    /// `tsnet.Server.HTTPClient`.
     pub async fn dial_tcp(&self, addr: &str) -> Result<netstack::TcpStream, Error> {
         Ok(self.started().await?.dial_tcp(addr).await?)
+    }
+
+    /// Dial a tailnet UDP address, yielding the connected overlay socket directly — the `"udp"`
+    /// sibling of [`Server::dial_tcp`] and the common case of [`Server::dial`] for `"udp"`.
+    ///
+    /// Returns a [`ConnectedUdpSocket`](crate::ConnectedUdpSocket) (`send`/`recv` against a fixed
+    /// peer) — the connected-`net.Conn` shape Go's `Dial("udp", …)` returns, as opposed to
+    /// [`Server::listen_packet`]'s unconnected packet socket.
+    pub async fn dial_udp(&self, addr: &str) -> Result<crate::ConnectedUdpSocket, Error> {
+        Ok(self.started().await?.dial_udp(addr).await?)
     }
 
     /// Listen for inbound TCP on the tailnet (Go `Listen`). `addr` may be `":80"` (any host) or
@@ -973,5 +1028,89 @@ mod tests {
         s.control_url = Some("not a url".into());
         assert!(matches!(s.start().await, Err(Error::InvalidControlUrl(_))));
         assert!(s.close(None).await);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Dial surface: Go-style `network`-string parsing + fail-fast, over
+    // Device::dial / dial_tcp / dial_udp.
+    //
+    // A *successful* dial establishes an overlay connection, so it needs a live tailnet (kept in
+    // integration/e2e). The hermetic, unit-testable half is the facade's own contribution: it
+    // parses the `network` string BEFORE starting the device, so an unsupported network is a typed
+    // `UnsupportedNetwork` with no network I/O, and a supported one only then proceeds to the lazy
+    // start (which a bad `Config` still fails fast, never hangs). These assert that ordering — and
+    // that the typed accessors `dial_tcp`/`dial_udp` are wired to the engine.
+    // -----------------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn dial_rejects_unsupported_network_fail_fast() {
+        // Every non-tsnet network string is a typed facade error, echoing the offending value, and
+        // returns WITHOUT starting the device: a default `Server` has no control server, so if this
+        // touched the network it would block — returning at all proves the parse is up front.
+        for n in ["", "TCP", "tcp5", "sctp", "unix", "ip", "udplite", "tcp ", " udp"] {
+            match Server::new().dial(n, "host:80").await {
+                Err(Error::UnsupportedNetwork { network }) => assert_eq!(network, n),
+                Err(e) => panic!("dial({n:?}) should be UnsupportedNetwork, got Err({e:?})"),
+                Ok(_) => panic!("dial({n:?}) should be UnsupportedNetwork, got Ok(conn)"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dial_accepts_every_tsnet_network_then_reaches_lazy_start() {
+        // The six supported networks all pass the facade parse and proceed to the lazy start; with a
+        // bad control_url that start fails fast at `build_config` (InvalidControlUrl) — never a hang,
+        // and never UnsupportedNetwork. This proves both that the tsnet set is accepted and that the
+        // parse precedes the device build. (The `addr` is a realistic per-network example but is not
+        // reached here — the bad config surfaces before any address resolution; `addr` parsing is
+        // covered by the `dial` module's own `split_host_port` tests.)
+        for (n, addr) in [
+            ("tcp", "host:80"),
+            ("tcp4", "1.2.3.4:80"),
+            ("tcp6", "[2001:db8::1]:80"),
+            ("udp", "host:53"),
+            ("udp4", "1.2.3.4:53"),
+            ("udp6", "[2001:db8::1]:53"),
+        ] {
+            let mut s = Server::new();
+            s.control_url = Some("not a url".into());
+            assert!(
+                matches!(s.dial(n, addr).await, Err(Error::InvalidControlUrl(_))),
+                "dial({n:?}, {addr:?}) with a bad control_url should fail fast at config build"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dial_parses_network_before_touching_config() {
+        // Ordering: an unsupported network is reported even when the control_url is ALSO invalid,
+        // because the network parse happens before the lazy start that would surface the bad URL.
+        let mut s = Server::new();
+        s.control_url = Some("not a url".into());
+        match s.dial("sctp", "host:80").await {
+            Err(Error::UnsupportedNetwork { network }) => assert_eq!(network, "sctp"),
+            Err(e) => panic!("network parse must precede config build, got Err({e:?})"),
+            Ok(_) => panic!("network parse must precede config build, got Ok(conn)"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dial_tcp_and_dial_udp_fail_fast_on_bad_config() {
+        // The direct typed accessors (dial_tcp → TcpStream, dial_udp → ConnectedUdpSocket) go
+        // straight to the lazy start, so a bad `Config` fails them fast too — exercising that both
+        // are wired to the engine and share the fail-fast contract (never a hang).
+        let mut s = Server::new();
+        s.control_url = Some("not a url".into());
+        assert!(matches!(
+            s.dial_tcp("host:80").await,
+            Err(Error::InvalidControlUrl(_))
+        ));
+
+        let mut s = Server::new();
+        s.control_url = Some("not a url".into());
+        assert!(matches!(
+            s.dial_udp("host:80").await,
+            Err(Error::InvalidControlUrl(_))
+        ));
     }
 }
