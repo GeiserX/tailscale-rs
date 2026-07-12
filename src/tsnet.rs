@@ -689,4 +689,241 @@ mod tests {
     fn _server_is_send_sync() {
         _assert_send_sync::<Server>();
     }
+
+    // -----------------------------------------------------------------------------------------
+    // Config surface: the Go-named `Server` fields → `Config` mapping (docs/TSNET_FACADE_DESIGN.md
+    // §5) and the `Dir`/`Store` state-root shim over `Config::key_state` (§8). These exercise the
+    // private async `build_config` directly (same-module access), so the field translation and the
+    // identity round-trip are *asserted*, not merely compiled.
+    // -----------------------------------------------------------------------------------------
+
+    /// A unique, empty scratch dir for an on-disk state test. The facade adds **no** `tempfile`
+    /// dependency (the zero-new-dep constraint), so this rolls its own: namespaced by pid + a
+    /// per-test label (concurrent test binaries never collide) and wiped up front so a stale run
+    /// can't mask a bug.
+    fn scratch_dir(label: &str) -> PathBuf {
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("tsnet-rs-test-{pid}-{label}"));
+        std::fs::remove_dir_all(&dir).ok();
+        dir
+    }
+
+    #[tokio::test]
+    async fn build_config_maps_every_go_field_onto_config() {
+        // Every Go-parity field set to a non-default; assert build_config copies each onto the
+        // matching Config field — the §5 mapping table, row by row.
+        let mut srv = Server::new();
+        srv.hostname = Some("web".into());
+        srv.auth_key = Some("tskey-auth-xxxx".into());
+        srv.control_url = Some("https://control.example.com".into());
+        srv.ephemeral = false;
+        srv.advertise_tags = vec!["tag:web".into(), "tag:prod".into()];
+        srv.port = Some(41641);
+        srv.run_web_client = true;
+        srv.client_id = Some("cid".into());
+        srv.client_secret = Some("csecret".into());
+        srv.id_token = Some("idtok".into());
+        srv.audience = Some("aud".into());
+
+        let cfg = srv.build_config().await.unwrap();
+
+        assert_eq!(cfg.requested_hostname.as_deref(), Some("web"));
+        assert_eq!(cfg.auth_key.as_deref(), Some("tskey-auth-xxxx"));
+        assert_eq!(cfg.control_server_url.scheme(), "https");
+        assert_eq!(cfg.control_server_url.host_str(), Some("control.example.com"));
+        assert_eq!(
+            cfg.requested_tags,
+            vec!["tag:web".to_string(), "tag:prod".to_string()]
+        );
+        assert_eq!(cfg.wireguard_listen_port, Some(41641));
+        assert!(cfg.run_web_client);
+        assert_eq!(cfg.client_id.as_deref(), Some("cid"));
+        assert_eq!(cfg.client_secret.as_deref(), Some("csecret"));
+        assert_eq!(cfg.id_token.as_deref(), Some("idtok"));
+        assert_eq!(cfg.audience.as_deref(), Some("aud"));
+        // Tun unset ⇒ the default userspace netstack transport is preserved.
+        assert_eq!(cfg.transport_mode, crate::TransportMode::Netstack);
+    }
+
+    #[tokio::test]
+    async fn build_config_forces_go_default_ephemeral() {
+        // Go's zero-value Server is a *persistent* node, yet a bare Config::default() is ephemeral.
+        // build_config must force Go's default by always writing config.ephemeral = self.ephemeral.
+        assert!(
+            Config::default().ephemeral,
+            "precondition: a bare Config defaults to ephemeral=true"
+        );
+        let cfg = Server::new().build_config().await.unwrap();
+        assert!(
+            !cfg.ephemeral,
+            "a default tsnet::Server maps to a non-ephemeral Config (Go parity)"
+        );
+
+        // …and an explicit opt-in is honored.
+        let mut srv = Server::new();
+        srv.ephemeral = true;
+        assert!(srv.build_config().await.unwrap().ephemeral);
+    }
+
+    #[tokio::test]
+    async fn build_config_none_control_url_keeps_engine_default() {
+        let cfg = Server::new().build_config().await.unwrap();
+        assert_eq!(cfg.control_server_url, Config::default().control_server_url);
+    }
+
+    #[tokio::test]
+    async fn build_config_rejects_a_bad_control_url() {
+        let mut srv = Server::new();
+        srv.control_url = Some("not a url".into());
+        // `Config` isn't `Debug`, so match on the result rather than `unwrap_err()`.
+        assert!(matches!(
+            srv.build_config().await,
+            Err(Error::InvalidControlUrl(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn build_config_tun_selects_kernel_tun_transport() {
+        let mut srv = Server::new();
+        srv.tun = Some(TunSpec {
+            name: Some("tailscale0".into()),
+            mtu: Some(1280),
+        });
+        let cfg = srv.build_config().await.unwrap();
+        assert_eq!(
+            cfg.transport_mode,
+            crate::TransportMode::Tun(crate::TunConfig {
+                name: Some("tailscale0".into()),
+                mtu: Some(1280),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn build_config_runs_configure_hook_after_mapping() {
+        // The escape hatch reaches fork-superset Config knobs that have no Go tsnet field, and runs
+        // after the field mapping — so both the hook's writes and the mapped fields are present.
+        let mut srv = Server::new();
+        srv.hostname = Some("exit".into());
+        srv.configure(|c| {
+            c.advertise_exit_node = true;
+            c.accept_routes = true;
+        });
+        let cfg = srv.build_config().await.unwrap();
+        assert!(cfg.advertise_exit_node);
+        assert!(cfg.accept_routes);
+        assert_eq!(cfg.requested_hostname.as_deref(), Some("exit"));
+    }
+
+    #[test]
+    fn file_store_round_trips_on_disk() {
+        // The on-disk StateStore (Go store.FileStore): write-then-read, and a fresh store over the
+        // same dir still sees the value (identity survives a process restart).
+        let dir = scratch_dir("filestore");
+        let store = FileStore::new(dir.clone());
+        assert!(
+            store.read_state(STATE_KEY).unwrap().is_none(),
+            "never-written ⇒ None (a missing file is not an error)"
+        );
+        store.write_state(STATE_KEY, b"identity-blob").unwrap();
+        assert!(
+            dir.join(STATE_FILE).exists(),
+            "FileStore::new persists under dir/STATE_FILE"
+        );
+        assert_eq!(
+            store.read_state(STATE_KEY).unwrap().as_deref(),
+            Some(&b"identity-blob"[..])
+        );
+        assert_eq!(
+            FileStore::new(dir.clone())
+                .read_state(STATE_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(&b"identity-blob"[..]),
+            "a fresh FileStore over the same dir reloads the persisted value"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn file_store_at_writes_the_exact_path() {
+        let dir = scratch_dir("filestore-at");
+        let path = dir.join("custom.state");
+        FileStore::at(path.clone())
+            .write_state(STATE_KEY, b"x")
+            .unwrap();
+        assert!(path.exists(), "FileStore::at writes to the exact path given");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn dir_persists_node_identity_across_builds() {
+        // The headline `Dir` shim over Config::key_state (§8): a Dir-rooted node writes the engine
+        // key file once and reloads the SAME identity on the next boot, instead of re-minting.
+        let dir = scratch_dir("dir-state-root");
+
+        let mut srv = Server::new();
+        srv.dir = Some(dir.clone());
+        let cfg1 = srv.build_config().await.unwrap();
+        assert!(
+            dir.join(STATE_FILE).exists(),
+            "Dir persists identity to dir/STATE_FILE via the engine key-file format"
+        );
+
+        let mut srv2 = Server::new();
+        srv2.dir = Some(dir.clone());
+        let cfg2 = srv2.build_config().await.unwrap();
+        assert_eq!(
+            serde_json::to_vec(&cfg1.key_state).unwrap(),
+            serde_json::to_vec(&cfg2.key_state).unwrap(),
+            "a Dir-rooted node reloads a stable identity rather than re-minting each boot"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn custom_store_round_trips_identity_through_build_config() {
+        // A custom StateStore is the pluggable backend (Go ipn.StateStore): build_config mints and
+        // writes the identity blob under STATE_KEY, and a second server on the same store reloads it.
+        let store: Arc<dyn StateStore> = Arc::new(MemStore::default());
+
+        let mut srv = Server::new();
+        srv.store = Some(store.clone());
+        let cfg1 = srv.build_config().await.unwrap();
+        assert!(
+            store.read_state(STATE_KEY).unwrap().is_some(),
+            "the store now holds the minted identity blob"
+        );
+
+        let mut srv2 = Server::new();
+        srv2.store = Some(store.clone());
+        let cfg2 = srv2.build_config().await.unwrap();
+        assert_eq!(
+            serde_json::to_vec(&cfg1.key_state).unwrap(),
+            serde_json::to_vec(&cfg2.key_state).unwrap(),
+            "a shared store yields a stable identity across servers"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_takes_precedence_over_dir() {
+        // §8 resolution order: an explicit `store` wins over `dir`. The identity lands in the store
+        // and the Dir key file is never written.
+        let dir = scratch_dir("store-precedence");
+        let store: Arc<dyn StateStore> = Arc::new(MemStore::default());
+
+        let mut srv = Server::new();
+        srv.dir = Some(dir.clone());
+        srv.store = Some(store.clone());
+        srv.build_config().await.unwrap();
+
+        assert!(store.read_state(STATE_KEY).unwrap().is_some());
+        assert!(
+            !dir.join(STATE_FILE).exists(),
+            "store must take precedence over dir (design §8)"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
