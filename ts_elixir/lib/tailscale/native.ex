@@ -364,4 +364,66 @@ defmodule Tailscale.Native do
   @spec rotate_node_key(Tailscale.Keystate.t()) ::
           {:ok, Tailscale.Keystate.t()} | {:error, any()}
   def rotate_node_key(_keys), do: err()
+
+  @typedoc """
+  A handle to a `tsnet.Server`-shaped embedded node. Built lazily; GC tears down its loopback
+  listeners and shuts the node down.
+  """
+  @opaque server :: reference()
+
+  @typedoc """
+  A handle to a node's in-process LocalAPI HTTP client (Go `tsnet.Server.LocalClient()`).
+  """
+  @opaque local_client :: reference()
+
+  @doc """
+  Build a new `tsnet.Server`-shaped node from a Go-parity option map (all keys optional):
+  `hostname`, `auth_key`, `control_url`, `ephemeral`, `dir`, `tags`. No network I/O — the node is
+  built on first use.
+  """
+  @spec server_new(%{}) :: {:ok, server()} | {:error, any()}
+  def server_new(_opts), do: err()
+
+  @doc """
+  Start the loopback surface, returning `{:ok, {socks_addr, proxy_cred, localapi_addr,
+  localapi_cred}}` (Go `Loopback() (addr, proxyCred, localAPICred, err)`).
+  """
+  @spec server_loopback(server()) ::
+          {:ok,
+           {{:inet.ip_address(), :inet.port_number()}, String.t(),
+            {:inet.ip_address(), :inet.port_number()}, String.t()}}
+          | {:error, any()}
+  def server_loopback(_server), do: err()
+
+  @doc """
+  Obtain a LocalClient for this node's in-process LocalAPI HTTP server (Go
+  `tsnet.Server.LocalClient()`), starting the loopback surface if needed.
+  """
+  @spec server_local_client(server()) :: {:ok, local_client()} | {:error, any()}
+  def server_local_client(_server), do: err()
+
+  @doc """
+  `GET /localapi/v0/status` over the loopback: the node + peer status as a JSON string.
+  """
+  @spec local_client_status(local_client()) :: {:ok, String.t()} | {:error, any()}
+  def local_client_status(_client), do: err()
+
+  @doc """
+  Authenticated `GET` against an arbitrary LocalAPI `path`, returning `{:ok, {code, body}}`.
+  """
+  @spec local_client_get(local_client(), String.t()) ::
+          {:ok, {non_neg_integer(), String.t()}} | {:error, any()}
+  def local_client_get(_client, _path), do: err()
+
+  @doc """
+  The LocalAPI HTTP server address (`{ip, port}`) this client talks to.
+  """
+  @spec local_client_address(local_client()) :: {:inet.ip_address(), :inet.port_number()}
+  def local_client_address(_client), do: err()
+
+  @doc """
+  The LocalAPI credential (HTTP Basic-auth password) this client sends.
+  """
+  @spec local_client_credential(local_client()) :: String.t()
+  def local_client_credential(_client), do: err()
 end

@@ -11,7 +11,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-tailscale.workspace = true
+tailscale = { workspace = true, features = ["tsnet"] }
 ts_control.workspace = true
 
 hex.workspace = true
