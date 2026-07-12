@@ -2,6 +2,25 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.43.0](https://github.com/GeiserX/tailscale-rs/compare/v0.42.1...v0.43.0) (2026-07-12)
+
+
+### Features
+
+* **bindings:** expose tsnet Server dual-cred Loopback + LocalClient in C/Python/Elixir ([281f21d](https://github.com/GeiserX/tailscale-rs/commit/281f21dc6c9b3669bf3751e04b2bb14e42c45f44))
+* **tsnet:** implement Server::listen/listen_packet with a tcp/udp network parser ([470e49f](https://github.com/GeiserX/tailscale-rs/commit/470e49fd3a38516870a27ae914adf70d0556738a))
+* **tsnet:** Server::dial tcp/udp network-string parsing over Device::dial{,_tcp,_udp} ([7850012](https://github.com/GeiserX/tailscale-rs/commit/78500123993bb2d316d4671b6c98439f8bc9a4aa))
+* **tsnet:** Server::listen_funnel/listen_service wrappers, split lifecycle-start from typed error ([e85875f](https://github.com/GeiserX/tailscale-rs/commit/e85875f279e315805761d9254d87dec4cc5c23ed))
+* **tsnet:** Server::loopback full Go parity — LocalAPI cred + in-process HTTP server, + local_client/http_client ([ddf19f3](https://github.com/GeiserX/tailscale-rs/commit/ddf19f3092528a6f87ca9c9ab8045367899aa8c9))
+* **tsnet:** tsnet_echo example + facade docs & Go API mapping ([22741be](https://github.com/GeiserX/tailscale-rs/commit/22741be86fa9fde938514d6b75f2c2e6309e7599))
+
+
+### Bug Fixes
+
+* **metrics:** use portable-atomic for AtomicU64 (32-bit target support) ([#280](https://github.com/GeiserX/tailscale-rs/issues/280)) ([6c7a1bd](https://github.com/GeiserX/tailscale-rs/commit/6c7a1bd9104e7fb444105bc721a5b8e0cc9443b1))
+* **tsnet:** address 5 review findings on the tsnet facade ([8a81ba9](https://github.com/GeiserX/tailscale-rs/commit/8a81ba9b09f6b23c8ca9c959278dea243e5d10cf))
+* **tsnet:** address 7 CodeRabbit review findings on PR [#283](https://github.com/GeiserX/tailscale-rs/issues/283) ([b871761](https://github.com/GeiserX/tailscale-rs/commit/b871761b9e4c506182dafb2367315015d76e1cd2))
+
 ## [0.42.1](https://github.com/GeiserX/tailscale-rs/compare/v0.42.0...v0.42.1) (2026-07-11)
 
 
