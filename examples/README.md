@@ -33,6 +33,13 @@ A UDP client that sends "hello" to a tailnet peer on a configurable interval.
 
 A TCP server that listens on the tailnet and echoes input back to the sender.
 
+### [tsnet Echo](tsnet_echo)
+
+The same TCP echo server as [TCP Echo](tcp_echo), rewritten against the Go-idiomatic
+[`tsnet::Server`](../src/tsnet.rs) facade (requires `--features tsnet`): set the
+`tsnet.Server`-parity fields, then call a method and let the node start lazily — the shape a Go
+`tsnet` user expects.
+
 ### [SSH Peer Lookup](ssh_peer_lookup)
 
 A TUI app served over an in-process SSH server which allows you to query info about peers on your

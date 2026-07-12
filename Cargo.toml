@@ -354,5 +354,9 @@ name = "peer_ping"
 name = "tcp_echo"
 
 [[example]]
+name = "tsnet_echo"
+required-features = ["tsnet"]
+
+[[example]]
 name = "ssh_peer_lookup"
 required-features = ["ssh"]

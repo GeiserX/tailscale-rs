@@ -91,6 +91,71 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 ```
 
+### tsnet facade (Go-idiomatic `Server`)
+
+If you're coming from Go's [`tsnet`](https://pkg.go.dev/tailscale.com/tsnet), the optional `tsnet`
+feature adds a `tsnet::Server` facade with the shape you already know — settable fields, a lazy
+`Start` on the first method call, and `Up`/`Listen`/`Dial`/`Loopback`/`ListenFunnel`/`ListenService`/
+`Close`. It's a **thin ergonomics layer** over the same `Device`/`Config` engine — no new crate, same
+typed returns — so you get Go's lifecycle *shape* without giving up Rust's typed values.
+
+```toml
+[dependencies]
+tailscale = { package = "geiserx_tailscale", version = "0.6", features = ["tsnet"] }
+```
+
+```rust
+use tailscale::tsnet::Server;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Set fields where Go writes struct fields...
+    let mut srv = Server::new();
+    srv.hostname = Some("web".into());
+    srv.auth_key = Some("YOUR_AUTH_KEY_HERE".into());
+    srv.dir = Some("web_state".into());
+
+    // ...then call a method: the wrapped Device is built and started lazily here.
+    let listener = srv.listen("tcp", ":80").await?;
+    loop {
+        let conn = listener.accept().await?;
+        // ...serve conn... (see the tsnet_echo example for a full echo server)
+        drop(conn);
+    }
+}
+```
+
+The equivalent Go:
+
+```go
+srv := &tsnet.Server{Hostname: "web", AuthKey: key, Dir: "web_state"}
+defer srv.Close()
+ln, _ := srv.Listen("tcp", ":80")
+```
+
+See the runnable [`tsnet_echo` example](examples/tsnet_echo) — the [`tcp_echo`](examples/tcp_echo)
+server rewritten against this facade — and the crate's `tsnet` module docs.
+
+#### Go `tsnet.Server` → `tsnet::Server` mapping
+
+| Go `tsnet.Server` | `tsnet::Server` | Notes |
+|---|---|---|
+| struct fields (`Hostname`, `AuthKey`, `ControlURL`, `Ephemeral`, `AdvertiseTags`, `Port`, `Dir`, `Store`, `Tun`, …) | public fields on `Server` | Set before the first method call. |
+| `Start()` / `Up(ctx)` | `start()` / `up(timeout)` | Lazy start; `up` waits until `Running`. |
+| `Dial(ctx, net, addr)` | `dial(net, addr)` | Returns the typed `DialConn` (`dial_tcp`/`dial_udp` for the stream/socket directly). |
+| `Listen(net, addr)` | `listen(net, addr)` | Returns the overlay `netstack::TcpListener`. |
+| `ListenPacket(net, addr)` | `listen_packet(net, addr)` | Returns the overlay `netstack::UdpSocket`. |
+| `ListenFunnel(...)` / `ListenService(name, mode)` | `listen_funnel(...)` / `listen_service(name, mode)` | Keep the fork-typed `FunnelError` / `ServiceError`. |
+| `Loopback()` / `LocalClient()` | `loopback()` / `local_client()` | SOCKS5 proxy + in-process LocalAPI HTTP server. |
+| `HTTPClient()` | `http_client()` | Requires the `hyper` feature. |
+| `TailscaleIPs()` / `CertDomains()` | `tailscale_ips()` / `cert_domains()` | |
+| `Close()` | `close(timeout)` | Consumes the server; reports whether it shut down cleanly in time. |
+
+For fork capabilities beyond Go `tsnet` parity (accept-routes, exit nodes, residential-proxy exit
+egress, …) reach the full `Config` via `Server::configure`, or drop to the whole engine surface with
+`Server::device`. The complete field/method mapping (with parity verdicts) and the design rationale
+live in [docs/TSNET_FACADE_DESIGN.md](docs/TSNET_FACADE_DESIGN.md).
+
 ## How it works
 
 A `Device` joins the tailnet by authenticating to the **control plane** over Tailscale's
