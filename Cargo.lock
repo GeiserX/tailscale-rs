@@ -1844,6 +1844,7 @@ name = "geiserx_tailscale"
 version = "0.42.1"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "clap 4.6.1",

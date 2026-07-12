@@ -67,7 +67,8 @@ not a facade, and would discard the fork's typed values. So the design draws a d
 | State store | `tsnet::StateStore` / `FileStore` / `MemStore` | Go `ipn.StateStore` / `store.FileStore` / `mem.Store` analogs (§8). |
 | Funnel options | `tsnet::FunnelOptions` (`funnel_only`, `with_tls`) | Rust-idiomatic collapse of Go's variadic `...FunnelOption` (§9). |
 | Service listener | `tsnet::ServiceListener` | Go's `*tsnet.ServiceListener` (`net.Listener` + `FQDN`) analog (§10). |
-| Loopback result | `tsnet::Loopback` | Names Go's `(addr, proxyCred, localAPICred, err)` tuple, minus the second cred (§11). |
+| Loopback result | `tsnet::Loopback` | Names Go's `(addr, proxyCred, localAPICred, err)` tuple — **both** creds + a running LocalAPI HTTP server (§11). |
+| LocalAPI client | `tsnet::LocalClient` | Go's `LocalClient()` return — a client that round-trips through the loopback LocalAPI (§11). |
 
 Methods keep Go's names in Rust snake_case: `start`, `up`, `close`, `dial`, `listen`,
 `listen_packet`, `listen_funnel`, `listen_service`, `loopback`, `tailscale_ips`, `cert_domains`,
@@ -190,7 +191,8 @@ would bloat the facade); the headline ones are folded onto `Server`, and the res
 | `ListenPacket(net, addr)` | `listen_packet(net, addr)` | `listen_packet` :697 | `netstack::UdpSocket` |
 | `ListenFunnel(net, addr, opts…)` | `listen_funnel(cfg, opts)` | `listen_funnel` :1874 | `FunnelAcceptedReceiver` (§9) |
 | `ListenService(name, mode)` | `listen_service(name, mode)` | `listen_service` :1940 | [`ServiceListener`] (§10) |
-| `Loopback()` | `loopback()` | `loopback` :772 | [`Loopback`] (§11) |
+| `Loopback()` | `loopback()` | `loopback` :774 + facade LocalAPI server | [`Loopback`] (§11) |
+| `LocalClient()` | `local_client()` | facade LocalAPI HTTP client over the loopback | [`LocalClient`] (§11) |
 | `TailscaleIPs()` | `tailscale_ips()` | `tailscale_ips` :434 | `(Ipv4Addr, Option<Ipv6Addr>)` |
 | `CertDomains()` | `cert_domains()` | `cert_domains` :860 | `Vec<String>` |
 | `LocalClient().Status` | `status()` | `status` :1207 | [`Status`] |
@@ -379,14 +381,44 @@ equivalence so a Go reader finds it.
 
 ---
 
-## 11. Loopback
+## 11. Loopback — full Go parity: two credentials + a live LocalAPI HTTP server
 
-`tsnet::Loopback { address: SocketAddr, proxy_cred: String, /* RAII handle */ }` names the engine's
-`(SocketAddr, String, LoopbackHandle)` return (`lib.rs:772`). This mirrors Go's
-`Loopback() (addr, proxyCred, localAPICred, err)` **minus the second credential**: the fork serves
-the SOCKS5 half with one cred and intentionally does not run the in-process LocalAPI HTTP server
-(matrix §5.1, `tsr-ask7`). The facade documents that delta at the type rather than papering over it,
-and exposes `shutdown(self)` (the handle also aborts on drop).
+`tsnet::Loopback { address, proxy_cred, local_api_address, local_api_cred }` implements the **full**
+Go `Loopback() (addr, proxyCred, localAPICred, err)` surface: **both** credentials, plus an
+in-process **LocalAPI HTTP server** that is actually running and serving (Go `localapi.Handler` on
+the loopback). This closes the gap the parity matrix flagged (matrix §5.1, `tsr-ask7`).
+
+- **SOCKS5 half** — the engine's own [`Device::loopback`](../src/lib.rs) (`lib.rs:774`) is unchanged:
+  it binds `127.0.0.1:0` and serves SOCKS5 (RFC 1928/1929) gated by `proxy_cred` (username `tsnet`).
+- **LocalAPI half** — `Server::loopback` layers a facade-owned HTTP/1.1 server on a **second**
+  `127.0.0.1:0` listener, gated by a **separate** `local_api_cred` (HTTP Basic-auth password; any
+  username, matching Go). It serves `GET /localapi/v0/status` backed by `Device::status`, returning
+  its JSON. The server is hand-rolled over `tokio` TCP — the crate's `hyper` is HTTP/2-**client**-only
+  (`Cargo.toml`), so there is no ready-made HTTP server to reuse; this mirrors how the SOCKS5 half
+  hand-rolls its own protocol in `src/loopback.rs`. Zero new dependencies (`base64` for Basic-auth
+  decode and `rand` for the credential are already in `[dependencies]`); no TLS, so the **ring-only**
+  crypto invariant is untouched.
+- **`Server::local_client()`** (Go `LocalClient()`) returns a dependency-free `LocalClient` that
+  round-trips authenticated `GET`s through that server (`/localapi/v0/status`), and
+  **`Server::http_client()`** (Go `HTTPClient()`, `#[cfg(feature = "hyper")]`) returns a `hyper_util`
+  client over [`Device::http_connector`](../src/http.rs).
+
+### The one honest delta (surfaced, not faked)
+
+Go muxes SOCKS5 + LocalAPI on a **single** listener (first-byte demux). This fork runs **two**
+`127.0.0.1` listeners — one per function — rather than re-implementing (or demuxing over) the proven
+engine SOCKS5 path. The observable contract is identical: a proxy gated by `proxy_cred`, a LocalAPI
+gated by `local_api_cred`. Both `SocketAddr`s are returned. This is documented at the [`Loopback`]
+type, per the project's "surface the delta" rule.
+
+### Lifecycle
+
+Like Go's `s.loopbackListener`, both listeners live for the `Server`'s lifetime and are torn down by
+`Server::close` (which aborts both accept loops and gracefully shuts the device down). `loopback()`
+is **idempotent** (cached in a `OnceCell`), returning the same addresses + credentials each call —
+also matching Go's `if s.loopbackListener == nil` guard. The device is held as `Arc<Device>` so the
+LocalAPI server can carry a `Weak<Device>` without blocking `close` from reclaiming the device by
+value for a graceful shutdown.
 
 ---
 
@@ -454,22 +486,30 @@ let status = srv.up(Some(Duration::from_secs(30))).await?;
 
 ## 14. Verification evidence
 
-All commands run against `feat/tsnet-facade` on the Rust 1.95.0 toolchain the repo pins.
+All commands run on the Rust 1.95.0 toolchain the repo pins (loopback/LocalAPI work on
+`feat/tsnet-loopback`, based on `feat/tsnet-facade`).
 
 | Check | Command | Result |
 |---|---|---|
-| Baseline builds | `cargo check -p geiserx_tailscale` | ✅ `Finished` |
-| Facade compiles vs real `Device`/`Config` | `cargo check -p geiserx_tailscale --features tsnet` | ✅ `Finished in 9.61s` |
-| Strict lint | `cargo clippy -p geiserx_tailscale --features tsnet -- -D warnings` | ✅ clean (0 warnings) |
-| Logic tests | `cargo test -p geiserx_tailscale --features tsnet tsnet::` | ✅ `6 passed; 0 failed` |
-| Default build unaffected | `cargo check -p geiserx_tailscale` (no features) | ✅ `Finished in 3.48s` |
+| Strict lint (lib + tests + examples) | `cargo clippy -p geiserx_tailscale --features tsnet --all-targets -- -D warnings` | ✅ clean (0 warnings) |
+| Logic tests | `cargo test -p geiserx_tailscale --features tsnet tsnet::` | ✅ `33 passed; 0 failed` |
+| Facade builds | `cargo build -p geiserx_tailscale --features tsnet` | ✅ `Finished` |
+| `http_client` path (hyper) | `cargo clippy -p geiserx_tailscale --features tsnet,hyper --all-targets -- -D warnings` | ✅ clean (0 warnings) |
 
-The reference skeleton (`src/tsnet.rs`) implements the load-bearing shape end-to-end — `Server` +
+`src/tsnet.rs` implements the load-bearing shape end-to-end against the real engine — `Server` +
 field→`Config` mapping + lazy `OnceCell` start + `Error` + `StateStore`/`FileStore`/`MemStore` +
-`FunnelOptions` + `ServiceListener` + `Loopback` — so "the shape compiles against the real engine" is
-demonstrated, not asserted. The 6 unit tests cover address parsing (`":80"` → unspecified host),
-`MemStore` round-trip, `FunnelOptions` → engine mapping, the Go-default (`ephemeral == false`), and a
-`Server: Send + Sync` compile-time assertion (required for `Arc<Server>` concurrent use).
+`FunnelOptions` + `ServiceListener`, plus the **full loopback surface** (§11): `Loopback` (both
+credentials), the in-process LocalAPI HTTP server, `LocalClient`, and the `hyper`-gated
+`http_client`.
+
+The 33 tests are hermetic (no live control server): address parsing, `MemStore`/`FileStore`/`Dir`
+identity round-trips, `FunnelOptions` → engine mapping, the Go-default (`ephemeral == false`), the
+`build_config` field mapping, and — new for the loopback work — the LocalAPI HTTP framing/auth as
+pure functions (`parse_head`, `basic_auth_password` (username-ignored), constant-time `cred_ok`,
+`parse_response`), the `status_json` serializer, and two **end-to-end** tests that drive the real
+in-process LocalAPI server over a `127.0.0.1` socket with a mock status backend (200 with the right
+cred, 401 without / wrong cred, 404 for unknown paths) and round-trip a `LocalClient` through it. A
+`Server: Send + Sync` compile-time assertion guards `Arc<Server>` concurrent use.
 
 ---
 
@@ -482,7 +522,7 @@ Each is documented at its call site; none blocks the facade shape.
 | Thread `FunnelTLSConfig` acceptor into `Device::listen_funnel` | `FunnelOptions::tls` warns until then | §9 |
 | `ServiceMode` `TerminateTLS` / `HTTPS` / `PROXYProtocol*` / `AcceptAppCaps` | enum gains fields; re-export follows | §10, matrix §3 |
 | Prefs + netmap persistence (full Go `Store` semantics) | `StateStore` KV already shaped for it | §8, matrix §5.3 |
-| `localAPICred` + in-process LocalAPI HTTP on loopback | `Loopback` documents the single-cred delta | §11, `tsr-ask7` |
+| ~~`localAPICred` + in-process LocalAPI HTTP on loopback~~ **(done, §11)** — both creds + a live LocalAPI server now ship; only the single-listener mux remains a delta | resolved | §11, `tsr-ask7` |
 | `Logf` / `UserLogf` injectable loggers, `LogtailWriter` | fields omitted rather than faked | matrix §5.2, `tsr-reh3` |
 | `listen_funnel_addr(net, addr, opts)` convenience overload | synthesize `ServeConfig` from `cert_domains()` | §9 |
 

@@ -41,15 +41,19 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::OnceCell;
+use tokio::task::AbortHandle;
 use ts_keys::PersistState;
 
 use crate::config::Config;
 use crate::netstack;
-use crate::{Device, RegistrationError, ServiceError, ServiceMode, Status};
+use crate::{Device, RegistrationError, ServiceError, ServiceMode, Status, StatusNode};
 
 // ---------------------------------------------------------------------------------------------
 // State store — the `Dir` / `Store` design (Go `ipn.StateStore` + `FileStore`), over `key_state`.
@@ -213,6 +217,11 @@ pub enum Error {
     /// A [`Server::logout`] call failed.
     #[error("logout error: {0}")]
     Logout(#[from] crate::LogoutError),
+
+    /// The loopback proxy / in-process LocalAPI HTTP server hit an I/O error (binding its
+    /// `127.0.0.1` listener, or a [`LocalClient`] request to it).
+    #[error("loopback I/O error: {0}")]
+    Loopback(std::io::Error),
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -299,24 +308,84 @@ impl std::ops::Deref for ServiceListener {
     }
 }
 
-/// The result of [`Server::loopback`] (Go `Loopback() (addr, proxyCred, localAPICred, err)`), minus
-/// the second credential.
+/// The result of [`Server::loopback`] — the full Go `Loopback() (addr, proxyCred, localAPICred,
+/// err)` surface: **both** credentials, and an in-process LocalAPI HTTP server actually running.
 ///
-/// This fork's loopback serves the **SOCKS5** half with **one** credential; the in-process LocalAPI
-/// HTTP server (and its `localAPICred`) is intentionally not served — the LocalClient surface lives
-/// directly on [`Server`]/[`Device`] instead (see `docs/TSNET_PARITY.md` §5.1).
+/// # Go parity, and the one honest delta
+///
+/// Go serves the SOCKS5 proxy *and* the LocalAPI on a **single** muxed loopback listener. This fork
+/// runs two `127.0.0.1` listeners instead — [`address`](Self::address) for the SOCKS5 proxy
+/// ([`proxy_cred`](Self::proxy_cred)) and [`local_api_address`](Self::local_api_address) for the
+/// LocalAPI HTTP server ([`local_api_cred`](Self::local_api_cred)) — because the SOCKS5 half is the
+/// engine's own [`Device::loopback`](crate::Device::loopback) and the LocalAPI half is layered on
+/// top without re-implementing (or first-byte-demuxing) the proven proxy path. The observable
+/// contract is identical: a SOCKS5 proxy gated by `proxy_cred`, and a LocalAPI gated by
+/// `local_api_cred`. This delta is surfaced, not faked (see `docs/TSNET_FACADE_DESIGN.md` §11).
+///
+/// # Lifecycle
+///
+/// Like Go's `s.loopbackListener`, both listeners live for the [`Server`]'s lifetime and are torn
+/// down by [`Server::close`] — [`Server::loopback`] is idempotent and returns the same addresses and
+/// credentials on every call. There is no per-result handle to drop.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Loopback {
-    /// The bound `127.0.0.1:<port>` address of the SOCKS5 proxy.
+    /// The bound `127.0.0.1:<port>` address of the SOCKS5 proxy (Go's `addr`, SOCKS5 half).
     pub address: SocketAddr,
-    /// The SOCKS5 proxy credential (username is fixed to `"tsnet"`).
+    /// The SOCKS5 proxy credential (Go's `proxyCred`; username is fixed to `"tsnet"`).
     pub proxy_cred: String,
-    handle: crate::LoopbackHandle,
+    /// The bound `127.0.0.1:<port>` address of the in-process LocalAPI HTTP server.
+    pub local_api_address: SocketAddr,
+    /// The LocalAPI credential (Go's `localAPICred`): the HTTP Basic-auth **password** the LocalAPI
+    /// server requires (any username is accepted, matching Go). Reach it with [`LocalClient`].
+    pub local_api_cred: String,
 }
 
-impl Loopback {
-    /// Shut down the loopback proxy (the RAII handle also does this on drop).
-    pub fn shutdown(self) {
-        self.handle.shutdown()
+/// A minimal client for the in-process LocalAPI HTTP server started alongside the loopback proxy —
+/// the Rust analog of what Go's `tsnet.Server.LocalClient()` returns (a `*local.Client` wired to the
+/// node's own LocalAPI).
+///
+/// Obtain one with [`Server::local_client`]. It authenticates every request with the loopback's
+/// `local_api_cred` (HTTP Basic auth, empty username) and speaks plain HTTP to `127.0.0.1`, so it is
+/// dependency-free (no `hyper`) and needs only the `tsnet` feature.
+///
+/// The fork's [`Status`](crate::Status) is not a `serde` type, so [`status`](Self::status) returns
+/// the server's raw JSON bytes rather than a deserialized struct; for typed status prefer
+/// [`Server::status`] (the in-process path). For arbitrary endpoints use [`get`](Self::get).
+#[derive(Clone, Debug)]
+pub struct LocalClient {
+    address: SocketAddr,
+    cred: String,
+}
+
+impl LocalClient {
+    /// The `127.0.0.1:<port>` address of the LocalAPI HTTP server this client talks to.
+    pub fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    /// The LocalAPI credential (HTTP Basic-auth password) this client sends.
+    pub fn credential(&self) -> &str {
+        &self.cred
+    }
+
+    /// `GET /localapi/v0/status` — the node + peer status as raw JSON bytes (Go
+    /// `LocalClient().Status`, over the loopback). Errors if the server answers non-`200`.
+    pub async fn status(&self) -> Result<Vec<u8>, Error> {
+        match self.get("/localapi/v0/status").await? {
+            (200, body) => Ok(body),
+            (code, _) => Err(Error::Loopback(std::io::Error::other(format!(
+                "localapi /status returned HTTP {code}"
+            )))),
+        }
+    }
+
+    /// Perform an authenticated `GET` against an arbitrary LocalAPI `path` (e.g.
+    /// `"/localapi/v0/status"`), returning `(http_status_code, body_bytes)`.
+    pub async fn get(&self, path: &str) -> Result<(u16, Vec<u8>), Error> {
+        localapi_client_get(self.address, &self.cred, path)
+            .await
+            .map_err(Error::Loopback)
     }
 }
 
@@ -400,8 +469,15 @@ pub struct Server {
     /// before [`Device::new`]. Set via [`Server::configure`].
     configure: Option<ConfigureHook>,
 
-    /// The wrapped device, built once on first use.
-    device: OnceCell<Device>,
+    /// The wrapped device, built once on first use. Held in an [`Arc`] so the in-process LocalAPI
+    /// HTTP server (spawned by [`Server::loopback`]) can hold a [`Weak`] handle to it without
+    /// blocking [`Server::close`] from reclaiming and gracefully shutting the device down.
+    device: OnceCell<Arc<Device>>,
+
+    /// The running loopback SOCKS5 proxy + in-process LocalAPI HTTP server, started once on the
+    /// first [`Server::loopback`]/[`Server::local_client`] and torn down on [`Server::close`]
+    /// (mirrors Go's `s.loopbackListener` living for the server's lifetime).
+    loopback_rt: OnceCell<LoopbackRt>,
 }
 
 impl Server {
@@ -480,13 +556,14 @@ impl Server {
     }
 
     /// Build + start the wrapped device from the current fields.
-    async fn build_and_start(&self) -> Result<Device, Error> {
+    async fn build_and_start(&self) -> Result<Arc<Device>, Error> {
         let config = self.build_config().await?;
-        Ok(Device::new(&config, self.auth_key.clone()).await?)
+        Ok(Arc::new(Device::new(&config, self.auth_key.clone()).await?))
     }
 
-    /// Get the wrapped device, starting it on first call (Go's lazy `Start`).
-    async fn started(&self) -> Result<&Device, Error> {
+    /// Get the wrapped device (as the shared [`Arc`]), starting it on first call (Go's lazy
+    /// `Start`).
+    async fn started(&self) -> Result<&Arc<Device>, Error> {
         self.device
             .get_or_try_init(|| self.build_and_start())
             .await
@@ -508,7 +585,7 @@ impl Server {
     /// The wrapped [`Device`] (Go `LocalClient`-and-more), starting it if needed. The escape hatch to
     /// the full engine surface (`whois`, `ping`, `set_*` prefs, taildrop, TKA, …).
     pub async fn device(&self) -> Result<&Device, Error> {
-        self.started().await
+        Ok(&**self.started().await?)
     }
 
     /// Dial a tailnet address over TCP or UDP (Go `Dial(ctx, network, address)`), returning the
@@ -647,14 +724,77 @@ impl Server {
         Ok(ServiceListener { inner, fqdn })
     }
 
-    /// Start a loopback SOCKS5 proxy onto the tailnet (Go `Loopback`).
+    /// Start (once) the loopback surface and return its addresses + both credentials (Go
+    /// `Loopback() (addr, proxyCred, localAPICred, err)`).
+    ///
+    /// Brings up two things, living for the [`Server`]'s lifetime (torn down by [`Server::close`]):
+    ///
+    /// * a **SOCKS5 proxy** onto the tailnet (the engine's [`Device::loopback`](crate::Device::loopback)),
+    ///   authenticated with [`Loopback::proxy_cred`]; and
+    /// * an **in-process LocalAPI HTTP server** authenticated with the separate
+    ///   [`Loopback::local_api_cred`] (HTTP Basic-auth password), serving `GET
+    ///   /localapi/v0/status`.
+    ///
+    /// Idempotent: repeated calls return the same addresses and credentials. See [`Loopback`] for
+    /// the one honest delta from Go (two `127.0.0.1` listeners rather than one muxed listener).
     pub async fn loopback(&self) -> Result<Loopback, Error> {
-        let (address, proxy_cred, handle) = self.started().await?.loopback().await?;
+        let rt = self.ensure_loopback().await?;
         Ok(Loopback {
-            address,
-            proxy_cred,
-            handle,
+            address: rt.socks_address,
+            proxy_cred: rt.proxy_cred.clone(),
+            local_api_address: rt.local_api_address,
+            local_api_cred: rt.local_api_cred.clone(),
         })
+    }
+
+    /// A [`LocalClient`] for this node's in-process LocalAPI HTTP server (Go
+    /// `tsnet.Server.LocalClient()`), starting the loopback surface if needed.
+    ///
+    /// The returned client authenticates with the loopback's `local_api_cred` and speaks plain HTTP
+    /// to `127.0.0.1` (no `hyper` dependency). For typed status prefer the in-process [`Server::status`];
+    /// the `LocalClient` is the Go-shaped path that actually round-trips through the LocalAPI server.
+    pub async fn local_client(&self) -> Result<LocalClient, Error> {
+        let rt = self.ensure_loopback().await?;
+        Ok(LocalClient {
+            address: rt.local_api_address,
+            cred: rt.local_api_cred.clone(),
+        })
+    }
+
+    /// Start (once) and cache the loopback runtime: the engine SOCKS5 proxy plus a facade-owned
+    /// in-process LocalAPI HTTP server on its own `127.0.0.1` listener.
+    async fn ensure_loopback(&self) -> Result<&LoopbackRt, Error> {
+        // Capture the device Arc first (outside the closure) so we can downgrade it to a `Weak` for
+        // the LocalAPI backend — the server must not keep the device alive past `Server::close`.
+        let device = self.started().await?.clone();
+        self.loopback_rt
+            .get_or_try_init(|| build_loopback_rt(device))
+            .await
+    }
+
+    /// A `hyper` HTTP client whose every request egresses over the tailnet (Go
+    /// `tsnet.Server.HTTPClient()`), built over [`Device::http_connector`](crate::Device::http_connector).
+    ///
+    /// The exact analog of Go's `&http.Client{Transport: &http.Transport{DialContext: s.Dial}}`: a
+    /// pooled [`hyper_util`] client wired to the tailnet connector, with TLS/redirects/pooling left
+    /// to the client (the connector is plaintext — see [`TailnetConnector`](crate::http::TailnetConnector)
+    /// for wrapping it in TLS). `B` is your request body type (e.g. `String`, or
+    /// `http_body_util::Full<Bytes>`).
+    ///
+    /// Available only with the **`hyper`** crate feature (as in the engine).
+    #[cfg(feature = "hyper")]
+    pub async fn http_client<B>(
+        &self,
+    ) -> Result<hyper_util::client::legacy::Client<crate::http::TailnetConnector, B>, Error>
+    where
+        B: hyper::body::Body + Send + 'static,
+        B::Data: Send,
+    {
+        let connector = self.started().await?.http_connector().await?;
+        Ok(
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build(connector),
+        )
     }
 
     /// This node's tailnet addresses (Go `TailscaleIPs`). The tuple shape mirrors
@@ -686,10 +826,23 @@ impl Server {
 
     /// Stop the server (Go `Close`). Consumes `self`; returns whether shutdown completed within
     /// `timeout` (`None` = wait forever). A never-started server closes cleanly.
+    ///
+    /// Tears down the loopback surface first (aborting the SOCKS5 and LocalAPI accept loops), then
+    /// gracefully shuts the wrapped device down. The LocalAPI server holds only a [`Weak`] to the
+    /// device, so this reclaims the sole strong reference for the graceful shutdown.
     pub async fn close(self, timeout: Option<Duration>) -> bool {
+        // Abort the SOCKS5 + LocalAPI accept loops (and drop their `Weak` device refs) before
+        // reclaiming the device by value.
+        drop(self.loopback_rt);
         match self.device.into_inner() {
-            Some(dev) => dev.shutdown(timeout).await,
             None => true,
+            Some(arc) => match Arc::into_inner(arc) {
+                Some(dev) => dev.shutdown(timeout).await,
+                // A LocalAPI request raced `close` and briefly holds the last strong ref; it is
+                // released the instant that request returns, and the device tears down then — we
+                // just could not reclaim it by value for a graceful shutdown.
+                None => false,
+            },
         }
     }
 }
@@ -771,6 +924,344 @@ fn parse_listen_addr(addr: &str, family: Family) -> Result<SocketAddr, Error> {
             addr: addr.to_string(),
             source,
         })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Loopback runtime: the engine SOCKS5 proxy + the facade's in-process LocalAPI HTTP server.
+// ---------------------------------------------------------------------------------------------
+
+/// The running loopback surface, cached on [`Server`] and torn down on [`Server::close`].
+struct LoopbackRt {
+    socks_address: SocketAddr,
+    proxy_cred: String,
+    local_api_address: SocketAddr,
+    local_api_cred: String,
+    /// Aborts the engine SOCKS5 accept loop on drop (RAII).
+    _socks_handle: crate::LoopbackHandle,
+    /// Aborts the in-process LocalAPI accept loop on drop (via the [`Drop`] impl below).
+    localapi_task: AbortHandle,
+}
+
+impl Drop for LoopbackRt {
+    fn drop(&mut self) {
+        // Stop accepting new LocalAPI connections. In-flight requests hold only a `Weak<Device>` and
+        // finish on their own. (`_socks_handle` aborts the SOCKS5 loop via its own `Drop`.)
+        self.localapi_task.abort();
+    }
+}
+
+/// Build the loopback runtime: start the engine SOCKS5 proxy, bind a second `127.0.0.1` listener for
+/// the LocalAPI, mint a *separate* credential, and spawn the in-process LocalAPI HTTP server backed
+/// by a [`Weak`] handle to `device`.
+async fn build_loopback_rt(device: Arc<Device>) -> Result<LoopbackRt, Error> {
+    // SOCKS5 half — the engine's own loopback (address + proxy_cred + RAII handle), unchanged.
+    let (socks_address, proxy_cred, socks_handle) = device.loopback().await?;
+
+    // LocalAPI half — a facade-owned HTTP server on its own host-loopback listener.
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .map_err(Error::Loopback)?;
+    let local_api_address = listener.local_addr().map_err(Error::Loopback)?;
+    let local_api_cred = gen_cred();
+
+    // Backend: a `Weak<Device>` so the spawned server never blocks `Server::close` from reclaiming
+    // the device by value. Each request upgrades it just long enough to read status.
+    let weak: Weak<Device> = Arc::downgrade(&device);
+    let status: localapi::StatusFn = Arc::new(move || {
+        let weak = weak.clone();
+        Box::pin(async move {
+            match weak.upgrade() {
+                Some(dev) => dev
+                    .status()
+                    .await
+                    .map(|s| status_json(&s))
+                    .map_err(|e| e.to_string()),
+                None => Err("device has shut down".to_string()),
+            }
+        })
+    });
+
+    let task = tokio::spawn(localapi::serve(listener, local_api_cred.clone(), status));
+
+    Ok(LoopbackRt {
+        socks_address,
+        proxy_cred,
+        local_api_address,
+        local_api_cred,
+        _socks_handle: socks_handle,
+        localapi_task: task.abort_handle(),
+    })
+}
+
+/// Generate a 16-byte random credential rendered as 32 lowercase-hex chars (Go uses
+/// `hex.EncodeToString(crand[16])`; no new dependency — reuses `rand`, like the SOCKS5 half).
+fn gen_cred() -> String {
+    let bytes: [u8; 16] = rand::random();
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Serialize a [`StatusNode`] into a JSON value using explicit conversions (the fork's status types
+/// are not `serde` types, and their field crates don't enable serde features here).
+fn status_node_json(n: &StatusNode) -> serde_json::Value {
+    serde_json::json!({
+        "stable_id": n.stable_id.0,
+        "display_name": n.display_name,
+        "ipv4": n.ipv4.to_string(),
+        "ipv6": n.ipv6.to_string(),
+        "online": n.online,
+        // Unix seconds — a feature-free encoding (chrono is `default-features = false` here, so the
+        // `to_rfc3339`/`Display` formatters are unavailable; `timestamp()` is always present).
+        "last_seen": n.last_seen.map(|t| t.timestamp()),
+        "allowed_routes": n.allowed_routes.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+        "is_exit_node": n.is_exit_node,
+        "cur_addr": n.cur_addr.map(|a| a.to_string()),
+        "relay": n.relay,
+        "ssh_host_keys": n.ssh_host_keys,
+    })
+}
+
+/// Serialize a [`Status`] snapshot into the LocalAPI `/status` JSON body.
+fn status_json(s: &Status) -> Vec<u8> {
+    let value = serde_json::json!({
+        "self": s.self_node.as_ref().map(status_node_json),
+        "peers": s.peers.iter().map(status_node_json).collect::<Vec<_>>(),
+        "active_exit_node": s.active_exit_node.as_ref().map(|id| id.0.clone()),
+        "magic_dns_suffix": s.magic_dns_suffix,
+    });
+    serde_json::to_vec(&value).unwrap_or_else(|_| b"{}".to_vec())
+}
+
+/// Find the first occurrence of `needle` in `hay` (splits an HTTP head from its body — no dep).
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Parse an HTTP/1.x response into `(status_code, body_bytes)`. Used by [`LocalClient`].
+fn parse_response(resp: &[u8]) -> Option<(u16, Vec<u8>)> {
+    let head_end = find_subslice(resp, b"\r\n\r\n")?;
+    let head = std::str::from_utf8(&resp[..head_end]).ok()?;
+    let status_line = head.split("\r\n").next()?;
+    // "HTTP/1.1 200 OK" — the status code is the second whitespace-separated token.
+    let code: u16 = status_line.split_whitespace().nth(1)?.parse().ok()?;
+    Some((code, resp[head_end + 4..].to_vec()))
+}
+
+/// Perform an authenticated LocalAPI `GET` over plain HTTP to `127.0.0.1` (dependency-free client).
+async fn localapi_client_get(
+    addr: SocketAddr,
+    cred: &str,
+    path: &str,
+) -> std::io::Result<(u16, Vec<u8>)> {
+    let mut sock = TcpStream::connect(addr).await?;
+    // HTTP Basic auth with an empty username (Go ignores the username; the password is the cred).
+    let auth = STANDARD.encode(format!(":{cred}"));
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic {auth}\r\nConnection: close\r\n\r\n"
+    );
+    sock.write_all(req.as_bytes()).await?;
+    // The server replies with `Connection: close`, so reading to EOF yields the whole response.
+    let mut resp = Vec::new();
+    sock.read_to_end(&mut resp).await?;
+    parse_response(&resp).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed HTTP response")
+    })
+}
+
+/// The in-process LocalAPI HTTP server (Go's `localapi.Handler` served on the loopback). A minimal,
+/// dependency-free HTTP/1.1 server: the crate's `hyper` is HTTP/2-**client**-only, so this hand-rolls
+/// request framing exactly as the SOCKS5 half hand-rolls its own protocol in `src/loopback.rs`.
+mod localapi {
+    use super::{Duration, STANDARD, TcpListener, TcpStream, find_subslice};
+    use base64::Engine as _;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::sync::Semaphore;
+
+    /// Upper bound on the buffered HTTP request head (request line + headers). LocalAPI requests are
+    /// tiny; a client that floods the head is rejected rather than buffered unbounded.
+    const MAX_HEAD: usize = 8 * 1024;
+    /// Deadline for reading a full request head and writing the response.
+    const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+    /// Cap on concurrent LocalAPI connections (loopback-only, but bounded for hygiene).
+    const MAX_CONCURRENT: usize = 64;
+
+    /// A cloneable, `'static` async backend for `GET /localapi/v0/status`: returns the JSON body
+    /// bytes, or an error string mapped to HTTP 500. Boxed so tests can inject a mock backend
+    /// without a live [`Device`](crate::Device).
+    pub(super) type StatusFn =
+        Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send>> + Send + Sync>;
+
+    /// Serve the LocalAPI on `listener` until the task is aborted (by [`super::LoopbackRt`]'s drop).
+    pub(super) async fn serve(listener: TcpListener, cred: String, status: StatusFn) {
+        let sem = Arc::new(Semaphore::new(MAX_CONCURRENT));
+        loop {
+            // Back-pressure at the cap: acquire before accepting.
+            let permit = match sem.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            let (sock, _peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!(error = %e, "loopback LocalAPI accept failed; stopping accept loop");
+                    return;
+                }
+            };
+            let cred = cred.clone();
+            let status = status.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                match tokio::time::timeout(REQUEST_TIMEOUT, handle(sock, &cred, &status)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::debug!(error = %e, "loopback LocalAPI connection ended"),
+                    Err(_) => tracing::debug!("loopback LocalAPI request timed out"),
+                }
+            });
+        }
+    }
+
+    /// Serve one LocalAPI connection: read the head, authenticate, route, respond, close.
+    async fn handle(mut sock: TcpStream, cred: &str, status: &StatusFn) -> std::io::Result<()> {
+        // Read up to the end of the header block (CRLF CRLF), capped.
+        let mut buf = Vec::with_capacity(1024);
+        let mut chunk = [0u8; 1024];
+        let head_len = loop {
+            if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+                break pos;
+            }
+            if buf.len() > MAX_HEAD {
+                let r = response(
+                    431,
+                    "Request Header Fields Too Large",
+                    "text/plain",
+                    b"header too large",
+                    &[],
+                );
+                sock.write_all(&r).await?;
+                return Ok(());
+            }
+            let n = sock.read(&mut chunk).await?;
+            if n == 0 {
+                return Ok(()); // client closed before sending a full head
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        };
+
+        let Some((method, target, password)) = parse_head(&buf[..head_len]) else {
+            let r = response(400, "Bad Request", "text/plain", b"bad request", &[]);
+            sock.write_all(&r).await?;
+            return Ok(());
+        };
+
+        // Auth: the Basic-auth password must equal the cred (any username, matching Go).
+        if !password.as_deref().is_some_and(|p| cred_ok(p, cred)) {
+            let r = response(
+                401,
+                "Unauthorized",
+                "text/plain",
+                b"unauthorized",
+                &[("WWW-Authenticate", "Basic realm=\"tailscale localapi\"")],
+            );
+            sock.write_all(&r).await?;
+            return Ok(());
+        }
+
+        // Route on method + path (any query string is ignored).
+        let path = target.split('?').next().unwrap_or(&target);
+        let resp = match (method.as_str(), path) {
+            ("GET", "/localapi/v0/status") => match status().await {
+                Ok(body) => response(200, "OK", "application/json", &body, &[]),
+                Err(_) => response(
+                    500,
+                    "Internal Server Error",
+                    "text/plain",
+                    b"status error",
+                    &[],
+                ),
+            },
+            _ => response(404, "Not Found", "text/plain", b"not found", &[]),
+        };
+        sock.write_all(&resp).await?;
+        Ok(())
+    }
+
+    /// Parse an HTTP request head into `(method, request_target, basic_auth_password)`. `None` when
+    /// the request line is malformed.
+    pub(super) fn parse_head(head: &[u8]) -> Option<(String, String, Option<String>)> {
+        let text = std::str::from_utf8(head).ok()?;
+        let mut lines = text.split("\r\n");
+        let mut request_line = lines.next()?.split(' ');
+        let method = request_line.next()?.to_string();
+        let target = request_line.next()?.to_string();
+        request_line.next()?; // require the HTTP-version token
+        let mut password = None;
+        for line in lines {
+            if let Some((name, value)) = line.split_once(':')
+                && name.trim().eq_ignore_ascii_case("authorization")
+            {
+                password = basic_auth_password(value.trim());
+            }
+        }
+        Some((method, target, password))
+    }
+
+    /// Decode `Basic <base64(user:pass)>` into the password (Go ignores the username). `None` if the
+    /// header is not Basic auth or is malformed.
+    pub(super) fn basic_auth_password(value: &str) -> Option<String> {
+        // The auth scheme is case-insensitive (RFC 7617; Go's `r.BasicAuth` uses `EqualFold`), so
+        // `Basic`/`basic`/`BASIC`/… all authenticate.
+        let (scheme, b64) = value.split_once(' ')?;
+        if !scheme.eq_ignore_ascii_case("basic") {
+            return None;
+        }
+        let decoded = STANDARD.decode(b64.trim()).ok()?;
+        let decoded = String::from_utf8(decoded).ok()?;
+        // "user:pass" — the username (before the first colon) is ignored; a header with no colon at
+        // all is malformed Basic auth and yields no password (→ 401).
+        decoded.split_once(':').map(|(_user, pass)| pass.to_string())
+    }
+
+    /// Constant-time credential comparison (don't leak the cred via early-exit timing).
+    pub(super) fn cred_ok(provided: &str, expected: &str) -> bool {
+        let (a, b) = (provided.as_bytes(), expected.as_bytes());
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut diff = 0u8;
+        for (x, y) in a.iter().zip(b.iter()) {
+            diff |= x ^ y;
+        }
+        diff == 0
+    }
+
+    /// Build a complete HTTP/1.1 response with `Connection: close`.
+    pub(super) fn response(
+        code: u16,
+        reason: &str,
+        content_type: &str,
+        body: &[u8],
+        extra_headers: &[(&str, &str)],
+    ) -> Vec<u8> {
+        let mut head = format!(
+            "HTTP/1.1 {code} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
+        for (name, value) in extra_headers {
+            head.push_str(name);
+            head.push_str(": ");
+            head.push_str(value);
+            head.push_str("\r\n");
+        }
+        head.push_str("\r\n");
+        let mut out = head.into_bytes();
+        out.extend_from_slice(body);
+        out
+    }
 }
 
 #[cfg(test)]
@@ -1308,5 +1799,237 @@ mod tests {
             s.dial_udp("host:80").await,
             Err(Error::InvalidControlUrl(_))
         ));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Loopback dual-credential + in-process LocalAPI HTTP server (the headline gap this closes).
+    // These are hermetic: the HTTP framing/auth/routing are pure functions, and the server is
+    // exercised end-to-end over a real `127.0.0.1` socket with a *mock* status backend — no live
+    // `Device`/tailnet needed. (The successful in-process `Server::loopback` round-trip needs a
+    // running control server and stays in integration/e2e.)
+    // -----------------------------------------------------------------------------------------
+
+    /// A mock status backend returning a fixed JSON body — the stand-in for `Device::status`.
+    fn mock_status(body: &'static [u8]) -> localapi::StatusFn {
+        Arc::new(move || Box::pin(async move { Ok(body.to_vec()) }))
+    }
+
+    #[test]
+    fn gen_cred_is_32_lowercase_hex() {
+        let cred = gen_cred();
+        assert_eq!(cred.len(), 32, "16 random bytes → 32 hex chars (Go parity)");
+        assert!(
+            cred.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+        assert_ne!(gen_cred(), gen_cred(), "credentials are random per call");
+    }
+
+    #[test]
+    fn find_subslice_locates_header_terminator() {
+        assert_eq!(find_subslice(b"ab\r\n\r\ncd", b"\r\n\r\n"), Some(2));
+        assert_eq!(find_subslice(b"no terminator", b"\r\n\r\n"), None);
+        assert_eq!(find_subslice(b"", b"\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn parse_response_extracts_code_and_body() {
+        let (code, body) =
+            parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi").unwrap();
+        assert_eq!(code, 200);
+        assert_eq!(body, b"hi");
+        assert_eq!(parse_response(b"garbage without terminator"), None);
+    }
+
+    #[test]
+    fn parse_head_reads_method_target_and_auth() {
+        // "user:pass" base64 = dXNlcjpwYXNz
+        let head = b"GET /localapi/v0/status HTTP/1.1\r\nHost: x\r\nAuthorization: Basic dXNlcjpwYXNz\r\nAccept: */*";
+        let (method, target, password) = localapi::parse_head(head).unwrap();
+        assert_eq!(method, "GET");
+        assert_eq!(target, "/localapi/v0/status");
+        assert_eq!(password.as_deref(), Some("pass"));
+    }
+
+    #[test]
+    fn parse_head_rejects_malformed_request_line() {
+        assert!(localapi::parse_head(b"GET-only-one-token").is_none());
+        assert!(localapi::parse_head(b"GET /x").is_none(), "needs a version token");
+    }
+
+    #[test]
+    fn basic_auth_password_ignores_username() {
+        // Go authenticates on the password only; the username is ignored.
+        // base64("anyuser:the-cred") and base64(":the-cred") both yield "the-cred".
+        let with_user = STANDARD.encode("anyuser:the-cred");
+        let no_user = STANDARD.encode(":the-cred");
+        assert_eq!(
+            localapi::basic_auth_password(&format!("Basic {with_user}")).as_deref(),
+            Some("the-cred")
+        );
+        assert_eq!(
+            localapi::basic_auth_password(&format!("Basic {no_user}")).as_deref(),
+            Some("the-cred")
+        );
+        // The auth scheme is case-insensitive (RFC 7617 / Go `EqualFold`).
+        assert_eq!(
+            localapi::basic_auth_password(&format!("bAsIc {with_user}")).as_deref(),
+            Some("the-cred")
+        );
+        // A non-Basic scheme, no scheme, or garbage base64 is not accepted.
+        assert!(localapi::basic_auth_password("Bearer xyz").is_none());
+        assert!(localapi::basic_auth_password("Basic !!!not-base64").is_none());
+        assert!(localapi::basic_auth_password("no-space-token").is_none());
+    }
+
+    #[test]
+    fn cred_ok_matches_only_exact_credentials() {
+        assert!(localapi::cred_ok("abc123", "abc123"));
+        assert!(!localapi::cred_ok("abc123", "abc124"));
+        assert!(!localapi::cred_ok("abc", "abc123"), "length mismatch is a mismatch");
+        assert!(!localapi::cred_ok("", "x"));
+    }
+
+    #[test]
+    fn status_json_serializes_status_snapshot() {
+        // Build a snapshot and assert the emitted JSON reflects it (the fork's `Status` is not a
+        // serde type, so `status_json` builds the object by hand — this pins that mapping).
+        use crate::StableNodeId;
+        let node = StatusNode {
+            stable_id: StableNodeId("nabc123".to_string()),
+            display_name: "web.tail0.ts.net".to_string(),
+            ipv4: "100.64.0.1".parse().unwrap(),
+            ipv6: "fd7a:115c:a1e0::1".parse().unwrap(),
+            online: Some(true),
+            last_seen: None,
+            allowed_routes: vec![],
+            is_exit_node: false,
+            cur_addr: None,
+            relay: Some("nyc".to_string()),
+            ssh_host_keys: vec![],
+        };
+        let status = Status {
+            self_node: Some(node),
+            peers: vec![],
+            active_exit_node: None,
+            magic_dns_suffix: Some("tail0.ts.net".to_string()),
+        };
+        let bytes = status_json(&status);
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
+        assert_eq!(v["self"]["stable_id"], "nabc123");
+        assert_eq!(v["self"]["display_name"], "web.tail0.ts.net");
+        assert_eq!(v["self"]["ipv4"], "100.64.0.1");
+        assert_eq!(v["self"]["online"], true);
+        assert_eq!(v["self"]["relay"], "nyc");
+        assert_eq!(v["magic_dns_suffix"], "tail0.ts.net");
+        assert!(v["peers"].as_array().unwrap().is_empty());
+        assert!(v["active_exit_node"].is_null());
+    }
+
+    #[tokio::test]
+    async fn localapi_server_authenticates_and_routes_over_real_socket() {
+        // Bind the real in-process LocalAPI server on 127.0.0.1 with a mock status backend, then
+        // drive it with the dependency-free client — exercising accept → parse → auth → route →
+        // respond end-to-end.
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cred = "s3cr3t-cred".to_string();
+        let task = tokio::spawn(localapi::serve(
+            listener,
+            cred.clone(),
+            mock_status(br#"{"ok":true}"#),
+        ));
+
+        // Correct credential → 200 + the backend's JSON body.
+        let (code, body) = localapi_client_get(addr, &cred, "/localapi/v0/status")
+            .await
+            .unwrap();
+        assert_eq!(code, 200);
+        assert_eq!(body, br#"{"ok":true}"#);
+
+        // Authenticated but unknown path → 404.
+        let (code, _) = localapi_client_get(addr, &cred, "/localapi/v0/nope")
+            .await
+            .unwrap();
+        assert_eq!(code, 404);
+
+        // Wrong credential → 401.
+        let (code, _) = localapi_client_get(addr, "wrong-cred", "/localapi/v0/status")
+            .await
+            .unwrap();
+        assert_eq!(code, 401);
+
+        // Missing Authorization header entirely → 401.
+        {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let mut sock = TcpStream::connect(addr).await.unwrap();
+            sock.write_all(
+                b"GET /localapi/v0/status HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let mut resp = Vec::new();
+            sock.read_to_end(&mut resp).await.unwrap();
+            assert_eq!(parse_response(&resp).unwrap().0, 401);
+        }
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn local_client_round_trips_through_the_localapi_server() {
+        // `LocalClient` is what `Server::local_client()` hands back: point one at a running server
+        // and assert its accessors + `status()`/`get()` round-trip through real HTTP.
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cred = "local-api-cred".to_string();
+        let task = tokio::spawn(localapi::serve(
+            listener,
+            cred.clone(),
+            mock_status(br#"{"self":null,"peers":[]}"#),
+        ));
+
+        let client = LocalClient {
+            address: addr,
+            cred: cred.clone(),
+        };
+        assert_eq!(client.address(), addr);
+        assert_eq!(client.credential(), cred);
+
+        let body = client.status().await.unwrap();
+        assert_eq!(body, br#"{"self":null,"peers":[]}"#);
+
+        let (code, _) = client.get("/localapi/v0/status").await.unwrap();
+        assert_eq!(code, 200);
+
+        // A wrong-credential client sees the 401 surfaced as an error from `status()`.
+        let bad = LocalClient {
+            address: addr,
+            cred: "nope".to_string(),
+        };
+        assert!(matches!(bad.status().await, Err(Error::Loopback(_))));
+
+        task.abort();
+    }
+
+    #[test]
+    fn loopback_result_carries_both_distinct_credentials() {
+        // Shape assertion: the `Loopback` result exposes both Go credentials + both addresses, and
+        // `Clone`/`Debug` derive (so it can be logged/stored). Distinctness of the two creds is the
+        // point of this task.
+        let lb = Loopback {
+            address: "127.0.0.1:1080".parse().unwrap(),
+            proxy_cred: "proxy".to_string(),
+            local_api_address: "127.0.0.1:1081".parse().unwrap(),
+            local_api_cred: "localapi".to_string(),
+        };
+        let cloned = lb.clone();
+        assert_ne!(cloned.proxy_cred, cloned.local_api_cred);
+        assert_ne!(cloned.address, cloned.local_api_address);
+        assert!(format!("{cloned:?}").contains("local_api_cred"));
     }
 }
