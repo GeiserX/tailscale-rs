@@ -243,6 +243,18 @@ pub enum Error {
         source: std::net::AddrParseError,
     },
 
+    /// A family-pinned listen `network` (`"tcp4"`/`"tcp6"`) was given an explicit host literal of the
+    /// *other* address family — e.g. [`Server::listen`]`("tcp4", "[::1]:80")`. Go's `net.Listen`
+    /// rejects the same mismatch (`tcp4` binds only IPv4 addresses, `tcp6` only IPv6). A bare
+    /// `":port"` never trips this: it is filled with the family's own wildcard host first.
+    #[error("address {addr:?} is not an {want} address (required by the family-pinned listen network)")]
+    AddrFamilyMismatch {
+        /// The offending address string, whose family differs from the network's.
+        addr: String,
+        /// The address family the `…4`/`…6` network required: `"IPv4"` (`tcp4`) or `"IPv6"` (`tcp6`).
+        want: &'static str,
+    },
+
     /// A Go-style dial `network` string was not one of the supported
     /// `"tcp"`/`"tcp4"`/`"tcp6"`/`"udp"`/`"udp4"`/`"udp6"` (Go's `Dial` likewise rejects an unknown
     /// network). Reported by [`Server::dial`] at the facade boundary, *before* the device is started.
@@ -491,6 +503,10 @@ impl LocalClient {
 
     /// Perform an authenticated `GET` against an arbitrary LocalAPI `path` (e.g.
     /// `"/localapi/v0/status"`), returning `(http_status_code, body_bytes)`.
+    ///
+    /// The facade's in-process server implements only `GET /localapi/v0/status` (unlike Go's full
+    /// `localapi.Handler`); any other path returns HTTP `404`. Every request also automatically
+    /// carries Go's `Sec-Tailscale: localapi` anti-DNS-rebinding header alongside the credential.
     pub async fn get(&self, path: &str) -> Result<(u16, Vec<u8>), Error> {
         localapi_client_get(self.address, &self.cred, path)
             .await
@@ -775,9 +791,10 @@ impl Server {
     ///
     /// `network` is a **packet** network — `"udp"`, `"udp4"`, or `"udp6"`; a `"tcp*"` or unknown
     /// value is [`Error::InvalidNetwork`]. `addr` is a `host:port` **IP literal** (a bare `":0"` is
-    /// filled with the family's wildcard host); like Go's `ListenPacket` — and unlike
-    /// [`Server::listen`] — a MagicDNS name is not accepted here. An unspecified host binds this
-    /// node's tailnet address. Returns the std::net-style overlay [`netstack::UdpSocket`] (backed by
+    /// filled with the family's wildcard host); like Go's `ListenPacket`, a MagicDNS name is **not**
+    /// accepted — and neither does [`Server::listen`] accept one (both bind by IP literal; only
+    /// [`Server::dial`] resolves MagicDNS names). An unspecified host binds this node's tailnet
+    /// address. Returns the std::net-style overlay [`netstack::UdpSocket`] (backed by
     /// `ts_netstack_smoltcp`), a `net.PacketConn` analog (`recv_from`/`send_to`).
     pub async fn listen_packet(
         &self,
@@ -1121,14 +1138,32 @@ fn normalize_listen_addr(addr: &str, family: Family) -> String {
 }
 
 /// Parse a Go-style listen `addr` into a [`SocketAddr`], filling a bare `":port"` with the family's
-/// wildcard host (see [`normalize_listen_addr`]).
+/// wildcard host (see [`normalize_listen_addr`]). A family-pinned `family` (`V4`/`V6`, i.e. a
+/// `tcp4`/`tcp6` network) additionally rejects an explicit host literal of the *other* family —
+/// `parse_listen_addr("[::1]:80", Family::V4)` is [`Error::AddrFamilyMismatch`], exactly as Go's
+/// `net.Listen("tcp4", "[::1]:80")` errors — while `Family::Any` accepts either.
 fn parse_listen_addr(addr: &str, family: Family) -> Result<SocketAddr, Error> {
-    normalize_listen_addr(addr, family)
+    let sa: SocketAddr = normalize_listen_addr(addr, family)
         .parse()
         .map_err(|source| Error::InvalidAddr {
             addr: addr.to_string(),
             source,
-        })
+        })?;
+    // A `…4`/`…6` network pins the family: reject an explicit host literal that parsed to the other
+    // family. A bare `":port"` already got the matching wildcard from `normalize_listen_addr`, so it
+    // never reaches here; `Family::Any` (bare `tcp`/`udp`) follows the address and accepts either.
+    let mismatch = match family {
+        Family::Any => None,
+        Family::V4 => (!sa.is_ipv4()).then_some("IPv4"),
+        Family::V6 => (!sa.is_ipv6()).then_some("IPv6"),
+    };
+    match mismatch {
+        Some(want) => Err(Error::AddrFamilyMismatch {
+            addr: addr.to_string(),
+            want,
+        }),
+        None => Ok(sa),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1263,8 +1298,10 @@ async fn localapi_client_get(
     let mut sock = TcpStream::connect(addr).await?;
     // HTTP Basic auth with an empty username (Go ignores the username; the password is the cred).
     let auth = STANDARD.encode(format!(":{cred}"));
+    // Send Go's anti-DNS-rebinding header (`Sec-Tailscale: localapi`) the server now requires in
+    // addition to Basic auth — a browser rebinding attack cannot set this custom header.
     let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic {auth}\r\nConnection: close\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nSec-Tailscale: localapi\r\nAuthorization: Basic {auth}\r\nConnection: close\r\n\r\n"
     );
     sock.write_all(req.as_bytes()).await?;
     // The server replies with `Connection: close`, so reading to EOF yields the whole response.
@@ -1278,6 +1315,11 @@ async fn localapi_client_get(
 /// The in-process LocalAPI HTTP server (Go's `localapi.Handler` served on the loopback). A minimal,
 /// dependency-free HTTP/1.1 server: the crate's `hyper` is HTTP/2-**client**-only, so this hand-rolls
 /// request framing exactly as the SOCKS5 half hand-rolls its own protocol in `src/loopback.rs`.
+///
+/// **Scope (vs Go).** Unlike Go's full `localapi.Handler` (dozens of endpoints), this serves the one
+/// route the facade needs — `GET /localapi/v0/status` — and returns `404` for every other
+/// path/method. Every request must additionally carry Go's `Sec-Tailscale: localapi` request header
+/// (anti-DNS-rebinding) on top of the Basic-auth credential, or it is rejected `403` before auth.
 mod localapi {
     use super::{Duration, STANDARD, TcpListener, TcpStream, find_subslice};
     use base64::Engine as _;
@@ -1294,6 +1336,14 @@ mod localapi {
     const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
     /// Cap on concurrent LocalAPI connections (loopback-only, but bounded for hygiene).
     const MAX_CONCURRENT: usize = 64;
+    /// Go's anti-DNS-rebinding request header. Every LocalAPI request must carry
+    /// `Sec-Tailscale: localapi` in addition to the Basic-auth credential: a browser steered at the
+    /// loopback listener by a rebinding attack cannot set this custom header cross-origin (it is not
+    /// CORS-safelisted, so `fetch` may send it only after a preflight this server never approves), so
+    /// requiring it keeps browser-driven callers out even if they learn the port and credential.
+    const SEC_TAILSCALE_HEADER: &str = "Sec-Tailscale";
+    /// The one accepted value of [`SEC_TAILSCALE_HEADER`] (Go compares `== "localapi"`).
+    const SEC_TAILSCALE_VALUE: &str = "localapi";
 
     /// A cloneable, `'static` async backend for `GET /localapi/v0/status`: returns the JSON body
     /// bytes, or an error string mapped to HTTP 500. Boxed so tests can inject a mock backend
@@ -1357,11 +1407,26 @@ mod localapi {
             buf.extend_from_slice(&chunk[..n]);
         };
 
-        let Some((method, target, password)) = parse_head(&buf[..head_len]) else {
+        let Some((method, target, password, sec_tailscale)) = parse_head(&buf[..head_len]) else {
             let r = response(400, "Bad Request", "text/plain", b"bad request", &[]);
             sock.write_all(&r).await?;
             return Ok(());
         };
+
+        // Anti-DNS-rebinding gate (Go's `Sec-Tailscale: localapi`), checked *before* the credential:
+        // block browser-driven (rebinding) callers even when they know the port + cred, since they
+        // cannot set this custom header. See [`SEC_TAILSCALE_HEADER`].
+        if sec_tailscale.as_deref() != Some(SEC_TAILSCALE_VALUE) {
+            let r = response(
+                403,
+                "Forbidden",
+                "text/plain",
+                b"missing 'Sec-Tailscale: localapi' header",
+                &[],
+            );
+            sock.write_all(&r).await?;
+            return Ok(());
+        }
 
         // Auth: the Basic-auth password must equal the cred (any username, matching Go).
         if !password.as_deref().is_some_and(|p| cred_ok(p, cred)) {
@@ -1395,9 +1460,12 @@ mod localapi {
         Ok(())
     }
 
-    /// Parse an HTTP request head into `(method, request_target, basic_auth_password)`. `None` when
-    /// the request line is malformed.
-    pub(super) fn parse_head(head: &[u8]) -> Option<(String, String, Option<String>)> {
+    /// Parse an HTTP request head into `(method, request_target, basic_auth_password,
+    /// sec_tailscale)`. `None` when the request line is malformed. `sec_tailscale` carries the
+    /// `Sec-Tailscale` request-header value (Go's anti-DNS-rebinding token), or `None` when absent.
+    pub(super) fn parse_head(
+        head: &[u8],
+    ) -> Option<(String, String, Option<String>, Option<String>)> {
         let text = std::str::from_utf8(head).ok()?;
         let mut lines = text.split("\r\n");
         let mut request_line = lines.next()?.split(' ');
@@ -1405,14 +1473,19 @@ mod localapi {
         let target = request_line.next()?.to_string();
         request_line.next()?; // require the HTTP-version token
         let mut password = None;
+        let mut sec_tailscale = None;
         for line in lines {
-            if let Some((name, value)) = line.split_once(':')
-                && name.trim().eq_ignore_ascii_case("authorization")
-            {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            let name = name.trim();
+            if name.eq_ignore_ascii_case("authorization") {
                 password = basic_auth_password(value.trim());
+            } else if name.eq_ignore_ascii_case(SEC_TAILSCALE_HEADER) {
+                sec_tailscale = Some(value.trim().to_string());
             }
         }
-        Some((method, target, password))
+        Some((method, target, password, sec_tailscale))
     }
 
     /// Decode `Basic <base64(user:pass)>` into the password (Go ignores the username). `None` if the
@@ -1534,6 +1607,39 @@ mod tests {
     }
 
     #[test]
+    fn parse_listen_addr_enforces_the_pinned_family_on_explicit_hosts() {
+        // A `tcp4`/`tcp6` network pins the family: an explicit host literal of the *other* family is
+        // rejected, exactly as Go `net.Listen("tcp4", "[::1]:80")` errors (this is the case a bare
+        // ":port" — filled with the matching wildcard — never reaches).
+        assert!(
+            matches!(
+                parse_listen_addr("[::1]:80", Family::V4),
+                Err(Error::AddrFamilyMismatch { want: "IPv4", ref addr }) if addr == "[::1]:80"
+            ),
+            "a v6 literal under tcp4 must be AddrFamilyMismatch(IPv4)"
+        );
+        assert!(
+            matches!(
+                parse_listen_addr("127.0.0.1:80", Family::V6),
+                Err(Error::AddrFamilyMismatch { want: "IPv6", .. })
+            ),
+            "a v4 literal under tcp6 must be AddrFamilyMismatch(IPv6)"
+        );
+        // The matching family passes through unchanged...
+        assert!(matches!(
+            parse_listen_addr("[::1]:80", Family::V6),
+            Ok(SocketAddr::V6(_))
+        ));
+        assert!(matches!(
+            parse_listen_addr("127.0.0.1:80", Family::V4),
+            Ok(SocketAddr::V4(_))
+        ));
+        // ...and the family-agnostic bare `tcp`/`udp` (Any) follows the address, accepting either.
+        assert!(parse_listen_addr("[::1]:80", Family::Any).unwrap().is_ipv6());
+        assert!(parse_listen_addr("127.0.0.1:80", Family::Any).unwrap().is_ipv4());
+    }
+
+    #[test]
     fn normalize_listen_addr_only_fills_a_bare_port() {
         // A bare ":port" is filled with the family wildcard; an explicit host is left untouched
         // (including a name, which the engine's ListenPacket then rejects — the facade doesn't
@@ -1569,6 +1675,22 @@ mod tests {
         assert!(matches!(
             s.listen("tcp", "not-an-addr").await,
             Err(Error::InvalidAddr { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn listen_rejects_a_family_mismatched_explicit_host_before_starting() {
+        // `listen("tcp4", "[::1]:80")` must fail like Go `net.Listen` — enforced at the facade
+        // boundary, before the lazy `Device::new` / any network I/O (hermetic: never reaches
+        // `started()`). This is the family check for an *explicit* host literal, not just ":port".
+        let s = Server::new();
+        assert!(matches!(
+            s.listen("tcp4", "[::1]:80").await,
+            Err(Error::AddrFamilyMismatch { want: "IPv4", .. })
+        ));
+        assert!(matches!(
+            s.listen("tcp6", "127.0.0.1:80").await,
+            Err(Error::AddrFamilyMismatch { want: "IPv6", .. })
         ));
     }
 
@@ -2239,13 +2361,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_head_reads_method_target_and_auth() {
+    fn parse_head_reads_method_target_auth_and_sec_tailscale() {
         // "user:pass" base64 = dXNlcjpwYXNz
-        let head = b"GET /localapi/v0/status HTTP/1.1\r\nHost: x\r\nAuthorization: Basic dXNlcjpwYXNz\r\nAccept: */*";
-        let (method, target, password) = localapi::parse_head(head).unwrap();
+        let head = b"GET /localapi/v0/status HTTP/1.1\r\nHost: x\r\nSec-Tailscale: localapi\r\nAuthorization: Basic dXNlcjpwYXNz\r\nAccept: */*";
+        let (method, target, password, sec_tailscale) = localapi::parse_head(head).unwrap();
         assert_eq!(method, "GET");
         assert_eq!(target, "/localapi/v0/status");
         assert_eq!(password.as_deref(), Some("pass"));
+        assert_eq!(sec_tailscale.as_deref(), Some("localapi"), "captures the anti-rebinding header");
+
+        // A head *without* the header parses fine with `sec_tailscale = None` (the handler then 403s).
+        let no_hdr = b"GET /localapi/v0/status HTTP/1.1\r\nHost: x\r\nAuthorization: Basic dXNlcjpwYXNz";
+        let (_, _, _, sec_tailscale) = localapi::parse_head(no_hdr).unwrap();
+        assert_eq!(sec_tailscale, None);
     }
 
     #[test]
@@ -2352,24 +2480,47 @@ mod tests {
             .unwrap();
         assert_eq!(code, 404);
 
-        // Wrong credential → 401.
+        // Wrong credential (the client still sends the Sec-Tailscale header) → 401.
         let (code, _) = localapi_client_get(addr, "wrong-cred", "/localapi/v0/status")
             .await
             .unwrap();
         assert_eq!(code, 401);
 
-        // Missing Authorization header entirely → 401.
+        // Missing Authorization header, but *with* the required Sec-Tailscale header → 401.
         {
             use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
             let mut sock = TcpStream::connect(addr).await.unwrap();
             sock.write_all(
-                b"GET /localapi/v0/status HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                b"GET /localapi/v0/status HTTP/1.1\r\nHost: x\r\nSec-Tailscale: localapi\r\nConnection: close\r\n\r\n",
             )
             .await
             .unwrap();
             let mut resp = Vec::new();
             sock.read_to_end(&mut resp).await.unwrap();
             assert_eq!(parse_response(&resp).unwrap().0, 401);
+        }
+
+        // Anti-DNS-rebinding: a *valid* credential but NO `Sec-Tailscale` header is rejected 403,
+        // before auth is even considered (Go's browser-rebinding guard).
+        {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let auth = STANDARD.encode(format!(":{cred}"));
+            let mut sock = TcpStream::connect(addr).await.unwrap();
+            sock.write_all(
+                format!(
+                    "GET /localapi/v0/status HTTP/1.1\r\nHost: x\r\nAuthorization: Basic {auth}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            let mut resp = Vec::new();
+            sock.read_to_end(&mut resp).await.unwrap();
+            assert_eq!(
+                parse_response(&resp).unwrap().0,
+                403,
+                "no Sec-Tailscale header → 403 even with a valid credential"
+            );
         }
 
         task.abort();

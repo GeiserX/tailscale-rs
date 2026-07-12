@@ -62,7 +62,7 @@ not a facade, and would discard the fork's typed values. So the design draws a d
 |---|---|---|
 | Module | `tailscale::tsnet` | Matches the Go package name; discoverable; `use tailscale::tsnet::Server`. |
 | Wrapper type | `tsnet::Server` | Same name/role as Go's `tsnet.Server`. |
-| Feature flag | `tsnet` (`Cargo.toml`: `tsnet = []`) | Off by default; pulls **zero** new deps (reuses the crate's existing `serde_json`/`tokio`/`thiserror`). |
+| Feature flag | `tsnet` (`Cargo.toml`: `tsnet = ["dep:base64"]`) | Off by default. Reuses the crate's existing `serde_json`/`tokio`/`thiserror`/`rand`; adds **one** new *optional, direct* dependency edge — `base64` (HTTP Basic-auth for the loopback LocalAPI). It was already in the workspace graph, so no new crate is compiled — but it is a new direct edge for `tailscale`, not literally "zero new deps". |
 | Lifecycle error | `tsnet::Error` | One Go-shaped error for the lifecycle path (§7). |
 | State store | `tsnet::StateStore` / `FileStore` / `MemStore` | Go `ipn.StateStore` / `store.FileStore` / `mem.Store` analogs (§8). |
 | Funnel options | `tsnet::FunnelOptions` (`funnel_only`, `with_tls`) | Rust-idiomatic collapse of Go's variadic `...FunnelOption` (§9). |
@@ -405,9 +405,11 @@ the loopback). This closes the gap the parity matrix flagged (matrix §5.1, `tsr
   username, matching Go). It serves `GET /localapi/v0/status` backed by `Device::status`, returning
   its JSON. The server is hand-rolled over `tokio` TCP — the crate's `hyper` is HTTP/2-**client**-only
   (`Cargo.toml`), so there is no ready-made HTTP server to reuse; this mirrors how the SOCKS5 half
-  hand-rolls its own protocol in `src/loopback.rs`. Zero new dependencies (`base64` for Basic-auth
-  decode and `rand` for the credential are already in `[dependencies]`); no TLS, so the **ring-only**
-  crypto invariant is untouched.
+  hand-rolls its own protocol in `src/loopback.rs`. The `tsnet` feature adds one new *optional,
+  direct* dependency edge — `base64` (Basic-auth decode; `tsnet = ["dep:base64"]`) — while `rand`
+  (the credential) is already a direct dependency. `base64` was already in the workspace graph, so no
+  new crate is compiled; it is a new direct edge for `tailscale`, not literally "zero new deps". No
+  TLS, so the **ring-only** crypto invariant is untouched.
 - **`Server::local_client()`** (Go `LocalClient()`) returns a dependency-free `LocalClient` that
   round-trips authenticated `GET`s through that server (`/localapi/v0/status`), and
   **`Server::http_client()`** (Go `HTTPClient()`, `#[cfg(feature = "hyper")]`) returns a `hyper_util`
@@ -436,7 +438,9 @@ value for a graceful shutdown.
 
 ```toml
 # Cargo.toml [features]
-tsnet = []   # zero extra deps; reuses serde_json / tokio / thiserror already in [dependencies]
+tsnet = ["dep:base64"]   # one new optional *direct* dep edge: base64 (loopback LocalAPI Basic-auth),
+                         # already in the workspace graph (no new crate compiled). Otherwise reuses
+                         # serde_json / tokio / thiserror / rand already in [dependencies].
 ```
 
 ```rust

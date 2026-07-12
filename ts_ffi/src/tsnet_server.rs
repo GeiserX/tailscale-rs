@@ -37,19 +37,24 @@ pub struct server(tsnet::Server);
 /// handle.
 pub struct local_client(tsnet::LocalClient);
 
-/// Create a new tsnet server (Go `&tsnet.Server{Hostname, AuthKey, ControlURL, Dir, Ephemeral}`).
+/// Create a new tsnet server (Go `&tsnet.Server{Hostname, AuthKey, ControlURL, Dir, Ephemeral,
+/// AdvertiseTags}`).
 ///
 /// Every string argument may be `NULL` to leave that field unset (engine default). `dir`, when
 /// non-`NULL`, is the state directory that persists this node's identity keys across runs (Go
-/// `Server.Dir`); `NULL` gives a fresh ephemeral in-memory identity. No network I/O happens here —
-/// the wrapped device is built on the first [`ts_server_loopback`]/[`ts_server_local_client`] call.
+/// `Server.Dir`); `NULL` gives a fresh ephemeral in-memory identity. `tags` (Go `AdvertiseTags`) is
+/// a `tags_len`-long array of C strings — the ACL tags to advertise — or `NULL` (with `tags_len` 0)
+/// for none. No network I/O happens here — the wrapped device is built on the first
+/// [`ts_server_loopback`]/[`ts_server_local_client`] call.
 ///
 /// Returns an owned handle (free with [`ts_server_free`]), or `NULL` only if the call panicked.
 ///
 /// # Safety
 ///
 /// Each non-`NULL` string argument must be readable per [`std::ffi::CStr`] rules (NUL-terminated,
-/// valid up to and including the NUL).
+/// valid up to and including the NUL). When `tags` is non-`NULL` it must point to `tags_len`
+/// readable, properly-aligned `*const c_char` elements, each element itself `NULL` or such a C
+/// string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ts_server_new(
     hostname: *const c_char,
@@ -57,6 +62,8 @@ pub unsafe extern "C" fn ts_server_new(
     control_url: *const c_char,
     dir: *const c_char,
     ephemeral: bool,
+    tags: *const *const c_char,
+    tags_len: usize,
 ) -> Option<Box<server>> {
     ffi_guard(move || {
         // A server may be the first entry point a caller touches, before any `ts_init`.
@@ -70,6 +77,16 @@ pub unsafe extern "C" fn ts_server_new(
         s.ephemeral = ephemeral;
         // SAFETY: `dir` is `NULL` or a valid C string per the safety precondition.
         s.dir = unsafe { util::str(dir) }.map(PathBuf::from);
+        // ACL tags (Go `AdvertiseTags`): read the `tags_len`-long pointer array, keeping each valid
+        // UTF-8 C string (a `NULL` or non-UTF-8 element is skipped). A `NULL` array leaves it empty.
+        if !tags.is_null() {
+            // SAFETY: non-`NULL` `tags` is valid for `tags_len` `*const c_char` reads per the
+            // precondition; each element pointer is dereferenced null-safely by `util::str`.
+            s.advertise_tags = unsafe { std::slice::from_raw_parts(tags, tags_len) }
+                .iter()
+                .filter_map(|&p| unsafe { util::str(p) }.map(ToOwned::to_owned))
+                .collect();
+        }
         Some(Box::new(server(s)))
     })
 }
@@ -239,6 +256,17 @@ pub unsafe extern "C" fn ts_local_client_get(
 #[unsafe(no_mangle)]
 pub extern "C" fn ts_local_client_address(lc: &local_client) -> sockaddr {
     ffi_guard(move || lc.0.address().into())
+}
+
+/// The LocalAPI credential (HTTP Basic-auth password) this client sends (Go `LocalClient()`'s cred),
+/// matching the Python/Elixir `credential` accessors.
+///
+/// Returns a newly-allocated, NUL-terminated string the caller must free with
+/// [`ts_string_free`](crate::ts_string_free). Returns `NULL` only on panic (the hex credential never
+/// contains an interior NUL).
+#[unsafe(no_mangle)]
+pub extern "C" fn ts_local_client_credential(lc: &local_client) -> *mut c_char {
+    ffi_guard(move || into_c_string(lc.0.credential().to_owned()))
 }
 
 /// Free the server, tearing down the loopback SOCKS5 proxy + LocalAPI HTTP server and shutting the
