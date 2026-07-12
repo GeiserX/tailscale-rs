@@ -22,6 +22,8 @@ srv.hostname = Some("tsnet_echo_example".into());
 srv.auth_key = Some(key);
 srv.dir = Some("tsnet_echo_state".into());
 let listener = srv.listen("tcp", ":1234").await?;   // Start() happens lazily on this first call
+// … accept connections …
+drop(listener);                                     // release the netstack listener before closing
 // … srv.close(Some(Duration::from_secs(5))).await;
 ```
 

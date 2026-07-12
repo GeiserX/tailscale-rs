@@ -130,11 +130,14 @@ async fn f2_facade_listen_and_dial_two_nodes() {
     // A: accept exactly one overlay connection and echo its bytes back.
     let server_side = async {
         let mut conn = listener.accept().await.expect("A accepts an overlay connection");
-        let mut buf = [0u8; 16];
-        let n = conn.read(&mut buf).await.expect("A reads the request");
-        conn.write_all(&buf[..n]).await.expect("A echoes it back");
+        // The client sends a fixed 4-byte "ping". A single `read` may return a short prefix, which
+        // would echo <4 bytes while the client's `read_exact` blocks forever waiting for the rest —
+        // a false failure. `read_exact` pulls the whole fixed-size payload before echoing.
+        let mut buf = [0u8; 4];
+        conn.read_exact(&mut buf).await.expect("A reads the request");
+        conn.write_all(&buf).await.expect("A echoes it back");
         conn.flush().await.ok();
-        n
+        buf.len()
     };
 
     // B: retry the dial while its netmap converges to include A (fresh nodes can lag), then

@@ -87,6 +87,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let args = Args::parse();
 
+    // `--listen-port 0` would bind an OS-chosen ephemeral port, but this example logs and tells the
+    // user to `nc` the *requested* port below — `:0` is not a connectable address. Reject it with a
+    // clear error rather than print an address nobody can reach.
+    if args.listen_port == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--listen-port must be between 1 and 65535",
+        )
+        .into());
+    }
+
     // Set the Go-`tsnet.Server`-parity fields, exactly where Go writes struct fields. The wrapped
     // `Device` is *not* built yet — it is constructed and started lazily on the first method call
     // below, so every field may still be changed until then.

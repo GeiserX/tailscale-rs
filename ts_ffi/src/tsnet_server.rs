@@ -47,7 +47,8 @@ pub struct local_client(tsnet::LocalClient);
 /// for none. No network I/O happens here — the wrapped device is built on the first
 /// [`ts_server_loopback`]/[`ts_server_local_client`] call.
 ///
-/// Returns an owned handle (free with [`ts_server_free`]), or `NULL` only if the call panicked.
+/// Returns an owned handle (free with [`ts_server_free`]), or `NULL` if the call panicked or a
+/// non-`NULL` string argument (`hostname`, `auth_key`, `control_url`, or `dir`) is not valid UTF-8.
 ///
 /// # Safety
 ///
@@ -68,15 +69,33 @@ pub unsafe extern "C" fn ts_server_new(
     ffi_guard(move || {
         // A server may be the first entry point a caller touches, before any `ts_init`.
         crate::ts_init_tracing();
-        // SAFETY: each pointer is `NULL` or a valid C string per the safety precondition.
-        let owned = |p| unsafe { util::str(p) }.map(ToOwned::to_owned);
+        // Decode each optional text field. A `NULL` pointer stays unset (`None`, engine default),
+        // but a non-`NULL` pointer holding invalid UTF-8 fails the whole call (returns `NULL`)
+        // rather than silently dropping the setting: a malformed `dir` must not quietly select
+        // in-memory state (losing identity persistence), nor `auth_key`/`control_url` be dropped.
+        let optional_text = |p: *const c_char| {
+            if p.is_null() {
+                Some(None)
+            } else {
+                // SAFETY: `p` is non-`NULL` and a valid C string per the safety precondition.
+                unsafe { util::str(p) }.map(|value| Some(value.to_owned()))
+            }
+        };
+        let (Some(hostname), Some(auth_key), Some(control_url), Some(dir)) = (
+            optional_text(hostname),
+            optional_text(auth_key),
+            optional_text(control_url),
+            optional_text(dir),
+        ) else {
+            tracing::error!("ts_server_new: configuration contains invalid UTF-8");
+            return None;
+        };
         let mut s = tsnet::Server::new();
-        s.hostname = owned(hostname);
-        s.auth_key = owned(auth_key);
-        s.control_url = owned(control_url);
+        s.hostname = hostname;
+        s.auth_key = auth_key;
+        s.control_url = control_url;
         s.ephemeral = ephemeral;
-        // SAFETY: `dir` is `NULL` or a valid C string per the safety precondition.
-        s.dir = unsafe { util::str(dir) }.map(PathBuf::from);
+        s.dir = dir.map(PathBuf::from);
         // ACL tags (Go `AdvertiseTags`): read the `tags_len`-long pointer array, keeping each valid
         // UTF-8 C string (a `NULL` or non-UTF-8 element is skipped). A `NULL` array leaves it empty.
         if !tags.is_null() {
@@ -106,17 +125,41 @@ pub unsafe extern "C" fn ts_server_new(
 ///
 /// # Safety
 ///
-/// `out_socks_addr`, `out_proxy_cred`, `out_localapi_addr`, and `out_localapi_cred` must each be
-/// valid, writable pointers.
+/// Each output pointer, when non-`NULL`, must be valid for a write of its pointee type and properly
+/// aligned. A `NULL` destination, or two outputs that share an address (aliasing), is detected and
+/// rejected with a negative return before anything is written — so passing one is safe but fails.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ts_server_loopback(
     srv: &server,
-    out_socks_addr: &mut sockaddr,
+    out_socks_addr: *mut sockaddr,
     out_proxy_cred: *mut *mut c_char,
-    out_localapi_addr: &mut sockaddr,
+    out_localapi_addr: *mut sockaddr,
     out_localapi_cred: *mut *mut c_char,
 ) -> ffi::c_int {
     ffi_guard(move || {
+        // Validate the four output destinations up front — before starting the loopback or
+        // allocating any credential. Reject a `NULL` pointer, and reject any two outputs that share
+        // an address: two `&mut sockaddr` at one location would be aliasing UB, and two aliasing
+        // credential slots would leak the first `CString` when the second overwrites it. Raw
+        // pointers (not `&mut`) let the caller pass these without forming overlapping references.
+        let outs = [
+            out_socks_addr as *const (),
+            out_proxy_cred as *const (),
+            out_localapi_addr as *const (),
+            out_localapi_cred as *const (),
+        ];
+        if outs.iter().any(|p| p.is_null()) {
+            tracing::error!("server loopback: a NULL output pointer");
+            return -1;
+        }
+        if outs
+            .iter()
+            .enumerate()
+            .any(|(i, p)| outs[i + 1..].contains(p))
+        {
+            tracing::error!("server loopback: aliasing (duplicate) output pointers");
+            return -1;
+        }
         let lb = match TOKIO_RUNTIME.block_on(srv.0.loopback()) {
             Ok(lb) => lb,
             Err(e) => {
@@ -133,10 +176,11 @@ pub unsafe extern "C" fn ts_server_loopback(
                 return -1;
             }
         };
-        *out_socks_addr = lb.address.into();
-        *out_localapi_addr = lb.local_api_address.into();
-        // SAFETY: `out_proxy_cred`/`out_localapi_cred` are valid writable pointers by precondition.
+        // SAFETY: all four destinations are non-`NULL`, pairwise distinct (checked above), and valid
+        // writable pointers to their pointee types per the safety precondition.
         unsafe {
+            *out_socks_addr = lb.address.into();
+            *out_localapi_addr = lb.local_api_address.into();
             *out_proxy_cred = proxy.into_raw();
             *out_localapi_cred = localapi.into_raw();
         }

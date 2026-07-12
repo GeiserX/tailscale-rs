@@ -102,6 +102,7 @@ typed returns — so you get Go's lifecycle *shape* without giving up Rust's typ
 ```toml
 [dependencies]
 tailscale = { package = "geiserx_tailscale", version = "0.6", features = ["tsnet"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 ```rust

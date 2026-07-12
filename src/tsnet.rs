@@ -448,7 +448,7 @@ impl std::ops::Deref for ServiceListener {
 /// Like Go's `s.loopbackListener`, both listeners live for the [`Server`]'s lifetime and are torn
 /// down by [`Server::close`] — [`Server::loopback`] is idempotent and returns the same addresses and
 /// credentials on every call. There is no per-result handle to drop.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct Loopback {
     /// The bound `127.0.0.1:<port>` address of the SOCKS5 proxy (Go's `addr`, SOCKS5 half).
@@ -462,6 +462,19 @@ pub struct Loopback {
     pub local_api_cred: String,
 }
 
+impl std::fmt::Debug for Loopback {
+    /// Redacts both credentials — `proxy_cred` and `local_api_cred` are secrets and must never reach
+    /// `{:?}`/`tracing` output. Field *names* are preserved so the shape is still legible.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Loopback")
+            .field("address", &self.address)
+            .field("proxy_cred", &"<redacted>")
+            .field("local_api_address", &self.local_api_address)
+            .field("local_api_cred", &"<redacted>")
+            .finish()
+    }
+}
+
 /// A minimal client for the in-process LocalAPI HTTP server started alongside the loopback proxy —
 /// the Rust analog of what Go's `tsnet.Server.LocalClient()` returns (a `*local.Client` wired to the
 /// node's own LocalAPI).
@@ -473,10 +486,21 @@ pub struct Loopback {
 /// The fork's [`Status`] is not a `serde` type, so [`status`](Self::status) returns
 /// the server's raw JSON bytes rather than a deserialized struct; for typed status prefer
 /// [`Server::status`] (the in-process path). For arbitrary endpoints use [`get`](Self::get).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LocalClient {
     address: SocketAddr,
     cred: String,
+}
+
+impl std::fmt::Debug for LocalClient {
+    /// Redacts `cred` — the LocalAPI Basic-auth password is a secret and must never reach
+    /// `{:?}`/`tracing` output. Field *names* are preserved so the shape is still legible.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalClient")
+            .field("address", &self.address)
+            .field("cred", &"<redacted>")
+            .finish()
+    }
 }
 
 impl LocalClient {
