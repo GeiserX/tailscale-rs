@@ -247,7 +247,9 @@ pub enum Error {
     /// *other* address family — e.g. [`Server::listen`]`("tcp4", "[::1]:80")`. Go's `net.Listen`
     /// rejects the same mismatch (`tcp4` binds only IPv4 addresses, `tcp6` only IPv6). A bare
     /// `":port"` never trips this: it is filled with the family's own wildcard host first.
-    #[error("address {addr:?} is not an {want} address (required by the family-pinned listen network)")]
+    #[error(
+        "address {addr:?} is not an {want} address (required by the family-pinned listen network)"
+    )]
     AddrFamilyMismatch {
         /// The offending address string, whose family differs from the network's.
         addr: String,
@@ -713,9 +715,7 @@ impl Server {
     /// Get the wrapped device (as the shared [`Arc`]), starting it on first call (Go's lazy
     /// `Start`).
     async fn started(&self) -> Result<&Arc<Device>, Error> {
-        self.device
-            .get_or_try_init(|| self.build_and_start())
-            .await
+        self.device.get_or_try_init(|| self.build_and_start()).await
     }
 
     /// Connect to the tailnet (Go `Start`). Idempotent — subsequent calls are no-ops.
@@ -762,12 +762,8 @@ impl Server {
         Ok(match (net.transport, net.family) {
             // Unsuffixed tcp/udp: the family follows the resolved address, so these are exactly the
             // transport-specific typed Device calls — route over them and wrap into `DialConn`.
-            (Transport::Tcp, Family::Any) => {
-                crate::DialConn::Tcp(dev.dial_tcp(addr).await?)
-            }
-            (Transport::Udp, Family::Any) => {
-                crate::DialConn::Udp(dev.dial_udp(addr).await?)
-            }
+            (Transport::Tcp, Family::Any) => crate::DialConn::Tcp(dev.dial_tcp(addr).await?),
+            (Transport::Udp, Family::Any) => crate::DialConn::Udp(dev.dial_udp(addr).await?),
             // Family-pinned (tcp4/tcp6/udp4/udp6): forward the whole network string so the engine
             // enforces the v4/v6 family that the family-agnostic sub-calls above would ignore.
             _ => dev.dial(network, addr).await?,
@@ -1090,7 +1086,9 @@ impl Server {
 /// start is surfaced as a [`ts_control::CertError::Io`] carrying the underlying reason rather than
 /// swallowed. (The start error only fires for an already-validated config.)
 fn start_failed_cert(e: Error) -> ts_control::CertError {
-    ts_control::CertError::Io(std::io::Error::other(format!("server failed to start: {e}")))
+    ts_control::CertError::Io(std::io::Error::other(format!(
+        "server failed to start: {e}"
+    )))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1372,8 +1370,9 @@ mod localapi {
     /// A cloneable, `'static` async backend for `GET /localapi/v0/status`: returns the JSON body
     /// bytes, or an error string mapped to HTTP 500. Boxed so tests can inject a mock backend
     /// without a live [`Device`](crate::Device).
-    pub(super) type StatusFn =
-        Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send>> + Send + Sync>;
+    pub(super) type StatusFn = Arc<
+        dyn Fn() -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send>> + Send + Sync,
+    >;
 
     /// Serve the LocalAPI on `listener` until the task is aborted (by [`super::LoopbackRt`]'s drop).
     pub(super) async fn serve(listener: TcpListener, cred: String, status: StatusFn) {
@@ -1525,7 +1524,9 @@ mod localapi {
         let decoded = String::from_utf8(decoded).ok()?;
         // "user:pass" — the username (before the first colon) is ignored; a header with no colon at
         // all is malformed Basic auth and yields no password (→ 401).
-        decoded.split_once(':').map(|(_user, pass)| pass.to_string())
+        decoded
+            .split_once(':')
+            .map(|(_user, pass)| pass.to_string())
     }
 
     /// Constant-time credential comparison (don't leak the cred via early-exit timing).
@@ -1659,8 +1660,16 @@ mod tests {
             Ok(SocketAddr::V4(_))
         ));
         // ...and the family-agnostic bare `tcp`/`udp` (Any) follows the address, accepting either.
-        assert!(parse_listen_addr("[::1]:80", Family::Any).unwrap().is_ipv6());
-        assert!(parse_listen_addr("127.0.0.1:80", Family::Any).unwrap().is_ipv4());
+        assert!(
+            parse_listen_addr("[::1]:80", Family::Any)
+                .unwrap()
+                .is_ipv6()
+        );
+        assert!(
+            parse_listen_addr("127.0.0.1:80", Family::Any)
+                .unwrap()
+                .is_ipv4()
+        );
     }
 
     #[test]
@@ -1756,7 +1765,7 @@ mod tests {
         let s = Server::new();
         let cfg = ts_control::ServeConfig {
             name: "host.tailnet.ts.net".into(), // a valid tailnet name...
-            port: 0,                             // ...but port 0 is rejected by ServeConfig::validate
+            port: 0, // ...but port 0 is rejected by ServeConfig::validate
             target: ts_control::ServeTarget::Accept,
         };
         assert!(matches!(
@@ -1775,7 +1784,10 @@ mod tests {
         assert!(matches!(e, ts_control::CertError::Io(_)));
         let msg = e.to_string();
         assert!(msg.contains("server failed to start"), "got {msg:?}");
-        assert!(msg.contains("boom"), "underlying reason must be preserved, got {msg:?}");
+        assert!(
+            msg.contains("boom"),
+            "underlying reason must be preserved, got {msg:?}"
+        );
     }
 
     #[cfg(feature = "acme")]
@@ -1805,7 +1817,10 @@ mod tests {
         let store = MemStore::default();
         assert!(store.read_state(STATE_KEY).unwrap().is_none());
         store.write_state(STATE_KEY, b"blob").unwrap();
-        assert_eq!(store.read_state(STATE_KEY).unwrap().as_deref(), Some(&b"blob"[..]));
+        assert_eq!(
+            store.read_state(STATE_KEY).unwrap().as_deref(),
+            Some(&b"blob"[..])
+        );
     }
 
     #[test]
@@ -1991,7 +2006,10 @@ mod tests {
         assert_eq!(cfg.requested_hostname.as_deref(), Some("web"));
         assert_eq!(cfg.auth_key.as_deref(), Some("tskey-auth-xxxx"));
         assert_eq!(cfg.control_server_url.scheme(), "https");
-        assert_eq!(cfg.control_server_url.host_str(), Some("control.example.com"));
+        assert_eq!(
+            cfg.control_server_url.host_str(),
+            Some("control.example.com")
+        );
         assert_eq!(
             cfg.requested_tags,
             vec!["tag:web".to_string(), "tag:prod".to_string()]
@@ -2137,7 +2155,10 @@ mod tests {
         FileStore::at(path.clone())
             .write_state(STATE_KEY, b"x")
             .unwrap();
-        assert!(path.exists(), "FileStore::at writes to the exact path given");
+        assert!(
+            path.exists(),
+            "FileStore::at writes to the exact path given"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2277,7 +2298,9 @@ mod tests {
         // Every non-tsnet network string is a typed facade error, echoing the offending value, and
         // returns WITHOUT starting the device: a default `Server` has no control server, so if this
         // touched the network it would block — returning at all proves the parse is up front.
-        for n in ["", "TCP", "tcp5", "sctp", "unix", "ip", "udplite", "tcp ", " udp"] {
+        for n in [
+            "", "TCP", "tcp5", "sctp", "unix", "ip", "udplite", "tcp ", " udp",
+        ] {
             match Server::new().dial(n, "host:80").await {
                 Err(Error::UnsupportedNetwork { network }) => assert_eq!(network, n),
                 Err(e) => panic!("dial({n:?}) should be UnsupportedNetwork, got Err({e:?})"),
@@ -2392,10 +2415,15 @@ mod tests {
         assert_eq!(method, "GET");
         assert_eq!(target, "/localapi/v0/status");
         assert_eq!(password.as_deref(), Some("pass"));
-        assert_eq!(sec_tailscale.as_deref(), Some("localapi"), "captures the anti-rebinding header");
+        assert_eq!(
+            sec_tailscale.as_deref(),
+            Some("localapi"),
+            "captures the anti-rebinding header"
+        );
 
         // A head *without* the header parses fine with `sec_tailscale = None` (the handler then 403s).
-        let no_hdr = b"GET /localapi/v0/status HTTP/1.1\r\nHost: x\r\nAuthorization: Basic dXNlcjpwYXNz";
+        let no_hdr =
+            b"GET /localapi/v0/status HTTP/1.1\r\nHost: x\r\nAuthorization: Basic dXNlcjpwYXNz";
         let (_, _, _, sec_tailscale) = localapi::parse_head(no_hdr).unwrap();
         assert_eq!(sec_tailscale, None);
     }
@@ -2403,7 +2431,10 @@ mod tests {
     #[test]
     fn parse_head_rejects_malformed_request_line() {
         assert!(localapi::parse_head(b"GET-only-one-token").is_none());
-        assert!(localapi::parse_head(b"GET /x").is_none(), "needs a version token");
+        assert!(
+            localapi::parse_head(b"GET /x").is_none(),
+            "needs a version token"
+        );
     }
 
     #[test]
@@ -2435,7 +2466,10 @@ mod tests {
     fn cred_ok_matches_only_exact_credentials() {
         assert!(localapi::cred_ok("abc123", "abc123"));
         assert!(!localapi::cred_ok("abc123", "abc124"));
-        assert!(!localapi::cred_ok("abc", "abc123"), "length mismatch is a mismatch");
+        assert!(
+            !localapi::cred_ok("abc", "abc123"),
+            "length mismatch is a mismatch"
+        );
         assert!(!localapi::cred_ok("", "x"));
     }
 

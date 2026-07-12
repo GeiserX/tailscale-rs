@@ -33,10 +33,10 @@ mod loopback;
 mod net_types;
 mod panic_guard;
 mod status;
-mod tsnet_server;
 mod taildrop;
 mod tcp;
 mod tls;
+mod tsnet_server;
 mod udp;
 mod util;
 
@@ -48,11 +48,6 @@ pub use net_types::{
 };
 pub(crate) use panic_guard::ffi_guard;
 pub use status::{status_node, status_visitor, ts_status, ts_whois};
-pub use tsnet_server::{
-    local_client, server, ts_local_client_address, ts_local_client_credential,
-    ts_local_client_free, ts_local_client_get, ts_local_client_status, ts_server_free,
-    ts_server_local_client, ts_server_loopback, ts_server_new,
-};
 pub use taildrop::{
     ts_taildrop_delete_file, ts_taildrop_file_size, ts_taildrop_save_file,
     ts_taildrop_waiting_files,
@@ -64,6 +59,11 @@ pub use tcp::{
 };
 pub use tls::{
     serve_config, serve_target, service_mode, ts_get_certificate, ts_listen_service, ts_listen_tls,
+};
+pub use tsnet_server::{
+    local_client, server, ts_local_client_address, ts_local_client_credential,
+    ts_local_client_free, ts_local_client_get, ts_local_client_status, ts_server_free,
+    ts_server_local_client, ts_server_loopback, ts_server_new,
 };
 pub use udp::{ts_udp_bind, ts_udp_close, ts_udp_recvfrom, ts_udp_sendto, udp_socket};
 

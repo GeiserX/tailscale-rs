@@ -761,9 +761,7 @@ impl Server {
         if let Some(tags) = tags {
             s.advertise_tags = tags;
         }
-        Server {
-            inner: Arc::new(s),
-        }
+        Server { inner: Arc::new(s) }
     }
 
     /// Start (once) the loopback surface and return `(socks_addr, proxy_cred, localapi_addr,

@@ -69,16 +69,27 @@ fn build_server(opts: &HashMap<Atom, Term<'_>>) -> Result<tsnet::Server, &'stati
     let mut s = tsnet::Server::new();
 
     if let Some(v) = opts.get(&atoms::hostname()) {
-        s.hostname = Some(v.decode::<String>().map_err(|_| "hostname must be a string")?);
+        s.hostname = Some(
+            v.decode::<String>()
+                .map_err(|_| "hostname must be a string")?,
+        );
     }
     if let Some(v) = opts.get(&atoms::auth_key()) {
-        s.auth_key = Some(v.decode::<String>().map_err(|_| "auth_key must be a string")?);
+        s.auth_key = Some(
+            v.decode::<String>()
+                .map_err(|_| "auth_key must be a string")?,
+        );
     }
     if let Some(v) = opts.get(&atoms::control_url()) {
-        s.control_url = Some(v.decode::<String>().map_err(|_| "control_url must be a string")?);
+        s.control_url = Some(
+            v.decode::<String>()
+                .map_err(|_| "control_url must be a string")?,
+        );
     }
     if let Some(v) = opts.get(&atoms::ephemeral()) {
-        s.ephemeral = v.decode::<bool>().map_err(|_| "ephemeral must be a boolean")?;
+        s.ephemeral = v
+            .decode::<bool>()
+            .map_err(|_| "ephemeral must be a boolean")?;
     }
     if let Some(v) = opts.get(&atoms::dir()) {
         s.dir = Some(PathBuf::from(
@@ -165,7 +176,10 @@ fn local_client_get(
 
 /// The LocalAPI HTTP server address (`{ip, port}`) this client talks to.
 #[rustler::nif]
-fn local_client_address(env: rustler::Env<'_>, lc: ResourceArc<LocalClientResource>) -> impl Encoder {
+fn local_client_address(
+    env: rustler::Env<'_>,
+    lc: ResourceArc<LocalClientResource>,
+) -> impl Encoder {
     crate::sockaddr_to_erl(env, lc.inner.address())
 }
 

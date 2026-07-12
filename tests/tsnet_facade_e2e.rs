@@ -70,8 +70,14 @@ async fn join(label: &str, auth: &str) -> (Server, Ipv4Addr) {
         .await
         .expect("facade up() within timeout")
         .expect("facade up() must reach Running against real Tailscale");
-    let (ipv4, _v6) = srv.tailscale_ips().await.expect("tailscale_ips() after up()");
-    assert!(is_cgnat(ipv4), "{label}: facade node IP {ipv4} must be CGNAT");
+    let (ipv4, _v6) = srv
+        .tailscale_ips()
+        .await
+        .expect("tailscale_ips() after up()");
+    assert!(
+        is_cgnat(ipv4),
+        "{label}: facade node IP {ipv4} must be CGNAT"
+    );
     eprintln!("[{label}] facade node up as {ipv4}");
     (srv, ipv4)
 }
@@ -104,7 +110,10 @@ async fn f1_facade_up_status_close() {
 
     let closed = srv.close(Some(Duration::from_secs(10))).await;
     eprintln!("[f1] facade close() completed_gracefully={closed}");
-    assert!(closed, "facade close() must complete a graceful shutdown in time");
+    assert!(
+        closed,
+        "facade close() must complete a graceful shutdown in time"
+    );
 }
 
 /// F2 — LISTEN + DIAL across two facade nodes. `listen("tcp", ":port")` on node A (Go `Listen`)
@@ -129,12 +138,17 @@ async fn f2_facade_listen_and_dial_two_nodes() {
 
     // A: accept exactly one overlay connection and echo its bytes back.
     let server_side = async {
-        let mut conn = listener.accept().await.expect("A accepts an overlay connection");
+        let mut conn = listener
+            .accept()
+            .await
+            .expect("A accepts an overlay connection");
         // The client sends a fixed 4-byte "ping". A single `read` may return a short prefix, which
         // would echo <4 bytes while the client's `read_exact` blocks forever waiting for the rest —
         // a false failure. `read_exact` pulls the whole fixed-size payload before echoing.
         let mut buf = [0u8; 4];
-        conn.read_exact(&mut buf).await.expect("A reads the request");
+        conn.read_exact(&mut buf)
+            .await
+            .expect("A reads the request");
         conn.write_all(&buf).await.expect("A echoes it back");
         conn.flush().await.ok();
         buf.len()
@@ -157,7 +171,10 @@ async fn f2_facade_listen_and_dial_two_nodes() {
             tokio::time::sleep(Duration::from_secs(2)).await;
             waited += Duration::from_secs(2);
         };
-        stream.write_all(b"ping").await.expect("B writes 'ping' over the overlay");
+        stream
+            .write_all(b"ping")
+            .await
+            .expect("B writes 'ping' over the overlay");
         stream.flush().await.ok();
         let mut back = [0u8; 4];
         timeout(Duration::from_secs(10), stream.read_exact(&mut back))
@@ -200,8 +217,14 @@ async fn f3_facade_loopback_and_localclient() {
         lb.local_api_address,
         lb.proxy_cred != lb.local_api_cred
     );
-    assert_ne!(lb.proxy_cred, lb.local_api_cred, "the two Go creds must be distinct");
-    assert_ne!(lb.address, lb.local_api_address, "two separate 127.0.0.1 listeners");
+    assert_ne!(
+        lb.proxy_cred, lb.local_api_cred,
+        "the two Go creds must be distinct"
+    );
+    assert_ne!(
+        lb.address, lb.local_api_address,
+        "two separate 127.0.0.1 listeners"
+    );
     assert!(
         lb.address.ip().is_loopback() && lb.local_api_address.ip().is_loopback(),
         "both listeners bind 127.0.0.1"
@@ -214,7 +237,10 @@ async fn f3_facade_loopback_and_localclient() {
 
     // LocalClient round-trips authenticated status through the LIVE in-process LocalAPI server.
     let client = srv.local_client().await.expect("facade local_client()");
-    let body = client.status().await.expect("LocalClient status() must round-trip 200");
+    let body = client
+        .status()
+        .await
+        .expect("LocalClient status() must round-trip 200");
     let text = String::from_utf8_lossy(&body);
     eprintln!("[f3] localapi status body ({} bytes)", body.len());
     assert!(
@@ -258,7 +284,9 @@ async fn f4_facade_listen_tls_failclosed() {
         // (a real acceptor) or a typed Acme/Io error — either way typed and never plaintext.
         match res {
             Ok(_acceptor) => eprintln!("[f4] acme: issued a real TLS acceptor"),
-            Err(e) => eprintln!("[f4] acme: typed CertError (tailnet HTTPS config dependent): {e:?}"),
+            Err(e) => {
+                eprintln!("[f4] acme: typed CertError (tailnet HTTPS config dependent): {e:?}")
+            }
         }
     } else {
         // Default build: the fork refuses to serve TLS without a real cert engine — fail-closed as
@@ -296,7 +324,9 @@ async fn f5_facade_listen_funnel_failclosed_typed() {
     };
     eprintln!("[f5] listen_funnel(name={name:?}, port=443)");
     match srv.listen_funnel(&cfg, FunnelOptions::default()).await {
-        Ok(_rx) => eprintln!("[f5] Funnel enabled on this tailnet: got a live funnel receiver (Ok)"),
+        Ok(_rx) => {
+            eprintln!("[f5] Funnel enabled on this tailnet: got a live funnel receiver (Ok)")
+        }
         Err(ListenFunnelError::Funnel(f)) => eprintln!(
             "[f5] fail-closed typed Funnel access denial: {f:?} (node registered ⇒ NOT a Start error) — correct"
         ),

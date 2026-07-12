@@ -169,7 +169,8 @@ pub unsafe extern "C" fn ts_server_loopback(
         };
         // Build both C strings before writing any output, so a NUL in one credential (never happens
         // for a base64/hex credential) cannot leak the other.
-        let (proxy, localapi) = match (CString::new(lb.proxy_cred), CString::new(lb.local_api_cred)) {
+        let (proxy, localapi) = match (CString::new(lb.proxy_cred), CString::new(lb.local_api_cred))
+        {
             (Ok(p), Ok(l)) => (p, l),
             _ => {
                 tracing::error!("loopback credential contains interior NUL");
