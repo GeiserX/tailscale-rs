@@ -13,7 +13,7 @@ rust-version.workspace = true
 [dependencies]
 rustler = "0.37.2"
 
-tailscale = { workspace = true }
+tailscale = { workspace = true, features = ["tsnet"] }
 ts_control = { workspace = true }
 
 tokio = { workspace = true, features = ["full"] }

@@ -33,6 +33,7 @@ mod loopback;
 mod net_types;
 mod panic_guard;
 mod status;
+mod tsnet_server;
 mod taildrop;
 mod tcp;
 mod tls;
@@ -47,6 +48,11 @@ pub use net_types::{
 };
 pub(crate) use panic_guard::ffi_guard;
 pub use status::{status_node, status_visitor, ts_status, ts_whois};
+pub use tsnet_server::{
+    local_client, server, ts_local_client_address, ts_local_client_free, ts_local_client_get,
+    ts_local_client_status, ts_server_free, ts_server_local_client, ts_server_loopback,
+    ts_server_new,
+};
 pub use taildrop::{
     ts_taildrop_delete_file, ts_taildrop_file_size, ts_taildrop_save_file,
     ts_taildrop_waiting_files,
