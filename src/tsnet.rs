@@ -806,7 +806,79 @@ impl Server {
         Ok(self.started().await?.tailscale_ips().await?)
     }
 
-    /// The cert domains for this node (Go `CertDomains`).
+    /// Build a [`TlsAcceptor`](crate::TlsAcceptor) that terminates TLS for `cfg.name` on the tailnet
+    /// overlay using this node's own certificate (Go `tsnet.Server.ListenTLS`'s cert path).
+    ///
+    /// A thin delegation to [`Device::listen_tls`](crate::Device::listen_tls). The serve config is
+    /// validated at the facade boundary **first** — a non-tailnet `cfg.name` or a zero `cfg.port` is a
+    /// typed [`ts_control::CertError`] returned *before* the lazy device start, so a misconfiguration
+    /// never touches the network (fail-fast, exactly as [`Server::dial`]/[`Server::listen`] reject a
+    /// bad network/address up front). The certificate is then acquired through
+    /// [`ts_control::tls`] via the node's ACME-aware cert path.
+    ///
+    /// **`acme` feature.** Issuance is fail-closed: with the **`acme`** feature this issues a real
+    /// Let's Encrypt certificate (DNS-01, published via the node's `set-dns` RPC — SaaS-only); without
+    /// it (the default) it surfaces [`ts_control::CertError::Unimplemented`] rather than ever serving a
+    /// self-signed cert or downgrading to plaintext. Either way the acceptor is **ring-only**
+    /// ([`ts_control::tls_acceptor`] pins the `ring` provider — no aws-lc/openssl).
+    ///
+    /// This keeps the fork's typed [`ts_control::CertError`] (matching [`Device::listen_tls`]), not the
+    /// unified lifecycle [`Error`] — the cert path is a specialized, typed surface (design doc §7).
+    /// Like Go's `ListenTLS`, terminate accepted overlay streams (from a [`Server::listen`] listener)
+    /// with [`ts_control::accept_tls`], reusing the one acceptor across connections.
+    pub async fn listen_tls(
+        &self,
+        cfg: &crate::ServeConfig,
+    ) -> Result<crate::TlsAcceptor, ts_control::CertError> {
+        // Fail-fast at the facade boundary: reject a bad serve config (non-tailnet name / zero port)
+        // before the lazy device start, so a misconfiguration never reaches the network. The wrapped
+        // `Device::listen_tls` validates again internally (idempotent) — this only surfaces the
+        // identical typed error earlier, matching the dial/listen "reject before starting" contract.
+        cfg.validate()?;
+        self.started()
+            .await
+            .map_err(start_failed_cert)?
+            .listen_tls(cfg)
+            .await
+    }
+
+    /// Issue a real Let's Encrypt certificate for this node's MagicDNS `name` and return the **PEM
+    /// pair** `(cert_chain_pem, key_pem)` — the analog of Go `LocalClient().CertPair` /
+    /// `CertPairWithValidity`, for writing an on-disk `.crt` + `.key`. A thin delegation to
+    /// [`Device::cert_pair`](crate::Device::cert_pair); **`acme` feature only** (the wrapped engine
+    /// method is itself `acme`-gated).
+    ///
+    /// The `name` is checked at the facade boundary first — a non-tailnet (`*.ts.net`) name is
+    /// [`ts_control::CertError::NotTailnetName`] before any device start (anti-leak: this fork never
+    /// mints certs for off-tailnet names). `min_validity` is accepted for Go signature parity but does
+    /// not change behavior: this fork keeps no cert cache and always issues fresh, so a freshly issued
+    /// (full-lifetime) cert satisfies any `min_validity` (see [`Device::cert_pair`]). The second tuple
+    /// element is **secret key material** — persist it to a `0600` file and never log it. Fail-closed
+    /// and ring-only, like [`Server::listen_tls`].
+    #[cfg(feature = "acme")]
+    pub async fn cert_pair(
+        &self,
+        name: &str,
+        min_validity: Option<Duration>,
+    ) -> Result<(String, String), ts_control::CertError> {
+        // Anti-leak name check up front (matches the wrapped engine method), before the device start.
+        if !ts_control::is_tailnet_name(name) {
+            return Err(ts_control::CertError::NotTailnetName(name.to_string()));
+        }
+        self.started()
+            .await
+            .map_err(start_failed_cert)?
+            .cert_pair(name, min_validity)
+            .await
+    }
+
+    /// The DNS names this node may obtain TLS certificates for (Go `tsnet.Server.CertDomains`).
+    ///
+    /// A thin delegation to [`Device::cert_domains`](crate::Device::cert_domains): the `CertDomains`
+    /// control pushed in the netmap DNS config — the names to request a cert for via
+    /// [`Server::listen_tls`] (or, with `acme`, `cert_pair`). Empty before the first netmap, or when
+    /// control granted none (Go returns a clone of `nm.DNS.CertDomains`). Unlike the cert-*issuance*
+    /// calls this only reads netmap state, so it returns the unified lifecycle [`Error`].
     pub async fn cert_domains(&self) -> Result<Vec<String>, Error> {
         Ok(self.started().await?.cert_domains().await?)
     }
@@ -845,6 +917,15 @@ impl Server {
             },
         }
     }
+}
+
+/// Map a facade lazy-start failure into the cert surface's typed error. The cert calls
+/// ([`Server::listen_tls`], `cert_pair`) return [`ts_control::CertError`] — not the unified
+/// [`Error`] — to preserve the specialized typed surface (design doc §7), so a device that fails to
+/// start is surfaced as a [`ts_control::CertError::Io`] carrying the underlying reason rather than
+/// swallowed. (The start error only fires for an already-validated config.)
+fn start_failed_cert(e: Error) -> ts_control::CertError {
+    ts_control::CertError::Io(std::io::Error::other(format!("server failed to start: {e}")))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1377,6 +1458,65 @@ mod tests {
         assert!(matches!(
             s.listen_packet("nope", "0.0.0.0:0").await,
             Err(Error::InvalidNetwork { .. })
+        ));
+    }
+
+    // --- listen_tls()/cert_pair(): the serve config / cert name is validated at the facade boundary,
+    //     so a non-tailnet name or a zero port is the typed CertError rejected up front — before the
+    //     lazy Device::new / any cert issuance / any network I/O (hermetic: never reaches `started()`).
+    //     This holds with or without the `acme` feature; real ACME issuance needs a live SaaS tailnet
+    //     and is out of scope for a unit test. ---
+
+    #[tokio::test]
+    async fn listen_tls_rejects_a_non_tailnet_name_before_starting() {
+        let s = Server::new();
+        let cfg = ts_control::ServeConfig {
+            name: "example.com".into(), // not a `*.ts.net` tailnet name (anti-leak)
+            port: 443,
+            target: ts_control::ServeTarget::Accept,
+        };
+        assert!(matches!(
+            s.listen_tls(&cfg).await,
+            Err(ts_control::CertError::NotTailnetName(n)) if n == "example.com"
+        ));
+    }
+
+    #[tokio::test]
+    async fn listen_tls_rejects_a_zero_port_before_starting() {
+        let s = Server::new();
+        let cfg = ts_control::ServeConfig {
+            name: "host.tailnet.ts.net".into(), // a valid tailnet name...
+            port: 0,                             // ...but port 0 is rejected by ServeConfig::validate
+            target: ts_control::ServeTarget::Accept,
+        };
+        assert!(matches!(
+            s.listen_tls(&cfg).await,
+            Err(ts_control::CertError::Acme(_))
+        ));
+    }
+
+    #[test]
+    fn start_failure_maps_to_a_typed_cert_io_error() {
+        // A lazy-start failure on the cert path is surfaced (not swallowed) as CertError::Io carrying
+        // the underlying reason — exercised directly on the mapper, since a real start needs a live
+        // tailnet. This is why listen_tls/cert_pair keep the typed CertError rather than the unified
+        // lifecycle Error (design doc §7).
+        let e = start_failed_cert(Error::Store(std::io::Error::other("boom")));
+        assert!(matches!(e, ts_control::CertError::Io(_)));
+        let msg = e.to_string();
+        assert!(msg.contains("server failed to start"), "got {msg:?}");
+        assert!(msg.contains("boom"), "underlying reason must be preserved, got {msg:?}");
+    }
+
+    #[cfg(feature = "acme")]
+    #[tokio::test]
+    async fn cert_pair_rejects_a_non_tailnet_name_before_starting() {
+        // The `acme`-gated PEM-pair path applies the same anti-leak name check at the facade boundary,
+        // before the device is started. (Compiled + linted under `--features "tsnet acme"`.)
+        let s = Server::new();
+        assert!(matches!(
+            s.cert_pair("example.com", None).await,
+            Err(ts_control::CertError::NotTailnetName(n)) if n == "example.com"
         ));
     }
 

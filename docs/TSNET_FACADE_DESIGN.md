@@ -202,7 +202,10 @@ would bloat the facade); the headline ones are folded onto `Server`, and the res
 Feature-gated (mirroring the engine's own gates), included in the design but exercised only with the
 matching feature: `http_client()` → `Device::http_connector` (`hyper`), `listen_ssh(...)` →
 `ssh::listen_ssh` (`ssh`, a documented **superset** — matrix §5.5a), `listen_tls(...)` →
-`Device::listen_tls` (`acme` for real issuance).
+`Device::listen_tls` (`acme` for real issuance; the acceptor is ring-only), and `cert_pair(...)` →
+`Device::cert_pair` (`acme`-gated — Go `LocalClient().CertPair`, the on-disk `.crt`/`.key` PEM pair).
+All three validate the cert name/serve config at the facade boundary (fail-fast, before the lazy
+device start) and keep the fork's typed `ts_control::CertError`, not the unified lifecycle `Error`.
 
 ---
 
