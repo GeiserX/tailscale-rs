@@ -572,7 +572,7 @@ version = "0.29.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ecb53484c9c167ba674026b656d8a27d7657a58e6066aa902bfb1a4aa00ae20"
 dependencies = [
- "clap 4.6.3",
+ "clap 4.6.4",
  "heck",
  "indexmap 2.14.0",
  "log",
@@ -650,7 +650,7 @@ dependencies = [
 name = "checks"
 version = "0.43.0"
 dependencies = [
- "clap 4.6.3",
+ "clap 4.6.4",
  "globwalk",
  "serde",
  "toml 1.1.3+spec-1.1.0",
@@ -710,9 +710,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.6.3"
+version = "4.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fb99565819980999fb7b4a1796046a5c949e6d4ff132cf5fadf5a641e20d776"
+checksum = "d91e0c145792ef73a6ad36d27c75ac09f1832222a3c209689d90f534685ee5b7"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -733,14 +733,14 @@ dependencies = [
 
 [[package]]
 name = "clap_derive"
-version = "4.6.3"
+version = "4.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32f2392eae7f16557a3d727ef3a12e57b2b2ca6f98566a5f4fb41ffe305df077"
+checksum = "d012d2b9d65aca7f18f4d9878a045bc17899bba951561ba5ec3c2ba1eed9a061"
 dependencies = [
  "heck",
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 3.0.2",
 ]
 
 [[package]]
@@ -1371,7 +1371,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a405457ec78b8fe08b0e32b4a3570ab5dff6dd16eb9e76a5ee0a9d9cbd898933"
 dependencies = [
  "cfg-if",
- "clap 4.6.3",
+ "clap 4.6.4",
  "condtype",
  "divan-macros",
  "libc",
@@ -1847,7 +1847,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
- "clap 4.6.3",
+ "clap 4.6.4",
  "geiserx_ts_control",
  "geiserx_ts_keys",
  "geiserx_ts_metrics",
@@ -2245,7 +2245,7 @@ version = "0.43.0"
 dependencies = [
  "axum",
  "bytes",
- "clap 4.6.3",
+ "clap 4.6.4",
  "console-subscriber",
  "futures-util",
  "geiserx_ts_netstack_smoltcp_core",
@@ -2482,7 +2482,7 @@ dependencies = [
  "blake2 0.10.6",
  "bytes",
  "chacha20poly1305",
- "clap 4.6.3",
+ "clap 4.6.4",
  "dudect-bencher",
  "geiserx_ts_keys",
  "geiserx_ts_packet",
@@ -3397,9 +3397,9 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "libc"
-version = "0.2.186"
+version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libloading"
@@ -6119,9 +6119,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-stream"
-version = "0.1.18"
+version = "0.1.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32da49809aab5c3bc678af03902d4ccddea2a87d028d86392a4b1560c6906c70"
+checksum = "a3d06f0b082ba57c26b79407372e57cf2a1e28124f78e9479fe80322cf53420b"
 dependencies = [
  "futures-core",
  "pin-project-lite",
@@ -6131,13 +6131,14 @@ dependencies = [
 
 [[package]]
 name = "tokio-util"
-version = "0.7.18"
+version = "0.7.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098"
+checksum = "494815d09bf52b5548659851081238f0ca39ff638363907596da739561c62c52"
 dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "libc",
  "pin-project-lite",
  "slab",
  "tokio",
@@ -6431,7 +6432,7 @@ name = "ts_cli_util"
 version = "0.43.0"
 dependencies = [
  "cfg-if",
- "clap 4.6.3",
+ "clap 4.6.4",
  "futures-util",
  "geiserx_tailscale",
  "geiserx_ts_control",
@@ -6450,7 +6451,7 @@ name = "ts_devtools"
 version = "0.43.0"
 dependencies = [
  "bytes",
- "clap 4.6.3",
+ "clap 4.6.4",
  "futures",
  "geiserx_ts_derp",
  "geiserx_ts_keys",
@@ -6467,9 +6468,9 @@ version = "0.43.0"
 
 [[package]]
 name = "tun-rs"
-version = "2.8.7"
+version = "2.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea75f145e8f32c72b1afdf137f2181810b0232be9930519e8d82071b4a3b3bdf"
+checksum = "bb50fdefaf791097b5559791cef2b2e9da2fad974809264d104cafbaa3efc452"
 dependencies = [
  "blocking",
  "byteorder",
