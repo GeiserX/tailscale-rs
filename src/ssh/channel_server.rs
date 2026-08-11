@@ -315,8 +315,10 @@ where
             },
         );
 
-        session.channel_success(channel.id())?;
-
+        // `accept()` is what confirms the channel. No `channel_success` here: until the accept is
+        // processed the channel is still inside the pending open (held by `reply`), never in the
+        // session's channel map, so a pre-accept `channel_success` is a silent no-op — and would
+        // hit its `assert!(channel.confirmed)` if russh ever registered the channel earlier.
         reply.accept().await;
 
         Ok(())
