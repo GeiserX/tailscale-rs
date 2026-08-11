@@ -1,8 +1,8 @@
 use std::{collections::HashMap, marker::PhantomData, net::SocketAddr, sync::Arc};
 
 use russh::{
-    Channel, ChannelId, Pty, Sig,
-    server::{Auth, Handle, Msg, Session},
+    Channel, ChannelId, ChannelOpenFailure, Pty, Sig,
+    server::{Auth, ChannelOpenHandle, Handle, Msg, Session},
 };
 use tokio::{
     sync::{mpsc, mpsc::UnboundedSender},
@@ -233,8 +233,9 @@ where
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
         session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         tracing::debug!(channel = ?channel.id(), "new session");
 
         // Fail closed: a channel open must be preceded by a successful `auth_none` that stashed
@@ -245,7 +246,10 @@ where
                 channel = ?channel.id(),
                 "ssh: channel open with no accepted identity; refusing"
             );
-            return Ok(false);
+            reply
+                .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
         };
 
         // Bound the number of concurrent channels (each opens a session/handler — e.g. a login
@@ -257,7 +261,8 @@ where
                 cap = MAX_CHANNELS_PER_CONN,
                 "ssh: per-connection channel cap reached; refusing new channel"
             );
-            return Ok(false);
+            reply.reject(ChannelOpenFailure::ResourceShortage).await;
+            return Ok(());
         }
 
         let (tx, mut rx) = mpsc::unbounded_channel::<Request>();
@@ -312,7 +317,9 @@ where
 
         session.channel_success(channel.id())?;
 
-        Ok(true)
+        reply.accept().await;
+
+        Ok(())
     }
 
     async fn channel_close(
