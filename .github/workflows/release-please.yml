@@ -38,6 +38,23 @@
 # the facade's `version.workspace = true` inheritance) plus an `extra-files` generic
 # TOML updater that bumps `$.workspace.package.version`. Pre-1.0: feat→minor,
 # fix→patch, breaking→minor (bump-minor-pre-major).
+#
+# Cargo.lock is bumped by a THIRD extra-files updater, and must be:
+#   { "type": "toml", "path": "Cargo.lock", "jsonpath": "$.package[?(!@.source)].version" }
+# `!@.source` selects exactly the path/workspace members — a registry package always
+# carries `source = "registry+…"`, a workspace member never does — so this rewrites our
+# 48 local entries and nothing vendored. Without it the release bumped Cargo.toml but
+# left every lock entry on the previous version, so `--locked` builds on a fresh clone
+# of main failed with "cannot update the lock file because --locked was passed".
+#   Do NOT "fix" this by switching to release-type `rust`. That strategy's CargoToml
+# updater only ever writes `['package','version']` and has no concept of
+# `[workspace.package]`; against this repo it throws "value at path package.version is
+# not tagged" on the root AND every member manifest, which stops releases outright
+# (googleapis/release-please#2111, #2478). The `cargo-workspace` plugin is also wrong
+# here: it is a no-op unless release-type is `rust`, and would then mint per-crate
+# components/tags instead of our single `v{version}` tag.
+#   `x-release-please-version` comments cannot be used on Cargo.lock either — cargo
+# re-serialises the lockfile from its in-memory model and strips them.
 
 name: Release Please
 
