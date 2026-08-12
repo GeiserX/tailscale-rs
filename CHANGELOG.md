@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.43.1](https://github.com/GeiserX/tailscale-rs/compare/v0.43.0...v0.43.1) (2026-08-12)
+
+
+### Bug Fixes
+
+* **deps:** bump russh 0.61.2 -&gt; 0.62.6 (4 security advisories) ([#292](https://github.com/GeiserX/tailscale-rs/issues/292)) ([9d847a6](https://github.com/GeiserX/tailscale-rs/commit/9d847a6e252c0b268f823145ccfa4fc04006798d))
+
 ## [0.43.0](https://github.com/GeiserX/tailscale-rs/compare/v0.42.1...v0.43.0) (2026-07-12)
 
 
