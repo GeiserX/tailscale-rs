@@ -1024,4 +1024,48 @@ mod handle_aba_tests {
             "both occurrences (the live one + the stale duplicate) must drain"
         );
     }
+
+    /// Sibling of tsr-ufm for #297: a handle sitting in `pending_tcp_closes` can have its slot
+    /// freed AND recycled by a socket of another type before the drain runs. An existence-only
+    /// check then passes and the typed `get::<tcp::Socket>` panics, killing the netstack actor.
+    #[test]
+    fn pending_close_handle_recycled_by_other_type_does_not_panic() {
+        use core::net::SocketAddr;
+
+        let mut stack = Netstack::new(Config::default(), Instant::ZERO);
+        let sock = smoltcp::socket::tcp::Socket::new(
+            smoltcp::socket::tcp::SocketBuffer::new(alloc::vec![0u8; 64]),
+            smoltcp::socket::tcp::SocketBuffer::new(alloc::vec![0u8; 64]),
+        );
+        let handle = stack.add_socket(sock);
+        stack.pending_tcp_closes.push(handle);
+
+        // The socket is reclaimed elsewhere (orphan reap, an explicit Close, ...) and a UDP bind
+        // recycles the slot, handing back an EQUAL handle.
+        stack.remove_socket(handle);
+        let udp_handle = match stack.process_udp(
+            crate::command::udp::Command::Bind {
+                endpoint: SocketAddr::from(([127, 0, 0, 1], 9203)),
+            },
+            None,
+        ) {
+            Response::Udp(crate::command::udp::Response::Bound { handle, .. }) => handle,
+            other => panic!("expected Bound, got {other:?}"),
+        };
+        assert_eq!(udp_handle, handle, "the freed TCP slot must be reused");
+
+        stack.drain_tcp_closes();
+
+        assert!(
+            stack
+                .socket_set
+                .get::<smoltcp::socket::udp::Socket>(udp_handle)
+                .is_open(),
+            "the drain must not touch the replacement UDP socket"
+        );
+        assert!(
+            stack.pending_tcp_closes.is_empty(),
+            "the stale entry must drain"
+        );
+    }
 }
