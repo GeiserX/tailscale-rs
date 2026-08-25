@@ -35,12 +35,14 @@ macro_rules! get_socket_mut {
 
         // `iter()` borrows `self.socket_set` immutably; resolve the bool before the mutable
         // `get_mut` borrow below so the two borrows never overlap.
-        let exists = $self.socket_set.iter().any(|(h, _)| h == handle);
+        let matches_type = $self.socket_set.iter().any(|(h, socket)| {
+            h == handle && <$ty as smoltcp::socket::AnySocket<'_>>::downcast(socket).is_some()
+        });
 
-        if !exists {
+        if !matches_type {
             tracing::debug!(
                 ?handle,
-                "socket gone (closed before blocked command re-ran); dropping command"
+                "socket gone or slot reused by another type; dropping command"
             );
 
             return $crate::command::Error::missing_socket().into();
