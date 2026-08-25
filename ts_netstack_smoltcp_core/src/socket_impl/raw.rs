@@ -97,8 +97,8 @@ impl Netstack {
                 //
                 // Identity alone is not enough: `SocketHandle` is a bare slot index, so a freed raw
                 // slot can come back holding a TCP or UDP socket. Matching on the handle only would
-                // then remove that live socket instead of a no-op, with no panic at the point of
-                // damage. Check the type too, as the UDP `Close` arm does.
+                // then remove that live socket instead of doing nothing, and nothing panics at the
+                // point of damage. Check the type too, as the UDP `Close` arm does (#297).
                 let handle = unwrap_handle!(handle);
                 let matches_type = self
                     .socket_set
@@ -184,7 +184,8 @@ mod tests {
 
     /// Regression test for the raw half of #297: a freed raw slot can be recycled by a socket of
     /// another type, and `SocketHandle` is a bare slot index, so a stale raw `Close` that checks
-    /// only handle identity will remove somebody else's live socket.
+    /// only handle identity removes somebody else's live socket. Nothing panics at the point of
+    /// damage, which is what makes this quieter than the TCP case and worse for it.
     #[test]
     fn stale_raw_close_does_not_remove_recycled_socket_of_another_type() {
         use core::net::SocketAddr;
@@ -202,13 +203,11 @@ mod tests {
             other => panic!("expected Opened, got {other:?}"),
         };
 
-        // Close it, freeing the slab slot.
         assert!(matches!(
             stack.process_raw(RawSocketCommand::Close, Some(raw_handle)),
             Response::Ok
         ));
 
-        // A UDP bind must reuse the freed slot, yielding an equal handle.
         let udp_handle = match stack.process_udp(
             crate::command::udp::Command::Bind {
                 endpoint: SocketAddr::from(([127, 0, 0, 1], 9101)),
@@ -220,7 +219,6 @@ mod tests {
         };
         assert_eq!(udp_handle, raw_handle, "the freed raw slot must be reused");
 
-        // The stale raw `Close` must be a no-op, not a removal of the UDP socket.
         assert!(matches!(
             stack.process_raw(RawSocketCommand::Close, Some(raw_handle)),
             Response::Ok

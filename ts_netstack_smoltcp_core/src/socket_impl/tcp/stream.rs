@@ -159,8 +159,15 @@ impl Netstack {
             // existence scan `get_socket_mut!` uses: a handle no longer in the set is already gone
             // (reaped here, by the orphan reap, or elsewhere) — drop it from `pending` without a
             // second remove. (tsr-ufm)
-            let exists = self.socket_set.iter().any(|(h, _)| h == handle);
-            if !exists {
+            //
+            // The slot may also have been recycled by a socket of ANOTHER type, in which case the
+            // existence check passes and the typed `get::<tcp::Socket>` below panics instead
+            // (#297). Match on the type as well as the handle.
+            let matches_type = self.socket_set.iter().any(|(h, socket)| {
+                h == handle
+                    && <tcp::Socket as smoltcp::socket::AnySocket<'_>>::downcast(socket).is_some()
+            });
+            if !matches_type {
                 return false;
             }
 
