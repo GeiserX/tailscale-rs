@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.43.2](https://github.com/GeiserX/tailscale-rs/compare/v0.43.1...v0.43.2) (2026-08-25)
+
+
+### Bug Fixes
+
+* **deps:** patch h2 unbounded empty DATA frames (RUSTSEC-2026-0258) ([#299](https://github.com/GeiserX/tailscale-rs/issues/299)) ([f93e7e8](https://github.com/GeiserX/tailscale-rs/commit/f93e7e8ec503312f0d0b94ec1103697ba88bba8b))
+
 ## [0.43.1](https://github.com/GeiserX/tailscale-rs/compare/v0.43.0...v0.43.1) (2026-08-12)
 
 
