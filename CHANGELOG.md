@@ -2,6 +2,14 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.43.3](https://github.com/GeiserX/tailscale-rs/compare/v0.43.2...v0.43.3) (2026-08-25)
+
+
+### Bug Fixes
+
+* **netstack:** guard the last two recycled-slot sites [#298](https://github.com/GeiserX/tailscale-rs/issues/298) missed ([#302](https://github.com/GeiserX/tailscale-rs/issues/302)) ([4c8b456](https://github.com/GeiserX/tailscale-rs/commit/4c8b456d32af0560351165fe1d89ace7719a46cb))
+* **netstack:** reject handles for recycled socket types ([#298](https://github.com/GeiserX/tailscale-rs/issues/298)) ([66f33ec](https://github.com/GeiserX/tailscale-rs/commit/66f33ec4f4d204507c9a09427cdfc93fe109075f))
+
 ## [0.43.2](https://github.com/GeiserX/tailscale-rs/compare/v0.43.1...v0.43.2) (2026-08-25)
 
 
