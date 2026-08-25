@@ -9,7 +9,14 @@
 # `cargo deny --all-features check advisories` themselves.
 [advisories]
 ignore = [
-    { id = "RUSTSEC-2024-0436", reason = "archived crate depended on by netlink-packet-utils. Already fixed upstream, just hasn't bubbled through the dependency stack yet" },
+    # `paste` 1.0.15 is archived and unmaintained. It is NOT fixed upstream: it reaches us
+    # through netlink-packet-core 0.8.1, pulled in by netconfig-rs / netlink-packet-route /
+    # route_manager under tun-rs, which ts_transport_tun depends on. That whole subtree sits
+    # outside the ring-only graph the `hosted_test` lane scans, so that lane reports this entry
+    # as `advisory-not-detected` -- expected, not stale. The entry IS load-bearing for
+    # `cargo deny --all-features check advisories`, which fails without it. Drop it only once
+    # `paste` is gone from the tun transport's dependency tree.
+    { id = "RUSTSEC-2024-0436", reason = "paste is archived/unmaintained; transitive via netlink-packet-core -> tun-rs under the tun transport. Not yet fixed upstream" },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is unmaintained (functionality folded into rustls-pki-types >=1.9); transitive via the TLS stack, no published vulnerability. Pre-existing advisory, unrelated to the supply-chain ban below." },
 ]
 # NOTE: the `dudect-bencher` dev-dependency (constant-time leakage bench, ts_tunnel) was reviewed for
