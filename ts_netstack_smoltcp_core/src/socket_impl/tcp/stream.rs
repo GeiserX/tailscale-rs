@@ -579,6 +579,17 @@ mod reap_tests {
         stack.drain_tcp_closes();
         assert!(!present(&stack, accepted), "socket must be reaped first");
 
+        let udp_handle = match stack.process_udp(
+            crate::command::udp::Command::Bind {
+                endpoint: SocketAddr::from(([127, 0, 0, 1], 9002)),
+            },
+            None,
+        ) {
+            Response::Udp(crate::command::udp::Response::Bound { handle, .. }) => handle,
+            other => panic!("expected Bound, got {other:?}"),
+        };
+        assert_eq!(udp_handle, accepted, "the freed TCP slot must be reused");
+
         use crate::command::InternalErrorKind;
         let missing = |r: &Response| {
             matches!(
@@ -616,6 +627,26 @@ mod reap_tests {
             missing(&shutdown),
             "first-touch ShutdownWrite must be missing_socket, got {shutdown:?}"
         );
+        assert!(
+            stack
+                .socket_set
+                .get::<smoltcp::socket::udp::Socket>(udp_handle)
+                .is_open(),
+            "stale TCP commands must not alter the replacement UDP socket"
+        );
+
+        assert!(matches!(
+            stack.process_udp(crate::command::udp::Command::Close, Some(udp_handle)),
+            Response::Ok
+        ));
+        let replacement = stack.new_tcp_socket();
+        let replacement = stack.add_socket(replacement);
+        assert_eq!(replacement, udp_handle, "the freed UDP slot must be reused");
+        assert!(matches!(
+            stack.process_udp(crate::command::udp::Command::Close, Some(udp_handle)),
+            Response::Ok
+        ));
+        let _ = stack.socket_set.get::<tcp::Socket>(replacement);
     }
 
     /// Test 8 (no-regression sibling) — a plain `Connect` socket left in `SynSent` (never reaches
