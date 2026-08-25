@@ -1,7 +1,10 @@
 use alloc::vec;
 
 use bytes::Bytes;
-use smoltcp::{iface::SocketHandle, socket::raw};
+use smoltcp::{
+    iface::SocketHandle,
+    socket::{AnySocket, raw},
+};
 
 use crate::{
     Netstack, Response,
@@ -91,8 +94,17 @@ impl Netstack {
                 // `remove` also panics on a stale handle. A `Close` is never re-queued (it returns
                 // `Response::Ok`, never `WouldBlock`), but a caller could send it twice, so guard
                 // the double-close rather than panic the netstack actor.
+                //
+                // Identity alone is not enough: `SocketHandle` is a bare slot index, so a freed raw
+                // slot can come back holding a TCP or UDP socket. Matching on the handle only would
+                // then remove that live socket instead of a no-op, with no panic at the point of
+                // damage. Check the type too, as the UDP `Close` arm does.
                 let handle = unwrap_handle!(handle);
-                if self.socket_set.iter().any(|(h, _)| h == handle) {
+                let matches_type = self
+                    .socket_set
+                    .iter()
+                    .any(|(h, socket)| h == handle && raw::Socket::downcast(socket).is_some());
+                if matches_type {
                     self.remove_socket(handle);
                 }
                 Response::Ok
@@ -168,5 +180,57 @@ mod tests {
             stack.process_raw(RawSocketCommand::Close, Some(handle)),
             Response::Ok
         ));
+    }
+
+    /// Regression test for the raw half of #297: a freed raw slot can be recycled by a socket of
+    /// another type, and `SocketHandle` is a bare slot index, so a stale raw `Close` that checks
+    /// only handle identity will remove somebody else's live socket.
+    #[test]
+    fn stale_raw_close_does_not_remove_recycled_socket_of_another_type() {
+        use core::net::SocketAddr;
+
+        let mut stack = Netstack::new(Config::default(), Instant::ZERO);
+
+        let raw_handle = match stack.process_raw(
+            RawSocketCommand::Open {
+                ip_version: IpVersion::Ipv4,
+                protocol: IpProtocol::Icmp,
+            },
+            None,
+        ) {
+            Response::Raw(RawSocketResponse::Opened { handle }) => handle,
+            other => panic!("expected Opened, got {other:?}"),
+        };
+
+        // Close it, freeing the slab slot.
+        assert!(matches!(
+            stack.process_raw(RawSocketCommand::Close, Some(raw_handle)),
+            Response::Ok
+        ));
+
+        // A UDP bind must reuse the freed slot, yielding an equal handle.
+        let udp_handle = match stack.process_udp(
+            crate::command::udp::Command::Bind {
+                endpoint: SocketAddr::from(([127, 0, 0, 1], 9101)),
+            },
+            None,
+        ) {
+            Response::Udp(crate::command::udp::Response::Bound { handle, .. }) => handle,
+            other => panic!("expected Bound, got {other:?}"),
+        };
+        assert_eq!(udp_handle, raw_handle, "the freed raw slot must be reused");
+
+        // The stale raw `Close` must be a no-op, not a removal of the UDP socket.
+        assert!(matches!(
+            stack.process_raw(RawSocketCommand::Close, Some(raw_handle)),
+            Response::Ok
+        ));
+        assert!(
+            stack
+                .socket_set
+                .get::<smoltcp::socket::udp::Socket>(udp_handle)
+                .is_open(),
+            "a stale raw Close must not remove the replacement UDP socket"
+        );
     }
 }
