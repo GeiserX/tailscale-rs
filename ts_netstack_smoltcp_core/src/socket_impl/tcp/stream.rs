@@ -577,6 +577,12 @@ mod reap_tests {
     /// Test 6 (Part 2) — a consumer first-touch (direct, non-blocked) command against a reaped
     /// handle returns a clean `missing_socket` error and does NOT panic the netstack actor. Covers
     /// `Recv`/`Send`/`Close` (the four direct handlers now route through `get_socket_mut!`).
+    ///
+    /// Also covers the recycled-slot half of #297: the reaped slot is deliberately re-filled, first
+    /// by a UDP socket and then by a TCP one, so each stale command meets a handle that still
+    /// EXISTS but holds the wrong type. An identity-only guard passes that check and the typed
+    /// getter then panics, so this exercises both directions — a stale TCP command finding UDP, and
+    /// a stale UDP command finding TCP — plus the hand-rolled guard on the UDP `Close` arm.
     #[test]
     fn first_touch_command_on_reaped_handle_returns_error_not_panic() {
         let (mut stack, _dev, accepted) = establish_accepted(8005);
@@ -653,7 +659,28 @@ mod reap_tests {
             stack.process_udp(crate::command::udp::Command::Close, Some(udp_handle)),
             Response::Ok
         ));
-        let _ = stack.socket_set.get::<tcp::Socket>(replacement);
+        // Load-bearing, despite looking inert. With the pre-#297 identity-only guard, the `Close`
+        // just above would have removed THIS TCP socket rather than no-oping on the stale UDP
+        // handle it targeted, and `get` panics on a vanished handle. Asserting the state (rather
+        // than `let _ = ...`) keeps the check visible so a future cleanup cannot quietly delete
+        // the only regression signal for the UDP-Close half of the fix.
+        assert_eq!(
+            stack.socket_set.get::<tcp::Socket>(replacement).state(),
+            tcp::State::Closed,
+            "a stale UDP Close on a recycled-into-TCP slot must not remove the new TCP socket"
+        );
+
+        // The mirror direction, which nothing else covers: the macro instantiated at
+        // `udp::Socket` (udp.rs:118 `Recv`, udp.rs:65 `Send`) must also reject a handle whose slot
+        // now holds a TCP socket. Without the type check these panic in `get_mut::<udp::Socket>`.
+        let recv = stack.process_udp(
+            crate::command::udp::Command::Recv { max_len: None },
+            Some(replacement),
+        );
+        assert!(
+            missing(&recv),
+            "stale UDP Recv on a recycled-into-TCP slot must be missing_socket, got {recv:?}"
+        );
     }
 
     /// Test 8 (no-regression sibling) — a plain `Connect` socket left in `SynSent` (never reaches
