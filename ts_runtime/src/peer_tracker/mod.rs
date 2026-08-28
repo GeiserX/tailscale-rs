@@ -15,7 +15,7 @@ use tokio::sync::watch;
 use ts_control::{Node, UserId, UserProfile};
 use ts_transport::PeerId;
 
-use crate::{Error, env::Env, status::StatusNode};
+use crate::{Error, dataplane::PeerDiscoKeyAdvertisement, env::Env, status::StatusNode};
 
 mod peer_db;
 
@@ -328,6 +328,7 @@ impl kameo::Actor for PeerTracker {
         slf: ActorRef<Self>,
     ) -> Result<Self, Self::Error> {
         env.subscribe::<Arc<ts_control::StateUpdate>>(&slf).await?;
+        env.subscribe::<PeerDiscoKeyAdvertisement>(&slf).await?;
 
         let (peer_watch, _) = watch::channel(Vec::new());
 
@@ -658,6 +659,39 @@ impl Message<Arc<ts_control::StateUpdate>> for PeerTracker {
     }
 }
 
+impl Message<PeerDiscoKeyAdvertisement> for PeerTracker {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: PeerDiscoKeyAdvertisement,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) {
+        if !self.learn_disco_key(msg.peer, msg.key) {
+            return;
+        }
+
+        // The key changed, so republish: the direct-path machinery resolves a peer's disco key out
+        // of the published `PeerState` snapshot (`direct::DiscoPeerLookup`), which is the whole
+        // point of learning it — it is what lets disco reach this peer without waiting for a
+        // netmap update. Go does the equivalent by writing the key straight into the magicsock
+        // endpoint and re-keying its peer map.
+        self.peer_watch.send_replace(self.status_peers());
+
+        if let Err(e) = self
+            .env
+            .publish(Arc::new(PeerState {
+                upserts: HashSet::from_iter([msg.peer]),
+                deletions: HashSet::default(),
+                peers: Arc::new(self.peer_db.clone()),
+            }))
+            .await
+        {
+            tracing::error!(error = %e, "publishing peer state after a TSMP disco-key advertisement");
+        }
+    }
+}
+
 /// Ask the peer tracker to re-broadcast its current peer snapshot on the bus, without any peer
 /// change. Sent after a runtime preference change so the route updater and source filter (both
 /// `Arc<PeerState>` subscribers) re-resolve against the new value immediately, rather than waiting
@@ -688,6 +722,63 @@ impl Message<RepublishState> for PeerTracker {
 }
 
 impl PeerTracker {
+    /// Learn a peer's disco key from a TSMP disco-key advertisement, returning whether the peer db
+    /// actually changed.
+    ///
+    /// Go [`magicsock.Conn.HandleDiscoKeyAdvertisement`], reduced to the state this fork keeps:
+    /// Go stores the learned key on the magicsock endpoint and re-keys its peer map, whereas here
+    /// the peer db's `disco_key` (and its disco index) *is* the live lookup every direct-path
+    /// consumer reads. The three refusals are Go's, in Go's order:
+    ///
+    /// 1. **A zero key is never learned.** Go checks it twice — `tstun` publishes only
+    ///    `if !Key.IsZero()`, and `HandleDiscoKeyAdvertisement` rejects it again. The dataplane
+    ///    already dropped it here too; this is the second check, kept because the cost of getting
+    ///    it wrong is a peer bound to an unusable key.
+    /// 2. **An unknown peer is ignored** (Go: "endpoint not found for node"). An advertisement
+    ///    never creates a peer — only control does — so one that arrives before or after the
+    ///    peer's netmap entry is a no-op, exactly like a `PeersChangedPatch` for an unknown node.
+    /// 3. **An unchanged key is a no-op**, so a peer re-advertising the key we already hold costs
+    ///    no upsert and no republish (Go counts this as
+    ///    `magicsock_tsmp_disco_key_advertisement_unchanged` and returns).
+    ///
+    /// The tailnet-lock gate is deliberately *not* re-run: unlike a `PeersChangedPatch`, an
+    /// advertisement cannot touch the node key or its TKA signature — only the disco key — so the
+    /// peer-trust decision that admitted this node is unchanged by definition.
+    ///
+    /// [`magicsock.Conn.HandleDiscoKeyAdvertisement`]: https://github.com/tailscale/tailscale/blob/main/wgengine/magicsock/magicsock.go
+    fn learn_disco_key(&mut self, peer: PeerId, key: ts_keys::DiscoPublicKey) -> bool {
+        if key.to_bytes() == [0u8; ts_keys::DiscoPublicKey::KEY_LEN_BYTES] {
+            tracing::debug!(?peer, "TSMP-advertised disco key is the zero key; ignoring");
+            return false;
+        }
+
+        let Some((_id, existing)) = self.peer_db.get(&peer) else {
+            tracing::debug!(
+                ?peer,
+                "TSMP disco-key advertisement for unknown peer; ignoring"
+            );
+            return false;
+        };
+
+        if existing.disco_key == Some(key) {
+            tracing::trace!(?peer, "TSMP-advertised disco key is unchanged");
+            return false;
+        }
+
+        let mut node = existing.clone();
+        node.disco_key = Some(key);
+        self.peer_db.upsert(&node);
+
+        tracing::info!(
+            ?peer,
+            stable_id = ?node.stable_id,
+            %key,
+            "learned peer disco key from a TSMP advertisement"
+        );
+
+        true
+    }
+
     /// Apply a single [`PeerUpdate`](ts_control::PeerUpdate) to the peer db, enforcing the
     /// Tailnet-Lock peer-trust chokepoint ([`tka_admits`](Self::tka_admits)) at every upsert site.
     ///
@@ -1082,7 +1173,7 @@ mod tka_tests {
 
     /// Build a real [`Env`] for the tracker. Only the bus/keys/shutdown plumbing matters here; the
     /// TKA gate reads neither, so the forwarding preferences are all benign defaults.
-    fn test_env() -> Env {
+    pub(super) fn test_env() -> Env {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         Env::new(
             ts_keys::NodeState::generate(),
@@ -1110,7 +1201,7 @@ mod tka_tests {
     }
 
     /// A minimal peer [`Node`] carrying `node_key` and the given `key_signature`.
-    fn peer_node(stable_id: &str, node_key: [u8; 32], key_signature: Vec<u8>) -> Node {
+    pub(super) fn peer_node(stable_id: &str, node_key: [u8; 32], key_signature: Vec<u8>) -> Node {
         Node {
             id: 1,
             stable_id: StableNodeId(stable_id.to_string()),
@@ -2268,6 +2359,129 @@ mod tka_tests {
         assert!(
             tracker.peer_db.get(&stale_peer.node_key).is_none(),
             "the peer presenting the rotated-away key is dropped (Go tkaFilterNetmapLocked)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tsmp_disco_key_tests {
+    //! Receive side of the TSMP disco-key advertisement, at the point the key is *learned*.
+    //!
+    //! These exercise [`PeerTracker::learn_disco_key`] — the fork's stand-in for Go
+    //! `magicsock.Conn.HandleDiscoKeyAdvertisement` — which is the single place an advertisement
+    //! reaches peer state. The wire decode and the "consumed, not delivered" drop are covered in
+    //! `ts_packet::tsmp` and `ts_dataplane` respectively.
+
+    use ts_keys::DiscoPublicKey;
+
+    use super::{
+        tka_tests::{peer_node, test_env},
+        *,
+    };
+
+    /// The key a peer advertises, and a second one for the re-advertise case.
+    const ADVERTISED: [u8; 32] = [0xa5u8; 32];
+    const READVERTISED: [u8; 32] = [0x5au8; 32];
+
+    /// A tracker holding one peer with no disco key yet, plus that peer's [`PeerId`].
+    fn tracker_with_peer() -> (PeerTracker, PeerId) {
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
+        let node = peer_node("peer", [1u8; 32], Vec::new());
+        let id = tracker.peer_db.upsert(&node);
+        (tracker, id)
+    }
+
+    /// The happy path: an advertised key is applied to the peer AND lands in the disco index, which
+    /// is what the direct-path machinery (`direct::DiscoPeerLookup`) reads. Re-advertising the same
+    /// key is a no-op; advertising a different one replaces it, retracting the old index entry.
+    #[tokio::test]
+    async fn advertisement_learns_the_peers_disco_key() {
+        let (mut tracker, peer) = tracker_with_peer();
+        let key = DiscoPublicKey::from(ADVERTISED);
+
+        assert!(
+            tracker.learn_disco_key(peer, key),
+            "a first advertisement changes the peer db"
+        );
+        assert_eq!(
+            tracker
+                .peer_db
+                .get(&peer)
+                .expect("peer still present")
+                .1
+                .disco_key,
+            Some(key),
+            "the advertised disco key is learned"
+        );
+        assert_eq!(
+            tracker.peer_db.has(&key),
+            Some(peer),
+            "and is reachable through the disco index the direct path resolves against"
+        );
+
+        assert!(
+            !tracker.learn_disco_key(peer, key),
+            "re-advertising the same key is a no-op (Go counts it 'unchanged' and returns)"
+        );
+
+        let rotated = DiscoPublicKey::from(READVERTISED);
+        assert!(tracker.learn_disco_key(peer, rotated));
+        assert_eq!(
+            tracker
+                .peer_db
+                .get(&peer)
+                .expect("peer still present")
+                .1
+                .disco_key,
+            Some(rotated),
+            "a later advertisement replaces the key without a netmap update"
+        );
+        assert_eq!(tracker.peer_db.has(&rotated), Some(peer));
+        assert_eq!(
+            tracker.peer_db.has(&key),
+            None,
+            "the superseded key no longer resolves to the peer"
+        );
+    }
+
+    /// The refusals, each of which must leave the peer db untouched: the zero key is never learned,
+    /// and an advertisement never creates a peer.
+    #[tokio::test]
+    async fn refused_advertisements_change_nothing() {
+        let (mut tracker, peer) = tracker_with_peer();
+
+        assert!(
+            !tracker.learn_disco_key(peer, DiscoPublicKey::from([0u8; 32])),
+            "the zero key is never learned"
+        );
+        assert_eq!(
+            tracker
+                .peer_db
+                .get(&peer)
+                .expect("peer still present")
+                .1
+                .disco_key,
+            None,
+            "a zero-key advertisement must not bind the peer to an unusable key"
+        );
+
+        // An advertisement for a peer control has never told us about. Go logs "endpoint not found
+        // for node" and returns; it must not conjure a peer into existence.
+        let unknown = PeerId(4242);
+        assert_eq!(tracker.peer_db.get(&unknown), None, "precondition");
+        assert!(
+            !tracker.learn_disco_key(unknown, DiscoPublicKey::from(ADVERTISED)),
+            "an advertisement for an unknown peer is ignored"
+        );
+        assert_eq!(
+            tracker.peer_db.peers().len(),
+            1,
+            "an advertisement never creates a peer — only control does"
+        );
+        assert_eq!(
+            tracker.peer_db.has(&DiscoPublicKey::from(ADVERTISED)),
+            None,
+            "and never indexes a key against a peer that does not exist"
         );
     }
 }
