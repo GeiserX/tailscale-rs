@@ -153,7 +153,7 @@ exactly what upstream has added since this port last tracked it. Descriptions ar
 | --- | --- | --- | --- |
 | 131 | 2025-11-25 | Client respects `NodeAttrDefaultAutoUpdate` | **not applicable** — self-updating a client binary; this is an embedded library with no updatable binary (`Hostinfo.allows_update` is modelled and false by default) |
 | 132 | 2026-02-13 | Client respects `NodeAttrDisableHostsFileUpdates` | **not applicable** — nothing here writes a hosts file; upstream notes the attr is Windows-only as of 2026-02, and there is no Windows `ts_host_net` backend |
-| 133 | 2026-02-17 | `NodeAttrForceRegisterMagicDNSIPv4Only`; MagicDNS IPv6 registered with the OS by default | **already covered** by construction — `ts_host_net::linux::resolvectl_dns_argv` takes `&[Ipv4Addr]`, so only the IPv4 MagicDNS address is ever registered with the OS. Revisit if OS-level IPv6 registration is ever added |
+| 133 | 2026-02-17 | `NodeAttrForceRegisterMagicDNSIPv4Only`; MagicDNS IPv6 registered with the OS by default | **needs port** — upstream `net/dns/config.go` `serviceIPs` registers **both** `100.100.100.100` and the IPv6 service IP with the OS resolver *by default*, and falls back to IPv4-only when control sets the attr. This tree registers IPv4 only *unconditionally* — which is upstream's attr-set branch, not its default — so the behaviours are not equivalent. Wider than a type signature: the IPv6 MagicDNS service IP is not served here at all (`ts_runtime::magic_dns` binds `100.100.100.100:53` only; `ts_host_net::HostDns::nameservers` is `Vec<Ipv4Addr>` for both the Linux and macOS backends), so registering it before serving it would point the host resolver at a dead address. The port is: serve MagicDNS on the IPv6 service IP, register both by default, honour the attr to drop back to IPv4-only. Host-OS-facing, not wire-facing — no peer or control plane observes it directly — and it pairs with `Config::enable_ipv6` |
 | 134 | 2026-03-09 | Client understands `NodeAttrDisableAndroidBindToActiveNetwork` | **not applicable** — Android-only socket binding |
 | 135 | 2026-03-30 | Client understands `NodeAttrCacheNetworkMaps` (and `DisableCacheNetworkMaps`, #19947) | **needs port** (optional) — no netmap persistence here. A client that does not cache is conformant, so this is cold-start latency only, not a correctness gap |
 | 136 | 2026-04-09 | Client understands `NodeAttrDisableLinuxCGNATDropRule` | **not applicable** — `ts_host_net` programs routes and DNS only; it never installs firewall rules, so there is no CGNAT DROP rule to disable |
@@ -167,9 +167,9 @@ exactly what upstream has added since this port last tracked it. Descriptions ar
 | 144 | 2026-07-31 | Client sends `packet.TSMPDiscoKeyAdvertisement` around WireGuard handshakes | **needs port** — the highest-value row in this table; see §B |
 | 145 | 2026-08-04 | Client understands `NodeAttrScopeQuad100OnMacOS` | **not applicable** — the attr changes resolver ordering for the *sandboxed* macOS app; `ts_host_net::macos` installs a service-scoped `scutil` DNS dictionary and has no default-resolver behaviour to scope |
 
-Net: of the fifteen versions upstream added, **four need a port** — 135 (optional), 138, 142
-(narrow), and the interop-visible 144 — **two are already covered** (137 outright, 133 by
-construction), and the remaining nine are not applicable to an embedded userspace node.
+Net: of the fifteen versions upstream added, **five need a port** — 133 (host-OS-facing), 135
+(optional), 138, 142 (narrow), and the interop-visible 144 — **one is already covered** (137), and
+the remaining nine are not applicable to an embedded userspace node.
 
 ### B. Behaviour upstream changed in the window that is not capver-gated
 
@@ -232,7 +232,7 @@ watchdog, `types/netmap` field removals), and upstream-internal locking/allocati
 ```sh
 # The capability-version window (§A): everything above CapabilityVersion::CURRENT here.
 git -C <tailscale-go> grep -n 'CurrentCapabilityVersion CapabilityVersion' 1e69418 -- tailcfg/tailcfg.go
-git -C <tailscale-go> grep -n '^//   - 1[3-9][0-9]:' 1e69418 -- tailcfg/tailcfg.go
+git -C <tailscale-go> grep -nE '^//[[:space:]]*-[[:space:]]*1[3-9][0-9]:' 1e69418 -- tailcfg/tailcfg.go
 
 # What upstream touched per mapped package since capver 130 landed (§B).
 for p in tailcfg disco derp net/packet net/tstun wgengine/filter wgengine/magicsock \
@@ -241,6 +241,13 @@ for p in tailcfg disco derp net/packet net/tstun wgengine/filter wgengine/magics
   echo "== $p"; git -C <tailscale-go> log --since=2025-10-06 --oneline -- "$p"
 done
 ```
+
+The capability-history pattern is deliberately whitespace-tolerant: upstream writes those entries as
+`//   - 133: …`, but the exact indentation is a comment convention, not something `gofmt` enforces,
+and a pattern that pins it would go silently empty the day it changes. Check the row count rather
+than trusting the exit status — at the pinned commit the second command returns **16 lines**, 130
+through 145, i.e. the fifteen-version window of §A plus the 130 row this repository already
+declares. An empty or short result means the pattern broke, not that upstream added nothing.
 
 When the pin is advanced, bump the header table, re-run the above, and rewrite §A and §B. A row
 whose assessment changes should say *why* it changed.
