@@ -39,6 +39,58 @@ fn build_vip_services_response(config: &crate::Config) -> String {
     format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{body}")
 }
 
+/// Route a parsed C2N request to the full HTTP/1.1 response this node sends back to control.
+///
+/// This mirrors Go's `handleC2N` (`ipn/ipnlocal/c2n.go`): an exact path match selects a handler,
+/// and anything with no registered handler falls through to
+/// `http.Error(w, "unknown c2n path", http.StatusBadRequest)`. Only the paths listed below are
+/// registered here; the fallthrough is the contract for everything else, so it is asserted by test
+/// rather than left implicit.
+///
+/// ## Debug paths this node deliberately does not serve
+///
+/// Upstream gained three c2n debug endpoints that this tree has no subsystem to answer, so they
+/// take the 400 fallthrough like any other unregistered path:
+///
+/// - `GET|POST /debug/netmap` (Go `handleC2NDebugNetMap`, `ipn/ipnlocal/c2n.go`) marshals the
+///   client's whole `netmap.NetworkMap` — returned as an opaque `json.RawMessage` inside
+///   `tailcfg.C2NDebugNetmapResponse` precisely because that struct is Go-internal and unstable —
+///   and, for a `POST`, re-derives a *candidate* netmap from a supplied `MapResponse` via
+///   `controlclient.NetmapFromMapResponseForDebug`. There is no `NetworkMap` aggregate in this
+///   tree at all: the netmap arrives as a stream of [`StateUpdate`] deltas and is accumulated by
+///   the runtime's peer tracker, which this responder cannot see. Answering with an approximation
+///   would be worse than the 400 — control unmarshals the body into Go's `netmap.NetworkMap`, so
+///   every field we could not fill would silently read back as a zero value rather than as
+///   "unknown".
+/// - `/debug/health` (Go `handleC2NDebugHealth`, `ipn/ipnlocal/c2n.go`) marshals
+///   `health.Tracker.CurrentState()`. This fork has no health subsystem — see the `LockedOut`
+///   discussion in `ts_runtime::control_runner`, which logs where Go would raise a health warning.
+/// - `/debug/tka/log` (Go `handleC2NDebugTKALog`, `feature/tailnetlock/tailnetlock.go`) serves the
+///   Tailnet Lock AUM chain. The chain exists here (`ts_tka`), but it is held by
+///   `ts_runtime::tka_sync`, and `ts_control` deliberately does not depend on `ts_tka` — this crate
+///   carries only the wire-level [`crate::TkaStatus`] head/disabled signal.
+///
+/// The declared [`CapabilityVersion::CURRENT`](ts_capabilityversion::CapabilityVersion::CURRENT) is
+/// held below the versions that promise these handlers (127, 128 and 138) so the declaration and
+/// the responder agree; see that constant's documentation before raising it.
+fn build_c2n_response(request: &Request<String>, config: &crate::Config) -> String {
+    let c2n_request_path = request.uri().path();
+    match c2n_request_path {
+        C2N_PATH_ECHO => {
+            tracing::trace!(c2n_request_path, "handling c2n echo");
+            format!("{}{}", C2N_RESPONSE_ECHO_PREAMBLE, request.body())
+        }
+        C2N_PATH_VIP_SERVICES => {
+            tracing::trace!(c2n_request_path, "handling c2n vip-services fetch");
+            build_vip_services_response(config)
+        }
+        _ => {
+            tracing::debug!(c2n_request_path, "no handler for c2n path");
+            C2N_PATH_UNKNOWN.to_string()
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error, Clone, Copy, Eq, PartialEq)]
 pub enum PingError {
     #[error("HTTP error")]
@@ -135,21 +187,7 @@ pub async fn handle_ping(
             }
         };
 
-        let c2n_request_path = c2n_request.uri().path();
-        let c2n_response = match c2n_request_path {
-            C2N_PATH_ECHO => {
-                tracing::trace!(c2n_request_path, "handling c2n echo");
-                format!("{}{}", C2N_RESPONSE_ECHO_PREAMBLE, c2n_request.body())
-            }
-            C2N_PATH_VIP_SERVICES => {
-                tracing::trace!(c2n_request_path, "handling c2n vip-services fetch");
-                build_vip_services_response(config)
-            }
-            _ => {
-                tracing::debug!(c2n_request_path, "no handler for c2n path");
-                C2N_PATH_UNKNOWN.to_string()
-            }
-        };
+        let c2n_response = build_c2n_response(&c2n_request, config);
 
         let ping_response_url = control_url.join(ping_request.url.path())?;
         tracing::trace!(%ping_response_url, ?c2n_response, "posting c2n response");
@@ -171,6 +209,94 @@ mod tests {
     use alloc::string::ToString;
 
     use super::*;
+
+    /// Parse a raw HTTP/1.1 request exactly as it arrives inside a C2N
+    /// [`ts_control_serde::PingRequest`] payload, so the routing tests exercise the same parse the
+    /// network path uses rather than a hand-built [`Request`].
+    fn c2n_request(raw: &str) -> Request<String> {
+        parse_c2n_ping(raw).expect("control sends a well-formed HTTP/1.1 c2n request")
+    }
+
+    /// The three c2n debug endpoints upstream added above this node's declared capability version
+    /// must answer with Go's exact fallthrough: `handleC2N` (`ipn/ipnlocal/c2n.go`) ends with
+    /// `http.Error(w, "unknown c2n path", http.StatusBadRequest)` for any path with no registered
+    /// handler, and none of these three is registered here.
+    ///
+    /// - `/debug/netmap` — Go `handleC2NDebugNetMap` (capver 127); needs a `netmap.NetworkMap`
+    ///   aggregate this tree does not have.
+    /// - `/debug/health` — Go `handleC2NDebugHealth` (capver 128); needs a `health.Tracker`
+    ///   this fork does not have.
+    /// - `/debug/tka/log` — Go `handleC2NDebugTKALog`
+    ///   (`feature/tailnetlock/tailnetlock.go`, capver 138); needs the AUM chain, which lives in
+    ///   `ts_runtime`, not in this crate.
+    ///
+    /// The query-string case pins that the match is on the path alone, so
+    /// `/debug/tka/log?limit=60` (the form Go's handler reads its `limit` from) cannot accidentally
+    /// route somewhere else.
+    #[test]
+    fn c2n_debug_endpoints_answer_unknown_path() {
+        let config = crate::Config::default();
+        for raw in [
+            "GET /debug/netmap HTTP/1.1\r\nHost: c2n\r\n\r\n",
+            "POST /debug/netmap HTTP/1.1\r\nHost: c2n\r\nContent-Length: 2\r\n\r\n{}",
+            "GET /debug/health HTTP/1.1\r\nHost: c2n\r\n\r\n",
+            "GET /debug/tka HTTP/1.1\r\nHost: c2n\r\n\r\n",
+            "GET /debug/tka/log HTTP/1.1\r\nHost: c2n\r\n\r\n",
+            "GET /debug/tka/log?limit=60 HTTP/1.1\r\nHost: c2n\r\n\r\n",
+        ] {
+            let resp = build_c2n_response(&c2n_request(raw), &config);
+            assert_eq!(
+                resp, "HTTP/1.1 400 Bad Request\r\n\r\nunknown c2n path",
+                "{raw} must take the unknown-c2n-path fallthrough"
+            );
+        }
+    }
+
+    /// The 400 fallthrough is the contract for *every* unregistered path, not just the three debug
+    /// endpoints — including other handlers Go registers that this node does not implement. Losing
+    /// it (e.g. by routing a prefix) would make control believe an unimplemented feature works.
+    #[test]
+    fn c2n_unknown_path_still_answers_400() {
+        let config = crate::Config::default();
+        for raw in [
+            "GET /debug/goroutines HTTP/1.1\r\nHost: c2n\r\n\r\n",
+            "GET /debug/metrics HTTP/1.1\r\nHost: c2n\r\n\r\n",
+            "POST /netfilter-kind HTTP/1.1\r\nHost: c2n\r\n\r\n",
+            "GET /not-a-real-path HTTP/1.1\r\nHost: c2n\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: c2n\r\n\r\n",
+        ] {
+            let resp = build_c2n_response(&c2n_request(raw), &config);
+            assert_eq!(
+                resp, "HTTP/1.1 400 Bad Request\r\n\r\nunknown c2n path",
+                "{raw} must take the unknown-c2n-path fallthrough"
+            );
+        }
+    }
+
+    /// The two paths this node *does* serve still route through the same dispatcher, so the
+    /// fallthrough above is proven to be a real routing decision and not a blanket 400.
+    /// Go's `handleC2NEcho` writes the request body back verbatim with a bare 200.
+    #[test]
+    fn c2n_echo_and_vip_services_still_route() {
+        let config = crate::Config {
+            advertise_services: alloc::vec!["svc:web".to_string()],
+            ..Default::default()
+        };
+
+        let echo = build_c2n_response(
+            &c2n_request("GET /echo HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello"),
+            &config,
+        );
+        assert_eq!(echo, "HTTP/1.1 200 OK\r\n\r\nhello");
+
+        let vip = build_c2n_response(
+            &c2n_request("GET /vip-services HTTP/1.1\r\nHost: c2n\r\n\r\n"),
+            &config,
+        );
+        let (status, json) = parse_response(&vip);
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert_eq!(json["VIPServices"][0]["Name"].as_str().unwrap(), "svc:web");
+    }
 
     /// Split the HTTP/1.1 response built by [`build_vip_services_response`] into its status line and
     /// JSON body for assertions.

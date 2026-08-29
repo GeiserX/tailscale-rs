@@ -305,8 +305,41 @@ impl CapabilityVersion {
     /// registered w/ OS by default
     pub const V133: Self = Self(133);
 
-    /// The current capability version of this Tailscale node.
-    pub const CURRENT: Self = Self::V130;
+    /// The capability version this node declares to control.
+    ///
+    /// **This is a claim control acts on, so it is pinned to the highest version whose behaviour
+    /// this tree actually implements — not to the newest constant defined above.** The constants
+    /// above are a transcription of upstream's list (they document what each version *means*);
+    /// this one is a promise. Declaring a version whose behaviour is missing does not gain a
+    /// feature, it just tells control to stop sending the compatibility path for it.
+    ///
+    /// The declaration is held at **125** because the next three versions each name a behaviour
+    /// this tree does not have:
+    ///
+    /// - **126** — seamless key renewal. Go renews the node key ahead of expiry without breaking
+    ///   connections (`controlknobs.Knobs.SeamlessKeyRenewal`). This tree's expiry recovery is a
+    ///   node-key rotation plus a full re-register with the stored auth key
+    ///   (`ts_control::Config::reauth_on_expiry`, Go `doLogin`) — that is upstream's *non*-seamless
+    ///   path, so connections do break across a renewal.
+    /// - **127** — c2n `GET|POST /debug/netmap` (Go `handleC2NDebugNetMap`,
+    ///   `ipn/ipnlocal/c2n.go`). Needs a `netmap.NetworkMap` aggregate to marshal; this tree has
+    ///   none — the netmap arrives as a stream of deltas accumulated by the runtime's peer tracker.
+    /// - **128** — c2n `/debug/health` (Go `handleC2NDebugHealth`, `ipn/ipnlocal/c2n.go`). Needs a
+    ///   `health.Tracker`; this fork has no health subsystem.
+    ///
+    /// and **138** (c2n `/debug/tka/log`, Go `handleC2NDebugTKALog` in
+    /// `feature/tailnetlock/tailnetlock.go`) is unimplemented for the same reason: the AUM chain
+    /// lives in `ts_runtime`, and the c2n responder in `ts_control` cannot reach it. All three
+    /// paths take the responder's `400 Bad Request` / `unknown c2n path` fallthrough, which is
+    /// exactly what Go's `handleC2N` writes for an unregistered path.
+    ///
+    /// 125 is also a version a real client shipped (Tailscale `v1.88.0` declares it), which keeps
+    /// this coherent with the `IPNVersion` advertised in `ts_control::hostinfo`.
+    ///
+    /// **Before raising this**, check that every version between the old value and the new one is
+    /// implemented here, not just the topmost one — capability versions are monotone, so declaring
+    /// `N` asserts everything at or below `N`.
+    pub const CURRENT: Self = Self::V125;
 
     /// Create a new [`CapabilityVersion`] instance from a `u16`. Note that the versions 0, 1, 2,
     /// and 35 are undefined and will result in an error.
@@ -336,5 +369,21 @@ impl TryFrom<u16> for CapabilityVersion {
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         Self::new(value).ok_or(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CapabilityVersion;
+
+    /// The declared version must stay below the first capability this tree does not implement.
+    /// 126 (seamless key renewal), 127 (c2n `/debug/netmap`) and 128 (c2n `/debug/health`) are all
+    /// unimplemented, so 125 is the ceiling; see [`CapabilityVersion::CURRENT`] for the evidence
+    /// behind each. This test exists so raising the constant without doing the port fails here
+    /// rather than silently on the wire.
+    #[test]
+    fn current_is_not_declared_above_what_is_implemented() {
+        assert_eq!(CapabilityVersion::CURRENT, CapabilityVersion::V125);
+        assert!(CapabilityVersion::CURRENT < CapabilityVersion::V126);
     }
 }
