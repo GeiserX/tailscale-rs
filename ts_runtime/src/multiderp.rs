@@ -536,8 +536,8 @@ async fn run_derp_once(
                     // magicsock so it can learn the peer's candidate endpoints and open a direct
                     // path; everything else goes to the dataplane unchanged.
                     //
-                    // Anti-leak: only CallMeMaybe is acted on (see
-                    // `MagicSock::handle_relayed_call_me_maybe`). A relayed frame has no real UDP
+                    // Anti-leak: only CallMeMaybe / CallMeMaybeVia are acted on (see
+                    // `MagicSock::handle_relayed_disco`). A relayed frame has no real UDP
                     // source, so we must never feed a relayed Ping/Pong into a path that would pong
                     // to a bogus address — that entry point drops them. If the direct socket isn't
                     // bound yet (or its bind failed), disco frames fall through to the dataplane as
@@ -618,15 +618,16 @@ async fn run_derp_once(
 /// direct socket and returning the remaining (WireGuard data) frames to forward to the dataplane.
 ///
 /// A peer reachable only over the relay (e.g. symmetric NAT on both ends) sends its `CallMeMaybe`
-/// over DERP; it is interleaved with WireGuard data on this path. Each frame that
-/// [`ts_magicsock::looks_like_disco`] and is consumed by
-/// [`MagicSock::handle_relayed_call_me_maybe`] is dropped from the data stream (the magicsock
-/// learns the peer's candidate endpoints from it). Everything else — and *all* frames when no
-/// direct socket is installed — is returned unchanged for the dataplane.
+/// — or, when it has a UDP relay server to offer, its `CallMeMaybeVia` — over DERP; both are
+/// interleaved with WireGuard data on this path. Each frame that
+/// [`ts_magicsock::looks_like_disco`] and is consumed by [`MagicSock::handle_relayed_disco`] is
+/// dropped from the data stream (the magicsock learns the peer's candidate endpoints, or starts a
+/// peer-relay bind handshake, from it). Everything else — and *all* frames when no direct socket
+/// is installed — is returned unchanged for the dataplane.
 ///
-/// Anti-leak: a relayed frame has no real UDP source, so only `CallMeMaybe` is acted on; relayed
-/// Pings/Pongs are dropped by `handle_relayed_call_me_maybe` rather than producing a pong to a
-/// bogus address.
+/// Anti-leak: a relayed frame has no real UDP source, so only the two call-me-maybe messages are
+/// acted on; relayed Pings/Pongs are dropped by `handle_relayed_disco` rather than producing a
+/// pong to a bogus address.
 async fn demux_relayed_disco(
     pkts: impl IntoIterator<Item = ts_packet::PacketMut>,
     sock: Option<&MagicSock>,
@@ -635,7 +636,7 @@ async fn demux_relayed_disco(
     for mut pkt in pkts {
         if ts_magicsock::looks_like_disco(pkt.as_ref())
             && let Some(sock) = sock
-            && sock.handle_relayed_call_me_maybe(pkt.as_mut()).await
+            && sock.handle_relayed_disco(pkt.as_mut()).await
         {
             // Consumed as a relayed disco frame; keep it off the dataplane.
             continue;

@@ -2,10 +2,8 @@
 //!
 //! Tailscale's peer-relay data path encapsulates both relayed disco (the bind handshake) and
 //! relayed WireGuard data in a Geneve header carrying a 24-bit VNI (virtual network identifier).
-//! This module parses/encodes just the 8-byte fixed Geneve header Tailscale uses — the relay data
-//! path itself (the `relayManager` handshake + magicsock integration) is not yet implemented in this
-//! fork, but recognizing the framing keeps the fork wire-aware (e.g. so relayed frames can be
-//! classified rather than treated as opaque/undecodable).
+//! This module parses/encodes just the 8-byte fixed Geneve header Tailscale uses; the relay client
+//! that drives it lives in `ts_magicsock::relay`.
 //!
 //! Header layout (RFC 8926 §3.4, fixed 8 bytes; Tailscale uses no variable options):
 //!
@@ -22,6 +20,10 @@
 /// The fixed Geneve header length in bytes (Tailscale uses no variable options, so `Opt Len` is 0).
 pub const GENEVE_FIXED_HEADER_LEN: usize = 8;
 
+/// Mask of the control-packet bit in byte 1: RFC 8926's **O** bit, which Go's
+/// `packet.GeneveHeader` calls `Control`.
+const CONTROL_BIT: u8 = 0x80;
+
 /// Geneve "Protocol Type" for relayed **disco** frames (Tailscale `GeneveProtocolDisco`).
 pub const GENEVE_PROTOCOL_DISCO: u16 = 0x7A11;
 /// Geneve "Protocol Type" for relayed **WireGuard** frames (Tailscale `GeneveProtocolWireGuard`).
@@ -30,8 +32,16 @@ pub const GENEVE_PROTOCOL_WIREGUARD: u16 = 0x7A12;
 /// A parsed Tailscale Geneve fixed header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GeneveHeader {
-    /// The "Control" (C) bit: set when the payload is a control message (the relay bind handshake)
-    /// rather than tunneled data.
+    /// The control-packet bit: set when the payload is a control message (the relay bind
+    /// handshake) rather than tunneled data.
+    ///
+    /// This is RFC 8926's **O** bit — byte 1 bit 7, mask `0x80` — *not* the adjacent **C**
+    /// ("critical options present") bit at `0x40`. Go's `packet.GeneveHeader.Control` encodes and
+    /// decodes it at `0x80` (`net/packet/geneve.go`), and a UDP relay server dispatches on it:
+    /// `net/udprelay.Server` routes a datagram to its bind-handshake handler only when the bit is
+    /// set. Setting the wrong bit would make a Go relay treat this fork's handshake as tunneled
+    /// data and drop it, and would make us read a relay's challenge as data — no peer-relay path
+    /// could ever come up.
     pub control: bool,
     /// The inner protocol type (`GENEVE_PROTOCOL_DISCO` / `GENEVE_PROTOCOL_WIREGUARD`).
     pub protocol: u16,
@@ -67,8 +77,8 @@ impl GeneveHeader {
         if opt_len_words != 0 {
             return Err(GeneveError::UnexpectedOptions);
         }
-        // Byte 1: O (bit 7) | C (bit 6) | reserved.
-        let control = (buf[1] & 0x40) != 0;
+        // Byte 1: O (bit 7, the control-packet bit) | C (bit 6) | reserved.
+        let control = (buf[1] & CONTROL_BIT) != 0;
         // Bytes 2..4: Protocol Type (big-endian u16).
         let protocol = u16::from_be_bytes([buf[2], buf[3]]);
         // Bytes 4..7: 24-bit VNI (big-endian); byte 7 is reserved.
@@ -89,8 +99,8 @@ impl GeneveHeader {
         let mut out = [0u8; GENEVE_FIXED_HEADER_LEN];
         // Ver = 0, Opt Len = 0 => byte 0 is 0.
         out[0] = 0;
-        // O bit unused (0); set C bit when control.
-        out[1] = if self.control { 0x40 } else { 0x00 };
+        // Set the O (control-packet) bit when control; C and the reserved bits stay 0.
+        out[1] = if self.control { CONTROL_BIT } else { 0x00 };
         out[2..4].copy_from_slice(&self.protocol.to_be_bytes());
         out[4] = (self.vni >> 16) as u8;
         out[5] = (self.vni >> 8) as u8;
@@ -125,7 +135,7 @@ mod tests {
             vni: 1,
         };
         let bytes = h.encode();
-        assert_eq!(bytes[1] & 0x40, 0, "control bit must be clear");
+        assert_eq!(bytes[1] & 0x80, 0, "control bit must be clear");
         let (parsed, _) = GeneveHeader::parse(&bytes).unwrap();
         assert_eq!(parsed, h);
     }
@@ -178,16 +188,16 @@ mod tests {
 
     #[test]
     fn encode_matches_spec_byte_layout() {
-        // Byte-exact reference vector hand-derived from RFC 8926 §3.4 + Tailscale's usage,
-        // NOT computed by round-tripping through this fork's own encoder (that would be
-        // circular and would mask any byte-order / bit-position bug). The 6 round-trip tests
-        // above only prove encode/parse are mutually consistent, not that either matches the
-        // wire format.
+        // Byte-exact reference vector hand-derived from RFC 8926 §3.4 and cross-checked against
+        // Go's `packet.GeneveHeader.Encode` (`net/packet/geneve.go`), NOT computed by
+        // round-tripping through this fork's own encoder (that would be circular and would mask
+        // any byte-order / bit-position bug). The round-trip tests above only prove encode/parse
+        // are mutually consistent, not that either matches the wire format.
         //
         // For GeneveHeader { control: true, protocol: GENEVE_PROTOCOL_DISCO (0x7A11),
         //                    vni: 0x0ABCDE }:
         //   byte 0: Ver(2b)=00 | Opt Len(6b)=000000                     => 0x00
-        //   byte 1: O(bit7)=0 | C(bit6)=1 | Rsvd(6b)=0  (0b0100_0000)   => 0x40
+        //   byte 1: O(bit7)=1 | C(bit6)=0 | Rsvd(6b)=0  (0b1000_0000)   => 0x80
         //   byte 2: Protocol Type high byte (0x7A11 big-endian)          => 0x7A
         //   byte 3: Protocol Type low  byte                              => 0x11
         //   byte 4: VNI[23:16] of 0x0ABCDE                               => 0x0A
@@ -195,15 +205,20 @@ mod tests {
         //   byte 6: VNI[7:0]                                             => 0xDE
         //   byte 7: Reserved                                             => 0x00
         //
-        // Residual gap: this is a SPEC-derived vector, not one captured from a live Go
-        // `tailscaled` peer-relay packet. Full Go cross-validation would require a captured
-        // on-wire Geneve frame from tailscaled and is left as the remaining verification step.
+        // Byte 1 is the one this fork got wrong before: Go writes the control-packet flag with
+        // `b[1] |= 0x80` and reads it with `b[1]&0x80 != 0`, and `net/udprelay.Server` dispatches
+        // a datagram to its bind-handshake handler only on that bit. Encoding it at 0x40 (the
+        // adjacent RFC "critical options" bit) made every relay handshake message look like
+        // tunneled data to a Go relay server, so no peer-relay path could come up.
+        //
+        // Residual gap: this is a SPEC- and source-derived vector, not one captured from a live
+        // Go `tailscaled` peer-relay packet.
         let h = GeneveHeader {
             control: true,
             protocol: GENEVE_PROTOCOL_DISCO,
             vni: 0x0A_BC_DE,
         };
-        assert_eq!(h.encode(), [0x00, 0x40, 0x7A, 0x11, 0x0A, 0xBC, 0xDE, 0x00]);
+        assert_eq!(h.encode(), [0x00, 0x80, 0x7A, 0x11, 0x0A, 0xBC, 0xDE, 0x00]);
     }
 
     #[test]
@@ -211,14 +226,13 @@ mod tests {
         // Hand-built wire bytes (NOT produced by this fork's encoder), decoded field-by-field
         // per RFC 8926 §3.4:
         //   byte 0 = 0x00: Ver=00 (ok), Opt Len=000000 (no options)
-        //   byte 1 = 0x00: O=0, C(bit6)=0  => control = false
+        //   byte 1 = 0x00: O(bit7)=0  => control = false (Go: `b[1]&0x80 != 0`)
         //   bytes 2..4 = 0x7A,0x12: Protocol Type big-endian 0x7A12 = GENEVE_PROTOCOL_WIREGUARD
         //   bytes 4..7 = 0x00,0x00,0x01: 24-bit VNI big-endian = 0x000001 = 1
         //   byte 7 = 0x00: Reserved
         // Inner payload therefore begins at offset GENEVE_FIXED_HEADER_LEN (8).
         //
-        // Residual gap: spec-derived, not captured from Go `tailscaled`; a real captured
-        // peer-relay frame would be needed for full cross-implementation validation.
+        // Residual gap: spec- and source-derived, not captured from a live Go `tailscaled`.
         let wire = [0x00, 0x00, 0x7A, 0x12, 0x00, 0x00, 0x01, 0x00];
         let (parsed, off) = GeneveHeader::parse(&wire).unwrap();
         assert_eq!(
@@ -244,5 +258,36 @@ mod tests {
         buf.extend_from_slice(b"payload");
         let (_, off) = GeneveHeader::parse(&buf).unwrap();
         assert_eq!(&buf[off..], b"payload");
+    }
+
+    /// The control-packet flag must sit on RFC 8926's **O** bit (`0x80`), byte-for-byte where Go
+    /// puts it — `net/packet/geneve.go` writes `b[1] |= 0x80` and reads `b[1]&0x80 != 0`.
+    ///
+    /// This is an interop assertion, not a style one. `net/udprelay.Server` hands a datagram to
+    /// its bind-handshake handler only when it decodes this bit as set, and magicsock's receive
+    /// demux uses it to decide whether an inbound Geneve-wrapped disco frame is a relay handshake
+    /// message at all. Off by one bit and the whole peer-relay path is dead in both directions,
+    /// while every round-trip test in this file still passes.
+    #[test]
+    fn control_flag_is_the_o_bit_at_0x80() {
+        let control = GeneveHeader {
+            control: true,
+            protocol: GENEVE_PROTOCOL_DISCO,
+            vni: 1,
+        }
+        .encode();
+        assert_eq!(
+            control[1], 0x80,
+            "Go writes the control flag as b[1] |= 0x80"
+        );
+
+        // Decoding Go's byte must give control = true, and the neighbouring C bit must not.
+        let (from_go, _) = GeneveHeader::parse(&[0x00, 0x80, 0x7A, 0x11, 0, 0, 1, 0]).unwrap();
+        assert!(from_go.control);
+        let (c_bit_only, _) = GeneveHeader::parse(&[0x00, 0x40, 0x7A, 0x11, 0, 0, 1, 0]).unwrap();
+        assert!(
+            !c_bit_only.control,
+            "0x40 is the RFC 'critical options' C bit, not Go's control flag"
+        );
     }
 }

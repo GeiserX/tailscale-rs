@@ -109,8 +109,11 @@ cut with its eyes open. Items already tracked in
 [`docs/PARITY_ROADMAP.md`](docs/PARITY_ROADMAP.md) are marked *(roadmap)*.
 
 - `derp/derpserver`, `cmd/derper` — DERP **server**/mesh. Client half only here *(roadmap)*.
-- `net/udprelay`, `feature/relayserver` — peer-relay endpoint allocation and relay serving. See the
-  gap list: the disco message *types* exist here, the codec and handlers do not.
+- `net/udprelay`, `feature/relayserver` — peer-relay endpoint allocation and relay **serving**.
+  The relay *client* half is here (`ts_magicsock`'s relay module: the disco `0x04`–`0x09` codecs,
+  the 3-way bind handshake and the Geneve-framed relay data path); this node never serves as a
+  relay itself, and does not send `AllocateUDPRelayEndpointRequest` — a relay-capable peer
+  allocates on our behalf and announces the endpoint with a `CallMeMaybeVia`.
 - `net/portmapper`, `feature/portmapper`, `feature/debugportmapper` — UPnP / PCP / NAT-PMP *(roadmap)*.
 - `appc`, `feature/conn25`, `types/appctype` — app connectors (classic and conn25) *(roadmap)*.
 - `drive`, `feature/drive` — Taildrive.
@@ -190,10 +193,15 @@ docs/typo/refactor commits filtered out.
   implements the classification for IPv4 only (`Ipv4Fragment`, `MIN_FRAG_BLKS`), which matches the
   default IPv4-only posture but leaves the opt-in IPv6 path without upstream's fragment rules.
 - **Peer relay** (`disco` 0x04–0x09, `net/udprelay`, `feature/relayserver`; capver 120/121, i.e.
-  *behind* the declared 130) — `ts_disco_protocol::MessageType` carries all nine upstream type bytes,
-  but only `Ping`/`Pong`/`CallMeMaybe` have a codec, so `CallMeMaybeVia` and the bind/allocate
-  handshake are unparseable. **Needs port** to honour the declared capability version; the failure
-  mode today is a dropped disco message and a fall back to DERP, which is safe but not parity.
+  *behind* the declared 130) — **ported (client half)**. All nine disco message types now have a
+  codec (`ts_disco_protocol`'s relay module, checked against Go's own `disco_test.go` vectors), and
+  `ts_magicsock` runs the client side end to end: an inbound `CallMeMaybeVia` starts the 3-way bind
+  handshake with the named relay server, and a relayed ping/pong confirms a Geneve-framed path that
+  carries WireGuard data instead of falling back to DERP. Direct paths still take priority over
+  relay ones, as upstream requires. Not ported, and out of scope for an embedded client: **serving**
+  as a relay (`net/udprelay.Server`, `feature/relayserver`) and *requesting* an allocation of our
+  own — the `AllocateUDPRelayEndpointRequest`/`Response` pair is decoded but never originated,
+  because a relay-capable peer allocates on our behalf.
 - **c2n endpoints behind the declared capability version** — capver 127 (`/debug/netmap`) and 128
   (`/debug/health`) are below 130 and are not implemented either (same responder as row 138).
   **Needs port** if the declared capability version is to be honest; alternatively the honest fix is

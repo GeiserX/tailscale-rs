@@ -1986,9 +1986,13 @@ pub mod netstack {
 
 /// Geneve (RFC 8926) framing for Tailscale **peer-relay** traffic. A peer that advertises
 /// [`NodeInfo::is_peer_relay`] runs a UDP relay server; relayed disco + WireGuard frames are
-/// Geneve-encapsulated with a VNI. This module exposes the header codec so the framing is
-/// recognizable. NOTE: the active relay *data path* (the relay-allocation handshake +
-/// magicsock integration) is **not yet implemented** in this fork — this is the wire-aware slice.
+/// Geneve-encapsulated with a VNI. This module exposes the header codec.
+///
+/// The relay *client* path is implemented: a peer's `CallMeMaybeVia` starts a bind handshake with
+/// the relay server it names, and once that completes the relay endpoint carries WireGuard data
+/// instead of the peer falling back to DERP (`ts_magicsock`'s relay module). This node does not
+/// *serve* as a relay, and does not request endpoint allocations of its own — a relay-capable peer
+/// allocates on our behalf and tells us with a `CallMeMaybeVia`.
 pub mod geneve {
     #[doc(inline)]
     pub use ts_packet::geneve::{

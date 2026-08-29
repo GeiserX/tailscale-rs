@@ -25,7 +25,7 @@ Verdict legend: **PRESENT** = works, no material gap · **PARTIAL** = works with
 | Subsystem | Verdict | Notes | Open beads |
 |---|---|---|---|
 | Control protocol (register/auth, map-poll, Noise/TS2021, zstd, capver) | **PRESENT** | + auto-reauth on key expiry, NeedsMachineAuth-transient, zstd map responses, Container/Env hostinfo — all shipped this cycle | parity polish: `tsr-84mh`, `tsr-cbw4`, `tsr-ajyc` |
-| MagicSock / disco / direct paths | **PARTIAL** | STUN/DERP/CallMeMaybe/ping-pong/best-addr work; **portmapper absent**, **peer-relays absent** | `tsr-x4yg` (portmapper), `tsr-a9x4` (peer relays), `tsr-dsjq` (full netcheck), `tsr-7s3` (ping cadence), `tsr-qc3o` (NoPath demand-ping), `tsr-51o6` (flaky test) |
+| MagicSock / disco / direct paths | **PARTIAL** | STUN/DERP/CallMeMaybe/ping-pong/best-addr work; peer-relay **client** half present (disco 0x04–0x09 codecs, bind handshake, Geneve data path); **portmapper absent**, relay **serving** absent | `tsr-x4yg` (portmapper), `tsr-a9x4` (peer relays), `tsr-dsjq` (full netcheck), `tsr-7s3` (ping cadence), `tsr-qc3o` (NoPath demand-ping), `tsr-51o6` (flaky test) |
 | WireGuard tunnel | **PARTIAL** | initiator path complete (handshake/session/rekey/replay/cookie-consume); responder cookie issuance missing | `tsr-rl3n` (responder cookie + IsUnderLoad), `tsr-qn2` (MTU-aware padding) |
 | Netstack (userspace TCP/IP + TUN) | **PARTIAL** | TCP/UDP both modes; needs backpressure + icmp-echo | `tsr-fqus` (unbounded ingress queue, DoS), `tsr-rsu` (auto-icmp-echo), `tsr-4pp` (per-session sharding) |
 | MagicDNS | **PARTIAL** | responder + plain-UDP upstream + recursive (TUN) work; encrypted upstream dropped | `tsr-3l78` (DoH/DoT upstream), `tsr-i2w` (exit-node DoH authoritative-vs-forward) |
