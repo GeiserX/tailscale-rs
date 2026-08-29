@@ -70,11 +70,14 @@ pub enum ServeTarget {
         to: String,
     },
     /// HTTP path-prefix mux (Go `HTTPHandler` path map). Terminates TLS, reads the request line, and
-    /// dispatches the longest-matching path prefix's nested target on the already-decrypted stream.
+    /// dispatches the longest-matching mount's nested target on the already-decrypted stream.
     Path {
-        /// Path-prefix → nested target. Longest-prefix wins at dispatch; an unmatched path is a
-        /// fail-closed 404. Nested `Path` is rejected by [`validate`](ServeState::validate) to bound
-        /// recursion (one level of nesting only).
+        /// Mount point → nested target. A mount at `P` claims `P` itself and the paths below it
+        /// (`P` followed by `/`), never an unrelated path that merely starts with the same bytes —
+        /// a `/api` mount does not claim `/apifoo`, matching Go's segment-boundary handler lookup.
+        /// Longest match wins at dispatch; an unmatched path is a fail-closed 404. Nested `Path` is
+        /// rejected by [`validate`](ServeState::validate) to bound recursion (one level of nesting
+        /// only).
         handlers: alloc::collections::BTreeMap<String, ServeTarget>,
     },
     /// HTTP redirect response (Go `HTTPHandler` redirect). Terminates TLS, then writes a bodyless
