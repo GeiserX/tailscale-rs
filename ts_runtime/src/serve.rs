@@ -494,10 +494,67 @@ where
     drop(tls.shutdown().await);
 }
 
+/// Whether a mount point in a [`ServeTarget::Path`] map claims `path`.
+///
+/// A mount at `P` claims exactly `P` itself and the paths **below** it — i.e. `path == P`, or `path`
+/// begins with `P` followed by `/`. It does **not** claim arbitrary strings that merely start with
+/// the same bytes: a `/api` mount does not claim `/apifoo`, `/apibar` or `/api-internal`, which fall
+/// through to whatever shorter mount (typically `/`) does claim them.
+///
+/// A mount written with a trailing slash means the same thing as one without: `/api/` is normalized
+/// to `/api`, so it claims `/api/v2` without needing the request to be `/api//v2`, and it also
+/// claims the bare `/api`. The root mount `/` normalizes to the empty prefix and therefore claims
+/// every path.
+///
+/// ## Go behaviour this mirrors
+///
+/// Go's `getServeHandler` (`ipn/ipnlocal/serve.go`) never does a raw byte-prefix test. It first
+/// looks the cleaned request path up in the handler map exactly, and only then walks *backwards*
+/// over the path's `/` separators, retrying the lookup on each successively shorter truncation of
+/// the path. Because every candidate it ever tries is the path cut at a `/`, a handler can only ever
+/// be reached at a path-segment boundary — `/apifoo` never reaches the `/api` handler there, and it
+/// must not here either.
+fn mount_claims_path(mount: &str, path: &str) -> bool {
+    // "/api/" and "/api" are the same mount; "/" becomes the empty prefix, which claims everything.
+    let base = mount.strip_suffix('/').unwrap_or(mount);
+    if base.is_empty() {
+        return true;
+    }
+    match path.strip_prefix(base) {
+        // Exactly the mount itself, or a path below it. Anything else (`/apifoo` for `/api`) is a
+        // different path that merely shares a byte prefix.
+        Some(rest) => rest.is_empty() || rest.starts_with('/'),
+        None => false,
+    }
+}
+
+/// Pick the [`ServeTarget`] a request `path` dispatches to in a [`ServeTarget::Path`] mux.
+///
+/// Pure and total over `(handlers, path)` — the whole routing decision, with no I/O — so it is
+/// testable directly instead of only through a TLS-terminated socket. [`serve_path`] calls this; it
+/// is the single definition of the rule, and a test that re-implemented it would be testing its own
+/// copy rather than what dispatch does.
+///
+/// Longest match wins: of the mounts that claim `path` (see [`mount_claims_path`]), the one with the
+/// most path bytes is chosen, so `/api/v2` beats `/api` beats `/`. Ties (only reachable between the
+/// same mount spelled with and without a trailing slash, e.g. `/api` and `/api/`) resolve to the
+/// last in `BTreeMap` order, deterministically. `None` means no mount claims the path, which
+/// dispatch turns into a fail-closed 404.
+fn match_path_handler<'h>(
+    handlers: &'h BTreeMap<String, ServeTarget>,
+    path: &str,
+) -> Option<&'h ServeTarget> {
+    handlers
+        .iter()
+        .filter(|(mount, _)| mount_claims_path(mount, path))
+        .max_by_key(|(mount, _)| mount.strip_suffix('/').unwrap_or(mount).len())
+        .map(|(_, target)| target)
+}
+
 /// Serve a [`ServeTarget::Path`] mux on a TLS-terminated stream: read the request head, pick the
-/// longest-matching path prefix in `handlers`, and dispatch the matched nested target on the
-/// already-decrypted stream. Fail-closed: a malformed head, no matching prefix, or an
-/// un-dispatchable nested target ⇒ 404/drop. For a matched nested `Proxy`, the request head consumed
+/// longest-matching mount in `handlers` (via [`match_path_handler`]), and dispatch the matched
+/// nested target on the already-decrypted stream. Fail-closed: a malformed head, no matching mount,
+/// or an un-dispatchable nested target ⇒ 404/drop. For a matched nested `Proxy`, the request head consumed
 /// here is replayed to the backend first (via [`proxy_to_backend_with_prefix`]) so the backend sees
 /// the complete request. Backend dial failures inside a nested `Proxy` drop the conn. Nested `Path`
 /// is rejected by `ServeState::validate`, so it is not expected here; it is dropped fail-closed if it
@@ -515,14 +572,7 @@ where
         return;
     };
 
-    // Longest-matching prefix wins.
-    let matched = handlers
-        .iter()
-        .filter(|(prefix, _)| path.starts_with(prefix.as_str()))
-        .max_by_key(|(prefix, _)| prefix.len())
-        .map(|(_, target)| target);
-
-    let Some(target) = matched else {
+    let Some(target) = match_path_handler(handlers, &path) else {
         write_http_status(port, tls, "404 Not Found").await;
         return;
     };
@@ -663,25 +713,112 @@ mod tests {
         assert_eq!(request_path(b"").as_deref(), None);
     }
 
-    #[test]
-    fn longest_prefix_wins() {
-        // Mirror the selection serve_path performs: longest matching prefix wins.
+    /// The mux `serve_path` dispatch tests below route against: root, `/api`, `/api/v2`, each with a
+    /// distinguishable backend so a test can assert which one a path did *not* reach.
+    fn mux() -> BTreeMap<String, ServeTarget> {
         let mut handlers: BTreeMap<String, ServeTarget> = BTreeMap::new();
         handlers.insert("/".to_string(), proxy("127.0.0.1:1"));
         handlers.insert("/api".to_string(), proxy("127.0.0.1:2"));
         handlers.insert("/api/v2".to_string(), proxy("127.0.0.1:3"));
+        handlers
+    }
 
-        let pick = |path: &str| -> Option<&ServeTarget> {
-            handlers
-                .iter()
-                .filter(|(prefix, _)| path.starts_with(prefix.as_str()))
-                .max_by_key(|(prefix, _)| prefix.len())
-                .map(|(_, target)| target)
-        };
+    #[test]
+    fn longest_matching_mount_wins() {
+        // Calls the production selection (`serve_path` calls the same fn) — not a copy of it.
+        let handlers = mux();
+        assert_eq!(
+            match_path_handler(&handlers, "/api/v2/x"),
+            Some(&proxy("127.0.0.1:3")),
+            "the longest mount claiming the path must win"
+        );
+        assert_eq!(
+            match_path_handler(&handlers, "/api/v1"),
+            Some(&proxy("127.0.0.1:2"))
+        );
+        assert_eq!(
+            match_path_handler(&handlers, "/api"),
+            Some(&proxy("127.0.0.1:2"))
+        );
+        assert_eq!(
+            match_path_handler(&handlers, "/other"),
+            Some(&proxy("127.0.0.1:1"))
+        );
+    }
 
-        assert_eq!(pick("/api/v2/x"), Some(&proxy("127.0.0.1:3")));
-        assert_eq!(pick("/api/v1"), Some(&proxy("127.0.0.1:2")));
-        assert_eq!(pick("/other"), Some(&proxy("127.0.0.1:1")));
+    #[test]
+    fn mount_does_not_claim_a_longer_first_segment() {
+        // The negative case, and the whole point: a `/api` mount must NOT swallow `/apifoo`. A raw
+        // byte-prefix test routes these to the `/api` backend; Go's segment-boundary lookup does
+        // not, and neither may we. Assert where they must *not* go, not only where they must.
+        let handlers = mux();
+        let api = proxy("127.0.0.1:2");
+        let root = proxy("127.0.0.1:1");
+        for path in ["/apifoo", "/apibar", "/api-internal", "/api_v2", "/apis/x"] {
+            let picked = match_path_handler(&handlers, path);
+            assert_ne!(picked, Some(&api), "{path} must not reach the /api backend");
+            assert_eq!(
+                picked,
+                Some(&root),
+                "{path} must fall through to the / mount"
+            );
+        }
+        // Same shape one level down: `/api/v2` must not claim `/api/v20`.
+        let picked = match_path_handler(&handlers, "/api/v20");
+        assert_ne!(
+            picked,
+            Some(&proxy("127.0.0.1:3")),
+            "/api/v20 must not reach the /api/v2 backend"
+        );
+        assert_eq!(picked, Some(&api));
+    }
+
+    #[test]
+    fn mount_claims_itself_and_paths_below_it() {
+        assert!(mount_claims_path("/api", "/api"));
+        assert!(mount_claims_path("/api", "/api/"));
+        assert!(mount_claims_path("/api", "/api/v2/x"));
+        assert!(!mount_claims_path("/api", "/apifoo"));
+        assert!(!mount_claims_path("/api", "/ap"));
+        assert!(!mount_claims_path("/api", "/"));
+        // The root mount claims everything.
+        assert!(mount_claims_path("/", "/"));
+        assert!(mount_claims_path("/", "/anything/at/all"));
+    }
+
+    #[test]
+    fn trailing_slash_mount_needs_no_doubled_slash() {
+        // `/api/` is the same mount as `/api`: it claims `/api/v2`, not only `/api//v2`.
+        assert!(mount_claims_path("/api/", "/api/v2"));
+        assert!(mount_claims_path("/api/", "/api/"));
+        assert!(mount_claims_path("/api/", "/api"));
+        assert!(!mount_claims_path("/api/", "/apifoo"));
+
+        let mut handlers: BTreeMap<String, ServeTarget> = BTreeMap::new();
+        handlers.insert("/".to_string(), proxy("127.0.0.1:1"));
+        handlers.insert("/api/".to_string(), proxy("127.0.0.1:2"));
+        assert_eq!(
+            match_path_handler(&handlers, "/api/v2"),
+            Some(&proxy("127.0.0.1:2"))
+        );
+        assert_eq!(
+            match_path_handler(&handlers, "/apifoo"),
+            Some(&proxy("127.0.0.1:1")),
+            "/apifoo must fall through to / even when the mount is spelled /api/"
+        );
+    }
+
+    #[test]
+    fn unmatched_path_selects_nothing() {
+        // No root mount => a path no mount claims is `None`, which dispatch turns into a 404.
+        let mut handlers: BTreeMap<String, ServeTarget> = BTreeMap::new();
+        handlers.insert("/api".to_string(), proxy("127.0.0.1:2"));
+        assert_eq!(match_path_handler(&handlers, "/apifoo"), None);
+        assert_eq!(match_path_handler(&handlers, "/other"), None);
+        assert_eq!(
+            match_path_handler(&handlers, "/api/v2"),
+            Some(&proxy("127.0.0.1:2"))
+        );
     }
 
     #[test]
@@ -888,6 +1025,41 @@ mod tests {
         let got = drain_to_string(client).await;
         t.await.unwrap();
         assert_eq!(got, "hello-body");
+    }
+
+    #[tokio::test]
+    async fn serve_path_does_not_route_a_longer_first_segment_to_the_shorter_mount() {
+        // End to end through the real dispatch: with `/` and `/hello` mounted, `/hellofoo` is a
+        // different path, not a path below `/hello`, so it must be served by the `/` mount.
+        let mut handlers: BTreeMap<String, ServeTarget> = BTreeMap::new();
+        handlers.insert(
+            "/".to_string(),
+            ServeTarget::Text {
+                body: "root".into(),
+            },
+        );
+        handlers.insert(
+            "/hello".to_string(),
+            ServeTarget::Text {
+                body: "hello-body".into(),
+            },
+        );
+
+        let (mut client, server) = tokio::io::duplex(4096);
+        let t = tokio::spawn(async move {
+            serve_path(443, server, &handlers).await;
+        });
+        client
+            .write_all(b"GET /hellofoo HTTP/1.1\r\nHost: h\r\n\r\n")
+            .await
+            .unwrap();
+        let got = drain_to_string(client).await;
+        t.await.unwrap();
+        assert_ne!(
+            got, "hello-body",
+            "/hellofoo must not reach the /hello mount"
+        );
+        assert_eq!(got, "root");
     }
 
     // NOTE: a live bind+accept test needs a running netstack channel + overlay; the existing
