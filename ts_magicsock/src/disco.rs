@@ -8,18 +8,23 @@
 //!
 //! [crypto_box]: https://docs.rs/crypto_box
 
-use core::net::SocketAddr;
+use core::{net::SocketAddr, time::Duration};
 
 use rand::Rng;
 use ts_disco_protocol::{
-    CallMeMaybe, Endpoint, Header, MessageType, Packet, Ping, Pong, is_disco_message,
+    BIND_UDP_RELAY_CHALLENGE_LEN, BindUdpRelayEndpoint, BindUdpRelayEndpointAnswer,
+    BindUdpRelayEndpointChallenge, BindUdpRelayEndpointCommon, CallMeMaybe, CallMeMaybeVia,
+    Endpoint, Header, Message, MessageType, Packet, Ping, Pong, is_disco_message,
 };
 use ts_keys::{DiscoPrivateKey, DiscoPublicKey, NodePublicKey};
+use ts_packet::geneve::{
+    GENEVE_FIXED_HEADER_LEN, GENEVE_PROTOCOL_DISCO, GENEVE_PROTOCOL_WIREGUARD, GeneveHeader,
+};
 // `IntoBytes` is only needed by the test-only `magic_prefix` wire-format guard.
 #[cfg(test)]
 use zerocopy::IntoBytes;
 
-use crate::error::DiscoError;
+use crate::{error::DiscoError, relay::RelayServerEndpoint};
 
 /// Maximum number of endpoints accepted from a single inbound `CallMeMaybe`.
 ///
@@ -124,6 +129,193 @@ pub fn seal_call_me_maybe(
     Ok(buf)
 }
 
+/// Seal one of the three bind-handshake messages, addressed to the **relay server**.
+///
+/// The handshake is between us and the relay server, not between us and the peer, so `server` is
+/// the relay's disco key (upstream `sendDiscoMessage(..., work.se.ServerDisco, bind, ...)`). The
+/// returned bytes are the naked disco frame; wrap them with [`geneve_encap`] before sending.
+fn seal_bind_message<M>(
+    our_disco: &DiscoPrivateKey,
+    receiver: &DiscoPublicKey,
+    common: RelayHandshakeCommon,
+) -> Result<Vec<u8>, DiscoError>
+where
+    M: Message
+        + Sized
+        + From<BindUdpRelayEndpointCommon>
+        + zerocopy::Immutable
+        + zerocopy::TryFromBytes
+        + zerocopy::IntoBytes
+        + zerocopy::KnownLayout,
+{
+    let mut buf = vec![0u8; Packet::size_for_message(size_of::<M>())];
+    let pkt = Packet::init_from_bytes::<M>(&mut buf, |msg| {
+        *msg = M::from(common.to_wire());
+    })?;
+    pkt.encrypt_in_place(our_disco, receiver, random_nonce())?;
+    Ok(buf)
+}
+
+/// Seal a [`BindUdpRelayEndpoint`] (disco `0x04`) — the first message of the bind handshake,
+/// addressed to the relay server.
+pub fn seal_relay_bind(
+    our_disco: &DiscoPrivateKey,
+    server: &DiscoPublicKey,
+    common: RelayHandshakeCommon,
+) -> Result<Vec<u8>, DiscoError> {
+    seal_bind_message::<BindUdpRelayEndpoint>(our_disco, server, common)
+}
+
+/// Seal a [`BindUdpRelayEndpointChallenge`] (disco `0x05`) — the second message of the bind
+/// handshake, which a relay *server* sends to a client.
+///
+/// This fork is a relay client, so nothing in it sends this message on a production path. It is
+/// provided so the codec is complete in both directions and so the peer-relay tests can stand in
+/// for a relay server; `receiver` is the client's disco key.
+pub fn seal_relay_bind_challenge(
+    server_disco: &DiscoPrivateKey,
+    receiver: &DiscoPublicKey,
+    common: RelayHandshakeCommon,
+) -> Result<Vec<u8>, DiscoError> {
+    seal_bind_message::<BindUdpRelayEndpointChallenge>(server_disco, receiver, common)
+}
+
+/// Seal a [`BindUdpRelayEndpointAnswer`] (disco `0x06`) — the third message of the bind
+/// handshake, echoing the server's challenge back to it.
+pub fn seal_relay_bind_answer(
+    our_disco: &DiscoPrivateKey,
+    server: &DiscoPublicKey,
+    common: RelayHandshakeCommon,
+) -> Result<Vec<u8>, DiscoError> {
+    seal_bind_message::<BindUdpRelayEndpointAnswer>(our_disco, server, common)
+}
+
+/// Seal a [`CallMeMaybeVia`] (disco `0x07`) advertising `endpoint` to `receiver`.
+///
+/// Provided for completeness of the codec and exercised by the round-trip tests: this fork does
+/// not run a relay server and so never allocates an endpoint to advertise. Sent over DERP.
+///
+/// `endpoint` must carry at least one `addr:port`: Go's `UDPRelayEndpoint.decode` treats a message
+/// with none as short and errors, so a zero-address message would be unparseable at the far end.
+pub fn seal_call_me_maybe_via(
+    our_disco: &DiscoPrivateKey,
+    receiver: &DiscoPublicKey,
+    endpoint: &RelayServerEndpoint,
+) -> Result<Vec<u8>, DiscoError> {
+    let mut buf = vec![
+        0u8;
+        Packet::size_for_message(CallMeMaybeVia::size_for_addr_port_count(
+            endpoint.addr_ports.len()
+        ))
+    ];
+    let pkt = Packet::init_from_bytes::<CallMeMaybeVia>(&mut buf, |m| {
+        m.endpoint.server_disco = endpoint.server_disco;
+        m.endpoint.client_disco = endpoint.client_disco;
+        m.endpoint.lamport_id = endpoint.lamport_id.into();
+        m.endpoint.vni = endpoint.vni.into();
+        // Go marshals `time.Duration`, an int64 nanosecond count. Saturate rather than wrap: a
+        // lifetime past ~584 years is nonsense, and a wrapped one would read as a tiny lifetime.
+        m.endpoint.bind_lifetime_nanos = duration_nanos(endpoint.bind_lifetime).into();
+        m.endpoint.steady_state_lifetime_nanos =
+            duration_nanos(endpoint.steady_state_lifetime).into();
+        for (slot, addr) in m.endpoint.addr_ports.iter_mut().zip(&endpoint.addr_ports) {
+            *slot = Endpoint::from(*addr);
+        }
+    })?;
+    pkt.encrypt_in_place(our_disco, receiver, random_nonce())?;
+    Ok(buf)
+}
+
+/// A `Duration` as the u64 nanosecond count Go's `time.Duration` marshals to, saturating instead
+/// of wrapping.
+fn duration_nanos(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Prefix a frame with the Geneve header the peer-relay leg uses.
+///
+/// `control` must be set for the three bind-handshake messages and clear for everything else
+/// (relayed ping/pong and relayed WireGuard data) — that bit is how a relay server tells a
+/// message addressed *to it* from one it should forward. See
+/// [`ts_packet::geneve::GeneveHeader::control`].
+pub fn geneve_encap(vni: u32, protocol: u16, control: bool, frame: &[u8]) -> Vec<u8> {
+    let header = GeneveHeader {
+        control,
+        protocol,
+        vni,
+    }
+    .encode();
+    let mut out = Vec::with_capacity(header.len() + frame.len());
+    out.extend_from_slice(&header);
+    out.extend_from_slice(frame);
+    out
+}
+
+/// Wrap a frame as relayed **disco**: Geneve protocol `0x7A11`.
+pub fn geneve_encap_disco(vni: u32, control: bool, frame: &[u8]) -> Vec<u8> {
+    geneve_encap(vni, GENEVE_PROTOCOL_DISCO, control, frame)
+}
+
+/// Wrap a frame as relayed **WireGuard** data: Geneve protocol `0x7A12`, never control.
+pub fn geneve_encap_wireguard(vni: u32, frame: &[u8]) -> Vec<u8> {
+    geneve_encap(vni, GENEVE_PROTOCOL_WIREGUARD, false, frame)
+}
+
+/// What a Geneve-encapsulated datagram turned out to carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeneveKind {
+    /// A relayed disco frame. `control` distinguishes a bind-handshake message (terminating on
+    /// the relay server, or originating from it) from a relayed ping/pong.
+    Disco {
+        /// The Geneve control bit.
+        control: bool,
+    },
+    /// Relayed WireGuard data.
+    WireGuard,
+}
+
+/// Classify a datagram that may be Geneve-encapsulated, returning the VNI, what it carries, and
+/// the offset of the inner frame.
+///
+/// This mirrors Go's `packetLooksLike` (`wgengine/magicsock/magicsock.go`) rather than simply
+/// decoding a header: a naked WireGuard datagram must never be mistaken for a Geneve one. Go's
+/// argument for why the two cannot collide is the byte pattern — this fork's port of that check is
+/// the version/reserved-bit gate below plus the protocol-field match, and, for a disco protocol
+/// value, the requirement that the inner frame actually carry the disco magic. When the Geneve
+/// header is well-formed but says "disco" over something that is not disco, Go deliberately falls
+/// back to treating the datagram as naked WireGuard rather than dropping it; so do we, by
+/// returning `None`.
+pub fn geneve_prefix(buf: &[u8]) -> Option<(u32, GeneveKind, usize)> {
+    if buf.len() < GENEVE_FIXED_HEADER_LEN {
+        return None;
+    }
+    // Go: version bits, the reserved bits of byte 1 and the reserved byte 7 are all values
+    // Tailscale always transmits as zero, and are what separate a Geneve header from a naked
+    // WireGuard message type or a STUN binding.
+    if buf[0] & 0xC0 != 0 || buf[1] & 0x3F != 0 || buf[7] != 0 {
+        return None;
+    }
+    let (header, offset) = GeneveHeader::parse(buf).ok()?;
+    match header.protocol {
+        GENEVE_PROTOCOL_DISCO => {
+            // A Geneve header claiming disco over a non-disco payload: Go keeps pre-Geneve
+            // behaviour and treats the datagram as naked WireGuard.
+            is_disco_message(buf.get(offset..)?).then_some((
+                header.vni,
+                GeneveKind::Disco {
+                    control: header.control,
+                },
+                offset,
+            ))
+        }
+        GENEVE_PROTOCOL_WIREGUARD => Some((header.vni, GeneveKind::WireGuard, offset)),
+        // A well-formed Geneve header with a protocol we do not know: Go falls through to the
+        // naked-disco / naked-WireGuard checks, because the bytes examined so far do not
+        // distinguish it from either.
+        _ => None,
+    }
+}
+
 /// A disco message decoded from the wire, together with the disco key that sent it.
 #[derive(Debug)]
 pub enum Inbound {
@@ -166,6 +358,110 @@ pub enum Inbound {
         /// The endpoints the peer believes it is reachable on.
         endpoints: Vec<SocketAddr>,
     },
+    /// A call-me-maybe-via: the peer is asking us to open a path *through a UDP relay server*
+    /// it has already had an endpoint allocated on.
+    ///
+    /// Arrives over DERP, exactly like [`Inbound::CallMeMaybe`]. Acting on it means running the
+    /// 3-way bind handshake against the named relay server before anything can flow.
+    CallMeMaybeVia {
+        /// The disco key that sealed the message: the peer, not the relay server.
+        sender: DiscoPublicKey,
+        /// The relay endpoint to handshake with.
+        endpoint: RelayServerEndpoint,
+    },
+    /// The first bind-handshake message, sent by a relay *client* to a relay *server*.
+    ///
+    /// This fork is a relay client only, never a relay server (upstream's server half lives in
+    /// `net/udprelay` / `feature/relayserver`, which this repository does not implement), so
+    /// receiving one means a peer took us for a relay server. Decoded so the message is
+    /// recognized rather than mistaken for something else, then dropped.
+    BindUdpRelayEndpoint {
+        /// The disco key that sealed the message.
+        sender: DiscoPublicKey,
+        /// The handshake fields.
+        common: RelayHandshakeCommon,
+    },
+    /// A relay server's challenge, the second bind-handshake message. This is the one message of
+    /// the three a relay *client* acts on.
+    BindUdpRelayEndpointChallenge {
+        /// The disco key that sealed the message: the relay server's.
+        sender: DiscoPublicKey,
+        /// The handshake fields, including the challenge to echo back.
+        common: RelayHandshakeCommon,
+    },
+    /// The third bind-handshake message, client → server. Server-bound like
+    /// [`Inbound::BindUdpRelayEndpoint`]: decoded, then dropped.
+    BindUdpRelayEndpointAnswer {
+        /// The disco key that sealed the message.
+        sender: DiscoPublicKey,
+        /// The handshake fields, echoing the server's challenge.
+        common: RelayHandshakeCommon,
+    },
+    /// A request to allocate a relay endpoint, addressed to a relay server. Server-bound:
+    /// decoded, then dropped.
+    AllocateUdpRelayEndpointsRequest {
+        /// The disco key that sealed the message.
+        sender: DiscoPublicKey,
+        /// The two client disco keys the endpoint should serve.
+        client_disco: [DiscoPublicKey; 2],
+        /// The request generation, to be echoed in the response.
+        generation: u32,
+    },
+    /// A relay server's response to an allocation request.
+    ///
+    /// This fork does not *request* allocations (it has no relay-allocation client; peers that
+    /// run a relay allocate on our behalf and tell us with a `CallMeMaybeVia`), so an unsolicited
+    /// response is decoded and dropped rather than acted on.
+    AllocateUdpRelayEndpointsResponse {
+        /// The disco key that sealed the message: the relay server's.
+        sender: DiscoPublicKey,
+        /// The generation echoed from the request.
+        generation: u32,
+        /// The endpoint that was allocated.
+        endpoint: RelayServerEndpoint,
+    },
+}
+
+/// The fields shared by all three bind-handshake messages, in owned host-order form
+/// (upstream `disco.BindUDPRelayEndpointCommon`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayHandshakeCommon {
+    /// The relay endpoint's Geneve Virtual Network Identifier.
+    ///
+    /// Upstream requires this sealed copy to equal the VNI in the *cleartext* Geneve header the
+    /// message arrived under. They can only differ if the cleartext header was tampered with or
+    /// mangled, so a mismatch drops the message.
+    pub vni: u32,
+    /// The handshake generation the client chose. Non-zero.
+    pub generation: u32,
+    /// The disco key of the remote *peer* on this relay endpoint — not the relay server's, and
+    /// not ours.
+    pub remote_key: DiscoPublicKey,
+    /// The server's challenge, echoed by the client in its answer. Meaningless padding in the
+    /// first (bind) message.
+    pub challenge: [u8; BIND_UDP_RELAY_CHALLENGE_LEN],
+}
+
+impl RelayHandshakeCommon {
+    /// Read the wire form into owned host order.
+    fn from_wire(wire: &BindUdpRelayEndpointCommon) -> Self {
+        Self {
+            vni: wire.vni.get(),
+            generation: wire.generation.get(),
+            remote_key: wire.remote_key,
+            challenge: wire.challenge,
+        }
+    }
+
+    /// Write owned host order back to the wire form.
+    fn to_wire(self) -> BindUdpRelayEndpointCommon {
+        BindUdpRelayEndpointCommon {
+            vni: self.vni.into(),
+            generation: self.generation.into(),
+            remote_key: self.remote_key,
+            challenge: self.challenge,
+        }
+    }
 }
 
 /// Parse and open an inbound disco datagram.
@@ -216,7 +512,70 @@ pub fn open(our_disco: &DiscoPrivateKey, buf: &mut [u8]) -> Result<Inbound, Disc
                 .collect();
             Ok(Inbound::CallMeMaybe { sender, endpoints })
         }
-        _ => Err(DiscoError::UnknownMessageType),
+        // The peer-relay handshake messages (0x04/0x05/0x06). Go's parsers ignore the version
+        // byte for all three and read the fixed 72-byte common block from the body prefix, which
+        // is exactly `as_msg_lax`.
+        Some(MessageType::BindUdpRelayEndpoint) => {
+            let msg = plain
+                .as_msg_lax::<BindUdpRelayEndpoint>()
+                .ok_or(DiscoError::Malformed)?;
+            Ok(Inbound::BindUdpRelayEndpoint {
+                sender,
+                common: RelayHandshakeCommon::from_wire(&msg.common),
+            })
+        }
+        Some(MessageType::BindUdpRelayEndpointChallenge) => {
+            let msg = plain
+                .as_msg_lax::<BindUdpRelayEndpointChallenge>()
+                .ok_or(DiscoError::Malformed)?;
+            Ok(Inbound::BindUdpRelayEndpointChallenge {
+                sender,
+                common: RelayHandshakeCommon::from_wire(&msg.common),
+            })
+        }
+        Some(MessageType::BindUdpRelayEndpointAnswer) => {
+            let msg = plain
+                .as_msg_lax::<BindUdpRelayEndpointAnswer>()
+                .ok_or(DiscoError::Malformed)?;
+            Ok(Inbound::BindUdpRelayEndpointAnswer {
+                sender,
+                common: RelayHandshakeCommon::from_wire(&msg.common),
+            })
+        }
+        Some(MessageType::CallMeMaybeVia) => {
+            let msg = plain
+                .call_me_maybe_via()
+                .ok_or(DiscoError::Malformed)?
+                .map_err(|_| DiscoError::Malformed)?;
+            Ok(Inbound::CallMeMaybeVia {
+                sender,
+                endpoint: RelayServerEndpoint::from_wire(&msg.endpoint),
+            })
+        }
+        Some(MessageType::AllocateUdpRelayEndpointsRequest) => {
+            let msg = plain
+                .allocate_udp_relay_endpoints_request()
+                .ok_or(DiscoError::Malformed)?
+                .map_err(|_| DiscoError::Malformed)?;
+            Ok(Inbound::AllocateUdpRelayEndpointsRequest {
+                sender,
+                client_disco: msg.client_disco,
+                generation: msg.generation.get(),
+            })
+        }
+        Some(MessageType::AllocateUdpRelayEndpointsResponse) => {
+            let msg = plain
+                .allocate_udp_relay_endpoints_response()
+                .ok_or(DiscoError::Malformed)?
+                .map_err(|_| DiscoError::Malformed)?;
+            Ok(Inbound::AllocateUdpRelayEndpointsResponse {
+                sender,
+                generation: msg.generation(),
+                endpoint: RelayServerEndpoint::from_wire(&msg.endpoint),
+            })
+        }
+        // A type byte outside the nine upstream defines. Go's `disco.Parse` errors here too.
+        None => Err(DiscoError::UnknownMessageType),
     }
 }
 

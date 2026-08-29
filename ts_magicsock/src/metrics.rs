@@ -62,6 +62,27 @@ pub(crate) struct MagicsockMetrics {
     /// Reflexive (STUN-equivalent) addresses actually recorded as NEW by `note_reflexive` — counts
     /// only fresh inserts, not duplicates of an address already learned (`magicsock_reflexive_learned`).
     pub reflexive_learned: &'static Metric,
+
+    /// Inbound disco `CallMeMaybeVia` frames ACCEPTED: the sender passed the netmap-membership
+    /// gate, the relay endpoint was allocated for this pair, and we started a bind handshake
+    /// (`magicsock_disco_call_me_maybe_via_recv`).
+    pub disco_call_me_maybe_via_recv: &'static Metric,
+    /// Inbound disco `CallMeMaybeVia` frames DROPPED — non-member sender, an endpoint allocated
+    /// for some other pair, no acceptable relay address, or a stale Lamport id
+    /// (`magicsock_disco_call_me_maybe_via_recv_rejected`).
+    pub disco_call_me_maybe_via_recv_rejected: &'static Metric,
+    /// Peer-relay bind handshakes completed: a relayed pong confirmed a relay `addr:port`, so the
+    /// peer has a usable peer-relay path instead of falling back to DERP
+    /// (`magicsock_peer_relay_bound`).
+    pub peer_relay_bound: &'static Metric,
+    /// WireGuard datagrams sent over a confirmed peer-relay path (`magicsock_send_peer_relay`).
+    pub send_peer_relay: &'static Metric,
+    /// Bytes sent over a confirmed peer-relay path (`magicsock_send_peer_relay_bytes`).
+    pub send_peer_relay_bytes: &'static Metric,
+    /// WireGuard datagrams received over a peer-relay path (`magicsock_recv_data_peer_relay`).
+    pub recv_data_peer_relay: &'static Metric,
+    /// Bytes received over a peer-relay path (`magicsock_recv_data_peer_relay_bytes`).
+    pub recv_data_peer_relay_bytes: &'static Metric,
 }
 
 /// Access the global magicsock counter set, registering it on first use.
@@ -86,5 +107,14 @@ pub(crate) fn metrics() -> &'static MagicsockMetrics {
         disco_call_me_maybe_sealed: Metric::new_counter("magicsock_disco_call_me_maybe_sealed"),
         stun_recv: Metric::new_counter("magicsock_stun_recv"),
         reflexive_learned: Metric::new_counter("magicsock_reflexive_learned"),
+        disco_call_me_maybe_via_recv: Metric::new_counter("magicsock_disco_call_me_maybe_via_recv"),
+        disco_call_me_maybe_via_recv_rejected: Metric::new_counter(
+            "magicsock_disco_call_me_maybe_via_recv_rejected",
+        ),
+        peer_relay_bound: Metric::new_counter("magicsock_peer_relay_bound"),
+        send_peer_relay: Metric::new_counter("magicsock_send_peer_relay"),
+        send_peer_relay_bytes: Metric::new_counter("magicsock_send_peer_relay_bytes"),
+        recv_data_peer_relay: Metric::new_counter("magicsock_recv_data_peer_relay"),
+        recv_data_peer_relay_bytes: Metric::new_counter("magicsock_recv_data_peer_relay_bytes"),
     })
 }

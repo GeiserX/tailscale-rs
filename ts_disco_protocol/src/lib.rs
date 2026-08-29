@@ -13,6 +13,7 @@ mod message_type;
 mod packet;
 mod ping;
 mod pong;
+mod relay;
 
 pub use call_me_maybe::CallMeMaybe;
 pub use endpoint::Endpoint;
@@ -22,6 +23,11 @@ pub use message_type::MessageType;
 pub use packet::Packet;
 pub use ping::Ping;
 pub use pong::Pong;
+pub use relay::{
+    AllocateUdpRelayEndpointsRequest, AllocateUdpRelayEndpointsResponse,
+    BIND_UDP_RELAY_CHALLENGE_LEN, BindUdpRelayEndpoint, BindUdpRelayEndpointAnswer,
+    BindUdpRelayEndpointChallenge, BindUdpRelayEndpointCommon, CallMeMaybeVia, UdpRelayEndpoint,
+};
 
 /// Common disco message functionality.
 pub trait Message {

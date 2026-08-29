@@ -5,7 +5,7 @@ use crypto_box::Tag;
 use ts_keys::{DiscoPrivateKey, DiscoPublicKey, NodePublicKey};
 use zerocopy::{FromBytes, IntoBytes, KnownLayout, TryFromBytes};
 
-use crate::{Error, Header, Message, message_type::MessageType};
+use crate::{Error, Header, Message, message_type::MessageType, relay::RelayEndpointMessage};
 
 /// The transaction-id length at the head of a Ping body (Go `disco.Ping.TxID` is `[12]byte`).
 const PING_TX_ID_LEN: usize = 12;
@@ -319,6 +319,88 @@ impl Packet<Plaintext> {
                 .chunks_exact(ep_size)
                 .filter_map(|chunk| crate::Endpoint::ref_from_bytes(chunk).ok()),
         )
+    }
+
+    /// Parse a [`CallMeMaybeVia`][crate::CallMeMaybeVia] payload, mirroring Go's
+    /// `parseCallMeMaybeVia` + `UDPRelayEndpoint.decode`.
+    ///
+    /// Returns `None` when the type byte isn't `CallMeMaybeVia`. Otherwise:
+    /// - a `version != 0` body yields [`Error::UnknownVersion`]. Go returns an *empty*
+    ///   `CallMeMaybeVia` there rather than an error, but an empty one carries no relay
+    ///   `addr:port`s, so Go's relay manager sends no bind message and the message is a no-op.
+    ///   A borrowed view cannot represent a message that isn't in the buffer, so we surface the
+    ///   typed error the consumer drops — identical observable behaviour (nothing is sent, no
+    ///   error goes back to the peer), and it keeps a future disco version from being silently
+    ///   read with this version's field layout.
+    /// - a body shorter than one fixed part plus **one** `addr:port`, or one whose `addr:port`
+    ///   tail is not a whole multiple of the 18-byte endpoint size, yields [`Error::TooShort`]
+    ///   (Go's `errShort` — note that unlike [`CallMeMaybe`][crate::CallMeMaybe], this message is
+    ///   *not* lax about a ragged tail).
+    pub fn call_me_maybe_via(&self) -> Option<Result<&crate::CallMeMaybeVia, Error>> {
+        let body = self.relay_body(crate::CallMeMaybeVia::TYPE)?;
+        Some(body.and_then(Self::parse_udp_relay_endpoint_message))
+    }
+
+    /// Parse an [`AllocateUdpRelayEndpointsRequest`][crate::AllocateUdpRelayEndpointsRequest]
+    /// payload, mirroring Go's `parseAllocateUDPRelayEndpointRequest`.
+    ///
+    /// `None` when the type byte doesn't match; [`Error::UnknownVersion`] for a non-zero version
+    /// (see [`call_me_maybe_via`](Self::call_me_maybe_via) for why that is an error here and an
+    /// empty message in Go); [`Error::TooShort`] for a body under the fixed 68-byte size. Longer
+    /// bodies parse from the prefix — Go is "deliberately lax on longer-than-expected messages".
+    pub fn allocate_udp_relay_endpoints_request(
+        &self,
+    ) -> Option<Result<&crate::AllocateUdpRelayEndpointsRequest, Error>> {
+        let body = self.relay_body(crate::AllocateUdpRelayEndpointsRequest::TYPE)?;
+        Some(body.and_then(|body| {
+            crate::AllocateUdpRelayEndpointsRequest::ref_from_prefix(body)
+                .map(|(msg, _rest)| msg)
+                .map_err(|_| Error::TooShort)
+        }))
+    }
+
+    /// Parse an [`AllocateUdpRelayEndpointsResponse`][crate::AllocateUdpRelayEndpointsResponse]
+    /// payload, mirroring Go's `parseAllocateUDPRelayEndpointResponse`.
+    ///
+    /// Same version handling as [`call_me_maybe_via`](Self::call_me_maybe_via). The body is a
+    /// 4-byte generation followed by a relay endpoint, and the endpoint half is decoded with the
+    /// same "at least one whole `addr:port`" rule, so a truncated or ragged body is
+    /// [`Error::TooShort`].
+    pub fn allocate_udp_relay_endpoints_response(
+        &self,
+    ) -> Option<Result<&crate::AllocateUdpRelayEndpointsResponse, Error>> {
+        let body = self.relay_body(crate::AllocateUdpRelayEndpointsResponse::TYPE)?;
+        Some(body.and_then(Self::parse_udp_relay_endpoint_message))
+    }
+
+    /// Shared prologue for the three version-gated relay messages: match the type byte, then
+    /// apply Go's `if ver != 0` short-circuit. `None` means "not this type".
+    fn relay_body(&self, ty: MessageType) -> Option<Result<&[u8], Error>> {
+        let pt = self.plaintext()?;
+        if pt.ty() != Some(ty) {
+            return None;
+        }
+        if pt.version != Plaintext::VERSION {
+            return Some(Err(Error::UnknownVersion));
+        }
+        Some(Ok(&pt.message))
+    }
+
+    /// Decode a message whose body ends in a [`UdpRelayEndpoint`][crate::UdpRelayEndpoint],
+    /// enforcing Go's `UDPRelayEndpoint.decode` length rule: the trailing `addr:port` array must
+    /// hold **at least one** whole endpoint and no partial one.
+    ///
+    /// `T::ref_from_bytes` already rejects a body whose trailing slice isn't a whole multiple of
+    /// the element size; the explicit minimum-length check is what additionally rejects a
+    /// zero-`addr:port` message, which Go treats as short.
+    fn parse_udp_relay_endpoint_message<T>(body: &[u8]) -> Result<&T, Error>
+    where
+        T: ?Sized + Message + RelayEndpointMessage + zerocopy::Immutable + KnownLayout + FromBytes,
+    {
+        if body.len() < T::MIN_LEN {
+            return Err(Error::TooShort);
+        }
+        T::ref_from_bytes(body).map_err(|_| Error::TooShort)
     }
 
     /// Convert the payload of this packet to a mutable reference to the given message type.

@@ -9,12 +9,22 @@ pub enum Error {
     #[error("wrong magic bytes sequence")]
     WrongMagic,
 
-    /// The version number of a decrypted message was incorrect.
+    /// The version number of a decrypted message was one this message type does not understand.
     ///
-    /// Retained for API stability; **no longer produced**. The disco version byte is now a
-    /// per-message-type advisory (matching Go's `disco.Parse`): Ping/Pong ignore it and CallMeMaybe
-    /// soft-empties on a non-zero version, rather than the whole packet being rejected. See
+    /// Never a packet-wide verdict: the disco version byte is a per-message-type advisory (matching
+    /// Go's `disco.Parse`), so Ping/Pong ignore it, the bind-handshake messages ignore it, and
+    /// CallMeMaybe soft-empties on a non-zero version. See
     /// [`Packet::validate`][crate::Packet::validate].
+    ///
+    /// It *is* produced by the three version-gated peer-relay accessors —
+    /// [`call_me_maybe_via`][crate::Packet::call_me_maybe_via],
+    /// [`allocate_udp_relay_endpoints_request`][crate::Packet::allocate_udp_relay_endpoints_request]
+    /// and
+    /// [`allocate_udp_relay_endpoints_response`][crate::Packet::allocate_udp_relay_endpoints_response]
+    /// — where Go returns an *empty* message instead of an error. An empty relay message carries no
+    /// candidate `addr:port`, so Go's relay manager acts on nothing; surfacing the typed error the
+    /// caller drops reaches the same observable outcome without reading a future version's body
+    /// under this version's field layout.
     #[error("disco version other than 0")]
     UnknownVersion,
 
