@@ -6,8 +6,8 @@
 | **Upstream commit this ledger was written against** | `1e69418c298b680562a2fecd7020f7f58d17d166` (2026-08-27, `net/dns: fix openresolv DNS config when no other snippets exist (#20996)`) |
 | **Upstream `tailcfg.CurrentCapabilityVersion` at that commit** | **145** (2026-08-04) |
 | **This repository at ledger time** | `d30f2ff` — workspace version `0.43.3` |
-| **`ts_capabilityversion::CapabilityVersion::CURRENT` here** | **130** (2025-10-06) |
-| **Gap window this ledger covers** | capability version **131 → 145**, i.e. upstream commits from 2025-10-06 to 2026-08-27 |
+| **`ts_capabilityversion::CapabilityVersion::CURRENT` here** | **125** (2025-08-11) — lowered from 130; see §B, *c2n endpoints behind the declared capability version* |
+| **Gap window this ledger covers** | capability version **131 → 145**, i.e. upstream commits from 2025-10-06 to 2026-08-27 (the window was fixed when the ledger was written against a declared 130; lowering the declaration to 125 does not change what upstream added) |
 
 > This repository is also a fork of the Rust port `tailscale/tailscale-rs` — see
 > [`VENDOR.md`](VENDOR.md) for that provenance. This ledger is about the *other* upstream: the Go
@@ -145,8 +145,9 @@ Assessments are one of **needs port**, **not applicable**, **already covered**.
 ### A. Capability versions 131 → 145
 
 This is the sharpest available axis: `tailcfg.CurrentCapabilityVersion` is upstream's own record of
-every client behaviour change that control can observe. This repo declares **130**, so 131–145 is
-exactly what upstream has added since this port last tracked it. Descriptions are upstream's own
+every client behaviour change that control can observe. This repo declared **130** when this ledger
+was written — it now declares **125**, see §B — so 131–145 is exactly what upstream has added since
+this port last tracked it. Descriptions are upstream's own
 (`tailcfg/tailcfg.go`, `tailcfg/nodecap`).
 
 | Ver | Date | Upstream change | Assessment |
@@ -158,7 +159,7 @@ exactly what upstream has added since this port last tracked it. Descriptions ar
 | 135 | 2026-03-30 | Client understands `NodeAttrCacheNetworkMaps` (and `DisableCacheNetworkMaps`, #19947) | **needs port** (optional) — no netmap persistence here. A client that does not cache is conformant, so this is cold-start latency only, not a correctness gap |
 | 136 | 2026-04-09 | Client understands `NodeAttrDisableLinuxCGNATDropRule` | **not applicable** — `ts_host_net` programs routes and DNS only; it never installs firewall rules, so there is no CGNAT DROP rule to disable |
 | 137 | 2026-04-15 | Client handles 429 responses to `/machine/register` | **already covered** — `ts_control/src/tokio/register.rs:261` parses the 429 plus its retry delay into a typed rate-limit error instead of an opaque HTTP error |
-| 138 | 2026-03-31 | Can handle c2n `/debug/tka` (`/debug/tka/log`) | **needs port** — the c2n responder (`ts_control/src/tokio/ping.rs`) serves `/echo` and `GET /vip-services` only; every other path returns 400 |
+| 138 | 2026-03-31 | Can handle c2n `/debug/tka` (`/debug/tka/log`) | **not applicable (declaration lowered)** — the c2n responder (`ts_control/src/tokio/ping.rs`) serves `/echo` and `GET /vip-services` only; `/debug/tka/log` takes Go's own `400`/`unknown c2n path` fallthrough, and the declared capability version is now held below the versions that promise it. Resolved together with 127 and 128; see §B |
 | 139 | 2026-05-22 | Client understands `NodeAttrEmitRuntimeMetrics` (emit Go `runtime/metrics` as clientmetrics) | **not applicable** — the attr exports the *Go runtime's* metrics; there is no Rust equivalent. `ts_metrics` already mirrors `util/clientmetric` itself |
 | 140 | 2026-05-27 | Client understands `NodeAttrDisableUDPGRO` / `DisableUDPGSO` / `DisableTUNUDPGRO` / `DisableTUNTCPGRO` | **not applicable** — no GRO/GSO offload on this datapath (`ts_transport_tun` is single-queue, no offload), so there is nothing for control to disable |
 | 141 | 2026-05-28 | Client understands `NodeAttrNeverGSOEqualTail` | **not applicable** — same: the attr is a workaround for kernel GSO batching this port does not do |
@@ -193,15 +194,28 @@ docs/typo/refactor commits filtered out.
   implements the classification for IPv4 only (`Ipv4Fragment`, `MIN_FRAG_BLKS`), which matches the
   default IPv4-only posture but leaves the opt-in IPv6 path without upstream's fragment rules.
 - **Peer relay** (`disco` 0x04–0x09, `net/udprelay`, `feature/relayserver`; capver 120/121, i.e.
-  *behind* the declared 130) — `ts_disco_protocol::MessageType` carries all nine upstream type bytes,
+  *behind* the declared 125) — `ts_disco_protocol::MessageType` carries all nine upstream type bytes,
   but only `Ping`/`Pong`/`CallMeMaybe` have a codec, so `CallMeMaybeVia` and the bind/allocate
   handshake are unparseable. **Needs port** to honour the declared capability version; the failure
   mode today is a dropped disco message and a fall back to DERP, which is safe but not parity.
-- **c2n endpoints behind the declared capability version** — capver 127 (`/debug/netmap`) and 128
-  (`/debug/health`) are below 130 and are not implemented either (same responder as row 138).
-  **Needs port** if the declared capability version is to be honest; alternatively the honest fix is
-  to lower `CapabilityVersion::CURRENT`. Whichever is chosen, it is one decision covering rows 127,
-  128 and 138.
+- **c2n endpoints behind the declared capability version** — capver 127 (`/debug/netmap`), 128
+  (`/debug/health`) and row 138 (`/debug/tka/log`) share one responder
+  (`ts_control/src/tokio/ping.rs`), which serves `/echo` and `GET /vip-services` only. **Resolved by
+  lowering `CapabilityVersion::CURRENT`**, which was the alternative to porting the three handlers.
+  Porting them was rejected on evidence, not preference: each needs a subsystem this tree does not
+  have. `handleC2NDebugNetMap` marshals a whole `netmap.NetworkMap` (there is no netmap aggregate
+  here — the netmap arrives as `StateUpdate` deltas accumulated by the runtime's peer tracker, which
+  the responder cannot see, and control unmarshals the body back into Go's struct, so any field we
+  could not fill would read as a zero value rather than as "unknown"); `handleC2NDebugHealth`
+  marshals `health.Tracker.CurrentState()` and this fork has no health subsystem; and
+  `handleC2NDebugTKALog` serves the AUM chain, which lives in `ts_runtime` because `ts_control`
+  deliberately does not depend on `ts_tka`. All three now take Go's own `400`/`unknown c2n path`
+  fallthrough (`handleC2N`, `ipn/ipnlocal/c2n.go`), which is asserted by test. The declaration
+  landed at **125**, not 126: capver 126 (seamless key renewal) is not implemented here either —
+  this tree's expiry recovery is a node-key rotation plus a full re-register
+  (`ts_control::Config::reauth_on_expiry`), which is upstream's *non*-seamless path. 125 is also the
+  capability version Tailscale `v1.88.0` declares, so it pairs with a real release for the
+  `IPNVersion` in `ts_control::hostinfo`.
 - **Services model extension** (`tailcfg`: `1cd8bcc82`, `6cd185bf3`, `fc9b18f50`) — upstream added
   client application *actions* (with attributes and `ServiceActionType` constants) to the VIP
   services model. **Needs port** only for the consume side to stay current:
@@ -258,8 +272,8 @@ The capability-history pattern is deliberately whitespace-tolerant: upstream wri
 `//   - 133: …`, but the exact indentation is a comment convention, not something `gofmt` enforces,
 and a pattern that pins it would go silently empty the day it changes. Check the row count rather
 than trusting the exit status — at the pinned commit the second command returns **16 lines**, 130
-through 145, i.e. the fifteen-version window of §A plus the 130 row this repository already
-declares. An empty or short result means the pattern broke, not that upstream added nothing.
+through 145, i.e. the fifteen-version window of §A plus the 130 row this repository declared when
+the ledger was written. An empty or short result means the pattern broke, not that upstream added nothing.
 
 When the pin is advanced, bump the header table, re-run the above, and rewrite §A and §B. A row
 whose assessment changes should say *why* it changed.

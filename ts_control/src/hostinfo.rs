@@ -16,10 +16,14 @@
 //! bead); their absence is far less distinguishing than the empty `OS`/fake `IPNVersion` this fixes.
 
 /// The Tailscale release this fork advertises capability-parity with. Kept in sync with
-/// [`CapabilityVersion::CURRENT`](ts_capabilityversion::CapabilityVersion::CURRENT): capver 130
-/// corresponds to the Tailscale 1.100 line, so a `1.100.x` `IPNVersion` is coherent with the capver
-/// we already send (a mismatched pair would itself be a tell).
-const TAILSCALE_VERSION: &str = "1.100.0";
+/// [`CapabilityVersion::CURRENT`](ts_capabilityversion::CapabilityVersion::CURRENT), because a
+/// version/capver pair no real client ever sent is itself a tell: `v1.88.0` is the release whose
+/// `tailcfg.CurrentCapabilityVersion` is exactly the 125 we declare, so the pair is one a genuine
+/// client produced.
+///
+/// Update this whenever `CURRENT` moves, to the release that declares the new value — not to the
+/// newest release. (The two are not the same: `v1.100.0`, for instance, declares capver 141.)
+const TAILSCALE_VERSION: &str = "1.88.0";
 
 /// The Go toolchain version the [`TAILSCALE_VERSION`] release was built with, reported as
 /// `HostInfo.GoVersion`. A genuine Go-built Tailscale node ALWAYS sends this (`runtime.Version()`);
@@ -27,8 +31,9 @@ const TAILSCALE_VERSION: &str = "1.100.0";
 /// inconsistent set a detector could key on (no real Go binary lacks a Go version). This fork has no
 /// honest Go version, so — exactly as with the synthetic [`TAILSCALE_VERSION`] — we present the
 /// toolchain that release shipped with, pinned to it (not a runtime probe) so the pair stays
-/// coherent. `go1.24` is the toolchain line the Tailscale 1.100 series was built with.
-const GO_VERSION: &str = "go1.24.4";
+/// coherent. `go1.25` is the toolchain line [`TAILSCALE_VERSION`] was built with (its `go.mod`
+/// pins `go 1.25.1`).
+const GO_VERSION: &str = "go1.25.1";
 
 /// Owned host-environment facts, detected once and borrowed into a wire
 /// [`HostInfo`](ts_control_serde::HostInfo).
@@ -48,7 +53,7 @@ pub struct HostInfoData {
     pub os_version: String,
     /// `runtime.GOARCH`-style arch (e.g. `amd64`, `arm64`).
     pub go_arch: String,
-    /// The Go toolchain version, reported as `HostInfo.GoVersion` (e.g. `go1.24.4`).
+    /// The Go toolchain version, reported as `HostInfo.GoVersion` (e.g. `go1.25.1`).
     pub go_version: String,
     /// `uname -m`-style machine (e.g. `x86_64`, `aarch64`).
     pub machine: String,
@@ -195,7 +200,8 @@ fn env_type_from(get: impl Fn(&str) -> Option<alloc::string::String>) -> ts_cont
 pub const PACKAGE_TSNET: &str = "tsnet";
 
 /// A `version.Long()`-shaped version string: `"<ver>-dev<date>-t<commit>"` in Go. We don't carry a
-/// VCS commit/date in this crate, so we emit the stable `<ver>` base (`1.100.0`) — a real, plausible
+/// VCS commit/date in this crate, so we emit the stable `<ver>` base ([`TAILSCALE_VERSION`]) — a
+/// real, plausible
 /// Tailscale release string that matches the capability version we advertise. This is the value the
 /// admin console and control see; it must NOT be the crate version (e.g. `0.37.4`), which no real
 /// `tailscaled` ever reports.
@@ -415,8 +421,9 @@ mod tests {
     fn ipn_version_is_tailscale_shaped_not_crate_version() {
         let v = ipn_version_long();
         // Must be a plausible Tailscale release, never the crate version (e.g. "0.37.4") which no
-        // real tailscaled reports. Coheres with the capability version we advertise (1.100 line).
-        assert_eq!(v, "1.100.0");
+        // real tailscaled reports. Must also be the release that declares the capability version we
+        // advertise, so the pair is one a genuine client sent: v1.88.0 declares capver 125.
+        assert_eq!(v, "1.88.0");
         assert!(
             v.starts_with("1."),
             "IPNVersion must look like a Tailscale 1.x release, got {v:?}"
