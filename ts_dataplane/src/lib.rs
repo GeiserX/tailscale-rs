@@ -139,6 +139,125 @@ fn inbound_filter_verdict(
     verdict
 }
 
+/// Apply the inbound packet filter to one peer's already-source-attributed batch of decrypted
+/// packets, in place, and harvest any TSMP disco-key advertisements it carried.
+///
+/// This is the body of Go's `tstun.Wrapper.filterPacketInboundFromWireGuard`, in Go's order:
+///
+/// 1. **TSMP consumption.** Go inspects TSMP *before* running the ACL filter and returns
+///    `filter.DropSilently` for the messages it consumes itself. The one consumed here is the
+///    disco-key advertisement (Go `packet.TSMPDiscoKeyAdvertisement`, upstream capability version
+///    144): a peer announces its disco public key right after an eligible WireGuard session comes
+///    up, so the receiver learns it without waiting for a netmap update or restarting WireGuard.
+///    A real Go peer sends this unprompted. Every *other* TSMP message (ping, pong,
+///    rejected-connection) is left in the batch and falls through to step 2, which admits it —
+///    exactly as Go's filter does for the TSMP types it does not consume.
+/// 2. **The ACL verdict**, [`inbound_filter_verdict`] (Go `runIn4`/`runIn6`).
+///
+/// `learned_disco_keys` is appended to, never cleared, so one batch can carry advertisements from
+/// several peers. A learned key is attributed to `peer_id` — the WireGuard peer whose session
+/// decrypted the packet, and whose source addresses the caller's source filter has already bound.
+/// Go reaches the same peer the long way round, looking the advertisement's source IP up in the
+/// netmap (`wgengine.userspaceEngine.peerForIP`). Either way a peer can only advertise a key for
+/// *itself*: it cannot speak for another peer.
+fn filter_inbound_from_peer(
+    filter: &(dyn ts_packetfilter::Filter + Send + Sync),
+    peer_id: PeerId,
+    packets: &mut Vec<PacketMut>,
+    learned_disco_keys: &mut Vec<(PeerId, ts_packet::tsmp::DiscoKeyAdvertisement)>,
+) {
+    packets.retain(|packet| {
+        let bytes = packet.as_ref();
+        let Ok(pkt) = etherparse::SlicedPacket::from_ip(bytes) else {
+            tracing::trace!("does not look like ip packet");
+            return false;
+        };
+
+        let (proto, src, dst, frag) = match pkt.net {
+            Some(etherparse::NetSlice::Ipv4(ipv4)) => {
+                // IPv4 fragment state (Go `net/packet.decode4` reads `b[6:8]`): a
+                // non-first fragment carries no L4 header, so etherparse leaves
+                // `transport == None` and the port would read as 0 below — which a normal
+                // ACL rule never admits. Without classifying the fragment that silently
+                // drops valid later fragments Go *accepts* (breaking large/fragmented
+                // inbound traffic on the 1280-MTU overlay). Capture the offset (in 8-byte
+                // blocks) + the more-fragments bit so the verdict can mirror Go's
+                // `decode4`/`pre()` fragment handling.
+                let hdr = ipv4.header();
+                (
+                    IpProto::new(ipv4.payload().ip_number.0 as _),
+                    hdr.source_addr().into(),
+                    hdr.destination_addr().into(),
+                    Some(Ipv4Fragment {
+                        offset_blocks: hdr.fragments_offset().value(),
+                        more_fragments: hdr.more_fragments(),
+                    }),
+                )
+            }
+            Some(etherparse::NetSlice::Ipv6(ipv6)) => (
+                IpProto::new(ipv6.payload().ip_number.0 as _),
+                ipv6.header().source_addr().into(),
+                ipv6.header().destination_addr().into(),
+                // IPv6 fragmentation is carried in a Fragment extension header, not the
+                // base header; the tailnet is IPv4-only by default so a v6 fragment can't
+                // reach here on the live path. Treat v6 as non-fragment (the existing
+                // behavior) — full v6 fragment parity is tracked separately.
+                None,
+            ),
+            _ => {
+                // A packet that parsed as IP but is neither IPv4 nor IPv6 (e.g. a
+                // future/odd `NetSlice` shape). These bytes are attacker-controlled
+                // post-decrypt, so fail closed — drop it — rather than `unreachable!`,
+                // which would panic the single-threaded dataplane on a crafted packet.
+                // Go's filter `pre()` likewise returns Drop/"not-ip" here, never panics.
+                tracing::trace!("parsed packet is neither IPv4 nor IPv6; dropping");
+                return false;
+            }
+        };
+
+        let (_src_port, dst_port) = match pkt.transport {
+            Some(etherparse::TransportSlice::Udp(udp)) => {
+                (udp.source_port(), udp.destination_port())
+            }
+            Some(etherparse::TransportSlice::Tcp(tcp)) => {
+                (tcp.source_port(), tcp.destination_port())
+            }
+            _ => (0, 0),
+        };
+
+        // TSMP disco-key advertisement (Go `packet.TSMPDiscoKeyAdvertisement`,
+        // upstream capability version 144). Go handles TSMP in
+        // `tstun.filterPacketInboundFromWireGuard` *before* the ACL filter runs, and
+        // returns `filter.DropSilently` for an advertisement: it is an inter-node
+        // control message consumed here, never delivered to the local stack. Mirror
+        // both the position (after source attribution, before the ACL) and the drop.
+        //
+        if proto == IpProto::TSMP
+            && let Some(advert) = ts_packet::tsmp::DiscoKeyAdvertisement::parse(bytes)
+        {
+            if advert.key_is_zero() {
+                // Go publishes only `if !discoKeyAdvert.Key.IsZero()`. Still a
+                // well-formed advertisement, so it is still dropped.
+                tracing::debug!(
+                    ?peer_id,
+                    "TSMP disco-key advertisement carried the zero key; ignoring"
+                );
+            } else {
+                tracing::debug!(?peer_id, %src, "learned peer disco key over TSMP");
+                learned_disco_keys.push((peer_id, advert));
+            }
+            return false;
+        }
+
+        // The inbound proto-switch (Go `runIn4`/`runIn6`): Go `pre()` multicast/link-local
+        // drops, then the fragment classification (Go `decode4` + `pre()`), then
+        // unconditional TSMP accept, then the control-derived ACL. The caller's source
+        // attribution and `or_in.route` bound this to attributable peers and local
+        // destinations (Go's `local4`/`local6` precondition).
+        inbound_filter_verdict(filter, proto, src, dst, dst_port, frag)
+    });
+}
+
 /// A data plane subsystem that can be the subject of timer events.
 pub enum Subsystem {
     /// The wireguard component.
@@ -275,9 +394,16 @@ impl DataPlane {
             }
         }
 
+        // TSMP disco-key advertisements learned from this batch (Go `tstun.Wrapper`'s
+        // `discoKeyAdvertisementPub` publisher). Filled in by the packet-filter stage below, which
+        // is the point at which a packet has both been attributed to a peer and decoded far enough
+        // to know it is TSMP.
+        let mut learned_disco_keys: Vec<(PeerId, ts_packet::tsmp::DiscoKeyAdvertisement)> =
+            Vec::new();
+
         let to_local = to_local
             .into_iter()
-            .map(|(peer_id, mut packets)| -> Vec<PacketMut> {
+            .map(|(peer_id, mut packets)| -> (PeerId, Vec<PacketMut>) {
                 let _span = tracing::trace_span!(
                     "src_filter_inbound",
                     peer_id = ?peer_id,
@@ -300,84 +426,22 @@ impl DataPlane {
                     verdict
                 });
 
-                packets
+                (PeerId(peer_id.0), packets)
             })
-            .map(|mut v| {
-                let _span =
-                    tracing::trace_span!("packet_filter_inbound", n_packet = v.len()).entered();
+            .map(|(peer_id, mut v)| {
+                let _span = tracing::trace_span!(
+                    "packet_filter_inbound",
+                    peer_id = ?peer_id,
+                    n_packet = v.len()
+                )
+                .entered();
 
-                v.retain(|pkt| {
-                    let Ok(pkt) = etherparse::SlicedPacket::from_ip(pkt.as_ref()) else {
-                        tracing::trace!("does not look like ip packet");
-                        return false;
-                    };
-
-                    let (proto, src, dst, frag) = match pkt.net {
-                        Some(etherparse::NetSlice::Ipv4(ipv4)) => {
-                            // IPv4 fragment state (Go `net/packet.decode4` reads `b[6:8]`): a
-                            // non-first fragment carries no L4 header, so etherparse leaves
-                            // `transport == None` and the port would read as 0 below — which a normal
-                            // ACL rule never admits. Without classifying the fragment that silently
-                            // drops valid later fragments Go *accepts* (breaking large/fragmented
-                            // inbound traffic on the 1280-MTU overlay). Capture the offset (in 8-byte
-                            // blocks) + the more-fragments bit so the verdict can mirror Go's
-                            // `decode4`/`pre()` fragment handling.
-                            let hdr = ipv4.header();
-                            (
-                                IpProto::new(ipv4.payload().ip_number.0 as _),
-                                hdr.source_addr().into(),
-                                hdr.destination_addr().into(),
-                                Some(Ipv4Fragment {
-                                    offset_blocks: hdr.fragments_offset().value(),
-                                    more_fragments: hdr.more_fragments(),
-                                }),
-                            )
-                        }
-                        Some(etherparse::NetSlice::Ipv6(ipv6)) => (
-                            IpProto::new(ipv6.payload().ip_number.0 as _),
-                            ipv6.header().source_addr().into(),
-                            ipv6.header().destination_addr().into(),
-                            // IPv6 fragmentation is carried in a Fragment extension header, not the
-                            // base header; the tailnet is IPv4-only by default so a v6 fragment can't
-                            // reach here on the live path. Treat v6 as non-fragment (the existing
-                            // behavior) — full v6 fragment parity is tracked separately.
-                            None,
-                        ),
-                        _ => {
-                            // A packet that parsed as IP but is neither IPv4 nor IPv6 (e.g. a
-                            // future/odd `NetSlice` shape). These bytes are attacker-controlled
-                            // post-decrypt, so fail closed — drop it — rather than `unreachable!`,
-                            // which would panic the single-threaded dataplane on a crafted packet.
-                            // Go's filter `pre()` likewise returns Drop/"not-ip" here, never panics.
-                            tracing::trace!("parsed packet is neither IPv4 nor IPv6; dropping");
-                            return false;
-                        }
-                    };
-
-                    let (_src_port, dst_port) = match pkt.transport {
-                        Some(etherparse::TransportSlice::Udp(udp)) => {
-                            (udp.source_port(), udp.destination_port())
-                        }
-                        Some(etherparse::TransportSlice::Tcp(tcp)) => {
-                            (tcp.source_port(), tcp.destination_port())
-                        }
-                        _ => (0, 0),
-                    };
-
-                    // The inbound proto-switch (Go `runIn4`/`runIn6`): Go `pre()` multicast/link-local
-                    // drops, then the fragment classification (Go `decode4` + `pre()`), then
-                    // unconditional TSMP accept, then the control-derived ACL. Source attribution above
-                    // and `or_in.route` below bound this to attributable peers and local destinations
-                    // (Go's `local4`/`local6` precondition).
-                    inbound_filter_verdict(
-                        self.packet_filter.as_ref(),
-                        proto,
-                        src,
-                        dst,
-                        dst_port,
-                        frag,
-                    )
-                });
+                filter_inbound_from_peer(
+                    self.packet_filter.as_ref(),
+                    peer_id,
+                    &mut v,
+                    &mut learned_disco_keys,
+                );
 
                 v
             });
@@ -397,7 +461,11 @@ impl DataPlane {
             prev.cancel();
         }
 
-        InboundResult { to_local, to_peers }
+        InboundResult {
+            to_local,
+            to_peers,
+            learned_disco_keys,
+        }
     }
 
     /// Return the next time at which [`DataPlane::process_events`] must be called.
@@ -457,6 +525,14 @@ pub struct InboundResult {
     pub to_local: HashMap<OverlayTransportId, Vec<PacketMut>>,
     /// Encrypted packets to be sent to wireguard peers by the underlay.
     pub to_peers: HashMap<(UnderlayTransportId, PeerId), Vec<PacketMut>>,
+    /// Disco keys peers advertised over TSMP in this batch, each paired with the WireGuard peer
+    /// whose session carried it (Go `tstun.Wrapper` publishing `events.PeerDiscoKeyUpdate`, which
+    /// `wgengine` turns into a `magicsock.Conn.HandleDiscoKeyAdvertisement` call).
+    ///
+    /// The advertisement packets themselves are dropped: they are inter-node control messages, not
+    /// traffic for the local stack. Zero keys are already filtered out. Empty for a batch that
+    /// carried none, which is the overwhelmingly common case.
+    pub learned_disco_keys: Vec<(PeerId, ts_packet::tsmp::DiscoKeyAdvertisement)>,
 }
 
 /// The result of processing an event.
@@ -681,6 +757,122 @@ mod tests {
             ),
             "a later TSMP fragment is accepted via the fragment path (proto-independent)"
         );
+    }
+
+    /// Build the IPv4 packet a Go peer puts on the wire for a TSMP message: a 20-byte IPv4
+    /// header with proto 99 and `body` appended (Go `packet.Generate(IP4Header{...}, body)`,
+    /// which is what `TSMPDiscoKeyAdvertisement.Marshal` calls). The header checksum is left
+    /// zero — nothing on this path verifies it, and neither does Go's decoder.
+    fn tsmp_packet4(src: [u8; 4], dst: [u8; 4], body: &[u8]) -> PacketMut {
+        let mut buf = vec![0u8; 20 + body.len()];
+        buf[20..].copy_from_slice(body);
+        buf[0] = 0x45;
+        let total_len = buf.len() as u16;
+        buf[2..4].copy_from_slice(&total_len.to_be_bytes());
+        buf[8] = 64;
+        buf[9] = 99;
+        buf[12..16].copy_from_slice(&src);
+        buf[16..20].copy_from_slice(&dst);
+        PacketMut::from(buf)
+    }
+
+    /// A body a real Go peer sends: `'a'` then its 32-byte disco key.
+    fn advertisement_body(key: [u8; 32]) -> Vec<u8> {
+        let mut body = vec![ts_packet::tsmp::TSMP_TYPE_DISCO_ADVERTISEMENT];
+        body.extend_from_slice(&key);
+        body
+    }
+
+    /// The receive side of the TSMP disco-key advertisement, at the point Go handles it: a
+    /// well-formed advertisement is CONSUMED — the peer's key is learned and the packet is
+    /// dropped rather than delivered to the local stack (Go `filter.DropSilently`) — while every
+    /// other TSMP body is left alone and still admitted by the TSMP ACL bypass.
+    ///
+    /// The ACL here denies everything, so an admitted packet can only have come through the
+    /// TSMP bypass, and a learned key can only have come from the advertisement path.
+    #[test]
+    fn tsmp_disco_key_advertisement_is_learned_and_dropped() {
+        let peer = PeerId(7);
+        let src = [100, 64, 0, 2];
+        let dst = [100, 64, 0, 1];
+        let key = [0xa5u8; 32];
+
+        let mut packets = vec![tsmp_packet4(src, dst, &advertisement_body(key))];
+        let mut learned = Vec::new();
+        filter_inbound_from_peer(&DenyAll, peer, &mut packets, &mut learned);
+
+        assert!(
+            packets.is_empty(),
+            "a consumed advertisement must not be delivered to the local stack"
+        );
+        assert_eq!(learned.len(), 1, "the advertisement must be harvested");
+        assert_eq!(
+            learned[0].0, peer,
+            "attributed to the sending wireguard peer"
+        );
+        assert_eq!(learned[0].1.key, key, "the advertised disco key is learned");
+        assert_eq!(learned[0].1.src, std::net::IpAddr::from(src));
+
+        // A TSMP message that is NOT an advertisement stays in the batch (Go leaves the types it
+        // does not consume to the filter, which accepts TSMP) and teaches us nothing.
+        let mut ping = vec![ts_packet::tsmp::TSMP_TYPE_PING];
+        ping.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let mut packets = vec![tsmp_packet4(src, dst, &ping)];
+        let mut learned = Vec::new();
+        filter_inbound_from_peer(&DenyAll, peer, &mut packets, &mut learned);
+        assert_eq!(packets.len(), 1, "a TSMP ping still bypasses the ACL");
+        assert!(learned.is_empty(), "a ping advertises no disco key");
+    }
+
+    /// The negative case, at the dataplane boundary: a TSMP body that is *nearly* an
+    /// advertisement must not be half-parsed into a learned key. None of these may put anything
+    /// in `learned` — a truncated key that was zero-padded, or a zero key that was accepted,
+    /// would be a wrong disco key bound to a real peer.
+    #[test]
+    fn malformed_tsmp_disco_key_advertisements_teach_nothing() {
+        let peer = PeerId(7);
+        let src = [100, 64, 0, 2];
+        let dst = [100, 64, 0, 1];
+
+        // A truncated advertisement: the type byte and only 31 of 32 key bytes.
+        let mut truncated = advertisement_body([0xa5u8; 32]);
+        truncated.truncate(32);
+
+        for (name, body, still_delivered) in [
+            ("truncated advertisement", truncated, true),
+            (
+                "unknown TSMP type byte",
+                {
+                    let mut b = advertisement_body([0xa5u8; 32]);
+                    b[0] = b'Z';
+                    b
+                },
+                true,
+            ),
+            // A well-formed advertisement of the zero key: Go parses it but publishes only
+            // `if !discoKeyAdvert.Key.IsZero()`, so it teaches nothing — and it is still a TSMP
+            // message we consumed, so it is still dropped.
+            (
+                "zero-key advertisement",
+                advertisement_body([0u8; 32]),
+                false,
+            ),
+        ] {
+            let mut packets = vec![tsmp_packet4(src, dst, &body)];
+            let mut learned = Vec::new();
+            filter_inbound_from_peer(&DenyAll, peer, &mut packets, &mut learned);
+
+            assert!(
+                learned.is_empty(),
+                "a {name} must not be half-parsed into a learned disco key"
+            );
+            assert_eq!(
+                packets.len(),
+                usize::from(still_delivered),
+                "a {name} must {} be delivered",
+                if still_delivered { "still" } else { "not" }
+            );
+        }
     }
 
     /// Behavioral guard: an installed capture hook MUST be invoked with `CapturePath::FromLocal`
