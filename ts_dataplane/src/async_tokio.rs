@@ -21,6 +21,18 @@ pub type DataplaneToUnderlay = mpsc::UnboundedSender<(PeerId, Vec<PacketMut>)>;
 /// Queue for packets entering the data plane "up" from an underlay transport.
 pub type DataplaneFromUnderlay = mpsc::UnboundedReceiver<(PeerId, Vec<PacketMut>)>;
 
+/// A disco key a peer advertised over TSMP, paired with the WireGuard peer that sent it. See
+/// [`crate::InboundResult::learned_disco_keys`].
+pub type LearnedDiscoKey = (PeerId, ts_packet::tsmp::DiscoKeyAdvertisement);
+
+/// Sink the data plane writes TSMP-learned peer disco keys to, installed by the embedder with
+/// [`DataPlane::install_disco_key_sink`]. Go's `tstun.Wrapper` publishes the equivalent event on
+/// its event bus for `wgengine` to consume.
+pub type DataplaneToDiscoKeySink = mpsc::UnboundedSender<LearnedDiscoKey>;
+
+/// Read end of a [`DataplaneToDiscoKeySink`].
+pub type DiscoKeysFromDataplane = mpsc::UnboundedReceiver<LearnedDiscoKey>;
+
 // TODO: wire in overlay/underlay transport traits
 
 /// Transforms packets to make tailscale happen.
@@ -45,6 +57,12 @@ struct CoreState {
     overlay_transports: HashMap<OverlayTransportId, DataplaneToOverlay>,
     /// Queues to write packets to underlay transports.
     underlay_transports: HashMap<UnderlayTransportId, DataplaneToUnderlay>,
+
+    /// Where TSMP-learned peer disco keys go, if anyone is listening. `None` (the default) simply
+    /// discards them: parsing still happens and the advertisement packets are still dropped, so an
+    /// embedder that does not wire a sink is not left delivering TSMP control messages to its
+    /// local stack.
+    disco_key_sink: Option<DataplaneToDiscoKeySink>,
 }
 
 /// State that must be held during async polling.
@@ -79,6 +97,7 @@ impl DataPlane {
                 sync,
                 overlay_transports: Default::default(),
                 underlay_transports: Default::default(),
+                disco_key_sink: None,
             }),
 
             poll_state: Mutex::new(PollState {
@@ -132,6 +151,15 @@ impl DataPlane {
         self.transports_changed.notify_waiters();
 
         (id, self.overlay_up.clone(), rx)
+    }
+
+    /// Install (`Some`) or clear (`None`) the sink that receives peer disco keys learned from TSMP
+    /// disco-key advertisements (Go `packet.TSMPDiscoKeyAdvertisement`).
+    ///
+    /// Install this before [`run`](Self::run) starts: an advertisement arrives immediately after a
+    /// WireGuard session is established, so a sink installed later can miss the first one.
+    pub async fn install_disco_key_sink(&self, sink: Option<DataplaneToDiscoKeySink>) {
+        self.core_state.lock().await.disco_key_sink = sink;
     }
 
     /// Run the data plane forever, moving packets from the input queues to output queues.
@@ -207,6 +235,8 @@ impl DataPlane {
 
         let mut core = self.core_state.lock().await;
 
+        let mut learned_disco_keys = Vec::new();
+
         let (to_peers, to_local) = match select_result {
             SelectResult::OverlayDown(overlay_down) => {
                 let OutboundResult { to_peers, loopback } =
@@ -215,7 +245,13 @@ impl DataPlane {
                 (Some(to_peers), Some(loopback))
             }
             SelectResult::UnderlayUp(_peer_id, underlay_up) => {
-                let InboundResult { to_local, to_peers } = core.sync.process_inbound(underlay_up);
+                let InboundResult {
+                    to_local,
+                    to_peers,
+                    learned_disco_keys: learned,
+                } = core.sync.process_inbound(underlay_up);
+
+                learned_disco_keys = learned;
 
                 (Some(to_peers), Some(to_local))
             }
@@ -232,6 +268,19 @@ impl DataPlane {
 
         if let Some(to_local) = to_local {
             write_to_overlay(&core, to_local).await;
+        }
+
+        if !learned_disco_keys.is_empty()
+            && let Some(sink) = &core.disco_key_sink
+        {
+            for learned in learned_disco_keys {
+                // A closed sink means the consumer is gone (runtime shutting down); the key is
+                // simply not learned, which is the same position we were in before this existed.
+                if sink.send(learned).is_err() {
+                    tracing::debug!("disco key sink closed; dropping TSMP disco-key advertisement");
+                    break;
+                }
+            }
         }
     }
 

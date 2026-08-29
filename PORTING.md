@@ -165,7 +165,7 @@ this port last tracked it. Descriptions are upstream's own
 | 141 | 2026-05-28 | Client understands `NodeAttrNeverGSOEqualTail` | **not applicable** — same: the attr is a workaround for kernel GSO batching this port does not do |
 | 142 | 2026-07-06 | Client understands c2n `/remoteapi/localapi/*` proxy (`feature/remoteconfig`) | **needs port** (narrow) — a one-route LocalAPI does exist (`GET /localapi/v0/status` in `src/tsnet.rs`), but the c2n responder matches exact paths only, so there is no prefix route to proxy into it. Worth almost nothing until the LocalAPI surface grows |
 | 143 | 2026-07-22 | Client correctly ignores conn25 node attributes when not enabled by environment variable | **not applicable** — no app connector of either generation here, so conn25 attributes are already ignored |
-| 144 | 2026-07-31 | Client sends `packet.TSMPDiscoKeyAdvertisement` around WireGuard handshakes | **needs port** — the highest-value row in this table; see §B |
+| 144 | 2026-07-31 | Client sends `packet.TSMPDiscoKeyAdvertisement` around WireGuard handshakes | **needs port** — the *send* side. The receive side (learning a peer's advertised disco key) is covered; see §B |
 | 145 | 2026-08-04 | Client understands `NodeAttrScopeQuad100OnMacOS` | **not applicable** — the attr changes resolver ordering for the *sandboxed* macOS app; `ts_host_net::macos` installs a service-scoped `scutil` DNS dictionary and has no default-resolver behaviour to scope |
 
 Net: of the fifteen versions upstream added, **five need a port** — 133 (host-OS-facing), 135
@@ -180,11 +180,14 @@ docs/typo/refactor commits filtered out.
 - **TSMP disco-key advertisement** (`net/packet`, `net/tstun`, `wgengine/magicsock`,
   `control/controlclient`: `c54d24369`, `c870d3811`, `bf467727f`, `82a381e54`, `014d5bd9e`) —
   peers now advertise their disco key in a TSMP message around the WireGuard handshake, and learn a
-  peer's disco key from it without restarting WireGuard. **Needs port**, and it is the one item here
-  a real Go peer will *send us* unprompted: `ts_dataplane` admits IP proto 99 (TSMP) past the ACL
-  (`ts_dataplane/src/lib.rs:124`) but nothing parses TSMP message bodies, so the advertisement is
-  accepted and then dropped on the floor. Port the receive side first (learn the peer's disco key),
-  the send side second (capver 144).
+  peer's disco key from it without restarting WireGuard. It is the one item here a real Go peer will
+  *send us* unprompted. **Receive side covered**: `ts_packet::tsmp` decodes the advertisement (Go
+  `Parsed.AsTSMPDiscoAdvertisement`), `ts_dataplane::filter_inbound_from_peer` consumes it ahead of
+  the ACL and drops it rather than delivering it to the local stack (Go
+  `tstun.filterPacketInboundFromWireGuard` returning `filter.DropSilently`), and
+  `PeerTracker::learn_disco_key` applies it to the peer (Go
+  `magicsock.Conn.HandleDiscoKeyAdvertisement`). **The send side still needs a port** — that is
+  capver 144, and it is what row 144 above tracks.
 - **IPv6 fragment extension-header handling in the filter** (`net/packet`, `wgengine/filter`:
   `4c4ec3d46`, `26b2ed0a6`) — upstream extended its RFC 1858-style fragment classification to IPv6
   fragment extension headers. **Needs port only under `Config::enable_ipv6`**: `ts_dataplane`
