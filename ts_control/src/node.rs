@@ -337,6 +337,30 @@ impl Node {
         name.eq_ignore_ascii_case(&self.hostname)
     }
 
+    /// Report whether this node is a **router**: it routes addresses besides its own. An exit
+    /// node, a subnet router and an app connector are all routers.
+    ///
+    /// Mirrors Go's `tailcfg.Node.IsRouter` (`tailcfg/tailcfg.go`, added upstream in `8d830599b`),
+    /// which is `true` when any prefix in `AllowedIPs` is not also one of the node's own
+    /// `Addresses`. It is a *derived predicate*, not a wire field: control sends nothing new for
+    /// it, so there is no interop surface here and no capability version to gate on.
+    ///
+    /// Deliberately **not** [`Node::is_subnet_route`] folded over [`Node::accepted_routes`]. That
+    /// predicate also excuses any single Tailscale-range IP (`100.64.0.0/10` /
+    /// `fd7a:115c:a1e0::/48`) so route installation never mistakes another peer's address for an
+    /// advertised subnet; Go's `IsRouter` makes no such exception — a `/32` that is not *this*
+    /// node's own address still makes it a router. The two must stay separate.
+    ///
+    /// The domain [`Node`] retains only the first IPv4 and first IPv6 prefix control assigned
+    /// ([`Node::tailnet_address`]), which is what control assigns in practice; a node handed two
+    /// prefixes of the same family would count the extra one as a routed address.
+    pub fn is_router(&self) -> bool {
+        self.accepted_routes.iter().any(|route| match route {
+            ipnet::IpNet::V4(v4) => *v4 != self.tailnet_address.ipv4,
+            ipnet::IpNet::V6(v6) => *v6 != self.tailnet_address.ipv6,
+        })
+    }
+
     /// Report whether `route` is an advertised *subnet* route (as opposed to one of this node's
     /// own tailnet addresses).
     ///
@@ -1225,6 +1249,76 @@ mod tests {
         good.peerapi_port = Some(443);
         let good_addr = good.peerapi_addr().expect("peerapi_addr yields Some");
         assert!(is_tailscale_ip(good_addr.ip()));
+    }
+
+    /// Ported from upstream's `TestNodeIsRouter` (`tailcfg/tailcfg_test.go`, `8d830599b`): a node
+    /// is a router exactly when its `AllowedIPs` reach past its own `Addresses`. The absent case
+    /// (a plain node advertising only its own addresses) is asserted alongside the present one,
+    /// since "no routes besides my own" is the answer that must not drift.
+    #[test]
+    fn is_router_reports_routes_beyond_own_addresses() {
+        let v4: ipnet::Ipv4Net = "100.64.0.1/32".parse().unwrap();
+        let v6: ipnet::Ipv6Net = "fd7a:115c:a1e0::1/128".parse().unwrap();
+        let self4 = ipnet::IpNet::V4(v4);
+        let self6 = ipnet::IpNet::V6(v6);
+
+        let cases: &[(&str, Vec<ipnet::IpNet>, bool)] = &[
+            ("empty", vec![], false),
+            ("plain-ipv4", vec![self4], false),
+            ("plain-ipv6", vec![self6], false),
+            ("plain-ipv4-ipv6", vec![self4, self6], false),
+            ("duplicates", vec![self4, self4], false),
+            (
+                "exit-node-ipv4",
+                vec![self4, "0.0.0.0/0".parse().unwrap()],
+                true,
+            ),
+            ("exit-node-ipv6", vec![self6, "::/0".parse().unwrap()], true),
+            (
+                "exit-node-ipv4-ipv6",
+                vec![
+                    self4,
+                    self6,
+                    "0.0.0.0/0".parse().unwrap(),
+                    "::/0".parse().unwrap(),
+                ],
+                true,
+            ),
+            (
+                "subnet-router-ipv4",
+                vec![self4, "192.0.2.0/24".parse().unwrap()],
+                true,
+            ),
+            (
+                "subnet-router-ipv6",
+                vec![self6, "2001:db8::/32".parse().unwrap()],
+                true,
+            ),
+            (
+                "subnet-router-ipv4-ipv6",
+                vec![
+                    self4,
+                    self6,
+                    "192.0.2.0/24".parse().unwrap(),
+                    "2001:db8::/32".parse().unwrap(),
+                ],
+                true,
+            ),
+            // Go's `IsRouter` has no Tailscale-range exception: another peer's /32 is still a
+            // routed address. This is where it parts ways with `is_subnet_route`.
+            (
+                "other-tailnet-host",
+                vec![self4, "100.64.5.5/32".parse().unwrap()],
+                true,
+            ),
+        ];
+
+        for (name, allowed, want) in cases {
+            let mut n = node("host", Some("ts.net"));
+            n.tailnet_address = TailnetAddress { ipv4: v4, ipv6: v6 };
+            n.accepted_routes = allowed.clone();
+            assert_eq!(n.is_router(), *want, "{name}");
+        }
     }
 
     #[test]

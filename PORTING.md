@@ -167,7 +167,7 @@ exactly what upstream has added since this port last tracked it. Descriptions ar
 | 141 | 2026-05-28 | Client understands `NodeAttrNeverGSOEqualTail` | **not applicable** — same: the attr is a workaround for kernel GSO batching this port does not do |
 | 142 | 2026-07-06 | Client understands c2n `/remoteapi/localapi/*` proxy (`feature/remoteconfig`) | **needs port** (narrow) — a one-route LocalAPI does exist (`GET /localapi/v0/status` in `src/tsnet.rs`), but the c2n responder matches exact paths only, so there is no prefix route to proxy into it. Worth almost nothing until the LocalAPI surface grows |
 | 143 | 2026-07-22 | Client correctly ignores conn25 node attributes when not enabled by environment variable | **not applicable** — no app connector of either generation here, so conn25 attributes are already ignored |
-| 144 | 2026-07-31 | Client sends `packet.TSMPDiscoKeyAdvertisement` around WireGuard handshakes | **needs port** — the highest-value row in this table; see §B |
+| 144 | 2026-07-31 | Client sends `packet.TSMPDiscoKeyAdvertisement` around WireGuard handshakes | **needs port** — the *send* side. The receive side (learning a peer's advertised disco key) is covered; see §B |
 | 145 | 2026-08-04 | Client understands `NodeAttrScopeQuad100OnMacOS` | **not applicable** — the attr changes resolver ordering for the *sandboxed* macOS app; `ts_host_net::macos` installs a service-scoped `scutil` DNS dictionary and has no default-resolver behaviour to scope |
 
 Net: of the fifteen versions upstream added, **five need a port** — 133 (host-OS-facing), 135
@@ -182,11 +182,14 @@ docs/typo/refactor commits filtered out.
 - **TSMP disco-key advertisement** (`net/packet`, `net/tstun`, `wgengine/magicsock`,
   `control/controlclient`: `c54d24369`, `c870d3811`, `bf467727f`, `82a381e54`, `014d5bd9e`) —
   peers now advertise their disco key in a TSMP message around the WireGuard handshake, and learn a
-  peer's disco key from it without restarting WireGuard. **Needs port**, and it is the one item here
-  a real Go peer will *send us* unprompted: `ts_dataplane` admits IP proto 99 (TSMP) past the ACL
-  (`ts_dataplane/src/lib.rs:124`) but nothing parses TSMP message bodies, so the advertisement is
-  accepted and then dropped on the floor. Port the receive side first (learn the peer's disco key),
-  the send side second (capver 144).
+  peer's disco key from it without restarting WireGuard. It is the one item here a real Go peer will
+  *send us* unprompted. **Receive side covered**: `ts_packet::tsmp` decodes the advertisement (Go
+  `Parsed.AsTSMPDiscoAdvertisement`), `ts_dataplane::filter_inbound_from_peer` consumes it ahead of
+  the ACL and drops it rather than delivering it to the local stack (Go
+  `tstun.filterPacketInboundFromWireGuard` returning `filter.DropSilently`), and
+  `PeerTracker::learn_disco_key` applies it to the peer (Go
+  `magicsock.Conn.HandleDiscoKeyAdvertisement`). **The send side still needs a port** — that is
+  capver 144, and it is what row 144 above tracks.
 - **IPv6 fragment extension-header handling in the filter** (`net/packet`, `wgengine/filter`:
   `4c4ec3d46`, `26b2ed0a6`) — upstream extended its RFC 1858-style fragment classification to IPv6
   fragment extension headers. **Needs port only under `Config::enable_ipv6`**: `ts_dataplane`
@@ -212,8 +215,17 @@ docs/typo/refactor commits filtered out.
   services model. **Needs port** only for the consume side to stay current:
   `ts_control_serde/src/service_vip.rs` models `VipService` and the c2n response with no action
   types.
-- **`Node.IsRouter` / `PeerStatus.IsRouter`** (`8d830599b`) — a new status/netmap field with no
-  counterpart in `ts_control_serde` or `ts_runtime::status`. **Needs port** (small, status-only).
+- **`Node.IsRouter` / `PeerStatus.IsRouter`** (`8d830599b`) — **already covered** as of this
+  ledger revision. Note the row's original wording ("a new status/netmap field") was wrong and is
+  corrected here: upstream added no wire field. `tailcfg.Node.IsRouter` and
+  `ipnstate.PeerStatus.IsRouter` are *derived predicates* — "does this node route addresses
+  besides its own" — spelled as methods so IPN-bus watchers can classify routers out of the netmap
+  they already hold. Control sends nothing new, so there was never a round-trip to match; adding
+  an `IsRouter` JSON key would have been a divergence, not a port. Mirrored here as
+  `ts_control::Node::is_router` (over `accepted_routes` vs `tailnet_address`) and
+  `ts_runtime::status::StatusNode::is_router` (over `allowed_routes` vs `ipv4`/`ipv6`), both
+  covering the present *and* absent case, and cross-checked against each other the way upstream's
+  `TestNodeIsRouter` cross-checks its two definitions.
 - **DERP `ClientInfo.AppName`** (`246c82a65`, `75519889f`) — clients may advertise an opaque app
   name (≤32 bytes printable ASCII) which servers relay to watchers and can ban on. **Not
   applicable** — the field is `omitempty` and optional, and `ts_derp`'s `ClientInfoPayload` simply
