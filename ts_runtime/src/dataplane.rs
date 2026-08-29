@@ -29,9 +29,31 @@ pub type UnderlayToDataplane = mpsc::UnboundedSender<(PeerId, Vec<PacketMut>)>;
 /// Queue for packets entering an underlay from the dataplane.
 pub type UnderlayFromDataplane = mpsc::UnboundedReceiver<(PeerId, Vec<PacketMut>)>;
 
+/// A peer's disco public key, learned from a TSMP disco-key advertisement it sent us inside the
+/// WireGuard tunnel (Go `packet.TSMPDiscoKeyAdvertisement`, upstream capability version 144).
+///
+/// Published on the bus by [`DataplaneActor`] and consumed by the peer tracker, which applies it to
+/// the peer. This is the Rust shape of Go's `events.PeerDiscoKeyUpdate`, which `wgengine` turns
+/// into a `magicsock.Conn.HandleDiscoKeyAdvertisement` call.
+///
+/// `peer` is the WireGuard peer whose session decrypted the advertisement — the dataplane's source
+/// filter has already bound that peer's source addresses — so a peer can only ever advertise a key
+/// for itself. Go arrives at the same peer by looking the advertisement's source IP up in the
+/// netmap (`wgengine.userspaceEngine.peerForIP`).
+#[derive(Debug, Clone, Copy)]
+pub struct PeerDiscoKeyAdvertisement {
+    /// The peer that advertised the key.
+    pub peer: PeerId,
+    /// The disco public key it advertised. Never the zero key: the dataplane drops those, as Go
+    /// does, before they get this far.
+    pub key: ts_keys::DiscoPublicKey,
+}
+
 pub struct DataplaneActor {
     dataplane: Arc<ts_dataplane::async_tokio::DataPlane>,
     task: tokio::task::JoinHandle<()>,
+    /// Forwards TSMP-learned peer disco keys from the dataplane onto the bus.
+    disco_key_task: tokio::task::JoinHandle<()>,
     /// Persistent-keepalive interval applied to every upserted peer (or `None` to disable). Snapshot
     /// of [`Env::persistent_keepalive_interval`] taken at actor start. See the peer-upsert handler.
     persistent_keepalive_interval: Option<std::time::Duration>,
@@ -40,6 +62,7 @@ pub struct DataplaneActor {
 impl Drop for DataplaneActor {
     fn drop(&mut self) {
         self.task.abort();
+        self.disco_key_task.abort();
     }
 }
 
@@ -85,6 +108,28 @@ impl kameo::Actor for DataplaneActor {
 
         let persistent_keepalive_interval = env.persistent_keepalive_interval;
 
+        // Peers advertise their disco key over TSMP immediately after an eligible WireGuard
+        // session is established, so the sink must be installed before the dataplane starts
+        // running or the first advertisement is lost.
+        let (disco_key_tx, mut disco_key_rx) = mpsc::unbounded_channel();
+        dataplane.install_disco_key_sink(Some(disco_key_tx)).await;
+
+        let disco_key_env = env.clone();
+        let disco_key_task = tokio::task::spawn(async move {
+            while let Some((peer, advert)) = disco_key_rx.recv().await {
+                let key = ts_keys::DiscoPublicKey::from(advert.key);
+
+                tracing::debug!(?peer, %key, "publishing TSMP-advertised peer disco key");
+
+                if let Err(e) = disco_key_env
+                    .publish(PeerDiscoKeyAdvertisement { peer, key })
+                    .await
+                {
+                    tracing::error!(error = %e, "publishing TSMP disco-key advertisement");
+                }
+            }
+        });
+
         env.subscribe::<PeerRouteUpdate>(&slf).await?;
         env.subscribe::<SelfRouteUpdate>(&slf).await?;
         env.subscribe::<PacketFilterState>(&slf).await?;
@@ -102,6 +147,7 @@ impl kameo::Actor for DataplaneActor {
         Ok(Self {
             dataplane,
             task,
+            disco_key_task,
             persistent_keepalive_interval,
         })
     }

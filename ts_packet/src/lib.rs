@@ -5,6 +5,8 @@ extern crate alloc;
 
 /// Geneve (RFC 8926) fixed-header codec for Tailscale peer-relay framing.
 pub mod geneve;
+/// TSMP (Tailscale Message Protocol, IP proto 99) message parsing.
+pub mod tsmp;
 
 use alloc::{borrow::ToOwned, string::String, vec::Vec};
 use core::{
