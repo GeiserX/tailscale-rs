@@ -221,8 +221,17 @@ docs/typo/refactor commits filtered out.
   services model. **Needs port** only for the consume side to stay current:
   `ts_control_serde/src/service_vip.rs` models `VipService` and the c2n response with no action
   types.
-- **`Node.IsRouter` / `PeerStatus.IsRouter`** (`8d830599b`) — a new status/netmap field with no
-  counterpart in `ts_control_serde` or `ts_runtime::status`. **Needs port** (small, status-only).
+- **`Node.IsRouter` / `PeerStatus.IsRouter`** (`8d830599b`) — **already covered** as of this
+  ledger revision. Note the row's original wording ("a new status/netmap field") was wrong and is
+  corrected here: upstream added no wire field. `tailcfg.Node.IsRouter` and
+  `ipnstate.PeerStatus.IsRouter` are *derived predicates* — "does this node route addresses
+  besides its own" — spelled as methods so IPN-bus watchers can classify routers out of the netmap
+  they already hold. Control sends nothing new, so there was never a round-trip to match; adding
+  an `IsRouter` JSON key would have been a divergence, not a port. Mirrored here as
+  `ts_control::Node::is_router` (over `accepted_routes` vs `tailnet_address`) and
+  `ts_runtime::status::StatusNode::is_router` (over `allowed_routes` vs `ipv4`/`ipv6`), both
+  covering the present *and* absent case, and cross-checked against each other the way upstream's
+  `TestNodeIsRouter` cross-checks its two definitions.
 - **DERP `ClientInfo.AppName`** (`246c82a65`, `75519889f`) — clients may advertise an opaque app
   name (≤32 bytes printable ASCII) which servers relay to watchers and can ban on. **Not
   applicable** — the field is `omitempty` and optional, and `ts_derp`'s `ClientInfoPayload` simply

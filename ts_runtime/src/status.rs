@@ -99,6 +99,32 @@ pub struct StatusNode {
 }
 
 impl StatusNode {
+    /// Report whether this node is a **router**: it routes addresses besides its own. An exit
+    /// node, a subnet router and an app connector are all routers.
+    ///
+    /// Mirrors Go's `ipnstate.PeerStatus.IsRouter` (`ipn/ipnstate/ipnstate.go`, added upstream in
+    /// `8d830599b` alongside `tailcfg.Node.IsRouter`, which
+    /// [`Node::is_router`](ts_control::Node::is_router) mirrors): a route in
+    /// [`allowed_routes`](Self::allowed_routes) that is not a single host IP, or that is a host IP
+    /// other than this node's own [`ipv4`](Self::ipv4)/[`ipv6`](Self::ipv6), makes the node a
+    /// router. Upstream spells both as *methods*, not wire fields — control sends nothing new for
+    /// this, so it is a pure projection of the netmap a peer already gave us.
+    ///
+    /// Strictly wider than [`is_exit_node`](Self::is_exit_node), which asks only about the default
+    /// route: every exit node is a router, but a subnet router advertising no `/0` is not an exit
+    /// node.
+    pub fn is_router(&self) -> bool {
+        self.allowed_routes.iter().any(|route| {
+            let host_prefix = match route {
+                ipnet::IpNet::V4(_) => 32,
+                ipnet::IpNet::V6(_) => 128,
+            };
+            // Not a single host IP, or a host IP that is not one of this node's own addresses.
+            route.prefix_len() != host_prefix
+                || (route.addr() != self.ipv4 && route.addr() != self.ipv6)
+        })
+    }
+
     /// Build a [`StatusNode`] from a domain [`Node`].
     pub fn from_node(node: &Node) -> Self {
         let is_exit_node = node
@@ -389,6 +415,72 @@ mod tests {
         let mut exit6 = node("n3", "c", Some("ts.net"), "100.64.0.3");
         exit6.accepted_routes = vec!["::/0".parse().unwrap()];
         assert!(StatusNode::from_node(&exit6).is_exit_node);
+    }
+
+    /// Ported from upstream's `TestPeerStatusIsRouter` (`ipn/ipnstate/ipnstate_test.go`,
+    /// `8d830599b`), and cross-checked against [`ts_control::Node::is_router`] the way upstream's
+    /// `TestNodeIsRouter` cross-checks the two definitions: a peer is a router exactly when its
+    /// allowed routes reach past its own tailnet addresses. Both the present and the absent case
+    /// are pinned — a plain peer must keep answering `false`.
+    #[test]
+    fn status_node_is_router_reports_routes_beyond_own_addresses() {
+        let self4: ipnet::IpNet = "100.64.0.1/32".parse().unwrap();
+        let self6: ipnet::IpNet = "fd7a:115c:a1e0::1/128".parse().unwrap();
+
+        let cases: &[(&str, Vec<ipnet::IpNet>, bool)] = &[
+            ("empty", vec![], false),
+            ("plain-ipv4", vec![self4], false),
+            ("plain-ipv6", vec![self6], false),
+            ("plain-ipv4-ipv6", vec![self4, self6], false),
+            (
+                "exit-node-ipv4",
+                vec![self4, "0.0.0.0/0".parse().unwrap()],
+                true,
+            ),
+            ("exit-node-ipv6", vec![self6, "::/0".parse().unwrap()], true),
+            (
+                "subnet-router-ipv4",
+                vec![self4, "192.0.2.0/24".parse().unwrap()],
+                true,
+            ),
+            (
+                "subnet-router-ipv6",
+                vec![self6, "2001:db8::/32".parse().unwrap()],
+                true,
+            ),
+            (
+                "subnet-router-ipv4-ipv6",
+                vec![
+                    self4,
+                    self6,
+                    "192.0.2.0/24".parse().unwrap(),
+                    "2001:db8::/32".parse().unwrap(),
+                ],
+                true,
+            ),
+            // No Tailscale-range exception, matching Go: another peer's /32 is a routed address.
+            (
+                "other-tailnet-host",
+                vec![self4, "100.64.5.5/32".parse().unwrap()],
+                true,
+            ),
+        ];
+
+        for (name, allowed, want) in cases {
+            let mut n = node("n1", "host", Some("ts.net"), "100.64.0.1");
+            n.tailnet_address.ipv6 = "fd7a:115c:a1e0::1/128".parse().unwrap();
+            n.accepted_routes = allowed.clone();
+
+            let s = StatusNode::from_node(&n);
+            assert_eq!(s.is_router(), *want, "{name}");
+            // The status projection and the domain node must agree, as upstream asserts of
+            // `ipnstate.PeerStatus.IsRouter` against `tailcfg.Node.IsRouter`.
+            assert_eq!(
+                s.is_router(),
+                n.is_router(),
+                "{name}: domain/status disagree"
+            );
+        }
     }
 
     /// `from_node` carries NO live connectivity: a bare domain `Node` has no path state, so
