@@ -423,6 +423,21 @@ pub struct Config {
     /// [`taildrop_delete_file`](crate::Device::taildrop_delete_file) methods.
     pub taildrop_dir: Option<std::path::PathBuf>,
 
+    /// Directory the last full network map is cached in, or `None` (the default) to never persist
+    /// one — the cold-start netmap cache (Go `nodecap.CacheNetworkMaps`, capability version 135).
+    ///
+    /// A configured directory only makes caching *possible*. Nothing is written unless control also
+    /// grants this node the `cache-network-maps` node attribute and withholds
+    /// `disable-cache-network-maps`, and a later netmap that withdraws the grant deletes what was
+    /// cached. When a cache is present at start-up it is replayed onto the netmap bus before control
+    /// answers the first map poll, so peer connectivity can start coming up sooner; control's own
+    /// netmap replaces it moments later.
+    ///
+    /// The cached frame carries the tailnet's peer list (with public keys and endpoints), the DNS
+    /// configuration and the packet filter, so the directory is created `0700` and the file `0600`
+    /// on Unix. [`Server::dir`](crate::Server::dir) fills this in as `<dir>/netmap-cache`.
+    pub netmap_cache_dir: Option<std::path::PathBuf>,
+
     /// Pre-auth key for non-interactive registration (Go `tsnet.Server.AuthKey`). When set, used as
     /// the registration auth key. If it is an OAuth client secret (prefix `tskey-client-`) and the
     /// `identity-federation` feature is enabled, it is exchanged for an auth key before registration.
@@ -651,6 +666,7 @@ impl From<&Config> for ts_control::Config {
             persistent_keepalive_interval: value.persistent_keepalive_interval,
             peerapi_port: None,
             taildrop_dir: value.taildrop_dir.clone(),
+            netmap_cache_dir: value.netmap_cache_dir.clone(),
             enable_ipv6: value.enable_ipv6,
             network_monitor: value.network_monitor,
             wireguard_listen_port: value.wireguard_listen_port,
@@ -716,6 +732,7 @@ impl Default for Config {
             remote_config: false,
             c2n_local_api: None,
             taildrop_dir: None,
+            netmap_cache_dir: None,
             auth_key: None,
             client_id: None,
             client_secret: None,

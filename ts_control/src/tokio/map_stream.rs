@@ -10,6 +10,7 @@ use ts_packetfilter as pf;
 use ts_packetfilter_state as pf_state;
 use url::Url;
 
+use super::netmap_cache::NetmapCache;
 use crate::{DialPlan, NodeId};
 
 #[derive(Debug, thiserror::Error, Clone, Copy, Eq, PartialEq)]
@@ -262,8 +263,18 @@ fn decompress_frame(frame: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     Some(decoded)
 }
 
-pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpdate> {
-    futures_util::stream::unfold(reader, async |mut reader| {
+/// The live netmap poll: decode each length-prefixed frame off `reader` into a [`StateUpdate`].
+///
+/// When `cache` is `Some`, every decoded frame is also offered to [`NetmapCache::observe`], which
+/// decides — from the self node's own attributes in that frame — whether to persist it, discard a
+/// previously persisted one, or do nothing. `None` disables persistence entirely (no storage
+/// configured), which is what Go does when the node has no writable state directory, and makes the
+/// stream byte-for-byte the pre-cache one.
+pub fn map_stream(
+    reader: impl AsyncRead + Unpin,
+    cache: Option<NetmapCache>,
+) -> impl Stream<Item = StateUpdate> {
+    futures_util::stream::unfold((reader, cache), async |(mut reader, cache)| {
         // Watchdog the length read: this is where the stream idles between frames, so a silently
         // dead long poll blocks here. A timeout ends the stream (returns `None`) → reconnect.
         let msg_len = match tokio::time::timeout(MAP_READ_WATCHDOG, reader.read_u32_le()).await {
@@ -322,111 +333,129 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
         // stream (`None`) so the caller reconnects, mirroring the other frame-read failure paths.
         let decoded = decompress_frame(buf.as_ref())?;
 
-        let map_response: MapResponse = serde_json::from_slice(&decoded)
-            .inspect_err(|e| {
-                tracing::error!(error = %e, "deserializing netmap");
-            })
-            .ok()?;
+        let update = state_update_from_frame(&decoded)?;
 
-        tracing::trace!(?msg_len, ?map_response);
-
-        let packetfilter = packet_filter(&map_response);
-        let cap_grants = cap_grants(&map_response);
-
-        fn nonempty<T>(x: &Option<Vec<T>>) -> bool {
-            x.as_ref().is_some_and(|x| !x.is_empty())
+        // Offer the frame to the netmap cache before yielding it. The cache reads the self node's
+        // attributes out of this very frame, so an attribute that was just granted takes effect on
+        // the frame that granted it and one that was just removed drops the cache on the frame that
+        // removed it — Go applies the same test on every netmap it installs.
+        if let Some(cache) = cache.as_ref() {
+            cache.observe(&update, &decoded).await;
         }
 
-        // `peers_changed_patch` carries field-level patches to already-known peers. Go's
-        // `controlclient` applies the whole-node `Peers*` set first and then `PeersChangedPatch`, so
-        // patches are a SEPARATE always-populated channel (`peer_patches`) rather than a third
-        // `peer_update` variant: when a response carries both a full/delta AND patches, the consumer
-        // applies the peer set then the patches, in that order. (Previously patches shared the single
-        // `peer_update` slot and a co-occurring full/delta took precedence, silently dropping them.)
-        let peer_patches: Vec<crate::PeerChange> = map_response
-            .peers_changed_patch
+        Some((update, (reader, cache)))
+    })
+}
+
+/// Decode one decompressed map-poll frame (the raw `MapResponse` JSON) into a [`StateUpdate`].
+///
+/// The single netmap decode in the crate: the live map poll ([`map_stream`]) feeds it every frame
+/// it reads off the wire, and the cold-start netmap cache ([`NetmapCache::load_state_update`])
+/// feeds it the frame it persisted, so a replayed netmap is built by exactly the code that built
+/// it when it arrived. `None` on a frame that is not decodable as a `MapResponse`, which the live
+/// stream turns into "end the stream and reconnect".
+pub(crate) fn state_update_from_frame(decoded: &[u8]) -> Option<StateUpdate> {
+    let map_response: MapResponse = serde_json::from_slice(decoded)
+        .inspect_err(|e| {
+            tracing::error!(error = %e, "deserializing netmap");
+        })
+        .ok()?;
+
+    tracing::trace!(?map_response);
+
+    let packetfilter = packet_filter(&map_response);
+    let cap_grants = cap_grants(&map_response);
+
+    fn nonempty<T>(x: &Option<Vec<T>>) -> bool {
+        x.as_ref().is_some_and(|x| !x.is_empty())
+    }
+
+    // `peers_changed_patch` carries field-level patches to already-known peers. Go's
+    // `controlclient` applies the whole-node `Peers*` set first and then `PeersChangedPatch`, so
+    // patches are a SEPARATE always-populated channel (`peer_patches`) rather than a third
+    // `peer_update` variant: when a response carries both a full/delta AND patches, the consumer
+    // applies the peer set then the patches, in that order. (Previously patches shared the single
+    // `peer_update` slot and a co-occurring full/delta took precedence, silently dropping them.)
+    let peer_patches: Vec<crate::PeerChange> = map_response
+        .peers_changed_patch
+        .iter()
+        .flatten()
+        .map(crate::PeerChange::from)
+        .collect();
+
+    // A full peer set is signalled by a NON-EMPTY `peers`, matching Go `controlclient`
+    // `updatePeersStateFromResponse` (`if len(resp.Peers) > 0`): Go treats a nil OR zero-length
+    // `Peers` identically as "not a full set" and falls through to delta handling. A
+    // present-but-empty `"Peers": []` (which a non-Go control plane — Headscale, a custom server,
+    // or a `nil`->`[]` re-encoder — can emit, since Go's own `omitempty` never serializes one)
+    // must NOT be read as a full reset: gating on `Some` rather than non-empty here would build a
+    // `PeerUpdate::Full(empty)` and the peer tracker's `Full` path would evict EVERY peer,
+    // blackholing the tailnet datapath until the next full resync. Gate on non-empty so `[]`
+    // becomes a no-op delta instead. (`tailcfg.go`: "Peers, if non-empty, is the complete list".)
+    let peer_update = if nonempty(&map_response.peers) {
+        let full_map = map_response.peers.unwrap_or_default();
+        Some(PeerUpdate::Full(full_map.iter().map(Into::into).collect()))
+    } else if nonempty(&map_response.peers_removed) || nonempty(&map_response.peers_changed) {
+        Some(PeerUpdate::Delta {
+            remove: map_response.peers_removed.unwrap_or_default(),
+            upsert: map_response
+                .peers_changed
+                .unwrap_or_default()
+                .iter()
+                .map(Into::into)
+                .collect(),
+        })
+    } else {
+        None
+    };
+
+    Some(StateUpdate {
+        session_handle: (!map_response.map_session_handle.is_empty())
+            .then(|| map_response.map_session_handle.to_owned()),
+        seq: map_response.seq,
+        // `KeepAlive` is `omitempty` on the wire, so an absent value means "not a
+        // keep-alive" (a substantive response). Default `None` to `false` accordingly.
+        keep_alive: map_response.keep_alive.unwrap_or(false),
+        peer_update,
+        peer_patches,
+        user_profiles: map_response
+            .user_profiles
             .iter()
-            .flatten()
-            .map(crate::PeerChange::from)
-            .collect();
-
-        // A full peer set is signalled by a NON-EMPTY `peers`, matching Go `controlclient`
-        // `updatePeersStateFromResponse` (`if len(resp.Peers) > 0`): Go treats a nil OR zero-length
-        // `Peers` identically as "not a full set" and falls through to delta handling. A
-        // present-but-empty `"Peers": []` (which a non-Go control plane — Headscale, a custom server,
-        // or a `nil`->`[]` re-encoder — can emit, since Go's own `omitempty` never serializes one)
-        // must NOT be read as a full reset: gating on `Some` rather than non-empty here would build a
-        // `PeerUpdate::Full(empty)` and the peer tracker's `Full` path would evict EVERY peer,
-        // blackholing the tailnet datapath until the next full resync. Gate on non-empty so `[]`
-        // becomes a no-op delta instead. (`tailcfg.go`: "Peers, if non-empty, is the complete list".)
-        let peer_update = if nonempty(&map_response.peers) {
-            let full_map = map_response.peers.unwrap_or_default();
-            Some(PeerUpdate::Full(full_map.iter().map(Into::into).collect()))
-        } else if nonempty(&map_response.peers_removed) || nonempty(&map_response.peers_changed) {
-            Some(PeerUpdate::Delta {
-                remove: map_response.peers_removed.unwrap_or_default(),
-                upsert: map_response
-                    .peers_changed
-                    .unwrap_or_default()
-                    .iter()
-                    .map(Into::into)
-                    .collect(),
-            })
-        } else {
-            None
-        };
-
-        Some((
-            StateUpdate {
-                session_handle: (!map_response.map_session_handle.is_empty())
-                    .then(|| map_response.map_session_handle.to_owned()),
-                seq: map_response.seq,
-                // `KeepAlive` is `omitempty` on the wire, so an absent value means "not a
-                // keep-alive" (a substantive response). Default `None` to `false` accordingly.
-                keep_alive: map_response.keep_alive.unwrap_or(false),
-                peer_update,
-                peer_patches,
-                user_profiles: map_response
-                    .user_profiles
-                    .iter()
-                    .map(crate::UserProfile::from)
-                    .collect(),
-                node: map_response.node.as_ref().map(Into::into),
-                derp: map_response
-                    .derp_map
-                    .as_ref()
-                    .map(|x| crate::convert_derp_map(x).collect()),
-                ping: map_response.ping_request,
-                packetfilter,
-                cap_grants,
-                pop_browser_url: map_response.pop_browser_url.and_then(|u| {
-                    u.parse()
-                        .inspect_err(|e| tracing::error!(error = %e, "invalid pop browser url"))
-                        .ok()
-                }),
-                dial_plan: map_response.control_dial_plan.map(Into::into),
-                dns_config: map_response
-                    .dns_config
-                    .as_ref()
-                    .map(crate::DnsConfig::from_serde),
-                ssh_policy: map_response
-                    .ssh_policy
-                    .as_ref()
-                    .map(crate::SshPolicy::from_serde),
-                tka: map_response
-                    .tka_info
-                    .as_ref()
-                    .map(crate::TkaStatus::from_serde),
-                // Online/last-seen delta maps (channels C/D). `NodeId` is the control node id
-                // (`Id`), so these copy across directly. The peer tracker applies them on every
-                // update — including responses that carry NO peer_update — so a standalone online
-                // flip (the common case) isn't lost. (Control sends these on their own, never
-                // alongside a `peers*` set for the same node, so apply-order vs the peer set is moot.)
-                online_change: map_response.online_change.clone(),
-                peer_seen_change: map_response.peer_seen_change.clone(),
-            },
-            reader,
-        ))
+            .map(crate::UserProfile::from)
+            .collect(),
+        node: map_response.node.as_ref().map(Into::into),
+        derp: map_response
+            .derp_map
+            .as_ref()
+            .map(|x| crate::convert_derp_map(x).collect()),
+        ping: map_response.ping_request,
+        packetfilter,
+        cap_grants,
+        pop_browser_url: map_response.pop_browser_url.and_then(|u| {
+            u.parse()
+                .inspect_err(|e| tracing::error!(error = %e, "invalid pop browser url"))
+                .ok()
+        }),
+        dial_plan: map_response.control_dial_plan.map(Into::into),
+        dns_config: map_response
+            .dns_config
+            .as_ref()
+            .map(crate::DnsConfig::from_serde),
+        ssh_policy: map_response
+            .ssh_policy
+            .as_ref()
+            .map(crate::SshPolicy::from_serde),
+        tka: map_response
+            .tka_info
+            .as_ref()
+            .map(crate::TkaStatus::from_serde),
+        // Online/last-seen delta maps (channels C/D). `NodeId` is the control node id
+        // (`Id`), so these copy across directly. The peer tracker applies them on every
+        // update — including responses that carry NO peer_update — so a standalone online
+        // flip (the common case) isn't lost. (Control sends these on their own, never
+        // alongside a `peers*` set for the same node, so apply-order vs the peer set is moot.)
+        online_change: map_response.online_change.clone(),
+        peer_seen_change: map_response.peer_seen_change.clone(),
     })
 }
 
@@ -593,7 +622,7 @@ mod tests {
     async fn map_stream_watchdog_ends_stream_on_silent_connection() {
         let reader = StallAfter::new(&frame(&[r#"{"MapSessionHandle":"sess-1","Seq":1}"#]));
 
-        let mut stream = core::pin::pin!(map_stream(reader));
+        let mut stream = core::pin::pin!(map_stream(reader, None));
 
         // First frame arrives normally.
         let update = stream.next().await.expect("first frame");
@@ -612,7 +641,7 @@ mod tests {
     async fn map_stream_watchdog_ends_stream_when_no_frame_ever_arrives() {
         let reader = StallAfter::new(&[]);
 
-        let mut stream = core::pin::pin!(map_stream(reader));
+        let mut stream = core::pin::pin!(map_stream(reader, None));
 
         assert!(
             stream.next().await.is_none(),
@@ -629,7 +658,7 @@ mod tests {
         bytes.extend_from_slice(b"abc");
         let reader = StallAfter::new(&bytes);
 
-        let mut stream = core::pin::pin!(map_stream(reader));
+        let mut stream = core::pin::pin!(map_stream(reader, None));
 
         assert!(
             stream.next().await.is_none(),
@@ -641,7 +670,7 @@ mod tests {
     async fn map_stream_carries_session_handle_and_seq() {
         let buf = frame(&[r#"{"MapSessionHandle":"sess-xyz","Seq":12}"#]);
 
-        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let mut stream = core::pin::pin!(map_stream(&buf[..], None));
         let update = stream.next().await.expect("one update");
 
         assert_eq!(update.session_handle.as_deref(), Some("sess-xyz"));
@@ -655,7 +684,7 @@ mod tests {
         // backoff-reset gate can tell it apart from a substantive netmap.
         let buf = frame(&[r#"{"KeepAlive":true}"#]);
 
-        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let mut stream = core::pin::pin!(map_stream(&buf[..], None));
         let update = stream.next().await.expect("one update");
 
         assert_eq!(update.session_handle, None);
@@ -673,7 +702,7 @@ mod tests {
         // backoff-reset gate must treat as progress (gating on `seq` would wrongly skip it).
         let buf = frame(&[r#"{ "Node": { "Name": "n" } }"#]);
 
-        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let mut stream = core::pin::pin!(map_stream(&buf[..], None));
         let update = stream.next().await.expect("one update");
 
         assert_eq!(update.seq, 0, "this fixture omits Seq (Headscale-style)");
@@ -695,7 +724,7 @@ mod tests {
             ]
         }"#]);
 
-        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let mut stream = core::pin::pin!(map_stream(&buf[..], None));
         let update = stream.next().await.expect("one update");
 
         // Patches ride their own channel; with no `Peers*` set there is no `peer_update`.
@@ -730,7 +759,7 @@ mod tests {
             "PeersChangedPatch": [ { "NodeID": 1, "DERPRegion": 9 } ]
         }"#]);
 
-        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let mut stream = core::pin::pin!(map_stream(&buf[..], None));
         let update = stream.next().await.expect("one update");
 
         // The whole-node delta is present...
@@ -753,7 +782,7 @@ mod tests {
     #[tokio::test]
     async fn empty_peers_array_is_noop_not_full_wipe() {
         let buf = frame(&[r#"{ "Seq": 9, "Peers": [] }"#]);
-        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let mut stream = core::pin::pin!(map_stream(&buf[..], None));
         let update = stream.next().await.expect("one update");
         assert!(
             update.peer_update.is_none(),
@@ -772,7 +801,7 @@ mod tests {
                   "Key": "nodekey:0000000000000000000000000000000000000000000000000000000000000000" }
             ]
         }"#]);
-        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let mut stream = core::pin::pin!(map_stream(&buf[..], None));
         let update = stream.next().await.expect("one update");
         match update.peer_update {
             Some(PeerUpdate::Full(peers)) => {
@@ -790,7 +819,7 @@ mod tests {
     #[tokio::test]
     async fn empty_peers_with_delta_is_delta_not_noop() {
         let buf = frame(&[r#"{ "Seq": 11, "Peers": [], "PeersRemoved": [42] }"#]);
-        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let mut stream = core::pin::pin!(map_stream(&buf[..], None));
         let update = stream.next().await.expect("one update");
         match update.peer_update {
             Some(PeerUpdate::Delta { remove, upsert }) => {
@@ -832,7 +861,7 @@ mod tests {
         let mut buf = (GOLDEN_ZSTD_FRAME.len() as u32).to_le_bytes().to_vec();
         buf.extend_from_slice(GOLDEN_ZSTD_FRAME);
 
-        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let mut stream = core::pin::pin!(map_stream(&buf[..], None));
         let update = stream
             .next()
             .await
@@ -850,7 +879,7 @@ mod tests {
     async fn decodes_uncompressed_frame_when_control_ignores_compress() {
         let buf = frame_uncompressed(&[r#"{"MapSessionHandle":"sess-plain","Seq":3}"#]);
 
-        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let mut stream = core::pin::pin!(map_stream(&buf[..], None));
         let update = stream
             .next()
             .await
@@ -868,7 +897,7 @@ mod tests {
         // The helper really did compress (zstd magic present after the 4-byte length prefix).
         assert_eq!(&buf[4..8], &ZSTD_MAGIC);
 
-        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let mut stream = core::pin::pin!(map_stream(&buf[..], None));
         let update = stream
             .next()
             .await
@@ -898,7 +927,7 @@ mod tests {
         let mut buf = (compressed.len() as u32).to_le_bytes().to_vec();
         buf.extend_from_slice(&compressed);
 
-        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let mut stream = core::pin::pin!(map_stream(&buf[..], None));
         assert!(
             stream.next().await.is_none(),
             "a frame decompressing past MAX_DECODED_NETMAP must end the stream, not allocate it"
@@ -919,7 +948,7 @@ mod tests {
         // Sanity: the decompressed body really is ~1 MiB (far above a keep-alive, far below the cap).
         assert!(body.len() as u64 > 1_000_000 && (body.len() as u64) < MAX_DECODED_NETMAP);
 
-        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let mut stream = core::pin::pin!(map_stream(&buf[..], None));
         let update = stream
             .next()
             .await
@@ -941,7 +970,7 @@ mod tests {
         buf.extend_from_slice(&(bad.len() as u32).to_le_bytes());
         buf.extend_from_slice(&bad);
 
-        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let mut stream = core::pin::pin!(map_stream(&buf[..], None));
         let first = stream
             .next()
             .await
@@ -964,7 +993,7 @@ mod tests {
         let mut buf = (body.len() as u32).to_le_bytes().to_vec();
         buf.extend_from_slice(&body);
 
-        let mut stream = core::pin::pin!(map_stream(&buf[..]));
+        let mut stream = core::pin::pin!(map_stream(&buf[..], None));
         assert!(
             stream.next().await.is_none(),
             "a malformed zstd frame must end the stream cleanly"

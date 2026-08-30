@@ -62,7 +62,7 @@ zerocopy.workspace = true
 
 # Required dependencies for the async_tokio feature.
 futures-util = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true, features = ["fs", "time"] }
+tokio = { workspace = true, optional = true, features = ["fs", "io-util", "time"] }
 tokio-stream = { version = "0.1", optional = true, default-features = false, features = ["sync"] }
 # Jittered reconnect backoff for the map-poll loop (`ControlBackoff`, mirrors Go `util/backoff`);
 # only the `async_tokio` map-poll path uses it. `RngExt`/`rng()` is the same API the rest of the

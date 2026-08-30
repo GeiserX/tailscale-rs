@@ -124,6 +124,11 @@ pub const STATE_FILE: &str = "tailscale-rs.state";
 /// [`StateStore`] (Go stores the machine key + profile under fixed keys in the `StateStore`).
 pub const STATE_KEY: &str = "_tailscale-rs/persist";
 
+/// Subdirectory of [`Server::dir`] the cold-start netmap cache lives in (Go caches a profile's
+/// netmap under a `netmap-cache` directory of its own). Held apart from the identity state file so
+/// dropping the cache — which control can ask for at any time — cannot reach the node's keys.
+pub const NETMAP_CACHE_DIR: &str = "netmap-cache";
+
 /// A pluggable key/value state store — the Rust analog of Go's `ipn.StateStore`
 /// ([`Server::store`]).
 ///
@@ -693,6 +698,16 @@ impl Server {
         config.client_secret = self.client_secret.clone();
         config.id_token = self.id_token.clone();
         config.audience = self.audience.clone();
+
+        // Cold-start netmap cache (Go `nodecap.CacheNetworkMaps`): a state directory is what makes
+        // persistence possible, exactly as Go gates its cache on the profile having a writable
+        // directory. It stays inert until control grants the attribute, so setting it here costs a
+        // node whose tailnet never asks for caching nothing at all — no file is ever created.
+        // Its own subdirectory, not `dir` itself, so discarding the cache can never touch the
+        // identity keys sharing that root.
+        if let Some(dir) = &self.dir {
+            config.netmap_cache_dir = Some(dir.join(NETMAP_CACHE_DIR));
+        }
 
         if let Some(raw) = &self.control_url {
             config.control_server_url = raw.parse().map_err(Error::InvalidControlUrl)?;
@@ -2246,6 +2261,42 @@ mod tests {
             path.exists(),
             "FileStore::at writes to the exact path given"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn dir_roots_the_netmap_cache_and_no_dir_leaves_it_off() {
+        // `Dir` is what makes the cold-start netmap cache possible (Go gates its cache on the
+        // profile having a writable directory). It lands in a subdirectory of its own so control
+        // asking the node to drop its cache can never reach the identity state file next to it —
+        // and a node with no `Dir` gets no cache at all, which is the conformant default.
+        let dir = scratch_dir("netmap-cache-root");
+
+        let mut srv = Server::new();
+        srv.dir = Some(dir.clone());
+        let cfg = srv.build_config().await.unwrap();
+        assert_eq!(
+            cfg.netmap_cache_dir.as_deref(),
+            Some(dir.join(NETMAP_CACHE_DIR).as_path()),
+            "Dir roots the netmap cache at dir/NETMAP_CACHE_DIR"
+        );
+        assert_ne!(
+            cfg.netmap_cache_dir.as_deref(),
+            Some(dir.as_path()),
+            "the cache must not share a directory with the identity state file"
+        );
+        assert!(
+            !dir.join(NETMAP_CACHE_DIR).exists(),
+            "configuring the cache must not create it: nothing is written until control grants \
+             the attribute"
+        );
+
+        let cfg = Server::new().build_config().await.unwrap();
+        assert_eq!(
+            cfg.netmap_cache_dir, None,
+            "with no Dir there is no storage, so no netmap is ever cached"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
