@@ -1264,7 +1264,8 @@ impl MagicSock {
     /// framing that no upstream sender produces, and is dropped rather than guessed at.
     ///
     /// `frame` is the inner disco frame (the Geneve header already stripped) and is decrypted in
-    /// place.
+    /// place. `from` must pass [`relay_addr_allowed`](Self::relay_addr_allowed) before any of it is
+    /// read: every handler here replies to `from`, so it is a host-sourced send target.
     ///
     /// Errors are logged and swallowed rather than returned: the reply this handler emits goes to
     /// a *peer-supplied* relay address, so a transient send failure there must not propagate out of
@@ -1276,6 +1277,24 @@ impl MagicSock {
         vni: u32,
         control: bool,
     ) {
+        // Every branch below answers to `from`: a challenge is answered and then pinged there, a
+        // relayed ping is ponged there, and a relayed pong makes it attribute inbound data. So
+        // `from` is a peer-relay send target exactly as an advertised relay address is, and it
+        // gets the same sanitizer — the one `start_relay_handshake` already applies to the
+        // addresses a `CallMeMaybeVia` names. Without it the sanitizer is trivially bypassed:
+        // a relay server named by a peer (or anything that can put a datagram sealed by that
+        // server's disco key on our socket with a forged source) picks the source address, and
+        // this node emits host-sourced datagrams at it — loopback, link-local, or the LAN.
+        //
+        // Deliberately stricter than upstream, which keys handshake work by (server disco, VNI)
+        // and takes the challenge's source as given (`relayManager.handleRxDiscoMsg`), for the
+        // same reason `MAX_RELAY_ADDR_PORTS` is: nothing here may turn this host's socket into a
+        // scanner. It costs nothing in interop — a real relay server answers from a routable
+        // address, and this does not require it to be one it advertised.
+        if !self.relay_addr_allowed(&from) {
+            tracing::debug!(%from, "dropping peer-relay disco from a forbidden source address");
+            return;
+        }
         let msg = match disco::open(&self.our_disco, frame) {
             Ok(msg) => msg,
             Err(e) => {
@@ -1469,9 +1488,10 @@ impl MagicSock {
         };
         // Attribute both the address we send to and the source we actually observed: a relay may
         // legitimately answer from a different port than it listens on, and inbound relayed
-        // WireGuard data is attributed by observed source.
-        relay.note_confirmed_addr(sender, addr, vni);
-        relay.note_confirmed_addr(sender, from, vni);
+        // WireGuard data is attributed by observed source. Set, not add — this runs on every
+        // refresh pong for as long as the path lives, so accumulating would let one peer's relay
+        // grow the attribution map without bound by varying its source port.
+        relay.set_confirmed_addrs(sender, [addr, from], vni);
         drop(relay);
         m.disco_pong_recv_solicited.inc();
         m.peer_relay_bound.inc();
@@ -3121,6 +3141,121 @@ mod tests {
             "a forbidden relay address must never be probed from the host socket"
         );
         assert_eq!(a.relay_path(&fx.peer.public_key()), None);
+    }
+
+    /// The *source* of a peer-relay datagram is a host-sourced send target too, and gets the same
+    /// sanitizer an advertised relay address does.
+    ///
+    /// Every handler on this leg replies to `from`: a challenge is answered and then pinged there,
+    /// a relayed ping is ponged there, a relayed pong makes it attribute inbound data. The relay
+    /// server is named by a peer and a UDP source address is forgeable, so without this check the
+    /// sanitizer that `relay_addresses_are_sanitized_before_any_packet_leaves` pins is bypassed by
+    /// simply putting the challenge on the wire with the source set to loopback, the cloud
+    /// metadata address, or a LAN host — and this node emits a bind answer and a disco ping at it.
+    #[tokio::test]
+    async fn a_relay_message_from_a_forbidden_source_is_dropped() {
+        let our_disco = DiscoPrivateKey::random();
+        let mut fx = RelayFixture::new(29);
+        // A routable relay address, so the handshake itself starts under the production filter.
+        fx.addr = "192.0.2.10:41641".parse().unwrap();
+        let a = Arc::new(
+            MagicSock::bind(
+                localhost(),
+                our_disco.clone(),
+                ts_keys::NodePrivateKey::random().public_key(),
+            )
+            .await
+            .unwrap()
+            .with_binding_verifier(allow_all()),
+        );
+        // Note: `allow_loopback_relay` deliberately NOT set — this is the production filter.
+        let mut sends = a.tap_relay_sends();
+        let generation = begin_handshake(&a, &fx, &our_disco, &mut sends).await;
+
+        for forbidden in ["127.0.0.1:8080", "169.254.169.254:80", "10.0.0.5:41641"] {
+            let mut challenge = fx.challenge(our_disco.public_key(), fx.vni, generation, 6);
+            a.handle_relay_disco(&mut challenge, forbidden.parse().unwrap(), fx.vni, true)
+                .await;
+            assert!(
+                sends.try_recv().is_err(),
+                "a challenge sourced from {forbidden} must not be answered"
+            );
+        }
+        assert_eq!(
+            lock(&a.relay_paths)
+                .get(&fx.peer.public_key())
+                .expect("the handshake is still outstanding")
+                .state,
+            HandshakeState::BindSent,
+            "a forbidden source must not advance the handshake either"
+        );
+
+        // A routable source is answered even when it is not one of the advertised addresses: a
+        // relay server may answer from a port other than the one we sent to, so this is a
+        // sanitizer, not a membership test. Requiring membership would cost interop.
+        let elsewhere: SocketAddr = "203.0.113.9:52000".parse().unwrap();
+        let mut challenge = fx.challenge(our_disco.public_key(), fx.vni, generation, 7);
+        a.handle_relay_disco(&mut challenge, elsewhere, fx.vni, true)
+            .await;
+        let (to, _) = sends
+            .try_recv()
+            .expect("a challenge from a routable source must be answered");
+        assert_eq!(to, elsewhere, "the answer goes back to the challenger");
+    }
+
+    /// A relay that answers from a fresh source port on every refresh pong must not leave an entry
+    /// behind for each one.
+    ///
+    /// `handle_relay_pong` attributes both the address it sends through and the source it observed,
+    /// and it runs on every refresh for as long as the path lives. Adding rather than replacing
+    /// would let one peer's relay grow the attribution map for the lifetime of the path, with
+    /// nothing to prune it.
+    #[tokio::test]
+    async fn a_varying_relay_source_port_does_not_grow_the_attribution_map() {
+        let our_disco = DiscoPrivateKey::random();
+        let fx = RelayFixture::new(31);
+        let (a, mut sends) = relay_client(&our_disco).await;
+        confirm_relay_path(&a, &fx, &our_disco, &mut sends).await;
+
+        let peer = fx.peer.public_key();
+        let mut previous: Option<SocketAddr> = None;
+        for port in 50_000u16..50_016 {
+            // A refresh ping through the confirmed address, answered from a fresh source port.
+            let observed: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            assert!(
+                a.send_relay_ping(peer, fx.addr, fx.vni).await.unwrap(),
+                "the refresh ping must go out"
+            );
+            let (_, wire) = sends.try_recv().expect("a relayed ping must be sent");
+            let mut ping = expect_relay_frame(&wire, fx.vni, false);
+            let tx_id = match disco::open(&fx.peer, &mut ping).unwrap() {
+                Inbound::Ping { tx_id, .. } => tx_id,
+                other => panic!("expected a ping, got {other:?}"),
+            };
+            let mut pong =
+                disco::seal_pong(&fx.peer, &our_disco.public_key(), tx_id, fx.addr).unwrap();
+            a.handle_relay_disco(&mut pong, observed, fx.vni, false)
+                .await;
+
+            let relay = lock(&a.relay_paths);
+            assert_eq!(
+                relay.peer_for_addr(observed, fx.vni),
+                Some(peer),
+                "the source we just observed must attribute"
+            );
+            assert_eq!(
+                relay.peer_for_addr(fx.addr, fx.vni),
+                Some(peer),
+                "so must the address we send through"
+            );
+            if let Some(stale) = previous.replace(observed) {
+                assert_eq!(
+                    relay.peer_for_addr(stale, fx.vni),
+                    None,
+                    "a source port the relay has stopped using must stop attributing"
+                );
+            }
+        }
     }
 
     /// A `CallMeMaybeVia` from a disco key that is not a current netmap member is dropped, exactly
