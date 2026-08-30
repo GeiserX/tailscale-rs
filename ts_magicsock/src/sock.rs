@@ -1480,12 +1480,27 @@ impl MagicSock {
         let confirmed = match relay.get_mut(&sender) {
             Some(path) if path.endpoint.vni == vni => path
                 .note_pong(tx_id, now)
-                .and_then(|latency| path.usable(now).map(|(addr, _)| (addr, latency))),
+                .and_then(|(to, latency)| path.usable(now).map(|(addr, _)| (to, addr, latency))),
             _ => None,
         };
-        let Some((addr, latency)) = confirmed else {
+        let Some((to, addr, latency)) = confirmed else {
             return;
         };
+        m.disco_pong_recv_solicited.inc();
+        if to != addr {
+            // A rival address of the same endpoint answered, and lost: `addr` is still the
+            // incumbent this pong says nothing about, and `from` is the rival's source, which
+            // carries no data. Rewriting the attribution here would evict the *incumbent's* own
+            // observed source, so relayed WireGuard arriving on the path actually in use would go
+            // unattributed until its next refresh pong restored the mapping.
+            tracing::trace!(
+                rival = %to,
+                confirmed = %addr,
+                vni,
+                "relayed pong from a rival relay address that did not win; attribution unchanged"
+            );
+            return;
+        }
         // Attribute both the address we send to and the source we actually observed: a relay may
         // legitimately answer from a different port than it listens on, and inbound relayed
         // WireGuard data is attributed by observed source. Set, not add — this runs on every
@@ -1493,7 +1508,6 @@ impl MagicSock {
         // grow the attribution map without bound by varying its source port.
         relay.set_confirmed_addrs(sender, [addr, from], vni);
         drop(relay);
-        m.disco_pong_recv_solicited.inc();
         m.peer_relay_bound.inc();
         tracing::debug!(
             %addr,
@@ -3389,6 +3403,88 @@ mod tests {
         assert!(
             sends.try_recv().is_err(),
             "an un-encapsulated relay message must not advance the handshake"
+        );
+    }
+
+    /// A relayed pong from a *rival* address of the same endpoint that loses the race must leave
+    /// the confirmed path's attribution exactly as it was.
+    ///
+    /// An endpoint advertises several addresses and every one of them can end up with a ping
+    /// outstanding, so a pong for an address that is not the confirmed one is ordinary. Such a
+    /// pong still reports a latency, and the source it arrived from belongs to the *rival* leg —
+    /// which carries no data. Attributing it as if it were the confirmed path's source evicted the
+    /// incumbent's own observed source, and relayed WireGuard on the path actually in use then
+    /// went unattributed until the next refresh pong put the mapping back.
+    #[tokio::test]
+    async fn a_losing_rival_pong_leaves_the_confirmed_attribution_alone() {
+        let our_disco = DiscoPrivateKey::random();
+        let fx = RelayFixture::new(47);
+        let peer = fx.peer.public_key();
+        let (a, mut sends) = relay_client(&our_disco).await;
+        confirm_relay_path(&a, &fx, &our_disco, &mut sends).await;
+
+        // Give the confirmed path a source port distinct from the address we send through — a
+        // relay may answer from a port other than the one it listens on, which is the whole reason
+        // the observed source is attributed separately.
+        let incumbent_src: SocketAddr = "127.0.0.1:50001".parse().unwrap();
+        assert!(
+            a.send_relay_ping(peer, fx.addr, fx.vni).await.unwrap(),
+            "the refresh ping must go out"
+        );
+        let (_, wire) = sends.try_recv().expect("a relayed ping must be sent");
+        let mut ping = expect_relay_frame(&wire, fx.vni, false);
+        let tx_id = match disco::open(&fx.peer, &mut ping).unwrap() {
+            Inbound::Ping { tx_id, .. } => tx_id,
+            other => panic!("expected a ping, got {other:?}"),
+        };
+        let mut pong = disco::seal_pong(&fx.peer, &our_disco.public_key(), tx_id, fx.addr).unwrap();
+        a.handle_relay_disco(&mut pong, incumbent_src, fx.vni, false)
+            .await;
+        assert_eq!(
+            lock(&a.relay_paths).peer_for_addr(incumbent_src, fx.vni),
+            Some(peer),
+            "the confirmed path's observed source attributes"
+        );
+
+        // A second address of the same endpoint answers, half a second slower, from its own
+        // source port. Backdating the ping is what makes it deterministically the loser.
+        let rival: SocketAddr = "127.0.0.1:41642".parse().unwrap();
+        let rival_src: SocketAddr = "127.0.0.1:50002".parse().unwrap();
+        let rival_tx = [77u8; 12];
+        assert!(
+            lock(&a.relay_paths).get_mut(&peer).unwrap().note_ping_sent(
+                rival_tx,
+                rival,
+                Instant::now() - Duration::from_millis(500)
+            ),
+            "the rival ping must be recorded as in flight"
+        );
+        let mut pong =
+            disco::seal_pong(&fx.peer, &our_disco.public_key(), rival_tx, rival).unwrap();
+        a.handle_relay_disco(&mut pong, rival_src, fx.vni, false)
+            .await;
+
+        assert_eq!(
+            a.relay_path(&peer),
+            Some((fx.addr, fx.vni)),
+            "a slower rival must not take over the path"
+        );
+        let relay = lock(&a.relay_paths);
+        assert_eq!(
+            relay.peer_for_addr(incumbent_src, fx.vni),
+            Some(peer),
+            "the confirmed path's observed source must survive a rival's pong: it is where the \
+             relayed WireGuard actually arrives"
+        );
+        assert_eq!(
+            relay.peer_for_addr(fx.addr, fx.vni),
+            Some(peer),
+            "so must the address we send through"
+        );
+        assert_eq!(
+            relay.peer_for_addr(rival_src, fx.vni),
+            None,
+            "the source of a pong for an address we do not send through carries no data"
         );
     }
 
