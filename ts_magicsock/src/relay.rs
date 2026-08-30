@@ -309,10 +309,28 @@ impl RelayPaths {
         self.by_peer.get(peer)
     }
 
-    /// Record that `addr`/`vni` now carries traffic for `peer`, so inbound datagrams from it can
-    /// be attributed. Called once a relayed pong confirms the address.
-    pub(crate) fn note_confirmed_addr(&mut self, peer: DiscoPublicKey, addr: SocketAddr, vni: u32) {
-        self.by_addr_vni.insert((addr, vni), peer);
+    /// Make `addrs` on `vni` — and nothing else — attribute inbound datagrams to `peer`.
+    ///
+    /// Called once a relayed pong confirms a path, with the address we send through and the source
+    /// the pong actually arrived from (a relay may legitimately answer from a different port than
+    /// it listens on).
+    ///
+    /// Replacing rather than accumulating is what bounds the map. A confirming pong arrives on
+    /// every refresh, roughly every [`TRUST_DURATION`] for as long as the path lives, so a relay
+    /// that answers from a varying source port would otherwise add an entry every few seconds and
+    /// never drop one: growth for a single peer, driven from the wire, with nothing to stop it
+    /// short of the path being replaced or removed. Only the addresses currently in use can carry
+    /// data, so only those are kept.
+    pub(crate) fn set_confirmed_addrs(
+        &mut self,
+        peer: DiscoPublicKey,
+        addrs: impl IntoIterator<Item = SocketAddr>,
+        vni: u32,
+    ) {
+        self.forget_addrs(&peer);
+        for addr in addrs {
+            self.by_addr_vni.insert((addr, vni), peer);
+        }
     }
 
     /// Drop a peer's relay path entirely (it left the netmap, or its endpoint was superseded).
@@ -491,7 +509,7 @@ mod tests {
         let mut paths = RelayPaths::default();
         let relay: SocketAddr = "192.0.2.10:41641".parse().unwrap();
         paths.insert(key(2), endpoint(1, 7, "192.0.2.10:41641"), 1);
-        paths.note_confirmed_addr(key(2), relay, 7);
+        paths.set_confirmed_addrs(key(2), [relay], 7);
         assert_eq!(paths.peer_for_addr(relay, 7), Some(key(2)));
         assert_eq!(
             paths.peer_for_addr(relay, 8),
@@ -500,6 +518,47 @@ mod tests {
         );
         paths.remove(&key(2));
         assert_eq!(paths.peer_for_addr(relay, 7), None);
+    }
+
+    #[test]
+    fn attribution_is_replaced_not_accumulated() {
+        let mut paths = RelayPaths::default();
+        let relay: SocketAddr = "192.0.2.10:41641".parse().unwrap();
+        paths.insert(key(2), endpoint(1, 7, "192.0.2.10:41641"), 1);
+
+        // A relay that answers from a fresh source port on every refresh pong. Without
+        // replacement each round would leave another entry behind for this one peer.
+        for port in 50_000u16..50_064 {
+            let observed: SocketAddr = format!("192.0.2.10:{port}").parse().unwrap();
+            paths.set_confirmed_addrs(key(2), [relay, observed], 7);
+            assert_eq!(paths.peer_for_addr(observed, 7), Some(key(2)));
+        }
+
+        assert_eq!(
+            paths.by_addr_vni.len(),
+            2,
+            "the map must hold only the addresses in use, not one per pong ever seen"
+        );
+        assert_eq!(paths.peer_for_addr(relay, 7), Some(key(2)));
+        assert_eq!(
+            paths.peer_for_addr("192.0.2.10:50000".parse().unwrap(), 7),
+            None,
+            "a source port the relay has stopped using must stop attributing"
+        );
+    }
+
+    #[test]
+    fn replacing_attribution_leaves_another_peers_entries_alone() {
+        let mut paths = RelayPaths::default();
+        let a: SocketAddr = "192.0.2.10:41641".parse().unwrap();
+        let b: SocketAddr = "192.0.2.11:41641".parse().unwrap();
+        paths.insert(key(2), endpoint(1, 7, "192.0.2.10:41641"), 1);
+        paths.insert(key(3), endpoint(1, 8, "192.0.2.11:41641"), 1);
+        paths.set_confirmed_addrs(key(2), [a], 7);
+        paths.set_confirmed_addrs(key(3), [b], 8);
+
+        paths.set_confirmed_addrs(key(2), [a], 7);
+        assert_eq!(paths.peer_for_addr(b, 8), Some(key(3)));
     }
 
     #[test]
