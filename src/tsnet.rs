@@ -708,8 +708,21 @@ impl Server {
 
     /// Build + start the wrapped device from the current fields.
     async fn build_and_start(&self) -> Result<Arc<Device>, Error> {
-        let config = self.build_config().await?;
-        Ok(Arc::new(Device::new(&config, self.auth_key.clone()).await?))
+        let mut config = self.build_config().await?;
+
+        // Install this facade's LocalAPI as the target of control's c2n `/remoteapi/localapi/*`
+        // proxy, so the route table the loopback listener serves is the one control reaches. The
+        // hook has to be on the `Config` that builds the device, but its backend needs the built
+        // device — so it goes in empty and is attached the instant `Device::new` returns. Registering
+        // it is not the same as enabling it: the proxy stays refused until the local machine opts in
+        // with `Config::remote_config` (Go `Prefs.RemoteConfig`), which the `configure` hook above
+        // may have just set.
+        let c2n_local_api = Arc::new(C2nLocalApi::default());
+        config.c2n_local_api = Some(c2n_local_api.clone());
+
+        let device = Arc::new(Device::new(&config, self.auth_key.clone()).await?);
+        c2n_local_api.attach(&device);
+        Ok(device)
     }
 
     /// Get the wrapped device (as the shared [`Arc`]), starting it on first call (Go's lazy
@@ -1212,6 +1225,77 @@ impl Drop for LoopbackRt {
     }
 }
 
+/// The target of control's c2n `/remoteapi/localapi/*` proxy: this facade's LocalAPI routes,
+/// reachable over the control connection instead of over the loopback listener (Go
+/// `feature/remoteconfig`'s `handleC2NRemoteAPI`, which builds a `localapi.Handler` over the same
+/// `LocalBackend` the loopback one serves).
+///
+/// Installed on [`Config::c2n_local_api`](crate::Config::c2n_local_api) by
+/// [`Server::build_and_start`], which is *before* the device exists — so the backend is filled in by
+/// [`attach`](Self::attach) the moment [`Device::new`] returns. Like the loopback server it holds a
+/// [`Weak`], so an in-flight c2n request never blocks [`Server::close`] from reclaiming the device.
+///
+/// One state answers without reaching a route at all: before `attach`, a window that closes in the
+/// statement after the one that opens it — control cannot have delivered a c2n ping inside it, since
+/// the map poll that would carry one has not been read yet. That answers `503 device unavailable`
+/// rather than pretending the endpoint does not exist. Once attached, a device that has since been
+/// reclaimed is the *backend's* failure and surfaces as the LocalAPI's own `500`, exactly as it does
+/// for a loopback request.
+#[derive(Default)]
+struct C2nLocalApi {
+    /// The LocalAPI status backend, set once by [`attach`](Self::attach).
+    status: std::sync::OnceLock<localapi::StatusFn>,
+}
+
+impl C2nLocalApi {
+    /// Point this hook at the built device. Called once; a second call is ignored.
+    fn attach(&self, device: &Arc<Device>) {
+        let _already_attached = self.status.set(device_status_fn(Arc::downgrade(device)));
+    }
+}
+
+impl ts_control::LocalApi for C2nLocalApi {
+    fn serve<'a>(
+        &'a self,
+        method: &'a str,
+        target: &'a str,
+        _body: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>> {
+        Box::pin(async move {
+            let resp = match self.status.get() {
+                Some(status) => localapi::route(method, target, status).await,
+                None => localapi::response(
+                    503,
+                    "Service Unavailable",
+                    "text/plain",
+                    b"device unavailable",
+                    &[],
+                ),
+            };
+            String::from_utf8_lossy(&resp).into_owned()
+        })
+    }
+}
+
+/// A LocalAPI status backend over a [`Weak`] device handle: upgrade for just long enough to read
+/// status, and report the shutdown as an error rather than keeping the device alive. Shared by the
+/// loopback LocalAPI server and the c2n proxy so both serve the same status.
+fn device_status_fn(weak: Weak<Device>) -> localapi::StatusFn {
+    Arc::new(move || {
+        let weak = weak.clone();
+        Box::pin(async move {
+            match weak.upgrade() {
+                Some(dev) => dev
+                    .status()
+                    .await
+                    .map(|s| status_json(&s))
+                    .map_err(|e| e.to_string()),
+                None => Err("device has shut down".to_string()),
+            }
+        })
+    })
+}
+
 /// Build the loopback runtime: start the engine SOCKS5 proxy, bind a second `127.0.0.1` listener for
 /// the LocalAPI, mint a *separate* credential, and spawn the in-process LocalAPI HTTP server backed
 /// by a [`Weak`] handle to `device`.
@@ -1228,20 +1312,7 @@ async fn build_loopback_rt(device: Arc<Device>) -> Result<LoopbackRt, Error> {
 
     // Backend: a `Weak<Device>` so the spawned server never blocks `Server::close` from reclaiming
     // the device by value. Each request upgrades it just long enough to read status.
-    let weak: Weak<Device> = Arc::downgrade(&device);
-    let status: localapi::StatusFn = Arc::new(move || {
-        let weak = weak.clone();
-        Box::pin(async move {
-            match weak.upgrade() {
-                Some(dev) => dev
-                    .status()
-                    .await
-                    .map(|s| status_json(&s))
-                    .map_err(|e| e.to_string()),
-                None => Err("device has shut down".to_string()),
-            }
-        })
-    });
+    let status = device_status_fn(Arc::downgrade(&device));
 
     let task = tokio::spawn(localapi::serve(listener, local_api_cred.clone(), status));
 
@@ -1464,9 +1535,27 @@ mod localapi {
             return Ok(());
         }
 
-        // Route on method + path (any query string is ignored).
-        let path = target.split('?').next().unwrap_or(&target);
-        let resp = match (method.as_str(), path) {
+        let resp = route(&method, &target, status).await;
+        sock.write_all(&resp).await?;
+        Ok(())
+    }
+
+    /// Route one *already authorized* LocalAPI request to its complete HTTP/1.1 response.
+    ///
+    /// Split out of [`handle`] because this server has two front doors onto the same routes: the
+    /// loopback listener (which authorizes with the anti-DNS-rebinding header plus the Basic-auth
+    /// credential before getting here) and control's c2n `/remoteapi/localapi/*` proxy (authorized
+    /// by the [`Config::remote_config`](crate::Config::remote_config) pref, checked in
+    /// `ts_control`'s c2n responder). Neither gate belongs to the routing, and Go likewise builds
+    /// the proxied handler with no `RequiredPassword` — so the auth lives in the callers and the
+    /// route table is shared.
+    ///
+    /// `target` is a request target, so it may carry a query string; the query is ignored, as none
+    /// of the one route this facade serves reads it (Go's `localapi.Handler` also dispatches on
+    /// `URL.Path` alone).
+    pub(super) async fn route(method: &str, target: &str, status: &StatusFn) -> Vec<u8> {
+        let path = target.split('?').next().unwrap_or(target);
+        match (method, path) {
             ("GET", "/localapi/v0/status") => match status().await {
                 Ok(body) => response(200, "OK", "application/json", &body, &[]),
                 Err(_) => response(
@@ -1478,9 +1567,7 @@ mod localapi {
                 ),
             },
             _ => response(404, "Not Found", "text/plain", b"not found", &[]),
-        };
-        sock.write_all(&resp).await?;
-        Ok(())
+        }
     }
 
     /// Parse an HTTP request head into `(method, request_target, basic_auth_password,
@@ -2378,6 +2465,72 @@ mod tests {
     /// A mock status backend returning a fixed JSON body — the stand-in for `Device::status`.
     fn mock_status(body: &'static [u8]) -> localapi::StatusFn {
         Arc::new(move || Box::pin(async move { Ok(body.to_vec()) }))
+    }
+
+    /// Control's c2n `/remoteapi/localapi/*` proxy reaches this facade's LocalAPI through
+    /// [`C2nLocalApi`], which serves the *same* route table as the loopback listener — Go's
+    /// `handleC2NRemoteAPI` likewise builds its `localapi.Handler` over the same backend.
+    ///
+    /// The backend is injected into the slot [`C2nLocalApi::attach`] fills (that call needs a live
+    /// `Arc<Device>`, which a hermetic test cannot build; all it does is wrap the device in
+    /// [`device_status_fn`]). The proxy is authorized upstream, in `ts_control`'s c2n responder, so
+    /// there is deliberately no credential or `Sec-Tailscale` gate here: the paths that reach
+    /// `serve` have already passed the `Config::remote_config` check.
+    #[tokio::test]
+    async fn c2n_local_api_serves_the_same_routes_as_the_loopback_server() {
+        use ts_control::LocalApi as _;
+
+        let hook = C2nLocalApi::default();
+        assert!(hook.status.set(mock_status(br#"{"ok":true}"#)).is_ok());
+
+        let served = hook.serve("GET", "/localapi/v0/status", "").await;
+        let (code, body) = parse_response(served.as_bytes()).expect("a full HTTP/1.1 response");
+        assert_eq!(code, 200);
+        assert_eq!(body, br#"{"ok":true}"#);
+
+        // The query string rides through the proxy (`ts_control` keeps it) and is ignored by the
+        // route table, exactly as it is for a loopback request.
+        let (code, body) = parse_response(
+            hook.serve("GET", "/localapi/v0/status?peers=true", "")
+                .await
+                .as_bytes(),
+        )
+        .expect("a full HTTP/1.1 response");
+        assert_eq!(code, 200);
+        assert_eq!(body, br#"{"ok":true}"#);
+
+        // Everything else this facade does not serve is a LocalAPI 404 — distinct from the c2n
+        // responder's own `400 unknown c2n path`, so control can tell "no such LocalAPI endpoint"
+        // apart from "no such c2n route".
+        let (code, _) =
+            parse_response(hook.serve("GET", "/localapi/v0/prefs", "").await.as_bytes())
+                .expect("a full HTTP/1.1 response");
+        assert_eq!(code, 404);
+        let (code, _) = parse_response(
+            hook.serve("POST", "/localapi/v0/status", "")
+                .await
+                .as_bytes(),
+        )
+        .expect("a full HTTP/1.1 response");
+        assert_eq!(code, 404);
+    }
+
+    /// Before [`C2nLocalApi::attach`] there is no backend to route to at all, so the proxy answers
+    /// `503` instead of claiming the endpoint does not exist. (A device reclaimed *after* attach is
+    /// a backend failure and surfaces as the LocalAPI's own `500`, like any loopback request.)
+    #[tokio::test]
+    async fn c2n_local_api_reports_503_before_it_is_attached() {
+        use ts_control::LocalApi as _;
+
+        let hook = C2nLocalApi::default();
+        let (code, body) = parse_response(
+            hook.serve("GET", "/localapi/v0/status", "")
+                .await
+                .as_bytes(),
+        )
+        .expect("a full HTTP/1.1 response");
+        assert_eq!(code, 503);
+        assert_eq!(body, b"device unavailable");
     }
 
     #[test]
