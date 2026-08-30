@@ -1477,16 +1477,38 @@ impl MagicSock {
         m.disco_pong_recv.inc();
         let now = Instant::now();
         let mut relay = lock(&self.relay_paths);
-        let confirmed = match relay.get_mut(&sender) {
+        // Take the match and the usability separately. Whether the pong was *solicited* is
+        // decided by `note_pong` alone — the transaction id matched a ping we sent through this
+        // endpoint — and folding `usable` into that match would silently reclassify a solicited
+        // pong as an unknown one whenever the endpoint happens to hold no trusted address.
+        let matched = match relay.get_mut(&sender) {
             Some(path) if path.endpoint.vni == vni => path
                 .note_pong(tx_id, now)
-                .and_then(|(to, latency)| path.usable(now).map(|(addr, _)| (to, addr, latency))),
+                .map(|(to, latency)| (to, latency, path.usable(now))),
             _ => None,
         };
-        let Some((to, addr, latency)) = confirmed else {
+        let Some((to, latency, usable)) = matched else {
             return;
         };
+        // Solicited: we sent this ping and this is its answer. Counted before anything is asked
+        // about the endpoint's state, exactly like the direct path counts it — the counter feeds
+        // the direct-vs-relay-vs-DERP ratio, so a pong that arrives and matches must appear in it
+        // whether or not it changes which address is in use.
         m.disco_pong_recv_solicited.inc();
+        let Some((addr, _)) = usable else {
+            // Matched, but the endpoint has no trusted address to attribute it to: the incumbent's
+            // trust lapsed and `note_pong` kept it anyway because this rival was no faster. The
+            // same rule as the losing rival below applies — the pong's source describes the
+            // rival's leg, which carries no data — and there is not even an incumbent mapping to
+            // leave alone, so nothing is written.
+            tracing::trace!(
+                rival = %to,
+                vni,
+                latency_ms = latency.as_millis(),
+                "relayed pong matched no trusted address; attribution unchanged"
+            );
+            return;
+        };
         if to != addr {
             // A rival address of the same endpoint answered, and lost: `addr` is still the
             // incumbent this pong says nothing about, and `from` is the rival's source, which
@@ -3485,6 +3507,85 @@ mod tests {
             relay.peer_for_addr(rival_src, fx.vni),
             None,
             "the source of a pong for an address we do not send through carries no data"
+        );
+    }
+
+    /// A relayed pong whose transaction id matches is a *solicited* pong, and must be counted as
+    /// one even when the endpoint it belongs to holds no trusted address.
+    ///
+    /// `note_pong` decides a rival on latency alone: if the incumbent's trust has already lapsed
+    /// and a slower rival answers, the incumbent is kept, so `usable` still reports `None`. The
+    /// pong is nonetheless the answer to a ping we sent. Deriving "solicited" from `usable`
+    /// instead of from the match dropped that event out of `disco_pong_recv_solicited` — and out
+    /// of the trace — which is precisely the case an operator debugging a relay path that will
+    /// not come back needs to see: pongs are arriving and matching, they are just not winning.
+    #[tokio::test]
+    async fn a_matched_relayed_pong_is_counted_when_no_address_is_trusted() {
+        // The counter is process-global, so serialize with the other counter tests and read it
+        // tightly around the single operation under test. A concurrent bump could only ADD to the
+        // delta, and the regression this pins is a delta of zero.
+        let _guard = counter_test_guard().await;
+        let our_disco = DiscoPrivateKey::random();
+        let fx = RelayFixture::new(53);
+        let peer = fx.peer.public_key();
+        let (a, mut sends) = relay_client(&our_disco).await;
+        confirm_relay_path(&a, &fx, &our_disco, &mut sends).await;
+
+        let rival: SocketAddr = "127.0.0.1:41643".parse().unwrap();
+        let rival_src: SocketAddr = "127.0.0.1:50004".parse().unwrap();
+        let rival_tx = [83u8; 12];
+        {
+            // Re-confirm the incumbent as of a moment more than a trust window ago, so its trust
+            // has lapsed by the time the rival's pong lands, and put a rival ping in flight that
+            // is deterministically slower (500ms against the incumbent's zero).
+            let stale = Instant::now() - crate::TRUST_DURATION - Duration::from_millis(500);
+            let stale_tx = [82u8; 12];
+            let mut relay = lock(&a.relay_paths);
+            let path = relay
+                .get_mut(&peer)
+                .expect("the handshake installed a path");
+            assert!(path.note_ping_sent(stale_tx, fx.addr, stale));
+            assert!(
+                path.note_pong(stale_tx, stale).is_some(),
+                "the incumbent must re-confirm, dated far enough back that its trust lapses"
+            );
+            assert!(path.note_ping_sent(
+                rival_tx,
+                rival,
+                Instant::now() - Duration::from_millis(500)
+            ));
+        }
+        assert_eq!(
+            a.relay_path(&peer),
+            None,
+            "the incumbent's trust must have lapsed for this to be the case under test"
+        );
+
+        let mut pong =
+            disco::seal_pong(&fx.peer, &our_disco.public_key(), rival_tx, rival).unwrap();
+        let before = CounterSnapshot::take();
+        a.handle_relay_disco(&mut pong, rival_src, fx.vni, false)
+            .await;
+        let after = CounterSnapshot::take();
+
+        assert!(
+            after.pong_recv - before.pong_recv >= 1,
+            "every inbound relayed pong is counted as received"
+        );
+        assert!(
+            after.pong_recv_solicited - before.pong_recv_solicited >= 1,
+            "a relayed pong that matched an outstanding ping is solicited, whether or not it \
+             leaves the endpoint with a trusted address"
+        );
+        assert_eq!(
+            a.relay_path(&peer),
+            None,
+            "a slower rival still does not take the path over"
+        );
+        assert_eq!(
+            lock(&a.relay_paths).peer_for_addr(rival_src, fx.vni),
+            None,
+            "the source of a losing pong carries no data and must not be attributed"
         );
     }
 
