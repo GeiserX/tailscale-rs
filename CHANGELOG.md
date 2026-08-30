@@ -2,6 +2,26 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.44.0](https://github.com/GeiserX/tailscale-rs/compare/v0.43.3...v0.44.0) (2026-08-30)
+
+
+### Features
+
+* **c2n:** give the responder a prefix route so control can reach the LocalAPI ([#317](https://github.com/GeiserX/tailscale-rs/issues/317)) ([1579fb5](https://github.com/GeiserX/tailscale-rs/commit/1579fb50e46886080c937441f2a86506736dd397))
+* **magicsock:** open peer-relay paths instead of silently falling back to DERP ([#312](https://github.com/GeiserX/tailscale-rs/issues/312)) ([a0c8276](https://github.com/GeiserX/tailscale-rs/commit/a0c82765f0d2003e3579c12b4f12787ab5d16a54))
+* **status:** distinguish a subnet router from a plain peer ([#310](https://github.com/GeiserX/tailscale-rs/issues/310)) ([199fd9c](https://github.com/GeiserX/tailscale-rs/commit/199fd9c0ef299928a2d8ad355e46889bdf989259))
+* **tsmp:** advertise our own disco key to a peer when its session comes up ([#314](https://github.com/GeiserX/tailscale-rs/issues/314)) ([4e6c05b](https://github.com/GeiserX/tailscale-rs/commit/4e6c05b4656653fa8a3026f5c9230152bf3a3932))
+* **tsmp:** learn a peer's disco key from the TSMP advertisement it already sends us ([#308](https://github.com/GeiserX/tailscale-rs/issues/308)) ([849541f](https://github.com/GeiserX/tailscale-rs/commit/849541f54f901ad39d6afcf0e8e55019679122a6))
+
+
+### Bug Fixes
+
+* **build:** bound build parallelism outside CI too ([#316](https://github.com/GeiserX/tailscale-rs/issues/316)) ([37d6d80](https://github.com/GeiserX/tailscale-rs/commit/37d6d801e5cb9c48280ec394fea92bc51bb1c859))
+* **capver:** declare 125, the highest capability version this node implements ([#311](https://github.com/GeiserX/tailscale-rs/issues/311)) ([6ef1bdb](https://github.com/GeiserX/tailscale-rs/commit/6ef1bdbd16b88aec12e82551e8cb78350700c894))
+* **magicsock:** don't let a peer's relay server aim our sends or grow our state ([#313](https://github.com/GeiserX/tailscale-rs/issues/313)) ([c269192](https://github.com/GeiserX/tailscale-rs/commit/c26919225037cbdd3c77b872e12564882b8f7c4c))
+* **serve:** stop a /api mount from swallowing /apifoo ([#307](https://github.com/GeiserX/tailscale-rs/issues/307)) ([e41d208](https://github.com/GeiserX/tailscale-rs/commit/e41d208365145d6ce53f7275758cff1fe76805c7))
+* **tsmp:** send the disco-key advertisement ahead of the traffic a fresh session flushes ([#318](https://github.com/GeiserX/tailscale-rs/issues/318)) ([6ae2d0b](https://github.com/GeiserX/tailscale-rs/commit/6ae2d0b9c395022f5fb431a2df3fed709d970228))
+
 ## [0.43.3](https://github.com/GeiserX/tailscale-rs/compare/v0.43.2...v0.43.3) (2026-08-25)
 
 
