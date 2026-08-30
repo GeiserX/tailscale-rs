@@ -108,8 +108,17 @@ pub struct SSHAction<'a> {
     #[serde(default, rename = "accept")]
     pub accept: bool,
 
-    /// The maximum duration of the session, in **nanoseconds**. Go marshals `time.Duration` with
-    /// the `format:nano` tag as an integer nanosecond count. A value of `None`/`0` means no limit.
+    /// The maximum duration of the session, in **nanoseconds**. A value of `None`/`0` means no
+    /// limit.
+    ///
+    /// Go's `tailcfg.SSHAction.SessionDuration` is a `time.Duration` tagged
+    /// `json:"sessionDuration,omitempty"`, which `encoding/json` writes as an int64 nanosecond
+    /// count. It briefly also carried a jsonv2 `format:nano` tag option, added to pin exactly that
+    /// representation; upstream `82cfea90c` REMOVED the option, because Go 1.27's finalized
+    /// `encoding/json` fails at runtime on the mere presence of a `format` tag — which broke the
+    /// decode of every netmap carrying an SSH policy. The wire form did not change with it (Go 1.27
+    /// sets `FormatDurationAsNano` in v1 mode), so this field did not change either; see
+    /// `session_duration_is_int64_nanoseconds` below.
     #[serde(default, rename = "sessionDuration")]
     pub session_duration: Option<i64>,
 
@@ -269,6 +278,39 @@ mod test {
         assert_eq!(empty.reject_session_with_message, "");
         assert_eq!(empty.terminate_session_with_message, "");
         assert_eq!(empty.notify_url, "");
+    }
+
+    /// `SSHAction.sessionDuration` is an int64 nanosecond count on the wire, and an absent key
+    /// means "no limit". Upstream `82cfea90c` dropped the `format:nano` jsonv2 tag option from
+    /// `tailcfg.SSHAction.SessionDuration` (Go 1.27's `encoding/json` rejects any `format` option
+    /// outright) while keeping the encoding byte-for-byte identical, and locked that down with
+    /// `TestSSHActionJSON` in `tailcfg/tailcfg_test.go`. This is the same assertion from the
+    /// decoding side: the exact bytes upstream's test marshals must decode to the same duration
+    /// here, so the tag change upstream is a no-op on this wire.
+    #[test]
+    fn session_duration_is_int64_nanoseconds() {
+        // Byte-for-byte the `want` string of upstream's TestSSHActionJSON.
+        const WIRE: &str = r#"{"accept":true,"sessionDuration":5000000000}"#;
+
+        let action =
+            serde_json::from_str::<SSHAction>(WIRE).expect("Go's SSHAction wire form must decode");
+        assert!(action.accept);
+        assert_eq!(
+            action.session_duration,
+            Some(5_000_000_000),
+            "sessionDuration is an int64 count of NANOseconds (5s), not seconds or a string"
+        );
+
+        // `omitempty` on the Go side: a zero duration is not sent at all, and must read as "no
+        // limit" rather than failing the decode.
+        let unlimited = serde_json::from_str::<SSHAction>(r#"{"accept":true}"#)
+            .expect("an SSHAction without sessionDuration must decode");
+        assert_eq!(unlimited.session_duration, None);
+
+        // A duration is never a string or a float on this wire; either would silently mean Go and
+        // this client disagree about the representation.
+        assert!(serde_json::from_str::<SSHAction>(r#"{"sessionDuration":"5s"}"#).is_err());
+        assert!(serde_json::from_str::<SSHAction>(r#"{"sessionDuration":5.5}"#).is_err());
     }
 
     #[test]
