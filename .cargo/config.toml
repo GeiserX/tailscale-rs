@@ -1,0 +1,25 @@
+# Bound build parallelism for EVERY invocation, not just the ones CI runs.
+#
+# CI already caps this. `.github/workflows/ci.yml` sets `CARGO_BUILD_JOBS: 4` and `RUST_TEST_THREADS: 4`, and
+# its comment says why: with unbounded jobs several heavy rustc invocations link concurrently and the
+# heaviest — `ts_python`'s pyo3 cdylib — gets OOM-killed (SIGKILL) mid-link, flaking the build for reasons
+# unrelated to the change under test.
+#
+# That guardrail lived only in the workflow's `env:` block, so nothing outside CI inherited it. A laptop, or
+# an automated session on a memory-capped host, ran the same workspace at one job per core. CONTRIBUTING.md
+# prescribes `cargo nextest run --locked --workspace --all-features`, which is heavier still, and AGENTS.md
+# tells an agent to follow it — so the unprotected path was also the documented one.
+#
+# Measured on a 10-core / 16 GiB host building `--workspace --all-targets`: peak resident memory across the
+# build reached ~4.0 GiB, of which ~3.5 GiB was ten concurrent `rustc`, with the largest single process at
+# 707 MiB. Four jobs brings the rustc set to roughly 2.1 GiB.
+#
+# This changes SCHEDULING ONLY. Output is byte-identical, no lint or type-check behaviour moves, and nothing
+# is hidden — it trades wall-clock for a peak that fits. Raise it on a machine with headroom to spare.
+[build]
+jobs = 4
+
+# Bounds the RUN phase the same way, and for the same reason as the CI comment: unbounded test threads spawn
+# one process per core, and those are charged to the same memory budget as the compile that produced them.
+[env]
+RUST_TEST_THREADS = "4"
