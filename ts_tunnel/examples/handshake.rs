@@ -132,7 +132,11 @@ async fn main() -> BoxResult<()> {
                 eprintln!("receive resp (len {n}, from {from})");
                 let buf = &buf[..n];
 
-                let ts_tunnel::RecvResult { to_peers, to_local } = ep.recv(vec![PacketMut::from(buf)]);
+                let ts_tunnel::RecvResult {
+                    to_peers,
+                    to_local,
+                    ..
+                } = ep.recv(vec![PacketMut::from(buf)]);
 
                 eprintln!(
                     "resp: {} packets to peers, {} to local",
