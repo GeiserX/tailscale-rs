@@ -383,6 +383,34 @@ pub struct Config {
     /// in this engine) can consume it; until such a layer exists it is inert. Never advertised.
     pub exit_node_allow_lan_access: bool,
 
+    /// Whether the control plane may invoke this node's LocalAPI through the c2n
+    /// `/remoteapi/localapi/*` proxy (Go `Prefs.RemoteConfig`, `feature/remoteconfig`). Defaults to
+    /// `false`.
+    ///
+    /// Tailscale's default posture is per-feature *double* opt-in: the tailnet admin can ask for
+    /// something server-side, but the local machine owner still consents to each individual setting.
+    /// This pref is upstream's one deliberate exception — a single client-side "I trust the tailnet
+    /// admin" switch. While it is `true`, control may invoke any LocalAPI endpoint this node serves
+    /// with no further local consent. Appropriate when the tailnet admin owns the machine (a
+    /// corporate fleet device); **not** appropriate on a personal or BYOD device.
+    ///
+    /// Only meaningful when this node actually serves a LocalAPI — in this fork that is the
+    /// [`tsnet`](crate::tsnet) facade, which installs its in-process LocalAPI as the proxy target
+    /// when it builds the device. A bare [`Device`](crate::Device) has no LocalAPI, so the c2n prefix
+    /// route does not exist for it and the path takes the responder's `unknown c2n path` `400`
+    /// regardless of this pref (matching an upstream build with the `remoteconfig` feature omitted).
+    pub remote_config: bool,
+
+    /// This node's LocalAPI, for control's c2n `/remoteapi/localapi/*` proxy to dispatch into
+    /// (Go `localapi.NewHandler(...)` inside `handleC2NRemoteAPI`).
+    ///
+    /// `None` — the default — leaves the c2n prefix route unregistered, so `/remoteapi/localapi/*`
+    /// takes the `unknown c2n path` `400`. The [`tsnet`](crate::tsnet) facade sets this to its
+    /// in-process LocalAPI when it builds the device; set it directly only to expose a LocalAPI of
+    /// your own. Requests reaching it are gated solely by
+    /// [`remote_config`](Config::remote_config).
+    pub c2n_local_api: Option<std::sync::Arc<dyn ts_control::LocalApi>>,
+
     /// Filesystem directory that received Taildrop files land in, or `None` to disable Taildrop
     /// (the default, fail-closed).
     ///
@@ -641,6 +669,8 @@ impl From<&Config> for ts_control::Config {
             run_web_client: value.run_web_client,
             exit_node_allow_lan_access: value.exit_node_allow_lan_access,
             allow_http_key_fetch: value.allow_http_key_fetch,
+            remote_config: value.remote_config,
+            local_api: value.c2n_local_api.clone(),
         }
     }
 }
@@ -683,6 +713,8 @@ impl Default for Config {
             posture_checking: false,
             run_web_client: false,
             exit_node_allow_lan_access: false,
+            remote_config: false,
+            c2n_local_api: None,
             taildrop_dir: None,
             auth_key: None,
             client_id: None,
@@ -701,8 +733,8 @@ mod tests {
     // drops any field a future edit forgets to add. These tests assert each dataplane field
     // crosses the boundary, with special attention to the anti-leak ones (`forward_exit_egress`,
     // `exit_proxy`) whose loss would change egress behavior.
-    #[test]
-    fn from_config_threads_all_dataplane_fields() {
+    #[tokio::test]
+    async fn from_config_threads_all_dataplane_fields() {
         let cfg = Config {
             accept_routes: true,
             // Set to the non-default (`false`) so its crossing is observable (default is `true`).
@@ -733,6 +765,8 @@ mod tests {
             posture_checking: true,
             run_web_client: true,
             exit_node_allow_lan_access: true,
+            remote_config: true,
+            c2n_local_api: Some(std::sync::Arc::new(NoRoutesLocalApi)),
             ephemeral: false,
             exit_proxy: Some(ExitProxyConfig {
                 addr: "198.51.100.9:8080".parse().unwrap(),
@@ -798,6 +832,39 @@ mod tests {
         assert!(control.posture_checking);
         assert!(control.run_web_client);
         assert!(control.exit_node_allow_lan_access);
+        assert!(
+            control.remote_config,
+            "remote_config crosses the boundary (set true)"
+        );
+        // The LocalAPI hook is the c2n `/remoteapi/localapi/*` proxy's target: losing it in the
+        // hand-copy would silently unregister the prefix route rather than fail to compile.
+        let local_api = control
+            .local_api
+            .as_ref()
+            .expect("c2n_local_api crosses the boundary");
+        assert_eq!(
+            local_api.serve("GET", "/localapi/v0/status", "").await,
+            NO_ROUTES_RESPONSE,
+            "the installed LocalAPI is the one that crossed, not a stand-in"
+        );
+    }
+
+    /// A [`ts_control::LocalApi`] that serves nothing, used to prove the hook itself crosses the
+    /// `From<&Config>` boundary without standing up the facade's real LocalAPI server.
+    struct NoRoutesLocalApi;
+
+    /// What [`NoRoutesLocalApi`] answers with, whatever it is asked.
+    const NO_ROUTES_RESPONSE: &str = "HTTP/1.1 404 Not Found\r\n\r\nnot found";
+
+    impl ts_control::LocalApi for NoRoutesLocalApi {
+        fn serve<'a>(
+            &'a self,
+            _method: &'a str,
+            _target: &'a str,
+            _body: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>> {
+            Box::pin(async { NO_ROUTES_RESPONSE.to_owned() })
+        }
     }
 
     /// All eight up/set pref fields default off/None on a fresh top-level `Config`, and the defaults
@@ -815,6 +882,8 @@ mod tests {
         assert!(!cfg.posture_checking);
         assert!(!cfg.run_web_client);
         assert!(!cfg.exit_node_allow_lan_access);
+        assert!(!cfg.remote_config);
+        assert!(cfg.c2n_local_api.is_none());
 
         // And they cross the boundary defaulted off.
         let control: ts_control::Config = (&cfg).into();
@@ -826,6 +895,14 @@ mod tests {
         assert!(!control.posture_checking);
         assert!(!control.run_web_client);
         assert!(!control.exit_node_allow_lan_access);
+        assert!(
+            !control.remote_config,
+            "fail-closed: control cannot drive the LocalAPI of a default node"
+        );
+        assert!(
+            control.local_api.is_none(),
+            "a default node registers no c2n LocalAPI proxy route"
+        );
     }
 
     #[test]
