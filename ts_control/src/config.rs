@@ -569,6 +569,65 @@ pub struct Config {
     /// Fail-closed default is `false`.
     #[serde(default)]
     pub allow_http_key_fetch: bool,
+
+    /// Whether the control plane may invoke this node's LocalAPI through the c2n
+    /// `/remoteapi/localapi/*` proxy (Go `ipn.Prefs.RemoteConfig`, consumed by
+    /// `feature/remoteconfig`'s `handleC2NRemoteAPI`).
+    ///
+    /// Tailscale's default posture is per-feature *double* opt-in: the tailnet admin can ask for
+    /// something server-side, but the local machine owner still consents to each individual
+    /// setting. This pref is the one deliberate exception — a single client-side "I trust the
+    /// tailnet admin" switch. While it is `true`, control can invoke any LocalAPI endpoint this
+    /// node serves with no further local consent, which upstream grants as read **and** write.
+    /// Appropriate when the tailnet admin owns the machine (a corporate fleet device); not
+    /// appropriate on a personal or BYOD device. Defaults to `false` (fail-closed): the c2n
+    /// proxy answers `403 remote config not enabled by local machine` until it is set.
+    #[serde(default)]
+    pub remote_config: bool,
+
+    /// This node's LocalAPI, for the c2n `/remoteapi/localapi/*` proxy to dispatch into
+    /// (Go `localapi.NewHandler(...)` inside `handleC2NRemoteAPI`).
+    ///
+    /// `None` — the default — means this node was built with no LocalAPI at all, so the c2n prefix
+    /// handler is not registered and `/remoteapi/localapi/*` takes the responder's
+    /// `unknown c2n path` `400` like any other unregistered path. That is exactly what upstream
+    /// does when the `remoteconfig` feature is omitted from the build: the `init` that calls
+    /// `ipnlocal.RegisterC2NPrefix` never runs, so no prefix matches and `handleC2N` falls through.
+    /// The `tsnet` facade installs its in-process LocalAPI here when it builds the device.
+    ///
+    /// Not serialized — it is a live in-process handler, not persisted configuration, so it is
+    /// `None` after a serde round-trip.
+    #[serde(skip, default)]
+    pub local_api: Option<std::sync::Arc<dyn LocalApi>>,
+}
+
+/// This node's LocalAPI, as reachable by the control plane through the c2n
+/// `/remoteapi/localapi/*` proxy (Go `ipn/localapi.Handler`, invoked by `feature/remoteconfig`'s
+/// `handleC2NRemoteAPI`).
+///
+/// Implemented outside this crate — `ts_control` routes the c2n request and enforces upstream's
+/// refusals, but the LocalAPI surface itself lives above the control client (in this tree, the
+/// `tsnet` facade's one-route server). Install an implementation on
+/// [`Config::local_api`](Config::local_api) to register the prefix route.
+///
+/// The request handed to [`serve`](LocalApi::serve) is already authorized: upstream builds the
+/// proxied handler with `Actor: ipnauth.Self` and `PermitRead`/`PermitWrite` set, and leaves
+/// `RequiredPassword` empty, so the loopback listener's Basic-auth and anti-DNS-rebinding gates do
+/// not apply to it. The [`Config::remote_config`](Config::remote_config) pref is the whole of the
+/// authorization decision, and `ts_control` has already checked it before calling.
+pub trait LocalApi: Send + Sync {
+    /// Serve one LocalAPI request, returning the complete HTTP/1.1 response to hand back to
+    /// control.
+    ///
+    /// `method` is the c2n request's HTTP method. `target` is its request target *after* the
+    /// `/remoteapi` prefix strip, so it always begins `/localapi/` and may still carry a query
+    /// string. `body` is the c2n request body, verbatim.
+    fn serve<'a>(
+        &'a self,
+        method: &'a str,
+        target: &'a str,
+        body: &'a str,
+    ) -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = String> + Send + 'a>>;
 }
 
 impl Config {
@@ -769,6 +828,8 @@ impl Default for Config {
             posture_checking: false,
             run_web_client: false,
             exit_node_allow_lan_access: false,
+            remote_config: false,
+            local_api: None,
             reauth_on_expiry: default_true(),
             allow_http_key_fetch: false,
         }

@@ -59,7 +59,7 @@ pub use cert::{
 #[doc(inline)]
 pub use config::{
     Config, DEFAULT_CONTROL_SERVER, DEFAULT_PERSISTENT_KEEPALIVE, ExitProxyConfig, ExitProxyScheme,
-    TransportMode, TunConfig, services_hash,
+    LocalApi, TransportMode, TunConfig, services_hash,
 };
 pub use control_dialer::{ControlDialer, TcpDialer, complete_connection};
 pub use derp::{Map as DerpMap, Region as DerpRegion, convert_derp_map};
