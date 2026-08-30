@@ -571,14 +571,38 @@ impl DataPlane {
         // session is otherwise untouched.
         let mut to_peers = to_peers;
         if let Some(advert) = self.disco_advertisement.clone() {
+            // Held apart from what `recv` already queued for these peers so it can be spliced in
+            // FRONT of it below, rather than appended behind it.
+            let mut priority: HashMap<ts_tunnel::PeerId, Vec<PacketMut>> = HashMap::new();
             for peer in sessions_established {
                 let Some(msg) = advert.advertisement_for(PeerId(peer.0)) else {
                     continue;
                 };
                 tracing::debug!(peer_id = ?peer, "advertising our disco key over TSMP");
                 for (peer, packets) in self.wireguard.send_priority_message(peer, &msg).to_peers {
-                    to_peers.entry(peer).or_default().extend(packets);
+                    priority.entry(peer).or_default().extend(packets);
                 }
+            }
+            // A priority message leads the traffic the same establishment released. wireguard-go
+            // hands it straight to the peer's *outbound* queue (`SendPriorityMessage` →
+            // `queueOutboundIfRunning`), never to the staged queue, and both call sites run it
+            // before the flush that follows — `peer.SendPriorityMessage()` ahead of
+            // `peer.SendKeepalive()` on the initiator and ahead of `peer.SendStagedPackets()` on
+            // the responder (`device/receive.go`). Here the flush has already happened inside
+            // [`Endpoint::recv`] (`activate` encrypts whatever was queued), so restoring Go's wire
+            // order means splicing the advertisement in front of it.
+            //
+            // Only the wire order is restored, not Go's nonce order: those flushed packets were
+            // sealed first and so hold the lower nonces, where Go would have numbered the priority
+            // message first. That is invisible to the peer. A WireGuard receiver accepts an
+            // earlier counter after a later one by construction, and the inversion is bounded by
+            // the send queue a session flushes on activation (`MAX_QUEUED_PER_PEER`, 32 packets) —
+            // two orders of magnitude inside the 8128-packet anti-replay window WireGuard
+            // receivers carry (`ts_tunnel`'s `ReplayWindow::WINDOW_SIZE`, wireguard-go parity).
+            for (peer, mut packets) in priority {
+                let queued = to_peers.entry(peer).or_default();
+                packets.append(queued);
+                *queued = packets;
             }
         }
 
@@ -1226,6 +1250,129 @@ mod tests {
         assert!(
             inbound.to_peers.is_empty(),
             "B has no advertisement state, so it advertises nothing back"
+        );
+    }
+
+    /// Order regression: the advertisement must LEAD the traffic the same establishment released,
+    /// not trail it.
+    ///
+    /// wireguard-go hands a priority message straight to the peer's *outbound* queue
+    /// (`SendPriorityMessage` → `queueOutboundIfRunning`) and runs it before the flush that
+    /// follows at both call sites — `peer.SendPriorityMessage()` ahead of `peer.SendKeepalive()`
+    /// on the initiator and ahead of `peer.SendStagedPackets()` on the responder
+    /// (`device/receive.go`) — so the advertisement is the first thing on the wire once a keypair
+    /// becomes current. In this tree the flush has already happened inside `Endpoint::recv` by the
+    /// time the advertisement exists, so `process_inbound` has to splice it in front; appending it
+    /// would put it behind up to `MAX_QUEUED_PER_PEER` packets of queued traffic.
+    ///
+    /// The order is read off B's *decrypted* stream — its capture tee, which sees every inbound
+    /// packet before any filtering — so what is pinned is the order the peer actually observes,
+    /// not the order of a local vector.
+    #[test]
+    fn the_advertisement_leads_the_traffic_released_by_the_same_establishment() {
+        let underlay: UnderlayTransportId = 0.into();
+        let wg_peer = ts_tunnel::PeerId(1);
+        let peer = PeerId(1);
+        let a_addr = std::net::IpAddr::from([100, 64, 0, 1]);
+        let b_addr = std::net::IpAddr::from([100, 64, 0, 2]);
+
+        let (a_static, b_static) = (NodeKeyPair::new(), NodeKeyPair::new());
+        let (mut a, mut b) = (
+            DataPlane::new(a_static.clone()),
+            DataPlane::new(b_static.clone()),
+        );
+
+        for (dp, key) in [(&mut a, b_static.public), (&mut b, a_static.public)] {
+            dp.wireguard.upsert_peer(
+                wg_peer,
+                ts_tunnel::PeerConfig {
+                    key,
+                    psk: [0u8; 32].into(),
+                    persistent_keepalive_interval: None,
+                },
+            );
+            dp.ur_out.table.insert(peer, underlay);
+        }
+
+        a.disco_advertisement = Some(Arc::new(advertisement_state(
+            peer,
+            AdvertisementTarget {
+                node_addr: b_addr,
+                wireguard_only: false,
+            },
+        )));
+
+        let mut src_filter = ts_bart::Table::default();
+        src_filter.insert(ipnet::IpNet::from(a_addr), peer);
+        b.src_filter_in = Arc::new(src_filter);
+
+        // Everything B decrypts, in arrival order, before any filtering runs.
+        let recorded: CaptureLog = Arc::new(Mutex::new(Vec::new()));
+        let sink = recorded.clone();
+        b.capture = Some(Arc::new(move |path: CapturePath, bytes: &[u8]| {
+            sink.lock().unwrap().push((path, bytes.to_vec()));
+        }));
+
+        let take = |out: HashMap<(UnderlayTransportId, PeerId), Vec<PacketMut>>| {
+            out.into_values().flatten().collect::<Vec<_>>()
+        };
+
+        // Traffic for a peer with no session yet: it stages, and a handshake starts.
+        const QUEUED: &[u8] = b"staged while the session was still coming up";
+        let init = a
+            .wireguard
+            .send([(wg_peer, vec![PacketMut::from(QUEUED)])])
+            .to_peers
+            .remove(&wg_peer)
+            .expect("handshake initiation");
+        let resp = take(b.process_inbound(init).to_peers);
+
+        // A's keypair becomes current here, which both flushes the staged packet and produces the
+        // advertisement — the batch whose order is under test.
+        let from_a = take(a.process_inbound(resp).to_peers);
+        assert_eq!(
+            from_a.len(),
+            2,
+            "A must emit the queued data AND its disco-key advertisement"
+        );
+
+        // Hand them to B in exactly the order A produced them.
+        let learned = b.process_inbound(from_a).learned_disco_keys;
+        assert_eq!(
+            learned
+                .iter()
+                .map(|(peer, advert)| (*peer, advert.key))
+                .collect::<Vec<_>>(),
+            vec![(peer, SELF_DISCO_KEY)],
+            "B must still learn A's disco key"
+        );
+
+        let advertisement = ts_packet::tsmp::DiscoKeyAdvertisement {
+            src: a_addr,
+            dst: b_addr,
+            key: SELF_DISCO_KEY,
+        }
+        .marshal()
+        .expect("a v4 advertisement between two v4 addresses marshals");
+
+        let captured = recorded.lock().unwrap();
+        let from_peer = captured
+            .iter()
+            .filter(|(path, _)| *path == CapturePath::FromPeer)
+            .map(|(_, bytes)| bytes.as_slice())
+            .collect::<Vec<_>>();
+        assert_eq!(from_peer.len(), 2, "B must decrypt both of A's packets");
+        // The send path zero-pads each payload up to a 16-byte boundary and the receiver delivers
+        // it with that padding intact (see `session::PADDING_MULTIPLE`), so compare on the leading
+        // bytes rather than for equality.
+        assert!(
+            from_peer[0].starts_with(&advertisement),
+            "the advertisement must reach the peer FIRST, ahead of the traffic the same \
+             establishment released"
+        );
+        assert!(
+            from_peer[1].starts_with(QUEUED),
+            "the queued traffic follows the advertisement"
         );
     }
 
