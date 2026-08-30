@@ -326,6 +326,24 @@ pub struct Config {
     #[serde(default)]
     pub taildrop_dir: Option<std::path::PathBuf>,
 
+    /// Directory the last full network map is cached in, or `None` (the default) to never persist
+    /// one.
+    ///
+    /// Unlike the other dataplane fields on this struct, `ts_control` **does** read this one: the
+    /// map-poll loop builds a [`NetmapCache`](crate::NetmapCache) from it and the control runner
+    /// replays what it finds there on a cold start, before control has answered. Setting it only
+    /// makes caching *possible* — nothing is written unless control also grants the node
+    /// `cache-network-maps` and withholds `disable-cache-network-maps` (Go
+    /// `nodecap.CacheNetworkMaps` / `DisableCacheNetworkMaps`), and a netmap that withdraws the
+    /// grant deletes whatever was cached.
+    ///
+    /// The cached frame is sensitive — it is the tailnet's peer list with their public keys and
+    /// endpoints, the DNS configuration and the packet filter — so the directory is created `0700`
+    /// and the file `0600` on Unix. Point it somewhere only this node's user can read. The `tsnet`
+    /// facade sets it to `<Server::dir>/netmap-cache` when a state directory is configured.
+    #[serde(default)]
+    pub netmap_cache_dir: Option<std::path::PathBuf>,
+
     /// Per-direction TCP send/receive buffer size (bytes) for the userspace netstack, or `None` to
     /// use the netstack default (256 KiB per direction, ~512 KiB per socket).
     ///
@@ -811,6 +829,7 @@ impl Default for Config {
             exit_proxy: None,
             peerapi_port: None,
             taildrop_dir: None,
+            netmap_cache_dir: None,
             tcp_buffer_size: None,
             enable_ipv6: false,
             network_monitor: false,

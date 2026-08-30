@@ -16,6 +16,7 @@ use crate::{
     map_request_builder::MapRequestBuilder,
     tokio::{
         map_stream::{StateUpdate, map_stream, send_map_request},
+        netmap_cache::NetmapCache,
         ping::handle_ping,
     },
 };
@@ -784,7 +785,12 @@ async fn run_once(
 
     let reader = send_map_request(request, &map_url, &h2_client).await?;
 
-    let mut stream = core::pin::pin!(map_stream(reader));
+    // The netmap cache is maintained from inside the stream, on the raw frame bytes, because that
+    // is the only place they still exist — a `StateUpdate` is the decoded netmap, not the wire
+    // message. `None` when the embedder configured no cache directory, which makes the stream
+    // byte-for-byte the pre-cache one.
+    let cache = config.netmap_cache_dir.as_ref().map(NetmapCache::new);
+    let mut stream = core::pin::pin!(map_stream(reader, cache));
     tracing::info!("netmap stream started");
 
     loop {

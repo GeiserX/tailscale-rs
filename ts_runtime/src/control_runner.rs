@@ -185,6 +185,21 @@ impl kameo::Actor for ControlRunner {
     type Error = ControlRunnerError;
 
     async fn on_start(params: Params, slf: ActorRef<Self>) -> Result<Self, Self::Error> {
+        // Cold start: replay the netmap this node cached the last time control granted it
+        // `cache-network-maps` (Go `nodecap.CacheNetworkMaps`, capability version 135 — upstream
+        // does the same from `ipnlocal.Start`, feeding the cached map through
+        // `setControlClientStatusLocked` before it builds its control client). Publishing it here,
+        // ahead of registration, is the whole point: the peer tracker, dataplane and packet filter
+        // get the last-known peers, DERP map and rules while this node is still doing its
+        // register/poll round trips, so peer connectivity can start coming up before control has
+        // said a word. Control's own first netmap lands on the same bus moments later and replaces
+        // it, and a netmap that no longer carries the attribute deletes the cache (see
+        // `NetmapCache::observe`).
+        //
+        // Nothing here can fail the start-up: no cache configured, nothing cached, or an
+        // undecodable cache all mean "carry on without one".
+        replay_cached_netmap(&params).await;
+
         // The interactive AuthURL, captured on the first unauthorized reply and reused as the
         // `followup` on every subsequent poll so control long-polls ONE stable URL (rather than
         // minting a fresh, racing URL each retry) until the user visits it.
@@ -1450,6 +1465,44 @@ async fn issue_cert_pair_inner(
             ts_control::CertError::Acme(format!("parsing Let's Encrypt directory URL: {e}"))
         })?;
     ts_control::issue_cert_pair_via_setdns(config, keys, name, &account_key, &directory).await
+}
+
+/// Publish the cached netmap, if this node has one, onto the netmap bus.
+///
+/// The cold-start half of the netmap cache (Go `nodecap.CacheNetworkMaps`). Reads
+/// [`Config::netmap_cache_dir`](ts_control::Config::netmap_cache_dir) — `None` means the embedder
+/// configured no storage, so there is nothing to replay — and decodes whatever is there with the
+/// same decoder the live map poll uses.
+///
+/// The read is deliberately **not** gated on the node attributes. Nothing is ever written without
+/// the grant, so the presence of a cache is itself the record that control asked for one (Go makes
+/// the same argument: at this point in start-up the client has not spoken to control yet, so the
+/// grant is not knowable). If the grant has since been withdrawn, the first netmap of this session
+/// says so and the cache is discarded then.
+///
+/// The bus has no replay, so this reaches only subscribers already registered. Every netmap
+/// subscriber is spawned by `Runtime::spawn` before the control runner and registers from its own
+/// `on_start` with no I/O in the way, while this path awaits a file read first — so in practice the
+/// subscribers are there. A subscriber that is not simply misses the head start and is brought
+/// current by control's first netmap, which is exactly the behaviour of a node with no cache.
+async fn replay_cached_netmap(params: &Params) {
+    let Some(dir) = params.config.netmap_cache_dir.as_ref() else {
+        return;
+    };
+
+    let Some(update) = ts_control::NetmapCache::new(dir).load_state_update().await else {
+        return;
+    };
+
+    let peers = match update.peer_update.as_ref() {
+        Some(ts_control::PeerUpdate::Full(peers)) => peers.len(),
+        _ => 0,
+    };
+    tracing::info!(peers, "replaying cached netmap on cold start");
+
+    if let Err(e) = params.env.publish(Arc::new(update)).await {
+        tracing::warn!(error = %e, "publishing the cached netmap");
+    }
 }
 
 impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
