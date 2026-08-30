@@ -6,6 +6,10 @@ pub use connect::{
 pub use id_token::{IdTokenError, fetch_id_token};
 pub use logout::{LogoutError, LogoutInternalErrorKind, logout};
 pub use map_stream::{FilterUpdate, PeerUpdate, StateUpdate};
+pub use netmap_cache::{
+    NETMAP_CACHE_FILE, NODE_ATTR_CACHE_NETWORK_MAPS, NODE_ATTR_DISABLE_CACHE_NETWORK_MAPS,
+    NetmapCache, netmap_caching_enabled,
+};
 use register::register;
 // `set_dns` is a generic control RPC. It is exposed unconditionally because the `tailscale` facade
 // surfaces it as `Device::set_dns` (Go `LocalClient.SetDNS`), independent of the `acme` feature;
@@ -21,6 +25,7 @@ mod connect;
 mod id_token;
 mod logout;
 mod map_stream;
+mod netmap_cache;
 mod ping;
 mod prefixed_reader;
 mod register;
