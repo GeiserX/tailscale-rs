@@ -2040,6 +2040,7 @@ dependencies = [
  "geiserx_ts_transport",
  "geiserx_ts_tunnel",
  "geiserx_ts_underlay_router",
+ "ipnet",
  "tokio",
  "tracing",
 ]

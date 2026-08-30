@@ -13,5 +13,7 @@ pub use ts_keys::{NodeKeyPair, NodePrivateKey, NodePublicKey};
 
 pub use crate::{
     config::{PeerConfig, PeerId, Psk},
-    endpoint::{Endpoint, Event, EventResult, RecvResult, SendResult},
+    endpoint::{
+        Endpoint, Event, EventResult, MAX_PRIORITY_MESSAGE_CONTENT_SIZE, RecvResult, SendResult,
+    },
 };

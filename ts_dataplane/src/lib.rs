@@ -258,6 +258,109 @@ fn filter_inbound_from_peer(
     });
 }
 
+/// Where this node sends a TSMP disco-key advertisement, and what it puts in one.
+///
+/// The send half of Go's capability version 144 (`packet.TSMPDiscoKeyAdvertisement`): when a
+/// WireGuard session with a peer is established, this node announces its own disco public key to
+/// that peer over TSMP, so the peer can learn (or re-learn) the key without waiting for a netmap
+/// update from control. It is the mirror image of the receive half in
+/// [`filter_inbound_from_peer`], and both are unconditional — a real Go peer sends us one whether
+/// or not we send one back.
+///
+/// This is the netmap state Go's [`magicsock.Conn.PriorityMessageForPeer`] reads, snapshotted into
+/// the dataplane so building the message stays a cheap, synchronous, allocation-only step on the
+/// datapath. wireguard-go requires the same of its callback: "must be cheap and must not call back
+/// into the [`Device`]". The runtime refreshes the snapshot whenever the netmap changes.
+///
+/// [`magicsock.Conn.PriorityMessageForPeer`]: https://github.com/tailscale/tailscale/blob/main/wgengine/magicsock/magicsock.go
+/// [`Device`]: https://github.com/tailscale/wireguard-go/blob/main/device/device.go
+#[derive(Debug, Clone, Default)]
+pub struct DiscoAdvertisementState {
+    /// This node's own disco public key, raw (Go `Conn.DiscoPublicKey()`). The all-zero key means
+    /// "no disco key", and nothing is ever advertised — Go's first refusal.
+    pub disco_key: [u8; ts_packet::tsmp::DISCO_KEY_LEN],
+    /// This node's own tailnet addresses, in the order control sent them (Go `self.Addresses()`,
+    /// already narrowed to the single-IP prefixes `selfIPMatchingFamily` accepts). The
+    /// advertisement's source is the first entry matching the destination's family.
+    pub self_addrs: Vec<std::net::IpAddr>,
+    /// Where to send an advertisement, per peer. A peer absent from this map is never advertised
+    /// to — Go's `endpointForNodeKey` miss.
+    pub peers: HashMap<PeerId, AdvertisementTarget>,
+}
+
+/// One peer's advertisement destination, as [`DiscoAdvertisementState`] holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdvertisementTarget {
+    /// The peer's first tailnet address (Go `endpoint.nodeAddr`), which is the advertisement's
+    /// destination address.
+    pub node_addr: std::net::IpAddr,
+    /// Whether this is a plain WireGuard peer rather than a Tailscale node (Go
+    /// `endpoint.isWireguardOnly`). Such a peer speaks no TSMP, so Go never sends it one — and a
+    /// kernel-WireGuard or `wireguard-go` peer would hand the advertisement straight to its host
+    /// network stack as an unknown-protocol packet.
+    pub wireguard_only: bool,
+}
+
+impl DiscoAdvertisementState {
+    /// The marshalled TSMP disco-key advertisement to send `peer` on session establishment, or
+    /// `None` if this node must not advertise to it.
+    ///
+    /// Go [`magicsock.Conn.PriorityMessageForPeer`], refusal for refusal — every one of these is a
+    /// silent "send nothing", never a fallback to some other message:
+    ///
+    /// 1. **No disco key of our own** (`disco.IsZero()`): there is nothing to advertise.
+    /// 2. **Unknown peer** (`endpointForNodeKey` miss, or `!self.Valid()`): the netmap snapshot has
+    ///    no destination address for this WireGuard peer, so any address we invented would be a
+    ///    guess.
+    /// 3. **A WireGuard-only peer** (`ep.isWireguardOnly`): "Do not send TSMP messages to peers
+    ///    that only speaks wireguard."
+    /// 4. **No source address in the destination's family** (`selfIPMatchingFamily` returning the
+    ///    zero `Addr`): an IPv4-only node has nothing to put in the source field of a packet to a
+    ///    peer's IPv6 address.
+    /// 5. A marshal refusal, which by construction of (4) cannot happen — see
+    ///    [`ts_packet::tsmp::DiscoKeyAdvertisement::marshal`].
+    ///
+    /// [`magicsock.Conn.PriorityMessageForPeer`]: https://github.com/tailscale/tailscale/blob/main/wgengine/magicsock/magicsock.go
+    pub fn advertisement_for(&self, peer: PeerId) -> Option<Vec<u8>> {
+        if self.disco_key == [0u8; ts_packet::tsmp::DISCO_KEY_LEN] {
+            tracing::debug!(?peer, "no disco key of our own; not advertising");
+            return None;
+        }
+
+        let target = self.peers.get(&peer)?;
+
+        if target.wireguard_only {
+            return None;
+        }
+
+        let src = self_ip_matching_family(&self.self_addrs, target.node_addr)?;
+
+        ts_packet::tsmp::DiscoKeyAdvertisement {
+            src,
+            dst: target.node_addr,
+            key: self.disco_key,
+        }
+        .marshal()
+        .inspect_err(|e| tracing::debug!(?peer, error = %e, "not advertising our disco key"))
+        .ok()
+    }
+}
+
+/// This node's first tailnet address whose family matches `want`, or `None`.
+///
+/// Go `magicsock.selfIPMatchingFamily`, which walks `self.Addresses()` and returns the first
+/// single-IP prefix with `Addr().BitLen() == want.BitLen()`. `addrs` is already narrowed to
+/// single IPs by the caller that builds the snapshot, so only the family test remains.
+fn self_ip_matching_family(
+    addrs: &[std::net::IpAddr],
+    want: std::net::IpAddr,
+) -> Option<std::net::IpAddr> {
+    addrs
+        .iter()
+        .copied()
+        .find(|addr| addr.is_ipv4() == want.is_ipv4())
+}
+
 /// A data plane subsystem that can be the subject of timer events.
 pub enum Subsystem {
     /// The wireguard component.
@@ -323,6 +426,13 @@ pub struct DataPlane {
     /// means no capture and zero datapath overhead. Installed/cleared at runtime by the dataplane
     /// actor; see [`DataPlane::process_outbound`]/[`DataPlane::process_inbound`] for the tee points.
     pub capture: Option<CaptureHook>,
+
+    /// Netmap snapshot for the TSMP disco-key advertisement this node sends on session
+    /// establishment (Go capability version 144). `None` (the default) advertises nothing at all,
+    /// which is what an embedder that never populates it gets — the same position this fork was in
+    /// before the send side existed, and still fully interoperable, since a peer's own
+    /// advertisement is unsolicited. Refreshed from the netmap by the runtime's dataplane actor.
+    pub disco_advertisement: Option<Arc<DiscoAdvertisementState>>,
 }
 
 impl DataPlane {
@@ -338,6 +448,7 @@ impl DataPlane {
             packet_filter: Arc::new(ts_packetfilter::DropAllFilter),
             wg_next: None,
             capture: None,
+            disco_advertisement: None,
         }
     }
 
@@ -384,7 +495,11 @@ impl DataPlane {
         &mut self,
         packets: impl IntoIterator<Item = PacketMut>,
     ) -> InboundResult {
-        let ts_tunnel::RecvResult { to_local, to_peers } = self.wireguard.recv(packets);
+        let ts_tunnel::RecvResult {
+            to_local,
+            to_peers,
+            sessions_established,
+        } = self.wireguard.recv(packets);
 
         if let Some(hook) = &self.capture {
             for packets in to_local.values() {
@@ -445,6 +560,27 @@ impl DataPlane {
 
                 v
             });
+
+        // TSMP disco-key advertisement, send side (Go capability version 144). wireguard-go calls
+        // `peer.SendPriorityMessage()` the moment a keypair becomes current for forward
+        // transmission — on the initiator when the handshake response lands, and on the responder
+        // when the first transport packet authenticates on the new keypair (`device/receive.go`).
+        // `sessions_established` is exactly those two moments; the message is Go's
+        // `magicsock.Conn.PriorityMessageForPeer` return value. A peer we must not advertise to
+        // (see [`DiscoAdvertisementState::advertisement_for`]) simply gets nothing, and the fresh
+        // session is otherwise untouched.
+        let mut to_peers = to_peers;
+        if let Some(advert) = self.disco_advertisement.clone() {
+            for peer in sessions_established {
+                let Some(msg) = advert.advertisement_for(PeerId(peer.0)) else {
+                    continue;
+                };
+                tracing::debug!(peer_id = ?peer, "advertising our disco key over TSMP");
+                for (peer, packets) in self.wireguard.send_priority_message(peer, &msg).to_peers {
+                    to_peers.entry(peer).or_default().extend(packets);
+                }
+            }
+        }
 
         let to_peers = to_peers
             .into_iter()
@@ -873,6 +1009,224 @@ mod tests {
                 if still_delivered { "still" } else { "not" }
             );
         }
+    }
+
+    /// Our own disco key, the one this node advertises. Asymmetric so a reversed or offset slice
+    /// would be visible in the marshalled bytes.
+    const SELF_DISCO_KEY: [u8; 32] = [
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+        0x00, 0x9c, 0x5f, 0x3a, 0x01, 0x7d, 0xe2, 0x44, 0xb8, 0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a,
+        0x69, 0x78,
+    ];
+
+    /// An advertisement state with one peer, a v4 and a v6 address of our own, and a real disco key.
+    fn advertisement_state(peer: PeerId, target: AdvertisementTarget) -> DiscoAdvertisementState {
+        DiscoAdvertisementState {
+            disco_key: SELF_DISCO_KEY,
+            self_addrs: vec![
+                std::net::IpAddr::from([100, 64, 0, 1]),
+                std::net::IpAddr::from([
+                    0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                ]),
+            ],
+            peers: HashMap::from([(peer, target)]),
+        }
+    }
+
+    /// What this node advertises, and to whom (Go `magicsock.Conn.PriorityMessageForPeer`): the
+    /// happy path emits the exact bytes `TSMPDiscoKeyAdvertisement.Marshal` emits, and each of Go's
+    /// refusals emits nothing at all.
+    #[test]
+    fn disco_advertisement_matches_priority_message_for_peer() {
+        let peer = PeerId(3);
+        let peer_v4 = std::net::IpAddr::from([100, 64, 0, 2]);
+        let target = AdvertisementTarget {
+            node_addr: peer_v4,
+            wireguard_only: false,
+        };
+        let state = advertisement_state(peer, target);
+
+        // Happy path: a v4 peer gets a v4 advertisement sourced from our v4 address — the first
+        // self address in the destination's family (Go `selfIPMatchingFamily`).
+        let msg = state
+            .advertisement_for(peer)
+            .expect("a Tailscale peer with a matching-family address must be advertised to");
+        let parsed = ts_packet::tsmp::DiscoKeyAdvertisement::parse(&msg)
+            .expect("what we emit must parse as an advertisement");
+        assert_eq!(parsed.key, SELF_DISCO_KEY, "we advertise OUR disco key");
+        assert_eq!(parsed.src, std::net::IpAddr::from([100, 64, 0, 1]));
+        assert_eq!(parsed.dst, peer_v4);
+        assert_eq!(
+            msg,
+            ts_packet::tsmp::DiscoKeyAdvertisement {
+                src: std::net::IpAddr::from([100, 64, 0, 1]),
+                dst: peer_v4,
+                key: SELF_DISCO_KEY,
+            }
+            .marshal()
+            .unwrap(),
+            "the emitted bytes are exactly what Marshal produces"
+        );
+
+        // A v6 peer is sourced from our v6 address, not our v4 one.
+        let peer_v6 = std::net::IpAddr::from([
+            0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+        ]);
+        let v6_state = advertisement_state(
+            peer,
+            AdvertisementTarget {
+                node_addr: peer_v6,
+                wireguard_only: false,
+            },
+        );
+        let parsed = v6_state
+            .advertisement_for(peer)
+            .and_then(|m| ts_packet::tsmp::DiscoKeyAdvertisement::parse(&m))
+            .expect("a v6 peer must be advertised to over v6");
+        assert!(parsed.src.is_ipv6(), "source must match the peer's family");
+        assert_eq!(parsed.dst, peer_v6);
+
+        // Refusal 1 (Go `disco.IsZero()`): no disco key of our own, nothing to advertise.
+        let mut no_key = advertisement_state(peer, target);
+        no_key.disco_key = [0u8; 32];
+        assert!(
+            no_key.advertisement_for(peer).is_none(),
+            "the zero disco key must never be advertised"
+        );
+
+        // Refusal 2 (Go `endpointForNodeKey` miss / `!self.Valid()`): a peer the netmap snapshot
+        // does not cover, and a node with no addresses of its own.
+        assert!(
+            state.advertisement_for(PeerId(0xbad)).is_none(),
+            "an unknown peer must not be advertised to"
+        );
+        let mut no_self = advertisement_state(peer, target);
+        no_self.self_addrs.clear();
+        assert!(
+            no_self.advertisement_for(peer).is_none(),
+            "a node with no tailnet address of its own has no source to advertise from"
+        );
+
+        // Refusal 3 (Go `ep.isWireguardOnly`): "Do not send TSMP messages to peers that only speaks
+        // wireguard" — such a peer would hand it to its host stack as an unknown protocol.
+        let wg_only = advertisement_state(
+            peer,
+            AdvertisementTarget {
+                node_addr: peer_v4,
+                wireguard_only: true,
+            },
+        );
+        assert!(
+            wg_only.advertisement_for(peer).is_none(),
+            "a WireGuard-only peer must never be sent TSMP"
+        );
+
+        // Refusal 4 (Go `selfIPMatchingFamily` returning the zero Addr): an IPv4-only node has no
+        // source address for a packet to a peer's IPv6 address.
+        let mut v4_only = advertisement_state(
+            peer,
+            AdvertisementTarget {
+                node_addr: peer_v6,
+                wireguard_only: false,
+            },
+        );
+        v4_only.self_addrs = vec![std::net::IpAddr::from([100, 64, 0, 1])];
+        assert!(
+            v4_only.advertisement_for(peer).is_none(),
+            "no self address in the peer's family means no advertisement"
+        );
+    }
+
+    /// End to end, over a real WireGuard handshake: when a session with a peer comes up, this
+    /// node's dataplane emits its own TSMP disco-key advertisement to that peer — and the peer's
+    /// dataplane learns the key from it and drops the packet.
+    ///
+    /// This is the send side (Go capability version 144) meeting the receive side already in this
+    /// tree, so the assertion is not "some bytes went out" but "the far side learned exactly the
+    /// disco key we hold". B is deliberately left with no advertisement state, which also pins the
+    /// unconfigured case: it establishes the same session and sends nothing back.
+    #[test]
+    fn session_establishment_advertises_our_disco_key_to_the_peer() {
+        let underlay: UnderlayTransportId = 0.into();
+        let wg_peer = ts_tunnel::PeerId(1);
+        let peer = PeerId(1);
+        let a_addr = std::net::IpAddr::from([100, 64, 0, 1]);
+        let b_addr = std::net::IpAddr::from([100, 64, 0, 2]);
+
+        let (a_static, b_static) = (NodeKeyPair::new(), NodeKeyPair::new());
+        let (mut a, mut b) = (
+            DataPlane::new(a_static.clone()),
+            DataPlane::new(b_static.clone()),
+        );
+
+        for (dp, key) in [(&mut a, b_static.public), (&mut b, a_static.public)] {
+            dp.wireguard.upsert_peer(
+                wg_peer,
+                ts_tunnel::PeerConfig {
+                    key,
+                    psk: [0u8; 32].into(),
+                    persistent_keepalive_interval: None,
+                },
+            );
+            dp.ur_out.table.insert(peer, underlay);
+        }
+
+        // Only A knows how to advertise: its own disco key, its own address, and B's address.
+        a.disco_advertisement = Some(Arc::new(advertisement_state(
+            peer,
+            AdvertisementTarget {
+                node_addr: b_addr,
+                wireguard_only: false,
+            },
+        )));
+
+        // B attributes A's tailnet address to the WireGuard peer that carries it, as the runtime's
+        // source filter does — without that, B drops the advertisement before parsing it.
+        let mut src_filter = ts_bart::Table::default();
+        src_filter.insert(ipnet::IpNet::from(a_addr), peer);
+        b.src_filter_in = Arc::new(src_filter);
+
+        // Drive the handshake. Only the initiation is kicked off directly (the dataplane starts one
+        // from routed outbound traffic, which is not what this test is about); everything after it
+        // goes through `process_inbound`, the path under test.
+        let take = |out: HashMap<(UnderlayTransportId, PeerId), Vec<PacketMut>>| {
+            out.into_values().flatten().collect::<Vec<_>>()
+        };
+        let init = a
+            .wireguard
+            .send([(wg_peer, vec![PacketMut::from(&b"hello"[..])])])
+            .to_peers
+            .remove(&wg_peer)
+            .expect("handshake initiation");
+
+        let resp = take(b.process_inbound(init).to_peers);
+        assert!(!resp.is_empty(), "B must answer the handshake initiation");
+
+        // A completes the handshake. Its session is now current, so alongside the queued data it
+        // emits the advertisement.
+        let from_a = take(a.process_inbound(resp).to_peers);
+        assert_eq!(
+            from_a.len(),
+            2,
+            "A must emit the queued data AND its disco-key advertisement"
+        );
+
+        // B learns A's disco key from it, and the advertisement itself is consumed rather than
+        // delivered to B's local stack.
+        let inbound = b.process_inbound(from_a);
+        assert_eq!(
+            inbound
+                .learned_disco_keys
+                .iter()
+                .map(|(peer, advert)| (*peer, advert.key))
+                .collect::<Vec<_>>(),
+            vec![(peer, SELF_DISCO_KEY)],
+            "B must learn exactly the disco key A holds, attributed to A's wireguard peer"
+        );
+        assert!(
+            inbound.to_peers.is_empty(),
+            "B has no advertisement state, so it advertises nothing back"
+        );
     }
 
     /// Behavioral guard: an installed capture hook MUST be invoked with `CapturePath::FromLocal`

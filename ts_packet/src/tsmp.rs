@@ -4,16 +4,18 @@
 //! **99** ("any private encryption scheme") *inside* the WireGuard tunnel, so a TSMP message is
 //! only ever seen after decryption and never touches the host network stack.
 //!
-//! This module carries the **receive** side of the disco-key advertisement
-//! (Go `packet.TSMPDiscoKeyAdvertisement`, upstream capability version 144): a peer announces its
+//! This module carries both directions of the disco-key advertisement
+//! (Go `packet.TSMPDiscoKeyAdvertisement`, upstream capability version 144): a node announces its
 //! current disco public key immediately after an eligible WireGuard session is established, which
-//! lets the receiver learn (or re-learn) that key without waiting for a netmap update or restarting
-//! WireGuard. A real Go peer sends this to us **unprompted**, so parsing it is interop-visible even
-//! though this node does not yet send one.
+//! lets the far side learn (or re-learn) that key without waiting for a netmap update or restarting
+//! WireGuard. A real Go peer sends this to us **unprompted**, and from capability version 144 we
+//! send our own the same way — see [`DiscoKeyAdvertisement::parse`] and
+//! [`DiscoKeyAdvertisement::marshal`].
 //!
 //! [`net/packet/tsmp.go`]: https://github.com/tailscale/tailscale/blob/main/net/packet/tsmp.go
 
-use core::net::IpAddr;
+use alloc::vec::Vec;
+use core::{fmt, net::IpAddr};
 
 /// The IP protocol number TSMP rides on (Go `ipproto.TSMP`). Not IANA-assigned: 99 is "any private
 /// encryption scheme", which Tailscale reuses for inter-node messages.
@@ -90,6 +92,43 @@ impl DiscoKeyAdvertisement {
         self.key == [0u8; DISCO_KEY_LEN]
     }
 
+    /// Marshal this advertisement into a complete IP packet, ready to be handed to WireGuard as
+    /// the plaintext of a transport-data message.
+    ///
+    /// Go [`TSMPDiscoKeyAdvertisement.Marshal`]: an IPv4 or IPv6 base header (chosen by the address
+    /// family, `packet.Generate` over `IP4Header`/`IP6Header`) carrying IP protocol
+    /// [`IP_PROTO_TSMP`], followed by the [`DISCO_ADVERTISEMENT_LEN`]-byte body — the type byte
+    /// `'a'` and the raw 32-byte disco key. Field for field this is Go's `IP4Header.Marshal` /
+    /// `IP6Header.Marshal`: TTL/hop-limit 64, IP ID 0, no options, no fragmentation, and (v4 only)
+    /// an RFC 1071 header checksum.
+    ///
+    /// # Errors
+    ///
+    /// [`MarshalError::MixedAddressFamilies`] when `src` and `dst` are not in the same address
+    /// family. Go picks the header family from `Src` alone and then *discards* the
+    /// `errWrongFamily` its `IP4Header.Marshal` returns for a v6 `Dst` (`packet.Generate` ignores
+    /// the error), emitting a packet with an all-zero header. Refusing is the fail-closed reading
+    /// of the same check, and the divergence is unobservable: Go's only caller,
+    /// `magicsock.Conn.PriorityMessageForPeer`, picks `src` with `selfIPMatchingFamily(self, dst)`,
+    /// so the families always match by construction — as they do here.
+    ///
+    /// [`TSMPDiscoKeyAdvertisement.Marshal`]: https://github.com/tailscale/tailscale/blob/main/net/packet/tsmp.go
+    pub fn marshal(&self) -> Result<Vec<u8>, MarshalError> {
+        // Go: `payload = append([]byte{byte(TSMPTypeDiscoAdvertisement)}, ka.Key.AppendTo(...)...)`,
+        // then a belt-and-braces `len(payload) != 33` check. That check cannot fail here: the body
+        // is a type byte plus a fixed-size `[u8; DISCO_KEY_LEN]`, so the length is a compile-time
+        // constant.
+        let mut body = [0u8; DISCO_ADVERTISEMENT_LEN];
+        body[0] = TSMP_TYPE_DISCO_ADVERTISEMENT;
+        body[1..].copy_from_slice(&self.key);
+
+        match (self.src, self.dst) {
+            (IpAddr::V4(src), IpAddr::V4(dst)) => Ok(generate4(src.octets(), dst.octets(), &body)),
+            (IpAddr::V6(src), IpAddr::V6(dst)) => Ok(generate6(src.octets(), dst.octets(), &body)),
+            _ => Err(MarshalError::MixedAddressFamilies),
+        }
+    }
+
     /// Parse a complete IP packet (IPv4 or IPv6, as handed up by WireGuard decryption) as a TSMP
     /// disco-key advertisement, or `None` if it is not one.
     ///
@@ -115,6 +154,96 @@ impl DiscoKeyAdvertisement {
 
         Some(Self { src, dst, key })
     }
+}
+
+/// Why a [`DiscoKeyAdvertisement`] could not be marshalled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarshalError {
+    /// `src` and `dst` are in different address families, so neither an IPv4 nor an IPv6 header
+    /// can carry both. See [`DiscoKeyAdvertisement::marshal`].
+    MixedAddressFamilies,
+}
+
+impl fmt::Display for MarshalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MixedAddressFamilies => f.write_str("wrong address family for src/dst IP"),
+        }
+    }
+}
+
+impl core::error::Error for MarshalError {}
+
+/// Build a complete IPv4 packet carrying `payload` as IP protocol [`IP_PROTO_TSMP`]
+/// (Go `packet.Generate(IP4Header{IPProto: ipproto.TSMP, Src, Dst}, payload)`).
+///
+/// Byte for byte Go's `IP4Header.Marshal`: version 4 with IHL 5 (no options), DSCP/ECN 0, the Total
+/// Length field, IP ID 0, no flags and no fragment offset, TTL 64, the protocol byte, an RFC 1071
+/// header checksum, then the addresses.
+fn generate4(src: [u8; 4], dst: [u8; 4], payload: &[u8]) -> Vec<u8> {
+    let mut buf = alloc::vec![0u8; IP4_HEADER_LEN + payload.len()];
+    buf[IP4_HEADER_LEN..].copy_from_slice(payload);
+
+    buf[0] = 0x40 | (IP4_HEADER_LEN >> 2) as u8;
+    buf[1] = 0x00;
+    // `as u16` cannot truncate in practice: the only caller marshals a 53-byte advertisement, and
+    // the IP total-length field is a u16 by definition.
+    let total_len = buf.len() as u16;
+    buf[2..4].copy_from_slice(&total_len.to_be_bytes());
+    // IP ID 0, then flags + fragment offset 0: Go's `IP4Header` for an advertisement carries no
+    // `IPID`, and TSMP is never fragmented.
+    buf[4..6].copy_from_slice(&0u16.to_be_bytes());
+    buf[6..8].copy_from_slice(&0u16.to_be_bytes());
+    buf[8] = 64;
+    buf[9] = IP_PROTO_TSMP;
+    // The checksum field must be zero while the checksum is computed over these same bytes.
+    buf[10..12].copy_from_slice(&0u16.to_be_bytes());
+    buf[12..16].copy_from_slice(&src);
+    buf[16..20].copy_from_slice(&dst);
+
+    let checksum = ip4_checksum(&buf[..IP4_HEADER_LEN]);
+    buf[10..12].copy_from_slice(&checksum.to_be_bytes());
+
+    buf
+}
+
+/// Build a complete IPv6 packet carrying `payload` as next header [`IP_PROTO_TSMP`]
+/// (Go `packet.Generate(IP6Header{IPProto: ipproto.TSMP, Src, Dst}, payload)`).
+///
+/// Byte for byte Go's `IP6Header.Marshal`: version 6 with traffic class and flow label 0 (Go writes
+/// `IPID & 0x000FFFFF`, which is 0 for an advertisement, then stamps `0x60` over the top nibble),
+/// the Payload Length field, the next-header byte, hop limit 64, then the addresses. IPv6 headers
+/// carry no checksum.
+fn generate6(src: [u8; 16], dst: [u8; 16], payload: &[u8]) -> Vec<u8> {
+    let mut buf = alloc::vec![0u8; IP6_HEADER_LEN + payload.len()];
+    buf[IP6_HEADER_LEN..].copy_from_slice(payload);
+
+    buf[0] = 0x60;
+    buf[4..6].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+    buf[6] = IP_PROTO_TSMP;
+    buf[7] = 64;
+    buf[8..24].copy_from_slice(&src);
+    buf[24..40].copy_from_slice(&dst);
+
+    buf
+}
+
+/// The IPv4 header checksum (RFC 1071), Go `packet.ip4Checksum`: the one's-complement of the
+/// one's-complement sum of the header's 16-bit big-endian words, with a trailing odd byte taken as
+/// the high half of a final word. The caller must zero the checksum field first.
+fn ip4_checksum(b: &[u8]) -> u16 {
+    let mut ac: u32 = 0;
+    let mut chunks = b.chunks_exact(2);
+    for pair in &mut chunks {
+        ac += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
+    }
+    if let [last] = chunks.remainder() {
+        ac += u32::from(*last) << 8;
+    }
+    while (ac >> 16) > 0 {
+        ac = (ac >> 16) + (ac & 0xffff);
+    }
+    !(ac as u16)
 }
 
 /// The TSMP body of an IP packet, plus the source and destination from its IP header, or `None` if
@@ -228,7 +357,11 @@ mod tests {
 
     /// Go `packet.ip4Checksum` (RFC 1071), so the test vectors below are byte-identical to what
     /// Go's `IP4Header.Marshal` emits rather than merely parseable by our own decoder.
-    fn ip4_checksum(b: &[u8]) -> u16 {
+    ///
+    /// Deliberately a second, independent implementation of the production [`ip4_checksum`]: the
+    /// parse tests below build their inputs with it, so a bug in the marshal path cannot make both
+    /// sides of a parse test agree with each other.
+    fn ref_ip4_checksum(b: &[u8]) -> u16 {
         let mut ac: u32 = 0;
         for pair in b.chunks(2) {
             ac += match pair {
@@ -244,8 +377,9 @@ mod tests {
     }
 
     /// Go `packet.Generate(IP4Header{...}, payload)`: an IPv4 header with no options, TTL 64, a
-    /// correct header checksum, and `payload` appended.
-    fn generate4(proto: u8, src: [u8; 4], dst: [u8; 4], payload: &[u8]) -> Vec<u8> {
+    /// correct header checksum, and `payload` appended. Independent of the production
+    /// [`generate4`], and takes the protocol byte so the negative cases can build a non-TSMP packet.
+    fn ref_generate4(proto: u8, src: [u8; 4], dst: [u8; 4], payload: &[u8]) -> Vec<u8> {
         let mut buf = alloc::vec![0u8; IP4_HEADER_LEN + payload.len()];
         buf[IP4_HEADER_LEN..].copy_from_slice(payload);
 
@@ -261,14 +395,14 @@ mod tests {
         buf[12..16].copy_from_slice(&src);
         buf[16..20].copy_from_slice(&dst);
 
-        let sum = ip4_checksum(&buf[0..IP4_HEADER_LEN]);
+        let sum = ref_ip4_checksum(&buf[0..IP4_HEADER_LEN]);
         buf[10..12].copy_from_slice(&sum.to_be_bytes());
 
         buf
     }
 
-    /// Go `packet.Generate(IP6Header{...}, payload)`.
-    fn generate6(next_header: u8, src: [u8; 16], dst: [u8; 16], payload: &[u8]) -> Vec<u8> {
+    /// Go `packet.Generate(IP6Header{...}, payload)`. Independent of the production [`generate6`].
+    fn ref_generate6(next_header: u8, src: [u8; 16], dst: [u8; 16], payload: &[u8]) -> Vec<u8> {
         let mut buf = alloc::vec![0u8; IP6_HEADER_LEN + payload.len()];
         buf[IP6_HEADER_LEN..].copy_from_slice(payload);
 
@@ -294,11 +428,154 @@ mod tests {
         body
     }
 
+    /// Decode a hex string into bytes, so the pinned Go vectors below can be written the way Go's
+    /// own test writes them.
+    fn unhex(s: &str) -> Vec<u8> {
+        assert!(
+            s.len().is_multiple_of(2),
+            "hex string must have even length"
+        );
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex"))
+            .collect()
+    }
+
+    /// The **send** side, against pinned bytes: [`DiscoKeyAdvertisement::marshal`] must emit exactly
+    /// what Go's `TSMPDiscoKeyAdvertisement.Marshal` emits.
+    ///
+    /// The expected packets are pinned as literal bytes, not rebuilt by the test, and the header
+    /// prefixes are the ones Go's own `TestTSMPDiscoKeyAdvertisementMarshal`
+    /// (`net/packet/tsmp_test.go`) pins:
+    ///
+    /// - IPv4 `45 00 0035 0000 0000 40 63 <cksum>` — version 4 / IHL 5, DSCP+ECN 0, total length
+    ///   53, IP ID 0, no flags or fragment offset, TTL 64, proto 99, RFC 1071 checksum. Go's own
+    ///   vector uses different addresses (and so a different checksum); the header is otherwise
+    ///   byte-identical, and `ref_ip4_checksum` — the independent RFC 1071 implementation this test
+    ///   module carries — reproduces Go's published checksum for Go's own addresses.
+    /// - IPv6 `6000000000216340` — Go's vector verbatim: version 6, traffic class and flow label 0,
+    ///   payload length 33, next header 99, hop limit 64.
+    #[test]
+    fn marshals_the_bytes_go_marshals() {
+        // Go's test key is 32 repeats of `'a'`; keep that so the on-wire body is 33 bytes of `'a'`
+        // and a transposed type byte would be invisible — hence the separate `KEY` case below.
+        let go_test_key = [b'a'; DISCO_KEY_LEN];
+
+        let src4 = [100u8, 64, 0, 2];
+        let dst4 = [100u8, 64, 0, 1];
+        let mut want4 = unhex("45000035000000004063b1e3");
+        want4.extend_from_slice(&src4);
+        want4.extend_from_slice(&dst4);
+        want4.push(b'a');
+        want4.extend_from_slice(&go_test_key);
+
+        let advert = DiscoKeyAdvertisement {
+            src: IpAddr::from(src4),
+            dst: IpAddr::from(dst4),
+            key: go_test_key,
+        };
+        let got = advert
+            .marshal()
+            .expect("a same-family advertisement marshals");
+        assert_eq!(
+            got, want4,
+            "IPv4 advertisement must be byte-identical to Go's"
+        );
+        assert_eq!(
+            got.len(),
+            IP4_HEADER_LEN + DISCO_ADVERTISEMENT_LEN,
+            "53 bytes"
+        );
+        assert_eq!(
+            ref_ip4_checksum(&got[..IP4_HEADER_LEN]),
+            0,
+            "a correct IPv4 header checksums to zero over the whole header"
+        );
+
+        // `2001:db8::1`/`::2`, the documentation prefix Go's own vector uses.
+        let src6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let dst6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let mut want6 = unhex("6000000000216340");
+        want6.extend_from_slice(&src6);
+        want6.extend_from_slice(&dst6);
+        want6.push(b'a');
+        want6.extend_from_slice(&go_test_key);
+
+        let advert = DiscoKeyAdvertisement {
+            src: IpAddr::from(src6),
+            dst: IpAddr::from(dst6),
+            key: go_test_key,
+        };
+        let got = advert
+            .marshal()
+            .expect("a same-family advertisement marshals");
+        assert_eq!(
+            got, want6,
+            "IPv6 advertisement must be byte-identical to Go's"
+        );
+        assert_eq!(
+            got.len(),
+            IP6_HEADER_LEN + DISCO_ADVERTISEMENT_LEN,
+            "73 bytes"
+        );
+    }
+
+    /// What we marshal is what we parse: a marshalled advertisement decodes back to the same
+    /// addresses and key, over both families. This is the round trip Go's `Parsed.Decode` +
+    /// `AsTSMPDiscoAdvertisement` does to a `Marshal`ed packet, and it is what makes the send side
+    /// interop-checkable against our own receive side.
+    #[test]
+    fn marshal_round_trips_through_parse() {
+        for (src, dst) in [
+            (IpAddr::from([100, 64, 0, 2]), IpAddr::from([100, 64, 0, 1])),
+            (
+                IpAddr::from([
+                    0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                ]),
+                IpAddr::from([
+                    0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                ]),
+            ),
+        ] {
+            let advert = DiscoKeyAdvertisement { src, dst, key: KEY };
+            let bytes = advert
+                .marshal()
+                .expect("same-family advertisement marshals");
+
+            assert_eq!(
+                DiscoKeyAdvertisement::parse(&bytes),
+                Some(advert),
+                "a marshalled advertisement must parse back identically ({src} -> {dst})"
+            );
+        }
+    }
+
+    /// The marshal refusal: `src` and `dst` in different address families have no header that can
+    /// carry both. Go reaches for `Src`'s family and then throws away the `errWrongFamily` its
+    /// `IP4Header.Marshal` returns, emitting an all-zero header; we refuse instead. Nothing on the
+    /// wire diverges — Go's only caller picks `src` to match `dst`'s family — but a garbage packet
+    /// is never handed to WireGuard.
+    #[test]
+    fn mixed_address_families_do_not_marshal() {
+        let v4 = IpAddr::from([100, 64, 0, 1]);
+        let v6 = IpAddr::from([
+            0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]);
+
+        for (src, dst) in [(v4, v6), (v6, v4)] {
+            assert_eq!(
+                DiscoKeyAdvertisement { src, dst, key: KEY }.marshal(),
+                Err(MarshalError::MixedAddressFamilies),
+                "a mixed-family advertisement must not marshal ({src} -> {dst})"
+            );
+        }
+    }
+
     /// The happy path: a real advertisement, marshalled exactly as Go's
     /// `TSMPDiscoKeyAdvertisement.Marshal` would emit it, decodes to the advertised key.
     #[test]
     fn decodes_a_real_ipv4_advertisement() {
-        let pkt = generate4(
+        let pkt = ref_generate4(
             IP_PROTO_TSMP,
             [100, 64, 0, 2],
             [100, 64, 0, 1],
@@ -329,7 +606,7 @@ mod tests {
         let dst = [
             0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
         ];
-        let pkt = generate6(IP_PROTO_TSMP, src, dst, &advertisement_body(&KEY));
+        let pkt = ref_generate6(IP_PROTO_TSMP, src, dst, &advertisement_body(&KEY));
 
         let advert = DiscoKeyAdvertisement::parse(&pkt).expect("advertisement must decode");
         assert_eq!(advert.key, KEY);
@@ -341,7 +618,7 @@ mod tests {
     /// publishes only `if !discoKeyAdvert.Key.IsZero()`.
     #[test]
     fn zero_key_parses_but_is_flagged() {
-        let pkt = generate4(
+        let pkt = ref_generate4(
             IP_PROTO_TSMP,
             [100, 64, 0, 2],
             [100, 64, 0, 1],
@@ -361,7 +638,7 @@ mod tests {
     fn non_advertisements_do_not_parse() {
         let src = [100, 64, 0, 2];
         let dst = [100, 64, 0, 1];
-        let tsmp = |body: &[u8]| generate4(IP_PROTO_TSMP, src, dst, body);
+        let tsmp = |body: &[u8]| ref_generate4(IP_PROTO_TSMP, src, dst, body);
 
         // Other TSMP message types this client does not (yet) consume. Each is a legitimate
         // message a real Go peer can send us; none is an advertisement.
@@ -404,7 +681,7 @@ mod tests {
 
         // Right body, wrong IP protocol: TSMP is proto 99, and nothing else is TSMP.
         assert!(
-            DiscoKeyAdvertisement::parse(&generate4(6, src, dst, &advertisement_body(&KEY)))
+            DiscoKeyAdvertisement::parse(&ref_generate4(6, src, dst, &advertisement_body(&KEY)))
                 .is_none(),
             "a TCP packet whose payload happens to look like an advertisement must not parse"
         );
@@ -419,7 +696,7 @@ mod tests {
     /// `ipproto.Fragment`, so neither reaches a TSMP consumer.
     #[test]
     fn fragmented_tsmp_does_not_parse() {
-        let base = generate4(
+        let base = ref_generate4(
             IP_PROTO_TSMP,
             [100, 64, 0, 2],
             [100, 64, 0, 1],
@@ -457,7 +734,7 @@ mod tests {
 
         // Total length says 52 (a 32-byte body) while 53 bytes are present: the last key byte is
         // past the IP length, so this is a 32-byte body and not an advertisement.
-        let mut short_len = generate4(IP_PROTO_TSMP, src, dst, &advertisement_body(&KEY));
+        let mut short_len = ref_generate4(IP_PROTO_TSMP, src, dst, &advertisement_body(&KEY));
         let declared = (short_len.len() - 1) as u16;
         short_len[2..4].copy_from_slice(&declared.to_be_bytes());
         assert!(
@@ -466,7 +743,7 @@ mod tests {
         );
 
         // Total length says 54 while only 53 bytes are present: cut off, Go demotes to "unknown".
-        let mut long_len = generate4(IP_PROTO_TSMP, src, dst, &advertisement_body(&KEY));
+        let mut long_len = ref_generate4(IP_PROTO_TSMP, src, dst, &advertisement_body(&KEY));
         let declared = (long_len.len() + 1) as u16;
         long_len[2..4].copy_from_slice(&declared.to_be_bytes());
         assert!(
@@ -479,7 +756,7 @@ mod tests {
         // `==`), so a future upstream field append stays parseable.
         let mut extended = advertisement_body(&KEY);
         extended.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
-        let pkt = generate4(IP_PROTO_TSMP, src, dst, &extended);
+        let pkt = ref_generate4(IP_PROTO_TSMP, src, dst, &extended);
         assert_eq!(
             DiscoKeyAdvertisement::parse(&pkt).map(|a| a.key),
             Some(KEY),

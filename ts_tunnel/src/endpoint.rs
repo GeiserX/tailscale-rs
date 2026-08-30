@@ -192,6 +192,27 @@ impl SessionState {
         }
     }
 
+    /// Encrypt one *priority* message for transmission on the CURRENT keypair, or `None` if there
+    /// is no keypair that may still send.
+    ///
+    /// wireguard-go `Peer.SendPriorityMessage` (`device/send.go`), which bails on
+    /// `keypair == nil || keypair.sendNonce >= RejectAfterMessages || time.Since(keypair.created) >=
+    /// RejectAfterTime` — [`TransmitSession::expired`] is exactly that nonce-or-age pair. Unlike
+    /// [`Self::encrypt_or_queue`] this never queues and never tears the session down: Go is explicit
+    /// that a priority message "is only intended to flow around symmetric session establishment, but
+    /// it should never trigger a new session", so a missing or spent keypair simply drops it.
+    fn encrypt_priority(&mut self, msg: &[u8]) -> Option<PacketMut> {
+        if let SessionState::Active { send, .. } = self
+            && !send.expired(Instant::now())
+        {
+            let mut packet = vec![PacketMut::from(msg)];
+            send.encrypt(&mut packet);
+            packet.pop()
+        } else {
+            None
+        }
+    }
+
     /// Encrypt packets for transmission.
     ///
     /// Returns the encrypted packets if a session is available, otherwise queues the packets and
@@ -483,6 +504,55 @@ impl Peer {
         self.start_handshake(endpoint, out, false);
     }
 
+    /// Send one priority message on this peer's current keypair, if it has one.
+    ///
+    /// wireguard-go `Peer.SendPriorityMessage` (`device/send.go`), called by the device the moment a
+    /// keypair becomes current for forward transmission. Returns whether a packet was queued.
+    ///
+    /// Go's refusals, all of them silent drops:
+    ///
+    /// - an empty message (`len(msg) == 0`) — the callback's way of saying "nothing to send";
+    /// - a message over [`MAX_PRIORITY_MESSAGE_CONTENT_SIZE`], which wireguard-go logs and discards
+    ///   rather than truncating;
+    /// - no current keypair, or one too old or too far through its nonces to send on — see
+    ///   [`SessionState::encrypt_priority`]. In particular this **never starts a handshake**, which
+    ///   is what separates it from [`Self::send`].
+    ///
+    /// A queued priority message is ordinary authenticated outbound traffic once encrypted, so it
+    /// arms the same timers a data send does (Go runs it through the same outbound queue, and so
+    /// through `timersAnyAuthenticatedPacketTraversal` / `timersDataSent`).
+    fn send_priority_message(
+        &mut self,
+        endpoint: &mut EndpointState,
+        msg: &[u8],
+        out: &mut impl QueueToPeer,
+    ) -> bool {
+        if msg.is_empty() {
+            return false;
+        }
+        if msg.len() > MAX_PRIORITY_MESSAGE_CONTENT_SIZE {
+            tracing::debug!(
+                peer_id = ?self.id,
+                len = msg.len(),
+                "priority message exceeds the maximum content size; dropping"
+            );
+            return false;
+        }
+
+        let Some(packet) = self.session.encrypt_priority(msg) else {
+            tracing::debug!(
+                peer_id = ?self.id,
+                "no keypair available for a priority message; dropping"
+            );
+            return false;
+        };
+
+        self.arm_persistent_keepalive(&mut endpoint.scheduler);
+        self.arm_new_handshake(&mut endpoint.scheduler);
+        out.queue_to_peer(self.id).push(packet);
+        true
+    }
+
     #[tracing::instrument(skip_all, fields(?session_id, n_packets = packets.len()))]
     fn recv(
         &mut self,
@@ -576,6 +646,12 @@ impl Peer {
         // traffic, so the first persistent keepalive is a full interval away.
         self.arm_persistent_keepalive(&mut endpoint.scheduler);
         out.queue_to_peer(self.id).append(&mut packets);
+
+        // The keypair is now current for forward transmission: this is where wireguard-go calls
+        // `peer.SendPriorityMessage()` on the initiator (`device/receive.go`, after
+        // `BeginSymmetricSession` / `timersHandshakeComplete` for a received handshake response).
+        // The caller turns this into the actual send — see [`Endpoint::send_priority_message`].
+        out.note_session_established(self.id);
     }
 
     fn recv_transport_data(
@@ -655,6 +731,12 @@ impl Peer {
         if !packets_for_peer.is_empty() {
             out.queue_to_peer(self.id).append(&mut packets_for_peer);
         }
+
+        // The responder's keypair becomes current the moment a transport packet authenticates on
+        // it, which is where wireguard-go calls `peer.SendPriorityMessage()` on this side
+        // (`device/receive.go`, inside the `peer.ReceivedWithKeypair(elem.keypair)` branch). The
+        // advertisement is symmetric: both ends send one around the same session establishment.
+        out.note_session_established(self.id);
     }
 
     fn respond_to_handshake(
@@ -1014,6 +1096,36 @@ impl Endpoint {
         ret
     }
 
+    /// Send one *priority* message to `peer_id` on its current WireGuard keypair.
+    ///
+    /// This is the transmit half of wireguard-go's priority-message hook
+    /// (`Device.SetPriorityMessageOnEstablishmentFunc` → `Peer.SendPriorityMessage`): the device
+    /// invokes the embedder's callback whenever a peer's keypair becomes current for forward
+    /// transmission, and sends the returned plaintext ahead of any staged traffic. Here the two
+    /// halves are split — [`Endpoint::recv`] reports which peers just established a session in
+    /// [`RecvResult::sessions_established`], and the caller feeds the message back through this
+    /// method — so the tunnel layer stays free of the netmap state a message's *content* needs.
+    ///
+    /// `msg` is the plaintext to send. Per wireguard-go it must start with an IPv4 or IPv6 header
+    /// (the far side runs it through the same allowed-IPs check as any other transport message) and
+    /// must not exceed [`MAX_PRIORITY_MESSAGE_CONTENT_SIZE`].
+    ///
+    /// Nothing is sent — and no handshake is started — when the peer is unknown, the message is
+    /// empty or oversized, or the peer has no keypair that may still send. A priority message
+    /// rides an *existing* session or it does not ride at all.
+    pub fn send_priority_message(&mut self, peer_id: PeerId, msg: &[u8]) -> SendResult {
+        let mut ret = SendResult::default();
+
+        let Some(peer) = self.peers.get_mut(&peer_id) else {
+            tracing::warn!(?peer_id, "no peer stored for id");
+            return ret;
+        };
+
+        peer.send_priority_message(&mut self.state, msg, &mut ret);
+
+        ret
+    }
+
     /// Receive packets from peers.
     pub fn recv(&mut self, packets: impl IntoIterator<Item = PacketMut>) -> RecvResult {
         let mut ret = RecvResult::default();
@@ -1171,11 +1283,27 @@ pub struct RecvResult {
     pub to_local: HashMap<PeerId, Vec<PacketMut>>,
     /// Packets to be sent to remote peers.
     pub to_peers: HashMap<PeerId, Vec<PacketMut>>,
+    /// Peers whose WireGuard keypair became current for forward transmission while processing this
+    /// batch — the moment wireguard-go calls `peer.SendPriorityMessage()` (`device/receive.go`).
+    ///
+    /// Reported symmetrically: for the **initiator** when the handshake response completes the
+    /// handshake, and for the **responder** when the first transport packet authenticates on the
+    /// tentative keypair. A rekey establishes a new keypair and so reports again; a peer can appear
+    /// more than once only if one batch establishes more than one keypair for it.
+    ///
+    /// Empty for the overwhelmingly common batch that establishes nothing. The caller decides what
+    /// (if anything) to send on the fresh session — see [`Endpoint::send_priority_message`].
+    pub sessions_established: Vec<PeerId>,
 }
 
 impl RecvResult {
     fn queue_to_local(&mut self, peer: PeerId) -> &mut Vec<PacketMut> {
         self.to_local.entry(peer).or_default()
+    }
+
+    /// Record that `peer`'s keypair just became current for forward transmission.
+    fn note_session_established(&mut self, peer: PeerId) {
+        self.sessions_established.push(peer);
     }
 }
 
@@ -1212,6 +1340,15 @@ pub enum Event {
     /// re-initiate the handshake (wireguard-go `newHandshake` / `expiredNewHandshake`).
     NewHandshakeTimeout(PeerId),
 }
+
+/// The largest plaintext a peer will carry as a *priority message* around session establishment
+/// (wireguard-go `device.MaxPriorityMessageContentSize`, `device/device.go`). A longer message is
+/// silently discarded rather than truncated, on the sending side here and in wireguard-go alike.
+///
+/// Upstream picked a power of two that "leaves significant space when accounting for all WireGuard
+/// overhead and encapsulating network protocol headers"; the one message this fork sends — a TSMP
+/// disco-key advertisement — is 53 bytes over IPv4 and 73 over IPv6, comfortably inside it.
+pub const MAX_PRIORITY_MESSAGE_CONTENT_SIZE: usize = 512;
 
 /// Base interval between handshake-initiation retransmits, `REKEY_TIMEOUT` from wireguard-go
 /// `device/constants.go` (`RekeyTimeout = 5s`). The actual scheduled delay adds upward jitter — see
@@ -1689,6 +1826,176 @@ mod tests {
         );
 
         (a_ep, b_ep, a_peer, b_peer)
+    }
+
+    /// A marshalled TSMP disco-key advertisement (Go `packet.TSMPDiscoKeyAdvertisement.Marshal`) —
+    /// the one message this fork sends as a WireGuard priority message. Built here so the tunnel
+    /// tests carry the real payload rather than an arbitrary blob: its exact shape is what has to
+    /// survive the encrypt/decrypt round trip.
+    fn disco_key_advertisement(key: [u8; 32]) -> Vec<u8> {
+        ts_packet::tsmp::DiscoKeyAdvertisement {
+            src: std::net::IpAddr::from([100, 64, 0, 2]),
+            dst: std::net::IpAddr::from([100, 64, 0, 1]),
+            key,
+        }
+        .marshal()
+        .expect("a same-family advertisement marshals")
+    }
+
+    /// The priority message rides the keypair the handshake just established, on both sides.
+    ///
+    /// wireguard-go calls `peer.SendPriorityMessage()` at exactly two points (`device/receive.go`):
+    /// on the **initiator** when the handshake response completes the handshake, and on the
+    /// **responder** when the first transport packet authenticates on the tentative keypair. This
+    /// drives a real handshake and pins both — [`RecvResult::sessions_established`] must name the
+    /// peer at those two moments and nowhere else — then sends a real disco-key advertisement on
+    /// the fresh session and checks the far side decrypts the exact bytes.
+    #[test]
+    fn priority_message_rides_the_session_the_handshake_established() {
+        let (a_static, b_static) = (NodeKeyPair::new(), NodeKeyPair::new());
+        let psk = rand::random::<crate::config::Psk>();
+        let (mut a_ep, mut b_ep) = (
+            Endpoint::new(a_static.clone()),
+            Endpoint::new(b_static.clone()),
+        );
+        let (a_peer, b_peer) = (PeerId(1), PeerId(2));
+
+        a_ep.upsert_peer(
+            a_peer,
+            PeerConfig {
+                key: b_static.public,
+                psk: psk.clone(),
+                persistent_keepalive_interval: None,
+            },
+        );
+        b_ep.upsert_peer(
+            b_peer,
+            PeerConfig {
+                key: a_static.public,
+                psk: psk.clone(),
+                persistent_keepalive_interval: None,
+            },
+        );
+
+        // A sends -> handshake initiation.
+        let init = a_ep.send(HashMap::from([(
+            a_peer,
+            vec![PacketMut::from(&b"hello"[..])],
+        )]));
+        let init = init.to_peers.get(&a_peer).expect("handshake init").clone();
+
+        // B responds. B's keypair is only *tentative* until a transport packet authenticates on it,
+        // so nothing is established yet — Go's responder does not call SendPriorityMessage here.
+        let out = b_ep.recv(init);
+        assert!(
+            out.sessions_established.is_empty(),
+            "a handshake initiation must not establish a keypair on the responder"
+        );
+        let resp = out.to_peers.get(&b_peer).expect("handshake resp").clone();
+
+        // A completes the handshake: A's keypair is now current for forward transmission.
+        let out = a_ep.recv(resp);
+        assert_eq!(
+            out.sessions_established,
+            vec![a_peer],
+            "the initiator establishes on the handshake response"
+        );
+        let data = out.to_peers.get(&a_peer).expect("queued data").clone();
+
+        // A advertises its disco key on that fresh session.
+        let advert = disco_key_advertisement([0x5au8; 32]);
+        assert!(
+            advert.len() <= MAX_PRIORITY_MESSAGE_CONTENT_SIZE,
+            "an advertisement must fit in a priority message (Go asserts the same)"
+        );
+        let sent = a_ep.send_priority_message(a_peer, &advert);
+        let sent = sent
+            .to_peers
+            .get(&a_peer)
+            .expect("the priority message must be encrypted and queued")
+            .clone();
+        assert_eq!(sent.len(), 1, "exactly one packet per priority message");
+
+        // B receives A's queued data, which promotes B's tentative keypair to current.
+        let out = b_ep.recv(data);
+        assert_eq!(
+            out.sessions_established,
+            vec![b_peer],
+            "the responder establishes when a transport packet authenticates on the keypair"
+        );
+
+        // ...and then A's advertisement, which decrypts to the exact bytes A marshalled. (The
+        // transport path zero-pads the plaintext to a 16-byte boundary before sealing and delivers
+        // the pad intact — see `pad16`.)
+        let out = b_ep.recv(sent);
+        assert!(
+            out.sessions_established.is_empty(),
+            "a data packet on an already-current keypair establishes nothing new"
+        );
+        assert_eq!(
+            out.to_local.get(&b_peer).map(|p| p.as_slice()),
+            Some([pad16(&advert)].as_slice()),
+            "the peer must receive the advertisement byte for byte"
+        );
+    }
+
+    /// The priority-message refusals, all silent drops in wireguard-go `Peer.SendPriorityMessage`:
+    /// an empty message, one over `MaxPriorityMessageContentSize`, an unknown peer, and — the
+    /// load-bearing one — a peer with no keypair, which must NOT be turned into a handshake. Go is
+    /// explicit: a priority message "should never trigger a new session".
+    #[test]
+    fn priority_message_refusals_match_wireguard_go() {
+        let advert = disco_key_advertisement([0x5au8; 32]);
+        let (mut a_ep, _b_ep, a_peer, _b_peer) = establish_session(None, b"hello");
+
+        assert!(
+            a_ep.send_priority_message(a_peer, &[]).to_peers.is_empty(),
+            "an empty priority message sends nothing"
+        );
+        assert!(
+            a_ep.send_priority_message(a_peer, &vec![0u8; MAX_PRIORITY_MESSAGE_CONTENT_SIZE + 1])
+                .to_peers
+                .is_empty(),
+            "a message over the maximum content size is dropped, not truncated"
+        );
+        assert_eq!(
+            a_ep.send_priority_message(a_peer, &vec![0u8; MAX_PRIORITY_MESSAGE_CONTENT_SIZE])
+                .to_peers
+                .get(&a_peer)
+                .map(Vec::len),
+            Some(1),
+            "a message exactly at the maximum content size is still sent"
+        );
+        assert!(
+            a_ep.send_priority_message(PeerId(0xbad), &advert)
+                .to_peers
+                .is_empty(),
+            "an unknown peer sends nothing"
+        );
+
+        // A peer that has never handshaked: no keypair, so no priority message — and, unlike an
+        // ordinary `send`, no handshake initiation and no retransmit timer either.
+        let peer_static = NodeKeyPair::new();
+        let mut fresh = Endpoint::new(NodeKeyPair::new());
+        fresh.upsert_peer(
+            a_peer,
+            PeerConfig {
+                key: peer_static.public,
+                psk: rand::random::<crate::config::Psk>(),
+                persistent_keepalive_interval: None,
+            },
+        );
+        assert!(
+            fresh
+                .send_priority_message(a_peer, &advert)
+                .to_peers
+                .is_empty(),
+            "a peer with no keypair sends nothing"
+        );
+        assert!(
+            fresh.next_event().is_none(),
+            "a priority message must never trigger a handshake (Go: it should never trigger a new session)"
+        );
     }
 
     /// The persistent keepalive fires on a fully idle tunnel and **re-arms unconditionally** — the

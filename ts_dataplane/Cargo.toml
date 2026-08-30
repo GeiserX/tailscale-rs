@@ -35,5 +35,9 @@ tracing.workspace = true
 # Required dependencies for the async_tokio feature.
 tokio = { workspace = true, optional = true, features = ["time", "sync"] }
 
+[dev-dependencies]
+# Prefixes for the source-attribution table an end-to-end inbound test has to populate.
+ipnet.workspace = true
+
 [lints]
 workspace = true
