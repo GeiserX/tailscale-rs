@@ -13,8 +13,30 @@ const C2N_PATH_ECHO: &str = "/echo";
 /// this node hosts (Go `c2n` `GET /vip-services`). Answered with a JSON
 /// [`C2NVIPServicesResponse`].
 const C2N_PATH_VIP_SERVICES: &str = "/vip-services";
+/// C2N URL path **prefix** under which requests are proxied into this node's LocalAPI, whatever the
+/// LocalAPI version (`v0`, `v1`, …). Go `feature/remoteconfig`'s `c2nPrefix`, registered with
+/// `ipnlocal.RegisterC2NPrefix`. Unlike every other route here this matches by prefix, so it is
+/// tried only after the exact-path handlers above miss (Go `handleC2N` does the same).
+const C2N_PREFIX_REMOTE_API: &str = "/remoteapi/localapi/";
+/// The portion of [`C2N_PREFIX_REMOTE_API`] stripped from an incoming c2n path to yield the LocalAPI
+/// path (Go `feature/remoteconfig`'s `localAPIStrip`).
+const C2N_REMOTE_API_STRIP: &str = "/remoteapi";
+/// What a stripped [`C2N_PREFIX_REMOTE_API`] path must begin with to be a LocalAPI path. Go
+/// re-checks this after the strip so a mis-registered prefix cannot proxy somewhere else.
+const C2N_LOCAL_API_PREFIX: &str = "/localapi/";
 /// HTTP 400 Bad Request response sent for all unimplemented C2N methods/paths.
 const C2N_PATH_UNKNOWN: &str = "HTTP/1.1 400 Bad Request\r\n\r\nunknown c2n path";
+/// HTTP 403 Forbidden response sent when control invokes the `/remoteapi/localapi/*` proxy but the
+/// local machine has not opted in via [`crate::Config::remote_config`] (Go
+/// `handleC2NRemoteAPI`'s `http.Error(w, "remote config not enabled by local machine",
+/// http.StatusForbidden)`).
+const C2N_REMOTE_CONFIG_DISABLED: &str =
+    "HTTP/1.1 403 Forbidden\r\n\r\nremote config not enabled by local machine";
+/// HTTP 400 Bad Request response sent when a `/remoteapi/…` path does not survive the
+/// `/remoteapi` strip into a `/localapi/` path (Go `handleC2NRemoteAPI`'s three
+/// `http.Error(w, "unexpected remote-config path", http.StatusBadRequest)` refusals).
+const C2N_REMOTE_API_BAD_PATH: &str =
+    "HTTP/1.1 400 Bad Request\r\n\r\nunexpected remote-config path";
 /// The start of an HTTP/1.1 200 response with no headers, just missing the body. Intended for use
 /// with C2N echo responses, which can append the request body.
 const C2N_RESPONSE_ECHO_PREAMBLE: &str = "HTTP/1.1 200 OK\r\n\r\n";
@@ -41,11 +63,20 @@ fn build_vip_services_response(config: &crate::Config) -> String {
 
 /// Route a parsed C2N request to the full HTTP/1.1 response this node sends back to control.
 ///
-/// This mirrors Go's `handleC2N` (`ipn/ipnlocal/c2n.go`): an exact path match selects a handler,
-/// and anything with no registered handler falls through to
-/// `http.Error(w, "unknown c2n path", http.StatusBadRequest)`. Only the paths listed below are
+/// This mirrors Go's `handleC2N` (`ipn/ipnlocal/c2n.go`), including its dispatch *order*: exact
+/// path matches are tried first, then the prefix handlers registered with
+/// `ipnlocal.RegisterC2NPrefix`, and anything still unmatched falls through to
+/// `http.Error(w, "unknown c2n path", http.StatusBadRequest)`. Only the routes listed below are
 /// registered here; the fallthrough is the contract for everything else, so it is asserted by test
 /// rather than left implicit.
+///
+/// The one prefix route is [`C2N_PREFIX_REMOTE_API`] — the LocalAPI proxy — and it exists only when
+/// a [`LocalApi`](crate::LocalApi) is installed on the config, mirroring upstream's
+/// `feature/remoteconfig` build tag: with the feature omitted, `RegisterC2NPrefix` is never called,
+/// no prefix matches, and the path takes the same 400 as any other unknown path. Its capability
+/// version (142) is not declared either — the declaration is held at 125 for the reasons below — so
+/// control does not yet know to send one. The route is here so that raising the declaration is a
+/// declaration change and not also a port.
 ///
 /// ## Debug paths this node deliberately does not serve
 ///
@@ -73,22 +104,91 @@ fn build_vip_services_response(config: &crate::Config) -> String {
 /// The declared [`CapabilityVersion::CURRENT`](ts_capabilityversion::CapabilityVersion::CURRENT) is
 /// held below the versions that promise these handlers (127, 128 and 138) so the declaration and
 /// the responder agree; see that constant's documentation before raising it.
-fn build_c2n_response(request: &Request<String>, config: &crate::Config) -> String {
+async fn build_c2n_response(request: &Request<String>, config: &crate::Config) -> String {
     let c2n_request_path = request.uri().path();
+    // Exact-path handlers first.
     match c2n_request_path {
         C2N_PATH_ECHO => {
             tracing::trace!(c2n_request_path, "handling c2n echo");
-            format!("{}{}", C2N_RESPONSE_ECHO_PREAMBLE, request.body())
+            return format!("{}{}", C2N_RESPONSE_ECHO_PREAMBLE, request.body());
         }
         C2N_PATH_VIP_SERVICES => {
             tracing::trace!(c2n_request_path, "handling c2n vip-services fetch");
-            build_vip_services_response(config)
+            return build_vip_services_response(config);
         }
-        _ => {
-            tracing::debug!(c2n_request_path, "no handler for c2n path");
-            C2N_PATH_UNKNOWN.to_string()
-        }
+        _ => {}
     }
+    // Then prefix handlers, exactly as Go walks `c2nPrefixHandlers` after both exact-match lookups
+    // miss. Registered only when this node has a LocalAPI to proxy into (see the fn docs).
+    if let Some(local_api) = &config.local_api
+        && c2n_request_path.starts_with(C2N_PREFIX_REMOTE_API)
+    {
+        tracing::trace!(
+            c2n_request_path,
+            "handling c2n remote-config localapi proxy"
+        );
+        return handle_c2n_remote_api(request, local_api.as_ref(), config.remote_config).await;
+    }
+    tracing::debug!(c2n_request_path, "no handler for c2n path");
+    C2N_PATH_UNKNOWN.to_string()
+}
+
+/// Proxy a c2n request under `/remoteapi/localapi/*` into this node's LocalAPI at `/localapi/*`,
+/// with full read/write permission, when the local machine has opted in via
+/// [`Config::remote_config`](crate::Config::remote_config).
+///
+/// A faithful port of Go `handleC2NRemoteAPI` (`feature/remoteconfig/remoteconfig.go`), refusals
+/// included and in upstream's order:
+///
+/// 1. The pref gate comes **first**: with `RemoteConfig` off the answer is
+///    `403 remote config not enabled by local machine`, and the path is never even parsed. This is
+///    the whole of the authorization decision — upstream builds the proxied LocalAPI handler with
+///    `Actor: ipnauth.Self`, `PermitRead`/`PermitWrite` set and no `RequiredPassword`, so nothing
+///    downstream re-checks it.
+/// 2. The prefix is re-checked inside the handler, so a mis-registered prefix refuses with
+///    `400 unexpected remote-config path` instead of proxying an unrelated path.
+/// 3. `/remoteapi` is stripped; if the strip changed nothing Go refuses "rather than looping".
+///    Here that case *is* the failed `strip_prefix`, so the two collapse into one refusal.
+/// 4. The stripped path must land under `/localapi/`, else the same 400. Upstream's own comment is
+///    that the rewrite must not be able to aim the LocalAPI handler at an arbitrary path.
+///
+/// Only then is the request handed to the LocalAPI. The query string rides along: Go rewrites
+/// `URL.Path` only, leaving `RawQuery` untouched, so a LocalAPI endpoint that reads query
+/// parameters still sees them.
+async fn handle_c2n_remote_api(
+    request: &Request<String>,
+    local_api: &dyn crate::LocalApi,
+    remote_config: bool,
+) -> String {
+    if !remote_config {
+        tracing::debug!("refusing c2n remote-config request: pref not enabled by local machine");
+        return C2N_REMOTE_CONFIG_DISABLED.to_string();
+    }
+    let path = request.uri().path();
+    if !path.starts_with(C2N_PREFIX_REMOTE_API) {
+        tracing::debug!(
+            c2n_request_path = path,
+            "remote-config path outside the c2n prefix"
+        );
+        return C2N_REMOTE_API_BAD_PATH.to_string();
+    }
+    let Some(local_api_path) = path
+        .strip_prefix(C2N_REMOTE_API_STRIP)
+        .filter(|stripped| stripped.starts_with(C2N_LOCAL_API_PREFIX))
+    else {
+        tracing::debug!(
+            c2n_request_path = path,
+            "remote-config path is not a LocalAPI path"
+        );
+        return C2N_REMOTE_API_BAD_PATH.to_string();
+    };
+    let target = match request.uri().query() {
+        Some(query) => format!("{local_api_path}?{query}"),
+        None => local_api_path.to_string(),
+    };
+    local_api
+        .serve(request.method().as_str(), &target, request.body())
+        .await
 }
 
 #[derive(Debug, thiserror::Error, Clone, Copy, Eq, PartialEq)]
@@ -135,9 +235,11 @@ fn parse_c2n_ping(payload: &str) -> Result<Request<String>, PingError> {
 }
 
 /// Handles [`ts_control_serde::PingRequest`]s from the control plane to this Tailscale node.
-/// Handles Control-to-Node (C2N) `GET /echo` (echo back the body) and `GET /vip-services` (report
-/// the VIP services this node hosts, from `config`); non-C2N requests are skipped with a warning,
-/// while C2N requests for an unhandled path return a "400 Bad Request" to the control plane.
+/// Handles Control-to-Node (C2N) `GET /echo` (echo back the body), `GET /vip-services` (report
+/// the VIP services this node hosts, from `config`) and — when a [`LocalApi`](crate::LocalApi) is
+/// installed on `config` — the `/remoteapi/localapi/*` prefix that proxies into this node's
+/// LocalAPI; non-C2N requests are skipped with a warning, while C2N requests for an unhandled path
+/// return a "400 Bad Request" to the control plane.
 ///
 /// ## C2N Mechanism
 ///
@@ -187,7 +289,7 @@ pub async fn handle_ping(
             }
         };
 
-        let c2n_response = build_c2n_response(&c2n_request, config);
+        let c2n_response = build_c2n_response(&c2n_request, config).await;
 
         let ping_response_url = control_url.join(ping_request.url.path())?;
         tracing::trace!(%ping_response_url, ?c2n_response, "posting c2n response");
@@ -233,8 +335,8 @@ mod tests {
     /// The query-string case pins that the match is on the path alone, so
     /// `/debug/tka/log?limit=60` (the form Go's handler reads its `limit` from) cannot accidentally
     /// route somewhere else.
-    #[test]
-    fn c2n_debug_endpoints_answer_unknown_path() {
+    #[tokio::test]
+    async fn c2n_debug_endpoints_answer_unknown_path() {
         let config = crate::Config::default();
         for raw in [
             "GET /debug/netmap HTTP/1.1\r\nHost: c2n\r\n\r\n",
@@ -244,7 +346,7 @@ mod tests {
             "GET /debug/tka/log HTTP/1.1\r\nHost: c2n\r\n\r\n",
             "GET /debug/tka/log?limit=60 HTTP/1.1\r\nHost: c2n\r\n\r\n",
         ] {
-            let resp = build_c2n_response(&c2n_request(raw), &config);
+            let resp = build_c2n_response(&c2n_request(raw), &config).await;
             assert_eq!(
                 resp, "HTTP/1.1 400 Bad Request\r\n\r\nunknown c2n path",
                 "{raw} must take the unknown-c2n-path fallthrough"
@@ -255,8 +357,8 @@ mod tests {
     /// The 400 fallthrough is the contract for *every* unregistered path, not just the three debug
     /// endpoints — including other handlers Go registers that this node does not implement. Losing
     /// it (e.g. by routing a prefix) would make control believe an unimplemented feature works.
-    #[test]
-    fn c2n_unknown_path_still_answers_400() {
+    #[tokio::test]
+    async fn c2n_unknown_path_still_answers_400() {
         let config = crate::Config::default();
         for raw in [
             "GET /debug/goroutines HTTP/1.1\r\nHost: c2n\r\n\r\n",
@@ -265,7 +367,7 @@ mod tests {
             "GET /not-a-real-path HTTP/1.1\r\nHost: c2n\r\n\r\n",
             "GET / HTTP/1.1\r\nHost: c2n\r\n\r\n",
         ] {
-            let resp = build_c2n_response(&c2n_request(raw), &config);
+            let resp = build_c2n_response(&c2n_request(raw), &config).await;
             assert_eq!(
                 resp, "HTTP/1.1 400 Bad Request\r\n\r\nunknown c2n path",
                 "{raw} must take the unknown-c2n-path fallthrough"
@@ -273,11 +375,229 @@ mod tests {
         }
     }
 
+    /// A stand-in for this node's LocalAPI: records what the proxy handed it and answers with a
+    /// fixed `200`, so the rewrite the proxy performs is observable without standing up a live
+    /// LocalAPI server. The real implementation is installed by the `tsnet` facade.
+    #[derive(Default)]
+    struct RecordingLocalApi {
+        /// Every `(method, target, body)` triple [`crate::LocalApi::serve`] was called with.
+        seen: std::sync::Mutex<alloc::vec::Vec<(String, String, String)>>,
+    }
+
+    impl crate::LocalApi for RecordingLocalApi {
+        fn serve<'a>(
+            &'a self,
+            method: &'a str,
+            target: &'a str,
+            body: &'a str,
+        ) -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = String> + Send + 'a>>
+        {
+            alloc::boxed::Box::pin(async move {
+                self.seen
+                    .lock()
+                    .expect("no test panics while holding it")
+                    .push((method.to_string(), target.to_string(), body.to_string()));
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{{\"Target\":\"{target}\"}}"
+                )
+            })
+        }
+    }
+
+    /// A config with a [`RecordingLocalApi`] installed, plus a handle to inspect what it recorded.
+    fn config_with_local_api(
+        remote_config: bool,
+    ) -> (crate::Config, alloc::sync::Arc<RecordingLocalApi>) {
+        let local_api = alloc::sync::Arc::new(RecordingLocalApi::default());
+        let config = crate::Config {
+            remote_config,
+            local_api: Some(local_api.clone()),
+            ..Default::default()
+        };
+        (config, local_api)
+    }
+
+    /// The one prefix route: `/remoteapi/localapi/*` is proxied into this node's LocalAPI at
+    /// `/localapi/*` once the local machine has opted in (Go `handleC2NRemoteAPI`,
+    /// `feature/remoteconfig/remoteconfig.go`). The proxy must strip exactly `/remoteapi`, keep the
+    /// method and body, and leave the query string on — Go rewrites `URL.Path` only and never
+    /// touches `RawQuery`. The version segment is deliberately not matched: the prefix ends at
+    /// `/localapi/`, so a future `v1` proxies the same way `v0` does.
+    #[tokio::test]
+    async fn c2n_remote_api_proxies_into_the_local_api() {
+        let (config, local_api) = config_with_local_api(true);
+
+        let status = build_c2n_response(
+            &c2n_request("GET /remoteapi/localapi/v0/status HTTP/1.1\r\nHost: c2n\r\n\r\n"),
+            &config,
+        )
+        .await;
+        assert_eq!(
+            status,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"Target\":\"/localapi/v0/status\"}",
+            "the LocalAPI's own response is returned to control verbatim"
+        );
+
+        let set = build_c2n_response(
+            &c2n_request(
+                "POST /remoteapi/localapi/v1/prefs?exit-node=hq HTTP/1.1\r\nHost: c2n\r\nContent-Length: 14\r\n\r\n{\"RouteAll\":1}",
+            ),
+            &config,
+        )
+        .await;
+        assert!(
+            set.starts_with("HTTP/1.1 200 OK"),
+            "a LocalAPI version the prefix does not name proxies the same way; got {set}"
+        );
+
+        let seen = local_api
+            .seen
+            .lock()
+            .expect("no test panics while holding it")
+            .clone();
+        assert_eq!(
+            seen,
+            alloc::vec![
+                (
+                    "GET".to_string(),
+                    "/localapi/v0/status".to_string(),
+                    String::new()
+                ),
+                (
+                    "POST".to_string(),
+                    "/localapi/v1/prefs?exit-node=hq".to_string(),
+                    "{\"RouteAll\":1}".to_string(),
+                ),
+            ],
+            "method, the `/remoteapi`-stripped target (query string kept) and body all cross intact"
+        );
+    }
+
+    /// The trust gate. Go checks `Prefs.RemoteConfig` *before* it looks at the path at all, and
+    /// answers `403 remote config not enabled by local machine` when it is off. This fork's pref
+    /// defaults to `false`, so an un-opted-in node refuses control's LocalAPI proxy and the request
+    /// never reaches the LocalAPI.
+    #[tokio::test]
+    async fn c2n_remote_api_refuses_when_pref_disabled() {
+        let (config, local_api) = config_with_local_api(false);
+
+        for raw in [
+            "GET /remoteapi/localapi/v0/status HTTP/1.1\r\nHost: c2n\r\n\r\n",
+            "POST /remoteapi/localapi/v0/prefs HTTP/1.1\r\nHost: c2n\r\n\r\n",
+        ] {
+            let resp = build_c2n_response(&c2n_request(raw), &config).await;
+            assert_eq!(
+                resp, "HTTP/1.1 403 Forbidden\r\n\r\nremote config not enabled by local machine",
+                "{raw} must be refused while the local machine has not opted in"
+            );
+        }
+        assert!(
+            local_api
+                .seen
+                .lock()
+                .expect("no test panics while holding it")
+                .is_empty(),
+            "a refused request must never reach the LocalAPI"
+        );
+    }
+
+    /// The prefix must match in full, trailing slash included — everything else keeps taking the
+    /// `unknown c2n path` 400, *even with a LocalAPI installed*. Go registers the prefix as
+    /// `"/remoteapi/localapi/"` and `handleC2N` prefix-matches on exactly that string, so
+    /// `/remoteapi/localapi` (no slash), a sibling path under `/remoteapi/`, and a path that merely
+    /// starts with the same bytes all fall through. Losing this would make control believe an
+    /// unimplemented endpoint works.
+    #[tokio::test]
+    async fn c2n_remote_api_near_miss_paths_still_answer_400() {
+        let (config, local_api) = config_with_local_api(true);
+
+        for raw in [
+            "GET /remoteapi/localapi HTTP/1.1\r\nHost: c2n\r\n\r\n",
+            "GET /remoteapi/localapinot/v0/status HTTP/1.1\r\nHost: c2n\r\n\r\n",
+            "GET /remoteapi/ HTTP/1.1\r\nHost: c2n\r\n\r\n",
+            "GET /remoteapi HTTP/1.1\r\nHost: c2n\r\n\r\n",
+            "GET /localapi/v0/status HTTP/1.1\r\nHost: c2n\r\n\r\n",
+            "GET /remoteapi/localapi?v0/status HTTP/1.1\r\nHost: c2n\r\n\r\n",
+        ] {
+            let resp = build_c2n_response(&c2n_request(raw), &config).await;
+            assert_eq!(
+                resp, "HTTP/1.1 400 Bad Request\r\n\r\nunknown c2n path",
+                "{raw} must take the unknown-c2n-path fallthrough"
+            );
+        }
+        assert!(
+            local_api
+                .seen
+                .lock()
+                .expect("no test panics while holding it")
+                .is_empty(),
+            "no near-miss path may reach the LocalAPI"
+        );
+    }
+
+    /// With no LocalAPI installed the prefix route is not registered at all, so the proxy path
+    /// takes the same `unknown c2n path` 400 as any other unregistered path — and does so *before*
+    /// the pref is consulted, so it is indistinguishable from a node that never had the feature.
+    /// This is upstream's omitted-`remoteconfig`-build behaviour: the `init` that calls
+    /// `ipnlocal.RegisterC2NPrefix` never runs, so `handleC2N` finds no prefix to match.
+    #[tokio::test]
+    async fn c2n_remote_api_unknown_without_a_local_api() {
+        for remote_config in [false, true] {
+            let config = crate::Config {
+                remote_config,
+                local_api: None,
+                ..Default::default()
+            };
+            let resp = build_c2n_response(
+                &c2n_request("GET /remoteapi/localapi/v0/status HTTP/1.1\r\nHost: c2n\r\n\r\n"),
+                &config,
+            )
+            .await;
+            assert_eq!(
+                resp, "HTTP/1.1 400 Bad Request\r\n\r\nunknown c2n path",
+                "with no LocalAPI to proxy into, the prefix route does not exist \
+                 (remote_config = {remote_config})"
+            );
+        }
+    }
+
+    /// Go's handler re-derives the LocalAPI path itself and refuses with
+    /// `400 unexpected remote-config path` if the strip does not land under `/localapi/` — a
+    /// defensive check against a mis-registered prefix, which is why it is unreachable through the
+    /// dispatcher and is exercised on the handler directly.
+    #[tokio::test]
+    async fn c2n_remote_api_handler_refuses_a_path_it_cannot_rewrite() {
+        let local_api = RecordingLocalApi::default();
+
+        for raw in [
+            // Strips to `/v0/status`, which is not under `/localapi/`.
+            "GET /remoteapi/v0/status HTTP/1.1\r\nHost: c2n\r\n\r\n",
+            // Nothing to strip: Go refuses "rather than looping" when the rewrite is a no-op.
+            "GET /localapi/v0/status HTTP/1.1\r\nHost: c2n\r\n\r\n",
+            // Under the strip prefix but not under the registered c2n prefix.
+            "GET /remoteapi/localapi HTTP/1.1\r\nHost: c2n\r\n\r\n",
+        ] {
+            let resp = handle_c2n_remote_api(&c2n_request(raw), &local_api, true).await;
+            assert_eq!(
+                resp, "HTTP/1.1 400 Bad Request\r\n\r\nunexpected remote-config path",
+                "{raw} is not rewritable into a LocalAPI path"
+            );
+        }
+        assert!(
+            local_api
+                .seen
+                .lock()
+                .expect("no test panics while holding it")
+                .is_empty(),
+            "a path the handler cannot rewrite must never reach the LocalAPI"
+        );
+    }
+
     /// The two paths this node *does* serve still route through the same dispatcher, so the
     /// fallthrough above is proven to be a real routing decision and not a blanket 400.
     /// Go's `handleC2NEcho` writes the request body back verbatim with a bare 200.
-    #[test]
-    fn c2n_echo_and_vip_services_still_route() {
+    #[tokio::test]
+    async fn c2n_echo_and_vip_services_still_route() {
         let config = crate::Config {
             advertise_services: alloc::vec!["svc:web".to_string()],
             ..Default::default()
@@ -286,13 +606,15 @@ mod tests {
         let echo = build_c2n_response(
             &c2n_request("GET /echo HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello"),
             &config,
-        );
+        )
+        .await;
         assert_eq!(echo, "HTTP/1.1 200 OK\r\n\r\nhello");
 
         let vip = build_c2n_response(
             &c2n_request("GET /vip-services HTTP/1.1\r\nHost: c2n\r\n\r\n"),
             &config,
-        );
+        )
+        .await;
         let (status, json) = parse_response(&vip);
         assert_eq!(status, "HTTP/1.1 200 OK");
         assert_eq!(json["VIPServices"][0]["Name"].as_str().unwrap(), "svc:web");
