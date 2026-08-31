@@ -8,7 +8,7 @@
 | **This repository at ledger time** | `6bddedb` — workspace version `0.44.0` |
 | **`ts_capabilityversion::CapabilityVersion::CURRENT` here** | **125** (2025-08-11) — held below 126; see §B, *c2n endpoints behind the declared capability version* |
 | **Gap window this ledger covers** | capability version **131 → 145**, i.e. upstream commits from 2025-10-06 to 2026-08-29 (the window is anchored to when capver 130 landed upstream; the declaration here being 125 rather than 130 does not change what upstream added) |
-| **Previous pin** | `1e69418c298b680562a2fecd7020f7f58d17d166` (2026-08-27). Four upstream commits separate the two, three of them in mapped packages — see §B, *New since the previous pin* |
+| **Previous pin** | `1e69418c298b680562a2fecd7020f7f58d17d166` (2026-08-27). Four upstream commits separate the two, three of them in mapped packages — see §B, *New at this revision* |
 
 > This repository is also a fork of the Rust port `tailscale/tailscale-rs` — see
 > [`VENDOR.md`](VENDOR.md) for that provenance. This ledger is about the *other* upstream: the Go
@@ -289,10 +289,12 @@ docs/typo/refactor commits filtered out. The sweep list itself was widened at th
 #### New at this revision
 
 Two things produced this list. Upstream moved four commits (`1e69418` → `49e148c`), and the sweep
-list itself was widened — `net/socks5`, `net/tsdial`, `net/tlsdial`, `net/bakedroots`, `ipn/localapi`
-and `tsnet` are all in the package-mapping table above and none of them was in the `for p in …`
-loop, so a whole class of upstream change had been going unseen. All four new commits landed in
-packages that were unswept, which is why three of them are here and not in the previous revision.
+list itself was widened — `net/socks5`, `net/tsdial`, `net/tlsdial`, `net/bakedroots`,
+`ipn/localapi`, `feature/remoteconfig` and `tsnet` are all covered by
+[Package mapping](#package-mapping) above, whether as a table row or as a *partial* entry in the
+no-counterpart list, and none of them was in the `for p in …` loop, so a whole class of upstream
+change had been going unseen. All four new commits landed in packages that were unswept, which is
+why three of them are here and not in the previous revision.
 The loop is corrected in [Re-deriving this ledger](#re-deriving-this-ledger); the last three bullets
 below predate the pin move and were surfaced only by the widening.
 
@@ -402,13 +404,16 @@ short result means the pattern broke, not that upstream added nothing.
 
 **The sweep list is part of the ledger, and it was wrong.** The loop above gained
 `net/socks5`, `net/tsdial`, `net/tlsdial`, `net/bakedroots`, `ipn/localapi`,
-`feature/remoteconfig` and `tsnet` at this revision. All seven appear in the package-mapping table at
-the top of this document, and none of them was being swept, so upstream changes to the SOCKS5 loopback,
+`feature/remoteconfig` and `tsnet` at this revision. All seven are covered by
+[Package mapping](#package-mapping) at the top of this document — five as table rows,
+`ipn/localapi` and `feature/remoteconfig` as *partial* entries in the no-counterpart list below it —
+and none of them was being swept, so upstream changes to the SOCKS5 loopback,
 the user-facing dialer, the baked root certificates, the LocalAPI and the `tsnet` facade were
 invisible to every previous re-derivation. That is how upstream's constant-time fix to the SOCKS5
 credential comparison — the sharpest new row in §B — reached this ledger only at the revision that
-widened the loop, rather than at the one after it landed. When the mapping table gains a row, add it
-here too, or the mapping is a claim the sweep never checks.
+widened the loop, rather than at the one after it landed. When [Package mapping](#package-mapping)
+gains an upstream package — a table row or a *partial* entry alike — add it here too, or the mapping
+is a claim the sweep never checks.
 Two of the additions are noisy by nature and should be read with that in mind: `ipn/localapi` catches
 every multi-package commit that also touched `cmd/tailscale`, most of which is the daemon CLI this
 library deliberately does not have, and `tsnet` is swept but not itemised row-by-row in §B — see the
