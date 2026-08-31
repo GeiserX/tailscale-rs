@@ -8,6 +8,7 @@ mod funnel_fail_closed;
 mod ipv4_only_forwarder;
 mod ipv4_only_host_net;
 mod lints_enabled;
+mod porting_ledger;
 mod ssh_isolation;
 
 /// Run CI checks on all crates.
@@ -31,6 +32,7 @@ pub const CHECK_FNS: &[(&str, CheckFn)] = &[
     ("ipv4_only_host_net", ipv4_only_host_net::run),
     ("funnel_fail_closed", funnel_fail_closed::run),
     ("ssh_isolation", ssh_isolation::run),
+    ("porting_ledger", porting_ledger::run),
 ];
 
 /// Convenience alias for `Result` with a boxed `std::error::Error`.
