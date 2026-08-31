@@ -1,0 +1,18 @@
+{
+  "schema": "restock-beads/v1",
+  "pin": "49e148c4a30b4f8098f69468fd27a7021d85ea02",
+  "beads": [
+    {
+      "title": "Compare the loopback SOCKS5 proxy credentials in constant time",
+      "description": "Upstream's SOCKS5 server checked the client-supplied username and password with plain Go string equality, which returns at the first differing byte, and replaced both with subtle.ConstantTimeCompare -- evaluating both halves unconditionally so the username result does not gate whether the password is examined. This repository has the same shape and the same exposure: src/loopback.rs's negotiate() does `uname.as_slice() == PROXY_USERNAME.as_bytes() && passwd.as_slice() == cred.as_bytes()`, two data-dependent comparisons with the second short-circuited by the first. The threat model transfers unchanged -- gen_cred mints a 16-byte random credential that gates every dial into the tailnet, the listener is on 127.0.0.1, and any local process can retry without limit or lockout, so a reject whose timing varies leaks the credential a byte at a time. The decision to make: reuse the constant-time comparison this tree already has (src/tsnet.rs's localapi::cred_ok, the fork's mirror of the subtle.ConstantTimeCompare Go's LocalAPI has always used) rather than adding a dependency, hoist it somewhere both the LocalAPI and the SOCKS5 path can call, and cover both the length-mismatch and equal-length-differing cases plus the both-fields-evaluated property by test. Host-facing, not wire-facing: no peer or control plane observes it, so this is not an interop change. See PORTING.md section B, 'New at this revision'.",
+      "upstream": "net/socks5/socks5.go @ 49e148c4a30b4f8098f69468fd27a7021d85ea02",
+      "priority": 2
+    },
+    {
+      "title": "Give tsnet Server::http_client the transport defaults Go's HTTPClient now inherits",
+      "description": "Upstream stopped returning `&http.Client{Transport: &http.Transport{DialContext: s.Dial}}` from tsnet.Server.HTTPClient. It now clones http.DefaultTransport, overrides DialContext to dial over the tailnet and sets Proxy to nil, so the returned client picks up ForceAttemptHTTP2, MaxIdleConns, MaxIdleConnsPerHost, IdleConnTimeout, TLSHandshakeTimeout and ExpectContinueTimeout -- and any default Go adds later. This repository's Server::http_client (src/tsnet.rs) builds a hyper_util legacy client over Device::http_connector with the builder's own defaults, and its doc comment still describes itself as 'the exact analog' of the Go expression upstream has just stopped using, so the comment is now stale as well as the behaviour. The decision to make: for each http.DefaultTransport setting, decide what the hyper_util equivalent is, whether hyper's default already matches it, and where it differs whether Go's value or hyper's is right for a tailnet-only client -- then apply it and correct the comment. The Proxy=nil half needs no work and should be recorded as already true: TailnetConnector dials the overlay directly and has no environment-proxy path to disable. Worth copying upstream's test shape (TestHTTPClientDefaultTransport) -- it fails on any unrecognised future field, forcing a decision instead of drifting. Host-facing, not wire-facing. See PORTING.md section B, 'New at this revision'.",
+      "upstream": "tsnet/tsnet.go @ 49e148c4a30b4f8098f69468fd27a7021d85ea02",
+      "priority": 2
+    }
+  ]
+}
