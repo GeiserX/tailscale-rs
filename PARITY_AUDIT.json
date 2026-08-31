@@ -1,0 +1,104 @@
+{
+  "schema": "parity-audit/v1",
+  "auditedPrs": [
+    {
+      "url": "https://github.com/GeiserX/tailscale-rs/pull/305",
+      "verdict": "faithful",
+      "notes": "Docs only (PORTING.md). Its factual claims about upstream check out at the pin: tailcfg.CurrentCapabilityVersion is 145, the 131-145 capability rows exist with the dates and subjects quoted, and the re-derive appendix's commands work. No code, so no behaviour to diverge."
+    },
+    {
+      "url": "https://github.com/GeiserX/tailscale-rs/pull/306",
+      "verdict": "faithful",
+      "notes": "Docs only. The correction it makes is right: net/dns/config.go serviceIPs returns BOTH the IPv4 and IPv6 MagicDNS service IPs by default and narrows to IPv4 only when ShouldForceRegisterMagicDNSIPv4Only is set, so the old row had the default inverted. Row 133 now reads needs-port, which matches the tree."
+    },
+    {
+      "url": "https://github.com/GeiserX/tailscale-rs/pull/308",
+      "verdict": "gaps",
+      "notes": "The wire decode (ts_packet::tsmp) is faithful, including Go's len(p) < 33 laxity. The state model is not: upstream keeps the control-learned and TSMP-learned disco keys as separate fields with the TSMP one taking precedence; this tree keeps one field. See findings."
+    },
+    {
+      "url": "https://github.com/GeiserX/tailscale-rs/pull/310",
+      "verdict": "gaps",
+      "notes": "StatusNode::is_router matches ipnstate.PeerStatus.IsRouter clause for clause, including the AllowedIPs-empty case. Node::is_router narrows Go's comparison against the full Addresses list to one prefix per family; disclosed in the doc comment, and a divergence only on multi-address-per-family input. See findings."
+    },
+    {
+      "url": "https://github.com/GeiserX/tailscale-rs/pull/311",
+      "verdict": "gaps",
+      "notes": "The reasoning for not implementing c2n /debug/netmap, /debug/health and /debug/tka/log is sound, and the routing refactor plus its 400 fallthrough tests match Go's handler set. But the declaration it lands on still asserts capability versions 120 and 121, which this tree did not implement at that commit. See findings."
+    },
+    {
+      "url": "https://github.com/GeiserX/tailscale-rs/pull/307",
+      "verdict": "gaps",
+      "notes": "The segment-boundary rule is correct and the test rewrite genuinely calls the production selector now. The other half of Go's lookup, path.Clean on the request path plus its non-absolute-path refusal, was not ported. See findings."
+    },
+    {
+      "url": "https://github.com/GeiserX/tailscale-rs/pull/312",
+      "verdict": "gaps",
+      "notes": "Codecs check out against disco/disco.go: the 72-byte bind common block, the UDPRelayEndpoint layout and its at-least-one-addr:port rule, the per-type version laxity, and the 4-in-6 unmap on decode. The Geneve control-bit fix is right, Go sets it at 0x80 in byte 1. The relay-address sanitizer is stricter than upstream. See findings."
+    },
+    {
+      "url": "https://github.com/GeiserX/tailscale-rs/pull/313",
+      "verdict": "gaps",
+      "notes": "The unbounded-attribution-map fix has no upstream analogue to diverge from and is a straight improvement. The source-address filter is a deliberate fork restriction that upstream's relayManager does not have, and the PR says so. Recorded as a divergence because it is one. See findings."
+    },
+    {
+      "url": "https://github.com/GeiserX/tailscale-rs/pull/314",
+      "verdict": "faithful",
+      "notes": "Matches magicsock.Conn.PriorityMessageForPeer refusal for refusal (zero self disco key, unknown peer, isWireguardOnly, no selfIPMatchingFamily source) and wireguard-go's own drops in Peer.SendPriorityMessage (no live keypair, empty message, over MaxPriorityMessageContentSize). Both call sites match device/receive.go. Marshal mirrors TSMPDiscoKeyAdvertisement.Marshal including the mixed-family refusal."
+    },
+    {
+      "url": "https://github.com/GeiserX/tailscale-rs/pull/318",
+      "verdict": "faithful",
+      "notes": "Verified against wireguard-go at the revision the pinned tailscale go.mod names. SendPriorityMessage queues straight to the outbound queue, and both call sites run it before the flush that follows: ahead of SendKeepalive on the initiator and ahead of SendStagedPackets on the responder. Splicing the advertisement in front of the batch is the right restoration of that order here."
+    }
+  ],
+  "gate": {
+    "ran": true,
+    "pass": false,
+    "detail": "TS_RS_EXPERIMENT=this_is_unstable_software bin/check on current main (7c39ae0, clean tree), CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=4. Two failures, both reproduce on untouched main and neither is caused by the audited PRs. (1) Step 1, cargo +nightly fmt --check: 22 import-granularity diffs across 10 files. Toolchain artifact, not a repo regression: local nightly rustfmt is 1.10.0-nightly (fd7ed57dfd 2026-08-29), and the gating CI lane runs cargo fmt --check on the pinned stable toolchain (rustfmt 1.9.0-stable), which I ran separately and it exits 0. (2) The bins/tests/benches/examples clippy pass: clippy::items_after_test_module in ts_netstack_smoltcp_socket/src/tcp/stream.rs:429, a file untouched by every PR audited here. Steps that did pass when run individually past the set -e stop: cargo run -p checks (the anti-leak check) and the --lib clippy pass. The steps after the clippy failure (doc, deny, machete, nextest, doc-tests, build) were not reached. The PR bodies of #305 and #310 already record both failures as pre-existing."
+  },
+  "findings": [
+    {
+      "prUrl": "https://github.com/GeiserX/tailscale-rs/pull/307",
+      "title": "The serve mux matches the raw request target; Go cleans the path first, so a dot-dot segment still reaches a backend it was never mounted for",
+      "detail": "getServeHandler looks up r.URL.Path exactly, then sets pth = path.Clean(r.URL.Path), refuses to continue if the cleaned path is not absolute (the guard against the '*' and '' request targets spinning the loop), and only then walks the path backwards over its separators. The merged fork keeps the raw target: request_path returns the request-line path with the query stripped and applies no cleaning, and match_path_handler runs mount_claims_path over that string. With mounts at / and /api, a request for /api/../secret is claimed by /api here because the remainder after the mount starts with a slash, while Go cleans it to /secret and routes it to /. That is the same class the PR set out to fix, a request reaching a backend it was never mounted for, left standing in the half of Go's lookup that was not ported. The malformed-target guard is missing too: 'GET * HTTP/1.1' yields the path '*', which no mount claims in Go but which the root mount claims here, since a root mount normalizes to the empty prefix that claims everything.",
+      "upstream": "ipn/ipnlocal/serve.go @ 49e148c4a30b4f8098f69468fd27a7021d85ea02",
+      "severity": "major"
+    },
+    {
+      "prUrl": "https://github.com/GeiserX/tailscale-rs/pull/308",
+      "title": "A TSMP-learned disco key is stored in the same field control writes, so the next netmap update overwrites it with control's stale key",
+      "detail": "Upstream models this as two keys per endpoint. endpointDisco carries controlKey and tsmpKey side by side with a tsmpActive flag, endpointDisco.key() returns tsmpKey whenever tsmpActive is set, and updateTSMPDiscoKey preserves controlKey while writing tsmpKey. HandleDiscoKeyAdvertisement's unchanged-key early return compares the advertisement against epDisco.keyFromTSMP(), the TSMP-learned key specifically, not against the effective one. The merged fork has one field: PeerTracker::learn_disco_key compares against existing.disco_key and writes node.disco_key, and there is no TSMP-versus-control distinction anywhere in ts_runtime/src/peer_tracker. Two consequences. First, apply_peer_update upserts nodes built from control wholesale, so a later netmap Full or Delta carrying the peer's old disco key silently discards the key just learned over TSMP, where upstream keeps preferring the TSMP one. That is precisely the situation the feature exists for, a peer whose key control has not caught up with, so the port loses its own motivating case on the next map poll. Second, the unchanged-key refusal is evaluated against the effective key rather than the TSMP key, so an advertisement that merely restates what control already said is dropped where upstream would record it as the active TSMP key.",
+      "upstream": "wgengine/magicsock/endpoint.go @ 49e148c4a30b4f8098f69468fd27a7021d85ea02",
+      "severity": "major"
+    },
+    {
+      "prUrl": "https://github.com/GeiserX/tailscale-rs/pull/310",
+      "title": "Node::is_router compares routes against one prefix per family, where Go compares against every address the node holds",
+      "detail": "tailcfg.Node.IsRouter iterates AllowedIPs and reports true for any prefix not present in the node's full Addresses slice, so a node control gave several prefixes in one family is still not a router on account of any of them. The merged is_router tests each accepted route against tailnet_address.ipv4 or tailnet_address.ipv6, the single first prefix retained per family, so a second same-family address assigned by control reads as a routed prefix and the node is misreported as a router. The doc comment discloses this and the case does not arise with what control assigns today, which is why this is minor rather than major, but it is a divergence from the predicate the PR claims to port. The sibling StatusNode::is_router has no such gap: it reproduces ipnstate.PeerStatus.IsRouter's clause, not-a-single-host-IP or a host IP that is not one of ours, exactly.",
+      "upstream": "tailcfg/tailcfg.go @ 49e148c4a30b4f8098f69468fd27a7021d85ea02",
+      "severity": "minor"
+    },
+    {
+      "prUrl": "https://github.com/GeiserX/tailscale-rs/pull/311",
+      "title": "Declaring capability version 125 still claims 120 and 121, the peer-relay versions this tree did not implement at that commit",
+      "detail": "A capability version is a contiguous claim, which the PR states and which its own test asserts by pinning CURRENT below the first unimplemented version. Upstream's list makes 120 'Client understands peer relay disco messages, and implements peer client and relay server functions' and 121 'Client understands peer relay endpoint alloc with AllocateUDPRelayEndpointRequest and AllocateUDPRelayEndpointResponse'. At the merge of this PR neither was implemented: peer-relay disco arrived later in #312, which by its own account implements only the client half and deliberately excludes serving as a relay and originating an allocation request. So 125 was, and after #312 remains, an overclaim on 120 and 121, the exact defect the PR was opened to remove for 127, 128 and 138. The commit body acknowledges the choice and PORTING.md tracks it, so this is filed as the unresolved half of the PR's own stated goal rather than as an undetected error.",
+      "upstream": "tailcfg/tailcfg.go @ 49e148c4a30b4f8098f69468fd27a7021d85ea02",
+      "severity": "minor"
+    },
+    {
+      "prUrl": "https://github.com/GeiserX/tailscale-rs/pull/312",
+      "title": "The relay-address sanitizer rejects relay servers on private, unique-local and (by default) all IPv6 addresses, which upstream handshakes with normally",
+      "detail": "start_relay_handshake runs every addr:port a CallMeMaybeVia advertises through relay_addr_allowed, which is is_pingable_candidate: for IPv4 it rejects unspecified, loopback, link-local, multicast, broadcast and is_private, and for IPv6 it rejects everything unless enable_ipv6 is set, then rejects unique-local and link-local. Upstream's relayManager applies no such filter to a UDPRelayEndpoint's AddrPorts; it handshakes with what the endpoint advertises. A self-hosted peer relay on a private LAN address, which is a normal deployment of net/udprelay, therefore never yields a path here and the peer stays on DERP, which is the outcome this PR exists to avoid. The restriction is a deliberate fork anti-leak invariant and is documented as such, and the fork's invariants outrank parity by the repo's own rule, so it is recorded rather than disputed. Worth a ledger row so the interop cost is not rediscovered as a bug.",
+      "upstream": "wgengine/magicsock/relaymanager.go @ 49e148c4a30b4f8098f69468fd27a7021d85ea02",
+      "severity": "minor"
+    },
+    {
+      "prUrl": "https://github.com/GeiserX/tailscale-rs/pull/313",
+      "title": "The source address of a peer-relay datagram is filtered before the frame is read, where upstream takes it as given",
+      "detail": "handleRxDiscoMsg passes src.ap straight through to handleRxDiscoMsgRunLoop, which keys handshake work by addrPortVNI{event.from, event.vni} and never tests the source address against any address class. The merged handle_relay_disco applies relay_addr_allowed to from before parsing, so a relay server answering from a private, loopback or link-local source has its challenge dropped and the handshake does not advance. This is the same divergence family as the finding on #312 and is stated plainly in the commit body as a deliberate fork restriction with no upstream counterpart; it is filed because it is a behavioural difference from the function the diff cites, not because the reasoning is wrong. Its practical reach is narrower than the #312 finding, since a relay whose advertised addresses already passed the sanitizer will normally answer from one of them.",
+      "upstream": "wgengine/magicsock/relaymanager.go @ 49e148c4a30b4f8098f69468fd27a7021d85ea02",
+      "severity": "minor"
+    }
+  ]
+}
