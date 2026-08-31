@@ -3,12 +3,12 @@
 | | |
 | --- | --- |
 | **Upstream source** | `https://github.com/tailscale/tailscale` (Go) |
-| **Upstream commit this ledger was written against** | `49e148c4a30b4f8098f69468fd27a7021d85ea02` (2026-08-29, `tsnet: base HTTPClient's transport on http.DefaultTransport`) |
-| **Upstream `tailcfg.CurrentCapabilityVersion` at that commit** | **145** (2026-08-04) — unchanged from the previous pin |
-| **This repository at ledger time** | `6bddedb` — workspace version `0.44.0` |
+| **Upstream commit this ledger was written against** | `d9cc55e33b4a9f092e21b882df39aa4005cb0fa4` (2026-08-31, `tsnet: avoid depending on mutable DefaultTransport`) |
+| **Upstream `tailcfg.CurrentCapabilityVersion` at that commit** | **145** (2026-08-04) — unchanged from the previous two pins |
+| **This repository at ledger time** | `7c39ae0` — workspace version `0.44.0` |
 | **`ts_capabilityversion::CapabilityVersion::CURRENT` here** | **125** (2025-08-11) — held below 126; see §B, *c2n endpoints behind the declared capability version* |
-| **Gap window this ledger covers** | capability version **131 → 145**, i.e. upstream commits from 2025-10-06 to 2026-08-29 (the window is anchored to when capver 130 landed upstream; the declaration here being 125 rather than 130 does not change what upstream added) |
-| **Previous pin** | `1e69418c298b680562a2fecd7020f7f58d17d166` (2026-08-27). Four upstream commits separate the two, three of them in mapped packages — see §B, *New at this revision* |
+| **Gap window this ledger covers** | capability version **131 → 145**, i.e. upstream commits from 2025-10-06 to 2026-08-31 (the window is anchored to when capver 130 landed upstream; the declaration here being 125 rather than 130 does not change what upstream added) |
+| **Previous pin** | `49e148c4a30b4f8098f69468fd27a7021d85ea02` (2026-08-30). Only two upstream commits separate the two, one of them in a mapped package — but the sweep list was widened again at this revision, which is where the new rows came from. See §B, *New at this revision* |
 
 > This repository is also a fork of the Rust port `tailscale/tailscale-rs` — see
 > [`VENDOR.md`](VENDOR.md) for that provenance. This ledger is about the *other* upstream: the Go
@@ -155,13 +155,16 @@ Assessments are one of **needs port**, **not applicable**, **already covered**.
 This is the sharpest available axis: `tailcfg.CurrentCapabilityVersion` is upstream's own record of
 every client behaviour change that control can observe. The window is anchored to capver 130, the
 last version this port tracked before the ledger existed; the declaration here is **125**, held
-below 126, see §B. Upstream is still at **145** at the new pin, so the window is the same fifteen
-versions the previous revision covered — what moved is *this tree*, which has since ported three of
-them (135, 142, 144). Descriptions are upstream's own (`tailcfg/tailcfg.go`, `tailcfg/nodecap`).
+below 126, see §B. Upstream is still at **145** at the new pin — `tailcfg/tailcfg.go:197` — so the
+window is the same fifteen versions the previous revision covered. Descriptions are upstream's own
+(`tailcfg/tailcfg.go`, `tailcfg/nodecap`).
 
-Three rows changed assessment since the previous revision, all in the same direction — **needs
-port** → **already covered** — and all because work landed here, not because upstream moved. Each
-says so inline.
+**No row changed assessment at this revision.** Both halves of the usual reason are absent:
+upstream added no capability version between `49e148c4a` and `d9cc55e33`, and no port landed in
+this tree in the interval either — the only two commits here since the last revision are the two
+documentation passes that produced and then corrected it (#323, #324). The three rows the previous
+revision flipped (135, 142, 144) still say why they flipped, because that history is what makes the
+row re-checkable; they did not move again. §B is where this revision's changes are.
 
 | Ver | Date | Upstream change | Assessment |
 | --- | --- | --- | --- |
@@ -184,8 +187,10 @@ says so inline.
 Net: of the fifteen versions upstream added, **one still needs a port** — 133, host-OS-facing —
 **four are already covered** (135, 137, 142, 144), and the remaining ten are not applicable to an
 embedded userspace node (138 among them, once the declaration was held below the version that
-promises it). The previous revision counted five needing a port; three of those five landed here in
-the interval and one (138) was resolved by the declaration, leaving 133.
+promises it). That is the same count the previous revision reached, and for the same reasons: this
+axis stood still on both sides. Row 133 was re-checked against the tree at this pin and is still
+open — `ts_host_net::HostDns::nameservers` is a `Vec<Ipv4Addr>`, and `ts_runtime::tun_actor` fills
+it with the single IPv4 service IP, so there is still no IPv6 MagicDNS address to register.
 
 ### B. Behaviour upstream changed in the window that is not capver-gated
 
@@ -194,7 +199,8 @@ docs/typo/refactor commits filtered out. The sweep list itself was widened at th
 *New at this revision* below and the note in [Re-deriving this ledger](#re-deriving-this-ledger).
 
 - **TSMP disco-key advertisement** (`net/packet`, `net/tstun`, `wgengine/magicsock`,
-  `control/controlclient`: `c54d24369`, `c870d3811`, `bf467727f`, `82a381e54`, `014d5bd9e`) —
+  `control/controlclient`: `c54d24369`, `c870d3811`, `bf467727f`, `82a381e54`, `014d5bd9e`,
+  `3799eaf26`, `fb27d87e0`) —
   peers now advertise their disco key in a TSMP message around the WireGuard handshake, and learn a
   peer's disco key from it without restarting WireGuard. It is the one item here a real Go peer will
   *send us* unprompted. **Both halves are now covered** — *changed from "receive side covered, send
@@ -211,6 +217,19 @@ docs/typo/refactor commits filtered out. The sweep list itself was widened at th
   triggers a handshake), and `ts_dataplane` decides the content (Go
   `magicsock.Conn.PriorityMessageForPeer`). Row 144 above is the capability-version view of the same
   work.
+  Two upstream commits that the previous revision did not name are worth recording, because both
+  turn out to *confirm* what is here rather than to open a gap. `3799eaf26`
+  (`wgengine/magicsock`, `wgengine`) replaced the periodic advertiser — a 2-minute timer with
+  suppression rules bolted on (`c76113ac7`, `92ab4866d`, `ee76a7d3f`, `54005752a`) — with the
+  single `SetPriorityMessageOnEstablishmentFunc` callback that `wireguard-go` invokes on rekey. At
+  the pin there is no periodic sender left in `wgengine/magicsock/magicsock.go`, so the
+  establishment-only send this tree implements is upstream's current shape, not a subset of it.
+  And `fb27d87e0` (`net/tstun/wrap.go`) removed the `buildfeatures.HasCacheNetMap &&
+  envknob.BoolDefaultTrue("TS_USE_CACHED_NETMAP")` guard from the *receive* side, so a Go node now
+  consumes any advertisement carrying a non-zero key regardless of whether it participates in
+  netmap caching — which is exactly what `ts_dataplane::filter_inbound_from_peer` has always done
+  (the only guard here is the zero-key check, and the advertisement is still dropped rather than
+  delivered). Upstream converged on this tree's behaviour; nothing to do.
 - **IPv6 fragment extension-header handling in the filter** (`net/packet`, `wgengine/filter`:
   `4c4ec3d46`, `26b2ed0a6`) — upstream extended its RFC 1858-style fragment classification to IPv6
   fragment extension headers. **Needs port only under `Config::enable_ipv6`**: `ts_dataplane`
@@ -288,15 +307,125 @@ docs/typo/refactor commits filtered out. The sweep list itself was widened at th
 
 #### New at this revision
 
-Two things produced this list. Upstream moved four commits (`1e69418` → `49e148c`), and the sweep
-list itself was widened — `net/socks5`, `net/tsdial`, `net/tlsdial`, `net/bakedroots`,
-`ipn/localapi`, `feature/remoteconfig` and `tsnet` are all covered by
-[Package mapping](#package-mapping) above, whether as a table row or as a *partial* entry in the
-no-counterpart list, and none of them was in the `for p in …` loop, so a whole class of upstream
-change had been going unseen. All four new commits landed in packages that were unswept, which is
-why three of them are here and not in the previous revision.
-The loop is corrected in [Re-deriving this ledger](#re-deriving-this-ledger); the last three bullets
-below predate the pin move and were surfaced only by the widening.
+Upstream moved almost nothing: two commits (`49e148c` → `d9cc55e3`), one of them
+(`2a4d74356`, `wgengine/netstack`) a data-race fix on a *test* logger in a Go test helper
+(`makeHangDialer`) with no production counterpart, and the other (`d9cc55e33`) a revision of the
+`tsnet` row already above. Everything else new here came from **widening the sweep list a second
+time**.
+
+The previous revision widened the loop by seven packages and wrote down the rule that produced
+them: *every upstream package [Package mapping](#package-mapping) names must be in the sweep, or the
+mapping is a claim the sweep never checks.* Applying that rule literally at this revision shows it
+was not finished. Sixteen more mapped packages were still unswept: `wgengine` itself (only three of
+its subdirectories were in the loop, so `wgengine/userspace.go`, `wgengine/wgcfg` and
+`wgengine/router` were not), `ipn` (only `ipn/localapi` was, so `ipn/ipnlocal`, `ipn/ipnstate` and
+`ipn/store` were not), and then `net/netmon`, `net/art`, `control/controlhttp`, `types/persist`,
+`feature/identityfederation`, `feature/taildrop`, `feature/ssh`, `feature/acme`, `ssh/tailssh`,
+`util/clientmetric`, `tstime`, `tstest`, `tool/` and `tsd`.
+The loop in [Re-deriving this ledger](#re-deriving-this-ledger) is rewritten to cover all of them,
+and is now built from parent paths (`wgengine`, `ipn`) so that a *new* subdirectory upstream adds
+cannot fall outside it the way `wgengine/router` did.
+
+Two of the rows the widening surfaced need a port; the rest are recorded so the next re-derivation
+does not re-cut them.
+
+- **Quad-100 traffic is absorbed locally regardless of port and protocol** (`wgengine/netstack`:
+  `1b4091161`) — **needs port**, and it is the sharpest row at this revision. Upstream's
+  `handleLocalPackets` used to intercept traffic to the Tailscale service IP only for an
+  allow-list — TCP 53/80/8080, UDP 53 — and returned `filter.Accept` for everything else, letting
+  the packet fall through to the ACL filter and on to `wireguard-go`. Upstream removed the
+  allow-list: quad-100 is now absorbed into netstack unconditionally, "so such traffic never
+  reaches the conntrack / peer-routing layers", and a companion `hittingServiceIP` case in
+  `acceptTCP` RSTs an unserved quad-100 TCP port instead of falling through to the
+  `isTailscaleIP` branch that rewrote the dial to `127.0.0.1:<port>`.
+  This tree has the same allow-list, and in **TUN transport mode it has the leak upstream closed**.
+  `ts_runtime::tun_actor`'s `classify_magic_dns` intercepts an inbound packet only when it is
+  IPv4 **and** UDP **and** destined to `100.100.100.100:53`; every other packet takes
+  `Intercept::NotIntercepted` and is handed to the overlay unchanged. `tun_actor` steers
+  `100.100.100.100/32` into the TUN whenever MagicDNS is enabled, so the host really does emit such
+  packets — a stub resolver speculatively trying DoT on `100.100.100.100:853` is upstream's own
+  cited example. `ts_overlay_router` then resolves the destination against the outbound table, and
+  that table carries a configured exit node's `0.0.0.0/0` as `RouteAction::Wireguard(peer)`
+  (`ts_runtime::route_updater`), which matches `100.100.100.100`. With an exit node selected — the
+  configuration this fork exists for — the node's own service-IP traffic is encrypted and sent to a
+  peer. Without one it is merely dropped as unrouted, which is why this has not been visible.
+  The **netstack** transport is already correct and needs no change: `ts_runtime::netstack_actor`
+  gives the netstack interface `100.100.100.100` as a local address, so all quad-100 traffic
+  terminates there whatever its port or protocol. The second half of upstream's fix is
+  **not applicable**: this tree has no `isTailscaleIP` → host-loopback dial rewrite for an
+  unserved port to fall through to, so there is nothing to guard.
+- **The DNS forwarder sets TC against the *client's* size limit, not just its own read buffer**
+  (`net/dns/resolver`: `8cac8b117`) — **needs port (narrow)**. Upstream added
+  `checkResponseSizeAndSetTC` and calls it on every path that returns a UDP answer: if the response
+  exceeds the EDNS buffer size the *request* advertised — or 512 bytes when the request carried no
+  EDNS OPT record, per RFC 1035 — the TC bit is set (the body is left intact), so the stub resolver
+  knows to retry over TCP.
+  Here, `ts_dns_wire` already does this correctly for the answers this node *builds* itself: it
+  caps an authoritative response at 512 and sets TC when it drops an answer, asserted by
+  `oversized_answer_set_sets_tc_and_caps_512`. The gap is the **forwarded** path.
+  `ts_runtime::magic_dns`'s `cap_response` sets TC only when the upstream reply exceeds
+  `MAX_UPSTREAM_RESPONSE` (4096) and has to be chopped mid-message. A reply between the client's
+  limit and 4096 — say 900 bytes for a client that sent a plain, non-EDNS query — is relayed
+  verbatim with TC clear, where Go would set it. The port is to parse the forwarded request's OPT
+  record for its advertised UDP size, default to 512 when absent, and set TC when the reply exceeds
+  it; the existing 4096 cap stays as the read bound it already is. Narrow in practice, because the
+  query is forwarded verbatim and a well-behaved upstream honours the EDNS size itself — but "the
+  upstream is well-behaved" is exactly the assumption upstream stopped making. Host-facing, not
+  wire-facing.
+- **DNS is still configured when router programming fails** (`wgengine`: `cfd101f9d`) — **not
+  applicable: deliberate divergence, and it should stay one.** Upstream's `Reconfig` returned on
+  any `router.Set` error before its DNS block ran, so a host where route programming always fails
+  never learned about MagicDNS at all; upstream now records the router error, still calls
+  `dns.Set`, and joins the errors. This tree does the opposite on purpose: `ts_runtime::tun_actor`
+  logs `"host route programming failed; TUN idle (fail-closed)"`, tears the host state down and
+  returns, so the interface never carries traffic it cannot route. Pointing the host resolver at
+  `100.100.100.100` while the TUN is being torn down would point it at an address nothing answers
+  on. The fail-closed invariant outranks parity here — see the quality bar's rule 5 — and the
+  Linux half of the same commit (per-interface IPv6 gating in `wgengine/router/osrouter`) is
+  independently not applicable: `ts_host_net` programs routes and DNS and installs no netfilter
+  rules. Recording the divergence rather than porting it.
+- **SSH `acceptEnv` hardening** (`ssh/tailssh`: `651049ec1`, `9d48dbd56`) — **not applicable**, and
+  the reason is structural. Upstream rejects `LD_*`/`DYLD_*` in `acceptEnv` filtering and keeps
+  accepted variable names and values off the incubator command line. This fork's SSH server never
+  reaches that hazard: `src/ssh/shell.rs` builds the child environment with `env_clear()` plus a
+  fixed six-variable allow-list (`HOME`, `USER`, `LOGNAME`, `SHELL`, `PATH`, `TERM`), so no
+  client-supplied variable — dangerous or benign — is ever placed in the shell's environment, and
+  there is no incubator process whose argv could carry one. The visible divergence is that the
+  policy's `acceptEnv` is modelled here — `ts_control::ssh_policy`'s `SshRule::accept_env`, carried
+  through onto `SshAccept::accept_env` — and then deliberately never applied: Go passes accepted
+  variables through to the session, this fork drops all of them. That is a scope decision in the
+  safe direction, named here so it is not re-cut as a defect.
+- **Digit-only SSH usernames refused** (`ssh/tailssh`: `f368a96e0`) — **not applicable**, narrowly.
+  Upstream rejects a purely numeric SSH username with a banner because Go's user lookup falls back
+  to resolving a numeric string as a UID, making `ssh 0@host` ambiguous with root. This tree's
+  `resolve_user` calls `getpwnam` only and has no numeric-UID fallback, so a digit-only name
+  matches nothing and already fails closed before a shell is spawned. The ambiguity the refusal
+  exists to close cannot arise; what differs is only the message the client sees.
+- **`net/netmon`'s `InterfaceIPDisappeared` predicate** (`5927c1864`) — **not applicable**.
+  Upstream fixed a reversed predicate that reported addresses which had *appeared* as having
+  disappeared. `ts_netmon` exposes no `ChangeDelta` equivalent — it emits a debounced link-changed
+  signal and nothing that answers "which address went away" — so there is no predicate here to be
+  reversed. Named because `net/netmon` is a mapped package that had never been swept.
+- **`ipn/store`: `WriteState(id, nil)` deletes the key** (`7355116c0`) — **not applicable**.
+  Upstream's stores wrote a nil value into their cache map, so a later `ReadState` returned
+  `(nil, nil)` instead of `ErrStateNotExist` and a reset node could not log back in. The bug needs a
+  nil/absent ambiguity to exist. `StateStore::write_state` (`src/tsnet.rs`) takes `&[u8]`, which has
+  no nil, and `read_state` returns `Option<Vec<u8>>`, which distinguishes absent from present; the
+  single call site writes a serialized identity blob and never an empty slice.
+- **`feature/identityfederation`: query parameters stripped from the client ID** (`34e992f59`) —
+  **already covered**. Upstream was sending the whole `tskey-client-…?ephemeral=…` string as the
+  OAuth `client_id` in the JWT-for-token exchange, and now sends the part before the `?`.
+  `ts_control::wif` has always split the secret at the first `?` into a `stripped` value plus its
+  parsed attributes, and `token_exchange_body` takes that stripped id. Recorded because
+  `feature/identityfederation` is a mapped package this sweep reached for the first time.
+
+#### Carried from the previous revision's widening
+
+The six bullets below were new when the loop first gained `net/socks5`, `net/tsdial`,
+`net/tlsdial`, `net/bakedroots`, `ipn/localapi`, `feature/remoteconfig` and `tsnet`. All six were
+re-checked against this pin and against this tree. Five are unchanged; the `tsnet.Server.HTTPClient`
+row is the one upstream revised at this pin, and its bullet is rewritten in place to describe what
+upstream now does rather than what it did for one day.
 
 - **SOCKS5 proxy credentials compared in constant time** (`net/socks5`: `60576f8bd`) — upstream's
   SOCKS5 server checked the client-supplied username and password with plain string equality, which
@@ -313,20 +442,30 @@ below predate the pin move and were surfaced only by the widening.
   the `subtle.ConstantTimeCompare` Go's LocalAPI has always used), so the SOCKS5 path is the one
   place on the loopback that does not use it. Host-facing, not wire-facing; no peer or control plane
   observes it.
-- **`tsnet.Server.HTTPClient` built from `http.DefaultTransport`** (`tsnet`: `49e148c4a`) — upstream
-  stopped returning `&http.Client{Transport: &http.Transport{DialContext: s.Dial}}` and now clones
-  `http.DefaultTransport`, overriding `DialContext` and setting `Proxy` to nil, so the client picks
-  up `ForceAttemptHTTP2`, `MaxIdleConns`, `IdleConnTimeout`, `TLSHandshakeTimeout` and
-  `ExpectContinueTimeout` — and any default Go adds later. **Needs port** (narrow, host-facing).
-  `Server::http_client` (`src/tsnet.rs`) builds a `hyper_util` legacy client over the tailnet
-  connector with the builder's own defaults, and its doc comment still calls itself "the exact
-  analog of Go's `&http.Client{Transport: &http.Transport{DialContext: s.Dial}}`" — a sentence that
-  described upstream accurately until this commit and no longer does. The port is to decide, per
-  setting, what the `hyper` equivalent of each `http.DefaultTransport` default is, apply it, and
-  correct the comment. The `Proxy = nil` half is already structurally true here: `TailnetConnector`
-  dials the overlay directly and has no environment-proxy path to disable. Upstream's own test
-  (`TestHTTPClientDefaultTransport`) fails on any unrecognised future field, which is the shape worth
-  copying — a test that forces a decision rather than one that drifts.
+- **`tsnet.Server.HTTPClient` carries `http.DefaultTransport`'s settings** (`tsnet`: `49e148c4a`,
+  then `d9cc55e33`) — **still needs a port** (narrow, host-facing), but *the port target changed at
+  this revision*, so the row is rewritten rather than restated. `49e148c4a` stopped returning
+  `&http.Client{Transport: &http.Transport{DialContext: s.Dial}}` and *cloned*
+  `http.DefaultTransport`. `d9cc55e33` — the new pin, landed a day later — undid the clone: an
+  application is permitted to replace or mutate the package-level `http.DefaultTransport`, so
+  cloning it made `HTTPClient` inherit whatever an embedder had done to a global. Upstream now
+  spells the transport out as a literal and pins the settings by hand: `ForceAttemptHTTP2: true`,
+  `MaxIdleConns: 100`, `IdleConnTimeout: 90s`, `TLSHandshakeTimeout: 10s`,
+  `ExpectContinueTimeout: 1s`, `DialContext: s.Dial`, and no `Proxy` — with a comment telling the
+  next reader to keep it in sync with `http.DefaultTransport` by hand.
+  That matters here twice over. First, the port is no longer "work out the `hyper` equivalent of
+  whatever Go's global currently holds"; it is a fixed list — five settings, plus the tailnet
+  dialer this tree already installs — to decide about one at a time. Second,
+  the reason upstream backed the clone out — a mutable process-global leaking into a tailnet
+  client — is a hazard this tree never had, because `hyper_util`'s builder has no such global; the
+  divergence is only that `Server::http_client` (`src/tsnet.rs`) takes the builder's own defaults
+  rather than Go's chosen ones, and its doc comment still calls itself "the exact analog" of the Go
+  expression upstream stopped using at the previous pin. The `Proxy = nil` half stays structurally true:
+  `TailnetConnector` dials the overlay directly and has no environment-proxy path to disable.
+  Upstream's `TestHTTPClientDefaultTransport` still fails on any unrecognised future field — and now
+  also asserts that `TLSClientConfig`, `TLSNextProto` and `HTTP2` are *nil*, since a literal
+  transport must not pick up the lazily-populated state a shared global accumulates. That test shape
+  is still the one worth copying: it forces a decision instead of drifting.
 - **`Dialer.Close` no longer touches the peerapi transport when omitted** (`net/tsdial`:
   `72780705e`) — **not applicable**. The bug is that Go's `Dialer.Close` called `PeerAPITransport()`
   unconditionally, which panics in a binary built with the `ts_omit_peerapiclient` build tag. There
@@ -367,32 +506,41 @@ watchdog, `types/netmap` field removals), and upstream-internal locking/allocati
 `control/controlclient`, `derp/derpserver` and `ipn/ipnlocal`. From the newly swept packages: the
 tree-wide renames and modernizers that touched `net/socks5` (`bd2a2d53d`, `2810f0c6f`, `3ec5be3f5`,
 `c2e474e72`) and the `net/tsdial` commits that only follow upstream's own refactors of
-`types/netmap`, `netmon` and `syncs`. `tsnet` itself has 124 commits in the window and is **not**
-re-derived here: that facade has its own line-by-line parity matrix in
-[`docs/TSNET_PARITY.md`](docs/TSNET_PARITY.md), and duplicating it into this ledger would create two
-records that disagree. Only `tsnet` changes that alter behaviour a mapped crate already implements
-are pulled in, as `49e148c4a` was above.
+`types/netmap`, `netmon` and `syncs`. From the packages swept for the first time at this revision:
+`wgengine/router`'s Linux netfilter, `ip rule` and connmark work (`ts_host_net` installs no firewall
+rules), `wgengine/wgcfg`'s removal of `Peers` from its config struct and the `wireguard-go` bumps
+that go with it, `ssh/tailssh`'s exit-status framing and incubator test fixes, `feature/acme`'s
+per-domain locking, `ipn/ipnlocal`'s locking and delta-path rework, and `2a4d74356`, the new pin's
+sibling commit, which fixes a data race on a *test* logger in a Go test helper. `tsnet` itself has
+125 commits in the window and is **not** re-derived here: that facade has its own line-by-line
+parity matrix in [`docs/TSNET_PARITY.md`](docs/TSNET_PARITY.md), and duplicating it into this ledger
+would create two records that disagree. Only `tsnet` changes that alter behaviour a mapped crate
+already implements are pulled in, as `49e148c4a` and `d9cc55e33` were above.
 
 ### Re-deriving this ledger
 
 ```sh
 # The capability-version window (§A): everything above CapabilityVersion::CURRENT here.
-git -C <tailscale-go> grep -n 'CurrentCapabilityVersion CapabilityVersion' 49e148c -- tailcfg/tailcfg.go
-git -C <tailscale-go> grep -nE '^//[[:space:]]*-[[:space:]]*1[3-9][0-9]:' 49e148c -- tailcfg/tailcfg.go
+git -C <tailscale-go> grep -n 'CurrentCapabilityVersion CapabilityVersion' d9cc55e3 -- tailcfg/tailcfg.go
+git -C <tailscale-go> grep -nE '^//[[:space:]]*-[[:space:]]*1[3-9][0-9]:' d9cc55e3 -- tailcfg/tailcfg.go
 
-# What upstream touched per mapped package since capver 130 landed (§B).
-for p in tailcfg disco derp net/packet net/tstun wgengine/filter wgengine/magicsock \
-         net/netcheck net/stun control/controlclient control/controlbase tka \
-         net/dns wgengine/netstack net/udprelay types/key \
-         net/socks5 net/tsdial net/tlsdial net/bakedroots ipn/localapi \
-         feature/remoteconfig tsnet; do
+# What upstream touched per mapped package since capver 130 landed (§B). Every upstream package
+# named in "Package mapping" is in this list; parent paths (wgengine, ipn) are used where the
+# mapping names several children, so a subdirectory upstream adds later cannot fall outside it.
+for p in tailcfg disco derp net/packet net/tstun net/netcheck net/stun net/dns \
+         net/udprelay net/socks5 net/tsdial net/tlsdial net/bakedroots net/netmon net/art \
+         control/controlclient control/controlbase control/controlhttp \
+         wgengine ipn tsd tka types/key types/persist tsnet \
+         feature/remoteconfig feature/identityfederation feature/taildrop feature/ssh \
+         feature/acme ssh/tailssh util/clientmetric tstime tstest tool/; do
   echo "== $p"; git -C <tailscale-go> log --since=2025-10-06 --oneline -- "$p"
 done
 
 # Only what moved since the pin this ledger currently carries — the fast path on a re-derivation
 # that follows soon after the last one. Read it *in addition to* the full sweep, never instead of
-# it: a row's assessment can change because this tree moved, with upstream perfectly still.
-git -C <tailscale-go> log --oneline 49e148c..<new-pin>
+# it: a row's assessment can change because this tree moved, with upstream perfectly still, and the
+# sweep list itself can be wrong (it has been, twice).
+git -C <tailscale-go> log --oneline d9cc55e3..<new-pin>
 ```
 
 The capability-history pattern is deliberately whitespace-tolerant: upstream writes those entries as
@@ -402,27 +550,42 @@ than trusting the exit status — at the pinned commit the second command return
 through 145, i.e. the fifteen-version window of §A plus the 130 row that anchors it. An empty or
 short result means the pattern broke, not that upstream added nothing.
 
-**The sweep list is part of the ledger, and it was wrong.** The loop above gained
-`net/socks5`, `net/tsdial`, `net/tlsdial`, `net/bakedroots`, `ipn/localapi`,
-`feature/remoteconfig` and `tsnet` at this revision. All seven are covered by
-[Package mapping](#package-mapping) at the top of this document — five as table rows,
-`ipn/localapi` and `feature/remoteconfig` as *partial* entries in the no-counterpart list below it —
-and none of them was being swept, so upstream changes to the SOCKS5 loopback,
-the user-facing dialer, the baked root certificates, the LocalAPI and the `tsnet` facade were
-invisible to every previous re-derivation. That is how upstream's constant-time fix to the SOCKS5
-credential comparison — the sharpest new row in §B — reached this ledger only at the revision that
-widened the loop, rather than at the one after it landed. When [Package mapping](#package-mapping)
-gains an upstream package — a table row or a *partial* entry alike — add it here too, or the mapping
-is a claim the sweep never checks.
-Two of the additions are noisy by nature and should be read with that in mind: `ipn/localapi` catches
-every multi-package commit that also touched `cmd/tailscale`, most of which is the daemon CLI this
-library deliberately does not have, and `tsnet` is swept but not itemised row-by-row in §B — see the
-note at the end of §B for why.
+**The sweep list is part of the ledger, and it has been wrong twice.** The previous revision added
+`net/socks5`, `net/tsdial`, `net/tlsdial`, `net/bakedroots`, `ipn/localapi`, `feature/remoteconfig`
+and `tsnet`, and wrote down the rule that produced them: when
+[Package mapping](#package-mapping) gains an upstream package — a table row or a *partial* entry
+alike — add it here too, or the mapping is a claim the sweep never checks. Applying that rule
+literally at this revision showed the list was still short by sixteen mapped packages, so the loop
+above was rebuilt from the mapping rather than extended by hand. The additions are `net/netmon`,
+`net/art`, `control/controlhttp`, `types/persist`, `feature/identityfederation`, `feature/taildrop`,
+`feature/ssh`, `feature/acme`, `ssh/tailssh`, `util/clientmetric`, `tstime`, `tstest`, `tool/`, `tsd`,
+and — the consequential ones — the parent paths `wgengine` and `ipn`.
+
+`wgengine` is the lesson. The old loop swept `wgengine/filter`, `wgengine/magicsock` and
+`wgengine/netstack` but not `wgengine` itself, so `wgengine/userspace.go`, `wgengine/wgcfg` and
+`wgengine/router` — all three named in [Package mapping](#package-mapping) — were invisible, and a
+subdirectory upstream created after the loop was written would have been invisible too. Sweeping
+the parent removes that failure mode entirely. It is why the quad-100 row, the sharpest new row in
+§B, is only reaching this ledger now: `1b4091161` landed upstream in April 2026, in a package that
+*was* in the loop, but the pattern that hid `wgengine/router` is the same pattern that makes a
+long-swept package's older commits easy to skim past. Re-derive against the list, not against
+memory of the last derivation.
+
+Two entries are noisy by nature and should be read with that in mind: `ipn` (which subsumes
+`ipn/localapi` and `ipn/ipnlocal`) catches every multi-package commit that also touched
+`cmd/tailscale`, most of which is the daemon CLI this library deliberately does not have, and
+`tsnet` is swept but not itemised row-by-row in §B — see the note at the end of §B for why. One
+mapping row has no upstream path to sweep at all: `golang.zx2c4.com/wireguard`'s device, which
+`ts_tunnel` re-implements, is an upstream *dependency* rather than a package in this repository —
+track it through upstream's `go.mod` bumps, not through this loop.
 
 When the pin is advanced, bump the header table, re-run the above, and rewrite §A and §B. A row
-whose assessment changes should say *why* it changed — and note that "why" is as often *this* tree
-moving as upstream moving: at this revision every changed row changed because a port landed here
-while upstream stood still.
+whose assessment changes should say *why* it changed — and note that "why" has three sources, not
+one. Upstream can move (as `d9cc55e33` moved the `tsnet.Server.HTTPClient` row at this revision,
+revising its own previous commit a day later). This tree can move, with upstream perfectly still (as
+it did at the previous revision, when three capability-version rows flipped to *already covered*).
+Or the **sweep itself** can widen and surface something that was true all along — which is where
+every new row at this revision came from.
 
 ## The quality bar for port PRs
 
