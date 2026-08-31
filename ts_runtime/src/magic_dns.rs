@@ -71,13 +71,24 @@ const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
 /// benign outcome — the stub resolver simply retries or times out — and Go's resolver likewise
 /// bounds outstanding forwards rather than spawning without limit.
 const MAX_INFLIGHT_FORWARDS: usize = 512;
-/// Cap on a forwarded upstream response we read into memory (a single UDP datagram).
+/// Cap on how much of a forwarded upstream response we relay back to the stub resolver (a single
+/// UDP datagram).
 ///
-/// Matches Go's forwarder read buffer (`maxResponseBytes`, ~4 KiB). The client's query is forwarded
-/// verbatim, so a client advertising a large EDNS UDP size can elicit a legitimately large
-/// (1300–4096 byte) UDP answer (big TXT sets, DNSSEC, many-record round-robins). Capping at the old
-/// 1232 truncated those and set TC, forcing a TCP retry this fork's UDP-only forwarder can't serve —
-/// so the large answer became unreachable. 4096 relays them intact.
+/// The value matches Go's forwarder read buffer (`maxResponseBytes`, ~4 KiB), but *where it applies
+/// differs*: here it is not a read bound and it does not bound memory. [`forward_query`] reads with
+/// `recv_from_bytes`, which issues `Recv { max_len: None }`, so the netstack has already copied the
+/// whole queued datagram out before [`cap_response`] sees it. What bounds the read is the netstack
+/// UDP socket's receive ring — `netcore::Config::udp_buffer_size`, 4 KiB by default and not
+/// overridden by `ts_runtime` — and smoltcp drops a datagram larger than that ring at enqueue rather
+/// than delivering a chopped one. With the ring and this cap both at 4 KiB, [`cap_response`]'s
+/// truncate-and-set-`TC` branch is therefore defensive: no datagram this socket can deliver reaches
+/// it (pinned by `cap_is_a_relay_bound_not_the_read_bound`).
+///
+/// The client's query is forwarded verbatim, so a client advertising a large EDNS UDP size can
+/// elicit a legitimately large (1300–4096 byte) UDP answer (big TXT sets, DNSSEC, many-record
+/// round-robins). Capping at the old 1232 truncated those and set TC, forcing a TCP retry this
+/// fork's UDP-only forwarder can't serve — so the large answer became unreachable. 4096 relays them
+/// intact.
 const MAX_UPSTREAM_RESPONSE: usize = 4096;
 
 /// The MagicDNS service IP. The netstack interface owns this address, so a `udp_bind` here
@@ -585,11 +596,15 @@ pub(crate) fn recursive_plan(view: &DnsView, default_upstreams: Vec<SocketAddr>)
     }
 }
 
-/// Cap a forwarded upstream response to a single UDP datagram ([`MAX_UPSTREAM_RESPONSE`]). When the
-/// response is too large it is truncated mid-message, so we set the `TC` (truncation) flag in the
-/// DNS header (byte 2, bit `0x02`) telling the stub resolver to retry over TCP — relaying a chopped
-/// answer without `TC` would surface a malformed-but-"complete" message. The flag is only set when
-/// truncation actually occurs.
+/// Cap a forwarded upstream response to a single UDP datagram ([`MAX_UPSTREAM_RESPONSE`]) before
+/// relaying it. When the response is too large it is truncated mid-message, so we set the `TC`
+/// (truncation) flag in the DNS header (byte 2, bit `0x02`) telling the stub resolver to retry over
+/// TCP — relaying a chopped answer without `TC` would surface a malformed-but-"complete" message.
+/// The flag is only set when truncation actually occurs.
+///
+/// This runs *after* the whole datagram has been read (see [`MAX_UPSTREAM_RESPONSE`]), so it bounds
+/// what we relay, not what we allocate — and while the cap is ≥ the netstack's UDP receive ring the
+/// truncating branch cannot fire on a datagram that ring could deliver.
 fn cap_response(mut resp: Vec<u8>) -> Vec<u8> {
     if resp.len() > MAX_UPSTREAM_RESPONSE {
         resp.truncate(MAX_UPSTREAM_RESPONSE);
@@ -2175,6 +2190,41 @@ mod tests {
         let out = cap_response(small);
         assert_eq!(out, before, "small response unchanged");
         assert_eq!(out[2] & 0x02, 0, "TC bit not set when no truncation");
+    }
+
+    #[test]
+    fn cap_is_a_relay_bound_not_the_read_bound() {
+        // `forward_query` reads with `recv_from_bytes`, which issues `Recv { max_len: None }`, so
+        // the netstack has already copied the whole datagram out before `cap_response` runs: the
+        // cap bounds what we relay, not what we read or allocate. What bounds the read is the
+        // netstack UDP socket's receive ring (`udp_buffer_size`, which `ts_runtime` leaves at the
+        // `netcore` default) -- smoltcp drops a datagram larger than that ring at enqueue instead
+        // of delivering it. Pin the consequence: the largest answer this socket can deliver is
+        // relayed byte-for-byte with TC untouched, so on the forwarded path the truncate-and-set-TC
+        // branch never fires and nothing sets TC today.
+        let ring = netstack::netcore::Config::default().udp_buffer_size;
+        assert!(
+            MAX_UPSTREAM_RESPONSE >= ring,
+            "cap ({MAX_UPSTREAM_RESPONSE}) is below the netstack udp receive ring ({ring}): the cap \
+             would then be what truncates a deliverable answer, and the docs saying otherwise are \
+             wrong"
+        );
+
+        let mut largest = build_query(0x302, &["example", "com"], 1, 1);
+        largest[2] |= 0x80; // QR=1
+        largest.resize(ring, 0xAB);
+        let before = largest.clone();
+
+        let out = cap_response(largest);
+        assert_eq!(
+            out, before,
+            "the largest deliverable datagram must be relayed verbatim"
+        );
+        assert_eq!(
+            out[2] & 0x02,
+            0,
+            "TC must not be set on a datagram that was never chopped"
+        );
     }
 
     #[test]
