@@ -203,6 +203,7 @@ mod tests {
             user_id: 0,
             tailnet: Some("tail1.ts.net".to_string()),
             tags: vec![],
+            addresses: vec![addr.ipv4.into(), addr.ipv6.into()],
             tailnet_address: addr,
             node_key: [0u8; 32].into(),
             node_key_expiry: None,

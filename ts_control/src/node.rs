@@ -141,7 +141,22 @@ pub struct Node {
     /// The tags assigned to this node.
     pub tags: Vec<String>,
 
-    /// The address of the node in the tailnet.
+    /// Every prefix control assigned this node (`tailcfg.Node.Addresses`), in wire order.
+    ///
+    /// Normally one IPv4 `/32` and one IPv6 `/128`, but the wire field is a variable-length list:
+    /// an IPv6-off tailnet assigns only the v4 prefix, and nothing in the protocol stops control
+    /// assigning more than one prefix of a family.
+    ///
+    /// [`tailnet_address`](Self::tailnet_address) is the *identity* projection of this list — the
+    /// first prefix of each family — and is what the overlay, MagicDNS and exit-node selection
+    /// reason about. The whole list is retained because [`is_router`](Self::is_router) has to ask
+    /// "is this prefix one of my own?" of **all** of them, exactly as Go's `tailcfg.Node.IsRouter`
+    /// does. Keep the two consistent when building a `Node` by hand.
+    pub addresses: Vec<ipnet::IpNet>,
+
+    /// The address of the node in the tailnet: the first prefix of each family in
+    /// [`addresses`](Self::addresses), with an unspecified placeholder for a family the tailnet
+    /// does not assign.
     pub tailnet_address: TailnetAddress,
 
     /// The node's [`NodePublicKey`].
@@ -351,14 +366,14 @@ impl Node {
     /// advertised subnet; Go's `IsRouter` makes no such exception — a `/32` that is not *this*
     /// node's own address still makes it a router. The two must stay separate.
     ///
-    /// The domain [`Node`] retains only the first IPv4 and first IPv6 prefix control assigned
-    /// ([`Node::tailnet_address`]), which is what control assigns in practice; a node handed two
-    /// prefixes of the same family would count the extra one as a routed address.
+    /// The comparison is against [`Node::addresses`] — *every* prefix control assigned this node,
+    /// as Go's `slices.Contains(n.Addresses, r)` is — and not against the first-prefix-per-family
+    /// pair in [`Node::tailnet_address`]. A node control handed two prefixes of one family would
+    /// otherwise have the second read as a routed address and be misreported as a router.
     pub fn is_router(&self) -> bool {
-        self.accepted_routes.iter().any(|route| match route {
-            ipnet::IpNet::V4(v4) => *v4 != self.tailnet_address.ipv4,
-            ipnet::IpNet::V6(v6) => *v6 != self.tailnet_address.ipv6,
-        })
+        self.accepted_routes
+            .iter()
+            .any(|route| !self.addresses.contains(route))
     }
 
     /// Report whether `route` is an advertised *subnet* route (as opposed to one of this node's
@@ -755,7 +770,9 @@ impl From<&ts_control_serde::Node<'_>> for Node {
         let service_vips = service_vips_from_cap_map(&cap_map);
 
         // `addresses` is a variable-length `Vec<IpNet>` on the wire (Go `[]netip.Prefix`), not a
-        // fixed (v4, v6) pair: an IPv6-off tailnet assigns only a v4 prefix. Pick the first of each
+        // fixed (v4, v6) pair: an IPv6-off tailnet assigns only a v4 prefix. The whole list is kept
+        // verbatim on `Node::addresses` (Go's `Node.Addresses`, which `IsRouter` tests routes
+        // against); `tailnet_address` is the identity projection. Pick the first of each
         // family. The v4 prefix is the node's tailnet identity (always present on a normal node);
         // if somehow absent we fall back to the unspecified `0.0.0.0/32` rather than panicking.
         // The v6 prefix is optional — when the tailnet is IPv4-only there is none, and the overlay
@@ -792,6 +809,7 @@ impl From<&ts_control_serde::Node<'_>> for Node {
                 .map(|x| x.iter().map(|x| x.to_string()).collect())
                 .unwrap_or_default(),
 
+            addresses: value.addresses.clone(),
             tailnet_address: TailnetAddress { ipv4, ipv6 },
             node_key: value.key,
             node_key_expiry: value.key_expiry,
@@ -1150,6 +1168,10 @@ mod tests {
             user_id: 0,
             tailnet: tailnet.map(str::to_string),
             tags: vec![],
+            addresses: vec![
+                "100.64.0.1/32".parse().unwrap(),
+                "fd7a::1/128".parse().unwrap(),
+            ],
             tailnet_address: TailnetAddress {
                 ipv4: "100.64.0.1/32".parse().unwrap(),
                 ipv6: "fd7a::1/128".parse().unwrap(),
@@ -1315,10 +1337,61 @@ mod tests {
 
         for (name, allowed, want) in cases {
             let mut n = node("host", Some("ts.net"));
+            n.addresses = vec![self4, self6];
             n.tailnet_address = TailnetAddress { ipv4: v4, ipv6: v6 };
             n.accepted_routes = allowed.clone();
             assert_eq!(n.is_router(), *want, "{name}");
         }
+    }
+
+    /// Go's `IsRouter` tests each `AllowedIPs` prefix against the node's **whole** `Addresses`
+    /// slice, so every prefix control assigned is "its own". The wire field is a variable-length
+    /// list, not a v4/v6 pair, so a tailnet may hand a node more than one prefix of a family; such
+    /// a node must not be reported as a router on account of the extra one — which comparing only
+    /// against the first-of-family `tailnet_address` pair does. Runs through the production `From`
+    /// impl so the retention of the full list is pinned along with the predicate.
+    #[test]
+    fn is_router_tests_every_assigned_address_not_only_the_first_of_each_family() {
+        let second4: ipnet::IpNet = "100.64.0.9/32".parse().unwrap();
+        let second6: ipnet::IpNet = "fd7a:115c:a1e0::9/128".parse().unwrap();
+        let wire = ts_control_serde::Node {
+            addresses: vec![
+                "100.64.0.1/32".parse().unwrap(),
+                second4,
+                "fd7a:115c:a1e0::1/128".parse().unwrap(),
+                second6,
+            ],
+            ..Default::default()
+        };
+        let domain: Node = (&wire).into();
+
+        // The identity projection is still the first prefix of each family...
+        assert_eq!(
+            domain.tailnet_address.ipv4,
+            "100.64.0.1/32".parse().unwrap()
+        );
+        // ...but every assigned prefix is retained, and (AllowedIPs absent ⇒ routes are exactly
+        // the addresses) none of them makes the node a router.
+        assert_eq!(domain.addresses, wire.addresses);
+        assert!(
+            !domain.is_router(),
+            "a node whose routes are exactly its own assigned prefixes is not a router"
+        );
+
+        // Either second-of-family address on its own is still not a routed prefix.
+        for extra in [second4, second6] {
+            let mut n = domain.clone();
+            n.accepted_routes = vec![extra];
+            assert!(
+                !n.is_router(),
+                "{extra} is one of this node's own addresses"
+            );
+        }
+
+        // The predicate still fires for a route that does reach past every assigned address.
+        let mut router = domain.clone();
+        router.accepted_routes.push("192.0.2.0/24".parse().unwrap());
+        assert!(router.is_router(), "a real subnet route makes it a router");
     }
 
     #[test]
