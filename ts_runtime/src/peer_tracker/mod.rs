@@ -1395,6 +1395,10 @@ mod tka_tests {
             user_id: 0,
             tailnet: Some("ts.net".to_string()),
             tags: Vec::new(),
+            addresses: vec![
+                "100.64.0.1/32".parse().unwrap(),
+                "fd7a:115c:a1e0::1/128".parse().unwrap(),
+            ],
             tailnet_address: TailnetAddress {
                 ipv4: "100.64.0.1/32".parse().unwrap(),
                 ipv6: "fd7a:115c:a1e0::1/128".parse().unwrap(),
