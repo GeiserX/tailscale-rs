@@ -529,13 +529,15 @@ mod test {
 
     fn rand_node() -> Node {
         let mut rng = rand::rng();
+        let tailnet_address = TailnetAddress {
+            ipv4: rand_ipv4(&mut rng).into(),
+            ipv6: rand_ipv6(&mut rng).into(),
+        };
 
         Node {
             stable_id: StableNodeId(rand_string(&mut rng, 32)),
-            tailnet_address: TailnetAddress {
-                ipv4: rand_ipv4(&mut rng).into(),
-                ipv6: rand_ipv6(&mut rng).into(),
-            },
+            addresses: vec![tailnet_address.ipv4.into(), tailnet_address.ipv6.into()],
+            tailnet_address,
             node_key: rng.random::<[u8; 32]>().into(),
             key_signature: vec![],
             disco_key: rng
@@ -778,6 +780,7 @@ mod test {
         };
 
         let node_a = Node {
+            addresses: vec![shared.ipv4.into(), shared.ipv6.into()],
             tailnet_address: shared.clone(),
             ..rand_node()
         };
@@ -785,6 +788,7 @@ mod test {
 
         // B claims the same tailnet IPs (churn). The ip index now points at B.
         let node_b = Node {
+            addresses: vec![shared.ipv4.into(), shared.ipv6.into()],
             tailnet_address: shared.clone(),
             ..rand_node()
         };
@@ -793,11 +797,13 @@ mod test {
 
         // Re-upsert A with different IPs. The old-value removal must not panic even though the
         // shared IP entries now belong to B.
+        let renumbered = TailnetAddress {
+            ipv4: Ipv4Addr::new(100, 64, 0, 2).into(),
+            ipv6: Ipv6Addr::new(0xfd7a, 0, 0, 0, 0, 0, 0, 2).into(),
+        };
         let node_a2 = Node {
-            tailnet_address: TailnetAddress {
-                ipv4: Ipv4Addr::new(100, 64, 0, 2).into(),
-                ipv6: Ipv6Addr::new(0xfd7a, 0, 0, 0, 0, 0, 0, 2).into(),
-            },
+            addresses: vec![renumbered.ipv4.into(), renumbered.ipv6.into()],
+            tailnet_address: renumbered,
             ..node_a.clone()
         };
         let id_a2 = db.upsert(&node_a2);
@@ -968,6 +974,10 @@ mod test {
             online: None,
             last_seen: None,
 
+                    addresses: vec![
+                        ipnet::IpNet::V4(ipv4.into()),
+                        ipnet::IpNet::V6(ipv6.into()),
+                    ],
                     tailnet_address: TailnetAddress {
                         ipv4: ipv4.into(),
                         ipv6: ipv6.into(),
