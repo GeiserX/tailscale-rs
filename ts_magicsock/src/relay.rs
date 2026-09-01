@@ -189,13 +189,24 @@ impl RelayPath {
         true
     }
 
-    /// Consume a relayed pong. Returns the round-trip latency when `tx_id` matched a ping we sent
-    /// through this endpoint, and marks the relay address confirmed and trusted.
+    /// Consume a relayed pong. Returns the address the matching ping was **sent to** and the
+    /// round-trip latency when `tx_id` matched a ping we sent through this endpoint, and marks
+    /// that address confirmed and trusted unless a better one is already held.
     ///
     /// The transaction id is single-use (removed on match), so a replayed pong confirms nothing.
-    /// `from` — the relay server address the pong arrived from — is what gets confirmed, because
-    /// that is the address we must send through; the peer's own address never appears here.
-    pub(crate) fn note_pong(&mut self, tx_id: TxId, now: Instant) -> Option<Duration> {
+    /// The address we sent to is what gets confirmed, because that is the address we must send
+    /// through; the peer's own address never appears here.
+    ///
+    /// The returned address is what lets the caller tell a winning pong from a losing one: compare
+    /// it against [`usable`](Self::usable) and they differ exactly when a rival address answered
+    /// and the incumbent was kept. A latency alone cannot express that, and the caller acts on the
+    /// difference — the pong's source only describes the path it came over, so it must not be
+    /// attributed to a path that is not the one carrying data.
+    pub(crate) fn note_pong(
+        &mut self,
+        tx_id: TxId,
+        now: Instant,
+    ) -> Option<(SocketAddr, Duration)> {
         let (to, sent) = self.in_flight.remove(&tx_id)?;
         let latency = now.saturating_duration_since(sent);
         match self.confirmed {
@@ -214,7 +225,7 @@ impl RelayPath {
                 });
             }
         }
-        Some(latency)
+        Some((to, latency))
     }
 
     /// The confirmed relay address and VNI, if one is confirmed and still trusted.
@@ -449,7 +460,12 @@ mod tests {
         // A slower rival neither takes over nor extends `a`'s trust window.
         let held = now + Duration::from_millis(100) + TRUST_DURATION;
         assert!(path.note_ping_sent([2u8; 12], b, now));
-        path.note_pong([2u8; 12], now + Duration::from_millis(300));
+        assert_eq!(
+            path.note_pong([2u8; 12], now + Duration::from_millis(300)),
+            Some((b, Duration::from_millis(300))),
+            "a losing pong still reports the address it answered for, so the caller can tell it \
+             apart from the confirmed one"
+        );
         assert_eq!(path.usable(now + Duration::from_millis(300)), Some((a, 7)));
         assert_eq!(
             path.usable(held + Duration::from_millis(1)),
@@ -462,7 +478,10 @@ mod tests {
         assert!(path.note_ping_sent([3u8; 12], a, later));
         path.note_pong([3u8; 12], later + Duration::from_millis(100));
         assert!(path.note_ping_sent([4u8; 12], b, later));
-        path.note_pong([4u8; 12], later + Duration::from_millis(10));
+        assert_eq!(
+            path.note_pong([4u8; 12], later + Duration::from_millis(10)),
+            Some((b, Duration::from_millis(10)))
+        );
         assert_eq!(path.usable(later + Duration::from_millis(10)), Some((b, 7)));
     }
 
