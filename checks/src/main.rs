@@ -8,6 +8,7 @@ mod funnel_fail_closed;
 mod ipv4_only_forwarder;
 mod ipv4_only_host_net;
 mod lints_enabled;
+mod parity_audit;
 mod porting_ledger;
 mod ssh_isolation;
 
@@ -33,6 +34,7 @@ pub const CHECK_FNS: &[(&str, CheckFn)] = &[
     ("funnel_fail_closed", funnel_fail_closed::run),
     ("ssh_isolation", ssh_isolation::run),
     ("porting_ledger", porting_ledger::run),
+    ("parity_audit", parity_audit::run),
 ];
 
 /// Convenience alias for `Result` with a boxed `std::error::Error`.
