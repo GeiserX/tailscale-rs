@@ -424,6 +424,43 @@ impl tokio::io::AsyncWrite for TcpStream {
     }
 }
 
+#[cfg(feature = "futures-io")]
+impl futures_io::AsyncRead for TcpStream {
+    fn poll_read(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> core::task::Poll<std::io::Result<usize>> {
+        self.poll_read(cx, buf)
+    }
+}
+
+#[cfg(feature = "futures-io")]
+impl futures_io::AsyncWrite for TcpStream {
+    fn poll_write(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+        buf: &[u8],
+    ) -> core::task::Poll<std::io::Result<usize>> {
+        self.poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: core::pin::Pin<&mut Self>,
+        _cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<std::io::Result<()>> {
+        core::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(
+        self: core::pin::Pin<&mut Self>,
+        _cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<std::io::Result<()>> {
+        self.shutdown_write();
+        core::task::Poll::Ready(Ok(()))
+    }
+}
+
 #[cfg(feature = "tokio")]
 #[cfg(test)]
 mod reaped_socket_mapping_tests {
@@ -509,42 +546,5 @@ mod reaped_socket_mapping_tests {
             std::io::ErrorKind::ConnectionReset,
             "writing to a reaped socket must surface as ConnectionReset"
         );
-    }
-}
-
-#[cfg(feature = "futures-io")]
-impl futures_io::AsyncRead for TcpStream {
-    fn poll_read(
-        self: core::pin::Pin<&mut Self>,
-        cx: &mut core::task::Context<'_>,
-        buf: &mut [u8],
-    ) -> core::task::Poll<std::io::Result<usize>> {
-        self.poll_read(cx, buf)
-    }
-}
-
-#[cfg(feature = "futures-io")]
-impl futures_io::AsyncWrite for TcpStream {
-    fn poll_write(
-        self: core::pin::Pin<&mut Self>,
-        cx: &mut core::task::Context<'_>,
-        buf: &[u8],
-    ) -> core::task::Poll<std::io::Result<usize>> {
-        self.poll_write(cx, buf)
-    }
-
-    fn poll_flush(
-        self: core::pin::Pin<&mut Self>,
-        _cx: &mut core::task::Context<'_>,
-    ) -> core::task::Poll<std::io::Result<()>> {
-        core::task::Poll::Ready(Ok(()))
-    }
-
-    fn poll_close(
-        self: core::pin::Pin<&mut Self>,
-        _cx: &mut core::task::Context<'_>,
-    ) -> core::task::Poll<std::io::Result<()>> {
-        self.shutdown_write();
-        core::task::Poll::Ready(Ok(()))
     }
 }
