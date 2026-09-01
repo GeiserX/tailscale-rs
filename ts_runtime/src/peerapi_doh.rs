@@ -81,7 +81,7 @@ use tokio::{
 };
 use ts_dns_wire::{Rcode, decode_query, encode_response};
 
-use crate::magic_dns::{Decision, DnsView, decide, forward_query};
+use crate::magic_dns::{Decision, DnsView, decide, forward_query, set_tc_if_over_client_limit};
 
 /// Largest HTTP request (headers + body) we will read for one DoH query. A DNS message is at most
 /// 64 KiB, but a peerAPI DoH query is a single small question; cap well below that to bound memory
@@ -108,6 +108,11 @@ const MAX_CLIENT_RESPONSE: usize = 64 * 1024;
 /// Anti-leak: the connection is made over the overlay (`channel.tcp_connect(0.0.0.0:0, doh_addr)`),
 /// so it rides the encrypted WireGuard tunnel to the peer — never a host socket. IPv4-only:
 /// `doh_addr` is always the peer's tailnet IPv4 (see [`Node::peerapi_doh_addr`]).
+///
+/// The delegated answer is relayed back to the stub resolver as a UDP datagram, so — exactly as on
+/// the plain UDP forward — it is marked truncated when it exceeds the buffer size `query`
+/// advertised (see [`set_tc_if_over_client_limit`]). The DoH transport itself has no such limit;
+/// the limit belongs to the client we answer, not to the hop we fetched over.
 pub(crate) async fn forward_doh(
     channel: &Channel,
     doh_addr: SocketAddr,
@@ -115,7 +120,7 @@ pub(crate) async fn forward_doh(
     fallback: Vec<u8>,
 ) -> Vec<u8> {
     match timeout(CLIENT_TIMEOUT, doh_round_trip(channel, doh_addr, query)).await {
-        Ok(Ok(resp)) if !resp.is_empty() => resp,
+        Ok(Ok(resp)) if !resp.is_empty() => set_tc_if_over_client_limit(query, resp),
         Ok(Ok(_)) => {
             // A broken exit-node recursive resolver silently fails every delegated query, so
             // surface delegation failures at warn (default level) — the operator needs the signal.
@@ -301,6 +306,12 @@ pub(crate) async fn handle_conn(
 /// - Authoritative answer => returned as-is from [`decide`].
 /// - Recursive forward when `forward_exit_egress` is false => `REFUSED` (fail-closed, no leak).
 /// - Recursive forward when enabled => forwarded over the overlay via [`forward_query`].
+///
+/// A forwarded answer carries the `TC` bit when it exceeds the buffer size the *query* advertised
+/// (`forward_query` → `cap_response`), even though we hand it back over HTTP rather than UDP. That
+/// is deliberate and not a DoH size limit: the query a peer POSTs here is its own UDP client's
+/// query relayed verbatim, so the advertised size is that client's, and the peer would set the same
+/// bit when it relays our answer onward as a datagram. Marking it here only makes the two agree.
 async fn resolve(
     view: &DnsView,
     query: &[u8],
