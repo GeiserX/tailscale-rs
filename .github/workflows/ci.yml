@@ -152,7 +152,7 @@ jobs:
       - name: Anti-leak firewall checks (cargo run -p checks)
         run: cargo run -p checks
       - name: binstall
-        uses: cargo-bins/cargo-binstall@e00d2c94cc0067b77737821097a62d91c0301baa #v1.21.1
+        uses: cargo-bins/cargo-binstall@75b4bfae1b2c753a6806bbce6e6cb89b602de33c #v1.22.0
       - name: Install cargo-deny
         run: command -v cargo-deny || cargo binstall --no-confirm cargo-deny
       # Machine-enforce the ring-only / no-aws-lc supply-chain invariant on every push, on the
@@ -311,7 +311,7 @@ jobs:
           # while preventing the cross-container artifact collision.
           cache-key: musl-${{ matrix.target.triple }}
       - name: Install cross
-        uses: cargo-bins/cargo-binstall@e00d2c94cc0067b77737821097a62d91c0301baa #v1.21.1
+        uses: cargo-bins/cargo-binstall@75b4bfae1b2c753a6806bbce6e6cb89b602de33c #v1.22.0
       - name: Install cross (binary)
         run: command -v cross || cargo binstall --no-confirm cross
       - name: Build static musl (cross build --no-default-features)
@@ -346,7 +346,7 @@ jobs:
           components: rustfmt
       - &binstall
         name: binstall
-        uses: cargo-bins/cargo-binstall@e00d2c94cc0067b77737821097a62d91c0301baa #v1.21.1
+        uses: cargo-bins/cargo-binstall@75b4bfae1b2c753a6806bbce6e6cb89b602de33c #v1.22.0
       - name: Install cargo-deny
         run: command -v cargo-deny || cargo binstall --no-confirm cargo-deny
       - &cargo_ws
