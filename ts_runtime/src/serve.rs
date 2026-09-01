@@ -434,6 +434,11 @@ where
 /// Parse the request-line path from an HTTP head. Returns the path component (without the query
 /// string), or `None` if the head is malformed. Hand-rolled; no HTTP library framing assumptions
 /// beyond the request line.
+///
+/// The target is returned **raw**, exactly as the client wrote it: normalizing it is
+/// [`match_path_handler`]'s job, because Go's `getServeHandler` looks the raw target up first and
+/// only then cleans it. A malformed target (`*`, an authority-form `host:port`) comes back here as
+/// itself and is refused there, not here.
 fn request_path(buf: &[u8]) -> Option<String> {
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut req = httparse::Request::new(&mut headers);
@@ -494,6 +499,82 @@ where
     drop(tls.shutdown().await);
 }
 
+/// Go's `path.Clean` (Go stdlib `path/path.go`), transliterated. This is the lexical cleaning
+/// `getServeHandler` (`ipn/ipnlocal/serve.go` @ `49e148c4a30b4f8098f69468fd27a7021d85ea02`) applies
+/// to the request path *before* it walks the mounts, so it must be the same cleaning here: dot and
+/// dot-dot segments are resolved, repeated and trailing separators collapse, and a leading dot-dot
+/// on a rooted path is dropped (`/api/../secret` ⇒ `/secret`, `/../x` ⇒ `/x`, `//a//b/` ⇒ `/a/b`).
+///
+/// Purely lexical, exactly like Go's: it never touches a filesystem and never decodes percent
+/// escapes. Non-rooted inputs keep Go's answers too — `""` and `"."` clean to `"."`, and `"*"`
+/// cleans to `"*"` — which is what makes the "not absolute" refusal in [`match_path_handler`]
+/// catch the malformed request targets.
+fn clean_path(path: &str) -> String {
+    let s = path.as_bytes();
+    if s.is_empty() {
+        return ".".to_string();
+    }
+    let n = s.len();
+    let rooted = s[0] == b'/';
+
+    // `out` is Go's `lazybuf`: the cleaned bytes written so far. `dotdot` is the index past which
+    // a `..` may still eat an element (1 on a rooted path, so `..` can never eat the leading `/`).
+    let mut out: Vec<u8> = Vec::with_capacity(n);
+    let mut r = 0usize;
+    let mut dotdot = 0usize;
+    if rooted {
+        out.push(b'/');
+        r = 1;
+        dotdot = 1;
+    }
+
+    while r < n {
+        if s[r] == b'/' {
+            // Empty path element: drop it (this is what collapses `//` and a trailing `/`).
+            r += 1;
+        } else if s[r] == b'.' && (r + 1 == n || s[r + 1] == b'/') {
+            // `.` element: drop it.
+            r += 1;
+        } else if s[r] == b'.' && r + 1 < n && s[r + 1] == b'.' && (r + 2 == n || s[r + 2] == b'/')
+        {
+            // `..` element: back up over the previously written element, if there is one.
+            r += 2;
+            if out.len() > dotdot {
+                let mut w = out.len() - 1;
+                while w > dotdot && out[w] != b'/' {
+                    w -= 1;
+                }
+                out.truncate(w);
+            } else if !rooted {
+                // Nothing to back up over and no leading `/` to anchor to: the `..` is kept, as
+                // Go keeps it (`../..` cleans to itself). A rooted path drops it instead, which is
+                // why `/../secret` is `/secret` and can never escape above the root.
+                if !out.is_empty() {
+                    out.push(b'/');
+                }
+                out.extend_from_slice(b"..");
+                dotdot = out.len();
+            }
+        } else {
+            // A real path element: add the separator if one is needed, then copy the element.
+            if (rooted && out.len() != 1) || (!rooted && !out.is_empty()) {
+                out.push(b'/');
+            }
+            while r < n && s[r] != b'/' {
+                out.push(s[r]);
+                r += 1;
+            }
+        }
+    }
+
+    if out.is_empty() {
+        return ".".to_string();
+    }
+    // Every byte written is copied verbatim from `path` (valid UTF-8) and the buffer is only ever
+    // truncated at an ASCII `/`, so this cannot split a multi-byte character.
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
 /// Whether a mount point in a [`ServeTarget::Path`] map claims `path`.
 ///
 /// A mount at `P` claims exactly `P` itself and the paths **below** it — i.e. `path == P`, or `path`
@@ -528,25 +609,55 @@ fn mount_claims_path(mount: &str, path: &str) -> bool {
     }
 }
 
-/// Pick the [`ServeTarget`] a request `path` dispatches to in a [`ServeTarget::Path`] mux.
+/// Pick the [`ServeTarget`] a request `path` dispatches to in a [`ServeTarget::Path`] mux, given the
+/// raw request target from the request line.
 ///
 /// Pure and total over `(handlers, path)` — the whole routing decision, with no I/O — so it is
 /// testable directly instead of only through a TLS-terminated socket. [`serve_path`] calls this; it
 /// is the single definition of the rule, and a test that re-implemented it would be testing its own
 /// copy rather than what dispatch does.
 ///
-/// Longest match wins: of the mounts that claim `path` (see [`mount_claims_path`]), the one with the
-/// most path bytes is chosen, so `/api/v2` beats `/api` beats `/`. Ties (only reachable between the
-/// same mount spelled with and without a trailing slash, e.g. `/api` and `/api/`) resolve to the
-/// last in `BTreeMap` order, deterministically. `None` means no mount claims the path, which
-/// dispatch turns into a fail-closed 404.
+/// ## Go behaviour this mirrors
+///
+/// `getServeHandler` (`ipn/ipnlocal/serve.go` @ `49e148c4a30b4f8098f69468fd27a7021d85ea02`) resolves
+/// a request in three steps, and so does this:
+///
+/// 1. **Exact lookup of the raw target.** A mount spelled exactly as the request target wins
+///    verbatim, before any normalization (Go: `wsc.Handlers().GetOk(r.URL.Path)`).
+/// 2. **Clean, then match.** Otherwise the target is [`clean_path`]ed — Go's `path.Clean` — and only
+///    the *cleaned* path is offered to the mounts. Dot-dot is therefore resolved **before** any
+///    mount is consulted: with mounts at `/` and `/api`, `/api/../secret` is `/secret` and is served
+///    by `/`; it must never reach the `/api` backend, which was never mounted for it.
+/// 3. **Refuse a target that is not an absolute path.** A cleaned path not starting with `/` matches
+///    nothing. Go needs this guard because the malformed request targets — `*` (`GET *`) and the
+///    empty authority-form target — clean to `*` and `.`, which are `path.Dir` fixed points that
+///    would spin its backwards walk forever. Here the walk cannot spin, but the guard still carries
+///    Go's *routing* answer: those targets match no mount. Without it a root mount claims them,
+///    because `/` normalizes to the empty prefix that claims every string.
+///
+/// Longest match wins among the mounts that claim the cleaned path (see [`mount_claims_path`]): the
+/// one with the most path bytes is chosen, so `/api/v2` beats `/api` beats `/`. This is the same
+/// answer as Go's backwards walk, which tries the path cut at each `/` from longest to shortest.
+/// Ties (only reachable between the same mount spelled with and without a trailing slash, e.g.
+/// `/api` and `/api/`) resolve to the last in `BTreeMap` order, deterministically. `None` means no
+/// mount claims the path, which dispatch turns into a fail-closed 404.
 fn match_path_handler<'h>(
     handlers: &'h BTreeMap<String, ServeTarget>,
     path: &str,
 ) -> Option<&'h ServeTarget> {
+    // (1) The raw target, looked up exactly.
+    if let Some(target) = handlers.get(path) {
+        return Some(target);
+    }
+    // (2) Everything else routes on the cleaned path, never the raw one.
+    let cleaned = clean_path(path);
+    // (3) Not an absolute path => no mount claims it.
+    if !cleaned.starts_with('/') {
+        return None;
+    }
     handlers
         .iter()
-        .filter(|(mount, _)| mount_claims_path(mount, path))
+        .filter(|(mount, _)| mount_claims_path(mount, &cleaned))
         .max_by_key(|(mount, _)| mount.strip_suffix('/').unwrap_or(mount).len())
         .map(|(_, target)| target)
 }
@@ -809,6 +920,123 @@ mod tests {
     }
 
     #[test]
+    fn clean_path_matches_go_path_clean() {
+        // The table is Go's own `path.Clean` test table (Go stdlib `path/path_test.go`), which is
+        // the cleaning `getServeHandler` applies before it consults the mounts.
+        for (input, want) in [
+            ("", "."),
+            ("abc", "abc"),
+            ("abc/def", "abc/def"),
+            ("a/b/c", "a/b/c"),
+            (".", "."),
+            ("..", ".."),
+            ("../..", "../.."),
+            ("/abc", "/abc"),
+            ("/", "/"),
+            ("abc/", "abc"),
+            ("abc/def/", "abc/def"),
+            ("a/b/c/", "a/b/c"),
+            ("./", "."),
+            ("../", ".."),
+            ("../../", "../.."),
+            ("/abc/", "/abc"),
+            ("abc//def//ghi", "abc/def/ghi"),
+            ("//abc", "/abc"),
+            ("///abc", "/abc"),
+            ("//abc//", "/abc"),
+            ("abc//", "abc"),
+            ("abc/./def", "abc/def"),
+            ("/./abc/def", "/abc/def"),
+            ("abc/..", "."),
+            ("abc/def/..", "abc"),
+            ("abc/def/../ghi", "abc/ghi"),
+            ("abc/def/../../ghi", "ghi"),
+            ("abc/def/../../..", ".."),
+            ("/abc/def/../../..", "/"),
+            ("abc/./../def", "def"),
+            ("abc//./../def", "def"),
+            ("abc/../../././../def", "../../def"),
+            // A rooted path can never climb above the root: the leading `..` is dropped.
+            ("/../abc", "/abc"),
+            ("/api/../secret", "/secret"),
+            // The malformed request targets. Neither becomes absolute, which is what the
+            // "not absolute" refusal keys off.
+            ("*", "*"),
+            ("host:443", "host:443"),
+        ] {
+            assert_eq!(clean_path(input), want, "clean_path({input:?})");
+        }
+    }
+
+    #[test]
+    fn dot_dot_segment_is_cleaned_before_the_mounts_are_consulted() {
+        // The bug: matching the RAW target means `/api/../secret` starts with `/api/`, so the `/api`
+        // mount claims it and the request reaches a backend it was never mounted for. Go cleans
+        // first — the path is `/secret`, which only the `/` mount claims.
+        let handlers = mux();
+        let root = proxy("127.0.0.1:1");
+        let api = proxy("127.0.0.1:2");
+        let api_v2 = proxy("127.0.0.1:3");
+
+        for path in [
+            "/api/../secret",
+            "/api/v2/../../secret",
+            "/api/./../secret",
+            "/api/..//secret",
+            // Climbing above the root is dropped, not an escape: still `/secret`.
+            "/../api/../secret",
+        ] {
+            let picked = match_path_handler(&handlers, path);
+            assert_ne!(picked, Some(&api), "{path} must not reach the /api backend");
+            assert_ne!(
+                picked,
+                Some(&api_v2),
+                "{path} must not reach the /api/v2 backend"
+            );
+            assert_eq!(
+                picked,
+                Some(&root),
+                "{path} cleans to /secret, which only / claims"
+            );
+        }
+
+        // Cleaning cuts both ways: a dot-dot that lands back inside a mount still routes there.
+        assert_eq!(
+            match_path_handler(&handlers, "/api/v2/../v2/x"),
+            Some(&api_v2),
+            "/api/v2/../v2/x cleans to /api/v2/x"
+        );
+        assert_eq!(
+            match_path_handler(&handlers, "/api/v2/.."),
+            Some(&api),
+            "/api/v2/.. cleans to /api"
+        );
+        // Redundant separators and dot segments normalize away too.
+        assert_eq!(match_path_handler(&handlers, "//api//v2//x"), Some(&api_v2));
+        assert_eq!(match_path_handler(&handlers, "/api/./v2"), Some(&api_v2));
+    }
+
+    #[test]
+    fn malformed_request_target_matches_no_mount() {
+        // `GET * HTTP/1.1` yields the target `*`, and an authority-form target has no path at all.
+        // Go refuses both (they do not clean to an absolute path). A root mount normalizes to the
+        // empty prefix that claims every string, so without the refusal `*` would be served by `/`.
+        let handlers = mux();
+        for target in ["*", "host:443", "example.com:443", "", ".", "..", "api/v2"] {
+            assert_eq!(
+                match_path_handler(&handlers, target),
+                None,
+                "{target:?} is not an absolute path and must match no mount, not even /"
+            );
+        }
+        // A mount spelled exactly as the raw target still wins: that is Go's first lookup, which
+        // happens before the cleaning and the absolute-path refusal.
+        let mut odd: BTreeMap<String, ServeTarget> = BTreeMap::new();
+        odd.insert("*".to_string(), proxy("127.0.0.1:9"));
+        assert_eq!(match_path_handler(&odd, "*"), Some(&proxy("127.0.0.1:9")));
+    }
+
+    #[test]
     fn unmatched_path_selects_nothing() {
         // No root mount => a path no mount claims is `None`, which dispatch turns into a 404.
         let mut handlers: BTreeMap<String, ServeTarget> = BTreeMap::new();
@@ -1060,6 +1288,91 @@ mod tests {
             "/hellofoo must not reach the /hello mount"
         );
         assert_eq!(got, "root");
+    }
+
+    /// Text mux used by the dispatch tests below: `/` and `/api` with distinguishable bodies, so a
+    /// test can assert which backend a request did *not* reach.
+    fn text_mux() -> BTreeMap<String, ServeTarget> {
+        let mut handlers: BTreeMap<String, ServeTarget> = BTreeMap::new();
+        handlers.insert(
+            "/".to_string(),
+            ServeTarget::Text {
+                body: "root".into(),
+            },
+        );
+        handlers.insert(
+            "/api".to_string(),
+            ServeTarget::Text {
+                body: "api-body".into(),
+            },
+        );
+        handlers
+    }
+
+    /// Run one raw request line through the real dispatch and return everything the server wrote.
+    async fn serve_path_response(
+        request: &[u8],
+        handlers: BTreeMap<String, ServeTarget>,
+    ) -> String {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let t = tokio::spawn(async move {
+            serve_path(443, server, &handlers).await;
+        });
+        client.write_all(request).await.unwrap();
+        let got = drain_to_string(client).await;
+        t.await.unwrap();
+        got
+    }
+
+    #[tokio::test]
+    async fn serve_path_does_not_route_a_dot_dot_target_to_the_mount_it_climbed_out_of() {
+        // End to end through the real dispatch: the request target names `/api`, but it climbs out
+        // of it. Go cleans to `/secret` and serves it from `/`; the `/api` backend must never see
+        // it — it was never mounted for `/secret`.
+        let got = serve_path_response(
+            b"GET /api/../secret HTTP/1.1\r\nHost: h\r\n\r\n",
+            text_mux(),
+        )
+        .await;
+        assert_ne!(
+            got, "api-body",
+            "/api/../secret must not reach the /api mount"
+        );
+        assert_eq!(got, "root", "/api/../secret cleans to /secret, served by /");
+
+        // The query string is stripped before cleaning, exactly as Go cleans `r.URL.Path`.
+        let got = serve_path_response(
+            b"GET /api/../secret?x=1 HTTP/1.1\r\nHost: h\r\n\r\n",
+            text_mux(),
+        )
+        .await;
+        assert_eq!(got, "root");
+
+        // And a target that stays inside the mount after cleaning still reaches it.
+        let got =
+            serve_path_response(b"GET /api/v2/../v2 HTTP/1.1\r\nHost: h\r\n\r\n", text_mux()).await;
+        assert_eq!(got, "api-body");
+    }
+
+    #[tokio::test]
+    async fn serve_path_404s_a_malformed_request_target() {
+        // `GET *` parses fine as a request line but is not an absolute path. Go matches no handler
+        // for it; here the root mount would otherwise claim it, since `/` normalizes to the empty
+        // prefix. Fail closed with a 404 instead of serving the root backend.
+        let got = serve_path_response(b"GET * HTTP/1.1\r\nHost: h\r\n\r\n", text_mux()).await;
+        assert_ne!(got, "root", "`GET *` must not be served by the / mount");
+        assert!(
+            got.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "expected a 404, got {got:?}"
+        );
+
+        // Authority-form (`CONNECT host:443`) likewise has no path to route on.
+        let got =
+            serve_path_response(b"CONNECT host:443 HTTP/1.1\r\nHost: h\r\n\r\n", text_mux()).await;
+        assert!(
+            got.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "expected a 404, got {got:?}"
+        );
     }
 
     // NOTE: a live bind+accept test needs a running netstack channel + overlay; the existing
