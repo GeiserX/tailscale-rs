@@ -19,7 +19,6 @@ workspace = true
 [dependencies]
 ts_netstack_smoltcp = { workspace = true, features = ["tokio"] }
 ipnet.workspace = true
-bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }

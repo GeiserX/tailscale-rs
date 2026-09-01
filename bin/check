@@ -14,14 +14,45 @@ set -euo pipefail
 SCOPE_NO_WS=${SCOPE:-}
 readonly SCOPE=${@:---workspace}
 
+# Format with the toolchain CI actually gates on -- the channel pinned in `rust-toolchain.toml`,
+# which the `hosted_test` lane installs rustfmt into and runs `cargo fmt --all -- --check` under.
+#
+# This used to be `cargo +nightly fmt --check`, mirroring the `arch_independent` job. That job
+# targets a self-hosted runner label this fork does not have, so it never runs and never gates
+# anything -- while ambient nightly rustfmt kept moving. Nightly 1.10.0 wanted 22
+# import-granularity rewrites across 10 files that stable rustfmt 1.9.0 (the pinned 1.95.0
+# toolchain's) is perfectly happy with, so `bin/check` was red on a tree CI called green.
+#
+# `+${FMT_TOOLCHAIN}` is passed explicitly rather than relying on `rust-toolchain.toml` resolution
+# so a `RUSTUP_TOOLCHAIN=nightly` already in the caller's environment cannot silently reintroduce
+# the drift. Note the unstable `rustfmt.toml` keys (`imports_granularity`, `group_imports`, ...)
+# are inert on a stable channel and warn once per crate; that is exactly what CI sees too.
+FMT_TOOLCHAIN=$(sed -n 's/^ *channel *= *"\(.*\)"/\1/p' "$(dirname "$0")/../rust-toolchain.toml")
+readonly FMT_TOOLCHAIN
+if [ -z "$FMT_TOOLCHAIN" ]; then
+  echo "bin/check: could not read [toolchain] channel from rust-toolchain.toml" >&2
+  exit 1
+fi
+
 set -x
 
-cargo +nightly fmt --check
+cargo +"$FMT_TOOLCHAIN" fmt --all --check
 cargo run -p checks
 cargo clippy      $SCOPE --lib                               --no-deps --all-features -- -D warnings
 cargo clippy      $SCOPE --bins --tests --benches --examples --no-deps --all-features -- -D warnings -A missing_docs
 cargo doc         $SCOPE                                     --no-deps --all-features
-cargo deny        $SCOPE                                               --all-features check all
+# Audit the SAME dependency graph the gating lane audits:
+#   cargo deny --no-default-features --exclude-dev check all
+# `--all-features` is deliberately NOT used, and neither is `--workspace`. `--all-features` turns
+# on `ssh`, which pulls `russh -> aws-lc-rs`/`aws-lc-sys` -- crates `deny.toml` bans on purpose,
+# because keeping them out of the egress path is the whole point of the ring-only invariant. So the
+# old `cargo deny $SCOPE --all-features check all` line asked cargo-deny to audit a graph the repo
+# has deliberately constructed to contain banned crates; it could not pass, on any commit.
+# `--workspace` additionally drags in `ts_ffi`'s `cbindgen` build-dependency (MPL-2.0, not on the
+# allow-list) for the same false-red. Scoping (`bin/check -p foo`) does not apply to this step, for
+# the same reason it does not in CI: the supply-chain invariant is a property of the whole shipped
+# graph, not of one crate.
+cargo deny --no-default-features --exclude-dev check all
 cargo machete     $SCOPE_NO_WS  --with-metadata
 cargo vet         $SCOPE_NO_WS || true
 cargo nextest run $SCOPE                                               --all-features --no-tests=pass

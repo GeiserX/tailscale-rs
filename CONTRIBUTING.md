@@ -18,9 +18,11 @@ Formatting, linting, dependency checking, and testing:
 
 ```sh
 # Verify that all files are formatted properly:
-$ cargo +nightly fmt --check
+# NOTE: use the toolchain pinned in rust-toolchain.toml (what CI gates on), NOT ambient nightly.
+# Nightly rustfmt moves independently of the pin and will rewrite imports CI is happy with.
+$ cargo fmt --all --check
 # Format any incorrectly-formatted files:
-$ cargo +nightly fmt
+$ cargo fmt --all
 # Lint the codebase with clippy:
 $ cargo clippy
 # Verify dependency licenses are compatible, and have no outstanding security issues:

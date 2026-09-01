@@ -264,7 +264,7 @@ fn filter_inbound_from_peer(
 /// WireGuard session with a peer is established, this node announces its own disco public key to
 /// that peer over TSMP, so the peer can learn (or re-learn) the key without waiting for a netmap
 /// update from control. It is the mirror image of the receive half in
-/// [`filter_inbound_from_peer`], and both are unconditional — a real Go peer sends us one whether
+/// `filter_inbound_from_peer`, and both are unconditional — a real Go peer sends us one whether
 /// or not we send one back.
 ///
 /// This is the netmap state Go's [`magicsock.Conn.PriorityMessageForPeer`] reads, snapshotted into

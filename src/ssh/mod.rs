@@ -181,7 +181,7 @@ impl crate::Device {
     /// Run a turnkey Tailscale SSH server on `listen_addr` (tailnet overlay) that grants authorized
     /// connections an interactive login shell as their policy-mapped local user.
     ///
-    /// Authorization is the control-pushed SSH policy (see [`Device::authorize_ssh`]) — fail-closed:
+    /// Authorization is the control-pushed SSH policy (see [`crate::Device::authorize_ssh`]) — fail-closed:
     /// unknown source, no policy, no matching rule, or any error rejects. The accepted connection's
     /// `local_user` is resolved against the local passwd database and the login shell is spawned in
     /// a PTY **after dropping privileges** to that user's uid/gid (the daemon must run as root to do

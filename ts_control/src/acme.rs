@@ -10,7 +10,7 @@
 //!
 //! - [`ts_http_util`] — ring HTTPS via `ts_tls_util` (the same substrate [`crate::wif`] uses; see
 //!   it for the `connect_tls` / `ClientExt::{get,post}` / `ResponseExt::collect_bytes` idiom — we
-//!   additionally read response headers via [`http::Response::headers`]),
+//!   additionally read response headers via [`ts_http_util::Response::headers`]),
 //! - [`ring`] — ES256 JWS signing (P-256, fixed `r||s`) and SHA-256 digests,
 //! - [`rcgen`] (ring backend) — the finalize CSR.
 //!
@@ -19,13 +19,13 @@
 //! # DNS-01 flow ([RFC 8555] §7) implemented by [`issue_certificate`]
 //!
 //! 1. account key (ECDSA P-256), 2. fetch directory + seed a `Replay-Nonce`, 3. `newAccount`
-//! (`jwk` header) → account URL (the `kid`), 4. `newOrder` → authorization + finalize URLs,
+//!    (`jwk` header) → account URL (the `kid`), 4. `newOrder` → authorization + finalize URLs,
 //! 5. POST-as-GET the authorization → the `dns-01` challenge `token`, 6. compute the key
-//! authorization + TXT digest ([RFC 8555] §8.1/§8.4, [RFC 7638] §3) and publish it via the
-//! [`crate::cert::PublishTxt`] seam (control's `set-dns`), 7. signal the challenge ready, poll the
-//! authorization to `valid`, 8. finalize with a fresh-cert-key CSR, poll the order to `valid`,
+//!    authorization + TXT digest ([RFC 8555] §8.1/§8.4, [RFC 7638] §3) and publish it via the
+//!    [`crate::cert::PublishTxt`] seam (control's `set-dns`), 7. signal the challenge ready, poll the
+//!    authorization to `valid`, 8. finalize with a fresh-cert-key CSR, poll the order to `valid`,
 //! 9. download the PEM chain and assemble an [`IssuedCert`] (the chain + leaf-key PEMs and a
-//! [`CertifiedKey`] built from them via [`crate::cert::certified_key_from_pem`]).
+//!    [`CertifiedKey`] built from them via [`crate::cert::certified_key_from_pem`]).
 //!
 //! Every ACME POST body is a flattened JWS (`{"protected","payload","signature"}`,
 //! `application/jose+json`); `base64url` is **always unpadded**.

@@ -2127,7 +2127,6 @@ dependencies = [
 name = "geiserx_ts_forwarder"
 version = "0.44.0"
 dependencies = [
- "bytes",
  "geiserx_ts_netstack_smoltcp",
  "ipnet",
  "thiserror 2.0.20",
@@ -2202,7 +2201,6 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
- "tracing-test",
  "zerocopy",
 ]
 

@@ -22,7 +22,11 @@ const PKG_VERSION: &str = if let Some(version) = option_env!("CARGO_PKG_VERSION"
 /// ACME its own 256 KiB bound — those payloads are differently sized.)
 pub(crate) const MAX_CONTROL_RESPONSE: usize = 1024 * 1024;
 
-/// Client-side ACME (Let's Encrypt) DNS-01 cert issuance engine (`acme` feature, SaaS-only).
+// NOTE: no outer `///` summary here on purpose. `acme.rs` carries inner `//!` module docs, and
+// when rustdoc merges an outer fragment from this file with the module's own inner fragments it
+// resolves the WHOLE merged doc in the crate-root scope -- so every unqualified intra-doc link in
+// `acme.rs` (`[`IssuedCert`]`, `[`issue_certificate`]`, ...) failed to resolve and the errors lost
+// their file/line spans. The module's inner docs are the summary; they also satisfy `missing_docs`.
 #[cfg(feature = "acme")]
 pub mod acme;
 #[cfg(feature = "async_tokio")]

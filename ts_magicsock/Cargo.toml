@@ -35,7 +35,6 @@ zerocopy = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
-tracing-test.workspace = true
 
 [lints]
 workspace = true

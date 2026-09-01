@@ -78,7 +78,7 @@ use crate::{Error, InternalErrorKind, loopback::OverlayDialer, netstack};
 /// tsnet.Server.Dial`). Build one with [`Device::http_connector`](crate::Device::http_connector) and
 /// pass it to `hyper_util::client::legacy::Client::builder(...).build(connector)`.
 ///
-/// Cloneable and `Send`/`'static` (it holds only the `&Device`-free [`OverlayDialer`]), so it
+/// Cloneable and `Send`/`'static` (it holds only the `&Device`-free `OverlayDialer`), so it
 /// satisfies hyper-util's connector bounds and can back a pooled `Client`.
 #[derive(Clone)]
 pub struct TailnetConnector {

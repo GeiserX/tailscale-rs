@@ -1302,7 +1302,7 @@ mod msg_impl {
         /// **PEM pair** — `(cert_chain_pem, key_pem)` — for writing the on-disk `.crt` + `.key`
         /// (the daemon's `tnet cert`, Go's `LocalClient.CertPair`). `acme` feature.
         ///
-        /// Identical issuance to [`get_certificate`](Self::get_certificate) (same client-side ACME
+        /// Identical issuance to `get_certificate` (same client-side ACME
         /// DNS-01 flow, same set-dns publish, same account-key handling), only the *shape* of the
         /// result differs: this surfaces the raw chain + leaf-key PEMs instead of the opaque
         /// [`CertifiedKey`](ts_control::tls::CertifiedKey). The leaf **private key** PEM is the

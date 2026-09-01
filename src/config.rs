@@ -435,7 +435,7 @@ pub struct Config {
     ///
     /// The cached frame carries the tailnet's peer list (with public keys and endpoints), the DNS
     /// configuration and the packet filter, so the directory is created `0700` and the file `0600`
-    /// on Unix. [`Server::dir`](crate::Server::dir) fills this in as `<dir>/netmap-cache`.
+    /// on Unix. `tsnet::Server::dir` fills this in as `<dir>/netmap-cache`.
     pub netmap_cache_dir: Option<std::path::PathBuf>,
 
     /// Pre-auth key for non-interactive registration (Go `tsnet.Server.AuthKey`). When set, used as

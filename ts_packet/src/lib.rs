@@ -3,9 +3,10 @@
 
 extern crate alloc;
 
-/// Geneve (RFC 8926) fixed-header codec for Tailscale peer-relay framing.
+// NOTE: no outer `///` summaries here on purpose -- both modules carry inner `//!` docs, and
+// rustdoc resolves a merged outer+inner module doc in the crate-root scope, which breaks every
+// unqualified intra-doc link inside them (and drops the error spans). See `ts_control`'s `acme`.
 pub mod geneve;
-/// TSMP (Tailscale Message Protocol, IP proto 99) message parsing.
 pub mod tsmp;
 
 use alloc::{borrow::ToOwned, string::String, vec::Vec};
