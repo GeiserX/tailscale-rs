@@ -10,6 +10,7 @@ rust-version.workspace = true
 clap = { workspace = true, features = ["derive"] }
 globwalk = "0.9"
 serde.workspace = true
+serde_json.workspace = true
 toml = "1"
 
 [lints]
