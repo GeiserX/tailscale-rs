@@ -1177,7 +1177,10 @@ impl MagicSock {
     /// 2. **Every relay address must pass [`is_pingable_candidate`](Self::is_pingable_candidate)**
     ///    — the same sanitizer a `CallMeMaybe` endpoint goes through. Without it a peer could name
     ///    `127.0.0.1:*` or an RFC 1918 address and have us emit host-sourced probes into the local
-    ///    network. If nothing survives, we do nothing and the peer stays on DERP.
+    ///    network. If nothing survives, we do nothing and the peer stays on DERP. This gate is
+    ///    **deliberately stricter than upstream**, which sends a bind message to every advertised
+    ///    `AddrPort` that is merely non-zero; see [`relay_addr_allowed`](Self::relay_addr_allowed)
+    ///    for why it is kept, and for what it costs in interop.
     /// 3. **The allocation must supersede what we have.** Upstream orders competing allocations for
     ///    a peer pair by the relay server's Lamport id; an older or equal id is stale.
     ///
@@ -1653,6 +1656,44 @@ impl MagicSock {
     /// The production rule is exactly [`is_pingable_candidate`](Self::is_pingable_candidate) — a
     /// relay address is peer-supplied and becomes a host-sourced send target, so it gets the same
     /// sanitizer a `CallMeMaybe` endpoint does.
+    ///
+    /// # Deliberately stricter than upstream
+    ///
+    /// Upstream [`relayManager.handshakeServerEndpoint`] walks the `UDPRelayEndpoint`'s
+    /// `AddrPorts` and fires a bind message at each one that satisfies `addrPort.IsValid()` —
+    /// netip's "this is not the zero value" test, which a Rust [`SocketAddr`] cannot fail, and
+    /// nothing further. No address *class* is refused there: a Go client handshakes with a peer
+    /// relay on `10.0.0.0/8`, on a ULA, or on a link-local address exactly as it does with one on
+    /// a public IP. Every clause below is therefore this fork's own.
+    ///
+    /// It is kept because of the threat model, not because the upstream loop was missed. The disco
+    /// datagram this gate authorizes leaves the node's single real host socket, and the "relay
+    /// server" is named by a peer in a `CallMeMaybeVia` whose contents are wholly peer-chosen. On
+    /// the deployment this fork targets — a cloud VPS exit node — "the LAN" is the provider's
+    /// network: the metadata service on `169.254.169.254`, this host's own loopback services, and
+    /// neighbouring tenants. Handshaking with whatever the endpoint advertises would let any
+    /// authenticated tailnet peer aim host-sourced UDP at all of it, one bind message per
+    /// advertised address, which is the scanner the anti-leak rules exist to prevent.
+    /// [`handle_relay_disco`](Self::handle_relay_disco) applies this same rule to the challenge's
+    /// *source* address, for the same reason.
+    ///
+    /// # What it costs, and the one relaxation there is
+    ///
+    /// A self-hosted `net/udprelay` server reachable only on an RFC 1918 address — an ordinary
+    /// deployment of the upstream feature on a home or office LAN — advertises addresses that all
+    /// fail this gate, so no bind message is sent, no relay path forms, and the peer falls back to
+    /// DERP: the very outcome the peer-relay client exists to avoid. That interop cost is accepted
+    /// here, not overlooked, and
+    /// `a_relay_server_on_a_private_lan_address_is_refused_and_the_peer_stays_on_derp` pins it so
+    /// it reads as the invariant it is rather than as a bug to be rediscovered.
+    ///
+    /// The one relaxation available is IPv6: with [`with_enable_ipv6`](Self::with_enable_ipv6)
+    /// set, a relay server on a global-unicast IPv6 address is handshaked with normally (ULA and
+    /// link-local stay refused, mirroring the IPv4 clauses). There is deliberately no knob that
+    /// admits a *private IPv4* relay address, because this fork supports no direct-LAN path for
+    /// one to serve — see the `is_pingable_candidate` note on relaxing that clause.
+    ///
+    /// [`relayManager.handshakeServerEndpoint`]: https://github.com/tailscale/tailscale/blob/49e148c4a30b4f8098f69468fd27a7021d85ea02/wgengine/magicsock/relaymanager.go
     fn relay_addr_allowed(&self, addr: &SocketAddr) -> bool {
         #[cfg(test)]
         if self.allow_loopback_relay.load(Ordering::Relaxed) {
@@ -3177,6 +3218,123 @@ mod tests {
             "a forbidden relay address must never be probed from the host socket"
         );
         assert_eq!(a.relay_path(&fx.peer.public_key()), None);
+    }
+
+    /// A relay server reachable only on a private LAN address is refused, and the peer stays on
+    /// DERP. This is the interop cost of the relay-address sanitizer, pinned so that a reader who
+    /// meets it in the field finds a named invariant rather than an unexplained fallback.
+    ///
+    /// Upstream `relayManager.handshakeServerEndpoint` binds to every advertised `AddrPort` that
+    /// is merely non-zero, so a Go client handshakes with a self-hosted `net/udprelay` on
+    /// `10.0.0.0/8` normally. This node will not: the relay address is peer-supplied and becomes a
+    /// host-sourced send target, and on the cloud exit node this fork targets the "LAN" it would
+    /// be aimed at is the provider's. Nothing leaves the socket, no allocation is recorded, and
+    /// `send_wireguard` still has no path — so the peer keeps using DERP.
+    ///
+    /// See [`MagicSock::relay_addr_allowed`] for the full reasoning and the upstream citation.
+    #[tokio::test]
+    async fn a_relay_server_on_a_private_lan_address_is_refused_and_the_peer_stays_on_derp() {
+        let our_disco = DiscoPrivateKey::random();
+        let mut fx = RelayFixture::new(11);
+        // The whole advertised set is one RFC 1918 address, as a relay self-hosted on an office
+        // network would advertise it.
+        fx.addr = "10.0.0.5:41641".parse().unwrap();
+        let peer_pub = fx.peer.public_key();
+        let a = Arc::new(
+            MagicSock::bind(
+                localhost(),
+                our_disco.clone(),
+                ts_keys::NodePrivateKey::random().public_key(),
+            )
+            .await
+            .unwrap()
+            .with_binding_verifier(allow_all()),
+        );
+        // Note: `allow_loopback_relay` deliberately NOT set — this is the production filter.
+        let mut sends = a.tap_relay_sends();
+
+        let mut frame = fx.call_me_maybe_via(our_disco.public_key());
+        assert!(
+            a.handle_relayed_disco(&mut frame).await,
+            "the frame is still consumed as disco, never handed to the dataplane"
+        );
+        assert!(
+            sends.try_recv().is_err(),
+            "no bind message may be sent to a relay server on a private LAN address"
+        );
+        assert!(
+            lock(&a.relay_paths).get(&peer_pub).is_none(),
+            "a fully refused endpoint must not be recorded as an allocation either"
+        );
+        assert_eq!(a.relay_path(&peer_pub), None);
+        assert!(
+            matches!(
+                a.send_wireguard(&peer_pub, b"stays-on-derp")
+                    .await
+                    .unwrap_err(),
+                Error::NoPath
+            ),
+            "with no relay path and no direct path, the peer falls back to DERP"
+        );
+    }
+
+    /// The IPv6 half of the sanitizer is a gate, not a wall: a relay server on a global-unicast
+    /// IPv6 address is refused with the default IPv4-only posture and handshaked with normally
+    /// once [`MagicSock::with_enable_ipv6`] is set.
+    ///
+    /// This is the one relaxation of the upstream divergence that is actually available to a
+    /// deployer, so it is worth holding in place — the private-IPv4 clause has no counterpart knob.
+    #[tokio::test]
+    async fn a_global_unicast_ipv6_relay_server_is_refused_by_default_and_allowed_by_the_gate() {
+        let ipv6_relay: SocketAddr = "[2001:db8::1]:41641".parse().unwrap();
+
+        for enable_ipv6 in [false, true] {
+            let our_disco = DiscoPrivateKey::random();
+            let mut fx = RelayFixture::new(13);
+            fx.addr = ipv6_relay;
+            let peer_pub = fx.peer.public_key();
+            let a = Arc::new(
+                MagicSock::bind(
+                    localhost(),
+                    our_disco.clone(),
+                    ts_keys::NodePrivateKey::random().public_key(),
+                )
+                .await
+                .unwrap()
+                .with_binding_verifier(allow_all())
+                .with_enable_ipv6(enable_ipv6),
+            );
+            // Note: `allow_loopback_relay` deliberately NOT set — this is the production filter.
+            let mut sends = a.tap_relay_sends();
+
+            let mut frame = fx.call_me_maybe_via(our_disco.public_key());
+            assert!(a.handle_relayed_disco(&mut frame).await);
+
+            if enable_ipv6 {
+                // The socket here is IPv4-bound, so the write itself fails and is swallowed; the
+                // assertion is that the sanitizer let the bind message be addressed at all, which
+                // is the gate under test.
+                let (to, wire) = sends
+                    .try_recv()
+                    .expect("the IPv6 gate must admit a global-unicast relay server");
+                assert_eq!(to, ipv6_relay, "the bind message goes to the relay server");
+                let mut bind = expect_relay_frame(&wire, fx.vni, true);
+                assert!(
+                    matches!(
+                        disco::open(&fx.server, &mut bind).unwrap(),
+                        Inbound::BindUdpRelayEndpoint { .. }
+                    ),
+                    "and it is a bind message, sealed to the relay server"
+                );
+            } else {
+                assert!(
+                    sends.try_recv().is_err(),
+                    "with the gate off every IPv6 relay address is refused"
+                );
+                assert!(lock(&a.relay_paths).get(&peer_pub).is_none());
+                assert_eq!(a.relay_path(&peer_pub), None);
+            }
+        }
     }
 
     /// The *source* of a peer-relay datagram is a host-sourced send target too, and gets the same
