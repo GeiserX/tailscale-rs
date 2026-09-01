@@ -13,6 +13,7 @@ use kameo::{
 };
 use tokio::sync::watch;
 use ts_control::{Node, UserId, UserProfile};
+use ts_keys::{DiscoPublicKey, NodePublicKey};
 use ts_transport::PeerId;
 
 use crate::{Error, dataplane::PeerDiscoKeyAdvertisement, env::Env, status::StatusNode};
@@ -20,6 +21,88 @@ use crate::{Error, dataplane::PeerDiscoKeyAdvertisement, env::Env, status::Statu
 mod peer_db;
 
 pub use peer_db::PeerDb;
+
+/// Whether `key` is the all-zero disco key, which Go spells `key.DiscoPublic.IsZero()` and treats
+/// everywhere as "this peer has no disco key" rather than as a usable key.
+fn disco_key_is_zero(key: &DiscoPublicKey) -> bool {
+    key.to_bytes() == [0u8; DiscoPublicKey::KEY_LEN_BYTES]
+}
+
+/// Normalize a disco key as it arrives from control: the all-zero key means "absent", exactly as
+/// Go's `IsZero()` checks in `endpoint.updateDiscoKey` read it.
+fn disco_key_from_control(key: Option<DiscoPublicKey>) -> Option<DiscoPublicKey> {
+    key.filter(|k| !disco_key_is_zero(k))
+}
+
+/// The two disco keys a peer can present, and which of them is currently active — Go
+/// [`magicsock.endpointDisco`] (`wgengine/magicsock/endpoint.go`).
+///
+/// A peer's disco key reaches us from two independent sources: **control**, in a netmap node or a
+/// `PeersChangedPatch`, and the **peer itself**, in a TSMP disco-key advertisement carried inside
+/// the WireGuard tunnel. Go keeps both side by side on the endpoint, and so do we, because control
+/// is the slower of the two: an advertisement exists precisely to cover the window where control has
+/// not caught up with the peer's current key, so collapsing the two into one field would let the
+/// next map poll overwrite a freshly-learned key with control's stale one — losing the feature's own
+/// motivating case.
+///
+/// Only one key is active for sending at a time ([`key`](Self::key)). That active key is what the
+/// peer db carries in [`Node::disco_key`], which is this fork's live lookup for every direct-path
+/// consumer (`direct::DiscoPeerLookup` resolves against it, and `PeerDb`'s disco index is built from
+/// it) — the stand-in for Go's per-endpoint `disco` pointer.
+///
+/// [`magicsock.endpointDisco`]: https://github.com/tailscale/tailscale/blob/49e148c4a30b4f8098f69468fd27a7021d85ea02/wgengine/magicsock/endpoint.go
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct EndpointDisco {
+    /// The key learned from control (Go `endpointDisco.controlKey`).
+    control: Option<DiscoPublicKey>,
+    /// The key learned from a TSMP advertisement (Go `endpointDisco.tsmpKey`).
+    tsmp: Option<DiscoPublicKey>,
+    /// Whether [`tsmp`](Self::tsmp) is the active key (Go `endpointDisco.tsmpActive`).
+    tsmp_active: bool,
+}
+
+impl EndpointDisco {
+    /// The key currently regarded as active — Go `endpointDisco.key()`.
+    fn key(&self) -> Option<DiscoPublicKey> {
+        if self.tsmp_active {
+            self.tsmp
+        } else {
+            self.control
+        }
+    }
+
+    /// The control-learned key, active or not — Go `endpointDisco.keyFromControl()`.
+    fn key_from_control(&self) -> Option<DiscoPublicKey> {
+        self.control
+    }
+
+    /// The TSMP-learned key, active or not — Go `endpointDisco.keyFromTSMP()`.
+    fn key_from_tsmp(&self) -> Option<DiscoPublicKey> {
+        self.tsmp
+    }
+
+    /// Replace the control-learned key, leaving any TSMP-learned key in place — Go
+    /// `endpoint.updateDiscoKey`.
+    ///
+    /// A non-zero control key takes the active slot (control has caught up, so it is authoritative
+    /// again); an absent one hands the slot back to the TSMP key, if there is one.
+    fn update_from_control(&mut self, key: Option<DiscoPublicKey>) {
+        self.control = key;
+        self.tsmp_active = key.is_none();
+    }
+
+    /// Replace the TSMP-learned key, leaving the control-learned key in place — Go
+    /// `endpoint.updateTSMPDiscoKey`.
+    fn update_from_tsmp(&mut self, key: Option<DiscoPublicKey>) {
+        self.tsmp = key;
+        self.tsmp_active = key.is_some();
+    }
+
+    /// No key material from either source — Go nils out the endpoint's `disco` pointer here.
+    fn is_empty(&self) -> bool {
+        self.control.is_none() && self.tsmp.is_none()
+    }
+}
 
 /// Actor that tracks peer delta updates and emits new states.
 pub struct PeerTracker {
@@ -36,6 +119,16 @@ pub struct PeerTracker {
     /// than being replaced — a peer upserted in one response may reference a profile delivered in an
     /// earlier one.
     user_profiles: HashMap<UserId, UserProfile>,
+    /// Per-peer disco-key provenance ([`EndpointDisco`]), keyed by the peer's node key.
+    ///
+    /// Go keeps this on the magicsock `endpoint`, which the peer map keys by node key; here the peer
+    /// db stores control's [`Node`] verbatim, so the second key (and which of the two is active)
+    /// lives beside it. Keying by node key reproduces Go's lifetime exactly: the state is dropped
+    /// when the peer leaves the netmap, and a peer that ROTATES its node key gets a fresh entry —
+    /// Go builds it a new endpoint, so a key learned over TSMP under the old node key is never
+    /// carried onto the new one. [`prune_endpoint_disco`](PeerTracker::prune_endpoint_disco) does
+    /// the dropping.
+    endpoint_disco: HashMap<NodePublicKey, EndpointDisco>,
     /// Tailnet-Lock (TKA) authority enforced at the peer-trust chokepoint, matching Go
     /// `tkaFilterNetmapLocked`. Read on demand from a [`watch`] cell the control runner owns: when it
     /// holds `Some` (a verified lock has been synced from control), enforcement is **active** — every
@@ -338,6 +431,7 @@ impl kameo::Actor for PeerTracker {
             seen_state_update: false,
             peer_watch,
             user_profiles: HashMap::new(),
+            endpoint_disco: HashMap::new(),
             // The cell starts `None` (no lock synced ⇒ enforcement inactive, admit all, matching
             // Go's `b.tka == nil`); the control runner flips it to `Some` on the first sync.
             tka_authority,
@@ -722,13 +816,17 @@ impl Message<RepublishState> for PeerTracker {
 }
 
 impl PeerTracker {
-    /// Learn a peer's disco key from a TSMP disco-key advertisement, returning whether the peer db
-    /// actually changed.
+    /// Learn a peer's disco key from a TSMP disco-key advertisement, returning whether the
+    /// advertisement was applied.
     ///
     /// Go [`magicsock.Conn.HandleDiscoKeyAdvertisement`], reduced to the state this fork keeps:
     /// Go stores the learned key on the magicsock endpoint and re-keys its peer map, whereas here
     /// the peer db's `disco_key` (and its disco index) *is* the live lookup every direct-path
-    /// consumer reads. The three refusals are Go's, in Go's order:
+    /// consumer reads. The key is recorded in the peer's [`EndpointDisco`] TSMP slot — never on top
+    /// of control's — and the peer db then carries whichever of the two is active, so the next
+    /// netmap cannot silently undo it ([`upsert_from_control`](Self::upsert_from_control)).
+    ///
+    /// The three refusals are Go's, in Go's order:
     ///
     /// 1. **A zero key is never learned.** Go checks it twice — `tstun` publishes only
     ///    `if !Key.IsZero()`, and `HandleDiscoKeyAdvertisement` rejects it again. The dataplane
@@ -739,15 +837,19 @@ impl PeerTracker {
     ///    peer's netmap entry is a no-op, exactly like a `PeersChangedPatch` for an unknown node.
     /// 3. **An unchanged key is a no-op**, so a peer re-advertising the key we already hold costs
     ///    no upsert and no republish (Go counts this as
-    ///    `magicsock_tsmp_disco_key_advertisement_unchanged` and returns).
+    ///    `magicsock_tsmp_disco_key_advertisement_unchanged` and returns). "Unchanged" is measured
+    ///    against the **TSMP-learned** key (Go compares `epDisco.keyFromTSMP()`), NOT against the
+    ///    effective one: an advertisement that merely restates what control already told us is new
+    ///    information — it is the peer itself confirming the key — so it is recorded as the active
+    ///    TSMP key and survives control later dropping or contradicting it.
     ///
     /// The tailnet-lock gate is deliberately *not* re-run: unlike a `PeersChangedPatch`, an
     /// advertisement cannot touch the node key or its TKA signature — only the disco key — so the
     /// peer-trust decision that admitted this node is unchanged by definition.
     ///
-    /// [`magicsock.Conn.HandleDiscoKeyAdvertisement`]: https://github.com/tailscale/tailscale/blob/main/wgengine/magicsock/magicsock.go
-    fn learn_disco_key(&mut self, peer: PeerId, key: ts_keys::DiscoPublicKey) -> bool {
-        if key.to_bytes() == [0u8; ts_keys::DiscoPublicKey::KEY_LEN_BYTES] {
+    /// [`magicsock.Conn.HandleDiscoKeyAdvertisement`]: https://github.com/tailscale/tailscale/blob/49e148c4a30b4f8098f69468fd27a7021d85ea02/wgengine/magicsock/magicsock.go
+    fn learn_disco_key(&mut self, peer: PeerId, key: DiscoPublicKey) -> bool {
+        if disco_key_is_zero(&key) {
             tracing::debug!(?peer, "TSMP-advertised disco key is the zero key; ignoring");
             return false;
         }
@@ -760,13 +862,21 @@ impl PeerTracker {
             return false;
         };
 
-        if existing.disco_key == Some(key) {
+        let node_key = existing.node_key;
+        if self
+            .endpoint_disco
+            .get(&node_key)
+            .and_then(EndpointDisco::key_from_tsmp)
+            == Some(key)
+        {
             tracing::trace!(?peer, "TSMP-advertised disco key is unchanged");
             return false;
         }
 
         let mut node = existing.clone();
-        node.disco_key = Some(key);
+        let disco = self.endpoint_disco.entry(node_key).or_default();
+        disco.update_from_tsmp(Some(key));
+        node.disco_key = disco.key();
         self.peer_db.upsert(&node);
 
         tracing::info!(
@@ -777,6 +887,71 @@ impl PeerTracker {
         );
 
         true
+    }
+
+    /// Upsert a control-sourced [`Node`] into the peer db, resolving its disco key against anything
+    /// this peer has told us over TSMP first.
+    ///
+    /// Every node built from control goes through here — `Full`, `Delta { upsert }`, and a
+    /// `PeersChangedPatch` — so the three cannot diverge on which of the two keys wins. This is the
+    /// disco half of Go [`endpoint.updateFromNode`]: control's key is written through
+    /// [`EndpointDisco::update_from_control`] **only when it differs from what control last said**
+    /// (Go's `if discoKey != n.DiscoKey()` guard, which compares `keyFromControl()`, never the
+    /// effective key). So a netmap that merely restates the key control already sent leaves an
+    /// active TSMP key alone — which is the entire point of the advertisement, whose motivating case
+    /// is a peer whose key control has not caught up with. Control genuinely changing its mind still
+    /// wins, exactly as it does upstream.
+    ///
+    /// The node lands in the db carrying the *effective* key ([`EndpointDisco::key`]), so the disco
+    /// index and every direct-path consumer resolve against the key we would actually send to.
+    ///
+    /// [`endpoint.updateFromNode`]: https://github.com/tailscale/tailscale/blob/49e148c4a30b4f8098f69468fd27a7021d85ea02/wgengine/magicsock/endpoint.go
+    fn upsert_from_control(&mut self, node: &Node) -> PeerId {
+        let node_key = node.node_key;
+        let from_control = disco_key_from_control(node.disco_key);
+
+        let disco = self.endpoint_disco.entry(node_key).or_default();
+        if disco.key_from_control() != from_control {
+            disco.update_from_control(from_control);
+        }
+        let effective = disco.key();
+
+        // No key material from either source: Go nils the endpoint's `disco` pointer, so a peer
+        // that has never had a disco key costs us no entry either.
+        if disco.is_empty() {
+            self.endpoint_disco.remove(&node_key);
+        }
+
+        if effective == node.disco_key {
+            return self.peer_db.upsert(node);
+        }
+
+        let mut node = node.clone();
+        node.disco_key = effective;
+        self.peer_db.upsert(&node)
+    }
+
+    /// The disco key control last gave us for `node_key` — Go `endpointDisco.keyFromControl()`.
+    fn control_disco_key(&self, node_key: &NodePublicKey) -> Option<DiscoPublicKey> {
+        self.endpoint_disco
+            .get(node_key)
+            .and_then(EndpointDisco::key_from_control)
+    }
+
+    /// Drop [`EndpointDisco`] state for node keys the peer db no longer holds.
+    ///
+    /// Go gets this for free: the two keys live on the magicsock `endpoint`, which the peer map keys
+    /// by node key and deletes when the peer leaves the netmap — and a peer that rotates its node
+    /// key gets a brand-new endpoint, so a TSMP-learned key is not carried across a rotation. Here
+    /// the state is a side table, so every control update prunes it to get the same lifetime.
+    fn prune_endpoint_disco(&mut self) {
+        if self.endpoint_disco.is_empty() {
+            return;
+        }
+
+        let peers = &self.peer_db;
+        self.endpoint_disco
+            .retain(|node_key, _| peers.has(node_key).is_some());
     }
 
     /// Apply a single [`PeerUpdate`](ts_control::PeerUpdate) to the peer db, enforcing the
@@ -887,7 +1062,7 @@ impl PeerTracker {
                     if !k {
                         continue; // fail-CLOSED: rejected by tailnet lock or rotation-obsolete (above)
                     }
-                    let peer_id = self.peer_db.upsert(node);
+                    let peer_id = self.upsert_from_control(node);
                     upserts.insert(peer_id);
                 }
             }
@@ -911,7 +1086,7 @@ impl PeerTracker {
                         }
                         continue;
                     }
-                    let id = self.peer_db.upsert(peer);
+                    let id = self.upsert_from_control(peer);
 
                     upserts.insert(id);
                 }
@@ -934,6 +1109,8 @@ impl PeerTracker {
                 }
             }
         }
+
+        self.prune_endpoint_disco();
 
         (upserts, deletions)
     }
@@ -979,6 +1156,12 @@ impl PeerTracker {
             if let Some(cap_map) = &patch.cap_map {
                 node.cap_map = cap_map.clone();
             }
+            // The db entry carries the EFFECTIVE disco key, which may have been learned over TSMP,
+            // so restate what CONTROL last said before folding the patch in. Otherwise a patch that
+            // says nothing about the disco key would hand a TSMP-learned key back as if control had
+            // sent it, and `upsert_from_control` would read that as control having caught up —
+            // deactivating the TSMP key on a patch that never mentioned it.
+            node.disco_key = self.control_disco_key(&node.node_key);
             if let Some(disco_key) = patch.disco_key {
                 node.disco_key = Some(disco_key);
             }
@@ -1019,9 +1202,11 @@ impl PeerTracker {
                 continue;
             }
 
-            let id = self.peer_db.upsert(&node);
+            let id = self.upsert_from_control(&node);
             upserts.insert(id);
         }
+
+        self.prune_endpoint_disco();
 
         (upserts, deletions)
     }
@@ -1098,6 +1283,7 @@ impl PeerTracker {
             pending_requests: Vec::new(),
             peer_watch,
             user_profiles: HashMap::new(),
+            endpoint_disco: HashMap::new(),
             tka_authority: tka_rx,
             env,
         };
@@ -2382,13 +2568,57 @@ mod tsmp_disco_key_tests {
     /// The key a peer advertises, and a second one for the re-advertise case.
     const ADVERTISED: [u8; 32] = [0xa5u8; 32];
     const READVERTISED: [u8; 32] = [0x5au8; 32];
+    /// The (staler) key control has for that same peer, and the one control eventually catches up
+    /// to.
+    const FROM_CONTROL: [u8; 32] = [0xc0u8; 32];
+    const CONTROL_CAUGHT_UP: [u8; 32] = [0x0cu8; 32];
+
+    /// The node key of the single peer these tests use.
+    const PEER_NODE_KEY: [u8; 32] = [1u8; 32];
 
     /// A tracker holding one peer with no disco key yet, plus that peer's [`PeerId`].
     fn tracker_with_peer() -> (PeerTracker, PeerId) {
         let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
-        let node = peer_node("peer", [1u8; 32], Vec::new());
+        let node = peer_node("peer", PEER_NODE_KEY, Vec::new());
         let id = tracker.peer_db.upsert(&node);
         (tracker, id)
+    }
+
+    /// The peer as CONTROL describes it: the same node, carrying whatever disco key the netmap says
+    /// it has (`None` for a peer control has no disco key for at all).
+    fn node_from_control(disco_key: Option<[u8; 32]>) -> Node {
+        let mut node = peer_node("peer", PEER_NODE_KEY, Vec::new());
+        node.disco_key = disco_key.map(DiscoPublicKey::from);
+        node
+    }
+
+    /// A netmap `Full` carrying just this peer, as control currently describes it.
+    fn control_full(disco_key: Option<[u8; 32]>) -> ts_control::PeerUpdate {
+        ts_control::PeerUpdate::Full(vec![node_from_control(disco_key)])
+    }
+
+    /// A tracker whose single peer arrived through the netmap carrying `disco_key`, exactly as the
+    /// actor's handler applies it. Returns the peer's [`PeerId`] too.
+    fn tracker_with_control_peer(disco_key: Option<[u8; 32]>) -> (PeerTracker, PeerId) {
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
+        let node = node_from_control(disco_key);
+        tracker.apply_peer_update(&control_full(disco_key));
+        let id = tracker
+            .peer_db
+            .has(&node.node_key)
+            .expect("control delivered it");
+        (tracker, id)
+    }
+
+    /// The disco key the peer db currently holds for `peer` — the effective key every direct-path
+    /// consumer resolves against.
+    fn effective_key(tracker: &PeerTracker, peer: PeerId) -> Option<DiscoPublicKey> {
+        tracker
+            .peer_db
+            .get(&peer)
+            .expect("peer still present")
+            .1
+            .disco_key
     }
 
     /// The happy path: an advertised key is applied to the peer AND lands in the disco index, which
@@ -2482,6 +2712,206 @@ mod tsmp_disco_key_tests {
             tracker.peer_db.has(&DiscoPublicKey::from(ADVERTISED)),
             None,
             "and never indexes a key against a peer that does not exist"
+        );
+    }
+
+    /// The feature's motivating case, end to end: the peer told us a key control has not caught up
+    /// with, and then control polls again with the SAME stale key it had before. The advertisement
+    /// must survive.
+    ///
+    /// Go keeps the two keys apart on the endpoint (`endpointDisco.controlKey` /
+    /// `tsmpKey`), and `updateFromNode` only rewrites the control side when control's key actually
+    /// changed — so a netmap restating the old key never touches the active TSMP key. With a single
+    /// field the next map poll silently reverted the peer to control's stale key, which is precisely
+    /// the state the advertisement exists to escape.
+    #[tokio::test]
+    async fn netmap_restating_controls_stale_key_keeps_the_tsmp_key() {
+        let (mut tracker, peer) = tracker_with_control_peer(Some(FROM_CONTROL));
+        let advertised = DiscoPublicKey::from(ADVERTISED);
+        assert_eq!(
+            effective_key(&tracker, peer),
+            Some(DiscoPublicKey::from(FROM_CONTROL)),
+            "precondition: the peer starts on the key control gave us"
+        );
+
+        assert!(tracker.learn_disco_key(peer, advertised));
+        assert_eq!(effective_key(&tracker, peer), Some(advertised));
+
+        // Control polls again, still behind: a `Full` resync, then a `Delta` re-upsert, both
+        // carrying the key control already sent.
+        tracker.apply_peer_update(&control_full(Some(FROM_CONTROL)));
+        assert_eq!(
+            effective_key(&tracker, peer),
+            Some(advertised),
+            "a Full restating control's stale key must not undo the TSMP-learned key"
+        );
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Delta {
+            upsert: vec![node_from_control(Some(FROM_CONTROL))],
+            remove: vec![],
+        });
+        assert_eq!(
+            effective_key(&tracker, peer),
+            Some(advertised),
+            "and neither must a Delta re-upsert of the same node"
+        );
+        assert_eq!(
+            tracker.peer_db.has(&advertised),
+            Some(peer),
+            "the direct path still resolves the peer by the key it advertised"
+        );
+        assert_eq!(
+            tracker.peer_db.has(&DiscoPublicKey::from(FROM_CONTROL)),
+            None,
+            "and control's superseded key does not resolve to it"
+        );
+
+        // Control finally changes its mind. A genuinely NEW control key wins, exactly as it does
+        // upstream (`updateDiscoKey` clears `tsmpActive` for a non-zero control key).
+        tracker.apply_peer_update(&control_full(Some(CONTROL_CAUGHT_UP)));
+        assert_eq!(
+            effective_key(&tracker, peer),
+            Some(DiscoPublicKey::from(CONTROL_CAUGHT_UP)),
+            "control changing the key is authoritative again"
+        );
+    }
+
+    /// An advertisement that merely restates the key control already gave us is still *new*
+    /// information — it is the peer itself confirming the key — so Go records it as the TSMP key and
+    /// makes it active. Its "unchanged" early return compares `epDisco.keyFromTSMP()`, the
+    /// TSMP-learned key specifically, never the effective one.
+    ///
+    /// The observable consequence, asserted here: once the peer has confirmed the key, control
+    /// dropping it (a netmap node with no disco key) leaves the confirmed key in place instead of
+    /// blinding the direct path.
+    #[tokio::test]
+    async fn advertisement_restating_controls_key_is_recorded_as_the_tsmp_key() {
+        let (mut tracker, peer) = tracker_with_control_peer(Some(FROM_CONTROL));
+        let key = DiscoPublicKey::from(FROM_CONTROL);
+
+        assert!(
+            tracker.learn_disco_key(peer, key),
+            "an advertisement of the key control already sent is recorded, not dropped"
+        );
+        assert_eq!(
+            tracker
+                .endpoint_disco
+                .get(&PEER_NODE_KEY.into())
+                .and_then(EndpointDisco::key_from_tsmp),
+            Some(key),
+            "it lands in the TSMP slot (Go epDisco.tsmpKey), not only in control's"
+        );
+        assert!(
+            !tracker.learn_disco_key(peer, key),
+            "re-advertising it now IS unchanged, and is refused"
+        );
+
+        // Control drops the peer's disco key. The key the peer itself confirmed stays active.
+        tracker.apply_peer_update(&control_full(None));
+        assert_eq!(
+            effective_key(&tracker, peer),
+            Some(key),
+            "a control key going away hands the active slot to the TSMP-learned key"
+        );
+        assert_eq!(tracker.peer_db.has(&key), Some(peer));
+    }
+
+    /// A `PeersChangedPatch` is a control write like any other: one that says nothing about the
+    /// disco key must leave an active TSMP key alone, and one that carries a new key is control
+    /// catching up, so it wins.
+    ///
+    /// The patch path is the subtle one — it starts from the db node, which carries the *effective*
+    /// key, so without re-deriving what control last said it would hand the TSMP key back as if
+    /// control had sent it.
+    #[tokio::test]
+    async fn patch_without_a_disco_key_leaves_the_tsmp_key_active() {
+        let (mut tracker, peer) = tracker_with_control_peer(Some(FROM_CONTROL));
+        let advertised = DiscoPublicKey::from(ADVERTISED);
+        assert!(tracker.learn_disco_key(peer, advertised));
+
+        // A reachability-only patch (the idle-peer-reconnect case) for the same node.
+        let endpoint: std::net::SocketAddr = "203.0.113.9:41641".parse().unwrap();
+        let mut patch = ts_control::PeerChange {
+            id: 1,
+            derp_region: None,
+            cap: None,
+            cap_map: None,
+            underlay_addresses: Some(vec![endpoint]),
+            node_key: None,
+            key_signature: None,
+            disco_key: None,
+            node_key_expiry: None,
+            online: None,
+            last_seen: None,
+        };
+        tracker.apply_peer_patches(std::slice::from_ref(&patch));
+        assert_eq!(
+            effective_key(&tracker, peer),
+            Some(advertised),
+            "a patch that never mentions the disco key must not revert it to control's"
+        );
+        assert_eq!(
+            tracker
+                .peer_db
+                .get(&peer)
+                .expect("peer still present")
+                .1
+                .underlay_addresses,
+            vec![endpoint],
+            "and the patch it DID carry still applied"
+        );
+
+        // Now control catches up through the patch channel.
+        patch.disco_key = Some(DiscoPublicKey::from(CONTROL_CAUGHT_UP));
+        tracker.apply_peer_patches(std::slice::from_ref(&patch));
+        assert_eq!(
+            effective_key(&tracker, peer),
+            Some(DiscoPublicKey::from(CONTROL_CAUGHT_UP)),
+            "a patch that does carry a disco key is control catching up, and wins"
+        );
+    }
+
+    /// The TSMP-learned key lives exactly as long as Go's endpoint does: it is dropped when the peer
+    /// leaves the netmap, and it is not carried across a node-key rotation (Go builds the rotated
+    /// peer a brand-new endpoint, with a brand-new `endpointDisco`).
+    #[tokio::test]
+    async fn tsmp_key_does_not_outlive_the_peer_or_its_node_key() {
+        let (mut tracker, peer) = tracker_with_control_peer(Some(FROM_CONTROL));
+        assert!(tracker.learn_disco_key(peer, DiscoPublicKey::from(ADVERTISED)));
+
+        // The peer leaves the netmap, then comes back on control's key.
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![]));
+        assert!(tracker.peer_db.peers().is_empty());
+        assert!(
+            tracker.endpoint_disco.is_empty(),
+            "the departed peer's disco state goes with it"
+        );
+        tracker.apply_peer_update(&control_full(Some(FROM_CONTROL)));
+        let readded = node_from_control(Some(FROM_CONTROL));
+        let peer = tracker.peer_db.has(&readded.node_key).expect("re-added");
+        assert_eq!(
+            effective_key(&tracker, peer),
+            Some(DiscoPublicKey::from(FROM_CONTROL)),
+            "a peer that left and rejoined starts from control's key again"
+        );
+
+        // Learn a key again, then rotate the node key underneath it.
+        assert!(tracker.learn_disco_key(peer, DiscoPublicKey::from(READVERTISED)));
+        let mut rotated = node_from_control(Some(FROM_CONTROL));
+        rotated.node_key = [2u8; 32].into();
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![rotated.clone()]));
+        let peer = tracker
+            .peer_db
+            .has(&rotated.node_key)
+            .expect("rotated peer");
+        assert_eq!(
+            effective_key(&tracker, peer),
+            Some(DiscoPublicKey::from(FROM_CONTROL)),
+            "a key learned under the old node key is not carried onto the new one"
+        );
+        assert_eq!(
+            tracker.endpoint_disco.len(),
+            1,
+            "and the old node key's state is pruned"
         );
     }
 }

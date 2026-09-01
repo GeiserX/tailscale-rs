@@ -106,15 +106,30 @@ fn section_refs(text: &str) -> Vec<String> {
 /// opens a bullet in the gap list.
 fn anchors(text: &str) -> BTreeSet<String> {
     let mut anchors = BTreeSet::new();
+    let mut fenced = false;
 
     for line in text.lines() {
+        // The re-derivation block is shell, where a `#` opens a comment rather than a heading.
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+
         if let Some(heading) = line.strip_prefix('#') {
             anchors.insert(heading.trim_start_matches('#').trim().to_owned());
+            continue;
         }
-    }
 
-    for bold in text.split("**").skip(1).step_by(2) {
-        anchors.insert(bold.to_owned());
+        // Only bold that *opens* a bullet is a label a pointer may name; bold anywhere else is
+        // emphasis in running prose, and the ledger is full of it.
+        if let Some(rest) = line.trim_start().strip_prefix("- **")
+            && let Some(end) = rest.find("**")
+        {
+            anchors.insert(rest[..end].to_owned());
+        }
     }
 
     anchors
@@ -224,6 +239,7 @@ BODY
 ### Re-deriving this ledger
 
 ```sh
+# What upstream touched per mapped package
 for p in net/socks5 ipn/localapi tsnet; do
   echo \"== $p\"
 done
@@ -286,6 +302,32 @@ done
         );
 
         assert_eq!(inconsistencies(&text), Vec::<String>::new());
+    }
+
+    /// A shell comment in the re-derivation block is not a heading, so nothing may point at it.
+    #[test]
+    fn rejects_a_cross_reference_to_a_shell_comment() {
+        let text = ledger("What upstream touched per mapped package", "Nothing here.");
+
+        let problems = inconsistencies(&text);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("What upstream touched per mapped package"),
+            "{problems:?}"
+        );
+    }
+
+    /// Bold emphasis in running prose is not a label, so nothing may point at it either.
+    #[test]
+    fn rejects_a_cross_reference_to_bold_prose() {
+        let text = ledger(
+            "held below 126",
+            "The declaration is **held below 126**. `tsnet` is swept.",
+        );
+
+        let problems = inconsistencies(&text);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("held below 126"), "{problems:?}");
     }
 
     /// Sweep prose may not promise a mapping-table row for a package documented as a partial.

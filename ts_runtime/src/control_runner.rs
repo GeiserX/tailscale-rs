@@ -1480,6 +1480,16 @@ async fn issue_cert_pair_inner(
 /// grant is not knowable). If the grant has since been withdrawn, the first netmap of this session
 /// says so and the cache is discarded then.
 ///
+/// **Peers cached under Tailnet Lock are not part of this replay.** Go filters the netmap it
+/// replays through `tkaFilterNetmapLocked`, which it can do at cold start because its TKA authority
+/// is persisted on disk. This port's authority is in memory only (see [`crate::tka_sync`]), so at
+/// this point there is nothing to verify a cached peer's `key_signature` against and the peer
+/// tracker's enforcement cell still reads `None` — admit-all. So
+/// [`NetmapCache::load_state_update`](ts_control::NetmapCache::load_state_update) withholds the
+/// peers of a netmap that was cached while the lock was on, and this replay carries the rest (self
+/// node, DERP map, DNS, packet filter). Control's first netmap brings those peers back moments
+/// later, behind a synced authority.
+///
 /// The bus has no replay, so this reaches only subscribers already registered. Every netmap
 /// subscriber is spawned by `Runtime::spawn` before the control runner and registers from its own
 /// `on_start` with no I/O in the way, while this path awaits a file read first — so in practice the
