@@ -370,7 +370,14 @@ mod tests {
             user_id: 0,
             tailnet: None,
             tags: vec![],
-            addresses: vec![ipv4.parse().unwrap(), ipv6.parse().unwrap()],
+            // Go's `Node.Addresses` is what control actually assigned, and the wire -> domain
+            // `From` impl copies that list verbatim: the unspecified placeholder is synthesized
+            // onto `tailnet_address` alone, for a family the tailnet does not assign. Keep the
+            // same split here, or a fixture credits a node with an address it was never given.
+            addresses: [ipv4.parse().unwrap(), ipv6.parse().unwrap()]
+                .into_iter()
+                .filter(|net: &ipnet::IpNet| !net.addr().is_unspecified())
+                .collect(),
             tailnet_address: TailnetAddress {
                 ipv4: ipv4.parse().unwrap(),
                 ipv6: ipv6.parse().unwrap(),
@@ -429,6 +436,44 @@ mod tests {
         assert!(
             advertisement_self_addrs(&node("self", "0.0.0.0/32", "::/128", false)).is_empty(),
             "a node with no addresses at all advertises from nowhere"
+        );
+    }
+
+    /// A placeholder for a family the tailnet does not assign belongs to `tailnet_address` alone,
+    /// never to `Node::addresses` (Go `Node.Addresses`, control's assigned list, which the wire ->
+    /// domain `From` impl copies verbatim). `Node::is_router` asks "does this node route anything
+    /// besides its own addresses" of exactly that list, so a placeholder left in it answers "the
+    /// unassigned family is mine" and swallows a genuinely routed prefix.
+    #[test]
+    fn placeholder_families_are_not_assigned_addresses() {
+        let v4_only = node("self", "100.64.0.1/32", "::/128", false);
+
+        // A route to the family the tailnet never assigned is a routed prefix, not one of this
+        // node's own — the placeholder must not answer for it.
+        let mut routes_the_unassigned_family = v4_only.clone();
+        routes_the_unassigned_family.accepted_routes = vec!["::/128".parse().unwrap()];
+        assert!(
+            routes_the_unassigned_family.is_router(),
+            "a prefix this node was never assigned is a route, whatever family it is in"
+        );
+
+        // The same prefixes `advertisement_self_addrs` is willing to speak from, and no others:
+        // the two views of "what did control assign us" cannot disagree.
+        assert_eq!(
+            v4_only
+                .addresses
+                .iter()
+                .map(|net| net.addr())
+                .collect::<Vec<_>>(),
+            advertisement_self_addrs(&v4_only),
+            "the unspecified IPv6 placeholder is not an assigned prefix"
+        );
+
+        let dual = node("self", "100.64.0.1/32", "fd7a:115c:a1e0::1/128", false);
+        assert_eq!(
+            dual.addresses.len(),
+            2,
+            "a dual-stack node keeps both assigned prefixes"
         );
     }
 
