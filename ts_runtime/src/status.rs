@@ -324,6 +324,10 @@ mod tests {
             user_id: 0,
             tailnet: tailnet.map(str::to_string),
             tags: vec![],
+            addresses: vec![
+                format!("{ipv4}/32").parse().unwrap(),
+                "fd7a::1/128".parse().unwrap(),
+            ],
             tailnet_address: TailnetAddress {
                 ipv4: format!("{ipv4}/32").parse().unwrap(),
                 ipv6: "fd7a::1/128".parse().unwrap(),
@@ -468,6 +472,7 @@ mod tests {
 
         for (name, allowed, want) in cases {
             let mut n = node("n1", "host", Some("ts.net"), "100.64.0.1");
+            n.addresses = vec![self4, self6];
             n.tailnet_address.ipv6 = "fd7a:115c:a1e0::1/128".parse().unwrap();
             n.accepted_routes = allowed.clone();
 

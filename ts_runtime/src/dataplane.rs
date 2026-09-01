@@ -370,6 +370,7 @@ mod tests {
             user_id: 0,
             tailnet: None,
             tags: vec![],
+            addresses: vec![ipv4.parse().unwrap(), ipv6.parse().unwrap()],
             tailnet_address: TailnetAddress {
                 ipv4: ipv4.parse().unwrap(),
                 ipv6: ipv6.parse().unwrap(),
