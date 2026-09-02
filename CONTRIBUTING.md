@@ -17,10 +17,12 @@ We use a few `cargo` components/plugins in our development workflow you should i
 Formatting, linting, dependency checking, and testing:
 
 ```sh
-# Verify that all files are formatted properly:
-$ cargo +nightly fmt --check
+# Verify that all files are formatted properly (the toolchain in rust-toolchain.toml, which is what
+# CI checks with — a nightly rustfmt applies the nightly-only options in .rustfmt.toml and would
+# report diffs CI does not):
+$ cargo fmt --all -- --check
 # Format any incorrectly-formatted files:
-$ cargo +nightly fmt
+$ cargo fmt --all
 # Lint the codebase with clippy:
 $ cargo clippy
 # Verify dependency licenses are compatible, and have no outstanding security issues:

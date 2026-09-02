@@ -14,9 +14,24 @@ set -euo pipefail
 SCOPE_NO_WS=${SCOPE:-}
 readonly SCOPE=${@:---workspace}
 
+# Format with the SAME toolchain the gating CI job uses (the `rust` workflow's hosted-test job,
+# which runs `cargo fmt --all -- --check` under the `rust-toolchain.toml` channel) — never the
+# ambient `+nightly`. `.rustfmt.toml` sets nightly-only options (`imports_granularity`,
+# `group_imports`, ...); a nightly rustfmt applies them, the pinned stable one ignores them, so
+# `+nightly` here reported import-granularity diffs on a tree the gate considers clean and left
+# `bin/check` red on untouched main. Resolve the channel from `rust-toolchain.toml` and pass it
+# explicitly, so an ambient default or a `RUSTUP_TOOLCHAIN` in the environment cannot swap it out.
+RUST_TOOLCHAIN=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' \
+    "$(dirname "$0")/../rust-toolchain.toml")
+if [ -z "${RUST_TOOLCHAIN}" ]; then
+    echo "bin/check: could not read [toolchain] channel from rust-toolchain.toml" >&2
+    exit 1
+fi
+readonly RUST_TOOLCHAIN
+
 set -x
 
-cargo +nightly fmt --check
+cargo +"${RUST_TOOLCHAIN}" fmt --all -- --check
 cargo run -p checks
 cargo clippy      $SCOPE --lib                               --no-deps --all-features -- -D warnings
 cargo clippy      $SCOPE --bins --tests --benches --examples --no-deps --all-features -- -D warnings -A missing_docs

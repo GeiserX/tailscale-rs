@@ -782,6 +782,10 @@ mod tests {
             user_id: 0,
             tailnet: Some("user.ts.net".to_string()),
             tags: vec![],
+            addresses: vec![
+                format!("{ipv4}/32").parse().unwrap(),
+                "fd7a::1/128".parse().unwrap(),
+            ],
             tailnet_address: TailnetAddress {
                 ipv4: format!("{ipv4}/32").parse().unwrap(),
                 ipv6: "fd7a::1/128".parse().unwrap(),
