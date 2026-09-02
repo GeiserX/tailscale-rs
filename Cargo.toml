@@ -71,7 +71,7 @@ aead = { version = "0.5", features = ["std"] }
 # (consensus-critical), default-features off (drops rand/std; `alloc` still pulls password-hash/alloc
 # transitively — pure-Rust, ring-clean. The code calls the low-level hash_password_into, not the
 # PasswordHasher trait).
-argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
 base64 = "0.22"
 blake2 = "0.10"
 bytes = "1"
