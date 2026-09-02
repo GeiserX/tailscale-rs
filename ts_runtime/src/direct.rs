@@ -944,6 +944,10 @@ mod tests {
             user_id: 0,
             tailnet: Some("ts.net".to_string()),
             tags: vec![],
+            addresses: vec![
+                "100.64.0.9/32".parse().unwrap(),
+                "fd7a::9/128".parse().unwrap(),
+            ],
             tailnet_address: TailnetAddress {
                 ipv4: "100.64.0.9/32".parse().unwrap(),
                 ipv6: "fd7a::9/128".parse().unwrap(),

@@ -59,7 +59,208 @@ struct Ipv4Fragment {
 /// fragment starting before this could overlap a transport header (the RFC 1858 overlapping-fragment
 /// evasion), so Go demotes it to `unknown` and drops it; only fragments at or beyond this offset are
 /// allowed to "slide through".
+///
+/// Upstream reuses this one bound for IPv6 too (Go `net/packet` `26b2ed0a6` documents the reuse):
+/// it is sized for IPv4 and is therefore *conservative* for IPv6, whose fragments carry no
+/// per-fragment IP header — so on the v6 side it only ever rejects more later fragments as
+/// `unknown`, never fewer. Keep the single constant for both, exactly as Go does.
 const MIN_FRAG_BLKS: u16 = (60 + 20) / 8;
+
+/// Fixed IPv6 base header length (Go `net/packet.ip6HeaderLength`).
+const IP6_HEADER_LEN: usize = 40;
+
+/// IANA protocol number of the IPv6 Fragment extension header, "IPv6-Frag" (Go
+/// `net/packet.ip6FragHeader`). It appears as the **base** header's Next Header on a
+/// source-fragmented IPv6 packet, and is distinct from Go's internal `ipproto.Fragment` sentinel
+/// (0xff), which marks a non-first fragment whose sub-protocol header is not present.
+const IP6_FRAG_HEADER: u8 = 44;
+
+/// Length of the IPv6 Fragment extension header (Go `net/packet.ip6FragHeaderLength`): Next Header,
+/// Reserved, a 13-bit Fragment Offset in 8-byte blocks plus two reserved bits and the
+/// More-Fragments flag, then a 32-bit Identification.
+const IP6_FRAG_HEADER_LEN: usize = 8;
+
+/// How an IPv6 packet whose base header's Next Header is the Fragment extension header classifies —
+/// the port of Go `net/packet.Parsed.decode6Fragment` plus the sub-protocol switch `decode6` runs
+/// when it reports `continueDecode` (upstream `4c4ec3d46`, clarified by `26b2ed0a6`).
+///
+/// This is the IPv6 half of the RFC 1858 fragment rules [`Ipv4Fragment`] already carries. It only
+/// matters on the opt-in `Config::enable_ipv6` path — the tailnet is IPv4-only by default — but
+/// without it a source-fragmented IPv6 datagram reaches the ACL with no sub-protocol and port 0,
+/// so an allow-all rule admits the very low-offset fragments upstream drops, and a port-scoped rule
+/// blackholes the later fragments upstream passes through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ipv6Fragment {
+    /// Go's `unknown`, which filter `pre()` drops outright: a Fragment header truncated by the
+    /// packet, a *first* fragment too short to hold its own transport header, a later fragment at
+    /// an offset small enough to overlap that transport header on reassembly (RFC 1858), the
+    /// on-the-wire use of Go's internal `ipproto.Fragment` sentinel, or a Fragment header reached
+    /// through a chained extension header rather than as the base header's immediate Next Header
+    /// ([`fragment_header_is_chained`]).
+    Unknown,
+    /// Go's `ipproto.Fragment`: a later fragment at a safe offset. It carries no sub-protocol
+    /// header, so there is nothing for a rule to match on and filter `pre()` passes it through
+    /// ahead of the ACL — statelessly, exactly as for IPv4. RFC 8200 §4.5 requires the receiver to
+    /// reassemble, and its kernel drops the pieces if the head fragment never arrives.
+    Later,
+    /// Go's `continueDecode == true`: the first fragment. `decode6` steps over the 8-byte Fragment
+    /// header and parses the real sub-protocol's header, so the ACL matches this datagram on the
+    /// same rule it would match unfragmented.
+    First {
+        /// The Fragment header's Next Header — the real sub-protocol (Go `q.IPProto = nextHdr`).
+        proto: IpProto,
+        /// The destination port read from that sub-protocol's header, 0 for a protocol Go does not
+        /// port-match (Go `withPort(q.Dst, ...)`).
+        dst_port: u16,
+    },
+}
+
+/// Classify a whole IPv6 packet `b` whose base header's Next Header is [`IP6_FRAG_HEADER`], as Go
+/// `net/packet.Parsed.decode6` does when it dispatches to `decode6Fragment`.
+///
+/// Callers must have already checked that immediate Next Header byte: Go parses the Fragment header
+/// **only** as the base header's immediate next header (upstream `26b2ed0a6` added a test locking
+/// that scoping in). No other extension header, and no IPSec AH/ESP header, is parsed here either —
+/// same as Go. A Fragment header reached through a chained extension header is *not* this
+/// function's business; it is [`fragment_header_is_chained`]'s, which classifies it
+/// [`Ipv6Fragment::Unknown`] so it is dropped.
+fn decode6_fragment(b: &[u8]) -> Ipv6Fragment {
+    // Go `q.length = BE16(b[4:6]) + ip6HeaderLength; if len(b) < q.length` — a packet cut off before
+    // its declared payload is `unknown`.
+    if b.len() < IP6_HEADER_LEN {
+        return Ipv6Fragment::Unknown;
+    }
+    let length = usize::from(u16::from_be_bytes([b[4], b[5]])) + IP6_HEADER_LEN;
+    if b.len() < length {
+        return Ipv6Fragment::Unknown;
+    }
+
+    // Go `if len(b) < q.subofs+ip6FragHeaderLength` with `q.subofs == 40`.
+    let Some(frag) = b.get(IP6_HEADER_LEN..) else {
+        return Ipv6Fragment::Unknown;
+    };
+    if frag.len() < IP6_FRAG_HEADER_LEN {
+        return Ipv6Fragment::Unknown;
+    }
+
+    let next_header = frag[0];
+    // Go `fragOfs := binary.BigEndian.Uint16(frag[2:4]) >> 3`: the top 13 bits are the offset in
+    // 8-byte blocks; the low 3 are two reserved bits and the More-Fragments flag. Go reads no MF
+    // flag here at all — unlike `decode4`, `decode6` has no more-fragments guard on the first
+    // fragment, so a first IPv6 fragment is decoded exactly like an unfragmented packet (TSMP
+    // included, where `decode4` instead demotes a fragmented first packet to `unknown`).
+    let frag_ofs = u16::from_be_bytes([frag[2], frag[3]]) >> 3;
+
+    // Go steps `q.subofs += ip6FragHeaderLength` before branching; `sub` is what follows.
+    let sub = &frag[IP6_FRAG_HEADER_LEN..];
+
+    if frag_ofs == 0 {
+        return decode6_first_fragment(IpProto::new(i64::from(next_header)), sub);
+    }
+    if frag_ofs < MIN_FRAG_BLKS {
+        // RFC 1858: this fragment's bytes could land on top of the transport header the ACL matched
+        // the head fragment on. Go `q.IPProto = unknown`, same guard as `decode4`.
+        return Ipv6Fragment::Unknown;
+    }
+    Ipv6Fragment::Later
+}
+
+/// The sub-protocol switch Go `decode6` runs on a first fragment once `decode6Fragment` has stepped
+/// over the Fragment header. `sub` is the buffer from the sub-protocol's header onwards (Go's
+/// `sub := b[q.subofs:]`, measured against the buffer, not the IPv6 length field).
+///
+/// Each arm's bounds check is Go's, and each failure is Go's `unknown`: a first fragment too short
+/// to hold the transport header must be **dropped**, never guessed at, or a follow-up fragment
+/// supplying the rest of that header would carry the flow past a rule the filter never really
+/// matched (RFC 1858, the same reason `decode4` rejects a short first fragment).
+fn decode6_first_fragment(proto: IpProto, sub: &[u8]) -> Ipv6Fragment {
+    /// Go `net/packet.icmp6HeaderLength`.
+    const ICMP6_HEADER_LEN: usize = 4;
+    /// Go `net/packet.tcpHeaderLength`.
+    const TCP_HEADER_LEN: usize = 20;
+    /// Go `net/packet.udpHeaderLength`.
+    const UDP_HEADER_LEN: usize = 8;
+    /// Go `net/packet.sctpHeaderLength`.
+    const SCTP_HEADER_LEN: usize = 12;
+    /// Go `net/packet.minTSMPSize` — the shortest TSMP body (a 7-byte rejected-connection message).
+    const MIN_TSMP_SIZE: usize = 7;
+    /// Go's internal `ipproto.Fragment` sentinel. Seeing it as a real Next Header is suspicious, so
+    /// Go maps it back to `unknown`.
+    const IPPROTO_FRAGMENT_SENTINEL: IpProto = IpProto::new(0xff);
+
+    // Go's port-ful arms: bounds-check, then read the destination port from `sub[2:4]`.
+    let ported = |min_len: usize| {
+        if sub.len() < min_len {
+            return Ipv6Fragment::Unknown;
+        }
+        Ipv6Fragment::First {
+            proto,
+            dst_port: u16::from_be_bytes([sub[2], sub[3]]),
+        }
+    };
+    // Go's portless arms: bounds-check only, both ports left at 0.
+    let portless = |min_len: usize| {
+        if sub.len() < min_len {
+            return Ipv6Fragment::Unknown;
+        }
+        Ipv6Fragment::First { proto, dst_port: 0 }
+    };
+
+    match proto {
+        IpProto::ICMPV6 => portless(ICMP6_HEADER_LEN),
+        IpProto::TCP => ported(TCP_HEADER_LEN),
+        IpProto::UDP => ported(UDP_HEADER_LEN),
+        IpProto::SCTP => ported(SCTP_HEADER_LEN),
+        IpProto::TSMP => portless(MIN_TSMP_SIZE),
+        IPPROTO_FRAGMENT_SENTINEL => Ipv6Fragment::Unknown,
+        // Go's switch has no default arm: any other protocol keeps its number and port 0, and the
+        // ACL matches it IPs-only (`IpProto::is_port_ful`).
+        _ => Ipv6Fragment::First { proto, dst_port: 0 },
+    }
+}
+
+/// Whether `ipv6` carries a Fragment extension header somewhere in its extension-header chain
+/// *other than* as the base header's immediate Next Header — the case [`decode6_fragment`] is
+/// deliberately not scoped to, and which must therefore fail closed here.
+///
+/// Callers must only ask this when the base header's Next Header is **not** [`IP6_FRAG_HEADER`];
+/// otherwise the leading Fragment header itself answers `true` and would shadow its own
+/// classification.
+///
+/// Why a drop and not a pass. Go's `decode6` sets `q.IPProto` from the base header's Next Header
+/// and steps over *only* a leading Fragment header, so a hop-by-hop-chained fragment leaves
+/// `q.IPProto == 0 == ipproto.Unknown` and filter `pre()` drops it before the ACL ever runs. This
+/// tree instead reads the sub-protocol out of etherparse's extension-header walk, which resolves
+/// straight through the chain to the real transport number — so without this check the packet
+/// reaches the ACL looking like an ordinary TCP/UDP datagram whose port merely happens to be 0
+/// (etherparse refuses to descend into a fragmenting payload), and a permissive "allow the whole
+/// tailnet" rule *admits* it. That re-opens the entire RFC 1858 hole this classification exists to
+/// close: prepend an 8-byte Hop-by-Hop Options header and a low-offset later fragment — the one
+/// whose bytes can land on top of the transport header the head fragment was matched on — slides
+/// past, as does a first fragment truncated before its own transport header. The fragment rules
+/// must not be defeatable by an extension header the attacker chooses to prepend, so anything
+/// carrying a chained Fragment header is [`Ipv6Fragment::Unknown`].
+///
+/// This drops a strict subset of what Go drops here (Go rejects the whole chained-extension-header
+/// class, fragmenting or not), so it cannot admit anything upstream refuses and cannot break a real
+/// Tailscale, `wireguard-go` or kernel-WireGuard peer: upstream would discard such a packet too, so
+/// no peer can already be relying on one being delivered.
+fn fragment_header_is_chained(ipv6: &etherparse::Ipv6Slice<'_>) -> bool {
+    ipv6.extensions()
+        .clone()
+        .into_iter()
+        .any(|ext| matches!(ext, etherparse::Ipv6ExtensionSlice::Fragment(_)))
+}
+
+/// Which address family's fragment rules apply to a packet, so [`inbound_filter_verdict`] can run
+/// Go's `decode4` and `decode6` fragment classifications on the packets each actually governs.
+#[derive(Debug, Clone, Copy)]
+enum Fragment {
+    /// IPv4: the offset and MF flag straight out of the base header (Go `decode4`).
+    V4(Ipv4Fragment),
+    /// IPv6: the already-resolved classification of a Fragment extension header (Go `decode6`).
+    V6(Ipv6Fragment),
+}
 
 /// The inbound packet-filter verdict for an already-parsed packet (`true` = admit). This is the
 /// proto-switch of Go's filter `runIn4`/`runIn6`, applied after `pre()` and after this fork's
@@ -67,14 +268,19 @@ const MIN_FRAG_BLKS: u16 = (60 + 20) / 8;
 /// precondition) have run:
 ///
 /// 1. `drop_before_rules` — Go `pre()`'s unconditional multicast / link-local-unicast drops.
-/// 2. **Fragment classification** (Go `net/packet.decode4` + filter `pre()`): a non-first IPv4
+/// 2. **Fragment classification** (Go `net/packet.decode4`/`decode6` + filter `pre()`): a non-first
 ///    fragment carries no L4 header, so it cannot be port-matched. Go classifies it by offset — a
 ///    fragment at offset `>= MIN_FRAG_BLKS` is mapped to `ipproto.Fragment` and `pre()` **accepts**
 ///    it (stateless pass-through; the receiver's kernel discards it if the head fragment was
-///    dropped), while a fragment at a smaller offset is dropped (RFC 1858). A *fragmented* TSMP is
-///    disallowed (`moreFrags` on a first TSMP fragment → drop). Without this, etherparse leaves the
-///    transport `None` and the port reads as 0, so a normal ACL rule would silently drop every valid
-///    later fragment — breaking large/fragmented inbound traffic on the 1280-MTU overlay.
+///    dropped), while a fragment at a smaller offset is dropped (RFC 1858). On IPv4 a *fragmented*
+///    TSMP is additionally disallowed (`moreFrags` on a first TSMP fragment → drop). Without this,
+///    etherparse leaves the transport `None` and the port reads as 0, so a normal ACL rule would
+///    silently drop every valid later fragment — breaking large/fragmented inbound traffic on the
+///    1280-MTU overlay. The IPv6 half ([`Ipv6Fragment`], Go `decode6Fragment`) additionally folds in
+///    the sub-protocol decode of a *first* fragment, so `proto`/`dst_port` here are already the ones
+///    read past the Fragment extension header, and `Ipv6Fragment::Unknown` — a truncated or
+///    short-first fragment, or one whose Fragment header sits behind a chained extension header
+///    ([`fragment_header_is_chained`]) — is dropped where Go's `pre()` drops `ipproto.Unknown`.
 /// 3. TSMP (proto 99) is always admitted, bypassing the ACL — Go `case ipproto.TSMP: return Accept`.
 ///    TSMP carries in-band control messages between nodes, so it must reach the local stack
 ///    regardless of the ACL rules.
@@ -85,40 +291,71 @@ fn inbound_filter_verdict(
     src: std::net::IpAddr,
     dst: std::net::IpAddr,
     dst_port: u16,
-    frag: Option<Ipv4Fragment>,
+    frag: Option<Fragment>,
 ) -> bool {
     if drop_before_rules(dst) {
         tracing::trace!(?dst, "dropping multicast/link-local dst (pre-rule)");
         return false;
     }
 
-    if let Some(frag) = frag {
-        if frag.offset_blocks > 0 {
-            // A non-first fragment (Go `decode4`'s `fragOfs != 0` branch). It has no transport
-            // header to match, so the verdict is decided purely by offset:
-            if frag.offset_blocks < MIN_FRAG_BLKS {
-                // Potentially overlaps a transport header (RFC 1858); Go demotes to `unknown` → drop.
-                tracing::trace!(?dst, "dropping low-offset IPv4 fragment (RFC 1858)");
+    match frag {
+        Some(Fragment::V4(frag)) => {
+            if frag.offset_blocks > 0 {
+                // A non-first fragment (Go `decode4`'s `fragOfs != 0` branch). It has no transport
+                // header to match, so the verdict is decided purely by offset:
+                if frag.offset_blocks < MIN_FRAG_BLKS {
+                    // Potentially overlaps a transport header (RFC 1858); Go demotes to `unknown` → drop.
+                    tracing::trace!(?dst, "dropping low-offset IPv4 fragment (RFC 1858)");
+                    return false;
+                }
+                // A valid later fragment — Go maps it to `ipproto.Fragment`, which `pre()` accepts
+                // ahead of the ACL. Stateless: if the head fragment was filtered the receiver's kernel
+                // drops this on reassembly timeout. Accepting here is what large fragmented inbound
+                // traffic relies on.
+                tracing::trace!(
+                    ?dst,
+                    "accepting later IPv4 fragment (Go pre() pass-through)"
+                );
+                return true;
+            }
+            // `frag.offset_blocks == 0`: the first fragment (or an unfragmented packet). Go disallows a
+            // *fragmented* TSMP (a first fragment with MF set) — without the whole message it can't be a
+            // valid inter-node control packet. Fall through to the normal proto-switch for everything
+            // else; the first fragment of TCP/UDP carries its L4 header, so `dst_port` was parsed above.
+            if proto == IpProto::TSMP && frag.more_fragments {
+                tracing::trace!(?dst, "dropping fragmented TSMP (Go parity)");
                 return false;
             }
-            // A valid later fragment — Go maps it to `ipproto.Fragment`, which `pre()` accepts
-            // ahead of the ACL. Stateless: if the head fragment was filtered the receiver's kernel
-            // drops this on reassembly timeout. Accepting here is what large fragmented inbound
-            // traffic relies on.
+        }
+        // The IPv6 Fragment extension header (Go `decode6Fragment`, upstream `4c4ec3d46`). Only
+        // reachable on the opt-in `Config::enable_ipv6` path; the classification itself already ran
+        // Go's offset and bounds checks, so all that is left is Go's `pre()` disposition of the
+        // three protocol values `decode6` can end up with.
+        Some(Fragment::V6(Ipv6Fragment::Unknown)) => {
+            // Go `pre()`: `if q.IPProto == ipproto.Unknown { return Drop }`. This is the
+            // security-relevant arm — a short first fragment, an RFC 1858 low-offset later
+            // fragment, or a Fragment header hidden behind a chained extension header must never
+            // reach the ACL, where an allow-all rule would admit it.
             tracing::trace!(
                 ?dst,
-                "accepting later IPv4 fragment (Go pre() pass-through)"
+                "dropping IPv6 fragment classified unknown (Go pre() drop)"
+            );
+            return false;
+        }
+        Some(Fragment::V6(Ipv6Fragment::Later)) => {
+            // Go `pre()`: `case ipproto.Fragment: return Accept`, same stateless pass-through as
+            // IPv4 — and required by RFC 8200 §4.5, which puts reassembly on the receiver.
+            tracing::trace!(
+                ?dst,
+                "accepting later IPv6 fragment (Go pre() pass-through)"
             );
             return true;
         }
-        // `frag.offset_blocks == 0`: the first fragment (or an unfragmented packet). Go disallows a
-        // *fragmented* TSMP (a first fragment with MF set) — without the whole message it can't be a
-        // valid inter-node control packet. Fall through to the normal proto-switch for everything
-        // else; the first fragment of TCP/UDP carries its L4 header, so `dst_port` was parsed above.
-        if proto == IpProto::TSMP && frag.more_fragments {
-            tracing::trace!(?dst, "dropping fragmented TSMP (Go parity)");
-            return false;
-        }
+        // A first IPv6 fragment: `proto` and `dst_port` were read past the Fragment header, so it
+        // takes the ordinary proto switch below and matches the rule an unfragmented datagram would.
+        // Note the deliberate asymmetry with IPv4: `decode6` has no more-fragments guard at all, so
+        // — unlike `decode4` — upstream does not demote a fragmented first TSMP packet to `unknown`.
+        Some(Fragment::V6(Ipv6Fragment::First { .. })) | None => {}
     }
 
     if proto == IpProto::TSMP {
@@ -188,22 +425,52 @@ fn filter_inbound_from_peer(
                     IpProto::new(ipv4.payload().ip_number.0 as _),
                     hdr.source_addr().into(),
                     hdr.destination_addr().into(),
-                    Some(Ipv4Fragment {
+                    Some(Fragment::V4(Ipv4Fragment {
                         offset_blocks: hdr.fragments_offset().value(),
                         more_fragments: hdr.more_fragments(),
-                    }),
+                    })),
                 )
             }
-            Some(etherparse::NetSlice::Ipv6(ipv6)) => (
-                IpProto::new(ipv6.payload().ip_number.0 as _),
-                ipv6.header().source_addr().into(),
-                ipv6.header().destination_addr().into(),
+            Some(etherparse::NetSlice::Ipv6(ipv6)) => {
+                let hdr = ipv6.header();
                 // IPv6 fragmentation is carried in a Fragment extension header, not the
-                // base header; the tailnet is IPv4-only by default so a v6 fragment can't
-                // reach here on the live path. Treat v6 as non-fragment (the existing
-                // behavior) — full v6 fragment parity is tracked separately.
-                None,
-            ),
+                // base header. Go `decode6` parses that header — and *only* when it is the
+                // base header's immediate Next Header. `next_header()` is exactly that
+                // immediate byte, so testing it here reproduces upstream's scoping. Only
+                // reachable under the opt-in `Config::enable_ipv6`; the tailnet is IPv4-only
+                // by default.
+                //
+                // A Fragment header reached through a *chained* hop-by-hop / routing /
+                // destination-options / AH header is outside that scope, and must fail
+                // closed rather than fall through to the ACL: Go drops it (the base Next
+                // Header leaves `q.IPProto` at `ipproto.Unknown`, which `pre()` refuses),
+                // whereas etherparse resolves the real sub-protocol through the chain, so an
+                // allow-all rule would otherwise admit exactly the RFC 1858 fragments this
+                // classification exists to reject. See `fragment_header_is_chained`.
+                let frag = if hdr.next_header().0 == IP6_FRAG_HEADER {
+                    Some(decode6_fragment(bytes))
+                } else if fragment_header_is_chained(&ipv6) {
+                    Some(Ipv6Fragment::Unknown)
+                } else {
+                    None
+                };
+                let proto = match frag {
+                    // Go `q.IPProto = nextHdr`: the first fragment's real sub-protocol, read
+                    // past the 8-byte Fragment header.
+                    Some(Ipv6Fragment::First { proto, .. }) => proto,
+                    // A later or malformed fragment has no sub-protocol at all (Go's
+                    // `ipproto.Fragment` / `unknown`); the verdict decides on the
+                    // classification alone and never consults this.
+                    Some(Ipv6Fragment::Later | Ipv6Fragment::Unknown) => IpProto::new(0),
+                    None => IpProto::new(ipv6.payload().ip_number.0 as _),
+                };
+                (
+                    proto,
+                    hdr.source_addr().into(),
+                    hdr.destination_addr().into(),
+                    frag.map(Fragment::V6),
+                )
+            }
             _ => {
                 // A packet that parsed as IP but is neither IPv4 nor IPv6 (e.g. a
                 // future/odd `NetSlice` shape). These bytes are attacker-controlled
@@ -215,14 +482,18 @@ fn filter_inbound_from_peer(
             }
         };
 
-        let (_src_port, dst_port) = match pkt.transport {
-            Some(etherparse::TransportSlice::Udp(udp)) => {
-                (udp.source_port(), udp.destination_port())
-            }
-            Some(etherparse::TransportSlice::Tcp(tcp)) => {
-                (tcp.source_port(), tcp.destination_port())
-            }
-            _ => (0, 0),
+        // Go `decode6` reads a *first* IPv6 fragment's transport ports past the Fragment
+        // extension header, so a fragmented datagram matches the same rule as an
+        // unfragmented one. etherparse deliberately refuses to descend into a fragmenting
+        // payload and leaves `transport == None`, so that port comes from the
+        // classification above instead.
+        let dst_port = match frag {
+            Some(Fragment::V6(Ipv6Fragment::First { dst_port, .. })) => dst_port,
+            _ => match pkt.transport {
+                Some(etherparse::TransportSlice::Udp(udp)) => udp.destination_port(),
+                Some(etherparse::TransportSlice::Tcp(tcp)) => tcp.destination_port(),
+                _ => 0,
+            },
         };
 
         // TSMP disco-key advertisement (Go `packet.TSMPDiscoKeyAdvertisement`,
@@ -835,10 +1106,10 @@ mod tests {
         let src = ip("100.64.0.9");
         let dst = ip("100.64.0.1");
         let frag = |offset_blocks: u16, more_fragments: bool| {
-            Some(Ipv4Fragment {
+            Some(Fragment::V4(Ipv4Fragment {
                 offset_blocks,
                 more_fragments,
-            })
+            }))
         };
 
         // A valid later fragment is accepted under a DENY-ALL ACL with port 0 — proves the accept is
@@ -916,6 +1187,529 @@ mod tests {
                 frag(MIN_FRAG_BLKS, true)
             ),
             "a later TSMP fragment is accepted via the fragment path (proto-independent)"
+        );
+    }
+
+    /// An ACL that admits everything, the shape a permissive "allow the whole tailnet" policy has.
+    /// Under it, a DROP can only have come from a rule the filter applies *ahead* of the ACL — which
+    /// is exactly what makes it the right control for the fragment classification's negative cases.
+    struct AllowAll;
+    impl ts_packetfilter::Filter for AllowAll {
+        fn match_for(
+            &self,
+            _info: &ts_packetfilter::PacketInfo,
+            _caps: ts_packetfilter::filter::CapIter,
+        ) -> Option<&str> {
+            Some("allow-all")
+        }
+    }
+
+    /// An ACL that admits exactly one destination port. An admitted packet therefore proves the
+    /// filter read that port off the wire — the point of Go `decode6` reaching past the Fragment
+    /// extension header to the first fragment's real transport header.
+    struct AllowPort(u16);
+    impl ts_packetfilter::Filter for AllowPort {
+        fn match_for(
+            &self,
+            info: &ts_packetfilter::PacketInfo,
+            _caps: ts_packetfilter::filter::CapIter,
+        ) -> Option<&str> {
+            (info.port == self.0).then_some("allow-port")
+        }
+    }
+
+    /// Source/destination for the IPv6 fixtures: RFC 3849 documentation addresses, standing in for
+    /// the real ones upstream's `udp6*FragmentBuffer` fixtures use. Neither is multicast or
+    /// link-local, so `drop_before_rules` never fires and every verdict below is the fragment
+    /// classification's own.
+    const IPV6_FIXTURE_SRC: std::net::Ipv6Addr =
+        std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5);
+    const IPV6_FIXTURE_DST: std::net::Ipv6Addr =
+        std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+
+    /// The IPv6 packet a source-fragmenting host puts on the wire, in the shape of upstream's
+    /// `udp6FirstFragmentBuffer` / `udp6NonFirstFragmentBuffer` fixtures (Go
+    /// `net/packet/packet_test.go`): a 40-byte base header whose Next Header is the Fragment
+    /// extension header (44), the 8-byte Fragment header itself, then `rest` — the real
+    /// sub-protocol header on a first fragment, or continued payload on a later one.
+    fn ipv6_fragment_packet(
+        next_header: u8,
+        offset_blocks: u16,
+        more_fragments: bool,
+        rest: &[u8],
+    ) -> Vec<u8> {
+        let mut buf = vec![0u8; IP6_HEADER_LEN + IP6_FRAG_HEADER_LEN + rest.len()];
+        buf[0] = 0x60; // version 6, traffic class/flow label 0
+        let payload_len = u16::try_from(IP6_FRAG_HEADER_LEN + rest.len()).unwrap();
+        buf[4..6].copy_from_slice(&payload_len.to_be_bytes());
+        buf[6] = IP6_FRAG_HEADER;
+        buf[7] = 64; // hop limit
+        buf[8..24].copy_from_slice(&IPV6_FIXTURE_SRC.octets());
+        buf[24..40].copy_from_slice(&IPV6_FIXTURE_DST.octets());
+        // Fragment extension header: Next Header, Reserved, offset<<3 | MF, Identification.
+        buf[40] = next_header;
+        let offset_field = (offset_blocks << 3) | u16::from(more_fragments);
+        buf[42..44].copy_from_slice(&offset_field.to_be_bytes());
+        buf[44..48].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        buf[48..].copy_from_slice(rest);
+        buf
+    }
+
+    /// A plain, unfragmented IPv6/UDP packet: the same 40-byte base header the fragment fixtures
+    /// use, but with UDP as its immediate Next Header. The control for the chained-extension-header
+    /// fixtures below.
+    fn ipv6_udp_packet(udp: &[u8]) -> Vec<u8> {
+        let mut buf = vec![0u8; IP6_HEADER_LEN + udp.len()];
+        buf[0] = 0x60; // version 6, traffic class/flow label 0
+        buf[4..6].copy_from_slice(&u16::try_from(udp.len()).unwrap().to_be_bytes());
+        buf[6] = 17; // Next Header = UDP
+        buf[7] = 64; // hop limit
+        buf[8..24].copy_from_slice(&IPV6_FIXTURE_SRC.octets());
+        buf[24..40].copy_from_slice(&IPV6_FIXTURE_DST.octets());
+        buf[IP6_HEADER_LEN..].copy_from_slice(udp);
+        // Unlike a fragment fixture, this datagram is actually parsed as UDP, so its Length field
+        // has to agree with the bytes present or etherparse rejects the packet outright.
+        let udp_len = u16::try_from(udp.len()).unwrap();
+        buf[IP6_HEADER_LEN + 4..IP6_HEADER_LEN + 6].copy_from_slice(&udp_len.to_be_bytes());
+        buf
+    }
+
+    /// Push one 8-byte extension header of protocol `ext_proto` in front of `inner`'s payload, so
+    /// whatever `inner`'s base header pointed at directly is now reached through a *chain*. The
+    /// generic Next-Header / Hdr-Ext-Len-0 / six-bytes-of-body shape is the on-the-wire layout of
+    /// Hop-by-Hop Options (0), Routing (43) and Destination Options (60) alike.
+    ///
+    /// Those six body bytes are chosen so the header is well formed under *every* one of those
+    /// three readings, not merely one etherparse happens not to look at:
+    ///
+    /// - as Options (0 / 60) they are a TLV stream — `1, 0` is a zero-length PadN, and the four
+    ///   trailing zeros are four Pad1s, filling the 8-byte header exactly;
+    /// - as Routing (43) they are Routing Type 1, **Segments Left 0**, and four bytes of
+    ///   type-specific data. Segments Left must stay 0: `Hdr Ext Len` is 0, so there is no room
+    ///   for a single 16-byte segment, and RFC 8200 §4.4 has a receiver that meets a non-zero
+    ///   Segments Left on an unrecognized Routing Type discard the packet and answer ICMP
+    ///   Parameter Problem. etherparse walks a Routing header as a raw ext header and never reads
+    ///   the field, so a non-zero value parses here today — but a fixture that only survives
+    ///   because the parser is lenient is one parser release away from turning the negative
+    ///   assertions below into vacuous passes.
+    fn ipv6_with_prepended_ext_header(ext_proto: u8, inner: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(inner.len() + 8);
+        buf.extend_from_slice(&inner[..IP6_HEADER_LEN]);
+        // The header we are displacing becomes the extension header's Next Header.
+        let displaced = buf[6];
+        buf[6] = ext_proto;
+        let payload_len = u16::try_from(inner.len() - IP6_HEADER_LEN + 8).unwrap();
+        buf[4..6].copy_from_slice(&payload_len.to_be_bytes());
+        buf.extend_from_slice(&[displaced, 0, 1, 0, 0, 0, 0, 0]);
+        buf.extend_from_slice(&inner[IP6_HEADER_LEN..]);
+        buf
+    }
+
+    /// An 8-byte UDP header carrying `dst_port`, as a first fragment's `rest`.
+    fn udp_header(dst_port: u16) -> Vec<u8> {
+        let mut hdr = vec![0u8; 8];
+        hdr[0..2].copy_from_slice(&54276u16.to_be_bytes());
+        hdr[2..4].copy_from_slice(&dst_port.to_be_bytes());
+        hdr[4..6].copy_from_slice(&16u16.to_be_bytes());
+        hdr
+    }
+
+    /// The IPv6 Fragment extension-header classification, mirroring Go
+    /// `net/packet.Parsed.decode6Fragment` plus the sub-protocol switch `decode6` runs when it
+    /// reports `continueDecode` (upstream `4c4ec3d46`, clarified by `26b2ed0a6`). Cases are
+    /// upstream's own `TestDecode` fixtures: `ipv6_frag_first`, `ipv6_frag_nonfirst`,
+    /// `ipv6_frag_short_first` and `ipv6_frag_small_offset`.
+    #[test]
+    fn ipv6_fragment_classification_matches_go_decode6() {
+        // `ipv6_frag_first`: offset 0 with MF set, and a whole UDP header behind the fragment
+        // header — Go steps over the 8 bytes and reads the ports, so the ACL matches this datagram
+        // on the same rule it would match unfragmented.
+        assert_eq!(
+            decode6_fragment(&ipv6_fragment_packet(17, 0, true, &udp_header(443))),
+            Ipv6Fragment::First {
+                proto: IpProto::UDP,
+                dst_port: 443,
+            },
+            "a first fragment is decoded past the Fragment header, ports and all"
+        );
+
+        // `ipv6_frag_nonfirst`: a later fragment at offset 185 blocks has no transport header at
+        // all, so Go marks it `ipproto.Fragment` for `pre()` to pass through.
+        assert_eq!(
+            decode6_fragment(&ipv6_fragment_packet(17, 185, false, &[0x61; 8])),
+            Ipv6Fragment::Later,
+            "a later fragment at a safe offset classifies as a pass-through fragment"
+        );
+        // The floor itself is safe; one block below it is not. `MIN_FRAG_BLKS` is the IPv4-sized
+        // bound upstream deliberately reuses for IPv6 (Go `26b2ed0a6`).
+        assert_eq!(
+            decode6_fragment(&ipv6_fragment_packet(17, MIN_FRAG_BLKS, false, &[0x61; 8])),
+            Ipv6Fragment::Later,
+            "offset == MIN_FRAG_BLKS is the first accepted later fragment"
+        );
+
+        // `ipv6_frag_small_offset`: a later fragment whose bytes could land on top of the transport
+        // header the head fragment was matched on — RFC 1858. Go rejects it as `unknown`.
+        assert_eq!(
+            decode6_fragment(&ipv6_fragment_packet(17, 1, false, &[0x61; 8])),
+            Ipv6Fragment::Unknown,
+            "a later fragment at offset 1 block is rejected (RFC 1858)"
+        );
+        assert_eq!(
+            decode6_fragment(&ipv6_fragment_packet(
+                17,
+                MIN_FRAG_BLKS - 1,
+                false,
+                &[0x61; 8]
+            )),
+            Ipv6Fragment::Unknown,
+            "one block below the floor is still rejected (RFC 1858)"
+        );
+
+        // `ipv6_frag_short_first`: a first fragment truncated before its full transport header. Go
+        // refuses to guess at the ports, because a follow-up fragment supplying the rest of that
+        // header would otherwise carry the flow past a rule the filter never really matched.
+        assert_eq!(
+            decode6_fragment(&ipv6_fragment_packet(17, 0, true, &udp_header(443)[..4])),
+            Ipv6Fragment::Unknown,
+            "a first fragment with only half a UDP header is rejected"
+        );
+        assert_eq!(
+            decode6_fragment(&ipv6_fragment_packet(6, 0, true, &[0u8; 19])),
+            Ipv6Fragment::Unknown,
+            "a first fragment one byte short of a TCP header is rejected"
+        );
+        // ...and the same header one byte longer is accepted, so the rejection is the bounds check
+        // and not the protocol.
+        let mut tcp = vec![0u8; 20];
+        tcp[2..4].copy_from_slice(&443u16.to_be_bytes());
+        assert_eq!(
+            decode6_fragment(&ipv6_fragment_packet(6, 0, true, &tcp)),
+            Ipv6Fragment::First {
+                proto: IpProto::TCP,
+                dst_port: 443,
+            },
+            "a complete TCP header in the first fragment is read normally"
+        );
+
+        // A Fragment header truncated by the packet itself (Go's `len(b) < q.subofs+8` guard).
+        let mut short = ipv6_fragment_packet(17, 0, true, &[]);
+        short.truncate(IP6_HEADER_LEN + 4);
+        short[4..6].copy_from_slice(&4u16.to_be_bytes());
+        assert_eq!(
+            decode6_fragment(&short),
+            Ipv6Fragment::Unknown,
+            "a truncated Fragment extension header is rejected"
+        );
+        // A packet cut off before its declared payload length (Go `len(b) < q.length`).
+        let mut cut = ipv6_fragment_packet(17, 0, true, &udp_header(443));
+        cut.truncate(cut.len() - 1);
+        assert_eq!(
+            decode6_fragment(&cut),
+            Ipv6Fragment::Unknown,
+            "a packet cut off before its declared IPv6 length is rejected"
+        );
+
+        // Go's portless arms bounds-check but leave the port at 0, and the on-the-wire use of Go's
+        // internal `ipproto.Fragment` sentinel (0xff) maps back to `unknown`.
+        assert_eq!(
+            decode6_fragment(&ipv6_fragment_packet(58, 0, true, &[0u8; 4])),
+            Ipv6Fragment::First {
+                proto: IpProto::ICMPV6,
+                dst_port: 0,
+            },
+            "a first ICMPv6 fragment keeps port 0 and is matched IPs-only"
+        );
+        assert_eq!(
+            decode6_fragment(&ipv6_fragment_packet(58, 0, true, &[0u8; 3])),
+            Ipv6Fragment::Unknown,
+            "a first ICMPv6 fragment shorter than the ICMPv6 header is rejected"
+        );
+        assert_eq!(
+            decode6_fragment(&ipv6_fragment_packet(0xff, 0, true, &[0u8; 8])),
+            Ipv6Fragment::Unknown,
+            "Go's internal Fragment sentinel seen on the wire maps back to unknown"
+        );
+    }
+
+    /// The verdict Go's filter `pre()` reaches for each IPv6 fragment classification, asserted
+    /// against an ACL that would otherwise decide the packet the other way — so each assertion can
+    /// only be the fragment rule, never the ACL:
+    ///
+    /// - `Unknown` is DROPPED under an ALLOW-ALL ACL (Go `pre()`: `IPProto == Unknown → Drop`).
+    ///   This is the security-relevant direction: an allow-all tailnet policy must not admit a
+    ///   short-first or RFC-1858 low-offset fragment.
+    /// - `Later` is ACCEPTED under a DENY-ALL ACL (Go `pre()`: `case ipproto.Fragment: Accept`).
+    /// - `First` consults the ACL normally on the port read past the Fragment header.
+    #[test]
+    fn ipv6_fragment_verdict_matches_go_pre() {
+        let src = std::net::IpAddr::V6(IPV6_FIXTURE_SRC);
+        let dst = std::net::IpAddr::V6(IPV6_FIXTURE_DST);
+        let v6 = |class| Some(Fragment::V6(class));
+
+        // The negative case, stated explicitly: allow-all cannot rescue an `unknown` fragment.
+        assert!(
+            !inbound_filter_verdict(
+                &AllowAll,
+                IpProto::new(0),
+                src,
+                dst,
+                0,
+                v6(Ipv6Fragment::Unknown)
+            ),
+            "an unknown IPv6 fragment is dropped even under an allow-all ACL"
+        );
+        // The control: the same allow-all ACL admits an ordinary non-fragment packet, so the drop
+        // above is the classification and not the harness.
+        assert!(
+            inbound_filter_verdict(&AllowAll, IpProto::UDP, src, dst, 443, None),
+            "the allow-all ACL does admit an ordinary packet"
+        );
+
+        // A safe later fragment slides through ahead of the ACL, with nothing but port 0 to match.
+        assert!(
+            inbound_filter_verdict(
+                &DenyAll,
+                IpProto::new(0),
+                src,
+                dst,
+                0,
+                v6(Ipv6Fragment::Later)
+            ),
+            "a later IPv6 fragment is accepted ahead of a deny-all ACL"
+        );
+
+        // A first fragment is an ordinary packet again: admitted on the port the ACL allows,
+        // dropped on one it does not.
+        let first = |dst_port| {
+            v6(Ipv6Fragment::First {
+                proto: IpProto::UDP,
+                dst_port,
+            })
+        };
+        assert!(
+            inbound_filter_verdict(&AllowPort(443), IpProto::UDP, src, dst, 443, first(443)),
+            "a first IPv6 fragment is matched on the port behind the Fragment header"
+        );
+        assert!(
+            !inbound_filter_verdict(&AllowPort(443), IpProto::UDP, src, dst, 444, first(444)),
+            "a first IPv6 fragment on a disallowed port is dropped by the ACL"
+        );
+        // Control: the same ACL decides an unfragmented packet the same way, so the two results
+        // above are the ACL being consulted on a real port and not a fragment-specific shortcut.
+        assert!(
+            inbound_filter_verdict(&AllowPort(443), IpProto::UDP, src, dst, 443, None),
+            "control: the port-scoped ACL admits an unfragmented packet to 443"
+        );
+        assert!(
+            !inbound_filter_verdict(&AllowPort(443), IpProto::UDP, src, dst, 0, None),
+            "control: port 0 - what a v6 fragment used to read as - is not admitted"
+        );
+
+        // `pre()`'s multicast/link-local drops still outrank the fragment pass-through, exactly as
+        // Go runs them before `case ipproto.Fragment`.
+        assert!(
+            !inbound_filter_verdict(
+                &AllowAll,
+                IpProto::new(0),
+                src,
+                "ff02::1".parse().unwrap(),
+                0,
+                v6(Ipv6Fragment::Later)
+            ),
+            "a later fragment to a multicast dst is still dropped by pre()"
+        );
+        assert!(
+            !inbound_filter_verdict(
+                &AllowAll,
+                IpProto::new(0),
+                src,
+                "fe80::1".parse().unwrap(),
+                0,
+                v6(Ipv6Fragment::Later)
+            ),
+            "a later fragment to a link-local dst is still dropped by pre()"
+        );
+    }
+
+    /// The whole inbound path on real IPv6 bytes — parse, classify, verdict — which is the shape
+    /// the bypass had: before the Fragment extension header was classified, every source-fragmented
+    /// IPv6 datagram reached the ACL with no sub-protocol and port 0, so an allow-all rule admitted
+    /// the RFC 1858 fragments upstream drops and a port-scoped rule blackholed the later fragments
+    /// upstream passes through.
+    #[test]
+    fn ipv6_fragments_are_filtered_end_to_end() {
+        let keep = |filter: &(dyn ts_packetfilter::Filter + Send + Sync), packet: Vec<u8>| {
+            let mut packets = vec![PacketMut::from(packet)];
+            let mut learned = Vec::new();
+            filter_inbound_from_peer(filter, PeerId(3), &mut packets, &mut learned);
+            assert!(
+                learned.is_empty(),
+                "no TSMP advertisement in these fixtures"
+            );
+            !packets.is_empty()
+        };
+
+        // Under an ALLOW-ALL ACL — the permissive policy the bypass needs — the RFC 1858 fragment
+        // must still be dropped, while the legitimate later fragment must still be delivered.
+        assert!(
+            !keep(&AllowAll, ipv6_fragment_packet(17, 1, false, &[0x61; 8])),
+            "a low-offset later IPv6 fragment is dropped even by an allow-all ACL (RFC 1858)"
+        );
+        assert!(
+            !keep(
+                &AllowAll,
+                ipv6_fragment_packet(17, 0, true, &udp_header(443)[..4])
+            ),
+            "a first IPv6 fragment too short to hold its UDP header is dropped by an allow-all ACL"
+        );
+        assert!(
+            keep(&AllowAll, ipv6_fragment_packet(17, 185, false, &[0x61; 8])),
+            "a legitimate later IPv6 fragment is delivered"
+        );
+
+        // ...and the later fragment is delivered even under a DENY-ALL ACL, which is the Go
+        // `pre()` pass-through and not the ACL agreeing.
+        assert!(
+            keep(&DenyAll, ipv6_fragment_packet(17, 185, false, &[0x61; 8])),
+            "a legitimate later IPv6 fragment slides through a deny-all ACL (Go pre())"
+        );
+        assert!(
+            !keep(&DenyAll, ipv6_fragment_packet(17, 1, false, &[0x61; 8])),
+            "a low-offset later IPv6 fragment is dropped under a deny-all ACL too"
+        );
+
+        // A first fragment is matched on the port that lives behind the Fragment extension header,
+        // which is the whole point of stepping over it: 443 is admitted, 444 is not, under the same
+        // port-scoped ACL. Before the port was read past the header both read as port 0 and both
+        // were dropped.
+        assert!(
+            keep(
+                &AllowPort(443),
+                ipv6_fragment_packet(17, 0, true, &udp_header(443))
+            ),
+            "a first IPv6 fragment to an allowed port is delivered"
+        );
+        assert!(
+            !keep(
+                &AllowPort(443),
+                ipv6_fragment_packet(17, 0, true, &udp_header(444))
+            ),
+            "a first IPv6 fragment to a disallowed port is dropped"
+        );
+
+        // Scoping (Go `26b2ed0a6`): the Fragment header is parsed here ONLY as the base header's
+        // immediate Next Header. What happens to one reached through a chained extension header —
+        // it must fail closed, not fall through to the ACL — is
+        // `chained_extension_header_cannot_bypass_the_ipv6_fragment_rules`.
+    }
+
+    /// Prepending an extension header must not defeat the fragment rules.
+    ///
+    /// [`decode6_fragment`] is scoped exactly as Go scopes it: the Fragment header is parsed only
+    /// as the base header's immediate Next Header. Go can afford that narrow scope because
+    /// everything it does not parse *keeps the base header's Next Header* as `q.IPProto`, so a
+    /// hop-by-hop-chained fragment is `ipproto.Unknown` and filter `pre()` drops it before the ACL
+    /// ever runs. This tree reads the sub-protocol out of etherparse's extension-header walk
+    /// instead, which resolves straight through the chain to the real transport number — so the
+    /// same packet reached the ACL looking like an ordinary UDP datagram that merely happened to
+    /// carry port 0, and a permissive "allow the whole tailnet" rule ADMITTED it. Eight bytes of
+    /// Hop-by-Hop Options were enough to walk every RFC 1858 fragment straight past the rules the
+    /// rest of this file exists to enforce.
+    ///
+    /// Every assertion is against an ALLOW-ALL ACL, so a drop can only be the fragment rule and
+    /// never the ACL — and each extension type carries its own control that proves it: the same
+    /// chain shape with no Fragment header in it is still delivered, on the port read past the
+    /// extension header. That control is per-type rather than once at the end because `keep`
+    /// cannot tell a fragment-rule drop from a parser rejection, so a fixture malformed for only
+    /// one of the three protocols would otherwise turn that protocol's four drops into vacuous
+    /// passes with the suite still green.
+    #[test]
+    fn chained_extension_header_cannot_bypass_the_ipv6_fragment_rules() {
+        let keep = |filter: &(dyn ts_packetfilter::Filter + Send + Sync), packet: Vec<u8>| {
+            let mut packets = vec![PacketMut::from(packet)];
+            let mut learned = Vec::new();
+            filter_inbound_from_peer(filter, PeerId(4), &mut packets, &mut learned);
+            assert!(
+                learned.is_empty(),
+                "no TSMP advertisement in these fixtures"
+            );
+            !packets.is_empty()
+        };
+
+        // Hop-by-Hop Options (0), Routing (43) and Destination Options (60): the fragment rules
+        // must not depend on which header the sender chose to hide behind.
+        for ext in [0u8, 43, 60] {
+            // The RFC 1858 evasion itself: a later fragment whose bytes can land on top of the
+            // transport header the head fragment was matched on.
+            assert!(
+                !keep(
+                    &AllowAll,
+                    ipv6_with_prepended_ext_header(
+                        ext,
+                        &ipv6_fragment_packet(17, 1, false, &[0x61; 8])
+                    )
+                ),
+                "a low-offset later fragment behind extension header {ext} is dropped (RFC 1858)"
+            );
+            // A first fragment truncated before its own transport header, which a follow-up
+            // fragment can then complete.
+            assert!(
+                !keep(
+                    &AllowAll,
+                    ipv6_with_prepended_ext_header(
+                        ext,
+                        &ipv6_fragment_packet(17, 0, true, &udp_header(443)[..4])
+                    )
+                ),
+                "a short first fragment behind extension header {ext} is dropped"
+            );
+            // A *well-formed* chained fragment is dropped too — Go drops this whole class, so
+            // failing closed here can never admit something upstream refuses.
+            assert!(
+                !keep(
+                    &AllowAll,
+                    ipv6_with_prepended_ext_header(
+                        ext,
+                        &ipv6_fragment_packet(17, 185, false, &[0x61; 8])
+                    )
+                ),
+                "a chained later fragment behind extension header {ext} gets no pass-through"
+            );
+            assert!(
+                !keep(
+                    &AllowAll,
+                    ipv6_with_prepended_ext_header(
+                        ext,
+                        &ipv6_fragment_packet(17, 0, true, &udp_header(443))
+                    )
+                ),
+                "a chained first fragment behind extension header {ext} is dropped"
+            );
+
+            // Control for THIS extension type. Every assertion above is a `!keep`, and `keep`
+            // reports a packet the parser rejected exactly as it reports a packet the fragment
+            // rule dropped — so on its own the block above would also pass if this builder simply
+            // produced eight bytes etherparse refuses to walk. The same chain shape with no
+            // Fragment header behind it is still parsed, still admitted, and still matched on the
+            // port read past the extension header, which pins the drops to the fragment rule.
+            let plain = ipv6_with_prepended_ext_header(ext, &ipv6_udp_packet(&udp_header(443)));
+            assert!(
+                keep(&AllowAll, plain.clone()),
+                "an unfragmented packet behind extension header {ext} is still delivered"
+            );
+            assert!(
+                keep(&AllowPort(443), plain),
+                "...and is still matched on the port read past extension header {ext}"
+            );
+        }
+
+        // Contrast: the very same later fragment, reached as the base header's immediate Next
+        // Header, is still delivered. Only the 8 prepended bytes separate this from the third
+        // assertion above, so the drops really are the chain and not the fragment fixtures.
+        assert!(
+            keep(&AllowAll, ipv6_fragment_packet(17, 185, false, &[0x61; 8])),
+            "an unchained later fragment is still delivered"
         );
     }
 

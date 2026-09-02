@@ -106,15 +106,25 @@ fn section_refs(text: &str) -> Vec<String> {
 /// opens a bullet in the gap list.
 fn anchors(text: &str) -> BTreeSet<String> {
     let mut anchors = BTreeSet::new();
-    let mut fenced = false;
+    let mut fence: Option<(char, usize)> = None;
 
     for line in text.lines() {
         // The re-derivation block is shell, where a `#` opens a comment rather than a heading.
-        if line.trim_start().starts_with("```") {
-            fenced = !fenced;
+        if let Some((marker, length)) = fence_marker(line) {
+            match fence {
+                None => fence = Some((marker, length)),
+                // A longer fence quotes shorter ones whole, so only a run of the same character
+                // that is at least as long as the opening one closes the block.
+                Some((open_marker, open_length))
+                    if marker == open_marker && length >= open_length =>
+                {
+                    fence = None;
+                }
+                Some(_) => {}
+            }
             continue;
         }
-        if fenced {
+        if fence.is_some() {
             continue;
         }
 
@@ -133,6 +143,19 @@ fn anchors(text: &str) -> BTreeSet<String> {
     }
 
     anchors
+}
+
+/// The fence delimiter a line runs, as the character it is made of and how long the run is.
+///
+/// A fence is three or more backticks or tildes; anything shorter is inline code, or prose. The
+/// character matters as much as the length: a tilde fence is closed by tildes alone, so a
+/// backtick run inside one is just content.
+fn fence_marker(line: &str) -> Option<(char, usize)> {
+    let line = line.trim_start();
+    let marker = line.chars().next().filter(|c| *c == '`' || *c == '~')?;
+    let length = line.chars().take_while(|c| *c == marker).count();
+
+    (length >= 3).then_some((marker, length))
 }
 
 /// The upstream packages the re-derivation loop actually sweeps.
@@ -315,6 +338,31 @@ done
             problems[0].contains("What upstream touched per mapped package"),
             "{problems:?}"
         );
+    }
+
+    /// A four-backtick fence quotes a three-backtick line without closing, so a shell comment
+    /// after that inner line is still inside the block and no pointer may land on it.
+    #[test]
+    fn rejects_a_cross_reference_inside_a_longer_fence() {
+        let text = ledger("Quoted heading", "Nothing here.").replace(
+            "```sh",
+            "````md\n# Not a heading\n\n```sh\n# Quoted heading\n```\n````\n\n```sh",
+        );
+
+        let problems = inconsistencies(&text);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("Quoted heading"), "{problems:?}");
+    }
+
+    /// Tildes fence a block just as backticks do, and a backtick run does not close one.
+    #[test]
+    fn rejects_a_cross_reference_inside_a_tilde_fence() {
+        let text = ledger("Quoted heading", "Nothing here.")
+            .replace("```sh", "~~~md\n# Quoted heading\n~~~\n\n```sh");
+
+        let problems = inconsistencies(&text);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("Quoted heading"), "{problems:?}");
     }
 
     /// Bold emphasis in running prose is not a label, so nothing may point at it either.

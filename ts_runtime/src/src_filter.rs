@@ -85,6 +85,10 @@ mod tests {
             user_id: 0,
             tailnet: Some("ts.net".to_string()),
             tags: vec![],
+            addresses: vec![
+                "100.64.0.7/32".parse().unwrap(),
+                "fd7a::7/128".parse().unwrap(),
+            ],
             tailnet_address: TailnetAddress {
                 ipv4: "100.64.0.7/32".parse().unwrap(),
                 ipv6: "fd7a::7/128".parse().unwrap(),
@@ -250,6 +254,12 @@ mod tests {
         n.id = 2;
         n.stable_id = StableNodeId("exit2".to_string());
         n.hostname = "router2".to_string();
+        // The whole assigned list moves with the identity projection derived from it. Leaving the
+        // cloned `.7` behind would credit this node with a prefix control gave the *other* peer.
+        n.addresses = vec![
+            "100.64.0.8/32".parse().unwrap(),
+            "fd7a::8/128".parse().unwrap(),
+        ];
         n.tailnet_address = TailnetAddress {
             ipv4: "100.64.0.8/32".parse().unwrap(),
             ipv6: "fd7a::8/128".parse().unwrap(),
@@ -324,6 +334,38 @@ mod tests {
         // Each peer still sources only its own tailnet address.
         assert_eq!(none.lookup("100.64.0.7".parse().unwrap()), Some(&peer1));
         assert_eq!(none.lookup("100.64.0.8".parse().unwrap()), Some(&peer2));
+    }
+
+    /// `exit_router_node_2` renumbers a clone of the `.7` router to `.8`, so its `addresses` (Go
+    /// `Node.Addresses` — the prefixes control assigned *this* node) must move with it. A stale
+    /// `.7` left in that list credits this peer with the other peer's address, and because
+    /// `Node::is_router` asks "does this node route anything besides its own addresses" of exactly
+    /// that list, it also reads a peer advertising nothing but its own prefixes as a router.
+    #[test]
+    fn renumbered_exit_fixture_owns_the_addresses_it_is_assigned() {
+        let exit2 = exit_router_node_2();
+        let own = vec![
+            ipnet::IpNet::V4(exit2.tailnet_address.ipv4),
+            ipnet::IpNet::V6(exit2.tailnet_address.ipv6),
+        ];
+
+        // Strip the advertised default routes: what is left is this node's own assigned prefixes
+        // and nothing else, which is the definition of "not a router".
+        let mut plain = exit2.clone();
+        plain.accepted_routes = own.clone();
+        assert!(
+            !plain.is_router(),
+            "a peer advertising only the prefixes it was assigned is not a router"
+        );
+
+        assert_eq!(
+            exit2.addresses, own,
+            "the assigned list follows the renumber"
+        );
+        assert!(
+            !exit2.addresses.contains(&"100.64.0.7/32".parse().unwrap()),
+            "the .7 peer's address stays the .7 peer's"
+        );
     }
 
     #[test]

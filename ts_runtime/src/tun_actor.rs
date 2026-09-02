@@ -1023,6 +1023,10 @@ mod tests {
             hostname: stable_id.to_string(),
             tailnet: Some("ts.net".to_string()),
             tags: vec![],
+            addresses: vec![
+                format!("{ipv4}/32").parse().unwrap(),
+                "fd7a::2/128".parse().unwrap(),
+            ],
             tailnet_address: TailnetAddress {
                 ipv4: format!("{ipv4}/32").parse().unwrap(),
                 ipv6: "fd7a::2/128".parse().unwrap(),
@@ -1102,6 +1106,10 @@ mod tests {
             hostname: stable_id.to_string(),
             tailnet: Some("ts.net".to_string()),
             tags: vec![],
+            addresses: vec![
+                format!("{ipv4}/32").parse().unwrap(),
+                format!("fd7a::{id}/128").parse().unwrap(),
+            ],
             tailnet_address: TailnetAddress {
                 ipv4: format!("{ipv4}/32").parse().unwrap(),
                 ipv6: format!("fd7a::{id}/128").parse().unwrap(),
@@ -1153,6 +1161,10 @@ mod tests {
             hostname: "self".to_string(),
             tailnet: Some("ts.net".to_string()),
             tags: vec![],
+            addresses: vec![
+                "100.64.0.1/32".parse().unwrap(),
+                "fd7a::1/128".parse().unwrap(),
+            ],
             tailnet_address: TailnetAddress {
                 ipv4: "100.64.0.1/32".parse().unwrap(),
                 ipv6: "fd7a::1/128".parse().unwrap(),
