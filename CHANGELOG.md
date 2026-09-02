@@ -2,6 +2,30 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.45.0](https://github.com/GeiserX/tailscale-rs/compare/v0.44.0...v0.45.0) (2026-09-02)
+
+
+### Features
+
+* **control:** start from the last netmap instead of waiting for control ([#320](https://github.com/GeiserX/tailscale-rs/issues/320)) ([2387dfe](https://github.com/GeiserX/tailscale-rs/commit/2387dfe92e37fc64aacfaf9bef2c27f6ffd087b7))
+
+
+### Bug Fixes
+
+* **checks:** close a ledger code fence only on a delimiter that can actually close it ([#334](https://github.com/GeiserX/tailscale-rs/issues/334)) ([e283bd7](https://github.com/GeiserX/tailscale-rs/commit/e283bd755057a3ff6560d519a4dc9ba40d7cb165))
+* **checks:** let a ledger cross-reference land only on a heading or a gap-list label ([#327](https://github.com/GeiserX/tailscale-rs/issues/327)) ([b1dd163](https://github.com/GeiserX/tailscale-rs/commit/b1dd163140551ad9b1d4fbf782f7ffef341b7942))
+* **ci:** stop bin/check reporting failures the CI gate cannot see ([#336](https://github.com/GeiserX/tailscale-rs/issues/336)) ([78ae0ed](https://github.com/GeiserX/tailscale-rs/commit/78ae0ed70c34bdcbbacfa2c835955875ca1d760f))
+* **control_serde:** decode the liveness ping that omits its zero-valued fields ([#319](https://github.com/GeiserX/tailscale-rs/issues/319)) ([5eb9dc9](https://github.com/GeiserX/tailscale-rs/commit/5eb9dc99b892f59512dc43b5130de827498f48d0))
+* **control:** only cache a netmap somewhere private, and only replay peers we can vouch for ([#330](https://github.com/GeiserX/tailscale-rs/issues/330)) ([c506fbb](https://github.com/GeiserX/tailscale-rs/commit/c506fbb91f870acf9241c99bec18981bbd158957))
+* **control:** stop calling a node with two same-family addresses a router ([#337](https://github.com/GeiserX/tailscale-rs/issues/337)) ([9141cf1](https://github.com/GeiserX/tailscale-rs/commit/9141cf1404e6b36a9ca539cdbc6e5d41104c0872))
+* **dataplane:** drop IPv6 fragments hidden behind a chained extension header ([#343](https://github.com/GeiserX/tailscale-rs/issues/343)) ([5d3eaaf](https://github.com/GeiserX/tailscale-rs/commit/5d3eaaf47a5d10c227b094ab5f81c2346b898d8a))
+* **dataplane:** stop IPv6 fragments bypassing the filter's RFC 1858 rules ([#342](https://github.com/GeiserX/tailscale-rs/issues/342)) ([e7e4759](https://github.com/GeiserX/tailscale-rs/commit/e7e4759680b7d87d5a0fdee084658dc38ebf252c))
+* **magic_dns:** set TC on a forwarded reply that outgrows the buffer size the client asked for ([#339](https://github.com/GeiserX/tailscale-rs/issues/339)) ([7ed7224](https://github.com/GeiserX/tailscale-rs/commit/7ed722424ab77182279b2bf82c4dcca15af3b54b))
+* **magicsock:** count a peer-relay pong that matched a ping we sent, even when the endpoint holds no trusted address ([#322](https://github.com/GeiserX/tailscale-rs/issues/322)) ([6bddedb](https://github.com/GeiserX/tailscale-rs/commit/6bddedb00c1642897c56c4b52e49b76349f13450))
+* **magicsock:** stop a losing peer-relay pong from unlearning where the live path's data arrives ([#315](https://github.com/GeiserX/tailscale-rs/issues/315)) ([a79e6a4](https://github.com/GeiserX/tailscale-rs/commit/a79e6a46cfa97f026e4dfb965cc9ec6d4eab6329))
+* **serve:** clean the request path before the serve mux picks a mount, so /api/../secret cannot reach the /api backend ([#332](https://github.com/GeiserX/tailscale-rs/issues/332)) ([3d62990](https://github.com/GeiserX/tailscale-rs/commit/3d6299071f105e2d6023448902709f09db789e48))
+* **tsmp:** keep a peer's TSMP-learned disco key when the next netmap restates control's stale one ([#329](https://github.com/GeiserX/tailscale-rs/issues/329)) ([302c69e](https://github.com/GeiserX/tailscale-rs/commit/302c69ea1b41568c5b8be7a306a4104395d2f952))
+
 ## [0.44.0](https://github.com/GeiserX/tailscale-rs/compare/v0.43.3...v0.44.0) (2026-08-30)
 
 
