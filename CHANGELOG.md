@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.45.1](https://github.com/GeiserX/tailscale-rs/compare/v0.45.0...v0.45.1) (2026-09-02)
+
+
+### Bug Fixes
+
+* **capver:** hold the declaration at 125 — under 121 no Tailscale peer offers this node a relay path ([#335](https://github.com/GeiserX/tailscale-rs/issues/335)) ([bc09723](https://github.com/GeiserX/tailscale-rs/commit/bc0972392bb03d860a62ccf6bf6904846f081675))
+
 ## [0.45.0](https://github.com/GeiserX/tailscale-rs/compare/v0.44.0...v0.45.0) (2026-09-02)
 
 
