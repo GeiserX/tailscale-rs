@@ -9,6 +9,14 @@
 //! the reply back into the TUN — mirroring Go's `handleLocalPackets`. No host loopback socket and no
 //! overlay egress is used for the DNS itself (anti-leak). Other netstack-only public APIs surface
 //! [`ErrorKind::UnsupportedInTunMode`](crate::ErrorKind::UnsupportedInTunMode).
+//!
+//! The service IP absorbs EVERYTHING, not just DNS. `100.100.100.100` is this node's own address:
+//! no peer owns it, and nothing outside this host may ever see a packet addressed to it. So the UP
+//! pump consumes every quad-100 packet whatever its IP protocol or port ([`classify_service_ip`]) —
+//! UDP/53 goes to the responder, a TCP segment is answered with a RST, everything else is dropped —
+//! and none of them reach the overlay. Mirrors Go `wgengine/netstack`'s `handleLocalPackets`, which
+//! absorbs the service IP unconditionally "so such traffic never reaches the conntrack / peer-routing
+//! layers", plus its `hittingServiceIP` RST in `acceptTCP`.
 
 use core::num::NonZeroU16;
 use std::{
@@ -39,10 +47,10 @@ use crate::{
 const MAGIC_DNS_IP: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 100);
 /// The DNS service port.
 const MAGIC_DNS_PORT: u16 = 53;
-/// TTL for the synthesized IPv4 response packet written back into the TUN. The response is consumed
-/// by the local host one hop away (the TUN endpoint), so the exact value is immaterial; 64 is the
-/// conventional default.
-const DNS_REPLY_TTL: u8 = 64;
+/// TTL for a synthesized IPv4 packet written back into the TUN (a MagicDNS reply, or the RST that
+/// answers an unserved quad-100 TCP port). The packet is consumed by the local host one hop away
+/// (the TUN endpoint), so the exact value is immaterial; 64 is the conventional default.
+const SERVICE_IP_REPLY_TTL: u8 = 64;
 
 /// The TUN transport-mode actor.
 ///
@@ -324,7 +332,7 @@ pub(crate) fn host_dns_from_dns_config(
 
 /// A MagicDNS query peeled off the TUN datapath: the inner DNS payload plus the original query's
 /// source endpoint (so the synthesized reply can be addressed back to it). Returned by
-/// [`classify_magic_dns`] when (and only when) an inbound packet is IPv4/UDP destined to
+/// [`classify_service_ip`] when (and only when) an inbound packet is IPv4/UDP destined to
 /// `100.100.100.100:53`.
 struct MagicDnsQuery<'a> {
     /// The original query's source `IP:port` (the host stub resolver). The reply's destination.
@@ -333,40 +341,132 @@ struct MagicDnsQuery<'a> {
     dns_payload: &'a [u8],
 }
 
-/// Classify an inbound TUN packet: if it is an IPv4 UDP datagram destined to the MagicDNS service
-/// `100.100.100.100:53`, return its DNS payload + source endpoint; otherwise `None` (the packet is
-/// forwarded to the overlay unchanged). Pure (no I/O), parse mirrors
-/// `ts_dataplane`'s inbound classify. A non-IPv4 / non-UDP / wrong-dest / unparseable packet is
-/// `None` — never intercepted.
-fn classify_magic_dns(pkt: &[u8]) -> Option<MagicDnsQuery<'_>> {
-    let sliced = etherparse::SlicedPacket::from_ip(pkt).ok()?;
+/// What an inbound TUN packet is, relative to the MagicDNS service IP `100.100.100.100`. Produced
+/// by the pure [`classify_service_ip`].
+enum ServiceIpPacket<'a> {
+    /// Not addressed to the service IP: none of our business, forwarded to the overlay unchanged.
+    Foreign,
+    /// A MagicDNS query: IPv4/UDP to `100.100.100.100:53`. Handed to the in-datapath responder.
+    DnsQuery(MagicDnsQuery<'a>),
+    /// Addressed to the service IP but NOT a MagicDNS query — some other port, some other IP
+    /// protocol. Absorbed here and never forwarded: the service IP is this node's own, no peer owns
+    /// it, and handing it to the overlay would encrypt it to a selected exit node.
+    Absorbed {
+        /// A synthesized TCP RST to write back into the TUN, for an inbound TCP segment to an
+        /// unserved quad-100 port. `None` for every non-TCP packet (and for a TCP RST, which is
+        /// never answered with another RST).
+        reset: Option<Vec<u8>>,
+    },
+}
+
+/// Classify an inbound TUN packet against the MagicDNS service IP `100.100.100.100`. Pure (no I/O);
+/// the parse mirrors `ts_dataplane`'s inbound classify.
+///
+/// A packet NOT addressed to the service IP is [`ServiceIpPacket::Foreign`] and is forwarded to the
+/// overlay unchanged. Everything addressed to the service IP is consumed here whatever its port or
+/// IP protocol — IPv4/UDP to `:53` as a [`ServiceIpPacket::DnsQuery`] for the in-datapath responder,
+/// anything else as [`ServiceIpPacket::Absorbed`]. This is Go `wgengine/netstack`'s
+/// `handleLocalPackets`, which absorbs the service IP unconditionally rather than for an allow-list
+/// of ports, "so such traffic never reaches the conntrack / peer-routing layers". The absorb is what
+/// keeps a speculative host probe — a stub resolver trying DoT on `100.100.100.100:853` is
+/// upstream's own example — from being routed: `ts_overlay_router`'s outbound table carries a
+/// selected exit node's `0.0.0.0/0` as `RouteAction::Wireguard(peer)`, which matches quad-100, so a
+/// forwarded service-IP packet would be encrypted and sent to that peer.
+///
+/// IPv4-only by construction, matching the rest of this module's MagicDNS posture: only
+/// `100.100.100.100/32` is steered into the TUN ([`host_routes_from_node`]), the responder binds v4
+/// only, and the IPv6 service IP `fd7a:115c:a1e0::53` is neither served nor routed here — so there
+/// is no v6 service-IP packet for the host to emit. Unparseable bytes are `Foreign`: we cannot tell
+/// where they are addressed, and the overlay router drops what it cannot read a destination from.
+fn classify_service_ip(pkt: &[u8]) -> ServiceIpPacket<'_> {
+    let Ok(sliced) = etherparse::SlicedPacket::from_ip(pkt) else {
+        return ServiceIpPacket::Foreign;
+    };
 
     let (src_ip, dst_ip) = match sliced.net {
         Some(etherparse::NetSlice::Ipv4(ipv4)) => (
             ipv4.header().source_addr(),
             ipv4.header().destination_addr(),
         ),
-        // IPv4-only by construction (mirrors the host-route/v6 posture): never intercept v6.
-        _ => return None,
+        _ => return ServiceIpPacket::Foreign,
     };
 
     if dst_ip != MAGIC_DNS_IP {
+        return ServiceIpPacket::Foreign;
+    }
+
+    match sliced.transport {
+        Some(etherparse::TransportSlice::Udp(udp)) if udp.destination_port() == MAGIC_DNS_PORT => {
+            ServiceIpPacket::DnsQuery(MagicDnsQuery {
+                src: SocketAddrV4::new(src_ip, udp.source_port()),
+                // The UDP payload is the DNS wire message.
+                dns_payload: udp.payload(),
+            })
+        }
+        // An unserved quad-100 TCP port is RST rather than dropped: nothing in this tree listens on
+        // a quad-100 TCP port, so a silent drop would leave the host retransmitting a SYN until its
+        // connect timeout. Mirrors Go's `hittingServiceIP` case in `acceptTCP`, and matches what the
+        // netstack transport of this fork already does — there quad-100 is a netstack interface
+        // address, and smoltcp answers a segment no socket accepts with `rst_reply`.
+        Some(etherparse::TransportSlice::Tcp(tcp)) => ServiceIpPacket::Absorbed {
+            reset: build_tcp_reset(src_ip, &tcp),
+        },
+        // Every other IP protocol (and a fragment whose transport header we cannot read) is
+        // absorbed silently.
+        _ => ServiceIpPacket::Absorbed { reset: None },
+    }
+}
+
+/// Build the TCP RST answering an inbound segment to an unserved quad-100 port, addressed back to
+/// `dst_ip` (the segment's source). Returns the IP packet bytes ready to write into the TUN, or
+/// `None` when no RST may be sent.
+///
+/// Sequence-number rules are the reset generation in RFC 9293 §3.10.7, CLOSED state (the same ones
+/// smoltcp's `rst_reply` implements): an inbound RST is never answered with another RST; a segment
+/// carrying ACK is answered with a bare
+/// RST whose sequence number is that ACK; a segment without ACK is answered with RST|ACK carrying
+/// `SEG.SEQ + SEG.LEN` (the payload plus one for each of SYN and FIN, which occupy sequence space).
+/// A window of 0 is correct for a RST — the sender is being told to give up, not to send more.
+fn build_tcp_reset(dst_ip: Ipv4Addr, tcp: &etherparse::TcpSlice<'_>) -> Option<Vec<u8>> {
+    // Never reply to a RST with a RST: that is how two ends ping-pong resets forever.
+    if tcp.rst() {
         return None;
     }
 
-    let udp = match sliced.transport {
-        Some(etherparse::TransportSlice::Udp(udp)) => udp,
-        _ => return None,
+    let builder = etherparse::PacketBuilder::ipv4(
+        MAGIC_DNS_IP.octets(),
+        dst_ip.octets(),
+        SERVICE_IP_REPLY_TTL,
+    )
+    .tcp(
+        tcp.destination_port(),
+        tcp.source_port(),
+        // Acknowledged data is where the peer already believes our send sequence is; an
+        // unacknowledged segment gets a reply at sequence 0.
+        if tcp.ack() {
+            tcp.acknowledgment_number()
+        } else {
+            0
+        },
+        0,
+    )
+    .rst();
+    // Only the un-ACKed case carries an ACK of its own (SYN and FIN each consume one sequence
+    // number on top of the payload).
+    let builder = if tcp.ack() {
+        builder
+    } else {
+        let seg_len = tcp.payload().len() as u32 + u32::from(tcp.syn()) + u32::from(tcp.fin());
+        builder.ack(tcp.sequence_number().wrapping_add(seg_len))
     };
-    if udp.destination_port() != MAGIC_DNS_PORT {
-        return None;
-    }
 
-    Some(MagicDnsQuery {
-        src: SocketAddrV4::new(src_ip, udp.source_port()),
-        // The UDP payload is the DNS wire message.
-        dns_payload: udp.payload(),
-    })
+    let mut out = Vec::with_capacity(builder.size(0));
+    // Writing into a `Vec<u8>` is infallible; `PacketBuilder::write` only errors on I/O write
+    // failures, which a `Vec` never produces.
+    builder
+        .write(&mut out, &[])
+        .expect("writing an IPv4+TCP packet into a Vec is infallible");
+    Some(out)
 }
 
 /// Build the IPv4+UDP response packet carrying `dns_response` from `100.100.100.100:53` back to the
@@ -374,9 +474,12 @@ fn classify_magic_dns(pkt: &[u8]) -> Option<MagicDnsQuery<'_>> {
 /// Pure: the src/dst are swapped relative to the query (we answer FROM the service IP TO the
 /// querier). The returned bytes are an IP packet ready to write into the TUN.
 fn build_dns_response(dst: SocketAddrV4, dns_response: &[u8]) -> Vec<u8> {
-    let builder =
-        etherparse::PacketBuilder::ipv4(MAGIC_DNS_IP.octets(), dst.ip().octets(), DNS_REPLY_TTL)
-            .udp(MAGIC_DNS_PORT, dst.port());
+    let builder = etherparse::PacketBuilder::ipv4(
+        MAGIC_DNS_IP.octets(),
+        dst.ip().octets(),
+        SERVICE_IP_REPLY_TTL,
+    )
+    .udp(MAGIC_DNS_PORT, dst.port());
 
     let mut out = Vec::with_capacity(builder.size(dns_response.len()));
     // Writing into a `Vec<u8>` is infallible; `PacketBuilder::write` only errors on I/O write
@@ -440,11 +543,22 @@ fn build_dns_view(
 /// by the UP pump: the slow [`Decision::Forward`] path is handed back as [`Self::Forward`] for the
 /// pump to SPAWN, never awaited inline — so one slow upstream cannot head-of-line-block the uplink.
 enum Intercept {
-    /// Not a MagicDNS query; the pump should forward the original packet to the overlay unchanged.
+    /// Not addressed to the MagicDNS service IP; the pump should forward the original packet to the
+    /// overlay unchanged.
     NotIntercepted,
     /// A malformed MagicDNS query — consumed (it was quad-100/UDP/53) but dropped silently with no
     /// reply. The pump must NOT forward it to the overlay.
     Dropped,
+    /// A quad-100 packet that is not a MagicDNS query at all: absorbed by the service IP whatever
+    /// its port or IP protocol, so it never reaches the overlay router (where a selected exit
+    /// node's `0.0.0.0/0` would match it). `reset` carries a synthesized TCP RST for the pump to
+    /// write back into the TUN when the packet was a TCP segment to an unserved port; `None` means
+    /// drop silently. Distinct from [`Self::Dropped`], which is the DNS responder refusing a query
+    /// it did parse as its own.
+    Absorbed {
+        /// The RST reply packet, if one is owed.
+        reset: Option<Vec<u8>>,
+    },
     /// An authoritative [`Decision::Reply`] (cache / in-tailnet name): the synthesized reply bytes
     /// are carried out for the pump to write back into the TUN INLINE (the fast path — no overlay
     /// round-trip). The pump must NOT forward the packet to the overlay.
@@ -481,7 +595,9 @@ enum Intercept {
 /// handed back to be SPAWNED rather than awaited inline — is unit-testable without a TUN device
 /// (mirrors `magic_dns::decide`'s "factored out of the socket loop" rationale).
 ///
-/// Fast paths resolve synchronously: a non-MagicDNS packet ⇒ [`Intercept::NotIntercepted`]; a
+/// Fast paths resolve synchronously: a packet not addressed to the service IP ⇒
+/// [`Intercept::NotIntercepted`]; a quad-100 packet that is not a DNS query ⇒
+/// [`Intercept::Absorbed`] (consumed, with a RST for TCP — see [`classify_service_ip`]); a
 /// malformed query ⇒ [`Intercept::Dropped`]; an authoritative [`Decision::Reply`] ⇒
 /// [`Intercept::Reply`] carrying the response bytes for the pump to write back into the TUN INLINE
 /// (no overlay round-trip — no host loopback socket, anti-leak).
@@ -500,8 +616,11 @@ enum Intercept {
 /// is carried into the spawned task and written on forward failure — same as before, just from the
 /// spawned task rather than inline.
 fn plan_intercept(view: &DnsView, pkt: &[u8]) -> Intercept {
-    let Some(query) = classify_magic_dns(pkt) else {
-        return Intercept::NotIntercepted;
+    let query = match classify_service_ip(pkt) {
+        ServiceIpPacket::Foreign => return Intercept::NotIntercepted,
+        // Addressed to the service IP but not DNS: absorbed without ever consulting the responder.
+        ServiceIpPacket::Absorbed { reset } => return Intercept::Absorbed { reset },
+        ServiceIpPacket::DnsQuery(query) => query,
     };
     // The reply destination (the query's source endpoint). Bound before the `Decision::Forward`
     // arm shadows `query` with the forward's own owned query bytes.
@@ -542,12 +661,22 @@ fn plan_intercept(view: &DnsView, pkt: &[u8]) -> Intercept {
 /// IPv4+UDP packet goes straight back to the querier via `device` — no host loopback socket and no
 /// overlay egress for the DNS itself (anti-leak).
 async fn send_dns_reply(device: &Arc<AsyncTunTransport>, src: SocketAddrV4, response: &[u8]) {
-    let reply_pkt = build_dns_response(src, response);
+    send_local_reply(
+        device,
+        build_dns_response(src, response),
+        "magic dns tun reply",
+    )
+    .await;
+}
+
+/// Write one locally-synthesized IP packet — a MagicDNS reply, or the RST answering an unserved
+/// quad-100 TCP port — back into the TUN. `what` names the packet in the failure log.
+async fn send_local_reply(device: &Arc<AsyncTunTransport>, pkt: Vec<u8>, what: &str) {
     if let Err(e) = device
-        .send(core::iter::once(ts_packet::PacketMut::from(reply_pkt)))
+        .send(core::iter::once(ts_packet::PacketMut::from(pkt)))
         .await
     {
-        tracing::warn!(error = %e, "magic dns tun reply send failed");
+        tracing::warn!(error = %e, what, "tun local reply send failed");
     }
 }
 
@@ -566,6 +695,8 @@ async fn send_dns_reply(device: &Arc<AsyncTunTransport>, src: SocketAddrV4, resp
 /// - For every received packet it runs the PURE [`plan_intercept`] against the latest MagicDNS
 ///   [`DnsView`] (read fresh per packet; the borrow guard is never held across an `await`):
 ///   - [`Intercept::NotIntercepted`] — forward the original packet to the overlay (`up`) unchanged.
+///   - [`Intercept::Absorbed`] — a quad-100 packet that is not a DNS query: consumed by the service
+///     IP whatever its port or protocol, never forwarded; a TCP segment gets a RST written back.
 ///   - [`Intercept::Dropped`] — a malformed quad-100 query: consumed, never forwarded.
 ///   - [`Intercept::Reply`] — an authoritative reply written straight back into the TUN INLINE
 ///     (the fast path — no overlay round-trip, no host socket; anti-leak).
@@ -624,6 +755,16 @@ async fn up_pump(
                         // Malformed query: consumed but dropped silently; never forward to
                         // the overlay.
                         Intercept::Dropped => {}
+                        // Quad-100, but not DNS. The service IP is ours; absorb it here so
+                        // it never reaches the overlay router, where a selected exit node's
+                        // `0.0.0.0/0` would match it and encrypt it to that peer. A TCP
+                        // segment to an unserved port is answered with a RST inline so the
+                        // host fails fast instead of retransmitting its SYN.
+                        Intercept::Absorbed { reset } => {
+                            if let Some(reset) = reset {
+                                send_local_reply(&dev_up, reset, "service ip tcp reset").await;
+                            }
+                        }
                         // Authoritative reply (fast path): write it back into the TUN inline.
                         Intercept::Reply { response, src } => {
                             send_dns_reply(&dev_up, src, &response).await;
@@ -679,13 +820,12 @@ async fn run_forward(
             crate::peerapi_doh::forward_doh(&channel, addr, &query, servfail).await
         }
     };
-    let reply_pkt = build_dns_response(src, &response);
-    if let Err(e) = device
-        .send(core::iter::once(ts_packet::PacketMut::from(reply_pkt)))
-        .await
-    {
-        tracing::warn!(error = %e, "magic dns tun forwarded reply send failed");
-    }
+    send_local_reply(
+        &device,
+        build_dns_response(src, &response),
+        "magic dns tun forwarded reply",
+    )
+    .await;
 }
 
 impl kameo::Actor for TunActor {
@@ -1616,12 +1756,12 @@ mod tests {
         );
     }
 
-    /// `classify_magic_dns` extracts the DNS payload + source endpoint from a quad-100/UDP/53
+    /// `classify_service_ip` extracts the DNS payload + source endpoint from a quad-100/UDP/53
     /// packet, and `build_dns_response` round-trips: the synthesized reply parses back as an
     /// IPv4/UDP datagram FROM `100.100.100.100:53` TO the original querier carrying the payload.
     #[test]
     fn classify_and_build_round_trip() {
-        use super::{build_dns_response, classify_magic_dns};
+        use super::{ServiceIpPacket, build_dns_response, classify_service_ip};
 
         let client: SocketAddrV4 = "100.64.0.7:34567".parse().unwrap();
         let payload = b"hello-dns-query";
@@ -1635,7 +1775,9 @@ mod tests {
             out
         };
 
-        let q = classify_magic_dns(&query_pkt).expect("quad-100/udp/53 is classified as DNS");
+        let ServiceIpPacket::DnsQuery(q) = classify_service_ip(&query_pkt) else {
+            panic!("quad-100/udp/53 is classified as DNS");
+        };
         assert_eq!(q.src, client, "source endpoint extracted");
         assert_eq!(q.dns_payload, payload, "DNS payload extracted");
 
@@ -1672,58 +1814,197 @@ mod tests {
         }
     }
 
-    /// Non-matching packets pass through (`classify_magic_dns` returns `None`): wrong destination
-    /// IP, wrong port, and a non-UDP (TCP) packet to quad-100.
+    /// A UDP datagram from `client` to `dst:dport`.
+    fn udp_packet(client: SocketAddrV4, dst: [u8; 4], dport: u16) -> Vec<u8> {
+        let b = etherparse::PacketBuilder::ipv4(client.ip().octets(), dst, 64)
+            .udp(client.port(), dport);
+        let mut out = Vec::new();
+        b.write(&mut out, b"x").unwrap();
+        out
+    }
+
+    /// A bare SYN from `client` to `dst:dport`, carrying the given initial sequence number.
+    fn syn_packet(client: SocketAddrV4, dst: [u8; 4], dport: u16, seq: u32) -> Vec<u8> {
+        let b = etherparse::PacketBuilder::ipv4(client.ip().octets(), dst, 64)
+            .tcp(client.port(), dport, seq, 1024)
+            .syn();
+        let mut out = Vec::new();
+        b.write(&mut out, &[]).unwrap();
+        out
+    }
+
+    /// An ICMP echo request from `client`'s IP to `dst` — a non-TCP, non-UDP quad-100 packet.
+    fn icmp_packet(client: SocketAddrV4, dst: [u8; 4]) -> Vec<u8> {
+        let b = etherparse::PacketBuilder::ipv4(client.ip().octets(), dst, 64)
+            .icmpv4_echo_request(1, 1);
+        let mut out = Vec::new();
+        b.write(&mut out, b"ping").unwrap();
+        out
+    }
+
+    /// Packets addressed somewhere other than the service IP are `Foreign` and go to the overlay
+    /// unchanged — the absorb must not swallow ordinary traffic. Unparseable bytes are `Foreign`
+    /// too: we cannot tell where they are addressed, so we do not claim them.
     #[test]
-    fn classify_passthrough_for_non_dns() {
-        use super::classify_magic_dns;
+    fn classify_passthrough_for_foreign_destinations() {
+        use super::{ServiceIpPacket, classify_service_ip};
 
         let client: SocketAddrV4 = "100.64.0.7:1234".parse().unwrap();
 
-        // UDP/53 but to a different IP (a real upstream resolver) — must pass through.
-        let to_other_ip = {
-            let b = etherparse::PacketBuilder::ipv4(client.ip().octets(), [8, 8, 8, 8], 64)
-                .udp(client.port(), 53);
-            let mut out = Vec::new();
-            b.write(&mut out, b"x").unwrap();
-            out
-        };
         assert!(
-            classify_magic_dns(&to_other_ip).is_none(),
+            matches!(
+                classify_service_ip(&udp_packet(client, [8, 8, 8, 8], 53)),
+                ServiceIpPacket::Foreign
+            ),
             "UDP/53 to a non-quad-100 IP must pass through"
         );
-
-        // UDP to quad-100 but a different port — must pass through.
-        let wrong_port = {
-            let b = etherparse::PacketBuilder::ipv4(client.ip().octets(), [100, 100, 100, 100], 64)
-                .udp(client.port(), 443);
-            let mut out = Vec::new();
-            b.write(&mut out, b"x").unwrap();
-            out
-        };
         assert!(
-            classify_magic_dns(&wrong_port).is_none(),
-            "non-53 dport to quad-100 must pass through"
+            matches!(
+                classify_service_ip(&syn_packet(client, [192, 0, 2, 10], 853, 7)),
+                ServiceIpPacket::Foreign
+            ),
+            "a TCP SYN to a non-quad-100 IP must pass through"
         );
-
-        // TCP to quad-100:53 — must pass through (we only intercept UDP).
-        let tcp = {
-            let b = etherparse::PacketBuilder::ipv4(client.ip().octets(), [100, 100, 100, 100], 64)
-                .tcp(client.port(), 53, 0, 1024);
-            let mut out = Vec::new();
-            b.write(&mut out, b"x").unwrap();
-            out
-        };
         assert!(
-            classify_magic_dns(&tcp).is_none(),
-            "TCP to quad-100:53 must pass through (UDP-only intercept)"
-        );
-
-        // Garbage / non-IP bytes — must pass through (unparseable).
-        assert!(
-            classify_magic_dns(&[0u8; 4]).is_none(),
+            matches!(classify_service_ip(&[0u8; 4]), ServiceIpPacket::Foreign),
             "unparseable bytes must pass through"
         );
+    }
+
+    /// The service IP absorbs EVERYTHING addressed to it, not just UDP/53: any other UDP port, any
+    /// TCP port (including 53, which this tree serves over UDP only), and any other IP protocol.
+    /// None of these may be handed to the overlay — quad-100 is this node's own address and no peer
+    /// owns it. TCP earns a RST; the rest are dropped silently.
+    #[test]
+    fn service_ip_absorbs_every_non_dns_packet() {
+        use super::{ServiceIpPacket, classify_service_ip};
+
+        let client: SocketAddrV4 = "100.64.0.7:1234".parse().unwrap();
+        const QUAD_100: [u8; 4] = [100, 100, 100, 100];
+
+        // A speculative DoT probe on quad-100:853 — upstream's own cited example.
+        for (pkt, what) in [
+            (syn_packet(client, QUAD_100, 853, 7), "a DoT SYN on :853"),
+            (
+                syn_packet(client, QUAD_100, 53, 7),
+                "a TCP/53 SYN (DNS here is UDP-only)",
+            ),
+            (syn_packet(client, QUAD_100, 80, 7), "an HTTP SYN on :80"),
+        ] {
+            let ServiceIpPacket::Absorbed { reset } = classify_service_ip(&pkt) else {
+                panic!("{what} to quad-100 must be absorbed, never forwarded to the overlay");
+            };
+            assert!(reset.is_some(), "{what} must be answered with a RST");
+        }
+
+        for (pkt, what) in [
+            (udp_packet(client, QUAD_100, 443), "UDP to a non-53 port"),
+            (icmp_packet(client, QUAD_100), "an ICMP echo request"),
+        ] {
+            let ServiceIpPacket::Absorbed { reset } = classify_service_ip(&pkt) else {
+                panic!("{what} to quad-100 must be absorbed, never forwarded to the overlay");
+            };
+            assert!(reset.is_none(), "{what} is dropped silently — no RST");
+        }
+    }
+
+    /// `build_tcp_reset` answers an unserved quad-100 TCP port per the reset generation in RFC 9293
+    /// §3.10.7, CLOSED state (the rules smoltcp's `rst_reply` implements, so the TUN transport resets
+    /// exactly as the netstack transport does): a SYN gets RST|ACK at sequence 0 acknowledging
+    /// `SEG.SEQ + 1`; a segment
+    /// carrying ACK gets a bare RST at that ACK; an inbound RST is never answered at all.
+    #[test]
+    fn unserved_service_ip_tcp_port_is_reset() {
+        use super::{ServiceIpPacket, classify_service_ip};
+
+        let client: SocketAddrV4 = "100.64.0.7:44321".parse().unwrap();
+        const QUAD_100: [u8; 4] = [100, 100, 100, 100];
+
+        // A bare SYN to :853.
+        let ServiceIpPacket::Absorbed { reset: Some(rst) } =
+            classify_service_ip(&syn_packet(client, QUAD_100, 853, 1000))
+        else {
+            panic!("a SYN to an unserved quad-100 port must produce a RST");
+        };
+        let sliced = etherparse::SlicedPacket::from_ip(&rst).expect("the RST parses");
+        match sliced.net {
+            Some(etherparse::NetSlice::Ipv4(ip)) => {
+                assert_eq!(
+                    ip.header().source_addr(),
+                    Ipv4Addr::new(100, 100, 100, 100),
+                    "the RST comes FROM the service IP"
+                );
+                assert_eq!(
+                    ip.header().destination_addr(),
+                    *client.ip(),
+                    "the RST goes back TO the host that probed"
+                );
+            }
+            _ => panic!("the RST must be IPv4"),
+        }
+        match sliced.transport {
+            Some(etherparse::TransportSlice::Tcp(tcp)) => {
+                assert!(tcp.rst(), "RST flag set");
+                assert_eq!(tcp.source_port(), 853, "RST comes from the probed port");
+                assert_eq!(
+                    tcp.destination_port(),
+                    client.port(),
+                    "RST goes to the prober's port"
+                );
+                assert!(tcp.ack(), "an un-ACKed SYN is answered with RST|ACK");
+                assert_eq!(tcp.sequence_number(), 0, "RST|ACK carries sequence 0");
+                assert_eq!(
+                    tcp.acknowledgment_number(),
+                    1001,
+                    "SYN occupies one sequence number: ack = SEG.SEQ + 1"
+                );
+            }
+            _ => panic!("the RST must be TCP"),
+        }
+
+        // A segment already carrying ACK (a stray data segment from a half-open connection) gets a
+        // bare RST seeded from its acknowledgment number.
+        let acked = {
+            let b = etherparse::PacketBuilder::ipv4(client.ip().octets(), QUAD_100, 64)
+                .tcp(client.port(), 853, 5, 1024)
+                .ack(4242);
+            let mut out = Vec::new();
+            b.write(&mut out, b"payload").unwrap();
+            out
+        };
+        let ServiceIpPacket::Absorbed { reset: Some(rst) } = classify_service_ip(&acked) else {
+            panic!("an ACKed segment to an unserved quad-100 port must produce a RST");
+        };
+        let sliced = etherparse::SlicedPacket::from_ip(&rst).expect("the RST parses");
+        match sliced.transport {
+            Some(etherparse::TransportSlice::Tcp(tcp)) => {
+                assert!(tcp.rst(), "RST flag set");
+                assert!(
+                    !tcp.ack(),
+                    "an ACKed segment gets a bare RST, no ACK of ours"
+                );
+                assert_eq!(
+                    tcp.sequence_number(),
+                    4242,
+                    "the bare RST sits at the sequence the sender already acknowledged"
+                );
+            }
+            _ => panic!("the RST must be TCP"),
+        }
+
+        // An inbound RST is absorbed but never answered — otherwise two ends trade resets forever.
+        let inbound_rst = {
+            let b = etherparse::PacketBuilder::ipv4(client.ip().octets(), QUAD_100, 64)
+                .tcp(client.port(), 853, 9, 0)
+                .rst();
+            let mut out = Vec::new();
+            b.write(&mut out, &[]).unwrap();
+            out
+        };
+        let ServiceIpPacket::Absorbed { reset } = classify_service_ip(&inbound_rst) else {
+            panic!("an inbound RST to quad-100 is still absorbed");
+        };
+        assert!(reset.is_none(), "a RST is never answered with another RST");
     }
 
     /// Build a `StateUpdate` carrying the self node + a MagicDNS-on config with the given global
@@ -1959,6 +2240,103 @@ mod tests {
             matches!(plan_intercept(&view, &malformed), Intercept::Dropped),
             "a malformed quad-100/UDP/53 query is dropped, never forwarded to the overlay"
         );
+    }
+
+    /// Anti-leak, the whole point of the absorb. A selected exit node puts `0.0.0.0/0` into the
+    /// overlay's outbound table as `RouteAction::Wireguard(peer)`, and `0.0.0.0/0` matches
+    /// `100.100.100.100` — so ANY quad-100 packet the pump forwards is encrypted and sent to that
+    /// peer. This test proves both halves against the real router: routed unfiltered, the node's own
+    /// service-IP probes land on the exit peer; routed through what the pump actually forwards
+    /// (`Intercept::NotIntercepted` only), nothing does.
+    #[tokio::test]
+    async fn exit_node_default_route_never_sees_service_ip_traffic() {
+        use ts_bart::{RoutingTable, Table};
+        use ts_overlay_router::outbound::{RouteAction, Router};
+        use ts_packet::PacketMut;
+        use ts_transport::PeerId;
+
+        let client: SocketAddrV4 = "100.64.0.7:44321".parse().unwrap();
+        const QUAD_100: [u8; 4] = [100, 100, 100, 100];
+
+        // The exit node's default route, exactly as `route_updater` builds it.
+        let exit = PeerId(7);
+        let mut table = Table::default();
+        table.insert("0.0.0.0/0".parse().unwrap(), RouteAction::Wireguard(exit));
+        let mut router = Router::default();
+        router.swap(table);
+
+        // Quad-100 traffic a host really emits that is not a MagicDNS query.
+        let probes = [
+            syn_packet(client, QUAD_100, 853, 7),
+            syn_packet(client, QUAD_100, 80, 7),
+            udp_packet(client, QUAD_100, 443),
+            icmp_packet(client, QUAD_100),
+        ];
+
+        // The premise: with the exit node's `/0` installed, these DO route to the peer.
+        let leaked = router.route(probes.iter().cloned().map(PacketMut::from));
+        assert_eq!(
+            leaked.to_wireguard.get(&exit).map(Vec::len),
+            Some(probes.len()),
+            "0.0.0.0/0 matches 100.100.100.100 — every probe would be encrypted to the exit peer"
+        );
+
+        // The fix: none of them survive the pump's classification, so the router never sees them.
+        // `Intercept::NotIntercepted` is the one and only arm on which the pump calls `up.send`.
+        let update = dns_update(vec![udp_resolver("8.8.8.8:53")]);
+        let env = test_env(None);
+        let view = build_dns_view(&env, &update, None, true);
+        let forwarded: Vec<PacketMut> = probes
+            .iter()
+            .filter(|pkt| matches!(plan_intercept(&view, pkt), Intercept::NotIntercepted))
+            .cloned()
+            .map(PacketMut::from)
+            .collect();
+        assert!(
+            forwarded.is_empty(),
+            "no quad-100 packet may reach the overlay: {} of {} were still forwarded",
+            forwarded.len(),
+            probes.len()
+        );
+        assert_eq!(
+            router.route(forwarded),
+            ts_overlay_router::outbound::Result::default(),
+            "with the absorb in place the exit peer receives nothing addressed to the service IP"
+        );
+    }
+
+    /// The two transports must agree that the service IP is local. The netstack transport gets it
+    /// for free — `overlay_addresses` hands `100.100.100.100` to the netstack as an interface
+    /// address, so quad-100 terminates there whatever the port or protocol (and smoltcp resets a TCP
+    /// segment no socket accepts). The TUN transport has no netstack to terminate in, so
+    /// `plan_intercept` must reach the same verdict for the same packets: absorbed, never forwarded.
+    #[tokio::test]
+    async fn both_transports_absorb_service_ip_traffic() {
+        use core::net::IpAddr;
+
+        let client: SocketAddrV4 = "100.64.0.7:44321".parse().unwrap();
+        const QUAD_100: [u8; 4] = [100, 100, 100, 100];
+
+        assert!(
+            crate::netstack_actor::overlay_addresses(&fixture_node(), false)
+                .contains(&IpAddr::V4(Ipv4Addr::new(100, 100, 100, 100))),
+            "netstack mode: the service IP is a netstack interface address, so it absorbs quad-100"
+        );
+
+        let update = dns_update(vec![udp_resolver("8.8.8.8:53")]);
+        let env = test_env(None);
+        let view = build_dns_view(&env, &update, None, true);
+        for pkt in [
+            syn_packet(client, QUAD_100, 853, 7),
+            syn_packet(client, QUAD_100, 53, 7),
+            udp_packet(client, QUAD_100, 443),
+            icmp_packet(client, QUAD_100),
+        ] {
+            assert!(
+                !matches!(plan_intercept(&view, &pkt), Intercept::NotIntercepted),
+                "tun mode must absorb the same quad-100 traffic the netstack terminates"
+            );
+        }
     }
 
     /// Defaults must apply when control supplies no knobs: name `tailscale0`, MTU `1280`, and the

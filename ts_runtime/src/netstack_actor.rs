@@ -45,7 +45,7 @@ pub struct NetstackActor {
 /// (`100.100.100.100`, which lets the in-netstack DNS responder bind `:53`). The IPv6 tailnet
 /// address is included **only** when `enable_ipv6` is `true`; when `false` (the default) it is
 /// dropped, keeping the assigned set byte-for-byte the historical IPv4-only path.
-fn overlay_addresses(self_node: &ts_control::Node, enable_ipv6: bool) -> Vec<IpAddr> {
+pub(crate) fn overlay_addresses(self_node: &ts_control::Node, enable_ipv6: bool) -> Vec<IpAddr> {
     let tailnet_address = &self_node.tailnet_address;
     let mut addrs = vec![tailnet_address.ipv4.addr().into()];
 
