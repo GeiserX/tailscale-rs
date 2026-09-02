@@ -93,8 +93,10 @@ const IP6_FRAG_HEADER_LEN: usize = 8;
 enum Ipv6Fragment {
     /// Go's `unknown`, which filter `pre()` drops outright: a Fragment header truncated by the
     /// packet, a *first* fragment too short to hold its own transport header, a later fragment at
-    /// an offset small enough to overlap that transport header on reassembly (RFC 1858), or the
-    /// on-the-wire use of Go's internal `ipproto.Fragment` sentinel.
+    /// an offset small enough to overlap that transport header on reassembly (RFC 1858), the
+    /// on-the-wire use of Go's internal `ipproto.Fragment` sentinel, or a Fragment header reached
+    /// through a chained extension header rather than as the base header's immediate Next Header
+    /// ([`fragment_header_is_chained`]).
     Unknown,
     /// Go's `ipproto.Fragment`: a later fragment at a safe offset. It carries no sub-protocol
     /// header, so there is nothing for a rule to match on and filter `pre()` passes it through
@@ -117,10 +119,11 @@ enum Ipv6Fragment {
 /// `net/packet.Parsed.decode6` does when it dispatches to `decode6Fragment`.
 ///
 /// Callers must have already checked that immediate Next Header byte: Go parses the Fragment header
-/// **only** as the base header's immediate next header, so a Fragment header reached through a
-/// chained hop-by-hop / routing / destination-options header stays `unknown` and is dropped
-/// (upstream `26b2ed0a6` added a test locking that scoping in). No other extension header, and no
-/// IPSec AH/ESP header, is parsed here either — same as Go.
+/// **only** as the base header's immediate next header (upstream `26b2ed0a6` added a test locking
+/// that scoping in). No other extension header, and no IPSec AH/ESP header, is parsed here either —
+/// same as Go. A Fragment header reached through a chained extension header is *not* this
+/// function's business; it is [`fragment_header_is_chained`]'s, which classifies it
+/// [`Ipv6Fragment::Unknown`] so it is dropped.
 fn decode6_fragment(b: &[u8]) -> Ipv6Fragment {
     // Go `q.length = BE16(b[4:6]) + ip6HeaderLength; if len(b) < q.length` — a packet cut off before
     // its declared payload is `unknown`.
@@ -216,6 +219,39 @@ fn decode6_first_fragment(proto: IpProto, sub: &[u8]) -> Ipv6Fragment {
     }
 }
 
+/// Whether `ipv6` carries a Fragment extension header somewhere in its extension-header chain
+/// *other than* as the base header's immediate Next Header — the case [`decode6_fragment`] is
+/// deliberately not scoped to, and which must therefore fail closed here.
+///
+/// Callers must only ask this when the base header's Next Header is **not** [`IP6_FRAG_HEADER`];
+/// otherwise the leading Fragment header itself answers `true` and would shadow its own
+/// classification.
+///
+/// Why a drop and not a pass. Go's `decode6` sets `q.IPProto` from the base header's Next Header
+/// and steps over *only* a leading Fragment header, so a hop-by-hop-chained fragment leaves
+/// `q.IPProto == 0 == ipproto.Unknown` and filter `pre()` drops it before the ACL ever runs. This
+/// tree instead reads the sub-protocol out of etherparse's extension-header walk, which resolves
+/// straight through the chain to the real transport number — so without this check the packet
+/// reaches the ACL looking like an ordinary TCP/UDP datagram whose port merely happens to be 0
+/// (etherparse refuses to descend into a fragmenting payload), and a permissive "allow the whole
+/// tailnet" rule *admits* it. That re-opens the entire RFC 1858 hole this classification exists to
+/// close: prepend an 8-byte Hop-by-Hop Options header and a low-offset later fragment — the one
+/// whose bytes can land on top of the transport header the head fragment was matched on — slides
+/// past, as does a first fragment truncated before its own transport header. The fragment rules
+/// must not be defeatable by an extension header the attacker chooses to prepend, so anything
+/// carrying a chained Fragment header is [`Ipv6Fragment::Unknown`].
+///
+/// This drops a strict subset of what Go drops here (Go rejects the whole chained-extension-header
+/// class, fragmenting or not), so it cannot admit anything upstream refuses and cannot break a real
+/// Tailscale, `wireguard-go` or kernel-WireGuard peer: upstream would discard such a packet too, so
+/// no peer can already be relying on one being delivered.
+fn fragment_header_is_chained(ipv6: &etherparse::Ipv6Slice<'_>) -> bool {
+    ipv6.extensions()
+        .clone()
+        .into_iter()
+        .any(|ext| matches!(ext, etherparse::Ipv6ExtensionSlice::Fragment(_)))
+}
+
 /// Which address family's fragment rules apply to a packet, so [`inbound_filter_verdict`] can run
 /// Go's `decode4` and `decode6` fragment classifications on the packets each actually governs.
 #[derive(Debug, Clone, Copy)]
@@ -243,7 +279,8 @@ enum Fragment {
 ///    1280-MTU overlay. The IPv6 half ([`Ipv6Fragment`], Go `decode6Fragment`) additionally folds in
 ///    the sub-protocol decode of a *first* fragment, so `proto`/`dst_port` here are already the ones
 ///    read past the Fragment extension header, and `Ipv6Fragment::Unknown` — a truncated or
-///    short-first fragment — is dropped where Go's `pre()` drops `ipproto.Unknown`.
+///    short-first fragment, or one whose Fragment header sits behind a chained extension header
+///    ([`fragment_header_is_chained`]) — is dropped where Go's `pre()` drops `ipproto.Unknown`.
 /// 3. TSMP (proto 99) is always admitted, bypassing the ACL — Go `case ipproto.TSMP: return Accept`.
 ///    TSMP carries in-band control messages between nodes, so it must reach the local stack
 ///    regardless of the ACL rules.
@@ -296,8 +333,9 @@ fn inbound_filter_verdict(
         // three protocol values `decode6` can end up with.
         Some(Fragment::V6(Ipv6Fragment::Unknown)) => {
             // Go `pre()`: `if q.IPProto == ipproto.Unknown { return Drop }`. This is the
-            // security-relevant arm — a short first fragment or an RFC 1858 low-offset later
-            // fragment must never reach the ACL, where an allow-all rule would admit it.
+            // security-relevant arm — a short first fragment, an RFC 1858 low-offset later
+            // fragment, or a Fragment header hidden behind a chained extension header must never
+            // reach the ACL, where an allow-all rule would admit it.
             tracing::trace!(
                 ?dst,
                 "dropping IPv6 fragment classified unknown (Go pre() drop)"
@@ -397,13 +435,25 @@ fn filter_inbound_from_peer(
                 let hdr = ipv6.header();
                 // IPv6 fragmentation is carried in a Fragment extension header, not the
                 // base header. Go `decode6` parses that header — and *only* when it is the
-                // base header's immediate Next Header, never one reached through a chained
-                // hop-by-hop/routing/destination-options header, which stays `unknown` and
-                // is dropped. `next_header()` is exactly that immediate byte, so testing it
-                // here reproduces upstream's scoping. Only reachable under the opt-in
-                // `Config::enable_ipv6`; the tailnet is IPv4-only by default.
-                let frag =
-                    (hdr.next_header().0 == IP6_FRAG_HEADER).then(|| decode6_fragment(bytes));
+                // base header's immediate Next Header. `next_header()` is exactly that
+                // immediate byte, so testing it here reproduces upstream's scoping. Only
+                // reachable under the opt-in `Config::enable_ipv6`; the tailnet is IPv4-only
+                // by default.
+                //
+                // A Fragment header reached through a *chained* hop-by-hop / routing /
+                // destination-options / AH header is outside that scope, and must fail
+                // closed rather than fall through to the ACL: Go drops it (the base Next
+                // Header leaves `q.IPProto` at `ipproto.Unknown`, which `pre()` refuses),
+                // whereas etherparse resolves the real sub-protocol through the chain, so an
+                // allow-all rule would otherwise admit exactly the RFC 1858 fragments this
+                // classification exists to reject. See `fragment_header_is_chained`.
+                let frag = if hdr.next_header().0 == IP6_FRAG_HEADER {
+                    Some(decode6_fragment(bytes))
+                } else if fragment_header_is_chained(&ipv6) {
+                    Some(Ipv6Fragment::Unknown)
+                } else {
+                    None
+                };
                 let proto = match frag {
                     // Go `q.IPProto = nextHdr`: the first fragment's real sub-protocol, read
                     // past the 8-byte Fragment header.
@@ -1205,6 +1255,42 @@ mod tests {
         buf
     }
 
+    /// A plain, unfragmented IPv6/UDP packet: the same 40-byte base header the fragment fixtures
+    /// use, but with UDP as its immediate Next Header. The control for the chained-extension-header
+    /// fixtures below.
+    fn ipv6_udp_packet(udp: &[u8]) -> Vec<u8> {
+        let mut buf = vec![0u8; IP6_HEADER_LEN + udp.len()];
+        buf[0] = 0x60; // version 6, traffic class/flow label 0
+        buf[4..6].copy_from_slice(&u16::try_from(udp.len()).unwrap().to_be_bytes());
+        buf[6] = 17; // Next Header = UDP
+        buf[7] = 64; // hop limit
+        buf[8..24].copy_from_slice(&IPV6_FIXTURE_SRC.octets());
+        buf[24..40].copy_from_slice(&IPV6_FIXTURE_DST.octets());
+        buf[IP6_HEADER_LEN..].copy_from_slice(udp);
+        // Unlike a fragment fixture, this datagram is actually parsed as UDP, so its Length field
+        // has to agree with the bytes present or etherparse rejects the packet outright.
+        let udp_len = u16::try_from(udp.len()).unwrap();
+        buf[IP6_HEADER_LEN + 4..IP6_HEADER_LEN + 6].copy_from_slice(&udp_len.to_be_bytes());
+        buf
+    }
+
+    /// Push one 8-byte extension header of protocol `ext_proto` in front of `inner`'s payload, so
+    /// whatever `inner`'s base header pointed at directly is now reached through a *chain*. The
+    /// generic Next-Header / Hdr-Ext-Len-0 / options shape is the on-the-wire layout of Hop-by-Hop
+    /// Options (0), Routing (43) and Destination Options (60) alike.
+    fn ipv6_with_prepended_ext_header(ext_proto: u8, inner: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(inner.len() + 8);
+        buf.extend_from_slice(&inner[..IP6_HEADER_LEN]);
+        // The header we are displacing becomes the extension header's Next Header.
+        let displaced = buf[6];
+        buf[6] = ext_proto;
+        let payload_len = u16::try_from(inner.len() - IP6_HEADER_LEN + 8).unwrap();
+        buf[4..6].copy_from_slice(&payload_len.to_be_bytes());
+        buf.extend_from_slice(&[displaced, 0, 1, 4, 0, 0, 0, 0]);
+        buf.extend_from_slice(&inner[IP6_HEADER_LEN..]);
+        buf
+    }
+
     /// An 8-byte UDP header carrying `dst_port`, as a first fragment's `rest`.
     fn udp_header(dst_port: u16) -> Vec<u8> {
         let mut hdr = vec![0u8; 8];
@@ -1498,26 +1584,111 @@ mod tests {
             "a first IPv6 fragment to a disallowed port is dropped"
         );
 
-        // Scoping (Go `26b2ed0a6`): the Fragment header is parsed ONLY as the base header's
-        // immediate Next Header. A Fragment header reached through a chained hop-by-hop options
-        // header is not a fragment as far as this classification is concerned, so it never gets the
-        // `pre()` pass-through — under a deny-all ACL it is dropped, where an immediate later
-        // fragment with the same offset is delivered.
-        let chained = {
-            let inner = ipv6_fragment_packet(17, 185, false, &[0x61; 8]);
-            let mut buf = Vec::with_capacity(inner.len() + 8);
-            buf.extend_from_slice(&inner[..IP6_HEADER_LEN]);
-            buf[6] = 0; // base Next Header = Hop-by-Hop Options
-            let payload_len = u16::try_from(inner.len() - IP6_HEADER_LEN + 8).unwrap();
-            buf[4..6].copy_from_slice(&payload_len.to_be_bytes());
-            // Hop-by-Hop Options header: Next Header = Fragment, Hdr Ext Len 0, then PadN.
-            buf.extend_from_slice(&[IP6_FRAG_HEADER, 0, 1, 4, 0, 0, 0, 0]);
-            buf.extend_from_slice(&inner[IP6_HEADER_LEN..]);
-            buf
+        // Scoping (Go `26b2ed0a6`): the Fragment header is parsed here ONLY as the base header's
+        // immediate Next Header. What happens to one reached through a chained extension header —
+        // it must fail closed, not fall through to the ACL — is
+        // `chained_extension_header_cannot_bypass_the_ipv6_fragment_rules`.
+    }
+
+    /// Prepending an extension header must not defeat the fragment rules.
+    ///
+    /// [`decode6_fragment`] is scoped exactly as Go scopes it: the Fragment header is parsed only
+    /// as the base header's immediate Next Header. Go can afford that narrow scope because
+    /// everything it does not parse *keeps the base header's Next Header* as `q.IPProto`, so a
+    /// hop-by-hop-chained fragment is `ipproto.Unknown` and filter `pre()` drops it before the ACL
+    /// ever runs. This tree reads the sub-protocol out of etherparse's extension-header walk
+    /// instead, which resolves straight through the chain to the real transport number — so the
+    /// same packet reached the ACL looking like an ordinary UDP datagram that merely happened to
+    /// carry port 0, and a permissive "allow the whole tailnet" rule ADMITTED it. Eight bytes of
+    /// Hop-by-Hop Options were enough to walk every RFC 1858 fragment straight past the rules the
+    /// rest of this file exists to enforce.
+    ///
+    /// Every assertion is against an ALLOW-ALL ACL, so a drop can only be the fragment rule and
+    /// never the ACL — and the last block is the control that proves it: the same chain shape with
+    /// no Fragment header in it is still delivered, on the port read past the extension header.
+    #[test]
+    fn chained_extension_header_cannot_bypass_the_ipv6_fragment_rules() {
+        let keep = |filter: &(dyn ts_packetfilter::Filter + Send + Sync), packet: Vec<u8>| {
+            let mut packets = vec![PacketMut::from(packet)];
+            let mut learned = Vec::new();
+            filter_inbound_from_peer(filter, PeerId(4), &mut packets, &mut learned);
+            assert!(
+                learned.is_empty(),
+                "no TSMP advertisement in these fixtures"
+            );
+            !packets.is_empty()
         };
+
+        // Hop-by-Hop Options (0), Routing (43) and Destination Options (60): the fragment rules
+        // must not depend on which header the sender chose to hide behind.
+        for ext in [0u8, 43, 60] {
+            // The RFC 1858 evasion itself: a later fragment whose bytes can land on top of the
+            // transport header the head fragment was matched on.
+            assert!(
+                !keep(
+                    &AllowAll,
+                    ipv6_with_prepended_ext_header(
+                        ext,
+                        &ipv6_fragment_packet(17, 1, false, &[0x61; 8])
+                    )
+                ),
+                "a low-offset later fragment behind extension header {ext} is dropped (RFC 1858)"
+            );
+            // A first fragment truncated before its own transport header, which a follow-up
+            // fragment can then complete.
+            assert!(
+                !keep(
+                    &AllowAll,
+                    ipv6_with_prepended_ext_header(
+                        ext,
+                        &ipv6_fragment_packet(17, 0, true, &udp_header(443)[..4])
+                    )
+                ),
+                "a short first fragment behind extension header {ext} is dropped"
+            );
+            // A *well-formed* chained fragment is dropped too — Go drops this whole class, so
+            // failing closed here can never admit something upstream refuses.
+            assert!(
+                !keep(
+                    &AllowAll,
+                    ipv6_with_prepended_ext_header(
+                        ext,
+                        &ipv6_fragment_packet(17, 185, false, &[0x61; 8])
+                    )
+                ),
+                "a chained later fragment behind extension header {ext} gets no pass-through"
+            );
+            assert!(
+                !keep(
+                    &AllowAll,
+                    ipv6_with_prepended_ext_header(
+                        ext,
+                        &ipv6_fragment_packet(17, 0, true, &udp_header(443))
+                    )
+                ),
+                "a chained first fragment behind extension header {ext} is dropped"
+            );
+        }
+
+        // Contrast: the very same later fragment, reached as the base header's immediate Next
+        // Header, is still delivered. Only the 8 prepended bytes separate this from the third
+        // assertion above, so the drops really are the chain and not the fragment fixtures.
         assert!(
-            !keep(&DenyAll, chained),
-            "a Fragment header behind a chained hop-by-hop header gets no pass-through"
+            keep(&AllowAll, ipv6_fragment_packet(17, 185, false, &[0x61; 8])),
+            "an unchained later fragment is still delivered"
+        );
+
+        // Control: a chained extension header with NO Fragment header behind it is untouched — it
+        // is still admitted, and still on the port read past the extension header. So the drops
+        // above are the fragment rule firing, not a blanket "any extension header is suspicious".
+        let plain = ipv6_with_prepended_ext_header(0, &ipv6_udp_packet(&udp_header(443)));
+        assert!(
+            keep(&AllowAll, plain.clone()),
+            "an unfragmented packet behind a chained extension header is still delivered"
+        );
+        assert!(
+            keep(&AllowPort(443), plain),
+            "...and still matched on its real destination port"
         );
     }
 
