@@ -1276,8 +1276,22 @@ mod tests {
 
     /// Push one 8-byte extension header of protocol `ext_proto` in front of `inner`'s payload, so
     /// whatever `inner`'s base header pointed at directly is now reached through a *chain*. The
-    /// generic Next-Header / Hdr-Ext-Len-0 / options shape is the on-the-wire layout of Hop-by-Hop
-    /// Options (0), Routing (43) and Destination Options (60) alike.
+    /// generic Next-Header / Hdr-Ext-Len-0 / six-bytes-of-body shape is the on-the-wire layout of
+    /// Hop-by-Hop Options (0), Routing (43) and Destination Options (60) alike.
+    ///
+    /// Those six body bytes are chosen so the header is well formed under *every* one of those
+    /// three readings, not merely one etherparse happens not to look at:
+    ///
+    /// - as Options (0 / 60) they are a TLV stream — `1, 0` is a zero-length PadN, and the four
+    ///   trailing zeros are four Pad1s, filling the 8-byte header exactly;
+    /// - as Routing (43) they are Routing Type 1, **Segments Left 0**, and four bytes of
+    ///   type-specific data. Segments Left must stay 0: `Hdr Ext Len` is 0, so there is no room
+    ///   for a single 16-byte segment, and RFC 8200 §4.4 has a receiver that meets a non-zero
+    ///   Segments Left on an unrecognized Routing Type discard the packet and answer ICMP
+    ///   Parameter Problem. etherparse walks a Routing header as a raw ext header and never reads
+    ///   the field, so a non-zero value parses here today — but a fixture that only survives
+    ///   because the parser is lenient is one parser release away from turning the negative
+    ///   assertions below into vacuous passes.
     fn ipv6_with_prepended_ext_header(ext_proto: u8, inner: &[u8]) -> Vec<u8> {
         let mut buf = Vec::with_capacity(inner.len() + 8);
         buf.extend_from_slice(&inner[..IP6_HEADER_LEN]);
@@ -1286,7 +1300,7 @@ mod tests {
         buf[6] = ext_proto;
         let payload_len = u16::try_from(inner.len() - IP6_HEADER_LEN + 8).unwrap();
         buf[4..6].copy_from_slice(&payload_len.to_be_bytes());
-        buf.extend_from_slice(&[displaced, 0, 1, 4, 0, 0, 0, 0]);
+        buf.extend_from_slice(&[displaced, 0, 1, 0, 0, 0, 0, 0]);
         buf.extend_from_slice(&inner[IP6_HEADER_LEN..]);
         buf
     }
@@ -1604,8 +1618,12 @@ mod tests {
     /// rest of this file exists to enforce.
     ///
     /// Every assertion is against an ALLOW-ALL ACL, so a drop can only be the fragment rule and
-    /// never the ACL — and the last block is the control that proves it: the same chain shape with
-    /// no Fragment header in it is still delivered, on the port read past the extension header.
+    /// never the ACL — and each extension type carries its own control that proves it: the same
+    /// chain shape with no Fragment header in it is still delivered, on the port read past the
+    /// extension header. That control is per-type rather than once at the end because `keep`
+    /// cannot tell a fragment-rule drop from a parser rejection, so a fixture malformed for only
+    /// one of the three protocols would otherwise turn that protocol's four drops into vacuous
+    /// passes with the suite still green.
     #[test]
     fn chained_extension_header_cannot_bypass_the_ipv6_fragment_rules() {
         let keep = |filter: &(dyn ts_packetfilter::Filter + Send + Sync), packet: Vec<u8>| {
@@ -1668,6 +1686,22 @@ mod tests {
                 ),
                 "a chained first fragment behind extension header {ext} is dropped"
             );
+
+            // Control for THIS extension type. Every assertion above is a `!keep`, and `keep`
+            // reports a packet the parser rejected exactly as it reports a packet the fragment
+            // rule dropped — so on its own the block above would also pass if this builder simply
+            // produced eight bytes etherparse refuses to walk. The same chain shape with no
+            // Fragment header behind it is still parsed, still admitted, and still matched on the
+            // port read past the extension header, which pins the drops to the fragment rule.
+            let plain = ipv6_with_prepended_ext_header(ext, &ipv6_udp_packet(&udp_header(443)));
+            assert!(
+                keep(&AllowAll, plain.clone()),
+                "an unfragmented packet behind extension header {ext} is still delivered"
+            );
+            assert!(
+                keep(&AllowPort(443), plain),
+                "...and is still matched on the port read past extension header {ext}"
+            );
         }
 
         // Contrast: the very same later fragment, reached as the base header's immediate Next
@@ -1676,19 +1710,6 @@ mod tests {
         assert!(
             keep(&AllowAll, ipv6_fragment_packet(17, 185, false, &[0x61; 8])),
             "an unchained later fragment is still delivered"
-        );
-
-        // Control: a chained extension header with NO Fragment header behind it is untouched — it
-        // is still admitted, and still on the port read past the extension header. So the drops
-        // above are the fragment rule firing, not a blanket "any extension header is suspicious".
-        let plain = ipv6_with_prepended_ext_header(0, &ipv6_udp_packet(&udp_header(443)));
-        assert!(
-            keep(&AllowAll, plain.clone()),
-            "an unfragmented packet behind a chained extension header is still delivered"
-        );
-        assert!(
-            keep(&AllowPort(443), plain),
-            "...and still matched on its real destination port"
         );
     }
 
