@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.46.0](https://github.com/GeiserX/tailscale-rs/compare/v0.45.3...v0.46.0) (2026-09-03)
+
+
+### Features
+
+* **tunnel:** answer handshake floods with cookies, not X25519 work ([#352](https://github.com/GeiserX/tailscale-rs/issues/352)) ([83a3c89](https://github.com/GeiserX/tailscale-rs/commit/83a3c892a29203b5ba63b14d852f929c7865371f)), closes [#27](https://github.com/GeiserX/tailscale-rs/issues/27)
+
 ## [0.45.3](https://github.com/GeiserX/tailscale-rs/compare/v0.45.2...v0.45.3) (2026-09-03)
 
 
