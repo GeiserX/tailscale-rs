@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.45.3](https://github.com/GeiserX/tailscale-rs/compare/v0.45.2...v0.45.3) (2026-09-03)
+
+
+### Bug Fixes
+
+* **tka:** enforce a newly synced lock on already-admitted peers ([#349](https://github.com/GeiserX/tailscale-rs/issues/349)) ([bfdeabe](https://github.com/GeiserX/tailscale-rs/commit/bfdeabe9ed0dd0dfaf58c74da9b2273c93125b9d))
+
 ## [0.45.2](https://github.com/GeiserX/tailscale-rs/compare/v0.45.1...v0.45.2) (2026-09-03)
 
 
