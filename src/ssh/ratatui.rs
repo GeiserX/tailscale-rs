@@ -84,13 +84,18 @@ where
 {
     type Error = std::io::Error;
 
-    fn new(
+    // The TUI runs in-process and streams nothing to a recorder, so a policy rule that demands
+    // session recording must not reach it — the connection is refused by `ChannelServer`'s
+    // fail-closed gate instead.
+    const RECORDS_SESSION: bool = false;
+
+    async fn new(
         rt: tokio::runtime::Handle,
         channel_id: ChannelId,
         session: Handle,
         dev: Arc<Device>,
         // The TUI demo handler ignores the policy-mapped local user; it runs purely in-process.
-        _accept: &crate::ssh::SshAccept,
+        _ctx: &crate::ssh::ChannelContext,
     ) -> Result<Self, Self::Error> {
         let mut term = Self {
             term: make_term(rt, session.clone(), channel_id)?,

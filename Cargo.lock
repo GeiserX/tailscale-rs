@@ -1838,6 +1838,7 @@ dependencies = [
  "chrono",
  "clap 4.6.6",
  "geiserx_ts_control",
+ "geiserx_ts_http_util",
  "geiserx_ts_keys",
  "geiserx_ts_metrics",
  "geiserx_ts_netstack_smoltcp",

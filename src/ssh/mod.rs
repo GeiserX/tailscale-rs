@@ -36,14 +36,15 @@ const MAX_SSH_CONNECTIONS: usize = 64;
 
 use russh::server::Handler;
 use ts_control::SshConnIdentity;
-pub use ts_control::{SshAccept, SshDecision, SshDenyReason, SshPolicy};
+pub use ts_control::{SshAccept, SshDecision, SshDenyReason, SshPolicy, SshRecorderFailureAction};
 
 mod channel_server;
 mod channel_write;
 mod ratatui;
+pub mod recording;
 mod shell;
 
-pub use channel_server::{ChannelEvent, ChannelHandler, ChannelServer};
+pub use channel_server::{ChannelContext, ChannelEvent, ChannelHandler, ChannelServer};
 pub use ratatui::{RatatuiApp, RatatuiEnv, RatatuiTerm};
 pub use shell::ShellHandler;
 
@@ -98,11 +99,57 @@ impl crate::Device {
 /// unreadable clock (time before the Unix epoch) is clamped to [`i64::MAX`] so SSH-rule expiry
 /// **fails closed**: a broken clock makes every time-limited rule look already-expired (deny)
 /// rather than perpetually-live.
-fn now_unix_secs() -> i64 {
+pub(crate) fn now_unix_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(i64::MAX)
+}
+
+/// Format `unix_secs` as ISO 8601 basic date-time in UTC (`20060102T150405`), Go
+/// `tstime.BasicDateTTime`.
+///
+/// Hand-rolled rather than pulled from `chrono`: the root crate deliberately has no `chrono`
+/// dependency (see [`now_unix_secs`]), and this is the only place it would be needed. The
+/// days-to-civil-date conversion is Howard Hinnant's `civil_from_days`, the same algorithm Go's
+/// `time` package uses, valid for any year in the proleptic Gregorian calendar.
+pub(crate) fn basic_date_t_time(unix_secs: i64) -> String {
+    let days = unix_secs.div_euclid(86_400);
+    let secs_of_day = unix_secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}{month:02}{day:02}T{:02}{:02}{:02}",
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60,
+    )
+}
+
+/// Convert days since the Unix epoch to a `(year, month, day)` civil date.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    // Shift the epoch to 0000-03-01 so leap days land at the end of the 400-year era.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// A fresh SSH connection identifier, shared by every session multiplexed on the connection.
+///
+/// Mirrors Go `tailssh`'s `conn.connID`
+/// (`fmt.Sprintf("ssh-conn-%s-%02x", now.UTC().Format(tstime.BasicDateTTime), randBytes(5))`); it
+/// is the `connectionID` recorded in every session's cast header, so an operator can group the
+/// recordings of one multiplexed connection.
+pub(crate) fn new_conn_id(now_unix: i64) -> String {
+    let rand: [u8; 5] = rand::random();
+    let hex: String = rand.iter().map(|b| format!("{b:02x}")).collect();
+    format!("ssh-conn-{}-{hex}", basic_date_t_time(now_unix))
 }
 
 /// Trait to construct a new [`Handler`] from a Tailscale [`Device`][crate::Device] and
@@ -214,5 +261,43 @@ impl crate::Device {
     {
         self.serve_ssh::<ChannelServer<RatatuiTerm<App>>>(config, listen_addr)
             .await
+    }
+}
+
+#[cfg(all(test, feature = "ssh"))]
+mod tests {
+    use super::{basic_date_t_time, new_conn_id};
+
+    /// The connection id's timestamp is ISO 8601 basic format in UTC, Go
+    /// `tstime.BasicDateTTime`.
+    #[test]
+    fn basic_date_t_time_formats_utc() {
+        // 2023-11-14T22:13:20Z, the round number 1_700_000_000.
+        assert_eq!(basic_date_t_time(1_700_000_000), "20231114T221320");
+        // The epoch itself, and the day before it (a negative timestamp must not wrap).
+        assert_eq!(basic_date_t_time(0), "19700101T000000");
+        assert_eq!(basic_date_t_time(-1), "19691231T235959");
+        // A leap day, where an off-by-one in the civil-date conversion would show.
+        assert_eq!(basic_date_t_time(1_709_164_800), "20240229T000000");
+        // A century year that IS a leap year (2000 is divisible by 400) has a 29 February.
+        assert_eq!(basic_date_t_time(951_782_400), "20000229T000000");
+        // One that is NOT (1900) does not: 59 days after 1900-01-01 is 1 March, not 29 February.
+        assert_eq!(basic_date_t_time(-2_203_891_200), "19000301T000000");
+    }
+
+    /// The connection id has Go's shape: the `ssh-conn-` prefix, a basic-format timestamp, and 5
+    /// random bytes in hex. Two connections never share one.
+    #[test]
+    fn conn_id_is_prefixed_timestamped_and_unique() {
+        let id = new_conn_id(1_700_000_000);
+        assert!(id.starts_with("ssh-conn-20231114T221320-"), "{id}");
+        let suffix = id.rsplit('-').next().expect("suffix");
+        assert_eq!(suffix.len(), 10, "5 random bytes as hex: {id}");
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()), "{id}");
+        assert_ne!(
+            new_conn_id(1_700_000_000),
+            new_conn_id(1_700_000_000),
+            "each connection must be distinguishable in the recordings"
+        );
     }
 }
