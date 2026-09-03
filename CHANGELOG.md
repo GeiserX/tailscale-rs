@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.46.1](https://github.com/GeiserX/tailscale-rs/compare/v0.46.0...v0.46.1) (2026-09-03)
+
+
+### Bug Fixes
+
+* **magicsock:** rotate the STUN sweep so trailing derp servers are probed ([#354](https://github.com/GeiserX/tailscale-rs/issues/354)) ([ed91ed6](https://github.com/GeiserX/tailscale-rs/commit/ed91ed67c8ed53accac4d150d657f2f2e9f506f6))
+
 ## [0.46.0](https://github.com/GeiserX/tailscale-rs/compare/v0.45.3...v0.46.0) (2026-09-03)
 
 
