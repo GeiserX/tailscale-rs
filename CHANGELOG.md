@@ -2,6 +2,18 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.47.0](https://github.com/GeiserX/tailscale-rs/compare/v0.46.1...v0.47.0) (2026-09-03)
+
+
+### Features
+
+* **ssh:** record sessions to a recorder instead of refusing them ([#357](https://github.com/GeiserX/tailscale-rs/issues/357)) ([3ab93f7](https://github.com/GeiserX/tailscale-rs/commit/3ab93f7695319304af3c7683d4d9be2273e2fbe4))
+
+
+### Bug Fixes
+
+* **runtime:** stop overlapping STUN sweeps rewinding the probe rotation ([#356](https://github.com/GeiserX/tailscale-rs/issues/356)) ([9f76847](https://github.com/GeiserX/tailscale-rs/commit/9f768472665dbd23783e7cc579205a25b91e66f3))
+
 ## [0.46.1](https://github.com/GeiserX/tailscale-rs/compare/v0.46.0...v0.46.1) (2026-09-03)
 
 
