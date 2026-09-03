@@ -1843,10 +1843,13 @@ impl MagicSock {
     /// budget lets the caller stop at the cap and resume there next round instead.
     ///
     /// Prunes expired transactions first (same `STUN_TX_TTL` sweep `send_stun_request` does), so the
-    /// answer counts only transactions whose responses we would still trust. It is a *lower bound*:
-    /// we are the only inserter, so between this call and the sends the budget can only grow (a
-    /// response arriving frees a slot). Sizing a round by it therefore never trips the fail-safe
-    /// drop.
+    /// answer counts only transactions whose responses we would still trust. It is a *lower bound*
+    /// for a caller that keeps its own rounds serialized: with one round in flight nothing else
+    /// inserts, so between this call and the sends the budget can only grow (a response arriving
+    /// frees a slot), and sizing a round by it never trips the fail-safe drop. Two rounds running
+    /// concurrently break that premise — they read the same budget and then both spend it, so the
+    /// later sends hit the silent drop. A caller with more than one sweep path must serialize them
+    /// across the query *and* the sends it sizes.
     pub fn stun_in_flight_remaining(&self) -> usize {
         let now = Instant::now();
         let mut in_flight = lock(&self.stun_in_flight);
