@@ -14,7 +14,7 @@ use zerocopy::IntoBytes;
 use crate::{
     config::{PeerConfig, PeerId},
     handshake::{Handshake, ReceivedHandshake, SessionPair, initiate_handshake},
-    macs::{MACReceiver, MACSender},
+    macs::{CookieGenerator, MACReceiver, MACSender},
     messages::{CookieReply, HandshakeResponse, Message, SessionId},
     session::{ReceiveSession, TransmitSession},
     time::{TAI64N, TAI64NClock},
@@ -982,6 +982,12 @@ struct EndpointState {
     my_key: NodeKeyPair,
 
     my_cookie: MACReceiver,
+    /// Responder-side cookie issuance, consulted only while [`HandshakeLoad`] says we are under
+    /// load. Idle (and holding no secret at all) on a normally-loaded node.
+    cookies: CookieGenerator,
+    /// Arrival counter for inbound handshake initiations: the under-load signal that decides
+    /// whether an initiation has to carry a valid `mac2`.
+    load: HandshakeLoad,
     ids: IdMap,
     timestamps: TAI64NClock,
     scheduler: Scheduler<Event>,
@@ -995,10 +1001,13 @@ impl Endpoint {
         // field move would otherwise invalidate the `&my_key.public` borrow. The public key IS
         // `Copy`, so this just copies the 32 public bytes out.
         let my_cookie = MACReceiver::new(&my_key.public);
+        let cookies = CookieGenerator::new(&my_key.public);
         Self {
             state: EndpointState {
                 my_key,
                 my_cookie,
+                cookies,
+                load: Default::default(),
                 ids: Default::default(),
                 timestamps: Default::default(),
                 scheduler: Default::default(),
@@ -1126,8 +1135,32 @@ impl Endpoint {
         ret
     }
 
-    /// Receive packets from peers.
+    /// Receive packets from peers, with no information about where they came from.
+    ///
+    /// Equivalent to [`Endpoint::recv_from`] with no attribution: see there for what the missing
+    /// attribution costs (responder-side cookie issuance, and nothing else).
     pub fn recv(&mut self, packets: impl IntoIterator<Item = PacketMut>) -> RecvResult {
+        self.recv_from(None, packets)
+    }
+
+    /// Receive packets that the underlay attributed to peer `from`.
+    ///
+    /// The attribution is what makes the WireGuard cookie mechanism (whitepaper §5.4.7) work here.
+    /// A responder under load answers a handshake initiation that carries no valid `mac2` with a
+    /// cookie reply *instead of* doing the initiation's X25519 work, and the reply has to go back
+    /// to wherever the initiation came from — wireguard-go sends it to the datagram's source
+    /// address (`device.SendHandshakeCookie`). This engine is sans-io and never sees a source
+    /// address; the underlay hands it packets already attributed to a peer, so that peer is both
+    /// the return path for the reply and the cookie's binding material.
+    ///
+    /// Passing `None` (what [`Endpoint::recv`] does) disables cookie issuance for the batch: with
+    /// no return path there is nothing to challenge with, so demanding a `mac2` we can never issue
+    /// would only deny service to ourselves. Everything else behaves identically.
+    pub fn recv_from(
+        &mut self,
+        from: Option<PeerId>,
+        packets: impl IntoIterator<Item = PacketMut>,
+    ) -> RecvResult {
         let mut ret = RecvResult::default();
 
         let mut packets = packets.into_iter().into_group_map_by(|packet| {
@@ -1145,7 +1178,7 @@ impl Endpoint {
         }
 
         for packet in handshakes {
-            self.process_one_handshake(packet, &mut ret);
+            self.process_one_handshake(from, packet, &mut ret);
         }
 
         tracing::trace!(n = packets.len(), "processing packets");
@@ -1168,11 +1201,50 @@ impl Endpoint {
         ret
     }
 
-    fn process_one_handshake(&mut self, packet: PacketMut, out: &mut RecvResult) {
+    fn process_one_handshake(
+        &mut self,
+        from: Option<PeerId>,
+        packet: PacketMut,
+        out: &mut RecvResult,
+    ) {
         let Ok(Message::HandshakeInitiation(init)) = Message::try_from(packet.as_ref()) else {
             tracing::error!("message parsing failed");
             return;
         };
+
+        // Every arriving initiation counts toward the load signal, authenticated or not — the
+        // sans-io stand-in for wireguard-go's handshake *queue depth*, which likewise counts
+        // packets it has not yet looked at (`device.IsUnderLoad`).
+        let now = Instant::now();
+        let under_load = self.state.load.record_initiation(now);
+
+        // mac1 is the cheap authenticator and is checked first, in Go's order
+        // (`device/receive.go`: `CheckMAC1`, then `IsUnderLoad`, then `CheckMAC2`, then the
+        // expensive handshake). `ReceivedHandshake::new` re-checks it below and keeps that
+        // guarantee for its own callers; a second keyed Blake2s over 148 bytes is noise next to
+        // the X25519 it guards.
+        if !self.state.my_cookie.verify_macs(init.as_bytes()) {
+            tracing::trace!("dropping handshake initiation with an invalid mac1");
+            return;
+        }
+
+        // Under load an initiation must prove return routability: it has to carry a `mac2`
+        // derived from a cookie we issued to this same underlay peer. Anything else is answered
+        // with a cookie reply and costs us one Blake2s plus one XChaCha20-Poly1305 seal, not the
+        // two X25519 operations the initiation is asking for. A flood with a forged origin never
+        // sees the reply, so it never gets past this point.
+        if under_load && let Some(from) = from {
+            let binding = cookie_binding(from);
+            if !self
+                .state
+                .cookies
+                .check_mac2(init.as_bytes(), &binding, now)
+            {
+                self.send_cookie_reply(from, init, &binding, now, out);
+                return;
+            }
+        }
+
         let Some(handshake) =
             ReceivedHandshake::new(init, &self.state.my_key, &self.state.my_cookie)
         else {
@@ -1190,6 +1262,36 @@ impl Endpoint {
         };
 
         peer.respond_to_handshake(&mut self.state, handshake, out)
+    }
+
+    /// Queue a cookie reply to `from` in answer to `init` (wireguard-go
+    /// `device.SendHandshakeCookie`, `device/send.go`).
+    ///
+    /// The reply is not itself MAC'd — it carries no `mac1`/`mac2` fields — and is authenticated
+    /// only by the AEAD, whose associated data is the initiation's own `mac1`. That binds it to
+    /// the exact initiation it answers, so it is useless to anyone who did not send that packet.
+    fn send_cookie_reply(
+        &mut self,
+        from: PeerId,
+        init: &crate::messages::HandshakeInitiation,
+        binding: &[u8],
+        now: Instant,
+        out: &mut RecvResult,
+    ) {
+        let Some(reply) =
+            self.state
+                .cookies
+                .create_reply(init.as_bytes(), init.sender_id, binding, now)
+        else {
+            tracing::warn!("could not build a cookie reply for a handshake initiation");
+            return;
+        };
+
+        let mut pkt = PacketMut::new(size_of::<CookieReply>());
+        // Allocated with exactly the message's size directly above.
+        reply.write_to(pkt.as_mut()).unwrap();
+        tracing::debug!(peer_id = ?from, "under load: answering a handshake initiation with a cookie");
+        out.queue_to_peer(from).push(pkt);
     }
 
     /// Dispatch time-based events that are due to occur at or before the given instant.
@@ -1398,6 +1500,70 @@ fn new_handshake_delay() -> Duration {
 /// window stays within a few tens of ms of Go's `[5.000s, 5.334s)`.
 const HANDSHAKE_RETRANSMIT_COALESCE: Duration = Duration::from_millis(50);
 
+/// How many handshake initiations must arrive inside [`UNDER_LOAD_WINDOW`] before the endpoint
+/// treats itself as under load and starts demanding cookies.
+///
+/// wireguard-go trips at `UnderLoadQueueSize` = `QueueHandshakeSize / 8` = 128 initiations *queued
+/// at once* (`device.IsUnderLoad`, `device/device.go`). This engine is sans-io: it has no handshake
+/// queue to measure, because the embedder hands packets straight to [`Endpoint::recv_from`]. The
+/// same 128 is therefore applied as an arrival *rate* over one second, which is the closest
+/// faithful analogue — and far above anything legitimate traffic produces, since a peer re-initiates
+/// at most once per `REKEY_TIMEOUT` (5s), so 128/s implies hundreds of peers rekeying continuously.
+const UNDER_LOAD_INITIATIONS: u32 = 128;
+
+/// The window over which [`UNDER_LOAD_INITIATIONS`] is counted, and how long the under-load state
+/// sticks once tripped — wireguard-go `UnderLoadAfterTime` (`device/constants.go`), which keeps a
+/// device "under load" for one second after the last time its queue was full, so a bursty flood
+/// does not flip the mitigation on and off between packets.
+const UNDER_LOAD_WINDOW: Duration = Duration::from_secs(1);
+
+/// The arrival counter behind [`Endpoint::recv_from`]'s under-load decision.
+///
+/// Deliberately not a rolling histogram: Go's signal is a single queue-depth comparison, and the
+/// only thing either version has to get right is "many initiations arriving at once, recently".
+#[derive(Default)]
+struct HandshakeLoad {
+    /// Start of the current counting window and how many initiations have arrived in it.
+    window: Option<(Instant, u32)>,
+    /// While set and in the future, the endpoint is under load (Go's `underLoadUntil`).
+    under_load_until: Option<Instant>,
+}
+
+impl HandshakeLoad {
+    /// Record one arriving handshake initiation and report whether the endpoint is under load.
+    fn record_initiation(&mut self, now: Instant) -> bool {
+        match &mut self.window {
+            Some((start, count)) if now.saturating_duration_since(*start) < UNDER_LOAD_WINDOW => {
+                *count += 1;
+                if *count >= UNDER_LOAD_INITIATIONS {
+                    self.under_load_until = Some(now + UNDER_LOAD_WINDOW);
+                }
+            }
+            // First initiation, or the previous window has closed: start counting again.
+            window => *window = Some((now, 1)),
+        }
+        self.under_load(now)
+    }
+
+    /// Whether the endpoint is (still) under load, without recording an arrival.
+    fn under_load(&self, now: Instant) -> bool {
+        self.under_load_until.is_some_and(|until| until > now)
+    }
+}
+
+/// The cookie's return-routability binding for a peer (the `src` argument of wireguard-go's
+/// `CookieChecker.CreateReply`/`CheckMAC2`).
+///
+/// Go binds the cookie to the datagram's source address so that a cookie issued to one origin is
+/// worthless from another. The equivalent here is the underlay peer the datagram was attributed
+/// to, because that — not a source address — is where this engine sends the reply, and it is the
+/// underlay (magicsock's source-address-to-peer map, or a DERP frame's authenticated sender key)
+/// that decides the attribution. The property that matters is preserved: an origin that cannot
+/// receive the reply cannot compute the `mac2` we will demand.
+fn cookie_binding(peer: PeerId) -> [u8; 4] {
+    peer.0.to_le_bytes()
+}
+
 /// Max consecutive handshake-initiation retransmits before giving up (Go wireguard-go
 /// `MaxTimerHandshakes = RekeyAttemptTime / RekeyTimeout = 90s / 5s = 18`). After this many failed
 /// retransmits, [`Peer::handshake_timeout`] stops retransmitting and tears the session down rather
@@ -1467,6 +1633,8 @@ mod tests {
         let my_key = NodeKeyPair::new();
         EndpointState {
             my_cookie: MACReceiver::new(&my_key.public),
+            cookies: CookieGenerator::new(&my_key.public),
+            load: Default::default(),
             my_key,
             ids: IdMap::default(),
             timestamps: Default::default(),
@@ -2569,6 +2737,215 @@ mod tests {
             "expected packets for exactly one peer ({what})"
         );
         map.get(&peer).expect(what).clone()
+    }
+
+    /// A wire-shaped but unauthenticated handshake initiation. It parses as
+    /// `MessageType::HandshakeInitiation` — so it reaches the responder's load counter — and its
+    /// mac1 is zero, so it is dropped before any X25519 work. This is what a flood looks like.
+    fn junk_initiation(sender_id: u32) -> PacketMut {
+        let init = crate::messages::HandshakeInitiation {
+            sender_id: SessionId::from(sender_id),
+            ..Default::default()
+        };
+        PacketMut::from(init.as_bytes())
+    }
+
+    /// Stand up two endpoints that know each other, with A holding B as `a_peer` and B holding A
+    /// as `b_peer`.
+    fn peered_endpoints(
+        a_static: &NodeKeyPair,
+        b_static: &NodeKeyPair,
+        a_peer: PeerId,
+        b_peer: PeerId,
+    ) -> (Endpoint, Endpoint) {
+        let psk = rand::random::<crate::config::Psk>();
+        let (mut a_ep, mut b_ep) = (
+            Endpoint::new(a_static.clone()),
+            Endpoint::new(b_static.clone()),
+        );
+        a_ep.upsert_peer(
+            a_peer,
+            PeerConfig {
+                key: b_static.public,
+                psk: psk.clone(),
+                persistent_keepalive_interval: None,
+            },
+        );
+        b_ep.upsert_peer(
+            b_peer,
+            PeerConfig {
+                key: a_static.public,
+                psk,
+                persistent_keepalive_interval: None,
+            },
+        );
+        (a_ep, b_ep)
+    }
+
+    /// A's first outbound packet to B, which comes out as a handshake initiation.
+    fn first_initiation(a_ep: &mut Endpoint, a_peer: PeerId) -> Vec<PacketMut> {
+        let out = a_ep.send(HashMap::from([(
+            a_peer,
+            vec![PacketMut::from(&b"hello"[..])],
+        )]));
+        only_to_peer(&out.to_peers, a_peer, "A's handshake initiation")
+    }
+
+    /// GitHub issue #27: responder-side cookie issuance, the WireGuard under-load DoS mitigation
+    /// (whitepaper §5.4.7 / wireguard-go `device/cookie.go`).
+    ///
+    /// Drives the whole exchange through the public API: B is flooded with unauthenticated
+    /// initiations until it considers itself under load, then A's genuine initiation is answered
+    /// with a cookie reply instead of the two X25519 operations it asks for. A opens the cookie,
+    /// its retransmit carries the derived mac2, and B — still under load — does the handshake.
+    ///
+    /// The last step is the one that matters for a dialing client: the mitigation must not become
+    /// a way to refuse service to a peer that answers the challenge correctly.
+    #[test]
+    fn responder_under_load_issues_a_cookie_and_accepts_the_answered_retransmit() {
+        let (a_static, b_static) = (NodeKeyPair::new(), NodeKeyPair::new());
+        let (a_peer, b_peer) = (PeerId(1), PeerId(2));
+        let (mut a_ep, mut b_ep) = peered_endpoints(&a_static, &b_static, a_peer, b_peer);
+
+        let init = first_initiation(&mut a_ep, a_peer);
+
+        // Flood B. Every one of these fails mac1, so they cost B a keyed Blake2s each and are
+        // dropped — but they still count as arrivals, exactly as they would sit in wireguard-go's
+        // handshake queue.
+        let flood: Vec<PacketMut> = (0..UNDER_LOAD_INITIATIONS).map(junk_initiation).collect();
+        let dropped = b_ep.recv_from(Some(b_peer), flood);
+        assert!(
+            dropped.to_peers.is_empty() && dropped.to_local.is_empty(),
+            "unauthenticated initiations must be dropped without a reply"
+        );
+
+        // A's real initiation now gets challenged rather than answered.
+        let challenged = b_ep.recv_from(Some(b_peer), init);
+        let reply = only_to_peer(&challenged.to_peers, b_peer, "B's cookie reply");
+        assert_eq!(reply.len(), 1, "exactly one cookie reply");
+        assert!(
+            matches!(
+                Message::try_from(reply[0].as_ref()),
+                Ok(Message::CookieReply(_))
+            ),
+            "under load B must answer an initiation with no valid mac2 with a cookie reply"
+        );
+
+        // A opens the cookie and retransmits when the rekey timer fires.
+        a_ep.recv(reply);
+        let retransmitted =
+            a_ep.dispatch_events(Instant::now() + REKEY_TIMEOUT + Duration::from_secs(1));
+        let retransmit = only_to_peer(&retransmitted.to_peers, a_peer, "A's retransmit");
+        assert!(
+            matches!(
+                Message::try_from(retransmit[0].as_ref()),
+                Ok(Message::HandshakeInitiation(_))
+            ),
+            "the retransmit must be a fresh handshake initiation"
+        );
+        assert_ne!(
+            retransmit[0].as_ref()[132..],
+            [0u8; 16][..],
+            "the retransmit must carry the mac2 derived from the cookie B issued"
+        );
+
+        // B accepts the answered retransmit and completes the handshake.
+        let responded = b_ep.recv_from(Some(b_peer), retransmit);
+        let response = only_to_peer(&responded.to_peers, b_peer, "B's handshake response");
+        assert!(
+            matches!(
+                Message::try_from(response[0].as_ref()),
+                Ok(Message::HandshakeResponse(_))
+            ),
+            "an initiation carrying a valid mac2 must be answered, not challenged again"
+        );
+        let established = a_ep.recv(response);
+        assert_eq!(
+            established.sessions_established,
+            vec![a_peer],
+            "A must complete the handshake it was challenged for"
+        );
+    }
+
+    /// The mitigation is inert on a normally-loaded node: no cookie is issued, no extra round trip
+    /// is imposed, and a peer's very first initiation is answered directly. This is the ordinary
+    /// path against real Tailscale / wireguard-go peers, so it must stay byte-for-byte what it was.
+    #[test]
+    fn a_responder_that_is_not_under_load_never_issues_a_cookie() {
+        let (a_static, b_static) = (NodeKeyPair::new(), NodeKeyPair::new());
+        let (a_peer, b_peer) = (PeerId(1), PeerId(2));
+        let (mut a_ep, mut b_ep) = peered_endpoints(&a_static, &b_static, a_peer, b_peer);
+
+        let init = first_initiation(&mut a_ep, a_peer);
+        let responded = b_ep.recv_from(Some(b_peer), init);
+        let response = only_to_peer(&responded.to_peers, b_peer, "B's handshake response");
+        assert_eq!(response.len(), 1, "exactly one reply");
+        assert!(
+            matches!(
+                Message::try_from(response[0].as_ref()),
+                Ok(Message::HandshakeResponse(_))
+            ),
+            "a responder that is not under load answers the first initiation directly"
+        );
+    }
+
+    /// With no attribution (`Endpoint::recv`), cookie issuance is off even under load: there is no
+    /// return path for a challenge, so demanding a mac2 nobody can obtain would only deny service
+    /// to ourselves. The handshake must go through as it always did.
+    #[test]
+    fn without_attribution_an_under_load_responder_still_completes_the_handshake() {
+        let (a_static, b_static) = (NodeKeyPair::new(), NodeKeyPair::new());
+        let (a_peer, b_peer) = (PeerId(1), PeerId(2));
+        let (mut a_ep, mut b_ep) = peered_endpoints(&a_static, &b_static, a_peer, b_peer);
+
+        let init = first_initiation(&mut a_ep, a_peer);
+        let flood: Vec<PacketMut> = (0..UNDER_LOAD_INITIATIONS).map(junk_initiation).collect();
+        b_ep.recv(flood);
+
+        let responded = b_ep.recv(init);
+        let response = only_to_peer(&responded.to_peers, b_peer, "B's handshake response");
+        assert!(
+            matches!(
+                Message::try_from(response[0].as_ref()),
+                Ok(Message::HandshakeResponse(_))
+            ),
+            "an unattributed batch must be handled exactly as before this existed"
+        );
+    }
+
+    /// The under-load signal itself: it trips at the threshold, expires a window later, and a
+    /// steady trickle of initiations never trips it however many arrive in total.
+    #[test]
+    fn under_load_trips_at_the_threshold_and_expires_after_the_window() {
+        let now = Instant::now();
+
+        let mut load = HandshakeLoad::default();
+        for i in 1..UNDER_LOAD_INITIATIONS {
+            assert!(
+                !load.record_initiation(now),
+                "{i} initiations in a window is not yet load"
+            );
+        }
+        assert!(
+            load.record_initiation(now),
+            "the {UNDER_LOAD_INITIATIONS}th initiation in the window trips under-load"
+        );
+        assert!(
+            load.under_load(now + UNDER_LOAD_WINDOW - Duration::from_millis(1)),
+            "under-load must stick for the whole window (Go's UnderLoadAfterTime)"
+        );
+        assert!(
+            !load.under_load(now + UNDER_LOAD_WINDOW),
+            "under-load must lapse once the window passes"
+        );
+
+        let mut trickle = HandshakeLoad::default();
+        for i in 1..=UNDER_LOAD_INITIATIONS * 4 {
+            assert!(
+                !trickle.record_initiation(now + UNDER_LOAD_WINDOW * i),
+                "one initiation per window is never load, whatever the total"
+            );
+        }
     }
 
     /// Regression test for issue #20: WireGuard *simultaneous initiation*.

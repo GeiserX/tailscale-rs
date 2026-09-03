@@ -761,16 +761,35 @@ impl DataPlane {
         OutboundResult { to_peers, loopback }
     }
 
-    /// Processes packets received from elsewhere.
+    /// Processes packets received from elsewhere, with no information about which peer sent them.
+    ///
+    /// Equivalent to [`DataPlane::process_inbound_from`] with no attribution; see there for what
+    /// the attribution buys.
     pub fn process_inbound(
         &mut self,
+        packets: impl IntoIterator<Item = PacketMut>,
+    ) -> InboundResult {
+        self.process_inbound_from(None, packets)
+    }
+
+    /// Processes packets an underlay transport received and attributed to peer `from`.
+    ///
+    /// The attribution is what lets the WireGuard layer answer a handshake initiation with a
+    /// cookie while it is under load: the reply has to go back where the initiation came from, and
+    /// in this stack that origin is a peer, not a source address. See
+    /// [`ts_tunnel::Endpoint::recv_from`].
+    pub fn process_inbound_from(
+        &mut self,
+        from: Option<PeerId>,
         packets: impl IntoIterator<Item = PacketMut>,
     ) -> InboundResult {
         let ts_tunnel::RecvResult {
             to_local,
             to_peers,
             sessions_established,
-        } = self.wireguard.recv(packets);
+        } = self
+            .wireguard
+            .recv_from(from.map(|p| ts_tunnel::PeerId(p.0)), packets);
 
         if let Some(hook) = &self.capture {
             for packets in to_local.values() {
