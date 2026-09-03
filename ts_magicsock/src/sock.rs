@@ -1797,7 +1797,9 @@ impl MagicSock {
     ///
     /// Before recording the transaction we prune transactions older than `STUN_TX_TTL`; if the
     /// in-flight set is still at `MAX_STUN_IN_FLIGHT` we drop this request fail-safe (return
-    /// `Ok`) rather than evict a live transaction.
+    /// `Ok`) rather than evict a live transaction. A caller with a *list* of servers to sweep
+    /// should size its round with [`MagicSock::stun_in_flight_remaining`] first — the drop here is
+    /// silent, so a blind fan-out longer than the cap probes only its head.
     pub async fn send_stun_request(&self, server: SocketAddr) -> Result<(), Error> {
         if !matches!(server.ip(), IpAddr::V4(_)) {
             // IPv6 underlay is disabled; never open a STUN exchange over IPv6.
@@ -1829,6 +1831,27 @@ impl MagicSock {
         let req = crate::stun::encode_binding_request(tx_id);
         self.sock().send_to(&req, server).await?;
         Ok(())
+    }
+
+    /// How many further STUN Binding Requests [`send_stun_request`][Self::send_stun_request] will
+    /// admit right now, i.e. `MAX_STUN_IN_FLIGHT` minus the live in-flight transactions.
+    ///
+    /// Exists so a caller sweeping a *list* of STUN servers can size the round to what the socket
+    /// will actually accept. `send_stun_request` drops silently once the set is full, so a sweep
+    /// that fans out blindly over a server list longer than the cap emits nothing for every entry
+    /// past the cap — and, because the list order is stable, starves the same tail every round. The
+    /// budget lets the caller stop at the cap and resume there next round instead.
+    ///
+    /// Prunes expired transactions first (same `STUN_TX_TTL` sweep `send_stun_request` does), so the
+    /// answer counts only transactions whose responses we would still trust. It is a *lower bound*:
+    /// we are the only inserter, so between this call and the sends the budget can only grow (a
+    /// response arriving frees a slot). Sizing a round by it therefore never trips the fail-safe
+    /// drop.
+    pub fn stun_in_flight_remaining(&self) -> usize {
+        let now = Instant::now();
+        let mut in_flight = lock(&self.stun_in_flight);
+        in_flight.retain(|_, sent| now.duration_since(*sent) < STUN_TX_TTL);
+        MAX_STUN_IN_FLIGHT.saturating_sub(in_flight.len())
     }
 
     /// Demux a datagram that [`crate::stun::looks_like_stun_success`] flagged as a STUN Binding
@@ -4851,6 +4874,65 @@ mod tests {
             s.stun_in_flight.lock().unwrap().len(),
             MAX_STUN_IN_FLIGHT,
             "the in-flight set must be capped at MAX_STUN_IN_FLIGHT under a request flood"
+        );
+    }
+
+    /// `stun_in_flight_remaining` must report what `send_stun_request` will actually admit: the
+    /// full cap on a fresh socket, one less per recorded request, and zero once the set is full.
+    /// A sweep over a list of STUN servers sizes its round by this, so an answer that overshot the
+    /// cap would put the sweep straight back into the silent-drop path it exists to avoid.
+    #[tokio::test]
+    async fn stun_in_flight_remaining_reports_the_admittable_budget() {
+        let s = MagicSock::bind(
+            localhost(),
+            DiscoPrivateKey::random(),
+            ts_keys::NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap();
+
+        let sink = UdpSocket::bind(localhost()).await.unwrap();
+        let server = sink.local_addr().unwrap();
+
+        assert_eq!(
+            s.stun_in_flight_remaining(),
+            MAX_STUN_IN_FLIGHT,
+            "a fresh socket admits a full cap's worth of requests"
+        );
+
+        // Every recorded request costs exactly one slot of the budget.
+        for sent in 1..=3 {
+            s.send_stun_request(server).await.unwrap();
+            assert_eq!(
+                s.stun_in_flight_remaining(),
+                MAX_STUN_IN_FLIGHT - sent,
+                "each in-flight transaction consumes one slot of the budget"
+            );
+        }
+
+        // Fill the rest: the budget bottoms out at zero and never goes negative under a flood.
+        for _ in 0..(MAX_STUN_IN_FLIGHT * 2) {
+            s.send_stun_request(server).await.unwrap();
+        }
+        assert_eq!(
+            s.stun_in_flight_remaining(),
+            0,
+            "a full in-flight set admits nothing more"
+        );
+
+        // Expired transactions are pruned by the same TTL sweep `send_stun_request` runs, so the
+        // budget recovers rather than pinning a sweep at zero forever.
+        {
+            let mut in_flight = s.stun_in_flight.lock().unwrap();
+            let stale_when = Instant::now() - (STUN_TX_TTL + Duration::from_secs(1));
+            for sent in in_flight.values_mut() {
+                *sent = stale_when;
+            }
+        }
+        assert_eq!(
+            s.stun_in_flight_remaining(),
+            MAX_STUN_IN_FLIGHT,
+            "expired transactions must be pruned out of the budget"
         );
     }
 
