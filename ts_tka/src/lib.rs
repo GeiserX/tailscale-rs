@@ -22,9 +22,12 @@
 //! [`NodeKeySignature`] path against real `tka.NodeKeySignature.Serialize`/`SigHash` golden vectors
 //! (`tka_cbor_matches_go_golden`), and the [`Aum`] path against the literal `[]byte` vectors in Go's
 //! `tka/aum_test.go` `TestSerialization` (`aum_serialize_matches_go_test_serialization_vectors`).
-//! What remains for full Tailnet-Lock support is the *acquisition* side — the `/machine/tka/sync`
-//! RPC client and the [`Aum`]-chain replayer that folds a chain into a trusted-key [`State`] (the
-//! [`Authority`] is currently only constructible via [`Authority::from_state`]). See issue #7.
+//! The *acquisition* side is here too: [`VerifiedAumChain::verify`] +
+//! [`Authority::from_verified_chain`] are the un-bypassable trust boundary that folds a
+//! control-supplied [`Aum`] chain into a trusted-key [`State`], and [`MemAumStore`] /
+//! [`Authority::sync_offer`] / [`Authority::missing_aums`] are the chain-diff half of the
+//! `/machine/tka/sync` flow. The transport RPCs live in `ts_control` and the driver that ties the
+//! two together in `ts_runtime` (this crate stays network-free).
 
 extern crate alloc;
 
