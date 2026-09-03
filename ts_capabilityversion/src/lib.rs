@@ -307,11 +307,16 @@ impl CapabilityVersion {
 
     /// The capability version this node declares to control.
     ///
-    /// **This is a claim control acts on, so it is pinned to the highest version whose behaviour
-    /// this tree actually implements — not to the newest constant defined above.** The constants
-    /// above are a transcription of upstream's list (they document what each version *means*);
-    /// this one is a promise. Declaring a version whose behaviour is missing does not gain a
-    /// feature, it just tells control to stop sending the compatibility path for it.
+    /// **This is a claim control and peers act on, so it is pinned to what this tree actually
+    /// implements — not to the newest constant defined above.** The constants above are a
+    /// transcription of upstream's list (they document what each version *means*); this one is a
+    /// promise. Declaring a version whose behaviour is missing does not gain a feature, it just
+    /// tells control to stop sending the compatibility path for it.
+    ///
+    /// The value is bracketed from **both** sides, and both bounds are load-bearing. See
+    /// [`Self::is_relay_capable`] for the lower one.
+    ///
+    /// # Upper bound: below 126
     ///
     /// The declaration is held at **125** because the next three versions each name a behaviour
     /// this tree does not have:
@@ -336,10 +341,67 @@ impl CapabilityVersion {
     /// 125 is also a version a real client shipped (Tailscale `v1.88.0` declares it), which keeps
     /// this coherent with the `IPNVersion` advertised in `ts_control::hostinfo`.
     ///
+    /// # Lower bound: at or above 121 — and the one exception it leaves standing
+    ///
+    /// A capability version is a single integer, so declaring 125 also asserts **120** ("Client
+    /// understands peer relay disco messages, and implements peer client and relay server
+    /// functions") and **121** ("Client understands peer relay endpoint alloc with
+    /// `disco.AllocateUDPRelayEndpointRequest` & `disco.AllocateUDPRelayEndpointResponse`").
+    /// Neither is *fully* implemented here: this tree ports the peer-relay **client** half only —
+    /// it answers an inbound `CallMeMaybeVia` and brings the relayed path up (`ts_magicsock`'s
+    /// relay module) — but it never serves as a relay (Go `net/udprelay.Server`,
+    /// `feature/relayserver`) and never originates an allocation request of its own.
+    ///
+    /// That is a real overclaim, and it is deliberately **not** resolved the way 126, 127, 128 and
+    /// 138 were, because here the two directions are not symmetric:
+    ///
+    /// - **Lowering would be unconditionally destructive.** An upstream peer decides whether we may
+    ///   be offered a relay path from our declared version alone, with
+    ///   `magicsock.capVerIsRelayCapable(n.Cap())` — ported here as [`Self::is_relay_capable`]. It
+    ///   gates both `endpoint.wantUDPRelayPathDiscoveryLocked` (no discovery is started toward a
+    ///   peer below the floor) and the inbound `CallMeMaybeVia` handler (the message is ignored
+    ///   outright). Declaring 119 would mean no Go peer ever sends us a `CallMeMaybeVia`, making
+    ///   the ported client half unreachable in production. 122–125 would go with it, including
+    ///   125's `dnstype.Resolver.UseWithExitNode`, which `ts_runtime::magic_dns` *does* implement.
+    /// - **The overclaim is inert unless an operator opts in.** The half we do not implement —
+    ///   serving as a relay — is additionally gated on tailnet policy: a peer treats us as a
+    ///   relay-server candidate only if it *also* holds `peercap.RelayTarget`
+    ///   (`tailscale.com/cap/relay-target`) on us (`Conn.updateRelayServersSet`), a grant an
+    ///   operator writes into the policy file. Absent it no peer ever asks us to allocate, and an
+    ///   `AllocateUDPRelayEndpointRequest` that does arrive is decoded and dropped. Contrast
+    ///   127/128/138, which control acts on unilaterally the moment the version is declared — which
+    ///   is why *those* were resolved by lowering and this one is not.
+    ///
+    /// Closing it for real means porting the relay server, which was ruled out of scope for an
+    /// embedded client when the peer-relay client half landed. Until then it is a recorded,
+    /// bounded exception rather than an oversight.
+    ///
     /// **Before raising this**, check that every version between the old value and the new one is
     /// implemented here, not just the topmost one — capability versions are monotone, so declaring
-    /// `N` asserts everything at or below `N`.
+    /// `N` asserts everything at or below `N`. **Before lowering it**, check it against
+    /// [`Self::is_relay_capable`] first.
     pub const CURRENT: Self = Self::V125;
+
+    /// The capability version at and above which an upstream Go peer will treat a node as
+    /// **peer-relay capable**: `121`.
+    ///
+    /// Faithful port of Go `magicsock.capVerIsRelayCapable` (`wgengine/magicsock/magicsock.go`,
+    /// pinned at `49e148c4a30b4f8098f69468fd27a7021d85ea02`), which is exactly
+    /// `version >= 121`. Go evaluates it over a peer's netmap `tailcfg.Node.Cap` and stores the
+    /// result as `endpoint.relayCapable`, which gates two things:
+    ///
+    /// - `endpoint.wantUDPRelayPathDiscoveryLocked` — a peer below the floor never has UDP relay
+    ///   path discovery started toward it, so it is never sent a `CallMeMaybeVia`.
+    /// - the inbound `CallMeMaybeVia` path in `Conn.handleDiscoMessage` — a `CallMeMaybeVia`
+    ///   *from* a peer below the floor is ignored ("is not known to be relay capable").
+    ///
+    /// So this is the floor [`Self::CURRENT`] must stay at or above for this tree's ported
+    /// peer-relay client half to be reachable at all by a real Tailscale peer; see that constant
+    /// for why the tree sits above the floor despite not implementing all of 120/121.
+    #[must_use]
+    pub const fn is_relay_capable(self) -> bool {
+        self.0 >= Self::V121.0
+    }
 
     /// Create a new [`CapabilityVersion`] instance from a `u16`. Note that the versions 0, 1, 2,
     /// and 35 are undefined and will result in an error.
@@ -376,14 +438,50 @@ impl TryFrom<u16> for CapabilityVersion {
 mod tests {
     use super::CapabilityVersion;
 
-    /// The declared version must stay below the first capability this tree does not implement.
-    /// 126 (seamless key renewal), 127 (c2n `/debug/netmap`) and 128 (c2n `/debug/health`) are all
-    /// unimplemented, so 125 is the ceiling; see [`CapabilityVersion::CURRENT`] for the evidence
-    /// behind each. This test exists so raising the constant without doing the port fails here
-    /// rather than silently on the wire.
+    /// Upper bound. 126 (seamless key renewal), 127 (c2n `/debug/netmap`) and 128 (c2n
+    /// `/debug/health`) are all unimplemented, so 125 is the ceiling; see
+    /// [`CapabilityVersion::CURRENT`] for the evidence behind each. This test exists so raising the
+    /// constant without doing the port fails here rather than silently on the wire.
     #[test]
     fn current_is_not_declared_above_what_is_implemented() {
         assert_eq!(CapabilityVersion::CURRENT, CapabilityVersion::V125);
         assert!(CapabilityVersion::CURRENT < CapabilityVersion::V126);
+    }
+
+    /// Lower bound, and the reason 125 is not lowered to 119 even though 120 and 121 are only
+    /// half-implemented (peer-relay client, no relay server, no allocation request of our own).
+    ///
+    /// Go decides whether a node may be offered a peer-relay path from its declared capability
+    /// version alone — `magicsock.capVerIsRelayCapable(n.Cap())`, `>= 121`, ported as
+    /// [`CapabilityVersion::is_relay_capable`]. Below that floor no Go peer starts UDP relay path
+    /// discovery toward us and any `CallMeMaybeVia` we did receive would have been dropped by the
+    /// sender's own gate, so the ported client half in `ts_magicsock` would be dead code against
+    /// every real peer. Dropping under the floor is therefore a functional regression, not a
+    /// tightening of an honest claim, and this test is what makes that visible to whoever tries it.
+    #[test]
+    fn current_stays_at_or_above_the_relay_capable_floor() {
+        assert!(
+            CapabilityVersion::CURRENT.is_relay_capable(),
+            "declaring below {} makes upstream peers stop offering peer-relay paths, which would \
+             leave this tree's ported peer-relay client half unreachable in production",
+            CapabilityVersion::V121,
+        );
+    }
+
+    /// The floor itself is upstream's, not a local guess: Go `capVerIsRelayCapable` is
+    /// `version >= 121`, so 120 is out and 121 is in, exactly.
+    #[test]
+    fn relay_capable_floor_matches_upstream() {
+        for below in [3u16, 119, 120] {
+            let v = CapabilityVersion::new(below).expect("valid capability version");
+            assert!(!v.is_relay_capable(), "{v} is below Go's 121 relay floor");
+        }
+        for at_or_above in [121u16, 122, 125, 145, u16::MAX] {
+            let v = CapabilityVersion::new(at_or_above).expect("valid capability version");
+            assert!(
+                v.is_relay_capable(),
+                "{v} is at or above Go's 121 relay floor"
+            );
+        }
     }
 }
