@@ -28,8 +28,12 @@
 //!   `Authority`, the control runner publishes it to the peer tracker's enforcement cell and the
 //!   peer-trust chokepoint fails **closed** — a peer presenting a missing or unauthorized
 //!   `key_signature` is **dropped** at the peer-db upsert path (`peer_tracker::tka_snapshot_admits`,
-//!   matching Go's `tkaFilterNetmapLocked`). With no lock synced, every peer is admitted (Go's
-//!   `b.tka == nil` early return); a control-signalled *disable* clears enforcement back to admit-all.
+//!   matching Go's `tkaFilterNetmapLocked`). Installing the `Authority` also re-filters the peers
+//!   **already** in the db (`peer_tracker::tka_reevaluate_peer_db`), because this sync is
+//!   asynchronous: the netmap that announced the lock was applied before the `Authority` existed,
+//!   whereas Go filters that same netmap in the pass that synced it. With no lock synced, every peer
+//!   is admitted (Go's `b.tka == nil` early return); a control-signalled *disable* clears
+//!   enforcement back to admit-all.
 //!
 //! The chain always passes through the **un-bypassable trust boundary** `VerifiedAumChain::verify`
 //! before it can reach enforcement, so a malicious control plane cannot forge a trusted key to admit

@@ -74,6 +74,12 @@ neither is admitted into the peer database. With no lock synced, every peer is a
 Go's `b.tka == nil` early return / pre-TKA behavior); when the lock is disabled, enforcement clears
 and all peers are admitted again.
 
+Installing a freshly-synced authority also **re-filters the peers already in the peer database**,
+not just the ones a later netmap brings. Go filters the very netmap it synced from
+(`SetControlClientStatus` runs `tkaSyncIfNeeded` and then `tkaFilterNetmapLocked` on the same
+netmap); here the sync is asynchronous, so that netmap is admitted before the authority exists and
+the second pass is what stops the initial peer set from escaping the lock.
+
 The authority only ever reaches the enforcement path **after** `VerifiedAumChain::verify` — a
 cryptographically verified AUM chain. Enforcement never engages on an unverified chain; the verified
 authority is delivered from the control runner to the peer tracker over an internal watch channel.
