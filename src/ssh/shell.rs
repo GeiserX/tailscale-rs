@@ -10,7 +10,7 @@
 //! This handler **spawns a real login shell and drops privileges** to the authorized user. Several
 //! invariants keep it fail-closed:
 //!
-//! * The local user comes **only** from the [`SshAccept`] produced by the single fail-closed
+//! * The local user comes **only** from the [`SshAccept`][crate::ssh::SshAccept] produced by the single fail-closed
 //!   authorization decision in [`auth_none`][russh::server::Handler::auth_none]. The handler never
 //!   re-evaluates policy nor falls back to a configured default user.
 //! * If the user cannot be resolved against the local passwd database, [`ShellHandler::new`]
@@ -22,6 +22,10 @@
 //!   `setuid`/`setgid` calls fail and the spawn fails closed.
 //! * The child environment is built from scratch (`HOME`/`USER`/`SHELL`/`PATH`/`TERM`) rather than
 //!   inherited, so the daemon's environment (which may carry secrets) never leaks into the shell.
+//! * When the matched policy rule demands **session recording**, the recorder is dialed and the
+//!   cast header written *before* the shell is spawned, so a session that must be recorded but
+//!   cannot be is never started. See [`recording`][crate::ssh::recording] for the transport and
+//!   for Go's fail-open / fail-closed rules around it.
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -35,7 +39,10 @@ use tokio::{
 
 use crate::{
     Device,
-    ssh::{ChannelEvent, ChannelHandler, SshAccept},
+    ssh::{
+        ChannelContext, ChannelEvent, ChannelHandler,
+        recording::{CastHeader, RecordingRejected, SessionRecording, TailnetDialer},
+    },
 };
 
 /// Default shell used when a resolved user has no shell set in the passwd database.
@@ -108,13 +115,121 @@ fn build_env(user: &ResolvedUser) -> Vec<(String, String)> {
             user.shell.to_string_lossy().into_owned(),
         ),
         ("PATH".to_string(), DEFAULT_PATH.to_string()),
-        ("TERM".to_string(), "xterm-256color".to_string()),
+        ("TERM".to_string(), DEFAULT_TERM.to_string()),
     ]
 }
 
 /// The login-shell flag (`-l`) passed to the user's shell to start it as a login shell, mirroring
 /// Go `tailssh`'s interactive path.
 const LOGIN_SHELL_ARG: &str = "-l";
+
+/// `TERM` for the spawned shell, and the value recorded in a session recording's cast header. Go
+/// falls back to the same `xterm-256color` when the client sends no `TERM`.
+const DEFAULT_TERM: &str = "xterm-256color";
+
+/// Exit status reported when a session is refused because the recording policy could not be
+/// satisfied.
+///
+/// Go uses 254 for exactly this and documents why: 1 is overloaded, 127 is "command not found",
+/// 130 is Ctrl-C, and 255 means "ssh itself failed", so 254 is the one code in the reserved >128
+/// region an operator can alert on unambiguously.
+const RECORDING_DENIED_EXIT_CODE: u32 = 254;
+
+/// The cast header for this session (Go `startNewRecording`'s `sessionrecording.CastHeader`).
+///
+/// `width`/`height` are left at zero, the value Go writes for a session with no PTY request. This
+/// fork's channel abstraction creates the session handler at channel-open, which is *before* the
+/// client's `pty-req` arrives (it is delivered later as a [`ChannelEvent::Resize`]), so the
+/// terminal size is not yet known when the header has to be written. The size is still applied to
+/// the PTY itself when the resize event arrives; only the header's advisory dimensions are absent.
+fn session_cast_header(ctx: &ChannelContext, user: &ResolvedUser) -> CastHeader {
+    let mut header = CastHeader::new(crate::ssh::now_unix_secs(), DEFAULT_TERM);
+    header.ssh_user = ctx.ssh_user.clone();
+    header.local_user = user.name.clone();
+    header.connection_id = ctx.conn_id.clone();
+
+    if let Some(node) = &ctx.src_node {
+        set_src_node(
+            &mut header,
+            node.fqdn(false),
+            node.stable_id.0.clone(),
+            &node.tags,
+            node.user_id,
+        );
+    }
+
+    header
+}
+
+/// Record the originating node in `header`.
+///
+/// Go records the *owner* of an untagged node and the *tags* of a tagged one, never both. The
+/// owner's login name is not retained by this fork's node model (see
+/// [`Device::authorize_ssh`][crate::Device::authorize_ssh]), so an untagged node contributes only
+/// its numeric user id.
+fn set_src_node(
+    header: &mut CastHeader,
+    fqdn: String,
+    stable_id: String,
+    tags: &[String],
+    user_id: i64,
+) {
+    header.src_node = fqdn;
+    header.src_node_id = stable_id;
+    if tags.is_empty() {
+        header.src_node_user_id = user_id;
+    } else {
+        header.src_node_tags = tags.to_vec();
+    }
+}
+
+/// Tell the client why its session is refused, then close the channel.
+///
+/// Reached only when the policy set `onRecordingFailure.rejectSessionWithMessage` and no recorder
+/// would take the recording.
+async fn reject_session(session: &Handle, channel_id: ChannelId, rejected: RecordingRejected) {
+    tracing::warn!(
+        %channel_id,
+        error = %rejected.cause,
+        message = %rejected.message,
+        "ssh: session refused: session recording could not be started"
+    );
+    let refused = session
+        .data(channel_id, format!("{}\r\n", rejected.message).into_bytes())
+        .await
+        .is_err()
+        || session
+            .exit_status_request(channel_id, RECORDING_DENIED_EXIT_CODE)
+            .await
+            .is_err()
+        || session.close(channel_id).await.is_err();
+    if refused {
+        tracing::debug!(%channel_id, "ssh: client gone before the refusal reached it");
+    }
+}
+
+/// Tell the client the session is being terminated, then kill the shell.
+///
+/// Reached only when the policy set `onRecordingFailure.terminateSessionWithMessage` and the
+/// recording of a *running* session failed.
+async fn end_session(
+    session: &Handle,
+    channel_id: ChannelId,
+    child: &Arc<Mutex<tokio::process::Child>>,
+    message: &str,
+) {
+    tracing::warn!(%channel_id, message, "ssh: terminating session: session recording failed");
+    if session
+        .data(channel_id, format!("\r\n{message}\r\n").into_bytes())
+        .await
+        .is_err()
+    {
+        tracing::debug!(%channel_id, "ssh: client gone before the termination notice reached it");
+    }
+    if let Err(e) = child.lock().await.start_kill() {
+        tracing::debug!(error = %e, %channel_id, "ssh: failed to kill shell after recording failure");
+    }
+}
 
 /// One privilege-drop operation, in the order it must be applied.
 ///
@@ -243,16 +358,48 @@ fn sig_to_signum(sig: &Sig) -> Option<i32> {
 impl ChannelHandler for ShellHandler {
     type Error = std::io::Error;
 
-    fn new(
+    // This handler streams its PTY output to the policy's `recorders`, so `ChannelServer` may
+    // admit a connection whose rule demands recording; see `SessionRecording` for what happens
+    // when the recorders cannot be reached.
+    const RECORDS_SESSION: bool = true;
+
+    async fn new(
         rt: tokio::runtime::Handle,
         channel_id: ChannelId,
         session: Handle,
-        _dev: Arc<Device>,
-        accept: &SshAccept,
+        dev: Arc<Device>,
+        ctx: &ChannelContext,
     ) -> Result<Self, Self::Error> {
+        let accept = &ctx.accept;
         // SECURITY: the identity comes solely from the fail-closed `auth_none` decision.
         let user = resolve_user(&accept.local_user)?;
         let env = build_env(&user);
+
+        // SECURITY: start the recording BEFORE the shell exists. Go does the same (the session
+        // handler calls `startNewRecording` and only then `launchProcess`), and the ordering is
+        // what makes a fail-closed policy mean anything: a session that must be recorded is never
+        // spawned first and recorded second.
+        let recording = if accept.recorders.is_empty() {
+            None
+        } else {
+            let header = session_cast_header(ctx, &user);
+            match SessionRecording::start(
+                &accept.recorders,
+                accept.on_recording_failure.as_ref(),
+                &header,
+                &TailnetDialer::new(dev),
+            )
+            .await
+            {
+                Ok(rec) => rec,
+                Err(rejected) => {
+                    // The policy set `rejectSessionWithMessage`: show it and refuse. The channel
+                    // is closed by the caller on `Err`, so the message is written first.
+                    reject_session(&session, channel_id, rejected).await;
+                    return Err(std::io::Error::other("ssh: session recording refused"));
+                }
+            }
+        };
 
         // Allocate the PTY master/subordinate pair.
         let (pty, pts) = pty_process::open().map_err(std::io::Error::other)?;
@@ -311,10 +458,40 @@ impl ChannelHandler for ShellHandler {
         let pump_child = child.clone();
         rt.spawn(async move {
             let mut buf = [0u8; 16 * 1024];
+            let mut recording = recording;
+            // Fires with the message to show the client when the recorder upload failed and the
+            // policy says terminate (Go's `TerminateSessionWithMessage`).
+            let mut terminate = recording.as_mut().and_then(|r| r.take_terminate());
             loop {
-                match pty_read.read(&mut buf).await {
+                let read = tokio::select! {
+                    message = async {
+                        match terminate.as_mut() {
+                            Some(rx) => rx.await.ok(),
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        terminate = None;
+                        if let Some(message) = message {
+                            end_session(&session, channel_id, &pump_child, &message).await;
+                            break;
+                        }
+                        continue;
+                    }
+                    read = pty_read.read(&mut buf) => read,
+                };
+
+                match read {
                     Ok(0) => break,
                     Ok(n) => {
+                        // Only output is recorded, and it is recorded *before* it reaches the
+                        // client. Go deliberately does not record input, which may carry
+                        // passwords.
+                        if let Some(rec) = recording.as_mut()
+                            && let Err(message) = rec.record_output(&buf[..n]).await
+                        {
+                            end_session(&session, channel_id, &pump_child, &message).await;
+                            break;
+                        }
                         if session.data(channel_id, buf[..n].to_vec()).await.is_err() {
                             tracing::debug!(%channel_id, "ssh: client gone; stopping shell pump");
                             break;
@@ -495,6 +672,94 @@ mod tests {
                 "setgid must precede setuid (with_initgroups={with_initgroups})"
             );
         }
+    }
+
+    /// A [`ChannelContext`] with no resolved peer, carrying the facts the cast header needs.
+    fn ctx() -> ChannelContext {
+        ChannelContext {
+            accept: crate::ssh::SshAccept {
+                local_user: "ubuntu".to_string(),
+                accept_env: Vec::new(),
+                session_duration_nanos: None,
+                allow_agent_forwarding: false,
+                allow_local_port_forwarding: false,
+                allow_remote_port_forwarding: false,
+                recorders: Vec::new(),
+                on_recording_failure: None,
+                hold_and_delegate: String::new(),
+                recording_refusal_message: String::new(),
+            },
+            ssh_user: "operator".to_string(),
+            remote: "100.64.0.7:52344".parse().unwrap(),
+            src_node: None,
+            conn_id: "ssh-conn-20231114T221320-0011223344".to_string(),
+        }
+    }
+
+    /// The cast header identifies the session: the username the client asked for, the local user
+    /// it was mapped to, the connection it belongs to, and the terminal type.
+    #[test]
+    fn cast_header_describes_the_session() {
+        let header = session_cast_header(&ctx(), &fake_user());
+        assert_eq!(
+            header.ssh_user, "operator",
+            "the username the client presented"
+        );
+        assert_eq!(
+            header.local_user,
+            fake_user().name,
+            "the local user the policy mapped it to"
+        );
+        assert_eq!(header.connection_id, "ssh-conn-20231114T221320-0011223344");
+        assert_eq!(
+            header.env.get("TERM").map(String::as_str),
+            Some(DEFAULT_TERM)
+        );
+        // No PTY size is known when the handler is built; see `session_cast_header`.
+        assert_eq!((header.width, header.height), (0, 0));
+        // With no resolved peer nothing about the source node is invented.
+        assert!(header.src_node.is_empty());
+        assert!(header.src_node_id.is_empty());
+        assert_eq!(header.src_node_user_id, 0);
+        assert!(header.src_node_tags.is_empty());
+    }
+
+    /// An untagged node contributes its owner id; a tagged node contributes its tags. Never both,
+    /// which is Go's rule.
+    #[test]
+    fn src_node_records_owner_or_tags_never_both() {
+        let mut untagged = CastHeader::new(0, DEFAULT_TERM);
+        set_src_node(
+            &mut untagged,
+            "laptop.tail-scale.ts.net".to_string(),
+            "nodeid-abc".to_string(),
+            &[],
+            42,
+        );
+        assert_eq!(untagged.src_node, "laptop.tail-scale.ts.net");
+        assert_eq!(untagged.src_node_id, "nodeid-abc");
+        assert_eq!(untagged.src_node_user_id, 42);
+        assert!(untagged.src_node_tags.is_empty());
+
+        let mut tagged = CastHeader::new(0, DEFAULT_TERM);
+        set_src_node(
+            &mut tagged,
+            "ci.tail-scale.ts.net".to_string(),
+            "nodeid-def".to_string(),
+            &["tag:ci".to_string()],
+            42,
+        );
+        assert_eq!(tagged.src_node_tags, vec!["tag:ci".to_string()]);
+        assert_eq!(
+            tagged.src_node_user_id, 0,
+            "a tagged node has no human owner to record"
+        );
+    }
+
+    /// The refusal exit status is the one Go reserves for a denied recording-required session.
+    #[test]
+    fn recording_refusal_uses_the_reserved_exit_code() {
+        assert_eq!(RECORDING_DENIED_EXIT_CODE, 254);
     }
 
     #[test]

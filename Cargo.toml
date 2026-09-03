@@ -264,6 +264,10 @@ ts_tka.workspace = true
 ts_packet.workspace = true
 ts_netstack_smoltcp = { workspace = true, features = ["tokio"] }
 ts_keys.workspace = true
+# `ssh` feature: the HTTP/2 (h2c) client the SSH session-recording transport uploads a recording
+# over. A workspace crate already in the graph, kept optional so the default build stays
+# HTTP-stack-free.
+ts_http_util = { workspace = true, optional = true }
 
 axum = { version = "0.8", optional = true }
 # `tsnet` feature: HTTP Basic-auth codec for the in-process LocalAPI HTTP server on the loopback (Go
@@ -276,6 +280,7 @@ bytes = { workspace = true, optional = true }
 # facade build stays HTTP-stack-free. `hyper` provides the `rt::{Read,Write}` IO traits, `hyper-util`
 # the `client-legacy` `Connect`/`Connection` glue + `TokioIo`, and `tower-service` the `Service<Uri>`
 # trait the connector implements (the blanket impl grants the sealed `Connect`).
+# Also used by the `ssh` feature, for the `http::Body` the session recording is streamed as.
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true, features = ["client-legacy", "tokio"] }
 tower-service = { workspace = true, optional = true }
@@ -309,6 +314,12 @@ tracing-test = "0.2"
 ts_keys.workspace = true
 ts_test_util.workspace = true
 
+# The in-process fake tsrecorder the SSH session-recording tests run against: `hyper`'s h2c server
+# half (the client half is already a dependency under the `ssh` feature) plus hyper-util's tokio
+# executor/IO glue. Both are already in the workspace graph, and neither reaches a shipped build.
+hyper = { workspace = true, features = ["server"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+
 [lints]
 workspace = true
 
@@ -327,7 +338,18 @@ axum = ["dep:axum"]
 # outbound HTTP requests over the tailnet, the analog of Go `tsnet.Server.HTTPClient`. Off by default
 # so the default build pulls no HTTP client stack.
 hyper = ["dep:hyper", "dep:hyper-util", "dep:tower-service"]
-ssh = ["dep:russh", "dep:bytes", "dep:ratatui", "dep:pty-process", "dep:nix"]
+# Enable the `ssh` module: tailnet SSH servers, including the turnkey login-shell server and its
+# session-recording transport. `ts_http_util`/`hyper` are the h2c client a recording is uploaded
+# with; both are already in the workspace graph, so no new crate enters it.
+ssh = [
+    "dep:russh",
+    "dep:bytes",
+    "dep:ratatui",
+    "dep:pty-process",
+    "dep:nix",
+    "dep:hyper",
+    "dep:ts_http_util",
+]
 tun = ["ts_runtime/tun"]
 # Enables the internal OS network-link monitor (`Config::network_monitor`): on a link change the
 # runtime re-binds the underlay socket and re-probes connectivity (re-ping, immediate STUN,

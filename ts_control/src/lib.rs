@@ -77,7 +77,7 @@ pub use serve::{
 pub use service::{ServiceError, ServiceMode, resolve_service_listen};
 pub use ssh_policy::{
     SshAccept, SshAction, SshConnIdentity, SshDecision, SshDenyReason, SshPolicy, SshPrincipal,
-    SshRule,
+    SshRecorderFailureAction, SshRule,
 };
 pub use tka::TkaStatus;
 pub use ts_control_serde::{
