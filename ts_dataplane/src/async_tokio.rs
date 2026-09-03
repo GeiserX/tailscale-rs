@@ -244,12 +244,12 @@ impl DataPlane {
 
                 (Some(to_peers), Some(loopback))
             }
-            SelectResult::UnderlayUp(_peer_id, underlay_up) => {
+            SelectResult::UnderlayUp(peer_id, underlay_up) => {
                 let InboundResult {
                     to_local,
                     to_peers,
                     learned_disco_keys: learned,
-                } = core.sync.process_inbound(underlay_up);
+                } = core.sync.process_inbound_from(Some(peer_id), underlay_up);
 
                 learned_disco_keys = learned;
 

@@ -113,9 +113,15 @@ the implementation's burden, *not* covered by any protocol proof; see §4):
   nanoseconds; store greatest-per-peer, big-endian so `memcmp` orders correctly), hardened against
   NTP rollback (the class of CVE-2021-46873).
 - **mac1** (proves knowledge of the responder's public key, gates cheap DoS) and **mac2/cookie**
-  (load-based return-routability; `mac2 = 0^16` until a cookie is held). *Known gap:* the fork's
-  mac2/cookie path is unimplemented (`verify_macs` requires `mac2 == 0`) — a DoS limitation for an
-  internet-facing responder, not an auth bypass.
+  (load-based return-routability; `mac2 = 0^16` until a cookie is held). Both directions are
+  implemented: an initiator opens a `CookieReply` and carries the derived `mac2` on its retransmit
+  (`MACSender::receive_cookie`), and a responder that is **under load** answers an initiation with
+  no valid `mac2` with a `CookieReply` of its own instead of doing the initiation's X25519 work
+  (`CookieGenerator`, driven from `Endpoint::recv_from`). `mac1` is checked unconditionally;
+  `mac2` is checked only while under load, as in wireguard-go — a peer's non-zero `mac2` is never
+  by itself grounds for rejection. The cookie's return-routability binding is the underlay peer the
+  datagram was attributed to rather than a raw source address, because this engine is sans-io and
+  never sees one; an unattributed receive path (`Endpoint::recv`) simply does not issue cookies.
 
 > **Key-confirmation rule (Dowling & Paterson 2018, IACR 2018/080, §3.1, Thm 1).** WireGuard's bare
 > 1-RTT handshake provides **no explicit key confirmation** — it is KCI-vulnerable until the

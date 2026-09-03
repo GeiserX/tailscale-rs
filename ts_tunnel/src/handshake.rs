@@ -236,8 +236,11 @@ impl ReceivedHandshake {
             return None;
         };
 
-        // TODO: cookie DoS protection. Deferring implementation until more of the surrounding code is in place,
-        // because the right place to do cookie enforcement might be outside of the core Noise handshake logic.
+        // Cookie (under-load DoS) enforcement deliberately does NOT live here: it needs the
+        // endpoint's load state and the origin the packet was attributed to, neither of which
+        // belongs in the core Noise handshake. See `Endpoint::recv_from`, which runs the mac1
+        // check, the under-load decision and the cookie challenge before it ever gets here — so
+        // by this point the X25519 work below has already been judged worth doing.
         let peer_ephemeral = x25519_dalek::PublicKey::from(pkt.ephemeral_pub);
         let my_static_dalek = x25519_dalek::StaticSecret::from(&my_static.private);
         let mut peer_static_bytes = [0; 32];
