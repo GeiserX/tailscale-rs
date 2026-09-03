@@ -17,7 +17,10 @@
 use core::{net::SocketAddr, time::Duration};
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use kameo::{
@@ -219,6 +222,10 @@ pub struct DirectManager {
     /// the same source the periodic [`run_stun_prober`] uses. Held here (not just cloned into the
     /// prober task) because the on-demand sweep runs inside the actor handler.
     multiderp: ActorRef<Multiderp>,
+    /// Where the next STUN sweep resumes in the derp map's v4 server list. Shared with the periodic
+    /// [`run_stun_prober`] task so an on-demand sweep and the periodic one advance one rotation
+    /// between them rather than both re-probing the same head. See [`probe_stun_servers_once`].
+    stun_cursor: Arc<AtomicUsize>,
     #[allow(dead_code)]
     tasks: JoinSet<()>,
 }
@@ -394,7 +401,7 @@ impl DirectManager {
     async fn stun_sweep_once(&self, sock: &MagicSock) {
         if stun_probe_should_run(&self.peer_db) {
             match self.multiderp.ask(multiderp::StunServersV4).await {
-                Ok((servers,)) => probe_stun_servers_once(sock, &servers).await,
+                Ok((servers,)) => probe_stun_servers_once(sock, &servers, &self.stun_cursor).await,
                 Err(e) => {
                     tracing::trace!(error = %e, "stun sweep: querying stun servers");
                 }
@@ -555,6 +562,7 @@ async fn run_stun_prober(
     sock: Arc<MagicSock>,
     peer_db: Arc<RwLock<Option<Arc<PeerDb>>>>,
     multiderp: ActorRef<Multiderp>,
+    stun_cursor: Arc<AtomicUsize>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     // Re-randomize the delay every cycle (Go re-arms `periodicReSTUNTimer` with a fresh
@@ -583,7 +591,7 @@ async fn run_stun_prober(
                         continue;
                     }
                 };
-                probe_stun_servers_once(&sock, &servers).await;
+                probe_stun_servers_once(&sock, &servers, &stun_cursor).await;
             }
         }
     }
@@ -610,19 +618,62 @@ fn stun_probe_should_run(peer_db: &RwLock<Option<Arc<PeerDb>>>) -> bool {
     db.as_ref().is_some_and(|db| !db.peers().is_empty())
 }
 
-/// Send one STUN Binding Request to each server in `servers` from the one bound socket.
+/// Send one STUN Binding Request per server for as much of `servers` as the socket will admit this
+/// round, resuming from — and advancing — `cursor`.
 ///
-/// Each send fails closed inside [`MagicSock::send_stun_request`] (a non-v4 server is refused, the
-/// in-flight set is capped); a transient io error just skips that server for this round rather than
-/// aborting the sweep. Factored out of [`run_stun_prober`]'s sweep loop so the per-sweep fan-out
-/// (including the empty-list no-op when the derp map lists no FixedAddr-v4 STUN servers) is
-/// unit-testable without the actor/timer machinery.
-async fn probe_stun_servers_once(sock: &MagicSock, servers: &[SocketAddr]) {
-    for &s in servers {
+/// The round is sized by [`MagicSock::stun_in_flight_remaining`] rather than by the server list.
+/// `send_stun_request` records a transaction id per request and drops anything past its in-flight
+/// cap *silently*, so a blind `for server in servers` fan-out over a list longer than that cap
+/// emits nothing at all for every entry past it. A real derp map lists well over a cap's worth of
+/// FixedAddr-v4 STUN servers (one per server node, across every region), the list order is stable,
+/// and a round's sends all land inside the same microsecond — no response can free a slot mid-round
+/// — so the blind form probed the same head every sweep and never once reached the tail. `cursor`
+/// makes the window rotate: each round resumes where the last stopped, so every server in the list
+/// is probed within a few rounds and a head of unreachable servers can no longer mask the rest.
+///
+/// The per-round volume is unchanged (it was already capped, just by a silent drop instead of by
+/// the loop bound). A transient io error still just skips that server for this round rather than
+/// aborting the sweep.
+///
+/// Factored out of [`run_stun_prober`]'s sweep loop so the per-sweep fan-out (including the
+/// empty-list no-op when the derp map lists no FixedAddr-v4 STUN servers) is unit-testable without
+/// the actor/timer machinery.
+async fn probe_stun_servers_once(sock: &MagicSock, servers: &[SocketAddr], cursor: &AtomicUsize) {
+    let (window, next) = stun_probe_window(
+        servers,
+        cursor.load(Ordering::Relaxed),
+        sock.stun_in_flight_remaining(),
+    );
+    for s in window {
         if let Err(e) = sock.send_stun_request(s).await {
             tracing::trace!(error = %e, server = %s, "sending stun binding request");
         }
     }
+    cursor.store(next, Ordering::Relaxed);
+}
+
+/// The servers one sweep round should probe — at most `budget` of them, starting at `cursor` and
+/// wrapping — together with the cursor the next round resumes from.
+///
+/// Pure so the rotation is unit-testable without a socket: `budget` is the caller's live in-flight
+/// budget ([`MagicSock::stun_in_flight_remaining`]) and `cursor` the value the previous round
+/// returned. `cursor` is taken modulo the list length, so a derp map that shrinks between rounds
+/// cannot push it out of range. `budget` is clamped to the list length so no server is probed twice
+/// in one round. An empty list yields an empty round and resets the cursor.
+fn stun_probe_window(
+    servers: &[SocketAddr],
+    cursor: usize,
+    budget: usize,
+) -> (Vec<SocketAddr>, usize) {
+    if servers.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let start = cursor % servers.len();
+    let take = budget.min(servers.len());
+    let window = (0..take)
+        .map(|i| servers[(start + i) % servers.len()])
+        .collect();
+    (window, (start + take) % servers.len())
 }
 
 /// Periodically re-evaluate our own candidate endpoints and publish them on the bus when they
@@ -786,6 +837,10 @@ impl kameo::Actor for DirectManager {
         env.subscribe::<Arc<PeerState>>(&slf).await?;
 
         let peer_db: Arc<RwLock<Option<Arc<PeerDb>>>> = Default::default();
+        // One rotation shared by the periodic prober task and the actor's on-demand sweeps, so the
+        // two advance through the derp map's STUN servers together instead of each restarting at
+        // the head (see `probe_stun_servers_once`).
+        let stun_cursor: Arc<AtomicUsize> = Default::default();
         let mut tasks = JoinSet::new();
 
         // The disco<->node-key binding verifier: an inbound disco ping must present the node key
@@ -833,6 +888,7 @@ impl kameo::Actor for DirectManager {
                     transport_id: None,
                     peer_db,
                     multiderp,
+                    stun_cursor,
                     tasks,
                 });
             }
@@ -863,6 +919,7 @@ impl kameo::Actor for DirectManager {
             sock.clone(),
             peer_db.clone(),
             multiderp.clone(),
+            stun_cursor.clone(),
             env.shutdown.clone(),
         ));
 
@@ -892,6 +949,7 @@ impl kameo::Actor for DirectManager {
             transport_id: Some(transport_id),
             peer_db,
             multiderp: multiderp_for_field,
+            stun_cursor,
             tasks,
         })
     }
@@ -929,6 +987,8 @@ impl Message<Arc<PeerState>> for DirectManager {
 
 #[cfg(test)]
 mod tests {
+    use core::net::Ipv4Addr;
+
     use ts_control::{Node, StableNodeId, TailnetAddress};
     use ts_keys::{DiscoPrivateKey, NodePrivateKey};
 
@@ -1055,7 +1115,8 @@ mod tests {
         let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server: SocketAddr = sink.local_addr().unwrap();
 
-        probe_stun_servers_once(&sock, &[server]).await;
+        let cursor = AtomicUsize::new(0);
+        probe_stun_servers_once(&sock, &[server], &cursor).await;
 
         let mut buf = [0u8; 64];
         let (n, _from) = tokio::time::timeout(Duration::from_secs(2), sink.recv_from(&mut buf))
@@ -1098,6 +1159,152 @@ mod tests {
             &0x8028u16.to_be_bytes(),
             "FINGERPRINT attribute type"
         );
+    }
+
+    /// A server list longer than the socket's in-flight budget must not starve its tail forever.
+    ///
+    /// This is the regression: `send_stun_request` drops silently once its in-flight set is full, a
+    /// real derp map lists far more FixedAddr-v4 STUN servers than that cap, and a round's sends all
+    /// land before any response can free a slot — so the old blind `for server in servers` fan-out
+    /// probed the same head every sweep and never reached the tail at all. A round must instead stop
+    /// at the budget and leave the cursor on the first server it could not reach, so the next round
+    /// starts there.
+    ///
+    /// Asserted through the socket's own budget rather than by receiving the datagrams: the point
+    /// under test is where the round stops and resumes, and `stun_in_flight_remaining` is the same
+    /// number `send_stun_request` admits against. Which servers a window covers is pinned by
+    /// [`stun_probe_window_rotates_across_rounds`]; that a request reaches the wire is pinned by
+    /// [`probe_stun_servers_once_sends_binding_request`].
+    #[tokio::test]
+    async fn probe_stun_servers_once_stops_at_the_in_flight_budget() {
+        let sock = Arc::new(
+            MagicSock::bind(
+                BIND_ADDR.parse().unwrap(),
+                DiscoPrivateKey::random(),
+                NodePrivateKey::random().public_key(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        // The budget the socket will actually admit this round, read from the production accessor
+        // rather than hard-coded: the cap lives in ts_magicsock and is private there.
+        let budget = sock.stun_in_flight_remaining();
+        assert!(budget > 0, "a fresh socket must admit some requests");
+
+        // A server list deliberately longer than that budget — the shape of a real derp map, and
+        // the premise of the bug. Real bound sockets so every `send_to` has a live destination.
+        let mut sinks = Vec::new();
+        for _ in 0..(budget + 4) {
+            sinks.push(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        }
+        let servers: Vec<SocketAddr> = sinks.iter().map(|s| s.local_addr().unwrap()).collect();
+        assert!(
+            servers.len() > budget,
+            "the test needs a server list longer than the in-flight budget"
+        );
+
+        let cursor = AtomicUsize::new(0);
+        probe_stun_servers_once(&sock, &servers, &cursor).await;
+
+        // The round consumed exactly the budget — it neither stopped short nor ran on into the
+        // silent-drop path for the remaining servers.
+        assert_eq!(
+            sock.stun_in_flight_remaining(),
+            0,
+            "the round must use the whole in-flight budget"
+        );
+        assert_eq!(
+            cursor.load(Ordering::Relaxed),
+            budget,
+            "the cursor must resume at the first server this round could not reach"
+        );
+
+        // A later sweep, whose in-flight set has drained (a real round is ~23s later and
+        // STUN_TX_TTL is 5s), picks up at that cursor rather than back at the head — so the tail
+        // this round starved is what the next round probes first.
+        let (next_round, _) = stun_probe_window(&servers, cursor.load(Ordering::Relaxed), budget);
+        for starved in &servers[budget..] {
+            assert!(
+                next_round.contains(starved),
+                "{starved} was starved this round and must be probed in the next"
+            );
+        }
+    }
+
+    /// The rotation itself: successive rounds over a list longer than one round's budget must cover
+    /// every server, with no server probed twice inside a round and no gap between rounds.
+    #[test]
+    fn stun_probe_window_rotates_across_rounds() {
+        // RFC 5737 documentation addresses; 20 servers, 16 per round.
+        let servers: Vec<SocketAddr> = (1..=20u8)
+            .map(|i| SocketAddr::from((Ipv4Addr::new(192, 0, 2, i), 3478)))
+            .collect();
+        let budget = 16;
+
+        let (round1, next) = stun_probe_window(&servers, 0, budget);
+        assert_eq!(round1, servers[..16], "round 1 probes the head of the list");
+        assert_eq!(
+            next, 16,
+            "round 2 resumes at the first server round 1 skipped"
+        );
+
+        let (round2, next) = stun_probe_window(&servers, next, budget);
+        let expected2: Vec<SocketAddr> = servers[16..]
+            .iter()
+            .chain(servers[..12].iter())
+            .copied()
+            .collect();
+        assert_eq!(round2, expected2, "round 2 wraps from the cursor");
+        assert_eq!(next, 12);
+
+        // The starved tail of round 1 is covered by round 2 — the whole point.
+        for s in &servers[16..] {
+            assert!(
+                round2.contains(s),
+                "{s} was starved in round 1 and must be probed in round 2"
+            );
+        }
+        // Two rounds cover every server at least once.
+        for s in &servers {
+            assert!(
+                round1.contains(s) || round2.contains(s),
+                "{s} must be probed within two rounds"
+            );
+        }
+    }
+
+    /// Degenerate windows: no servers, and a budget wider than the list. A budget wider than the
+    /// list must not probe a server twice in one round (the cap makes the duplicate a silent drop,
+    /// which would starve a real server for its sake).
+    #[test]
+    fn stun_probe_window_handles_short_lists() {
+        let (window, next) = stun_probe_window(&[], 7, 16);
+        assert!(window.is_empty(), "an empty derp map probes nothing");
+        assert_eq!(next, 0, "an empty list resets the cursor");
+
+        let servers: Vec<SocketAddr> = (1..=3u8)
+            .map(|i| SocketAddr::from((Ipv4Addr::new(192, 0, 2, i), 3478)))
+            .collect();
+        let (window, next) = stun_probe_window(&servers, 2, 16);
+        assert_eq!(
+            window.len(),
+            servers.len(),
+            "a budget wider than the list probes each server exactly once"
+        );
+        assert_eq!(window[0], servers[2], "the round starts at the cursor");
+        for s in &servers {
+            assert_eq!(
+                window.iter().filter(|w| *w == s).count(),
+                1,
+                "{s} must be probed exactly once per round"
+            );
+        }
+        assert_eq!(next, 2, "a full pass leaves the cursor where it started");
+
+        // An out-of-range cursor (the derp map shrank between rounds) is taken modulo the length.
+        let (window, _) = stun_probe_window(&servers, 99, 1);
+        assert_eq!(window, vec![servers[99 % 3]]);
     }
 
     /// With `enable_ipv6 == false` (the default) the underlay socket binds the historical IPv4
@@ -1234,8 +1441,10 @@ mod tests {
             .unwrap(),
         );
 
-        // No servers => no sends, no panic, returns promptly.
-        probe_stun_servers_once(&sock, &[]).await;
+        // No servers => no sends, no panic, returns promptly, and the cursor stays parked.
+        let cursor = AtomicUsize::new(0);
+        probe_stun_servers_once(&sock, &[], &cursor).await;
+        assert_eq!(cursor.load(Ordering::Relaxed), 0);
     }
 
     /// The periodic STUN sweep is gated on having at least one peer — Go magicsock's
@@ -1305,7 +1514,7 @@ mod tests {
             .unwrap(),
         );
         // Empty server list (what an unavailable/stale derp map yields) → no sends, returns promptly.
-        probe_stun_servers_once(&sock, &[]).await;
+        probe_stun_servers_once(&sock, &[], &AtomicUsize::new(0)).await;
     }
 
     /// The periodic STUN delay is a uniform random value in `[20s, 26s)`, matching Go magicsock's
