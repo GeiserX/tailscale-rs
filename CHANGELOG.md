@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.45.2](https://github.com/GeiserX/tailscale-rs/compare/v0.45.1...v0.45.2) (2026-09-03)
+
+
+### Bug Fixes
+
+* **runtime:** keep quad-100 traffic off the overlay in TUN mode ([#347](https://github.com/GeiserX/tailscale-rs/issues/347)) ([0ba3004](https://github.com/GeiserX/tailscale-rs/commit/0ba3004d52bdf65a35fe74efd97762fce89af272))
+
 ## [0.45.1](https://github.com/GeiserX/tailscale-rs/compare/v0.45.0...v0.45.1) (2026-09-02)
 
 
