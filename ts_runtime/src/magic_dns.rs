@@ -31,6 +31,14 @@
 //!   `REFUSED` (a stub reads REFUSED as "won't serve me" and abandons the resolver). Tailnet reverse
 //!   zones (CGNAT `in-addr.arpa` / any `ip6.arpa`) still fail closed to NXDOMAIN for every qtype
 //!   (never forwarded — anti-leak).
+//! - A **negative** answer this node is authoritative for — an NXDOMAIN for a name inside a zone we
+//!   serve (a tailnet search domain, a negative split-DNS route, or the CGNAT reverse zone), or a
+//!   NODATA for such a name — carries that zone's `SOA` in the authority section, advertising a
+//!   10-second negative-caching bound (RFC 2308). Without one, macOS `mDNSResponder` keeps an
+//!   SOA-less negative answer on its own schedule, so a name queried shortly *before* a node was
+//!   renamed to it stays unresolvable until something flushes the cache. Positive answers carry a
+//!   5-second TTL for the same reason in the other direction. `SERVFAIL`, `REFUSED` and the blanket
+//!   `ip6.arpa` refusal claim no zone and carry no SOA.
 //! - Malformed query => dropped (no response).
 //! - A **forwarded** reply larger than the UDP payload size the query advertised — its EDNS(0) OPT
 //!   record, or 512 bytes when it carried none (RFC 1035) — comes back with the `TC` (truncated)
@@ -55,7 +63,7 @@ use tokio::{
     time::timeout,
 };
 use ts_control::{DnsConfig, DnsResolver, Node};
-use ts_dns_wire::{Name, QType, RData, Rcode, decode_query, encode_response};
+use ts_dns_wire::{Name, QType, RData, Rcode, SoaZone, decode_query, encode_response};
 
 use crate::{
     Error,
@@ -260,7 +268,10 @@ enum Upstreams<'a> {
     /// No route matched: forward to these recursive (fallback/global) resolvers. Eligible for
     /// exit-node DoH delegation in the client serve loop.
     Recursive(&'a [DnsResolver]),
-    /// A negative split-DNS route matched: do not resolve (NXDOMAIN).
+    /// A negative split-DNS route matched: do not resolve (NXDOMAIN). The route's suffix is a zone
+    /// this node is authoritative for — Go's `localDomains` is exactly the set of routes configured
+    /// with no resolvers — so [`authoritative_zone_for`] finds it again when naming the negative
+    /// answer's SOA zone.
     Block,
     /// No route and no resolver configured: fail closed (NXDOMAIN).
     None,
@@ -331,13 +342,89 @@ fn is_tailnet_cgnat(ip: Ipv4Addr) -> bool {
     o[0] == 100 && (64..=127).contains(&o[1])
 }
 
+/// The zone this node is authoritative for that contains `canon`, or `None` when it is not
+/// authoritative for the name.
+///
+/// Mirrors Go `net/dns/resolver/tsdns.go` `authoritativeZoneFor`, which scans `Resolver.localDomains`.
+/// Go's `localDomains` is exactly the set of control-pushed routes with **no** resolvers
+/// (`net/dns/manager.go` `compileConfig`), so the equivalent set here is the union of:
+///
+/// - the tailnet search domains — what [`is_tailnet_name`] tests, and the zone a tailnet-suffix
+///   NXDOMAIN belongs to;
+/// - the negative split-DNS routes (a route with an empty upstream list), the literal shape of
+///   Go's `localDomains`;
+/// - the CGNAT reverse zone `<b>.100.in-addr.arpa` covering a `100.64.0.0/10` reverse name.
+///   Synthesized rather than read from the routes: this fork's reverse guard is structural
+///   ([`is_tailnet_cgnat`]) and holds whether or not control pushed the matching route, and the
+///   zone it names is the same per-/16 chunk real tailscaled advertises.
+///
+/// `ip6.arpa` is deliberately absent. This fork NXDOMAINs *every* `ip6.arpa` name as an anti-leak
+/// measure ([`is_ip6_arpa`]) rather than because it serves that zone, and an SOA naming `ip6.arpa`
+/// would claim authority over the whole IPv6 reverse tree — a claim we do not have and one that
+/// would have a client negative-cache far more than this node answers for.
+///
+/// The longest match wins. Go returns the first match from an unordered slice; longest gives the
+/// same answer whenever the zones nest (the usual case) and is a defensible tie-break when they
+/// do not.
+fn authoritative_zone_for(view: &DnsView, name: &Name, canon: &str) -> Option<String> {
+    if let Some(octets) = name.ptr_to_ipv4() {
+        let v4: Ipv4Addr = octets.into();
+        if is_tailnet_cgnat(v4) {
+            return Some(format!("{}.100.in-addr.arpa", v4.octets()[1]));
+        }
+    }
+
+    view.cfg
+        .search_domains
+        .iter()
+        .map(String::as_str)
+        .chain(
+            view.cfg
+                .routes
+                .iter()
+                .filter(|(_, upstreams)| upstreams.is_empty())
+                .map(|(suffix, _)| suffix.as_str()),
+        )
+        .filter(|zone| suffix_matches(canon, zone))
+        .max_by_key(|zone| zone.len())
+        .map(str::to_owned)
+}
+
+/// The SOA record to attach to an authoritative **negative** answer (NXDOMAIN, or NODATA for a
+/// name we serve), or `None` when this node is not authoritative for a zone containing the name.
+///
+/// Without it, a downstream cache decides for itself how long to remember the nonexistence: macOS
+/// `mDNSResponder` holds an SOA-less negative answer for a long time, so a name queried shortly
+/// *before* a node was renamed to it keeps failing until something flushes the cache. The SOA
+/// bounds that at 10 seconds (RFC 2308), which is what Go's resolver advertises.
+fn soa_for(view: &DnsView, name: &Name, canon: &str) -> Option<SoaZone> {
+    let zone = authoritative_zone_for(view, name, canon)?;
+    Some(SoaZone {
+        zone: Name(zone.split('.').map(str::to_owned).collect()),
+        serial: soa_serial(),
+    })
+}
+
+/// The SOA SERIAL to publish: the response time in unix seconds.
+///
+/// A serial is meant to change only when the zone data does, but nothing consumes ours — this node
+/// has no secondaries and serves no zone transfers — so Go uses the current time and so do we. It
+/// is monotonic, cheap, and fits in a `u32` until 2106. A clock before the epoch yields 0 rather
+/// than panicking; the value carries no meaning either way.
+fn soa_serial() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() as u32)
+}
+
 /// Decide what to do with a single DNS query against `view`: either a complete response is ready
 /// ([`Decision::Reply`]), the query should be forwarded to upstream resolvers
 /// ([`Decision::Forward`]), or the packet should be dropped without answering (`None`).
 ///
-/// Pure (no I/O), factored out of the socket loop so it can be unit-tested without a netstack. It
-/// never panics and fails closed: an unknown, unroutable, or tailnet-suffix name resolves to
-/// NXDOMAIN rather than leaking to an upstream resolver.
+/// Factored out of the socket loop so it can be unit-tested without a netstack: it does no I/O and
+/// reads no state but `view` and the wall clock (the SOA SERIAL of a negative answer, which nothing
+/// consumes — see [`soa_serial`]). It never panics and fails closed: an unknown, unroutable, or
+/// tailnet-suffix name resolves to NXDOMAIN rather than leaking to an upstream resolver.
 pub(crate) fn decide(view: &DnsView, buf: &[u8]) -> Option<Decision> {
     // Malformed / non-query input is dropped: we never answer something we can't parse.
     let query = decode_query(buf).ok()?;
@@ -347,8 +434,23 @@ pub(crate) fn decide(view: &DnsView, buf: &[u8]) -> Option<Decision> {
     // from the query header.
     let rd = query.recursion_desired;
 
-    let reply =
-        |rcode, answers: &[RData]| Decision::Reply(encode_response(id, q, rd, rcode, answers));
+    let reply = |rcode, answers: &[RData]| {
+        Decision::Reply(encode_response(id, q, rd, rcode, answers, None))
+    };
+    // A negative answer (NXDOMAIN, or NODATA) for a name inside a zone we serve carries that zone's
+    // SOA in the authority section, which bounds how long a downstream resolver may cache the
+    // nonexistence (RFC 2308). `soa_for` returns `None` when we are not authoritative for the name,
+    // in which case this is exactly `reply`.
+    let reply_negative = |rcode, canon: &str| {
+        Decision::Reply(encode_response(
+            id,
+            q,
+            rd,
+            rcode,
+            &[],
+            soa_for(view, &q.name, canon).as_ref(),
+        ))
+    };
 
     // Fail closed: MagicDNS off, or the node doesn't accept the tailnet's DNS config
     // (`--accept-dns` / `CorpDNS` is false) => serve nothing. The `accept_dns` gate mirrors Go
@@ -387,7 +489,10 @@ pub(crate) fn decide(view: &DnsView, buf: &[u8]) -> Option<Decision> {
             Some(IpAddr::V6(v6)) if view.enable_ipv6 => {
                 reply(Rcode::NoError, &[RData::Aaaa(v6.octets())])
             }
-            Some(IpAddr::V6(_)) => reply(Rcode::NoError, &[]),
+            // NODATA: the name exists but we hold no address of the queried family for it, so it
+            // takes the SOA — Go sets `SOAZone` on exactly this case (`rcode == RCodeSuccess &&
+            // !ip.IsValid()` for an A/AAAA/ALL question).
+            Some(IpAddr::V6(_)) => reply_negative(Rcode::NoError, &canon),
             // No overlay/extra-record answer: split-DNS / recursive upstreams (off-tailnet names);
             // tailnet names fail closed to NXDOMAIN inside `forward_or_nxdomain`.
             _ => forward_or_nxdomain(view, &canon, buf, id, q, rd),
@@ -406,13 +511,15 @@ pub(crate) fn decide(view: &DnsView, buf: &[u8]) -> Option<Decision> {
                     // (100.64.0.0/10) that misses the peer set is authoritative-but-unknown; fail
                     // closed to NXDOMAIN rather than leaking the probed tailnet IP upstream. Only
                     // genuinely off-tailnet reverse queries are forwarded.
-                    None if is_tailnet_cgnat(v4) => reply(Rcode::NxDomain, &[]),
+                    None if is_tailnet_cgnat(v4) => reply_negative(Rcode::NxDomain, &canon),
                     None => forward_or_nxdomain(view, &canon, buf, id, q, rd),
                 }
             }
             // Anti-leak / IPv4-only-tailnet: an IPv6 reverse (`ip6.arpa`) PTR must never be
             // forwarded — relaying it would reveal that a tailnet v6 address (e.g. a ULA `fd7a:…`)
-            // was probed. Fail closed to NXDOMAIN, exactly like the IPv4 CGNAT guard above.
+            // was probed. Fail closed to NXDOMAIN, exactly like the IPv4 CGNAT guard above. No SOA:
+            // this blanket refusal is anti-leak, not a claim to serve `ip6.arpa` (see
+            // [`authoritative_zone_for`]).
             None if is_ip6_arpa(&canon) => reply(Rcode::NxDomain, &[]),
             None => forward_or_nxdomain(view, &canon, buf, id, q, rd),
         },
@@ -453,18 +560,31 @@ fn forward_or_nxdomain(
     rd: bool,
 ) -> Decision {
     // NXDOMAIN for authoritative-absent names; SERVFAIL for an off-tailnet name we can't forward.
-    let nxdomain = encode_response(id, q, rd, Rcode::NxDomain, &[]);
-    let servfail = encode_response(id, q, rd, Rcode::ServFail, &[]);
+    // An authoritative NXDOMAIN carries the zone's SOA so a downstream cache bounds how long it
+    // remembers the nonexistence (RFC 2308); a SERVFAIL never does — it asserts nothing to cache,
+    // and we are not authoritative for the name we failed to forward.
+    let nxdomain = |canon: &str| {
+        encode_response(
+            id,
+            q,
+            rd,
+            Rcode::NxDomain,
+            &[],
+            soa_for(view, &q.name, canon).as_ref(),
+        )
+    };
+    let servfail = encode_response(id, q, rd, Rcode::ServFail, &[], None);
 
     if is_tailnet_name(view, canon) {
-        return Decision::Reply(nxdomain);
+        return Decision::Reply(nxdomain(canon));
     }
 
     let (resolvers, recursive) = match view.route_for(canon) {
         Upstreams::Route(resolvers) => (resolvers, false),
         Upstreams::Recursive(resolvers) => (resolvers, true),
         // A negative split-DNS route is authoritative-absent (Go answers it from Hosts): NXDOMAIN.
-        Upstreams::Block => return Decision::Reply(nxdomain),
+        // Go's `localDomains` *is* this route set, so the route's own suffix names the zone.
+        Upstreams::Block => return Decision::Reply(nxdomain(canon)),
         // No route and no resolver: an off-tailnet name we have nowhere to forward — SERVFAIL, not
         // a cacheable non-existence (Go forwarder.go:1207).
         Upstreams::None => return Decision::Reply(servfail),
@@ -539,7 +659,9 @@ fn forward_or_nodata(
         } else {
             Rcode::NoError
         };
-        return Decision::Reply(encode_response(id, q, rd, rcode, &[]));
+        // No SOA. Go sets `SOAZone` on a no-data answer only for an A/AAAA/ALL question; a TXT or
+        // SRV miss on a name we serve — and the NOTIMP types — go back bare, as they do upstream.
+        return Decision::Reply(encode_response(id, q, rd, rcode, &[], None));
     }
     // Anti-leak parity with the `QType::Ptr` arm: a reverse query for a tailnet CGNAT IPv4
     // (100.64.0.0/10) or ANY `ip6.arpa` name must NEVER egress to an upstream resolver, regardless
@@ -548,12 +670,22 @@ fn forward_or_nodata(
     // exotic-qtype (TXT/ANY/…) or non-IN-class query for a tailnet reverse name would slip through to
     // the forward path below. Fail closed to NXDOMAIN, matching the PTR arm's disposition.
     if is_ip6_arpa(canon) {
-        return Decision::Reply(encode_response(id, q, rd, Rcode::NxDomain, &[]));
+        // No SOA: see the matching guard in [`decide`]'s PTR arm.
+        return Decision::Reply(encode_response(id, q, rd, Rcode::NxDomain, &[], None));
     }
     if let Some(octets) = q.name.ptr_to_ipv4()
         && is_tailnet_cgnat(octets.into())
     {
-        return Decision::Reply(encode_response(id, q, rd, Rcode::NxDomain, &[]));
+        // Authoritative for the CGNAT reverse zone, so this NXDOMAIN carries its SOA — same
+        // disposition as the PTR arm, whatever the qtype or class that got us here.
+        return Decision::Reply(encode_response(
+            id,
+            q,
+            rd,
+            Rcode::NxDomain,
+            &[],
+            soa_for(view, &q.name, canon).as_ref(),
+        ));
     }
     // Off-tailnet, non-reverse-zone: forward verbatim. `forward_or_nxdomain` already forwards
     // non-tailnet names and soft-fails (SERVFAIL) when no upstream is configured/routable; reuse it
@@ -2637,5 +2769,313 @@ mod tests {
             recursive_plan(&view, vec!["8.8.8.8:53".parse().unwrap()]),
             RecursivePlan::Udp(vec!["10.0.0.53:53".parse().unwrap()])
         );
+    }
+
+    // --- SOA on authoritative negative answers (RFC 2308) -----------------------------------
+
+    /// Read an uncompressed name at `off`, returning it dotted and the offset just past it.
+    fn read_name(resp: &[u8], mut off: usize) -> (String, usize) {
+        let mut labels: Vec<String> = Vec::new();
+        loop {
+            let len = resp[off] as usize;
+            assert_eq!(len & 0xC0, 0, "no compression pointer expected here");
+            off += 1;
+            if len == 0 {
+                break;
+            }
+            labels.push(String::from_utf8(resp[off..off + len].to_vec()).expect("ascii label"));
+            off += len;
+        }
+        (labels.join("."), off)
+    }
+
+    /// The number of records in a response's authority section (NSCOUNT).
+    fn nscount(resp: &[u8]) -> u16 {
+        u16::from_be_bytes([resp[8], resp[9]])
+    }
+
+    /// Walk an answer-less response to its authority section and read the SOA there, returning
+    /// `(zone, record TTL, SERIAL, MINIMUM)`. `None` when the authority section is empty.
+    ///
+    /// Also asserts the record's shape as it goes: TYPE=SOA, CLASS=IN, and MNAME/RNAME both equal
+    /// the owner name (the placeholders Go writes).
+    fn parse_soa(resp: &[u8]) -> Option<(String, u32, u32, u32)> {
+        let (.., ancount) = parse_header(resp);
+        assert_eq!(ancount, 0, "parse_soa only walks answer-less responses");
+        if nscount(resp) == 0 {
+            return None;
+        }
+        assert_eq!(nscount(resp), 1, "at most one SOA");
+
+        // Question: QNAME then QTYPE + QCLASS.
+        let (_, off) = read_name(resp, 12);
+        // Authority record: NAME, TYPE, CLASS, TTL, RDLENGTH, RDATA.
+        let (zone, off) = read_name(resp, off + 4);
+        let u16_at = |at: usize| u16::from_be_bytes([resp[at], resp[at + 1]]);
+        let u32_at = |at: usize| u32::from_be_bytes(resp[at..at + 4].try_into().unwrap());
+        assert_eq!(u16_at(off), 6, "TYPE = SOA");
+        assert_eq!(u16_at(off + 2), 1, "CLASS = IN");
+        let ttl = u32_at(off + 4);
+        let rdlength = u16_at(off + 8) as usize;
+
+        // RDATA: MNAME, RNAME, SERIAL, REFRESH, RETRY, EXPIRE, MINIMUM.
+        let rdata_start = off + 10;
+        let (mname, off) = read_name(resp, rdata_start);
+        let (rname, off) = read_name(resp, off);
+        assert_eq!(mname, zone, "MNAME is the zone (placeholder)");
+        assert_eq!(rname, zone, "RNAME is the zone (placeholder)");
+        let serial = u32_at(off);
+        let minimum = u32_at(off + 16);
+        assert_eq!(
+            off + 20 - rdata_start,
+            rdlength,
+            "RDLENGTH covers exactly the SOA fields"
+        );
+        assert_eq!(resp.len(), off + 20, "the SOA is the last record");
+        Some((zone, ttl, serial, minimum))
+    }
+
+    /// Roughly-now, for asserting the SOA SERIAL is a unix timestamp rather than a constant.
+    fn now_unix() -> u32 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_secs() as u32
+    }
+
+    /// An NXDOMAIN for a name under a tailnet search domain is authoritative, so it carries that
+    /// search domain's SOA with the 10-second negative TTL. Without it a downstream cache picks its
+    /// own (much longer) negative lifetime and a node renamed to that name stays unresolvable.
+    #[test]
+    fn nxdomain_for_tailnet_name_carries_the_search_domain_soa() {
+        let view = view_with_peer();
+        let buf = build_query(0x1111, &["nope", "user", "ts", "net"], 1, 1);
+
+        let resp = answer(&view, &buf).expect("answers");
+        let (_, rcode, ancount) = parse_header(&resp);
+        assert_eq!(rcode, 3, "NXDOMAIN");
+        assert_eq!(ancount, 0);
+
+        let (zone, ttl, serial, minimum) =
+            parse_soa(&resp).expect("an SOA in the authority section");
+        assert_eq!(zone, "user.ts.net", "the search domain containing the name");
+        assert_eq!(ttl, 10, "negative TTL");
+        assert_eq!(minimum, 10, "MINIMUM also bounds negative caching");
+        // The serial is the response time in unix seconds, not a fixed placeholder.
+        assert!(
+            serial.abs_diff(now_unix()) < 60,
+            "SERIAL should be about now, got {serial}"
+        );
+    }
+
+    /// A NODATA — the name exists but we hold no address of the queried family, which is what an
+    /// AAAA query for a peer becomes with the IPv6 gate off — is negative too, and takes the SOA.
+    #[test]
+    fn nodata_aaaa_for_known_peer_carries_the_soa() {
+        let view = view_with_peer();
+        assert!(!view.enable_ipv6, "default gate is off");
+        let buf = build_query(0x2222, &["host", "user", "ts", "net"], 28, 1);
+
+        let resp = answer(&view, &buf).expect("answers");
+        let (_, rcode, ancount) = parse_header(&resp);
+        assert_eq!(rcode, 0, "NoError (NODATA)");
+        assert_eq!(ancount, 0);
+        let (zone, ttl, _, minimum) = parse_soa(&resp).expect("an SOA in the authority section");
+        assert_eq!(zone, "user.ts.net");
+        assert_eq!((ttl, minimum), (10, 10));
+    }
+
+    /// A reverse query for an unmatched IP in the tailnet CGNAT range is authoritatively absent, so
+    /// it carries the SOA of the reverse zone that covers it — the same per-/16 `in-addr.arpa`
+    /// chunk real tailscaled advertises, not the search domain.
+    #[test]
+    fn cgnat_reverse_miss_carries_the_reverse_zone_soa() {
+        let view = view_with_peer();
+        // Reverse name for an unclaimed 100.64.0.0/10 address, least-significant octet first.
+        let buf = build_query(0x3333, &["9", "0", "64", "100", "in-addr", "arpa"], 12, 1);
+
+        let resp = answer(&view, &buf).expect("answers");
+        let (_, rcode, ancount) = parse_header(&resp);
+        assert_eq!(rcode, 3, "NXDOMAIN");
+        assert_eq!(ancount, 0);
+        let (zone, ttl, _, minimum) = parse_soa(&resp).expect("an SOA in the authority section");
+        assert_eq!(zone, "64.100.in-addr.arpa", "the CGNAT reverse zone");
+        assert_eq!((ttl, minimum), (10, 10));
+    }
+
+    /// The exotic-qtype path re-applies the CGNAT reverse guard, and its NXDOMAIN is just as
+    /// authoritative — so it carries the same reverse-zone SOA the PTR arm does.
+    #[test]
+    fn exotic_qtype_cgnat_reverse_nxdomain_carries_the_soa() {
+        let view = view_with_peer();
+        // TXT (16) for a CGNAT reverse name.
+        let buf = build_query(0x4444, &["9", "0", "64", "100", "in-addr", "arpa"], 16, 1);
+
+        let resp = answer(&view, &buf).expect("answers");
+        assert_eq!(parse_header(&resp).1, 3, "NXDOMAIN");
+        let (zone, ..) = parse_soa(&resp).expect("an SOA in the authority section");
+        assert_eq!(zone, "64.100.in-addr.arpa");
+    }
+
+    /// A negative split-DNS route (a route with no resolvers) is Go's `localDomains` verbatim: the
+    /// NXDOMAIN it produces is authoritative and names the route's own suffix as its zone.
+    #[test]
+    fn negative_route_nxdomain_carries_the_route_zone_soa() {
+        let mut routes = std::collections::BTreeMap::new();
+        routes.insert("corp.example".to_string(), vec![]);
+        let view = view_with_routes(routes, vec![], vec![]);
+        let buf = build_query(0x5555, &["intranet", "corp", "example"], 1, 1);
+
+        let resp = answer(&view, &buf).expect("answers");
+        assert_eq!(parse_header(&resp).1, 3, "NXDOMAIN");
+        let (zone, ttl, _, minimum) = parse_soa(&resp).expect("an SOA in the authority section");
+        assert_eq!(zone, "corp.example");
+        assert_eq!((ttl, minimum), (10, 10));
+    }
+
+    /// Answers we are NOT authoritative for carry no SOA: a SERVFAIL is a soft failure with nothing
+    /// to cache, and an `ip6.arpa` NXDOMAIN is this fork's blanket anti-leak refusal, not a claim to
+    /// serve the IPv6 reverse tree.
+    #[test]
+    fn non_authoritative_negative_answers_carry_no_soa() {
+        let view = view_with_peer();
+
+        // Off-tailnet name, no upstream configured => SERVFAIL.
+        let servfail =
+            answer(&view, &build_query(0x6, &["example", "com"], 1, 1)).expect("answers");
+        assert_eq!(parse_header(&servfail).1, 2, "ServFail");
+        assert_eq!(nscount(&servfail), 0, "SERVFAIL carries no SOA");
+
+        // An ip6.arpa reverse name. The exact nibble labels do not matter to the guard.
+        let mut labels: Vec<&str> = vec!["1"; 32];
+        labels.push("ip6");
+        labels.push("arpa");
+        let ip6 = answer(&view, &build_query(0x7, &labels, 12, 1)).expect("answers");
+        assert_eq!(parse_header(&ip6).1, 3, "NXDOMAIN");
+        assert_eq!(nscount(&ip6), 0, "ip6.arpa NXDOMAIN carries no SOA");
+
+        // MagicDNS off => REFUSED, which asserts nothing about the name.
+        let mut off = view_with_peer();
+        off.cfg.magic_dns = false;
+        let refused = answer(
+            &off,
+            &build_query(0x8, &["host", "user", "ts", "net"], 1, 1),
+        )
+        .expect("answers");
+        assert_eq!(parse_header(&refused).1, 5, "Refused");
+        assert_eq!(nscount(&refused), 0, "REFUSED carries no SOA");
+    }
+
+    /// A NODATA for a type we simply do not serve on a name we do (TXT on a tailnet name) carries
+    /// no SOA: Go sets `SOAZone` on a no-data answer only for an A/AAAA/ALL question.
+    #[test]
+    fn nodata_for_an_unserved_qtype_carries_no_soa() {
+        let view = view_with_peer();
+        let resp = answer(
+            &view,
+            &build_query(0x9, &["host", "user", "ts", "net"], 16, 1),
+        )
+        .expect("answers");
+        let (_, rcode, ancount) = parse_header(&resp);
+        assert_eq!((rcode, ancount), (0, 0), "NODATA");
+        assert_eq!(nscount(&resp), 0);
+    }
+
+    /// A positive answer has an empty authority section and a 5-second TTL. The short TTL is the
+    /// positive half of the same argument: the netmap is local and in-memory, so a re-query is
+    /// nearly free, while a downstream cache would otherwise hide a node rename for the full TTL.
+    #[test]
+    fn positive_answer_has_ttl_5_and_no_authority_section() {
+        let view = view_with_peer();
+        let resp = answer(
+            &view,
+            &build_query(0xA, &["host", "user", "ts", "net"], 1, 1),
+        )
+        .expect("answers");
+        let (_, rcode, ancount) = parse_header(&resp);
+        assert_eq!((rcode, ancount), (0, 1), "one A record");
+        assert_eq!(nscount(&resp), 0, "a positive answer claims no zone");
+        // The single A record's tail is TTL, RDLENGTH, RDATA.
+        let ttl_at = resp.len() - 10;
+        let ttl = u32::from_be_bytes(resp[ttl_at..ttl_at + 4].try_into().unwrap());
+        assert_eq!(ttl, 5, "positive TTL");
+    }
+
+    /// An authoritative negative answer with its SOA attached must still fit the classic 512-byte
+    /// UDP limit, so the forwarded-path client-limit check leaves TC clear on it. That check floors
+    /// the client's limit at 512, so this holds for a plain query and an EDNS one alike.
+    #[test]
+    fn nxdomain_with_soa_stays_within_the_client_udp_limit() {
+        let view = view_with_peer();
+        let long = "a".repeat(63);
+        let buf = build_query(0xB, &[&long, "user", "ts", "net"], 1, 1);
+
+        let resp = answer(&view, &buf).expect("answers");
+        assert_eq!(nscount(&resp), 1, "the SOA fits beside this question");
+        assert!(resp.len() <= 512, "still one classic UDP datagram");
+
+        let marked = set_tc_if_over_client_limit(&buf, resp.clone());
+        assert_eq!(marked, resp, "nothing to mark: an authoritative reply fits");
+        assert_eq!(
+            u16::from_be_bytes([marked[2], marked[3]]) & 0x0200,
+            0,
+            "TC must stay clear"
+        );
+    }
+
+    /// When the zone is so long that its SOA no longer fits under the 512-byte cap, the SOA is
+    /// dropped rather than the answer being truncated: the NXDOMAIN goes back complete, with an
+    /// empty authority section, TC clear, and still within a client's UDP limit. Losing the SOA
+    /// only means a resolver falls back to its own negative-cache policy.
+    #[test]
+    fn an_soa_that_will_not_fit_is_dropped_and_the_nxdomain_still_answers() {
+        let long = "a".repeat(63);
+        let zone = [long.as_str(), long.as_str(), long.as_str()].join(".");
+        let mut view = view_with_peer();
+        view.cfg.search_domains = vec![zone.clone()];
+
+        let buf = build_query(0xC, &["x", &long, &long, &long], 1, 1);
+        let resp = answer(&view, &buf).expect("answers");
+
+        assert_eq!(parse_header(&resp).1, 3, "NXDOMAIN");
+        assert_eq!(nscount(&resp), 0, "the SOA did not fit and was dropped");
+        assert!(resp.len() <= 512, "response stays within the UDP limit");
+        let marked = set_tc_if_over_client_limit(&buf, resp.clone());
+        assert_eq!(
+            u16::from_be_bytes([marked[2], marked[3]]) & 0x0200,
+            0,
+            "a dropped SOA must not set TC: the fork cannot serve the TCP retry it would ask for"
+        );
+    }
+
+    /// The zone is the *longest* authoritative suffix containing the name, so a name under a
+    /// sub-zone gets the sub-zone's SOA rather than the shorter search domain's.
+    #[test]
+    fn the_longest_authoritative_zone_wins() {
+        let mut routes = std::collections::BTreeMap::new();
+        routes.insert("sub.user.ts.net".to_string(), vec![]);
+        let mut view = view_with_routes(routes, vec![], vec![]);
+        view.cfg.search_domains = vec!["user.ts.net".to_string()];
+
+        let buf = build_query(0xD, &["nope", "sub", "user", "ts", "net"], 1, 1);
+        let resp = answer(&view, &buf).expect("answers");
+        assert_eq!(parse_header(&resp).1, 3, "NXDOMAIN");
+        let (zone, ..) = parse_soa(&resp).expect("an SOA in the authority section");
+        assert_eq!(zone, "sub.user.ts.net");
+    }
+
+    /// A name we resolved only by search-domain qualification (a short name like `host`) is not
+    /// itself inside a zone we serve, so its negative answer names no zone — matching Go, whose
+    /// `authoritativeZoneFor` is given the query name as asked.
+    #[test]
+    fn a_short_name_outside_every_zone_gets_no_soa() {
+        let mut view = view_with_peer();
+        view.enable_ipv6 = false;
+        // `host` resolves to the peer via search-domain qualification, and with IPv6 off the AAAA
+        // is a NODATA — but `host` sits under no zone we serve.
+        let resp = answer(&view, &build_query(0xE, &["host"], 28, 1)).expect("answers");
+        let (_, rcode, ancount) = parse_header(&resp);
+        assert_eq!((rcode, ancount), (0, 0), "NODATA");
+        assert_eq!(nscount(&resp), 0, "no zone contains a single-label name");
     }
 }
