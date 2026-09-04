@@ -368,6 +368,9 @@ fn server_decide(view: &DnsView, query: &[u8], forward_exit_egress: bool) -> Ser
             decoded.recursion_desired,
             Rcode::Refused,
             &[],
+            // No SOA: REFUSED asserts nothing about the name, so there is nothing to bound the
+            // caching of, and we are not authoritative for a name we are declining to answer.
+            None,
         ));
     }
 
@@ -393,6 +396,7 @@ fn server_decide(view: &DnsView, query: &[u8], forward_exit_egress: bool) -> Ser
                     decoded.recursion_desired,
                     Rcode::Refused,
                     &[],
+                    None,
                 ));
             }
             ServerDecision::Forward {

@@ -4,8 +4,9 @@
 //!
 //! - decode an incoming UDP DNS query (the first question only), via
 //!   [`decode_query`], and
-//! - encode a corresponding response (echoing the question, appending
-//!   answer records), via [`encode_response`].
+//! - encode a corresponding response (echoing the question, appending answer
+//!   records and, for an authoritative negative answer, the zone's SOA in the
+//!   authority section), via [`encode_response`].
 //!
 //! It is `#![no_std]` and depends only on `alloc`. It performs no I/O and
 //! does no networking; it is pure wire-format codec. None of the parsing
@@ -26,8 +27,27 @@ const MAX_LABEL_LEN: usize = 63;
 /// Maximum total length of a DNS name (RFC 1035 §2.3.4).
 const MAX_NAME_LEN: usize = 255;
 
-/// TTL (seconds) applied to every answer record we emit.
-const ANSWER_TTL: u32 = 600;
+/// TTL (seconds) applied to every positive answer record we emit.
+///
+/// Deliberately short. The source of truth for a MagicDNS answer is the local, in-memory netmap,
+/// so a re-query costs nothing, while anything that caches downstream (notably macOS
+/// `mDNSResponder`) holds the stale answer for the full TTL and delays clients noticing a node
+/// rename by that long. Go `net/dns/resolver/tsdns.go` `defaultTTL`.
+const ANSWER_TTL: u32 = 5;
+
+/// TTL (seconds) advertised for negative caching by the SOA record attached to the authority
+/// section of a negative answer we are authoritative for (RFC 2308).
+///
+/// It is the record's own TTL and its MINIMUM field: a resolver bounds how long it caches the
+/// nonexistence of the name (or of records of the queried type) by the smaller of the two, so both
+/// carry the same value. Go `net/dns/resolver/tsdns.go` `negativeTTL`.
+const NEGATIVE_TTL: u32 = 10;
+
+/// The RR TYPE of a start-of-authority record (RFC 1035 §3.3.13).
+const SOA_TYPE: u16 = 6;
+
+/// The `IN` (internet) RR CLASS (RFC 1035 §3.2.4).
+const CLASS_IN: u16 = 1;
 
 /// Maximum size of a DNS message over UDP without EDNS (RFC 1035 §4.2.1).
 ///
@@ -114,6 +134,28 @@ pub enum RData {
     Aaaa([u8; 16]),
     /// A pointer to another name (PTR record).
     Ptr(Name),
+}
+
+/// The zone an authoritative *negative* answer advertises in its authority section.
+///
+/// [`encode_response`] turns this into a single SOA record whose only purpose is telling a caching
+/// resolver how long it may remember the answer's negativeness (`NEGATIVE_TTL`, RFC 2308). Every
+/// field except the TTLs is a placeholder — nothing consumes them here (no secondaries, no zone
+/// transfers) — so the record's NAME, MNAME and RNAME are all just `zone`, mirroring Go
+/// `net/dns/resolver/tsdns.go` `marshalSOA`.
+///
+/// Set it only on a response that is negative *and* authoritative: an NXDOMAIN for a name inside a
+/// zone this node serves, or a NODATA (empty NOERROR) for such a name. Attaching it to a positive
+/// answer, a SERVFAIL, or a name we merely forward for would be a claim of authority we do not have.
+#[derive(Clone)]
+pub struct SoaZone {
+    /// The zone we are authoritative for that contains the question's name — for MagicDNS, the
+    /// matching tailnet search domain, negative split-DNS route, or CGNAT reverse zone.
+    pub zone: Name,
+    /// The SOA SERIAL field. A serial should only change when the zone data does, but nothing
+    /// consumes ours, so the caller passes the response time in unix seconds: monotonic, cheap, and
+    /// it fits in a `u32` until 2106.
+    pub serial: u32,
 }
 
 /// A decoded DNS query (the first question only).
@@ -368,7 +410,7 @@ fn encode_answer(out: &mut Vec<u8>, ans: &RData, compress: bool, qname: &Name) {
     // TYPE.
     out.extend_from_slice(&rdata_type(ans).to_be_bytes());
     // CLASS = IN.
-    out.extend_from_slice(&1u16.to_be_bytes());
+    out.extend_from_slice(&CLASS_IN.to_be_bytes());
     // TTL.
     out.extend_from_slice(&ANSWER_TTL.to_be_bytes());
     // RDLENGTH + RDATA.
@@ -391,6 +433,35 @@ fn encode_answer(out: &mut Vec<u8>, ans: &RData, compress: bool, qname: &Name) {
     }
 }
 
+/// Encode `soa` as a single SOA resource record for the authority section of a negative answer.
+///
+/// The NAME is written uncompressed: the zone is not the question name (it is a suffix of it), so
+/// the `0xC0 0x0C` pointer the answer section uses does not apply, and this crate emits no other
+/// compression targets.
+///
+/// Only the TTLs carry meaning. REFRESH/RETRY/EXPIRE/MINIMUM all repeat [`NEGATIVE_TTL`] and MNAME/
+/// RNAME both repeat the zone name, exactly as Go's `marshalSOA` does: the record exists solely to
+/// bound a downstream resolver's negative caching (RFC 2308), and this node has no secondaries to
+/// serve the other fields to.
+fn encode_soa(out: &mut Vec<u8>, soa: &SoaZone) {
+    encode_name(out, &soa.zone);
+    out.extend_from_slice(&SOA_TYPE.to_be_bytes());
+    out.extend_from_slice(&CLASS_IN.to_be_bytes());
+    out.extend_from_slice(&NEGATIVE_TTL.to_be_bytes());
+
+    // RDATA into a scratch buffer so RDLENGTH can be written ahead of it.
+    let mut rdata: Vec<u8> = Vec::new();
+    encode_name(&mut rdata, &soa.zone); // MNAME (placeholder)
+    encode_name(&mut rdata, &soa.zone); // RNAME (placeholder)
+    rdata.extend_from_slice(&soa.serial.to_be_bytes()); // SERIAL
+    rdata.extend_from_slice(&NEGATIVE_TTL.to_be_bytes()); // REFRESH
+    rdata.extend_from_slice(&NEGATIVE_TTL.to_be_bytes()); // RETRY
+    rdata.extend_from_slice(&NEGATIVE_TTL.to_be_bytes()); // EXPIRE
+    rdata.extend_from_slice(&NEGATIVE_TTL.to_be_bytes()); // MINIMUM
+    out.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+    out.extend_from_slice(&rdata);
+}
+
 /// Encode a DNS response.
 ///
 /// The header echoes `id`, sets QR=1 (response) and AA=1 (authoritative), echoes the query's
@@ -398,11 +469,16 @@ fn encode_answer(out: &mut Vec<u8>, ans: &RData, compress: bool, qname: &Name) {
 /// (RA), matching Go `net/dns/resolver` `marshalResponse`, which derives the response header from the
 /// parsed query header (so a reply to a stub resolver, which always sets RD=1, has RD=1+RA=1). It
 /// places `rcode` in the low 4 bits; Z and the opcode stay clear (MagicDNS answers standard opcode-0
-/// queries). `QDCOUNT` is 1, `ANCOUNT` is the number of answers actually included, and
-/// `NSCOUNT`/`ARCOUNT` are 0. The question `q` is echoed in the question section. A single answer's
-/// NAME is written uncompressed (full label sequence); compression pointers (`0xC0 0x0C` back to the
-/// question name) are used only when there is more than one answer — matching Go, which calls
-/// `EnableCompression` only for `len(IPs) > 1`. Answer records use class IN and a TTL of 600 seconds.
+/// queries). `QDCOUNT` is 1, `ANCOUNT` is the number of answers actually included, `NSCOUNT` is 1
+/// when an `soa` was given and fitted, and `ARCOUNT` is 0. The question `q` is echoed in the
+/// question section. A single answer's NAME is written uncompressed (full label sequence);
+/// compression pointers (`0xC0 0x0C` back to the question name) are used only when there is more
+/// than one answer — matching Go, which calls `EnableCompression` only for `len(IPs) > 1`. Answer
+/// records use class IN and a TTL of `ANSWER_TTL` (5) seconds.
+///
+/// `soa` attaches the zone's SOA record to the authority section, advertising a `NEGATIVE_TTL`
+/// (10-second) negative-caching bound to downstream resolvers (RFC 2308). Pass it only on an authoritative
+/// negative answer — see [`SoaZone`].
 ///
 /// The encoded datagram is capped at the classic 512-byte UDP limit
 /// (`MAX_UDP_MSG_LEN`); this fork does not implement EDNS(0). If the full
@@ -413,12 +489,20 @@ fn encode_answer(out: &mut Vec<u8>, ans: &RData, compress: bool, qname: &Name) {
 /// a shorter answer set than when every answer was a 2-byte pointer — only material for a near-maximal
 /// (~240+ wire-byte) name, where even one answer is then dropped + TC set (valid DNS; this fork is
 /// UDP-only).
+///
+/// The SOA is appended last and only if it still fits under that cap; if it does not, it is
+/// **dropped** (`NSCOUNT` stays 0) and TC is *not* set on its account. The record is advisory — it
+/// only shortens how long a resolver may cache a negative answer that is already complete without
+/// it — so it must never displace an answer, and setting TC would tell a stub to retry over TCP,
+/// which this UDP-only fork cannot serve. That keeps the "an authoritative reply always fits 512"
+/// invariant the forwarded-path truncation check relies on.
 pub fn encode_response(
     id: u16,
     q: &Question,
     recursion_desired: bool,
     rcode: Rcode,
     answers: &[RData],
+    soa: Option<&SoaZone>,
 ) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
 
@@ -464,6 +548,19 @@ pub fn encode_response(
         ancount += 1;
     }
 
+    // Authority section: the zone's SOA, when this is an authoritative negative answer. Appended
+    // only if it fits within what is left of the 512-byte budget; see the note above on why an
+    // SOA that does not fit is dropped rather than truncating the message or setting TC.
+    let mut nscount: u16 = 0;
+    if let Some(soa) = soa {
+        let mut rr: Vec<u8> = Vec::new();
+        encode_soa(&mut rr, soa);
+        if out.len() + rr.len() <= MAX_UDP_MSG_LEN {
+            out.extend_from_slice(&rr);
+            nscount = 1;
+        }
+    }
+
     // Finalize the flags word: QR=1 (bit15), AA=1 (bit10); echo RD (bit8) from the query and set RA
     // (bit7) when RD is set (Go derives the response header from the query header — a stub resolver's
     // RD=1 query gets RD=1+RA=1 back); TC (bit9) if any answers were dropped; low 4 RCODE bits.
@@ -477,6 +574,7 @@ pub fn encode_response(
     }
     out[2..4].copy_from_slice(&flags.to_be_bytes());
     out[6..8].copy_from_slice(&ancount.to_be_bytes());
+    out[8..10].copy_from_slice(&nscount.to_be_bytes());
 
     out
 }
@@ -592,6 +690,7 @@ mod tests {
             q.recursion_desired,
             Rcode::NoError,
             &[RData::A([100, 64, 0, 1])],
+            None,
         );
 
         // Re-parse the header.
@@ -608,14 +707,14 @@ mod tests {
         assert_eq!(ancount, 1);
 
         // A single answer's NAME is the FULL uncompressed label sequence (Go compresses only for
-        // >1 answer), then type=1, class=1, ttl=600, rdlen=4, addr.
+        // >1 answer), then type=1, class=1, ttl=5, rdlen=4, addr.
         let expected_rr: &[u8] = &[
             // NAME: "host.user.ts.net." uncompressed (labels + root 0).
             4, b'h', b'o', b's', b't', 4, b'u', b's', b'e', b'r', 2, b't', b's', 3, b'n', b'e',
             b't', 0, //
             0x00, 0x01, // TYPE = A
             0x00, 0x01, // CLASS = IN
-            0x00, 0x00, 0x02, 0x58, // TTL = 600
+            0x00, 0x00, 0x00, 0x05, // TTL = 5 (ANSWER_TTL)
             0x00, 0x04, // RDLENGTH = 4
             100, 64, 0, 1, // RDATA = 100.64.0.1
         ];
@@ -640,6 +739,7 @@ mod tests {
             q.recursion_desired,
             Rcode::NoError,
             &[RData::A([100, 64, 0, 1]), RData::A([100, 64, 0, 2])],
+            None,
         );
         let ancount = u16::from_be_bytes([out[6], out[7]]);
         assert_eq!(ancount, 2);
@@ -682,6 +782,7 @@ mod tests {
             q.recursion_desired,
             Rcode::NoError,
             &[RData::A([100, 64, 0, 1])],
+            None,
         );
         let flags = u16::from_be_bytes([out[2], out[3]]);
         assert_eq!(
@@ -797,6 +898,7 @@ mod tests {
             q.recursion_desired,
             Rcode::NoError,
             &answers,
+            None,
         );
 
         assert!(
@@ -823,12 +925,200 @@ mod tests {
             q.recursion_desired,
             Rcode::NoError,
             &[RData::A([100, 64, 0, 1])],
+            None,
         );
         assert!(out.len() <= MAX_UDP_MSG_LEN);
         let flags = u16::from_be_bytes([out[2], out[3]]);
         assert_eq!(flags & 0x0200, 0, "TC bit must be clear");
         let ancount = u16::from_be_bytes([out[6], out[7]]);
         assert_eq!(ancount, 1);
+    }
+
+    /// Build an [`SoaZone`] for a dotted zone name.
+    fn soa(zone: &str, serial: u32) -> SoaZone {
+        SoaZone {
+            zone: Name(zone.split('.').map(String::from).collect()),
+            serial,
+        }
+    }
+
+    /// A negative answer carrying an SOA puts exactly one record in the authority section, with
+    /// the zone name, TYPE=SOA, CLASS=IN, TTL=NEGATIVE_TTL and an RDATA of MNAME/RNAME (both the
+    /// zone) + SERIAL + REFRESH/RETRY/EXPIRE/MINIMUM (all NEGATIVE_TTL).
+    #[test]
+    fn nxdomain_with_soa_emits_one_authority_record() {
+        let buf = build_query(0x0F0F, &["nope", "user", "ts", "net"], 1, 1);
+        let q = decode_query(&buf).expect("decodes");
+        let out = encode_response(
+            0x0F0F,
+            &q.question,
+            q.recursion_desired,
+            Rcode::NxDomain,
+            &[],
+            Some(&soa("user.ts.net", 0x0102_0304)),
+        );
+
+        let flags = u16::from_be_bytes([out[2], out[3]]);
+        assert_eq!(flags & 0x000F, 3, "NXDOMAIN");
+        assert_eq!(flags & 0x0400, 0x0400, "AA still set");
+        assert_eq!(u16::from_be_bytes([out[6], out[7]]), 0, "ANCOUNT=0");
+        assert_eq!(u16::from_be_bytes([out[8], out[9]]), 1, "NSCOUNT=1");
+        assert_eq!(u16::from_be_bytes([out[10], out[11]]), 0, "ARCOUNT=0");
+        assert_eq!(flags & 0x0200, 0, "TC must stay clear");
+
+        // The whole authority record, byte for byte. "user.ts.net." is 14 wire bytes.
+        let zone: &[u8] = &[
+            4, b'u', b's', b'e', b'r', 2, b't', b's', 3, b'n', b'e', b't', 0,
+        ];
+        let mut expected: Vec<u8> = Vec::new();
+        expected.extend_from_slice(zone);
+        expected.extend_from_slice(&[0x00, 0x06]); // TYPE = SOA
+        expected.extend_from_slice(&[0x00, 0x01]); // CLASS = IN
+        expected.extend_from_slice(&[0x00, 0x00, 0x00, 0x0A]); // TTL = 10
+        // RDLENGTH = MNAME + RNAME + 5 * u32.
+        let rdlen = (zone.len() * 2 + 20) as u16;
+        expected.extend_from_slice(&rdlen.to_be_bytes());
+        expected.extend_from_slice(zone); // MNAME
+        expected.extend_from_slice(zone); // RNAME
+        expected.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]); // SERIAL
+        for _ in 0..4 {
+            // REFRESH, RETRY, EXPIRE, MINIMUM
+            expected.extend_from_slice(&[0x00, 0x00, 0x00, 0x0A]);
+        }
+        assert_eq!(&out[out.len() - expected.len()..], expected.as_slice());
+        // The SOA NAME is written in full: the zone is a suffix of the question name, not the
+        // question name itself, so the answer section's 0xC0 0x0C pointer does not apply.
+        assert!(
+            !out[HEADER_LEN..].contains(&0xC0),
+            "no compression pointer in a negative answer"
+        );
+    }
+
+    /// Passing no `soa` leaves the authority section empty — an SOA-less negative answer is still
+    /// what a non-authoritative rcode (SERVFAIL, REFUSED) must produce.
+    #[test]
+    fn negative_answer_without_soa_has_empty_authority_section() {
+        let buf = build_query(0x0F0F, &["nope", "example", "com"], 1, 1);
+        let q = decode_query(&buf).expect("decodes");
+        let out = encode_response(
+            0x0F0F,
+            &q.question,
+            q.recursion_desired,
+            Rcode::ServFail,
+            &[],
+            None,
+        );
+        assert_eq!(u16::from_be_bytes([out[8], out[9]]), 0, "NSCOUNT=0");
+        // Header + question only.
+        assert_eq!(out.len(), HEADER_LEN + (1 + 4 + 1 + 7 + 1 + 3 + 1) + 4);
+    }
+
+    /// A NODATA (empty NOERROR) answer takes the SOA too: "the name exists, but holds no record of
+    /// the queried type" is a negative answer a resolver caches, so it needs the same TTL bound.
+    #[test]
+    fn nodata_answer_carries_the_soa() {
+        let buf = build_query(0x2222, &["host", "user", "ts", "net"], 28, 1);
+        let q = decode_query(&buf).expect("decodes");
+        let out = encode_response(
+            0x2222,
+            &q.question,
+            q.recursion_desired,
+            Rcode::NoError,
+            &[],
+            Some(&soa("user.ts.net", 7)),
+        );
+        assert_eq!(flags_of(&out) & 0x000F, 0, "NOERROR");
+        assert_eq!(u16::from_be_bytes([out[6], out[7]]), 0, "ANCOUNT=0");
+        assert_eq!(u16::from_be_bytes([out[8], out[9]]), 1, "NSCOUNT=1");
+    }
+
+    /// The flags word of a response.
+    fn flags_of(out: &[u8]) -> u16 {
+        u16::from_be_bytes([out[2], out[3]])
+    }
+
+    /// The SOA is advisory: when it does not fit under the 512-byte cap it is dropped, NSCOUNT
+    /// stays 0, TC is NOT set, and the message stays within the cap. Setting TC here would tell a
+    /// stub to retry over TCP, which this UDP-only fork cannot serve — for an answer that was
+    /// already complete without the SOA.
+    #[test]
+    fn soa_that_does_not_fit_is_dropped_without_setting_tc() {
+        // A near-maximal question name: 3 labels of 63 bytes = 193 wire bytes.
+        let long = "a".repeat(MAX_LABEL_LEN);
+        let labels = [long.as_str(), long.as_str(), long.as_str()];
+        let buf = build_query(0x3333, &labels, 1, 1);
+        let q = decode_query(&buf).expect("decodes");
+
+        // The zone is the question's last two labels (129 wire bytes). Its RR is the zone name
+        // three times over (NAME, MNAME, RNAME) plus 30 bytes of fixed fields = 417 bytes, and
+        // only 512 - 12 - 193 - 4 = 303 are left after the header and question.
+        let zone = Name(vec![long.clone(), long.clone()]);
+        let out = encode_response(
+            0x3333,
+            &q.question,
+            q.recursion_desired,
+            Rcode::NxDomain,
+            &[],
+            Some(&SoaZone { zone, serial: 1 }),
+        );
+
+        assert!(
+            out.len() <= MAX_UDP_MSG_LEN,
+            "response must stay within 512 bytes, got {}",
+            out.len()
+        );
+        assert_eq!(
+            u16::from_be_bytes([out[8], out[9]]),
+            0,
+            "the SOA must be dropped, not truncated in"
+        );
+        assert_eq!(
+            flags_of(&out) & 0x0200,
+            0,
+            "TC must NOT be set for a dropped SOA"
+        );
+        assert_eq!(flags_of(&out) & 0x000F, 3, "still NXDOMAIN");
+    }
+
+    /// The SOA never displaces an answer: with an answer set that already overflows 512 bytes the
+    /// answers still fill the datagram, TC is set for the *answers* that were dropped, and the
+    /// authority section is simply left out.
+    #[test]
+    fn soa_never_displaces_answers_in_a_truncated_response() {
+        let buf = build_query(0x4444, &["host", "ts", "net"], 28, 1);
+        let q = decode_query(&buf).expect("decodes");
+        let answers: Vec<RData> = (0..64u8).map(|i| RData::Aaaa([i; 16])).collect();
+
+        let without = encode_response(
+            0x4444,
+            &q.question,
+            q.recursion_desired,
+            Rcode::NoError,
+            &answers,
+            None,
+        );
+        let with = encode_response(
+            0x4444,
+            &q.question,
+            q.recursion_desired,
+            Rcode::NoError,
+            &answers,
+            Some(&soa("ts.net", 1)),
+        );
+
+        assert!(with.len() <= MAX_UDP_MSG_LEN);
+        assert_eq!(
+            u16::from_be_bytes([with[6], with[7]]),
+            u16::from_be_bytes([without[6], without[7]]),
+            "the same answers fit with an SOA requested as without one"
+        );
+        assert_eq!(u16::from_be_bytes([with[8], with[9]]), 0, "SOA dropped");
+        assert_eq!(
+            flags_of(&with) & 0x0200,
+            0x0200,
+            "TC set for the dropped answers"
+        );
+        assert_eq!(with, without, "a dropped SOA changes nothing on the wire");
     }
 
     #[test]
