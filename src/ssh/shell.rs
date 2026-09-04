@@ -27,7 +27,7 @@
 //!   cannot be is never started. See [`recording`][crate::ssh::recording] for the transport and
 //!   for Go's fail-open / fail-closed rules around it.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{future::Future, path::PathBuf, sync::Arc};
 
 use nix::unistd::{Gid, Uid, User};
 use pty_process::{OwnedWritePty, Size};
@@ -183,28 +183,86 @@ fn set_src_node(
     }
 }
 
+/// The three client-visible steps of a refused session, behind a trait so the rule that *every*
+/// step is attempted can be tested without a live SSH connection.
+///
+/// Production is [`ChannelRefusal`] over russh's [`Handle`]. Each method reports only whether the
+/// step reached the client, because that is all the refusal path can do about it.
+trait RefusalSink {
+    /// The channel number, for logs. (russh's `ChannelId` displays as exactly this.)
+    fn channel(&self) -> u32;
+
+    /// Write the refusal message to the client.
+    fn send_message(&self, message: String) -> impl Future<Output = bool> + Send;
+
+    /// Report the refusal exit status.
+    fn send_exit_status(&self, status: u32) -> impl Future<Output = bool> + Send;
+
+    /// Close the channel.
+    fn close(&self) -> impl Future<Output = bool> + Send;
+}
+
+/// The production [`RefusalSink`]: one channel of a live russh session.
+struct ChannelRefusal<'a> {
+    /// The session the refused channel belongs to.
+    session: &'a Handle,
+    /// The refused channel.
+    channel_id: ChannelId,
+}
+
+impl RefusalSink for ChannelRefusal<'_> {
+    fn channel(&self) -> u32 {
+        self.channel_id.number()
+    }
+
+    async fn send_message(&self, message: String) -> bool {
+        self.session
+            .data(self.channel_id, message.into_bytes())
+            .await
+            .is_ok()
+    }
+
+    async fn send_exit_status(&self, status: u32) -> bool {
+        self.session
+            .exit_status_request(self.channel_id, status)
+            .await
+            .is_ok()
+    }
+
+    async fn close(&self) -> bool {
+        self.session.close(self.channel_id).await.is_ok()
+    }
+}
+
 /// Tell the client why its session is refused, then close the channel.
 ///
 /// Reached only when the policy set `onRecordingFailure.rejectSessionWithMessage` and no recorder
 /// would take the recording.
-async fn reject_session(session: &Handle, channel_id: ChannelId, rejected: RecordingRejected) {
+///
+/// The three steps are independent: a failure to write the message does not skip the exit status,
+/// and neither skips the close. Go's refusal path has the same shape — it writes the message with
+/// `fmt.Fprintf`, discards that write's error, and calls `ss.Exit` unconditionally — so an
+/// operator alerting on the refusal exit status still sees it when the client has stopped reading
+/// its output.
+async fn reject_session<S: RefusalSink>(sink: &S, rejected: RecordingRejected) {
+    let channel_id = sink.channel();
     tracing::warn!(
         %channel_id,
         error = %rejected.cause,
         message = %rejected.message,
         "ssh: session refused: session recording could not be started"
     );
-    let refused = session
-        .data(channel_id, format!("{}\r\n", rejected.message).into_bytes())
-        .await
-        .is_err()
-        || session
-            .exit_status_request(channel_id, RECORDING_DENIED_EXIT_CODE)
-            .await
-            .is_err()
-        || session.close(channel_id).await.is_err();
-    if refused {
-        tracing::debug!(%channel_id, "ssh: client gone before the refusal reached it");
+    let message_sent = sink.send_message(format!("{}\r\n", rejected.message)).await;
+    let status_sent = sink.send_exit_status(RECORDING_DENIED_EXIT_CODE).await;
+    let closed = sink.close().await;
+    if !(message_sent && status_sent && closed) {
+        tracing::debug!(
+            %channel_id,
+            message_sent,
+            status_sent,
+            closed,
+            "ssh: client gone before the refusal reached it"
+        );
     }
 }
 
@@ -395,7 +453,14 @@ impl ChannelHandler for ShellHandler {
                 Err(rejected) => {
                     // The policy set `rejectSessionWithMessage`: show it and refuse. The channel
                     // is closed by the caller on `Err`, so the message is written first.
-                    reject_session(&session, channel_id, rejected).await;
+                    reject_session(
+                        &ChannelRefusal {
+                            session: &session,
+                            channel_id,
+                        },
+                        rejected,
+                    )
+                    .await;
                     return Err(std::io::Error::other("ssh: session recording refused"));
                 }
             }
@@ -760,6 +825,93 @@ mod tests {
     #[test]
     fn recording_refusal_uses_the_reserved_exit_code() {
         assert_eq!(RECORDING_DENIED_EXIT_CODE, 254);
+    }
+
+    /// A [`RefusalSink`] that records the steps it was asked to perform, and can be told to fail
+    /// the message write so the independence of the later steps is observable.
+    #[derive(Default)]
+    struct FakeRefusal {
+        /// When set, `send_message` reports the write as not having reached the client.
+        message_fails: bool,
+        /// Every step attempted, in order.
+        steps: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeRefusal {
+        fn steps(&self) -> Vec<String> {
+            self.steps.lock().expect("steps mutex").clone()
+        }
+    }
+
+    impl RefusalSink for FakeRefusal {
+        fn channel(&self) -> u32 {
+            7
+        }
+
+        async fn send_message(&self, message: String) -> bool {
+            self.steps
+                .lock()
+                .expect("steps mutex")
+                .push(format!("message:{message:?}"));
+            !self.message_fails
+        }
+
+        async fn send_exit_status(&self, status: u32) -> bool {
+            self.steps
+                .lock()
+                .expect("steps mutex")
+                .push(format!("exit-status:{status}"));
+            true
+        }
+
+        async fn close(&self) -> bool {
+            self.steps.lock().expect("steps mutex").push("close".into());
+            true
+        }
+    }
+
+    fn rejection() -> RecordingRejected {
+        RecordingRejected {
+            message: "this session must be recorded".to_string(),
+            cause: crate::ssh::recording::RecorderError::NoRecorders,
+        }
+    }
+
+    /// The happy path: the policy's message reaches the client CRLF-terminated, then the reserved
+    /// exit status, then the close.
+    #[tokio::test]
+    async fn refusal_writes_message_then_exit_status_then_close() {
+        let sink = FakeRefusal::default();
+        reject_session(&sink, rejection()).await;
+        assert_eq!(
+            sink.steps(),
+            vec![
+                "message:\"this session must be recorded\\r\\n\"".to_string(),
+                "exit-status:254".to_string(),
+                "close".to_string(),
+            ],
+        );
+    }
+
+    /// A client that has stopped reading must still be sent the refusal exit status and have its
+    /// channel closed. The message write failing is not a reason to skip either — an operator
+    /// alerting on exit 254 would otherwise never see the refusal.
+    #[tokio::test]
+    async fn refusal_sends_exit_status_even_when_the_message_write_fails() {
+        let sink = FakeRefusal {
+            message_fails: true,
+            ..FakeRefusal::default()
+        };
+        reject_session(&sink, rejection()).await;
+        assert_eq!(
+            sink.steps(),
+            vec![
+                "message:\"this session must be recorded\\r\\n\"".to_string(),
+                "exit-status:254".to_string(),
+                "close".to_string(),
+            ],
+            "a failed message write must not short-circuit the exit status or the close",
+        );
     }
 
     #[test]
