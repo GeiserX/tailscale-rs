@@ -251,6 +251,54 @@ impl PeerPaths {
         self.in_flight.clear();
     }
 
+    /// Invalidate the *disco path* for this peer after its active disco key changed, **keeping the
+    /// best address** — Go magicsock `endpoint.changedActiveDiscoLocked`
+    /// (`wgengine/magicsock/endpoint.go`), which every disco-key transition funnels through:
+    /// control-side (`endpoint.updateFromNode`), TSMP-side (`Conn.HandleDiscoKeyAdvertisement`) and
+    /// on an active-slot switch (`endpoint.checkAndUpdateDiscoKey`).
+    ///
+    /// Everything this peer's path state records was established by disco frames sealed under the
+    /// key the peer has just stopped using: the pong that confirmed `best`, the measured latencies,
+    /// and the pings still awaiting an answer. None of it says anything about the key the peer uses
+    /// now, so all of it is reset:
+    ///
+    /// - `trust_until` is dropped (Go `trustBestAddrUntil = 0`), so [`best_addr`](Self::best_addr)
+    ///   reports no trusted direct path and the peer relays over DERP until a fresh pong lands;
+    /// - in-flight probes are dropped — their tx ids were sent to the old key, and a matching pong
+    ///   must not re-confirm a path across the rotation;
+    /// - each candidate's measured `latency` is cleared, so no candidate counts as confirmed. This
+    ///   matters: `recompute_best` picks the lowest-latency *remembered* candidate, so a stale
+    ///   pre-rotation measurement left in place could be promoted — and re-trusted for a full
+    ///   [`TRUST_DURATION`] — by a pong for some *other* address;
+    /// - each candidate's `last_ping` and `last_full_ping` are cleared, so the next pinger tick is a
+    ///   full sweep that re-probes every candidate immediately instead of waiting out the
+    ///   `DISCO_PING_INTERVAL` floor (Go's `invalidateDiscoPathLocked`, whose point is to
+    ///   re-discover the path now rather than coast until trust lapses on its own).
+    ///
+    /// `best` itself and the candidate set are deliberately **kept**, which is the whole shape of
+    /// the upstream call: "keep bestAddr so that we can still send data while we find a new path".
+    /// The addresses are still where the peer is believed to live — control advertised them, or the
+    /// peer itself did over an authenticated `CallMeMaybe` — and a disco-key rotation is no evidence
+    /// against them. Note the fork-local limit: [`best_addr`](Self::best_addr) gates on trust, so
+    /// this node does not keep *sending* to the retained best the way Go's `addrForSendLocked`
+    /// dual-sends to an untrusted `bestAddr`; here the retained address is what the immediate
+    /// re-probe targets, and traffic rides DERP for the one round trip it takes to re-confirm.
+    ///
+    /// Contrast [`invalidate_best`](Self::invalidate_best), the rebind case: there the *local* NAT
+    /// mapping changed, so the best address is stale as an address and is cleared outright.
+    pub fn invalidate_disco_path(&mut self) {
+        self.trust_until = None;
+        self.in_flight.clear();
+        self.last_full_ping = None;
+        for cand in self.candidates.values_mut() {
+            // Keep only where the candidate came from; every measurement is pre-rotation.
+            *cand = Candidate {
+                source: cand.source,
+                ..Candidate::default()
+            };
+        }
+    }
+
     /// Reconcile the netmap-advertised candidate set to exactly `endpoints`.
     ///
     /// Netmap candidates absent from `endpoints` are removed (control revoked them); endpoints
@@ -522,6 +570,14 @@ impl PeerPaths {
     #[cfg(test)]
     fn in_flight_len(&self) -> usize {
         self.in_flight.len()
+    }
+
+    /// The best address as *stored*, ignoring the trust window. Test-only: `best_addr` cannot tell
+    /// "no best" apart from "best kept but untrusted", which is exactly the distinction
+    /// [`invalidate_disco_path`](Self::invalidate_disco_path) turns on.
+    #[cfg(test)]
+    fn stored_best(&self) -> Option<SocketAddr> {
+        self.best
     }
 
     /// Recompute the best path after a pong confirmed `confirmed` (the address whose latency was
@@ -1271,6 +1327,170 @@ mod tests {
         assert!(
             !pinged.contains(&b),
             "an already-probed rival stays quieted by the good-enough best"
+        );
+    }
+
+    /// A disco-key change drops the trust window and resets path discovery, but KEEPS the best
+    /// address and the candidate set — Go `endpoint.changedActiveDiscoLocked`.
+    ///
+    /// The positive half: `best_addr` reports no trusted path (so the caller falls back to DERP),
+    /// and the peer is immediately re-probed — the candidate is returned by `candidates_to_ping`
+    /// even though it was pinged well inside the `DISCO_PING_INTERVAL` floor, which without the
+    /// reset would have deferred re-discovery by up to 5s.
+    #[test]
+    fn disco_key_change_drops_trust_and_reprobes_now() {
+        let mut p = PeerPaths::default();
+        let addr: SocketAddr = "203.0.113.1:41641".parse().unwrap();
+        p.add_netmap_candidates([addr]);
+
+        let now = Instant::now();
+        p.note_ping_sent(tx(1), addr, now);
+        p.note_pong(tx(1), addr, now + Duration::from_millis(10));
+        // A second probe still awaiting its pong, to pin that in-flight state is dropped too.
+        p.note_ping_sent(tx(2), addr, now + Duration::from_millis(20));
+        let t = now + Duration::from_millis(30);
+        assert_eq!(
+            p.best_addr(t),
+            Some(addr),
+            "precondition: a trusted direct path"
+        );
+        assert_eq!(p.in_flight_len(), 1, "precondition: a probe is in flight");
+
+        p.invalidate_disco_path();
+
+        assert_eq!(
+            p.best_addr(t),
+            None,
+            "a pong sealed under the peer's old disco key must no longer be trusted"
+        );
+        assert_eq!(
+            p.best_addr_and_latency(t),
+            None,
+            "and the reported direct-path RTT goes with it"
+        );
+        assert_eq!(
+            p.in_flight_len(),
+            0,
+            "a probe sent to the old key must not be able to confirm a path across the rotation"
+        );
+        assert!(
+            p.needs_refresh(t),
+            "an untrusted path always wants a re-ping"
+        );
+        assert_eq!(
+            p.candidates_to_ping(t),
+            vec![addr],
+            "the candidate is re-probed now, not after the DISCO_PING_INTERVAL floor"
+        );
+    }
+
+    /// The negative half, which is what gives the change its value: the disco-key change does NOT
+    /// clear `best` or the candidate set. Upstream keeps `bestAddr` "so that we can still send data
+    /// while we find a new path"; here the retained address is the one the immediate re-probe
+    /// targets, and a single fresh pong on it restores the trusted direct path.
+    #[test]
+    fn disco_key_change_keeps_the_best_address_and_candidates() {
+        let mut p = PeerPaths::default();
+        let best: SocketAddr = "203.0.113.1:41641".parse().unwrap();
+        let other: SocketAddr = "198.51.100.4:41641".parse().unwrap();
+        p.add_netmap_candidates([best]);
+        p.add_learned_candidates([other]);
+
+        let now = Instant::now();
+        p.note_ping_sent(tx(1), best, now);
+        p.note_pong(tx(1), best, now + Duration::from_millis(5));
+        let t = now + Duration::from_millis(6);
+        assert_eq!(
+            p.best_addr(t),
+            Some(best),
+            "precondition: `best` is confirmed"
+        );
+
+        p.invalidate_disco_path();
+
+        assert_eq!(
+            p.stored_best(),
+            Some(best),
+            "the best address is kept across a disco-key change (only its trust is dropped)"
+        );
+        let mut candidates = p.candidate_addrs();
+        candidates.sort();
+        let mut want = vec![best, other];
+        want.sort();
+        assert_eq!(
+            candidates, want,
+            "both control-advertised and learned candidates survive the rotation"
+        );
+
+        // One fresh pong under the new key re-confirms the same path: traffic returns to it after a
+        // single round trip rather than after a full TRUST_DURATION.
+        let reping = t + Duration::from_millis(1);
+        p.note_ping_sent(tx(2), best, reping);
+        assert_eq!(
+            p.note_pong(tx(2), best, reping + Duration::from_millis(5)),
+            Some(Duration::from_millis(5))
+        );
+        assert_eq!(
+            p.best_addr(reping + Duration::from_millis(6)),
+            Some(best),
+            "a pong under the new disco key restores the trusted direct path"
+        );
+    }
+
+    /// A pre-rotation latency must not be able to re-trust a path without a fresh pong for it: the
+    /// disco-key change clears every measurement, so a pong for a *slower* rival makes that rival
+    /// the best rather than promoting the remembered (and possibly dead) fast address.
+    #[test]
+    fn disco_key_change_forgets_pre_rotation_latencies() {
+        let mut p = PeerPaths::default();
+        let fast: SocketAddr = "203.0.113.1:41641".parse().unwrap();
+        let slow: SocketAddr = "198.51.100.4:41641".parse().unwrap();
+        p.add_netmap_candidates([fast, slow]);
+
+        let now = Instant::now();
+        p.note_ping_sent(tx(1), fast, now);
+        p.note_pong(tx(1), fast, now + Duration::from_millis(2));
+        assert_eq!(p.best_addr(now + Duration::from_millis(3)), Some(fast));
+
+        p.invalidate_disco_path();
+
+        // Only `slow` answers under the new key.
+        let t = now + Duration::from_millis(10);
+        p.note_ping_sent(tx(2), slow, t);
+        p.note_pong(tx(2), slow, t + Duration::from_millis(60));
+        assert_eq!(
+            p.best_addr(t + Duration::from_millis(61)),
+            Some(slow),
+            "only a path re-confirmed under the new key may be trusted, even if a stale \
+             measurement for another candidate was faster"
+        );
+    }
+
+    /// The rebind invalidation is the stricter sibling and must stay that way: a rebind changed the
+    /// *local* mapping, so the best address is stale as an address and is cleared outright, whereas
+    /// a disco-key change keeps it.
+    #[test]
+    fn rebind_clears_the_best_address_unlike_a_disco_key_change() {
+        let mut p = PeerPaths::default();
+        let addr: SocketAddr = "203.0.113.1:41641".parse().unwrap();
+        p.add_netmap_candidates([addr]);
+
+        let now = Instant::now();
+        p.note_ping_sent(tx(1), addr, now);
+        p.note_pong(tx(1), addr, now + Duration::from_millis(5));
+        assert_eq!(p.best_addr(now + Duration::from_millis(6)), Some(addr));
+
+        p.invalidate_best();
+
+        assert_eq!(
+            p.stored_best(),
+            None,
+            "a rebind drops the best address itself, not just its trust"
+        );
+        assert_eq!(
+            p.candidate_addrs(),
+            vec![addr],
+            "but the candidate set survives a rebind too"
         );
     }
 }
