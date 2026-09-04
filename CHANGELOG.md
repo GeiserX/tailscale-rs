@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.47.1](https://github.com/GeiserX/tailscale-rs/compare/v0.47.0...v0.47.1) (2026-09-04)
+
+
+### Bug Fixes
+
+* **dataplane:** refuse TSMP a host process writes into the tun ([#360](https://github.com/GeiserX/tailscale-rs/issues/360)) ([6b33e4a](https://github.com/GeiserX/tailscale-rs/commit/6b33e4a1c2b9c0fc9e377db7cfc6f4bdad4ded55))
+
 ## [0.47.0](https://github.com/GeiserX/tailscale-rs/compare/v0.46.1...v0.47.0) (2026-09-03)
 
 
