@@ -715,6 +715,7 @@ mod tests {
             peer_relay: false,
             ssh_host_keys: vec![],
             service_vips: Default::default(),
+            unsigned_peer_api_only: false,
             // Cross-stream coupling (S4): `Node` gains `key_signature: Vec<u8>`. Empty here so this
             // exhaustive literal compiles once S4's field lands.
             key_signature: vec![],
