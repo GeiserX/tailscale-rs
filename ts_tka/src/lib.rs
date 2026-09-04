@@ -1644,15 +1644,11 @@ impl Authority {
 // them until that boundary runs.
 // ===========================================================================================
 
-/// The starting number of AUMs to skip between ancestors in a [`SyncOffer`] (Go
-/// `ancestorsSkipStart`). The gap grows exponentially (`<< ancestorsSkipShift` each step).
-const ANCESTORS_SKIP_START: u64 = 4;
-/// How many bits to advance the ancestor skip count each step (Go `ancestorsSkipShift`): `4 << 2 =
-/// 16`, so after skipping 4 it skips 16, then 64…
-const ANCESTORS_SKIP_SHIFT: u64 = 2;
 /// Iteration cap for the backward head-intersection walk + offer ancestor walk (Go
-/// `maxSyncHeadIntersectionIter`, `tka/limits.go`).
-const MAX_SYNC_HEAD_INTERSECTION_ITER: u64 = 400;
+/// `maxSyncHeadIntersectionIter`, `tka/limits.go`). Raised from 400 alongside the switch from an
+/// exponentially-spaced ancestor sample to "offer every checkpoint": the walk now visits AUMs one
+/// at a time looking for checkpoints, so it needs more headroom to reach the oldest one.
+const MAX_SYNC_HEAD_INTERSECTION_ITER: u64 = 1000;
 /// Iteration cap for forward fast-forward / `computeStateAt` walks (Go `maxSyncIter` /
 /// `maxScanIterations`, `tka/limits.go`).
 const MAX_SYNC_ITER: usize = 2000;
@@ -1791,14 +1787,15 @@ impl AumStore for MemAumStore {
 }
 
 /// A node's view of where its chain is, offered to a peer so the peer can work out what to send (Go
-/// `tka.SyncOffer`): the current `head` plus a sparse, exponentially-spaced sample of `ancestors`
-/// back to the oldest AUM the node holds. The last entry is always the oldest-known AUM.
+/// `tka.SyncOffer`): the current `head` plus every **checkpoint** AUM the node holds between the
+/// head and the oldest AUM it holds. The last entry is always the oldest-known AUM.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncOffer {
     /// The node's current chain head.
     pub head: AumHash,
     /// A subset of the chain's ancestors, newest-first, ending with the oldest-known AUM. Used by a
-    /// peer to find a "tail intersection" when it doesn't recognise the head.
+    /// peer to find a "tail intersection" when it doesn't recognise the head. Every entry before the
+    /// last is a `Checkpoint` AUM (the head itself is included when it is one).
     pub ancestors: Vec<AumHash>,
 }
 
@@ -1844,10 +1841,23 @@ fn compute_state_at(
         path.insert(curs.hash());
 
         if curs.message_kind == AumKind::Checkpoint {
-            // A checkpoint encapsulates the state at that point: fold it into an empty state.
-            let mut s = ReplayState::default();
-            s.apply_verified_aum(&curs)?;
-            state = s;
+            // A checkpoint encapsulates the state at that point: take its embedded snapshot as the
+            // starting state, with the cursor set to the checkpoint itself (Go
+            // `curs.State.cloneForUpdate(&curs)`).
+            //
+            // Not `apply_verified_aum` into an empty state: that path is the *genesis* path and
+            // refuses an AUM that names a parent, so a mid-chain checkpoint — the normal kind —
+            // would come back `BadParent` and no state could be computed at it at all. Since
+            // `sync_offer` now offers checkpoints, every tail-intersection candidate lands here.
+            let snapshot = curs
+                .state
+                .as_ref()
+                .ok_or(TkaError::Decode("checkpoint AUM missing state"))?;
+            state = ReplayState {
+                keys: snapshot.keys.clone().unwrap_or_default(),
+                last_aum_hash: Some(curs.hash()),
+                state_id: Some((snapshot.state_id1, snapshot.state_id2)),
+            };
             started = true;
             break;
         }
@@ -1950,10 +1960,17 @@ fn fast_forward(
 
 impl Authority {
     /// Build the [`SyncOffer`] this authority would send a peer (Go `Authority.SyncOffer`): its
-    /// `head` plus an exponentially-spaced sample of ancestors back to `oldest`, ending with
-    /// `oldest`. `oldest` is the oldest AUM the caller holds (Go `a.oldestAncestor.Hash()`); our
-    /// verify-only [`Authority`] does not track it, so it is passed in — typically the genesis hash
-    /// of the chain the caller staged in `storage`.
+    /// `head` plus **every checkpoint** on the chain back to `oldest`, ending with `oldest`.
+    /// `oldest` is the oldest AUM the caller holds (Go `a.oldestAncestor.Hash()`); our verify-only
+    /// [`Authority`] does not track it, so it is passed in — typically the genesis hash of the chain
+    /// the caller staged in `storage`.
+    ///
+    /// Checkpoints, not a sample: a node compacts its chain (keep the last 24 AUMs, keep two weeks,
+    /// then back to the last checkpoint) and can end up holding only a few dozen AUMs. A sparse
+    /// sample of *positions* taken from a long chain can then be entirely disjoint from the window a
+    /// peer kept, leaving the peer unable to find a common ancestor and stuck re-polling with a
+    /// permanently stale view. Compaction is guaranteed to leave at least one checkpoint behind, so
+    /// offering the checkpoints is what makes an intersection findable.
     ///
     /// `storage` must contain the chain from `head` back to `oldest`; a gap simply truncates the
     /// ancestor list early (the walk breaks on the first missing parent, exactly like Go).
@@ -1966,19 +1983,18 @@ impl Authority {
             head: self.head,
             ancestors: Vec::with_capacity(6),
         };
-        let mut skip_amount = ANCESTORS_SKIP_START;
         let mut curs = self.head;
-        for i in 0..MAX_SYNC_HEAD_INTERSECTION_ITER {
-            if i > 0 && skip_amount != 0 && i % skip_amount == 0 {
-                out.ancestors.push(curs);
-                skip_amount <<= ANCESTORS_SKIP_SHIFT;
-            }
+        for _ in 0..MAX_SYNC_HEAD_INTERSECTION_ITER {
             let Some(parent) = storage.aum(&curs) else {
                 break; // os.ErrNotExist: stop, don't error
             };
             // We append `oldest` after the loop, so don't duplicate it.
             if parent.hash() == oldest {
                 break;
+            }
+            // Every checkpoint goes in the offer — including the head itself when it is one.
+            if parent.message_kind == AumKind::Checkpoint {
+                out.ancestors.push(curs);
             }
             match parent.prev_aum_hash {
                 Some(prev) => curs = prev,
@@ -5905,6 +5921,39 @@ mod tests {
         chain
     }
 
+    /// A `Checkpoint` child of `parent` snapshotting `keys` — the AUM kind `sync_offer` now offers.
+    /// The embedded state is a valid checkpoint state (one disablement value, a non-empty key set)
+    /// with the default all-zero StateID, so a chain may carry several of them.
+    fn checkpoint_child(parent: &Aum, keys: &[AumKey]) -> Aum {
+        let mut cp = child(parent, AumKind::Checkpoint, None, Vec::new());
+        cp.state = Some(AumState {
+            last_aum_hash: None,
+            disablement_values: Some(alloc::vec![alloc::vec![0xaa; DISABLEMENT_LENGTH]]),
+            keys: Some(keys.to_vec()),
+            state_id1: 0,
+            state_id2: 0,
+        });
+        cp
+    }
+
+    /// A linear chain of `len` AUMs: a genesis `AddKey(k1)`, then `NoOp`s, except that every
+    /// `checkpoint_every`-th index is a `Checkpoint` snapshotting `k1`. Long enough that the old
+    /// exponential ancestor sample and the checkpoint list are genuinely different sets.
+    fn checkpointed_chain(len: usize, checkpoint_every: usize) -> Vec<Aum> {
+        let k1 = test_aum_key(1, 1);
+        let mut chain = alloc::vec![genesis_add(k1.clone())];
+        for i in 1..len {
+            let parent = chain.last().unwrap();
+            let next = if i % checkpoint_every == 0 {
+                checkpoint_child(parent, core::slice::from_ref(&k1))
+            } else {
+                child(parent, AumKind::NoOp, None, Vec::new())
+            };
+            chain.push(next);
+        }
+        chain
+    }
+
     /// An [`Authority`] whose head is the last AUM of `chain` (via the structural `from_chain`; the
     /// sync layer is signature-agnostic, so unsigned test chains are fine here).
     fn authority_at_head(chain: &[Aum]) -> Authority {
@@ -6089,21 +6138,129 @@ mod tests {
     }
 
     #[test]
-    fn sync_offer_ancestors_are_exponentially_spaced() {
-        // With a long chain the ancestor sampling thins out (skip 4, then 16, ...), so the count is
-        // far below the chain length — the whole point of the offer.
-        let chain = linear_chain(60);
+    fn compute_state_at_starts_from_a_mid_chain_checkpoint() {
+        // A checkpoint that is not the genesis is the normal kind, and it is what `sync_offer` now
+        // offers, so every tail-intersection candidate is computed from one. The state computed at
+        // (and after) such a checkpoint must equal a full replay of the prefix — and, unlike a
+        // genesis fold, must not be refused for naming a parent.
+        let chain = checkpointed_chain(24, 8); // checkpoints at 8 and 16
+        assert_eq!(chain[8].message_kind, AumKind::Checkpoint);
+        let store = MemAumStore::from_aums(chain.clone());
+        for i in [8usize, 9, 16, 23] {
+            let via_store = compute_state_at(&store, MAX_SYNC_ITER, chain[i].hash())
+                .expect("compute_state_at ok")
+                .expect("hash present");
+            let via_replay = Authority::from_chain(&chain[0..=i]).expect("prefix replays");
+            assert_eq!(
+                via_store.to_state(),
+                *via_replay.state(),
+                "computed state at chain[{i}] must match a direct prefix replay"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_offer_ancestors_are_every_checkpoint() {
+        // The offer carries every Checkpoint between head and oldest, newest-first, and nothing
+        // else; `oldest` is still the bookend. Checkpoints at 10, 25 and 40 of a 60-AUM chain.
+        let k1 = test_aum_key(1, 1);
+        let mut chain = alloc::vec![genesis_add(k1.clone())];
+        let checkpoints = [10usize, 25, 40];
+        for i in 1..60 {
+            let parent = chain.last().unwrap();
+            let next = if checkpoints.contains(&i) {
+                checkpoint_child(parent, core::slice::from_ref(&k1))
+            } else {
+                child(parent, AumKind::NoOp, None, Vec::new())
+            };
+            chain.push(next);
+        }
         let store = MemAumStore::from_aums(chain.clone());
         let auth = authority_at_head(&chain);
+
         let offer = auth.sync_offer(&store, chain[0].hash()).expect("offer");
-        assert!(
-            offer.ancestors.len() < 12,
-            "exponential spacing keeps the ancestor list small (got {})",
-            offer.ancestors.len()
+        assert_eq!(
+            offer.ancestors,
+            alloc::vec![
+                chain[40].hash(),
+                chain[25].hash(),
+                chain[10].hash(),
+                chain[0].hash(),
+            ],
+            "every checkpoint, newest-first, then the oldest bookend — and no NoOp ancestors"
         );
-        // First sampled ancestor is 4 back from head (i=4 is the first i%4==0 with i>0): chain[56].
-        assert_eq!(offer.ancestors[0], chain[60 - 1 - 4].hash());
-        assert_eq!(*offer.ancestors.last().unwrap(), chain[0].hash());
+
+        // The head itself is offered when the head is a checkpoint (the walk starts at i=0, unlike
+        // the sample it replaces, which never offered the head).
+        let head_is_checkpoint = authority_at_head(&chain[0..=40]);
+        let offer = head_is_checkpoint
+            .sync_offer(&store, chain[0].hash())
+            .expect("offer");
+        assert_eq!(offer.head, chain[40].hash());
+        assert_eq!(
+            offer.ancestors[0],
+            chain[40].hash(),
+            "head checkpoint offered"
+        );
+    }
+
+    #[test]
+    fn missing_aums_intersects_a_chain_compacted_back_to_one_checkpoint() {
+        // The failure this change exists for. A node compacts down to its last checkpoint plus the
+        // AUMs after it, so its storage is a small window in the middle of a long chain. The remote
+        // is far ahead. An offer built from position-sampled ancestors (4, 16, 64, ... AUMs back
+        // from the remote's head) can be wholly outside that window, and then the node finds no
+        // common ancestor at all and re-polls forever with a stale view. Offering checkpoints fixes
+        // it because compaction is guaranteed to leave a checkpoint behind.
+        let chain = checkpointed_chain(100, 10); // checkpoints at 10, 20, ... 90
+
+        // The remote holds everything and is at chain[99].
+        let remote_store = MemAumStore::from_aums(chain.clone());
+        let remote = authority_at_head(&chain);
+        let remote_offer = remote
+            .sync_offer(&remote_store, chain[0].hash())
+            .expect("remote offer");
+
+        // We forked at the checkpoint chain[80] with one AUM the remote has never seen, and have
+        // since compacted: storage holds that checkpoint and nothing older.
+        let ours = child(
+            &chain[80],
+            AumKind::AddKey,
+            Some(test_aum_key(7, 1)),
+            Vec::new(),
+        );
+        let mut full: Vec<Aum> = chain[0..=80].to_vec();
+        full.push(ours.clone());
+        let us = authority_at_head(&full);
+        let store = MemAumStore::from_aums(alloc::vec![chain[80].clone(), ours.clone()]);
+        let oldest = chain[80].hash();
+
+        // The remote's head and its recent ancestors are not in our window at all...
+        assert!(
+            store.aum(&remote_offer.head).is_none(),
+            "remote head unknown"
+        );
+        for far in [95usize, 83, 35, 0] {
+            assert!(
+                store.aum(&chain[far].hash()).is_none(),
+                "chain[{far}] — a position an exponential sample would offer — is compacted away"
+            );
+        }
+        // ...but the checkpoint we kept is in the remote's offer, which is the whole point.
+        assert!(
+            remote_offer.ancestors.contains(&oldest),
+            "the remote offers the checkpoint we compacted back to"
+        );
+
+        // So the intersection is findable, and we send the remote exactly the AUM it lacks.
+        let missing = us
+            .missing_aums(&store, &remote_offer, oldest)
+            .expect("a compacted chain still intersects a far-ahead remote offer");
+        assert_eq!(
+            missing.iter().map(Aum::hash).collect::<Vec<_>>(),
+            alloc::vec![ours.hash()],
+            "gather starts at the checkpoint intersection and excludes it"
+        );
     }
 
     #[test]
