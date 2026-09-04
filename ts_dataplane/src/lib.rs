@@ -66,6 +66,10 @@ struct Ipv4Fragment {
 /// `unknown`, never fewer. Keep the single constant for both, exactly as Go does.
 const MIN_FRAG_BLKS: u16 = (60 + 20) / 8;
 
+/// Minimum IPv4 base header length (Go `net/packet.ip4HeaderLength`). A buffer shorter than this
+/// is not a decodable IPv4 packet at all (Go `decode4` returns `unknown`).
+const IP4_HEADER_LEN: usize = 20;
+
 /// Fixed IPv6 base header length (Go `net/packet.ip6HeaderLength`).
 const IP6_HEADER_LEN: usize = 40;
 
@@ -632,6 +636,81 @@ fn self_ip_matching_family(
         .find(|addr| addr.is_ipv4() == want.is_ipv4())
 }
 
+/// The `tstun_out_to_wg_drop_tsmp` counter (Go `metricPacketOutDropTSMP`), registered into the
+/// process-global registry on first use and exported by `ts_metrics::write_prometheus`. This is the
+/// durable signal for [`outbound_packet_carries_tsmp`] firing: the datapath log below it is
+/// `debug!`, because a local process can write these as fast as it likes and this tree has no
+/// rate-limited logger to put behind Go's `limitedLogf`.
+fn metric_out_to_wg_drop_tsmp() -> &'static ts_metrics::Metric {
+    static M: std::sync::OnceLock<&'static ts_metrics::Metric> = std::sync::OnceLock::new();
+    M.get_or_init(|| ts_metrics::Metric::new_counter("tstun_out_to_wg_drop_tsmp"))
+}
+
+/// Whether the IP packet `b`, written into the TUN by a local host process, carries TSMP and must
+/// therefore be dropped before it reaches WireGuard.
+///
+/// Go `tstun.filterPacketOutboundToWireGuard`: "TSMP traffic should only originate from tailscaled,
+/// not from the host itself." TSMP is the inter-node control channel — capability version 144's
+/// disco-key advertisement rides it — so a TSMP packet the host writes is either a confused
+/// networking stack or a local process forging a control message in this node's name. A peer cannot
+/// tell a forged advertisement from one this node meant to send: both arrive inside this node's
+/// WireGuard session, from this node's tailnet address. It would bind whatever disco key the forger
+/// chose.
+///
+/// The advertisements this node legitimately sends never pass through here. They are built in
+/// [`DiscoAdvertisementState::advertisement_for`] and injected straight into the WireGuard session
+/// by [`DataPlane::process_inbound`] (the priority-message path), which is *below* this check —
+/// the same relationship Go has, where `injectedRead` bypasses the outbound filter entirely.
+///
+/// # Where this is a superset of Go's classification, and why
+///
+/// Go tests the decoded `p.IPProto`, so a *malformed* proto-99 packet decodes to `ipproto.Unknown`
+/// rather than TSMP and slips past this particular check — only to be dropped one step later by the
+/// outbound ACL, whose `pre()` refuses `ipproto.Unknown` outright. This tree has no outbound ACL at
+/// all, so there is no second refusal to fall through to; testing the header's protocol byte
+/// reaches Go's *net* verdict (nothing carrying proto 99 leaves the host) in one step instead of
+/// two. Concretely, three shapes are dropped here that Go's TSMP arm alone would not:
+///
+/// - an IPv4 TSMP packet that is fragmented, truncated, or shorter than `minTSMPSize`;
+/// - an IPv6 packet whose Fragment extension header names TSMP but whose first fragment is too
+///   short to hold a TSMP body;
+/// - a *later* IPv6 fragment of a TSMP datagram (Go classifies it `ipproto.Fragment` and does put
+///   it on the wire). This is the one shape Go sends and we do not, and it is unreachable in
+///   practice: its head fragment is dropped by Go and by us alike, so no peer could ever reassemble
+///   the datagram, and nothing in a Tailscale node ever emits a fragmented TSMP message in the
+///   first place. No real peer can be relying on one arriving.
+///
+/// A Fragment header reached through a *chained* extension header (hop-by-hop, routing, destination
+/// options) is deliberately not chased: Go's `decode6` only steps over a Fragment header that is the
+/// base header's immediate Next Header, so such a packet decodes to `ipproto.Unknown` at every
+/// Tailscale receiver — including [`ts_packet::tsmp::DiscoKeyAdvertisement::parse`] here — and is
+/// discarded rather than read as a control message. It is not a forgery vector.
+fn outbound_packet_carries_tsmp(b: &[u8]) -> bool {
+    match b.first().map(|first| first >> 4) {
+        // Go `decode4`: `q.IPProto = ipproto.Proto(b[9])`.
+        Some(4) => b.len() >= IP4_HEADER_LEN && b[9] == ts_packet::tsmp::IP_PROTO_TSMP,
+        Some(6) => {
+            if b.len() < IP6_HEADER_LEN {
+                return false;
+            }
+            // Go `decode6`: `q.IPProto = ipproto.Proto(b[6])`, then step over a leading Fragment
+            // extension header and take its Next Header instead. Every fragment of one datagram
+            // repeats that Next Header, so this catches the head fragment (which is what Go's TSMP
+            // arm catches) and its followers alike.
+            match b[6] {
+                ts_packet::tsmp::IP_PROTO_TSMP => true,
+                IP6_FRAG_HEADER => b
+                    .get(IP6_HEADER_LEN)
+                    .is_some_and(|next| *next == ts_packet::tsmp::IP_PROTO_TSMP),
+                _ => false,
+            }
+        }
+        // Not an IP packet at all: `or_out.route` drops it a moment later for want of a
+        // destination address. Nothing to classify.
+        _ => false,
+    }
+}
+
 /// A data plane subsystem that can be the subject of timer events.
 pub enum Subsystem {
     /// The wireguard component.
@@ -724,13 +803,30 @@ impl DataPlane {
     }
 
     /// Processes packets originating from the local device.
+    ///
+    /// Packets carrying TSMP are refused here (Go `tstun.filterPacketOutboundToWireGuard`): the
+    /// inter-node control channel must only ever carry messages this node built, never bytes a host
+    /// process handed us. See `outbound_packet_carries_tsmp` for why, and for the one shape Go
+    /// forwards that this refuses.
     #[tracing::instrument(skip_all, fields(n_packets = packets.len()))]
-    pub fn process_outbound(&mut self, packets: Vec<PacketMut>) -> OutboundResult {
+    pub fn process_outbound(&mut self, mut packets: Vec<PacketMut>) -> OutboundResult {
+        // The capture tee runs first, and so still sees the packets dropped just below — Go tees to
+        // its capture hook in `Wrapper.Read` before calling the outbound filter, so a pcap taken on
+        // either implementation shows the refused packet.
         if let Some(hook) = &self.capture {
             for p in &packets {
                 hook(CapturePath::FromLocal, p.as_ref());
             }
         }
+
+        packets.retain(|p| {
+            if outbound_packet_carries_tsmp(p.as_ref()) {
+                tracing::debug!("[unexpected] TSMP packet written into the tun; dropping");
+                metric_out_to_wg_drop_tsmp().inc();
+                return false;
+            }
+            true
+        });
 
         let or::outbound::Result {
             to_wireguard,
@@ -2215,5 +2311,274 @@ mod tests {
         assert_eq!(captured.len(), 1, "hook must fire exactly once per packet");
         assert_eq!(captured[0].0, CapturePath::FromLocal);
         assert_eq!(captured[0].1, payload);
+    }
+
+    /// A minimal IPv4/UDP datagram from `src` to `dst`. The control for the outbound TSMP refusal:
+    /// same source, same destination, same batch as the forged advertisement — only the protocol
+    /// byte differs.
+    fn v4_udp_packet(src: std::net::IpAddr, dst: std::net::IpAddr, payload: &[u8]) -> Vec<u8> {
+        let (std::net::IpAddr::V4(src), std::net::IpAddr::V4(dst)) = (src, dst) else {
+            panic!("v4_udp_packet needs two IPv4 addresses");
+        };
+        let total_len = u16::try_from(IP4_HEADER_LEN + 8 + payload.len()).unwrap();
+        let mut buf = vec![0u8; usize::from(total_len)];
+        buf[0] = 0x45; // version 4, IHL 5 (no options)
+        buf[2..4].copy_from_slice(&total_len.to_be_bytes());
+        buf[8] = 64; // TTL
+        buf[9] = 17; // UDP
+        buf[12..16].copy_from_slice(&src.octets());
+        buf[16..20].copy_from_slice(&dst.octets());
+        buf[20..22].copy_from_slice(&4242u16.to_be_bytes()); // source port
+        buf[22..24].copy_from_slice(&4343u16.to_be_bytes()); // destination port
+        let udp_len = u16::try_from(8 + payload.len()).unwrap();
+        buf[24..26].copy_from_slice(&udp_len.to_be_bytes());
+        // UDP checksum left 0 ("not computed"), which is legal for IPv4.
+        buf[IP4_HEADER_LEN + 8..].copy_from_slice(payload);
+        buf
+    }
+
+    /// What `process_outbound` refuses, mirroring the `p.IPProto == ipproto.TSMP` arm of Go
+    /// `tstun.filterPacketOutboundToWireGuard` — plus the three shapes this tree drops that Go's
+    /// TSMP arm alone does not, because there is no outbound ACL behind it here to refuse them as
+    /// `ipproto.Unknown`. See [`outbound_packet_carries_tsmp`].
+    #[test]
+    fn outbound_tsmp_classification_matches_go_decode() {
+        let v4_src = std::net::IpAddr::from([100, 64, 0, 1]);
+        let v4_dst = std::net::IpAddr::from([100, 64, 0, 2]);
+        let v4 = ts_packet::tsmp::DiscoKeyAdvertisement {
+            src: v4_src,
+            dst: v4_dst,
+            key: SELF_DISCO_KEY,
+        }
+        .marshal()
+        .expect("a v4 advertisement between two v4 addresses marshals");
+        let v6 = ts_packet::tsmp::DiscoKeyAdvertisement {
+            src: std::net::IpAddr::V6(IPV6_FIXTURE_SRC),
+            dst: std::net::IpAddr::V6(IPV6_FIXTURE_DST),
+            key: SELF_DISCO_KEY,
+        }
+        .marshal()
+        .expect("a v6 advertisement between two v6 addresses marshals");
+
+        // The forgery this exists to stop, in both families: bytes byte-identical to what this node
+        // would itself emit, handed to us by the host instead.
+        assert!(
+            outbound_packet_carries_tsmp(&v4),
+            "an IPv4 TSMP packet from the host is refused"
+        );
+        assert!(
+            outbound_packet_carries_tsmp(&v6),
+            "an IPv6 TSMP packet from the host is refused"
+        );
+
+        // Ordinary traffic is untouched — the refusal is protocol-specific, not a blanket drop.
+        assert!(
+            !outbound_packet_carries_tsmp(&v4_udp_packet(v4_src, v4_dst, b"hello")),
+            "IPv4 UDP passes"
+        );
+        assert!(
+            !outbound_packet_carries_tsmp(&ipv6_udp_packet(&udp_header(53))),
+            "IPv6 UDP passes"
+        );
+
+        // Go demotes a *fragmented* IPv4 TSMP packet to `ipproto.Unknown`, which its outbound ACL
+        // then drops for "unknown proto". With no outbound ACL here the protocol byte is the whole
+        // verdict, so the refusal happens one step earlier and the packet still never ships.
+        let mut fragmented = v4.clone();
+        fragmented[6] = 0x20; // More Fragments
+        assert!(
+            outbound_packet_carries_tsmp(&fragmented),
+            "a fragmented IPv4 TSMP packet is refused too"
+        );
+
+        // An IPv6 Fragment extension header naming TSMP: Go classifies the head fragment TSMP and
+        // its followers `ipproto.Fragment`. Both are refused here — every fragment of one datagram
+        // repeats the same Next Header, and with the head refused no peer could reassemble anyway.
+        assert!(
+            outbound_packet_carries_tsmp(&ipv6_fragment_packet(
+                ts_packet::tsmp::IP_PROTO_TSMP,
+                0,
+                true,
+                &[b'a'; 33],
+            )),
+            "the head fragment of an IPv6 TSMP datagram is refused"
+        );
+        assert!(
+            outbound_packet_carries_tsmp(&ipv6_fragment_packet(
+                ts_packet::tsmp::IP_PROTO_TSMP,
+                MIN_FRAG_BLKS,
+                false,
+                &[0u8; 8],
+            )),
+            "so are its later fragments"
+        );
+        assert!(
+            !outbound_packet_carries_tsmp(&ipv6_fragment_packet(17, 0, true, &udp_header(53))),
+            "a fragmented IPv6 UDP datagram is not TSMP and still passes"
+        );
+
+        // Nothing to classify: not IP at all, or truncated before the protocol byte can be trusted.
+        assert!(
+            !outbound_packet_carries_tsmp(&[]),
+            "the empty buffer passes"
+        );
+        assert!(
+            !outbound_packet_carries_tsmp(&[0xde, 0xad, 0xbe, 0xef]),
+            "a non-IP buffer passes (the router drops it for want of a destination)"
+        );
+        assert!(
+            !outbound_packet_carries_tsmp(&v4[..IP4_HEADER_LEN - 1]),
+            "an IPv4 packet cut off inside its header passes"
+        );
+        assert!(
+            !outbound_packet_carries_tsmp(&v6[..IP6_HEADER_LEN - 1]),
+            "an IPv6 packet cut off inside its header passes"
+        );
+    }
+
+    /// The whole point of the outbound TSMP refusal, end to end, together with the negative case
+    /// that keeps it from silently disabling capability version 144.
+    ///
+    /// A local process writes a well-formed disco-key advertisement — naming a disco key of its own
+    /// choosing, addressed to a peer whose route really does resolve to a live WireGuard session —
+    /// into the tun. The peer must never see it: it arrives inside this node's session from this
+    /// node's tailnet address, so it is indistinguishable from one this node meant to send, and the
+    /// peer would bind the forger's key for us. Ordinary traffic in the same batch to the same
+    /// destination must be untouched.
+    ///
+    /// And the advertisement this node itself sends must still go out. It is built by
+    /// `DiscoAdvertisementState::advertisement_for` and injected by `process_inbound` on session
+    /// establishment, *below* the refusal — Go has the same relationship, where `injectedRead`
+    /// bypasses the outbound filter. Without this half of the test a drop placed one layer too low
+    /// would look green.
+    #[test]
+    fn host_written_tsmp_is_dropped_while_our_own_advertisement_still_goes_out() {
+        let underlay: UnderlayTransportId = 0.into();
+        let wg_peer = ts_tunnel::PeerId(1);
+        let peer = PeerId(1);
+        let a_addr = std::net::IpAddr::from([100, 64, 0, 1]);
+        let b_addr = std::net::IpAddr::from([100, 64, 0, 2]);
+
+        let (a_static, b_static) = (NodeKeyPair::new(), NodeKeyPair::new());
+        let (mut a, mut b) = (
+            DataPlane::new(a_static.clone()),
+            DataPlane::new(b_static.clone()),
+        );
+
+        for (dp, key) in [(&mut a, b_static.public), (&mut b, a_static.public)] {
+            dp.wireguard.upsert_peer(
+                wg_peer,
+                ts_tunnel::PeerConfig {
+                    key,
+                    psk: [0u8; 32].into(),
+                    persistent_keepalive_interval: None,
+                },
+            );
+            dp.ur_out.table.insert(peer, underlay);
+        }
+
+        a.disco_advertisement = Some(Arc::new(advertisement_state(
+            peer,
+            AdvertisementTarget {
+                node_addr: b_addr,
+                wireguard_only: false,
+            },
+        )));
+
+        // A routes B's tailnet address to the wireguard peer, so a host-written packet addressed to
+        // B really would be encrypted and shipped were it not refused. Without this the test would
+        // pass on an empty routing table and prove nothing.
+        let mut routes = ts_bart::Table::default();
+        routes.insert(
+            ipnet::IpNet::from(b_addr),
+            or::outbound::RouteAction::Wireguard(peer),
+        );
+        a.or_out.swap(routes);
+
+        // B attributes A's tailnet address to the wireguard peer that carries it, as the runtime's
+        // source filter does.
+        let mut src_filter = ts_bart::Table::default();
+        src_filter.insert(ipnet::IpNet::from(a_addr), peer);
+        b.src_filter_in = Arc::new(src_filter);
+
+        // Everything B decrypts, in arrival order, before any filtering runs.
+        let recorded: CaptureLog = Arc::new(Mutex::new(Vec::new()));
+        let sink = recorded.clone();
+        b.capture = Some(Arc::new(move |path: CapturePath, bytes: &[u8]| {
+            sink.lock().unwrap().push((path, bytes.to_vec()));
+        }));
+
+        let take = |out: HashMap<(UnderlayTransportId, PeerId), Vec<PacketMut>>| {
+            out.into_values().flatten().collect::<Vec<_>>()
+        };
+
+        // Establish the session. A's own advertisement rides the establishment.
+        let init = a
+            .wireguard
+            .send([(wg_peer, vec![PacketMut::from(&b"hello"[..])])])
+            .to_peers
+            .remove(&wg_peer)
+            .expect("handshake initiation");
+        let resp = take(b.process_inbound(init).to_peers);
+        let from_a = take(a.process_inbound(resp).to_peers);
+        let learned = b.process_inbound(from_a).learned_disco_keys;
+        assert_eq!(
+            learned
+                .iter()
+                .map(|(peer, advert)| (*peer, advert.key))
+                .collect::<Vec<_>>(),
+            vec![(peer, SELF_DISCO_KEY)],
+            "our own advertisement must still reach the peer: it is injected below process_outbound"
+        );
+
+        // Now the forgery, alongside ordinary traffic to the same destination in the same batch.
+        const FORGED_KEY: [u8; 32] = [0xff; 32];
+        let forged = ts_packet::tsmp::DiscoKeyAdvertisement {
+            src: a_addr,
+            dst: b_addr,
+            key: FORGED_KEY,
+        }
+        .marshal()
+        .expect("a v4 advertisement between two v4 addresses marshals");
+        const CARRIED: &[u8] = b"ordinary traffic in the same batch";
+        let control = v4_udp_packet(a_addr, b_addr, CARRIED);
+
+        // This is the only test that increments this counter, so the delta is exact.
+        let counted_before = metric_out_to_wg_drop_tsmp().value();
+        let out = a.process_outbound(vec![
+            PacketMut::from(&forged[..]),
+            PacketMut::from(&control[..]),
+        ]);
+
+        let mark = recorded.lock().unwrap().len();
+        let inbound = b.process_inbound(take(out.to_peers));
+        assert!(
+            inbound.learned_disco_keys.is_empty(),
+            "the forged advertisement must never reach the peer, or it binds the forger's key for us"
+        );
+
+        let captured = recorded.lock().unwrap();
+        let delivered = captured[mark..]
+            .iter()
+            .filter(|(path, _)| *path == CapturePath::FromPeer)
+            .map(|(_, bytes)| bytes.as_slice())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            delivered.len(),
+            1,
+            "exactly the one non-TSMP packet of the batch crosses the tunnel"
+        );
+        // The send path zero-pads each payload up to a 16-byte boundary and the receiver delivers it
+        // with that padding intact (see `session::PADDING_MULTIPLE`), so compare on the leading bytes.
+        assert!(
+            delivered[0].starts_with(&control),
+            "and it is the ordinary traffic, unaltered"
+        );
+
+        assert_eq!(
+            metric_out_to_wg_drop_tsmp().value(),
+            counted_before + 1,
+            "the drop is counted in tstun_out_to_wg_drop_tsmp (Go metricPacketOutDropTSMP)"
+        );
     }
 }

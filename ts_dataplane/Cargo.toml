@@ -27,6 +27,7 @@ ts_transport.workspace = true
 ts_underlay_router.workspace = true
 ts_tunnel.workspace = true
 ts_bart.workspace = true
+ts_metrics.workspace = true
 
 # Unconditionally required dependencies.
 etherparse = "0.19"
