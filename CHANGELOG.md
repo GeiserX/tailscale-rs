@@ -2,6 +2,14 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.47.2](https://github.com/GeiserX/tailscale-rs/compare/v0.47.1...v0.47.2) (2026-09-04)
+
+
+### Bug Fixes
+
+* **ssh:** a refused session must still report exit 254 ([#362](https://github.com/GeiserX/tailscale-rs/issues/362)) ([9ac47fa](https://github.com/GeiserX/tailscale-rs/commit/9ac47faaedce7e114c1f6522ee1cc3e139ba8646))
+* **tka:** offer checkpoints in a sync offer so compacted nodes resync ([#363](https://github.com/GeiserX/tailscale-rs/issues/363)) ([03154c2](https://github.com/GeiserX/tailscale-rs/commit/03154c2016b68e0179a924a1b03ce06b7b85d8a6))
+
 ## [0.47.1](https://github.com/GeiserX/tailscale-rs/compare/v0.47.0...v0.47.1) (2026-09-04)
 
 
