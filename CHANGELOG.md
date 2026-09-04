@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.47.3](https://github.com/GeiserX/tailscale-rs/compare/v0.47.2...v0.47.3) (2026-09-04)
+
+
+### Bug Fixes
+
+* **control:** deny an UnsignedPeerAPIOnly peer network access via routes ([#365](https://github.com/GeiserX/tailscale-rs/issues/365)) ([fb38e79](https://github.com/GeiserX/tailscale-rs/commit/fb38e79d0f2cb845c1148baae1d7322e70144408))
+
 ## [0.47.2](https://github.com/GeiserX/tailscale-rs/compare/v0.47.1...v0.47.2) (2026-09-04)
 
 
