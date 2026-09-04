@@ -2024,6 +2024,7 @@ version = "0.47.0"
 dependencies = [
  "etherparse",
  "geiserx_ts_bart",
+ "geiserx_ts_metrics",
  "geiserx_ts_overlay_router",
  "geiserx_ts_packet",
  "geiserx_ts_packetfilter",
