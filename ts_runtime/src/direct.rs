@@ -979,6 +979,54 @@ impl kameo::Actor for DirectManager {
     }
 }
 
+/// A peer whose *active* disco key changed between two consecutive peer-db snapshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiscoKeyRotation {
+    node_key: NodePublicKey,
+    previous: DiscoPublicKey,
+    current: DiscoPublicKey,
+}
+
+/// The peers whose active disco key changed from `previous` to `current`.
+///
+/// The active key is decided in `peer_tracker` — control's netmap key, a TSMP-advertised one, or
+/// whichever of the two `EndpointDisco` holds active — and reaches this actor only as the resolved
+/// `Node::disco_key` on the published snapshot. Diffing two consecutive snapshots therefore catches
+/// every transition, whatever decided it, without a second channel that each new decision site would
+/// have to remember to use. Snapshots arrive in order through this actor's mailbox, so the previous
+/// one is exactly the state the magicsock was last reconciled against.
+///
+/// Only a genuine rotation is reported — a peer that had a key and now has a *different* one:
+///
+/// - Nodes are matched by **node key**, mirroring Go's peer map. A peer that rotated its node key is
+///   a new endpoint upstream, and gets no path state carried over here either.
+/// - Acquiring a first disco key (`None` -> `Some`) is not a rotation: there is no path state
+///   established under an earlier key, and any state that does exist under the new key was
+///   confirmed under that key by an inbound ping, so invalidating it would drop a good path.
+/// - Losing a key (`Some` -> `None`) is not one either: with no active key the peer has no path
+///   state to carry, and `MagicSock::retain_peers` drops the old entry on this same update.
+fn disco_key_rotations(previous: Option<&PeerDb>, current: &PeerDb) -> Vec<DiscoKeyRotation> {
+    let Some(previous) = previous else {
+        // First snapshot: nothing was reconciled before it, so nothing can have rotated.
+        return Vec::new();
+    };
+
+    current
+        .peers()
+        .values()
+        .filter_map(|node| {
+            let current_key = node.disco_key?;
+            let (_, was) = previous.get(&node.node_key)?;
+            let previous_key = was.disco_key?;
+            (previous_key != current_key).then_some(DiscoKeyRotation {
+                node_key: node.node_key,
+                previous: previous_key,
+                current: current_key,
+            })
+        })
+        .collect()
+}
+
 impl Message<Arc<PeerState>> for DirectManager {
     type Reply = ();
 
@@ -993,6 +1041,26 @@ impl Message<Arc<PeerState>> for DirectManager {
         // any other consumers and so the manager recovers no worse than the route-updater's
         // DERP-only path.
         if let Some(sock) = self.sock.as_ref() {
+            // A peer whose active disco key changed keeps its path state, minus the trust window —
+            // Go `endpoint.changedActiveDiscoLocked`. This must run BEFORE the reconcile and prune
+            // below: those are keyed by the peer's *current* disco key, so the old key's entry would
+            // otherwise be deleted whole by `retain_peers` and the peer would have to rediscover
+            // every endpoint from scratch. See `disco_key_rotations` for why the previous snapshot
+            // is the signal.
+            let rotations = {
+                let previous = poisoned_read(&self.peer_db);
+                disco_key_rotations(previous.as_deref(), &msg.peers)
+            };
+            for rotation in rotations {
+                tracing::info!(
+                    node_key = %rotation.node_key,
+                    previous = %rotation.previous,
+                    current = %rotation.current,
+                    "peer disco key changed; invalidating its trusted direct path",
+                );
+                sock.changed_active_disco(&rotation.previous, &rotation.current);
+            }
+
             let mut live = HashSet::new();
             for node in msg.peers.peers().values() {
                 let Some(disco) = node.disco_key else {
@@ -1742,6 +1810,111 @@ mod tests {
             seen.len() > 100,
             "expected jittered delays, got only {} distinct value(s)",
             seen.len()
+        );
+    }
+
+    /// Build a peer db from nodes.
+    fn db_of(nodes: impl IntoIterator<Item = Node>) -> PeerDb {
+        let mut db = PeerDb::default();
+        for node in nodes {
+            db.upsert(&node);
+        }
+        db
+    }
+
+    /// The signal the disco-path invalidation hangs off: a peer that kept its node key but is now
+    /// published under a different disco key has rotated, and its trusted direct path is no longer
+    /// backed by anything the peer signs today.
+    #[test]
+    fn disco_key_rotation_is_detected_across_snapshots() {
+        let node_key = NodePrivateKey::random().public_key();
+        let old = DiscoPrivateKey::random().public_key();
+        let new = DiscoPrivateKey::random().public_key();
+
+        let before = db_of([node_with_keys(old, node_key, "n1")]);
+        let after = db_of([node_with_keys(new, node_key, "n1")]);
+
+        assert_eq!(
+            disco_key_rotations(Some(&before), &after),
+            vec![DiscoKeyRotation {
+                node_key,
+                previous: old,
+                current: new,
+            }],
+        );
+
+        // Republishing the same snapshot is not a rotation — the reconcile below it runs on every
+        // peer state update, so a false positive would drop a healthy path's trust every time.
+        assert!(disco_key_rotations(Some(&after), &after).is_empty());
+    }
+
+    /// The three non-rotations, each of which would cost a working path if it were treated as one:
+    /// a peer that has no previous snapshot, one acquiring its first disco key, and one that rotated
+    /// its NODE key (a fresh endpoint upstream, with no path state to carry across).
+    #[test]
+    fn disco_key_rotations_ignores_non_rotations() {
+        let node_key = NodePrivateKey::random().public_key();
+        let disco = DiscoPrivateKey::random().public_key();
+        let with_key = node_with_keys(disco, node_key, "n1");
+        let without_key = Node {
+            disco_key: None,
+            ..with_key.clone()
+        };
+
+        assert!(
+            disco_key_rotations(None, &db_of([with_key.clone()])).is_empty(),
+            "the first snapshot has nothing to diff against"
+        );
+        assert!(
+            disco_key_rotations(
+                Some(&db_of([without_key.clone()])),
+                &db_of([with_key.clone()])
+            )
+            .is_empty(),
+            "acquiring a first disco key is not a rotation"
+        );
+        assert!(
+            disco_key_rotations(Some(&db_of([with_key.clone()])), &db_of([without_key])).is_empty(),
+            "losing the disco key leaves nothing to carry over"
+        );
+
+        let rekeyed = Node {
+            node_key: NodePrivateKey::random().public_key(),
+            disco_key: Some(DiscoPrivateKey::random().public_key()),
+            ..with_key.clone()
+        };
+        assert!(
+            disco_key_rotations(Some(&db_of([with_key])), &db_of([rekeyed])).is_empty(),
+            "a node-key rotation is a new endpoint, not a disco-key change on the old one"
+        );
+    }
+
+    /// Only the peer that rotated is reported: an unrelated peer's confirmed path must not lose its
+    /// trust because someone else changed keys.
+    #[test]
+    fn disco_key_rotations_reports_only_the_peer_that_rotated() {
+        let rotator = NodePrivateKey::random().public_key();
+        let steady = NodePrivateKey::random().public_key();
+        let old = DiscoPrivateKey::random().public_key();
+        let new = DiscoPrivateKey::random().public_key();
+        let steady_disco = DiscoPrivateKey::random().public_key();
+
+        let before = db_of([
+            node_with_keys(old, rotator, "n1"),
+            node_with_keys(steady_disco, steady, "n2"),
+        ]);
+        let after = db_of([
+            node_with_keys(new, rotator, "n1"),
+            node_with_keys(steady_disco, steady, "n2"),
+        ]);
+
+        assert_eq!(
+            disco_key_rotations(Some(&before), &after),
+            vec![DiscoKeyRotation {
+                node_key: rotator,
+                previous: old,
+                current: new,
+            }],
         );
     }
 }

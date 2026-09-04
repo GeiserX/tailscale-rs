@@ -745,6 +745,66 @@ impl MagicSock {
         }
     }
 
+    /// Move a peer's path state onto its new disco key and invalidate the trusted direct path —
+    /// Go magicsock `endpoint.changedActiveDiscoLocked` (`wgengine/magicsock/endpoint.go`), reached
+    /// from every disco-key transition upstream funnels through it.
+    ///
+    /// Go keys its peer map by *node* key and hangs the two disco keys off the endpoint, so a
+    /// rotation leaves the endpoint — and its path state — in place. Here the path map is keyed by
+    /// the peer's active disco key, so the same rotation would otherwise strand the state under the
+    /// old key for [`retain_peers`](Self::retain_peers) to delete, losing the candidate set (the
+    /// learned, `CallMeMaybe`-derived addresses among them, which may be the only way to reach a
+    /// NATed peer) and forcing re-discovery from whatever control happens to advertise. Moving it
+    /// gives the rotation Go's shape: the endpoints stay, the trust and discovery state reset (see
+    /// [`PeerPaths::invalidate_disco_path`]), and every candidate is re-probed on the next pinger
+    /// tick.
+    ///
+    /// The `addr -> disco` attribution map moves with it, so inbound data on those addresses is
+    /// still attributed to this peer under its new key.
+    ///
+    /// No-ops when the key did not really change, or when the peer had no path state under the old
+    /// key. If path state already exists under `current` the old entry is dropped instead of moved:
+    /// that only happens when the peer already reached us under its new key (an inbound ping or
+    /// `CallMeMaybe` built the entry), which is fresher, new-key-confirmed state that must not be
+    /// overwritten by the pre-rotation one.
+    pub fn changed_active_disco(&self, previous: &DiscoPublicKey, current: &DiscoPublicKey) {
+        if previous == current {
+            return;
+        }
+
+        // Locked disjointly, never nested (as in `rebind`).
+        let moved = {
+            let mut paths = lock(&self.paths);
+            match paths.remove(previous) {
+                Some(mut state) if !paths.contains_key(current) => {
+                    state.invalidate_disco_path();
+                    paths.insert(*current, state);
+                    true
+                }
+                Some(_) => {
+                    tracing::debug!(
+                        "disco key changed but path state already exists under the new key; \
+                         keeping the state confirmed under the key the peer is using"
+                    );
+                    false
+                }
+                None => false,
+            }
+        };
+        if !moved {
+            // Nothing was carried over, so leave attribution alone: any entry still pointing at the
+            // old key is dropped by the `retain_peers` that follows a netmap update.
+            return;
+        }
+
+        let mut a2d = lock(&self.addr_to_disco);
+        for peer in a2d.values_mut() {
+            if peer == previous {
+                *peer = *current;
+            }
+        }
+    }
+
     /// Drop all path state for peers absent from `live`.
     ///
     /// Called after a netmap update so peers removed from the tailnet stop being ping targets and
@@ -5497,6 +5557,124 @@ mod tests {
         assert_eq!(
             size_before, size_after,
             "re-noting an existing reflexive address must not grow the set (dedup)"
+        );
+    }
+
+    /// A peer that rotates its disco key carries its path state onto the new key with the trusted
+    /// direct path invalidated — the `ts_runtime` side of Go `changedActiveDiscoLocked`.
+    ///
+    /// Both halves are pinned here: the confirmed best is no longer trusted under either key (so the
+    /// peer relays over DERP until a fresh pong lands), and the candidate endpoints — control's and
+    /// the peer's own learned ones — plus their `addr -> disco` attribution follow the peer to the
+    /// new key instead of being deleted with the old one.
+    #[tokio::test]
+    async fn changed_active_disco_moves_path_state_and_drops_trust() {
+        let sock = plain_sock().await;
+        let old = DiscoPrivateKey::random().public_key();
+        let new = DiscoPrivateKey::random().public_key();
+
+        let advertised: SocketAddr = "203.0.113.9:41641".parse().unwrap();
+        let learned: SocketAddr = "198.51.100.7:41641".parse().unwrap();
+        sock.set_netmap_endpoints(old, [advertised]);
+        sock.add_peer_endpoints(old, [learned]);
+
+        // Confirm `advertised` as the trusted best path, as a pong under the OLD disco key would.
+        let now = Instant::now();
+        let tx_id = disco::random_tx_id();
+        {
+            let mut paths = lock(&sock.paths);
+            let pp = paths.get_mut(&old).expect("the peer has path state");
+            pp.note_ping_sent(tx_id, advertised, now);
+            pp.note_pong(tx_id, advertised, now + Duration::from_millis(5));
+        }
+        assert_eq!(
+            sock.best_addr(&old),
+            Some(advertised),
+            "precondition: a trusted direct path under the old key"
+        );
+
+        sock.changed_active_disco(&old, &new);
+
+        assert!(
+            sock.best_addr(&new).is_none(),
+            "a path confirmed under the peer's old disco key must not stay trusted under the new one"
+        );
+        assert!(
+            sock.candidate_addrs(&old).is_empty(),
+            "no path state is left behind under the old key"
+        );
+        let mut moved = sock.candidate_addrs(&new);
+        moved.sort();
+        let mut want = vec![advertised, learned];
+        want.sort();
+        assert_eq!(
+            moved, want,
+            "control-advertised and learned candidates both follow the peer to its new key"
+        );
+        {
+            let a2d = lock(&sock.addr_to_disco);
+            assert_eq!(a2d.get(&advertised), Some(&new));
+            assert_eq!(
+                a2d.get(&learned),
+                Some(&new),
+                "attribution follows the peer, so inbound data is still recognized as its own"
+            );
+        }
+    }
+
+    /// Path state already confirmed under the NEW key wins: that state was established by disco the
+    /// peer sealed with the key it is using now (it pinged us before the netmap caught up), so the
+    /// pre-rotation entry is dropped rather than overwriting it.
+    #[tokio::test]
+    async fn changed_active_disco_keeps_state_already_confirmed_under_the_new_key() {
+        let sock = plain_sock().await;
+        let old = DiscoPrivateKey::random().public_key();
+        let new = DiscoPrivateKey::random().public_key();
+
+        let stale: SocketAddr = "203.0.113.9:41641".parse().unwrap();
+        let fresh: SocketAddr = "198.51.100.7:41641".parse().unwrap();
+        sock.set_netmap_endpoints(old, [stale]);
+        sock.add_peer_endpoints(new, [fresh]);
+
+        sock.changed_active_disco(&old, &new);
+
+        assert_eq!(
+            sock.candidate_addrs(&new),
+            vec![fresh],
+            "the entry the peer built under its current key is left untouched"
+        );
+        assert!(
+            sock.candidate_addrs(&old).is_empty(),
+            "the pre-rotation entry is dropped, not merged"
+        );
+    }
+
+    /// The no-op cases: an unchanged key, and a key with no path state behind it.
+    #[tokio::test]
+    async fn changed_active_disco_is_a_noop_without_a_real_rotation() {
+        let sock = plain_sock().await;
+        let peer = DiscoPrivateKey::random().public_key();
+        let addr: SocketAddr = "203.0.113.9:41641".parse().unwrap();
+        sock.set_netmap_endpoints(peer, [addr]);
+
+        sock.changed_active_disco(&peer, &peer);
+        assert_eq!(
+            sock.candidate_addrs(&peer),
+            vec![addr],
+            "a key that did not change leaves the peer's path state alone"
+        );
+
+        let unknown = DiscoPrivateKey::random().public_key();
+        let other = DiscoPrivateKey::random().public_key();
+        sock.changed_active_disco(&unknown, &other);
+        assert!(
+            sock.candidate_addrs(&other).is_empty(),
+            "a rotation with no path state behind the old key creates none"
+        );
+        assert_eq!(
+            lock(&sock.addr_to_disco).get(&addr),
+            Some(&peer),
+            "and an unrelated peer's attribution is untouched"
         );
     }
 
