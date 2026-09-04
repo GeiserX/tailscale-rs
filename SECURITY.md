@@ -101,8 +101,9 @@ cryptographically verified chain. Two caveats remain, tracked as deferred work i
     This is genuine *under*-enforcement (more permissive than Go) and is not structurally closeable
     yet — it needs a `node_key_authorized_with_details` path plus a whole-netmap rotation pass.
   - **No `UnsignedPeerAPIOnly` exemption.** Go admits such peers unsigned; we drop them (*more*
-    restrictive — a connectivity gap, the safe direction), which would only surface if the node model
-    ever ingests that field.
+    restrictive — a connectivity gap, the safe direction). The node model now carries the field and
+    clamps such a peer's accepted routes to its own addresses (matching Go's `upgradeNode`), but the
+    lock-admission exemption itself is still not implemented.
 
 ## peerAPI capability gap
 

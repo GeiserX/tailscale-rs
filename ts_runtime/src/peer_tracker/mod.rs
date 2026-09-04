@@ -246,8 +246,12 @@ impl PeerTracker {
     /// that is dropped, unsigned, or signed by a non-rotation chain carries `rotation == None`.
     ///
     /// Never logs key/signature bytes — only the `stable_id` and the `TkaError` Display (static
-    /// descriptors). One documented parity gap remains vs Go (under-enforcement, in PARITY_ROADMAP):
-    /// no `UnsignedPeerAPIOnly` exemption (our node model lacks the field).
+    /// descriptors). One documented parity gap remains vs Go (in PARITY_ROADMAP): no
+    /// `UnsignedPeerAPIOnly` *admission* exemption — Go admits such a peer unsigned under an active
+    /// lock, we drop it (stricter, the safe direction). [`Node::unsigned_peer_api_only`] is now
+    /// carried, and the routes half of upstream's treatment is enforced at decode
+    /// (`ts_control::Node`'s `From` impl clamps such a peer's accepted routes to its own addresses,
+    /// unconditionally, whether or not a lock is active); only the admission carve-out is deferred.
     fn tka_snapshot_admits(authority: Option<&ts_tka::Authority>, node: &Node) -> TkaVerdict {
         let Some(auth) = authority else {
             return TkaVerdict::admit();
@@ -1561,6 +1565,7 @@ mod tka_tests {
             peer_relay: false,
             ssh_host_keys: Vec::new(),
             service_vips: Default::default(),
+            unsigned_peer_api_only: false,
         }
     }
 

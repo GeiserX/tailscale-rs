@@ -401,6 +401,7 @@ mod tests {
             peer_relay: false,
             ssh_host_keys: vec![],
             service_vips: Default::default(),
+            unsigned_peer_api_only: false,
         }
     }
 

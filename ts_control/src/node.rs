@@ -185,7 +185,24 @@ pub struct Node {
     /// The node's [`DiscoPublicKey`], if known.
     pub disco_key: Option<DiscoPublicKey>,
 
+    /// Whether control marked this node as peerAPI-only and outside tailnet lock's coverage
+    /// (`tailcfg.Node.UnsignedPeerAPIOnly`).
+    ///
+    /// Such a node carries no node-key signature and is deliberately exempt from tailnet-lock
+    /// verification; in exchange it gets **no network access** — only this node's peerAPI. Because
+    /// it is outside the lock, a (possibly malicious) control server must not be able to grant it
+    /// network access via advertised routes, so [`accepted_routes`](Self::accepted_routes) is
+    /// clamped to the node's own [`addresses`](Self::addresses) when this is set. See the `From`
+    /// impl on this type, which mirrors Go's `upgradeNode` in `control/controlclient/map.go`.
+    ///
+    /// The clamp is **unconditional** — it does not depend on tailnet lock being enabled locally,
+    /// because the point is that an unsigned peer is by definition outside the lock's coverage.
+    pub unsigned_peer_api_only: bool,
+
     /// The routes this node accepts traffic for.
+    ///
+    /// Clamped to [`addresses`](Self::addresses) when
+    /// [`unsigned_peer_api_only`](Self::unsigned_peer_api_only) is set.
     pub accepted_routes: Vec<ipnet::IpNet>,
     /// The underlay addresses this node is reachable on (`Endpoints` in Go).
     pub underlay_addresses: Vec<SocketAddr>,
@@ -819,13 +836,26 @@ impl From<&ts_control_serde::Node<'_>> for Node {
             machine_key: value.machine,
             disco_key: value.disco_key,
 
+            unsigned_peer_api_only: value.unsigned_peer_api_only,
+
             // Per capver-112, `AllowedIPs` null/absent means "same as `addresses`". Fall back to the
             // node's own assigned prefixes verbatim (whatever families the wire carried), not a
             // synthesized v4+v6 pair.
-            accepted_routes: value
-                .allowed_ips
-                .clone()
-                .unwrap_or_else(|| value.addresses.clone()),
+            //
+            // `UnsignedPeerAPIOnly` clamps the result back to `addresses` whatever control sent,
+            // mirroring Go's `upgradeNode` (`control/controlclient/map.go`): such a node is outside
+            // tailnet lock's coverage, so a possibly-malicious control server must not be able to
+            // grant it network access by handing it advertised routes (in the limit, `0.0.0.0/0`).
+            // Unconditional, exactly as upstream — it does not depend on tailnet lock being
+            // enabled here.
+            accepted_routes: if value.unsigned_peer_api_only {
+                value.addresses.clone()
+            } else {
+                value
+                    .allowed_ips
+                    .clone()
+                    .unwrap_or_else(|| value.addresses.clone())
+            },
             underlay_addresses: value.endpoints.clone(),
 
             // legacy_derp_string is still in practical use as of 3/2026
@@ -1057,6 +1087,124 @@ mod tests {
         );
     }
 
+    /// A wire peer that owns `100.64.0.9/32` and is handed `route` plus the default route in its
+    /// `AllowedIPs`. `unsigned` sets `UnsignedPeerAPIOnly`; everything else is identical between
+    /// the two, so the only variable in the test below is that flag.
+    fn wire_peer_advertising(
+        stable_id: &'static str,
+        route: &str,
+        unsigned: bool,
+    ) -> ts_control_serde::Node<'static> {
+        ts_control_serde::Node {
+            stable_id: ts_control_serde::StableNodeId(stable_id),
+            addresses: vec!["100.64.0.9/32".parse().unwrap()],
+            allowed_ips: Some(vec![
+                "100.64.0.9/32".parse().unwrap(),
+                route.parse().unwrap(),
+                "0.0.0.0/0".parse().unwrap(),
+            ]),
+            unsigned_peer_api_only: unsigned,
+            ..Default::default()
+        }
+    }
+
+    /// `UnsignedPeerAPIOnly` must clamp a peer's accepted routes back to its own addresses, so a
+    /// control server cannot grant an unsigned (lock-exempt) peer network access via advertised
+    /// routes. Mirrors Go's `upgradeNode` in `control/controlclient/map.go`.
+    ///
+    /// The signed peer is the control: it advertises the **same** route and the same default route,
+    /// and keeps both. Without it this test would still pass if the `From` impl simply dropped every
+    /// advertised route.
+    #[test]
+    fn from_wire_unsigned_peer_api_only_clamps_routes_to_own_addresses() {
+        let own: ipnet::IpNet = "100.64.0.9/32".parse().unwrap();
+        let subnet: ipnet::IpNet = "192.0.2.0/24".parse().unwrap();
+        let default_route: ipnet::IpNet = "0.0.0.0/0".parse().unwrap();
+
+        let unsigned: Node = (&wire_peer_advertising("nUnsigned", "192.0.2.0/24", true)).into();
+        let signed: Node = (&wire_peer_advertising("nSigned", "192.0.2.0/24", false)).into();
+
+        // The flag is carried onto the domain node, not silently dropped.
+        assert!(unsigned.unsigned_peer_api_only);
+        assert!(!signed.unsigned_peer_api_only);
+
+        // Unsigned: clamped to its own addresses. The advertised subnet and the default route are
+        // both gone, whatever control sent.
+        assert_eq!(unsigned.accepted_routes, vec![own]);
+
+        // Signed: the identical advertisement survives verbatim.
+        assert_eq!(
+            signed.accepted_routes,
+            vec![own, subnet, default_route],
+            "the clamp must be specific to UnsignedPeerAPIOnly, not a blanket route drop"
+        );
+
+        // Consequences the rest of the fork reads. `is_router` reports the unsigned peer routes
+        // nothing but itself...
+        assert!(!unsigned.is_router());
+        assert!(signed.is_router());
+
+        // ...and no route-install policy can resurrect the advertisement: even with
+        // `--accept-routes` on AND the peer selected as the exit node — the most permissive input
+        // `routes_to_install` accepts — the unsigned peer yields only its own address.
+        let installed: Vec<_> = unsigned
+            .routes_to_install(true, Some(&unsigned.stable_id))
+            .copied()
+            .collect();
+        assert_eq!(installed, vec![own]);
+
+        // The same permissive inputs against the signed peer do install the subnet and the /0,
+        // proving the difference is the flag and not the policy arguments.
+        let installed_signed: Vec<_> = signed
+            .routes_to_install(true, Some(&signed.stable_id))
+            .copied()
+            .collect();
+        assert_eq!(installed_signed, vec![own, subnet, default_route]);
+    }
+
+    /// The wire default (`UnsignedPeerAPIOnly` absent) must leave `AllowedIPs` untouched, including
+    /// the capver-112 "null AllowedIPs means the node's own addresses" fallback. Guards against the
+    /// clamp being applied on the wrong branch.
+    #[test]
+    fn from_wire_default_is_not_clamped() {
+        let wire = ts_control_serde::Node {
+            addresses: vec!["100.64.0.9/32".parse().unwrap()],
+            allowed_ips: Some(vec!["198.51.100.0/24".parse().unwrap()]),
+            ..Default::default()
+        };
+        assert!(!wire.unsigned_peer_api_only);
+        let domain: Node = (&wire).into();
+        assert_eq!(
+            domain.accepted_routes,
+            vec!["198.51.100.0/24".parse::<ipnet::IpNet>().unwrap()]
+        );
+    }
+
+    /// An unsigned peer with **no** `AllowedIPs` on the wire still lands on its own addresses (the
+    /// clamp and the capver-112 fallback agree), and a multi-prefix unsigned peer keeps *all* of
+    /// its assigned prefixes — the clamp is to `Addresses`, not to the v4/v6 identity pair.
+    #[test]
+    fn from_wire_unsigned_peer_clamp_keeps_every_assigned_prefix() {
+        let wire = ts_control_serde::Node {
+            addresses: vec![
+                "100.64.0.9/32".parse().unwrap(),
+                "fd7a:115c:a1e0::9/128".parse().unwrap(),
+            ],
+            allowed_ips: None,
+            unsigned_peer_api_only: true,
+            ..Default::default()
+        };
+        let domain: Node = (&wire).into();
+        assert_eq!(
+            domain.accepted_routes,
+            vec![
+                "100.64.0.9/32".parse::<ipnet::IpNet>().unwrap(),
+                "fd7a:115c:a1e0::9/128".parse::<ipnet::IpNet>().unwrap(),
+            ]
+        );
+        assert!(!domain.is_router());
+    }
+
     /// The deserialization regression itself: a MapResponse-style Node JSON with a 1-element
     /// `Addresses` array must parse (this is the exact shape the dev-Headscale sends).
     #[test]
@@ -1195,6 +1343,7 @@ mod tests {
             peer_relay: false,
             ssh_host_keys: vec![],
             service_vips: Default::default(),
+            unsigned_peer_api_only: false,
         }
     }
 
