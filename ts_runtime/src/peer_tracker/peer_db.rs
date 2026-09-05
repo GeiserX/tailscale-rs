@@ -26,6 +26,21 @@ mod private {
     impl Sealed for ipnet::IpNet {}
 }
 
+/// Which of a peer's two known disco keys an inbound frame resolved through.
+///
+/// The two outcomes Go's [`endpoint.checkAndUpdateDiscoKey`] accepts (a third key is refused, which
+/// is the whole point of the check).
+///
+/// [`endpoint.checkAndUpdateDiscoKey`]: https://github.com/tailscale/tailscale/blob/9ea7cba44591e0cd840c6c94d23274dd222059bf/wgengine/magicsock/endpoint.go
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoKeyMatch {
+    /// The key we would send disco to — the node's [`Node::disco_key`], Go `endpointDisco.key()`.
+    Active,
+    /// The peer's *other* known key. Go compare-and-swaps `tsmpActive` here so that key becomes the
+    /// active one: receiving under it is proof of what the peer is actually using.
+    Inactive,
+}
+
 /// A [`Node`] field indexed by [`PeerDb`].
 pub trait IndexedField: Debug + private::Sealed {
     /// Look up the peer id that has this field.
@@ -70,7 +85,23 @@ struct IndexState {
     /// Index on the node's [`NodePublicKey`].
     nk_idx: Index<NodePublicKey>,
     /// Index on the [`DiscoPublicKey`], assuming it's known.
+    ///
+    /// This carries the peer's **effective** (active) key only — the one we would send disco to.
+    /// The peer's other known key, if it has one, lives in
+    /// [`inactive_disco_idx`](Self::inactive_disco_idx).
     disco_idx: Index<DiscoPublicKey>,
+    /// Index on the peer's known-but-**inactive** disco key — the other slot of Go's
+    /// `endpointDisco` (`wgengine/magicsock/endpoint.go`), the one we are not currently sending to.
+    ///
+    /// Ingress attribution only. A peer mid-rotation keeps sending disco under the key it has not
+    /// yet switched away from, so a frame arriving under this key still has to resolve to the peer
+    /// ([`peer_by_known_disco_key`](PeerDb::peer_by_known_disco_key)); the send path never reads it.
+    /// Maintained out of band by the peer tracker ([`PeerDb::set_inactive_disco_key`]), because a
+    /// control [`Node`] carries only one disco key.
+    inactive_disco_idx: Index<DiscoPublicKey>,
+    /// Reverse of [`inactive_disco_idx`](Self::inactive_disco_idx), so the entry can be retracted
+    /// when the peer's inactive key changes or the peer leaves the db.
+    inactive_disco: HashMap<PeerId, DiscoPublicKey>,
     /// Index on the peer [`StableNodeId`].
     stableid_idx: Index<StableNodeId>,
     /// Index for the [`ts_control::NodeId`].
@@ -280,6 +311,60 @@ impl PeerDb {
         field.lookup(self)
     }
 
+    /// Resolve an inbound disco frame's sender key to the peer that owns it, accepting **either**
+    /// of that peer's two known disco keys — Go [`endpoint.checkAndUpdateDiscoKey`].
+    ///
+    /// The active key is tried first, so a key that is one peer's active key and another peer's
+    /// stale inactive one resolves to the peer that is actually using it. A key belonging to
+    /// neither slot of any peer returns `None` and must be refused by the caller: that refusal is
+    /// what stops an unknown disco key from opening a path or being attributed to a peer.
+    ///
+    /// Two peers can transiently claim the same key under netmap churn (see
+    /// `disco_key_reassigned_across_peers_no_panic`); like every other index here the answer is the
+    /// last writer's, never a panic.
+    ///
+    /// [`endpoint.checkAndUpdateDiscoKey`]: https://github.com/tailscale/tailscale/blob/9ea7cba44591e0cd840c6c94d23274dd222059bf/wgengine/magicsock/endpoint.go
+    pub fn peer_by_known_disco_key(
+        &self,
+        key: &DiscoPublicKey,
+    ) -> Option<(PeerId, &Node, DiscoKeyMatch)> {
+        let (id, matched) = match self.index_state.disco_idx.get(key) {
+            Some(&id) => (id, DiscoKeyMatch::Active),
+            None => (
+                self.index_state.inactive_disco_idx.get(key).copied()?,
+                DiscoKeyMatch::Inactive,
+            ),
+        };
+
+        Some((id, self.peers.get(&id)?, matched))
+    }
+
+    /// Register (or clear) the peer's known-but-inactive disco key, so ingress under it still
+    /// resolves to the peer.
+    ///
+    /// A control [`Node`] carries a single disco key, so the second slot of Go's `endpointDisco`
+    /// cannot come in through [`upsert`](Self::upsert); the peer tracker — which owns that state —
+    /// writes it here immediately after each upsert. Passing `None` retracts the entry, which is
+    /// what a peer that has only ever had one key needs.
+    pub fn set_inactive_disco_key(&mut self, id: PeerId, key: Option<DiscoPublicKey>) {
+        let idx = &mut self.index_state;
+
+        // Guarded remove, as everywhere else: only retract a mapping that is still ours.
+        if let Some(previous) = idx.inactive_disco.remove(&id)
+            && idx
+                .inactive_disco_idx
+                .get(&previous)
+                .is_some_and(|&x| x == id)
+        {
+            idx.inactive_disco_idx.remove(&previous);
+        }
+
+        if let Some(key) = key {
+            idx.inactive_disco.insert(id, key);
+            idx.inactive_disco_idx.insert(key, id);
+        }
+    }
+
     /// Get a reference to the peer map.
     pub const fn peers(&self) -> &HashMap<PeerId, Node> {
         &self.peers
@@ -323,6 +408,14 @@ impl IndexState {
         if let Some(disco) = &node.disco_key {
             self.disco_idx.remove(disco);
         }
+
+        // Guarded remove, for the same reason as every other index above: a key this peer holds
+        // inactive may since have been claimed (actively or inactively) by another peer.
+        if let Some(key) = self.inactive_disco.remove(&id)
+            && self.inactive_disco_idx.get(&key).is_some_and(|&x| x == id)
+        {
+            self.inactive_disco_idx.remove(&key);
+        }
     }
 
     /// Remove `route` from the `route_idx`.
@@ -361,6 +454,8 @@ impl IndexState {
             && self.name_idx.is_empty()
             && self.route_idx.size() == 0
             && self.disco_idx.is_empty()
+            && self.inactive_disco_idx.is_empty()
+            && self.inactive_disco.is_empty()
     }
 }
 
@@ -767,6 +862,119 @@ mod test {
 
         // The disco index should still resolve to the last writer (B), unharmed.
         assert_eq!(disco.lookup(&db), Some(id_b));
+    }
+
+    /// Ingress resolves either of a peer's two known disco keys, and refuses everything else.
+    ///
+    /// This is the `PeerDb` half of Go `endpoint.checkAndUpdateDiscoKey`: a peer mid-rotation is
+    /// still sending under the key it has not switched away from, so that key has to attribute to
+    /// it — while a key nobody registered must not resolve to anything.
+    #[test]
+    fn either_known_disco_key_resolves_on_ingress() {
+        let mut db = PeerDb::default();
+
+        let active: DiscoPublicKey = [1u8; 32].into();
+        let inactive: DiscoPublicKey = [2u8; 32].into();
+        let stranger: DiscoPublicKey = [3u8; 32].into();
+
+        let node = Node {
+            disco_key: Some(active),
+            ..rand_node()
+        };
+        let id = db.upsert(&node);
+
+        assert!(
+            db.peer_by_known_disco_key(&inactive).is_none(),
+            "a peer with one key resolves only that key"
+        );
+
+        db.set_inactive_disco_key(id, Some(inactive));
+
+        let (got, _, matched) = db
+            .peer_by_known_disco_key(&active)
+            .expect("active resolves");
+        assert_eq!((got, matched), (id, DiscoKeyMatch::Active));
+
+        let (got, _, matched) = db
+            .peer_by_known_disco_key(&inactive)
+            .expect("the other known key resolves too");
+        assert_eq!((got, matched), (id, DiscoKeyMatch::Inactive));
+
+        assert!(
+            db.peer_by_known_disco_key(&stranger).is_none(),
+            "a key in neither slot is refused — the whole security value of the check"
+        );
+        assert_eq!(
+            inactive.lookup(&db),
+            None,
+            "and the send-side disco index still carries only the active key"
+        );
+
+        // Retracting it (the peer's two slots collapsed to one) removes it from ingress too.
+        db.set_inactive_disco_key(id, None);
+        assert!(db.peer_by_known_disco_key(&inactive).is_none());
+
+        // Removing the peer leaves no dangling entry in either index.
+        db.set_inactive_disco_key(id, Some(inactive));
+        db.remove(&id);
+        assert!(db.peer_by_known_disco_key(&inactive).is_none());
+        assert!(db.index_state.is_empty());
+    }
+
+    /// Two peers transiently claiming the same key, the ingress case of
+    /// `disco_key_reassigned_across_peers_no_panic`.
+    ///
+    /// A key that is one peer's ACTIVE key and another's stale inactive one resolves to the peer
+    /// actually using it — the active index is consulted first. Between two peers holding it
+    /// inactive, the answer is the last writer's, exactly like every other index here, and
+    /// retracting the loser's entry must not clobber the winner's.
+    #[test]
+    fn a_key_claimed_by_two_peers_resolves_to_the_one_using_it() {
+        let mut db = PeerDb::default();
+
+        let shared: DiscoPublicKey = [9u8; 32].into();
+
+        let node_a = Node {
+            disco_key: Some([1u8; 32].into()),
+            ..rand_node()
+        };
+        let id_a = db.upsert(&node_a);
+        db.set_inactive_disco_key(id_a, Some(shared));
+
+        // B holds it inactive too — the later writer wins the inactive index.
+        let node_b = Node {
+            disco_key: Some([2u8; 32].into()),
+            ..rand_node()
+        };
+        let id_b = db.upsert(&node_b);
+        db.set_inactive_disco_key(id_b, Some(shared));
+        assert_eq!(
+            db.peer_by_known_disco_key(&shared)
+                .map(|(id, _, m)| (id, m)),
+            Some((id_b, DiscoKeyMatch::Inactive))
+        );
+
+        // A retracts its claim. The guarded remove must leave B's mapping alone.
+        db.set_inactive_disco_key(id_a, None);
+        assert_eq!(
+            db.peer_by_known_disco_key(&shared)
+                .map(|(id, _, m)| (id, m)),
+            Some((id_b, DiscoKeyMatch::Inactive)),
+            "retracting another peer's stale claim must not clobber the live one"
+        );
+
+        // C is actively using it. An active claim outranks any inactive one.
+        let node_c = Node {
+            disco_key: Some(shared),
+            ..rand_node()
+        };
+        let id_c = db.upsert(&node_c);
+        assert_eq!(
+            db.peer_by_known_disco_key(&shared)
+                .map(|(id, _, m)| (id, m)),
+            Some((id_c, DiscoKeyMatch::Active)),
+            "the peer sending under the key beats one that merely still knows it"
+        );
     }
 
     #[test]
