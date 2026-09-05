@@ -1868,6 +1868,32 @@ mod tka_tests {
     }
 
     #[tokio::test]
+    async fn tka_empty_keyset_authority_admits_unsigned_peer_api_only_peer() {
+        // The other side of `tka_active_rejects_unsigned_peer_api_only_peer`: "an authority is
+        // present" is NOT on its own enough to drop an unsigned peer. The brick-guard fires first,
+        // so an authority carrying no trusted keys enforces nothing and admits even the peer class
+        // a keyed lock would reject. Pins the qualifier on the
+        // `ts_control::Node::unsigned_peer_api_only` field docs — remove the guard and this fails.
+        use ts_tka::{AumHash, Authority, State};
+        let empty_auth = Authority::from_state(AumHash([0u8; 32]), State { keys: Vec::new() });
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), Some(empty_auth));
+
+        let mut peer_api_only = peer_node("peerapi-only", NODE_KEY_BYTES, vec![]);
+        peer_api_only.unsigned_peer_api_only = true;
+
+        assert!(
+            tracker.tka_admits(&peer_api_only),
+            "an empty-keyset authority must not enforce, not even against an unsigned peer"
+        );
+
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer_api_only.clone()]));
+        assert!(
+            tracker.peer_db.get(&peer_api_only.node_key).is_some(),
+            "the peer reaches the peer db, so the gate's drop is keyset-conditional"
+        );
+    }
+
+    #[tokio::test]
     async fn tka_active_rejects_bad_signature() {
         // Authority present + a signature that fails to verify ⇒ rejected, not in peer_db.
         let (authority, mut sig) = authority_and_valid_sig();

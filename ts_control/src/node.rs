@@ -193,11 +193,18 @@ pub struct Node {
     /// only this node's peerAPI.
     ///
     /// **This fork does not implement that admission exemption yet.** While a tailnet-lock authority
-    /// is active, the runtime's peer-admission gate (`ts_runtime`'s
-    /// `PeerTracker::tka_snapshot_admits`) drops *every* peer with an empty
+    /// with a **non-empty trusted-key set** is active, the runtime's peer-admission gate
+    /// (`ts_runtime`'s `PeerTracker::tka_snapshot_admits`) drops *every* peer with an empty
     /// [`key_signature`](Self::key_signature), this flag included — so such a peer is not admitted
     /// to the peer db at all and gets no peerAPI access either. That is stricter than Go (the safe
     /// direction); the carve-out is tracked as a parity gap in `docs/PARITY_ROADMAP.md`.
+    ///
+    /// The trusted-key qualifier is not hypothetical hedging, it names the one case where the gate
+    /// does not enforce: an authority whose trusted-key set is *empty* admits every peer, signed or
+    /// not. A verified chain can never produce that state (genesis rejects an empty key set and the
+    /// last key cannot be removed), so it means a `ts_tka` invariant was violated — and the gate
+    /// prefers admitting everyone (logged at `error!`) over black-holing the whole netmap. In that
+    /// state this flag changes nothing either, because nothing is being enforced against.
     ///
     /// The *routes* half of upstream's treatment **is** implemented here. Because the node is
     /// outside the lock, a (possibly malicious) control server must not be able to grant it
