@@ -1670,6 +1670,33 @@ mod tka_tests {
     }
 
     #[tokio::test]
+    async fn tka_active_rejects_unsigned_peer_api_only_peer() {
+        // `UnsignedPeerAPIOnly` buys NO admission exemption here: Go admits such a peer unsigned
+        // under an active lock (peerAPI-only, no network access), this fork drops it like any other
+        // unsigned peer. Pins the documented parity gap (`docs/PARITY_ROADMAP.md`, and the
+        // `ts_control::Node::unsigned_peer_api_only` field docs) so implementing the carve-out has
+        // to update the prose that promises no peerAPI access today.
+        let (authority, _sig) = authority_and_valid_sig();
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), Some(authority));
+
+        let mut peer_api_only = peer_node("peerapi-only", NODE_KEY_BYTES, vec![]);
+        peer_api_only.unsigned_peer_api_only = true;
+
+        assert!(
+            !tracker.tka_admits(&peer_api_only),
+            "unsigned_peer_api_only must not exempt a peer from the tailnet-lock admission gate"
+        );
+
+        // Mirror the handler's `if !tka_admits { continue }` loop: nothing reaches the peer db, so
+        // the peer is not reachable for peerAPI either.
+        if tracker.tka_admits(&peer_api_only) {
+            tracker.peer_db.upsert(&peer_api_only);
+        }
+        assert_eq!(tracker.peer_db.peers().len(), 0);
+        assert!(tracker.peer_db.get(&peer_api_only.node_key).is_none());
+    }
+
+    #[tokio::test]
     async fn tka_active_rejects_bad_signature() {
         // Authority present + a signature that fails to verify ⇒ rejected, not in peer_db.
         let (authority, mut sig) = authority_and_valid_sig();
