@@ -35,8 +35,64 @@ use crate::{
     Env, Error,
     dataplane::{DataplaneActor, NewUnderlayTransport, UnderlayFromDataplane, UnderlayToDataplane},
     multiderp::{self, Multiderp},
-    peer_tracker::{PeerDb, PeerState},
+    peer_tracker::{DiscoKeyMatch, PeerDb, PeerState},
 };
+
+/// A peer sent us a disco frame sealed under one of its two known disco keys, and it was **not**
+/// the key we are currently sending to.
+///
+/// Published by the disco ingress gate ([`verify_binding`]) and consumed by the peer tracker, which
+/// makes that key active (Go [`endpoint.checkAndUpdateDiscoKey`], which compare-and-swaps
+/// `endpointDisco.tsmpActive` and then calls `changedActiveDiscoLocked`). Receiving under a key
+/// proves the peer holds its private half and is what the peer is really using, so it beats what
+/// control last said.
+///
+/// Only frames that have already passed the disco<->node-key binding check are reported, so this
+/// cannot be used by a third party to steer a peer onto a different key. The peer tracker refuses
+/// any key that is neither of the peer's two slots regardless.
+///
+/// [`endpoint.checkAndUpdateDiscoKey`]: https://github.com/tailscale/tailscale/blob/9ea7cba44591e0cd840c6c94d23274dd222059bf/wgengine/magicsock/endpoint.go
+#[derive(Debug, Clone, Copy)]
+pub struct DiscoKeyObserved {
+    /// The peer the frame was attributed to.
+    pub peer: PeerId,
+    /// The sender disco key the frame was sealed under — the peer's currently-inactive key.
+    pub key: DiscoPublicKey,
+}
+
+/// The channel the disco ingress gate reports an inactive-key sighting on.
+///
+/// [`verify_binding`] runs inside a synchronous verifier callback on the packet path, so it cannot
+/// `await` a bus publish; it hands the sighting to [`run_disco_key_observer`], which does. Sending
+/// is non-blocking and lossy-by-drop only if the forwarder has stopped, which is shutdown.
+type DiscoKeyObserver = tokio::sync::mpsc::UnboundedSender<DiscoKeyObserved>;
+
+/// Forward inactive-key sightings from the packet path onto the bus for the peer tracker.
+///
+/// The tracker is the sole owner of the two-slot disco state, so the switch itself — and the
+/// republish that makes the direct manager invalidate the path built under the old key — happens
+/// there. Duplicates are expected and harmless: several frames can arrive under the old key before
+/// the switch lands, and the tracker no-ops once the key is already active.
+async fn run_disco_key_observer(
+    mut observed: tokio::sync::mpsc::UnboundedReceiver<DiscoKeyObserved>,
+    env: Env,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    while !*shutdown.borrow() {
+        let msg = tokio::select! {
+            _ = shutdown.changed() => break,
+            msg = observed.recv() => match msg {
+                Some(msg) => msg,
+                // Every sender is gone: the verifier closure (and so the socket) has been dropped.
+                None => break,
+            },
+        };
+
+        if let Err(e) = env.publish(msg).await {
+            tracing::error!(error = %e, "publishing an observed peer disco key");
+        }
+    }
+}
 
 /// How often to (re)ping candidate endpoints. [`MagicSock::send_pings`] only pings paths that
 /// need (re)confirmation, so this interval just bounds how quickly an expired path
@@ -424,25 +480,56 @@ impl DirectManager {
 /// - For a **CallMeMaybe** (`claimed_node_key == None`, no node key on the wire): returns `true`
 ///   only if the disco key is a current netmap member. This stops an unknown/spoofed disco key
 ///   from steering us into host-probing attacker-chosen endpoints.
+///
+/// **Either** of a peer's two known disco keys is accepted — Go
+/// [`endpoint.checkAndUpdateDiscoKey`], which every inbound disco comparison in
+/// `Conn.handleDiscoMessage` goes through. A peer mid-rotation is still sending under the key it
+/// has not switched away from, and refusing that frame costs it its direct path until control
+/// catches up. A key belonging to neither slot of any peer is still refused, which is the whole
+/// security value of the check.
+///
+/// When the frame arrived under the peer's *inactive* key — and only after it has passed the
+/// binding check above — the sighting is reported on `observed` so the peer tracker can make that
+/// key the one we send to (Go's compare-and-swap of `endpointDisco.tsmpActive`). The switch and the
+/// path invalidation it triggers both happen there; see [`DiscoKeyObserved`].
+///
+/// [`endpoint.checkAndUpdateDiscoKey`]: https://github.com/tailscale/tailscale/blob/9ea7cba44591e0cd840c6c94d23274dd222059bf/wgengine/magicsock/endpoint.go
 fn verify_binding(
     peer_db: &RwLock<Option<Arc<PeerDb>>>,
+    observed: &DiscoKeyObserver,
     disco: &DiscoPublicKey,
     claimed_node_key: Option<&NodePublicKey>,
 ) -> bool {
-    let db = poisoned_read(peer_db);
-    let Some(db) = db.as_ref() else {
+    // Resolve and copy out what the decision needs, so the read lock is released before the
+    // sighting is reported (the observer channel is unbounded and never blocks, but holding the
+    // peer-db lock across an unrelated send is a deadlock shape worth not having).
+    let resolved = {
+        let db = poisoned_read(peer_db);
+        let db = db.as_ref().and_then(|db| db.peer_by_known_disco_key(disco));
+        db.map(|(peer, node, matched)| (peer, node.node_key, matched))
+    };
+    let Some((peer, node_key, matched)) = resolved else {
         return false;
     };
-    let Some((_, node)) = db.get(disco) else {
-        return false;
-    };
-    match claimed_node_key {
+
+    let bound = match claimed_node_key {
         // Ping: the claimed node key must be exactly the one control bound to this disco key.
-        Some(claimed) => node.node_key == *claimed,
+        Some(claimed) => node_key == *claimed,
         // CallMeMaybe: membership is enough — the disco key resolving to a netmap peer above
         // already proves it.
         None => true,
+    };
+    if !bound {
+        return false;
     }
+
+    if matched == DiscoKeyMatch::Inactive {
+        // Best effort: a closed channel means the runtime is shutting down. The frame is still
+        // accepted — attribution is correct either way, only the active-key switch is missed.
+        let _ = observed.send(DiscoKeyObserved { peer, key: *disco });
+    }
+
+    true
 }
 
 /// Read an [`RwLock`] guarding the peer db, recovering from poisoning rather than propagating the
@@ -482,10 +569,21 @@ impl PeerLookup<PeerId, DiscoPublicKey> for DiscoPeerLookup {
 }
 
 impl PeerLookup<DiscoPublicKey, PeerId> for DiscoPeerLookup {
+    /// Ingress attribution: accepts **either** of the peer's two known disco keys.
+    ///
+    /// A path opened by a disco ping under the peer's inactive key attributes its source address to
+    /// that key (`MagicSock::add_peer_endpoints` records the sender key of the frame that opened
+    /// it), so data arriving over that path resolves through the inactive slot until the active-key
+    /// switch lands. Resolving only the active key would drop it.
+    ///
+    /// No active-key switch is reported from here: this is data attributed by *source address*, not
+    /// a disco frame, so it is not the proof-of-possession upstream switches on. That signal comes
+    /// from [`verify_binding`] alone, matching Go, which drives `checkAndUpdateDiscoKey` from
+    /// `Conn.handleDiscoMessage` and `unambiguousNodeKeyOfPingLocked` only.
     fn lookup_key(&self, key: DiscoPublicKey) -> Option<PeerId> {
         let db = poisoned_read(&self.0);
         let db = db.as_ref()?;
-        let (id, _) = db.get(&key)?;
+        let (id, _, _) = db.peer_by_known_disco_key(&key)?;
         Some(id)
     }
 }
@@ -870,9 +968,20 @@ impl kameo::Actor for DirectManager {
         // The disco<->node-key binding verifier: an inbound disco ping must present the node key
         // control bound to its disco key, or `handle_disco` drops it (fail closed). Closed over a
         // live handle to `peer_db` so it tracks netmap changes (revocations take effect at once).
+        //
+        // A frame that arrives under the peer's *other* known disco key is accepted too, and the
+        // sighting is forwarded to the peer tracker over `observed_tx` so that key becomes the one
+        // we send to (Go `endpoint.checkAndUpdateDiscoKey`).
+        let (observed_tx, observed_rx) = tokio::sync::mpsc::unbounded_channel();
+        tasks.spawn(run_disco_key_observer(
+            observed_rx,
+            env.clone(),
+            env.shutdown.clone(),
+        ));
+
         let verifier_db = peer_db.clone();
         let binding_verifier: BindingVerifier = Arc::new(move |disco, claimed_node_key| {
-            verify_binding(&verifier_db, disco, claimed_node_key)
+            verify_binding(&verifier_db, &observed_tx, disco, claimed_node_key)
         });
 
         // Bind the direct underlay UDP socket. A bind failure is transient/environmental (e.g. no
@@ -1133,6 +1242,26 @@ mod tests {
         Arc::new(RwLock::new(Some(Arc::new(db))))
     }
 
+    /// A peer db holding `node` under its active disco key plus `inactive` as the peer's other
+    /// known key — the mid-rotation state the peer tracker publishes.
+    fn db_with_inactive_key(
+        node: Node,
+        inactive: DiscoPublicKey,
+    ) -> Arc<RwLock<Option<Arc<PeerDb>>>> {
+        let mut db = PeerDb::default();
+        let id = db.upsert(&node);
+        db.set_inactive_disco_key(id, Some(inactive));
+        Arc::new(RwLock::new(Some(Arc::new(db))))
+    }
+
+    /// An observer channel plus its receiver, for driving [`verify_binding`] in tests.
+    fn observer() -> (
+        DiscoKeyObserver,
+        tokio::sync::mpsc::UnboundedReceiver<DiscoKeyObserved>,
+    ) {
+        tokio::sync::mpsc::unbounded_channel()
+    }
+
     /// A Ping whose claimed node key matches the netmap binding is accepted; a mismatched node key
     /// (or unknown disco key, or empty netmap) is rejected. This is the disco<->node-key binding
     /// check that stops a peer opening a direct path under a node key control did not bind to it.
@@ -1143,26 +1272,32 @@ mod tests {
         let other_key = NodePrivateKey::random().public_key();
 
         let db = db_with(node_with_keys(disco, node_key, "n1"));
+        let (tx, mut rx) = observer();
 
         assert!(
-            verify_binding(&db, &disco, Some(&node_key)),
+            verify_binding(&db, &tx, &disco, Some(&node_key)),
             "correct disco<->node-key binding must be accepted"
         );
         assert!(
-            !verify_binding(&db, &disco, Some(&other_key)),
+            !verify_binding(&db, &tx, &disco, Some(&other_key)),
             "a claimed node key that is not the bound one must be rejected"
         );
 
         let unknown_disco = DiscoPrivateKey::random().public_key();
         assert!(
-            !verify_binding(&db, &unknown_disco, Some(&node_key)),
+            !verify_binding(&db, &tx, &unknown_disco, Some(&node_key)),
             "a disco key not in the netmap must be rejected"
         );
 
         let empty: Arc<RwLock<Option<Arc<PeerDb>>>> = Default::default();
         assert!(
-            !verify_binding(&empty, &disco, Some(&node_key)),
+            !verify_binding(&empty, &tx, &disco, Some(&node_key)),
             "with no netmap loaded the verifier fails closed"
+        );
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a frame under the peer's ACTIVE key reports no active-key switch"
         );
     }
 
@@ -1175,16 +1310,88 @@ mod tests {
         let node_key = NodePrivateKey::random().public_key();
 
         let db = db_with(node_with_keys(disco, node_key, "n1"));
+        let (tx, _rx) = observer();
 
         assert!(
-            verify_binding(&db, &disco, None),
+            verify_binding(&db, &tx, &disco, None),
             "a netmap-member disco key must be accepted for a CallMeMaybe"
         );
 
         let stranger = DiscoPrivateKey::random().public_key();
         assert!(
-            !verify_binding(&db, &stranger, None),
+            !verify_binding(&db, &tx, &stranger, None),
             "a non-member disco key must be rejected for a CallMeMaybe"
+        );
+    }
+
+    /// A peer mid-rotation sends disco under the key it has not switched away from. The frame must
+    /// be accepted — refusing it costs the peer its direct path until control catches up — and the
+    /// sighting must be reported so the peer tracker makes that key the one we send to (Go
+    /// `endpoint.checkAndUpdateDiscoKey`).
+    #[test]
+    fn verify_binding_accepts_the_peers_inactive_disco_key_and_reports_it() {
+        let active = DiscoPrivateKey::random().public_key();
+        let inactive = DiscoPrivateKey::random().public_key();
+        let node_key = NodePrivateKey::random().public_key();
+
+        let db = db_with_inactive_key(node_with_keys(active, node_key, "n1"), inactive);
+        let peer = db
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(|db| db.has(&node_key))
+            .expect("the peer is in the db");
+        let (tx, mut rx) = observer();
+
+        assert!(
+            verify_binding(&db, &tx, &inactive, Some(&node_key)),
+            "a ping under the peer's other known disco key must be accepted"
+        );
+        let seen = rx.try_recv().expect("the sighting is reported");
+        assert_eq!(seen.peer, peer);
+        assert_eq!(seen.key, inactive);
+
+        // A CallMeMaybe (no node key on the wire) resolves the same way.
+        assert!(
+            verify_binding(&db, &tx, &inactive, None),
+            "a CallMeMaybe under the peer's other known disco key must be accepted"
+        );
+        assert_eq!(rx.try_recv().expect("reported too").key, inactive);
+    }
+
+    /// The refusals that give the two-key check its security value, all against the SAME db that
+    /// accepts the inactive key above.
+    ///
+    /// A third key — one belonging to neither of the peer's two slots — is still refused, and so is
+    /// a frame that presents a real inactive key with somebody else's node key. Neither reports a
+    /// switch: a refused frame must not be able to move a peer's active key.
+    #[test]
+    fn verify_binding_refuses_a_key_in_neither_slot() {
+        let active = DiscoPrivateKey::random().public_key();
+        let inactive = DiscoPrivateKey::random().public_key();
+        let third = DiscoPrivateKey::random().public_key();
+        let node_key = NodePrivateKey::random().public_key();
+        let other_node_key = NodePrivateKey::random().public_key();
+
+        let db = db_with_inactive_key(node_with_keys(active, node_key, "n1"), inactive);
+        let (tx, mut rx) = observer();
+
+        assert!(
+            !verify_binding(&db, &tx, &third, Some(&node_key)),
+            "a disco key in neither slot must be refused even for a known node key"
+        );
+        assert!(
+            !verify_binding(&db, &tx, &third, None),
+            "and for a CallMeMaybe, which has no node key to check at all"
+        );
+        assert!(
+            !verify_binding(&db, &tx, &inactive, Some(&other_node_key)),
+            "the inactive key is still bound to its own node key"
+        );
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a refused frame must never report an active-key switch"
         );
     }
 
