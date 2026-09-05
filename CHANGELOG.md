@@ -2,6 +2,14 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.47.5](https://github.com/GeiserX/tailscale-rs/compare/v0.47.4...v0.47.5) (2026-09-05)
+
+
+### Bug Fixes
+
+* **magicsock:** accept disco under either of a peer's two known keys ([#372](https://github.com/GeiserX/tailscale-rs/issues/372)) ([da79897](https://github.com/GeiserX/tailscale-rs/commit/da79897bddf8f0eb06764d28b7e07abc6c8a2e72))
+* **runtime:** a peer's own disco key outranks control changing its mind ([#370](https://github.com/GeiserX/tailscale-rs/issues/370)) ([a312639](https://github.com/GeiserX/tailscale-rs/commit/a31263980342b48974607fe3757f616afcdf7948))
+
 ## [0.47.4](https://github.com/GeiserX/tailscale-rs/compare/v0.47.3...v0.47.4) (2026-09-04)
 
 
