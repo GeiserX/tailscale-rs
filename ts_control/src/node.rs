@@ -188,9 +188,19 @@ pub struct Node {
     /// Whether control marked this node as peerAPI-only and outside tailnet lock's coverage
     /// (`tailcfg.Node.UnsignedPeerAPIOnly`).
     ///
-    /// Such a node carries no node-key signature and is deliberately exempt from tailnet-lock
-    /// verification; in exchange it gets **no network access** — only this node's peerAPI. Because
-    /// it is outside the lock, a (possibly malicious) control server must not be able to grant it
+    /// Such a node carries no node-key signature. Upstream Go treats that as deliberate: it exempts
+    /// the node from tailnet-lock verification and, in exchange, gives it **no network access** —
+    /// only this node's peerAPI.
+    ///
+    /// **This fork does not implement that admission exemption yet.** While a tailnet-lock authority
+    /// is active, the runtime's peer-admission gate (`ts_runtime`'s
+    /// `PeerTracker::tka_snapshot_admits`) drops *every* peer with an empty
+    /// [`key_signature`](Self::key_signature), this flag included — so such a peer is not admitted
+    /// to the peer db at all and gets no peerAPI access either. That is stricter than Go (the safe
+    /// direction); the carve-out is tracked as a parity gap in `docs/PARITY_ROADMAP.md`.
+    ///
+    /// The *routes* half of upstream's treatment **is** implemented here. Because the node is
+    /// outside the lock, a (possibly malicious) control server must not be able to grant it
     /// network access via advertised routes, so [`accepted_routes`](Self::accepted_routes) is
     /// clamped to the node's own [`addresses`](Self::addresses) when this is set. See the `From`
     /// impl on this type, which mirrors Go's `upgradeNode` in `control/controlclient/map.go`.
