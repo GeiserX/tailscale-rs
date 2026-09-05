@@ -16,11 +16,14 @@ use ts_control::{Node, UserId, UserProfile};
 use ts_keys::{DiscoPublicKey, NodePublicKey};
 use ts_transport::PeerId;
 
-use crate::{Error, dataplane::PeerDiscoKeyAdvertisement, env::Env, status::StatusNode};
+use crate::{
+    Error, dataplane::PeerDiscoKeyAdvertisement, direct::DiscoKeyObserved, env::Env,
+    status::StatusNode,
+};
 
 mod peer_db;
 
-pub use peer_db::PeerDb;
+pub use peer_db::{DiscoKeyMatch, PeerDb};
 
 /// Whether `key` is the all-zero disco key, which Go spells `key.DiscoPublic.IsZero()` and treats
 /// everywhere as "this peer has no disco key" rather than as a usable key.
@@ -96,6 +99,55 @@ impl EndpointDisco {
     fn update_from_tsmp(&mut self, key: Option<DiscoPublicKey>) {
         self.tsmp = key;
         self.tsmp_active = key.is_some();
+    }
+
+    /// The peer's other known key: the slot that is not active, when it holds a key that differs
+    /// from the active one.
+    ///
+    /// This is what makes ingress under the peer's *other* key resolvable
+    /// ([`PeerDb::set_inactive_disco_key`]). `None` when the inactive slot is empty or holds the
+    /// same key as the active one — there is no second key to accept in either case.
+    fn inactive_key(&self) -> Option<DiscoPublicKey> {
+        let inactive = if self.tsmp_active {
+            self.control
+        } else {
+            self.tsmp
+        };
+
+        inactive.filter(|k| Some(*k) != self.key())
+    }
+
+    /// Accept `key` as this peer's, switching the active slot to it when it is the currently
+    /// *inactive* one — Go [`endpoint.checkAndUpdateDiscoKey`].
+    ///
+    /// Called with the sender key of a disco frame we have opened, which proves the sender holds
+    /// that key's private half. Receiving under a key is therefore demonstrative: it is what the
+    /// peer is actually using, so upstream makes it the key we send to as well.
+    ///
+    /// Returns `None` when `key` belongs to **neither** slot — the refusal that is the whole
+    /// security value of the check, and the reason this is not simply "trust whatever key opened".
+    /// Otherwise `Some(changed)`, where `changed` reports whether the active key moved (and so
+    /// whether the direct path built under the old one has to be invalidated).
+    ///
+    /// [`endpoint.checkAndUpdateDiscoKey`]: https://github.com/tailscale/tailscale/blob/9ea7cba44591e0cd840c6c94d23274dd222059bf/wgengine/magicsock/endpoint.go
+    fn check_and_update(&mut self, key: DiscoPublicKey) -> Option<bool> {
+        if self.key() == Some(key) {
+            return Some(false);
+        }
+
+        // Not the active key. Go's compare-and-swap on `tsmpActive`: whichever slot holds it
+        // becomes the active one. Control's slot is tried first only for determinism — the two
+        // holding the same key is already handled by the equality check above.
+        if self.control == Some(key) {
+            self.tsmp_active = false;
+            return Some(true);
+        }
+        if self.tsmp == Some(key) {
+            self.tsmp_active = true;
+            return Some(true);
+        }
+
+        None
     }
 
     /// No key material from either source — Go nils out the endpoint's `disco` pointer here.
@@ -470,6 +522,7 @@ impl kameo::Actor for PeerTracker {
     ) -> Result<Self, Self::Error> {
         env.subscribe::<Arc<ts_control::StateUpdate>>(&slf).await?;
         env.subscribe::<PeerDiscoKeyAdvertisement>(&slf).await?;
+        env.subscribe::<DiscoKeyObserved>(&slf).await?;
 
         // Re-filter the peer db whenever the enforcement authority changes. Go gets this for free:
         // `SetControlClientStatus` runs `tkaSyncIfNeeded` and `tkaFilterNetmapLocked` back to back
@@ -856,6 +909,37 @@ impl Message<PeerDiscoKeyAdvertisement> for PeerTracker {
     }
 }
 
+impl Message<DiscoKeyObserved> for PeerTracker {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: DiscoKeyObserved, _ctx: &mut Context<Self, Self::Reply>) {
+        if !self.observe_disco_key(msg.peer, msg.key) {
+            return;
+        }
+
+        // The active key moved, so republish. This is the *same* channel a TSMP advertisement and a
+        // netmap disco-key change use, and it is what makes the direct manager invalidate the
+        // trusted path built under the old key: it diffs consecutive snapshots
+        // (`direct::disco_key_rotations`) and calls `MagicSock::changed_active_disco` — this fork's
+        // `endpoint.changedActiveDiscoLocked`, which Go likewise reaches from
+        // `checkAndUpdateDiscoKey`. Keeping the switch and the invalidation on one path is why the
+        // switch is done here rather than on the packet path that spotted it.
+        self.peer_watch.send_replace(self.status_peers());
+
+        if let Err(e) = self
+            .env
+            .publish(Arc::new(PeerState {
+                upserts: HashSet::from_iter([msg.peer]),
+                deletions: HashSet::default(),
+                peers: Arc::new(self.peer_db.clone()),
+            }))
+            .await
+        {
+            tracing::error!(error = %e, "publishing peer state after a disco active-key switch");
+        }
+    }
+}
+
 /// Internal self-message: the Tailnet-Lock enforcement-authority cell changed — the control runner
 /// installed a freshly-synced [`Authority`](ts_tka::Authority) after a `/machine/tka/sync`, or
 /// cleared it because the lock was disabled. Sent by the watch task
@@ -980,17 +1064,109 @@ impl PeerTracker {
             return false;
         }
 
-        let mut node = existing.clone();
+        let node = existing.clone();
         let disco = self.endpoint_disco.entry(node_key).or_default();
         disco.update_from_tsmp(Some(key));
-        node.disco_key = disco.key();
-        self.peer_db.upsert(&node);
+        let disco = *disco;
+        self.store_disco(&node, disco);
 
         tracing::info!(
             ?peer,
             stable_id = ?node.stable_id,
             %key,
             "learned peer disco key from a TSMP advertisement"
+        );
+
+        true
+    }
+
+    /// Write a peer's resolved disco state onto the peer db.
+    ///
+    /// The node lands carrying the **effective** key ([`EndpointDisco::key`]), which is what the
+    /// disco index — and so every *send* path — resolves against, and the peer's other known key
+    /// (if any) is registered as its inactive ingress key so a frame arriving under it still
+    /// attributes to this peer ([`PeerDb::peer_by_known_disco_key`]).
+    ///
+    /// Every disco-key writer goes through here — control, a TSMP advertisement, and an
+    /// active-slot switch on receive — so the two cannot drift apart on which key is which.
+    fn store_disco(&mut self, node: &Node, disco: EndpointDisco) -> PeerId {
+        let effective = disco.key();
+
+        let id = if effective == node.disco_key {
+            self.peer_db.upsert(node)
+        } else {
+            let mut node = node.clone();
+            node.disco_key = effective;
+            self.peer_db.upsert(&node)
+        };
+
+        self.peer_db
+            .set_inactive_disco_key(id, disco.inactive_key());
+
+        id
+    }
+
+    /// Apply the sender key of an inbound disco frame to this peer's two-slot disco state — the
+    /// `ts_runtime` half of Go [`endpoint.checkAndUpdateDiscoKey`].
+    ///
+    /// A peer mid-rotation keeps sending disco under the key it has not yet switched away from.
+    /// Upstream accepts either of the two keys it knows for the peer and, when the one received is
+    /// the currently-inactive one, makes it active: receiving under a key is proof of what the peer
+    /// is using, and is stronger evidence than what control last said. Without this a rotation
+    /// costs the peer its direct path until control catches up or the peer re-advertises.
+    ///
+    /// Returns whether the active key changed, so the caller can republish — which is how the
+    /// direct manager learns to invalidate the trusted path built under the old key (Go's
+    /// `changedActiveDiscoLocked`, reached here through the same snapshot diff every other
+    /// disco-key transition uses).
+    ///
+    /// The refusals, all of which leave the peer db untouched:
+    ///
+    /// 1. **An unknown peer**, exactly as for a TSMP advertisement.
+    /// 2. **A peer with no disco key material at all** (Go: `epDisco == nil` ⇒ `false`).
+    /// 3. **A key belonging to neither slot.** This is the one that carries the security value:
+    ///    a peer must not be able to move itself onto a key nobody told us about, so a third key
+    ///    is refused even though the frame that carried it opened correctly.
+    ///
+    /// [`endpoint.checkAndUpdateDiscoKey`]: https://github.com/tailscale/tailscale/blob/9ea7cba44591e0cd840c6c94d23274dd222059bf/wgengine/magicsock/endpoint.go
+    fn observe_disco_key(&mut self, peer: PeerId, key: DiscoPublicKey) -> bool {
+        let Some((_id, existing)) = self.peer_db.get(&peer) else {
+            tracing::debug!(?peer, "disco received for an unknown peer; ignoring");
+            return false;
+        };
+
+        let node = existing.clone();
+        let Some(disco) = self.endpoint_disco.get_mut(&node.node_key) else {
+            // Go's `epDisco == nil`: the peer has no key from either source, so there is nothing
+            // this key could match and nothing to switch to.
+            tracing::debug!(
+                ?peer,
+                "disco received for a peer with no known disco key; ignoring"
+            );
+            return false;
+        };
+
+        let Some(changed) = disco.check_and_update(key) else {
+            tracing::debug!(
+                ?peer,
+                %key,
+                "refusing disco under a key that is neither of the peer's known disco keys"
+            );
+            return false;
+        };
+
+        if !changed {
+            return false;
+        }
+
+        let disco = *disco;
+        self.store_disco(&node, disco);
+
+        tracing::info!(
+            ?peer,
+            stable_id = ?node.stable_id,
+            %key,
+            "peer is sending disco under its other known key; making that key active"
         );
 
         true
@@ -1010,7 +1186,8 @@ impl PeerTracker {
     /// wins, exactly as it does upstream.
     ///
     /// The node lands in the db carrying the *effective* key ([`EndpointDisco::key`]), so the disco
-    /// index and every direct-path consumer resolve against the key we would actually send to.
+    /// index and every send path resolve against the key we would actually send to; the other known
+    /// key is registered for ingress attribution ([`store_disco`](Self::store_disco)).
     ///
     /// [`endpoint.updateFromNode`]: https://github.com/tailscale/tailscale/blob/49e148c4a30b4f8098f69468fd27a7021d85ea02/wgengine/magicsock/endpoint.go
     fn upsert_from_control(&mut self, node: &Node) -> PeerId {
@@ -1021,7 +1198,7 @@ impl PeerTracker {
         if disco.key_from_control() != from_control {
             disco.update_from_control(from_control);
         }
-        let effective = disco.key();
+        let disco = *disco;
 
         // No key material from either source: Go nils the endpoint's `disco` pointer, so a peer
         // that has never had a disco key costs us no entry either.
@@ -1029,13 +1206,7 @@ impl PeerTracker {
             self.endpoint_disco.remove(&node_key);
         }
 
-        if effective == node.disco_key {
-            return self.peer_db.upsert(node);
-        }
-
-        let mut node = node.clone();
-        node.disco_key = effective;
-        self.peer_db.upsert(&node)
+        self.store_disco(node, disco)
     }
 
     /// The disco key control last gave us for `node_key` — Go `endpointDisco.keyFromControl()`.
@@ -3299,6 +3470,191 @@ mod tsmp_disco_key_tests {
             tracker.endpoint_disco.len(),
             1,
             "and the old node key's state is pruned"
+        );
+    }
+
+    /// How the peer db resolves `key` for an inbound disco frame: the peer it belongs to and which
+    /// of that peer's two slots it matched.
+    fn ingress_match(
+        tracker: &PeerTracker,
+        key: DiscoPublicKey,
+    ) -> Option<(PeerId, peer_db::DiscoKeyMatch)> {
+        tracker
+            .peer_db
+            .peer_by_known_disco_key(&key)
+            .map(|(id, _node, matched)| (id, matched))
+    }
+
+    /// The bead's case, end to end: the peer advertised K2 over TSMP so we send to K2, but it is
+    /// still sending disco under the K1 control gave us. That frame must resolve to the peer, and
+    /// receiving under K1 must make K1 the key we send to — because it is demonstrably what the
+    /// peer uses.
+    ///
+    /// Go: every inbound disco comparison goes through `endpoint.checkAndUpdateDiscoKey`, which
+    /// accepts either slot and compare-and-swaps `tsmpActive` when the key seen is the inactive one.
+    #[tokio::test]
+    async fn disco_under_the_inactive_key_is_accepted_and_makes_that_key_active() {
+        let (mut tracker, peer) = tracker_with_control_peer(Some(FROM_CONTROL));
+        let from_control = DiscoPublicKey::from(FROM_CONTROL);
+        let advertised = DiscoPublicKey::from(ADVERTISED);
+
+        assert!(tracker.learn_disco_key(peer, advertised));
+        assert_eq!(
+            effective_key(&tracker, peer),
+            Some(advertised),
+            "precondition: we are sending to the TSMP-learned key"
+        );
+        assert_eq!(
+            ingress_match(&tracker, from_control),
+            Some((peer, peer_db::DiscoKeyMatch::Inactive)),
+            "control's key is still the peer's other known key, and still resolves on ingress"
+        );
+
+        // Disco arrives under control's key: accepted, and it becomes the active one.
+        assert!(
+            tracker.observe_disco_key(peer, from_control),
+            "receiving under the inactive key switches the active key"
+        );
+        assert_eq!(
+            effective_key(&tracker, peer),
+            Some(from_control),
+            "we now send to the key the peer is demonstrably using"
+        );
+        assert_eq!(
+            tracker.peer_db.has(&from_control),
+            Some(peer),
+            "and it is the key the send-side disco index carries"
+        );
+        assert_eq!(
+            ingress_match(&tracker, from_control),
+            Some((peer, peer_db::DiscoKeyMatch::Active))
+        );
+        assert_eq!(
+            ingress_match(&tracker, advertised),
+            Some((peer, peer_db::DiscoKeyMatch::Inactive)),
+            "the TSMP key is retained in the other slot, so ingress under it still resolves"
+        );
+
+        assert!(
+            !tracker.observe_disco_key(peer, from_control),
+            "a second frame under the now-active key changes nothing (and forces no republish)"
+        );
+
+        // And it switches back: the peer resumes sending under the key it advertised.
+        assert!(tracker.observe_disco_key(peer, advertised));
+        assert_eq!(effective_key(&tracker, peer), Some(advertised));
+        assert_eq!(
+            ingress_match(&tracker, from_control),
+            Some((peer, peer_db::DiscoKeyMatch::Inactive))
+        );
+    }
+
+    /// The refusal that is the whole security value of the check: a key belonging to NEITHER slot
+    /// is rejected, leaving the peer on the key it was on. Plus the two other refusals Go has —
+    /// an unknown peer, and a peer with no disco key material at all (`epDisco == nil`).
+    #[tokio::test]
+    async fn disco_under_a_key_in_neither_slot_is_refused() {
+        let (mut tracker, peer) = tracker_with_control_peer(Some(FROM_CONTROL));
+        let from_control = DiscoPublicKey::from(FROM_CONTROL);
+        let advertised = DiscoPublicKey::from(ADVERTISED);
+        let third = DiscoPublicKey::from(READVERTISED);
+
+        assert!(tracker.learn_disco_key(peer, advertised));
+
+        assert!(
+            !tracker.observe_disco_key(peer, third),
+            "a third key is refused: a peer must not move itself onto a key nobody told us about"
+        );
+        assert_eq!(
+            effective_key(&tracker, peer),
+            Some(advertised),
+            "and the peer stays on the key it was on"
+        );
+        assert_eq!(
+            ingress_match(&tracker, third),
+            None,
+            "the refused key never becomes resolvable"
+        );
+        assert_eq!(
+            ingress_match(&tracker, from_control),
+            Some((peer, peer_db::DiscoKeyMatch::Inactive)),
+            "the two real slots are untouched"
+        );
+
+        // An unknown peer: like a TSMP advertisement, this never creates one.
+        assert!(!tracker.observe_disco_key(PeerId(4242), from_control));
+        assert_eq!(tracker.peer_db.peers().len(), 1);
+
+        // A peer with no disco key from either source — Go returns false on `epDisco == nil`.
+        let (mut bare, bare_peer) = tracker_with_control_peer(None);
+        assert_eq!(effective_key(&bare, bare_peer), None, "precondition");
+        assert!(
+            !bare.observe_disco_key(bare_peer, from_control),
+            "a peer with no known disco key has no slot for this key to match"
+        );
+        assert_eq!(effective_key(&bare, bare_peer), None);
+    }
+
+    /// A peer that has only ever had one key registers no inactive key at all, so the second index
+    /// stays empty and an inbound frame under any other key is refused.
+    #[tokio::test]
+    async fn a_single_key_peer_has_no_second_slot() {
+        let (tracker, peer) = tracker_with_control_peer(Some(FROM_CONTROL));
+        let from_control = DiscoPublicKey::from(FROM_CONTROL);
+
+        assert_eq!(
+            ingress_match(&tracker, from_control),
+            Some((peer, peer_db::DiscoKeyMatch::Active))
+        );
+        assert_eq!(
+            ingress_match(&tracker, DiscoPublicKey::from(ADVERTISED)),
+            None,
+            "no second key was ever learned, so nothing else resolves to this peer"
+        );
+    }
+
+    /// An advertisement that merely restates control's key must not leave the peer with the same
+    /// key in both slots pretending to be two — `inactive_key` reports `None` when the inactive
+    /// slot holds the active key, so ingress sees exactly one key.
+    #[tokio::test]
+    async fn the_same_key_in_both_slots_is_one_key() {
+        let (mut tracker, peer) = tracker_with_control_peer(Some(FROM_CONTROL));
+        let from_control = DiscoPublicKey::from(FROM_CONTROL);
+
+        assert!(tracker.learn_disco_key(peer, from_control));
+        assert_eq!(
+            tracker
+                .endpoint_disco
+                .get(&PEER_NODE_KEY.into())
+                .and_then(EndpointDisco::inactive_key),
+            None,
+            "both slots hold the same key, so there is no second key"
+        );
+        assert_eq!(
+            ingress_match(&tracker, from_control),
+            Some((peer, peer_db::DiscoKeyMatch::Active))
+        );
+        assert!(
+            !tracker.observe_disco_key(peer, from_control),
+            "and receiving under it is a no-op, not a switch"
+        );
+    }
+
+    /// A peer that leaves the netmap takes BOTH its keys with it: the inactive-key index must not
+    /// keep attributing frames to a peer that is gone.
+    #[tokio::test]
+    async fn a_departed_peer_stops_resolving_under_either_key() {
+        let (mut tracker, peer) = tracker_with_control_peer(Some(FROM_CONTROL));
+        let advertised = DiscoPublicKey::from(ADVERTISED);
+        assert!(tracker.learn_disco_key(peer, advertised));
+        assert!(ingress_match(&tracker, DiscoPublicKey::from(FROM_CONTROL)).is_some());
+
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![]));
+        assert_eq!(ingress_match(&tracker, advertised), None);
+        assert_eq!(
+            ingress_match(&tracker, DiscoPublicKey::from(FROM_CONTROL)),
+            None,
+            "the inactive key is retracted with the peer, not left dangling"
         );
     }
 }
