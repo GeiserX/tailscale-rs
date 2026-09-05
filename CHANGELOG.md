@@ -2,6 +2,14 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.47.4](https://github.com/GeiserX/tailscale-rs/compare/v0.47.3...v0.47.4) (2026-09-04)
+
+
+### Bug Fixes
+
+* **dns:** attach an SOA to negative MagicDNS answers so renames resolve ([#367](https://github.com/GeiserX/tailscale-rs/issues/367)) ([5dff107](https://github.com/GeiserX/tailscale-rs/commit/5dff1070693639d3d7fc83c6b58fa1db3547fc12))
+* **magicsock:** a disco-key change must invalidate the direct path ([#369](https://github.com/GeiserX/tailscale-rs/issues/369)) ([8954421](https://github.com/GeiserX/tailscale-rs/commit/89544212c7446d4d832b3ef82be6b9a1babfc99a))
+
 ## [0.47.3](https://github.com/GeiserX/tailscale-rs/compare/v0.47.2...v0.47.3) (2026-09-04)
 
 
