@@ -85,13 +85,24 @@ impl EndpointDisco {
     }
 
     /// Replace the control-learned key, leaving any TSMP-learned key in place — Go
-    /// `endpoint.updateDiscoKey`.
+    /// [`endpoint.updateDiscoKey`].
     ///
-    /// A non-zero control key takes the active slot (control has caught up, so it is authoritative
-    /// again); an absent one hands the slot back to the TSMP key, if there is one.
+    /// Control's key is always recorded in control's own slot, but it takes the *active* slot only
+    /// if no TSMP-learned key already holds it: Go `epDisco.tsmpActive = old.tsmpActive ||
+    /// key.IsZero()`. A key the peer told us itself is better evidence than a control server that
+    /// is, by construction, the slower of the two sources — so control changing its mind no longer
+    /// preempts an active TSMP key. Upstream returns to control's key when disco is actually
+    /// *received* under it (`endpoint.checkAndUpdateDiscoKey`), not when control asserts it.
+    ///
+    /// An absent (Go: zero) control key still hands the slot to the TSMP key, if there is one. When
+    /// there is neither key, the caller drops the whole entry ([`is_empty`](Self::is_empty)) — which
+    /// is what stops an active TSMP slot with no TSMP key in it outliving this call, exactly as Go
+    /// nils the endpoint's `disco` pointer in the same case.
+    ///
+    /// [`endpoint.updateDiscoKey`]: https://github.com/tailscale/tailscale/blob/9ea7cba44591e0cd840c6c94d23274dd222059bf/wgengine/magicsock/endpoint.go
     fn update_from_control(&mut self, key: Option<DiscoPublicKey>) {
         self.control = key;
-        self.tsmp_active = key.is_none();
+        self.tsmp_active = self.tsmp_active || key.is_none();
     }
 
     /// Replace the TSMP-learned key, leaving the control-learned key in place — Go
@@ -1182,8 +1193,10 @@ impl PeerTracker {
     /// (Go's `if discoKey != n.DiscoKey()` guard, which compares `keyFromControl()`, never the
     /// effective key). So a netmap that merely restates the key control already sent leaves an
     /// active TSMP key alone — which is the entire point of the advertisement, whose motivating case
-    /// is a peer whose key control has not caught up with. Control genuinely changing its mind still
-    /// wins, exactly as it does upstream.
+    /// is a peer whose key control has not caught up with. Control genuinely changing its mind is
+    /// *recorded* in control's slot, but it does not take the active slot back from a TSMP-learned
+    /// key: upstream switches back only when disco is received under control's key
+    /// (`endpoint.checkAndUpdateDiscoKey`). See [`EndpointDisco::update_from_control`].
     ///
     /// The node lands in the db carrying the *effective* key ([`EndpointDisco::key`]), so the disco
     /// index and every send path resolve against the key we would actually send to; the other known
@@ -1473,8 +1486,8 @@ impl PeerTracker {
             // The db entry carries the EFFECTIVE disco key, which may have been learned over TSMP,
             // so restate what CONTROL last said before folding the patch in. Otherwise a patch that
             // says nothing about the disco key would hand a TSMP-learned key back as if control had
-            // sent it, and `upsert_from_control` would read that as control having caught up —
-            // deactivating the TSMP key on a patch that never mentioned it.
+            // sent it, and `upsert_from_control` would write it into control's slot — losing the key
+            // control actually gave us, on a patch that never mentioned the disco key at all.
             node.disco_key = self.control_disco_key(&node.node_key);
             if let Some(disco_key) = patch.disco_key {
                 node.disco_key = Some(disco_key);
@@ -3323,13 +3336,19 @@ mod tsmp_disco_key_tests {
             "and control's superseded key does not resolve to it"
         );
 
-        // Control finally changes its mind. A genuinely NEW control key wins, exactly as it does
-        // upstream (`updateDiscoKey` clears `tsmpActive` for a non-zero control key).
+        // Control finally changes its mind. The new key is recorded in control's slot, but the key
+        // the peer itself told us stays active — upstream returns to control's key only when disco
+        // is received under it (`endpoint.checkAndUpdateDiscoKey`).
         tracker.apply_peer_update(&control_full(Some(CONTROL_CAUGHT_UP)));
         assert_eq!(
             effective_key(&tracker, peer),
+            Some(advertised),
+            "a control-side key change must not preempt an active TSMP-learned key"
+        );
+        assert_eq!(
+            tracker.control_disco_key(&PEER_NODE_KEY.into()),
             Some(DiscoPublicKey::from(CONTROL_CAUGHT_UP)),
-            "control changing the key is authoritative again"
+            "but control's new key IS recorded in control's slot"
         );
     }
 
@@ -3418,13 +3437,103 @@ mod tsmp_disco_key_tests {
             "and the patch it DID carry still applied"
         );
 
-        // Now control catches up through the patch channel.
+        // Now control changes the key through the patch channel. Same rule as the netmap path: the
+        // key lands in control's slot, and the active TSMP key is left alone.
         patch.disco_key = Some(DiscoPublicKey::from(CONTROL_CAUGHT_UP));
         tracker.apply_peer_patches(std::slice::from_ref(&patch));
         assert_eq!(
             effective_key(&tracker, peer),
+            Some(advertised),
+            "a patch carrying a new disco key does not preempt the active TSMP-learned key either"
+        );
+        assert_eq!(
+            tracker.control_disco_key(&PEER_NODE_KEY.into()),
             Some(DiscoPublicKey::from(CONTROL_CAUGHT_UP)),
-            "a patch that does carry a disco key is control catching up, and wins"
+            "the patched key is still recorded as what control now says"
+        );
+    }
+
+    /// The rule this whole pair of slots exists to express: once the peer has told us its key over
+    /// TSMP, control changing its mind is *recorded* but does not take the active slot back — Go
+    /// `endpoint.updateDiscoKey`'s `epDisco.tsmpActive = old.tsmpActive || key.IsZero()`.
+    ///
+    /// Control is the slower source; a key the peer sent us itself is the better evidence. Upstream
+    /// hands the slot back only when disco is actually *received* under control's key
+    /// (`endpoint.checkAndUpdateDiscoKey`). Here the peer re-advertising is the path back, and it is
+    /// asserted at the end so the sticky rule cannot be read as "the TSMP key is now permanent".
+    #[tokio::test]
+    async fn a_control_key_change_does_not_preempt_an_active_tsmp_key() {
+        let (mut tracker, peer) = tracker_with_control_peer(Some(FROM_CONTROL));
+        let advertised = DiscoPublicKey::from(ADVERTISED);
+        let caught_up = DiscoPublicKey::from(CONTROL_CAUGHT_UP);
+        assert!(tracker.learn_disco_key(peer, advertised));
+
+        tracker.apply_peer_update(&control_full(Some(CONTROL_CAUGHT_UP)));
+        assert_eq!(
+            effective_key(&tracker, peer),
+            Some(advertised),
+            "the TSMP-learned key stays active across a control-side change"
+        );
+        assert_eq!(
+            tracker.peer_db.has(&advertised),
+            Some(peer),
+            "so the direct path still resolves the peer by the key it advertised"
+        );
+        assert_eq!(
+            tracker.peer_db.has(&caught_up),
+            None,
+            "and control's new key is not what we send to"
+        );
+        assert_eq!(
+            tracker.control_disco_key(&PEER_NODE_KEY.into()),
+            Some(caught_up),
+            "control's new key is recorded all the same — it is not discarded, just not active"
+        );
+
+        // Control changing its mind a second time, and then dropping the key entirely, changes
+        // nothing about which key is active.
+        tracker.apply_peer_update(&control_full(Some(FROM_CONTROL)));
+        tracker.apply_peer_update(&control_full(None));
+        assert_eq!(
+            effective_key(&tracker, peer),
+            Some(advertised),
+            "neither a second control change nor control dropping the key moves the active slot"
+        );
+
+        // The peer itself is what moves it: it advertises the key control had been trying to give
+        // us, and that advertisement is what we act on.
+        assert!(tracker.learn_disco_key(peer, caught_up));
+        assert_eq!(
+            effective_key(&tracker, peer),
+            Some(caught_up),
+            "a peer re-advertising moves the active key, because the peer is the evidence"
+        );
+    }
+
+    /// The sticky flag must not strand a peer that never had a TSMP key: control sending nothing
+    /// leaves no key material at all, and the key control sends next must become the active one.
+    ///
+    /// This is the case Go covers by nil-ing the endpoint's `disco` pointer when both keys are
+    /// zero; here [`PeerTracker::upsert_from_control`] drops the entry, so the "no control key means
+    /// the TSMP slot is active" flag cannot survive to shadow a later control key with nothing.
+    #[tokio::test]
+    async fn a_first_control_key_is_active_even_after_control_sent_none() {
+        let (mut tracker, peer) = tracker_with_control_peer(None);
+        assert_eq!(effective_key(&tracker, peer), None, "precondition");
+        assert!(
+            tracker.endpoint_disco.is_empty(),
+            "a peer with no key material from either source costs no entry"
+        );
+
+        tracker.apply_peer_update(&control_full(Some(FROM_CONTROL)));
+        assert_eq!(
+            effective_key(&tracker, peer),
+            Some(DiscoPublicKey::from(FROM_CONTROL)),
+            "control's first key is active — there is no TSMP key for it to defer to"
+        );
+        assert_eq!(
+            tracker.peer_db.has(&DiscoPublicKey::from(FROM_CONTROL)),
+            Some(peer)
         );
     }
 
