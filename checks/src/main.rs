@@ -10,6 +10,7 @@ mod ipv4_only_host_net;
 mod lints_enabled;
 mod parity_audit;
 mod porting_ledger;
+mod restock_beads;
 mod ssh_isolation;
 
 /// Run CI checks on all crates.
@@ -35,6 +36,7 @@ pub const CHECK_FNS: &[(&str, CheckFn)] = &[
     ("ssh_isolation", ssh_isolation::run),
     ("porting_ledger", porting_ledger::run),
     ("parity_audit", parity_audit::run),
+    ("restock_beads", restock_beads::run),
 ];
 
 /// Convenience alias for `Result` with a boxed `std::error::Error`.
