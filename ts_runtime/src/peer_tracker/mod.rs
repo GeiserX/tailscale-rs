@@ -382,7 +382,16 @@ impl PeerTracker {
     /// `authority` is borrowed once and each peer verified exactly once (the ed25519 verify is the
     /// expensive part). Returns one `bool` per input node, in input order; `None` authority ⇒ all
     /// `true` (no lock synced ⇒ admit all, Go's `b.tka == nil` early return).
-    fn tka_keep_verdicts(authority: Option<&ts_tka::Authority>, nodes: &[&Node]) -> Vec<bool> {
+    ///
+    /// `pub(crate)` for a third caller with the same requirement: the cold-start replay of a cached
+    /// netmap ([`control_runner::load_cached_netmap`](crate::control_runner::load_cached_netmap)),
+    /// which must apply the same pass to the cached peers that the netmap they were cached from
+    /// already went through — Go replays its cached map through `setNetMapLocked`, so it runs this
+    /// very filter.
+    pub(crate) fn tka_keep_verdicts(
+        authority: Option<&ts_tka::Authority>,
+        nodes: &[&Node],
+    ) -> Vec<bool> {
         let verdicts = nodes
             .iter()
             .map(|node| Self::tka_snapshot_admits(authority, node))
@@ -1659,7 +1668,7 @@ impl PeerTracker {
 }
 
 #[cfg(test)]
-mod tka_tests {
+pub(crate) mod tka_tests {
     //! Tailnet-Lock (TKA) enforcement tests for the peer-trust chokepoint.
     //!
     //! These exercise [`PeerTracker::tka_admits`] and the `tka_admits ⇒ upsert` loop the netmap
@@ -1714,7 +1723,11 @@ mod tka_tests {
     }
 
     /// A minimal peer [`Node`] carrying `node_key` and the given `key_signature`.
-    pub(super) fn peer_node(stable_id: &str, node_key: [u8; 32], key_signature: Vec<u8>) -> Node {
+    ///
+    /// `pub(crate)` so the cold-start replay tests in `control_runner` build their peers the same way
+    /// this module's TKA tests do — both run the same filter, and a second hand-rolled fixture could
+    /// drift from it.
+    pub(crate) fn peer_node(stable_id: &str, node_key: [u8; 32], key_signature: Vec<u8>) -> Node {
         Node {
             id: 1,
             stable_id: StableNodeId(stable_id.to_string()),
