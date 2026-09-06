@@ -3711,6 +3711,88 @@ mod tsmp_disco_key_tests {
         );
     }
 
+    /// The other half of `tsmpActive = old.tsmpActive || key.IsZero()`, picked up exactly where
+    /// `disco_under_the_inactive_key_is_accepted_and_makes_that_key_active` leaves off: control
+    /// has won the active slot back by disco actually being *received* under its key
+    /// (`endpoint.checkAndUpdateDiscoKey`), which upstream makes the only route back.
+    ///
+    /// This is coverage of that state, not the guard on the sticky rule — with the TSMP key demoted
+    /// the sticky left operand is false by construction, so every control write below evaluates the
+    /// same either way. The rule itself is locked by
+    /// `a_control_key_change_does_not_preempt_an_active_tsmp_key` and
+    /// `netmap_restating_controls_stale_key_keeps_the_tsmp_key`, which fail if the `||` goes.
+    ///
+    /// Two things follow here that are not obvious from the sticky rule alone. Control's later
+    /// changes **do** land, because what is sticky is the flag, not the TSMP key — so this is not
+    /// "the TSMP key wins forever", and a peer that genuinely rotated is not stranded. And control
+    /// *dropping* its key does not leave the peer with no disco key at all: the `key.IsZero()`
+    /// operand hands the slot to the TSMP key still sitting in the other slot, which is why Go only
+    /// nils the endpoint's `disco` pointer when **both** keys are zero.
+    #[tokio::test]
+    async fn control_regains_the_slot_on_receive_then_hands_it_back_when_it_drops_its_key() {
+        let (mut tracker, peer) = tracker_with_control_peer(Some(FROM_CONTROL));
+        let from_control = DiscoPublicKey::from(FROM_CONTROL);
+        let advertised = DiscoPublicKey::from(ADVERTISED);
+        let caught_up = DiscoPublicKey::from(CONTROL_CAUGHT_UP);
+
+        // Get into the state: the peer advertises, then sends disco under control's key anyway, so
+        // control's key is active again with the TSMP key demoted but retained.
+        assert!(tracker.learn_disco_key(peer, advertised));
+        assert!(tracker.observe_disco_key(peer, from_control));
+        assert_eq!(
+            effective_key(&tracker, peer),
+            Some(from_control),
+            "precondition: control holds the active slot because we received under its key"
+        );
+        assert_eq!(
+            ingress_match(&tracker, advertised),
+            Some((peer, peer_db::DiscoKeyMatch::Inactive)),
+            "precondition: the TSMP key is demoted, not discarded"
+        );
+
+        // Control changes its key. With the TSMP key demoted this one does take the active slot —
+        // the flag is what is sticky, not the TSMP key.
+        tracker.apply_peer_update(&control_full(Some(CONTROL_CAUGHT_UP)));
+        assert_eq!(
+            effective_key(&tracker, peer),
+            Some(caught_up),
+            "a demoted TSMP key does not block control's next key from becoming active"
+        );
+        assert_eq!(
+            ingress_match(&tracker, advertised),
+            Some((peer, peer_db::DiscoKeyMatch::Inactive)),
+            "and the TSMP key is still the peer's other known key for ingress"
+        );
+        assert_eq!(
+            ingress_match(&tracker, from_control),
+            None,
+            "control's superseded key is not a third slot"
+        );
+
+        // Control drops its key entirely. `key.IsZero()` is the operand that carries the peer here:
+        // the retained TSMP key becomes active rather than the peer losing disco altogether.
+        tracker.apply_peer_update(&control_full(None));
+        assert_eq!(
+            effective_key(&tracker, peer),
+            Some(advertised),
+            "control dropping its key falls back to the TSMP key, not to no key"
+        );
+        assert_eq!(
+            ingress_match(&tracker, advertised),
+            Some((peer, peer_db::DiscoKeyMatch::Active))
+        );
+        assert_eq!(
+            tracker.control_disco_key(&PEER_NODE_KEY.into()),
+            None,
+            "control's slot is cleared, so there is no second key to accept"
+        );
+        assert_eq!(
+            ingress_match(&tracker, caught_up),
+            None,
+            "the key control withdrew stops resolving on ingress"
+        );
+    }
+
     /// The refusal that is the whole security value of the check: a key belonging to NEITHER slot
     /// is rejected, leaving the peer on the key it was on. Plus the two other refusals Go has —
     /// an unknown peer, and a peer with no disco key material at all (`epDisco == nil`).
