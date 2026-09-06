@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.47.6](https://github.com/GeiserX/tailscale-rs/compare/v0.47.5...v0.47.6) (2026-09-06)
+
+
+### Bug Fixes
+
+* **serve:** decode the request target before the serve mux picks a mount ([#376](https://github.com/GeiserX/tailscale-rs/issues/376)) ([489eb0b](https://github.com/GeiserX/tailscale-rs/commit/489eb0b760ab5e51a8881bd6dcbec64b825fe8cb))
+
 ## [0.47.5](https://github.com/GeiserX/tailscale-rs/compare/v0.47.4...v0.47.5) (2026-09-05)
 
 
