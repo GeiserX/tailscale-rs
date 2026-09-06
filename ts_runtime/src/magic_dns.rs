@@ -87,22 +87,31 @@ const MAX_INFLIGHT_FORWARDS: usize = 512;
 /// Cap on how much of a forwarded upstream response we relay back to the stub resolver (a single
 /// UDP datagram).
 ///
-/// The value matches Go's forwarder read buffer (`maxResponseBytes`, ~4 KiB), but *where it applies
-/// differs*: here it is not a read bound and it does not bound memory. [`forward_query`] reads with
-/// `recv_from_bytes`, which issues `Recv { max_len: None }`, so the netstack has already copied the
-/// whole queued datagram out before [`cap_response`] sees it. What bounds the read is the netstack
-/// UDP socket's receive ring — `netcore::Config::udp_buffer_size`, 4 KiB by default and not
-/// overridden by `ts_runtime` — and smoltcp drops a datagram larger than that ring at enqueue rather
-/// than delivering a chopped one. With the ring and this cap both at 4 KiB, [`cap_response`]'s
-/// truncate-and-set-`TC` branch is therefore defensive: no datagram this socket can deliver reaches
-/// it (pinned by `cap_is_a_relay_bound_not_the_read_bound`).
+/// This is Go's `maxResponseBytes` — `const maxResponseBytes = 4095`, defined in
+/// net/dns/resolver/tsdns.go @ 9ea7cba44591e0cd840c6c94d23274dd222059bf and used by the forwarder.
+/// The odd-looking 4095 is deliberate upstream: `sendUDP` reads into a `maxResponseBytes+1` buffer
+/// precisely so that a 4096-byte read is *detectable* as "the answer did not fit", and then cuts the
+/// reply back to 4095 and sets `TC`. A 4096-byte answer is a truncated answer everywhere else in a
+/// tailnet, so it has to be one here too: relaying it whole with `TC` clear is a message a Go peer
+/// would have handed its stub resolver as truncated.
+///
+/// *Where the bound applies differs from Go*: here it is not a read bound and it does not bound
+/// memory. [`forward_query`] reads with `recv_from_bytes`, which issues `Recv { max_len: None }`, so
+/// the netstack has already copied the whole queued datagram out before [`cap_response`] sees it.
+/// What bounds the read is the netstack UDP socket's receive ring —
+/// `netcore::Config::udp_buffer_size`, 4 KiB by default and not overridden by `ts_runtime` — and
+/// smoltcp drops a datagram larger than that ring at enqueue rather than delivering a chopped one.
+/// That ring is 4096 and this cap is 4095, so the ring plays exactly the part Go's `+1` byte plays:
+/// the one datagram size it can deliver and this cap cannot pass is the full-ring 4096-byte answer,
+/// which [`cap_response`] then chops to 4095 and marks `TC` (pinned by
+/// `full_ring_datagram_is_chopped_and_marked_truncated`).
 ///
 /// The client's query is forwarded verbatim, so a client advertising a large EDNS UDP size can
-/// elicit a legitimately large (1300–4096 byte) UDP answer (big TXT sets, DNSSEC, many-record
+/// elicit a legitimately large (1300–4095 byte) UDP answer (big TXT sets, DNSSEC, many-record
 /// round-robins). Capping at the old 1232 truncated those and set TC, forcing a TCP retry this
-/// fork's UDP-only forwarder can't serve — so the large answer became unreachable. 4096 relays them
+/// fork's UDP-only forwarder can't serve — so the large answer became unreachable. 4095 relays them
 /// intact.
-const MAX_UPSTREAM_RESPONSE: usize = 4096;
+const MAX_UPSTREAM_RESPONSE: usize = 4095;
 
 /// The MagicDNS service IP. The netstack interface owns this address, so a `udp_bind` here
 /// receives the tailnet's DNS traffic.
@@ -745,9 +754,10 @@ pub(crate) fn recursive_plan(view: &DnsView, default_upstreams: Vec<SocketAddr>)
 /// second check is the *client's* bound, and never chops the body.
 ///
 /// The cap runs *after* the whole datagram has been read (see [`MAX_UPSTREAM_RESPONSE`]), so it
-/// bounds what we relay, not what we allocate — and while the cap is ≥ the netstack's UDP receive
-/// ring the truncating branch cannot fire on a datagram that ring could deliver. The client-limit
-/// check is therefore what actually sets `TC` on this path in practice.
+/// bounds what we relay, not what we allocate. The netstack's UDP receive ring (4096) is one byte
+/// wider than the cap (4095), so the truncating branch is reachable by exactly one deliverable
+/// datagram size — the full-ring 4096-byte answer — which is the same size Go's `maxResponseBytes+1`
+/// read buffer exists to catch.
 fn cap_response(query: &[u8], mut resp: Vec<u8>) -> Vec<u8> {
     if resp.len() > MAX_UPSTREAM_RESPONSE {
         resp.truncate(MAX_UPSTREAM_RESPONSE);
@@ -2497,29 +2507,28 @@ mod tests {
         // cap bounds what we relay, not what we read or allocate. What bounds the read is the
         // netstack UDP socket's receive ring (`udp_buffer_size`, which `ts_runtime` leaves at the
         // `netcore` default) -- smoltcp drops a datagram larger than that ring at enqueue instead
-        // of delivering it. Pin the consequence: the largest answer this socket can deliver is
-        // relayed byte-for-byte, so the truncate-and-chop branch never fires on the forwarded path.
-        // Ask with an EDNS buffer that covers the whole datagram, so the client-limit check (the
-        // other half of `cap_response`) is not what we are measuring.
+        // of delivering it, and hands us everything up to and including the ring whole. The ring
+        // being *wider* than the cap is what shows the two are different bounds: the read can put
+        // more bytes in front of `cap_response` than the cap will relay.
         let ring = netstack::netcore::Config::default().udp_buffer_size;
         assert!(
-            MAX_UPSTREAM_RESPONSE >= ring,
-            "cap ({MAX_UPSTREAM_RESPONSE}) is below the netstack udp receive ring ({ring}): the cap \
-             would then be what truncates a deliverable answer, and the docs saying otherwise are \
-             wrong"
+            ring > MAX_UPSTREAM_RESPONSE,
+            "the netstack udp receive ring ({ring}) no longer exceeds the relay cap \
+             ({MAX_UPSTREAM_RESPONSE}): the cap would then be unreachable through this socket, and \
+             the doc describing it as a relay bound the read can overrun is wrong"
         );
 
+        // The largest answer the cap passes is relayed byte-for-byte. Ask with an EDNS buffer that
+        // covers the whole datagram, so the client-limit check (the other half of `cap_response`)
+        // is not what we are measuring.
         let query = build_edns_query(0x302, &["example", "com"], 1, 1, 4096);
         let mut largest = query.clone();
         largest[2] |= 0x80; // QR=1
-        largest.resize(ring, 0xAB);
+        largest.resize(MAX_UPSTREAM_RESPONSE, 0xAB);
         let before = largest.clone();
 
         let out = cap_response(&query, largest);
-        assert_eq!(
-            out, before,
-            "the largest deliverable datagram must be relayed verbatim"
-        );
+        assert_eq!(out, before, "an answer at the cap must be relayed verbatim");
         assert_eq!(
             out[2] & 0x02,
             0,
@@ -2528,9 +2537,34 @@ mod tests {
     }
 
     #[test]
+    fn full_ring_datagram_is_chopped_and_marked_truncated() {
+        // Upstream's bound is `const maxResponseBytes = 4095` (net/dns/resolver/tsdns.go @
+        // 9ea7cba44591e0cd840c6c94d23274dd222059bf). `sendUDP` reads into `maxResponseBytes+1`
+        // bytes exactly so a 4096-byte answer is detectable as "did not fit", then cuts it to 4095
+        // and sets TC. Here the netstack's 4096-byte receive ring plays the part of Go's `+1`: a
+        // full-ring datagram is the one deliverable size the cap does not pass, and it must come
+        // back with the same shape a Go forwarder would have produced. With the cap at 4096 this
+        // datagram was relayed whole with TC clear, while a Go client on the same tailnet answering
+        // the same query returned 4095 bytes marked truncated.
+        let ring = netstack::netcore::Config::default().udp_buffer_size;
+        let query = build_edns_query(0x303, &["example", "com"], 1, 1, 4096);
+        let mut full_ring = query.clone();
+        full_ring[2] |= 0x80; // QR=1
+        full_ring.resize(ring, 0xAB);
+
+        let out = cap_response(&query, full_ring);
+        assert_eq!(
+            out.len(),
+            4095,
+            "a full-ring answer must be cut to upstream's maxResponseBytes"
+        );
+        assert_ne!(out[2] & 0x02, 0, "TC bit set on the chopped answer");
+    }
+
+    #[test]
     fn forwarded_reply_over_512_sets_tc_for_a_plain_query() {
         // A query with no EDNS OPT record is limited to 512 bytes (RFC 1035), so a 900-byte
-        // forwarded reply -- well under the 4096 relay cap, and therefore relayed with TC clear
+        // forwarded reply -- well under the 4095 relay cap, and therefore relayed with TC clear
         // before this check existed -- must come back marked truncated, body intact.
         let query = build_query(0x400, &["example", "com"], 1, 1);
         let mut reply = query.clone();
