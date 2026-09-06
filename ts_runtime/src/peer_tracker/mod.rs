@@ -3590,6 +3590,82 @@ mod tsmp_disco_key_tests {
         );
     }
 
+    /// The other half of `tsmpActive = old.tsmpActive || key.IsZero()`, in the one state where the
+    /// left operand is false *and* a TSMP key exists: after disco was received under control's key,
+    /// which is upstream's only route back to control holding the active slot
+    /// (`endpoint.checkAndUpdateDiscoKey`).
+    ///
+    /// Two things follow, and neither is obvious from the sticky rule alone. Control's later changes
+    /// **do** land, because what is sticky is the flag, not the TSMP key — so this is not "the TSMP
+    /// key wins forever", and a peer that genuinely rotated is not stranded. And control *dropping*
+    /// its key does not leave the peer with no disco key at all: the `key.IsZero()` operand hands the
+    /// slot to the TSMP key still sitting in the other slot, which is why Go only nils the endpoint's
+    /// `disco` pointer when **both** keys are zero.
+    #[tokio::test]
+    async fn control_regains_the_slot_by_being_received_under_and_then_keeps_it() {
+        let (mut tracker, peer) = tracker_with_control_peer(Some(FROM_CONTROL));
+        let from_control = DiscoPublicKey::from(FROM_CONTROL);
+        let advertised = DiscoPublicKey::from(ADVERTISED);
+        let caught_up = DiscoPublicKey::from(CONTROL_CAUGHT_UP);
+
+        // Get into the state: the peer advertises, then sends disco under control's key anyway, so
+        // control's key is active again with the TSMP key demoted but retained.
+        assert!(tracker.learn_disco_key(peer, advertised));
+        assert!(tracker.observe_disco_key(peer, from_control));
+        assert_eq!(
+            effective_key(&tracker, peer),
+            Some(from_control),
+            "precondition: control holds the active slot because we received under its key"
+        );
+        assert_eq!(
+            ingress_match(&tracker, advertised),
+            Some((peer, peer_db::DiscoKeyMatch::Inactive)),
+            "precondition: the TSMP key is demoted, not discarded"
+        );
+
+        // Control changes its key. With the TSMP key demoted the sticky operand is false, so this
+        // one does take the active slot — the flag is what is sticky, not the TSMP key.
+        tracker.apply_peer_update(&control_full(Some(CONTROL_CAUGHT_UP)));
+        assert_eq!(
+            effective_key(&tracker, peer),
+            Some(caught_up),
+            "a demoted TSMP key does not block control's next key from becoming active"
+        );
+        assert_eq!(
+            ingress_match(&tracker, advertised),
+            Some((peer, peer_db::DiscoKeyMatch::Inactive)),
+            "and the TSMP key is still the peer's other known key for ingress"
+        );
+        assert_eq!(
+            ingress_match(&tracker, from_control),
+            None,
+            "control's superseded key is not a third slot"
+        );
+
+        // Control drops its key entirely. `key.IsZero()` is the operand that carries the peer here:
+        // the retained TSMP key becomes active rather than the peer losing disco altogether.
+        tracker.apply_peer_update(&control_full(None));
+        assert_eq!(
+            effective_key(&tracker, peer),
+            Some(advertised),
+            "control dropping its key falls back to the TSMP key, not to no key"
+        );
+        assert_eq!(
+            ingress_match(&tracker, advertised),
+            Some((peer, peer_db::DiscoKeyMatch::Active))
+        );
+        assert_eq!(
+            tracker.control_disco_key(&PEER_NODE_KEY.into()),
+            None,
+            "control's slot is cleared, so there is no second key to accept"
+        );
+        assert_eq!(
+            ingress_match(&tracker, caught_up),
+            None,
+            "the key control withdrew stops resolving on ingress"
+        );
+    }
+
     /// The TSMP-learned key lives exactly as long as Go's endpoint does: it is dropped when the peer
     /// leaves the netmap, and it is not carried across a node-key rotation (Go builds the rotated
     /// peer a brand-new endpoint, with a brand-new `endpointDisco`).
