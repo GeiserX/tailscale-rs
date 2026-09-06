@@ -431,14 +431,15 @@ where
     }
 }
 
-/// Parse the request-line path from an HTTP head. Returns the path component (without the query
-/// string), or `None` if the head is malformed. Hand-rolled; no HTTP library framing assumptions
-/// beyond the request line.
+/// Parse an HTTP head into the URL path the serve mux routes on: the request-line target, run
+/// through [`request_target_path`]. Returns `None` if the head is malformed, or if the target is
+/// one Go's HTTP server refuses outright — dispatch answers 400 for both, which is Go's answer
+/// too. Hand-rolled; no HTTP library framing assumptions beyond the request line.
 ///
-/// The target is returned **raw**, exactly as the client wrote it: normalizing it is
-/// [`match_path_handler`]'s job, because Go's `getServeHandler` looks the raw target up first and
-/// only then cleans it. A malformed target (`*`, an authority-form `host:port`) comes back here as
-/// itself and is refused there, not here.
+/// The path that comes back is **not** the bytes off the wire: it is percent-decoded and stripped
+/// of scheme, authority and query, exactly as Go's `r.URL.Path` is, because that is what
+/// `getServeHandler` looks up and cleans. Normalizing it further — the cleaning, and the refusal
+/// of a path that is not absolute — is [`match_path_handler`]'s job.
 fn request_path(buf: &[u8]) -> Option<String> {
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut req = httparse::Request::new(&mut headers);
@@ -446,9 +447,164 @@ fn request_path(buf: &[u8]) -> Option<String> {
         Ok(_) => {}
         Err(_) => return None,
     }
-    let path = req.path?;
-    let raw = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
-    Some(raw.to_string())
+    request_target_path(req.method.unwrap_or(""), req.path?)
+}
+
+/// The URL path Go's `net/http` hands `getServeHandler` as `r.URL.Path`, for a request with this
+/// `method` and this request-line `target`. `None` means Go's server never reaches a handler at
+/// all and answers `400 Bad Request`.
+///
+/// ## Go behaviour this mirrors
+///
+/// Go does not route on the bytes off the request line. `net/http`'s `readRequest` (Go stdlib
+/// `net/http/request.go`, go1.25.1) runs the target through `url.ParseRequestURI` — `net/url`'s
+/// `parse(rawURL, viaRequest: true)` plus `setPath`'s `unescape` (Go stdlib `net/url/url.go`) —
+/// and `getServeHandler` (`ipn/ipnlocal/serve.go` @
+/// `9ea7cba44591e0cd840c6c94d23274dd222059bf`) then looks up, cleans and walks `r.URL.Path`. That
+/// path differs from the raw target in three ways that decide where a request goes:
+///
+/// * It is **percent-decoded**. `/api/%2e%2e/secret` is the path `/api/../secret`, which
+///   [`clean_path`] resolves to `/secret` — served by `/`, never by `/api`. Route on the still
+///   encoded bytes and the cleaning sees no dot-dot segment to resolve, so the `/api` mount claims
+///   a request it was never mounted for: the exact outcome the cleaning exists to prevent, spelled
+///   with two escapes. `%2f` likewise decodes to a real `/` and becomes a segment boundary, as it
+///   does in Go.
+/// * It has **no scheme, authority or query**. For the absolute-form target every server must
+///   accept (RFC 7230 §5.3.2) — `GET http://host/api HTTP/1.1` — the path is `/api`, and the
+///   `/api` mount serves it. Cleaning the raw target instead gives `http:/host/api`, which is not
+///   absolute and would 404 a request Go serves.
+/// * It is **empty** for a target that carries no path: an authority-form `CONNECT host:443`, or a
+///   rootless opaque target like `host:443`. `path.Clean("")` is `"."`, so those still reach no
+///   mount.
+///
+/// The `None` cases are Go's own parse errors, each of which makes `readRequest` fail before any
+/// handler runs: an empty target, a control byte in it, a `%` not followed by two hex digits
+/// (`/api/%zz`), and a target that is neither rooted nor scheme-prefixed (`api/v2`).
+///
+/// **Not ported:** `parseAuthority`'s validation of the authority, which this function (like Go)
+/// then throws away. A malformed authority in an absolute-form target (`http://ho%zzst/api`) is a
+/// 400 in Go and routes on its path here. The authority reaches neither the mux nor a backend, so
+/// this can only accept a request Go rejects, never route one somewhere Go would not.
+fn request_target_path(method: &str, target: &str) -> Option<String> {
+    // `readRequest`: a CONNECT target is authority-form, so Go re-parses it as `http://<target>`
+    // and then drops the scheme it added. What comes out has an empty path unless the authority
+    // itself carries one.
+    let connect_form;
+    let raw = if method == "CONNECT" && !target.starts_with('/') {
+        connect_form = format!("http://{target}");
+        connect_form.as_str()
+    } else {
+        target
+    };
+
+    // `parse(raw, viaRequest: true)`, in its order.
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.bytes().any(|b| b < b' ' || b == 0x7f) {
+        return None;
+    }
+    if raw == "*" {
+        // Go's own special case, ahead of everything else: `GET *` has the path `*`, which is not
+        // absolute and so matches no mount.
+        return Some("*".to_string());
+    }
+    let (scheme, rest) = split_scheme(raw)?;
+    // The query is cut off before the path is ever looked at.
+    let rest = rest.split_once('?').map(|(p, _)| p).unwrap_or(rest);
+    let rest = if !rest.starts_with('/') {
+        // Rootless. With a scheme this is an opaque URI, which has no path at all; without one,
+        // Go's server refuses the request.
+        if scheme.is_empty() {
+            return None;
+        }
+        ""
+    } else if !scheme.is_empty() {
+        // Absolute-form: `//authority` is consumed, and the path is whatever follows it. Go only
+        // splits an authority off a *request* target when a scheme is present, so a schemeless
+        // `//foo/bar` stays a path (and cleans to `/foo/bar`).
+        match rest.strip_prefix("//") {
+            Some(authority_and_path) => match authority_and_path.find('/') {
+                Some(i) => &authority_and_path[i..],
+                None => "",
+            },
+            None => rest,
+        }
+    } else {
+        rest
+    };
+    unescape_path(rest)
+}
+
+/// Go's `getScheme` (Go stdlib `net/url/url.go`): split a leading `scheme:` off a URL. Returns
+/// `("", raw)` when there is no scheme — an origin-form target starts with `/`, which is not a
+/// legal scheme byte — and `None` for Go's "missing protocol scheme" error, a target starting
+/// with `:`.
+fn split_scheme(raw: &str) -> Option<(&str, &str)> {
+    for (i, c) in raw.bytes().enumerate() {
+        match c {
+            b'a'..=b'z' | b'A'..=b'Z' => {}
+            // Legal inside a scheme but not as its first byte; leading one ⇒ there is no scheme.
+            b'0'..=b'9' | b'+' | b'-' | b'.' => {
+                if i == 0 {
+                    return Some(("", raw));
+                }
+            }
+            b':' => {
+                if i == 0 {
+                    return None;
+                }
+                // `i` indexes an ASCII byte, so both halves split on a char boundary.
+                return Some((&raw[..i], &raw[i + 1..]));
+            }
+            _ => return Some(("", raw)),
+        }
+    }
+    Some(("", raw))
+}
+
+/// Go's `unescape(s, encodePath)` (Go stdlib `net/url/url.go`), the decoding `setPath` applies
+/// before `r.URL.Path` is ever routed on: `%XX` becomes the byte it names, `+` stays a `+` (only a
+/// query *component* decodes it as a space), and a `%` not followed by two hex digits is Go's
+/// `EscapeError` — `None` here, a 400 there.
+///
+/// Go's decoded path is a Go string, which need not be UTF-8; a Rust `String` must be, so any
+/// undecodable byte becomes U+FFFD. Routing compares a mount only against runs of bytes delimited
+/// by `/`, and the substitution replaces no ASCII byte and introduces no `/`, so the segment
+/// structure — and with it every mount decision — is the one Go reaches on the raw bytes. (The
+/// single case it could differ in is a mount point spelled with a literal U+FFFD in it, which the
+/// decoded bytes could then equal without being it.)
+fn unescape_path(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let hi = unhex(*b.get(i + 1)?)?;
+            let lo = unhex(*b.get(i + 2)?)?;
+            out.push(hi << 4 | lo);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    // A decoded byte sequence that is not UTF-8 is kept lossily rather than refused: Go routes it,
+    // and see above for why the replacement cannot move the request to another mount.
+    Some(
+        String::from_utf8(out)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
+    )
+}
+
+/// Go's `unhex` (Go stdlib `net/url/url.go`): the value of one hex digit, or `None` if it is not one.
+fn unhex(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Reason phrase for a redirect status (best-effort; falls back to "Redirect").
@@ -609,8 +765,9 @@ fn mount_claims_path(mount: &str, path: &str) -> bool {
     }
 }
 
-/// Pick the [`ServeTarget`] a request `path` dispatches to in a [`ServeTarget::Path`] mux, given the
-/// raw request target from the request line.
+/// Pick the [`ServeTarget`] a request `path` dispatches to in a [`ServeTarget::Path`] mux, given
+/// the request's URL path — what [`request_path`] returns, i.e. Go's `r.URL.Path`: percent-decoded,
+/// with any scheme, authority and query already stripped, and not yet cleaned.
 ///
 /// Pure and total over `(handlers, path)` — the whole routing decision, with no I/O — so it is
 /// testable directly instead of only through a TLS-terminated socket. [`serve_path`] calls this; it
@@ -622,18 +779,22 @@ fn mount_claims_path(mount: &str, path: &str) -> bool {
 /// `getServeHandler` (`ipn/ipnlocal/serve.go` @ `49e148c4a30b4f8098f69468fd27a7021d85ea02`) resolves
 /// a request in three steps, and so does this:
 ///
-/// 1. **Exact lookup of the raw target.** A mount spelled exactly as the request target wins
-///    verbatim, before any normalization (Go: `wsc.Handlers().GetOk(r.URL.Path)`).
-/// 2. **Clean, then match.** Otherwise the target is [`clean_path`]ed — Go's `path.Clean` — and only
+/// 1. **Exact lookup of the path.** A mount spelled exactly as the request's path wins verbatim,
+///    before any cleaning (Go: `wsc.Handlers().GetOk(r.URL.Path)`).
+/// 2. **Clean, then match.** Otherwise the path is [`clean_path`]ed — Go's `path.Clean` — and only
 ///    the *cleaned* path is offered to the mounts. Dot-dot is therefore resolved **before** any
 ///    mount is consulted: with mounts at `/` and `/api`, `/api/../secret` is `/secret` and is served
-///    by `/`; it must never reach the `/api` backend, which was never mounted for it.
-/// 3. **Refuse a target that is not an absolute path.** A cleaned path not starting with `/` matches
-///    nothing. Go needs this guard because the malformed request targets — `*` (`GET *`) and the
-///    empty authority-form target — clean to `*` and `.`, which are `path.Dir` fixed points that
+///    by `/`; it must never reach the `/api` backend, which was never mounted for it. Because the
+///    path arrives percent-decoded, `/api/%2e%2e/secret` is that same request and gets that same
+///    answer.
+/// 3. **Refuse a path that is not absolute.** A cleaned path not starting with `/` matches nothing.
+///    Go needs this guard because the malformed request targets — `*` (`GET *`) and the empty path
+///    of an authority-form target — clean to `*` and `.`, which are `path.Dir` fixed points that
 ///    would spin its backwards walk forever. Here the walk cannot spin, but the guard still carries
 ///    Go's *routing* answer: those targets match no mount. Without it a root mount claims them,
-///    because `/` normalizes to the empty prefix that claims every string.
+///    because `/` normalizes to the empty prefix that claims every string. It fires on exactly what
+///    it fires on in Go — a parsed path, which can no longer carry a scheme — so an absolute-form
+///    `GET http://host/api` is routed on `/api` here as it is there, not refused.
 ///
 /// Longest match wins among the mounts that claim the cleaned path (see [`mount_claims_path`]): the
 /// one with the most path bytes is chosen, so `/api/v2` beats `/api` beats `/`. This is the same
@@ -645,11 +806,11 @@ fn match_path_handler<'h>(
     handlers: &'h BTreeMap<String, ServeTarget>,
     path: &str,
 ) -> Option<&'h ServeTarget> {
-    // (1) The raw target, looked up exactly.
+    // (1) The path, looked up exactly.
     if let Some(target) = handlers.get(path) {
         return Some(target);
     }
-    // (2) Everything else routes on the cleaned path, never the raw one.
+    // (2) Everything else routes on the cleaned path, never the uncleaned one.
     let cleaned = clean_path(path);
     // (3) Not an absolute path => no mount claims it.
     if !cleaned.starts_with('/') {
@@ -822,6 +983,155 @@ mod tests {
         assert_eq!(request_path(b"GARBAGE\r\n\r\n").as_deref(), None);
         // Empty buffer => incomplete => None.
         assert_eq!(request_path(b"").as_deref(), None);
+    }
+
+    #[test]
+    fn request_target_path_matches_go_url_path() {
+        // Each row is Go's `r.URL.Path` for that request line — the string `getServeHandler` looks
+        // up, cleans and walks. `None` is Go's parse error, which its server answers with a 400
+        // without ever reaching a handler.
+        for (method, target, want) in [
+            // Origin-form: the ordinary case, query cut off.
+            ("GET", "/", Some("/")),
+            ("GET", "/api/v1", Some("/api/v1")),
+            ("GET", "/api/v1?x=1", Some("/api/v1")),
+            ("GET", "/api?", Some("/api")),
+            // Percent-decoded, which is the whole point: an encoded dot-dot is a dot-dot, so
+            // `clean_path` can resolve it before any mount is consulted.
+            ("GET", "/api/%2e%2e/secret", Some("/api/../secret")),
+            ("GET", "/api/%2E%2E/secret", Some("/api/../secret")),
+            ("GET", "/api/..%2fsecret", Some("/api/../secret")),
+            // `%2f` is a real separator once decoded, exactly as it is in Go.
+            ("GET", "/api%2Fv2", Some("/api/v2")),
+            ("GET", "/%41", Some("/A")),
+            // `+` is only a space in a query *component*; in a path it stays a `+`.
+            ("GET", "/a+b", Some("/a+b")),
+            // Absolute-form (RFC 7230 §5.3.2): scheme and authority are stripped, leaving the path.
+            ("GET", "http://host/api", Some("/api")),
+            ("GET", "https://host/api/v2?x=1", Some("/api/v2")),
+            ("GET", "http://user@host/api", Some("/api")),
+            ("GET", "http://host", Some("")),
+            ("GET", "http://host/", Some("/")),
+            // No scheme means no authority to split: `//foo/bar` is a path (it cleans to /foo/bar).
+            ("GET", "//foo/bar", Some("//foo/bar")),
+            // Targets with no path at all. All of these clean to "." or "*", so no mount claims them.
+            ("GET", "*", Some("*")),
+            ("GET", "host:443", Some("")),
+            ("CONNECT", "host:443", Some("")),
+            ("CONNECT", "192.0.2.1:443", Some("")),
+            ("CONNECT", "*", Some("")),
+            // Go's parse errors => 400 before any handler.
+            ("GET", "", None),
+            ("GET", "api/v2", None),
+            ("GET", ":80/x", None),
+            ("GET", "/api/%zz", None),
+            ("GET", "/api/%2", None),
+            ("GET", "/api/%", None),
+            ("GET", "/api/\u{1}", None),
+        ] {
+            assert_eq!(
+                request_target_path(method, target).as_deref(),
+                want,
+                "request_target_path({method:?}, {target:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn request_path_returns_the_decoded_url_path() {
+        // Straight off the wire through the production parse: what dispatch routes on is Go's
+        // `r.URL.Path`, not the bytes of the request target.
+        assert_eq!(
+            request_path(b"GET /api/%2e%2e/secret HTTP/1.1\r\nHost: h\r\n\r\n").as_deref(),
+            Some("/api/../secret")
+        );
+        assert_eq!(
+            request_path(b"GET http://host/api?x=1 HTTP/1.1\r\nHost: host\r\n\r\n").as_deref(),
+            Some("/api")
+        );
+        // A bad escape is not a path: Go's server answers 400, and so does dispatch.
+        assert_eq!(
+            request_path(b"GET /api/%zz HTTP/1.1\r\nHost: h\r\n\r\n").as_deref(),
+            None
+        );
+    }
+
+    /// Route one request head the way dispatch does: the production parse ([`request_path`])
+    /// feeding the production selection ([`match_path_handler`]). Nothing here re-implements
+    /// either.
+    fn route<'h>(
+        head: &[u8],
+        handlers: &'h BTreeMap<String, ServeTarget>,
+    ) -> Option<&'h ServeTarget> {
+        match_path_handler(handlers, &request_path(head)?)
+    }
+
+    #[test]
+    fn percent_encoded_dot_dot_does_not_reach_the_mount_it_climbed_out_of() {
+        // The bug: routing on the raw target leaves `%2e%2e` an ordinary path segment, so the
+        // cleaning finds no dot-dot to resolve and the `/api` mount claims a request for
+        // `/secret`. Go decodes first, cleans `/api/../secret` to `/secret`, and serves it from `/`.
+        let handlers = mux();
+        let root = proxy("127.0.0.1:1");
+        let api = proxy("127.0.0.1:2");
+        let api_v2 = proxy("127.0.0.1:3");
+        for target in [
+            "/api/%2e%2e/secret",
+            "/api/%2E%2E/secret",
+            "/api/..%2fsecret",
+            "/api%2f..%2fsecret",
+            "/api/v2/%2e%2e/%2e%2e/secret",
+        ] {
+            let head = format!("GET {target} HTTP/1.1\r\nHost: h\r\n\r\n");
+            let picked = route(head.as_bytes(), &handlers);
+            assert_ne!(
+                picked,
+                Some(&api),
+                "{target} must not reach the /api backend"
+            );
+            assert_ne!(
+                picked,
+                Some(&api_v2),
+                "{target} must not reach the /api/v2 backend"
+            );
+            assert_eq!(
+                picked,
+                Some(&root),
+                "{target} decodes and cleans to /secret, which only / claims"
+            );
+        }
+        // Decoding cuts both ways: an encoded separator that lands inside a mount routes there.
+        let head = b"GET /api%2fv2/x HTTP/1.1\r\nHost: h\r\n\r\n";
+        assert_eq!(
+            route(head, &handlers),
+            Some(&api_v2),
+            "/api%2fv2/x decodes to /api/v2/x"
+        );
+    }
+
+    #[test]
+    fn absolute_form_request_target_routes_on_its_path() {
+        // RFC 7230 §5.3.2 requires every server to accept absolute-form. Go's `r.URL.Path` is
+        // `/api`, so the `/api` mount serves it; cleaning the raw target gives `http:/host/api`,
+        // which is not absolute and would 404.
+        let handlers = mux();
+        let api = proxy("127.0.0.1:2");
+        for target in [
+            "http://host/api",
+            "https://host/api",
+            "http://host/api?x=1",
+            "http://user@host/api/v1",
+        ] {
+            let head = format!("GET {target} HTTP/1.1\r\nHost: host\r\n\r\n");
+            assert_eq!(
+                route(head.as_bytes(), &handlers),
+                Some(&api),
+                "{target} is a request for /api"
+            );
+        }
+        // ...and the cleaning still applies to the path it carries.
+        let head = b"GET http://host/api/../secret HTTP/1.1\r\nHost: host\r\n\r\n";
+        assert_eq!(route(head, &handlers), Some(&proxy("127.0.0.1:1")));
     }
 
     /// The mux `serve_path` dispatch tests below route against: root, `/api`, `/api/v2`, each with a
@@ -1373,6 +1683,70 @@ mod tests {
             got.starts_with("HTTP/1.1 404 Not Found\r\n"),
             "expected a 404, got {got:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn serve_path_does_not_route_a_percent_encoded_dot_dot_to_the_mount_it_climbed_out_of() {
+        // End to end through the real dispatch, with the two dots spelled as escapes: the request
+        // target names `/api` but climbs out of it, and the `/api` backend must never see it.
+        for target in [
+            "/api/%2e%2e/secret",
+            "/api/..%2fsecret",
+            "/api%2f..%2fsecret",
+        ] {
+            let head = format!("GET {target} HTTP/1.1\r\nHost: h\r\n\r\n");
+            let got = serve_path_response(head.as_bytes(), text_mux()).await;
+            assert_ne!(got, "api-body", "{target} must not reach the /api mount");
+            assert_eq!(
+                got, "root",
+                "{target} decodes and cleans to /secret, served by /"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_path_serves_an_absolute_form_request_target() {
+        // `GET http://host/api HTTP/1.1` is a request for `/api` — absolute-form, which RFC 7230
+        // §5.3.2 requires every server to accept. Routing on the raw target 404s it.
+        let got = serve_path_response(
+            b"GET http://host/api HTTP/1.1\r\nHost: host\r\n\r\n",
+            text_mux(),
+        )
+        .await;
+        assert_eq!(
+            got, "api-body",
+            "absolute-form /api must reach the /api mount"
+        );
+
+        let got = serve_path_response(
+            b"GET https://host/other?x=1 HTTP/1.1\r\nHost: host\r\n\r\n",
+            text_mux(),
+        )
+        .await;
+        assert_eq!(got, "root");
+
+        // The path it carries is cleaned like any other.
+        let got = serve_path_response(
+            b"GET http://host/api/../secret HTTP/1.1\r\nHost: host\r\n\r\n",
+            text_mux(),
+        )
+        .await;
+        assert_eq!(got, "root");
+    }
+
+    #[tokio::test]
+    async fn serve_path_400s_a_target_go_refuses_to_parse() {
+        // Go's server fails these in `readRequest`, before any handler runs, and answers 400.
+        for target in ["/api/%zz", "api/v2"] {
+            let head = format!("GET {target} HTTP/1.1\r\nHost: h\r\n\r\n");
+            let got = serve_path_response(head.as_bytes(), text_mux()).await;
+            assert_ne!(got, "api-body", "{target} must reach no mount");
+            assert_ne!(got, "root", "{target} must reach no mount");
+            assert!(
+                got.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+                "expected a 400 for {target}, got {got:?}"
+            );
+        }
     }
 
     // NOTE: a live bind+accept test needs a running netstack channel + overlay; the existing
