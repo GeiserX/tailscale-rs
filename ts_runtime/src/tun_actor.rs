@@ -14,8 +14,9 @@
 //! no peer owns it, and nothing outside this host may ever see a packet addressed to it. So the UP
 //! pump consumes every quad-100 packet whatever its IP protocol or port ([`classify_service_ip`]) —
 //! UDP/53 goes to the responder, TCP/53 goes to the service netstack that terminates DNS over TCP
-//! ([`spawn_dns_tcp_service`]), any other TCP port is answered with a RST, everything else is
-//! dropped — and none of them reach the overlay. Mirrors Go `wgengine/netstack`'s
+//! ([`spawn_dns_tcp_service`]) — or, if that service did not come up, back to the RST — any other
+//! TCP port is answered with a RST, everything else is dropped — and none of them reach the
+//! overlay. Mirrors Go `wgengine/netstack`'s
 //! `handleLocalPackets`, which absorbs the service IP unconditionally "so such traffic never reaches
 //! the conntrack / peer-routing layers", plus `acceptTCP`'s split between the `hittingDNS` handler
 //! for port 53 and the `r.Complete(true)` RST for a quad-100 port the node does not serve.
@@ -387,12 +388,19 @@ enum ServiceIpPacket<'a> {
 /// selected exit node's `0.0.0.0/0` as `RouteAction::Wireguard(peer)`, which matches quad-100, so a
 /// forwarded service-IP packet would be encrypted and sent to that peer.
 ///
+/// `serve_dns_tcp` says whether the DNS-over-TCP service netstack is actually up and listening
+/// ([`spawn_dns_tcp_service`]). It is a parameter rather than an assumption because the two answers
+/// for TCP/53 are the two different right answers: with a listener behind the port the segment is
+/// terminated ([`ServiceIpPacket::DnsStream`]); without one it must be RST like any other unserved
+/// quad-100 port, because handing it to a stack that will not answer black-holes the SYN and the
+/// host retransmits until its connect timeout — the exact failure the RST exists to prevent.
+///
 /// IPv4-only by construction, matching the rest of this module's MagicDNS posture: only
 /// `100.100.100.100/32` is steered into the TUN ([`host_routes_from_node`]), the responder binds v4
 /// only, and the IPv6 service IP `fd7a:115c:a1e0::53` is neither served nor routed here — so there
 /// is no v6 service-IP packet for the host to emit. Unparseable bytes are `Foreign`: we cannot tell
 /// where they are addressed, and the overlay router drops what it cannot read a destination from.
-fn classify_service_ip(pkt: &[u8]) -> ServiceIpPacket<'_> {
+fn classify_service_ip(pkt: &[u8], serve_dns_tcp: bool) -> ServiceIpPacket<'_> {
     let Ok(sliced) = etherparse::SlicedPacket::from_ip(pkt) else {
         return ServiceIpPacket::Foreign;
     };
@@ -422,7 +430,15 @@ fn classify_service_ip(pkt: &[u8]) -> ServiceIpPacket<'_> {
         // `hittingDNS := hittingServiceIP && reqDetails.LocalPort == 53` and installs the DNS
         // handler for it, reaching `r.Complete(true)` — the RST — only for a quad-100 port it does
         // NOT serve. So the segment is terminated, not reset: it goes to the service netstack.
-        Some(etherparse::TransportSlice::Tcp(tcp)) if tcp.destination_port() == MAGIC_DNS_PORT => {
+        //
+        // `serve_dns_tcp` is what makes that true rather than assumed: it is set only when the
+        // service netstack came up AND is listening. Without it there is no handler behind :53
+        // either, so :53 joins every other unserved quad-100 port in the RST arm below — the same
+        // disposition `r.Complete(true)` gives an unhandled port upstream, and the same one this
+        // function gave TCP/53 before the service existed.
+        Some(etherparse::TransportSlice::Tcp(tcp))
+            if serve_dns_tcp && tcp.destination_port() == MAGIC_DNS_PORT =>
+        {
             ServiceIpPacket::DnsStream
         }
         // Any OTHER quad-100 TCP port is RST rather than dropped: nothing in this tree listens on
@@ -642,8 +658,12 @@ enum Intercept {
 /// `magic_dns.rs:385,429` is inherited (we never build a `SocketAddr` here). The `servfail` fallback
 /// is carried into the spawned task and written on forward failure — same as before, just from the
 /// spawned task rather than inline.
-fn plan_intercept(view: &DnsView, pkt: &[u8]) -> Intercept {
-    let query = match classify_service_ip(pkt) {
+///
+/// `serve_dns_tcp` is passed straight through to [`classify_service_ip`]: it is `true` only when the
+/// DNS-over-TCP service netstack is up and listening, and it is what decides whether quad-100 TCP/53
+/// is terminated ([`Intercept::DnsStream`]) or reset like any other unserved port.
+fn plan_intercept(view: &DnsView, pkt: &[u8], serve_dns_tcp: bool) -> Intercept {
+    let query = match classify_service_ip(pkt, serve_dns_tcp) {
         ServiceIpPacket::Foreign => return Intercept::NotIntercepted,
         // Addressed to the service IP but not DNS: absorbed without ever consulting the responder.
         ServiceIpPacket::Absorbed { reset } => return Intercept::Absorbed { reset },
@@ -724,7 +744,9 @@ async fn send_local_reply(device: &Arc<AsyncTunTransport>, pkt: Vec<u8>, what: &
 ///   - [`Intercept::Absorbed`] — a quad-100 packet that is not a DNS query: consumed by the service
 ///     IP whatever its port or protocol, never forwarded; a TCP segment gets a RST written back.
 ///   - [`Intercept::DnsStream`] — a quad-100 TCP/53 segment: injected into the service netstack
-///     (`dns_tcp_tx`), which terminates the connection and answers it over DNS-over-TCP.
+///     (`dns_tcp_tx`), which terminates the connection and answers it over DNS-over-TCP. Only
+///     produced when `dns_tcp_tx` is `Some`; if the service netstack did not come up, TCP/53
+///     classifies as [`Intercept::Absorbed`] with a RST instead (see [`classify_service_ip`]).
 ///   - [`Intercept::Dropped`] — a malformed quad-100 query: consumed, never forwarded.
 ///   - [`Intercept::Reply`] — an authoritative reply written straight back into the TUN INLINE
 ///     (the fast path — no overlay round-trip, no host socket; anti-leak).
@@ -742,8 +764,12 @@ async fn up_pump(
     up: OverlayToDataplane,
     dns_view_rx: watch::Receiver<Arc<DnsView>>,
     dns_channel: Channel,
-    dns_tcp_tx: netstack::WakingPipeSender,
+    dns_tcp_tx: Option<netstack::WakingPipeSender>,
 ) {
+    // `None` means the DNS-over-TCP service netstack did not come up. Telling `plan_intercept` so
+    // is what keeps quad-100 TCP/53 answered: it falls back to the RST every other unserved
+    // quad-100 port gets, instead of being injected into a stack that would never reply.
+    let serve_dns_tcp = dns_tcp_tx.is_some();
     // In-flight MagicDNS forward tasks. The slow `Decision::Forward` overlay round-trip
     // (bounded only by a ~5s timeout) is SPAWNED here rather than awaited inline, so one
     // slow/hung upstream never head-of-line-blocks the ENTIRE TUN uplink (all application
@@ -774,7 +800,7 @@ async fn up_pump(
                     // Everything else forwards to the overlay unchanged. The view is read
                     // fresh per packet (mirrors the netstack serve loop); the borrow guard
                     // is dropped at the end of this statement, never held across an `await`.
-                    let plan = plan_intercept(&dns_view_rx.borrow(), p.as_ref());
+                    let plan = plan_intercept(&dns_view_rx.borrow(), p.as_ref(), serve_dns_tcp);
                     match plan {
                         Intercept::NotIntercepted => {
                             if up.send(vec![p]).is_err() {
@@ -799,7 +825,11 @@ async fn up_pump(
                         // that netstack's downlink and are written into the TUN there, so nothing
                         // is written back here. Never forwarded to the overlay.
                         Intercept::DnsStream => {
-                            dns_tcp_tx.send_async(p.as_ref()).await;
+                            // `plan_intercept` only returns this when `serve_dns_tcp` is set, and
+                            // that is exactly `dns_tcp_tx.is_some()`, so the sender is here.
+                            if let Some(dns_tcp_tx) = &dns_tcp_tx {
+                                dns_tcp_tx.send_async(p.as_ref()).await;
+                            }
                         }
                         // Authoritative reply (fast path): write it back into the TUN inline.
                         Intercept::Reply { response, src } => {
@@ -905,18 +935,22 @@ const DNS_TCP_BACKLOG: usize = 16;
 /// It is deliberately not the forwarder netstack: that one has any-IP acceptance on and its
 /// downlink goes to the dataplane, which would put the node's own service-IP traffic on the wire.
 ///
-/// Fail-safe rather than fail-closed, because there is nothing here to leak: if the listener cannot
-/// be bound the server is not started, and the stack — which still owns `100.100.100.100` — resets
-/// the connection exactly as the old code did.
+/// Fail-safe rather than fail-closed, because there is nothing here to leak. `None` is returned if
+/// the stack cannot take the service IP or the listener cannot be bound, and the UP pump reads that
+/// as "no handler behind :53": quad-100 TCP/53 goes back to the RST it got before this existed,
+/// which is what a host can act on. The tempting alternative — hand the segments to the stack
+/// anyway — is what must not happen: an addressless stack drops what it cannot claim and a
+/// listener-less one has nothing to accept with, so the SYN would vanish and the host would
+/// retransmit to its connect timeout.
 async fn spawn_dns_tcp_service(
     joinset: &mut JoinSet<()>,
     device: Arc<AsyncTunTransport>,
     mtu: u16,
     dns_view_rx: watch::Receiver<Arc<DnsView>>,
     forward_channel: Channel,
-) -> netstack::WakingPipeSender {
+) -> Option<netstack::WakingPipeSender> {
     let (up_tx, mut down_rx) =
-        spawn_dns_tcp_netstack(joinset, mtu, dns_view_rx, forward_channel).await;
+        spawn_dns_tcp_netstack(joinset, mtu, dns_view_rx, forward_channel).await?;
 
     // Everything this stack emits is addressed to the host that opened the connection, one hop away
     // across the TUN. Write it there — never to the overlay.
@@ -926,7 +960,7 @@ async fn spawn_dns_tcp_service(
         }
     });
 
-    up_tx
+    Some(up_tx)
 }
 
 /// The half of [`spawn_dns_tcp_service`] that has no TUN in it: build the stack, give it the
@@ -935,12 +969,17 @@ async fn spawn_dns_tcp_service(
 /// Split out so the whole thing — address assignment, listener, TCP termination, the DNS-over-TCP
 /// framing and the responder behind it — is exercisable by feeding raw IP packets in one end and
 /// reading raw IP packets out the other, which is exactly what the UP pump and the TUN do to it.
+///
+/// `Some` is returned only when the stack owns the service IP *and* a listener is accepting on
+/// `:53` — the two conditions under which a segment pumped in actually produces an answer. On
+/// either failure the stack is torn down and `None` is returned, so the caller never holds a pipe
+/// into something that would swallow a SYN.
 async fn spawn_dns_tcp_netstack(
     joinset: &mut JoinSet<()>,
     mtu: u16,
     dns_view_rx: watch::Receiver<Arc<DnsView>>,
     forward_channel: Channel,
-) -> (netstack::WakingPipeSender, netstack::WakingPipeReceiver) {
+) -> Option<(netstack::WakingPipeSender, netstack::WakingPipeReceiver)> {
     let config = netstack::netcore::Config {
         // Match the TUN's MTU so the MSS this stack advertises fits the interface the segments
         // actually traverse.
@@ -958,35 +997,39 @@ async fn spawn_dns_tcp_netstack(
     ) = netstack::piped(config);
     let channel = netstack.command_channel();
 
-    joinset.spawn(async move {
+    // The run loop has to be up before either command below can round-trip, so it is spawned first
+    // and aborted if the stack turns out to be unusable. Nothing else has a handle to it yet.
+    let stack = joinset.spawn(async move {
         netstack.run_tokio().await;
         tracing::warn!("magic dns tcp netstack stopped!");
     });
 
     // Assign the service IP before any segment is pumped in: a stack with no address drops what it
-    // cannot claim, and the run loop is already up so this round-trips.
+    // cannot claim — before the segment ever reaches the TCP layer, so not even a RST comes back.
     if let Err(e) = channel.set_ips([core::net::IpAddr::V4(MAGIC_DNS_IP)]).await {
-        tracing::error!(error = %e, "magic dns tcp netstack address assignment failed; dns over tcp inert");
-        return (up_tx, down_rx);
+        tracing::error!(error = %e, "magic dns tcp netstack address assignment failed; quad-100 tcp/53 falls back to reset");
+        stack.abort();
+        return None;
     }
 
     // Bind here rather than inside the server task so the listener exists before the pump can hand
     // this stack its first SYN.
     let addr = SocketAddr::V4(SocketAddrV4::new(MAGIC_DNS_IP, MAGIC_DNS_PORT));
-    match channel.tcp_listen(addr).await {
-        Ok(listener) => {
-            joinset.spawn(crate::dns_over_tcp::serve(
-                listener,
-                dns_view_rx,
-                forward_channel,
-            ));
-        }
+    let listener = match channel.tcp_listen(addr).await {
+        Ok(listener) => listener,
         Err(e) => {
-            tracing::error!(error = %e, %addr, "magic dns tcp listen failed; dns over tcp inert");
+            tracing::error!(error = %e, %addr, "magic dns tcp listen failed; quad-100 tcp/53 falls back to reset");
+            stack.abort();
+            return None;
         }
-    }
+    };
+    joinset.spawn(crate::dns_over_tcp::serve(
+        listener,
+        dns_view_rx,
+        forward_channel,
+    ));
 
-    (up_tx, down_rx)
+    Some((up_tx, down_rx))
 }
 
 impl kameo::Actor for TunActor {
@@ -1163,7 +1206,9 @@ impl Message<Arc<ts_control::StateUpdate>> for TunActor {
         let dns_channel = self.channel.clone();
         // Stand up the service netstack that terminates quad-100 TCP/53 (DNS over TCP), and take
         // the pipe the UP pump injects those segments into. Built before the pump is spawned so the
-        // listener is already accepting when the first SYN arrives.
+        // listener is already accepting when the first SYN arrives. `None` if it could not be
+        // brought up, which the pump reads as "reset quad-100 TCP/53 as before" rather than
+        // dropping those segments into a stack that cannot answer them.
         let dns_tcp_tx = spawn_dns_tcp_service(
             &mut self._joinset,
             device.clone(),
@@ -1950,7 +1995,7 @@ mod tests {
             out
         };
 
-        let ServiceIpPacket::DnsQuery(q) = classify_service_ip(&query_pkt) else {
+        let ServiceIpPacket::DnsQuery(q) = classify_service_ip(&query_pkt, true) else {
             panic!("quad-100/udp/53 is classified as DNS");
         };
         assert_eq!(q.src, client, "source endpoint extracted");
@@ -2028,20 +2073,23 @@ mod tests {
 
         assert!(
             matches!(
-                classify_service_ip(&udp_packet(client, [8, 8, 8, 8], 53)),
+                classify_service_ip(&udp_packet(client, [8, 8, 8, 8], 53), true),
                 ServiceIpPacket::Foreign
             ),
             "UDP/53 to a non-quad-100 IP must pass through"
         );
         assert!(
             matches!(
-                classify_service_ip(&syn_packet(client, [192, 0, 2, 10], 853, 7)),
+                classify_service_ip(&syn_packet(client, [192, 0, 2, 10], 853, 7), true),
                 ServiceIpPacket::Foreign
             ),
             "a TCP SYN to a non-quad-100 IP must pass through"
         );
         assert!(
-            matches!(classify_service_ip(&[0u8; 4]), ServiceIpPacket::Foreign),
+            matches!(
+                classify_service_ip(&[0u8; 4], true),
+                ServiceIpPacket::Foreign
+            ),
             "unparseable bytes must pass through"
         );
     }
@@ -2062,7 +2110,7 @@ mod tests {
             (syn_packet(client, QUAD_100, 853, 7), "a DoT SYN on :853"),
             (syn_packet(client, QUAD_100, 80, 7), "an HTTP SYN on :80"),
         ] {
-            let ServiceIpPacket::Absorbed { reset } = classify_service_ip(&pkt) else {
+            let ServiceIpPacket::Absorbed { reset } = classify_service_ip(&pkt, true) else {
                 panic!("{what} to quad-100 must be absorbed, never forwarded to the overlay");
             };
             assert!(reset.is_some(), "{what} must be answered with a RST");
@@ -2072,7 +2120,7 @@ mod tests {
             (udp_packet(client, QUAD_100, 443), "UDP to a non-53 port"),
             (icmp_packet(client, QUAD_100), "an ICMP echo request"),
         ] {
-            let ServiceIpPacket::Absorbed { reset } = classify_service_ip(&pkt) else {
+            let ServiceIpPacket::Absorbed { reset } = classify_service_ip(&pkt, true) else {
                 panic!("{what} to quad-100 must be absorbed, never forwarded to the overlay");
             };
             assert!(reset.is_none(), "{what} is dropped silently — no RST");
@@ -2095,7 +2143,7 @@ mod tests {
 
         assert!(
             matches!(
-                classify_service_ip(&syn_packet(client, QUAD_100, 53, 7)),
+                classify_service_ip(&syn_packet(client, QUAD_100, 53, 7), true),
                 ServiceIpPacket::DnsStream
             ),
             "a SYN to quad-100:53 must be handed to the DNS-over-TCP service, never RST"
@@ -2106,7 +2154,7 @@ mod tests {
         let view = build_dns_view(&test_env(None), &dns_update(vec![]), None, false);
         assert!(
             matches!(
-                plan_intercept(&view, &syn_packet(client, QUAD_100, 53, 7)),
+                plan_intercept(&view, &syn_packet(client, QUAD_100, 53, 7), true),
                 Intercept::DnsStream
             ),
             "the UP pump must route a quad-100:53 segment into the DNS-over-TCP service"
@@ -2115,7 +2163,7 @@ mod tests {
         // The neighbours on either side of 53 are still unserved ports, and still get a RST.
         for port in [52, 54, 853] {
             let ServiceIpPacket::Absorbed { reset } =
-                classify_service_ip(&syn_packet(client, QUAD_100, port, 7))
+                classify_service_ip(&syn_packet(client, QUAD_100, port, 7), true)
             else {
                 panic!("quad-100:{port} is not served and must be absorbed with a RST");
             };
@@ -2124,6 +2172,50 @@ mod tests {
                 "quad-100:{port} is not served and must be answered with a RST"
             );
         }
+    }
+
+    /// The fallback that keeps the RST honest. `spawn_dns_tcp_service` returns `None` when the
+    /// service netstack cannot take `100.100.100.100` or cannot bind `:53`, and the UP pump then
+    /// classifies with `serve_dns_tcp = false`. In that state there is no handler behind quad-100
+    /// TCP/53 — exactly the condition under which upstream's `acceptTCP` falls through to
+    /// `r.Complete(true)` — so the segment must be RST, not handed to the service.
+    ///
+    /// Getting this wrong is worse than the divergence it replaces: a segment routed to a stack
+    /// that owns no address is dropped by smoltcp before it reaches the TCP layer, so not even a
+    /// RST comes back and the host retransmits its SYN until its connect timeout.
+    #[tokio::test]
+    async fn dns_tcp_falls_back_to_reset_when_the_service_is_not_up() {
+        use super::{ServiceIpPacket, classify_service_ip};
+
+        let client: SocketAddrV4 = "100.64.0.7:44321".parse().unwrap();
+        const QUAD_100: [u8; 4] = [100, 100, 100, 100];
+        let syn = syn_packet(client, QUAD_100, 53, 7);
+
+        let ServiceIpPacket::Absorbed { reset } = classify_service_ip(&syn, false) else {
+            panic!(
+                "with no DNS-over-TCP service listening, quad-100:53 must be absorbed, not sent to it"
+            );
+        };
+        assert!(
+            reset.is_some(),
+            "and it must be answered with a RST, so the host fails fast instead of retransmitting"
+        );
+
+        // Same verdict through the pump's planner, which is what actually decides the disposition.
+        let view = build_dns_view(&test_env(None), &dns_update(vec![]), None, false);
+        let Intercept::Absorbed { reset } = plan_intercept(&view, &syn, false) else {
+            panic!("the UP pump must absorb quad-100:53 when the service netstack did not come up");
+        };
+        assert!(reset.is_some(), "with a RST");
+
+        // UDP/53 is untouched by any of this: the in-datapath responder is always there.
+        assert!(
+            matches!(
+                classify_service_ip(&udp_packet(client, QUAD_100, 53), false),
+                ServiceIpPacket::DnsQuery(_)
+            ),
+            "the UDP responder does not depend on the TCP service"
+        );
     }
 
     /// End to end over the real service netstack: a TCP client on the far side of the TUN opens
@@ -2162,7 +2254,9 @@ mod tests {
         let forward_channel = unused_stack.command_channel();
 
         let (service_tx, mut service_rx) =
-            spawn_dns_tcp_netstack(&mut joinset, 1280, view_rx, forward_channel).await;
+            spawn_dns_tcp_netstack(&mut joinset, 1280, view_rx, forward_channel)
+                .await
+                .expect("the service netstack takes the service IP and binds :53");
 
         // The client: a second netstack holding this node's tailnet address, wired to the service
         // stack by the two pumps that stand in for the TUN.
@@ -2249,7 +2343,7 @@ mod tests {
 
         // A bare SYN to :853.
         let ServiceIpPacket::Absorbed { reset: Some(rst) } =
-            classify_service_ip(&syn_packet(client, QUAD_100, 853, 1000))
+            classify_service_ip(&syn_packet(client, QUAD_100, 853, 1000), true)
         else {
             panic!("a SYN to an unserved quad-100 port must produce a RST");
         };
@@ -2299,7 +2393,8 @@ mod tests {
             b.write(&mut out, b"payload").unwrap();
             out
         };
-        let ServiceIpPacket::Absorbed { reset: Some(rst) } = classify_service_ip(&acked) else {
+        let ServiceIpPacket::Absorbed { reset: Some(rst) } = classify_service_ip(&acked, true)
+        else {
             panic!("an ACKed segment to an unserved quad-100 port must produce a RST");
         };
         let sliced = etherparse::SlicedPacket::from_ip(&rst).expect("the RST parses");
@@ -2328,7 +2423,7 @@ mod tests {
             b.write(&mut out, &[]).unwrap();
             out
         };
-        let ServiceIpPacket::Absorbed { reset } = classify_service_ip(&inbound_rst) else {
+        let ServiceIpPacket::Absorbed { reset } = classify_service_ip(&inbound_rst, true) else {
             panic!("an inbound RST to quad-100 is still absorbed");
         };
         assert!(reset.is_none(), "a RST is never answered with another RST");
@@ -2498,7 +2593,7 @@ mod tests {
         let view = build_dns_view(&env, &update, Some(peer_db_with(&peer)), true);
 
         let fwd_pkt = quad100_query_packet(client, &build_query(0x4242, &["example", "com"]));
-        match plan_intercept(&view, &fwd_pkt) {
+        match plan_intercept(&view, &fwd_pkt, true) {
             Intercept::Forward {
                 plan, src, query, ..
             } => {
@@ -2527,7 +2622,7 @@ mod tests {
         // fixture — Forwarded; either way it is consumed, never passed through.
         let reply_pkt =
             quad100_query_packet(client, &build_query(0x1, &["self", "user", "ts", "net"]));
-        match plan_intercept(&view, &reply_pkt) {
+        match plan_intercept(&view, &reply_pkt, true) {
             Intercept::Reply { src, response } => {
                 assert_eq!(
                     src, client,
@@ -2555,7 +2650,7 @@ mod tests {
         };
         assert!(
             matches!(
-                plan_intercept(&view, &passthrough),
+                plan_intercept(&view, &passthrough, true),
                 Intercept::NotIntercepted
             ),
             "a packet not destined to quad-100:53 must pass through to the overlay"
@@ -2564,7 +2659,7 @@ mod tests {
         // A malformed query to quad-100:53 is consumed but dropped silently (never forwarded).
         let malformed = quad100_query_packet(client, &[0xff, 0x00]);
         assert!(
-            matches!(plan_intercept(&view, &malformed), Intercept::Dropped),
+            matches!(plan_intercept(&view, &malformed, true), Intercept::Dropped),
             "a malformed quad-100/UDP/53 query is dropped, never forwarded to the overlay"
         );
     }
@@ -2615,7 +2710,7 @@ mod tests {
         let view = build_dns_view(&env, &update, None, true);
         let forwarded: Vec<PacketMut> = probes
             .iter()
-            .filter(|pkt| matches!(plan_intercept(&view, pkt), Intercept::NotIntercepted))
+            .filter(|pkt| matches!(plan_intercept(&view, pkt, true), Intercept::NotIntercepted))
             .cloned()
             .map(PacketMut::from)
             .collect();
@@ -2665,7 +2760,7 @@ mod tests {
             icmp_packet(client, QUAD_100),
         ] {
             assert!(
-                !matches!(plan_intercept(&view, &pkt), Intercept::NotIntercepted),
+                !matches!(plan_intercept(&view, &pkt, true), Intercept::NotIntercepted),
                 "tun mode must absorb the same quad-100 traffic the netstack terminates"
             );
         }

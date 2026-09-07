@@ -3199,7 +3199,7 @@ mod tests {
         assert_eq!(
             u16::from_be_bytes([marked[2], marked[3]]) & 0x0200,
             0,
-            "a dropped SOA must not set TC: the fork cannot serve the TCP retry it would ask for"
+            "a dropped SOA must not set TC: the answer is already complete without it, so the TCP retry TC would ask for has nothing to fetch"
         );
     }
 

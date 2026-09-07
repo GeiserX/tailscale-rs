@@ -13,6 +13,20 @@
 //! recursive forward all behave identically on both transports. The one deliberate difference is
 //! the `TC` bit — see [`ClientTransport`].
 //!
+//! Scope of that `TC` difference, stated exactly: it is applied to **forwarded** answers only.
+//! An authoritative answer still comes out of `ts_dns_wire::encode_response`, which builds to the
+//! classic 512-byte datagram budget and sets `TC` if it has to drop an answer — a bound a TCP
+//! client does not have. That is left as is rather than re-plumbed, because overflowing 512 needs a
+//! ~240+ wire-byte question name and a name that long matches no peer, so the branch that would set
+//! `TC` on an authoritative answer is not reachable: every authoritative answer this serves
+//! provably fits. A forwarded answer, which really can be large, is the case the transport
+//! distinction exists for.
+//!
+//! One limit that stays: a forwarded answer above `MAX_UPSTREAM_RESPONSE` (4095 bytes) is chopped
+//! and marked `TC` on both transports, because the hop to the upstream resolver is UDP either way —
+//! so a TCP client is told "truncated" with no further transport to retry on. Closing that means
+//! forwarding upstream over TCP, which this does not do.
+//!
 //! Framing is RFC 1035 §4.2.2: each message, in both directions, is preceded by a two-byte
 //! big-endian length. Queries on one connection are answered **in order**: RFC 7766 §6.2.1 permits
 //! a server to answer out of order but does not require it, and in-order keeps a connection to a
@@ -102,8 +116,10 @@ const MAX_INFLIGHT_CONNS: usize = 64;
 /// must be resolved through the tunnel, never from a host socket.
 ///
 /// The caller binds the listener so that it exists before any packet is pumped in; if binding fails
-/// this server is simply never started, and quad-100 TCP/53 then behaves exactly as every other
-/// unserved quad-100 port does — the netstack resets it.
+/// this server is simply never started, and the caller stops classifying quad-100 TCP/53 as ours —
+/// so it behaves exactly as every other unserved quad-100 port does and is answered with a RST
+/// (`tun_actor::classify_service_ip` with `serve_dns_tcp` clear). The failure is never a silent
+/// drop: an unanswered SYN is worse than a refused one.
 pub(crate) async fn serve(
     listener: TcpListener,
     view_rx: watch::Receiver<Arc<DnsView>>,

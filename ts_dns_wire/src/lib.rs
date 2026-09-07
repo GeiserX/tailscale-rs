@@ -274,8 +274,9 @@ pub fn decode_query(buf: &[u8]) -> Result<Query, DecodeError> {
 /// Produces a standard recursion-desired query: a 12-byte header (`id`; flags `RD=1` with QR/opcode/
 /// AA/TC/RA/Z/RCODE all clear; `QDCOUNT=1`; `ANCOUNT`/`NSCOUNT`/`ARCOUNT=0`) followed by the question
 /// section (QNAME as length-prefixed labels + terminating zero, then `qtype` and `qclass`, both
-/// big-endian). No EDNS(0) OPT record is added, matching the rest of this fork's UDP-only,
-/// classic-512 DNS path. The result round-trips through [`decode_query`].
+/// big-endian). No EDNS(0) OPT record is added, matching the rest of this fork's classic-512 DNS
+/// path (the hop to an upstream resolver is a UDP datagram either way). The result round-trips
+/// through [`decode_query`].
 pub fn encode_query(id: u16, name: &Name, qtype: &QType, qclass: u16) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
 
@@ -487,15 +488,16 @@ fn encode_soa(out: &mut Vec<u8>, soa: &SoaZone) {
 /// `<= 512` bytes and never an oversized datagram. Note a single answer's size now includes the FULL
 /// uncompressed question name (compression only kicks in for >1 answer), so the 512 cap is reached by
 /// a shorter answer set than when every answer was a 2-byte pointer — only material for a near-maximal
-/// (~240+ wire-byte) name, where even one answer is then dropped + TC set (valid DNS; this fork is
-/// UDP-only).
+/// (~240+ wire-byte) name, where even one answer is then dropped + TC set (valid DNS: the TC bit
+/// asks the stub to retry over TCP, and the TUN data path serves that retry on
+/// `100.100.100.100:53`).
 ///
 /// The SOA is appended last and only if it still fits under that cap; if it does not, it is
 /// **dropped** (`NSCOUNT` stays 0) and TC is *not* set on its account. The record is advisory — it
 /// only shortens how long a resolver may cache a negative answer that is already complete without
-/// it — so it must never displace an answer, and setting TC would tell a stub to retry over TCP,
-/// which this UDP-only fork cannot serve. That keeps the "an authoritative reply always fits 512"
-/// invariant the forwarded-path truncation check relies on.
+/// it — so it must never displace an answer, and setting TC would send the stub into a TCP retry
+/// for an answer that was already complete without the SOA. That keeps the "an authoritative reply
+/// always fits 512" invariant the forwarded-path truncation check relies on.
 pub fn encode_response(
     id: u16,
     q: &Question,
@@ -1038,9 +1040,8 @@ mod tests {
     }
 
     /// The SOA is advisory: when it does not fit under the 512-byte cap it is dropped, NSCOUNT
-    /// stays 0, TC is NOT set, and the message stays within the cap. Setting TC here would tell a
-    /// stub to retry over TCP, which this UDP-only fork cannot serve — for an answer that was
-    /// already complete without the SOA.
+    /// stays 0, TC is NOT set, and the message stays within the cap. Setting TC here would send a
+    /// stub into a TCP retry for an answer that was already complete without the SOA.
     #[test]
     fn soa_that_does_not_fit_is_dropped_without_setting_tc() {
         // A near-maximal question name: 3 labels of 63 bytes = 193 wire bytes.
