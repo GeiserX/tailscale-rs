@@ -13,14 +13,16 @@
 //! The service IP absorbs EVERYTHING, not just DNS. `100.100.100.100` is this node's own address:
 //! no peer owns it, and nothing outside this host may ever see a packet addressed to it. So the UP
 //! pump consumes every quad-100 packet whatever its IP protocol or port ([`classify_service_ip`]) —
-//! UDP/53 goes to the responder, a TCP segment is answered with a RST, everything else is dropped —
-//! and none of them reach the overlay. Mirrors Go `wgengine/netstack`'s `handleLocalPackets`, which
-//! absorbs the service IP unconditionally "so such traffic never reaches the conntrack / peer-routing
-//! layers", plus its `hittingServiceIP` RST in `acceptTCP`.
+//! UDP/53 goes to the responder, TCP/53 goes to the service netstack that terminates DNS over TCP
+//! ([`spawn_dns_tcp_service`]), any other TCP port is answered with a RST, everything else is
+//! dropped — and none of them reach the overlay. Mirrors Go `wgengine/netstack`'s
+//! `handleLocalPackets`, which absorbs the service IP unconditionally "so such traffic never reaches
+//! the conntrack / peer-routing layers", plus `acceptTCP`'s split between the `hittingDNS` handler
+//! for port 53 and the `r.Complete(true)` RST for a quad-100 port the node does not serve.
 
 use core::num::NonZeroU16;
 use std::{
-    net::{Ipv4Addr, SocketAddrV4},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::Arc,
 };
 
@@ -28,7 +30,10 @@ use kameo::{
     actor::ActorRef,
     message::{Context, Message},
 };
-use netstack::netcore::Channel;
+use netstack::{
+    CreateSocket, HasChannel,
+    netcore::{Channel, NetstackControl},
+};
 use tokio::{sync::watch, task::JoinSet};
 use ts_transport::OverlayTransport;
 use ts_transport_tun::{AsyncTunTransport, Config as TunDeviceConfig};
@@ -37,7 +42,9 @@ use crate::{
     Error,
     dataplane::{OverlayFromDataplane, OverlayToDataplane},
     env::Env,
-    magic_dns::{Decision, DnsView, RecursivePlan, decide, forward_query, recursive_plan},
+    magic_dns::{
+        ClientTransport, Decision, DnsView, RecursivePlan, decide, forward_plan, forward_query,
+    },
     peer_tracker::PeerState,
 };
 
@@ -348,6 +355,12 @@ enum ServiceIpPacket<'a> {
     Foreign,
     /// A MagicDNS query: IPv4/UDP to `100.100.100.100:53`. Handed to the in-datapath responder.
     DnsQuery(MagicDnsQuery<'a>),
+    /// A segment of a DNS-over-TCP connection: IPv4/TCP to `100.100.100.100:53`. Absorbed like
+    /// everything else addressed to the service IP, but *terminated* rather than dropped — it is
+    /// injected into the service netstack, which runs the TCP state machine and hands the framed
+    /// query to [`dns_over_tcp`](crate::dns_over_tcp). Mirrors upstream's
+    /// `hittingDNS := hittingServiceIP && reqDetails.LocalPort == 53`.
+    DnsStream,
     /// Addressed to the service IP but NOT a MagicDNS query — some other port, some other IP
     /// protocol. Absorbed here and never forwarded: the service IP is this node's own, no peer owns
     /// it, and handing it to the overlay would encrypt it to a selected exit node.
@@ -365,6 +378,7 @@ enum ServiceIpPacket<'a> {
 /// A packet NOT addressed to the service IP is [`ServiceIpPacket::Foreign`] and is forwarded to the
 /// overlay unchanged. Everything addressed to the service IP is consumed here whatever its port or
 /// IP protocol — IPv4/UDP to `:53` as a [`ServiceIpPacket::DnsQuery`] for the in-datapath responder,
+/// IPv4/TCP to `:53` as a [`ServiceIpPacket::DnsStream`] for the service netstack to terminate,
 /// anything else as [`ServiceIpPacket::Absorbed`]. This is Go `wgengine/netstack`'s
 /// `handleLocalPackets`, which absorbs the service IP unconditionally rather than for an allow-list
 /// of ports, "so such traffic never reaches the conntrack / peer-routing layers". The absorb is what
@@ -403,9 +417,17 @@ fn classify_service_ip(pkt: &[u8]) -> ServiceIpPacket<'_> {
                 dns_payload: udp.payload(),
             })
         }
-        // An unserved quad-100 TCP port is RST rather than dropped: nothing in this tree listens on
-        // a quad-100 TCP port, so a silent drop would leave the host retransmitting a SYN until its
-        // connect timeout. Mirrors Go's `hittingServiceIP` case in `acceptTCP`, and matches what the
+        // TCP/53 is the transport a stub resolver retries on when a UDP answer came back truncated
+        // (RFC 1035 §4.2.1), and upstream serves it: `acceptTCP` computes
+        // `hittingDNS := hittingServiceIP && reqDetails.LocalPort == 53` and installs the DNS
+        // handler for it, reaching `r.Complete(true)` — the RST — only for a quad-100 port it does
+        // NOT serve. So the segment is terminated, not reset: it goes to the service netstack.
+        Some(etherparse::TransportSlice::Tcp(tcp)) if tcp.destination_port() == MAGIC_DNS_PORT => {
+            ServiceIpPacket::DnsStream
+        }
+        // Any OTHER quad-100 TCP port is RST rather than dropped: nothing in this tree listens on
+        // one, so a silent drop would leave the host retransmitting a SYN until its connect
+        // timeout. This is upstream's `r.Complete(true)` fallthrough, and it matches what the
         // netstack transport of this fork already does — there quad-100 is a netstack interface
         // address, and smoltcp answers a segment no socket accepts with `rst_reply`.
         Some(etherparse::TransportSlice::Tcp(tcp)) => ServiceIpPacket::Absorbed {
@@ -559,6 +581,11 @@ enum Intercept {
         /// The RST reply packet, if one is owed.
         reset: Option<Vec<u8>>,
     },
+    /// A segment of a DNS-over-TCP connection to `100.100.100.100:53`. The pump injects the packet
+    /// into the service netstack, which terminates the connection and answers through
+    /// [`dns_over_tcp`](crate::dns_over_tcp); the reply segments come back out of that netstack and
+    /// are written into the TUN. Never forwarded to the overlay — quad-100 is ours.
+    DnsStream,
     /// An authoritative [`Decision::Reply`] (cache / in-tailnet name): the synthesized reply bytes
     /// are carried out for the pump to write back into the TUN INLINE (the fast path — no overlay
     /// round-trip). The pump must NOT forward the packet to the overlay.
@@ -620,6 +647,9 @@ fn plan_intercept(view: &DnsView, pkt: &[u8]) -> Intercept {
         ServiceIpPacket::Foreign => return Intercept::NotIntercepted,
         // Addressed to the service IP but not DNS: absorbed without ever consulting the responder.
         ServiceIpPacket::Absorbed { reset } => return Intercept::Absorbed { reset },
+        // DNS over TCP: the connection is terminated by the service netstack, which owns the TCP
+        // state machine; the responder is consulted per framed query from there, not here.
+        ServiceIpPacket::DnsStream => return Intercept::DnsStream,
         ServiceIpPacket::DnsQuery(query) => query,
     };
     // The reply destination (the query's source endpoint). Bound before the `Decision::Forward`
@@ -642,11 +672,7 @@ fn plan_intercept(view: &DnsView, pkt: &[u8]) -> Intercept {
             servfail,
             recursive,
         }) => {
-            let plan = if recursive {
-                recursive_plan(view, upstreams)
-            } else {
-                RecursivePlan::Udp(upstreams)
-            };
+            let plan = forward_plan(view, upstreams, recursive);
             Intercept::Forward {
                 plan,
                 query,
@@ -697,6 +723,8 @@ async fn send_local_reply(device: &Arc<AsyncTunTransport>, pkt: Vec<u8>, what: &
 ///   - [`Intercept::NotIntercepted`] — forward the original packet to the overlay (`up`) unchanged.
 ///   - [`Intercept::Absorbed`] — a quad-100 packet that is not a DNS query: consumed by the service
 ///     IP whatever its port or protocol, never forwarded; a TCP segment gets a RST written back.
+///   - [`Intercept::DnsStream`] — a quad-100 TCP/53 segment: injected into the service netstack
+///     (`dns_tcp_tx`), which terminates the connection and answers it over DNS-over-TCP.
 ///   - [`Intercept::Dropped`] — a malformed quad-100 query: consumed, never forwarded.
 ///   - [`Intercept::Reply`] — an authoritative reply written straight back into the TUN INLINE
 ///     (the fast path — no overlay round-trip, no host socket; anti-leak).
@@ -714,6 +742,7 @@ async fn up_pump(
     up: OverlayToDataplane,
     dns_view_rx: watch::Receiver<Arc<DnsView>>,
     dns_channel: Channel,
+    dns_tcp_tx: netstack::WakingPipeSender,
 ) {
     // In-flight MagicDNS forward tasks. The slow `Decision::Forward` overlay round-trip
     // (bounded only by a ~5s timeout) is SPAWNED here rather than awaited inline, so one
@@ -765,6 +794,13 @@ async fn up_pump(
                                 send_local_reply(&dev_up, reset, "service ip tcp reset").await;
                             }
                         }
+                        // DNS over TCP: hand the segment to the service netstack, which owns the
+                        // TCP state machine for `100.100.100.100:53`. Its replies come back out of
+                        // that netstack's downlink and are written into the TUN there, so nothing
+                        // is written back here. Never forwarded to the overlay.
+                        Intercept::DnsStream => {
+                            dns_tcp_tx.send_async(p.as_ref()).await;
+                        }
                         // Authoritative reply (fast path): write it back into the TUN inline.
                         Intercept::Reply { response, src } => {
                             send_dns_reply(&dev_up, src, &response).await;
@@ -815,9 +851,12 @@ async fn run_forward(
     src: SocketAddrV4,
 ) {
     let response = match plan {
-        RecursivePlan::Udp(ups) => forward_query(&channel, &ups, &query, servfail).await,
+        RecursivePlan::Udp(ups) => {
+            forward_query(&channel, &ups, &query, servfail, ClientTransport::Udp).await
+        }
         RecursivePlan::Doh(addr) => {
-            crate::peerapi_doh::forward_doh(&channel, addr, &query, servfail).await
+            crate::peerapi_doh::forward_doh(&channel, addr, &query, servfail, ClientTransport::Udp)
+                .await
         }
     };
     send_local_reply(
@@ -826,6 +865,128 @@ async fn run_forward(
         "magic dns tun forwarded reply",
     )
     .await;
+}
+
+/// Per-direction TCP buffer for the service netstack's sockets.
+///
+/// The netstack allocates one buffer of this size for rx and another for tx on **every** TCP socket
+/// it creates, eagerly (there is no window auto-tuning — see
+/// [`Config::tcp_buffer_size`](netstack::netcore::Config::tcp_buffer_size)). The workspace default
+/// is 256 KiB, sized for bulk application flows; the only thing this netstack ever carries is a DNS
+/// message, which a `u16` length prefix caps at 64 KiB and which is in practice a few hundred bytes.
+/// 16 KiB keeps a stalled connection's footprint at ~32 KiB instead of ~512 KiB, and cannot throttle
+/// anything: a DNS exchange is one round trip, not a bandwidth-delay product.
+const DNS_TCP_BUFFER: usize = 16 * 1024;
+
+/// Accept-backlog for the service netstack's DNS listener.
+///
+/// Each queued half-open connection still pins two [`DNS_TCP_BUFFER`]-sized buffers, so the bound
+/// is what stops
+/// a SYN flood aimed at `100.100.100.100:53` — a *local* one, since only this host can reach the
+/// service IP — from growing the socket set. The clients are this host's own stub resolvers, so
+/// the queue never needs to be deep; the workspace default of 128 is sized for a public listener.
+const DNS_TCP_BACKLOG: usize = 16;
+
+/// Stand up the netstack that terminates quad-100 TCP, and start the DNS-over-TCP server on it.
+///
+/// TUN mode has no application netstack — that is the whole point of the mode — so a TCP connection
+/// to `100.100.100.100:53` has nothing to terminate it, and before this every such segment was
+/// answered with a RST. Upstream has a netstack in both modes and serves that port from it
+/// (`acceptTCP`'s `hittingDNS` case, wgengine/netstack/netstack.go @
+/// `9ea7cba44591e0cd840c6c94d23274dd222059bf`), so this puts one back — a small, dedicated stack
+/// that owns exactly one address and one listener:
+///
+/// - packets in: the UP pump injects quad-100 TCP/53 segments into the returned pipe sender;
+/// - packets out: this stack's downlink is written straight back into the TUN, never to the overlay;
+/// - queries: [`dns_over_tcp::serve`] answers them through the same [`DnsView`] the UDP responder
+///   uses, forwarding (when it must) over `forward_channel`, the OVERLAY netstack — anti-leak, a
+///   host socket is never involved.
+///
+/// It is deliberately not the forwarder netstack: that one has any-IP acceptance on and its
+/// downlink goes to the dataplane, which would put the node's own service-IP traffic on the wire.
+///
+/// Fail-safe rather than fail-closed, because there is nothing here to leak: if the listener cannot
+/// be bound the server is not started, and the stack — which still owns `100.100.100.100` — resets
+/// the connection exactly as the old code did.
+async fn spawn_dns_tcp_service(
+    joinset: &mut JoinSet<()>,
+    device: Arc<AsyncTunTransport>,
+    mtu: u16,
+    dns_view_rx: watch::Receiver<Arc<DnsView>>,
+    forward_channel: Channel,
+) -> netstack::WakingPipeSender {
+    let (up_tx, mut down_rx) =
+        spawn_dns_tcp_netstack(joinset, mtu, dns_view_rx, forward_channel).await;
+
+    // Everything this stack emits is addressed to the host that opened the connection, one hop away
+    // across the TUN. Write it there — never to the overlay.
+    joinset.spawn(async move {
+        while let Some(buf) = down_rx.recv_async().await {
+            send_local_reply(&device, buf.to_vec(), "magic dns tcp reply").await;
+        }
+    });
+
+    up_tx
+}
+
+/// The half of [`spawn_dns_tcp_service`] that has no TUN in it: build the stack, give it the
+/// service IP, start the server, and hand both ends of its packet pipe back.
+///
+/// Split out so the whole thing — address assignment, listener, TCP termination, the DNS-over-TCP
+/// framing and the responder behind it — is exercisable by feeding raw IP packets in one end and
+/// reading raw IP packets out the other, which is exactly what the UP pump and the TUN do to it.
+async fn spawn_dns_tcp_netstack(
+    joinset: &mut JoinSet<()>,
+    mtu: u16,
+    dns_view_rx: watch::Receiver<Arc<DnsView>>,
+    forward_channel: Channel,
+) -> (netstack::WakingPipeSender, netstack::WakingPipeReceiver) {
+    let config = netstack::netcore::Config {
+        // Match the TUN's MTU so the MSS this stack advertises fits the interface the segments
+        // actually traverse.
+        mtu: usize::from(mtu),
+        tcp_buffer_size: DNS_TCP_BUFFER,
+        tcp_listen_backlog: DNS_TCP_BACKLOG,
+        ..Default::default()
+    };
+    let (
+        mut netstack,
+        netstack::WakingPipe {
+            rx: down_rx,
+            tx: up_tx,
+        },
+    ) = netstack::piped(config);
+    let channel = netstack.command_channel();
+
+    joinset.spawn(async move {
+        netstack.run_tokio().await;
+        tracing::warn!("magic dns tcp netstack stopped!");
+    });
+
+    // Assign the service IP before any segment is pumped in: a stack with no address drops what it
+    // cannot claim, and the run loop is already up so this round-trips.
+    if let Err(e) = channel.set_ips([core::net::IpAddr::V4(MAGIC_DNS_IP)]).await {
+        tracing::error!(error = %e, "magic dns tcp netstack address assignment failed; dns over tcp inert");
+        return (up_tx, down_rx);
+    }
+
+    // Bind here rather than inside the server task so the listener exists before the pump can hand
+    // this stack its first SYN.
+    let addr = SocketAddr::V4(SocketAddrV4::new(MAGIC_DNS_IP, MAGIC_DNS_PORT));
+    match channel.tcp_listen(addr).await {
+        Ok(listener) => {
+            joinset.spawn(crate::dns_over_tcp::serve(
+                listener,
+                dns_view_rx,
+                forward_channel,
+            ));
+        }
+        Err(e) => {
+            tracing::error!(error = %e, %addr, "magic dns tcp listen failed; dns over tcp inert");
+        }
+    }
+
+    (up_tx, down_rx)
 }
 
 impl kameo::Actor for TunActor {
@@ -1000,8 +1161,19 @@ impl Message<Arc<ts_control::StateUpdate>> for TunActor {
         // The overlay `Channel` used by the MagicDNS responder to forward recursive / split-DNS
         // queries (the forwarder netstack's; egresses over the overlay — anti-leak).
         let dns_channel = self.channel.clone();
+        // Stand up the service netstack that terminates quad-100 TCP/53 (DNS over TCP), and take
+        // the pipe the UP pump injects those segments into. Built before the pump is spawned so the
+        // listener is already accepting when the first SYN arrives.
+        let dns_tcp_tx = spawn_dns_tcp_service(
+            &mut self._joinset,
+            device.clone(),
+            device_config.mtu.get(),
+            self.dns_view.subscribe(),
+            dns_channel.clone(),
+        )
+        .await;
         self._joinset
-            .spawn(up_pump(dev_up, up, dns_view_rx, dns_channel));
+            .spawn(up_pump(dev_up, up, dns_view_rx, dns_channel, dns_tcp_tx));
 
         // DOWN: dataplane -> device.
         let dev_down = device.clone();
@@ -1105,7 +1277,7 @@ impl Message<Arc<PeerState>> for TunActor {
 
 #[cfg(test)]
 mod tests {
-    use core::net::{Ipv4Addr, SocketAddrV4};
+    use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::sync::Arc;
 
     use ipnet::Ipv4Net;
@@ -1113,8 +1285,8 @@ mod tests {
     use ts_control::TunConfig;
 
     use super::{
-        Intercept, build_dns_view, host_dns_from_dns_config, host_routes_from_node, plan_intercept,
-        tun_config_from_control,
+        Intercept, MAGIC_DNS_IP, MAGIC_DNS_PORT, build_dns_view, host_dns_from_dns_config,
+        host_routes_from_node, plan_intercept, spawn_dns_tcp_netstack, tun_config_from_control,
     };
     use crate::{
         env::{Env, ForwarderConfig},
@@ -1875,9 +2047,9 @@ mod tests {
     }
 
     /// The service IP absorbs EVERYTHING addressed to it, not just UDP/53: any other UDP port, any
-    /// TCP port (including 53, which this tree serves over UDP only), and any other IP protocol.
-    /// None of these may be handed to the overlay — quad-100 is this node's own address and no peer
-    /// owns it. TCP earns a RST; the rest are dropped silently.
+    /// TCP port this node does not serve, and any other IP protocol. None of these may be handed to
+    /// the overlay — quad-100 is this node's own address and no peer owns it. TCP earns a RST; the
+    /// rest are dropped silently.
     #[test]
     fn service_ip_absorbs_every_non_dns_packet() {
         use super::{ServiceIpPacket, classify_service_ip};
@@ -1888,10 +2060,6 @@ mod tests {
         // A speculative DoT probe on quad-100:853 — upstream's own cited example.
         for (pkt, what) in [
             (syn_packet(client, QUAD_100, 853, 7), "a DoT SYN on :853"),
-            (
-                syn_packet(client, QUAD_100, 53, 7),
-                "a TCP/53 SYN (DNS here is UDP-only)",
-            ),
             (syn_packet(client, QUAD_100, 80, 7), "an HTTP SYN on :80"),
         ] {
             let ServiceIpPacket::Absorbed { reset } = classify_service_ip(&pkt) else {
@@ -1909,6 +2077,162 @@ mod tests {
             };
             assert!(reset.is_none(), "{what} is dropped silently — no RST");
         }
+    }
+
+    /// TCP/53 to the service IP is the transport a stub resolver retries on after a truncated UDP
+    /// answer, and upstream serves it: `acceptTCP` computes
+    /// `hittingDNS := hittingServiceIP && reqDetails.LocalPort == 53` and installs the DNS handler,
+    /// reaching its `r.Complete(true)` RST only for a quad-100 port it does not serve
+    /// (wgengine/netstack/netstack.go @ `9ea7cba44591e0cd840c6c94d23274dd222059bf`). So the segment
+    /// must be terminated, not reset — while every neighbouring port keeps its RST, which is what
+    /// stops this being a blanket "stop resetting quad-100 TCP".
+    #[tokio::test]
+    async fn service_ip_tcp_dns_is_terminated_not_reset() {
+        use super::{ServiceIpPacket, classify_service_ip};
+
+        let client: SocketAddrV4 = "100.64.0.7:44321".parse().unwrap();
+        const QUAD_100: [u8; 4] = [100, 100, 100, 100];
+
+        assert!(
+            matches!(
+                classify_service_ip(&syn_packet(client, QUAD_100, 53, 7)),
+                ServiceIpPacket::DnsStream
+            ),
+            "a SYN to quad-100:53 must be handed to the DNS-over-TCP service, never RST"
+        );
+
+        // And the pump sees the same verdict through `plan_intercept`: hand it to the service
+        // netstack, never to the overlay and never a RST.
+        let view = build_dns_view(&test_env(None), &dns_update(vec![]), None, false);
+        assert!(
+            matches!(
+                plan_intercept(&view, &syn_packet(client, QUAD_100, 53, 7)),
+                Intercept::DnsStream
+            ),
+            "the UP pump must route a quad-100:53 segment into the DNS-over-TCP service"
+        );
+
+        // The neighbours on either side of 53 are still unserved ports, and still get a RST.
+        for port in [52, 54, 853] {
+            let ServiceIpPacket::Absorbed { reset } =
+                classify_service_ip(&syn_packet(client, QUAD_100, port, 7))
+            else {
+                panic!("quad-100:{port} is not served and must be absorbed with a RST");
+            };
+            assert!(
+                reset.is_some(),
+                "quad-100:{port} is not served and must be answered with a RST"
+            );
+        }
+    }
+
+    /// End to end over the real service netstack: a TCP client on the far side of the TUN opens
+    /// `100.100.100.100:53`, sends a length-prefixed query, and gets a length-prefixed answer back.
+    ///
+    /// Everything between the two ends is production code — `spawn_dns_tcp_netstack` builds the
+    /// stack, assigns the service IP, binds the listener and starts `dns_over_tcp::serve` — driven
+    /// exactly as the UP pump and the TUN drive it: raw IP packets in one end, raw IP packets out
+    /// the other. The client is a second netstack standing in for the host's stub resolver, and the
+    /// two pumps between them stand in for the TUN. Before this change the same SYN was answered
+    /// with a RST and the exchange could not begin.
+    #[tokio::test]
+    async fn service_netstack_answers_a_dns_query_over_tcp() {
+        use netstack::{CreateSocket, HasChannel, netcore::NetstackControl};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // The client stands in for the host's stub resolver, at this node's own tailnet address.
+        const CLIENT: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(100, 64, 0, 1), 44321);
+
+        let mut joinset = tokio::task::JoinSet::new();
+
+        // The view the responder answers from: one peer, `peer.user.ts.net` at `100.64.0.9`, so the
+        // query resolves authoritatively and no upstream is ever consulted.
+        let mut peer = exit_peer("peer", "100.64.0.9", 1080);
+        peer.tailnet = Some("user.ts.net".to_owned());
+        let view = build_dns_view(
+            &test_env(None),
+            &dns_update(vec![]),
+            Some(peer_db_with(&peer)),
+            false,
+        );
+        let (_view_tx, view_rx) = watch::channel(Arc::new(view));
+
+        // The forwarding channel: a netstack that is never run, because nothing here forwards.
+        let (unused_stack, _unused_pipe) = netstack::piped(netstack::netcore::Config::default());
+        let forward_channel = unused_stack.command_channel();
+
+        let (service_tx, mut service_rx) =
+            spawn_dns_tcp_netstack(&mut joinset, 1280, view_rx, forward_channel).await;
+
+        // The client: a second netstack holding this node's tailnet address, wired to the service
+        // stack by the two pumps that stand in for the TUN.
+        let (mut client_stack, mut client_pipe) = netstack::piped(netstack::netcore::Config {
+            mtu: 1280,
+            ..Default::default()
+        });
+        let client_channel = client_stack.command_channel();
+        joinset.spawn(async move { client_stack.run_tokio().await });
+        client_channel
+            .set_ips([core::net::IpAddr::V4(*CLIENT.ip())])
+            .await
+            .expect("client netstack takes its address");
+
+        let client_out = client_pipe.tx.clone();
+        joinset.spawn(async move {
+            while let Some(pkt) = service_rx.recv_async().await {
+                client_out.send_async(&pkt).await;
+            }
+        });
+        joinset.spawn(async move {
+            while let Some(pkt) = client_pipe.rx.recv_async().await {
+                service_tx.send_async(&pkt).await;
+            }
+        });
+
+        let mut stream = client_channel
+            .tcp_connect(
+                SocketAddr::V4(CLIENT),
+                SocketAddr::V4(SocketAddrV4::new(MAGIC_DNS_IP, MAGIC_DNS_PORT)),
+            )
+            .await
+            .expect("the service netstack completes the handshake instead of resetting it");
+
+        // RFC 1035 §4.2.2 framing: two-byte big-endian length, then the message.
+        let query = build_query(0x7777, &["peer", "user", "ts", "net"]);
+        let len = u16::try_from(query.len()).expect("a query fits a length prefix");
+        stream
+            .write_all(&len.to_be_bytes())
+            .await
+            .expect("write the length prefix");
+        stream.write_all(&query).await.expect("write the query");
+
+        let mut len_buf = [0u8; 2];
+        stream
+            .read_exact(&mut len_buf)
+            .await
+            .expect("the answer carries its own length prefix");
+        let mut answer = vec![0u8; usize::from(u16::from_be_bytes(len_buf))];
+        stream
+            .read_exact(&mut answer)
+            .await
+            .expect("read the answer");
+
+        assert_eq!(
+            answer[0..2],
+            query[0..2],
+            "the answer echoes the query's transaction id"
+        );
+        assert_eq!(answer[3] & 0x0F, 0, "NOERROR");
+        assert_eq!(
+            u16::from_be_bytes([answer[6], answer[7]]),
+            1,
+            "one answer record"
+        );
+        assert_eq!(
+            &answer[answer.len() - 4..],
+            &[100, 64, 0, 9],
+            "and it is the peer's tailnet address"
+        );
     }
 
     /// `build_tcp_reset` answers an unserved quad-100 TCP port per the reset generation in RFC 9293
@@ -2311,8 +2635,13 @@ mod tests {
     /// The two transports must agree that the service IP is local. The netstack transport gets it
     /// for free — `overlay_addresses` hands `100.100.100.100` to the netstack as an interface
     /// address, so quad-100 terminates there whatever the port or protocol (and smoltcp resets a TCP
-    /// segment no socket accepts). The TUN transport has no netstack to terminate in, so
-    /// `plan_intercept` must reach the same verdict for the same packets: absorbed, never forwarded.
+    /// segment no socket accepts). The TUN transport has no application netstack, so
+    /// `plan_intercept` must reach the same verdict for the same packets: consumed, never forwarded.
+    ///
+    /// "Consumed" is the shared property, not "reset": TCP/53 is now *served* on the TUN side (see
+    /// `service_ip_tcp_dns_is_terminated_not_reset`), while the application netstack still has no
+    /// TCP listener on `100.100.100.100:53` and resets it. What this test pins is the one invariant
+    /// both transports must never break — no quad-100 packet reaches the overlay.
     #[tokio::test]
     async fn both_transports_absorb_service_ip_traffic() {
         use core::net::IpAddr;
