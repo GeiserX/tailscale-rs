@@ -117,6 +117,74 @@ pub(crate) fn tka_log_entries(
         .collect()
 }
 
+/// Magic first line of the persisted chain blob ([`encode_chain`]), so a decoder can tell this
+/// format from anything else that ever lands at that path — including an older or newer version of
+/// this format. An unrecognised first line is a decode error, i.e. no authority, i.e. the cached
+/// peers stay withheld.
+const TKA_CHAIN_BLOB_MAGIC: &str = "ts-tka-chain-v1";
+
+/// Encode a synced AUM chain for the cold-start store: [`TKA_CHAIN_BLOB_MAGIC`], then one
+/// standard-base64 raw-CBOR AUM per line, **genesis first**.
+///
+/// Go persists its authority as a directory of AUM files (`tka.ChonkDir`, `tka/chonk.go`, opened by
+/// `initTKALocked` in `ipn/ipnlocal/tailnet-lock.go`) and re-opens it at start-up, which is what lets
+/// its cold start filter a cached netmap. This is the same idea in one file: the chain in the linear
+/// genesis→head order [`VerifiedAumChain::verify`] wants, in the same base64-of-CBOR form the
+/// `/machine/tka/sync` RPC already moves AUMs in — so nothing new has to be understood to read it.
+///
+/// `None` when the store cannot be walked from `oldest` (a missing genesis or a broken link), which
+/// is the same "we hold no chain we can vouch with" outcome as never having written one.
+pub(crate) fn encode_chain(store: &MemAumStore, oldest: AumHash) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+
+    let chain = store.linear_chain_from(oldest).ok()?;
+    let mut out = String::from(TKA_CHAIN_BLOB_MAGIC);
+    for aum in &chain {
+        out.push('\n');
+        out.push_str(&base64::engine::general_purpose::STANDARD.encode(aum.serialize()));
+    }
+    Some(out.into_bytes())
+}
+
+/// Rebuild an [`Authority`] from a blob [`encode_chain`] wrote, **through the trust boundary**.
+///
+/// The chain is re-verified from genesis on every load ([`VerifiedAumChain::verify`] →
+/// [`Authority::from_verified_chain`]) rather than trusting the file's contents, so a blob whose AUMs
+/// do not form a signed chain yields no authority at all. What the file's integrity is still load
+/// bearing for is *which* signed chain this is: an attacker who can write it can offer a chain of
+/// their own making, whose genesis introduces their own keys. That is the same trust the cached
+/// netmap itself already carries — the same attacker could simply write a netmap with no `TKAInfo`
+/// and have every peer of their choosing replayed — and it is why both entries are written into, and
+/// read back out of, a directory this user owns with no group/other bits (`ts_control`'s
+/// `NetmapCache` vets both ends). Go's on-disk chonk rests on exactly the same assumption.
+///
+/// # Errors
+/// [`ts_tka::TkaError::Decode`] for a blob that is not this format, and every error
+/// [`VerifiedAumChain::verify`] raises for a chain that does not verify.
+pub(crate) fn authority_from_encoded_chain(blob: &[u8]) -> Result<Authority, ts_tka::TkaError> {
+    use base64::Engine as _;
+
+    let text =
+        core::str::from_utf8(blob).map_err(|_| ts_tka::TkaError::Decode("chain not utf-8"))?;
+    let mut lines = text.lines();
+    if lines.next() != Some(TKA_CHAIN_BLOB_MAGIC) {
+        return Err(ts_tka::TkaError::Decode("not a tailnet-lock chain blob"));
+    }
+
+    let mut chain = Vec::new();
+    for line in lines.filter(|l| !l.is_empty()) {
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(line)
+            .map_err(|_| ts_tka::TkaError::Decode("bad base64 AUM in chain blob"))?;
+        chain.push(Aum::from_cbor(&raw)?);
+    }
+
+    // `verify` rejects an empty chain (`BadChain`), which is the right answer for an empty blob.
+    Ok(Authority::from_verified_chain(VerifiedAumChain::verify(
+        &chain,
+    )?))
+}
+
 /// Errors internal to the sync driver. All map to "no Authority obtained" at the caller — the netmap
 /// is never errored and peers are never dropped on any of these.
 #[derive(Debug, thiserror::Error)]
@@ -442,5 +510,119 @@ mod tests {
         let g = genesis_checkpoint(test_aum_key(1, 1));
         let store = MemAumStore::from_aums([g]);
         assert!(tka_log_entries(&store, AumHash([0xEE; 32]), 100).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod chain_blob_tests {
+    //! The cold-start persistence of the synced chain: what [`encode_chain`] writes beside the
+    //! cached netmap is what [`authority_from_encoded_chain`] hands the replay, and nothing else
+    //! gets through.
+
+    use ed25519_dalek::SigningKey;
+
+    use super::*;
+
+    /// A one-AUM chain: a genesis checkpoint trusting `signer`, signed by it — the shape a node
+    /// holds after bootstrapping from control.
+    fn signed_genesis(signer: &SigningKey) -> Aum {
+        let key = ts_tka::AumKey {
+            kind: ts_tka::KeyKind::Ed25519,
+            votes: 1,
+            public: signer.verifying_key().to_bytes().to_vec(),
+            meta: Vec::new(),
+        };
+        let mut genesis = Aum::new_genesis_checkpoint(vec![key], vec![vec![0x11; 32]])
+            .expect("a well-formed genesis checkpoint");
+        genesis.sign(signer);
+        genesis
+    }
+
+    /// The round trip that makes the cold-start replay possible: a store the sync driver holds is
+    /// encoded, and the blob rebuilds an [`Authority`] **at the same head**. Without this, a locked
+    /// tailnet has nothing to judge its cached peers with.
+    #[test]
+    fn a_synced_chain_round_trips_into_an_authority_at_the_same_head() {
+        let signer = SigningKey::from_bytes(&[42u8; 32]);
+        let genesis = signed_genesis(&signer);
+        let oldest = genesis.hash();
+        let store = MemAumStore::from_aums([genesis]);
+
+        let blob = encode_chain(&store, oldest).expect("a walkable store encodes");
+        assert!(
+            blob.starts_with(TKA_CHAIN_BLOB_MAGIC.as_bytes()),
+            "the blob must name its own format so a foreign file is refused, not misread"
+        );
+
+        let authority = authority_from_encoded_chain(&blob).expect("the chain verifies");
+        assert!(
+            authority.head_matches(&oldest),
+            "the rebuilt authority must be the one the sync driver held: head {} vs {}",
+            authority.head().to_base32(),
+            oldest.to_base32()
+        );
+    }
+
+    /// A store that cannot be walked genesis→head yields no blob, so nothing stale is persisted.
+    #[test]
+    fn an_unwalkable_store_encodes_nothing() {
+        let signer = SigningKey::from_bytes(&[42u8; 32]);
+        let store = MemAumStore::from_aums([signed_genesis(&signer)]);
+
+        assert!(
+            encode_chain(&store, AumHash([0xEE; 32])).is_none(),
+            "a genesis the store does not hold is not a chain we can vouch with"
+        );
+    }
+
+    /// Everything that is not a chain this node wrote is refused, so a cold start falls back to
+    /// withholding the cached peers rather than enforcing against something it cannot verify.
+    #[test]
+    fn a_blob_that_is_not_a_verified_chain_yields_no_authority() {
+        let signer = SigningKey::from_bytes(&[42u8; 32]);
+        let genesis = signed_genesis(&signer);
+        let oldest = genesis.hash();
+        let good = encode_chain(&MemAumStore::from_aums([genesis]), oldest).expect("encode");
+
+        for (label, blob) in [
+            ("empty", Vec::new()),
+            ("no magic", b"AQID".to_vec()),
+            (
+                "magic only (an empty chain)",
+                TKA_CHAIN_BLOB_MAGIC.as_bytes().to_vec(),
+            ),
+            (
+                "magic, then something that is not base64",
+                format!("{TKA_CHAIN_BLOB_MAGIC}\nnot base64!").into_bytes(),
+            ),
+            (
+                "magic, then base64 of something that is not an AUM",
+                format!("{TKA_CHAIN_BLOB_MAGIC}\nAQIDBA==").into_bytes(),
+            ),
+            ("not utf-8", vec![0xff, 0xfe, 0xfd]),
+            ("a genesis with its signature stripped", {
+                let mut unsigned = Aum::new_genesis_checkpoint(
+                    vec![ts_tka::AumKey {
+                        kind: ts_tka::KeyKind::Ed25519,
+                        votes: 1,
+                        public: signer.verifying_key().to_bytes().to_vec(),
+                        meta: Vec::new(),
+                    }],
+                    vec![vec![0x11; 32]],
+                )
+                .expect("genesis");
+                unsigned.signatures.clear();
+                let hash = unsigned.hash();
+                encode_chain(&MemAumStore::from_aums([unsigned]), hash).expect("encode")
+            }),
+        ] {
+            assert!(
+                authority_from_encoded_chain(&blob).is_err(),
+                "{label} must not produce an authority"
+            );
+        }
+
+        // Control: the good blob still does, so the cases above fail for their own reasons.
+        assert!(authority_from_encoded_chain(&good).is_ok());
     }
 }

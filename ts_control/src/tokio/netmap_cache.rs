@@ -41,8 +41,11 @@
 //! Only the cache directory itself is vetted, not its ancestors — the embedder picks the root, and
 //! a state directory reachable through a world-writable parent is the embedder's to fix.
 //!
-//! **Peers cached while Tailnet Lock was on are not replayed** — see
-//! [`NetmapCache::load_state_update`].
+//! **Peers cached while Tailnet Lock was on are replayed only if the caller vouches for them** —
+//! see [`NetmapCache::load_state_update_vouched`]. The cache also holds a second, opaque entry next
+//! to the netmap ([`TKA_CHAIN_CACHE_FILE`]) that the runtime uses to persist the Tailnet-Lock
+//! authority those peers were admitted under, so a cold start can run that vouching before control
+//! has answered. This module never decodes that entry — it stores and vets bytes.
 
 use std::path::{Path, PathBuf};
 
@@ -65,6 +68,18 @@ pub const NETMAP_CACHE_FILE: &str = "netmap.json";
 /// Name of the temporary file the cache writes before renaming it over [`NETMAP_CACHE_FILE`], so a
 /// crash mid-write cannot leave a half-written netmap behind for the next cold start to read.
 const NETMAP_CACHE_TMP_FILE: &str = "netmap.json.tmp";
+
+/// File name, under [`NetmapCache`]'s directory, of the Tailnet-Lock chain the cached netmap's peers
+/// were admitted under.
+///
+/// Written and read by the runtime (`ts_runtime`), which owns every TKA type; this crate
+/// deliberately knows nothing of `ts_tka` and treats the entry as **opaque bytes**. It lives here so
+/// it shares the netmap cache's directory vetting, its private-file write, and its lifetime: the two
+/// entries are only ever useful together, and [`NetmapCache::discard`] drops both.
+pub const TKA_CHAIN_CACHE_FILE: &str = "tka-chain";
+
+/// Temporary file for [`TKA_CHAIN_CACHE_FILE`], renamed into place like the netmap's.
+const TKA_CHAIN_CACHE_TMP_FILE: &str = "tka-chain.tmp";
 
 /// Whether control's node attributes ask this node to persist network maps.
 ///
@@ -100,6 +115,11 @@ impl NetmapCache {
     /// The file the cached netmap frame lives in.
     pub fn path(&self) -> PathBuf {
         self.dir.join(NETMAP_CACHE_FILE)
+    }
+
+    /// The file the [Tailnet-Lock chain][TKA_CHAIN_CACHE_FILE] lives in.
+    pub fn tka_chain_path(&self) -> PathBuf {
+        self.dir.join(TKA_CHAIN_CACHE_FILE)
     }
 
     /// Apply the cache policy to one decoded netmap frame and the raw bytes it was decoded from.
@@ -141,11 +161,54 @@ impl NetmapCache {
     /// refused ([`create_dir_private`]) and nothing is written; the caller logs and carries on
     /// without a cache, which is always a safe outcome.
     async fn store(&self, frame: &[u8]) -> std::io::Result<()> {
+        self.store_entry(NETMAP_CACHE_FILE, NETMAP_CACHE_TMP_FILE, frame)
+            .await
+    }
+
+    /// Persist `bytes` as the cache entry `name`, staged through `tmp_name` and renamed into place.
+    ///
+    /// The one write path both cache entries take, so the netmap and the Tailnet-Lock chain get the
+    /// same directory vetting, the same freshly-created `0600` file, and the same torn-write-proof
+    /// rename. Anything the vetting refuses is an error the caller logs and carries on without.
+    async fn store_entry(&self, name: &str, tmp_name: &str, bytes: &[u8]) -> std::io::Result<()> {
         create_dir_private(&self.dir).await?;
 
-        let tmp = self.dir.join(NETMAP_CACHE_TMP_FILE);
-        write_private(&tmp, frame).await?;
-        tokio::fs::rename(&tmp, self.path()).await
+        let tmp = self.dir.join(tmp_name);
+        write_private(&tmp, bytes).await?;
+        tokio::fs::rename(&tmp, self.dir.join(name)).await
+    }
+
+    /// Persist the Tailnet-Lock chain the cached netmap's peers were admitted under.
+    ///
+    /// `chain` is opaque here: the runtime encodes it (and is the only thing that decodes it), so
+    /// this crate keeps its rule of never depending on `ts_tka`. Written exactly like the netmap —
+    /// same vetted private directory, same `0600` file — because it decides which cached peers a
+    /// cold start dials, and a chain another local user could choose would decide that for us.
+    /// Errors are logged and swallowed: without a chain the replay simply withholds the peers.
+    pub async fn store_tka_chain(&self, chain: &[u8]) {
+        if let Err(e) = self
+            .store_entry(TKA_CHAIN_CACHE_FILE, TKA_CHAIN_CACHE_TMP_FILE, chain)
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                path = %self.tka_chain_path().display(),
+                "writing tailnet-lock chain cache"
+            );
+        }
+    }
+
+    /// The persisted Tailnet-Lock chain, or `None` when there is none (or it could not be read).
+    /// Vetted exactly like the netmap; a refusal is a cold start with no chain, which withholds the
+    /// cached peers.
+    pub async fn load_tka_chain(&self) -> Option<Vec<u8>> {
+        self.load_entry(TKA_CHAIN_CACHE_FILE).await
+    }
+
+    /// Remove the persisted Tailnet-Lock chain, if any — the lock was disabled, or the chain does
+    /// not describe the cached netmap. Leaves the cached netmap alone; its peers are then withheld.
+    pub async fn discard_tka_chain(&self) {
+        remove_entry(&self.tka_chain_path()).await;
     }
 
     /// The cached netmap frame, or `None` when nothing has been cached (or it could not be read).
@@ -154,11 +217,17 @@ impl NetmapCache {
     /// symlink where the cache file should be — is `None` here and therefore a cold start with no
     /// cache, which is exactly the behaviour of a node that never cached anything.
     async fn load(&self) -> Option<Vec<u8>> {
-        match self.read_cached().await {
+        self.load_entry(NETMAP_CACHE_FILE).await
+    }
+
+    /// Read the cache entry `name`, or `None` when it is absent or fails the vetting below.
+    async fn load_entry(&self, name: &str) -> Option<Vec<u8>> {
+        let path = self.dir.join(name);
+        match self.read_cached(&path).await {
             Ok(bytes) => Some(bytes),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
-                tracing::warn!(error = %e, path = %self.path().display(), "reading netmap cache");
+                tracing::warn!(error = %e, path = %path.display(), "reading netmap cache");
                 None
             }
         }
@@ -171,22 +240,22 @@ impl NetmapCache {
     /// and a replayed netmap installs peers, a DERP map, a DNS configuration and a packet filter.
     /// That is the whole cold-start state of the node, so this path fails closed on anything it
     /// cannot vouch for.
-    async fn read_cached(&self) -> std::io::Result<Vec<u8>> {
+    async fn read_cached(&self, path: &Path) -> std::io::Result<Vec<u8>> {
         let dir = tokio::fs::symlink_metadata(&self.dir).await?;
         ensure_private(&self.dir, &dir, Entry::Dir)?;
-        read_private(&self.path()).await
+        read_private(path).await
     }
 
-    /// Remove the cached netmap, if any. Errors are logged, never propagated: the cache is being
-    /// thrown away, so failing to throw it away is not something a caller can act on.
+    /// Remove the cached netmap **and** the Tailnet-Lock chain that vouches for its peers, if any.
+    /// Errors are logged, never propagated: the cache is being thrown away, so failing to throw it
+    /// away is not something a caller can act on.
+    ///
+    /// Both entries go together. The chain exists only to say which of the cached peers may be
+    /// replayed, so keeping it after the netmap it describes is gone would leave a tailnet's key
+    /// authority on disk for nothing.
     pub async fn discard(&self) {
-        match tokio::fs::remove_file(self.path()).await {
-            Ok(()) => tracing::debug!(path = %self.path().display(), "discarded netmap cache"),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                tracing::warn!(error = %e, path = %self.path().display(), "discarding netmap cache");
-            }
-        }
+        remove_entry(&self.path()).await;
+        remove_entry(&self.tka_chain_path()).await;
     }
 
     /// The cached netmap, decoded into a [`StateUpdate`] ready to publish on a cold start.
@@ -206,26 +275,48 @@ impl NetmapCache {
     /// one. If the grant has since been withdrawn, the first netmap of this session says so and
     /// [`observe`](Self::observe) discards the cache then.
     ///
-    /// **The peers are dropped when the cached netmap was taken under Tailnet Lock.** Go replays its
-    /// cached map through the same `setNetMapLocked` the live one takes, so `tkaFilterNetmapLocked`
-    /// drops any peer whose node key the authority does not authorize — Go can do that at cold start
-    /// because its TKA authority is persisted on disk and is already loaded by then. This port keeps
-    /// the synced authority **in memory only** (`ts_runtime::tka_sync::SyncedTka` holds a
-    /// `MemAumStore`), so at cold start there is nothing to verify a cached peer's `key_signature`
-    /// against: the runtime's enforcement cell is still `None`, which means admit-all, and every
-    /// cached peer — including one the lock revoked while this node was off — would be installed and
-    /// dialed. So the replay fails closed on exactly the frames where enforcement would have applied:
-    /// if the cached frame's own `MapResponse.TKAInfo` said the lock was on, its peers are not
-    /// replayed. The rest of the netmap still is (self node, DERP map, DNS, packet filter) — none of
-    /// it carries a peer identity, and magicsock admits no traffic from a key the peer set does not
-    /// contain — so a locked tailnet keeps the relay/DNS half of the head start and gets its peers
-    /// from control's first netmap moments later, behind a synced authority.
+    /// **Peers cached under an active Tailnet Lock are replayed only if a caller vouches for them.**
+    /// This method has no vouching caller, so it withholds them; use
+    /// [`load_state_update_vouched`](Self::load_state_update_vouched) to supply the verdict.
+    pub async fn load_state_update(&self) -> Option<StateUpdate> {
+        self.load_state_update_vouched(|_, _| Vec::new()).await
+    }
+
+    /// [`load_state_update`](Self::load_state_update), with `vouch` deciding which peers a netmap
+    /// cached under an **active** Tailnet Lock replays.
+    ///
+    /// Go replays its cached map through the same `setNetMapLocked` a live one takes, so
+    /// `tkaFilterNetmapLocked` (`ipn/ipnlocal/tailnet-lock.go`) runs over it and drops only the peers
+    /// that fail it — an unsigned peer, one whose `NodeKeyAuthorizedWithDetails` errors, or one a
+    /// newer rotation obsoletes. The peers holding a valid signature survive and are dialed before
+    /// control answers, which is the entire point of the cache. Go can run that filter at cold start
+    /// because its TKA authority is persisted on disk and already loaded by then.
+    ///
+    /// This crate cannot run it: it deliberately depends on nothing TKA (`ts_tka` sits above it), so
+    /// it can decode `MapResponse.TKAInfo` but cannot verify a `key_signature`. So it asks. `vouch`
+    /// receives the lock the peers were cached under and the cached peers, and returns the ones to
+    /// replay — the runtime answers it with the authority it persisted next to this netmap
+    /// ([`TKA_CHAIN_CACHE_FILE`]), running the same filter the live netmap path runs. A caller with
+    /// no authority to answer with returns nothing and the peers are withheld, which is where
+    /// [`load_state_update`](Self::load_state_update) lands: safe, because the rest of the netmap
+    /// (self node, DERP map, DNS, packet filter) carries no peer identity, and magicsock admits no
+    /// traffic from a key the peer set does not contain.
+    ///
+    /// `vouch` is **not** consulted when the cached frame says the lock was off — there is nothing to
+    /// enforce then and every peer replays, exactly as Go's filter returns early on `b.tka == nil`.
     ///
     /// Reading the lock state from the cached frame is sound for the frames this cache holds: only a
     /// *full* netmap is ever stored, and `tailcfg` documents `TKAInfo` on a non-delta `MapResponse`
     /// as authoritative in both directions — populated means control believes the lock is on for this
     /// node, absent means it believes it is off.
-    pub async fn load_state_update(&self) -> Option<StateUpdate> {
+    ///
+    /// Peer *patches* (`MapResponse.PeersChangedPatch`) are always dropped under an active lock: a
+    /// patch carries no `key_signature`, so there is nothing for `vouch` to judge, and Go's filter
+    /// likewise only ever sees whole peers.
+    pub async fn load_state_update_vouched<F>(&self, vouch: F) -> Option<StateUpdate>
+    where
+        F: FnOnce(&crate::TkaStatus, Vec<crate::Node>) -> Vec<crate::Node>,
+    {
         let frame = self.load().await?;
         let mut update = state_update_from_frame(&frame)?;
 
@@ -233,20 +324,43 @@ impl NetmapCache {
         update.seq = 0;
         update.ping = None;
 
-        if update
-            .tka
-            .as_ref()
-            .is_some_and(crate::TkaStatus::is_enabled)
-        {
-            tracing::info!(
-                "cached netmap was taken under Tailnet Lock; replaying it without its peers (no \
-                 synced authority to verify their key signatures against at cold start)"
-            );
-            update.peer_update = None;
-            update.peer_patches.clear();
-        }
+        let Some(tka) = update.tka.as_ref().filter(|t| t.is_enabled()).cloned() else {
+            return Some(update);
+        };
+
+        let cached = match update.peer_update.take() {
+            Some(PeerUpdate::Full(peers)) => peers,
+            // Only a full frame is ever cached; anything else carries no complete peer set to vouch
+            // for, so there is nothing to replay.
+            _ => Vec::new(),
+        };
+        let cached_count = cached.len();
+        let vouched = vouch(&tka, cached);
+        tracing::info!(
+            cached = cached_count,
+            replayed = vouched.len(),
+            "cached netmap was taken under Tailnet Lock; replaying only the peers vouched for"
+        );
+
+        // An empty verdict replays no peer update at all rather than an empty *complete* peer list.
+        // At cold start the two install identically (the peer db starts empty), and this keeps a
+        // caller that can vouch for nothing on exactly the path a node with no cached peers takes.
+        update.peer_update = (!vouched.is_empty()).then_some(PeerUpdate::Full(vouched));
+        update.peer_patches.clear();
 
         Some(update)
+    }
+}
+
+/// Remove one cache entry, logging (never propagating) anything but its absence — the entry is being
+/// thrown away, so failing to throw it away is not something a caller can act on.
+async fn remove_entry(path: &Path) {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => tracing::debug!(path = %path.display(), "discarded netmap cache entry"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "discarding netmap cache entry");
+        }
     }
 }
 
@@ -430,6 +544,23 @@ mod tests {
     /// field comma-terminated — so a test can state `TKAInfo` (or anything else) on the frame
     /// without rebuilding the whole netmap.
     fn full_netmap_with(cap_map: &str, extra_fields: &str) -> String {
+        full_netmap_with_peers(
+            cap_map,
+            extra_fields,
+            r#"{
+                "ID": 2,
+                "StableID": "peer-2",
+                "Name": "peer.example.ts.net.",
+                "Addresses": ["100.64.0.2/32"],
+                "Endpoints": ["192.0.2.7:41641"],
+                "HomeDERP": 3
+            }"#,
+        )
+    }
+
+    /// [`full_netmap_with`] with the `Peers` array spelled out, so a test can cache more than one
+    /// peer and check *which* of them a vouching cold start replays.
+    fn full_netmap_with_peers(cap_map: &str, extra_fields: &str, peers: &str) -> String {
         format!(
             r#"{{
                 {extra_fields}
@@ -442,14 +573,7 @@ mod tests {
                     "Addresses": ["100.64.0.1/32"],
                     "CapMap": {cap_map}
                 }},
-                "Peers": [{{
-                    "ID": 2,
-                    "StableID": "peer-2",
-                    "Name": "peer.example.ts.net.",
-                    "Addresses": ["100.64.0.2/32"],
-                    "Endpoints": ["192.0.2.7:41641"],
-                    "HomeDERP": 3
-                }}],
+                "Peers": [{peers}],
                 "DERPMap": {{ "Regions": {{ "3": {{
                     "RegionID": 3,
                     "RegionCode": "tst",
@@ -655,13 +779,13 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A netmap cached while Tailnet Lock was on replays everything **except** its peers.
+    /// [`NetmapCache::load_state_update`] — the load with **no** voucher — replays everything of a
+    /// netmap cached under an active lock **except** its peers.
     ///
-    /// Go's cached replay goes through `tkaFilterNetmapLocked` against an authority it persisted on
-    /// disk; this port's authority is in memory only, so at cold start there is nothing to verify a
-    /// cached peer's key signature against and the runtime's enforcement cell still says admit-all.
-    /// The peers are therefore withheld until control's first netmap brings them back behind a
-    /// synced authority — while the relay/DNS half of the head start is kept.
+    /// Go's cached replay goes through `tkaFilterNetmapLocked` against the authority it persisted on
+    /// disk. A caller that brings no authority cannot run that filter, so it can vouch for nothing
+    /// and the peers wait for control's first netmap — while the relay/DNS half of the head start is
+    /// kept. [`NetmapCache::load_state_update_vouched`] is the load that can do better.
     #[tokio::test]
     async fn peers_cached_under_tailnet_lock_are_not_replayed() {
         let dir = scratch_dir("tka-locked");
@@ -691,6 +815,214 @@ mod tests {
             replayed.node.is_some() && replayed.derp.is_some(),
             "the rest of the netmap carries no peer identity and must still replay"
         );
+    }
+
+    /// The headline of the vouched load: a netmap cached under an active lock replays **exactly** the
+    /// peers the caller vouches for — not all of them, and not none of them.
+    ///
+    /// This is what Go does with its cached map: it runs `tkaFilterNetmapLocked` over it and keeps
+    /// the peers the authority authorizes, which is the whole point of the cache (peer connectivity
+    /// before control answers). The voucher is also handed the lock the peers were cached under, so
+    /// it can check that the authority it holds is the one this netmap was taken with.
+    #[tokio::test]
+    async fn a_vouched_load_replays_exactly_the_peers_the_caller_keeps() {
+        let dir = scratch_dir("tka-vouched");
+        let cache = NetmapCache::new(&dir);
+
+        poll_one(
+            &full_netmap_with_peers(
+                r#"{"cache-network-maps": null}"#,
+                r#""TKAInfo": { "Head": "s7ovkkqcbxlaqedbmdyrhqzhqu", "Disabled": false },"#,
+                r#"{
+                    "ID": 2,
+                    "StableID": "signed-peer",
+                    "Name": "signed.example.ts.net.",
+                    "Addresses": ["100.64.0.2/32"],
+                    "Endpoints": ["192.0.2.7:41641"],
+                    "HomeDERP": 3
+                }, {
+                    "ID": 3,
+                    "StableID": "revoked-peer",
+                    "Name": "revoked.example.ts.net.",
+                    "Addresses": ["100.64.0.3/32"],
+                    "Endpoints": ["192.0.2.8:41641"],
+                    "HomeDERP": 3
+                }"#,
+            ),
+            &cache,
+        )
+        .await;
+
+        let mut saw_head = String::new();
+        let replayed = NetmapCache::new(&dir)
+            .load_state_update_vouched(|tka, peers| {
+                saw_head = tka.head.clone();
+                assert_eq!(peers.len(), 2, "the voucher is handed every cached peer");
+                peers
+                    .into_iter()
+                    .filter(|p| p.stable_id.0 == "signed-peer")
+                    .collect()
+            })
+            .await
+            .expect("a locked tailnet still replays the netmap");
+
+        assert_eq!(
+            saw_head, "s7ovkkqcbxlaqedbmdyrhqzhqu",
+            "the voucher must be told which lock these peers were cached under"
+        );
+        let Some(PeerUpdate::Full(peers)) = replayed.peer_update.as_ref() else {
+            panic!(
+                "the vouched peers must replay as a full peer set, got {:?}",
+                replayed.peer_update
+            );
+        };
+        assert_eq!(
+            peers
+                .iter()
+                .map(|p| p.stable_id.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["signed-peer"],
+            "only the vouched peer replays"
+        );
+        assert_eq!(
+            peers[0].underlay_addresses,
+            vec!["192.0.2.7:41641".parse().unwrap()],
+            "with its endpoints, which are what a cold start dials"
+        );
+        assert!(
+            replayed.node.is_some() && replayed.derp.is_some(),
+            "the rest of the netmap replays as before"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A voucher that keeps nothing lands on the same replay as no voucher at all: no peer update.
+    #[tokio::test]
+    async fn a_voucher_that_keeps_nothing_replays_no_peers() {
+        let dir = scratch_dir("tka-vouched-none");
+        let cache = NetmapCache::new(&dir);
+
+        poll_one(
+            &full_netmap_with(
+                r#"{"cache-network-maps": null}"#,
+                r#""TKAInfo": { "Head": "s7ovkkqcbxlaqedbmdyrhqzhqu", "Disabled": false },"#,
+            ),
+            &cache,
+        )
+        .await;
+
+        let replayed = NetmapCache::new(&dir)
+            .load_state_update_vouched(|_, _| Vec::new())
+            .await
+            .expect("a cached netmap");
+
+        assert!(
+            replayed.peer_update.is_none(),
+            "a peer nobody vouches for must not be replayed, got {:?}",
+            replayed.peer_update
+        );
+        assert!(replayed.peer_patches.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The voucher is not consulted at all when the cached frame says the lock was off — there is
+    /// nothing to enforce, so every peer replays (Go's filter returns early on `b.tka == nil`).
+    #[tokio::test]
+    async fn an_unlocked_netmap_never_asks_the_voucher() {
+        let dir = scratch_dir("tka-vouched-unlocked");
+        let cache = NetmapCache::new(&dir);
+
+        poll_one(&full_netmap(r#"{"cache-network-maps": null}"#), &cache).await;
+
+        let replayed = NetmapCache::new(&dir)
+            .load_state_update_vouched(|_, _| panic!("the voucher must not be consulted"))
+            .await
+            .expect("a cached netmap");
+
+        assert!(
+            matches!(replayed.peer_update, Some(PeerUpdate::Full(ref p)) if p.len() == 1),
+            "an unlocked netmap replays its peers untouched: {:?}",
+            replayed.peer_update
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The Tailnet-Lock chain the runtime persists beside the netmap round-trips through the same
+    /// vetted directory, and [`NetmapCache::discard`] drops it with the netmap it vouches for.
+    #[tokio::test]
+    async fn the_tka_chain_round_trips_and_is_discarded_with_the_netmap() {
+        let dir = scratch_dir("tka-chain");
+        let cache = NetmapCache::new(&dir);
+
+        poll_one(&full_netmap(r#"{"cache-network-maps": null}"#), &cache).await;
+        cache.store_tka_chain(b"an opaque chain blob").await;
+
+        assert_eq!(
+            NetmapCache::new(&dir).load_tka_chain().await.as_deref(),
+            Some(&b"an opaque chain blob"[..]),
+            "a cold start must read back the chain the last session persisted"
+        );
+
+        // Discarding the netmap discards the chain that only exists to vouch for its peers.
+        cache.discard().await;
+        assert!(NetmapCache::new(&dir).load_tka_chain().await.is_none());
+        assert!(NetmapCache::new(&dir).load_state_update().await.is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `discard_tka_chain` drops the chain and **only** the chain: the netmap it described stays, and
+    /// is then replayed without its peers (the no-authority case).
+    #[tokio::test]
+    async fn discarding_the_chain_leaves_the_cached_netmap() {
+        let dir = scratch_dir("tka-chain-only");
+        let cache = NetmapCache::new(&dir);
+
+        poll_one(
+            &full_netmap_with(
+                r#"{"cache-network-maps": null}"#,
+                r#""TKAInfo": { "Head": "s7ovkkqcbxlaqedbmdyrhqzhqu", "Disabled": false },"#,
+            ),
+            &cache,
+        )
+        .await;
+        cache.store_tka_chain(b"an opaque chain blob").await;
+        cache.discard_tka_chain().await;
+
+        assert!(NetmapCache::new(&dir).load_tka_chain().await.is_none());
+        let replayed = NetmapCache::new(&dir)
+            .load_state_update()
+            .await
+            .expect("the netmap survives its chain");
+        assert!(replayed.node.is_some());
+        assert!(replayed.peer_update.is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The chain gets the netmap's write vetting, not a weaker one: a cache directory other users
+    /// can reach takes neither entry. The chain decides which cached peers a cold start dials, so a
+    /// chain another local user could choose would choose this node's first peers for it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_chain_is_not_written_into_a_shared_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = scratch_dir("tka-chain-shared");
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        NetmapCache::new(&dir).store_tka_chain(b"a chain").await;
+
+        assert!(
+            !NetmapCache::new(&dir).tka_chain_path().exists(),
+            "a chain must not be written into a directory other users can read"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Control saying the lock is *disabled* is not the lock being on: those peers replay. Both the

@@ -8,7 +8,7 @@ pub use logout::{LogoutError, LogoutInternalErrorKind, logout};
 pub use map_stream::{FilterUpdate, PeerUpdate, StateUpdate};
 pub use netmap_cache::{
     NETMAP_CACHE_FILE, NODE_ATTR_CACHE_NETWORK_MAPS, NODE_ATTR_DISABLE_CACHE_NETWORK_MAPS,
-    NetmapCache, netmap_caching_enabled,
+    NetmapCache, TKA_CHAIN_CACHE_FILE, netmap_caching_enabled,
 };
 use register::register;
 // `set_dns` is a generic control RPC. It is exposed unconditionally because the `tailscale` facade

@@ -86,6 +86,16 @@ authority is delivered from the control runner to the peer tracker over an inter
 **Self is structurally never filtered** — the self node never enters the peer database, so a node
 cannot lock itself out of its own netmap via this path.
 
+**The verified chain is persisted beside the cached netmap.** So that a cold start can filter the
+peers it replays from the netmap cache — Go's `initTKALocked` re-opens its on-disk chonk for exactly
+this — the synced AUM chain is written to `tka-chain` in the node's netmap-cache directory. It is
+**re-verified from genesis** on every load (`VerifiedAumChain::verify`), so a file that is not a
+signed chain yields no authority at all, and the authority it does yield is used only when its head
+equals the head the cached netmap frame itself recorded. Its confidentiality and integrity rest on
+the same vetting as the netmap cache: a `0700` directory this user owns, a freshly created `0600`
+file, and an `O_NOFOLLOW` read that refuses anything else. A local attacker who can write that
+directory gains nothing new — the same write lets them replace the cached netmap outright.
+
 **Threat model.** Control is trusted for the enable/disable *toggle* only. A malicious or compromised
 control plane can **disable** the lock (downgrade to admit-all), but it **cannot** forge a trusted
 key to admit a specific unauthorized peer: admission still requires a signature from a key in the
