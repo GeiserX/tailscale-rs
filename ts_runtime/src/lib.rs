@@ -27,6 +27,11 @@ mod derp_latency;
 /// ([`RegistrationError`]).
 pub mod device_state;
 mod direct;
+/// DNS over TCP for the MagicDNS service IP: the transport a stub resolver retries on when a UDP
+/// answer comes back truncated. Only the TUN application data path serves it today, so it is
+/// compiled with `tun`.
+#[cfg(feature = "tun")]
+mod dns_over_tcp;
 mod env;
 mod error;
 /// Exit-node suggestion algorithm (the classic DERP-region-latency path, Go

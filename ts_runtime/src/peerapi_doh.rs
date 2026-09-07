@@ -81,7 +81,9 @@ use tokio::{
 };
 use ts_dns_wire::{Rcode, decode_query, encode_response};
 
-use crate::magic_dns::{Decision, DnsView, decide, forward_query, set_tc_if_over_client_limit};
+use crate::magic_dns::{
+    ClientTransport, Decision, DnsView, decide, forward_query, set_tc_if_over_client_limit,
+};
 
 /// Largest HTTP request (headers + body) we will read for one DoH query. A DNS message is at most
 /// 64 KiB, but a peerAPI DoH query is a single small question; cap well below that to bound memory
@@ -109,18 +111,23 @@ const MAX_CLIENT_RESPONSE: usize = 64 * 1024;
 /// so it rides the encrypted WireGuard tunnel to the peer — never a host socket. IPv4-only:
 /// `doh_addr` is always the peer's tailnet IPv4 (see [`Node::peerapi_doh_addr`]).
 ///
-/// The delegated answer is relayed back to the stub resolver as a UDP datagram, so — exactly as on
-/// the plain UDP forward — it is marked truncated when it exceeds the buffer size `query`
-/// advertised (see [`set_tc_if_over_client_limit`]). The DoH transport itself has no such limit;
-/// the limit belongs to the client we answer, not to the hop we fetched over.
+/// When the delegated answer is relayed back to a **UDP** stub resolver it is marked truncated if
+/// it exceeds the buffer size `query` advertised (see [`set_tc_if_over_client_limit`]), exactly as
+/// on the plain UDP forward. The DoH transport itself has no such limit; the limit belongs to the
+/// client we answer, not to the hop we fetched over — which is why `client` selects it, and why a
+/// [`ClientTransport::Tcp`] client (RFC 7766 §8: no message-size bound) is never marked.
 pub(crate) async fn forward_doh(
     channel: &Channel,
     doh_addr: SocketAddr,
     query: &[u8],
     fallback: Vec<u8>,
+    client: ClientTransport,
 ) -> Vec<u8> {
     match timeout(CLIENT_TIMEOUT, doh_round_trip(channel, doh_addr, query)).await {
-        Ok(Ok(resp)) if !resp.is_empty() => set_tc_if_over_client_limit(query, resp),
+        Ok(Ok(resp)) if !resp.is_empty() => match client {
+            ClientTransport::Udp => set_tc_if_over_client_limit(query, resp),
+            ClientTransport::Tcp => resp,
+        },
         Ok(Ok(_)) => {
             // A broken exit-node recursive resolver silently fails every delegated query, so
             // surface delegation failures at warn (default level) — the operator needs the signal.
@@ -324,7 +331,18 @@ async fn resolve(
             upstreams,
             query,
             servfail,
-        } => forward_query(channel, &upstreams, &query, servfail).await,
+        } => {
+            forward_query(
+                channel,
+                &upstreams,
+                &query,
+                servfail,
+                // The query a peer POSTs here is its own UDP client's query, relayed verbatim, so
+                // the datagram limit that applies is that client's — see the note above.
+                ClientTransport::Udp,
+            )
+            .await
+        }
     }
 }
 

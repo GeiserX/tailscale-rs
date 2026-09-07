@@ -44,7 +44,10 @@
 //!   record, or 512 bytes when it carried none (RFC 1035) — comes back with the `TC` (truncated)
 //!   bit set and its body intact, so the stub resolver knows to retry over TCP
 //!   ([`set_tc_if_over_client_limit`]). The query is forwarded verbatim, so this is what catches an
-//!   upstream that ignores the size its requestor asked for.
+//!   upstream that ignores the size its requestor asked for. The retry that bit asks for is served
+//!   by the `dns_over_tcp` server (TUN mode), which reaches the same [`decide`] through
+//!   the same view — and which is never handed a `TC` bit for size, since a TCP client has no
+//!   datagram to overflow (see [`ClientTransport`]).
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -108,9 +111,10 @@ const MAX_INFLIGHT_FORWARDS: usize = 512;
 ///
 /// The client's query is forwarded verbatim, so a client advertising a large EDNS UDP size can
 /// elicit a legitimately large (1300–4095 byte) UDP answer (big TXT sets, DNSSEC, many-record
-/// round-robins). Capping at the old 1232 truncated those and set TC, forcing a TCP retry this
-/// fork's UDP-only forwarder can't serve — so the large answer became unreachable. 4095 relays them
-/// intact.
+/// round-robins). Capping at the old 1232 truncated those and set TC, forcing a TCP retry — which
+/// nothing served at the time, so the large answer became unreachable. 4095 relays them intact.
+/// (The retry now has a server in TUN mode, `dns_over_tcp`, but the hop to the *upstream* resolver
+/// is still UDP, so this cap is what bounds the answer either way.)
 const MAX_UPSTREAM_RESPONSE: usize = 4095;
 
 /// The MagicDNS service IP. The netstack interface owns this address, so a `udp_bind` here
@@ -742,9 +746,54 @@ pub(crate) fn recursive_plan(view: &DnsView, default_upstreams: Vec<SocketAddr>)
     }
 }
 
+/// Which transport the *client* we are answering reached us over.
+///
+/// The only thing it changes is whether a forwarded answer may be marked `TC` for exceeding the
+/// UDP payload size the query advertised. That limit describes the **datagram** we would answer in
+/// (RFC 1035 §4.2.1, RFC 6891 §6.2.3); a client that reached us over TCP has no such bound
+/// (RFC 7766 §8), and marking its answer truncated sends a stub resolver that already retried over
+/// TCP — the retry `TC` asked it to make — straight back into another retry. Go draws the same line:
+/// `checkResponseSizeAndSetTC` is applied on the UDP answer path, while the TCP DNS handler
+/// installed by `acceptTCP`'s `hittingDNS` case writes the answer under a 2-byte length prefix with
+/// no size check (wgengine/netstack/netstack.go, net/dns/resolver/tsdns.go @
+/// 9ea7cba44591e0cd840c6c94d23274dd222059bf).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClientTransport {
+    /// A UDP client: the EDNS(0)-advertised (or 512-byte) datagram limit applies.
+    Udp,
+    /// A TCP client: no datagram limit applies, so no `TC` bit is added for size.
+    ///
+    /// Only `dns_over_tcp` constructs this, and that module is compiled with the `tun` feature (the
+    /// application netstack has no TCP listener on `100.100.100.100:53` yet), so without `tun` the
+    /// variant is unreachable. Kept — and the dead-code warning suppressed — rather than gated,
+    /// because the distinction it draws belongs to the responder, not to a transport mode.
+    #[cfg_attr(not(feature = "tun"), allow(dead_code))]
+    Tcp,
+}
+
+/// Turn a [`Decision::Forward`] into the plan that will carry it: a recursive forward consults
+/// [`recursive_plan`] (which may delegate to the active exit node's DoH endpoint), a split-DNS
+/// forward always goes to its route's own upstreams over UDP.
+///
+/// One line of logic, but it is the point where "recursive" becomes "may egress from the exit node
+/// instead of this host", so every caller — the UDP serve loop, the `query_dns` handler, the TUN
+/// datapath's `plan_intercept` and the DNS-over-TCP connection loop — reads it from here rather than
+/// spelling the branch out again.
+pub(crate) fn forward_plan(
+    view: &DnsView,
+    upstreams: Vec<SocketAddr>,
+    recursive: bool,
+) -> RecursivePlan {
+    if recursive {
+        recursive_plan(view, upstreams)
+    } else {
+        RecursivePlan::Udp(upstreams)
+    }
+}
+
 /// Cap a forwarded upstream response to a single UDP datagram ([`MAX_UPSTREAM_RESPONSE`]) before
-/// relaying it, then mark it truncated if it is bigger than what `query`'s sender said it can
-/// receive ([`set_tc_if_over_client_limit`]).
+/// relaying it, then — for a [`ClientTransport::Udp`] client only — mark it truncated if it is
+/// bigger than what `query`'s sender said it can receive ([`set_tc_if_over_client_limit`]).
 ///
 /// The two checks **compose**; they are not alternatives. The [`MAX_UPSTREAM_RESPONSE`] cap is this
 /// forwarder's own relay bound: when the response is too large it is truncated mid-message, so we
@@ -758,7 +807,12 @@ pub(crate) fn recursive_plan(view: &DnsView, default_upstreams: Vec<SocketAddr>)
 /// wider than the cap (4095), so the truncating branch is reachable by exactly one deliverable
 /// datagram size — the full-ring 4096-byte answer — which is the same size Go's `maxResponseBytes+1`
 /// read buffer exists to catch.
-fn cap_response(query: &[u8], mut resp: Vec<u8>) -> Vec<u8> {
+///
+/// The [`MAX_UPSTREAM_RESPONSE`] chop applies on **both** transports and keeps setting `TC` when it
+/// fires: we really did cut the message, and saying otherwise would hand the client a
+/// malformed-but-"complete" answer. It is only the *client's advertised datagram size* that a TCP
+/// client does not have (see [`ClientTransport`]).
+fn cap_response(query: &[u8], mut resp: Vec<u8>, client: ClientTransport) -> Vec<u8> {
     if resp.len() > MAX_UPSTREAM_RESPONSE {
         resp.truncate(MAX_UPSTREAM_RESPONSE);
         // The header is 12 bytes; the TC bit lives in the second flags byte (header byte 2). A
@@ -767,7 +821,10 @@ fn cap_response(query: &[u8], mut resp: Vec<u8>) -> Vec<u8> {
             *flags_hi |= 0x02;
         }
     }
-    set_tc_if_over_client_limit(query, resp)
+    match client {
+        ClientTransport::Udp => set_tc_if_over_client_limit(query, resp),
+        ClientTransport::Tcp => resp,
+    }
 }
 
 /// The RFC 1035 §4.2.1 maximum size of a DNS message carried over UDP by a requestor that did not
@@ -963,13 +1020,15 @@ fn response_matches_query(query: &[u8], resp: &[u8]) -> bool {
 /// UDP socket per query), NEVER a host socket — so the real origin IP can't leak to the resolver,
 /// and split-DNS upstreams reachable only over the tailnet/subnet-router work. Each upstream is
 /// bounded by [`UPSTREAM_TIMEOUT`]; responses go through [`cap_response`], which caps them at
-/// [`MAX_UPSTREAM_RESPONSE`] and marks them truncated when they exceed what `query` advertised it
-/// can receive.
+/// [`MAX_UPSTREAM_RESPONSE`] and — for a [`ClientTransport::Udp`] client — marks them truncated when
+/// they exceed what `query` advertised it can receive. `client` names the transport the *client* we
+/// answer used, not the one we fetched over: the hop upstream is UDP either way.
 pub(crate) async fn forward_query(
     channel: &Channel,
     upstreams: &[SocketAddr],
     query: &[u8],
     fallback: Vec<u8>,
+    client: ClientTransport,
 ) -> Vec<u8> {
     for upstream in upstreams {
         let socket = match channel
@@ -998,7 +1057,7 @@ pub(crate) async fn forward_query(
                     tracing::debug!(%upstream, %from, "magic dns dropping unsolicited/mismatched response");
                     continue;
                 }
-                return cap_response(query, resp.to_vec());
+                return cap_response(query, resp.to_vec(), client);
             }
             Ok(Ok(_)) => continue,
             Ok(Err(e)) => {
@@ -1057,11 +1116,7 @@ async fn serve(
                 // A recursive forward is eligible for exit-node DoH delegation; a split-DNS route
                 // always stays on its configured upstreams. Decide the plan against the current
                 // view so a query routed while an exit node is active egresses from that exit node.
-                let plan = if recursive {
-                    recursive_plan(&view, upstreams)
-                } else {
-                    RecursivePlan::Udp(upstreams)
-                };
+                let plan = forward_plan(&view, upstreams, recursive);
                 // Fail closed at the in-flight cap: drop the query (the stub resolver retries or
                 // times out) rather than spawn an unbounded task that pins an overlay socket for up
                 // to UPSTREAM_TIMEOUT. The permit is moved into the task as a named `_permit` binding
@@ -1081,11 +1136,24 @@ async fn serve(
                     let _permit = permit;
                     let resp = match plan {
                         RecursivePlan::Udp(upstreams) => {
-                            forward_query(&channel, &upstreams, &query, servfail).await
+                            forward_query(
+                                &channel,
+                                &upstreams,
+                                &query,
+                                servfail,
+                                ClientTransport::Udp,
+                            )
+                            .await
                         }
                         RecursivePlan::Doh(doh_addr) => {
-                            crate::peerapi_doh::forward_doh(&channel, doh_addr, &query, servfail)
-                                .await
+                            crate::peerapi_doh::forward_doh(
+                                &channel,
+                                doh_addr,
+                                &query,
+                                servfail,
+                                ClientTransport::Udp,
+                            )
+                            .await
                         }
                     };
                     if let Err(e) = socket.send_to(src, &resp).await {
@@ -1281,14 +1349,17 @@ impl Message<Query> for MagicDnsActor {
                 servfail,
                 recursive,
             }) => {
-                let plan = if recursive {
-                    recursive_plan(&view, upstreams)
-                } else {
-                    RecursivePlan::Udp(upstreams)
-                };
+                let plan = forward_plan(&view, upstreams, recursive);
                 match plan {
                     RecursivePlan::Udp(upstreams) => {
-                        let resp = forward_query(&self.channel, &upstreams, &query, servfail).await;
+                        let resp = forward_query(
+                            &self.channel,
+                            &upstreams,
+                            &query,
+                            servfail,
+                            ClientTransport::Udp,
+                        )
+                        .await;
                         (resp, upstreams)
                     }
                     RecursivePlan::Doh(doh_addr) => {
@@ -1297,6 +1368,7 @@ impl Message<Query> for MagicDnsActor {
                             doh_addr,
                             &query,
                             servfail,
+                            ClientTransport::Udp,
                         )
                         .await;
                         // The query egressed via the exit node's DoH endpoint, not a local UDP
@@ -2472,6 +2544,55 @@ mod tests {
         }
     }
 
+    /// The `TC` bit a truncated UDP answer sets is what sends a stub resolver to TCP (RFC 1035
+    /// §4.2.1). Setting it *again* on the TCP answer sends that resolver straight back into another
+    /// retry, so the client's advertised UDP payload size — a property of the datagram it would
+    /// have been answered in, and one RFC 7766 §8 gives a TCP client no equivalent of — is applied
+    /// only to a [`ClientTransport::Udp`] client. Same query, same answer, two transports.
+    #[test]
+    fn client_udp_limit_is_not_applied_to_a_tcp_client() {
+        // No EDNS OPT record, so the client's limit is the classic 512 bytes.
+        let query = build_query(0x310, &["example", "com"], 1, 1);
+        let mut answer = query.clone();
+        answer[2] |= 0x80; // make it a response (QR=1)
+        answer.resize(900, 0xAB); // over 512, under MAX_UPSTREAM_RESPONSE: only the client limit bites
+
+        let udp = cap_response(&query, answer.clone(), ClientTransport::Udp);
+        assert_ne!(
+            udp[2] & 0x02,
+            0,
+            "a UDP client that advertised 512 bytes is told the 900-byte answer is truncated"
+        );
+        assert_eq!(udp.len(), 900, "and the body is left intact either way");
+
+        let tcp = cap_response(&query, answer, ClientTransport::Tcp);
+        assert_eq!(
+            tcp[2] & 0x02,
+            0,
+            "the same answer over TCP is NOT marked: the client already did the TCP retry"
+        );
+        assert_eq!(tcp.len(), 900, "and is relayed whole");
+    }
+
+    /// The relay cap is a different claim from the client's datagram size, and it holds on both
+    /// transports: when [`MAX_UPSTREAM_RESPONSE`] really did cut the message, `TC` says so. Handing
+    /// a TCP client a chopped body with `TC` clear would be a malformed-but-"complete" answer.
+    #[test]
+    fn a_chopped_answer_is_marked_truncated_on_both_transports() {
+        let query = build_edns_query(0x311, &["example", "com"], 1, 1, 4096);
+        let mut big = query.clone();
+        big[2] |= 0x80;
+        big.resize(MAX_UPSTREAM_RESPONSE + 500, 0xAB);
+
+        let out = cap_response(&query, big, ClientTransport::Tcp);
+        assert_eq!(out.len(), MAX_UPSTREAM_RESPONSE, "capped to one datagram");
+        assert_ne!(
+            out[2] & 0x02,
+            0,
+            "we really did chop the body, so TC is set for a TCP client too"
+        );
+    }
+
     #[test]
     fn cap_response_sets_tc_when_truncated() {
         // An oversize upstream answer is capped to a single datagram AND marked truncated (TC bit)
@@ -2482,7 +2603,7 @@ mod tests {
         big[2] |= 0x80; // make it a response (QR=1)
         big.resize(MAX_UPSTREAM_RESPONSE + 500, 0xAB);
 
-        let out = cap_response(&query, big);
+        let out = cap_response(&query, big, ClientTransport::Udp);
         assert_eq!(out.len(), MAX_UPSTREAM_RESPONSE, "capped to one datagram");
         assert_ne!(out[2] & 0x02, 0, "TC bit set on truncation");
     }
@@ -2495,7 +2616,7 @@ mod tests {
         small[2] |= 0x80;
         let before = small.clone();
 
-        let out = cap_response(&query, small);
+        let out = cap_response(&query, small, ClientTransport::Udp);
         assert_eq!(out, before, "small response unchanged");
         assert_eq!(out[2] & 0x02, 0, "TC bit not set when no truncation");
     }
@@ -2527,7 +2648,7 @@ mod tests {
         largest.resize(MAX_UPSTREAM_RESPONSE, 0xAB);
         let before = largest.clone();
 
-        let out = cap_response(&query, largest);
+        let out = cap_response(&query, largest, ClientTransport::Udp);
         assert_eq!(out, before, "an answer at the cap must be relayed verbatim");
         assert_eq!(
             out[2] & 0x02,
@@ -2552,7 +2673,7 @@ mod tests {
         full_ring[2] |= 0x80; // QR=1
         full_ring.resize(ring, 0xAB);
 
-        let out = cap_response(&query, full_ring);
+        let out = cap_response(&query, full_ring, ClientTransport::Udp);
         assert_eq!(
             out.len(),
             4095,
@@ -2571,7 +2692,7 @@ mod tests {
         reply[2] |= 0x80; // QR=1
         reply.resize(900, 0xAB);
 
-        let out = cap_response(&query, reply.clone());
+        let out = cap_response(&query, reply.clone(), ClientTransport::Udp);
 
         assert_ne!(
             out[2] & 0x02,
@@ -2596,7 +2717,7 @@ mod tests {
         reply.resize(900, 0xAB);
         let before = reply.clone();
 
-        let out = cap_response(&query, reply);
+        let out = cap_response(&query, reply, ClientTransport::Udp);
 
         assert_eq!(
             out, before,
