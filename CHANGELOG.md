@@ -2,6 +2,14 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.47.8](https://github.com/GeiserX/tailscale-rs/compare/v0.47.7...v0.47.8) (2026-09-07)
+
+
+### Bug Fixes
+
+* **control:** cache the netmap of a node that sees no peers ([#386](https://github.com/GeiserX/tailscale-rs/issues/386)) ([0798a91](https://github.com/GeiserX/tailscale-rs/commit/0798a91cc8e41c8c7c10819e4b90c3f454f94e5d))
+* **control:** stop a disabled lock's chain surviving on disk, and a stale delete eating a fresh one ([#384](https://github.com/GeiserX/tailscale-rs/issues/384)) ([c39b356](https://github.com/GeiserX/tailscale-rs/commit/c39b356e7a914e77dad840837a6bed13c5e3a093))
+
 ## [0.47.7](https://github.com/GeiserX/tailscale-rs/compare/v0.47.6...v0.47.7) (2026-09-07)
 
 
