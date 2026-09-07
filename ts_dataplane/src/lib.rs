@@ -79,6 +79,19 @@ const IP6_HEADER_LEN: usize = 40;
 /// (0xff), which marks a non-first fragment whose sub-protocol header is not present.
 const IP6_FRAG_HEADER: u8 = 44;
 
+/// Go's `ipproto.Unknown` (0). Go's decoders assign it to every packet they refuse to classify, and
+/// filter `pre()` drops it — `if q.IPProto == ipproto.Unknown { return Drop }` — before the ACL can
+/// see the packet. It is also the real IANA number of the IPv6 Hop-by-Hop Options extension header,
+/// which is why an IPv6 packet that leads with Hop-by-Hop is dropped by upstream: `decode6` reads
+/// the base header's Next Header byte straight into `q.IPProto`, and 0 *is* "unknown".
+const IPPROTO_UNKNOWN: IpProto = IpProto::new(0);
+
+/// Go's internal `ipproto.Fragment` sentinel (0xff), which `decode6Fragment` assigns to a later
+/// fragment. Seeing it as a real Next Header on the wire is suspicious, so Go's `decode6` switch
+/// maps it back to [`IPPROTO_UNKNOWN`] (`case ipproto.Fragment: q.IPProto = unknown`) — whether it
+/// arrived as the base header's Next Header or as a Fragment header's.
+const IPPROTO_FRAGMENT_SENTINEL: IpProto = IpProto::new(0xff);
+
 /// Length of the IPv6 Fragment extension header (Go `net/packet.ip6FragHeaderLength`): Next Header,
 /// Reserved, a 13-bit Fragment Offset in 8-byte blocks plus two reserved bits and the
 /// More-Fragments flag, then a 32-bit Identification.
@@ -188,9 +201,6 @@ fn decode6_first_fragment(proto: IpProto, sub: &[u8]) -> Ipv6Fragment {
     const SCTP_HEADER_LEN: usize = 12;
     /// Go `net/packet.minTSMPSize` — the shortest TSMP body (a 7-byte rejected-connection message).
     const MIN_TSMP_SIZE: usize = 7;
-    /// Go's internal `ipproto.Fragment` sentinel. Seeing it as a real Next Header is suspicious, so
-    /// Go maps it back to `unknown`.
-    const IPPROTO_FRAGMENT_SENTINEL: IpProto = IpProto::new(0xff);
 
     // Go's port-ful arms: bounds-check, then read the destination port from `sub[2:4]`.
     let ported = |min_len: usize| {
@@ -231,24 +241,20 @@ fn decode6_first_fragment(proto: IpProto, sub: &[u8]) -> Ipv6Fragment {
 /// otherwise the leading Fragment header itself answers `true` and would shadow its own
 /// classification.
 ///
-/// Why a drop and not a pass. Go's `decode6` sets `q.IPProto` from the base header's Next Header
-/// and steps over *only* a leading Fragment header, so a hop-by-hop-chained fragment leaves
-/// `q.IPProto == 0 == ipproto.Unknown` and filter `pre()` drops it before the ACL ever runs. This
-/// tree instead reads the sub-protocol out of etherparse's extension-header walk, which resolves
-/// straight through the chain to the real transport number — so without this check the packet
-/// reaches the ACL looking like an ordinary TCP/UDP datagram whose port merely happens to be 0
-/// (etherparse refuses to descend into a fragmenting payload), and a permissive "allow the whole
-/// tailnet" rule *admits* it. That re-opens the entire RFC 1858 hole this classification exists to
-/// close: prepend an 8-byte Hop-by-Hop Options header and a low-offset later fragment — the one
-/// whose bytes can land on top of the transport header the head fragment was matched on — slides
-/// past, as does a first fragment truncated before its own transport header. The fragment rules
-/// must not be defeatable by an extension header the attacker chooses to prepend, so anything
-/// carrying a chained Fragment header is [`Ipv6Fragment::Unknown`].
+/// Why a drop and not a pass. Go's `decode6` steps over *only* a leading Fragment header, so a
+/// chained one is never classified at all: the packet is filtered as whatever extension header the
+/// base Next Header names, and its fragment offset is never read. Anything this tree said about
+/// such a packet would therefore be its own invention, so it says the one thing that cannot be an
+/// invention in the permissive direction — [`Ipv6Fragment::Unknown`], a drop.
 ///
-/// This drops a strict subset of what Go drops here (Go rejects the whole chained-extension-header
-/// class, fragmenting or not), so it cannot admit anything upstream refuses and cannot break a real
-/// Tailscale, `wireguard-go` or kernel-WireGuard peer: upstream would discard such a packet too, so
-/// no peer can already be relying on one being delivered.
+/// This never admits what upstream refuses. Where the chain leads with Hop-by-Hop Options, Go's
+/// `q.IPProto` is 0 == `ipproto.Unknown` and `pre()` drops it too. Where it leads with Routing (43)
+/// or Destination Options (60), Go carries that number to `runIn6`'s `default` arm, so it can be
+/// admitted only by an all-ports rule that names protocol 43 or 60 IPs-only
+/// (`matchProtoAndIPsOnlyIfAllPorts`) — an ACL nobody writes by accident, and the sole case where
+/// this drop is stricter than upstream. Refusing it cannot break a real Tailscale, `wireguard-go`
+/// or kernel-WireGuard peer: none of them source-fragments behind a chained extension header, and
+/// no peer can be relying on delivery of a packet whose fragment offset upstream never looked at.
 fn fragment_header_is_chained(ipv6: &etherparse::Ipv6Slice<'_>) -> bool {
     ipv6.extensions()
         .clone()
@@ -285,10 +291,18 @@ enum Fragment {
 ///    read past the Fragment extension header, and `Ipv6Fragment::Unknown` — a truncated or
 ///    short-first fragment, or one whose Fragment header sits behind a chained extension header
 ///    ([`fragment_header_is_chained`]) — is dropped where Go's `pre()` drops `ipproto.Unknown`.
-/// 3. TSMP (proto 99) is always admitted, bypassing the ACL — Go `case ipproto.TSMP: return Accept`.
+/// 3. **Unknown protocol** ([`IPPROTO_UNKNOWN`]) — Go `pre()`'s `if q.IPProto == ipproto.Unknown`
+///    drop. `proto` is whatever the *base* header declared (Go `decode4`'s `b[9]`, `decode6`'s
+///    `b[6]`), so this is the arm that refuses an IPv6 packet leading with Hop-by-Hop Options,
+///    which is literally protocol 0.
+/// 4. TSMP (proto 99) is always admitted, bypassing the ACL — Go `case ipproto.TSMP: return Accept`.
 ///    TSMP carries in-band control messages between nodes, so it must reach the local stack
 ///    regardless of the ACL rules.
-/// 4. Everything else consults the control-derived ACL via `can_access` — Go's `matches4.match`.
+/// 5. Everything else consults the control-derived ACL via `can_access` — Go's `matches4.match`.
+///    A protocol Go's `runIn4`/`runIn6` switch has no arm for (an IPv6 Routing or
+///    Destination-Options header, say) lands in its `default`, which admits IPs-only and only
+///    under an all-ports rule naming that protocol (`matchProtoAndIPsOnlyIfAllPorts`); that
+///    per-protocol port semantics lives in [`ts_packetfilter::Rule`].
 fn inbound_filter_verdict(
     filter: &(dyn ts_packetfilter::Filter + Send + Sync),
     proto: IpProto,
@@ -360,6 +374,20 @@ fn inbound_filter_verdict(
         // Note the deliberate asymmetry with IPv4: `decode6` has no more-fragments guard at all, so
         // — unlike `decode4` — upstream does not demote a fragmented first TSMP packet to `unknown`.
         Some(Fragment::V6(Ipv6Fragment::First { .. })) | None => {}
+    }
+
+    // Go filter `pre()`: `if q.IPProto == ipproto.Unknown { return Drop }`. A protocol number
+    // upstream's decoder refused to classify never reaches the ACL, so no rule — however
+    // permissive — can admit it. The check sits after the fragment arms above rather than at the
+    // top of the function only because those arms use `IPPROTO_UNKNOWN` as their own "no
+    // sub-protocol here" placeholder; in Go the two are distinct values (`ipproto.Fragment` is
+    // 0xff) and `pre()` tests them in either order to the same effect.
+    //
+    // The common way to land here is an IPv6 packet whose base Next Header is Hop-by-Hop Options,
+    // which *is* protocol 0: `decode6` copies it into `q.IPProto` and never looks past it.
+    if proto == IPPROTO_UNKNOWN {
+        tracing::trace!(?dst, "dropping unknown-proto packet (Go pre() drop)");
+        return false;
     }
 
     if proto == IpProto::TSMP {
@@ -437,6 +465,16 @@ fn filter_inbound_from_peer(
             }
             Some(etherparse::NetSlice::Ipv6(ipv6)) => {
                 let hdr = ipv6.header();
+                // Go `decode6` reads the protocol out of the base header and only the base
+                // header (`q.IPProto = ipproto.Proto(b[6])`). `next_header()` is that byte.
+                // Its one remapping is `decode6`'s switch arm `case ipproto.Fragment:
+                // q.IPProto = unknown` — Go's internal later-fragment sentinel has no business
+                // being on the wire, and `decode6_first_fragment` already refuses it in the
+                // other place it can appear.
+                let base_proto = match IpProto::new(i64::from(hdr.next_header().0)) {
+                    IPPROTO_FRAGMENT_SENTINEL => IPPROTO_UNKNOWN,
+                    other => other,
+                };
                 // IPv6 fragmentation is carried in a Fragment extension header, not the
                 // base header. Go `decode6` parses that header — and *only* when it is the
                 // base header's immediate Next Header. `next_header()` is exactly that
@@ -445,12 +483,9 @@ fn filter_inbound_from_peer(
                 // by default.
                 //
                 // A Fragment header reached through a *chained* hop-by-hop / routing /
-                // destination-options / AH header is outside that scope, and must fail
-                // closed rather than fall through to the ACL: Go drops it (the base Next
-                // Header leaves `q.IPProto` at `ipproto.Unknown`, which `pre()` refuses),
-                // whereas etherparse resolves the real sub-protocol through the chain, so an
-                // allow-all rule would otherwise admit exactly the RFC 1858 fragments this
-                // classification exists to reject. See `fragment_header_is_chained`.
+                // destination-options / AH header is outside that scope, and fails closed
+                // rather than falling through to the ACL as a fragment Go never classified.
+                // See `fragment_header_is_chained`.
                 let frag = if hdr.next_header().0 == IP6_FRAG_HEADER {
                     Some(decode6_fragment(bytes))
                 } else if fragment_header_is_chained(&ipv6) {
@@ -465,8 +500,20 @@ fn filter_inbound_from_peer(
                     // A later or malformed fragment has no sub-protocol at all (Go's
                     // `ipproto.Fragment` / `unknown`); the verdict decides on the
                     // classification alone and never consults this.
-                    Some(Ipv6Fragment::Later | Ipv6Fragment::Unknown) => IpProto::new(0),
-                    None => IpProto::new(ipv6.payload().ip_number.0 as _),
+                    Some(Ipv6Fragment::Later | Ipv6Fragment::Unknown) => IPPROTO_UNKNOWN,
+                    // Go `decode6`: `q.IPProto = ipproto.Proto(b[6])` — the **base** header's
+                    // Next Header byte, and nothing after that line resolves it any further.
+                    // `decode6` steps over exactly one header, the leading Fragment header
+                    // handled above; every other extension header is left unparsed, so the
+                    // protocol Go matches on is the extension header's own number. Reading
+                    // `ipv6.payload().ip_number` instead would take etherparse's walk *through*
+                    // the whole chain to the real transport number, which is a different packet
+                    // than the one upstream filters: a chain that leads with Hop-by-Hop (0) is
+                    // `ipproto.Unknown` and `pre()` drops it, and one that leads with Routing
+                    // (43) or Destination Options (60) reaches the ACL as protocol 43/60 —
+                    // never matched against a TCP or UDP rule, and admitted only by an
+                    // all-ports rule naming that protocol (Go `matchProtoAndIPsOnlyIfAllPorts`).
+                    None => base_proto,
                 };
                 (
                     proto,
@@ -493,6 +540,14 @@ fn filter_inbound_from_peer(
         // classification above instead.
         let dst_port = match frag {
             Some(Fragment::V6(Ipv6Fragment::First { dst_port, .. })) => dst_port,
+            // Go reads a destination port in exactly three arms of `decode4`/`decode6` — TCP,
+            // UDP and SCTP — and which arm runs is decided by the protocol number the *base*
+            // header declared, not by what a header walk can reach. So an IPv6 packet that
+            // leads with an extension header takes the switch's `default` (in `decode6`, no
+            // arm at all) and keeps port 0 even though a transport header does sit further
+            // down its chain. Reading that buried port here is what let a chained packet be
+            // matched against a port-scoped TCP/UDP rule it is not upstream's to match.
+            _ if !proto.is_port_ful() => 0,
             _ => match pkt.transport {
                 Some(etherparse::TransportSlice::Udp(udp)) => udp.destination_port(),
                 Some(etherparse::TransportSlice::Tcp(tcp)) => tcp.destination_port(),
@@ -1724,21 +1779,20 @@ mod tests {
     /// [`decode6_fragment`] is scoped exactly as Go scopes it: the Fragment header is parsed only
     /// as the base header's immediate Next Header. Go can afford that narrow scope because
     /// everything it does not parse *keeps the base header's Next Header* as `q.IPProto`, so a
-    /// hop-by-hop-chained fragment is `ipproto.Unknown` and filter `pre()` drops it before the ACL
-    /// ever runs. This tree reads the sub-protocol out of etherparse's extension-header walk
-    /// instead, which resolves straight through the chain to the real transport number — so the
-    /// same packet reached the ACL looking like an ordinary UDP datagram that merely happened to
-    /// carry port 0, and a permissive "allow the whole tailnet" rule ADMITTED it. Eight bytes of
-    /// Hop-by-Hop Options were enough to walk every RFC 1858 fragment straight past the rules the
-    /// rest of this file exists to enforce.
+    /// chained fragment is filtered as the extension header it leads with and its fragment offset
+    /// is never read at all. This tree does classify the chain
+    /// ([`fragment_header_is_chained`]), and the only classification that cannot be an invention
+    /// in the permissive direction is [`Ipv6Fragment::Unknown`] — a drop. Without it, eight bytes
+    /// of Hop-by-Hop Options were enough to walk every RFC 1858 fragment straight past the rules
+    /// the rest of this file exists to enforce.
     ///
     /// Every assertion is against an ALLOW-ALL ACL, so a drop can only be the fragment rule and
     /// never the ACL — and each extension type carries its own control that proves it: the same
-    /// chain shape with no Fragment header in it is still delivered, on the port read past the
-    /// extension header. That control is per-type rather than once at the end because `keep`
-    /// cannot tell a fragment-rule drop from a parser rejection, so a fixture malformed for only
-    /// one of the three protocols would otherwise turn that protocol's four drops into vacuous
-    /// passes with the suite still green.
+    /// chain shape with no Fragment header in it is still walked to its UDP header by the parser.
+    /// That control is per-type rather than once at the end because `keep` cannot tell a
+    /// fragment-rule drop from a parser rejection, so a fixture malformed for only one of the
+    /// three protocols would otherwise turn that protocol's four drops into vacuous passes with
+    /// the suite still green.
     #[test]
     fn chained_extension_header_cannot_bypass_the_ipv6_fragment_rules() {
         let keep = |filter: &(dyn ts_packetfilter::Filter + Send + Sync), packet: Vec<u8>| {
@@ -1805,17 +1859,21 @@ mod tests {
             // Control for THIS extension type. Every assertion above is a `!keep`, and `keep`
             // reports a packet the parser rejected exactly as it reports a packet the fragment
             // rule dropped — so on its own the block above would also pass if this builder simply
-            // produced eight bytes etherparse refuses to walk. The same chain shape with no
-            // Fragment header behind it is still parsed, still admitted, and still matched on the
-            // port read past the extension header, which pins the drops to the fragment rule.
+            // produced eight bytes etherparse refuses to walk. It does not: the same chain shape
+            // with no Fragment header behind it is walked all the way to its UDP header. The drops
+            // above are therefore this file refusing a packet it could perfectly well have read,
+            // which is the whole claim.
+            //
+            // The control is a parser assertion and not a `keep`, because what the *filter* does
+            // with a chained non-fragment is no longer "deliver it on the port behind the chain" —
+            // it is Go's base-Next-Header disposition, which
+            // `ipv6_extension_header_chain_is_matched_on_the_base_next_header` covers in full.
             let plain = ipv6_with_prepended_ext_header(ext, &ipv6_udp_packet(&udp_header(443)));
+            let parsed = etherparse::SlicedPacket::from_ip(&plain)
+                .unwrap_or_else(|e| panic!("extension header {ext} fixture must parse: {e:?}"));
             assert!(
-                keep(&AllowAll, plain.clone()),
-                "an unfragmented packet behind extension header {ext} is still delivered"
-            );
-            assert!(
-                keep(&AllowPort(443), plain),
-                "...and is still matched on the port read past extension header {ext}"
+                matches!(parsed.transport, Some(etherparse::TransportSlice::Udp(_))),
+                "extension header {ext} fixture must chain to a UDP header the parser can reach"
             );
         }
 
@@ -1825,6 +1883,171 @@ mod tests {
         assert!(
             keep(&AllowAll, ipv6_fragment_packet(17, 185, false, &[0x61; 8])),
             "an unchained later fragment is still delivered"
+        );
+    }
+
+    /// A filter that admits everything and records the [`ts_packetfilter::PacketInfo`] it was asked
+    /// about, so a test can assert on the protocol and port the dataplane actually derived — and on
+    /// a packet never reaching the ACL at all.
+    #[derive(Default)]
+    struct Recording(Mutex<Vec<ts_packetfilter::PacketInfo>>);
+    impl ts_packetfilter::Filter for Recording {
+        fn match_for(
+            &self,
+            info: &ts_packetfilter::PacketInfo,
+            _caps: ts_packetfilter::filter::CapIter,
+        ) -> Option<&str> {
+            self.0.lock().unwrap().push(*info);
+            Some("recording")
+        }
+    }
+
+    /// A real control-derived ACL — one rule built out of [`ts_packetfilter::Rule`] itself rather
+    /// than a hand-written stub, so the assertions run through the same per-protocol port semantics
+    /// as production: TCP/UDP/SCTP are port-matched, and any other protocol matches IPs-only and
+    /// only under an all-ports rule (Go `matchProtoAndIPsOnlyIfAllPorts`).
+    fn ipv6_acl(
+        protos: &[i64],
+        ports: std::ops::RangeInclusive<u16>,
+    ) -> std::collections::BTreeMap<String, ts_packetfilter::Ruleset> {
+        let net: ipnet::IpNet = "2001:db8::/32".parse().unwrap();
+        std::collections::BTreeMap::from([(
+            ts_packetfilter::DEFAULT_RULESET_NAME.to_string(),
+            vec![ts_packetfilter::Rule {
+                src: ts_packetfilter::SrcMatch {
+                    pfxs: vec![net],
+                    caps: Vec::new(),
+                },
+                protos: protos.iter().copied().map(IpProto::new).collect(),
+                dst: vec![ts_packetfilter::DstMatch {
+                    ports,
+                    ips: vec![net],
+                }],
+            }],
+        )])
+    }
+
+    /// An IPv6 extension-header chain is filtered on the **base** header's Next Header, never on
+    /// the transport the chain resolves to.
+    ///
+    /// Go `net/packet.decode6` assigns `q.IPProto = ipproto.Proto(b[6])` and — apart from a leading
+    /// Fragment header — parses nothing further, so the number that reaches `wgengine/filter` is
+    /// the extension header's own. Two consequences, both asserted here:
+    ///
+    /// * Hop-by-Hop Options **is** protocol 0, which is `ipproto.Unknown`, so filter `pre()` drops
+    ///   the packet outright before any rule is consulted.
+    /// * Routing (43) and Destination Options (60) reach `runIn6`'s `default` arm, where the only
+    ///   way in is `matchProtoAndIPsOnlyIfAllPorts` — an all-ports rule naming protocol 43 or 60.
+    ///   Such a packet is never matched against a TCP or UDP rule and its transport port is never
+    ///   read.
+    ///
+    /// Reading the protocol out of etherparse's extension-header walk instead resolves straight
+    /// through the chain to the real transport number and reads that transport's destination port,
+    /// which is a strictly more permissive filter than upstream's: an ordinary `udp:443` ACL
+    /// admitted a packet Go matches IPs-only, and would admit it for any protocol an attacker
+    /// chose to bury the chain under.
+    ///
+    /// Ported from github.com/tailscale/tailscale `net/packet/packet.go` (`decode6`) and
+    /// `wgengine/filter/filter.go` (`pre`, `runIn6`) at
+    /// `9ea7cba44591e0cd840c6c94d23274dd222059bf`.
+    #[test]
+    fn ipv6_extension_header_chain_is_matched_on_the_base_next_header() {
+        let keep = |filter: &(dyn ts_packetfilter::Filter + Send + Sync), packet: Vec<u8>| {
+            let mut packets = vec![PacketMut::from(packet)];
+            let mut learned = Vec::new();
+            filter_inbound_from_peer(filter, PeerId(5), &mut packets, &mut learned);
+            assert!(
+                learned.is_empty(),
+                "no TSMP advertisement in these fixtures"
+            );
+            !packets.is_empty()
+        };
+        // What the ACL was asked about, or `None` if the packet never got that far.
+        let seen = |packet: Vec<u8>| {
+            let recording = Recording::default();
+            keep(&recording, packet);
+            let seen = recording.0.into_inner().unwrap();
+            assert!(seen.len() <= 1, "one packet in, at most one ACL question");
+            seen.into_iter().next()
+        };
+
+        let unchained = ipv6_udp_packet(&udp_header(443));
+
+        // The baseline this is all measured against: with UDP as the base header's Next Header,
+        // `decode6` takes its UDP arm, so the ACL sees protocol 17 on port 443.
+        let info = seen(unchained.clone()).expect("an unchained UDP datagram reaches the ACL");
+        assert_eq!(info.ip_proto, IpProto::UDP, "unchained: protocol is UDP");
+        assert_eq!(
+            info.port, 443,
+            "unchained: the UDP destination port is read"
+        );
+
+        // Routing (43) and Destination Options (60): the base header now says "extension header",
+        // so that is the protocol the ACL is asked about — and no port is read, even though the
+        // very same UDP header still sits 8 bytes further down the chain.
+        for ext in [43u8, 60] {
+            let chained = ipv6_with_prepended_ext_header(ext, &unchained);
+            let info = seen(chained.clone()).unwrap_or_else(|| {
+                panic!("a packet behind extension header {ext} reaches the ACL")
+            });
+            assert_eq!(
+                info.ip_proto,
+                IpProto::new(i64::from(ext)),
+                "behind extension header {ext}: the ACL sees the base Next Header, not the transport"
+            );
+            assert_eq!(
+                info.port, 0,
+                "behind extension header {ext}: no port is read past the chain"
+            );
+
+            // And what that means for a real ACL. An ordinary `udp:443` rule admits the unchained
+            // datagram and refuses the chained one, because protocol 43/60 is not UDP...
+            let udp443 = ipv6_acl(&[i64::from(IpProto::UDP)], 443..=443);
+            assert!(
+                keep(&udp443, unchained.clone()),
+                "a udp:443 rule admits the unchained datagram"
+            );
+            assert!(
+                !keep(&udp443, chained.clone()),
+                "a udp:443 rule does not admit a packet behind extension header {ext}"
+            );
+
+            // ...and the one rule that does admit it is Go's `matchProtoAndIPsOnlyIfAllPorts`:
+            // the protocol named, IPs-only, all ports open. A narrower port range on the same
+            // protocol opens nothing, because a portless protocol carries no port to match.
+            assert!(
+                keep(&ipv6_acl(&[i64::from(ext)], 0..=u16::MAX), chained.clone()),
+                "an all-ports rule naming protocol {ext} admits it IPs-only"
+            );
+            assert!(
+                !keep(&ipv6_acl(&[i64::from(ext)], 443..=443), chained),
+                "a port-scoped rule naming protocol {ext} opens nothing (matchProtoAndIPsOnlyIfAllPorts)"
+            );
+        }
+
+        // Hop-by-Hop Options is protocol 0, and protocol 0 is `ipproto.Unknown`: Go's `pre()`
+        // drops it before the ACL exists, so not even an allow-everything filter is consulted.
+        let hop_by_hop = ipv6_with_prepended_ext_header(0, &unchained);
+        assert!(
+            seen(hop_by_hop.clone()).is_none(),
+            "a hop-by-hop-led packet never reaches the ACL"
+        );
+        assert!(
+            !keep(&AllowAll, hop_by_hop),
+            "a hop-by-hop-led packet is dropped by an allow-all ACL (Go pre() unknown-proto drop)"
+        );
+
+        // The same drop for Go's internal later-fragment sentinel used as a real Next Header:
+        // `decode6`'s `case ipproto.Fragment: q.IPProto = unknown`.
+        let mut sentinel = unchained.clone();
+        sentinel[6] = 0xff;
+        assert!(
+            seen(sentinel.clone()).is_none(),
+            "a packet whose base Next Header is the 0xff sentinel never reaches the ACL"
+        );
+        assert!(
+            !keep(&AllowAll, sentinel),
+            "...and is dropped by an allow-all ACL"
         );
     }
 
