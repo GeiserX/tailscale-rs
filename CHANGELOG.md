@@ -2,6 +2,14 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.47.7](https://github.com/GeiserX/tailscale-rs/compare/v0.47.6...v0.47.7) (2026-09-07)
+
+
+### Bug Fixes
+
+* **control:** let a locked tailnet's cold start dial its signed peers ([#382](https://github.com/GeiserX/tailscale-rs/issues/382)) ([4597946](https://github.com/GeiserX/tailscale-rs/commit/45979464fe956677e94b2f63cdd84ec83d918551))
+* **magic_dns:** stop relaying a 4096-byte answer Go marks truncated ([#380](https://github.com/GeiserX/tailscale-rs/issues/380)) ([10d8ce5](https://github.com/GeiserX/tailscale-rs/commit/10d8ce5bb7490b79767d2e9bb3805f92591f5a55))
+
 ## [0.47.6](https://github.com/GeiserX/tailscale-rs/compare/v0.47.5...v0.47.6) (2026-09-06)
 
 
