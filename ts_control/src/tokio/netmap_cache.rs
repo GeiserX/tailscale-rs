@@ -13,14 +13,22 @@
 //! policy document can override the grant and "takes precedence over `CacheNetworkMaps`". Both are
 //! honoured here — see [`netmap_caching_enabled`].
 //!
-//! **What is persisted.** Go stores the assembled `netmap.NetworkMap` column by column. This port
-//! has no `NetworkMap` aggregate (the netmap is consumed as a [`StateUpdate`] stream), so the cache
-//! keeps the *raw decompressed `MapResponse` JSON* of the last **full** netmap frame and replays it
-//! through the same decoder the live poll uses. A frame counts as full only when control marked its
-//! peer list complete (`MapResponse.Peers` non-empty — Go's own "if non-empty, is the complete
-//! list" signal); delta frames are never persisted, because replaying a delta on a cold start would
-//! install a partial netmap. The cache therefore holds the last complete netmap, not a
-//! continuously-updated one: Go's per-peer delta merge into the cache is not ported.
+//! **What is persisted.** Go stores the assembled `netmap.NetworkMap` column by column
+//! (`netmapcache.Cache.Store` writes the self node, DNS config, DERP map and packet filter whether
+//! or not the map has peers). This port has no `NetworkMap` aggregate (the netmap is consumed as a
+//! [`StateUpdate`] stream), so the cache keeps the *raw decompressed `MapResponse` JSON* of the last
+//! **self-contained netmap frame** and replays it through the same decoder the live poll uses. A
+//! frame is self-contained when it carries a self node and either control's complete peer list
+//! (`MapResponse.Peers` non-empty — Go's own "if non-empty, is the complete list" signal) or no peer
+//! information at all alongside a DERP map, which is control's opening netmap for a node with no
+//! visible peers. See `cacheable`.
+//!
+//! Delta frames are never persisted, because replaying a delta on a cold start would install a
+//! partial netmap, and a peerless frame never evicts a cached peer list. The cache therefore holds
+//! the last self-contained netmap, not a continuously-updated one: Go's per-peer delta merge into
+//! the cache (`writePeerDeltaToDiskLocked` → `netmapcache.Cache.UpdatePeers`) is **not** ported, so
+//! between two full netmaps the cached peer list ages by every delta control sends, and a cold start
+//! can replay a peer that has since been removed until control's first netmap lands.
 //!
 //! **The persisted material is sensitive.** A `MapResponse` carries the tailnet's peer list with
 //! their node/disco public keys and endpoints, the DNS configuration, and the compiled packet
@@ -60,6 +68,16 @@ pub const NODE_ATTR_CACHE_NETWORK_MAPS: &str = "cache-network-maps";
 /// [`NODE_ATTR_CACHE_NETWORK_MAPS`] is also granted (Go `nodecap.DisableCacheNetworkMaps`,
 /// tailscale/tailscale#19947). It exists so a policy document can override the grant, and Go
 /// documents it as taking precedence — so it is checked first and wins.
+///
+/// **Deliberately ahead of the shipped Go.** Upstream declares this attribute and aliases it as
+/// `tailcfg.NodeAttrDisableCacheNetworkMaps`, but as of `9ea7cba44591e0cd840c6c94d23274dd222059bf`
+/// no code reads it: both cache decision sites in `ipn/ipnlocal/local.go` gate on
+/// `SelfHasCap(nodecap.CacheNetworkMaps)` and the `TS_USE_CACHED_NETMAP` envknob alone, so a Go node
+/// granted both attributes still caches. This port implements the contract the attribute documents
+/// rather than the one the current tree happens to enforce, because the attribute exists to let a
+/// tailnet's policy say "do not write this node's peer keys, DNS config and packet filter to disk",
+/// and a client that ignores it writes them anyway. The divergence only ever *withholds* a cache,
+/// so its whole cost is cold-start latency on a node whose policy asked for exactly that.
 pub const NODE_ATTR_DISABLE_CACHE_NETWORK_MAPS: &str = "disable-cache-network-maps";
 
 /// File name of the cached netmap frame under [`NetmapCache`]'s directory.
@@ -129,6 +147,8 @@ impl NetmapCache {
     /// whatever is on disk. The decision is taken from the **self node carried by this frame**, so
     /// a frame that carries no self node leaves the cache exactly as it was (control sends plenty of
     /// peer-only and keep-alive frames, and none of them re-state the node's attributes).
+    ///
+    /// What counts as a frame worth persisting is `cacheable`'s job.
     pub async fn observe(&self, update: &StateUpdate, frame: &[u8]) {
         let Some(node) = update.node.as_ref() else {
             return;
@@ -141,11 +161,26 @@ impl NetmapCache {
             return;
         }
 
-        // Only a frame whose peer list control marked complete is a self-contained netmap. Replaying
-        // a delta frame on a cold start would install a partial netmap (peers that happened to
-        // change last, and nothing else), which is worse than no cache at all.
-        if !matches!(update.peer_update, Some(PeerUpdate::Full(_))) {
-            return;
+        match cacheable(update) {
+            // A delta frame, or anything else that is only a piece of the netmap. Replaying one on a
+            // cold start would install a partial netmap (the peers that happened to change last, and
+            // nothing else), which is worse than no cache at all.
+            Cacheable::No => return,
+            Cacheable::WithPeers => {}
+            // A netmap with no peers in it. Go caches these — its `Store` writes the self node, DNS
+            // config, DERP map and packet filter whatever the peer count — and they are the only
+            // netmap a node with no visible peers ever gets, so without this such a node has no cache
+            // at all. But this port classifies frames, not an assembled map, so it declines to let
+            // one *replace* a cached peer list: a frame that looks peerless because control chose to
+            // re-state the netmap head without repeating the peers would otherwise throw the peers
+            // away. Go cannot make that mistake (it always writes back a complete aggregate), and
+            // keeping the richer cache is the same answer this cache gave before peerless netmaps
+            // were stored at all.
+            Cacheable::WithoutPeers => {
+                if self.cached_netmap_has_peers().await {
+                    return;
+                }
+            }
         }
 
         if let Err(e) = self.store(frame).await {
@@ -214,6 +249,22 @@ impl NetmapCache {
     /// cache, which is exactly the behaviour of a node that never cached anything.
     async fn load(&self) -> Option<Vec<u8>> {
         self.load_entry(NETMAP_CACHE_FILE).await
+    }
+
+    /// Whether the netmap currently on disk carries a peer list, i.e. whether replacing it with a
+    /// peerless frame would lose peers a cold start could otherwise dial.
+    ///
+    /// `false` when there is nothing cached, when what is cached fails the vetting, and when it no
+    /// longer decodes — in all three cases there are no peers to protect, and the caller should go
+    /// ahead and write. Only consulted for a [peerless][Cacheable::WithoutPeers] frame, which is
+    /// control's opening netmap for a peerless node rather than anything mid-session, so this costs
+    /// one read per map session at most.
+    async fn cached_netmap_has_peers(&self) -> bool {
+        let Some(frame) = self.load().await else {
+            return false;
+        };
+        state_update_from_frame(&frame)
+            .is_some_and(|cached| matches!(cached.peer_update, Some(PeerUpdate::Full(_))))
     }
 
     /// Read the cache entry `name`, or `None` when it is absent or fails the vetting below.
@@ -301,9 +352,9 @@ impl NetmapCache {
     /// `vouch` is **not** consulted when the cached frame says the lock was off — there is nothing to
     /// enforce then and every peer replays, exactly as Go's filter returns early on `b.tka == nil`.
     /// Reading the lock state from the cached frame is sound for the frames this cache holds: only a
-    /// *full* netmap is ever stored, and `tailcfg` documents `TKAInfo` on a non-delta `MapResponse`
-    /// as authoritative in both directions — populated means control believes the lock is on for this
-    /// node, absent means it believes it is off.
+    /// self-contained, non-delta netmap is ever stored (see `cacheable`), and `tailcfg` documents
+    /// `TKAInfo` on a non-delta `MapResponse` as authoritative in both directions — populated means
+    /// control believes the lock is on for this node, absent means it believes it is off.
     ///
     /// Peer *patches* (`MapResponse.PeersChangedPatch`) are always dropped under an active lock: a
     /// patch carries no `key_signature`, so there is nothing for `vouch` to judge, and Go's filter
@@ -325,8 +376,8 @@ impl NetmapCache {
 
         let cached = match update.peer_update.take() {
             Some(PeerUpdate::Full(peers)) => peers,
-            // Only a full frame is ever cached; anything else carries no complete peer set to vouch
-            // for, so there is nothing to replay.
+            // Only a self-contained netmap is ever cached, and a peerless one carries no peer set to
+            // vouch for, so there is nothing to replay.
             _ => Vec::new(),
         };
         let cached_count = cached.len();
@@ -344,6 +395,54 @@ impl NetmapCache {
         update.peer_patches.clear();
 
         Some(update)
+    }
+}
+
+/// What one decoded frame is worth to the cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cacheable {
+    /// A netmap carrying control's complete peer list. Always persisted.
+    WithPeers,
+    /// A netmap carrying no peer information at all. Persisted only over a cache that has no peers
+    /// of its own — see [`NetmapCache::observe`].
+    WithoutPeers,
+    /// A piece of a netmap: a delta, a patch, an online/last-seen flip, or a self-node update with
+    /// nothing else in it. Never persisted.
+    No,
+}
+
+/// Classify one frame for the cache.
+///
+/// Go never has to do this: `ipnlocal` caches the *assembled* `netmap.NetworkMap`, so every install
+/// writes a complete map back. Here the unit of storage is the frame control sent, so the frame has
+/// to be complete on its own or a cold start replays a fragment.
+///
+/// * **[`WithPeers`](Cacheable::WithPeers)** — `MapResponse.Peers` non-empty, which `tailcfg`
+///   defines as the complete peer list. This is control's opening netmap for a node with peers.
+/// * **[`WithoutPeers`](Cacheable::WithoutPeers)** — no peer information of any kind (no `Peers`,
+///   no `PeersChanged`/`PeersRemoved`/`PeersChangedPatch`, no `OnlineChange`/`PeerSeenChange`) plus
+///   a DERP map. Control's opening netmap always carries the DERP map, and a node that sees no peers
+///   gets no other kind of netmap, so this is how a peerless tailnet gets a cache — the case Go
+///   covers with `netmapcache.Cache.Store` over a zero-peer `NetworkMap`. Requiring the DERP map is
+///   what keeps a mid-session self-node update (a cap-map or endpoint change, which carries a self
+///   node and nothing else) out of the cache.
+/// * **[`No`](Cacheable::No)** — anything else.
+///
+/// The caller has already established that the frame carries a self node.
+fn cacheable(update: &StateUpdate) -> Cacheable {
+    if matches!(update.peer_update, Some(PeerUpdate::Full(_))) {
+        return Cacheable::WithPeers;
+    }
+
+    let carries_peer_deltas = update.peer_update.is_some()
+        || !update.peer_patches.is_empty()
+        || !update.online_change.is_empty()
+        || !update.peer_seen_change.is_empty();
+
+    if !carries_peer_deltas && update.derp.is_some() {
+        Cacheable::WithoutPeers
+    } else {
+        Cacheable::No
     }
 }
 
@@ -584,6 +683,36 @@ mod tests {
         )
     }
 
+    /// Control's opening netmap for a node that sees **no peers**: a self node carrying `cap_map`, an
+    /// explicitly empty peer list, a DERP map and a DNS config. This is the whole netmap such a node
+    /// ever receives, and the DERP map and DNS config in it are exactly what a cold start wants.
+    fn peerless_netmap(cap_map: &str) -> String {
+        format!(
+            r#"{{
+                "MapSessionHandle": "sess-1",
+                "Seq": 1,
+                "Node": {{
+                    "ID": 1,
+                    "StableID": "self-1",
+                    "Name": "self.example.ts.net.",
+                    "Addresses": ["100.64.0.1/32"],
+                    "CapMap": {cap_map}
+                }},
+                "Peers": [],
+                "DERPMap": {{ "Regions": {{ "3": {{
+                    "RegionID": 3,
+                    "RegionCode": "tst",
+                    "RegionName": "Test",
+                    "Nodes": []
+                }} }} }},
+                "DNSConfig": {{
+                    "Resolvers": [{{ "Addr": "192.0.2.53" }}],
+                    "Domains": ["example.ts.net"]
+                }}
+            }}"#
+        )
+    }
+
     /// Run one framed netmap through the production map-poll stream with `cache` attached, exactly
     /// as the live control session does.
     async fn poll_one(body: &str, cache: &NetmapCache) {
@@ -743,6 +872,130 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A netmap with no peers in it is still a netmap, and Go caches it: `netmapcache.Cache.Store`
+    /// writes the self node, DNS config, DERP map and packet filter whatever the peer count. A node
+    /// that sees no peers — a solo tailnet, or one whose ACLs show it nobody — gets no other kind of
+    /// netmap, so gating the write on a non-empty peer list left exactly that node with no cache at
+    /// all and no DERP map or DNS config to start from.
+    #[tokio::test]
+    async fn a_peerless_netmap_is_cached() {
+        let dir = scratch_dir("peerless");
+        let cache = NetmapCache::new(&dir);
+
+        poll_one(&peerless_netmap(r#"{"cache-network-maps": null}"#), &cache).await;
+
+        let replayed = NetmapCache::new(&dir)
+            .load_state_update()
+            .await
+            .expect("a node with no peers must still cache its netmap");
+
+        assert_eq!(
+            replayed.node.as_ref().expect("self node").stable_id.0,
+            "self-1"
+        );
+        assert!(
+            replayed.derp.is_some(),
+            "the DERP map is the head start a peerless node gets from the cache"
+        );
+        assert!(
+            replayed.dns_config.is_some(),
+            "so is the DNS configuration; Go stores both for a zero-peer netmap"
+        );
+        assert!(
+            replayed.peer_update.is_none(),
+            "there were no peers to replay, and an empty peer list is not a full reset"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A peerless frame refreshes a peerless cache but never replaces a cache that has peers in it.
+    ///
+    /// Go writes back a complete assembled `NetworkMap` every time, so it cannot lose peers this way;
+    /// this port stores the frame control sent, so a frame that re-states the netmap head without
+    /// repeating the peers would throw away the peer list a cold start exists to dial. Keeping the
+    /// richer cache is the conservative half of caching peerless netmaps at all.
+    #[tokio::test]
+    async fn a_peerless_netmap_never_evicts_cached_peers() {
+        let dir = scratch_dir("peerless-keeps-peers");
+        let cache = NetmapCache::new(&dir);
+
+        poll_one(&full_netmap(r#"{"cache-network-maps": null}"#), &cache).await;
+        poll_one(&peerless_netmap(r#"{"cache-network-maps": null}"#), &cache).await;
+
+        let replayed = NetmapCache::new(&dir)
+            .load_state_update()
+            .await
+            .expect("the cached netmap survives");
+        assert!(
+            matches!(replayed.peer_update, Some(PeerUpdate::Full(ref p)) if p[0].stable_id.0 == "peer-2"),
+            "the peer-bearing netmap must still be the cached one, got {:?}",
+            replayed.peer_update
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The narrowness that makes the above safe: a mid-session self-node update — a cap-map or
+    /// endpoint change, carrying a self node and nothing else — is not a netmap and is not cached.
+    /// Without the DERP map it is indistinguishable from the head of one, so the frame is refused
+    /// and whatever is cached stays.
+    #[tokio::test]
+    async fn a_self_only_update_is_not_a_netmap() {
+        let dir = scratch_dir("self-only");
+        let cache = NetmapCache::new(&dir);
+
+        poll_one(
+            r#"{
+                "Seq": 4,
+                "Node": {
+                    "ID": 1,
+                    "StableID": "self-1",
+                    "Name": "self.example.ts.net.",
+                    "Addresses": ["100.64.0.1/32"],
+                    "CapMap": {"cache-network-maps": null}
+                }
+            }"#,
+            &cache,
+        )
+        .await;
+
+        assert!(
+            !cache.path().exists(),
+            "a frame that carries only the self node is not a netmap a cold start can start from"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The classifier itself, over the frame shapes control actually sends.
+    #[test]
+    fn only_self_contained_netmap_frames_are_cacheable() {
+        let classify = |body: &str| {
+            cacheable(&state_update_from_frame(body.as_bytes()).expect("a decodable frame"))
+        };
+
+        assert_eq!(classify(&full_netmap("{}")), Cacheable::WithPeers);
+        assert_eq!(classify(&peerless_netmap("{}")), Cacheable::WithoutPeers);
+        // A peer delta, even one that also re-states the DERP map, is a piece of a netmap.
+        assert_eq!(
+            classify(
+                r#"{"Node": {"ID": 1}, "PeersChanged": [{"ID": 3, "StableID": "peer-3"}],
+                    "DERPMap": { "Regions": {} }}"#
+            ),
+            Cacheable::No
+        );
+        // So is a standalone online flip, which carries no peer body at all.
+        assert_eq!(
+            classify(
+                r#"{"Node": {"ID": 1}, "OnlineChange": {"3": true}, "DERPMap": {"Regions": {}}}"#
+            ),
+            Cacheable::No
+        );
+        // And so is a self-node update with no DERP map behind it.
+        assert_eq!(classify(r#"{"Node": {"ID": 1}}"#), Cacheable::No);
     }
 
     /// The cached frame is the tailnet's peer list, keys, DNS config and packet filter, so it is
