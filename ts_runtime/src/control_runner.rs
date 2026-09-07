@@ -456,6 +456,11 @@ impl ControlRunner {
             if self.tka_synced.is_some() {
                 tracing::info!("TKA lock disabled; clearing enforcement (admitting all peers)");
                 self.tka_synced = None;
+                // The chain we persisted for the cold-start replay described a lock that is now off.
+                // Dropping it is not what keeps the next cold start honest (the replay only vouches
+                // when the cached frame itself says the lock was on, and only with a chain at that
+                // frame's head) — it is so a disabled lock leaves nothing of itself on disk.
+                self.discard_persisted_tka_chain();
             }
             self.tka_authority.send_replace(None);
             return;
@@ -548,6 +553,12 @@ impl ControlRunner {
                     log_self_lockout(self_node, &synced.authority);
                 }
 
+                // Persist the verified chain beside the cached netmap so the *next* cold start can
+                // run this same filter over the cached peers before control answers — Go's cold
+                // start filters its cached map against the authority it re-opens from disk, and this
+                // is the disk it re-opens (see `replay_cached_netmap`).
+                self.persist_tka_chain(&synced).await;
+
                 self.tka_synced = Some(synced);
             }
             Ok(None) => {
@@ -557,6 +568,7 @@ impl ControlRunner {
                 if self.tka_synced.is_some() {
                     tracing::info!("TKA sync: control reports no lock; clearing enforcement");
                     self.tka_synced = None;
+                    self.discard_persisted_tka_chain();
                 }
                 self.tka_authority.send_replace(None);
             }
@@ -567,6 +579,66 @@ impl ControlRunner {
                 tracing::warn!(error = %e, "TKA sync failed; keeping prior enforcement state");
             }
         }
+    }
+
+    /// Persist the freshly-synced AUM chain next to the cached netmap, so a cold start can vouch for
+    /// the peers in that netmap ([`load_cached_netmap`]).
+    ///
+    /// Written only where the netmap itself is written: with no
+    /// [`netmap_cache_dir`](ts_control::Config::netmap_cache_dir) there is nothing to vouch for, and
+    /// with the `cache-network-maps` grant absent or overridden nothing is cached either, so the
+    /// chain is removed instead of written — the same withdrawal rule `NetmapCache::observe` applies
+    /// to the netmap. The grant is read from the last self node control sent, which is the same
+    /// source `observe` reads it from: nothing is ever cached before one arrives, so "no self node
+    /// yet" is also "nothing to vouch for". A write failure is logged inside the cache and changes
+    /// nothing: the next cold start simply withholds the cached peers.
+    async fn persist_tka_chain(&self, synced: &crate::tka_sync::SyncedTka) {
+        let Some(cache) = self.netmap_cache() else {
+            return;
+        };
+
+        // Scoped so the `watch` borrow is dropped before the awaits below (it is not `Send`).
+        let caching_granted = {
+            let self_node = self.self_node.borrow();
+            self_node
+                .as_ref()
+                .is_some_and(|node| ts_control::netmap_caching_enabled(&node.cap_map))
+        };
+        if !caching_granted {
+            cache.discard_tka_chain().await;
+            return;
+        }
+
+        match crate::tka_sync::encode_chain(&synced.store, synced.oldest) {
+            Some(blob) => cache.store_tka_chain(&blob).await,
+            None => {
+                // The store cannot be walked genesis→head, so there is no chain to persist. Drop any
+                // older one rather than leaving a chain that no longer matches what we enforce.
+                tracing::warn!("TKA: synced chain is not walkable; not persisting it");
+                cache.discard_tka_chain().await;
+            }
+        }
+    }
+
+    /// Remove the persisted AUM chain (the lock was disabled, or control reports no lock). Spawned
+    /// because the call sites are synchronous actor paths and this is best-effort cleanup: the file
+    /// is never *trusted* out of existence — the replay checks the chain against the cached frame's
+    /// own recorded head.
+    fn discard_persisted_tka_chain(&self) {
+        let Some(cache) = self.netmap_cache() else {
+            return;
+        };
+        tokio::spawn(async move { cache.discard_tka_chain().await });
+    }
+
+    /// The netmap cache this node was configured with, or `None` when the embedder configured no
+    /// directory (nothing is cached, so there is nothing to vouch for).
+    fn netmap_cache(&self) -> Option<ts_control::NetmapCache> {
+        self.params
+            .config
+            .netmap_cache_dir
+            .as_ref()
+            .map(ts_control::NetmapCache::new)
     }
 
     fn with_self_node<F, R>(&self, f: F) -> impl Future<Output = Option<R>> + use<F, R>
@@ -1480,14 +1552,12 @@ async fn issue_cert_pair_inner(
 /// grant is not knowable). If the grant has since been withdrawn, the first netmap of this session
 /// says so and the cache is discarded then.
 ///
-/// **Peers cached under Tailnet Lock are not part of this replay.** Go filters the netmap it
-/// replays through `tkaFilterNetmapLocked`, which it can do at cold start because its TKA authority
-/// is persisted on disk. This port's authority is in memory only (see [`crate::tka_sync`]), so at
-/// this point there is nothing to verify a cached peer's `key_signature` against and the peer
-/// tracker's enforcement cell still reads `None` — admit-all. So
-/// [`NetmapCache::load_state_update`](ts_control::NetmapCache::load_state_update) withholds the
-/// peers of a netmap that was cached while the lock was on, and this replay carries the rest (self
-/// node, DERP map, DNS, packet filter). Control's first netmap brings those peers back moments
+/// **Peers cached under Tailnet Lock are filtered, not withheld.** Go replays its cached map through
+/// `tkaFilterNetmapLocked`, which it can do at cold start because its TKA authority is persisted on
+/// disk; the peers that hold a valid signature survive and are dialed. This port persists the same
+/// authority next to the cached netmap (see [`load_cached_netmap`]) and runs the same filter over the
+/// cached peers. With no persisted authority to run it with — a cache written before this node ever
+/// completed a TKA sync — the peers are withheld and control's first netmap brings them back moments
 /// later, behind a synced authority.
 ///
 /// The bus has no replay, so this reaches only subscribers already registered. Every netmap
@@ -1500,7 +1570,7 @@ async fn replay_cached_netmap(params: &Params) {
         return;
     };
 
-    let Some(update) = ts_control::NetmapCache::new(dir).load_state_update().await else {
+    let Some(update) = load_cached_netmap(&ts_control::NetmapCache::new(dir)).await else {
         return;
     };
 
@@ -1513,6 +1583,98 @@ async fn replay_cached_netmap(params: &Params) {
     if let Err(e) = params.env.publish(Arc::new(update)).await {
         tracing::warn!(error = %e, "publishing the cached netmap");
     }
+}
+
+/// Read the cached netmap, vouching for its peers with the Tailnet-Lock authority persisted beside
+/// it — the whole of the cold-start decision, with no actor state in it so it can be tested directly.
+///
+/// A netmap cached while the lock was **off** replays whole; there is nothing to enforce (Go's
+/// `tkaFilterNetmapLocked` returns early on `b.tka == nil`). A netmap cached while the lock was
+/// **on** replays exactly the peers
+/// [`PeerTracker::tka_keep_verdicts`](crate::peer_tracker::PeerTracker::tka_keep_verdicts) admits —
+/// the same pass the live netmap path runs, so a peer that is dialed from the cache is one the
+/// authority authorized, and an unsigned peer, a peer whose signature fails, or a peer a newer
+/// rotation obsoletes is dropped.
+///
+/// Three things make the persisted authority safe to enforce with:
+///
+/// * it is re-verified from genesis on load ([`crate::tka_sync::authority_from_encoded_chain`]), so a
+///   blob that is not a signed chain yields no authority;
+/// * it is read back out of the same directory the netmap is, vetted as private to this user, so a
+///   local attacker cannot choose which chain we start from any more than they can choose the netmap;
+/// * its head must equal the head the **cached frame** recorded (`MapResponse.TKAInfo.Head`) — see
+///   [`vouch_cached_peers`]. Go does not need that check because it has no second file to reconcile,
+///   only the chonk.
+pub(crate) async fn load_cached_netmap(cache: &ts_control::NetmapCache) -> Option<StateUpdate> {
+    let authority = match cache.load_tka_chain().await {
+        None => None,
+        Some(blob) => match crate::tka_sync::authority_from_encoded_chain(&blob) {
+            Ok(authority) => Some(authority),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "persisted tailnet-lock chain did not verify; replaying the cached netmap \
+                     without its peers"
+                );
+                None
+            }
+        },
+    };
+
+    cache
+        .load_state_update_vouched(|tka, peers| vouch_cached_peers(authority.as_ref(), tka, peers))
+        .await
+}
+
+/// The peers of a netmap cached under an **active** Tailnet Lock that may be replayed on this cold
+/// start: those the persisted `authority` authorizes, by exactly the pass a live netmap's peers go
+/// through (Go's `tkaFilterNetmapLocked`, via
+/// [`PeerTracker::tka_keep_verdicts`](crate::peer_tracker::PeerTracker::tka_keep_verdicts) — the
+/// per-peer signature verdict plus the cross-peer rotation filter).
+///
+/// Nothing is replayed unless the authority can be held to the netmap:
+///
+/// * **no persisted authority** (this node has never completed a TKA sync, or the chain did not
+///   verify) ⇒ no peers. There is nothing to check a `key_signature` against, and admitting them
+///   unchecked would dial a peer the lock may have revoked while this node was off.
+/// * **the chain is not at the head the cached frame recorded** (`MapResponse.TKAInfo.Head`) ⇒ no
+///   peers. The netmap and the chain are written on separate events, so they can disagree — a crash
+///   between them, or a lock disabled and re-enabled under a fresh genesis — and a chain that
+///   describes a different lock says nothing about these peers.
+///
+/// Separated from the I/O in [`load_cached_netmap`] so the decision itself is directly testable with
+/// a real chain-derived [`Authority`](ts_tka::Authority) and real signatures.
+pub(crate) fn vouch_cached_peers(
+    authority: Option<&ts_tka::Authority>,
+    tka: &TkaStatus,
+    peers: Vec<Node>,
+) -> Vec<Node> {
+    let Some(authority) = authority else {
+        tracing::info!(
+            "no persisted tailnet-lock authority to verify the cached peers against; withholding \
+             them until control's first netmap"
+        );
+        return Vec::new();
+    };
+
+    if !ts_tka::AumHash::from_base32(&tka.head).is_some_and(|head| authority.head_matches(&head)) {
+        tracing::warn!(
+            head = %tka.head,
+            "persisted tailnet-lock chain is not at the head the cached netmap recorded; \
+             withholding its peers"
+        );
+        return Vec::new();
+    }
+
+    let keep = {
+        let refs: Vec<&Node> = peers.iter().collect();
+        crate::peer_tracker::PeerTracker::tka_keep_verdicts(Some(authority), &refs)
+    };
+    peers
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(peer, keep)| keep.then_some(peer))
+        .collect()
 }
 
 impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
@@ -2635,5 +2797,287 @@ mod self_lockout_tests {
             matches!(verdict, SelfLockVerdict::LockedOut(_)),
             "a signature the lock cannot authorize must classify as LockedOut, got {verdict:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod cached_replay_tests {
+    //! The cold-start replay of a netmap cached under Tailnet Lock: which of its peers this node
+    //! dials before control has answered.
+    //!
+    //! Go replays its cached map through `setNetMapLocked`, so `tkaFilterNetmapLocked`
+    //! (`ipn/ipnlocal/tailnet-lock.go`, upstream `9ea7cba44591e0cd840c6c94d23274dd222059bf`) runs
+    //! over it against the authority it re-opened from disk, and the peers holding a valid signature
+    //! survive. These cover the same outcome here, over a chain persisted beside the netmap.
+
+    use ed25519_dalek::SigningKey;
+    use ts_tka::{Aum, AumHash, AumKey, Authority, KeyKind, MemAumStore, NodeKeySignature};
+
+    use super::{TkaStatus, vouch_cached_peers};
+    use crate::peer_tracker::tka_tests::peer_node;
+
+    /// The node key of the peer the lock authorizes in these tests.
+    const SIGNED_PEER_KEY: [u8; 32] = [9u8; 32];
+    /// The node key of the peer that presents nothing.
+    const UNSIGNED_PEER_KEY: [u8; 32] = [10u8; 32];
+
+    /// A locked tailnet: a genesis checkpoint trusting `signer` (signed by it, so the chain verifies),
+    /// plus the store and the [`Authority`] a completed sync would hold.
+    fn locked_tailnet(signer: &SigningKey) -> (MemAumStore, AumHash, Authority) {
+        let key = AumKey {
+            kind: KeyKind::Ed25519,
+            votes: 1,
+            public: signer.verifying_key().to_bytes().to_vec(),
+            meta: Vec::new(),
+        };
+        let mut genesis = Aum::new_genesis_checkpoint(vec![key], vec![vec![0x11; 32]])
+            .expect("a well-formed genesis checkpoint");
+        genesis.sign(signer);
+        let oldest = genesis.hash();
+        let store = MemAumStore::from_aums([genesis]);
+        let authority = crate::tka_sync::authority_from_encoded_chain(
+            &crate::tka_sync::encode_chain(&store, oldest).expect("encode"),
+        )
+        .expect("the chain verifies");
+        (store, oldest, authority)
+    }
+
+    /// The status control stamped on the netmap that was cached under `authority`.
+    fn cached_lock(authority: &Authority) -> TkaStatus {
+        TkaStatus {
+            head: authority.head().to_base32(),
+            disabled: false,
+        }
+    }
+
+    /// The headline: with the authority those peers were cached under, the cold start replays the
+    /// peer that authority authorizes and drops the one it does not.
+    ///
+    /// Without the persisted authority this replays **nothing** — which is what made a locked
+    /// tailnet lose the cache entirely, while Go kept dialing its authorized peers.
+    #[test]
+    fn a_persisted_authority_replays_the_peers_it_authorizes() {
+        let signer = SigningKey::from_bytes(&[42u8; 32]);
+        let (_store, _oldest, authority) = locked_tailnet(&signer);
+
+        let signed = peer_node(
+            "signed-peer",
+            SIGNED_PEER_KEY,
+            NodeKeySignature::sign_direct(&SIGNED_PEER_KEY, &signer).serialize(),
+        );
+        let unsigned = peer_node("unsigned-peer", UNSIGNED_PEER_KEY, Vec::new());
+
+        let replayed = vouch_cached_peers(
+            Some(&authority),
+            &cached_lock(&authority),
+            vec![signed, unsigned],
+        );
+
+        assert_eq!(
+            replayed
+                .iter()
+                .map(|p| p.stable_id.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["signed-peer"],
+            "the peer the lock authorizes is dialed at cold start; the unsigned one is dropped"
+        );
+    }
+
+    /// No persisted authority (this node has never completed a sync, or the chain did not verify) ⇒
+    /// no peers. There is nothing to check a signature against, and a peer the lock revoked while
+    /// this node was off must not be dialed on the strength of a cache entry.
+    #[test]
+    fn without_an_authority_no_cached_peer_is_replayed() {
+        let signer = SigningKey::from_bytes(&[42u8; 32]);
+        let (_store, _oldest, authority) = locked_tailnet(&signer);
+        let signed = peer_node(
+            "signed-peer",
+            SIGNED_PEER_KEY,
+            NodeKeySignature::sign_direct(&SIGNED_PEER_KEY, &signer).serialize(),
+        );
+
+        assert!(
+            vouch_cached_peers(None, &cached_lock(&authority), vec![signed]).is_empty(),
+            "a peer nothing can vouch for waits for control's first netmap"
+        );
+    }
+
+    /// A netmap cached on disk (raw `MapResponse` JSON, exactly what `NetmapCache` persists), in a
+    /// directory private to this user so the cache's own vetting accepts it.
+    #[cfg(unix)]
+    fn cache_dir_with(label: &str, tka_info: &str, peers: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+        let dir = std::env::temp_dir().join(format!(
+            "ts-rs-cached-replay-{}-{label}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+
+        let body = format!(
+            r#"{{
+                {tka_info}
+                "Node": {{
+                    "ID": 1,
+                    "StableID": "self-1",
+                    "Name": "self.example.ts.net.",
+                    "Addresses": ["100.64.0.1/32"],
+                    "CapMap": {{"cache-network-maps": null}}
+                }},
+                "Peers": [{peers}],
+                "DERPMap": {{ "Regions": {{ "3": {{
+                    "RegionID": 3, "RegionCode": "tst", "RegionName": "Test", "Nodes": []
+                }} }} }}
+            }}"#
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dir.join(ts_control::NETMAP_CACHE_FILE))
+            .expect("cache file");
+        std::io::Write::write_all(&mut file, body.as_bytes()).expect("write cached netmap");
+        dir
+    }
+
+    /// One cached peer, with no `KeySignature` — an unsigned peer, which a lock drops.
+    #[cfg(unix)]
+    const UNSIGNED_CACHED_PEER: &str = r#"{
+        "ID": 2,
+        "StableID": "peer-2",
+        "Name": "peer.example.ts.net.",
+        "Addresses": ["100.64.0.2/32"],
+        "Endpoints": ["192.0.2.7:41641"],
+        "HomeDERP": 3
+    }"#;
+
+    /// End to end over the files a cold start actually finds: the persisted chain is read from the
+    /// cache directory, re-verified, and used to judge the cached peers — an unsigned one is dropped
+    /// while the rest of the netmap replays.
+    ///
+    /// The *admit* side is proven on [`vouch_cached_peers`] directly rather than here: a cached
+    /// frame's `KeySignature` decodes to the raw bytes of its JSON string, so a real signature (64
+    /// arbitrary bytes inside a CBOR structure) cannot be written into a JSON fixture at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cold_start_judges_the_cached_peers_against_the_persisted_chain() {
+        let signer = SigningKey::from_bytes(&[42u8; 32]);
+        let (store, oldest, authority) = locked_tailnet(&signer);
+        let dir = cache_dir_with(
+            "with-chain",
+            &format!(
+                r#""TKAInfo": {{ "Head": "{}", "Disabled": false }},"#,
+                authority.head().to_base32()
+            ),
+            UNSIGNED_CACHED_PEER,
+        );
+        let cache = ts_control::NetmapCache::new(&dir);
+        cache
+            .store_tka_chain(&crate::tka_sync::encode_chain(&store, oldest).expect("encode"))
+            .await;
+
+        let replayed = super::load_cached_netmap(&cache)
+            .await
+            .expect("the cached netmap replays");
+
+        assert!(
+            replayed.peer_update.is_none(),
+            "an unsigned peer is dropped by the same filter the live netmap runs, got {:?}",
+            replayed.peer_update
+        );
+        assert!(
+            replayed.node.is_some() && replayed.derp.is_some(),
+            "the rest of the netmap carries no peer identity and still replays"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A netmap cached while the lock was **off** replays whole: there is no authority to consult and
+    /// nothing to enforce (Go's filter returns early on `b.tka == nil`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cold_start_without_a_lock_replays_every_cached_peer() {
+        let dir = cache_dir_with("no-lock", "", UNSIGNED_CACHED_PEER);
+
+        let replayed = super::load_cached_netmap(&ts_control::NetmapCache::new(&dir))
+            .await
+            .expect("the cached netmap replays");
+
+        assert!(
+            matches!(replayed.peer_update, Some(ts_control::PeerUpdate::Full(ref p)) if p.len() == 1),
+            "an unlocked tailnet replays its cached peers untouched: {:?}",
+            replayed.peer_update
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A chain that does not verify is no authority at all, so the cached peers are withheld — the
+    /// same outcome as never having persisted one. The netmap around them still replays.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cold_start_withholds_peers_when_the_persisted_chain_does_not_verify() {
+        let signer = SigningKey::from_bytes(&[42u8; 32]);
+        let (_store, _oldest, authority) = locked_tailnet(&signer);
+        let tka_info = format!(
+            r#""TKAInfo": {{ "Head": "{}", "Disabled": false }},"#,
+            authority.head().to_base32()
+        );
+
+        // No chain at all.
+        let dir = cache_dir_with("no-chain", &tka_info, UNSIGNED_CACHED_PEER);
+        let replayed = super::load_cached_netmap(&ts_control::NetmapCache::new(&dir))
+            .await
+            .expect("the cached netmap replays");
+        assert!(replayed.peer_update.is_none());
+        assert!(replayed.node.is_some());
+        std::fs::remove_dir_all(&dir).ok();
+
+        // A chain blob that is not a verified chain.
+        let dir = cache_dir_with("bad-chain", &tka_info, UNSIGNED_CACHED_PEER);
+        let cache = ts_control::NetmapCache::new(&dir);
+        cache.store_tka_chain(b"ts-tka-chain-v1\nAQID").await;
+        let replayed = super::load_cached_netmap(&cache)
+            .await
+            .expect("the cached netmap replays");
+        assert!(replayed.peer_update.is_none());
+        assert!(replayed.node.is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A chain that is not at the head the cached frame recorded describes a different lock — a
+    /// disable-and-re-enable under a fresh genesis, or a crash between writing the netmap and syncing
+    /// the chain that followed it. It vouches for nothing.
+    #[test]
+    fn a_chain_at_another_head_vouches_for_nothing() {
+        let signer = SigningKey::from_bytes(&[42u8; 32]);
+        let (_store, _oldest, authority) = locked_tailnet(&signer);
+        let signed = peer_node(
+            "signed-peer",
+            SIGNED_PEER_KEY,
+            NodeKeySignature::sign_direct(&SIGNED_PEER_KEY, &signer).serialize(),
+        );
+
+        // Another lock's head: valid base32, not ours.
+        let other = TkaStatus {
+            head: AumHash([0x5a; 32]).to_base32(),
+            disabled: false,
+        };
+        assert!(vouch_cached_peers(Some(&authority), &other, vec![signed.clone()]).is_empty());
+
+        // A head control did not send, or one this node cannot parse, is not a match either.
+        for head in ["", "not base32"] {
+            let malformed = TkaStatus {
+                head: head.to_string(),
+                disabled: false,
+            };
+            assert!(
+                vouch_cached_peers(Some(&authority), &malformed, vec![signed.clone()]).is_empty(),
+                "a head that does not parse must not be treated as matching ({head:?})"
+            );
+        }
     }
 }
