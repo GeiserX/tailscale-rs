@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.47.9](https://github.com/GeiserX/tailscale-rs/compare/v0.47.8...v0.47.9) (2026-09-07)
+
+
+### Bug Fixes
+
+* **runtime:** answer the TCP DNS retry a truncated answer forces ([#387](https://github.com/GeiserX/tailscale-rs/issues/387)) ([41f3a71](https://github.com/GeiserX/tailscale-rs/commit/41f3a71045738c1e56e25012b751eda85092bb47))
+
 ## [0.47.8](https://github.com/GeiserX/tailscale-rs/compare/v0.47.7...v0.47.8) (2026-09-07)
 
 
