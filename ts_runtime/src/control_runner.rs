@@ -41,6 +41,9 @@ pub struct ControlRunner {
     /// triggers resync. Mutated only on the actor thread (the netmap handler spawns the sync RPC and
     /// the result returns via the [`TkaSynced`] self-message).
     tka_synced: Option<crate::tka_sync::SyncedTka>,
+    /// The Tailnet-Lock chain persisted beside the cached netmap for the cold-start replay, and the
+    /// single ordered path that writes or removes it. See [`PersistedTkaChain`].
+    tka_chain: PersistedTkaChain,
     /// The verified TKA [`Authority`](ts_tka::Authority) the peer tracker **enforces** (Go
     /// `tkaFilterNetmapLocked`). `None` until the first successful sync, and reset to `None` when the
     /// lock is disabled. This is the SOLE delivery channel to the peer tracker (which holds the
@@ -411,6 +414,11 @@ impl kameo::Actor for ControlRunner {
         // clear on disable).
         let tka_authority = params.tka_authority.clone();
 
+        // Same reason: the owner of the persisted Tailnet-Lock chain is built from the config before
+        // `params` moves. It starts out assuming a chain may already be on disk — an earlier process
+        // of this node can have left one there, and this one has synced nothing yet.
+        let tka_chain = PersistedTkaChain::new(params.config.netmap_cache_dir.as_ref());
+
         Ok(Self {
             client,
             params,
@@ -418,6 +426,7 @@ impl kameo::Actor for ControlRunner {
             ssh_policy: Default::default(),
             tka: Default::default(),
             tka_synced: None,
+            tka_chain,
             tka_authority,
             tka_syncing: false,
             tka_generation: 0,
@@ -442,7 +451,7 @@ impl ControlRunner {
     /// either we hold no `Authority` yet (→ bootstrap) or control's head differs from ours (→ catch
     /// up). When TKA is disabled, clears any synced state (the lock was turned off). Mirrors Go's
     /// `tkaSyncIfNeeded`: a no-op when our head already matches.
-    fn maybe_sync_tka(&mut self, tka: &TkaStatus, self_ref: ActorRef<Self>) {
+    async fn maybe_sync_tka(&mut self, tka: &TkaStatus, self_ref: ActorRef<Self>) {
         if !tka.is_enabled() {
             // Lock disabled (or never enabled): clear enforcement by writing `None` to the authority
             // cell the peer tracker reads — synchronously, so it can never be reordered behind or
@@ -456,12 +465,15 @@ impl ControlRunner {
             if self.tka_synced.is_some() {
                 tracing::info!("TKA lock disabled; clearing enforcement (admitting all peers)");
                 self.tka_synced = None;
-                // The chain we persisted for the cold-start replay described a lock that is now off.
-                // Dropping it is not what keeps the next cold start honest (the replay only vouches
-                // when the cached frame itself says the lock was on, and only with a chain at that
-                // frame's head) — it is so a disabled lock leaves nothing of itself on disk.
-                self.discard_persisted_tka_chain();
             }
+            // Outside that guard, deliberately: the chain on disk is not this process's to have
+            // synced. A cold start holds `tka_synced == None` while an earlier process's chain is
+            // still in the cache directory, and that chain is exactly the one the *next* cold start
+            // would find. So a lock control reports off clears it whether or not we ever enforced it.
+            // Dropping it is not what keeps the next cold start honest (the replay only vouches when
+            // the cached frame itself says the lock was on, and only with a chain at that frame's
+            // head) — it is so a disabled lock leaves nothing of itself on disk.
+            self.tka_chain.discard().await;
             self.tka_authority.send_replace(None);
             return;
         }
@@ -568,8 +580,10 @@ impl ControlRunner {
                 if self.tka_synced.is_some() {
                     tracing::info!("TKA sync: control reports no lock; clearing enforcement");
                     self.tka_synced = None;
-                    self.discard_persisted_tka_chain();
                 }
+                // Outside that guard for the same reason as the disable path: a chain an earlier
+                // process persisted outlives the synced state this one holds.
+                self.tka_chain.discard().await;
                 self.tka_authority.send_replace(None);
             }
             Err(e) => {
@@ -592,11 +606,7 @@ impl ControlRunner {
     /// source `observe` reads it from: nothing is ever cached before one arrives, so "no self node
     /// yet" is also "nothing to vouch for". A write failure is logged inside the cache and changes
     /// nothing: the next cold start simply withholds the cached peers.
-    async fn persist_tka_chain(&self, synced: &crate::tka_sync::SyncedTka) {
-        let Some(cache) = self.netmap_cache() else {
-            return;
-        };
-
+    async fn persist_tka_chain(&mut self, synced: &crate::tka_sync::SyncedTka) {
         // Scoped so the `watch` borrow is dropped before the awaits below (it is not `Send`).
         let caching_granted = {
             let self_node = self.self_node.borrow();
@@ -605,40 +615,19 @@ impl ControlRunner {
                 .is_some_and(|node| ts_control::netmap_caching_enabled(&node.cap_map))
         };
         if !caching_granted {
-            cache.discard_tka_chain().await;
+            self.tka_chain.discard().await;
             return;
         }
 
         match crate::tka_sync::encode_chain(&synced.store, synced.oldest) {
-            Some(blob) => cache.store_tka_chain(&blob).await,
+            Some(blob) => self.tka_chain.store(&blob).await,
             None => {
                 // The store cannot be walked genesis→head, so there is no chain to persist. Drop any
                 // older one rather than leaving a chain that no longer matches what we enforce.
                 tracing::warn!("TKA: synced chain is not walkable; not persisting it");
-                cache.discard_tka_chain().await;
+                self.tka_chain.discard().await;
             }
         }
-    }
-
-    /// Remove the persisted AUM chain (the lock was disabled, or control reports no lock). Spawned
-    /// because the call sites are synchronous actor paths and this is best-effort cleanup: the file
-    /// is never *trusted* out of existence — the replay checks the chain against the cached frame's
-    /// own recorded head.
-    fn discard_persisted_tka_chain(&self) {
-        let Some(cache) = self.netmap_cache() else {
-            return;
-        };
-        tokio::spawn(async move { cache.discard_tka_chain().await });
-    }
-
-    /// The netmap cache this node was configured with, or `None` when the embedder configured no
-    /// directory (nothing is cached, so there is nothing to vouch for).
-    fn netmap_cache(&self) -> Option<ts_control::NetmapCache> {
-        self.params
-            .config
-            .netmap_cache_dir
-            .as_ref()
-            .map(ts_control::NetmapCache::new)
     }
 
     fn with_self_node<F, R>(&self, f: F) -> impl Future<Output = Option<R>> + use<F, R>
@@ -1677,6 +1666,77 @@ pub(crate) fn vouch_cached_peers(
         .collect()
 }
 
+/// The Tailnet-Lock chain persisted beside the cached netmap ([`load_cached_netmap`]), and the only
+/// path that writes or removes it.
+///
+/// It is one owner because the two operations have to be ordered **against each other**. They used
+/// not to be: the write was awaited on the actor thread while the removal was `tokio::spawn`ed, so a
+/// removal scheduled by a lock *disable* could still be sitting in the runtime's queue when a sync
+/// that followed it persisted a fresh chain, and then delete that fresh chain. Nothing tells the node
+/// afterwards — the loss shows up one restart later, as a cold start that withholds peers it was
+/// entitled to dial. Every operation here is awaited by its caller instead, and both callers
+/// ([`ControlRunner::persist_tka_chain`] and the two lock-off paths) run on the actor thread, so the
+/// actor's mailbox is the order.
+///
+/// This owns no policy about *which* chain may be replayed: the cold-start replay judges whatever it
+/// finds on disk against the head the cached netmap frame itself recorded, so nothing here can admit
+/// a peer, and a failed removal is a chain the replay refuses rather than one it trusts.
+struct PersistedTkaChain {
+    /// The cache directory the chain lives in, or `None` when the embedder configured no
+    /// [`netmap_cache_dir`](ts_control::Config::netmap_cache_dir) — then no netmap is cached either,
+    /// so there is nothing to vouch for and nothing to remove.
+    cache: Option<ts_control::NetmapCache>,
+    /// Whether a chain may be on disk right now.
+    ///
+    /// **Starts `true`.** A fresh process has synced nothing, but an earlier process of this node can
+    /// have left a chain in the cache directory, and that chain is precisely what the next cold start
+    /// would load. So "this process never synced a lock" is not evidence that there is nothing to
+    /// remove, and the lock-off paths must not treat it as such.
+    ///
+    /// Its only job is to keep the repeated removal free: a tailnet with no lock reports the lock off
+    /// on *every* netmap, and one `remove_file` per netmap tick is a syscall for nothing. It is never
+    /// trusted in the other direction — a stale `false` cannot admit a peer, because admitting is the
+    /// replay's decision and the replay reads the disk.
+    maybe_on_disk: bool,
+}
+
+impl PersistedTkaChain {
+    /// The chain owner for a node configured with `dir` as its netmap cache directory.
+    fn new(dir: Option<&std::path::PathBuf>) -> Self {
+        Self {
+            cache: dir.map(ts_control::NetmapCache::new),
+            maybe_on_disk: true,
+        }
+    }
+
+    /// Persist `blob` as the chain the cached netmap's peers were admitted under. A write failure is
+    /// logged inside the cache and swallowed; the flag stays set, so the next lock-off still tries to
+    /// remove whatever did land.
+    async fn store(&mut self, blob: &[u8]) {
+        let Some(cache) = self.cache.as_ref() else {
+            return;
+        };
+        cache.store_tka_chain(blob).await;
+        self.maybe_on_disk = true;
+    }
+
+    /// Remove the persisted chain. Awaited, so it has happened by the time this returns and cannot
+    /// overtake a later [`store`](Self::store).
+    async fn discard(&mut self) {
+        if !self.maybe_on_disk {
+            return;
+        }
+        let Some(cache) = self.cache.as_ref() else {
+            // No directory was ever configured, so nothing can be on disk and nothing ever will be.
+            // Settle the flag rather than re-deciding this on every netmap.
+            self.maybe_on_disk = false;
+            return;
+        };
+        cache.discard_tka_chain().await;
+        self.maybe_on_disk = false;
+    }
+}
+
 impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
     type Reply = ();
 
@@ -1781,7 +1841,7 @@ impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
 
                 if let Some(tka) = msg.tka.as_ref() {
                     self.tka.send_replace(Some(tka.clone()));
-                    self.maybe_sync_tka(tka, ctx.actor_ref().clone());
+                    self.maybe_sync_tka(tka, ctx.actor_ref().clone()).await;
                 }
 
                 // Track the cert-domain list from the netmap DNS config (Go `nm.DNS.CertDomains`).
@@ -3079,5 +3139,114 @@ mod cached_replay_tests {
                 "a head that does not parse must not be treated as matching ({head:?})"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod persisted_tka_chain_tests {
+    //! The lifecycle of the Tailnet-Lock chain persisted for the cold-start replay: when it is
+    //! removed, and that a removal can never outlive the write that follows it.
+
+    use super::PersistedTkaChain;
+
+    /// A cache directory this test owns, not yet created — [`PersistedTkaChain::store`] creates it
+    /// private to this user, which is the same path the runtime takes.
+    fn scratch_dir(label: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("ts-rs-tka-chain-{}-{label}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        dir
+    }
+
+    /// An opaque chain blob. The cache stores and returns bytes; only the runtime decodes them, and
+    /// nothing in this module does.
+    const CHAIN: &[u8] = b"ts-tka-chain-v1\nAQID";
+
+    /// A process that has synced nothing still clears a chain an **earlier** process left behind.
+    ///
+    /// This is the state a cold start is in: `tka_synced` is `None` because this process has not
+    /// spoken to control yet, while the chain the last run persisted is sitting in the cache
+    /// directory — and that chain is exactly the one the *next* cold start would load. Gating the
+    /// removal on live synced state (as the lock-off paths once did) leaves it there for good on a
+    /// node whose lock was turned off between runs.
+    #[tokio::test]
+    async fn a_chain_an_earlier_process_left_is_cleared_by_one_that_synced_nothing() {
+        let dir = scratch_dir("stale");
+        let cache = ts_control::NetmapCache::new(&dir);
+        cache.store_tka_chain(CHAIN).await;
+        assert!(
+            cache.load_tka_chain().await.is_some(),
+            "the earlier process's chain is on disk"
+        );
+
+        // Freshly constructed, exactly as `on_start` builds it: no sync has happened.
+        let mut chain = PersistedTkaChain::new(Some(&dir));
+        chain.discard().await;
+
+        assert!(
+            cache.load_tka_chain().await.is_none(),
+            "a lock control reports off clears the chain whether or not this process enforced it"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A removal is complete when it returns, so a chain synced *after* it survives.
+    ///
+    /// The removal used to be detached (`tokio::spawn`), so a lock disable could leave one queued
+    /// while a later sync persisted a fresh chain, and the queued removal would then delete it. The
+    /// yields below are where such a task would get to run.
+    #[tokio::test]
+    async fn a_removal_never_outlives_the_chain_synced_after_it() {
+        let dir = scratch_dir("ordering");
+        let cache = ts_control::NetmapCache::new(&dir);
+        let mut chain = PersistedTkaChain::new(Some(&dir));
+
+        chain.store(CHAIN).await;
+        chain.discard().await;
+        assert!(
+            cache.load_tka_chain().await.is_none(),
+            "the removal has happened by the time it returns; nothing is left pending"
+        );
+
+        // The lock comes back on and a sync persists a new chain.
+        let resynced = b"ts-tka-chain-v1\nBBBB".as_slice();
+        chain.store(resynced).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            cache.load_tka_chain().await.as_deref(),
+            Some(resynced),
+            "the freshly synced chain is what the next cold start finds"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Repeated lock-off netmaps stay cheap: the removal is idempotent and the chain stays gone.
+    #[tokio::test]
+    async fn repeating_the_removal_is_a_no_op() {
+        let dir = scratch_dir("idempotent");
+        let cache = ts_control::NetmapCache::new(&dir);
+        let mut chain = PersistedTkaChain::new(Some(&dir));
+
+        chain.store(CHAIN).await;
+        for _ in 0..3 {
+            chain.discard().await;
+            assert!(cache.load_tka_chain().await.is_none());
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An embedder that configured no netmap cache directory writes nothing and removes nothing —
+    /// there is no cache, so there is never a chain to vouch with.
+    #[tokio::test]
+    async fn no_cache_directory_means_no_chain_at_all() {
+        let mut chain = PersistedTkaChain::new(None);
+        chain.store(CHAIN).await;
+        chain.discard().await;
     }
 }
