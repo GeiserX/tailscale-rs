@@ -61,10 +61,24 @@ pub struct StatusNode {
     /// A display name for the node: its fqdn if a tailnet component is known, else its bare
     /// hostname.
     pub display_name: String,
-    /// The node's tailnet IPv4 address.
+    /// The node's tailnet IPv4 address: the **first** IPv4 prefix control assigned it (the identity
+    /// projection the overlay, MagicDNS and exit-node selection reason about). See
+    /// [`tailscale_ips`](Self::tailscale_ips) for every address control assigned.
     pub ipv4: IpAddr,
-    /// The node's tailnet IPv6 address.
+    /// The node's tailnet IPv6 address: the **first** IPv6 prefix control assigned it. See
+    /// [`tailscale_ips`](Self::tailscale_ips) for every address control assigned.
     pub ipv6: IpAddr,
+    /// Every tailnet address control assigned this node (Go `ipnstate.PeerStatus.TailscaleIPs`), in
+    /// wire order.
+    ///
+    /// Normally the same two addresses as [`ipv4`](Self::ipv4) / [`ipv6`](Self::ipv6), but
+    /// `tailcfg.Node.Addresses` is a variable-length list: an IPv6-off tailnet assigns only the v4
+    /// prefix, and nothing in the protocol stops control assigning more than one prefix of a family.
+    /// Built from the domain [`Node::addresses`](ts_control::Node::addresses), keeping each
+    /// single-IP prefix's address exactly as Go's status builder does
+    /// (`ipn/ipnlocal/local.go`). This — not the first-of-family pair — is what
+    /// [`is_router`](Self::is_router) asks "is this route one of my own addresses?" of.
+    pub tailscale_ips: Vec<IpAddr>,
     /// Whether the node is online, if known (`ipnstate.PeerStatus.Online`). Tri-state: `Some(true)`
     /// connected to control, `Some(false)` offline, `None` unknown (control sent no online status or
     /// the local node lacks permission to know). Reflects control's liveness state, retained from the
@@ -98,6 +112,15 @@ pub struct StatusNode {
     pub ssh_host_keys: Vec<String>,
 }
 
+/// Whether `prefix` covers exactly one address (a `/32` or a `/128`) — Go `netip.Prefix.IsSingleIP`.
+fn is_single_ip(prefix: &ipnet::IpNet) -> bool {
+    let host_prefix = match prefix {
+        ipnet::IpNet::V4(_) => 32,
+        ipnet::IpNet::V6(_) => 128,
+    };
+    prefix.prefix_len() == host_prefix
+}
+
 impl StatusNode {
     /// Report whether this node is a **router**: it routes addresses besides its own. An exit
     /// node, a subnet router and an app connector are all routers.
@@ -106,22 +129,23 @@ impl StatusNode {
     /// `8d830599b` alongside `tailcfg.Node.IsRouter`, which
     /// [`Node::is_router`](ts_control::Node::is_router) mirrors): a route in
     /// [`allowed_routes`](Self::allowed_routes) that is not a single host IP, or that is a host IP
-    /// other than this node's own [`ipv4`](Self::ipv4)/[`ipv6`](Self::ipv6), makes the node a
+    /// other than one of this node's own [`tailscale_ips`](Self::tailscale_ips), makes the node a
     /// router. Upstream spells both as *methods*, not wire fields — control sends nothing new for
     /// this, so it is a pure projection of the netmap a peer already gave us.
+    ///
+    /// The comparison is against the **whole** [`tailscale_ips`](Self::tailscale_ips) list, as Go's
+    /// `slices.Contains(ps.TailscaleIPs, r.Addr())` is, and not against the first-of-family
+    /// [`ipv4`](Self::ipv4)/[`ipv6`](Self::ipv6) pair. A node control handed two prefixes of one
+    /// family would otherwise have the second read as a routed address and be misreported as a
+    /// router — the same narrowing [`Node::is_router`](ts_control::Node::is_router) had.
     ///
     /// Strictly wider than [`is_exit_node`](Self::is_exit_node), which asks only about the default
     /// route: every exit node is a router, but a subnet router advertising no `/0` is not an exit
     /// node.
     pub fn is_router(&self) -> bool {
         self.allowed_routes.iter().any(|route| {
-            let host_prefix = match route {
-                ipnet::IpNet::V4(_) => 32,
-                ipnet::IpNet::V6(_) => 128,
-            };
             // Not a single host IP, or a host IP that is not one of this node's own addresses.
-            route.prefix_len() != host_prefix
-                || (route.addr() != self.ipv4 && route.addr() != self.ipv6)
+            !is_single_ip(route) || !self.tailscale_ips.contains(&route.addr())
         })
     }
 
@@ -139,6 +163,16 @@ impl StatusNode {
                 .unwrap_or_else(|| node.hostname.clone()),
             ipv4: node.tailnet_address.ipv4.addr().into(),
             ipv6: node.tailnet_address.ipv6.addr().into(),
+            // Go's status builder fills `PeerStatus.TailscaleIPs` from the node's whole
+            // `Node.Addresses` list, keeping the address of each single-IP prefix
+            // (`ipn/ipnlocal/local.go`). Take the same list, not the first-of-family pair above:
+            // `is_router` compares against it.
+            tailscale_ips: node
+                .addresses
+                .iter()
+                .filter(|prefix| is_single_ip(prefix))
+                .map(|prefix| prefix.addr())
+                .collect(),
             online: node.online,
             last_seen: node.last_seen,
             allowed_routes: node.accepted_routes.clone(),
@@ -487,6 +521,84 @@ mod tests {
                 "{name}: domain/status disagree"
             );
         }
+    }
+
+    /// Go's `PeerStatus.IsRouter` tests each allowed prefix against the node's **whole**
+    /// `TailscaleIPs` slice, so every address control assigned is "its own". `Node.Addresses` is a
+    /// variable-length list, not a v4/v6 pair, so a tailnet may hand a node more than one prefix of
+    /// a family; such a node must not be reported as a router on account of the extra one — which
+    /// comparing only against the first-of-family `ipv4`/`ipv6` pair does. The sibling
+    /// `ts_control::Node::is_router` case is pinned in `ts_control`; this pins the status
+    /// projection, which carries the same list one level up.
+    #[test]
+    fn status_node_is_router_tests_every_assigned_address_not_only_the_first_of_each_family() {
+        let first4: ipnet::IpNet = "100.64.0.1/32".parse().unwrap();
+        let second4: ipnet::IpNet = "100.64.0.9/32".parse().unwrap();
+        let first6: ipnet::IpNet = "fd7a:115c:a1e0::1/128".parse().unwrap();
+        let second6: ipnet::IpNet = "fd7a:115c:a1e0::9/128".parse().unwrap();
+
+        let mut n = node("n1", "host", Some("ts.net"), "100.64.0.1");
+        n.addresses = vec![first4, second4, first6, second6];
+        n.tailnet_address.ipv6 = "fd7a:115c:a1e0::1/128".parse().unwrap();
+        // With `AllowedIPs` absent, control's routes for a node are exactly its addresses.
+        n.accepted_routes = n.addresses.clone();
+
+        let s = StatusNode::from_node(&n);
+
+        // The identity projection is still the first prefix of each family...
+        assert_eq!(s.ipv4, first4.addr());
+        assert_eq!(s.ipv6, first6.addr());
+        // ...and every assigned address is carried, as Go's `TailscaleIPs` is.
+        assert_eq!(
+            s.tailscale_ips,
+            vec![first4.addr(), second4.addr(), first6.addr(), second6.addr()]
+        );
+        assert!(
+            !s.is_router(),
+            "a node whose routes are exactly its own assigned addresses is not a router"
+        );
+        assert_eq!(s.is_router(), n.is_router(), "domain/status disagree");
+
+        // Either second-of-family address on its own is still not a routed address.
+        for extra in [second4, second6] {
+            let mut one = n.clone();
+            one.accepted_routes = vec![extra];
+            let s = StatusNode::from_node(&one);
+            assert!(
+                !s.is_router(),
+                "{extra} is one of this node's own addresses"
+            );
+            assert_eq!(s.is_router(), one.is_router(), "domain/status disagree");
+        }
+
+        // The predicate still fires for a route that does reach past every assigned address.
+        let mut router = n.clone();
+        router.accepted_routes.push("192.0.2.0/24".parse().unwrap());
+        assert!(
+            StatusNode::from_node(&router).is_router(),
+            "a real subnet route makes it a router"
+        );
+    }
+
+    /// An IPv6-off tailnet assigns a node only its IPv4 prefix, and the domain model fills the
+    /// missing family with an unspecified placeholder. `TailscaleIPs` must carry what control
+    /// actually assigned — not the placeholder — and the node must still not read as a router.
+    #[test]
+    fn status_node_tailscale_ips_omits_the_unassigned_family_placeholder() {
+        let only4: ipnet::IpNet = "100.64.0.1/32".parse().unwrap();
+
+        let mut n = node("n1", "host", Some("ts.net"), "100.64.0.1");
+        n.addresses = vec![only4];
+        n.tailnet_address.ipv6 = "::/128".parse().unwrap();
+        n.accepted_routes = vec![only4];
+
+        let s = StatusNode::from_node(&n);
+        assert_eq!(s.tailscale_ips, vec![only4.addr()]);
+        assert!(!s.is_router(), "its own /32 is not a routed address");
+        assert!(
+            s.ipv6.is_unspecified(),
+            "the unassigned family stays a placeholder on the identity projection"
+        );
     }
 
     /// `from_node` carries NO live connectivity: a bare domain `Node` has no path state, so

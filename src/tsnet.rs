@@ -2687,6 +2687,10 @@ mod tests {
             display_name: "web.tail0.ts.net".to_string(),
             ipv4: "100.64.0.1".parse().unwrap(),
             ipv6: "fd7a:115c:a1e0::1".parse().unwrap(),
+            tailscale_ips: vec![
+                "100.64.0.1".parse().unwrap(),
+                "fd7a:115c:a1e0::1".parse().unwrap(),
+            ],
             online: Some(true),
             last_seen: None,
             allowed_routes: vec![],
