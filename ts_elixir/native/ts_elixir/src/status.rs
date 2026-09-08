@@ -2,8 +2,8 @@
 //!
 //! Marshals the native [`tailscale::Status`] / [`tailscale::StatusNode`] / [`tailscale::WhoIs`]
 //! types into Elixir structs (`Tailscale.Status`, `Tailscale.StatusNode`, `Tailscale.WhoIs`).
-//! Per the native contract, `online`/`user`/`capabilities` are honestly surfaced as their
-//! actual (empty/`None`) values in this fork — never fabricated.
+//! Per the native contract, every field is surfaced at its actual value — `nil`/empty when the
+//! netmap did not carry one — never fabricated.
 
 use rustler::{Encoder, ResourceArc, Term};
 
@@ -65,17 +65,25 @@ impl<'a> Status<'a> {
 #[module = "Tailscale.WhoIs"]
 struct WhoIs<'a> {
     node: NodeInfo<'a>,
-    /// Owning user login, if known (always `nil` in this fork — see native contract).
+    /// Owning user login, if control sent a profile for it.
     user: Option<String>,
-    /// Capability map as a list of `{capability, [args]}` tuples (always empty in this fork).
+    /// The groups control reported for the owning user (SCIM groups such as
+    /// `engineering@example.com`, or policy-document names such as `group:eng`). Empty when
+    /// control reported none — which is not a proof of non-membership, so fail closed on it.
+    groups: Vec<String>,
+    /// Capability map as a list of `{capability, [args]}` tuples.
     capabilities: Vec<Term<'a>>,
 }
 
 impl<'a> WhoIs<'a> {
     fn from_whois(env: rustler::Env<'a>, value: tailscale::WhoIs) -> Self {
+        // Read the borrowing accessors before `value.node` is moved out below.
+        let user = value.user();
+        let groups = value.user_groups().to_vec();
         Self {
             node: NodeInfo::from_node(env, value.node),
-            user: value.user,
+            user,
+            groups,
             capabilities: value
                 .capabilities
                 .into_iter()

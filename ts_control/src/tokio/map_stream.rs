@@ -677,6 +677,56 @@ mod tests {
         assert_eq!(update.seq, 12);
     }
 
+    /// `MapResponse.UserProfiles` is the owner identity for the netmap's nodes, and its `Groups`
+    /// field is the one owner attribute a node cannot re-derive from anything else control sends —
+    /// so it is what an embedder authorising a connection on group membership reads. It must
+    /// survive the whole map-poll read (zstd frame → `MapResponse` → `StateUpdate`), in the order
+    /// control sent it.
+    #[tokio::test]
+    async fn map_stream_carries_user_profile_groups() {
+        let buf = frame(&[r#"{
+            "Seq": 3,
+            "UserProfiles": [{
+                "ID": 42,
+                "LoginName": "alice@example.com",
+                "DisplayName": "Alice Smith",
+                "Groups": ["engineering@example.com", "group:eng"]
+            }]
+        }"#]);
+
+        let mut stream = core::pin::pin!(map_stream(&buf[..], None));
+        let update = stream.next().await.expect("one update");
+
+        let profile = update
+            .user_profiles
+            .first()
+            .expect("the response carried one profile");
+        assert_eq!(profile.id, 42);
+        assert_eq!(profile.login_name, "alice@example.com");
+        assert_eq!(profile.groups, ["engineering@example.com", "group:eng"]);
+    }
+
+    /// `Groups` is `omitempty` in Go: a control server with nothing to report — or any server older
+    /// than the field — sends no key. The profile must still arrive, with an EMPTY group list. If
+    /// the decode failed instead, the whole `MapResponse` would be dropped and the node would lose
+    /// the netmap, not just the groups.
+    #[tokio::test]
+    async fn map_stream_profile_without_groups_keeps_the_profile() {
+        let buf = frame(&[
+            r#"{"Seq": 3, "UserProfiles": [{"ID": 42, "LoginName": "alice@example.com"}]}"#,
+        ]);
+
+        let mut stream = core::pin::pin!(map_stream(&buf[..], None));
+        let update = stream.next().await.expect("one update");
+
+        let profile = update
+            .user_profiles
+            .first()
+            .expect("an omitted Groups must not cost us the profile");
+        assert_eq!(profile.login_name, "alice@example.com");
+        assert!(profile.groups.is_empty());
+    }
+
     #[tokio::test]
     async fn map_stream_empty_handle_maps_to_none() {
         // A keep-alive-style response with no session handle and seq 0 must surface as None/0 so

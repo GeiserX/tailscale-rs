@@ -1,4 +1,4 @@
-use alloc::borrow::Cow;
+use alloc::{borrow::Cow, vec::Vec};
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -95,6 +95,22 @@ pub struct UserProfile<'a> {
         default
     )]
     pub profile_pic_url: Option<Url>,
+    /// A subset of the groups that contain this user and that the coordination server was
+    /// configured to report to this node: either SCIM groups (e.g. `engineering@example.com`) or
+    /// group names from the tailnet policy document (e.g. `group:eng`).
+    ///
+    /// This is the one attribute of an owning user that a node cannot re-derive from anything else
+    /// control sends it, so it is what an embedder authorising an inbound connection on group
+    /// membership needs (Go surfaces it through `WhoIs`).
+    ///
+    /// Control sorts the list when it loads the profile from storage, so it arrives sorted; it is
+    /// carried through verbatim rather than re-sorted here. The field is `omitempty` on the wire —
+    /// an older control server, or a tailnet that reports no groups to this node, simply omits it —
+    /// so it decodes to an **empty** list, never a missing profile. `null` (what a non-Go control
+    /// plane emits for an empty slice) lands the same way, per the crate-wide `null_to_default`
+    /// convention for bare `Vec` fields.
+    #[serde(borrow, default, deserialize_with = "crate::util::null_to_default")]
+    pub groups: Vec<Cow<'a, str>>,
 }
 
 #[cfg(test)]
@@ -151,6 +167,67 @@ mod tests {
             .expect("UserProfile with control escapes must decode");
         assert_eq!(profile.login_name, "a\nb@c.com");
         assert_eq!(profile.display_name.as_deref(), Some("x\"y\\z"));
+    }
+
+    /// `UserProfile.Groups` is the group membership control reports for the owning user, and the
+    /// only user attribute a node cannot re-derive locally. It must survive the wire boundary in
+    /// the order control sent it (control sorts it when it loads the profile from storage).
+    #[test]
+    fn user_profile_carries_groups() {
+        const TEST: &str = r#"{
+            "ID": 7,
+            "LoginName": "alice@example.com",
+            "DisplayName": "Alice Smith",
+            "Groups": ["engineering@example.com", "group:eng", "group:ops"]
+        }"#;
+        let profile =
+            serde_json::from_str::<UserProfile>(TEST).expect("UserProfile with Groups must decode");
+        assert_eq!(
+            profile.groups,
+            ["engineering@example.com", "group:eng", "group:ops"]
+        );
+    }
+
+    /// `Groups` is `omitempty` in Go, so a control server with nothing to report — or one older
+    /// than the field — sends no key at all. That must decode to a profile with an EMPTY group
+    /// list, not a failed decode (which would silently drop the whole profile). A wire `null`,
+    /// which a non-Go control plane can emit for an empty slice, must land the same way.
+    #[test]
+    fn user_profile_without_groups_decodes_to_an_empty_list() {
+        const ABSENT: &str = r#"{ "ID": 7, "LoginName": "alice@example.com" }"#;
+        let profile = serde_json::from_str::<UserProfile>(ABSENT)
+            .expect("UserProfile without Groups must still decode");
+        assert_eq!(profile.login_name, "alice@example.com");
+        assert!(profile.groups.is_empty());
+
+        const EMPTY: &str = r#"{ "ID": 7, "LoginName": "alice@example.com", "Groups": [] }"#;
+        assert!(
+            serde_json::from_str::<UserProfile>(EMPTY)
+                .expect("an explicit empty Groups must decode")
+                .groups
+                .is_empty()
+        );
+
+        const NULL: &str = r#"{ "ID": 7, "LoginName": "alice@example.com", "Groups": null }"#;
+        assert!(
+            serde_json::from_str::<UserProfile>(NULL)
+                .expect("a wire null Groups must decode, not fail the profile")
+                .groups
+                .is_empty()
+        );
+    }
+
+    /// Group names are control-authored text on the same JSON path as the display name, so they
+    /// carry the same escaping hazard: Go's `json.Marshal` HTML-escapes `&`, and a group named
+    /// `R&D` arrives as `R\u0026D`. `Cow` (not `&str`) is what lets serde own the unescaped value
+    /// instead of failing the whole `UserProfile` decode.
+    #[test]
+    fn user_profile_groups_with_escapes_decode() {
+        const TEST: &str =
+            r#"{ "ID": 7, "LoginName": "a@b.com", "Groups": ["R\u0026D", "group:q\"z"] }"#;
+        let profile = serde_json::from_str::<UserProfile>(TEST)
+            .expect("UserProfile with escaped group names must decode");
+        assert_eq!(profile.groups, ["R&D", "group:q\"z"]);
     }
 
     /// The no-escape fast path still decodes (and borrows zero-copy, though that is not observable
