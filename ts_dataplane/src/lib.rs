@@ -66,6 +66,14 @@ struct Ipv4Fragment {
 /// `unknown`, never fewer. Keep the single constant for both, exactly as Go does.
 const MIN_FRAG_BLKS: u16 = (60 + 20) / 8;
 
+/// [`MIN_FRAG_BLKS`] in bytes — Go `net/packet.minFrag`, the same 60 + 20 bound written the way
+/// `decode4` applies it to a *first* fragment: `if moreFrags && len(sub) < minFrag { q.IPProto =
+/// unknown; return }`. A first fragment too short to hold a max IPv4 header plus a basic TCP header
+/// is the other half of the RFC 1858 pair — the head the offset guard above protects — so upstream
+/// refuses to read any sub-protocol header out of it. `decode6` has no more-fragments guard at all,
+/// so this bound is IPv4-only where [`MIN_FRAG_BLKS`] is shared.
+const MIN_FRAG_LEN: usize = MIN_FRAG_BLKS as usize * 8;
+
 /// Minimum IPv4 base header length (Go `net/packet.ip4HeaderLength`). A buffer shorter than this
 /// is not a decodable IPv4 packet at all (Go `decode4` returns `unknown`).
 const IP4_HEADER_LEN: usize = 20;
@@ -96,6 +104,11 @@ const IPPROTO_FRAGMENT_SENTINEL: IpProto = IpProto::new(0xff);
 /// Reserved, a 13-bit Fragment Offset in 8-byte blocks plus two reserved bits and the
 /// More-Fragments flag, then a 32-bit Identification.
 const IP6_FRAG_HEADER_LEN: usize = 8;
+
+/// Length of the SCTP common header (Go `net/packet.sctpHeaderLength`): source port, destination
+/// port, verification tag, checksum. Go's `decode4`/`decode6` refuse an SCTP packet shorter than
+/// this rather than guess at its ports.
+const SCTP_HEADER_LEN: usize = 12;
 
 /// How an IPv6 packet whose base header's Next Header is the Fragment extension header classifies —
 /// the port of Go `net/packet.Parsed.decode6Fragment` plus the sub-protocol switch `decode6` runs
@@ -197,8 +210,6 @@ fn decode6_first_fragment(proto: IpProto, sub: &[u8]) -> Ipv6Fragment {
     const TCP_HEADER_LEN: usize = 20;
     /// Go `net/packet.udpHeaderLength`.
     const UDP_HEADER_LEN: usize = 8;
-    /// Go `net/packet.sctpHeaderLength`.
-    const SCTP_HEADER_LEN: usize = 12;
     /// Go `net/packet.minTSMPSize` — the shortest TSMP body (a 7-byte rejected-connection message).
     const MIN_TSMP_SIZE: usize = 7;
 
@@ -231,6 +242,24 @@ fn decode6_first_fragment(proto: IpProto, sub: &[u8]) -> Ipv6Fragment {
         // ACL matches it IPs-only (`IpProto::is_port_ful`).
         _ => Ipv6Fragment::First { proto, dst_port: 0 },
     }
+}
+
+/// The destination port of the SCTP packet whose common header starts at `sub` — Go's
+/// `case ipproto.SCTP` arm, which both `decode4` and `decode6` carry verbatim: bounds-check the
+/// 12-byte common header, then read `sub[2:4]`.
+///
+/// `None` is Go's refusal in that same arm (`q.IPProto = unknown`), which filter `pre()` turns into
+/// a drop. It must never be read as "port 0": a truncated SCTP header carries no port for a rule to
+/// match, and admitting it as port 0 would let an all-ports rule pass the packet Go throws away.
+///
+/// This exists because etherparse's `TransportSlice` has arms for ICMPv4/ICMPv6/TCP/UDP and nothing
+/// else, so an SCTP packet leaves `SlicedPacket::transport` empty and its ports have to be read the
+/// way Go reads them.
+fn sctp_dst_port(sub: &[u8]) -> Option<u16> {
+    if sub.len() < SCTP_HEADER_LEN {
+        return None;
+    }
+    Some(u16::from_be_bytes([sub[2], sub[3]]))
 }
 
 /// Whether `ipv6` carries a Fragment extension header somewhere in its extension-header chain
@@ -442,6 +471,22 @@ fn filter_inbound_from_peer(
             return false;
         };
 
+        // etherparse's IP payload, taken here because the classification below consumes
+        // `pkt.net`: for IPv4 the bytes after the header (options included), for IPv6 the bytes
+        // after the base header *and any extension headers*.
+        //
+        // That is Go's `sub` (`b[q.subofs:]`) only when the extension-header chain is empty, which
+        // is guaranteed for the one arm that reads it. `proto` for IPv6 comes from the **base**
+        // header's Next Header, so `proto == SCTP` means no extension header precedes the SCTP
+        // header and the two definitions coincide byte for byte. Any new arm that reads `sub` must
+        // re-establish that before doing so, or it will read a port out of a chained packet Go
+        // never descends into — the bug the base-header-only `proto` above exists to prevent.
+        let sub = match &pkt.net {
+            Some(etherparse::NetSlice::Ipv4(ipv4)) => ipv4.payload().payload,
+            Some(etherparse::NetSlice::Ipv6(ipv6)) => ipv6.payload().payload,
+            _ => &[][..],
+        };
+
         let (proto, src, dst, frag) = match pkt.net {
             Some(etherparse::NetSlice::Ipv4(ipv4)) => {
                 // IPv4 fragment state (Go `net/packet.decode4` reads `b[6:8]`): a
@@ -548,6 +593,43 @@ fn filter_inbound_from_peer(
             // down its chain. Reading that buried port here is what let a chained packet be
             // matched against a port-scoped TCP/UDP rule it is not upstream's to match.
             _ if !proto.is_port_ful() => 0,
+            // A later IPv4 fragment carries no transport header at all: Go `decode4` leaves both
+            // ports 0 and classifies it `ipproto.Fragment`, and the verdict below decides on the
+            // offset alone. `sub` is continued payload here, not a header, so the SCTP arm must
+            // not read it — that would invent a port, and would drop a short later fragment Go
+            // passes through.
+            Some(Fragment::V4(v4)) if v4.offset_blocks > 0 => 0,
+            // SCTP. etherparse's `TransportSlice` parses ICMPv4, ICMPv6, TCP and UDP and nothing
+            // else, so `pkt.transport` is `None` for SCTP and the arm below would report port 0
+            // for every SCTP packet on the wire — a match Go never makes. Go has an SCTP arm in
+            // both `decode4` and `decode6` that reads `sub[2:4]`, so read it there too, from the
+            // same bytes Go calls `sub`. (An IPv6 *first fragment* carrying SCTP is already
+            // handled by the first arm, out of `decode6_first_fragment`'s own SCTP arm.)
+            _ if proto == IpProto::SCTP => {
+                // Go `decode4` runs its whole sub-protocol switch — this arm included — behind a
+                // first-fragment length refusal: `if moreFrags && len(sub) < minFrag { q.IPProto =
+                // unknown; return }`. Reading a port out of a suspiciously short first fragment is
+                // exactly what RFC 1858 warns about, so refuse it, as [`MIN_FRAG_LEN`] documents.
+                // Only IPv4 reaches this (`decode6` has no more-fragments guard), and the arm
+                // above has already taken every later fragment, so `frag` here is offset 0.
+                if matches!(frag, Some(Fragment::V4(v4)) if v4.more_fragments)
+                    && sub.len() < MIN_FRAG_LEN
+                {
+                    tracing::trace!(
+                        ?dst,
+                        "dropping suspiciously short first SCTP fragment (RFC 1858)"
+                    );
+                    return false;
+                }
+                let Some(port) = sctp_dst_port(sub) else {
+                    // Go's `q.IPProto = unknown` for a header too short to hold the ports, which
+                    // `pre()` drops before any rule is consulted. Falling back to port 0 instead
+                    // would hand the packet to an all-ports SCTP rule.
+                    tracing::trace!(?dst, "dropping SCTP packet shorter than its own header");
+                    return false;
+                };
+                port
+            }
             _ => match pkt.transport {
                 Some(etherparse::TransportSlice::Udp(udp)) => udp.destination_port(),
                 Some(etherparse::TransportSlice::Tcp(tcp)) => tcp.destination_port(),
@@ -1425,18 +1507,24 @@ mod tests {
         buf
     }
 
-    /// A plain, unfragmented IPv6/UDP packet: the same 40-byte base header the fragment fixtures
-    /// use, but with UDP as its immediate Next Header. The control for the chained-extension-header
-    /// fixtures below.
-    fn ipv6_udp_packet(udp: &[u8]) -> Vec<u8> {
-        let mut buf = vec![0u8; IP6_HEADER_LEN + udp.len()];
+    /// A plain, unfragmented IPv6 packet: the same 40-byte base header the fragment fixtures use,
+    /// with `payload` sitting directly behind it as the protocol `next_header` names.
+    fn ipv6_packet(next_header: u8, payload: &[u8]) -> Vec<u8> {
+        let mut buf = vec![0u8; IP6_HEADER_LEN + payload.len()];
         buf[0] = 0x60; // version 6, traffic class/flow label 0
-        buf[4..6].copy_from_slice(&u16::try_from(udp.len()).unwrap().to_be_bytes());
-        buf[6] = 17; // Next Header = UDP
+        buf[4..6].copy_from_slice(&u16::try_from(payload.len()).unwrap().to_be_bytes());
+        buf[6] = next_header;
         buf[7] = 64; // hop limit
         buf[8..24].copy_from_slice(&IPV6_FIXTURE_SRC.octets());
         buf[24..40].copy_from_slice(&IPV6_FIXTURE_DST.octets());
-        buf[IP6_HEADER_LEN..].copy_from_slice(udp);
+        buf[IP6_HEADER_LEN..].copy_from_slice(payload);
+        buf
+    }
+
+    /// A plain, unfragmented IPv6/UDP packet: [`ipv6_packet`] with UDP as its immediate Next
+    /// Header. The control for the chained-extension-header fixtures below.
+    fn ipv6_udp_packet(udp: &[u8]) -> Vec<u8> {
+        let mut buf = ipv6_packet(17, udp);
         // Unlike a fragment fixture, this datagram is actually parsed as UDP, so its Length field
         // has to agree with the bytes present or etherparse rejects the packet outright.
         let udp_len = u16::try_from(udp.len()).unwrap();
@@ -1910,7 +1998,16 @@ mod tests {
         protos: &[i64],
         ports: std::ops::RangeInclusive<u16>,
     ) -> std::collections::BTreeMap<String, ts_packetfilter::Ruleset> {
-        let net: ipnet::IpNet = "2001:db8::/32".parse().unwrap();
+        acl("2001:db8::/32", protos, ports)
+    }
+
+    /// [`ipv6_acl`] for either family: one rule whose source and destination are both `net`.
+    fn acl(
+        net: &str,
+        protos: &[i64],
+        ports: std::ops::RangeInclusive<u16>,
+    ) -> std::collections::BTreeMap<String, ts_packetfilter::Ruleset> {
+        let net: ipnet::IpNet = net.parse().unwrap();
         std::collections::BTreeMap::from([(
             ts_packetfilter::DEFAULT_RULESET_NAME.to_string(),
             vec![ts_packetfilter::Rule {
@@ -2049,6 +2146,187 @@ mod tests {
             !keep(&AllowAll, sentinel),
             "...and is dropped by an allow-all ACL"
         );
+    }
+
+    /// Source/destination for the IPv4 fixtures: ordinary tailnet unicast, so `drop_before_rules`
+    /// never fires and every verdict below is the decode's own.
+    const IPV4_FIXTURE_SRC: std::net::Ipv4Addr = std::net::Ipv4Addr::new(100, 64, 0, 9);
+    const IPV4_FIXTURE_DST: std::net::Ipv4Addr = std::net::Ipv4Addr::new(100, 64, 0, 1);
+    /// The tailnet range both IPv4 fixture addresses sit in, for [`acl`].
+    const IPV4_FIXTURE_NET: &str = "100.64.0.0/10";
+
+    /// A minimal IPv4 packet: a 20-byte header carrying protocol `proto`, the fragment offset (in
+    /// 8-byte blocks) and More-Fragments flag asked for, and `payload` behind it. The header
+    /// checksum is left zero — nothing on this path verifies it, and neither does Go's decoder.
+    fn v4_packet(proto: u8, offset_blocks: u16, more_fragments: bool, payload: &[u8]) -> Vec<u8> {
+        let total_len = u16::try_from(IP4_HEADER_LEN + payload.len()).unwrap();
+        let mut buf = vec![0u8; usize::from(total_len)];
+        buf[0] = 0x45; // version 4, IHL 5 (no options)
+        buf[2..4].copy_from_slice(&total_len.to_be_bytes());
+        let frag_field = (offset_blocks & 0x1fff) | if more_fragments { 0x2000 } else { 0 };
+        buf[6..8].copy_from_slice(&frag_field.to_be_bytes());
+        buf[8] = 64; // TTL
+        buf[9] = proto;
+        buf[12..16].copy_from_slice(&IPV4_FIXTURE_SRC.octets());
+        buf[16..20].copy_from_slice(&IPV4_FIXTURE_DST.octets());
+        buf[IP4_HEADER_LEN..].copy_from_slice(payload);
+        buf
+    }
+
+    /// An SCTP common header carrying `dst_port`, truncated or zero-extended to `len` bytes so a
+    /// test can hand the decoder the short header Go refuses, or a first fragment long enough to
+    /// clear Go's `minFrag` bound.
+    fn sctp_header(dst_port: u16, len: usize) -> Vec<u8> {
+        let mut hdr = vec![0u8; SCTP_HEADER_LEN];
+        hdr[0..2].copy_from_slice(&54276u16.to_be_bytes()); // source port
+        hdr[2..4].copy_from_slice(&dst_port.to_be_bytes());
+        hdr[4..8].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]); // verification tag
+        hdr.resize(len, 0);
+        hdr
+    }
+
+    /// An SCTP packet is filtered on its real destination port, on both families — Go
+    /// `net/packet.decode4` and `decode6` each carry a `case ipproto.SCTP` arm that bounds-checks
+    /// the 12-byte common header and reads `sub[2:4]`, exactly as their TCP and UDP arms do.
+    ///
+    /// etherparse parses no SCTP header of its own (its `TransportSlice` has ICMPv4, ICMPv6, TCP
+    /// and UDP arms and nothing else), so leaving the port to `SlicedPacket::transport` reported
+    /// port 0 for every SCTP packet on the wire. That is wrong in both directions: an `sctp:443`
+    /// rule blackholed the SCTP traffic it was written to admit, and any rule whose port range
+    /// happens to contain 0 admitted SCTP to *every* port. Both are asserted below through a real
+    /// control-derived rule, not just through the recorded `PacketInfo`.
+    ///
+    /// The refusals come with it, because a ported switch brings its error paths. A header too
+    /// short to hold the ports is Go's `q.IPProto = unknown`, which filter `pre()` drops before any
+    /// rule is consulted — never a fallback to port 0, which an all-ports rule would admit. So is a
+    /// *first fragment* shorter than Go's `minFrag`, the guard `decode4` runs ahead of the whole
+    /// switch. And a *later* fragment is not an SCTP header at all: Go leaves its ports 0 and
+    /// passes it through on its offset alone.
+    ///
+    /// Ported from github.com/tailscale/tailscale `net/packet/packet.go` (`decode4`, `decode6`) and
+    /// `wgengine/filter/filter.go` (`pre`, `runIn4`, `runIn6`) at
+    /// `9ea7cba44591e0cd840c6c94d23274dd222059bf`.
+    #[test]
+    fn sctp_destination_port_is_read_before_the_acl() {
+        let keep = |filter: &(dyn ts_packetfilter::Filter + Send + Sync), packet: Vec<u8>| {
+            let mut packets = vec![PacketMut::from(packet)];
+            let mut learned = Vec::new();
+            filter_inbound_from_peer(filter, PeerId(11), &mut packets, &mut learned);
+            assert!(
+                learned.is_empty(),
+                "no TSMP advertisement in these fixtures"
+            );
+            !packets.is_empty()
+        };
+        // What the ACL was asked about, or `None` if the packet never got that far.
+        let seen = |packet: Vec<u8>| {
+            let recording = Recording::default();
+            keep(&recording, packet);
+            let seen = recording.0.into_inner().unwrap();
+            assert!(seen.len() <= 1, "one packet in, at most one ACL question");
+            seen.into_iter().next()
+        };
+
+        let sctp = i64::from(IpProto::SCTP);
+        let whole = sctp_header(443, SCTP_HEADER_LEN);
+        let v4 = v4_packet(132, 0, false, &whole);
+        let v6 = ipv6_packet(132, &whole);
+
+        for (family, packet) in [("IPv4", &v4), ("IPv6", &v6)] {
+            let info = seen(packet.clone())
+                .unwrap_or_else(|| panic!("{family}: an SCTP packet reaches the ACL"));
+            assert_eq!(
+                info.ip_proto,
+                IpProto::SCTP,
+                "{family}: the protocol is SCTP"
+            );
+            assert_eq!(
+                info.port, 443,
+                "{family}: the SCTP destination port is read off the wire"
+            );
+        }
+
+        // And what that means for a real control-derived rule. An `sctp:443` rule admits the
+        // packet; a rule whose range covers port 0 but not 443 does not — the ACL bypass a
+        // hard-coded port 0 would have opened.
+        assert!(
+            keep(&acl(IPV4_FIXTURE_NET, &[sctp], 443..=443), v4.clone()),
+            "IPv4: an sctp:443 rule admits an SCTP packet to port 443"
+        );
+        assert!(
+            !keep(&acl(IPV4_FIXTURE_NET, &[sctp], 0..=442), v4.clone()),
+            "IPv4: an sctp:0-442 rule does not admit an SCTP packet to port 443"
+        );
+        assert!(
+            keep(&ipv6_acl(&[sctp], 443..=443), v6.clone()),
+            "IPv6: an sctp:443 rule admits an SCTP packet to port 443"
+        );
+        assert!(
+            !keep(&ipv6_acl(&[sctp], 0..=442), v6),
+            "IPv6: an sctp:0-442 rule does not admit an SCTP packet to port 443"
+        );
+
+        // A *first* fragment long enough to clear Go's `minFrag` bound carries the whole common
+        // header, so `decode4` reads its ports like an unfragmented packet's. Real fragmented
+        // traffic is this shape: on a 1280-MTU overlay a first fragment is ~1200 bytes.
+        let long_first = sctp_header(443, MIN_FRAG_LEN);
+        let info = seen(v4_packet(132, 0, true, &long_first))
+            .expect("IPv4: a long-enough first SCTP fragment reaches the ACL");
+        assert_eq!(
+            info.port, 443,
+            "IPv4: a first fragment at or past minFrag has its SCTP port read, as decode4 does"
+        );
+        assert!(
+            keep(
+                &acl(IPV4_FIXTURE_NET, &[sctp], 443..=443),
+                v4_packet(132, 0, true, &long_first)
+            ),
+            "IPv4: ...and an sctp:443 rule admits it"
+        );
+
+        // But a first fragment *shorter* than `minFrag` is Go's `if moreFrags && len(sub) <
+        // minFrag { q.IPProto = unknown; return }` — the RFC 1858 head-fragment refusal that gates
+        // the whole sub-protocol switch, so no port is read and `pre()` drops it before the ACL
+        // exists. Without this the 12-byte header below would be admitted by an `sctp:443` rule
+        // that never saw the rest of the datagram.
+        let short_first = v4_packet(132, 0, true, &whole);
+        assert!(
+            seen(short_first.clone()).is_none(),
+            "IPv4: a first SCTP fragment shorter than minFrag never reaches the ACL"
+        );
+        assert!(
+            !keep(&AllowAll, short_first),
+            "IPv4: ...and an allow-all ACL does not admit it"
+        );
+
+        // A later fragment is continued payload, not a header: Go leaves its ports 0 and `pre()`
+        // passes it through on its offset alone. Reading `sub[2:4]` here would invent a port, and
+        // the short-header refusal would drop a fragment upstream delivers — so a deny-all ACL is
+        // the control, proving the accept came from the fragment path and not from a rule.
+        assert!(
+            keep(
+                &DenyAll,
+                v4_packet(132, MIN_FRAG_BLKS, false, &[0x01, 0x02, 0x03, 0x04])
+            ),
+            "IPv4: a valid later SCTP fragment is passed through ahead of the ACL"
+        );
+
+        // Go's short-header refusal on an unfragmented packet: `q.IPProto = unknown`, dropped by
+        // `pre()` before the ACL exists, so not even an allow-everything filter is consulted.
+        let short = sctp_header(443, SCTP_HEADER_LEN - 1);
+        for (family, packet) in [
+            ("IPv4", v4_packet(132, 0, false, &short)),
+            ("IPv6", ipv6_packet(132, &short)),
+        ] {
+            assert!(
+                seen(packet.clone()).is_none(),
+                "{family}: an SCTP header too short to hold its ports never reaches the ACL"
+            );
+            assert!(
+                !keep(&AllowAll, packet),
+                "{family}: ...and an allow-all ACL does not admit it"
+            );
+        }
     }
 
     /// Build the IPv4 packet a Go peer puts on the wire for a TSMP message: a 20-byte IPv4
