@@ -232,6 +232,15 @@ fn decode6_first_fragment(proto: IpProto, sub: &[u8]) -> Ipv6Fragment {
         IPPROTO_FRAGMENT_SENTINEL => Ipv6Fragment::Unknown,
         // Go's switch has no default arm: any other protocol keeps its number and port 0, and the
         // ACL matches it IPs-only (`IpProto::is_port_ful`).
+        //
+        // Protocol 0 is carried here like any other number, which is Go's `q.IPProto = nextHdr`
+        // followed by a switch that has no case for 0. That is not an admission: 0 *is*
+        // `ipproto.Unknown`, so the packet dies on [`inbound_filter_verdict`]'s
+        // [`IPPROTO_UNKNOWN`] arm before any rule sees it, exactly where Go's `pre()` kills it.
+        // (In practice such a packet never gets this far — a Fragment header naming 0 puts
+        // Hop-by-Hop Options out of position and etherparse refuses the packet — but the
+        // classification does not lean on that.) Pinned by
+        // `first_ipv6_fragment_with_unknown_next_header_is_dropped_before_the_acl`.
         _ => Ipv6Fragment::First { proto, dst_port: 0 },
     }
 }
@@ -394,6 +403,10 @@ fn inbound_filter_verdict(
         // takes the ordinary proto switch below and matches the rule an unfragmented datagram would.
         // Note the deliberate asymmetry with IPv4: `decode6` has no more-fragments guard at all, so
         // — unlike `decode4` — upstream does not demote a fragmented first TSMP packet to `unknown`.
+        //
+        // Falling through is also what refuses a first fragment whose Fragment header names
+        // protocol 0: it arrives here as `proto == IPPROTO_UNKNOWN` and the shared arm below drops
+        // it pre-rules, which is the same fall-through Go gets from a switch with no case for 0.
         Some(Fragment::V6(Ipv6Fragment::First { .. })) | None => {}
     }
 
@@ -1942,6 +1955,127 @@ mod tests {
         assert!(
             keep(&AllowAll, ipv6_fragment_packet(17, 185, false, &[0x61; 8])),
             "an unchained later fragment is still delivered"
+        );
+    }
+
+    /// A *first* IPv6 fragment whose Fragment header's Next Header is 0 is dropped ahead of the
+    /// rules, never matched by them.
+    ///
+    /// Go `net/packet.decode6Fragment` copies that byte into `q.IPProto` (`q.IPProto = nextHdr`)
+    /// and reports `continueDecode`, so the packet goes back through `decode6`'s sub-protocol
+    /// switch — which has no case for 0. `ipproto.Unknown` *is* 0, so `q.IPProto` is left at
+    /// Unknown and filter `pre()`'s `if q.IPProto == ipproto.Unknown { return Drop }` fires before
+    /// any rule is consulted. Protocol 0 on the wire is Hop-by-Hop Options.
+    ///
+    /// This tree diverged on that once. When the IPv6 fragment rules landed (`e7e4759`, #342)
+    /// [`inbound_filter_verdict`] had no unknown-proto arm at all, so a first fragment classified
+    /// protocol 0 fell through to `can_access` as `PacketInfo { ip_proto: 0, port: 0 }` and an
+    /// allow-all rule admitted it. `a8e6985` (#390) closed that incidentally, while fixing a
+    /// different bypass: it added the shared `pre()` unknown-proto drop that every protocol-0
+    /// packet now dies on, fragmented or not. Nothing pinned the fragment route to it — assertion
+    /// 2 below is what does, and it is the assertion that fails against `e7e4759`.
+    ///
+    /// Assertion 3 records the second, independent reason this was never a live bypass, which is
+    /// worth stating because it is easy to get wrong from the source alone: the `(proto 0, first
+    /// fragment)` pair the verdict was asked about **cannot be built from the wire**. A Fragment
+    /// header whose Next Header is 0 puts Hop-by-Hop Options behind an extension header, and
+    /// RFC 8200 §4.1 allows it only immediately after the base header, so etherparse refuses the
+    /// packet outright (`Ipv6Exts(HopByHopNotAtStart)`) and [`filter_inbound_from_peer`] drops it
+    /// at its parse arm — before any of this is reached. That is *not* the guarantee being tested
+    /// here (it belongs to a parser this crate does not own, and Go's own decoder has no such
+    /// check), so it is asserted separately rather than left to masquerade as a filter drop.
+    ///
+    /// The drop is deliberately not fragment-specific: [`decode6_first_fragment`]'s catch-all arm
+    /// keeps the number exactly as Go's absent switch case does, and the refusal comes from the arm
+    /// a first fragment falls through to for the same reason an unfragmented packet does.
+    #[test]
+    fn first_ipv6_fragment_with_unknown_next_header_is_dropped_before_the_acl() {
+        // 1. Classification. Go's `q.IPProto = nextHdr` on a first fragment, verbatim: the 0 is
+        //    carried, not translated. `dst_port` is 0 because Go reads a port in the TCP/UDP/SCTP
+        //    arms only, and protocol 0 is in none of them.
+        assert_eq!(
+            decode6_fragment(&ipv6_fragment_packet(0, 0, true, &udp_header(443))),
+            Ipv6Fragment::First {
+                proto: IPPROTO_UNKNOWN,
+                dst_port: 0,
+            },
+            "a first fragment carries its Fragment header's Next Header, 0 included"
+        );
+
+        // 2. Verdict — the regression this test exists for. The allow-all ACL is what makes a DROP
+        //    here mean "refused ahead of the rules" and not "a rule said no", so this is the whole
+        //    `pre()` guarantee in one assertion. It fails at `e7e4759` and passes since `a8e6985`.
+        let src = std::net::IpAddr::V6(IPV6_FIXTURE_SRC);
+        let dst = std::net::IpAddr::V6(IPV6_FIXTURE_DST);
+        assert!(
+            !inbound_filter_verdict(
+                &AllowAll,
+                IPPROTO_UNKNOWN,
+                src,
+                dst,
+                0,
+                Some(Fragment::V6(Ipv6Fragment::First {
+                    proto: IPPROTO_UNKNOWN,
+                    dst_port: 0,
+                })),
+            ),
+            "a first IPv6 fragment declaring protocol 0 is dropped under an allow-all ACL"
+        );
+
+        // 3. The whole inbound path on real bytes — where the packet dies for the *other* reason,
+        //    and where saying so is the only thing that keeps the `!keep` below honest. `keep`
+        //    reports a packet the parser rejected exactly as it reports one the filter dropped, so
+        //    assert the parse refusal directly first; without it the two assertions after it would
+        //    pass even if the filter admitted everything.
+        let unknown_proto = ipv6_fragment_packet(0, 0, true, &udp_header(443));
+        assert!(
+            etherparse::SlicedPacket::from_ip(&unknown_proto).is_err(),
+            "a Fragment header naming protocol 0 puts Hop-by-Hop Options out of position, and the \
+             parser refuses the packet before the filter sees it"
+        );
+
+        let keep = |filter: &(dyn ts_packetfilter::Filter + Send + Sync), packet: Vec<u8>| {
+            let mut packets = vec![PacketMut::from(packet)];
+            let mut learned = Vec::new();
+            filter_inbound_from_peer(filter, PeerId(5), &mut packets, &mut learned);
+            assert!(
+                learned.is_empty(),
+                "no TSMP advertisement in these fixtures"
+            );
+            !packets.is_empty()
+        };
+        // What the ACL was asked about, or `None` if the packet never got that far.
+        let seen = |packet: Vec<u8>| {
+            let recording = Recording::default();
+            keep(&recording, packet);
+            let seen = recording.0.into_inner().unwrap();
+            assert!(seen.len() <= 1, "one packet in, at most one ACL question");
+            seen.into_iter().next()
+        };
+
+        assert!(
+            !keep(&AllowAll, unknown_proto.clone()),
+            "so it never reaches the local stack, even under an allow-all ACL"
+        );
+        assert!(
+            seen(unknown_proto).is_none(),
+            "and the ACL is never asked about it"
+        );
+
+        // The control, and the reason the fixture above is not simply a packet nothing can read:
+        // the same bytes with UDP in that one byte parse, classify, and are matched on 17/443 —
+        // the first fragment reaching the ACL as the unfragmented datagram would.
+        let udp = ipv6_fragment_packet(17, 0, true, &udp_header(443));
+        assert!(
+            etherparse::SlicedPacket::from_ip(&udp).is_ok(),
+            "control: the same fragment naming UDP parses"
+        );
+        assert!(keep(&AllowAll, udp.clone()), "control: and is delivered");
+        let info = seen(udp).expect("control: and it got there by being matched against the rules");
+        assert_eq!(
+            (info.ip_proto, info.port),
+            (IpProto::UDP, 443),
+            "control: matched as the unfragmented datagram would be, on protocol 17 port 443"
         );
     }
 
