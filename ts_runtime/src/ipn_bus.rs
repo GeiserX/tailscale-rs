@@ -391,6 +391,7 @@ mod tests {
             cur_addr: None,
             relay: None,
             ssh_host_keys: Vec::new(),
+            expired: false,
         }
     }
 

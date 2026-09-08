@@ -164,6 +164,22 @@ pub struct Node {
     /// The node key's expiration.
     pub node_key_expiry: Option<DateTime<Utc>>,
 
+    /// Whether this node's key is expired (`tailcfg.Node.Expired`).
+    ///
+    /// Two writers, exactly as upstream. Control may send it on the wire, and the client sets it
+    /// itself — only ever `false` → `true` — when
+    /// [`node_key_expiry`](Self::node_key_expiry) has passed, so the decision is made against a
+    /// clock corrected for control skew rather than the raw local one. See
+    /// [`ExpiryManager::flag_expired_peer`](crate::ExpiryManager::flag_expired_peer), which is what
+    /// sets it and which also clears this node's endpoints and home DERP and breaks its
+    /// [`node_key`](Self::node_key).
+    ///
+    /// An expired peer is **kept** in the netmap, not dropped: that is what lets a caller answer
+    /// [`PEER_KEY_EXPIRED`](crate::PEER_KEY_EXPIRED) rather than "no such peer". Distinct from
+    /// [`key_expired`](Self::key_expired), which recomputes the answer from the raw local clock and
+    /// is what the **self**-node re-auth decision reads.
+    pub expired: bool,
+
     /// Whether control reports this node currently connected to the coordination server
     /// (`tailcfg.Node.Online`, a tri-state `*bool`). `None` = unknown / no permission to know /
     /// never been online — **do not collapse to `false`** (that would fabricate an offline status
@@ -488,6 +504,8 @@ impl Node {
     ///
     /// IPv4-only by deliberate design: the tailnet dataplane in this fork binds IPv4 only, so we
     /// never form a peerAPI URL on the peer's IPv6 address.
+    ///
+    /// `None` for an [`expired`](Self::expired) peer — see [`Node::peerapi_addr`].
     pub fn peerapi_doh_url(&self) -> Option<String> {
         self.peerapi_doh_addr()
             .map(|addr| format!("http://{addr}/dns-query"))
@@ -499,7 +517,7 @@ impl Node {
     /// resolution to a selected exit node. `SocketAddr`'s `Display` is `ip:port`, so
     /// `peerapi_doh_url` formats to `http://<ip>:<port>/dns-query` over this.
     pub fn peerapi_doh_addr(&self) -> Option<SocketAddr> {
-        if self.is_wireguard_only {
+        if self.is_wireguard_only || self.expired {
             return None;
         }
         let port = self.peerapi_port?;
@@ -520,8 +538,14 @@ impl Node {
     /// IPv4-only by this fork's deliberate design (the tailnet dataplane binds IPv4 only, so we never
     /// form a peerAPI URL on the peer's IPv6 address). Returns `None` for a WireGuard-only peer (which
     /// runs no peerAPI) or a peer advertising no IPv4 peerAPI port.
+    ///
+    /// Also `None` for an [`expired`](Self::expired) peer: Go refuses a peerAPI dial to one with
+    /// [`PEER_KEY_EXPIRED`](crate::PEER_KEY_EXPIRED) (`LocalBackend.pingPeerAPI`), and this is the
+    /// chokepoint every peerAPI dial in this fork resolves its destination through. Callers that
+    /// want to *report* the refusal rather than silently skip the peer should test
+    /// [`expired`](Self::expired) first.
     pub fn peerapi_addr(&self) -> Option<SocketAddr> {
-        if self.is_wireguard_only {
+        if self.is_wireguard_only || self.expired {
             return None;
         }
         let port = self.peerapi_port?;
@@ -847,6 +871,8 @@ impl From<&ts_control_serde::Node<'_>> for Node {
             tailnet_address: TailnetAddress { ipv4, ipv6 },
             node_key: value.key,
             node_key_expiry: value.key_expiry,
+            // Control's own verdict, carried verbatim; `ExpiryManager` only ever raises it.
+            expired: value.expired,
             online: value.online,
             last_seen: value.last_seen,
             key_signature: value.key_signature.to_vec(),
@@ -1022,7 +1048,7 @@ impl UserProfile {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The wire `Node.User` id must be carried onto the domain `Node.user_id` by the `From` impl
@@ -1341,6 +1367,12 @@ mod tests {
         assert!(!n.is_peer_relay());
     }
 
+    /// A minimal well-formed peer, shared with the `expiry` module's tests so both reason about
+    /// the same node shape.
+    pub(crate) fn test_node() -> Node {
+        node("h", Some("t.ts.net"))
+    }
+
     fn node(hostname: &str, tailnet: Option<&str>) -> Node {
         Node {
             id: 1,
@@ -1359,6 +1391,7 @@ mod tests {
             },
             node_key: [0u8; 32].into(),
             node_key_expiry: None,
+            expired: false,
             online: None,
             last_seen: None,
             key_signature: vec![],

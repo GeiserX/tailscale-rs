@@ -42,6 +42,16 @@ pub enum Error {
     #[error("no preferred DERP, try again later")]
     NoPreferredDerp,
 
+    /// The targeted peer's node key has expired, so this node refuses to talk to its peerAPI — the
+    /// Rust analog of Go's `errors.New("peer's node key has expired")` (`LocalBackend.pingPeerAPI`,
+    /// `ipn/ipnlocal/local.go`).
+    ///
+    /// An expired peer is deliberately kept in the netmap rather than dropped, precisely so this
+    /// can be reported instead of "no such peer". It is not transient: the peer is unreachable
+    /// until control re-issues its node key, at which point the next netmap clears the flag.
+    #[error("{}", ts_control::PEER_KEY_EXPIRED)]
+    PeerKeyExpired,
+
     /// An error occurred which can not be anticipated or handled by a library user.
     ///
     /// This is likely due to a bug in our code or a rare and unexpected error.

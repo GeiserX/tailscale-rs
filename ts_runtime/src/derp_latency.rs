@@ -166,6 +166,7 @@ mod tests {
             tka: None,
             online_change: Default::default(),
             peer_seen_change: Default::default(),
+            control_time: None,
         })
     }
 

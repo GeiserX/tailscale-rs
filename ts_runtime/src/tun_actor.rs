@@ -1356,6 +1356,7 @@ mod tests {
             },
             node_key: [1u8; 32].into(),
             node_key_expiry: None,
+            expired: false,
             key_signature: vec![],
             machine_key: None,
             disco_key: None,
@@ -1453,6 +1454,7 @@ mod tests {
             },
             node_key: [id as u8; 32].into(),
             node_key_expiry: None,
+            expired: false,
             key_signature: vec![],
             machine_key: None,
             disco_key: None,
@@ -1509,6 +1511,7 @@ mod tests {
             },
             node_key: [0u8; 32].into(),
             node_key_expiry: None,
+            expired: false,
             // Cross-stream coupling (S4): `Node` gains `key_signature: Vec<u8>`. Empty here so this
             // fixture compiles after S4 lands; no TKA enforcement is exercised by tun_actor tests.
             key_signature: vec![],
@@ -2385,6 +2388,7 @@ mod tests {
             tka: None,
             online_change: Default::default(),
             peer_seen_change: Default::default(),
+            control_time: None,
         }
     }
 

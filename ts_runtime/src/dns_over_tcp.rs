@@ -252,6 +252,7 @@ mod tests {
             },
             node_key: [1u8; 32].into(),
             node_key_expiry: None,
+            expired: false,
             key_signature: vec![],
             machine_key: None,
             disco_key: None,

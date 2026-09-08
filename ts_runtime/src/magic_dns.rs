@@ -1585,6 +1585,7 @@ mod tests {
             },
             node_key: [0u8; 32].into(),
             node_key_expiry: None,
+            expired: false,
             online: None,
             last_seen: None,
             key_signature: vec![],
