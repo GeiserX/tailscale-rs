@@ -2,6 +2,14 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.47.11](https://github.com/GeiserX/tailscale-rs/compare/v0.47.10...v0.47.11) (2026-09-08)
+
+
+### Bug Fixes
+
+* **dns:** set TC on the same answers a Go node sets it on ([#395](https://github.com/GeiserX/tailscale-rs/issues/395)) ([b382be0](https://github.com/GeiserX/tailscale-rs/commit/b382be0aebeeba22ad466a00bed53ad3ebc7f014))
+* **dns:** stop an oversized delegated DoH answer killing the TCP client ([#397](https://github.com/GeiserX/tailscale-rs/issues/397)) ([77daf59](https://github.com/GeiserX/tailscale-rs/commit/77daf590b5fe0cd053242bfefc7f45a1698f5242))
+
 ## [0.47.10](https://github.com/GeiserX/tailscale-rs/compare/v0.47.9...v0.47.10) (2026-09-08)
 
 
