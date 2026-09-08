@@ -71,6 +71,23 @@ pub(crate) struct MagicsockMetrics {
     /// for some other pair, no acceptable relay address, or a stale Lamport id
     /// (`magicsock_disco_call_me_maybe_via_recv_rejected`).
     pub disco_call_me_maybe_via_recv_rejected: &'static Metric,
+    /// Individual relay `addr:port`s advertised in a `CallMeMaybeVia` and refused by the
+    /// relay-address class filter (`MagicSock::relay_addr_allowed`) before any bind message could
+    /// be sent to them. This filter is this fork's own — upstream `relayManager.handshakeServerEndpoint`
+    /// binds to every advertised address that is merely non-zero — so this counter is what makes
+    /// the divergence visible in the field. A nonzero value with
+    /// [`peer_relay_endpoint_all_addrs_refused`](Self::peer_relay_endpoint_all_addrs_refused) at
+    /// zero means only *some* addresses were dropped and the endpoint is still usable
+    /// (`magicsock_peer_relay_addr_refused`).
+    pub peer_relay_addr_refused: &'static Metric,
+    /// `CallMeMaybeVia` endpoints where **every** advertised relay address was refused by the class
+    /// filter, so no bind message left the socket and the peer stays on DERP. This is the interop
+    /// cost of the filter — the signature of a self-hosted `net/udprelay` server reachable only on
+    /// a private, loopback or link-local address — and it is counted separately from the other
+    /// `CallMeMaybeVia` rejections so it can be told apart from a non-member sender, an endpoint
+    /// allocated for another pair, or a stale Lamport id
+    /// (`magicsock_peer_relay_endpoint_all_addrs_refused`).
+    pub peer_relay_endpoint_all_addrs_refused: &'static Metric,
     /// Peer-relay bind handshakes completed: a relayed pong confirmed a relay `addr:port`, so the
     /// peer has a usable peer-relay path instead of falling back to DERP
     /// (`magicsock_peer_relay_bound`).
@@ -110,6 +127,10 @@ pub(crate) fn metrics() -> &'static MagicsockMetrics {
         disco_call_me_maybe_via_recv: Metric::new_counter("magicsock_disco_call_me_maybe_via_recv"),
         disco_call_me_maybe_via_recv_rejected: Metric::new_counter(
             "magicsock_disco_call_me_maybe_via_recv_rejected",
+        ),
+        peer_relay_addr_refused: Metric::new_counter("magicsock_peer_relay_addr_refused"),
+        peer_relay_endpoint_all_addrs_refused: Metric::new_counter(
+            "magicsock_peer_relay_endpoint_all_addrs_refused",
         ),
         peer_relay_bound: Metric::new_counter("magicsock_peer_relay_bound"),
         send_peer_relay: Metric::new_counter("magicsock_send_peer_relay"),

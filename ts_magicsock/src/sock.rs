@@ -207,6 +207,15 @@ pub struct MagicSock {
     /// One-shot guard so the "no binding verifier installed" warning is emitted at most once
     /// instead of on every dropped ping.
     warned_no_verifier: AtomicBool,
+    /// One-shot guard so the "every advertised relay address was refused" warning is emitted at
+    /// most once per socket instead of once per `CallMeMaybeVia`.
+    ///
+    /// That refusal is the interop cost of [`relay_addr_allowed`](Self::relay_addr_allowed) — a
+    /// self-hosted relay server on a private LAN address is turned away and the peer stays on DERP
+    /// — and it is triggered by a *peer-supplied* message, so it is announced loudly exactly once
+    /// and then left to the counters. See
+    /// [`warn_relay_addrs_all_refused_once`](Self::warn_relay_addrs_all_refused_once).
+    warned_relay_addrs_all_refused: AtomicBool,
     /// Gate for accepting IPv6 disco candidates on the tailnet overlay (default `false`).
     ///
     /// The primary deployment is an IPv4-only privacy proxy / cloud exit node, so this defaults
@@ -296,6 +305,7 @@ impl MagicSock {
             stun_in_flight: Default::default(),
             binding_verifier: None,
             warned_no_verifier: AtomicBool::new(false),
+            warned_relay_addrs_all_refused: AtomicBool::new(false),
             enable_ipv6: false,
             symmetric_nat: AtomicBool::new(false),
             ping_waiters: Default::default(),
@@ -1240,7 +1250,10 @@ impl MagicSock {
     ///    network. If nothing survives, we do nothing and the peer stays on DERP. This gate is
     ///    **deliberately stricter than upstream**, which sends a bind message to every advertised
     ///    `AddrPort` that is merely non-zero; see [`relay_addr_allowed`](Self::relay_addr_allowed)
-    ///    for why it is kept, and for what it costs in interop.
+    ///    for why it is kept, and for what it costs in interop. Because it is a divergence with a
+    ///    real interop cost, it is counted (`magicsock_peer_relay_addr_refused`, and
+    ///    `magicsock_peer_relay_endpoint_all_addrs_refused` when nothing survived) and warned about
+    ///    once per socket, rather than dropping the endpoint silently.
     /// 3. **The allocation must supersede what we have.** Upstream orders competing allocations for
     ///    a peer pair by the relay server's Lamport id; an older or equal id is stale.
     ///
@@ -1256,6 +1269,7 @@ impl MagicSock {
             return;
         }
 
+        let mut refused: Vec<SocketAddr> = Vec::new();
         let addrs: Vec<SocketAddr> = endpoint
             .addr_ports
             .iter()
@@ -1264,11 +1278,24 @@ impl MagicSock {
                 let ok = self.relay_addr_allowed(addr);
                 if !ok {
                     tracing::debug!(%addr, "dropping non-pingable relay candidate address");
+                    refused.push(*addr);
                 }
                 ok
             })
             .collect();
+        if !refused.is_empty() {
+            m.peer_relay_addr_refused.add(refused.len() as i64);
+        }
         if addrs.is_empty() {
+            // Distinguish the two ways of arriving here. An endpoint that advertised nothing
+            // usable *to us* because the class filter took it all is this fork's divergence from
+            // upstream, and it is the one an operator running a self-hosted relay server needs to
+            // be told about; an endpoint that advertised no addresses at all is refused by
+            // upstream too (its `sentBindAny` stays false) and needs no special signal.
+            if !refused.is_empty() {
+                m.peer_relay_endpoint_all_addrs_refused.inc();
+                self.warn_relay_addrs_all_refused_once(&peer, &refused);
+            }
             m.disco_call_me_maybe_via_recv_rejected.inc();
             return;
         }
@@ -1747,6 +1774,16 @@ impl MagicSock {
     /// `a_relay_server_on_a_private_lan_address_is_refused_and_the_peer_stays_on_derp` pins it so
     /// it reads as the invariant it is rather than as a bug to be rediscovered.
     ///
+    /// It is also *observable*, which is the difference between an accepted cost and a silent one.
+    /// Each refused address increments `magicsock_peer_relay_addr_refused`; an endpoint whose
+    /// whole advertised set was refused increments `magicsock_peer_relay_endpoint_all_addrs_refused`
+    /// — separately from the shared `CallMeMaybeVia` reject counter, so "my relay server is being
+    /// turned away" is distinguishable from "that endpoint was not for this pair" — and emits a
+    /// one-shot warning naming the cause and the addresses
+    /// ([`warn_relay_addrs_all_refused_once`](Self::warn_relay_addrs_all_refused_once)). An
+    /// operator meeting this in the field is told what happened rather than left to infer it from
+    /// peers that never leave DERP.
+    ///
     /// The one relaxation available is IPv6: with [`with_enable_ipv6`](Self::with_enable_ipv6)
     /// set, a relay server on a global-unicast IPv6 address is handshaked with normally (ULA and
     /// link-local stay refused, mirroring the IPv4 clauses). There is deliberately no knob that
@@ -1802,6 +1839,39 @@ impl MagicSock {
                 self.warn_no_verifier_once();
                 false
             }
+        }
+    }
+
+    /// Emit the "every advertised relay address was refused" warning at most once per socket.
+    ///
+    /// This is the field-facing half of the divergence documented on
+    /// [`relay_addr_allowed`](Self::relay_addr_allowed). Without it the refusal is invisible at the
+    /// default log level: the per-address drops are `debug!`, and the endpoint-level drop shares
+    /// one counter with three unrelated `CallMeMaybeVia` rejections, so an operator whose
+    /// self-hosted relay server sits on an RFC 1918 address sees only that peers keep using DERP
+    /// and has nothing to search for. The message names the cause and the fix, and lists the
+    /// addresses that were turned away (at most [`MAX_RELAY_ADDR_PORTS`][crate::relay::MAX_RELAY_ADDR_PORTS]
+    /// of them) so the operator can recognise their own server.
+    ///
+    /// Warn-level is safe here despite the trigger being a peer-supplied message: the one-shot flag
+    /// bounds it to a single line for the socket's lifetime, and the counters carry the rest. Same
+    /// shape, and the same reason, as [`warn_no_verifier_once`](Self::warn_no_verifier_once).
+    fn warn_relay_addrs_all_refused_once(&self, peer: &DiscoPublicKey, refused: &[SocketAddr]) {
+        if !self
+            .warned_relay_addrs_all_refused
+            .swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                %peer,
+                ?refused,
+                "no peer-relay path: every relay address advertised for this peer was refused by \
+                 the relay-address filter, so the peer stays on DERP. A relay server is only \
+                 handshaked with on a routable address — loopback, RFC 1918, link-local and \
+                 multicast are refused, as is every IPv6 address unless IPv6 is enabled. Give the \
+                 relay server a routable address. Logged once per socket; see the \
+                 magicsock_peer_relay_addr_refused and \
+                 magicsock_peer_relay_endpoint_all_addrs_refused counters for the rest."
+            );
         }
     }
 
@@ -3361,6 +3431,162 @@ mod tests {
                 Error::NoPath
             ),
             "with no relay path and no direct path, the peer falls back to DERP"
+        );
+    }
+
+    /// The refusal the test above pins is *announced*, not silent: every address the class filter
+    /// turns away is counted, an endpoint that loses its whole advertised set is counted again on
+    /// its own counter, and the first such endpoint logs one warning naming the cause.
+    ///
+    /// Without this an operator running a self-hosted `net/udprelay` server on an RFC 1918 address
+    /// has nothing to go on — the per-address drops are `debug!`, and the endpoint-level drop is
+    /// indistinguishable in `magicsock_disco_call_me_maybe_via_recv_rejected` from a non-member
+    /// sender, an endpoint allocated for another pair, or a stale Lamport id. The divergence from
+    /// upstream (`relayManager.handshakeServerEndpoint` binds to every non-zero `AddrPort`) is
+    /// deliberate; being unable to tell it happened is not.
+    ///
+    /// The warning is one-shot per socket because a `CallMeMaybeVia` is peer-supplied: a peer that
+    /// keeps advertising refused addresses must not be able to drive the log. The counters, which
+    /// are cheap, keep counting after it.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_fully_refused_relay_endpoint_is_counted_and_warned_once() {
+        let our_disco = DiscoPrivateKey::random();
+        let fx = RelayFixture::new(23);
+        let peer_pub = fx.peer.public_key();
+        let a = Arc::new(
+            MagicSock::bind(
+                localhost(),
+                our_disco.clone(),
+                ts_keys::NodePrivateKey::random().public_key(),
+            )
+            .await
+            .unwrap()
+            .with_binding_verifier(allow_all()),
+        );
+        // Note: `allow_loopback_relay` deliberately NOT set — this is the production filter.
+        let mut sends = a.tap_relay_sends();
+
+        // One address per refused class, as a relay server on a LAN would advertise them.
+        let refused: Vec<SocketAddr> = ["10.0.0.5:41641", "127.0.0.1:41641", "169.254.1.1:41641"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+
+        let m = crate::metrics::metrics();
+        // Deltas, not absolutes: these counters are process-global and other relay tests move
+        // them in parallel, so every assertion below is `>=` this test's own contribution.
+        let addrs_before = m.peer_relay_addr_refused.value();
+        let endpoints_before = m.peer_relay_endpoint_all_addrs_refused.value();
+        assert!(
+            !a.warned_relay_addrs_all_refused.load(Ordering::Relaxed),
+            "a fresh socket has not warned yet"
+        );
+
+        // Two endpoints, the second superseding the first, so the one-shot warning has a second
+        // chance to fire that it must not take.
+        for lamport_id in [7u64, 8] {
+            let mut endpoint = fx.endpoint(our_disco.public_key());
+            endpoint.lamport_id = lamport_id;
+            endpoint.addr_ports = refused.clone();
+            let mut frame =
+                disco::seal_call_me_maybe_via(&fx.peer, &our_disco.public_key(), &endpoint)
+                    .unwrap();
+            assert!(a.handle_relayed_disco(&mut frame).await);
+        }
+
+        assert!(
+            sends.try_recv().is_err(),
+            "no bind message may be sent to any refused address"
+        );
+        assert!(
+            lock(&a.relay_paths).get(&peer_pub).is_none(),
+            "and no allocation is recorded"
+        );
+        assert!(
+            m.peer_relay_addr_refused.value() - addrs_before >= 6,
+            "each refused address is counted, on both endpoints"
+        );
+        assert!(
+            m.peer_relay_endpoint_all_addrs_refused.value() - endpoints_before >= 2,
+            "and each endpoint that lost its whole set is counted on its own counter"
+        );
+        assert!(
+            a.warned_relay_addrs_all_refused.load(Ordering::Relaxed),
+            "the one-shot warning flag is set by the first fully refused endpoint"
+        );
+        logs_assert(|lines: &[&str]| {
+            match lines
+                .iter()
+                .filter(|line| line.contains("no peer-relay path"))
+                .count()
+            {
+                1 => Ok(()),
+                n => Err(format!(
+                    "the refusal warning must be logged exactly once per socket, got {n}"
+                )),
+            }
+        });
+    }
+
+    /// A *partly* refused endpoint is not the interop failure: the surviving addresses are
+    /// handshaked with as normal, so the per-address counter moves while the endpoint-level
+    /// counter and the one-shot warning stay untouched. That is what makes the two counters worth
+    /// reading separately — one says "some addresses were dropped", the other says "this peer is
+    /// stuck on DERP because of the filter".
+    #[tokio::test]
+    async fn a_partly_refused_relay_endpoint_still_handshakes_and_does_not_warn() {
+        let admitted: SocketAddr = "[2001:db8::1]:41641".parse().unwrap();
+        let our_disco = DiscoPrivateKey::random();
+        let fx = RelayFixture::new(29);
+        let peer_pub = fx.peer.public_key();
+        let a = Arc::new(
+            MagicSock::bind(
+                localhost(),
+                our_disco.clone(),
+                ts_keys::NodePrivateKey::random().public_key(),
+            )
+            .await
+            .unwrap()
+            .with_binding_verifier(allow_all())
+            // The admitted address is a global-unicast IPv6 one purely so this test never puts a
+            // datagram on the network: the socket is IPv4-bound, so the send itself fails and is
+            // swallowed, while the tap still records that the bind message was addressed at all —
+            // the same device `a_global_unicast_ipv6_relay_server_is_refused_by_default_and_allowed_by_the_gate`
+            // uses. The gate under test is the filter, not the write.
+            .with_enable_ipv6(true),
+        );
+        // Note: `allow_loopback_relay` deliberately NOT set — this is the production filter.
+        let mut sends = a.tap_relay_sends();
+
+        let m = crate::metrics::metrics();
+        let addrs_before = m.peer_relay_addr_refused.value();
+
+        let mut endpoint = fx.endpoint(our_disco.public_key());
+        endpoint.addr_ports = vec!["10.0.0.5:41641".parse().unwrap(), admitted];
+        let mut frame =
+            disco::seal_call_me_maybe_via(&fx.peer, &our_disco.public_key(), &endpoint).unwrap();
+        assert!(a.handle_relayed_disco(&mut frame).await);
+
+        let (to, _wire) = sends
+            .try_recv()
+            .expect("the surviving address must still be handshaked with");
+        assert_eq!(to, admitted, "and only that address");
+        assert!(
+            sends.try_recv().is_err(),
+            "the refused address gets no bind message"
+        );
+        assert!(
+            lock(&a.relay_paths).get(&peer_pub).is_some(),
+            "the allocation is recorded — this peer is not stuck on DERP"
+        );
+        assert!(
+            m.peer_relay_addr_refused.value() - addrs_before >= 1,
+            "the dropped address is still counted"
+        );
+        assert!(
+            !a.warned_relay_addrs_all_refused.load(Ordering::Relaxed),
+            "but a usable endpoint must not raise the stuck-on-DERP warning"
         );
     }
 
