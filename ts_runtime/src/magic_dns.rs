@@ -40,11 +40,12 @@
 //!   5-second TTL for the same reason in the other direction. `SERVFAIL`, `REFUSED` and the blanket
 //!   `ip6.arpa` refusal claim no zone and carry no SOA.
 //! - Malformed query => dropped (no response).
-//! - A **forwarded** reply larger than the UDP payload size the query advertised — its EDNS(0) OPT
-//!   record, or 512 bytes when it carried none (RFC 1035) — comes back with the `TC` (truncated)
-//!   bit set and its body intact, so the stub resolver knows to retry over TCP
-//!   ([`set_tc_if_over_client_limit`]). The query is forwarded verbatim, so this is what catches an
-//!   upstream that ignores the size its requestor asked for. The retry that bit asks for is served
+//! - A reply larger than the UDP payload size the query advertised — its EDNS(0) OPT record, or 512
+//!   bytes when it carried none or carried one this node will not act on (RFC 1035) — comes back
+//!   with the `TC` (truncated) bit set and its body intact, so the stub resolver knows to retry over
+//!   TCP ([`check_response_size_and_set_tc`]). This applies to forwarded replies, where the query is
+//!   relayed verbatim and so this is what catches an upstream that ignores the size its requestor
+//!   asked for, and equally to answers this node composes itself. The retry that bit asks for is served
 //!   by the `dns_over_tcp` server (TUN mode), which reaches the same [`decide`] through
 //!   the same view — and which is never handed a `TC` bit for size, since a TCP client has no
 //!   datagram to overflow (see [`ClientTransport`]).
@@ -748,7 +749,7 @@ pub(crate) fn recursive_plan(view: &DnsView, default_upstreams: Vec<SocketAddr>)
 
 /// Which transport the *client* we are answering reached us over.
 ///
-/// The only thing it changes is whether a forwarded answer may be marked `TC` for exceeding the
+/// The only thing it changes is whether an answer may be marked `TC` for exceeding the
 /// UDP payload size the query advertised. That limit describes the **datagram** we would answer in
 /// (RFC 1035 §4.2.1, RFC 6891 §6.2.3); a client that reached us over TCP has no such bound
 /// (RFC 7766 §8), and marking its answer truncated sends a stub resolver that already retried over
@@ -763,11 +764,10 @@ pub(crate) enum ClientTransport {
     Udp,
     /// A TCP client: no datagram limit applies, so no `TC` bit is added for size.
     ///
-    /// Only `dns_over_tcp` constructs this, and that module is compiled with the `tun` feature (the
-    /// application netstack has no TCP listener on `100.100.100.100:53` yet), so without `tun` the
-    /// variant is unreachable. Kept — and the dead-code warning suppressed — rather than gated,
-    /// because the distinction it draws belongs to the responder, not to a transport mode.
-    #[cfg_attr(not(feature = "tun"), allow(dead_code))]
+    /// Two things reach for it: `dns_over_tcp` (compiled with the `tun` feature — the application
+    /// netstack has no TCP listener on `100.100.100.100:53` yet), and the peerAPI DoH *server*,
+    /// which answers as `"tcp"` because the datagram budget belongs to the peer that asked, not to
+    /// us (Go `Resolver.HandlePeerDNSQuery`, see `peerapi_doh::PEER_CLIENT_TRANSPORT`).
     Tcp,
 }
 
@@ -793,7 +793,7 @@ pub(crate) fn forward_plan(
 
 /// Cap a forwarded upstream response to a single UDP datagram ([`MAX_UPSTREAM_RESPONSE`]) before
 /// relaying it, then — for a [`ClientTransport::Udp`] client only — mark it truncated if it is
-/// bigger than what `query`'s sender said it can receive ([`set_tc_if_over_client_limit`]).
+/// bigger than what `query`'s sender said it can receive ([`check_response_size_and_set_tc`]).
 ///
 /// The two checks **compose**; they are not alternatives. The [`MAX_UPSTREAM_RESPONSE`] cap is this
 /// forwarder's own relay bound: when the response is too large it is truncated mid-message, so we
@@ -821,41 +821,57 @@ fn cap_response(query: &[u8], mut resp: Vec<u8>, client: ClientTransport) -> Vec
             *flags_hi |= 0x02;
         }
     }
-    match client {
-        ClientTransport::Udp => set_tc_if_over_client_limit(query, resp),
-        ClientTransport::Tcp => resp,
-    }
+    check_response_size_and_set_tc(query, resp, client)
 }
 
 /// The RFC 1035 §4.2.1 maximum size of a DNS message carried over UDP by a requestor that did not
-/// advertise an EDNS(0) buffer size. Also the floor RFC 6891 §6.2.3 puts under an advertised size
-/// ("Values lower than 512 MUST be treated as equal to 512").
+/// advertise an EDNS(0) buffer size. Go's `defaultUDPSize` in `checkResponseSizeAndSetTC`
+/// (net/dns/resolver/forwarder.go @ 9ea7cba44591e0cd840c6c94d23274dd222059bf).
+///
+/// It is **not** a floor under an advertised size. RFC 6891 §6.2.3 says a value below 512 "MUST be
+/// treated as equal to 512", but Go takes the advertised number verbatim (`maxSize = int(ednsSize)`)
+/// and only reaches for this constant when the request carries no usable OPT record at all. A stub
+/// that advertises 200 is told a 300-byte answer is truncated, and a Rust node on the same tailnet
+/// has to say the same thing.
 const NO_EDNS_UDP_LIMIT: usize = 512;
 
 /// The RR TYPE of an EDNS(0) OPT pseudo-record (RFC 6891 §6.1.2). In an OPT record the CLASS field
 /// is repurposed to carry the requestor's UDP payload size.
 const OPT_RR_TYPE: u16 = 41;
 
-/// Set the `TC` (truncated) bit on a forwarded `resp` when it is larger than the UDP payload size
-/// the client's `query` advertised — the size in its EDNS(0) OPT record, or 512 bytes when it sent
-/// no OPT record at all (RFC 1035). The body is left **intact**: `TC` tells the stub resolver the
-/// answer may not fit the datagram it asked for, so it should retry over TCP; it is not a claim
-/// that we chopped anything.
+/// Wire size of an EDNS(0) OPT record carrying **no** options: NAME (1 byte, the root label) +
+/// TYPE (2) + CLASS (2) + TTL (4) + RDLEN (2). Go's `optFixedBytes`.
+const OPT_FIXED_BYTES: usize = 11;
+
+/// Set the `TC` (truncated) bit on `resp` when it is larger than the UDP payload size the client's
+/// `query` advertised — the size in its EDNS(0) OPT record, or 512 bytes when it carries none
+/// (RFC 1035). The body is left **intact**: `TC` tells the stub resolver the answer may not fit the
+/// datagram it asked for, so it should retry over TCP; it is not a claim that we chopped anything.
 ///
-/// This exists because the query is forwarded verbatim and we then relay whatever comes back: a
-/// well-behaved upstream honours the client's EDNS size itself, but "the upstream is well-behaved"
-/// is exactly the assumption to stop making. Without this, a 900-byte reply to a plain non-EDNS
-/// query was relayed with `TC` clear (Go: `checkResponseSizeAndSetTC`, called on every path that
-/// returns a UDP answer).
+/// This is Go's `checkResponseSizeAndSetTC` (net/dns/resolver/forwarder.go @
+/// 9ea7cba44591e0cd840c6c94d23274dd222059bf), including its first statement — `if family != "udp"
+/// { return response }`. `client` is that `family`: it names the transport the client **we answer**
+/// used, never the hop we fetched the answer over. A [`ClientTransport::Tcp`] client has no
+/// datagram to overflow (RFC 7766 §8) and setting `TC` for it would only send its resolver into
+/// another retry of a transport that already has no size bound.
 ///
-/// Applied on the **forwarded** paths only. Answers this node builds itself already fit: `ts_dns_wire`
-/// caps an authoritative response at 512 bytes and sets `TC` when it has to drop an answer, and 512
-/// is the floor under any advertised EDNS size (RFC 6891 §6.2.3), so an authoritative reply can
-/// never exceed a client's limit. The two paths derive their limit differently — one from the
-/// request, one from a fixed constant — but the stricter fixed one can only ever agree.
-pub(crate) fn set_tc_if_over_client_limit(query: &[u8], mut resp: Vec<u8>) -> Vec<u8> {
+/// It runs on every path that returns an answer to a client, exactly as upstream does: the UDP and
+/// DoH forwards (via [`cap_response`] / `forward_doh`, Go's `forwarder.send`) **and** the answers
+/// this node builds itself (Go calls it in `Resolver.Query` right after `respond` succeeds). The
+/// local path is not exempt: `ts_dns_wire` caps an authoritative response at 512 bytes, which only
+/// bounds it below a *default* client limit — a client that advertised less than that can still be
+/// overflowed by an answer we composed.
+pub(crate) fn check_response_size_and_set_tc(
+    query: &[u8],
+    mut resp: Vec<u8>,
+    client: ClientTransport,
+) -> Vec<u8> {
+    if client == ClientTransport::Tcp {
+        return resp;
+    }
     // The header is 12 bytes and the TC bit lives in the second flags byte (header byte 2); a
-    // response shorter than that is not something we can (or need to) mark.
+    // response shorter than that is not something we can (or need to) mark. Re-setting a bit that
+    // is already set is a no-op, so upstream's `truncatedFlagSet` early return needs no analogue.
     if resp.len() > client_udp_limit(query)
         && let Some(flags_hi) = resp.get_mut(2)
     {
@@ -864,93 +880,60 @@ pub(crate) fn set_tc_if_over_client_limit(query: &[u8], mut resp: Vec<u8>) -> Ve
     resp
 }
 
-/// The largest UDP DNS response `query`'s sender is willing to receive: the EDNS(0) advertised
-/// size, floored at [`NO_EDNS_UDP_LIMIT`] per RFC 6891 §6.2.3, or [`NO_EDNS_UDP_LIMIT`] when the
-/// query carries no OPT record or cannot be walked.
+/// The largest UDP DNS response `query`'s sender is willing to receive: the EDNS(0) advertised size
+/// verbatim, or [`NO_EDNS_UDP_LIMIT`] when the query carries no valid OPT record. Go's
+/// `getEDNSBufferSize` plus the `hasEDNS` branch of `checkResponseSizeAndSetTC`.
 fn client_udp_limit(query: &[u8]) -> usize {
-    edns_udp_payload_size(query).map_or(NO_EDNS_UDP_LIMIT, |size| size.max(NO_EDNS_UDP_LIMIT))
+    find_opt_record(query).map_or(NO_EDNS_UDP_LIMIT, usize::from)
 }
 
-/// Return the requestor's UDP payload size from `query`'s EDNS(0) OPT record, or [`None`] when there
-/// is no OPT record in the additional section (or the message cannot be walked — a malformed query
-/// falls back to the conservative no-EDNS limit, never to a larger one).
+/// Return the requestor's UDP payload size from `query`'s EDNS(0) OPT record, or [`None`] when the
+/// message carries no OPT record this node will act on.
 ///
-/// Walks the question, answer and authority sections to reach the additional section, over the same
-/// label sequences [`question_range`] walks — generalised by [`skip_name`] to also step over a
-/// compression pointer, which is legal in a resource record's name and illegal in a question's.
-/// Only the *first* OPT record is consulted; a second one is illegal (RFC 6891 §6.1.1) and we do
-/// not need to reject it here — the query is forwarded verbatim, so the upstream will.
-fn edns_udp_payload_size(query: &[u8]) -> Option<usize> {
-    if query.len() < DNS_HEADER_LEN {
+/// A direct port of Go's `findOPTRecord` (net/dns/resolver/forwarder.go @
+/// 9ea7cba44591e0cd840c6c94d23274dd222059bf), and deliberately as narrow as it is: the OPT record
+/// must occupy the **final 11 bytes** of the message, and it must have a root NAME, TYPE `OPT`,
+/// EDNS version 0 and `RDLEN == 0`. Upstream states the restriction outright — "Only OPT records at
+/// the very end of the message with no option codes are addressed" — and everything else is
+/// `(0, nil)`, i.e. *no EDNS*, i.e. the 512-byte RFC 1035 limit.
+///
+/// That matters far more often than "malformed query" suggests. A query carrying **any** EDNS
+/// option — a DNS cookie (RFC 7873) or EDNS Client Subnet, both of which real stub resolvers send
+/// routinely — has `RDLEN != 0`, so upstream ignores the 4096 it advertises and caps the answer at
+/// 512. Walking the additional section properly and honouring that 4096 would leave `TC` clear on a
+/// 900-byte reply that every Go node on the tailnet marks truncated, and the two nodes would hand
+/// the same stub resolver different answers to the same question. Being generous here is the bug.
+fn find_opt_record(packet: &[u8]) -> Option<u16> {
+    /// The only EDNS version defined (RFC 6891 §6.1.3). Go: "Be conservative and don't touch
+    /// unknown versions."
+    const EDNS0_VERSION: u8 = 0;
+
+    if packet.len() < DNS_HEADER_LEN + OPT_FIXED_BYTES {
         return None;
     }
-    let count = |at: usize| u16::from_be_bytes([query[at], query[at + 1]]) as usize;
-    let (qdcount, ancount, nscount, arcount) = (count(4), count(6), count(8), count(10));
-
-    let mut off = DNS_HEADER_LEN;
-    for _ in 0..qdcount {
-        // QNAME then QTYPE (2) + QCLASS (2).
-        off = skip_name(query, off)?.checked_add(4)?;
-        if off > query.len() {
-            return None;
-        }
-    }
-    for _ in 0..(ancount + nscount) {
-        off = skip_rr_fields(query, skip_name(query, off)?)?;
-    }
-    for _ in 0..arcount {
-        let fields = skip_name(query, off)?;
-        let class_end = fields.checked_add(4)?;
-        if class_end > query.len() {
-            return None;
-        }
-        if u16::from_be_bytes([query[fields], query[fields + 1]]) == OPT_RR_TYPE {
-            // OPT repurposes CLASS as the requestor's UDP payload size (RFC 6891 §6.1.2).
-            return Some(u16::from_be_bytes([query[fields + 2], query[fields + 3]]) as usize);
-        }
-        off = skip_rr_fields(query, fields)?;
-    }
-    None
-}
-
-/// Advance past the DNS name starting at `off`, returning the offset just past it. Handles both an
-/// uncompressed label sequence and a compression pointer (which is two bytes and ends the name,
-/// RFC 1035 §4.1.4 — we never need to follow it, only to step over it). [`None`] on a reserved
-/// label type or a name that runs past the buffer.
-fn skip_name(msg: &[u8], mut off: usize) -> Option<usize> {
-    loop {
-        let len = *msg.get(off)? as usize;
-        match len & 0xC0 {
-            0x00 => {
-                off += 1;
-                if len == 0 {
-                    return Some(off); // root label: the name is complete.
-                }
-                off = off.checked_add(len)?;
-                if off > msg.len() {
-                    return None;
-                }
-            }
-            0xC0 => return off.checked_add(2).filter(|end| *end <= msg.len()),
-            // 0x40 and 0x80 are reserved label types (RFC 6891 §6.1.1 forbids them on the wire).
-            _ => return None,
-        }
-    }
-}
-
-/// Advance past a resource record's fixed fields (TYPE 2, CLASS 2, TTL 4, RDLENGTH 2) and its
-/// RDATA, given `off` — the offset just past that record's NAME. [`None`] if any of it runs past
-/// the buffer.
-fn skip_rr_fields(msg: &[u8], off: usize) -> Option<usize> {
-    let rdlength_at = off.checked_add(8)?;
-    let rdata_at = rdlength_at.checked_add(2)?;
-    if rdata_at > msg.len() {
+    // OPT lives in the additional section, so no additional records means no OPT.
+    if u16::from_be_bytes([packet[10], packet[11]]) == 0 {
         return None;
     }
-    let rdlength = u16::from_be_bytes([msg[rdlength_at], msg[rdlength_at + 1]]) as usize;
-    rdata_at
-        .checked_add(rdlength)
-        .filter(|end| *end <= msg.len())
+
+    let opt = &packet[packet.len() - OPT_FIXED_BYTES..];
+    if opt[0] != 0 {
+        return None; // NAME must be the root domain (a single zero byte).
+    }
+    if u16::from_be_bytes([opt[1], opt[2]]) != OPT_RR_TYPE {
+        return None;
+    }
+    // CLASS is repurposed as the requestor's UDP payload size (RFC 6891 §6.1.2).
+    let requested_size = u16::from_be_bytes([opt[3], opt[4]]);
+    // opt[5] is the extended RCODE: ignored, as upstream ignores it.
+    if opt[6] != EDNS0_VERSION {
+        return None;
+    }
+    // opt[7..9] are the EDNS flags (DO bit and friends): ignored.
+    if u16::from_be_bytes([opt[9], opt[10]]) != 0 {
+        return None; // RDLEN must be 0 — the record carries no options.
+    }
+    Some(requested_size)
 }
 
 /// The byte length of a fixed DNS header.
@@ -1103,6 +1086,11 @@ async fn serve(
             // Malformed query: drop silently.
             None => continue,
             Some(Decision::Reply(resp)) => {
+                // Upstream runs the same size check on a locally-composed answer as on a forwarded
+                // one (Go `Resolver.Query` calls `checkResponseSizeAndSetTC` right after `respond`).
+                // An authoritative answer is capped at 512 bytes, but a client that advertised less
+                // than that is still owed the `TC` bit.
+                let resp = check_response_size_and_set_tc(&buf, resp, ClientTransport::Udp);
                 if let Err(e) = socket.send_to(src, &resp).await {
                     tracing::warn!(error = %e, %src, "magic dns response send failed");
                 }
@@ -1342,7 +1330,10 @@ impl Message<Query> for MagicDnsActor {
             // silently drops here (the on-wire client times out); a programmatic caller gets a
             // definite, honest error instead.
             None => (servfail_response(), Vec::new()),
-            Some(Decision::Reply(resp)) => (resp, Vec::new()),
+            Some(Decision::Reply(resp)) => (
+                check_response_size_and_set_tc(&buf, resp, ClientTransport::Udp),
+                Vec::new(),
+            ),
             Some(Decision::Forward {
                 upstreams,
                 query,
@@ -1543,8 +1534,9 @@ mod tests {
         buf
     }
 
-    /// `build_query` plus an EDNS(0) OPT record in the additional section advertising `udp_size`
-    /// as the requestor's UDP payload size (RFC 6891: root NAME, TYPE 41, CLASS = the size).
+    /// `build_query` plus an EDNS(0) OPT record in the additional section advertising `udp_size` as
+    /// the requestor's UDP payload size (RFC 6891: root NAME, TYPE 41, CLASS = the size), in the
+    /// only shape Go's `findOPTRecord` accepts: last record in the message, version 0, `RDLEN` 0.
     fn build_edns_query(
         id: u16,
         labels: &[&str],
@@ -1559,6 +1551,27 @@ mod tests {
         buf.extend_from_slice(&udp_size.to_be_bytes()); // CLASS: requestor's UDP payload size
         buf.extend_from_slice(&0u32.to_be_bytes()); // TTL: extended rcode + flags
         buf.extend_from_slice(&0u16.to_be_bytes()); // RDLENGTH: no options
+        buf
+    }
+
+    /// Like [`build_edns_query`] but with one EDNS option in the OPT record's RDATA, so `RDLEN` is
+    /// non-zero — the shape a stub resolver sending a DNS cookie (option code 10) produces.
+    fn build_edns_query_with_option(
+        id: u16,
+        labels: &[&str],
+        qtype: u16,
+        qclass: u16,
+        udp_size: u16,
+        option_code: u16,
+        option_data: &[u8],
+    ) -> Vec<u8> {
+        let mut buf = build_edns_query(id, labels, qtype, qclass, udp_size);
+        let rdata_len = 4 + option_data.len();
+        let rdlength_at = buf.len() - 2;
+        buf[rdlength_at..].copy_from_slice(&(rdata_len as u16).to_be_bytes());
+        buf.extend_from_slice(&option_code.to_be_bytes());
+        buf.extend_from_slice(&(option_data.len() as u16).to_be_bytes());
+        buf.extend_from_slice(option_data);
         buf
     }
 
@@ -2726,6 +2739,10 @@ mod tests {
         assert_eq!(out[2] & 0x02, 0, "TC must stay clear");
     }
 
+    /// Go's `findOPTRecord` accepts an OPT record only in the final 11 bytes of the message, with a
+    /// root NAME, EDNS version 0 and `RDLEN == 0`; anything else is "no EDNS", i.e. the 512-byte
+    /// RFC 1035 limit. Every rejection below is a case where a laxer reader would honour a large
+    /// advertised buffer and leave `TC` clear on an answer a Go node marks truncated.
     #[test]
     fn client_udp_limit_reads_the_opt_record() {
         // No OPT record => the RFC 1035 512-byte limit.
@@ -2736,24 +2753,116 @@ mod tests {
         let edns = build_edns_query(0x403, &["example", "com"], 1, 1, 1232);
         assert_eq!(client_udp_limit(&edns), 1232);
 
-        // RFC 6891 6.2.3: a value below 512 is treated as 512, never as a smaller limit.
+        // A value below 512 is taken verbatim. RFC 6891 6.2.3 would floor it at 512, but Go does
+        // not (`maxSize = int(ednsSize)`), so a Rust node that did would leave `TC` clear where a
+        // Go node on the same tailnet sets it.
         let tiny = build_edns_query(0x404, &["example", "com"], 1, 1, 64);
-        assert_eq!(client_udp_limit(&tiny), NO_EDNS_UDP_LIMIT);
+        assert_eq!(client_udp_limit(&tiny), 64);
 
-        // A non-OPT record ahead of the OPT one in the additional section is stepped over, not
-        // mistaken for it.
-        let mut two_rrs = build_edns_query(0x405, &["example", "com"], 1, 1, 2048);
-        let opt = two_rrs.split_off(two_rrs.len() - 11);
-        // A 1-byte-RDATA TXT (type 16) record for the root name, spliced in before the OPT.
-        two_rrs.extend_from_slice(&[0, 0, 16, 0, 1, 0, 0, 0, 0, 0, 1, 0]);
-        two_rrs.extend_from_slice(&opt);
-        two_rrs[11] = 2; // ARCOUNT = 2
-        assert_eq!(client_udp_limit(&two_rrs), 2048);
+        // An OPT record that is not the last record in the message is not read at all: upstream
+        // only ever looks at the final 11 bytes.
+        let mut trailing_rr = build_edns_query(0x405, &["example", "com"], 1, 1, 2048);
+        // A 1-byte-RDATA TXT (type 16) record for the root name, appended after the OPT.
+        trailing_rr.extend_from_slice(&[0, 0, 16, 0, 1, 0, 0, 0, 0, 0, 1, 0]);
+        trailing_rr[11] = 2; // ARCOUNT = 2
+        assert_eq!(client_udp_limit(&trailing_rr), NO_EDNS_UDP_LIMIT);
 
-        // A truncated / unwalkable message falls back to the conservative limit, never a larger one.
-        let mut chopped = build_edns_query(0x406, &["example", "com"], 1, 1, 4096);
+        // An OPT record carrying options — a DNS cookie, EDNS Client Subnet — has RDLEN != 0 and is
+        // rejected. This is the common case, not a corner: stub resolvers send cookies routinely.
+        let cookie =
+            build_edns_query_with_option(0x406, &["example", "com"], 1, 1, 4096, 10, &[0; 8]);
+        assert_eq!(client_udp_limit(&cookie), NO_EDNS_UDP_LIMIT);
+
+        // An unknown EDNS version is left alone rather than guessed at.
+        let mut future_version = build_edns_query(0x407, &["example", "com"], 1, 1, 4096);
+        let ttl_at = future_version.len() - 6; // TTL = extended RCODE (1) | VERSION (1) | flags (2)
+        future_version[ttl_at + 1] = 1; // EDNS version 1
+        assert_eq!(client_udp_limit(&future_version), NO_EDNS_UDP_LIMIT);
+
+        // A non-root OPT NAME is rejected.
+        let mut named = build_edns_query(0x408, &["example", "com"], 1, 1, 4096);
+        let name_at = named.len() - 11;
+        named[name_at] = 0xC0; // a compression pointer where the root label must be
+        assert_eq!(client_udp_limit(&named), NO_EDNS_UDP_LIMIT);
+
+        // ARCOUNT == 0 means there is no additional section to hold an OPT, whatever the trailing
+        // bytes happen to look like.
+        let mut no_ar = build_edns_query(0x409, &["example", "com"], 1, 1, 4096);
+        no_ar[11] = 0;
+        assert_eq!(client_udp_limit(&no_ar), NO_EDNS_UDP_LIMIT);
+
+        // A truncated message falls back to the conservative limit, never a larger one.
+        let mut chopped = build_edns_query(0x40A, &["example", "com"], 1, 1, 4096);
         chopped.truncate(chopped.len() - 8);
         assert_eq!(client_udp_limit(&chopped), NO_EDNS_UDP_LIMIT);
+    }
+
+    /// The whole point of the narrow OPT reader, end to end: a stub resolver that advertises 4096
+    /// **and** sends a DNS cookie is capped at 512, so the 900-byte forwarded reply comes back with
+    /// `TC` set. A reader that walked the additional section properly would honour the 4096 and
+    /// leave `TC` clear — which is the answer no Go node on the tailnet would have produced.
+    #[test]
+    fn an_opt_record_carrying_options_is_not_honoured() {
+        let query =
+            build_edns_query_with_option(0x40B, &["example", "com"], 1, 1, 4096, 10, &[0; 8]);
+        let mut reply = query.clone();
+        reply[2] |= 0x80; // QR=1
+        reply.resize(900, 0xAB);
+
+        let out = cap_response(&query, reply, ClientTransport::Udp);
+        assert_ne!(
+            out[2] & 0x02,
+            0,
+            "an OPT record with options is no EDNS at all upstream: the 512-byte limit applies"
+        );
+        assert_eq!(out.len(), 900, "the body is left intact, not chopped");
+    }
+
+    /// An advertised size below 512 is honoured as-is. Go floors nothing: `maxSize = int(ednsSize)`
+    /// whenever an OPT record is present, and only a request with no OPT record falls back to 512.
+    #[test]
+    fn an_advertised_size_below_512_is_not_floored() {
+        let query = build_edns_query(0x40C, &["example", "com"], 1, 1, 200);
+        let mut reply = query.clone();
+        reply[2] |= 0x80; // QR=1
+        reply.resize(300, 0xAB);
+
+        let out = cap_response(&query, reply, ClientTransport::Udp);
+        assert_ne!(
+            out[2] & 0x02,
+            0,
+            "300 bytes overflows the 200 the client asked for, so TC is set"
+        );
+        assert_eq!(out.len(), 300, "the body is left intact, not chopped");
+    }
+
+    /// Upstream runs the size check on answers the resolver builds itself, not only on forwarded
+    /// ones (`Resolver.Query` calls `checkResponseSizeAndSetTC` right after `respond` succeeds). An
+    /// authoritative answer is capped at 512 bytes, which says nothing about a client that
+    /// advertised less than that.
+    #[test]
+    fn an_authoritative_answer_over_the_advertised_size_is_marked() {
+        let view = view_with_peer();
+        let buf = build_edns_query(0x40D, &["host", "user", "ts", "net"], 1, 1, 20);
+
+        let resp = answer(&view, &buf).expect("answers");
+        assert!(
+            resp.len() > 20,
+            "the fixture only works if the answer overflows the advertised 20 bytes"
+        );
+
+        let marked = check_response_size_and_set_tc(&buf, resp.clone(), ClientTransport::Udp);
+        assert_ne!(
+            marked[2] & 0x02,
+            0,
+            "an answer we composed ourselves can still overflow a small advertised buffer"
+        );
+        assert_eq!(marked.len(), resp.len(), "the body is left intact");
+        assert_eq!(
+            marked[3..],
+            resp[3..],
+            "only the flags byte carrying TC may differ"
+        );
     }
 
     #[test]
@@ -3157,8 +3266,9 @@ mod tests {
     }
 
     /// An authoritative negative answer with its SOA attached must still fit the classic 512-byte
-    /// UDP limit, so the forwarded-path client-limit check leaves TC clear on it. That check floors
-    /// the client's limit at 512, so this holds for a plain query and an EDNS one alike.
+    /// UDP limit, so the client-limit check leaves TC clear on it for a client that advertised no
+    /// EDNS buffer. (A client that advertises *less* than 512 is a different case and is marked —
+    /// see `an_authoritative_answer_over_the_advertised_size_is_marked`.)
     #[test]
     fn nxdomain_with_soa_stays_within_the_client_udp_limit() {
         let view = view_with_peer();
@@ -3169,7 +3279,7 @@ mod tests {
         assert_eq!(nscount(&resp), 1, "the SOA fits beside this question");
         assert!(resp.len() <= 512, "still one classic UDP datagram");
 
-        let marked = set_tc_if_over_client_limit(&buf, resp.clone());
+        let marked = check_response_size_and_set_tc(&buf, resp.clone(), ClientTransport::Udp);
         assert_eq!(marked, resp, "nothing to mark: an authoritative reply fits");
         assert_eq!(
             u16::from_be_bytes([marked[2], marked[3]]) & 0x0200,
@@ -3195,7 +3305,7 @@ mod tests {
         assert_eq!(parse_header(&resp).1, 3, "NXDOMAIN");
         assert_eq!(nscount(&resp), 0, "the SOA did not fit and was dropped");
         assert!(resp.len() <= 512, "response stays within the UDP limit");
-        let marked = set_tc_if_over_client_limit(&buf, resp.clone());
+        let marked = check_response_size_and_set_tc(&buf, resp.clone(), ClientTransport::Udp);
         assert_eq!(
             u16::from_be_bytes([marked[2], marked[3]]) & 0x0200,
             0,
