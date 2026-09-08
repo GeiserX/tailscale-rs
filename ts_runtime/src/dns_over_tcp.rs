@@ -202,9 +202,10 @@ where
         };
 
         // A response that cannot carry a length prefix cannot be sent at all. `decide` builds
-        // authoritative answers well under this and a forwarded one is capped far below it, so this
-        // is unreachable in practice — but truncating the *prefix* would frame the stream wrong for
-        // every later query, so close instead.
+        // authoritative answers well under this, a UDP-forwarded one is capped far below it, and a
+        // DoH-delegated one is capped at exactly 65,535 (`peerapi_doh::MAX_CLIENT_RESPONSE`), so
+        // this is unreachable — but truncating the *prefix* would frame the stream wrong for every
+        // later query, so close instead.
         let Ok(response_len) = u16::try_from(response.len()) else {
             tracing::warn!(
                 len = response.len(),
