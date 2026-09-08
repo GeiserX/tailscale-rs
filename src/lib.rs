@@ -153,6 +153,11 @@ pub use secrecy::SecretString;
 pub use ts_control::ExitNodeSelector;
 #[doc(inline)]
 pub use ts_control::Node as NodeInfo;
+// Re-exported so an embedder authorising an inbound connection on `WhoIs::user_profile` can name
+// the profile type — and match on its `groups` — through the `tailscale` facade alone, without
+// taking a direct dependency on `ts_control`.
+#[doc(inline)]
+pub use ts_control::UserProfile;
 #[doc(inline)]
 pub use ts_control::tls::{CertifiedKey, TlsAcceptor, TlsStream};
 #[doc(inline)]
@@ -1388,6 +1393,11 @@ impl Device {
     ///
     /// Only the IP of `addr` is used; the port is ignored. Returns `Ok(None)` if no tailnet node
     /// owns that address.
+    ///
+    /// This is how an application authorises an inbound tailnet connection by who opened it. The
+    /// result carries the owning user's whole profile ([`WhoIs::user_profile`]), including the
+    /// group membership control reported ([`WhoIs::user_groups`]) — the one owner attribute the
+    /// node cannot re-derive from the rest of the netmap.
     pub async fn whois(&self, addr: SocketAddr) -> Result<Option<WhoIs>, Error> {
         self.runtime.whois(addr).await.map_err(Into::into)
     }

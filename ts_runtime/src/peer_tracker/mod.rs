@@ -253,18 +253,33 @@ impl PeerTracker {
     fn whois_opt(&self, addr: std::net::SocketAddr) -> Option<crate::status::WhoIs> {
         let ip = crate::status::whois_addr(addr);
         let node = self.peer_by_tailnet_ip_opt(ip).cloned()?;
-        // Join the node's owning user id against the accumulated UserProfiles table to resolve a
-        // login/display name. `None` when control sent no profile for that user (e.g. tagged nodes
-        // with no human owner, or a profile not yet delivered).
-        let user = self.resolve_user(node.user_id);
-        Some(crate::status::WhoIs::from_node_with_user(node, user))
+        // Join the node's owning user id against the accumulated UserProfiles table. `None` when
+        // control sent no profile for that user (e.g. tagged nodes with no human owner, or a
+        // profile not yet delivered). The whole profile is handed over, not a flattened label:
+        // `WhoIs` is what an embedder authorises on, and `UserProfile::groups` is the only owner
+        // attribute it cannot re-derive from the netmap itself.
+        let user_profile = self.resolve_user_profile(node.user_id);
+        Some(crate::status::WhoIs::from_node_with_profile(
+            node,
+            user_profile,
+        ))
     }
 
-    /// Resolve a user id to its best display label from the accumulated profile table.
-    fn resolve_user(&self, user_id: UserId) -> Option<String> {
-        self.user_profiles
-            .get(&user_id)
-            .and_then(UserProfile::best_label)
+    /// Merge a response's `MapResponse.UserProfiles` into the accumulated table, keyed by user id.
+    ///
+    /// Control sends profiles incrementally — only new or changed ones per response — so this
+    /// **accumulates**: a profile already held for a user id that this response does not restate
+    /// stays, and one it does restate is replaced wholesale (control's newer copy wins, including
+    /// a group list that shrank).
+    fn accumulate_user_profiles(&mut self, profiles: &[UserProfile]) {
+        for profile in profiles {
+            self.user_profiles.insert(profile.id, profile.clone());
+        }
+    }
+
+    /// Resolve a user id to its profile from the accumulated profile table.
+    fn resolve_user_profile(&self, user_id: UserId) -> Option<UserProfile> {
+        self.user_profiles.get(&user_id).cloned()
     }
 
     /// Whether `node` may be admitted to the peer db under Tailnet Lock, matching Go
@@ -803,9 +818,7 @@ impl Message<Arc<ts_control::StateUpdate>> for PeerTracker {
         // Accumulate user profiles first — control sends them incrementally and a response may
         // carry profiles with no peer delta (or peers that reference a profile from an earlier
         // response), so this must happen before the no-peer-update early return below.
-        for profile in &msg.user_profiles {
-            self.user_profiles.insert(profile.id, profile.clone());
-        }
+        self.accumulate_user_profiles(&msg.user_profiles);
 
         // Apply the standalone online/last-seen delta maps (channels C/D, `MapResponse.OnlineChange`
         // / `PeerSeenChange`). These arrive keyed by control node id and may ride a response that
@@ -2906,14 +2919,15 @@ pub(crate) mod tka_tests {
     }
 
     /// A node's `user_id` joins against the accumulated UserProfiles table to resolve the owning
-    /// user's login name in `WhoIs.user`. With no matching profile, `user` is `None` (the
-    /// pre-existing behavior); once a profile arrives, the same node resolves to its login. This
+    /// user's profile in `WhoIs.user_profile`. With no matching profile, it is `None` (the
+    /// pre-existing behavior); once a profile arrives, the same node resolves to it. This
     /// proves the accumulate-then-join path the netmap handler builds.
     fn profile(id: ts_control::UserId, login: &str) -> ts_control::UserProfile {
         ts_control::UserProfile {
             id,
             login_name: login.to_string(),
             display_name: None,
+            groups: Vec::new(),
         }
     }
 
@@ -2929,13 +2943,14 @@ pub(crate) mod tka_tests {
 
         // No profile yet: the node resolves but its owner is unknown.
         let who = tracker.whois_opt(addr).expect("peer is known");
-        assert_eq!(who.user, None);
+        assert_eq!(who.user_profile, None);
+        assert_eq!(who.user(), None);
 
         // Profile for a DIFFERENT user must not match.
         tracker
             .user_profiles
             .insert(7, profile(7, "someone-else@example.com"));
-        assert_eq!(tracker.whois_opt(addr).unwrap().user, None);
+        assert_eq!(tracker.whois_opt(addr).unwrap().user(), None);
 
         // The owning user's profile arrives (as the netmap handler would accumulate it): now the
         // login resolves.
@@ -2943,9 +2958,135 @@ pub(crate) mod tka_tests {
             .user_profiles
             .insert(42, profile(42, "alice@example.com"));
         assert_eq!(
-            tracker.whois_opt(addr).unwrap().user,
+            tracker.whois_opt(addr).unwrap().user(),
             Some("alice@example.com".to_string())
         );
+    }
+
+    /// The whole carry, end to end: a real `MapResponse` body — the JSON control writes on the map
+    /// poll — decoded by the production wire types and the production `From` impls, accumulated by
+    /// the production profile merge, and read back out of `whois`.
+    ///
+    /// `Groups` is why `WhoIs` carries the profile rather than one display label: it is the only
+    /// attribute of an owning user that a node cannot re-derive from anything else in the netmap,
+    /// so an embedder authorising an inbound connection on group membership has no other source
+    /// for it. Every hop here is production code; the only thing the test assembles is the
+    /// `StateUpdate` struct itself (`ts_control`'s frame decode is not public, and its own tests
+    /// pin the body-to-`StateUpdate` half).
+    fn state_update_from_body(body: &str) -> ts_control::StateUpdate {
+        let wire: ts_control_serde::MapResponse<'_> =
+            serde_json::from_str(body).expect("a real MapResponse body decodes");
+        let peers = wire
+            .peers
+            .as_ref()
+            .expect("the fixture carries a full peer set")
+            .iter()
+            .map(ts_control::Node::from)
+            .collect();
+        ts_control::StateUpdate {
+            user_profiles: wire
+                .user_profiles
+                .iter()
+                .map(ts_control::UserProfile::from)
+                .collect(),
+            ..netmap_with_peers(peers)
+        }
+    }
+
+    /// The body control sends for a tailnet with one peer owned by user 42, whose profile carries
+    /// `Groups`. `groups` is spliced in so the present and absent cases share one fixture.
+    fn netmap_body_with_profile_groups(groups: &str) -> String {
+        format!(
+            r#"{{
+                "MapSessionHandle": "sess-1",
+                "Seq": 9,
+                "Peers": [{{
+                    "ID": 2,
+                    "StableID": "peer-2",
+                    "Name": "peer.example.ts.net.",
+                    "Addresses": ["100.64.0.1/32", "fd7a:115c:a1e0::1/128"],
+                    "User": 42
+                }}],
+                "UserProfiles": [{{
+                    "ID": 42,
+                    "LoginName": "alice@example.com",
+                    "DisplayName": "Alice Smith"{groups}
+                }}]
+            }}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn whois_carries_user_groups_from_a_real_map_response() {
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
+        let update = state_update_from_body(&netmap_body_with_profile_groups(
+            r#", "Groups": ["engineering@example.com", "group:eng"]"#,
+        ));
+
+        tracker.accumulate_user_profiles(&update.user_profiles);
+        tracker.apply_peer_update(update.peer_update.as_ref().expect("a full peer set"));
+
+        let who = tracker
+            .whois_opt("100.64.0.1:0".parse().unwrap())
+            .expect("the peer owns that address");
+
+        let profile = who.user_profile.as_ref().expect("user 42's profile");
+        assert_eq!(profile.id, 42);
+        assert_eq!(profile.login_name, "alice@example.com");
+        assert_eq!(profile.display_name.as_deref(), Some("Alice Smith"));
+        assert_eq!(
+            who.user_groups(),
+            ["engineering@example.com", "group:eng"],
+            "the groups control reported reach the embedder in the order control sent them"
+        );
+        // The flattened label the pre-widening `WhoIs.user` field carried is unchanged.
+        assert_eq!(who.user(), Some("alice@example.com".to_string()));
+    }
+
+    /// The absent case, which is what every control server that does not send the field looks
+    /// like: no `Groups` key at all. That must yield a profile with an EMPTY group list — never a
+    /// missing profile, and never a failed decode that would drop the owner identity entirely.
+    #[tokio::test]
+    async fn a_map_response_without_groups_yields_an_empty_group_list() {
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
+        let update = state_update_from_body(&netmap_body_with_profile_groups(""));
+
+        tracker.accumulate_user_profiles(&update.user_profiles);
+        tracker.apply_peer_update(update.peer_update.as_ref().expect("a full peer set"));
+
+        let who = tracker
+            .whois_opt("100.64.0.1:0".parse().unwrap())
+            .expect("the peer owns that address");
+
+        assert!(
+            who.user_profile.is_some(),
+            "an omitted Groups must not cost us the profile"
+        );
+        assert_eq!(who.user(), Some("alice@example.com".to_string()));
+        assert!(who.user_groups().is_empty());
+    }
+
+    /// Control sends profiles incrementally, so a later response restating user 42 replaces the
+    /// held copy wholesale — including a group list that SHRANK. A membership control has revoked
+    /// must stop being reported, or an embedder authorising on it keeps honouring it forever.
+    #[tokio::test]
+    async fn a_restated_profile_replaces_the_held_group_list() {
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
+        let first = state_update_from_body(&netmap_body_with_profile_groups(
+            r#", "Groups": ["group:eng", "group:oncall"]"#,
+        ));
+        tracker.accumulate_user_profiles(&first.user_profiles);
+        tracker.apply_peer_update(first.peer_update.as_ref().expect("a full peer set"));
+
+        let second = state_update_from_body(&netmap_body_with_profile_groups(
+            r#", "Groups": ["group:eng"]"#,
+        ));
+        tracker.accumulate_user_profiles(&second.user_profiles);
+
+        let who = tracker
+            .whois_opt("100.64.0.1:0".parse().unwrap())
+            .expect("the peer owns that address");
+        assert_eq!(who.user_groups(), ["group:eng"]);
     }
 
     /// `UserProfile::best_label` prefers the login name, falling back to display name, else `None`.
@@ -2959,12 +3100,14 @@ pub(crate) mod tka_tests {
             id: 2,
             login_name: String::new(),
             display_name: Some("Bob".to_string()),
+            groups: Vec::new(),
         };
         assert_eq!(display_only.best_label(), Some("Bob".to_string()));
         let empty = ts_control::UserProfile {
             id: 3,
             login_name: String::new(),
             display_name: None,
+            groups: Vec::new(),
         };
         assert_eq!(empty.best_label(), None);
     }

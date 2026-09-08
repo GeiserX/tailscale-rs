@@ -93,6 +93,11 @@ acme = ["ts_control/acme"]
 
 [dev-dependencies]
 proptest = "1.11"
+# Test-only: decode a real `MapResponse` JSON body so the WhoIs user-profile tests start from the
+# bytes control sends rather than from a hand-built domain struct. `ts_control` already depends on
+# it, so this pulls in no new crate.
+ts_control_serde.workspace = true
+serde_json.workspace = true
 itertools = "0.14"
 # Test-only: sign the TKA node-key-signature fixtures the peer_tracker TKA enforcement tests verify
 # against (mirrors how `ts_tka`'s own unit tests build a valid signature). Not on any egress path.

@@ -75,10 +75,13 @@ impl From<&tailscale::Status> for Status {
 pub struct WhoIs {
     /// The node that owns the queried source IP.
     pub node: NodeInfo,
-    /// The login/email of the user that owns the node, if known (always `None` in this fork).
+    /// The login/email of the user that owns the node, if control sent a profile for it.
     pub user: Option<String>,
-    /// The node's capability map, as a list of `(capability, args)` tuples (always empty in this
-    /// fork).
+    /// The groups control reported for the owning user (SCIM groups such as
+    /// `engineering@example.com`, or policy-document names such as `group:eng`). Empty when
+    /// control reported none — which is not a proof of non-membership, so fail closed on it.
+    pub groups: Vec<String>,
+    /// The node's capability map, as a list of `(capability, args)` tuples.
     pub capabilities: Vec<(String, Vec<String>)>,
 }
 
@@ -86,7 +89,8 @@ impl From<&tailscale::WhoIs> for WhoIs {
     fn from(value: &tailscale::WhoIs) -> Self {
         Self {
             node: NodeInfo::from(&value.node),
-            user: value.user.clone(),
+            user: value.user(),
+            groups: value.user_groups().to_vec(),
             capabilities: value.capabilities.clone(),
         }
     }
