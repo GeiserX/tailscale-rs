@@ -2,6 +2,14 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.47.10](https://github.com/GeiserX/tailscale-rs/compare/v0.47.9...v0.47.10) (2026-09-08)
+
+
+### Bug Fixes
+
+* **dataplane:** filter SCTP on the port it carries, not on port 0 ([#393](https://github.com/GeiserX/tailscale-rs/issues/393)) ([1ab7640](https://github.com/GeiserX/tailscale-rs/commit/1ab76402dc744ff4f3eb9c0119cd361c69d5e1d6))
+* **dataplane:** stop a prepended IPv6 header choosing which rule matches ([#390](https://github.com/GeiserX/tailscale-rs/issues/390)) ([a8e6985](https://github.com/GeiserX/tailscale-rs/commit/a8e69852696d3b76f8e0e15966c594f022915f63))
+
 ## [0.47.9](https://github.com/GeiserX/tailscale-rs/compare/v0.47.8...v0.47.9) (2026-09-07)
 
 
