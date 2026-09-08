@@ -969,9 +969,14 @@ impl From<&ts_control_serde::PeerChange<'_>> for PeerChange {
     }
 }
 
-/// Display-friendly identity for the user that owns a [`Node`], resolved from the netmap's
-/// `UserProfiles` table (Go `tailcfg.UserProfile`). Owned counterpart of the borrow-bound
+/// Identity of the user that owns a [`Node`], resolved from the netmap's `UserProfiles` table
+/// (Go `tailcfg.UserProfile`). Owned counterpart of the borrow-bound
 /// [`ts_control_serde::UserProfile`]. Keyed by [`UserProfile::id`] (== [`Node::user_id`]).
+///
+/// Mostly display-friendly text ([`login_name`](Self::login_name),
+/// [`display_name`](Self::display_name)), plus [`groups`](Self::groups) — the one attribute here an
+/// embedder can *authorise* on, because it is the one a node cannot re-derive from anything else
+/// control sends.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserProfile {
     /// The integer id of the Tailscale user this profile describes (matches [`Node::user_id`]).
@@ -981,6 +986,16 @@ pub struct UserProfile {
     pub login_name: String,
     /// The user's display name (e.g. `Alice Smith`), if the IdP provided one.
     pub display_name: Option<String>,
+    /// The groups that contain this user and that the coordination server was configured to report
+    /// to this node (Go `tailcfg.UserProfile.Groups`): SCIM groups (e.g.
+    /// `engineering@example.com`) or tailnet-policy group names (e.g. `group:eng`).
+    ///
+    /// Carried in the order control sent it (control sorts it when it loads the profile from
+    /// storage). **Empty** when control reported no groups — including every control server older
+    /// than the field, which omits it entirely. An empty list therefore means "control told this
+    /// node nothing", not "this user is in no group": treat it as no grant, never as a denial you
+    /// can act on.
+    pub groups: Vec<String>,
 }
 
 impl From<&ts_control_serde::UserProfile<'_>> for UserProfile {
@@ -989,6 +1004,7 @@ impl From<&ts_control_serde::UserProfile<'_>> for UserProfile {
             id: value.id,
             login_name: value.login_name.to_string(),
             display_name: value.display_name.as_deref().map(str::to_string),
+            groups: value.groups.iter().map(|g| g.to_string()).collect(),
         }
     }
 }

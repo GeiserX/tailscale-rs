@@ -11,10 +11,12 @@
 //! - **Capabilities** — surfaced: [`WhoIs::capabilities`] is populated from the domain
 //!   [`Node`](ts_control::Node)'s `cap_map` (the control-pushed `CapMap`), which the domain model
 //!   retains.
-//! - **User (login/profile)** — surfaced when the netmap provided it: [`WhoIs::user`] is the owning
-//!   user's login/display name, resolved by joining the node's owning user id against the netmap's
-//!   `UserProfiles` table (accumulated by the [`PeerTracker`](crate::peer_tracker::PeerTracker)
-//!   across delta updates). `None` when control sent no profile for that user.
+//! - **User (login/profile)** — surfaced when the netmap provided it: [`WhoIs::user_profile`] is
+//!   the owning user's whole profile (login name, display name, group membership), resolved by
+//!   joining the node's owning user id against the netmap's `UserProfiles` table (accumulated by
+//!   the [`PeerTracker`](crate::peer_tracker::PeerTracker) across delta updates). `None` when
+//!   control sent no profile for that user. [`WhoIs::user`] flattens it to one display label and
+//!   [`WhoIs::user_groups`] reaches the groups an embedder authorises on.
 //! - **Online state** — surfaced: [`StatusNode::online`] / [`StatusNode::last_seen`] reflect the
 //!   domain [`Node`](ts_control::Node)'s retained `online`/`last_seen`, populated from the netmap
 //!   node and its online deltas (`PeerChange`, `MapResponse.online_change`/`peer_seen_change`).
@@ -25,7 +27,7 @@ use std::{
     net::{IpAddr, SocketAddr},
 };
 
-use ts_control::{Node, StableNodeId, UserId};
+use ts_control::{Node, StableNodeId, UserId, UserProfile};
 
 /// A snapshot of the local netmap: this node plus every known peer.
 ///
@@ -195,11 +197,15 @@ impl StatusNode {
 pub struct WhoIs {
     /// The node that owns the queried source IP.
     pub node: Node,
-    /// The login/email of the user that owns the node, if known.
+    /// The profile of the user that owns the node — Go `apitype.WhoIsResponse.UserProfile`.
     ///
-    /// Always `None` in this fork: the domain [`Node`] does not retain the
-    /// wire-level user/login mapping (see the module-level capability/user gap note).
-    pub user: Option<String>,
+    /// Resolved by joining the node's owning user id against the netmap's `UserProfiles` table
+    /// (accumulated by the [`PeerTracker`](crate::peer_tracker::PeerTracker) across delta updates).
+    /// `None` when control sent no profile for that user — a tagged node with no human owner, or a
+    /// profile not yet delivered. Carries the whole profile rather than one flattened label so an
+    /// embedder can authorise on [`UserProfile::groups`], which is the one owner attribute a node
+    /// cannot re-derive locally; [`user`](Self::user) is still there for the display case.
+    pub user_profile: Option<UserProfile>,
     /// The node's **node-level** capability map (Go `Node.CapMap` — node attributes like
     /// `can-funnel`), as `(capability, args)` pairs, populated from the domain
     /// [`Node`]'s `cap_map`, sorted by capability name. Distinct from
@@ -214,13 +220,13 @@ pub struct WhoIs {
 }
 
 impl WhoIs {
-    /// Build a [`WhoIs`] from the owning node and its resolved owner login/display name (if the
-    /// netmap's `UserProfiles` table mapped the node's owning user id to a profile; `None` when
-    /// control sent no profile — e.g. a tagged node with no human owner).
+    /// Build a [`WhoIs`] from the owning node and its resolved owner profile (if the netmap's
+    /// `UserProfiles` table mapped the node's owning user id to one; `None` when control sent no
+    /// profile — e.g. a tagged node with no human owner).
     ///
     /// `capabilities` is the node-level cap map; `cap_map` (the flow-scoped grants) is filled
     /// separately by [`Runtime::whois`](crate::Runtime::whois) and defaults to empty here.
-    pub(crate) fn from_node_with_user(node: Node, user: Option<String>) -> Self {
+    pub(crate) fn from_node_with_profile(node: Node, user_profile: Option<UserProfile>) -> Self {
         let capabilities = node
             .cap_map
             .iter()
@@ -228,10 +234,35 @@ impl WhoIs {
             .collect();
         Self {
             node,
-            user,
+            user_profile,
             capabilities,
             cap_map: BTreeMap::new(),
         }
+    }
+
+    /// The best human-facing label for the owning user: the profile's login name when present,
+    /// else its display name, else `None` (no profile, or a profile with neither).
+    ///
+    /// This is the flattened view [`user_profile`](Self::user_profile) replaced; use the profile
+    /// itself for anything but display.
+    pub fn user(&self) -> Option<String> {
+        self.user_profile.as_ref().and_then(UserProfile::best_label)
+    }
+
+    /// The groups control reported for the owning user — Go
+    /// `apitype.WhoIsResponse.UserProfile.Groups`. SCIM groups (e.g. `engineering@example.com`) or
+    /// tailnet-policy group names (e.g. `group:eng`).
+    ///
+    /// The authorisation shortcut: `whois.user_groups().iter().any(|g| g == "group:eng")`.
+    ///
+    /// **Empty** both when there is no profile at all and when control reported no groups — which
+    /// includes every control server that does not send the field. An empty list is therefore
+    /// "control told this node nothing", not a proof of non-membership: fail closed on it (deny),
+    /// never treat it as a negative assertion.
+    pub fn user_groups(&self) -> &[String] {
+        self.user_profile
+            .as_ref()
+            .map_or(&[], |profile| profile.groups.as_slice())
     }
 }
 
@@ -618,10 +649,12 @@ mod tests {
         // A node with no cap_map surfaces empty capabilities (not fabricated), and no user unless a
         // profile was joined in.
         let n = node("n1", "host", Some("ts.net"), "100.64.0.9");
-        let whois = WhoIs::from_node_with_user(n.clone(), None);
+        let whois = WhoIs::from_node_with_profile(n.clone(), None);
 
         assert_eq!(whois.node, n);
-        assert_eq!(whois.user, None);
+        assert_eq!(whois.user_profile, None);
+        assert_eq!(whois.user(), None);
+        assert!(whois.user_groups().is_empty());
         assert!(whois.capabilities.is_empty());
     }
 
@@ -635,7 +668,7 @@ mod tests {
             "cap/ssh".to_string(),
             vec!["root".to_string(), "ubuntu".to_string()],
         );
-        let whois = WhoIs::from_node_with_user(n, None);
+        let whois = WhoIs::from_node_with_profile(n, None);
 
         // BTreeMap iteration is sorted: "cap/ssh" < "https://…".
         assert_eq!(
@@ -651,16 +684,47 @@ mod tests {
     }
 
     #[test]
-    fn whois_from_node_with_user_sets_user_and_caps() {
+    fn whois_from_node_with_profile_sets_profile_and_caps() {
         let mut n = node("n1", "host", Some("ts.net"), "100.64.0.9");
         n.cap_map.insert("cap/x".to_string(), vec!["y".to_string()]);
-        let whois = WhoIs::from_node_with_user(n, Some("alice@example.com".to_string()));
+        let profile = UserProfile {
+            id: 42,
+            login_name: "alice@example.com".to_string(),
+            display_name: Some("Alice Smith".to_string()),
+            groups: vec!["group:eng".to_string(), "sre@example.com".to_string()],
+        };
+        let whois = WhoIs::from_node_with_profile(n, Some(profile.clone()));
 
-        assert_eq!(whois.user, Some("alice@example.com".to_string()));
+        assert_eq!(whois.user_profile, Some(profile));
+        // The flattened label the pre-widening `user` field carried is still what `user()` answers.
+        assert_eq!(whois.user(), Some("alice@example.com".to_string()));
+        assert_eq!(whois.user_groups(), ["group:eng", "sre@example.com"]);
         assert_eq!(
             whois.capabilities,
             vec![("cap/x".to_string(), vec!["y".to_string()])]
         );
+    }
+
+    /// A profile control sent with no `Groups` still resolves — the profile is present, the group
+    /// list is merely empty. The absent case must never collapse to "no profile", because an
+    /// embedder distinguishes "control named this owner but reported no groups" (deny, with a
+    /// known owner) from "control named no owner at all".
+    #[test]
+    fn whois_with_a_groupless_profile_keeps_the_profile_and_reports_no_groups() {
+        let n = node("n1", "host", Some("ts.net"), "100.64.0.9");
+        let whois = WhoIs::from_node_with_profile(
+            n,
+            Some(UserProfile {
+                id: 42,
+                login_name: "alice@example.com".to_string(),
+                display_name: None,
+                groups: Vec::new(),
+            }),
+        );
+
+        assert!(whois.user_profile.is_some(), "the profile itself survives");
+        assert_eq!(whois.user(), Some("alice@example.com".to_string()));
+        assert!(whois.user_groups().is_empty());
     }
 
     /// Build a peer with a reachable peerAPI on `ipv4`, owned by `user`.
