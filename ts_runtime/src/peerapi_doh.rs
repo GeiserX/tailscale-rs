@@ -86,8 +86,8 @@ use crate::magic_dns::{
 };
 
 /// Largest HTTP request (headers + body) we will read for one DoH query. A DNS message is at most
-/// 64 KiB, but a peerAPI DoH query is a single small question; cap well below that to bound memory
-/// and reject abuse. Anything larger is answered `413` and the connection closed.
+/// 65,535 bytes, but a peerAPI DoH query is a single small question; cap well below that to bound
+/// memory and reject abuse. Anything larger is answered `413` and the connection closed.
 const MAX_REQUEST: usize = 8 * 1024;
 
 /// How long the DoH *client* waits for the exit node to answer a delegated query before giving up
@@ -95,9 +95,13 @@ const MAX_REQUEST: usize = 8 * 1024;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Cap on a DoH response body we read into memory from the exit node. A delegated answer is one DNS
-/// message; cap it at the DNS-over-TCP max (64 KiB) so a misbehaving/hostile exit node can't make us
-/// allocate without bound. Anything past this is treated as a failure (NXDOMAIN).
-const MAX_CLIENT_RESPONSE: usize = 64 * 1024;
+/// message, and a DNS message is at most 65,535 bytes — that is all a DNS-over-TCP two-byte length
+/// prefix (RFC 1035 §4.2.2) can frame. Capping here bounds the allocation a misbehaving/hostile exit
+/// node can force *and* keeps every delegated answer relayable: a 65,536-byte body is not a DNS
+/// message we could ever put back on the wire to a TCP stub resolver, so it is rejected at the read
+/// rather than carried to [`crate::dns_over_tcp`] where the framing would fail and take the client's
+/// connection down with it. Anything past this is treated as a failure (the caller's `fallback`).
+const MAX_CLIENT_RESPONSE: usize = u16::MAX as usize;
 
 /// Delegate a recursive DNS `query` to an exit node's peerAPI DoH endpoint at `doh_addr`, over the
 /// overlay netstack `channel`. Returns the exit node's DNS answer bytes, or the caller-supplied
@@ -627,6 +631,29 @@ mod tests {
             MAX_CLIENT_RESPONSE + 1
         );
         assert!(parse_response_head(head.as_bytes()).is_err());
+    }
+
+    /// A DNS message is at most 65,535 bytes, because that is all a DNS-over-TCP length prefix can
+    /// frame. A 65,536-byte delegated body is therefore not a DNS message at all: accept it and
+    /// `dns_over_tcp::serve_conn` cannot put a `u16` prefix on it and drops the client's connection
+    /// instead of answering. Reject it here, where the failure is a `fallback` the client still
+    /// gets.
+    #[test]
+    fn parse_response_head_rejects_body_too_large_to_frame_over_tcp() {
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\r\n";
+        assert!(
+            parse_response_head(head).is_err(),
+            "a 65,536-byte body exceeds the DNS-over-TCP framing limit"
+        );
+
+        // ...and one byte less is the largest DNS message there is: still accepted, and it frames.
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 65535\r\n\r\n";
+        let len = parse_response_head(head).expect("65,535 bytes is a legal DNS message");
+        assert_eq!(len, 65_535);
+        assert!(
+            u16::try_from(len).is_ok(),
+            "every accepted body must fit a two-byte length prefix"
+        );
     }
 
     #[test]
