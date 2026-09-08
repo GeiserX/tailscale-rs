@@ -82,7 +82,7 @@ use tokio::{
 use ts_dns_wire::{Rcode, decode_query, encode_response};
 
 use crate::magic_dns::{
-    ClientTransport, Decision, DnsView, decide, forward_query, set_tc_if_over_client_limit,
+    ClientTransport, Decision, DnsView, check_response_size_and_set_tc, decide, forward_query,
 };
 
 /// Largest HTTP request (headers + body) we will read for one DoH query. A DNS message is at most
@@ -93,6 +93,17 @@ const MAX_REQUEST: usize = 8 * 1024;
 /// How long the DoH *client* waits for the exit node to answer a delegated query before giving up
 /// and returning the fallback NXDOMAIN. Matches the local UDP upstream timeout.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The transport family this node answers a peer's DoH query as — Go's `family` argument, threaded
+/// into `checkResponseSizeAndSetTC`. `Resolver.HandlePeerDNSQuery` forwards a peer's query with
+/// `packet{q, "tcp", from}`, so the size check is a no-op for everything the DoH *server* returns.
+///
+/// It is not a claim that HTTP is TCP. It is a claim about *whose* datagram budget is at stake: the
+/// peer that POSTed the query holds it, and runs its own `checkResponseSizeAndSetTC` over our answer
+/// against its own client's family before relaying it onward. Marking the answer here as well would
+/// set `TC` on a reply the peer's client can receive perfectly well, sending it off to a TCP retry
+/// it has no reason to make.
+const PEER_CLIENT_TRANSPORT: ClientTransport = ClientTransport::Tcp;
 
 /// Cap on a DoH response body we read into memory from the exit node. A delegated answer is one DNS
 /// message, and a DNS message is at most 65,535 bytes — that is all a DNS-over-TCP two-byte length
@@ -116,10 +127,13 @@ const MAX_CLIENT_RESPONSE: usize = u16::MAX as usize;
 /// `doh_addr` is always the peer's tailnet IPv4 (see [`Node::peerapi_doh_addr`]).
 ///
 /// When the delegated answer is relayed back to a **UDP** stub resolver it is marked truncated if
-/// it exceeds the buffer size `query` advertised (see [`set_tc_if_over_client_limit`]), exactly as
-/// on the plain UDP forward. The DoH transport itself has no such limit; the limit belongs to the
+/// it exceeds the buffer size `query` advertised (see [`check_response_size_and_set_tc`]), exactly
+/// as on the plain UDP forward. The DoH transport itself has no such limit; the limit belongs to the
 /// client we answer, not to the hop we fetched over — which is why `client` selects it, and why a
-/// [`ClientTransport::Tcp`] client (RFC 7766 §8: no message-size bound) is never marked.
+/// [`ClientTransport::Tcp`] client (RFC 7766 §8: no message-size bound) is never marked. Upstream
+/// does the same: Go's `forwarder.send` calls `checkResponseSizeAndSetTC(res, fq.packet, fq.family)`
+/// on the `http://` (peerAPI DoH) branch, and `fq.family` is the *requesting client's* transport,
+/// not HTTP.
 pub(crate) async fn forward_doh(
     channel: &Channel,
     doh_addr: SocketAddr,
@@ -128,10 +142,7 @@ pub(crate) async fn forward_doh(
     client: ClientTransport,
 ) -> Vec<u8> {
     match timeout(CLIENT_TIMEOUT, doh_round_trip(channel, doh_addr, query)).await {
-        Ok(Ok(resp)) if !resp.is_empty() => match client {
-            ClientTransport::Udp => set_tc_if_over_client_limit(query, resp),
-            ClientTransport::Tcp => resp,
-        },
+        Ok(Ok(resp)) if !resp.is_empty() => check_response_size_and_set_tc(query, resp, client),
         Ok(Ok(_)) => {
             // A broken exit-node recursive resolver silently fails every delegated query, so
             // surface delegation failures at warn (default level) — the operator needs the signal.
@@ -318,11 +329,13 @@ pub(crate) async fn handle_conn(
 /// - Recursive forward when `forward_exit_egress` is false => `REFUSED` (fail-closed, no leak).
 /// - Recursive forward when enabled => forwarded over the overlay via [`forward_query`].
 ///
-/// A forwarded answer carries the `TC` bit when it exceeds the buffer size the *query* advertised
-/// (`forward_query` → `cap_response`), even though we hand it back over HTTP rather than UDP. That
-/// is deliberate and not a DoH size limit: the query a peer POSTs here is its own UDP client's
-/// query relayed verbatim, so the advertised size is that client's, and the peer would set the same
-/// bit when it relays our answer onward as a datagram. Marking it here only makes the two agree.
+/// A forwarded answer is **never** marked `TC` for size on this path. We are the DoH *server*, and
+/// the peer that POSTed the query is the one holding the datagram budget: it runs its own
+/// `checkResponseSizeAndSetTC` over our answer, against its own client's family, before relaying it
+/// onward. Upstream draws the line the same way — `Resolver.HandlePeerDNSQuery` forwards with
+/// `packet{q, "tcp", from}`, and the family guard at the top of `checkResponseSizeAndSetTC` makes
+/// the check a no-op for it. Marking it here would set `TC` on an answer the peer's own client can
+/// receive, telling it to retry over a transport it has no reason to reach for.
 async fn resolve(
     view: &DnsView,
     query: &[u8],
@@ -335,18 +348,7 @@ async fn resolve(
             upstreams,
             query,
             servfail,
-        } => {
-            forward_query(
-                channel,
-                &upstreams,
-                &query,
-                servfail,
-                // The query a peer POSTs here is its own UDP client's query, relayed verbatim, so
-                // the datagram limit that applies is that client's — see the note above.
-                ClientTransport::Udp,
-            )
-            .await
-        }
+        } => forward_query(channel, &upstreams, &query, servfail, PEER_CLIENT_TRANSPORT).await,
     }
 }
 
@@ -753,6 +755,30 @@ mod tests {
             ServerDecision::Reply(resp) => assert_eq!(rcode(&resp), 3, "NXDOMAIN, not REFUSED"),
             ServerDecision::Forward { .. } => panic!("tailnet name must not forward"),
         }
+    }
+
+    /// The DoH *server* never marks a peer's answer truncated for size. Upstream's
+    /// `HandlePeerDNSQuery` forwards with family `"tcp"` and the guard at the top of
+    /// `checkResponseSizeAndSetTC` drops the check entirely; the peer that asked us runs the same
+    /// check itself, against its own client's transport, before relaying our answer onward. Setting
+    /// `TC` here would tell that peer's client to retry over a transport it never needed.
+    #[test]
+    fn a_peers_doh_answer_is_never_marked_truncated_for_size() {
+        let query = query_for(0x5, &["example", "com"]);
+        let mut answer = query.clone();
+        answer[2] |= 0x80; // QR=1
+        answer.resize(900, 0xAB); // over the 512 bytes a query with no OPT record advertises
+
+        let out = check_response_size_and_set_tc(&query, answer.clone(), PEER_CLIENT_TRANSPORT);
+        assert_eq!(
+            out, answer,
+            "the DoH server relays the peer's answer byte-for-byte"
+        );
+        assert_eq!(
+            out[2] & 0x02,
+            0,
+            "TC is the requesting peer's call to make, not ours"
+        );
     }
 
     #[test]

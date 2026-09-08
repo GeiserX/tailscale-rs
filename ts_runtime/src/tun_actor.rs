@@ -43,7 +43,8 @@ use crate::{
     dataplane::{OverlayFromDataplane, OverlayToDataplane},
     env::Env,
     magic_dns::{
-        ClientTransport, Decision, DnsView, RecursivePlan, decide, forward_plan, forward_query,
+        ClientTransport, Decision, DnsView, RecursivePlan, check_response_size_and_set_tc, decide,
+        forward_plan, forward_query,
     },
     peer_tracker::PeerState,
 };
@@ -660,7 +661,17 @@ fn plan_intercept(view: &DnsView, pkt: &[u8]) -> Intercept {
         // Malformed query: drop silently. We still consumed it (it was quad-100/UDP/53) so it must
         // NOT be forwarded to the overlay.
         None => Intercept::Dropped,
-        Some(Decision::Reply(response)) => Intercept::Reply { response, src },
+        // The size check upstream runs on a locally-composed answer too (Go `Resolver.Query`
+        // calls `checkResponseSizeAndSetTC` right after `respond`): a quad-100 UDP client that
+        // advertised an EDNS buffer smaller than the answer we built is owed the `TC` bit.
+        Some(Decision::Reply(response)) => Intercept::Reply {
+            response: check_response_size_and_set_tc(
+                query.dns_payload,
+                response,
+                ClientTransport::Udp,
+            ),
+            src,
+        },
         // Forward over the overlay, mirroring the netstack serve loop (`magic_dns.rs:598-632`). The
         // plan (UDP upstreams vs exit-node DoH) is computed from the current view; both branches
         // route through `recursive_plan`/the `decide`-built upstreams, so the IPv4-only filter at
@@ -1397,6 +1408,19 @@ mod tests {
         buf.push(0); // root label
         buf.extend_from_slice(&1u16.to_be_bytes()); // QTYPE = A
         buf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
+        buf
+    }
+
+    /// [`build_query`] plus an EDNS(0) OPT record advertising `udp_size` bytes, in the only shape
+    /// Go's `findOPTRecord` accepts: last record in the message, root NAME, version 0, no options.
+    fn build_edns_query(id: u16, labels: &[&str], udp_size: u16) -> Vec<u8> {
+        let mut buf = build_query(id, labels);
+        buf[11] = 1; // ARCOUNT = 1
+        buf.push(0); // NAME: root
+        buf.extend_from_slice(&41u16.to_be_bytes()); // TYPE: OPT
+        buf.extend_from_slice(&udp_size.to_be_bytes()); // CLASS: requestor's UDP payload size
+        buf.extend_from_slice(&0u32.to_be_bytes()); // TTL: extended rcode + version + flags
+        buf.extend_from_slice(&0u16.to_be_bytes()); // RDLENGTH: no options
         buf
     }
 
@@ -2474,6 +2498,55 @@ mod tests {
         let mut out = Vec::with_capacity(b.size(payload.len()));
         b.write(&mut out, payload).unwrap();
         out
+    }
+
+    /// The in-datapath intercept answers a tailnet-authoritative name inline, and that answer is
+    /// held to the client's advertised EDNS buffer just like a forwarded one. Go runs
+    /// `checkResponseSizeAndSetTC` in `Resolver.Query` right after `respond` succeeds, so the local
+    /// fast path is not exempt: a client advertising 20 bytes gets `TC` on the NXDOMAIN+SOA we
+    /// composed, and goes to TCP, instead of being handed a datagram it said it could not receive.
+    #[tokio::test]
+    async fn an_inline_authoritative_reply_honours_the_clients_edns_size() {
+        let client: SocketAddrV4 = "100.64.0.7:34567".parse().unwrap();
+        let update = dns_update(vec![udp_resolver("8.8.8.8:53")]);
+        let env = test_env(None);
+        let view = build_dns_view(&env, &update, None, true);
+
+        // An unknown name inside the tailnet search domain: authoritative NXDOMAIN with the zone's
+        // SOA, answered inline and never forwarded.
+        let query = build_edns_query(0x9001, &["nope", "user", "ts", "net"], 20);
+        let pkt = quad100_query_packet(client, &query);
+
+        match plan_intercept(&view, &pkt) {
+            Intercept::Reply { src, response } => {
+                assert_eq!(src, client);
+                assert!(
+                    response.len() > 20,
+                    "the fixture only works if the answer overflows the advertised 20 bytes"
+                );
+                assert_ne!(
+                    response[2] & 0x02,
+                    0,
+                    "an answer over the advertised EDNS size must carry TC, even on the local path"
+                );
+            }
+            _ => panic!("an unknown name in the tailnet search domain is answered authoritatively"),
+        }
+
+        // The same name asked without EDNS fits the classic 512-byte limit, so TC stays clear —
+        // the check is the client's advertised size, not a blanket mark on every local answer.
+        let plain = build_query(0x9002, &["nope", "user", "ts", "net"]);
+        match plan_intercept(&view, &quad100_query_packet(client, &plain)) {
+            Intercept::Reply { response, .. } => {
+                assert!(response.len() <= 512);
+                assert_eq!(
+                    response[2] & 0x02,
+                    0,
+                    "TC must stay clear on an answer that fits"
+                );
+            }
+            _ => panic!("an unknown name in the tailnet search domain is answered authoritatively"),
+        }
     }
 
     /// HOL-blocking regression: the UP pump's intercept must hand a `Decision::Forward` back as
