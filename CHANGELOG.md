@@ -2,6 +2,18 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.50.0](https://github.com/GeiserX/tailscale-rs/compare/v0.49.1...v0.50.0) (2026-09-08)
+
+
+### Features
+
+* **runtime:** stop routing to peers whose node key control has expired ([#408](https://github.com/GeiserX/tailscale-rs/issues/408)) ([585a71b](https://github.com/GeiserX/tailscale-rs/commit/585a71bcfbbb2764809622121ba141bea126e97e))
+
+
+### Bug Fixes
+
+* **expiry:** recover an expired peer's routes, and refuse a stale send ([#410](https://github.com/GeiserX/tailscale-rs/issues/410)) ([95465c3](https://github.com/GeiserX/tailscale-rs/commit/95465c3ea155569d76b661f04db5f9b6a303a3ef))
+
 ## [0.49.1](https://github.com/GeiserX/tailscale-rs/compare/v0.49.0...v0.49.1) (2026-09-08)
 
 
