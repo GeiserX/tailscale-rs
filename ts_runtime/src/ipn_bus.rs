@@ -380,6 +380,10 @@ mod tests {
             display_name: id.to_owned(),
             ipv4: IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
             ipv6: IpAddr::V6(Ipv6Addr::LOCALHOST),
+            tailscale_ips: vec![
+                IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
+                IpAddr::V6(Ipv6Addr::LOCALHOST),
+            ],
             online: Some(true),
             last_seen: None,
             allowed_routes: Vec::new(),
