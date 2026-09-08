@@ -232,6 +232,12 @@ fn decode6_first_fragment(proto: IpProto, sub: &[u8]) -> Ipv6Fragment {
         IPPROTO_FRAGMENT_SENTINEL => Ipv6Fragment::Unknown,
         // Go's switch has no default arm: any other protocol keeps its number and port 0, and the
         // ACL matches it IPs-only (`IpProto::is_port_ful`).
+        //
+        // Protocol 0 is carried here like any other, which is Go's `q.IPProto = nextHdr` followed
+        // by a switch with no case for it. It is not an admission: 0 is `ipproto.Unknown`, so the
+        // packet dies on `inbound_filter_verdict`'s [`IPPROTO_UNKNOWN`] arm before a rule sees it,
+        // exactly where Go's `pre()` kills it. Pinned by
+        // `first_ipv6_fragment_with_unknown_next_header_is_dropped_before_the_acl`.
         _ => Ipv6Fragment::First { proto, dst_port: 0 },
     }
 }
@@ -394,6 +400,9 @@ fn inbound_filter_verdict(
         // takes the ordinary proto switch below and matches the rule an unfragmented datagram would.
         // Note the deliberate asymmetry with IPv4: `decode6` has no more-fragments guard at all, so
         // — unlike `decode4` — upstream does not demote a fragmented first TSMP packet to `unknown`.
+        // Falling through is also what refuses a first fragment whose Fragment header names
+        // protocol 0: it arrives here as `proto == IPPROTO_UNKNOWN` and the shared arm below drops
+        // it pre-rules, which is the same fall-through Go gets from a switch with no case for 0.
         Some(Fragment::V6(Ipv6Fragment::First { .. })) | None => {}
     }
 
@@ -1831,6 +1840,121 @@ mod tests {
         // immediate Next Header. What happens to one reached through a chained extension header —
         // it must fail closed, not fall through to the ACL — is
         // `chained_extension_header_cannot_bypass_the_ipv6_fragment_rules`.
+    }
+
+    /// An allow-all ACL that also records whether it was consulted at all.
+    ///
+    /// [`AllowAll`] alone can show that a packet was dropped; it cannot show *where*. Under an ACL
+    /// that admits everything, "dropped AND never consulted" is the signature of a `pre()` drop and
+    /// of nothing else — which is the guarantee the fragment classification exists to keep, so it
+    /// is worth asserting directly rather than inferring from the verdict.
+    #[derive(Default)]
+    struct RecordingAllowAll(std::sync::atomic::AtomicBool);
+
+    impl RecordingAllowAll {
+        /// Whether the ACL was asked about any packet since this filter was made.
+        fn consulted(&self) -> bool {
+            self.0.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl ts_packetfilter::Filter for RecordingAllowAll {
+        fn match_for(
+            &self,
+            _info: &ts_packetfilter::PacketInfo,
+            _caps: ts_packetfilter::filter::CapIter,
+        ) -> Option<&str> {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            Some("allow-all")
+        }
+    }
+
+    /// A *first* IPv6 fragment whose Fragment header's Next Header is 0 is dropped ahead of the
+    /// rules, never matched by them.
+    ///
+    /// Go `net/packet.decode6Fragment` copies that byte into `q.IPProto` (`q.IPProto = nextHdr`)
+    /// and reports `continueDecode`, so the packet goes back through `decode6`'s sub-protocol
+    /// switch — which has no case for 0. `ipproto.Unknown` *is* 0, so `q.IPProto` is left at
+    /// Unknown and filter `pre()`'s `if q.IPProto == ipproto.Unknown { return Drop }` fires before
+    /// any rule is consulted. (Protocol 0 on the wire is Hop-by-Hop Options; an IPv6 packet whose
+    /// *base* header declares it is refused by that same arm, and always has been.)
+    ///
+    /// This tree reaches the same drop by the same route: `decode6_first_fragment`'s catch-all arm
+    /// keeps the number, exactly as Go's absent switch case does, and the drop comes from
+    /// `inbound_filter_verdict`'s shared [`IPPROTO_UNKNOWN`] arm — which a first fragment falls
+    /// through to for the same reason an unfragmented packet does. Nothing about that is specific
+    /// to fragments, which is why there is no fragment-specific arm for it; this test is what pins
+    /// the fall-through, at each of the three levels the packet passes through.
+    #[test]
+    fn first_ipv6_fragment_with_unknown_next_header_is_dropped_before_the_acl() {
+        // 1. Classification. Go's `q.IPProto = nextHdr` on a first fragment, verbatim: the 0 is
+        //    carried, not translated. `dst_port` is 0 because Go reads a port in the TCP/UDP/SCTP
+        //    arms only, and protocol 0 is in none of them.
+        assert_eq!(
+            decode6_fragment(&ipv6_fragment_packet(0, 0, true, &udp_header(443))),
+            Ipv6Fragment::First {
+                proto: IPPROTO_UNKNOWN,
+                dst_port: 0,
+            },
+            "a first fragment carries its Fragment header's Next Header, 0 included"
+        );
+
+        // 2. Verdict. The allow-all ACL is the control that makes this a pre-rule drop and not a
+        //    rule saying no.
+        let src = std::net::IpAddr::V6(IPV6_FIXTURE_SRC);
+        let dst = std::net::IpAddr::V6(IPV6_FIXTURE_DST);
+        assert!(
+            !inbound_filter_verdict(
+                &AllowAll,
+                IPPROTO_UNKNOWN,
+                src,
+                dst,
+                0,
+                Some(Fragment::V6(Ipv6Fragment::First {
+                    proto: IPPROTO_UNKNOWN,
+                    dst_port: 0,
+                })),
+            ),
+            "a first IPv6 fragment declaring protocol 0 is dropped under an allow-all ACL"
+        );
+
+        // 3. The whole inbound path on real bytes, and the part the ACL never sees. The two
+        //    fixtures differ in exactly one byte — the Fragment header's Next Header — so the
+        //    control proves the drop is the protocol number and not the packet shape: the same
+        //    fragment naming UDP is parsed, matched and delivered.
+        let keep = |filter: &(dyn ts_packetfilter::Filter + Send + Sync), packet: Vec<u8>| {
+            let mut packets = vec![PacketMut::from(packet)];
+            let mut learned = Vec::new();
+            filter_inbound_from_peer(filter, PeerId(5), &mut packets, &mut learned);
+            assert!(
+                learned.is_empty(),
+                "no TSMP advertisement in these fixtures"
+            );
+            !packets.is_empty()
+        };
+
+        let acl = RecordingAllowAll::default();
+        assert!(
+            !keep(&acl, ipv6_fragment_packet(0, 0, true, &udp_header(443))),
+            "a crafted first IPv6 fragment naming protocol 0 is dropped by an allow-all ACL"
+        );
+        assert!(
+            !acl.consulted(),
+            "and it is dropped ahead of the rules: the ACL is never asked about it"
+        );
+
+        let control = RecordingAllowAll::default();
+        assert!(
+            keep(
+                &control,
+                ipv6_fragment_packet(17, 0, true, &udp_header(443))
+            ),
+            "control: the same fragment naming UDP is delivered"
+        );
+        assert!(
+            control.consulted(),
+            "control: and it got there by being matched against the rules"
+        );
     }
 
     /// Prepending an extension header must not defeat the fragment rules.
