@@ -23,9 +23,11 @@
 //! Note that a peer with no expiry at all — `node_key_expiry` is `None`, Go's zero `KeyExpiry`,
 //! which is what a tagged node carries — is never expired, however far the clock moves.
 
-use alloc::collections::BTreeMap;
+use alloc::{collections::BTreeMap, vec::Vec};
+use core::net::SocketAddr;
 
 use chrono::{DateTime, TimeDelta, Utc};
+use ts_derp::RegionId;
 use ts_keys::NodePublicKey;
 
 use crate::{Node, node::StableId};
@@ -79,6 +81,23 @@ pub struct FlaggedPeer {
     pub first_transition: bool,
 }
 
+/// What flagging a peer expired destroys, kept so extending the peer's expiry can put it back.
+///
+/// Upstream needs no such record: `flagExpiredPeers` rewrites a netmap freshly derived from
+/// `controlclient`'s pristine peer store, so the next map response carries the real key, the real
+/// endpoints and the real home DERP again. Here the peer db is the only copy, so an expiry-only
+/// [`PeerChange`](crate::PeerChange) — which is exactly how control extends a key — would otherwise
+/// leave a recovered peer with a usable key and no way to route to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PristinePeer {
+    /// The peer's real node key, before [`ts_keys::node_public_with_bad_old_prefix`] broke it.
+    node_key: NodePublicKey,
+    /// The peer's direct-path candidates (`tailcfg.Node.Endpoints`), before they were cleared.
+    underlay_addresses: Vec<SocketAddr>,
+    /// The peer's home DERP region, before it was cleared.
+    derp_region: Option<RegionId>,
+}
+
 /// Tracks expired peers and the local-to-control clock delta, and mutates peers to reflect expiry.
 ///
 /// Go `ipnlocal.expiryManager`. One instance per node, owned by whatever holds the peer set (here:
@@ -88,13 +107,14 @@ pub struct ExpiryManager {
     /// Peers already flagged expired, so a transition is logged (and acted on) once rather than on
     /// every netmap — Go `previouslyExpired`, which maps a stable id to a `bool`.
     ///
-    /// This fork stores the peer's **pristine node key** instead of a bare `true`. Upstream can
-    /// afford a `bool` because `controlclient` keeps an unmutated peer store and `flagExpiredPeers`
-    /// only ever mutates a freshly-derived netmap; here the peer db *is* the store, so breaking the
-    /// key in place would be unrecoverable. Remembering it under the same key, with the same
-    /// lifetime (dropped the moment the peer is no longer expired), restores upstream's behaviour
-    /// when control extends a peer's expiry with a field-level patch that does not restate the key.
-    previously_expired: BTreeMap<StableId, NodePublicKey>,
+    /// This fork stores the peer state the flagging pass **destroys** ([`PristinePeer`]) instead of
+    /// a bare `true`. Upstream can afford a `bool` because `controlclient` keeps an unmutated peer
+    /// store and `flagExpiredPeers` only ever mutates a freshly-derived netmap; here the peer db
+    /// *is* the store, so the rewrite is in place and unrecoverable without a memo. Remembering it
+    /// under the same key, with the same lifetime (dropped the moment the peer is no longer
+    /// expired), restores upstream's behaviour when control extends a peer's expiry with a
+    /// field-level patch that does not restate those fields.
+    previously_expired: BTreeMap<StableId, PristinePeer>,
 
     /// The offset to add to local time to get control's time — Go `clockDelta`, such that
     /// `now() + clock_delta == MapResponse.ControlTime`. Zero until control sends a `ControlTime`
@@ -169,8 +189,9 @@ impl ExpiryManager {
     /// Skipped, returning `None`:
     /// - a peer with no expiry at all (`node_key_expiry` is `None` — a tagged node; Go's zero
     ///   `KeyExpiry`), and a peer whose expiry is still in the future. Either way the peer is *not*
-    ///   expired, so a remembered pristine key is put back (see the manager's own docs) and the
-    ///   memo dropped, exactly where Go does its `delete(em.previouslyExpired, ...)`.
+    ///   expired, so the pristine key, endpoints and home DERP a previous pass memoized are put
+    ///   back (see the manager's own docs) and the memo dropped, exactly where Go does its
+    ///   `delete(em.previouslyExpired, ...)`.
     /// - a peer already marked [`Node::expired`](crate::Node::expired) — by control, or by an
     ///   earlier pass. Re-flagging would repeat the log and the invalidation on every netmap.
     /// - every peer, when the delta-adjusted clock is before [`flag_expired_peers_epoch`].
@@ -182,20 +203,31 @@ impl ExpiryManager {
         let control_now = self.usable_control_now(local_now)?;
 
         // Not expired: nothing to flag. Drop any memo we hold for this peer — and if the peer we
-        // are holding is the one whose key we broke, put the pristine key back, so a control-sent
-        // expiry extension recovers the peer's data path the way it does upstream.
+        // are holding is the one we rewrote, put back everything that rewrite destroyed, so a
+        // control-sent expiry extension recovers the peer's data path the way it does upstream.
         if peer
             .node_key_expiry
             .is_none_or(|expiry| expiry > control_now)
         {
             let pristine = self.previously_expired.remove(&peer.stable_id)?;
-            if peer.node_key != ts_keys::node_public_with_bad_old_prefix(pristine) {
+            if peer.node_key != ts_keys::node_public_with_bad_old_prefix(pristine.node_key) {
                 // The peer has since been restated by control with a key of its own; leave it be.
                 return None;
             }
             let mut peer = peer.clone();
-            peer.node_key = pristine;
+            peer.node_key = pristine.node_key;
             peer.expired = false;
+            // The key alone is not enough to reach the peer: flagging also cleared its direct-path
+            // candidates and its home DERP, and an expiry-extending patch that restates neither
+            // would leave the recovered peer with no route at all until the next full netmap.
+            // Restore only what is still cleared — control restating either field in the same
+            // update is fresher than anything we memoized, and must win.
+            if peer.underlay_addresses.is_empty() {
+                peer.underlay_addresses = pristine.underlay_addresses;
+            }
+            if peer.derp_region.is_none() {
+                peer.derp_region = pristine.derp_region;
+            }
             return Some(FlaggedPeer {
                 peer,
                 // The memo is gone, so this direction can only be reported once.
@@ -210,11 +242,18 @@ impl ExpiryManager {
         }
 
         // Go's `previouslyExpired` bookkeeping: remember the peer so the transition is reported
-        // once, not on every netmap that restates it. This fork remembers the peer's pristine node
-        // key rather than a bare `true`, so the break below can be undone — see the field's docs.
+        // once, not on every netmap that restates it. This fork remembers what the rewrite below
+        // destroys rather than a bare `true`, so it can be undone — see the field's docs.
         let first_transition = self
             .previously_expired
-            .insert(peer.stable_id.clone(), peer.node_key)
+            .insert(
+                peer.stable_id.clone(),
+                PristinePeer {
+                    node_key: peer.node_key,
+                    underlay_addresses: peer.underlay_addresses.clone(),
+                    derp_region: peer.derp_region,
+                },
+            )
             .is_none();
 
         let mut peer = peer.clone();
@@ -423,6 +462,99 @@ mod tests {
 
         assert!(!p.expired);
         assert_eq!(p.node_key, original_key);
+    }
+
+    /// The key alone does not make a recovered peer reachable. Flagging clears the peer's
+    /// direct-path candidates and its home DERP, and an expiry-extending `PeerChange` restates
+    /// neither — so unless they are put back too, the peer comes back with a usable key and nowhere
+    /// to send. Upstream never has to: it rewrites a netmap derived from a pristine peer store.
+    #[test]
+    fn extending_the_expiry_restores_the_routing_fields() {
+        let mut em = ExpiryManager::new();
+        let live = peer("nOdE1", 7, Some(now() - TimeDelta::hours(1)));
+        let flagged = em
+            .flag_expired_peer(&live, now())
+            .expect("peer is flagged")
+            .peer;
+        assert!(flagged.underlay_addresses.is_empty());
+        assert_eq!(flagged.derp_region, None);
+
+        // Control extends the expiry and says nothing else — the shape of a `PeerChange` that
+        // carries only `KeyExpiry`.
+        let mut extended = flagged;
+        extended.node_key_expiry = Some(now() + TimeDelta::days(30));
+        let recovered = em
+            .flag_expired_peer(&extended, now())
+            .expect("peer is un-flagged")
+            .peer;
+
+        assert!(!recovered.expired);
+        assert_eq!(
+            recovered.underlay_addresses, live.underlay_addresses,
+            "the peer's direct candidates come back with it"
+        );
+        assert_eq!(
+            recovered.derp_region, live.derp_region,
+            "and so does its home DERP route"
+        );
+    }
+
+    /// The restore must not clobber. If the same update that extends the expiry also carries fresh
+    /// endpoints or a new home DERP, control's word is newer than anything we memoized at flagging
+    /// time and has to survive.
+    #[test]
+    fn a_restated_route_beats_the_memo() {
+        let mut em = ExpiryManager::new();
+        let live = peer("nOdE1", 7, Some(now() - TimeDelta::hours(1)));
+        let flagged = em
+            .flag_expired_peer(&live, now())
+            .expect("peer is flagged")
+            .peer;
+
+        let fresh_endpoint: core::net::SocketAddr = "198.51.100.4:41641".parse().unwrap();
+        let fresh_derp = ts_derp::RegionId(core::num::NonZeroU32::new(9).unwrap());
+        let mut extended = flagged;
+        extended.node_key_expiry = Some(now() + TimeDelta::days(30));
+        extended.underlay_addresses = vec![fresh_endpoint];
+        extended.derp_region = Some(fresh_derp);
+
+        let recovered = em
+            .flag_expired_peer(&extended, now())
+            .expect("peer is un-flagged")
+            .peer;
+
+        assert_eq!(recovered.underlay_addresses, vec![fresh_endpoint]);
+        assert_eq!(recovered.derp_region, Some(fresh_derp));
+    }
+
+    /// The boundary, pinned in both directions because the two functions in this module genuinely
+    /// disagree at it — and so do the upstream functions they port.
+    ///
+    /// `flagExpiredPeers` skips a peer whose `KeyExpiry().After(controlNow)`, so an expiry landing
+    /// exactly on control's clock **is** expired; `nextPeerExpiry` skips one whose
+    /// `KeyExpiry().Before(controlNow)`, so the same instant is *not* in the past there. The order
+    /// of operations makes the disagreement unobservable — the flagging pass runs first and marks
+    /// the peer, and `next_peer_expiry` then skips it on `expired` — but a peer that reached
+    /// `next_peer_expiry` unflagged would report an already-due event, exactly as upstream does.
+    #[test]
+    fn key_expiry_exactly_at_control_now_is_expired() {
+        let mut em = ExpiryManager::new();
+        let p = peer("nOdE1", 7, Some(now()));
+
+        let flagged = em
+            .flag_expired_peer(&p, now())
+            .expect("expiry == control's now is expired, matching Go's `After`");
+        assert!(flagged.peer.expired);
+
+        // The same instant is still a "future" event to `next_peer_expiry` (Go's `Before`), which
+        // only matters for a peer that was never flagged: a flagged one is skipped outright.
+        let em = ExpiryManager::new();
+        assert_eq!(em.next_peer_expiry([&p], None, now()), Some(now()));
+        assert_eq!(
+            em.next_peer_expiry([&flagged.peer], None, now()),
+            None,
+            "the flagged peer is skipped, so no timer is armed for an event already handled"
+        );
     }
 
     /// A delta-adjusted clock before the hardcoded epoch disables the whole subsystem: a control

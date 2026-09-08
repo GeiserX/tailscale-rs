@@ -277,6 +277,41 @@ fn taildrop_send_err(e: ts_runtime::taildrop_send::TaildropSendError) -> Error {
     }
 }
 
+/// Resolve the peerAPI destination for a Taildrop send, preferring the peer tracker's `current`
+/// record over the caller-held `snapshot`.
+///
+/// Split out of [`Device::send_file`] so the decision is testable without a live device. The two
+/// refusals are the ones `send_file` documents:
+///
+/// - an [`expired`][ts_control::Node::expired] peer is refused with [`Error::PeerKeyExpired`], the
+///   reason rather than a generic bad request — Go `LocalBackend.pingPeerAPI` answers "peer's node
+///   key has expired" here. Checked before `peerapi_addr`, which also refuses an expired peer but
+///   can only say `None`; being able to name the cause is why an expired peer is kept in the netmap
+///   instead of dropped from it.
+/// - the destination comes only from the peer's own node record, and is asserted to be a Tailscale
+///   CGNAT address before it is dialed, so a malformed record cannot steer the PUT at a non-tailnet
+///   host.
+///
+/// `current` is `None` when the tracker holds no peer with that stable id — it left the tailnet, or
+/// no netmap has arrived. The snapshot is then all there is, and using it keeps the pre-existing
+/// behaviour; the CGNAT assertion still bounds where the send can go.
+fn taildrop_dst(snapshot: &NodeInfo, current: Option<&NodeInfo>) -> Result<SocketAddr, Error> {
+    let peer = current.unwrap_or(snapshot);
+
+    if peer.expired {
+        return Err(Error::PeerKeyExpired);
+    }
+
+    let dst = peer
+        .peerapi_addr()
+        .ok_or(Error::Internal(InternalErrorKind::BadRequest))?;
+    if !ts_control::is_tailscale_ip(dst.ip()) {
+        return Err(Error::Internal(InternalErrorKind::BadRequest));
+    }
+
+    Ok(dst)
+}
+
 /// Resolve the effective registration auth key from `auth_key` plus the config's
 /// workload-identity-federation (WIF) / OAuth-client fields.
 ///
@@ -1038,6 +1073,30 @@ impl Device {
             .map_err(Into::into)
     }
 
+    /// Look up the current record for a peer by its stable node id, or `None` when the peer
+    /// tracker holds no such peer (it has left the tailnet, or no netmap has arrived yet).
+    ///
+    /// Used to refresh a caller-held [`NodeInfo`] snapshot before acting on it — see
+    /// [`Device::send_file`]. Unlike [`Device::peer_by_name`] this never waits for the first netmap:
+    /// the caller has a snapshot to fall back on.
+    async fn peer_by_stable_id(
+        &self,
+        stable_id: &ts_control::StableNodeId,
+    ) -> Result<Option<NodeInfo>, Error> {
+        let pt = self
+            .runtime
+            .peer_tracker
+            .upgrade()
+            .ok_or(Error::Internal(InternalErrorKind::Actor))?;
+
+        pt.ask(ts_runtime::peer_tracker::PeerByStableId {
+            stable_id: stable_id.clone(),
+        })
+        .await
+        .map_err(ts_runtime::Error::from)
+        .map_err(Into::into)
+    }
+
     /// Look up the peer(s) with the most-specific route matches for `ip`.
     ///
     /// This reports which peers *advertise* a route covering `ip`, independent of this device's
@@ -1114,6 +1173,12 @@ impl Device {
     /// or attacker-chosen address can never be targeted. As defense in depth, the resolved address is
     /// additionally asserted to be a Tailscale CGNAT IP before dialing.
     ///
+    /// `peer` is a **snapshot**: every lookup on this device hands out a clone, and a caller may
+    /// have held it since before the last netmap. So the peer is re-read from the peer tracker by
+    /// [`stable_id`][ts_control::Node::stable_id] first, and everything below — the expiry refusal
+    /// and the destination — is decided on that current record; the snapshot is used only when the
+    /// tracker no longer knows the peer at all.
+    ///
     /// Returns [`Error::PeerKeyExpired`] when control has expired the peer's node key (Go refuses
     /// a peerAPI dial to such a peer with the same message);
     /// [`InternalErrorKind::BadRequest`] when the peer advertises no IPv4 peerAPI (so it
@@ -1132,24 +1197,13 @@ impl Device {
     {
         let channel = self.channel()?;
 
-        // Refuse a peer whose node key control has expired, with the reason rather than a generic
-        // bad-request — Go `LocalBackend.pingPeerAPI` answers "peer's node key has expired" here.
-        // Checked before `peerapi_addr`, which also refuses an expired peer but can only say
-        // `None`; being able to name the cause is the reason an expired peer is kept in the netmap
-        // instead of dropped from it.
-        if peer.expired {
-            return Err(Error::PeerKeyExpired);
-        }
-
-        // Destination comes only from the peer's own node record — never an arbitrary address.
-        let dst = peer
-            .peerapi_addr()
-            .ok_or(Error::Internal(InternalErrorKind::BadRequest))?;
-        // Defense in depth: refuse to dial anything outside the Tailscale CGNAT range, so a
-        // malformed node record can't steer the PUT at a non-tailnet host.
-        if !ts_control::is_tailscale_ip(dst.ip()) {
-            return Err(Error::Internal(InternalErrorKind::BadRequest));
-        }
+        // Re-read the peer before anything is decided from it. `peer` is whatever the caller kept
+        // from an earlier lookup, and a node's key expiry can pass with no netmap in between — the
+        // peer tracker's own timer flags it. Deciding on the snapshot would miss that entirely and
+        // dial a peer whose key this node has already broken, reporting the failed dial as a
+        // timeout rather than the reason.
+        let current = self.peer_by_stable_id(&peer.stable_id).await?;
+        let dst = taildrop_dst(peer, current.as_ref())?;
 
         let self_ipv4 = self.ipv4_addr().await?;
 
@@ -2091,6 +2145,106 @@ mod tests {
         assert_eq!(
             none_secret.map(|s| s.expose_secret().to_string()),
             None::<String>
+        );
+    }
+
+    /// A minimal peer record with a usable IPv4 peerAPI — the shape [`Device::peer_by_name`] and
+    /// [`Device::file_targets`] hand a caller, and which the caller may then hold for a while.
+    fn peer_snapshot() -> NodeInfo {
+        NodeInfo {
+            id: 1,
+            stable_id: ts_control::StableNodeId("nPeEr1".to_string()),
+            hostname: "peer".to_string(),
+            user_id: 0,
+            tailnet: Some("ts.net".to_string()),
+            tags: Vec::new(),
+            addresses: vec!["100.64.0.9/32".parse().unwrap()],
+            tailnet_address: ts_control::TailnetAddress {
+                ipv4: "100.64.0.9/32".parse().unwrap(),
+                ipv6: "fd7a:115c:a1e0::9/128".parse().unwrap(),
+            },
+            node_key: [1u8; 32].into(),
+            node_key_expiry: None,
+            expired: false,
+            online: Some(true),
+            last_seen: None,
+            key_signature: Vec::new(),
+            machine_key: None,
+            disco_key: None,
+            unsigned_peer_api_only: false,
+            accepted_routes: Vec::new(),
+            underlay_addresses: Vec::new(),
+            ssh_host_keys: Vec::new(),
+            derp_region: None,
+            cap: Default::default(),
+            cap_map: Default::default(),
+            peerapi_port: Some(8080),
+            peerapi_dns_proxy: false,
+            is_wireguard_only: false,
+            exit_node_dns_resolvers: Vec::new(),
+            peer_relay: false,
+            service_vips: Default::default(),
+        }
+    }
+
+    // The stale-snapshot case `send_file` re-reads the peer for. A caller can hold a `NodeInfo` from
+    // before the peer's node key expired — the peer tracker's own timer flags a peer with no netmap
+    // in between — and that snapshot still says `expired: false` and still yields a peerAPI address.
+    // Deciding on it dials a peer whose key this node has already broken and reports the dial
+    // failure (`Error::Timeout`) instead of the reason.
+    #[test]
+    fn taildrop_dst_refuses_a_peer_the_tracker_has_since_expired() {
+        let snapshot = peer_snapshot();
+
+        // What the snapshot alone says — i.e. what the send used to be decided on.
+        assert_eq!(
+            taildrop_dst(&snapshot, None),
+            Ok("100.64.0.9:8080".parse().unwrap()),
+            "the retained snapshot looks perfectly sendable"
+        );
+
+        // What the peer tracker says now.
+        let mut current = peer_snapshot();
+        current.expired = true;
+        assert_eq!(
+            taildrop_dst(&snapshot, Some(&current)),
+            Err(Error::PeerKeyExpired),
+            "the current record decides, and it names the reason"
+        );
+    }
+
+    // The destination follows the current record too, not just the refusal: a peer that moved its
+    // peerAPI port (or its tailnet address) since the snapshot was taken must be dialed where it is
+    // now.
+    #[test]
+    fn taildrop_dst_uses_the_current_records_address() {
+        let snapshot = peer_snapshot();
+        let mut current = peer_snapshot();
+        current.peerapi_port = Some(9099);
+
+        assert_eq!(
+            taildrop_dst(&snapshot, Some(&current)),
+            Ok("100.64.0.9:9099".parse().unwrap())
+        );
+    }
+
+    // No current record (the peer left the tailnet, or no netmap has arrived) leaves the snapshot as
+    // the only thing to go on — the pre-existing behaviour, still bounded by the CGNAT assertion.
+    #[test]
+    fn taildrop_dst_falls_back_to_the_snapshot() {
+        let snapshot = peer_snapshot();
+
+        assert_eq!(
+            taildrop_dst(&snapshot, None),
+            Ok("100.64.0.9:8080".parse().unwrap())
+        );
+
+        let mut off_tailnet = peer_snapshot();
+        off_tailnet.tailnet_address.ipv4 = "192.0.2.9/32".parse().unwrap();
+        assert_eq!(
+            taildrop_dst(&off_tailnet, None),
+            Err(Error::Internal(InternalErrorKind::BadRequest)),
+            "a record pointing off the tailnet is refused rather than dialed"
         );
     }
 
