@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.49.1](https://github.com/GeiserX/tailscale-rs/compare/v0.49.0...v0.49.1) (2026-09-08)
+
+
+### Bug Fixes
+
+* **magic_dns:** don't let one refusing resolver end a multi-upstream forward ([#406](https://github.com/GeiserX/tailscale-rs/issues/406)) ([0df0971](https://github.com/GeiserX/tailscale-rs/commit/0df09714704f3185d58c9fa1caee8eb0867adac1))
+
 ## [0.49.0](https://github.com/GeiserX/tailscale-rs/compare/v0.48.0...v0.49.0) (2026-09-08)
 
 
