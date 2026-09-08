@@ -1365,6 +1365,10 @@ fn status_node_json(n: &StatusNode) -> serde_json::Value {
         "cur_addr": n.cur_addr.map(|a| a.to_string()),
         "relay": n.relay,
         "ssh_host_keys": n.ssh_host_keys,
+        // Go `ipnstate.PeerStatus.Expired`. An expired peer is still listed — that is the whole
+        // point of keeping it in the netmap — so a watcher needs this to tell it apart from a live
+        // one.
+        "expired": n.expired,
     })
 }
 
@@ -2698,6 +2702,7 @@ mod tests {
             cur_addr: None,
             relay: Some("nyc".to_string()),
             ssh_host_keys: vec![],
+            expired: false,
         };
         let status = Status {
             self_node: Some(node),

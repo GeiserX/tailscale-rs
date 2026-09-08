@@ -92,6 +92,60 @@ create_x25519_keypair_types!(
     NodeKeyPair
 );
 
+/// The leading key bytes stamped over an expired node's public key so it base64s to a `bad01`
+/// ("bad ol'") prefix — Go `key.badOldPrefix` (`types/key/node.go`, upstream issue #6932).
+///
+/// The marker is purely a debugging aid: it makes an intentionally-broken expired node key jump
+/// out of a log or a `tailscale status` dump instead of looking like an ordinary key.
+const BAD_OLD_PREFIX: [u8; 6] = [109, 167, 116, 213, 215, 116];
+
+/// Break a node's public key so nothing can communicate with it, returning a copy of `key` whose
+/// leading bytes are replaced by the `bad01` marker — Go `key.NodePublicWithBadOldPrefix`
+/// (`types/key/node.go`).
+///
+/// Used as defence in depth when a peer's key expiry has passed: the expired peer stays in the
+/// netmap (so callers can report *why* it is unreachable rather than "no such peer"), but the key
+/// left on it can no longer complete a WireGuard handshake. See `ts_control`'s `ExpiryManager`.
+///
+/// **Idempotent**: the transform overwrites the first six bytes rather than mixing them, so
+/// re-applying it to an already-broken key yields the same key. That matters because the peer
+/// tracker re-runs the expiry pass on a timer over peers it may have already flagged.
+pub fn node_public_with_bad_old_prefix(key: NodePublicKey) -> NodePublicKey {
+    let mut raw = key.to_bytes();
+    raw[..BAD_OLD_PREFIX.len()].copy_from_slice(&BAD_OLD_PREFIX);
+    NodePublicKey::from(raw)
+}
+
+#[cfg(test)]
+mod bad_old_prefix_tests {
+    use super::{BAD_OLD_PREFIX, NodePublicKey, node_public_with_bad_old_prefix};
+
+    /// The transform stamps exactly the first six bytes and leaves the tail alone, so two distinct
+    /// expired peers keep distinct (broken) keys and never collide in a node-key index.
+    #[test]
+    fn stamps_the_prefix_and_keeps_the_tail() {
+        let key = NodePublicKey::from([0x11u8; 32]);
+        let broken = node_public_with_bad_old_prefix(key).to_bytes();
+
+        assert_eq!(&broken[..6], &BAD_OLD_PREFIX);
+        assert_eq!(&broken[6..], &[0x11u8; 26]);
+        assert_ne!(broken, key.to_bytes());
+
+        let other = node_public_with_bad_old_prefix(NodePublicKey::from([0x22u8; 32])).to_bytes();
+        assert_ne!(broken, other);
+    }
+
+    /// Re-flagging an already-flagged peer must not double-mangle the key: the timer pass in
+    /// `ts_runtime`'s peer tracker can revisit a peer it already broke.
+    #[test]
+    fn is_idempotent() {
+        let once = node_public_with_bad_old_prefix(NodePublicKey::from([0x11u8; 32]));
+        let twice = node_public_with_bad_old_prefix(once);
+
+        assert_eq!(once, twice);
+    }
+}
+
 #[cfg(test)]
 mod debug_redaction_tests {
     use alloc::format;

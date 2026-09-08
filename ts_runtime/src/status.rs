@@ -112,6 +112,15 @@ pub struct StatusNode {
     /// Mirrors the domain [`Node::ssh_host_keys`](ts_control::Node::ssh_host_keys); empty when
     /// control advertised none (never fabricated).
     pub ssh_host_keys: Vec<String>,
+    /// Whether this node's key has expired (Go `ipnstate.PeerStatus.Expired`).
+    ///
+    /// Set either by control on the wire or by this node's own expiry pass
+    /// ([`ts_control::ExpiryManager::flag_expired_peer`]) once the node's key expiry has passed —
+    /// judged against control's clock, not this host's. An expired peer is deliberately still
+    /// listed: it keeps its identity so a watcher can tell "expired" apart from "gone", but it has
+    /// no endpoints, no home DERP, and a broken node key, so nothing routes to it and a peerAPI
+    /// dial to it is refused ([`ts_control::PEER_KEY_EXPIRED`]).
+    pub expired: bool,
 }
 
 /// Whether `prefix` covers exactly one address (a `/32` or a `/128`) — Go `netip.Prefix.IsSingleIP`.
@@ -185,6 +194,7 @@ impl StatusNode {
             cur_addr: None,
             relay: None,
             ssh_host_keys: node.ssh_host_keys.clone(),
+            expired: node.expired,
         }
     }
 }
@@ -399,6 +409,7 @@ mod tests {
             },
             node_key: [0u8; 32].into(),
             node_key_expiry: None,
+            expired: false,
             online: None,
             last_seen: None,
             key_signature: vec![],

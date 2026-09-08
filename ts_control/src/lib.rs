@@ -32,6 +32,7 @@ mod control_dialer;
 mod derp;
 mod dial_plan;
 mod dns;
+mod expiry;
 mod hostinfo;
 #[cfg_attr(not(feature = "async_tokio"), expect(dead_code))]
 mod map_request_builder;
@@ -65,6 +66,11 @@ pub use control_dialer::{ControlDialer, TcpDialer, complete_connection};
 pub use derp::{Map as DerpMap, Region as DerpRegion, convert_derp_map};
 pub use dial_plan::{DialCandidate, DialMode, DialPlan};
 pub use dns::{DnsConfig, ExtraRecord, Resolver as DnsResolver, ResolverTransport};
+pub use expiry::{
+    CLOCK_SKEW_EXPIRY_FLOOR_SECS, EXPIRY_TIMER_SLACK_SECS, ExpiryManager,
+    FLAG_EXPIRED_PEERS_EPOCH_UNIX, FlaggedPeer, MIN_CLOCK_DELTA_SECS, PEER_KEY_EXPIRED,
+    flag_expired_peers_epoch,
+};
 pub use node::{
     ExitNodeSelector, Id as NodeId, Node, NodeCapMap, PeerChange, StableId as StableNodeId,
     TailnetAddress, UserProfile, is_tailscale_ip, validate_service_name,

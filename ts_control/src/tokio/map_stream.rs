@@ -155,6 +155,15 @@ pub struct StateUpdate {
     /// This drives ONLY `last_seen`, never `online` — online is driven solely by `online_change`
     /// (conflating them re-introduces a fixed bug). Empty when this response carried none.
     pub peer_seen_change: alloc::collections::BTreeMap<crate::NodeId, bool>,
+    /// Control's own clock at the moment it wrote this response (`MapResponse.ControlTime`), when
+    /// it sent one. `None` on responses that carry no timestamp (most of them — control sends it
+    /// periodically, not on every response).
+    ///
+    /// Fed to [`ExpiryManager::on_control_time`](crate::ExpiryManager::on_control_time), which
+    /// stores the local-to-control offset so every node-key expiry comparison is made against
+    /// control's clock rather than this host's. Without it a node with a skewed clock either
+    /// expires peers early or never notices they expired at all.
+    pub control_time: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Upper bound on a single netmap frame as read off the wire, checked before allocating the read
@@ -456,6 +465,9 @@ pub(crate) fn state_update_from_frame(decoded: &[u8]) -> Option<StateUpdate> {
         // alongside a `peers*` set for the same node, so apply-order vs the peer set is moot.)
         online_change: map_response.online_change.clone(),
         peer_seen_change: map_response.peer_seen_change.clone(),
+        // Control's clock, when this response carried it. The consumer keeps the delta against the
+        // local clock and makes every expiry comparison against the adjusted time.
+        control_time: map_response.control_time,
     })
 }
 

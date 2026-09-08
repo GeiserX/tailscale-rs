@@ -1215,6 +1215,7 @@ mod tests {
             },
             node_key,
             node_key_expiry: None,
+            expired: false,
             online: None,
             last_seen: None,
             key_signature: vec![],

@@ -1114,7 +1114,9 @@ impl Device {
     /// or attacker-chosen address can never be targeted. As defense in depth, the resolved address is
     /// additionally asserted to be a Tailscale CGNAT IP before dialing.
     ///
-    /// Returns [`InternalErrorKind::BadRequest`] when the peer advertises no IPv4 peerAPI (so it
+    /// Returns [`Error::PeerKeyExpired`] when control has expired the peer's node key (Go refuses
+    /// a peerAPI dial to such a peer with the same message);
+    /// [`InternalErrorKind::BadRequest`] when the peer advertises no IPv4 peerAPI (so it
     /// cannot receive files), when the name is invalid, or when the peer refuses the transfer
     /// (`403`/`409`/unexpected status); [`Error::Timeout`] on a dial failure or timeout; and
     /// [`InternalErrorKind::Io`] on a mid-transfer stream error.
@@ -1129,6 +1131,15 @@ impl Device {
         R: tokio::io::AsyncRead + Unpin,
     {
         let channel = self.channel()?;
+
+        // Refuse a peer whose node key control has expired, with the reason rather than a generic
+        // bad-request — Go `LocalBackend.pingPeerAPI` answers "peer's node key has expired" here.
+        // Checked before `peerapi_addr`, which also refuses an expired peer but can only say
+        // `None`; being able to name the cause is the reason an expired peer is kept in the netmap
+        // instead of dropped from it.
+        if peer.expired {
+            return Err(Error::PeerKeyExpired);
+        }
 
         // Destination comes only from the peer's own node record — never an arbitrary address.
         let dst = peer

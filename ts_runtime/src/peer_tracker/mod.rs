@@ -12,7 +12,7 @@ use kameo::{
     reply::ReplySender,
 };
 use tokio::sync::watch;
-use ts_control::{Node, UserId, UserProfile};
+use ts_control::{ExpiryManager, Node, UserId, UserProfile};
 use ts_keys::{DiscoPublicKey, NodePublicKey};
 use ts_transport::PeerId;
 
@@ -35,6 +35,20 @@ fn disco_key_is_zero(key: &DiscoPublicKey) -> bool {
 /// Go's `IsZero()` checks in `endpoint.updateDiscoKey` read it.
 fn disco_key_from_control(key: Option<DiscoPublicKey>) -> Option<DiscoPublicKey> {
     key.filter(|k| !disco_key_is_zero(k))
+}
+
+/// The local wall clock as a UTC timestamp.
+///
+/// chrono is built without its `clock` feature in this workspace, so derive it from `SystemTime`
+/// the same way the control runner and the ssh-policy paths do. A clock before the Unix epoch
+/// (unrepresentable) falls back to the epoch itself, which the expiry pass then refuses as being
+/// before its hardcoded epoch — fail-safe: flag nothing rather than expire everything.
+fn local_now() -> chrono::DateTime<chrono::Utc> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| chrono::DateTime::from_timestamp(d.as_secs() as i64, d.subsec_nanos()))
+        .unwrap_or_default()
 }
 
 /// The two disco keys a peer can present, and which of them is currently active — Go
@@ -213,6 +227,27 @@ pub struct PeerTracker {
     /// it is routed to the control runner's `self_node` cell), so a node cannot lock itself out of
     /// its own netmap.
     tka_authority: watch::Receiver<Option<Arc<ts_tka::Authority>>>,
+    /// Node-key expiry enforcement — Go `ipnlocal.expiryManager` (`ipn/ipnlocal/expiry.go`).
+    ///
+    /// Holds the local-to-control clock delta (fed from `MapResponse.ControlTime`) and the set of
+    /// peers already flagged, and is the thing that actually rewrites an expired peer. It lives
+    /// here because the peer db is this fork's netmap: every site that installs a peer goes through
+    /// [`upsert_from_control`](PeerTracker::upsert_from_control), so putting the pass there is what
+    /// makes "no peer is ever installed unflagged" true by construction rather than by review.
+    expiry: ExpiryManager,
+    /// The most recent self node control sent, kept only so it can be folded into
+    /// [`ExpiryManager::next_peer_expiry`] exactly as Go folds in `nm.SelfNode` — this node's own
+    /// key expiry must arm the timer too. Never entered into the peer db (self is not a peer) and
+    /// never flagged here: the self-expiry *decision* is the control runner's (`expiry_action`).
+    self_node: Option<Node>,
+    /// The armed expiry timer — Go `LocalBackend.nmExpiryTimer`.
+    ///
+    /// Sleeps until the soonest future key expiry across the peers and the self node, then sends
+    /// [`ExpiryTimerFired`] so expiry is re-evaluated **when it happens** rather than whenever the
+    /// next netmap arrives. Re-armed (and the old one aborted) after every netmap and after every
+    /// firing. Aborting rather than letting a stale timer run is this fork's equivalent of Go's
+    /// `numClientStatusCalls` generation check.
+    expiry_timer: Option<tokio::task::JoinHandle<()>>,
     env: Env,
 }
 
@@ -593,6 +628,9 @@ impl kameo::Actor for PeerTracker {
             // The cell starts `None` (no lock synced ⇒ enforcement inactive, admit all, matching
             // Go's `b.tka == nil`); the control runner flips it to `Some` on the first sync.
             tka_authority,
+            expiry: ExpiryManager::new(),
+            self_node: None,
+            expiry_timer: None,
             env,
         })
     }
@@ -813,30 +851,53 @@ impl Message<Arc<ts_control::StateUpdate>> for PeerTracker {
     async fn handle(
         &mut self,
         msg: Arc<ts_control::StateUpdate>,
-        _ctx: &mut Context<Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) {
         // Accumulate user profiles first — control sends them incrementally and a response may
         // carry profiles with no peer delta (or peers that reference a profile from an earlier
         // response), so this must happen before the no-peer-update early return below.
         self.accumulate_user_profiles(&msg.user_profiles);
 
+        // Wall clock for everything below, sampled once so one response is evaluated at one
+        // instant. chrono is built without its `clock` feature in this workspace, so `local_now`
+        // derives it from `SystemTime` the same way the control runner / ssh-policy paths do.
+        let now = local_now();
+
+        // Record control's own clock BEFORE anything reads expiry — Go `onControlTime`, delivered
+        // to the expiry manager as its own event. From here on every expiry comparison is made
+        // against control's time, not this host's, so a node with a skewed clock neither expires
+        // peers early nor misses that they expired at all.
+        if let Some(control_time) = msg.control_time {
+            let delta = self.expiry.on_control_time(control_time, now);
+            if !delta.is_zero() {
+                tracing::debug!(
+                    delta_secs = delta.num_seconds(),
+                    "control's clock differs from ours; expiry is judged against control's time"
+                );
+            }
+        }
+
+        // Remember the self node so it can be folded into the next-expiry computation below, exactly as Go
+        // folds `nm.SelfNode` into `nextPeerExpiry`. Self is never a peer and is never flagged
+        // here; the runtime's own expiry decision stays with the control runner.
+        if let Some(self_node) = msg.node.as_ref() {
+            self.self_node = Some(self_node.clone());
+        }
+
         // Apply the standalone online/last-seen delta maps (channels C/D, `MapResponse.OnlineChange`
         // / `PeerSeenChange`). These arrive keyed by control node id and may ride a response that
         // carries NO `peer_update` (a bare online flip is the common case), so they must be applied
         // *before* the no-peer-update early return — otherwise online status freezes at the last
         // full-node/patch value. Each entry only ever *sets* a value (never back to unknown).
-        // Wall clock for a `PeerSeenChange: true` (Go uses `clock.Now()`). chrono is built without
-        // its `clock` feature in this workspace, so derive it from `SystemTime` the same way the
-        // control runner / ssh-policy paths do (unix secs → `DateTime::from_timestamp`).
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .and_then(|d| chrono::DateTime::from_timestamp(d.as_secs() as i64, d.subsec_nanos()))
-            .unwrap_or_default();
+        // `now` (above) is also the wall clock for a `PeerSeenChange: true` (Go uses `clock.Now()`).
         let liveness_changed =
             self.apply_liveness_changes(&msg.online_change, &msg.peer_seen_change, now);
 
         if msg.peer_update.is_none() && msg.peer_patches.is_empty() {
+            // No peer set or patch, so the peer expiries are unchanged — but the self node or the
+            // clock delta may have moved, so the timer still has to be re-aimed.
+            self.rearm_expiry_timer(now, ctx.actor_ref());
+
             // No peer set or patch this response. If a liveness delta still mutated the netmap,
             // publish the refreshed snapshot so watchers (and `GetStatus`) see the new online state.
             if liveness_changed {
@@ -865,11 +926,11 @@ impl Message<Arc<ts_control::StateUpdate>> for PeerTracker {
         let (mut upserts, mut deletions) = msg
             .peer_update
             .as_ref()
-            .map(|u| self.apply_peer_update(u))
+            .map(|u| self.apply_peer_update(u, now))
             .unwrap_or_default();
 
         if !msg.peer_patches.is_empty() {
-            let (patch_upserts, patch_deletions) = self.apply_peer_patches(&msg.peer_patches);
+            let (patch_upserts, patch_deletions) = self.apply_peer_patches(&msg.peer_patches, now);
             // A patch can evict a node the set just upserted (TKA rejection after key rotation), or
             // re-admit/patch one not in the set — reconcile so each id lands in exactly one set.
             for id in &patch_upserts {
@@ -888,6 +949,12 @@ impl Message<Arc<ts_control::StateUpdate>> for PeerTracker {
             peer_count = self.peer_db.peers().len(),
             "new peer state"
         );
+
+        // Aim the timer at the soonest expiry in the peer set this response just installed — Go
+        // `setControlClientStatusLocked`, which stops the old timer and starts a new one on every
+        // netmap. Peers already past their expiry were flagged on the way in, so what is left is
+        // strictly in the future.
+        self.rearm_expiry_timer(now, ctx.actor_ref());
 
         self.service_pending_requests();
 
@@ -969,6 +1036,56 @@ impl Message<DiscoKeyObserved> for PeerTracker {
             .await
         {
             tracing::error!(error = %e, "publishing peer state after a disco active-key switch");
+        }
+    }
+}
+
+/// Internal self-message: the armed expiry timer fired — the soonest key expiry the peer set knew
+/// about has now passed, so expiry must be re-evaluated.
+///
+/// This is the whole point of the timer (Go `LocalBackend.nmExpiryTimer` →
+/// `handleNetmapExpiry`): without it a peer whose key expires between two netmaps stays fully
+/// configured — endpoints, DERP home, live node key — until control happens to send another
+/// response, which on a steady map poll may be a long time.
+///
+/// Upstream `0640312e5` had to fix this path, because the timer there closed over the netmap
+/// captured when it was armed and reinstalling that stale copy rolled back any delta that arrived
+/// meanwhile; the fix re-reads live peer state before reinstalling. Here the pass reads the peer db
+/// — the live state — directly, so there is no captured copy to roll anything back.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExpiryTimerFired;
+
+impl Message<ExpiryTimerFired> for PeerTracker {
+    type Reply = ();
+
+    async fn handle(&mut self, _msg: ExpiryTimerFired, ctx: &mut Context<Self, Self::Reply>) {
+        let now = local_now();
+        let upserts = self.reevaluate_expiry(now);
+
+        // Re-aim at the next expiry after this one, whether or not anything was flagged: a timer
+        // that fired early (clock skew, or the slack) must not be the last one armed.
+        self.rearm_expiry_timer(now, ctx.actor_ref());
+
+        if upserts.is_empty() {
+            return;
+        }
+
+        // A newly expired peer lost its endpoints, its DERP home and its node key, so the
+        // dataplane, route updater and source filter all have to see the new snapshot — the same
+        // publish the netmap handler does after a peer set changes.
+        self.service_pending_requests();
+        self.peer_watch.send_replace(self.status_peers());
+
+        if let Err(e) = self
+            .env
+            .publish(Arc::new(PeerState {
+                upserts,
+                deletions: HashSet::default(),
+                peers: Arc::new(self.peer_db.clone()),
+            }))
+            .await
+        {
+            tracing::error!(error = %e, "publishing peer state after a peer key expired");
         }
     }
 }
@@ -1225,7 +1342,32 @@ impl PeerTracker {
     /// key is registered for ingress attribution ([`store_disco`](Self::store_disco)).
     ///
     /// [`endpoint.updateFromNode`]: https://github.com/tailscale/tailscale/blob/49e148c4a30b4f8098f69468fd27a7021d85ea02/wgengine/magicsock/endpoint.go
-    fn upsert_from_control(&mut self, node: &Node) -> PeerId {
+    fn upsert_from_control(&mut self, node: &Node, now: chrono::DateTime<chrono::Utc>) -> PeerId {
+        // The expiry pass, at the one site every peer install funnels through — Go
+        // `flagExpiredPeers`, which runs over the whole netmap on the way in. A peer whose key
+        // expiry has passed (judged against CONTROL's clock) is rewritten, never dropped: it keeps
+        // its identity so `whois`, `status` and a peerAPI dial can all say *why* it is unreachable,
+        // but it loses its endpoints, its home DERP and its usable node key. `None` is the ordinary
+        // case — no transition — and costs no clone.
+        let flagged = self.expiry.flag_expired_peer(node, now);
+        // Log the transition, not the rewrite: control restates an expired peer unflagged on every
+        // full netmap, so without this the line (and the reader's alarm) would repeat forever.
+        if let Some(flagged) = flagged.as_ref().filter(|f| f.first_transition) {
+            if flagged.peer.expired {
+                tracing::info!(
+                    stable_id = ?flagged.peer.stable_id,
+                    "peer's node key has expired; clearing its endpoints and DERP home and \
+                     breaking its node key"
+                );
+            } else {
+                tracing::info!(
+                    stable_id = ?flagged.peer.stable_id,
+                    "peer's node-key expiry was extended; restoring its node key"
+                );
+            }
+        }
+        let node = flagged.as_ref().map_or(node, |flagged| &flagged.peer);
+
         let node_key = node.node_key;
         let from_control = disco_key_from_control(node.disco_key);
 
@@ -1274,10 +1416,16 @@ impl PeerTracker {
     /// netmap [`handle`](Message::handle) calls it, and so do the TKA enforcement tests, so the two
     /// real upsert sites (`Full` and `Delta { upsert }`) cannot diverge from what is tested.
     ///
+    /// `now` is the local wall clock the expiry pass in
+    /// [`upsert_from_control`](Self::upsert_from_control) judges against (after correction for
+    /// control's clock); it is threaded in rather than read per peer so one netmap is evaluated at
+    /// one instant.
+    ///
     /// Returns `(upserts, deletions)` — the [`PeerId`]s touched — for downstream bookkeeping.
     fn apply_peer_update(
         &mut self,
         peer_update: &ts_control::PeerUpdate,
+        now: chrono::DateTime<chrono::Utc>,
     ) -> (HashSet<PeerId>, HashSet<PeerId>) {
         let mut upserts = HashSet::default();
         let mut deletions = HashSet::default();
@@ -1347,7 +1495,7 @@ impl PeerTracker {
                     if !k {
                         continue; // fail-CLOSED: rejected by tailnet lock or rotation-obsolete (above)
                     }
-                    let peer_id = self.upsert_from_control(node);
+                    let peer_id = self.upsert_from_control(node, now);
                     upserts.insert(peer_id);
                 }
             }
@@ -1371,7 +1519,7 @@ impl PeerTracker {
                         }
                         continue;
                     }
-                    let id = self.upsert_from_control(peer);
+                    let id = self.upsert_from_control(peer, now);
 
                     upserts.insert(id);
                 }
@@ -1435,6 +1583,14 @@ impl PeerTracker {
                 .peer_db
                 .peers()
                 .iter()
+                // A peer this node already flagged expired is skipped: its node key is one WE
+                // broke (`ExpiryManager::flag_expired_peer`), so re-verifying control's signature
+                // against it would be checking our own mutation, and the peer would always be
+                // evicted. It was admitted by the lock when it was installed, against the real key
+                // control sent, and it has had no usable key since — so keeping the row costs no
+                // trust and preserves the thing expiry flagging exists for: an expired peer is
+                // FLAGGED, not dropped, so a caller can say why it is unreachable.
+                .filter(|(_, node)| !node.expired)
                 .map(|(id, node)| (*id, node))
                 .collect::<Vec<(PeerId, &Node)>>();
             let nodes = entries
@@ -1464,6 +1620,99 @@ impl PeerTracker {
         evicted
     }
 
+    /// Re-run the expiry pass over the peers **already in the peer db**, returning the [`PeerId`]s
+    /// whose node changed (empty when nothing expired, the overwhelmingly common case).
+    ///
+    /// The timer's counterpart to the pass [`upsert_from_control`](Self::upsert_from_control) runs
+    /// on the way in: that one catches a peer that was already expired when control handed it to
+    /// us, this one catches a peer that expires while we sit on the same netmap.
+    ///
+    /// Only peers that actually transition are cloned and re-installed — the pass returns `None`
+    /// for the rest — so a timer firing over a large peer set costs one walk and a handful of
+    /// upserts. Re-installing goes through the ordinary upsert path so the node-key index follows
+    /// the peer's now-broken key; the pass there is a no-op on an already-flagged peer.
+    fn reevaluate_expiry(&mut self, now: chrono::DateTime<chrono::Utc>) -> HashSet<PeerId> {
+        let flagged = self
+            .peer_db
+            .peers()
+            .values()
+            .filter_map(|peer| self.expiry.flag_expired_peer(peer, now))
+            .collect::<Vec<ts_control::FlaggedPeer>>();
+
+        if flagged.is_empty() {
+            return HashSet::default();
+        }
+
+        tracing::info!(
+            n = flagged.len(),
+            "netmap expiry timer fired; peers whose node keys expired between netmaps"
+        );
+
+        let mut upserts = HashSet::default();
+        for flagged in &flagged {
+            // `upsert_from_control` re-runs the pass, which is a no-op on the peer it just
+            // rewrote — so the log line belongs here, where the transition is known.
+            if flagged.first_transition && flagged.peer.expired {
+                tracing::info!(
+                    stable_id = ?flagged.peer.stable_id,
+                    "peer's node key has expired; clearing its endpoints and DERP home and \
+                     breaking its node key"
+                );
+            }
+            upserts.insert(self.upsert_from_control(&flagged.peer, now));
+        }
+        self.prune_endpoint_disco();
+
+        upserts
+    }
+
+    /// Stop the armed expiry timer and arm a new one for the soonest future key expiry across the
+    /// peer db and the self node — Go `setControlClientStatusLocked`'s `nmExpiryTimer` block.
+    ///
+    /// No future expiry (every peer tagged or already flagged, and no self expiry) leaves no timer
+    /// armed; the next netmap re-decides. The delay carries upstream's
+    /// [`EXPIRY_TIMER_SLACK_SECS`](ts_control::EXPIRY_TIMER_SLACK_SECS) of slack so the key is
+    /// unambiguously past its expiry by the time the pass runs.
+    ///
+    /// The old timer is **aborted**, which is this fork's version of Go's `numClientStatusCalls`
+    /// generation check: a task that has already been dropped cannot deliver a stale wake-up. The
+    /// spawned task holds only a `WeakActorRef`, so it can never keep the tracker's mailbox alive
+    /// past shutdown.
+    fn rearm_expiry_timer(&mut self, now: chrono::DateTime<chrono::Utc>, slf: &ActorRef<Self>) {
+        if let Some(timer) = self.expiry_timer.take() {
+            timer.abort();
+        }
+
+        let Some(next) = self.expiry.next_peer_expiry(
+            self.peer_db.peers().values(),
+            self.self_node.as_ref(),
+            now,
+        ) else {
+            return;
+        };
+
+        let delay = (next - now) + chrono::TimeDelta::seconds(ts_control::EXPIRY_TIMER_SLACK_SECS);
+        // `next` is never before `now` (the expiry manager floors it), so the conversion holds; a
+        // negative delta would only mean "fire immediately", which is also the safe reading.
+        let delay = delay.to_std().unwrap_or(std::time::Duration::ZERO);
+
+        tracing::debug!(
+            delay_secs = delay.as_secs(),
+            "arming the netmap expiry timer for the next node-key expiry"
+        );
+
+        let notify = slf.downgrade();
+        self.expiry_timer = Some(tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let Some(tracker) = notify.upgrade() else {
+                return; // the peer tracker is gone; nothing left to re-evaluate
+            };
+            if let Err(e) = tracker.tell(ExpiryTimerFired).await {
+                tracing::debug!(error = %e, "peer tracker stopped before the expiry timer fired");
+            }
+        }));
+    }
+
     /// Apply field-level peer patches (`MapResponse.PeersChangedPatch`), returning the upserted /
     /// deleted [`PeerId`]s.
     ///
@@ -1475,6 +1724,7 @@ impl PeerTracker {
     fn apply_peer_patches(
         &mut self,
         patches: &[ts_control::PeerChange],
+        now: chrono::DateTime<chrono::Utc>,
     ) -> (HashSet<PeerId>, HashSet<PeerId>) {
         let mut upserts = HashSet::default();
         let mut deletions = HashSet::default();
@@ -1531,6 +1781,12 @@ impl PeerTracker {
             // a mismatched pair.
             if let Some(node_key) = patch.node_key {
                 node.node_key = node_key;
+                // Control restated the key, so this node's own break of it (if the peer had
+                // expired) no longer applies: clear the client-set flag and let the expiry pass in
+                // `upsert_from_control` decide again against the (possibly also patched) expiry.
+                // Go gets this for free — it patches a pristine node and re-runs `flagExpiredPeers`
+                // over the result.
+                node.expired = false;
             }
             if let Some(sig) = &patch.key_signature {
                 node.key_signature = sig.clone();
@@ -1551,7 +1807,7 @@ impl PeerTracker {
                 continue;
             }
 
-            let id = self.upsert_from_control(&node);
+            let id = self.upsert_from_control(&node, now);
             upserts.insert(id);
         }
 
@@ -1634,6 +1890,9 @@ impl PeerTracker {
             user_profiles: HashMap::new(),
             endpoint_disco: HashMap::new(),
             tka_authority: tka_rx,
+            expiry: ExpiryManager::new(),
+            self_node: None,
+            expiry_timer: None,
             env,
         };
         (tracker, tka_tx)
@@ -1758,6 +2017,7 @@ pub(crate) mod tka_tests {
             },
             node_key: node_key.into(),
             node_key_expiry: None,
+            expired: false,
             online: None,
             last_seen: None,
             key_signature,
@@ -1912,7 +2172,10 @@ pub(crate) mod tka_tests {
             "an empty-keyset authority must not enforce, not even against an unsigned peer"
         );
 
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer_api_only.clone()]));
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Full(vec![peer_api_only.clone()]),
+            local_now(),
+        );
         assert!(
             tracker.peer_db.get(&peer_api_only.node_key).is_some(),
             "the peer reaches the peer db, so the gate's drop is keyset-conditional"
@@ -1973,7 +2236,7 @@ pub(crate) mod tka_tests {
             remove: Vec::new(),
         };
 
-        tracker.apply_peer_update(&update);
+        tracker.apply_peer_update(&update, local_now());
 
         assert_eq!(tracker.peer_db.peers().len(), 0);
         assert!(tracker.peer_db.get(&unsigned.node_key).is_none());
@@ -1991,7 +2254,7 @@ pub(crate) mod tka_tests {
             remove: Vec::new(),
         };
 
-        tracker.apply_peer_update(&update);
+        tracker.apply_peer_update(&update, local_now());
 
         assert_eq!(tracker.peer_db.peers().len(), 1);
         assert!(tracker.peer_db.get(&good.node_key).is_some());
@@ -2019,7 +2282,7 @@ pub(crate) mod tka_tests {
         let update =
             ts_control::PeerUpdate::Full(vec![good.clone(), unsigned.clone(), bad.clone()]);
 
-        tracker.apply_peer_update(&update);
+        tracker.apply_peer_update(&update, local_now());
 
         assert_eq!(tracker.peer_db.peers().len(), 1);
         assert!(tracker.peer_db.get(&good.node_key).is_some());
@@ -2047,13 +2310,13 @@ pub(crate) mod tka_tests {
         let unsigned = peer_node("unsigned", [8u8; 32], vec![]);
         let bad = peer_node("bad", [9u8; 32], bad_sig);
         let batch = ts_control::PeerUpdate::Full(vec![good.clone(), unsigned.clone(), bad.clone()]);
-        tracker.apply_peer_update(&batch);
+        tracker.apply_peer_update(&batch, local_now());
         assert_eq!(tracker.peer_db.peers().len(), 3, "no lock ⇒ admit all");
 
         // 2) Publish the verified authority over the watch cell (exactly what the control runner does
         //    on a successful sync) ⇒ enforcement ON. A re-applied Full now drops unsigned + bad.
         tka_tx.send_replace(Some(Arc::new(authority)));
-        tracker.apply_peer_update(&batch);
+        tracker.apply_peer_update(&batch, local_now());
         assert_eq!(
             tracker.peer_db.peers().len(),
             1,
@@ -2067,7 +2330,7 @@ pub(crate) mod tka_tests {
         //    re-admitted by a fresh netmap. Assert the specific previously-dropped key returns (not
         //    merely a count), so this proves the drop→clear→re-admit transition, not "admit-all-fresh".
         tka_tx.send_replace(None);
-        tracker.apply_peer_update(&batch);
+        tracker.apply_peer_update(&batch, local_now());
         assert_eq!(
             tracker.peer_db.peers().len(),
             3,
@@ -2102,11 +2365,10 @@ pub(crate) mod tka_tests {
         let good = peer_node("good", NODE_KEY_BYTES, sig);
         let unsigned = peer_node("unsigned", [8u8; 32], vec![]);
         let bad = peer_node("bad", [9u8; 32], bad_sig);
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![
-            good.clone(),
-            unsigned.clone(),
-            bad.clone(),
-        ]));
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Full(vec![good.clone(), unsigned.clone(), bad.clone()]),
+            local_now(),
+        );
         assert_eq!(tracker.peer_db.peers().len(), 3, "no lock yet ⇒ admit all");
         let unsigned_id = tracker
             .peer_db
@@ -2150,10 +2412,10 @@ pub(crate) mod tka_tests {
 
         let good = peer_node("good", NODE_KEY_BYTES, sig);
         let unsigned = peer_node("unsigned", [8u8; 32], vec![]);
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![
-            good.clone(),
-            unsigned.clone(),
-        ]));
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Full(vec![good.clone(), unsigned.clone()]),
+            local_now(),
+        );
 
         // Never synced.
         assert!(tracker.tka_reevaluate_peer_db().is_empty());
@@ -2208,10 +2470,10 @@ pub(crate) mod tka_tests {
 
         // Both admitted while nothing is synced.
         let (mut tracker, tka_tx) = PeerTracker::for_test(test_env(), None);
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![
-            stale.clone(),
-            rotated.clone(),
-        ]));
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Full(vec![stale.clone(), rotated.clone()]),
+            local_now(),
+        );
         assert_eq!(tracker.peer_db.peers().len(), 2, "no lock yet ⇒ admit all");
 
         tka_tx.send_replace(Some(Arc::new(authority)));
@@ -2234,7 +2496,7 @@ pub(crate) mod tka_tests {
 
     /// A `StateUpdate` carrying nothing but a `Full` peer set — the netmap shape the live-actor test
     /// publishes on the bus.
-    fn netmap_with_peers(peers: Vec<Node>) -> ts_control::StateUpdate {
+    pub(crate) fn netmap_with_peers(peers: Vec<Node>) -> ts_control::StateUpdate {
         ts_control::StateUpdate {
             session_handle: None,
             seq: 0,
@@ -2254,12 +2516,16 @@ pub(crate) mod tka_tests {
             tka: None,
             online_change: Default::default(),
             peer_seen_change: Default::default(),
+            control_time: None,
         }
     }
 
     /// Poll a live [`PeerTracker`] until it holds exactly `want` peers, bounded by a timeout so a
     /// broken wiring fails the test instead of hanging the suite.
-    async fn await_peer_count(tracker: &ActorRef<PeerTracker>, want: usize) -> Vec<Node> {
+    pub(crate) async fn await_peer_count(
+        tracker: &ActorRef<PeerTracker>,
+        want: usize,
+    ) -> Vec<Node> {
         let settled = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 let peers = tracker.ask(AllPeers).await.expect("peer tracker is alive");
@@ -2335,10 +2601,10 @@ pub(crate) mod tka_tests {
         // would (wrongly) leave the unsigned node's key in the db.
         let signed = peer_node("dup", NODE_KEY_BYTES, sig);
         let unsigned = peer_node("dup", [8u8; 32], vec![]);
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![
-            signed.clone(),
-            unsigned.clone(),
-        ]));
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Full(vec![signed.clone(), unsigned.clone()]),
+            local_now(),
+        );
 
         // The unsigned node's own verdict failed, so its key must NOT be present, regardless of the
         // shared stable_id. (The signed twin retained the stable_id; the db holds the signed key.)
@@ -2360,10 +2626,10 @@ pub(crate) mod tka_tests {
         let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
         let first = peer_node("dup", [1u8; 32], vec![]);
         let last = peer_node("dup", [2u8; 32], vec![]);
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![
-            first.clone(),
-            last.clone(),
-        ]));
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Full(vec![first.clone(), last.clone()]),
+            local_now(),
+        );
 
         // Exactly one db entry for the shared stable_id, holding the LAST node (upsert is
         // last-writer-wins on stable_id); the first node's key was transparently superseded.
@@ -2410,7 +2676,10 @@ pub(crate) mod tka_tests {
         let stale_sig = NodeKeySignature::sign_direct(&pivot_pub, &trusted).serialize();
         let stale_peer = peer_node("stale", pivot_pub, stale_sig);
         let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), Some(authority));
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![stale_peer.clone()]));
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Full(vec![stale_peer.clone()]),
+            local_now(),
+        );
         assert!(
             tracker.peer_db.get(&stale_peer.node_key).is_some(),
             "the stale peer is admitted while no rotation has superseded it yet"
@@ -2421,10 +2690,10 @@ pub(crate) mod tka_tests {
         let new_key = [4u8; 32];
         let new_sig = NodeKeySignature::sign_rotation(&new_key, &trusted, &pivot).serialize();
         let new_peer = peer_node("rotated", new_key, new_sig);
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![
-            new_peer.clone(),
-            stale_peer.clone(),
-        ]));
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Full(vec![new_peer.clone(), stale_peer.clone()]),
+            local_now(),
+        );
         assert!(
             tracker.peer_db.get(&new_peer.node_key).is_some(),
             "the freshly-rotated peer is admitted"
@@ -2446,10 +2715,10 @@ pub(crate) mod tka_tests {
         let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), Some(empty_auth));
         let signed = peer_node("signed", [7u8; 32], vec![0xde, 0xad]);
         let unsigned = peer_node("unsigned", [8u8; 32], vec![]);
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![
-            signed.clone(),
-            unsigned.clone(),
-        ]));
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Full(vec![signed.clone(), unsigned.clone()]),
+            local_now(),
+        );
         assert_eq!(
             tracker.peer_db.peers().len(),
             2,
@@ -2472,7 +2741,10 @@ pub(crate) mod tka_tests {
             !tracker.tka_admits(&imposter),
             "a signature bound to one node key must not authorize a different node key"
         );
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![imposter.clone()]));
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Full(vec![imposter.clone()]),
+            local_now(),
+        );
         assert!(tracker.peer_db.get(&imposter.node_key).is_none());
     }
 
@@ -2500,7 +2772,10 @@ pub(crate) mod tka_tests {
         );
         // Drive the real upsert path too (match the sibling replay test's depth): an untrusted-key
         // signature must keep the peer out of the db, not merely fail the verdict in isolation.
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer.clone()]));
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Full(vec![peer.clone()]),
+            local_now(),
+        );
         assert!(tracker.peer_db.get(&peer.node_key).is_none());
     }
 
@@ -2515,10 +2790,13 @@ pub(crate) mod tka_tests {
 
         let good = peer_node("good", NODE_KEY_BYTES, sig);
         let unsigned = peer_node("unsigned", [8u8; 32], vec![]);
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Delta {
-            remove: vec![],
-            upsert: vec![good.clone(), unsigned.clone()],
-        });
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Delta {
+                remove: vec![],
+                upsert: vec![good.clone(), unsigned.clone()],
+            },
+            local_now(),
+        );
         assert!(tracker.peer_db.get(&good.node_key).is_some());
         assert!(
             tracker.peer_db.get(&unsigned.node_key).is_none(),
@@ -2536,15 +2814,21 @@ pub(crate) mod tka_tests {
 
         // Admit the signed peer.
         let good = peer_node("good", NODE_KEY_BYTES, sig.clone());
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![good.clone()]));
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Full(vec![good.clone()]),
+            local_now(),
+        );
         assert!(tracker.peer_db.get(&good.node_key).is_some());
 
         // Re-upsert the SAME stable_id (now with no signature) via a delta ⇒ evicted, not retained.
         let revoked = peer_node("good", NODE_KEY_BYTES, vec![]);
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Delta {
-            remove: vec![],
-            upsert: vec![revoked],
-        });
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Delta {
+                remove: vec![],
+                upsert: vec![revoked],
+            },
+            local_now(),
+        );
         assert!(
             tracker.peer_db.get(&good.node_key).is_none(),
             "a delta re-upsert that fails the lock must evict the previously-admitted peer"
@@ -2567,7 +2851,10 @@ pub(crate) mod tka_tests {
 
         // 1) Admit the peer with a valid signature via a real `Full`.
         let good = peer_node("revoked", NODE_KEY_BYTES, sig.clone());
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![good.clone()]));
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Full(vec![good.clone()]),
+            local_now(),
+        );
         assert_eq!(tracker.peer_db.peers().len(), 1);
         assert!(tracker.peer_db.get(&good.node_key).is_some());
 
@@ -2576,7 +2863,10 @@ pub(crate) mod tka_tests {
         let last = bad_sig.len() - 1;
         bad_sig[last] ^= 0xff;
         let revoked = peer_node("revoked", NODE_KEY_BYTES, bad_sig);
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![revoked.clone()]));
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Full(vec![revoked.clone()]),
+            local_now(),
+        );
 
         // Eviction: the stale entry is dropped because its re-included signature fails the gate.
         assert_eq!(tracker.peer_db.peers().len(), 0);
@@ -2592,12 +2882,18 @@ pub(crate) mod tka_tests {
         let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
 
         let peer = peer_node("p", NODE_KEY_BYTES, vec![0xde, 0xad]);
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer.clone()]));
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Full(vec![peer.clone()]),
+            local_now(),
+        );
         assert_eq!(tracker.peer_db.peers().len(), 1);
 
         // Re-sync the same stable_id with garbage signature bytes; inactive enforcement keeps it.
         let resynced = peer_node("p", NODE_KEY_BYTES, vec![0x00]);
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![resynced.clone()]));
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Full(vec![resynced.clone()]),
+            local_now(),
+        );
         assert_eq!(tracker.peer_db.peers().len(), 1);
         assert!(tracker.peer_db.get(&resynced.node_key).is_some());
     }
@@ -2612,7 +2908,10 @@ pub(crate) mod tka_tests {
 
         // Seed a peer (id == 1, per `peer_node`) with no endpoints / no DERP.
         let peer = peer_node("mover", [1u8; 32], vec![]);
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer.clone()]));
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Full(vec![peer.clone()]),
+            local_now(),
+        );
         let (_pid, before) = tracker.peer_db.get(&(1 as ts_control::NodeId)).unwrap();
         assert!(before.underlay_addresses.is_empty());
         assert!(before.derp_region.is_none());
@@ -2632,7 +2931,8 @@ pub(crate) mod tka_tests {
             online: None,
             last_seen: None,
         };
-        let (upserts, deletions) = tracker.apply_peer_patches(std::slice::from_ref(&patch));
+        let (upserts, deletions) =
+            tracker.apply_peer_patches(std::slice::from_ref(&patch), local_now());
 
         assert_eq!(upserts.len(), 1);
         assert_eq!(deletions.len(), 0);
@@ -2658,10 +2958,13 @@ pub(crate) mod tka_tests {
 
         // The whole-node delta upserts a brand-new peer (id == 1) with no reachability.
         let peer = peer_node("mover", [1u8; 32], vec![]);
-        let (set_upserts, _) = tracker.apply_peer_update(&ts_control::PeerUpdate::Delta {
-            upsert: vec![peer.clone()],
-            remove: vec![],
-        });
+        let (set_upserts, _) = tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Delta {
+                upsert: vec![peer.clone()],
+                remove: vec![],
+            },
+            local_now(),
+        );
         assert_eq!(set_upserts.len(), 1, "delta upserts the new peer");
 
         // The patch from the SAME response then sets that peer's endpoints + DERP. This is exactly
@@ -2681,7 +2984,7 @@ pub(crate) mod tka_tests {
             last_seen: None,
         };
         let (patch_upserts, patch_deletions) =
-            tracker.apply_peer_patches(std::slice::from_ref(&patch));
+            tracker.apply_peer_patches(std::slice::from_ref(&patch), local_now());
 
         assert_eq!(
             patch_upserts.len(),
@@ -2704,7 +3007,7 @@ pub(crate) mod tka_tests {
     async fn patch_for_unknown_node_is_ignored() {
         let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
         let known = peer_node("known", [1u8; 32], vec![]); // id == 1
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![known]));
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![known]), local_now());
 
         let patch = ts_control::PeerChange {
             id: 999, // not in the netmap
@@ -2719,7 +3022,8 @@ pub(crate) mod tka_tests {
             online: None,
             last_seen: None,
         };
-        let (upserts, deletions) = tracker.apply_peer_patches(std::slice::from_ref(&patch));
+        let (upserts, deletions) =
+            tracker.apply_peer_patches(std::slice::from_ref(&patch), local_now());
 
         assert_eq!(upserts.len(), 0);
         assert_eq!(deletions.len(), 0);
@@ -2733,7 +3037,7 @@ pub(crate) mod tka_tests {
     async fn patch_updates_node_key_expiry() {
         let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
         let peer = peer_node("expiring", [1u8; 32], vec![]); // id == 1, node_key_expiry: None
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer]));
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer]), local_now());
 
         let expiry = "2027-01-01T00:00:00Z"
             .parse::<chrono::DateTime<chrono::Utc>>()
@@ -2751,7 +3055,7 @@ pub(crate) mod tka_tests {
             online: None,
             last_seen: None,
         };
-        tracker.apply_peer_patches(std::slice::from_ref(&patch));
+        tracker.apply_peer_patches(std::slice::from_ref(&patch), local_now());
 
         let (_pid, after) = tracker.peer_db.get(&(1 as ts_control::NodeId)).unwrap();
         assert_eq!(after.node_key_expiry, Some(expiry));
@@ -2762,7 +3066,7 @@ pub(crate) mod tka_tests {
     async fn patch_updates_online() {
         let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
         let peer = peer_node("p", [1u8; 32], vec![]); // id == 1, online: None
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer]));
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer]), local_now());
         assert_eq!(
             tracker
                 .peer_db
@@ -2786,7 +3090,7 @@ pub(crate) mod tka_tests {
             online: Some(true),
             last_seen: None,
         };
-        tracker.apply_peer_patches(std::slice::from_ref(&patch));
+        tracker.apply_peer_patches(std::slice::from_ref(&patch), local_now());
         assert_eq!(
             tracker
                 .peer_db
@@ -2800,7 +3104,7 @@ pub(crate) mod tka_tests {
 
         // A subsequent patch flips it offline.
         patch.online = Some(false);
-        tracker.apply_peer_patches(std::slice::from_ref(&patch));
+        tracker.apply_peer_patches(std::slice::from_ref(&patch), local_now());
         assert_eq!(
             tracker
                 .peer_db
@@ -2821,7 +3125,7 @@ pub(crate) mod tka_tests {
     async fn liveness_change_maps_apply_online() {
         let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
         let peer = peer_node("p", [1u8; 32], vec![]); // id == 1
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer]));
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer]), local_now());
         // A fixed timestamp (chrono is built without its `clock` feature, so no `Utc::now()`).
         let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
 
@@ -2894,7 +3198,10 @@ pub(crate) mod tka_tests {
 
         // Admit a correctly-signed peer (id == 1).
         let good = peer_node("rotator", NODE_KEY_BYTES, sig.clone());
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![good.clone()]));
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Full(vec![good.clone()]),
+            local_now(),
+        );
         assert_eq!(tracker.peer_db.peers().len(), 1);
 
         // Patch a new node key whose signature is garbage under the active authority.
@@ -2911,7 +3218,8 @@ pub(crate) mod tka_tests {
             online: None,
             last_seen: None,
         };
-        let (upserts, deletions) = tracker.apply_peer_patches(std::slice::from_ref(&patch));
+        let (upserts, deletions) =
+            tracker.apply_peer_patches(std::slice::from_ref(&patch), local_now());
 
         assert_eq!(upserts.len(), 0);
         assert_eq!(deletions.len(), 1);
@@ -2938,7 +3246,7 @@ pub(crate) mod tka_tests {
         // A peer owned by user id 42 at 100.64.0.1 (the peer_node fixture's address).
         let mut peer = peer_node("p", NODE_KEY_BYTES, Vec::new());
         peer.user_id = 42;
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer]));
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer]), local_now());
         let addr = "100.64.0.1:0".parse().unwrap();
 
         // No profile yet: the node resolves but its owner is unknown.
@@ -3024,7 +3332,10 @@ pub(crate) mod tka_tests {
         ));
 
         tracker.accumulate_user_profiles(&update.user_profiles);
-        tracker.apply_peer_update(update.peer_update.as_ref().expect("a full peer set"));
+        tracker.apply_peer_update(
+            update.peer_update.as_ref().expect("a full peer set"),
+            local_now(),
+        );
 
         let who = tracker
             .whois_opt("100.64.0.1:0".parse().unwrap())
@@ -3052,7 +3363,10 @@ pub(crate) mod tka_tests {
         let update = state_update_from_body(&netmap_body_with_profile_groups(""));
 
         tracker.accumulate_user_profiles(&update.user_profiles);
-        tracker.apply_peer_update(update.peer_update.as_ref().expect("a full peer set"));
+        tracker.apply_peer_update(
+            update.peer_update.as_ref().expect("a full peer set"),
+            local_now(),
+        );
 
         let who = tracker
             .whois_opt("100.64.0.1:0".parse().unwrap())
@@ -3076,7 +3390,10 @@ pub(crate) mod tka_tests {
             r#", "Groups": ["group:eng", "group:oncall"]"#,
         ));
         tracker.accumulate_user_profiles(&first.user_profiles);
-        tracker.apply_peer_update(first.peer_update.as_ref().expect("a full peer set"));
+        tracker.apply_peer_update(
+            first.peer_update.as_ref().expect("a full peer set"),
+            local_now(),
+        );
 
         let second = state_update_from_body(&netmap_body_with_profile_groups(
             r#", "Groups": ["group:eng"]"#,
@@ -3313,10 +3630,10 @@ pub(crate) mod tka_tests {
         let stale_peer = peer_node("stale", pivot_pub, stale_sig);
 
         let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), Some(authority));
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![
-            new_peer.clone(),
-            stale_peer.clone(),
-        ]));
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Full(vec![new_peer.clone(), stale_peer.clone()]),
+            local_now(),
+        );
 
         assert!(
             tracker.peer_db.get(&new_peer.node_key).is_some(),
@@ -3382,7 +3699,7 @@ mod tsmp_disco_key_tests {
     fn tracker_with_control_peer(disco_key: Option<[u8; 32]>) -> (PeerTracker, PeerId) {
         let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
         let node = node_from_control(disco_key);
-        tracker.apply_peer_update(&control_full(disco_key));
+        tracker.apply_peer_update(&control_full(disco_key), local_now());
         let id = tracker
             .peer_db
             .has(&node.node_key)
@@ -3519,16 +3836,19 @@ mod tsmp_disco_key_tests {
 
         // Control polls again, still behind: a `Full` resync, then a `Delta` re-upsert, both
         // carrying the key control already sent.
-        tracker.apply_peer_update(&control_full(Some(FROM_CONTROL)));
+        tracker.apply_peer_update(&control_full(Some(FROM_CONTROL)), local_now());
         assert_eq!(
             effective_key(&tracker, peer),
             Some(advertised),
             "a Full restating control's stale key must not undo the TSMP-learned key"
         );
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Delta {
-            upsert: vec![node_from_control(Some(FROM_CONTROL))],
-            remove: vec![],
-        });
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Delta {
+                upsert: vec![node_from_control(Some(FROM_CONTROL))],
+                remove: vec![],
+            },
+            local_now(),
+        );
         assert_eq!(
             effective_key(&tracker, peer),
             Some(advertised),
@@ -3548,7 +3868,7 @@ mod tsmp_disco_key_tests {
         // Control finally changes its mind. The new key is recorded in control's slot, but the key
         // the peer itself told us stays active — upstream returns to control's key only when disco
         // is received under it (`endpoint.checkAndUpdateDiscoKey`).
-        tracker.apply_peer_update(&control_full(Some(CONTROL_CAUGHT_UP)));
+        tracker.apply_peer_update(&control_full(Some(CONTROL_CAUGHT_UP)), local_now());
         assert_eq!(
             effective_key(&tracker, peer),
             Some(advertised),
@@ -3592,7 +3912,7 @@ mod tsmp_disco_key_tests {
         );
 
         // Control drops the peer's disco key. The key the peer itself confirmed stays active.
-        tracker.apply_peer_update(&control_full(None));
+        tracker.apply_peer_update(&control_full(None), local_now());
         assert_eq!(
             effective_key(&tracker, peer),
             Some(key),
@@ -3629,7 +3949,7 @@ mod tsmp_disco_key_tests {
             online: None,
             last_seen: None,
         };
-        tracker.apply_peer_patches(std::slice::from_ref(&patch));
+        tracker.apply_peer_patches(std::slice::from_ref(&patch), local_now());
         assert_eq!(
             effective_key(&tracker, peer),
             Some(advertised),
@@ -3649,7 +3969,7 @@ mod tsmp_disco_key_tests {
         // Now control changes the key through the patch channel. Same rule as the netmap path: the
         // key lands in control's slot, and the active TSMP key is left alone.
         patch.disco_key = Some(DiscoPublicKey::from(CONTROL_CAUGHT_UP));
-        tracker.apply_peer_patches(std::slice::from_ref(&patch));
+        tracker.apply_peer_patches(std::slice::from_ref(&patch), local_now());
         assert_eq!(
             effective_key(&tracker, peer),
             Some(advertised),
@@ -3677,7 +3997,7 @@ mod tsmp_disco_key_tests {
         let caught_up = DiscoPublicKey::from(CONTROL_CAUGHT_UP);
         assert!(tracker.learn_disco_key(peer, advertised));
 
-        tracker.apply_peer_update(&control_full(Some(CONTROL_CAUGHT_UP)));
+        tracker.apply_peer_update(&control_full(Some(CONTROL_CAUGHT_UP)), local_now());
         assert_eq!(
             effective_key(&tracker, peer),
             Some(advertised),
@@ -3701,8 +4021,8 @@ mod tsmp_disco_key_tests {
 
         // Control changing its mind a second time, and then dropping the key entirely, changes
         // nothing about which key is active.
-        tracker.apply_peer_update(&control_full(Some(FROM_CONTROL)));
-        tracker.apply_peer_update(&control_full(None));
+        tracker.apply_peer_update(&control_full(Some(FROM_CONTROL)), local_now());
+        tracker.apply_peer_update(&control_full(None), local_now());
         assert_eq!(
             effective_key(&tracker, peer),
             Some(advertised),
@@ -3734,7 +4054,7 @@ mod tsmp_disco_key_tests {
             "a peer with no key material from either source costs no entry"
         );
 
-        tracker.apply_peer_update(&control_full(Some(FROM_CONTROL)));
+        tracker.apply_peer_update(&control_full(Some(FROM_CONTROL)), local_now());
         assert_eq!(
             effective_key(&tracker, peer),
             Some(DiscoPublicKey::from(FROM_CONTROL)),
@@ -3781,7 +4101,7 @@ mod tsmp_disco_key_tests {
 
         // Control changes its key. With the TSMP key demoted the sticky operand is false, so this
         // one does take the active slot — the flag is what is sticky, not the TSMP key.
-        tracker.apply_peer_update(&control_full(Some(CONTROL_CAUGHT_UP)));
+        tracker.apply_peer_update(&control_full(Some(CONTROL_CAUGHT_UP)), local_now());
         assert_eq!(
             effective_key(&tracker, peer),
             Some(caught_up),
@@ -3800,7 +4120,7 @@ mod tsmp_disco_key_tests {
 
         // Control drops its key entirely. `key.IsZero()` is the operand that carries the peer here:
         // the retained TSMP key becomes active rather than the peer losing disco altogether.
-        tracker.apply_peer_update(&control_full(None));
+        tracker.apply_peer_update(&control_full(None), local_now());
         assert_eq!(
             effective_key(&tracker, peer),
             Some(advertised),
@@ -3831,13 +4151,13 @@ mod tsmp_disco_key_tests {
         assert!(tracker.learn_disco_key(peer, DiscoPublicKey::from(ADVERTISED)));
 
         // The peer leaves the netmap, then comes back on control's key.
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![]));
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![]), local_now());
         assert!(tracker.peer_db.peers().is_empty());
         assert!(
             tracker.endpoint_disco.is_empty(),
             "the departed peer's disco state goes with it"
         );
-        tracker.apply_peer_update(&control_full(Some(FROM_CONTROL)));
+        tracker.apply_peer_update(&control_full(Some(FROM_CONTROL)), local_now());
         let readded = node_from_control(Some(FROM_CONTROL));
         let peer = tracker.peer_db.has(&readded.node_key).expect("re-added");
         assert_eq!(
@@ -3850,7 +4170,10 @@ mod tsmp_disco_key_tests {
         assert!(tracker.learn_disco_key(peer, DiscoPublicKey::from(READVERTISED)));
         let mut rotated = node_from_control(Some(FROM_CONTROL));
         rotated.node_key = [2u8; 32].into();
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![rotated.clone()]));
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Full(vec![rotated.clone()]),
+            local_now(),
+        );
         let peer = tracker
             .peer_db
             .has(&rotated.node_key)
@@ -4043,12 +4366,253 @@ mod tsmp_disco_key_tests {
         assert!(tracker.learn_disco_key(peer, advertised));
         assert!(ingress_match(&tracker, DiscoPublicKey::from(FROM_CONTROL)).is_some());
 
-        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![]));
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![]), local_now());
         assert_eq!(ingress_match(&tracker, advertised), None);
         assert_eq!(
             ingress_match(&tracker, DiscoPublicKey::from(FROM_CONTROL)),
             None,
             "the inactive key is retracted with the peer, not left dangling"
+        );
+    }
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    //! Node-key expiry enforcement at the peer tracker — the port of Go's `expiryManager`
+    //! (`ipn/ipnlocal/expiry.go`) wired into this fork's netmap.
+    //!
+    //! [`ts_control::ExpiryManager`] carries its own unit tests for the decision itself. These
+    //! cover the wiring: that the pass runs at the install site, that the state it leaves is
+    //! observable through [`StatusNode`], and that the timer catches a peer that expires with **no
+    //! netmap in between** — the case the timer exists for.
+
+    use chrono::TimeDelta;
+    use kameo::actor::Spawn as _;
+
+    use super::{
+        tka_tests::{await_peer_count, netmap_with_peers, peer_node, test_env},
+        *,
+    };
+
+    /// A peer with a chosen key expiry, endpoints and a DERP home — the three things the expiry
+    /// pass strips.
+    fn expiring_peer(
+        stable_id: &str,
+        key: u8,
+        expiry: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Node {
+        let mut node = peer_node(stable_id, [key; 32], Vec::new());
+        node.node_key_expiry = expiry;
+        node.underlay_addresses = vec!["192.0.2.9:41641".parse().unwrap()];
+        node.derp_region = Some(ts_derp::RegionId(core::num::NonZeroU32::new(3).unwrap()));
+        node.peerapi_port = Some(8080);
+        node
+    }
+
+    /// The fail-closed direction here is to **flag, not drop**: Go deliberately keeps an expired
+    /// peer in the netmap so callers can give a clear error, and removing it would lose that. The
+    /// peer stays addressable by stable id while losing everything that could carry traffic.
+    #[tokio::test]
+    async fn an_expired_peer_is_flagged_and_kept_not_dropped() {
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
+        let now = local_now();
+        let peer = expiring_peer("eXpIrEd", 7, Some(now - TimeDelta::hours(1)));
+        let pristine_key = peer.node_key;
+
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer.clone()]), now);
+
+        let (_id, stored) = tracker
+            .peer_db
+            .get(&peer.stable_id)
+            .expect("the expired peer is KEPT in the netmap, not dropped");
+        assert!(stored.expired);
+        assert!(
+            stored.underlay_addresses.is_empty(),
+            "endpoints are cleared"
+        );
+        assert_eq!(stored.derp_region, None, "the DERP home is cleared");
+        assert_eq!(
+            stored.node_key,
+            ts_keys::node_public_with_bad_old_prefix(pristine_key),
+            "the node key is broken, so nothing can handshake with the peer"
+        );
+        assert_eq!(
+            stored.peerapi_addr(),
+            None,
+            "a peerAPI dial to the expired peer is refused"
+        );
+
+        let status = tracker.status_peers();
+        assert_eq!(status.len(), 1);
+        assert!(status[0].expired, "the state is observable to a watcher");
+    }
+
+    /// The negative case: a tagged node carries no key expiry at all (Go's zero `KeyExpiry`) and is
+    /// never flagged, however far the clock is pushed.
+    #[tokio::test]
+    async fn a_peer_with_no_expiry_is_never_flagged() {
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
+        let now = local_now();
+        let tagged = expiring_peer("tAgGeD", 8, None);
+
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![tagged.clone()]), now);
+        assert!(
+            tracker
+                .reevaluate_expiry(now + TimeDelta::days(3650))
+                .is_empty(),
+            "a node with no expiry never expires, ten years on"
+        );
+
+        let (_id, stored) = tracker
+            .peer_db
+            .get(&tagged.stable_id)
+            .expect("still a peer");
+        assert!(!stored.expired);
+        assert_eq!(stored.node_key, tagged.node_key, "its key is left alone");
+        assert_eq!(stored.underlay_addresses, tagged.underlay_addresses);
+        assert_eq!(stored.derp_region, tagged.derp_region);
+    }
+
+    /// The case the timer exists for: a peer that is perfectly live when it is installed, and whose
+    /// key expiry then passes with **no netmap in between**. `reevaluate_expiry` is what the fired
+    /// timer runs.
+    #[tokio::test]
+    async fn a_peer_that_expires_between_netmaps_is_flagged_by_the_timer_pass() {
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
+        let now = local_now();
+        let peer = expiring_peer("lIvE", 9, Some(now + TimeDelta::hours(1)));
+
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer.clone()]), now);
+        let (_id, stored) = tracker.peer_db.get(&peer.stable_id).expect("installed");
+        assert!(!stored.expired, "not expired when control handed it to us");
+
+        // No netmap arrives. The clock crosses the peer's expiry.
+        let upserts = tracker.reevaluate_expiry(now + TimeDelta::hours(2));
+
+        assert_eq!(upserts.len(), 1, "the peer is re-installed, flagged");
+        let (_id, stored) = tracker
+            .peer_db
+            .get(&peer.stable_id)
+            .expect("still kept, just flagged");
+        assert!(stored.expired);
+        assert!(stored.underlay_addresses.is_empty());
+        assert_eq!(stored.derp_region, None);
+    }
+
+    /// An already-expired peer must be skipped rather than re-flagged, or the log and the
+    /// invalidation it triggers repeat on every pass — and the broken key would be re-broken.
+    #[tokio::test]
+    async fn an_already_flagged_peer_is_not_reflagged() {
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
+        let now = local_now();
+        let peer = expiring_peer("lIvE", 9, Some(now + TimeDelta::hours(1)));
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer.clone()]), now);
+
+        let later = now + TimeDelta::hours(2);
+        assert_eq!(tracker.reevaluate_expiry(later).len(), 1);
+        let after_first = tracker
+            .peer_db
+            .get(&peer.stable_id)
+            .expect("kept")
+            .1
+            .clone();
+
+        assert!(
+            tracker.reevaluate_expiry(later).is_empty(),
+            "the second pass reports no transition, so nothing is re-published"
+        );
+        assert_eq!(
+            tracker.peer_db.get(&peer.stable_id).expect("kept").1,
+            &after_first,
+            "and nothing is mutated a second time"
+        );
+    }
+
+    /// End to end through the LIVE actor, which is the only thing that proves the wiring: a peer
+    /// that is live when the netmap installs it, and whose key then expires while the map poll sits
+    /// idle, is flagged by the timer alone. If the timer were never armed — or its firing never
+    /// re-ran the pass — the peer would keep its endpoints, its DERP home and a usable node key
+    /// until control happened to send another netmap.
+    #[tokio::test]
+    async fn a_key_expiring_with_no_netmap_in_between_is_caught_by_the_live_timer() {
+        let env = test_env();
+        let (_tka_tx, tka_rx) = watch::channel(None);
+        let live = PeerTracker::spawn((env.clone(), tka_rx));
+        assert!(live.ask(AllPeers).await.expect("started").is_empty());
+
+        // Expires shortly, but strictly in the future: the install-time pass must NOT flag it. The
+        // window has to outlast actor start + publish + one ask on a loaded box, hence seconds
+        // rather than milliseconds; the test does not wait it out, it only waits for the wall clock
+        // to cross it (below).
+        let expiry = local_now() + TimeDelta::seconds(2);
+        let peer = expiring_peer("sHoRtLiVeD", 4, Some(expiry));
+        env.publish(Arc::new(netmap_with_peers(vec![peer.clone()])))
+            .await
+            .expect("publish netmap");
+
+        let installed = await_peer_count(&live, 1).await;
+        assert!(
+            local_now() < expiry,
+            "the install has to finish inside the window, or this test is not testing the timer"
+        );
+        assert!(
+            !installed[0].expired,
+            "still live when control handed it to us"
+        );
+
+        // Let the key really expire on the wall clock the pass reads...
+        while local_now() <= expiry {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        // ...then jump the runtime's timer wheel past the armed delay (the peer's expiry plus Go's
+        // slack) so the timer fires now instead of ten seconds from now. No netmap in between.
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(
+            ts_control::EXPIRY_TIMER_SLACK_SECS as u64 + 5,
+        ))
+        .await;
+        tokio::time::resume();
+
+        let flagged = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let peers = live.ask(AllPeers).await.expect("peer tracker is alive");
+                if peers.first().is_some_and(|p| p.expired) {
+                    return peers;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the expiry timer flagged the peer with no netmap in between");
+
+        assert_eq!(flagged.len(), 1, "flagged, not dropped");
+        assert!(flagged[0].underlay_addresses.is_empty());
+        assert_eq!(flagged[0].derp_region, None);
+        assert_eq!(
+            flagged[0].node_key,
+            ts_keys::node_public_with_bad_old_prefix(peer.node_key)
+        );
+    }
+
+    /// `MapResponse.ControlTime` is the reason the comparison is exact rather than approximate: a
+    /// node whose own clock is hours behind control's must still see a peer as expired.
+    #[tokio::test]
+    async fn a_control_time_delta_decides_expiry_against_controls_clock() {
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
+        let now = local_now();
+        // Local time says this expires in an hour.
+        let peer = expiring_peer("sKeWeD", 5, Some(now + TimeDelta::hours(1)));
+
+        // Control's clock is two hours ahead of ours, so by control's reckoning it went an hour ago.
+        tracker
+            .expiry
+            .on_control_time(now + TimeDelta::hours(2), now);
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer.clone()]), now);
+
+        let (_id, stored) = tracker.peer_db.get(&peer.stable_id).expect("kept");
+        assert!(
+            stored.expired,
+            "expiry is judged against control's clock, not this host's"
         );
     }
 }
