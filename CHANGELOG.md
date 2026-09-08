@@ -2,6 +2,18 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.48.0](https://github.com/GeiserX/tailscale-rs/compare/v0.47.11...v0.48.0) (2026-09-08)
+
+
+### Features
+
+* **magicsock:** stop a refused relay server failing silently ([#400](https://github.com/GeiserX/tailscale-rs/issues/400)) ([8d01903](https://github.com/GeiserX/tailscale-rs/commit/8d019036f9ccd62aa212bbc72a9b32993e2273b5))
+
+
+### Bug Fixes
+
+* **runtime:** stop calling a peer with two same-family addresses a router ([#402](https://github.com/GeiserX/tailscale-rs/issues/402)) ([d5c0ebc](https://github.com/GeiserX/tailscale-rs/commit/d5c0ebc436181bc339c883b88c445aa8f5098b45))
+
 ## [0.47.11](https://github.com/GeiserX/tailscale-rs/compare/v0.47.10...v0.47.11) (2026-09-08)
 
 
