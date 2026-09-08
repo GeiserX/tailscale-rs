@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.49.0](https://github.com/GeiserX/tailscale-rs/compare/v0.48.0...v0.49.0) (2026-09-08)
+
+
+### Features
+
+* **whois:** carry UserProfile.Groups so embedders can authorise on it ([#404](https://github.com/GeiserX/tailscale-rs/issues/404)) ([68ae592](https://github.com/GeiserX/tailscale-rs/commit/68ae5927f71eec46413053c69b723937f6d7c1c1))
+
 ## [0.48.0](https://github.com/GeiserX/tailscale-rs/compare/v0.47.11...v0.48.0) (2026-09-08)
 
 
