@@ -787,6 +787,22 @@ mod msg_impl {
             self.peer_db.peers().values().cloned().collect()
         }
 
+        /// Look up a peer by its control-assigned stable node id ([`Node::stable_id`]).
+        ///
+        /// The lookup a caller holding an older [`Node`] snapshot uses to refresh it before acting
+        /// on it — notably the Taildrop send path (`tailscale::Device::send_file`), which must not
+        /// dial a peer this node has since flagged expired. `None` means the db holds no peer with
+        /// that id: either it has left the tailnet, or no netmap has arrived yet.
+        ///
+        /// Answers immediately in both cases; unlike [`PeerByName`] it does **not** queue until the
+        /// first peer update. A caller that already holds a snapshot has one to fall back on, and
+        /// blocking a send behind a netmap that may never come would be worse than answering from
+        /// what is known.
+        #[message]
+        pub fn peer_by_stable_id(&self, stable_id: ts_control::StableNodeId) -> Option<Node> {
+            self.peer_db.get(&stable_id).map(|(_id, node)| node.clone())
+        }
+
         /// Resolve which node owns a tailnet source address.
         ///
         /// Maps the source IP of `addr` to the owning node via the tailnet-IP index, returning a
@@ -4591,6 +4607,110 @@ mod expiry_tests {
         assert_eq!(
             flagged[0].node_key,
             ts_keys::node_public_with_bad_old_prefix(peer.node_key)
+        );
+    }
+
+    /// The recovery path, through the channel that actually carries it: control extends an expired
+    /// peer's key with a `PeerChange` that restates only `KeyExpiry`. The peer has to come back
+    /// with its direct candidates and its home DERP, not merely with a usable node key — flagging
+    /// cleared all three, the patch restates none of them, and a peer that is un-expired but has
+    /// neither an endpoint nor a DERP home is unroutable until the next full netmap.
+    #[tokio::test]
+    async fn an_expiry_only_patch_restores_the_peers_routes() {
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
+        let now = local_now();
+        let peer = expiring_peer("eXtEnDeD", 6, Some(now - TimeDelta::hours(1)));
+
+        tracker.apply_peer_update(&ts_control::PeerUpdate::Full(vec![peer.clone()]), now);
+        assert!(
+            tracker
+                .peer_db
+                .get(&peer.stable_id)
+                .expect("kept")
+                .1
+                .expired,
+            "flagged on the way in"
+        );
+
+        // Exactly the shape of a `PeerChange` that only extends the key's life.
+        let patch = ts_control::PeerChange {
+            id: peer.id,
+            derp_region: None,
+            cap: None,
+            cap_map: None,
+            underlay_addresses: None,
+            node_key: None,
+            key_signature: None,
+            disco_key: None,
+            node_key_expiry: Some(now + TimeDelta::days(30)),
+            online: None,
+            last_seen: None,
+        };
+        tracker.apply_peer_patches(std::slice::from_ref(&patch), now);
+
+        let (_id, stored) = tracker.peer_db.get(&peer.stable_id).expect("still a peer");
+        assert!(!stored.expired, "the extension un-expires the peer");
+        assert_eq!(stored.node_key, peer.node_key, "its real node key is back");
+        assert_eq!(
+            stored.underlay_addresses, peer.underlay_addresses,
+            "and its direct-path candidates"
+        );
+        assert_eq!(
+            stored.derp_region, peer.derp_region,
+            "and its home DERP route"
+        );
+        assert_eq!(
+            stored.peerapi_addr(),
+            peer.peerapi_addr(),
+            "so a peerAPI dial to it is answerable again"
+        );
+    }
+
+    /// The lookup a caller holding an older [`Node`] snapshot refreshes it through, end to end
+    /// through the live actor: `tailscale::Device::send_file` re-reads the peer by stable id so it
+    /// refuses an expired peer with the reason instead of dialing a broken one and reporting a
+    /// timeout. Also pins that the query answers *immediately* before the first netmap — queueing
+    /// it (as [`PeerByName`] does) would park a send behind a netmap that may never arrive.
+    #[tokio::test]
+    async fn peer_by_stable_id_answers_with_the_current_flagged_record() {
+        let env = test_env();
+        let (_tka_tx, tka_rx) = watch::channel(None);
+        let live = PeerTracker::spawn((env.clone(), tka_rx));
+
+        let peer = expiring_peer("eXpIrEd", 7, Some(local_now() - TimeDelta::hours(1)));
+
+        // Before any netmap: an immediate `None`, not a queued reply.
+        let unknown = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            live.ask(PeerByStableId {
+                stable_id: peer.stable_id.clone(),
+            }),
+        )
+        .await
+        .expect("the query answers without waiting for a netmap")
+        .expect("peer tracker is alive");
+        assert_eq!(unknown, None);
+
+        env.publish(Arc::new(netmap_with_peers(vec![peer.clone()])))
+            .await
+            .expect("publish netmap");
+        await_peer_count(&live, 1).await;
+
+        let current = live
+            .ask(PeerByStableId {
+                stable_id: peer.stable_id.clone(),
+            })
+            .await
+            .expect("peer tracker is alive")
+            .expect("the expired peer is kept, so it is still resolvable by stable id");
+        assert!(
+            current.expired,
+            "the record carries the flag, not the stale state"
+        );
+        assert_eq!(
+            current.peerapi_addr(),
+            None,
+            "so a peerAPI dial resolved from it is refused"
         );
     }
 
