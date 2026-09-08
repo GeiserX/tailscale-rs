@@ -32,7 +32,8 @@ use tokio::{
 };
 
 use crate::magic_dns::{
-    ClientTransport, Decision, DnsView, RecursivePlan, decide, forward_plan, forward_query,
+    ClientTransport, Decision, DnsView, RecursivePlan, check_response_size_and_set_tc, decide,
+    forward_plan, forward_query,
 };
 
 /// Resolve one client query end to end and return the wire response, or `None` when the query is
@@ -46,7 +47,14 @@ use crate::magic_dns::{
 /// Anti-leak: every forward rides `channel` (the overlay netstack), never a host socket.
 async fn answer_query(view: &DnsView, channel: &Channel, query: &[u8]) -> Option<Vec<u8>> {
     match decide(view, query)? {
-        Decision::Reply(response) => Some(response),
+        // A TCP client has no datagram budget, so the size check is a no-op here — it is called
+        // anyway because upstream calls it on every answered path and lets the family guard decide
+        // (Go `Resolver.Query`), and because that keeps the guard in one place.
+        Decision::Reply(response) => Some(check_response_size_and_set_tc(
+            query,
+            response,
+            ClientTransport::Tcp,
+        )),
         Decision::Forward {
             upstreams,
             query,
