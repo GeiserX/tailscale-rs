@@ -220,8 +220,14 @@ impl ExpiryManager {
             // The key alone is not enough to reach the peer: flagging also cleared its direct-path
             // candidates and its home DERP, and an expiry-extending patch that restates neither
             // would leave the recovered peer with no route at all until the next full netmap.
-            // Restore only what is still cleared — control restating either field in the same
-            // update is fresher than anything we memoized, and must win.
+            //
+            // Restore only what is *still* cleared, so control's word beats the memo where the two
+            // can be told apart: a same-update restatement of a non-empty endpoint set, or of a DERP
+            // region, is fresher than anything we memoized and survives. An update that explicitly
+            // clears the endpoints is NOT distinguishable from our own clear, and the memo wins
+            // there — the cost is one stale direct candidate, which fails a disco probe and is
+            // re-learned. (A DERP region has no explicit-clear channel: `PeerChange.derp_region` is
+            // only ever applied when present, so the ambiguity is the endpoints' alone.)
             if peer.underlay_addresses.is_empty() {
                 peer.underlay_addresses = pristine.underlay_addresses;
             }
@@ -502,6 +508,10 @@ mod tests {
     /// The restore must not clobber. If the same update that extends the expiry also carries fresh
     /// endpoints or a new home DERP, control's word is newer than anything we memoized at flagging
     /// time and has to survive.
+    ///
+    /// The one case this cannot cover is an update that restates the endpoints as *empty*: that is
+    /// byte-for-byte what the flagging pass itself left behind, so the memo wins and a stale direct
+    /// candidate comes back. It costs a failed disco probe, and disco re-learns from there.
     #[test]
     fn a_restated_route_beats_the_memo() {
         let mut em = ExpiryManager::new();
@@ -536,6 +546,14 @@ mod tests {
     /// of operations makes the disagreement unobservable — the flagging pass runs first and marks
     /// the peer, and `next_peer_expiry` then skips it on `expired` — but a peer that reached
     /// `next_peer_expiry` unflagged would report an already-due event, exactly as upstream does.
+    ///
+    /// A third predicate looks like it contradicts this one and does not:
+    /// [`Node::key_expired`](crate::Node::key_expired) uses a strict `<`, pinned by
+    /// `key_expiry_boundary_is_not_expired`, so equality is *not* expired there. It ports a
+    /// different upstream site — the **self**-node check in `ipnlocal`,
+    /// `!SelfKeyExpiry().IsZero() && SelfKeyExpiry().Before(clock.Now())` — which really is
+    /// `Before`. Three call sites, three upstream predicates, no disagreement to resolve: the only
+    /// way to be wrong here is to make them agree with each other instead of with the Go they port.
     #[test]
     fn key_expiry_exactly_at_control_now_is_expired() {
         let mut em = ExpiryManager::new();

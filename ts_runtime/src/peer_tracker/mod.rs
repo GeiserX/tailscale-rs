@@ -1378,7 +1378,8 @@ impl PeerTracker {
             } else {
                 tracing::info!(
                     stable_id = ?flagged.peer.stable_id,
-                    "peer's node-key expiry was extended; restoring its node key"
+                    "peer's node-key expiry was extended; restoring its node key, endpoints and \
+                     DERP home"
                 );
             }
         }
