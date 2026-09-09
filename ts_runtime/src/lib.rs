@@ -683,16 +683,17 @@ impl Runtime {
         })
     }
 
-    /// Suggest a reasonably good exit node to use, from the current netmap + latest netcheck report
+    /// Suggest a reasonably good exit node to use, from the current netmap + recent DERP latency
     /// (Go `LocalBackend.SuggestExitNode`). The Phase-1 classic DERP-region-latency path; see the
     /// [`exit_node_suggest`] module for the algorithm, scope, and the IPv4-only parity deviation.
     ///
     /// Gathers the inputs the way [`status`](Self::status) and [`file_targets`](Self::file_targets)
-    /// do — the latest [`NetcheckReport`] from the control runner (an immediate, non-blocking borrow
-    /// of the last DERP-latency measurement) and every peer [`Node`](ts_control::Node) from the peer
-    /// tracker — then runs the pure algorithm with the production uniform-random selectors
-    /// (`random_region` / `random_node`). The returned suggestion's id is remembered in the runtime's
-    /// `prev_suggestion` cell so the next call is *sticky* (Go `lastSuggestedExitNode`).
+    /// do — from the control runner, the latest [`NetcheckReport`]'s preferred DERP region plus the
+    /// recent per-region latencies (both immediate, non-blocking borrows), and every peer
+    /// [`Node`](ts_control::Node) from the peer tracker — then runs the pure algorithm with the
+    /// production uniform-random selectors (`random_region` / `random_node`). The returned
+    /// suggestion's id is remembered in the runtime's `prev_suggestion` cell so the next call is
+    /// *sticky* (Go `lastSuggestedExitNode`).
     ///
     /// Returns `Ok(None)` when no peer is an eligible candidate (Go's empty response), and
     /// `Err(`[`SuggestExitNodeError::NoPreferredDerp`]`)` when there is no netcheck report yet (Go's
@@ -702,9 +703,21 @@ impl Runtime {
     ) -> Result<Result<Option<ExitNodeSuggestion>, SuggestExitNodeError>, Error> {
         use ts_control::NODE_ATTR_SUGGEST_EXIT_NODE;
 
-        // The latest netcheck report (Go `MagicConn().GetLastNetcheckReport`): an immediate borrow of
-        // the control runner's published measurement (the same value `Device::netcheck` surfaces).
+        // The two netcheck inputs Go's `suggestExitNode` takes. First the preferred DERP region from
+        // the latest report (Go `MagicConn().GetLastNetcheckReport().PreferredDERP`): an immediate
+        // borrow of the control runner's published measurement (the value `Device::netcheck`
+        // surfaces), used only as the "have we netchecked at all yet" precondition.
         let report = self.control.ask(control_runner::Netcheck).await?;
+
+        // Then the *ranking* input: the lowest latency seen per region over the retained measurement
+        // history (Go `netcheck.Client.RecentRegionLatency()`). Deliberately NOT the latest report's
+        // own latency list — every measurement this fork makes is partial (`complete_threshold`), so
+        // ranking on one report leaves a distant candidate's region unmeasured and collapses the
+        // suggestion to a uniform random pick. See `exit_node_suggest`'s module docs.
+        let region_latency = self
+            .control
+            .ask(control_runner::RecentRegionLatency)
+            .await?;
 
         // Every known peer (Go reads the netmap peers via `AppendMatchingPeers`); the domain `Node`
         // retains the cap map, home DERP region, online state, and accepted routes the predicate
@@ -751,7 +764,8 @@ impl Runtime {
         // (`NoPreferredDerp` — no netcheck yet) returns before the assignment and leaves it untouched.
         let prev = self.prev_suggestion.lock().unwrap().clone();
         let outcome = exit_node_suggest::suggest_exit_node(
-            &report,
+            report.preferred_derp,
+            &region_latency,
             &candidates,
             prev.as_ref(),
             &exit_node_suggest::random_region,

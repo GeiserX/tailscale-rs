@@ -5,6 +5,17 @@ use core::{fmt::Debug, net::SocketAddr, time::Duration};
 use ts_control::DerpMap;
 use ts_derp::RegionId;
 
+/// Hard upper bound on a whole derp-map measurement, the default for
+/// [`Config::report_timeout`] — Go netcheck's exported `ReportTimeout` (5s).
+///
+/// Named as a const (rather than living only inside the `Default` impl) because callers *outside*
+/// the measurement size windows off it: `ts_runtime`'s rolling DERP-latency history retains
+/// `re-measure interval + REPORT_TIMEOUT`, exactly the way Go's netcheck sets its report-history
+/// `maxAge = fullReportInterval + ReportTimeout` — the window has to cover a whole measurement
+/// cycle *plus* the time a measurement itself is allowed to take, or a report can age out before
+/// its successor has been produced.
+pub const REPORT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Configuration for probing derp map latency.
 #[derive(Debug, Copy, Clone)]
 pub struct Config {
@@ -45,7 +56,7 @@ impl Default for Config {
         Config {
             complete_threshold: 3,
             min_timeout: Duration::from_millis(250),
-            report_timeout: Duration::from_secs(5),
+            report_timeout: REPORT_TIMEOUT,
             probe_timeout: Duration::from_secs(5),
 
             https: Default::default(),

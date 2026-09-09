@@ -10,6 +10,6 @@ pub mod https;
 // pong-harvest on magicsock's one bound socket (`ts_runtime::direct::run_advertiser`) plus the
 // hand-rolled single-socket STUN codec in `ts_magicsock`; DERP latency uses HTTPS (`measure_derp_map`).
 
-pub use derp_latency::{Config, RegionResult, measure_derp_map};
+pub use derp_latency::{Config, REPORT_TIMEOUT, RegionResult, measure_derp_map};
 #[doc(inline)]
 pub use https::measure_https_latency;
