@@ -973,8 +973,9 @@ impl Device {
             .map_err(Into::into)
     }
 
-    /// Suggest a reasonably good exit node to use, based on this node's current netmap and latest
-    /// network-conditions report — Go `tailscale exit-node suggest` / `LocalBackend.SuggestExitNode`.
+    /// Suggest a reasonably good exit node to use, based on this node's current netmap and the DERP
+    /// latency it has measured recently — Go `tailscale exit-node suggest` /
+    /// `LocalBackend.SuggestExitNode`.
     ///
     /// Returns the suggested exit node's stable id + name as an [`ExitNodeSuggestion`]; engage it by
     /// passing the id to [`Config::exit_node`](crate::config::Config) /
@@ -984,6 +985,12 @@ impl Device {
     /// it prefers the one whose home DERP region this node measured as lowest-latency, and is
     /// **sticky** — a prior suggestion that is still a good candidate is kept across calls, so
     /// repeated calls don't flap between equally-good options.
+    ///
+    /// The ranking reads the *lowest latency seen per region over the recent measurement history*,
+    /// not the newest net-report alone. A single measurement of this node's DERP map ends as soon
+    /// as a few regions have answered, so a candidate homed further away would otherwise have no
+    /// measurement to be ranked on and the suggestion would degrade to a random pick among the
+    /// candidate regions.
     ///
     /// Outcomes (mirroring Go):
     /// - `Ok(Some(suggestion))` — a node was suggested.

@@ -1,10 +1,11 @@
-//! Exit-node suggestion: pick a reasonably good exit node from the netmap + latest netcheck report.
+//! Exit-node suggestion: pick a reasonably good exit node from the netmap + recent DERP latency.
 //!
 //! This is the Rust port of Go `ipnlocal`'s `suggestExitNodeUsingDERP` (the classic DERP-region
-//! -latency path; tailscale v1.100.0 `ipn/ipnlocal/local.go`), surfaced as
-//! [`Runtime::suggest_exit_node`](crate::Runtime::suggest_exit_node) and consumed by the daemon's
-//! `tnet exit-node suggest`. The traffic-steering path (`NodeAttrTrafficSteering`) and the Mullvad
-//! geo-distance path are **Phase 2** and deliberately not ported here (see `suggest_exit_node`).
+//! -latency path; tailscale `ipn/ipnlocal/local.go` @ `3945b82f8a9550b54c33e61d4ed2227862d53e8a`),
+//! surfaced as [`Runtime::suggest_exit_node`](crate::Runtime::suggest_exit_node) and consumed by
+//! the daemon's `tnet exit-node suggest`. The traffic-steering path (`NodeAttrTrafficSteering`) and
+//! the Mullvad geo-distance path are **Phase 2** and deliberately not ported here (see
+//! `suggest_exit_node`).
 //!
 //! ## Determinism contract (this corrects a common misconception)
 //!
@@ -20,11 +21,33 @@
 //! / [`SelectNode`](crate::exit_node_suggest::SelectNode)); production passes the uniform-random
 //! `random_region` / `random_node`, and tests pass deterministic stubs. This is a direct port of
 //! Go's `selectRegionFunc` / `selectNodeFunc` parameters.
+//!
+//! ## Ranking input: recent per-region latency, not one report
+//!
+//! The ranking reads a [`RegionLatencies`](crate::exit_node_suggest::RegionLatencies) map — the
+//! *lowest latency seen per region over the retained measurement history* (Go
+//! `netcheck.Client.RecentRegionLatency()`, here
+//! [`ControlRunner::recent_region_latency`](crate::control_runner::ControlRunner)) — not the newest
+//! netcheck report. Upstream made that change because netcheck alternates full reports with
+//! incremental ones and "when the most recent report is incremental, the suggestion fell back to a
+//! random for exit nodes that are far away". It bites harder here: `ts_netcheck::Config` ends a
+//! measurement as soon as `complete_threshold` (3) regions have answered, so **every** report this
+//! fork produces names a handful of regions. Ranked against a single report, a candidate homed
+//! anywhere else has no latency at all, `min_latency_derp_region` returns `None`, and the
+//! suggestion degrades to the uniform `select_region` pick — the nearest exit node loses to a coin
+//! flip. Ranked against the history's union, it does not.
+
+use std::collections::HashMap;
 
 use ts_control::StableNodeId;
 use ts_derp::RegionId;
 
-use crate::status::NetcheckReport;
+/// The lowest latency seen for each DERP region across the retained measurement history — the Rust
+/// analog of the map Go's `netcheck.Client.RecentRegionLatency()` returns, and the input
+/// `suggest_exit_node` ranks candidate regions on. A region absent from the map has no recent
+/// measurement (Go's missing map key), which `min_latency_derp_region` sorts as the largest
+/// possible latency.
+pub type RegionLatencies = HashMap<RegionId, core::time::Duration>;
 
 /// A peer being considered as an exit-node suggestion, carrying exactly the inputs the suggestion
 /// algorithm reads. Built (in [`Runtime::suggest_exit_node`](crate::Runtime::suggest_exit_node))
@@ -105,9 +128,10 @@ pub struct ExitNodeSuggestion {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SuggestExitNodeError {
     /// No usable netcheck report yet: there is no measured preferred DERP region
-    /// ([`NetcheckReport::preferred_derp`] is `None`/`0`), so the latency-based region ranking can't
-    /// run. Go returns `ErrNoPreferredDERP` ("no preferred DERP, try again later"); callers tolerate
-    /// it and retry once a netcheck has completed.
+    /// ([`NetcheckReport::preferred_derp`](crate::status::NetcheckReport::preferred_derp) is
+    /// `None`/`0`), so the latency-based region ranking can't run. Go returns `ErrNoPreferredDERP`
+    /// ("no preferred DERP, try again later"); callers tolerate it and retry once a netcheck has
+    /// completed.
     NoPreferredDerp,
 }
 
@@ -134,15 +158,20 @@ pub type SelectRegion<'a> = dyn Fn(&[RegionId]) -> RegionId + 'a;
 pub type SelectNode<'a> =
     dyn Fn(&[ExitNodeCandidate], Option<&StableNodeId>) -> ExitNodeCandidate + 'a;
 
-/// Suggest an exit node from `candidates` given the latest netcheck `report` and the previous
-/// suggestion (for stickiness). Pure port of Go `suggestExitNodeUsingDERP` (v1.100.0), the classic
-/// DERP-region-latency path.
+/// Suggest an exit node from `candidates` given this node's `preferred_region`, the recent
+/// per-region latencies to rank on, and the previous suggestion (for stickiness). Pure port of Go
+/// `suggestExitNodeUsingDERP`, the classic DERP-region-latency path.
+///
+/// `preferred_region` is the newest netcheck report's preferred DERP region (Go `preferredDERP`,
+/// with `0`/absent meaning "no netcheck yet"). `region_latency` is the *history* union described in
+/// the module docs (Go `regionLatency`, from `netcheck.Client.RecentRegionLatency()`) — deliberately
+/// not the same report, so a region the newest partial measurement skipped is still rankable.
 ///
 /// `select_region` / `select_node` are injected (Go's `selectRegionFunc` / `selectNodeFunc`) so the
 /// algorithm is deterministic under test; production passes `random_region` / `random_node`.
 ///
 /// Returns:
-/// - `Err(`[`SuggestExitNodeError::NoPreferredDerp`]`)` when `report.preferred_derp` is `None`/`0`
+/// - `Err(`[`SuggestExitNodeError::NoPreferredDerp`]`)` when `preferred_region` is `None`/`0`
 ///   (Go's `ErrNoPreferredDERP` precondition — no netcheck yet).
 /// - `Ok(None)` when no candidate is eligible (Go's empty response + nil error — *not* an error).
 /// - `Ok(Some(suggestion))` otherwise.
@@ -175,17 +204,19 @@ pub type SelectNode<'a> =
 /// - **`Location` omitted** from the result (the domain node has none yet) — see
 ///   [`ExitNodeSuggestion`].
 pub(crate) fn suggest_exit_node(
-    report: &NetcheckReport,
+    preferred_region: Option<u32>,
+    region_latency: &RegionLatencies,
     candidates: &[ExitNodeCandidate],
     prev_suggestion: Option<&StableNodeId>,
     select_region: &SelectRegion<'_>,
     select_node: &SelectNode<'_>,
 ) -> Result<Option<ExitNodeSuggestion>, SuggestExitNodeError> {
     // 1. Precondition: a measured preferred DERP region must exist (Go: report == nil ||
-    //    report.PreferredDERP == 0 || no DERPMap ⇒ ErrNoPreferredDERP). The fork's report carries no
-    //    DERPMap (it isn't needed for the DERP-latency path), so the gate is "preferred_derp set and
-    //    non-zero". A `Some(0)` is impossible (region ids are NonZeroU32-derived) but guarded anyway.
-    match report.preferred_derp {
+    //    preferredDERP == 0 || no DERPMap ⇒ ErrNoPreferredDERP). The fork's report carries no
+    //    DERPMap (it isn't needed for the DERP-latency path), so the gate is "preferred region set
+    //    and non-zero". A `Some(0)` is impossible (region ids are NonZeroU32-derived) but guarded
+    //    anyway, mirroring Go's `preferredDERP == 0` test on a plain int.
+    match preferred_region {
         None | Some(0) => return Err(SuggestExitNodeError::NoPreferredDerp),
         Some(_) => {}
     }
@@ -222,7 +253,7 @@ pub(crate) fn suggest_exit_node(
         // DERP-homed path (the Phase-1 common case). Pick the lowest-latency region (tiebreak lowest
         // id); if none has a usable latency, fall back to the injected region selector.
         let regions: Vec<RegionId> = by_region.keys().copied().collect();
-        let min_region = match min_latency_derp_region(&regions, report) {
+        let min_region = match min_latency_derp_region(&regions, region_latency) {
             Some(region) => region,
             None => select_region(&regions),
         };
@@ -249,28 +280,24 @@ pub(crate) fn suggest_exit_node(
     }))
 }
 
-/// The region with the lowest measured latency in `report`, tiebroken by the lowest region id;
+/// The region with the lowest recent latency in `region_latency`, tiebroken by the lowest region id;
 /// `None` when the winner has no usable latency. Pure port of Go `minLatencyDERPRegion`.
 ///
-/// Mirrors Go's `slices.MinFunc` semantics exactly: a region missing from the report's latency map
-/// is treated as the maximum latency (so a region with *any* measurement always beats one with
-/// none), ties on latency break to the lower region id, and if the winning region's latency is
-/// missing *or* exactly zero the function returns `None` (Go returns `0`) — signalling the caller to
-/// fall back to a uniform region pick. `regions` is the candidate region set and is never empty when
-/// called.
-fn min_latency_derp_region(regions: &[RegionId], report: &NetcheckReport) -> Option<RegionId> {
-    // Latency lookup keyed by region id. The report stores an ordered Vec (sorted ascending), but we
-    // index by id to mirror Go's `report.RegionLatency[region]` map access.
-    let latency_of = |region: RegionId| -> Option<core::time::Duration> {
-        report
-            .region_latencies
-            .iter()
-            .find(|rl| rl.region_id == region.0.get())
-            .map(|rl| rl.latency)
-    };
+/// Mirrors Go's `slices.MinFunc` semantics exactly: a region missing from the latency map is treated
+/// as the maximum latency (so a region with *any* measurement always beats one with none), ties on
+/// latency break to the lower region id, and if the winning region's latency is missing *or* exactly
+/// zero the function returns `None` (Go returns `0`) — signalling the caller to fall back to a
+/// uniform region pick. `regions` is the candidate region set and is never empty when called.
+fn min_latency_derp_region(
+    regions: &[RegionId],
+    region_latency: &RegionLatencies,
+) -> Option<RegionId> {
+    // Go's `regionLatency[region]` map access, keyed by region id.
+    let latency_of =
+        |region: RegionId| -> Option<core::time::Duration> { region_latency.get(&region).copied() };
 
     // `slices.MinFunc`: a missing latency sorts as the largest possible value; ties break to the
-    // lower region id. Using `core::cmp::max` as the "missing" sentinel matches Go's
+    // lower region id. Using `Duration::MAX` as the "missing" sentinel matches Go's
     // `largeDuration = math.MaxInt64` semantics (any real measurement is smaller).
     let max_duration = core::time::Duration::MAX;
     let min = regions.iter().copied().min_by(|&i, &j| {
@@ -333,26 +360,19 @@ pub(crate) fn next_sticky(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::status::RegionLatency;
 
     fn region(id: u32) -> RegionId {
         RegionId(core::num::NonZeroU32::new(id).unwrap())
     }
 
-    /// Build a netcheck report from `(region_id, latency_ms)` pairs with the given preferred region.
-    /// The first pair is treated as preferred only via the explicit `preferred` arg (the latency map
-    /// drives ranking, not order).
-    fn report(preferred: Option<u32>, latencies: &[(u32, u64)]) -> NetcheckReport {
-        NetcheckReport {
-            preferred_derp: preferred,
-            region_latencies: latencies
-                .iter()
-                .map(|&(region_id, ms)| RegionLatency {
-                    region_id,
-                    latency: core::time::Duration::from_millis(ms),
-                })
-                .collect(),
-        }
+    /// Build a recent-per-region-latency map from `(region_id, latency_ms)` pairs — the
+    /// `ControlRunner::recent_region_latency` output the ranking consumes (Go `regionLatency`). A
+    /// region simply absent from the pairs has no recent measurement at all.
+    fn latencies(pairs: &[(u32, u64)]) -> RegionLatencies {
+        pairs
+            .iter()
+            .map(|&(region_id, ms)| (region(region_id), core::time::Duration::from_millis(ms)))
+            .collect()
     }
 
     /// An eligible candidate (online + suggest-cap + exit-route) in `derp` region, named `peer<id>`
@@ -430,16 +450,23 @@ mod tests {
     /// `preferred_derp == None` ⇒ `ErrNoPreferredDERP` (Go's nil-report / no-preferred-DERP cases).
     #[test]
     fn no_preferred_derp_errors() {
-        let r = report(None, &[(1, 10)]);
+        let lat = latencies(&[(1, 10)]);
         let cands = [candidate(1, Some(1)), candidate(2, Some(2))];
-        let err = suggest_exit_node(&r, &cands, None, &unused_region(), &unused_node())
+        let err = suggest_exit_node(None, &lat, &cands, None, &unused_region(), &unused_node())
             .expect_err("no preferred DERP must error");
         assert_eq!(err, SuggestExitNodeError::NoPreferredDerp);
 
-        // `Some(0)` is likewise the no-preferred-DERP precondition (Go `PreferredDERP == 0`).
-        let r0 = report(Some(0), &[(1, 10)]);
+        // `Some(0)` is likewise the no-preferred-DERP precondition (Go `preferredDERP == 0`), even
+        // with a fully populated latency history to rank on.
         assert_eq!(
-            suggest_exit_node(&r0, &cands, None, &unused_region(), &unused_node()),
+            suggest_exit_node(
+                Some(0),
+                &lat,
+                &cands,
+                None,
+                &unused_region(),
+                &unused_node()
+            ),
             Err(SuggestExitNodeError::NoPreferredDerp)
         );
     }
@@ -447,9 +474,9 @@ mod tests {
     /// 0 eligible candidates ⇒ `Ok(None)` (Go: empty response, nil error — NOT an error).
     #[test]
     fn no_candidates_returns_none() {
-        let r = report(Some(1), &[(1, 10)]);
+        let r = latencies(&[(1, 10)]);
         assert_eq!(
-            suggest_exit_node(&r, &[], None, &unused_region(), &unused_node()),
+            suggest_exit_node(Some(1), &r, &[], None, &unused_region(), &unused_node()),
             Ok(None)
         );
     }
@@ -457,9 +484,9 @@ mod tests {
     /// Exactly 1 eligible candidate ⇒ returned directly, no region/node selector invoked.
     #[test]
     fn single_candidate_returned_directly() {
-        let r = report(Some(1), &[(1, 10)]);
+        let r = latencies(&[(1, 10)]);
         let cands = [candidate(7, Some(2))];
-        let got = suggest_exit_node(&r, &cands, None, &unused_region(), &unused_node())
+        let got = suggest_exit_node(Some(1), &r, &cands, None, &unused_region(), &unused_node())
             .expect("ok")
             .expect("some");
         assert_eq!(got.id, StableNodeId("stable7".into()));
@@ -471,10 +498,10 @@ mod tests {
     #[test]
     fn two_regions_lower_latency_wins() {
         // peer2 in region 1 (10ms), peer4 in region 3 (30ms) ⇒ region 1 wins ⇒ peer2.
-        let r = report(Some(1), &[(1, 10), (2, 20), (3, 30)]);
+        let r = latencies(&[(1, 10), (2, 20), (3, 30)]);
         let cands = [candidate(2, Some(1)), candidate(4, Some(3))];
         let select_node = pick_node(vec!["stable2"], None, "stable2");
-        let got = suggest_exit_node(&r, &cands, None, &unused_region(), &select_node)
+        let got = suggest_exit_node(Some(1), &r, &cands, None, &unused_region(), &select_node)
             .expect("ok")
             .expect("some");
         assert_eq!(got.id, StableNodeId("stable2".into()));
@@ -485,10 +512,10 @@ mod tests {
     /// (Go `2-exits-same-region`.)
     #[test]
     fn two_candidates_same_region_select_node_picks() {
-        let r = report(Some(1), &[(1, 10), (2, 20), (3, 30)]);
+        let r = latencies(&[(1, 10), (2, 20), (3, 30)]);
         let cands = [candidate(1, Some(1)), candidate(2, Some(1))];
         let select_node = pick_node(vec!["stable1", "stable2"], None, "stable1");
-        let got = suggest_exit_node(&r, &cands, None, &unused_region(), &select_node)
+        let got = suggest_exit_node(Some(1), &r, &cands, None, &unused_region(), &select_node)
             .expect("ok")
             .expect("some");
         assert_eq!(got.id, StableNodeId("stable1".into()));
@@ -499,14 +526,21 @@ mod tests {
     /// id is threaded to `select_node` as `last`). Go `prefer-last-node`.
     #[test]
     fn prev_suggestion_sticky_when_present() {
-        let r = report(Some(1), &[(1, 10), (2, 20), (3, 30)]);
+        let r = latencies(&[(1, 10), (2, 20), (3, 30)]);
         let cands = [candidate(1, Some(1)), candidate(2, Some(1))];
         let prev = StableNodeId("stable2".into());
         // select_node sees both, `last == stable2`, and (via real random_node stickiness) returns it.
         let select_node = pick_node(vec!["stable1", "stable2"], Some("stable2"), "stable2");
-        let got = suggest_exit_node(&r, &cands, Some(&prev), &unused_region(), &select_node)
-            .expect("ok")
-            .expect("some");
+        let got = suggest_exit_node(
+            Some(1),
+            &r,
+            &cands,
+            Some(&prev),
+            &unused_region(),
+            &select_node,
+        )
+        .expect("ok")
+        .expect("some");
         assert_eq!(got.id, StableNodeId("stable2".into()));
         assert_eq!(got.name, "peer2");
     }
@@ -516,15 +550,22 @@ mod tests {
     /// `found-better-derp-node` (lastSuggestion stable3 in region 3, but region 1 wins ⇒ stable2).
     #[test]
     fn better_region_beats_stale_prev_suggestion() {
-        let r = report(Some(1), &[(1, 10), (2, 20), (3, 30)]);
+        let r = latencies(&[(1, 10), (2, 20), (3, 30)]);
         // peer2 region 1 (10ms), peer3 region 3 (30ms). prev = stable3 (region 3, higher latency).
         let cands = [candidate(2, Some(1)), candidate(3, Some(3))];
         let prev = StableNodeId("stable3".into());
         // Region 1 wins; only peer2 is in it; `last` is still threaded through as stable3.
         let select_node = pick_node(vec!["stable2"], Some("stable3"), "stable2");
-        let got = suggest_exit_node(&r, &cands, Some(&prev), &unused_region(), &select_node)
-            .expect("ok")
-            .expect("some");
+        let got = suggest_exit_node(
+            Some(1),
+            &r,
+            &cands,
+            Some(&prev),
+            &unused_region(),
+            &select_node,
+        )
+        .expect("ok")
+        .expect("some");
         assert_eq!(got.id, StableNodeId("stable2".into()));
     }
 
@@ -534,10 +575,10 @@ mod tests {
     #[test]
     fn equal_latency_lower_region_id_wins() {
         // peer1 region 1, peer3 region 3, both 10ms ⇒ region 1 (lower id) ⇒ peer1.
-        let r = report(Some(1), &[(1, 10), (2, 20), (3, 10)]);
+        let r = latencies(&[(1, 10), (2, 20), (3, 10)]);
         let cands = [candidate(1, Some(1)), candidate(3, Some(3))];
         let select_node = pick_node(vec!["stable1"], None, "stable1");
-        let got = suggest_exit_node(&r, &cands, None, &unused_region(), &select_node)
+        let got = suggest_exit_node(Some(1), &r, &cands, None, &unused_region(), &select_node)
             .expect("ok")
             .expect("some");
         assert_eq!(got.id, StableNodeId("stable1".into()));
@@ -551,11 +592,11 @@ mod tests {
     fn no_usable_latency_falls_back_to_select_region() {
         // peer2 region 1, peer4 region 3, all latencies 0 ⇒ region ranking unusable ⇒ select_region
         // (offered {1,3}, returns 1) ⇒ peer2.
-        let r = report(Some(1), &[(1, 0), (2, 0), (3, 0)]);
+        let r = latencies(&[(1, 0), (2, 0), (3, 0)]);
         let cands = [candidate(2, Some(1)), candidate(4, Some(3))];
         let select_region = pick_region(vec![region(1), region(3)], region(1));
         let select_node = pick_node(vec!["stable2"], None, "stable2");
-        let got = suggest_exit_node(&r, &cands, None, &select_region, &select_node)
+        let got = suggest_exit_node(Some(1), &r, &cands, None, &select_region, &select_node)
             .expect("ok")
             .expect("some");
         assert_eq!(got.id, StableNodeId("stable2".into()));
@@ -567,10 +608,10 @@ mod tests {
     /// wins. Here region 3 has 10ms, region 1 is missing ⇒ region 3 wins despite the higher id.
     #[test]
     fn missing_latency_loses_to_measured_region() {
-        let r = report(Some(3), &[(3, 10)]); // region 1 absent from the map
+        let r = latencies(&[(3, 10)]); // region 1 absent from the map
         let cands = [candidate(1, Some(1)), candidate(3, Some(3))];
         let select_node = pick_node(vec!["stable3"], None, "stable3");
-        let got = suggest_exit_node(&r, &cands, None, &unused_region(), &select_node)
+        let got = suggest_exit_node(Some(3), &r, &cands, None, &unused_region(), &select_node)
             .expect("ok")
             .expect("some");
         assert_eq!(got.id, StableNodeId("stable3".into()));
@@ -581,12 +622,12 @@ mod tests {
     /// dropped before the count check).
     #[test]
     fn predicate_excludes_missing_suggest_cap() {
-        let r = report(Some(1), &[(1, 10)]);
+        let r = latencies(&[(1, 10)]);
         let mut no_cap = candidate(1, Some(1));
         no_cap.has_suggest_cap = false;
         let cands = [no_cap, candidate(2, Some(2))];
         // Only peer2 is eligible ⇒ single-candidate direct return (no selector).
-        let got = suggest_exit_node(&r, &cands, None, &unused_region(), &unused_node())
+        let got = suggest_exit_node(Some(1), &r, &cands, None, &unused_region(), &unused_node())
             .expect("ok")
             .expect("some");
         assert_eq!(got.id, StableNodeId("stable2".into()));
@@ -595,11 +636,11 @@ mod tests {
     /// Candidate predicate — a peer NOT advertising an exit route (`0.0.0.0/0`) is excluded.
     #[test]
     fn predicate_excludes_no_exit_route() {
-        let r = report(Some(1), &[(1, 10)]);
+        let r = latencies(&[(1, 10)]);
         let mut no_route = candidate(1, Some(1));
         no_route.advertises_exit_route = false;
         let cands = [no_route, candidate(2, Some(2))];
-        let got = suggest_exit_node(&r, &cands, None, &unused_region(), &unused_node())
+        let got = suggest_exit_node(Some(1), &r, &cands, None, &unused_region(), &unused_node())
             .expect("ok")
             .expect("some");
         assert_eq!(got.id, StableNodeId("stable2".into()));
@@ -609,24 +650,31 @@ mod tests {
     /// is also excluded (fail-closed).
     #[test]
     fn predicate_excludes_offline_and_unknown() {
-        let r = report(Some(1), &[(1, 10)]);
+        let r = latencies(&[(1, 10)]);
         let mut offline = candidate(1, Some(1));
         offline.online = Some(false);
         let mut unknown = candidate(3, Some(3));
         unknown.online = None;
         let cands = [offline, unknown, candidate(2, Some(2))];
         // Only peer2 survives ⇒ direct return.
-        let got = suggest_exit_node(&r, &cands, None, &unused_region(), &unused_node())
+        let got = suggest_exit_node(Some(1), &r, &cands, None, &unused_region(), &unused_node())
             .expect("ok")
             .expect("some");
         assert_eq!(got.id, StableNodeId("stable2".into()));
 
         // If the ONLY candidate is offline ⇒ no eligible candidates ⇒ Ok(None).
-        let r2 = report(Some(1), &[(1, 10)]);
+        let r2 = latencies(&[(1, 10)]);
         let mut lone_offline = candidate(9, Some(1));
         lone_offline.online = Some(false);
         assert_eq!(
-            suggest_exit_node(&r2, &[lone_offline], None, &unused_region(), &unused_node()),
+            suggest_exit_node(
+                Some(1),
+                &r2,
+                &[lone_offline],
+                None,
+                &unused_region(),
+                &unused_node()
+            ),
             Ok(None)
         );
     }
@@ -636,10 +684,10 @@ mod tests {
     /// is never called.
     #[test]
     fn all_region_less_falls_back_to_select_node() {
-        let r = report(Some(1), &[(1, 10)]);
+        let r = latencies(&[(1, 10)]);
         let cands = [candidate(5, None), candidate(6, None)];
         let select_node = pick_node(vec!["stable5", "stable6"], None, "stable5");
-        let got = suggest_exit_node(&r, &cands, None, &unused_region(), &select_node)
+        let got = suggest_exit_node(Some(1), &r, &cands, None, &unused_region(), &select_node)
             .expect("ok")
             .expect("some");
         assert_eq!(got.id, StableNodeId("stable5".into()));
@@ -651,11 +699,11 @@ mod tests {
     /// region-less peer6 + a DERP-homed peer2 ⇒ only peer2's region is considered.
     #[test]
     fn region_less_skipped_when_derp_homed_exists() {
-        let r = report(Some(1), &[(1, 10)]);
+        let r = latencies(&[(1, 10)]);
         let cands = [candidate(6, None), candidate(2, Some(1))];
         // Only region 1 (peer2) is offered to select_node; peer6 (region-less) is dropped.
         let select_node = pick_node(vec!["stable2"], None, "stable2");
-        let got = suggest_exit_node(&r, &cands, None, &unused_region(), &select_node)
+        let got = suggest_exit_node(Some(1), &r, &cands, None, &unused_region(), &select_node)
             .expect("ok")
             .expect("some");
         assert_eq!(got.id, StableNodeId("stable2".into()));
@@ -683,22 +731,22 @@ mod tests {
     /// missing-on-winner ⇒ None.
     #[test]
     fn min_latency_region_semantics() {
-        let r = report(Some(1), &[(1, 30), (2, 10), (3, 20)]);
+        let r = latencies(&[(1, 30), (2, 10), (3, 20)]);
         assert_eq!(
             min_latency_derp_region(&[region(1), region(2), region(3)], &r),
             Some(region(2))
         );
         // Equal latency ⇒ lower id.
-        let req = report(Some(1), &[(1, 10), (2, 10)]);
+        let req = latencies(&[(1, 10), (2, 10)]);
         assert_eq!(
             min_latency_derp_region(&[region(1), region(2)], &req),
             Some(region(1))
         );
         // All zero ⇒ None (caller falls back to select_region).
-        let rz = report(Some(1), &[(1, 0), (2, 0)]);
+        let rz = latencies(&[(1, 0), (2, 0)]);
         assert_eq!(min_latency_derp_region(&[region(1), region(2)], &rz), None);
         // Winner missing from map ⇒ None. (region 5 not in the map; it's the only candidate.)
-        let rm = report(Some(1), &[(1, 10)]);
+        let rm = latencies(&[(1, 10)]);
         assert_eq!(min_latency_derp_region(&[region(5)], &rm), None);
     }
 

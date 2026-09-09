@@ -95,10 +95,17 @@ pub struct ControlRunner {
     /// regions does not flap the home relay (which would cause repeated reconnects + brief loss).
     home_region: Option<(ts_derp::RegionId, core::time::Duration)>,
     /// Rolling history of per-cycle DERP-latency reports within the last [`DERP_HISTORY_MAX_AGE`]
-    /// (Go `netcheck` `maxAge = 5 * time.Minute`), each stamped with its arrival `Instant`. Feeds the
-    /// `bestRecent` smoothing (Go `addReportHistoryAndSetPreferredDERP`): the new home candidate is
-    /// chosen by each region's **minimum** latency over this window, not its raw current sample, so a
-    /// best region whose latency oscillates across the switch boundary does not flap the home relay.
+    /// (Go `netcheck` `maxAge`), each stamped with its arrival `Instant`. This is Go's one
+    /// `netcheck.Client.prev` history and, like it, has two readers:
+    ///
+    /// 1. the `bestRecent` smoothing (Go `addReportHistoryAndSetPreferredDERP`) — the new home
+    ///    candidate is chosen by each region's **minimum** latency over this window, not its raw
+    ///    current sample, so a best region whose latency oscillates across the switch boundary does
+    ///    not flap the home relay; and
+    /// 2. [`ControlRunner::recent_region_latency`] (Go `RecentRegionLatency`) — the per-region
+    ///    latencies the exit-node suggestion ranks candidates on, which need the union of several
+    ///    *partial* measurements to cover every region at all.
+    ///
     /// Aged entries are evicted on each measurement; the buffer is therefore bounded by the netcheck
     /// cadence × the window.
     derp_report_history: Vec<(Instant, Arc<Vec<ts_netcheck::RegionResult>>)>,
@@ -1225,6 +1232,31 @@ mod msg_impl {
             self.netcheck.borrow().clone()
         }
 
+        /// The lowest latency seen for each DERP region across the retained measurement history —
+        /// the Rust analog of Go `netcheck.Client.RecentRegionLatency()`, and what
+        /// [`Runtime::suggest_exit_node`](crate::Runtime::suggest_exit_node) ranks exit-node
+        /// candidates on.
+        ///
+        /// Ranking on this rather than on the newest report is the whole point: every measurement
+        /// this fork makes is *partial* (`ts_netcheck::Config::complete_threshold` ends it once
+        /// three regions have answered), so the newest report names a handful of regions and a
+        /// candidate homed anywhere else would be ranked against nothing — collapsing the
+        /// suggestion to a uniform random pick. The union over the retained window gives every
+        /// region a recent latency to be ranked on.
+        ///
+        /// The window (`DERP_HISTORY_MAX_AGE`) is re-applied *here*, at read time, not just when
+        /// a measurement lands: the history is only pruned on arrival, so a node that has gone
+        /// quiet must not serve latencies that have since aged out. An immediate answer (does not
+        /// block); empty before the first DERP-latency measurement.
+        #[message]
+        pub fn recent_region_latency(&self) -> HashMap<ts_derp::RegionId, Duration> {
+            best_recent(
+                &self.derp_report_history,
+                Instant::now(),
+                DERP_HISTORY_MAX_AGE,
+            )
+        }
+
         /// Request an OIDC ID token from control scoped to `audience` (workload-identity federation).
         ///
         /// Opens a fresh Noise channel and POSTs `/machine/id-token`; returns the signed JWT or an
@@ -1966,14 +1998,37 @@ impl Message<DerpLatencyMeasurement> for ControlRunner {
     }
 }
 
-/// The window over which `best_recent` smooths per-region DERP latency (Go `netcheck` `maxAge`).
-const DERP_HISTORY_MAX_AGE: Duration = Duration::from_secs(5 * 60);
+/// The cadence on which this node re-measures the derp map — the fork's analog of Go netcheck's
+/// `fullReportInterval` (also 5 minutes). This fork has no netcheck timer of its own: a re-measure
+/// is triggered by control pushing a derp map and by a link change
+/// ([`MeasureNow`](crate::derp_latency::MeasureNow)), so this is the *assumed* cycle length that
+/// [`DERP_HISTORY_MAX_AGE`] is sized from, not a period anything here sleeps on.
+const FULL_REPORT_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// The window over which the rolling DERP-latency history is retained: it feeds both `best_recent`
+/// (the home-region smoothing) and [`ControlRunner::recent_region_latency`] (the exit-node
+/// suggestion's per-region ranking), exactly as Go's one `netcheck.Client.prev` history feeds both
+/// `bestRecent` and `RecentRegionLatency`.
+///
+/// Sized as Go sizes it — `maxAge = fullReportInterval + ReportTimeout` — so the window covers a
+/// whole re-measure cycle *plus* the time one measurement is allowed to take, and a report cannot
+/// age out before its successor exists. Go's stronger guarantee ("the window always holds one
+/// *full* report") does not carry over: `ts_netcheck`'s `complete_threshold` means **every**
+/// measurement here is partial, so the window holds a union of partial reports rather than one
+/// complete one — which is precisely why the union is what the suggestion ranks on.
+const DERP_HISTORY_MAX_AGE: Duration =
+    FULL_REPORT_INTERVAL.saturating_add(ts_netcheck::REPORT_TIMEOUT);
 
 /// Compute each region's `bestRecent` — its **minimum** latency over the reports within
 /// `max_age` of `now` (Go `addReportHistoryAndSetPreferredDERP`'s `bestRecent` map). Reports older
 /// than the window are ignored. `now` and `max_age` are parameters (not clock-read) so this is
 /// deterministically unit-testable. A region absent from every in-window report is absent from the
 /// result.
+///
+/// This is also the body of Go's `netcheck.Client.RecentRegionLatency()` — the same "lowest latency
+/// seen per region across the retained history" map — which is why
+/// [`ControlRunner::recent_region_latency`] serves the exit-node suggestion straight out of it
+/// rather than keeping a second history.
 fn best_recent(
     history: &[(Instant, Arc<Vec<ts_netcheck::RegionResult>>)],
     now: Instant,
@@ -2472,6 +2527,124 @@ mod home_region_hysteresis_tests {
     fn keeps_current_when_it_is_already_best() {
         let m = [region(2, 20), region(1, 50)];
         assert_eq!(sel(Some(rid(2)), &m).unwrap(), rid(2));
+    }
+
+    /// The exit-node suggestion ranks on the *union* of the retained partial measurements, not on
+    /// the newest one — this fork's form of upstream's `TestRecentReportsRetainFullNetcheck`.
+    ///
+    /// Go retains reports for `fullReportInterval + ReportTimeout` so the history is guaranteed to
+    /// hold one *full* netcheck. This fork never produces a full one: `complete_threshold` ends
+    /// every measurement once three regions have answered, so the window instead has to hold enough
+    /// *partial* reports for their union to cover every region. Both halves are asserted against
+    /// the production code — `best_recent`, which `ControlRunner::recent_region_latency` serves the
+    /// suggestion from, and `suggest_exit_node`, the ranking itself.
+    #[test]
+    fn partial_reports_union_keeps_every_region_rankable() {
+        use ts_control::StableNodeId;
+
+        use crate::exit_node_suggest::{ExitNodeCandidate, suggest_exit_node};
+
+        let now = Instant::now();
+
+        // Six measurement cycles, each naming only three regions — what a `complete_threshold: 3`
+        // measurement produces against a real derp map. The nearby regions 1/2/3 answer nearly every
+        // cycle; region 9 (far away, 300ms) got in exactly ONE cycle, four minutes ago; region 7 has
+        // never been measured at all. The 10-minute-old cycle is outside the retention window and
+        // its absurdly good 5ms sample for region 9 must not survive into the ranking.
+        let history = vec![
+            (now - Duration::from_secs(600), Arc::new(vec![region(9, 5)])),
+            (
+                now - Duration::from_secs(240),
+                Arc::new(vec![region(1, 13), region(2, 20), region(9, 300)]),
+            ),
+            (
+                now - Duration::from_secs(180),
+                Arc::new(vec![region(1, 11), region(2, 21), region(3, 30)]),
+            ),
+            (
+                now - Duration::from_secs(120),
+                Arc::new(vec![region(1, 14), region(2, 19), region(3, 31)]),
+            ),
+            (
+                now - Duration::from_secs(60),
+                Arc::new(vec![region(1, 10), region(2, 23), region(3, 29)]),
+            ),
+            (
+                now,
+                Arc::new(vec![region(1, 12), region(2, 18), region(3, 28)]),
+            ),
+        ];
+
+        // Half one: every region any in-window cycle reached still has a latency to rank on, at its
+        // lowest in-window sample. Region 9's stale 5ms is evicted; its 300ms stands.
+        let recent = best_recent(&history, now, DERP_HISTORY_MAX_AGE);
+        for (id, want_ms) in [(1, 10), (2, 18), (3, 28), (9, 300)] {
+            assert_eq!(
+                recent.get(&rid(id)).copied(),
+                Some(Duration::from_millis(want_ms)),
+                "region {id} must still be rankable off the retained history"
+            );
+        }
+        assert!(
+            !recent.contains_key(&rid(7)),
+            "a region no in-window cycle ever measured has no latency"
+        );
+
+        fn exit_node(id: u32, derp: u32) -> ExitNodeCandidate {
+            ExitNodeCandidate {
+                stable_id: StableNodeId(format!("stable{id}")),
+                name: format!("peer{id}"),
+                derp_region: Some(rid(derp)),
+                online: Some(true),
+                advertises_exit_route: true,
+                has_suggest_cap: true,
+            }
+        }
+        // One exit node in the far-but-measured region 9, one in the never-measured region 7.
+        let candidates = [exit_node(9, 9), exit_node(7, 7)];
+        let first_node = |nodes: &[ExitNodeCandidate], _: Option<&StableNodeId>| nodes[0].clone();
+
+        // Half two: ranked on the history, region 9's four-minute-old 300ms beats region 7's nothing,
+        // and the uniform region pick is never reached.
+        let no_random = |_: &[RegionId]| panic!("select_region must not be reached");
+        let got = suggest_exit_node(Some(1), &recent, &candidates, None, &no_random, &first_node)
+            .expect("ok")
+            .expect("some");
+        assert_eq!(
+            got.id,
+            StableNodeId("stable9".to_owned()),
+            "a region measured four minutes ago must still beat an unmeasured one"
+        );
+
+        // The regression this replaces: ranked on the NEWEST report alone — regions 1/2/3, the only
+        // ones that cycle answered — neither candidate's region has a latency, so the suggestion
+        // falls through to the uniform random pick and the unmeasured region 7 can win the coin flip.
+        let newest: HashMap<RegionId, Duration> = history
+            .last()
+            .unwrap()
+            .1
+            .iter()
+            .map(|r| (r.id, r.latency))
+            .collect();
+        let pick_seven = |regions: &[RegionId]| {
+            assert!(regions.contains(&rid(7)) && regions.contains(&rid(9)));
+            rid(7)
+        };
+        let got = suggest_exit_node(
+            Some(1),
+            &newest,
+            &candidates,
+            None,
+            &pick_seven,
+            &first_node,
+        )
+        .expect("ok")
+        .expect("some");
+        assert_eq!(
+            got.id,
+            StableNodeId("stable7".to_owned()),
+            "ranking on one partial report leaves both candidates unmeasured and picks at random"
+        );
     }
 
     /// `best_recent` is each region's MINIMUM latency over the in-window reports; a report older than
