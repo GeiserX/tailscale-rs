@@ -71,13 +71,15 @@ impl Filter for DropAllFilter {
 ///
 /// Scoping the deny to `self_addrs` (rather than dropping everything) is deliberate, because this
 /// fork's filter is **stateless** — it has no TCP-flow tracking, so it cannot tell a new inbound
-/// connection from a reply to one we initiated. Dropping only packets aimed at our own host
+/// TCP connection from a reply to one we initiated. Dropping only packets aimed at our own host
 /// addresses means:
 /// - new inbound connections *terminating on this node* are refused (the shields-up intent), but
 /// - **forwarded transit** (subnet-route / exit-node traffic, whose `dst` is some other route, never
 ///   a self address) is unaffected, and
-/// - reply admission for our own outbound flows continues to be governed by the wrapped ACL filter
-///   exactly as before (we don't blanket-drop it here).
+/// - reply admission for our own outbound flows is decided before this filter is ever consulted:
+///   `ts_dataplane` tracks outbound UDP/SCTP flows and admits their replies ahead of the rule match,
+///   which is where Go's `runIn4`/`runIn6` consult their own `flowtrack` cache. Shields-up blocks
+///   inbound *connections*, not the answers to ours — same as upstream.
 ///
 /// This is the honest stateless-filter approximation of Go's stateful ShieldsUp: it blocks inbound
 /// *to self* and leaves everything else to the real filter. Mirrors `DropAllFilter`'s "deny by

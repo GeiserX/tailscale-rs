@@ -13,6 +13,8 @@ use ts_underlay_router as ur;
 
 pub mod async_tokio;
 
+mod flowtrack;
+
 /// The single link-local destination Go's filter `pre()` exempts from the link-local drop: the
 /// cloud-metadata address `169.254.169.254` (Go `isAllowedLinkLocal`).
 const ALLOWED_LINK_LOCAL_V4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(169, 254, 169, 254);
@@ -131,6 +133,11 @@ enum Ipv6Fragment {
     First {
         /// The Fragment header's Next Header — the real sub-protocol (Go `q.IPProto = nextHdr`).
         proto: IpProto,
+        /// The source port read from that sub-protocol's header, 0 for a protocol Go does not
+        /// port-match (Go `withPort(q.Src, ...)`). Only the reverse-flow cache
+        /// ([`flowtrack::FlowCache`]) reads it — the ACL matches on the destination port alone —
+        /// but Go's `flowtrack.Tuple` keys on both, so both have to be carried.
+        src_port: u16,
         /// The destination port read from that sub-protocol's header, 0 for a protocol Go does not
         /// port-match (Go `withPort(q.Dst, ...)`).
         dst_port: u16,
@@ -205,13 +212,15 @@ fn decode6_first_fragment(proto: IpProto, sub: &[u8]) -> Ipv6Fragment {
     /// Go `net/packet.minTSMPSize` — the shortest TSMP body (a 7-byte rejected-connection message).
     const MIN_TSMP_SIZE: usize = 7;
 
-    // Go's port-ful arms: bounds-check, then read the destination port from `sub[2:4]`.
+    // Go's port-ful arms: bounds-check, then read the source port from `sub[0:2]` and the
+    // destination port from `sub[2:4]`.
     let ported = |min_len: usize| {
         if sub.len() < min_len {
             return Ipv6Fragment::Unknown;
         }
         Ipv6Fragment::First {
             proto,
+            src_port: u16::from_be_bytes([sub[0], sub[1]]),
             dst_port: u16::from_be_bytes([sub[2], sub[3]]),
         }
     };
@@ -220,7 +229,11 @@ fn decode6_first_fragment(proto: IpProto, sub: &[u8]) -> Ipv6Fragment {
         if sub.len() < min_len {
             return Ipv6Fragment::Unknown;
         }
-        Ipv6Fragment::First { proto, dst_port: 0 }
+        Ipv6Fragment::First {
+            proto,
+            src_port: 0,
+            dst_port: 0,
+        }
     };
 
     match proto {
@@ -238,13 +251,17 @@ fn decode6_first_fragment(proto: IpProto, sub: &[u8]) -> Ipv6Fragment {
         // packet dies on `inbound_filter_verdict`'s [`IPPROTO_UNKNOWN`] arm before a rule sees it,
         // exactly where Go's `pre()` kills it. Pinned by
         // `first_ipv6_fragment_with_unknown_next_header_is_dropped_before_the_acl`.
-        _ => Ipv6Fragment::First { proto, dst_port: 0 },
+        _ => Ipv6Fragment::First {
+            proto,
+            src_port: 0,
+            dst_port: 0,
+        },
     }
 }
 
-/// The destination port of the SCTP packet whose common header starts at `sub` — Go's
+/// The `(source, destination)` ports of the SCTP packet whose common header starts at `sub` — Go's
 /// `case ipproto.SCTP` arm, which both `decode4` and `decode6` carry verbatim: bounds-check the
-/// 12-byte common header, then read `sub[2:4]`.
+/// 12-byte common header, then read `sub[0:2]` and `sub[2:4]`.
 ///
 /// `None` is Go's refusal in that same arm (`q.IPProto = unknown`), which filter `pre()` turns into
 /// a drop. It must never be read as "port 0": a truncated SCTP header carries no port for a rule to
@@ -253,11 +270,14 @@ fn decode6_first_fragment(proto: IpProto, sub: &[u8]) -> Ipv6Fragment {
 /// This exists because etherparse's `TransportSlice` has arms for ICMPv4/ICMPv6/TCP/UDP and nothing
 /// else, so an SCTP packet leaves `SlicedPacket::transport` empty and its ports have to be read the
 /// way Go reads them.
-fn sctp_dst_port(sub: &[u8]) -> Option<u16> {
+fn sctp_ports(sub: &[u8]) -> Option<(u16, u16)> {
     if sub.len() < SCTP_HEADER_LEN {
         return None;
     }
-    Some(u16::from_be_bytes([sub[2], sub[3]]))
+    Some((
+        u16::from_be_bytes([sub[0], sub[1]]),
+        u16::from_be_bytes([sub[2], sub[3]]),
+    ))
 }
 
 /// Whether `ipv6` carries a Fragment extension header somewhere in its extension-header chain
@@ -325,20 +345,27 @@ enum Fragment {
 /// 4. TSMP (proto 99) is always admitted, bypassing the ACL — Go `case ipproto.TSMP: return Accept`.
 ///    TSMP carries in-band control messages between nodes, so it must reach the local stack
 ///    regardless of the ACL rules.
-/// 5. Everything else consults the control-derived ACL via `can_access` — Go's `matches4.match`.
+/// 5. **A UDP or SCTP reply to a flow this node started** is admitted from `flows` — Go's
+///    `case ipproto.UDP, ipproto.SCTP` arm, which consults the `flowtrack` LRU and returns
+///    `Accept, "cached"` *before* the rule match. See [`flowtrack`].
+/// 6. Everything else consults the control-derived ACL via `can_access` — Go's `matches4.match`.
 ///    A protocol Go's `runIn4`/`runIn6` switch has no arm for (an IPv6 Routing or
 ///    Destination-Options header, say) lands in its `default`, which admits IPs-only and only
 ///    under an all-ports rule naming that protocol (`matchProtoAndIPsOnlyIfAllPorts`); that
 ///    per-protocol port semantics lives in [`ts_packetfilter::Rule`].
+///
+/// `src` and `dst` carry ports because Go's `packet.Parsed` does (`q.Src`/`q.Dst` are
+/// `netip.AddrPort`) and because the flow cache in step 5 keys on all four fields. The ACL itself
+/// still sees only the destination port, which is all Go's `matches4.match` reads.
 fn inbound_filter_verdict(
     filter: &(dyn ts_packetfilter::Filter + Send + Sync),
+    flows: &mut flowtrack::FlowCache,
     proto: IpProto,
-    src: std::net::IpAddr,
-    dst: std::net::IpAddr,
-    dst_port: u16,
+    src: std::net::SocketAddr,
+    dst: std::net::SocketAddr,
     frag: Option<Fragment>,
 ) -> bool {
-    if drop_before_rules(dst) {
+    if drop_before_rules(dst.ip()) {
         tracing::trace!(?dst, "dropping multicast/link-local dst (pre-rule)");
         return false;
     }
@@ -425,11 +452,34 @@ fn inbound_filter_verdict(
         return true;
     }
 
+    // Go `runIn4`/`runIn6`, at the top of the UDP/SCTP arm and ahead of the rule match:
+    //
+    //     case ipproto.UDP, ipproto.SCTP:
+    //         t := flowtrack.MakeTuple(q.IPProto, q.Src, q.Dst)
+    //         f.state.mu.Lock()
+    //         _, ok := f.state.lru.Get(t)
+    //         f.state.mu.Unlock()
+    //         if ok {
+    //             return Accept, "cached"
+    //         }
+    //
+    // This is the reply to a datagram `process_outbound` sent, so no ACL rule can be expected to
+    // name it: our source port was ephemeral. A miss falls straight through to the rule match
+    // below, which is exactly what Go does — the cache only ever admits, it never denies.
+    if flows.admits_inbound(proto, src, dst) {
+        tracing::trace!(
+            ?src,
+            ?dst,
+            "accepting reply to a tracked outbound flow (cached)"
+        );
+        return true;
+    }
+
     let info = ts_packetfilter::PacketInfo {
         ip_proto: proto,
-        port: dst_port,
-        src,
-        dst,
+        port: dst.port(),
+        src: src.ip(),
+        dst: dst.ip(),
     };
     // TODO(npry): wire in nodecaps
     let caps = [];
@@ -461,6 +511,7 @@ fn inbound_filter_verdict(
 /// *itself*: it cannot speak for another peer.
 fn filter_inbound_from_peer(
     filter: &(dyn ts_packetfilter::Filter + Send + Sync),
+    flows: &mut flowtrack::FlowCache,
     peer_id: PeerId,
     packets: &mut Vec<PacketMut>,
     learned_disco_keys: &mut Vec<(PeerId, ts_packet::tsmp::DiscoKeyAdvertisement)>,
@@ -578,8 +629,10 @@ fn filter_inbound_from_peer(
         // unfragmented one. etherparse deliberately refuses to descend into a fragmenting
         // payload and leaves `transport == None`, so that port comes from the
         // classification above instead.
-        let dst_port = match frag {
-            Some(Fragment::V6(Ipv6Fragment::First { dst_port, .. })) => dst_port,
+        let (src_port, dst_port) = match frag {
+            Some(Fragment::V6(Ipv6Fragment::First {
+                src_port, dst_port, ..
+            })) => (src_port, dst_port),
             // Go reads a destination port in exactly three arms of `decode4`/`decode6` — TCP,
             // UDP and SCTP — and which arm runs is decided by the protocol number the *base*
             // header declared, not by what a header walk can reach. So an IPv6 packet that
@@ -587,13 +640,13 @@ fn filter_inbound_from_peer(
             // arm at all) and keeps port 0 even though a transport header does sit further
             // down its chain. Reading that buried port here is what let a chained packet be
             // matched against a port-scoped TCP/UDP rule it is not upstream's to match.
-            _ if !proto.is_port_ful() => 0,
+            _ if !proto.is_port_ful() => (0, 0),
             // A later IPv4 fragment carries no transport header at all: Go `decode4` leaves both
             // ports 0 and classifies it `ipproto.Fragment`, and the verdict below decides on the
             // offset alone. `sub` is continued payload here, not a header, so the SCTP arm must
             // not read it — that would invent a port, and would drop a short later fragment Go
             // passes through.
-            Some(Fragment::V4(v4)) if v4.offset_blocks > 0 => 0,
+            Some(Fragment::V4(v4)) if v4.offset_blocks > 0 => (0, 0),
             // SCTP. etherparse's `TransportSlice` parses ICMPv4, ICMPv6, TCP and UDP and nothing
             // else, so `pkt.transport` is `None` for SCTP and the arm below would report port 0
             // for every SCTP packet on the wire — a match Go never makes. Go has an SCTP arm in
@@ -601,19 +654,23 @@ fn filter_inbound_from_peer(
             // same bytes Go calls `sub`. (An IPv6 *first fragment* carrying SCTP is already
             // handled by the first arm, out of `decode6_first_fragment`'s own SCTP arm.)
             _ if proto == IpProto::SCTP => {
-                let Some(port) = sctp_dst_port(sub) else {
+                let Some(ports) = sctp_ports(sub) else {
                     // Go's `q.IPProto = unknown` for a header too short to hold the ports, which
                     // `pre()` drops before any rule is consulted. Falling back to port 0 instead
                     // would hand the packet to an all-ports SCTP rule.
                     tracing::trace!(?dst, "dropping SCTP packet shorter than its own header");
                     return false;
                 };
-                port
+                ports
             }
             _ => match pkt.transport {
-                Some(etherparse::TransportSlice::Udp(udp)) => udp.destination_port(),
-                Some(etherparse::TransportSlice::Tcp(tcp)) => tcp.destination_port(),
-                _ => 0,
+                Some(etherparse::TransportSlice::Udp(udp)) => {
+                    (udp.source_port(), udp.destination_port())
+                }
+                Some(etherparse::TransportSlice::Tcp(tcp)) => {
+                    (tcp.source_port(), tcp.destination_port())
+                }
+                _ => (0, 0),
             },
         };
 
@@ -646,7 +703,14 @@ fn filter_inbound_from_peer(
         // unconditional TSMP accept, then the control-derived ACL. The caller's source
         // attribution and `or_in.route` bound this to attributable peers and local
         // destinations (Go's `local4`/`local6` precondition).
-        inbound_filter_verdict(filter, proto, src, dst, dst_port, frag)
+        inbound_filter_verdict(
+            filter,
+            flows,
+            proto,
+            std::net::SocketAddr::new(src, src_port),
+            std::net::SocketAddr::new(dst, dst_port),
+            frag,
+        )
     });
 }
 
@@ -828,6 +892,113 @@ fn outbound_packet_carries_tsmp(b: &[u8]) -> bool {
     }
 }
 
+/// The UDP or SCTP flow an outbound packet belongs to — `(proto, src, dst)` with the packet's own
+/// source and destination — or `None` for anything Go's `UpdateOutboundFlowState` switch would not
+/// record. The caller hands it to [`flowtrack::FlowCache::record_outbound`], which stores the
+/// reverse.
+///
+/// This is Go's `net/packet.Parsed.decode4`/`decode6` narrowed to the two protocols that switch has
+/// arms for, and it keeps that decoder's refusals rather than guessing:
+///
+/// - **The protocol comes from the base header only** — `decode4`'s `b[9]`, `decode6`'s `b[6]` —
+///   so an IPv6 packet behind a chained extension header is not recorded even though etherparse can
+///   walk to its UDP header. Go never reaches that header either, so recording it would be this
+///   tree inventing a flow upstream does not track.
+/// - **A non-first IPv4 fragment is not a flow.** `decode4` classifies it `ipproto.Fragment`, which
+///   matches neither arm of Go's switch; it also has no transport header, so its ports would be
+///   invented.
+/// - **A leading IPv6 Fragment header is stepped over**, exactly as `decode6` does, so the *first*
+///   fragment of an outbound datagram records the same tuple an unfragmented one would.
+/// - **A truncated SCTP common header records nothing** (Go's `q.IPProto = unknown`), rather than
+///   recording a flow on ports read as 0 — an entry keyed on port 0 would admit inbound SCTP that
+///   no outbound packet ever justified.
+fn outbound_udp_or_sctp_flow(
+    b: &[u8],
+) -> Option<(IpProto, std::net::SocketAddr, std::net::SocketAddr)> {
+    let pkt = etherparse::SlicedPacket::from_ip(b).ok()?;
+
+    // Go's `sub`: the bytes from the sub-protocol header onwards. Only the SCTP arm reads it,
+    // because etherparse's `TransportSlice` has no SCTP variant.
+    let sub = match &pkt.net {
+        Some(etherparse::NetSlice::Ipv4(ipv4)) => ipv4.payload().payload,
+        Some(etherparse::NetSlice::Ipv6(ipv6)) => ipv6.payload().payload,
+        _ => &[][..],
+    };
+
+    let (proto, src_ip, dst_ip, v6_first_fragment_ports) = match &pkt.net {
+        Some(etherparse::NetSlice::Ipv4(ipv4)) => {
+            let hdr = ipv4.header();
+            if hdr.fragments_offset().value() > 0 {
+                return None;
+            }
+            (
+                IpProto::new(i64::from(ipv4.payload().ip_number.0)),
+                std::net::IpAddr::from(hdr.source_addr()),
+                std::net::IpAddr::from(hdr.destination_addr()),
+                None,
+            )
+        }
+        Some(etherparse::NetSlice::Ipv6(ipv6)) => {
+            let hdr = ipv6.header();
+            let src_ip = std::net::IpAddr::from(hdr.source_addr());
+            let dst_ip = std::net::IpAddr::from(hdr.destination_addr());
+            if hdr.next_header().0 == IP6_FRAG_HEADER {
+                // Go `decode6Fragment`: a first fragment yields the real sub-protocol and its
+                // ports; a later or malformed one yields no flow at all.
+                let Ipv6Fragment::First {
+                    proto,
+                    src_port,
+                    dst_port,
+                } = decode6_fragment(b)
+                else {
+                    return None;
+                };
+                (proto, src_ip, dst_ip, Some((src_port, dst_port)))
+            } else {
+                (
+                    IpProto::new(i64::from(hdr.next_header().0)),
+                    src_ip,
+                    dst_ip,
+                    None,
+                )
+            }
+        }
+        // Not an IP packet at all; `or_out.route` drops it a moment later for want of a
+        // destination address.
+        _ => return None,
+    };
+
+    /// Go `net/packet.udpHeaderLength`.
+    const UDP_HEADER_LEN: usize = 8;
+
+    // Go's `decode4`/`decode6` read both ports straight out of `sub` — `sub[0:2]` and `sub[2:4]` —
+    // after a bounds check, for exactly the protocols below. Reading them here rather than from
+    // etherparse's `TransportSlice` is not a shortcut: etherparse deliberately refuses to descend
+    // into a fragmenting payload, so a *first* IPv4 fragment would otherwise surface no ports at
+    // all, where Go reads them and records the flow like an unfragmented datagram's.
+    let (src_port, dst_port) = match (proto, v6_first_fragment_ports) {
+        (IpProto::UDP | IpProto::SCTP, Some(ports)) => ports,
+        (IpProto::UDP, None) => {
+            if sub.len() < UDP_HEADER_LEN {
+                return None;
+            }
+            (
+                u16::from_be_bytes([sub[0], sub[1]]),
+                u16::from_be_bytes([sub[2], sub[3]]),
+            )
+        }
+        (IpProto::SCTP, None) => sctp_ports(sub)?,
+        // Every other protocol: Go's switch has no arm for it, so nothing is recorded.
+        _ => return None,
+    };
+
+    Some((
+        proto,
+        std::net::SocketAddr::new(src_ip, src_port),
+        std::net::SocketAddr::new(dst_ip, dst_port),
+    ))
+}
+
 /// A data plane subsystem that can be the subject of timer events.
 pub enum Subsystem {
     /// The wireguard component.
@@ -894,6 +1065,13 @@ pub struct DataPlane {
     /// actor; see [`DataPlane::process_outbound`]/[`DataPlane::process_inbound`] for the tee points.
     pub capture: Option<CaptureHook>,
 
+    /// Reverse-flow connection tracking for outbound UDP and SCTP, so a peer's reply to a
+    /// datagram this node sent is admitted without an ACL rule naming our ephemeral source port
+    /// (Go `filter.Filter.state`). Filled by [`DataPlane::process_outbound`] and consulted by the
+    /// inbound filter; bounded at Go's `lruMax`. Private because it is derived datapath state, not
+    /// configuration — nothing outside this crate has anything to set it to.
+    flows: flowtrack::FlowCache,
+
     /// Netmap snapshot for the TSMP disco-key advertisement this node sends on session
     /// establishment (Go capability version 144). `None` (the default) advertises nothing at all,
     /// which is what an embedder that never populates it gets — the same position this fork was in
@@ -915,6 +1093,7 @@ impl DataPlane {
             packet_filter: Arc::new(ts_packetfilter::DropAllFilter),
             wg_next: None,
             capture: None,
+            flows: flowtrack::FlowCache::default(),
             disco_advertisement: None,
         }
     }
@@ -944,6 +1123,19 @@ impl DataPlane {
             }
             true
         });
+
+        // Go `filter.Filter.UpdateOutboundFlowState`, called from `RunOut` for every packet read
+        // off the TUN and — since upstream `e0677ccc7` — from `net/tstun`'s injected path too,
+        // because packets produced by netstack never pass `RunOut` and "a netstack-side dial of UDP
+        // would send fine but the reply would be dropped as `no matching rule`". Every outbound
+        // packet in this engine comes from the netstack, so this is that call site. It runs after
+        // the TSMP refusal above, matching Go's order in `filterPacketOutboundToWireGuard`, and
+        // before `or_out.route` consumes the batch.
+        for p in &packets {
+            if let Some((proto, src, dst)) = outbound_udp_or_sctp_flow(p.as_ref()) {
+                self.flows.record_outbound(proto, src, dst);
+            }
+        }
 
         let or::outbound::Result {
             to_wireguard,
@@ -1056,6 +1248,7 @@ impl DataPlane {
 
                 filter_inbound_from_peer(
                     self.packet_filter.as_ref(),
+                    &mut self.flows,
                     peer_id,
                     &mut v,
                     &mut learned_disco_keys,
@@ -1214,6 +1407,28 @@ mod tests {
     /// Records `(path, bytes)` for each capture-hook invocation in a test.
     type CaptureLog = Arc<Mutex<Vec<(CapturePath, Vec<u8>)>>>;
 
+    /// [`inbound_filter_verdict`] against an **empty** flow cache, which is the verdict for a packet
+    /// that is not a reply to anything this node sent. Every case that predates the reverse-flow
+    /// cache is exactly that case, so they all go through here and stay pinned to the stateless
+    /// decision; the tests that do record an outbound flow call `inbound_filter_verdict` directly.
+    fn stateless_verdict(
+        filter: &(dyn ts_packetfilter::Filter + Send + Sync),
+        proto: IpProto,
+        src: std::net::IpAddr,
+        dst: std::net::IpAddr,
+        dst_port: u16,
+        frag: Option<Fragment>,
+    ) -> bool {
+        inbound_filter_verdict(
+            filter,
+            &mut flowtrack::FlowCache::default(),
+            proto,
+            std::net::SocketAddr::new(src, 0),
+            std::net::SocketAddr::new(dst, dst_port),
+            frag,
+        )
+    }
+
     #[test]
     fn capture_path_codes() {
         assert_eq!(CapturePath::FromLocal.code(), 0);
@@ -1302,22 +1517,22 @@ mod tests {
 
         // TSMP is accepted even though the ACL denies everything — Go `case TSMP: return Accept`.
         assert!(
-            inbound_filter_verdict(&DenyAll, tsmp, src, dst, 0, None),
+            stateless_verdict(&DenyAll, tsmp, src, dst, 0, None),
             "TSMP admitted by bypassing the (deny-all) ACL"
         );
         // A non-TSMP proto under the same deny-all ACL is dropped — proves the bypass is TSMP-specific.
         assert!(
-            !inbound_filter_verdict(&DenyAll, IpProto::TCP, src, dst, 443, None),
+            !stateless_verdict(&DenyAll, IpProto::TCP, src, dst, 443, None),
             "TCP still consults the ACL (deny-all → dropped)"
         );
         // `pre()` drops outrank the TSMP accept: TSMP to a multicast/link-local dst is still dropped,
         // exactly as Go runs `pre()` before the proto switch.
         assert!(
-            !inbound_filter_verdict(&DenyAll, tsmp, src, ip("224.0.0.1"), 0, None),
+            !stateless_verdict(&DenyAll, tsmp, src, ip("224.0.0.1"), 0, None),
             "TSMP to a multicast dst is still dropped (pre() before the switch)"
         );
         assert!(
-            !inbound_filter_verdict(&DenyAll, tsmp, src, ip("169.254.1.1"), 0, None),
+            !stateless_verdict(&DenyAll, tsmp, src, ip("169.254.1.1"), 0, None),
             "TSMP to a link-local dst is still dropped (pre() before the switch)"
         );
         // IpProto::TSMP is the named constant for proto 99.
@@ -1347,7 +1562,7 @@ mod tests {
         // A valid later fragment is accepted under a DENY-ALL ACL with port 0 — proves the accept is
         // the Go `pre()` Fragment pass-through, not the ACL happening to allow it.
         assert!(
-            inbound_filter_verdict(
+            stateless_verdict(
                 &DenyAll,
                 IpProto::TCP,
                 src,
@@ -1358,7 +1573,7 @@ mod tests {
             "a valid later fragment (offset >= MIN_FRAG_BLKS) is accepted ahead of the ACL"
         );
         assert!(
-            inbound_filter_verdict(
+            stateless_verdict(
                 &DenyAll,
                 IpProto::UDP,
                 src,
@@ -1371,7 +1586,7 @@ mod tests {
 
         // A low-offset later fragment (could overlap a transport header) is dropped — RFC 1858.
         assert!(
-            !inbound_filter_verdict(
+            !stateless_verdict(
                 &DenyAll,
                 IpProto::TCP,
                 src,
@@ -1382,25 +1597,25 @@ mod tests {
             "a low-offset later fragment is dropped (RFC 1858)"
         );
         assert!(
-            !inbound_filter_verdict(&DenyAll, IpProto::TCP, src, dst, 0, frag(1, false)),
+            !stateless_verdict(&DenyAll, IpProto::TCP, src, dst, 0, frag(1, false)),
             "the smallest non-zero offset is dropped"
         );
 
         // A first fragment (offset 0) defers to the normal ACL on its real port: deny-all drops a
         // TCP first fragment, exactly as it drops a non-fragmented TCP packet.
         assert!(
-            !inbound_filter_verdict(&DenyAll, IpProto::TCP, src, dst, 443, frag(0, true)),
+            !stateless_verdict(&DenyAll, IpProto::TCP, src, dst, 443, frag(0, true)),
             "a first fragment defers to the ACL (deny-all -> dropped) on its parsed port"
         );
 
         // A fragmented TSMP first fragment (offset 0, MF set) is dropped — Go disallows it — even
         // though a non-fragmented TSMP bypasses the ACL.
         assert!(
-            !inbound_filter_verdict(&DenyAll, IpProto::TSMP, src, dst, 0, frag(0, true)),
+            !stateless_verdict(&DenyAll, IpProto::TSMP, src, dst, 0, frag(0, true)),
             "a fragmented TSMP first fragment is dropped (Go parity)"
         );
         assert!(
-            inbound_filter_verdict(&DenyAll, IpProto::TSMP, src, dst, 0, frag(0, false)),
+            stateless_verdict(&DenyAll, IpProto::TSMP, src, dst, 0, frag(0, false)),
             "a non-fragmented TSMP (offset 0, MF clear) still bypasses the ACL"
         );
 
@@ -1410,7 +1625,7 @@ mod tests {
         // and wins over the TSMP-specific logic (Go maps any offset>=minFragBlks to ipproto.Fragment
         // regardless of the L4 proto byte), locking the branch ordering against regression.
         assert!(
-            inbound_filter_verdict(
+            stateless_verdict(
                 &DenyAll,
                 IpProto::TSMP,
                 src,
@@ -1566,6 +1781,9 @@ mod tests {
             decode6_fragment(&ipv6_fragment_packet(17, 0, true, &udp_header(443))),
             Ipv6Fragment::First {
                 proto: IpProto::UDP,
+                // `udp_header` writes 54276 as its source port; Go reads `sub[0:2]` for it, and the
+                // reverse-flow cache is the only thing that consults it.
+                src_port: 54276,
                 dst_port: 443,
             },
             "a first fragment is decoded past the Fragment header, ports and all"
@@ -1625,6 +1843,7 @@ mod tests {
             decode6_fragment(&ipv6_fragment_packet(6, 0, true, &tcp)),
             Ipv6Fragment::First {
                 proto: IpProto::TCP,
+                src_port: 0,
                 dst_port: 443,
             },
             "a complete TCP header in the first fragment is read normally"
@@ -1654,6 +1873,7 @@ mod tests {
             decode6_fragment(&ipv6_fragment_packet(58, 0, true, &[0u8; 4])),
             Ipv6Fragment::First {
                 proto: IpProto::ICMPV6,
+                src_port: 0,
                 dst_port: 0,
             },
             "a first ICMPv6 fragment keeps port 0 and is matched IPs-only"
@@ -1687,7 +1907,7 @@ mod tests {
 
         // The negative case, stated explicitly: allow-all cannot rescue an `unknown` fragment.
         assert!(
-            !inbound_filter_verdict(
+            !stateless_verdict(
                 &AllowAll,
                 IpProto::new(0),
                 src,
@@ -1700,13 +1920,13 @@ mod tests {
         // The control: the same allow-all ACL admits an ordinary non-fragment packet, so the drop
         // above is the classification and not the harness.
         assert!(
-            inbound_filter_verdict(&AllowAll, IpProto::UDP, src, dst, 443, None),
+            stateless_verdict(&AllowAll, IpProto::UDP, src, dst, 443, None),
             "the allow-all ACL does admit an ordinary packet"
         );
 
         // A safe later fragment slides through ahead of the ACL, with nothing but port 0 to match.
         assert!(
-            inbound_filter_verdict(
+            stateless_verdict(
                 &DenyAll,
                 IpProto::new(0),
                 src,
@@ -1722,32 +1942,33 @@ mod tests {
         let first = |dst_port| {
             v6(Ipv6Fragment::First {
                 proto: IpProto::UDP,
+                src_port: 0,
                 dst_port,
             })
         };
         assert!(
-            inbound_filter_verdict(&AllowPort(443), IpProto::UDP, src, dst, 443, first(443)),
+            stateless_verdict(&AllowPort(443), IpProto::UDP, src, dst, 443, first(443)),
             "a first IPv6 fragment is matched on the port behind the Fragment header"
         );
         assert!(
-            !inbound_filter_verdict(&AllowPort(443), IpProto::UDP, src, dst, 444, first(444)),
+            !stateless_verdict(&AllowPort(443), IpProto::UDP, src, dst, 444, first(444)),
             "a first IPv6 fragment on a disallowed port is dropped by the ACL"
         );
         // Control: the same ACL decides an unfragmented packet the same way, so the two results
         // above are the ACL being consulted on a real port and not a fragment-specific shortcut.
         assert!(
-            inbound_filter_verdict(&AllowPort(443), IpProto::UDP, src, dst, 443, None),
+            stateless_verdict(&AllowPort(443), IpProto::UDP, src, dst, 443, None),
             "control: the port-scoped ACL admits an unfragmented packet to 443"
         );
         assert!(
-            !inbound_filter_verdict(&AllowPort(443), IpProto::UDP, src, dst, 0, None),
+            !stateless_verdict(&AllowPort(443), IpProto::UDP, src, dst, 0, None),
             "control: port 0 - what a v6 fragment used to read as - is not admitted"
         );
 
         // `pre()`'s multicast/link-local drops still outrank the fragment pass-through, exactly as
         // Go runs them before `case ipproto.Fragment`.
         assert!(
-            !inbound_filter_verdict(
+            !stateless_verdict(
                 &AllowAll,
                 IpProto::new(0),
                 src,
@@ -1758,7 +1979,7 @@ mod tests {
             "a later fragment to a multicast dst is still dropped by pre()"
         );
         assert!(
-            !inbound_filter_verdict(
+            !stateless_verdict(
                 &AllowAll,
                 IpProto::new(0),
                 src,
@@ -1780,7 +2001,13 @@ mod tests {
         let keep = |filter: &(dyn ts_packetfilter::Filter + Send + Sync), packet: Vec<u8>| {
             let mut packets = vec![PacketMut::from(packet)];
             let mut learned = Vec::new();
-            filter_inbound_from_peer(filter, PeerId(3), &mut packets, &mut learned);
+            filter_inbound_from_peer(
+                filter,
+                &mut flowtrack::FlowCache::default(),
+                PeerId(3),
+                &mut packets,
+                &mut learned,
+            );
             assert!(
                 learned.is_empty(),
                 "no TSMP advertisement in these fixtures"
@@ -1894,6 +2121,7 @@ mod tests {
             decode6_fragment(&ipv6_fragment_packet(0, 0, true, &udp_header(443))),
             Ipv6Fragment::First {
                 proto: IPPROTO_UNKNOWN,
+                src_port: 0,
                 dst_port: 0,
             },
             "a first fragment carries its Fragment header's Next Header, 0 included"
@@ -1904,7 +2132,7 @@ mod tests {
         let src = std::net::IpAddr::V6(IPV6_FIXTURE_SRC);
         let dst = std::net::IpAddr::V6(IPV6_FIXTURE_DST);
         assert!(
-            !inbound_filter_verdict(
+            !stateless_verdict(
                 &AllowAll,
                 IPPROTO_UNKNOWN,
                 src,
@@ -1912,6 +2140,7 @@ mod tests {
                 0,
                 Some(Fragment::V6(Ipv6Fragment::First {
                     proto: IPPROTO_UNKNOWN,
+                    src_port: 0,
                     dst_port: 0,
                 })),
             ),
@@ -1925,7 +2154,13 @@ mod tests {
         let keep = |filter: &(dyn ts_packetfilter::Filter + Send + Sync), packet: Vec<u8>| {
             let mut packets = vec![PacketMut::from(packet)];
             let mut learned = Vec::new();
-            filter_inbound_from_peer(filter, PeerId(5), &mut packets, &mut learned);
+            filter_inbound_from_peer(
+                filter,
+                &mut flowtrack::FlowCache::default(),
+                PeerId(5),
+                &mut packets,
+                &mut learned,
+            );
             assert!(
                 learned.is_empty(),
                 "no TSMP advertisement in these fixtures"
@@ -1981,7 +2216,13 @@ mod tests {
         let keep = |filter: &(dyn ts_packetfilter::Filter + Send + Sync), packet: Vec<u8>| {
             let mut packets = vec![PacketMut::from(packet)];
             let mut learned = Vec::new();
-            filter_inbound_from_peer(filter, PeerId(4), &mut packets, &mut learned);
+            filter_inbound_from_peer(
+                filter,
+                &mut flowtrack::FlowCache::default(),
+                PeerId(4),
+                &mut packets,
+                &mut learned,
+            );
             assert!(
                 learned.is_empty(),
                 "no TSMP advertisement in these fixtures"
@@ -2147,7 +2388,13 @@ mod tests {
         let keep = |filter: &(dyn ts_packetfilter::Filter + Send + Sync), packet: Vec<u8>| {
             let mut packets = vec![PacketMut::from(packet)];
             let mut learned = Vec::new();
-            filter_inbound_from_peer(filter, PeerId(5), &mut packets, &mut learned);
+            filter_inbound_from_peer(
+                filter,
+                &mut flowtrack::FlowCache::default(),
+                PeerId(5),
+                &mut packets,
+                &mut learned,
+            );
             assert!(
                 learned.is_empty(),
                 "no TSMP advertisement in these fixtures"
@@ -2303,7 +2550,13 @@ mod tests {
         let keep = |filter: &(dyn ts_packetfilter::Filter + Send + Sync), packet: Vec<u8>| {
             let mut packets = vec![PacketMut::from(packet)];
             let mut learned = Vec::new();
-            filter_inbound_from_peer(filter, PeerId(11), &mut packets, &mut learned);
+            filter_inbound_from_peer(
+                filter,
+                &mut flowtrack::FlowCache::default(),
+                PeerId(11),
+                &mut packets,
+                &mut learned,
+            );
             assert!(
                 learned.is_empty(),
                 "no TSMP advertisement in these fixtures"
@@ -2437,7 +2690,13 @@ mod tests {
 
         let mut packets = vec![tsmp_packet4(src, dst, &advertisement_body(key))];
         let mut learned = Vec::new();
-        filter_inbound_from_peer(&DenyAll, peer, &mut packets, &mut learned);
+        filter_inbound_from_peer(
+            &DenyAll,
+            &mut flowtrack::FlowCache::default(),
+            peer,
+            &mut packets,
+            &mut learned,
+        );
 
         assert!(
             packets.is_empty(),
@@ -2457,7 +2716,13 @@ mod tests {
         ping.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
         let mut packets = vec![tsmp_packet4(src, dst, &ping)];
         let mut learned = Vec::new();
-        filter_inbound_from_peer(&DenyAll, peer, &mut packets, &mut learned);
+        filter_inbound_from_peer(
+            &DenyAll,
+            &mut flowtrack::FlowCache::default(),
+            peer,
+            &mut packets,
+            &mut learned,
+        );
         assert_eq!(packets.len(), 1, "a TSMP ping still bypasses the ACL");
         assert!(learned.is_empty(), "a ping advertises no disco key");
     }
@@ -2498,7 +2763,13 @@ mod tests {
         ] {
             let mut packets = vec![tsmp_packet4(src, dst, &body)];
             let mut learned = Vec::new();
-            filter_inbound_from_peer(&DenyAll, peer, &mut packets, &mut learned);
+            filter_inbound_from_peer(
+                &DenyAll,
+                &mut flowtrack::FlowCache::default(),
+                peer,
+                &mut packets,
+                &mut learned,
+            );
 
             assert!(
                 learned.is_empty(),
@@ -2885,8 +3156,13 @@ mod tests {
     /// A minimal IPv4/UDP datagram from `src` to `dst`. The control for the outbound TSMP refusal:
     /// same source, same destination, same batch as the forged advertisement — only the protocol
     /// byte differs.
-    fn v4_udp_packet(src: std::net::IpAddr, dst: std::net::IpAddr, payload: &[u8]) -> Vec<u8> {
-        let (std::net::IpAddr::V4(src), std::net::IpAddr::V4(dst)) = (src, dst) else {
+    fn v4_udp_packet(
+        src: std::net::SocketAddr,
+        dst: std::net::SocketAddr,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let (std::net::IpAddr::V4(src_ip), std::net::IpAddr::V4(dst_ip)) = (src.ip(), dst.ip())
+        else {
             panic!("v4_udp_packet needs two IPv4 addresses");
         };
         let total_len = u16::try_from(IP4_HEADER_LEN + 8 + payload.len()).unwrap();
@@ -2895,10 +3171,10 @@ mod tests {
         buf[2..4].copy_from_slice(&total_len.to_be_bytes());
         buf[8] = 64; // TTL
         buf[9] = 17; // UDP
-        buf[12..16].copy_from_slice(&src.octets());
-        buf[16..20].copy_from_slice(&dst.octets());
-        buf[20..22].copy_from_slice(&4242u16.to_be_bytes()); // source port
-        buf[22..24].copy_from_slice(&4343u16.to_be_bytes()); // destination port
+        buf[12..16].copy_from_slice(&src_ip.octets());
+        buf[16..20].copy_from_slice(&dst_ip.octets());
+        buf[20..22].copy_from_slice(&src.port().to_be_bytes());
+        buf[22..24].copy_from_slice(&dst.port().to_be_bytes());
         let udp_len = u16::try_from(8 + payload.len()).unwrap();
         buf[24..26].copy_from_slice(&udp_len.to_be_bytes());
         // UDP checksum left 0 ("not computed"), which is legal for IPv4.
@@ -2942,7 +3218,11 @@ mod tests {
 
         // Ordinary traffic is untouched — the refusal is protocol-specific, not a blanket drop.
         assert!(
-            !outbound_packet_carries_tsmp(&v4_udp_packet(v4_src, v4_dst, b"hello")),
+            !outbound_packet_carries_tsmp(&v4_udp_packet(
+                std::net::SocketAddr::new(v4_src, 4242),
+                std::net::SocketAddr::new(v4_dst, 4343),
+                b"hello"
+            )),
             "IPv4 UDP passes"
         );
         assert!(
@@ -3110,7 +3390,11 @@ mod tests {
         .marshal()
         .expect("a v4 advertisement between two v4 addresses marshals");
         const CARRIED: &[u8] = b"ordinary traffic in the same batch";
-        let control = v4_udp_packet(a_addr, b_addr, CARRIED);
+        let control = v4_udp_packet(
+            std::net::SocketAddr::new(a_addr, 4242),
+            std::net::SocketAddr::new(b_addr, 4343),
+            CARRIED,
+        );
 
         // This is the only test that increments this counter, so the delta is exact.
         let counted_before = metric_out_to_wg_drop_tsmp().value();
@@ -3148,6 +3432,283 @@ mod tests {
             metric_out_to_wg_drop_tsmp().value(),
             counted_before + 1,
             "the drop is counted in tstun_out_to_wg_drop_tsmp (Go metricPacketOutDropTSMP)"
+        );
+    }
+
+    /// Run one inbound packet through the real inbound filter with `flows` as the connection-
+    /// tracking state, and report whether it survived.
+    fn admitted(
+        filter: &(dyn ts_packetfilter::Filter + Send + Sync),
+        flows: &mut flowtrack::FlowCache,
+        packet: Vec<u8>,
+    ) -> bool {
+        let mut packets = vec![PacketMut::from(packet)];
+        let mut learned = Vec::new();
+        filter_inbound_from_peer(filter, flows, PeerId(1), &mut packets, &mut learned);
+        assert!(
+            learned.is_empty(),
+            "no TSMP advertisement in these fixtures"
+        );
+        !packets.is_empty()
+    }
+
+    /// A dataplane wired up well enough that `process_outbound` really routes a packet to a peer,
+    /// so the flow-tracking tests exercise the live outbound path rather than a stub.
+    fn dataplane_routing_to(peer: PeerId, dsts: &[std::net::IpAddr]) -> DataPlane {
+        let mut dp = DataPlane::new(NodeKeyPair::new());
+        dp.wireguard.upsert_peer(
+            ts_tunnel::PeerId(peer.0),
+            ts_tunnel::PeerConfig {
+                key: NodeKeyPair::new().public,
+                psk: [0u8; 32].into(),
+                persistent_keepalive_interval: None,
+            },
+        );
+        dp.ur_out.table.insert(peer, 0.into());
+        let mut routes = ts_bart::Table::default();
+        for dst in dsts {
+            routes.insert(
+                ipnet::IpNet::from(*dst),
+                or::outbound::RouteAction::Wireguard(peer),
+            );
+        }
+        dp.or_out.swap(routes);
+        dp
+    }
+
+    /// Go's reverse-flow connection tracking (`wgengine/filter`'s `Filter.state`), across the two
+    /// paths it spans: `process_outbound` records the reversed tuple of every outbound UDP
+    /// datagram (Go `UpdateOutboundFlowState`, which upstream `e0677ccc7` had to start calling on
+    /// the netstack-injected path — the only path this engine has), and the inbound filter admits
+    /// the reply on it ahead of any rule (Go `runIn4`'s `return Accept, "cached"`).
+    ///
+    /// Every verdict here is taken under a **deny-all** ACL, so an admission can only have come
+    /// from the flow cache. The refusals are the point of the test as much as the admission is: a
+    /// conntrack that admits too much is an open door, so each of the four fields of Go's
+    /// `flowtrack.Tuple` is varied in turn and must miss.
+    #[test]
+    fn an_outbound_udp_flow_admits_its_own_reply_and_nothing_else() {
+        let peer = PeerId(1);
+        let me = std::net::IpAddr::from([100, 64, 0, 1]);
+        let them = std::net::IpAddr::from([100, 64, 0, 2]);
+        let elsewhere = std::net::IpAddr::from([100, 64, 0, 3]);
+        let sa = |ip, port| std::net::SocketAddr::new(ip, port);
+
+        let mut dp = dataplane_routing_to(peer, &[them, elsewhere]);
+
+        // Our datagram out, and the reply it should get: the same tuple, reversed. Our source port
+        // is ephemeral, which is exactly why no ACL from control can name it.
+        let query = v4_udp_packet(sa(me, 41234), sa(them, 53), b"query");
+        let reply = v4_udp_packet(sa(them, 53), sa(me, 41234), b"answer");
+
+        // Before anything is sent the reply is an unsolicited datagram to an ephemeral port, and a
+        // deny-all ACL drops it. That is what every UDP reply used to get in this fork.
+        assert!(
+            !admitted(&DenyAll, &mut dp.flows, reply.clone()),
+            "an inbound datagram matching no outbound flow and no rule is dropped"
+        );
+
+        let out = dp.process_outbound(vec![PacketMut::from(query)]);
+        assert!(
+            !out.to_peers.is_empty(),
+            "the datagram really did route to the peer, so this is the live outbound path"
+        );
+
+        assert!(
+            admitted(&DenyAll, &mut dp.flows, reply.clone()),
+            "the reply to our own datagram is admitted with no rule matching it"
+        );
+
+        // One field of Go's tuple differs in each of these, and each must miss. Without them the
+        // cache would be a blanket "any inbound UDP is fine once we have sent one".
+        for (why, packet) in [
+            (
+                "a different source PORT",
+                v4_udp_packet(sa(them, 5353), sa(me, 41234), b"x"),
+            ),
+            (
+                "a different source ADDRESS",
+                v4_udp_packet(sa(elsewhere, 53), sa(me, 41234), b"x"),
+            ),
+            (
+                "a different destination PORT",
+                v4_udp_packet(sa(them, 53), sa(me, 41235), b"x"),
+            ),
+            (
+                "a different destination ADDRESS",
+                v4_udp_packet(sa(them, 53), sa(elsewhere, 41234), b"x"),
+            ),
+        ] {
+            assert!(
+                !admitted(&DenyAll, &mut dp.flows, packet),
+                "{why} does not ride the recorded entry"
+            );
+        }
+
+        // And the entry admits, it never denies: the ACL still decides everything the cache misses.
+        assert!(
+            admitted(
+                &AllowAll,
+                &mut dp.flows,
+                v4_udp_packet(sa(elsewhere, 53), sa(me, 41234), b"x")
+            ),
+            "a cache miss falls through to the rule match, exactly as Go does"
+        );
+    }
+
+    /// SCTP is the second arm of Go's `case ipproto.UDP, ipproto.SCTP` — on both the recording and
+    /// the admitting side — and the protocol is part of the tuple, so a UDP entry cannot carry an
+    /// SCTP datagram or the other way round.
+    #[test]
+    fn outbound_sctp_flows_are_tracked_and_do_not_cross_protocols() {
+        let peer = PeerId(1);
+        let dst = std::net::IpAddr::V4(IPV4_FIXTURE_DST);
+        let mut dp = dataplane_routing_to(peer, &[dst]);
+
+        // `v4_packet` addresses this fixture src -> dst, so the reply is dst -> src. `sctp_header`
+        // writes source port 54276.
+        let out = v4_packet(132, 0, false, &sctp_header(443, SCTP_HEADER_LEN));
+        let mut reply = v4_packet(132, 0, false, &sctp_header(54276, SCTP_HEADER_LEN));
+        reply[12..16].copy_from_slice(&IPV4_FIXTURE_DST.octets());
+        reply[16..20].copy_from_slice(&IPV4_FIXTURE_SRC.octets());
+        reply[20..22].copy_from_slice(&443u16.to_be_bytes());
+
+        assert!(
+            !admitted(&DenyAll, &mut dp.flows, reply.clone()),
+            "an unsolicited SCTP packet with no rule is dropped"
+        );
+        drop(dp.process_outbound(vec![PacketMut::from(out)]));
+        assert!(
+            admitted(&DenyAll, &mut dp.flows, reply.clone()),
+            "the SCTP reply to our own packet is admitted (Go's second switch arm)"
+        );
+
+        // Same addresses, same ports, UDP instead of SCTP: the protocol is part of Go's tuple.
+        let mut as_udp = reply.clone();
+        as_udp[9] = 17;
+        assert!(
+            !admitted(&DenyAll, &mut dp.flows, as_udp),
+            "a UDP datagram does not ride an SCTP entry"
+        );
+    }
+
+    /// What [`outbound_udp_or_sctp_flow`] records and — the half that keeps the cache honest —
+    /// what it refuses to record, carrying Go's `decode4`/`decode6` refusals into
+    /// `UpdateOutboundFlowState`. Everything this function declines leaves the reply where it was
+    /// before: needing an ACL rule.
+    #[test]
+    fn outbound_flow_decoding_matches_go_decode() {
+        let me = std::net::IpAddr::from([100, 64, 0, 1]);
+        let them = std::net::IpAddr::from([100, 64, 0, 2]);
+        let sa = |ip, port| std::net::SocketAddr::new(ip, port);
+
+        // UDP: both ports off the wire, addresses in packet order — reversing them is the cache's
+        // job (Go `MakeTuple(q.IPProto, q.Dst, q.Src)`), not the decoder's.
+        assert_eq!(
+            outbound_udp_or_sctp_flow(&v4_udp_packet(sa(me, 41234), sa(them, 53), b"q")),
+            Some((IpProto::UDP, sa(me, 41234), sa(them, 53))),
+            "an outbound UDP datagram yields its own tuple"
+        );
+
+        // SCTP: etherparse has no arm for it, so the ports come from Go's `sub[0:2]`/`sub[2:4]`.
+        let v4_fixture_src = std::net::IpAddr::V4(IPV4_FIXTURE_SRC);
+        let v4_fixture_dst = std::net::IpAddr::V4(IPV4_FIXTURE_DST);
+        assert_eq!(
+            outbound_udp_or_sctp_flow(&v4_packet(
+                132,
+                0,
+                false,
+                &sctp_header(443, SCTP_HEADER_LEN)
+            )),
+            Some((
+                IpProto::SCTP,
+                sa(v4_fixture_src, 54276),
+                sa(v4_fixture_dst, 443)
+            )),
+            "an outbound SCTP packet yields its tuple, ports read the way Go reads them"
+        );
+        assert_eq!(
+            outbound_udp_or_sctp_flow(&v4_packet(
+                132,
+                0,
+                false,
+                &sctp_header(443, SCTP_HEADER_LEN - 1)
+            )),
+            None,
+            "an SCTP common header too short to hold its ports records nothing, not a port-0 flow"
+        );
+
+        // Go's switch has exactly two arms; TCP, ICMP and TSMP fall through it.
+        for (proto, name) in [(6u8, "TCP"), (1, "ICMP"), (99, "TSMP")] {
+            assert_eq!(
+                outbound_udp_or_sctp_flow(&v4_packet(proto, 0, false, &[0u8; 20])),
+                None,
+                "{name} is not tracked (Go tracks UDP and SCTP only)"
+            );
+        }
+
+        // A *first* IPv4 fragment carries its whole UDP header, so `decode4` reads its ports and
+        // the flow is recorded like an unfragmented datagram's...
+        let mut head = v4_udp_packet(sa(me, 41234), sa(them, 53), b"payload!");
+        head[6] = 0x20; // More Fragments, offset 0
+        assert_eq!(
+            outbound_udp_or_sctp_flow(&head),
+            Some((IpProto::UDP, sa(me, 41234), sa(them, 53))),
+            "the head fragment of an outbound datagram records the same tuple"
+        );
+        // ...while a non-first fragment is `ipproto.Fragment` to Go, matching neither arm, and has
+        // no transport header whose ports could be invented.
+        let mut later = v4_udp_packet(sa(me, 41234), sa(them, 53), b"payload!");
+        later[6..8].copy_from_slice(&MIN_FRAG_BLKS.to_be_bytes());
+        assert_eq!(
+            outbound_udp_or_sctp_flow(&later),
+            None,
+            "a non-first IPv4 fragment records nothing"
+        );
+
+        // IPv6: the protocol comes from the base header only (Go `decode6`'s `b[6]`), so a UDP
+        // header buried behind a chained extension header is not a flow upstream tracks either —
+        // even though etherparse could walk to it.
+        assert_eq!(
+            outbound_udp_or_sctp_flow(&ipv6_udp_packet(&udp_header(53))),
+            Some((
+                IpProto::UDP,
+                sa(std::net::IpAddr::V6(IPV6_FIXTURE_SRC), 54276),
+                sa(std::net::IpAddr::V6(IPV6_FIXTURE_DST), 53)
+            )),
+            "an outbound IPv6 UDP datagram yields its tuple"
+        );
+        assert_eq!(
+            outbound_udp_or_sctp_flow(&ipv6_with_prepended_ext_header(
+                60,
+                &ipv6_udp_packet(&udp_header(53))
+            )),
+            None,
+            "a UDP header behind a chained extension header is not a tracked flow"
+        );
+
+        // A leading IPv6 Fragment header IS stepped over, exactly as `decode6` does.
+        assert_eq!(
+            outbound_udp_or_sctp_flow(&ipv6_fragment_packet(17, 0, true, &udp_header(53))),
+            Some((
+                IpProto::UDP,
+                sa(std::net::IpAddr::V6(IPV6_FIXTURE_SRC), 54276),
+                sa(std::net::IpAddr::V6(IPV6_FIXTURE_DST), 53)
+            )),
+            "a first IPv6 fragment records the tuple behind its Fragment header"
+        );
+        assert_eq!(
+            outbound_udp_or_sctp_flow(&ipv6_fragment_packet(17, MIN_FRAG_BLKS, false, &[0u8; 8])),
+            None,
+            "a later IPv6 fragment records nothing"
+        );
+
+        // Nothing to decode at all.
+        assert_eq!(outbound_udp_or_sctp_flow(&[]), None, "the empty buffer");
+        assert_eq!(
+            outbound_udp_or_sctp_flow(&[0xde, 0xad, 0xbe, 0xef]),
+            None,
+            "a non-IP buffer"
         );
     }
 }
