@@ -2,7 +2,9 @@
 //!
 //! An in-netstack DNS server bound to `100.100.100.100:53`. It is authoritative for in-tailnet
 //! peer names and control-pushed [`ExtraRecord`][ts_control::ExtraRecord]s, answering `A`/`AAAA`/
-//! `PTR` for those directly. For names it is *not* authoritative for, it brings tsnet-style
+//! `PTR` for those directly — plus, for a peer control has marked with the `dns-subdomain-resolve`
+//! node attribute ([`Node::resolves_subdomains`]), every name *under* that peer's name
+//! ([`DnsView::subdomain_host_for`]). For names it is *not* authoritative for, it brings tsnet-style
 //! split-DNS and recursive resolution:
 //!
 //! - **Split DNS** ([`DnsConfig::routes`]): the longest matching suffix route forwards the query
@@ -185,12 +187,57 @@ impl DnsView {
             .cloned()
     }
 
+    /// Find the node a **parent** of `canon` names, when that node is a *subdomain host* — a node
+    /// control has set the `dns-subdomain-resolve` attribute on
+    /// ([`Node::resolves_subdomains`]), meaning every name under it resolves to its addresses.
+    ///
+    /// Mirrors the miss path of Go's resolver (`net/dns/resolver/tsdns.go`): a name that matches no
+    /// host walks its parents (`util/dnsname`'s `Parent`) and answers from the first parent that is
+    /// a subdomain host. The walk is over *every* parent, not one level: for a node `machine`, both
+    /// `my.machine` and `be.my.machine` resolve to it.
+    ///
+    /// Two bounds keep the walk from becoming a wildcard:
+    ///
+    /// - It stops at a **tailnet search domain**. `user.ts.net` is the zone apex, not a host under
+    ///   it, so the walk never climbs past it into names this node is not authoritative for.
+    /// - A candidate parent must be **fully qualified** (at least two labels) and is matched
+    ///   *exactly*, with no search-domain qualification. Unlike [`DnsView::resolve_addr`]'s exact
+    ///   lookup, the walk must not expand a short name against the search list: the peer-name index
+    ///   also holds bare hostnames, so a peer named after a public suffix (`com`, `dev`) carrying
+    ///   the attribute would otherwise swallow every name under that suffix — a hijack Go cannot
+    ///   perform, because its resolver does no search-list expansion at all (the client stub does).
+    ///   A stub resolver qualifies a short name against the search list before asking, so the
+    ///   fully-qualified form is what arrives here anyway.
+    fn subdomain_host_for(&self, canon: &str) -> Option<Node> {
+        let mut parent = canon;
+        while let Some((_, rest)) = parent.split_once('.') {
+            parent = rest;
+            // A bare label is never a candidate (see the doc comment): nothing is left to walk.
+            if !parent.contains('.') {
+                return None;
+            }
+            // The tailnet zone apex itself: stop rather than climb out of the zone we serve.
+            if self.cfg.search_domains.iter().any(|zone| zone == parent) {
+                return None;
+            }
+            if let Some(node) = self.node_by_name(parent)
+                && node.resolves_subdomains()
+            {
+                return Some(node);
+            }
+        }
+        None
+    }
+
     /// Resolve `canon` to an answer address of the requested family. A tailnet peer/self match
     /// wins first — tried as written and then qualified by each tailnet search domain (so a
     /// short/partially-qualified name like `host` or `host.user` still resolves to
     /// `host.user.ts.net`). Failing that, a control-pushed [`ExtraRecord`] of the matching family
     /// answers, matched as a fully-qualified name only (no search-domain expansion — like Go tsnet,
     /// ExtraRecords are authoritative FQDN entries, not subject to client search-list qualification).
+    /// Only when nothing matched the name *exactly* does the subdomain-host parent walk run
+    /// ([`DnsView::subdomain_host_for`]) — so an exact name always beats a parent match, as it does
+    /// upstream, where the parent walk is the lookup-miss path.
     /// Still fail-closed: only ever resolves to a known tailnet peer/self or an explicitly
     /// control-pushed static record — never anything else.
     fn resolve_addr(&self, canon: &str, want_v4: bool) -> Option<IpAddr> {
@@ -212,13 +259,28 @@ impl DnsView {
         }
 
         // Control-pushed static records match the fully-qualified query name only.
-        self.cfg.extra_records.iter().find_map(|rec| {
-            let family_ok = matches!(
+        let mut named_by_extra_record = false;
+        for rec in &self.cfg.extra_records {
+            if rec.name != canon {
+                continue;
+            }
+            named_by_extra_record = true;
+            if matches!(
                 (rec.addr, want_v4),
                 (IpAddr::V4(_), true) | (IpAddr::V6(_), false)
-            );
-            (rec.name == canon && family_ok).then_some(rec.addr)
-        })
+            ) {
+                return Some(rec.addr);
+            }
+        }
+        // An extra record for this exact name but of the other family means the name *exists* and
+        // simply holds no address of the queried type — Go's lookup found it, so the parent walk
+        // (its miss path) does not run and the answer stays NODATA.
+        if named_by_extra_record {
+            return None;
+        }
+
+        // Nothing answers this name exactly: fall back to a parent that resolves its subdomains.
+        self.subdomain_host_for(canon).map(addr_of)
     }
 
     /// Find the node (peer or self) that owns the tailnet IP `ip`.
@@ -2256,6 +2318,202 @@ mod tests {
         let resp = answer(&view, &buf).expect("answers");
         let (_, rcode, _) = parse_header(&resp);
         assert_eq!(rcode, 5, "Refused");
+    }
+
+    /// The node attribute control sets to make every subdomain of a node resolve to it (Go
+    /// `tailcfg/nodecap`'s `NodeAttrDNSSubdomainResolve`).
+    const DNS_SUBDOMAIN_RESOLVE: &str = "dns-subdomain-resolve";
+
+    /// A view holding a single peer `host.user.ts.net` that carries the `dns-subdomain-resolve`
+    /// node attribute, so control has declared every name under it to resolve to its addresses.
+    fn view_with_subdomain_host() -> DnsView {
+        let mut node = test_node();
+        node.cap_map
+            .insert(DNS_SUBDOMAIN_RESOLVE.to_string(), vec![]);
+
+        let mut db = PeerDb::default();
+        db.upsert(&node);
+
+        let mut view = view_with_peer();
+        view.peers = Some(Arc::new(db));
+        view
+    }
+
+    #[test]
+    fn subdomain_of_a_subdomain_host_resolves_to_it() {
+        // `my.host.user.ts.net` has no record of its own; its parent `host.user.ts.net` carries the
+        // attribute, so it answers with the parent's address.
+        let view = view_with_subdomain_host();
+        let buf = build_query(0x90, &["my", "host", "user", "ts", "net"], 1, 1);
+
+        let resp = answer(&view, &buf).expect("answers");
+        let (_, rcode, ancount) = parse_header(&resp);
+        assert_eq!(rcode, 0, "NoError from the subdomain host");
+        assert_eq!(ancount, 1);
+        assert_eq!(&resp[resp.len() - 4..], &[100, 64, 0, 1]);
+    }
+
+    #[test]
+    fn a_multi_label_subdomain_of_a_subdomain_host_resolves() {
+        // The walk climbs every parent, not one level: `be.my.host` reaches `host` just as
+        // `my.host` does. One level of parent is not what upstream implements.
+        let view = view_with_subdomain_host();
+        let buf = build_query(0x91, &["be", "my", "host", "user", "ts", "net"], 1, 1);
+
+        let resp = answer(&view, &buf).expect("answers");
+        let (_, rcode, ancount) = parse_header(&resp);
+        assert_eq!(rcode, 0, "NoError: the walk is not depth-limited");
+        assert_eq!(ancount, 1);
+        assert_eq!(&resp[resp.len() - 4..], &[100, 64, 0, 1]);
+    }
+
+    #[test]
+    fn subdomain_of_a_peer_without_the_attribute_is_nxdomain() {
+        // The attribute is what turns the walk on. Without it — the default for every node — a
+        // subdomain of a peer name is still authoritatively absent.
+        let view = view_with_peer();
+        assert!(
+            !view
+                .node_by_name("host.user.ts.net")
+                .expect("peer is present")
+                .resolves_subdomains(),
+            "the plain test peer carries no node attribute"
+        );
+        let buf = build_query(0x92, &["my", "host", "user", "ts", "net"], 1, 1);
+
+        let resp = answer(&view, &buf).expect("answers");
+        let (_, rcode, ancount) = parse_header(&resp);
+        assert_eq!(rcode, 3, "NxDomain: no attribute, no subdomain resolution");
+        assert_eq!(ancount, 0);
+    }
+
+    #[test]
+    fn an_exact_match_beats_the_subdomain_host() {
+        // The walk is the *miss* path: a name that resolves exactly — here a control-pushed extra
+        // record — keeps its own answer, and never takes the parent's.
+        let mut view = view_with_subdomain_host();
+        view.cfg.extra_records = vec![ts_control::ExtraRecord {
+            name: "my.host.user.ts.net".to_string(),
+            addr: IpAddr::V4(Ipv4Addr::new(100, 64, 0, 9)),
+        }];
+        let buf = build_query(0x93, &["my", "host", "user", "ts", "net"], 1, 1);
+
+        let resp = answer(&view, &buf).expect("answers");
+        let (_, rcode, ancount) = parse_header(&resp);
+        assert_eq!(rcode, 0, "NoError");
+        assert_eq!(ancount, 1);
+        assert_eq!(
+            &resp[resp.len() - 4..],
+            &[100, 64, 0, 9],
+            "the exact record answers, not the subdomain host's address"
+        );
+    }
+
+    #[test]
+    fn the_subdomain_walk_stops_at_the_tailnet_zone() {
+        // A node whose own FQDN *is* the search domain must not make the whole zone a wildcard:
+        // the walk stops at the zone apex rather than climbing into names we do not serve.
+        let mut zone_node = test_node();
+        zone_node.hostname = "user".to_string();
+        zone_node.tailnet = Some("ts.net".to_string());
+        zone_node
+            .cap_map
+            .insert(DNS_SUBDOMAIN_RESOLVE.to_string(), vec![]);
+        assert_eq!(zone_node.fqdn(false), "user.ts.net", "the zone apex itself");
+
+        let mut db = PeerDb::default();
+        db.upsert(&zone_node);
+        let mut view = view_with_peer();
+        view.peers = Some(Arc::new(db));
+
+        for labels in [
+            ["nothing", "user", "ts", "net"].as_slice(),
+            ["deeper", "nothing", "user", "ts", "net"].as_slice(),
+        ] {
+            let buf = build_query(0x94, labels, 1, 1);
+            let resp = answer(&view, &buf).expect("answers");
+            let (_, rcode, ancount) = parse_header(&resp);
+            assert_eq!(rcode, 3, "NxDomain: the walk stopped at {:?}", labels);
+            assert_eq!(ancount, 0);
+        }
+    }
+
+    #[test]
+    fn the_subdomain_walk_does_not_search_expand_a_bare_label() {
+        // The peer-name index also holds bare hostnames, so a peer named after a public suffix must
+        // not swallow every name under it: only a fully-qualified parent is a walk candidate. Go
+        // cannot do this at all — its resolver does no search-list expansion.
+        let mut suffix_node = test_node();
+        suffix_node.hostname = "com".to_string();
+        suffix_node
+            .cap_map
+            .insert(DNS_SUBDOMAIN_RESOLVE.to_string(), vec![]);
+
+        let mut db = PeerDb::default();
+        db.upsert(&suffix_node);
+        let mut view = view_with_peer();
+        view.peers = Some(Arc::new(db));
+
+        let buf = build_query(0x95, &["www", "example", "com"], 1, 1);
+        let resp = answer(&view, &buf).expect("answers");
+        let (_, rcode, ancount) = parse_header(&resp);
+        assert_eq!(
+            rcode, 2,
+            "ServFail: an off-tailnet name with no upstream, NOT the peer named 'com'"
+        );
+        assert_eq!(ancount, 0, "no answer manufactured from a bare hostname");
+
+        // The qualified form of the same peer still resolves its subdomains: the bound rejects the
+        // bare label, not the subdomain host.
+        let buf = build_query(0x96, &["www", "com", "user", "ts", "net"], 1, 1);
+        let resp = answer(&view, &buf).expect("answers");
+        let (_, rcode, ancount) = parse_header(&resp);
+        assert_eq!(rcode, 0, "NoError from com.user.ts.net");
+        assert_eq!(ancount, 1);
+        assert_eq!(&resp[resp.len() - 4..], &[100, 64, 0, 1]);
+    }
+
+    #[test]
+    fn aaaa_for_a_subdomain_host_follows_the_ipv6_gate() {
+        // The subdomain answer is the parent node's address, so it takes the same AAAA gate an
+        // exact peer match does: NODATA with IPv6 off, the overlay v6 with it on.
+        let mut view = view_with_subdomain_host();
+        let buf = build_query(0x97, &["my", "host", "user", "ts", "net"], 28, 1);
+
+        let resp = answer(&view, &buf).expect("answers");
+        let (_, rcode, ancount) = parse_header(&resp);
+        assert_eq!(rcode, 0, "NoError (NODATA) with the gate off");
+        assert_eq!(ancount, 0);
+
+        view.enable_ipv6 = true;
+        let resp = answer(&view, &buf).expect("answers");
+        let (_, rcode, ancount) = parse_header(&resp);
+        assert_eq!(rcode, 0, "NoError");
+        assert_eq!(ancount, 1);
+        let expected = "fd7a::1".parse::<std::net::Ipv6Addr>().unwrap().octets();
+        assert_eq!(&resp[resp.len() - 16..], expected);
+    }
+
+    #[test]
+    fn a_subdomain_of_the_self_node_resolves_when_it_has_the_attribute() {
+        // The walk runs over the same name lookup the exact match uses, so the self node is a
+        // subdomain host too when control sets the attribute on it.
+        let mut self_node = test_node();
+        self_node.hostname = "me".to_string();
+        self_node
+            .cap_map
+            .insert(DNS_SUBDOMAIN_RESOLVE.to_string(), vec![]);
+
+        let mut view = view_with_peer();
+        view.peers = None;
+        view.self_node = Some(self_node);
+
+        let buf = build_query(0x98, &["a", "b", "me", "user", "ts", "net"], 1, 1);
+        let resp = answer(&view, &buf).expect("answers");
+        let (_, rcode, ancount) = parse_header(&resp);
+        assert_eq!(rcode, 0, "NoError from the self node");
+        assert_eq!(ancount, 1);
+        assert_eq!(&resp[resp.len() - 4..], &[100, 64, 0, 1]);
     }
 
     #[test]
