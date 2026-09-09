@@ -22,6 +22,9 @@
 //! asking this exit node's DoH for one of the **exit node's own** tailnet peer names gets a positive
 //! answer where Go would forward it to upstream — a narrow MagicDNS-namespace bleed across the exit
 //! boundary (no leak: the answer comes from local netmap data and never touches a host socket).
+//! A peer control has marked with the `dns-subdomain-resolve` node attribute widens that same bleed
+//! by the names *under* its own name and nothing else, from the same netmap data (the walk in
+//! `DnsView::subdomain_host_for`).
 //!
 //! Matching Go by making this path blanket forward-only would be a **regression in the unsafe
 //! direction**: `decide`'s authoritative replies include this fork's anti-leak guards — a PTR for a
@@ -754,6 +757,82 @@ mod tests {
         match server_decide(&v, &q, false) {
             ServerDecision::Reply(resp) => assert_eq!(rcode(&resp), 3, "NXDOMAIN, not REFUSED"),
             ServerDecision::Forward { .. } => panic!("tailnet name must not forward"),
+        }
+    }
+
+    #[test]
+    fn a_subdomain_host_answers_here_like_any_other_peer_name() {
+        // The DoH server shares `decide`, so the `dns-subdomain-resolve` walk reaches this path
+        // too: a subdomain of one of *this* node's peers is answered locally, from netmap data,
+        // exactly as that peer's own name already is (the documented MagicDNS-namespace bleed at
+        // the top of this module — it is the same bleed, one name wider, and it still never
+        // touches a host socket). It is authoritative, so the egress gate does not apply.
+        use std::sync::Arc;
+
+        use crate::peer_tracker::PeerDb;
+
+        let mut node = {
+            use ts_control::{Node, NodeCapMap, StableNodeId, TailnetAddress};
+            Node {
+                id: 1,
+                stable_id: StableNodeId("n1".to_string()),
+                hostname: "host".to_string(),
+                user_id: 0,
+                tailnet: Some("user.ts.net".to_string()),
+                tags: vec![],
+                addresses: vec![
+                    "100.64.0.1/32".parse().unwrap(),
+                    "fd7a::1/128".parse().unwrap(),
+                ],
+                tailnet_address: TailnetAddress {
+                    ipv4: "100.64.0.1/32".parse().unwrap(),
+                    ipv6: "fd7a::1/128".parse().unwrap(),
+                },
+                node_key: [0u8; 32].into(),
+                node_key_expiry: None,
+                expired: false,
+                online: None,
+                last_seen: None,
+                key_signature: vec![],
+                machine_key: None,
+                disco_key: None,
+                accepted_routes: vec![],
+                underlay_addresses: vec![],
+                derp_region: None,
+                cap: Default::default(),
+                cap_map: NodeCapMap::new(),
+                peerapi_port: None,
+                peerapi_dns_proxy: false,
+                is_wireguard_only: false,
+                exit_node_dns_resolvers: vec![],
+                peer_relay: false,
+                ssh_host_keys: vec![],
+                service_vips: Default::default(),
+                unsigned_peer_api_only: false,
+            }
+        };
+        node.cap_map
+            .insert("dns-subdomain-resolve".to_string(), vec![]);
+
+        let mut db = PeerDb::default();
+        db.upsert(&node);
+        let mut v = view(&[]);
+        v.peers = Some(Arc::new(db));
+
+        let q = query_for(0x9, &["my", "host", "user", "ts", "net"]);
+        match server_decide(&v, &q, false) {
+            ServerDecision::Reply(resp) => {
+                assert_eq!(rcode(&resp), 0, "NoError from the subdomain host");
+                assert_eq!(
+                    u16::from_be_bytes([resp[6], resp[7]]),
+                    1,
+                    "one A record, the peer's own address"
+                );
+                assert_eq!(&resp[resp.len() - 4..], &[100, 64, 0, 1]);
+            }
+            ServerDecision::Forward { .. } => {
+                panic!("an authoritative subdomain answer must not forward")
+            }
         }
     }
 

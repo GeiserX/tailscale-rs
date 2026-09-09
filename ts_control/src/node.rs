@@ -603,6 +603,26 @@ impl Node {
         self.has_node_attr(Self::CAP_FILE_SHARING_TARGET)
     }
 
+    /// The node attribute control sets on a node whose **subdomains** all resolve to the node
+    /// itself (Go `tailcfg/nodecap`'s `NodeAttrDNSSubdomainResolve`). Read by
+    /// [`Node::resolves_subdomains`].
+    const NODE_ATTR_DNS_SUBDOMAIN_RESOLVE: &'static str = "dns-subdomain-resolve";
+
+    /// Report whether every subdomain of this node's MagicDNS name resolves to this node's
+    /// addresses — `foo.<node>` and `bar.foo.<node>` alike.
+    ///
+    /// Go's resolver (`net/dns/resolver/tsdns.go`) learns the same thing two ways — a
+    /// `Config.SubdomainHosts` set of FQDNs beside its `Hosts` map, and a `SubdomainHost` predicate
+    /// on its MagicDNS host index — and on a lookup miss walks the queried name's parents,
+    /// answering from the first parent either one accepts. Here the attribute on the node *is* that
+    /// predicate, read where the parent walk finds the node.
+    ///
+    /// Being a plain per-node attribute, it needs no capability version: a node control has not set
+    /// it on is unaffected, and its subdomains stay `NXDOMAIN`.
+    pub fn resolves_subdomains(&self) -> bool {
+        self.has_node_attr(Self::NODE_ATTR_DNS_SUBDOMAIN_RESOLVE)
+    }
+
     /// Report whether `wanted_port` is allowed for Funnel on this node.
     ///
     /// Mirrors Go `ipn.CheckFunnelPort`: scan the cap-map keys for one prefixed by
@@ -1846,6 +1866,21 @@ pub(crate) mod tests {
         assert!(
             n.is_file_sharing_target(),
             "the file-sharing-target cap marks a cross-owner target"
+        );
+    }
+
+    #[test]
+    fn resolves_subdomains_gated_on_the_node_attribute() {
+        let mut n = node("peer", Some("ts.net"));
+        assert!(
+            !n.resolves_subdomains(),
+            "no attribute → not a subdomain host: control has to opt the node in"
+        );
+        n.cap_map
+            .insert("dns-subdomain-resolve".to_string(), vec![]);
+        assert!(
+            n.resolves_subdomains(),
+            "the dns-subdomain-resolve attribute makes this node a subdomain host"
         );
     }
 
