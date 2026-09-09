@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.50.1](https://github.com/GeiserX/tailscale-rs/compare/v0.50.0...v0.50.1) (2026-09-09)
+
+
+### Bug Fixes
+
+* **peers:** don't let a departing peer evict its successor's index rows ([#412](https://github.com/GeiserX/tailscale-rs/issues/412)) ([354b405](https://github.com/GeiserX/tailscale-rs/commit/354b405225f900ef9ee4dd8812efafd26a120a3d))
+
 ## [0.50.0](https://github.com/GeiserX/tailscale-rs/compare/v0.49.1...v0.50.0) (2026-09-08)
 
 
