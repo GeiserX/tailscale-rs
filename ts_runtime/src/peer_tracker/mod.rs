@@ -4393,6 +4393,189 @@ mod tsmp_disco_key_tests {
 }
 
 #[cfg(test)]
+mod index_eviction_tests {
+    //! A departing peer must not evict the index rows of the peer that took its place.
+    //!
+    //! Control reassigns a churning (typically ephemeral) peer's tailnet IP and MagicDNS name to a
+    //! newer node, and the newer node's upsert can reach us before the old node's removal — either
+    //! in an earlier `MapResponse`, or reordered inside one batch. Here it is not even a race:
+    //! [`PeerTracker::apply_peer_update`] applies a delta's upserts first and its removals second,
+    //! so the intra-batch ordering is the one this tree ALWAYS uses. These drive real
+    //! [`ts_control::PeerUpdate`]s through that function and assert the lookups an embedder
+    //! actually depends on — `peer_by_tailnet_ip` (whois, peerAPI source checks) and
+    //! `peer_by_name` — still answer with the live peer.
+
+    use super::{
+        tka_tests::{peer_node, test_env},
+        *,
+    };
+
+    /// A peer holding a specific control node id, tailnet address pair and hostname.
+    fn peer_at(stable_id: &str, control_id: i64, key: u8, host: u8) -> Node {
+        let mut node = peer_node(stable_id, [key; 32], Vec::new());
+        node.id = control_id;
+        node.hostname = stable_id.to_string();
+        node.tailnet = Some("ts.net".to_string());
+
+        let ipv4: ipnet::Ipv4Net = format!("100.64.0.{host}/32").parse().unwrap();
+        let ipv6: ipnet::Ipv6Net = format!("fd7a:115c:a1e0::{host}/128").parse().unwrap();
+        node.addresses = vec![ipv4.into(), ipv6.into()];
+        node.tailnet_address = ts_control::TailnetAddress { ipv4, ipv6 };
+        node.disco_key = Some([key; 32].into());
+        node
+    }
+
+    fn tailnet_ipv4(host: u8) -> IpAddr {
+        format!("100.64.0.{host}").parse().unwrap()
+    }
+
+    /// The successor's upsert and the departing peer's removal in ONE delta — the ordering
+    /// `apply_peer_update` always applies (upserts, then removals).
+    #[tokio::test]
+    async fn a_delta_that_replaces_a_peer_keeps_the_successor_addressable() {
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
+        let now = local_now();
+
+        let departing = peer_at("departing", 1, 1, 9);
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Delta {
+                upsert: vec![departing.clone()],
+                remove: Vec::new(),
+            },
+            now,
+        );
+        assert_eq!(
+            tracker
+                .peer_by_tailnet_ip_opt(tailnet_ipv4(9))
+                .map(|n| &n.stable_id),
+            Some(&departing.stable_id)
+        );
+
+        // Control hands the address and the MagicDNS name to a new node and retires the old one in
+        // the same batch.
+        let mut successor = peer_at("successor", 2, 2, 9);
+        successor.hostname = departing.hostname.clone();
+        successor.disco_key = departing.disco_key;
+
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Delta {
+                upsert: vec![successor.clone()],
+                remove: vec![departing.id],
+            },
+            now,
+        );
+
+        assert_eq!(tracker.peer_db.peers().len(), 1, "the old peer is gone");
+        assert_eq!(
+            tracker
+                .peer_by_tailnet_ip_opt(tailnet_ipv4(9))
+                .map(|n| &n.stable_id),
+            Some(&successor.stable_id),
+            "whois and every peerAPI source check resolve through this index"
+        );
+        assert_eq!(
+            tracker
+                .peer_by_name_opt("departing.ts.net")
+                .map(|n| &n.stable_id),
+            Some(&successor.stable_id),
+            "the MagicDNS name follows the address to its new owner"
+        );
+        assert_eq!(
+            tracker
+                .peer_db
+                .get(&successor.disco_key.unwrap())
+                .map(|(_id, n)| &n.stable_id),
+            Some(&successor.stable_id),
+            "and so does the disco key, which is the successor's direct path"
+        );
+    }
+
+    /// The same replacement split across TWO deltas: the successor arrives in one `MapResponse`,
+    /// the departing peer's removal trails in a later one.
+    #[tokio::test]
+    async fn a_removal_trailing_a_later_upsert_keeps_the_successor_addressable() {
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
+        let now = local_now();
+
+        let departing = peer_at("departing", 1, 1, 9);
+        let successor = peer_at("successor", 2, 2, 9);
+
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Delta {
+                upsert: vec![departing.clone()],
+                remove: Vec::new(),
+            },
+            now,
+        );
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Delta {
+                upsert: vec![successor.clone()],
+                remove: Vec::new(),
+            },
+            now,
+        );
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Delta {
+                upsert: Vec::new(),
+                remove: vec![departing.id],
+            },
+            now,
+        );
+
+        assert_eq!(tracker.peer_db.peers().len(), 1);
+        assert_eq!(
+            tracker
+                .peer_by_tailnet_ip_opt(tailnet_ipv4(9))
+                .map(|n| &n.stable_id),
+            Some(&successor.stable_id),
+            "a removal that arrives late must not evict the address's live owner"
+        );
+        assert!(
+            tracker
+                .whois_opt("100.64.0.9:80".parse().unwrap())
+                .is_some(),
+            "so whois still identifies the peer that is present and handshaking"
+        );
+    }
+
+    /// The positive case, through the same path: a peer removed while it still owns its rows is
+    /// really gone from every index, so the guard cannot pass by never evicting anything.
+    #[tokio::test]
+    async fn a_removal_with_no_successor_clears_the_indexes() {
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
+        let now = local_now();
+
+        let peer = peer_at("solo", 1, 1, 9);
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Delta {
+                upsert: vec![peer.clone()],
+                remove: Vec::new(),
+            },
+            now,
+        );
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Delta {
+                upsert: Vec::new(),
+                remove: vec![peer.id],
+            },
+            now,
+        );
+
+        assert!(tracker.peer_db.peers().is_empty());
+        assert!(tracker.peer_by_tailnet_ip_opt(tailnet_ipv4(9)).is_none());
+        assert!(tracker.peer_by_name_opt("solo.ts.net").is_none());
+        assert!(tracker.peer_db.get(&peer.node_key).is_none());
+        assert!(tracker.peer_db.get(&peer.stable_id).is_none());
+        assert!(
+            tracker
+                .whois_opt("100.64.0.9:80".parse().unwrap())
+                .is_none(),
+            "a departed peer must not stay attributable by its old address"
+        );
+    }
+}
+
+#[cfg(test)]
 mod expiry_tests {
     //! Node-key expiry enforcement at the peer tracker — the port of Go's `expiryManager`
     //! (`ipn/ipnlocal/expiry.go`) wired into this fork's netmap.
