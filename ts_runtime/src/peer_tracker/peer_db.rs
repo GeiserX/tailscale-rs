@@ -163,13 +163,7 @@ impl PeerDb {
             &mut self.index_state.disco_idx,
             |old, idx| {
                 if let Some(key) = &old.disco_key {
-                    // Guarded remove: under netmap churn this entry may already belong to another
-                    // peer (or be gone); only retract our own mapping — never clobber another
-                    // peer's. (was an assert!, which panicked the actor under concurrent joins;
-                    // tsr-gxq)
-                    if idx.get(key).is_some_and(|&x| x == id) {
-                        idx.remove(key);
-                    }
+                    delete_if_owned(idx, key, id);
                 }
             },
             |new, idx| {
@@ -197,20 +191,10 @@ impl PeerDb {
             |x| (&x.hostname, &x.tailnet),
             &mut self.index_state.name_idx,
             |old, idx| {
-                let old_hostname = canon_name(&old.hostname);
-                if idx.get(&old_hostname).is_some_and(|&x| x == id) {
-                    idx.remove(&old_hostname);
-                }
+                delete_if_owned(idx, &canon_name(&old.hostname), id);
 
                 if let Some(fqdn) = old.fqdn_opt(false) {
-                    // Guarded remove: under netmap churn this entry may already belong to another
-                    // peer (or be gone); only retract our own mapping — never clobber another
-                    // peer's. (was an assert!, which panicked the actor under concurrent joins;
-                    // tsr-gxq)
-                    let k = canon_name(&fqdn);
-                    if idx.get(&k).is_some_and(|&x| x == id) {
-                        idx.remove(&k);
-                    }
+                    delete_if_owned(idx, &canon_name(&fqdn), id);
                 }
             },
             |new, idx| {
@@ -228,18 +212,8 @@ impl PeerDb {
             |x| &x.tailnet_address,
             &mut self.index_state.ip_idx,
             |old, idx| {
-                // Guarded remove: under netmap churn these entries may already belong to another
-                // peer (or be gone); only retract our own mapping — never clobber another peer's.
-                // (was an assert!, which panicked the actor under concurrent joins; tsr-gxq)
-                let ipv4: ipnet::IpNet = old.tailnet_address.ipv4.into();
-                let ipv6: ipnet::IpNet = old.tailnet_address.ipv6.into();
-
-                if idx.lookup_prefix_exact(ipv4).is_some_and(|&x| x == id) {
-                    idx.remove(ipv4);
-                }
-                if idx.lookup_prefix_exact(ipv6).is_some_and(|&x| x == id) {
-                    idx.remove(ipv6);
-                }
+                delete_ip_if_owned(idx, old.tailnet_address.ipv4.into(), id);
+                delete_ip_if_owned(idx, old.tailnet_address.ipv6.into(), id);
             },
             |new, idx| {
                 idx.insert(new.tailnet_address.ipv4.into(), id);
@@ -385,20 +359,27 @@ impl PeerDb {
 }
 
 impl IndexState {
+    /// Retract every index entry a departing (or replaced) peer holds.
+    ///
+    /// Every retraction is guarded by [`delete_if_owned`]: an entry is dropped only while it still
+    /// maps to `id`. Control can hand a churning peer's tailnet IP, MagicDNS name, node key or
+    /// disco key to a NEWER peer and deliver the new peer's upsert before the old peer's removal —
+    /// and `PeerTracker::apply_peer_update` applies a delta's upserts before its removals, so
+    /// that is the ordering this tree always uses. An unconditional delete here would wipe the
+    /// live owner's entry, leaving a peer that is present and handshaking unresolvable by IP
+    /// (whois, peerapi source checks) or by disco key until the next full netmap.
     fn remove(&mut self, id: PeerId, node: &Node) {
-        self.nk_idx.remove(&node.node_key);
-        self.stableid_idx.remove(&node.stable_id);
-        self.control_idx.remove(&node.id);
-        self.ip_idx.remove(node.tailnet_address.ipv4.into());
-        self.ip_idx.remove(node.tailnet_address.ipv6.into());
+        delete_if_owned(&mut self.nk_idx, &node.node_key, id);
+        delete_if_owned(&mut self.stableid_idx, &node.stable_id, id);
+        delete_if_owned(&mut self.control_idx, &node.id, id);
 
-        let hostname = canon_name(&node.hostname);
-        if self.name_idx.get(&hostname).is_some_and(|&x| x == id) {
-            self.name_idx.remove(&hostname);
-        }
+        delete_ip_if_owned(&mut self.ip_idx, node.tailnet_address.ipv4.into(), id);
+        delete_ip_if_owned(&mut self.ip_idx, node.tailnet_address.ipv6.into(), id);
+
+        delete_if_owned(&mut self.name_idx, &canon_name(&node.hostname), id);
 
         if let Some(fqdn) = node.fqdn_opt(false) {
-            self.name_idx.remove(&canon_name(&fqdn));
+            delete_if_owned(&mut self.name_idx, &canon_name(&fqdn), id);
         }
 
         for route in &node.accepted_routes {
@@ -406,15 +387,11 @@ impl IndexState {
         }
 
         if let Some(disco) = &node.disco_key {
-            self.disco_idx.remove(disco);
+            delete_if_owned(&mut self.disco_idx, disco, id);
         }
 
-        // Guarded remove, for the same reason as every other index above: a key this peer holds
-        // inactive may since have been claimed (actively or inactively) by another peer.
-        if let Some(key) = self.inactive_disco.remove(&id)
-            && self.inactive_disco_idx.get(&key).is_some_and(|&x| x == id)
-        {
-            self.inactive_disco_idx.remove(&key);
+        if let Some(key) = self.inactive_disco.remove(&id) {
+            delete_if_owned(&mut self.inactive_disco_idx, &key, id);
         }
     }
 
@@ -456,6 +433,30 @@ impl IndexState {
             && self.disco_idx.is_empty()
             && self.inactive_disco_idx.is_empty()
             && self.inactive_disco.is_empty()
+    }
+}
+
+/// Retract `key` from `idx`, but only while it still maps to `id`.
+///
+/// The one rule every index retraction in this file obeys — Go's `deleteIfOwned`
+/// (`ipn/ipnlocal/node_backend.go`). Under netmap churn an entry a peer used to own may already
+/// have been re-pointed at a NEWER peer that inherited its address, name or key; retracting it
+/// unconditionally would evict the live owner and strand a peer that is present and handshaking.
+/// Never clobber another peer's entry — only ever your own. (An earlier version asserted ownership
+/// instead and panicked the actor under concurrent joins.)
+fn delete_if_owned<T: Eq + Hash>(idx: &mut Index<T>, key: &T, id: PeerId) {
+    if idx.get(key).is_some_and(|&x| x == id) {
+        idx.remove(key);
+    }
+}
+
+/// [`delete_if_owned`] for the prefix-keyed IP index, which is a routing table rather than a map.
+///
+/// Matches on the EXACT prefix (`lookup_prefix_exact`), never a longest-prefix match: a peer owns
+/// the entry for its own address, not for whatever covering route happens to answer a lookup.
+fn delete_ip_if_owned(idx: &mut ts_bart::Table<PeerId>, prefix: ipnet::IpNet, id: PeerId) {
+    if idx.lookup_prefix_exact(prefix).is_some_and(|&x| x == id) {
+        idx.remove(prefix);
     }
 }
 
@@ -507,12 +508,7 @@ fn maybe_update_idx<T>(
         &accessor,
         idx,
         |old, idx| {
-            // Guarded remove: under netmap churn this entry may already belong to another peer
-            // (or be gone); only retract our own mapping — never clobber another peer's. (was an
-            // assert!, which panicked the actor under concurrent joins; tsr-gxq)
-            if idx.get(accessor(old)).is_some_and(|&x| x == new_id) {
-                idx.remove(accessor(old));
-            }
+            delete_if_owned(idx, accessor(old), new_id);
         },
         |new, idx| {
             idx.insert(accessor(new).clone(), new_id);
@@ -1028,6 +1024,165 @@ mod test {
         assert_eq!(
             IpAddr::from(Ipv4Addr::new(100, 64, 0, 2)).lookup(&db),
             Some(id_a)
+        );
+    }
+
+    /// The removal path's half of the guard: a peer that LEAVES must not evict the entries a
+    /// successor already took over.
+    ///
+    /// Control can hand a churning peer's tailnet IP, MagicDNS name, disco key or control node id
+    /// to a newer peer and deliver the newer peer's upsert first — which is what
+    /// `PeerTracker::apply_peer_update` does with every delta, since it applies upserts before
+    /// removals. An unconditional retraction in `IndexState::remove` then wipes the live owner's
+    /// rows, and a peer that is present and handshaking stops resolving by IP (whois, peerAPI
+    /// source checks) or by disco key until the next full netmap.
+    #[test]
+    fn a_departing_peer_does_not_evict_its_successors_index_rows() {
+        let mut db = PeerDb::default();
+
+        let shared_ips = TailnetAddress {
+            ipv4: Ipv4Addr::new(100, 64, 0, 7).into(),
+            ipv6: Ipv6Addr::new(0xfd7a, 0, 0, 0, 0, 0, 0, 7).into(),
+        };
+        let shared_disco: DiscoPublicKey = [4u8; 32].into();
+        let shared_node_key: NodePublicKey = [5u8; 32].into();
+        let shared_control_id = 4242;
+
+        let departing = Node {
+            stable_id: StableNodeId("departing".to_string()),
+            id: shared_control_id,
+            hostname: "churny".to_string(),
+            tailnet: Some("ts.net".to_string()),
+            addresses: vec![shared_ips.ipv4.into(), shared_ips.ipv6.into()],
+            tailnet_address: shared_ips.clone(),
+            node_key: shared_node_key,
+            disco_key: Some(shared_disco),
+            accepted_routes: Vec::new(),
+            ..rand_node()
+        };
+        let departing_id = db.upsert(&departing);
+
+        // The successor inherits every one of those, and — the ordering that matters — is upserted
+        // BEFORE the departing peer's removal arrives.
+        let successor = Node {
+            stable_id: StableNodeId("successor".to_string()),
+            ..departing.clone()
+        };
+        let successor_id = db.upsert(&successor);
+        assert_ne!(departing_id, successor_id);
+
+        let (removed_id, _node) = db
+            .remove(&departing.stable_id)
+            .expect("the departing peer is still in the db under its own stable id");
+        assert_eq!(removed_id, departing_id);
+
+        assert_eq!(db.peers().len(), 1, "only the departing peer is gone");
+        assert_eq!(
+            departing.stable_id.lookup(&db),
+            None,
+            "and its own stable id no longer resolves"
+        );
+
+        for (what, got) in [
+            (
+                "tailnet ipv4",
+                IpAddr::from(Ipv4Addr::new(100, 64, 0, 7)).lookup(&db),
+            ),
+            (
+                "tailnet ipv6",
+                IpAddr::from(Ipv6Addr::new(0xfd7a, 0, 0, 0, 0, 0, 0, 7)).lookup(&db),
+            ),
+            ("hostname", "churny".lookup(&db)),
+            ("fqdn", "churny.ts.net".lookup(&db)),
+            ("disco key", shared_disco.lookup(&db)),
+            ("node key", shared_node_key.lookup(&db)),
+            ("control node id", shared_control_id.lookup(&db)),
+            ("stable id", successor.stable_id.lookup(&db)),
+        ] {
+            assert_eq!(
+                got,
+                Some(successor_id),
+                "the departing peer evicted the successor's {what}"
+            );
+        }
+    }
+
+    /// The successor's claim can also arrive in an EARLIER batch than the removal (Go's
+    /// `MapResponse` reordering); the removal still must not evict it. Same guard, the ordering
+    /// that reaches the db across two updates rather than inside one.
+    #[test]
+    fn a_departing_peers_inactive_disco_claim_does_not_evict_the_successors() {
+        let mut db = PeerDb::default();
+
+        let shared: DiscoPublicKey = [6u8; 32].into();
+
+        let departing = Node {
+            stable_id: StableNodeId("departing".to_string()),
+            disco_key: Some([1u8; 32].into()),
+            accepted_routes: Vec::new(),
+            ..rand_node()
+        };
+        let departing_id = db.upsert(&departing);
+        db.set_inactive_disco_key(departing_id, Some(shared));
+
+        // The successor is now the one actually sending under that key.
+        let successor = Node {
+            stable_id: StableNodeId("successor".to_string()),
+            disco_key: Some(shared),
+            accepted_routes: Vec::new(),
+            ..rand_node()
+        };
+        let successor_id = db.upsert(&successor);
+
+        db.remove(&departing_id).expect("departing peer removed");
+
+        assert_eq!(
+            db.peer_by_known_disco_key(&shared)
+                .map(|(id, _, m)| (id, m)),
+            Some((successor_id, DiscoKeyMatch::Active)),
+            "the departing peer's stale inactive claim must not take the live path with it"
+        );
+    }
+
+    /// The other direction, so the guard cannot pass by simply never evicting anything: a peer
+    /// removed while it still OWNS its rows must leave the indexes empty.
+    #[test]
+    fn a_peer_removed_while_it_owns_its_rows_leaves_no_index_entries() {
+        let mut db = PeerDb::default();
+
+        let node = Node {
+            hostname: "solo".to_string(),
+            tailnet: Some("ts.net".to_string()),
+            disco_key: Some([3u8; 32].into()),
+            accepted_routes: vec!["192.0.2.0/24".parse().unwrap()],
+            ..rand_node()
+        };
+        let id = db.upsert(&node);
+        db.set_inactive_disco_key(id, Some([4u8; 32].into()));
+        validate_indices(&db, &node, id);
+
+        db.remove(&id).expect("the peer is in the db");
+
+        assert!(db.peers().is_empty());
+        assert_eq!(node.node_key.lookup(&db), None);
+        assert_eq!(node.stable_id.lookup(&db), None);
+        assert_eq!(node.id.lookup(&db), None);
+        assert_eq!(
+            IpAddr::from(node.tailnet_address.ipv4.addr()).lookup(&db),
+            None
+        );
+        assert_eq!(
+            IpAddr::from(node.tailnet_address.ipv6.addr()).lookup(&db),
+            None
+        );
+        assert_eq!("solo".lookup(&db), None);
+        assert_eq!("solo.ts.net".lookup(&db), None);
+        assert_eq!(node.disco_key.unwrap().lookup(&db), None);
+        assert!(db.peer_by_known_disco_key(&[4u8; 32].into()).is_none());
+        assert_eq!(db.get_route("192.0.2.0/24".parse().unwrap()).count(), 0);
+        assert!(
+            db.index_state.is_empty(),
+            "an owned row must still be retracted — the guard is conditional, not a no-op"
         );
     }
 
