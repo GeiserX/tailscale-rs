@@ -2,6 +2,19 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.51.0](https://github.com/GeiserX/tailscale-rs/compare/v0.50.1...v0.51.0) (2026-09-09)
+
+
+### Features
+
+* **dns:** resolve subdomains of peers marked dns-subdomain-resolve ([#415](https://github.com/GeiserX/tailscale-rs/issues/415)) ([8c2f02a](https://github.com/GeiserX/tailscale-rs/commit/8c2f02a89d33329daf7cc4e88dc1b43ced254e50))
+
+
+### Bug Fixes
+
+* **dataplane:** stop dropping the replies to our own UDP and SCTP flows ([#418](https://github.com/GeiserX/tailscale-rs/issues/418)) ([bebe07f](https://github.com/GeiserX/tailscale-rs/commit/bebe07f8daaabf2832c5a14de885551dd553cf30))
+* **exit-node:** don't fall back to a random pick for distant exit nodes ([#417](https://github.com/GeiserX/tailscale-rs/issues/417)) ([496a6b6](https://github.com/GeiserX/tailscale-rs/commit/496a6b66275ea37d268218bd338e963d313f16ba))
+
 ## [0.50.1](https://github.com/GeiserX/tailscale-rs/compare/v0.50.0...v0.50.1) (2026-09-09)
 
 
