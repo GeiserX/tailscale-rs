@@ -1180,4 +1180,316 @@ mod tests {
             "100.64.0.1".parse().unwrap()
         ));
     }
+
+    // ---------------------------------------------------------------------------------------------
+    // How the filter gets here.
+    //
+    // The gate above is only as good as its input: it refuses when it has no filter, so a filter
+    // that goes missing on the way is not a silent no-op, it is this node refusing peers control's
+    // ACL admits, until control happens to send another one. These exercise the delivery path from
+    // the production `PacketfilterUpdater` to the value `handle_conn` passes to `dns_source_allowed`.
+
+    use kameo::actor::Spawn;
+
+    /// A minimal `ForwarderConfig` for standing up an `Env` (mirrors the sibling actor tests;
+    /// nothing here reads the forwarding fields).
+    fn forwarder_cfg() -> crate::env::ForwarderConfig {
+        crate::env::ForwarderConfig {
+            accept_routes: false,
+            accept_dns: true,
+            exit_node: None,
+            forward_routes: vec![],
+            forward_tcp_ports: vec![],
+            forward_udp_ports: vec![],
+            forward_all_ports: false,
+            forward_exit_egress: false,
+            block_incoming: false,
+            exit_proxy: None,
+            peerapi_port: None,
+            taildrop_dir: None,
+            enable_ipv6: false,
+            wireguard_listen_port: None,
+            network_monitor: false,
+            persistent_keepalive_interval: None,
+            ingress_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// A netmap update carrying `rules` as control's packet filter, and nothing else.
+    fn netmap_with(rules: Vec<ts_packetfilter::Rule>) -> Arc<ts_control::StateUpdate> {
+        Arc::new(ts_control::StateUpdate {
+            session_handle: None,
+            seq: 0,
+            keep_alive: false,
+            derp: None,
+            node: None,
+            peer_update: None,
+            peer_patches: Vec::new(),
+            user_profiles: Vec::new(),
+            ping: None,
+            packetfilter: Some((Some(rules), Default::default())),
+            cap_grants: None,
+            pop_browser_url: None,
+            dial_plan: None,
+            dns_config: None,
+            ssh_policy: None,
+            tka: None,
+            online_change: Default::default(),
+            peer_seen_change: Default::default(),
+            control_time: None,
+        })
+    }
+
+    /// Stand up the production packet-filter updater over a fresh `Env`, returning it with the live
+    /// filter cell the peerAPI DoH gate reads.
+    fn updater_with_cell() -> (
+        kameo::actor::ActorRef<crate::packetfilter::PacketfilterUpdater>,
+        crate::packetfilter::LiveFilterRx,
+        watch::Sender<Option<crate::packetfilter::PacketFilterState>>,
+        crate::env::Env,
+    ) {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        // The shutdown sender is dropped here on purpose: nothing in these tests reads it, and the
+        // `Env` only ever borrows the receiver.
+        let env = crate::env::Env::new(ts_keys::NodeState::generate(), shutdown_rx, forwarder_cfg());
+        let (cap_grants_tx, _cap_grants_rx) = watch::channel(Default::default());
+        let (filter_tx, filter_rx) = watch::channel(None);
+        let updater = crate::packetfilter::PacketfilterUpdater::spawn((
+            env.clone(),
+            cap_grants_tx,
+            filter_tx.clone(),
+        ));
+        (updater, filter_rx, filter_tx, env)
+    }
+
+    /// Run the gate against whatever the cell currently holds, exactly as `handle_conn` does
+    /// (`filter_rx.borrow().clone()`, then `dns_source_allowed`).
+    fn gate_says_yes(view: &DnsView, filter_rx: &crate::packetfilter::LiveFilterRx, src: &str) -> bool {
+        let filter = filter_rx.borrow().clone();
+        dns_source_allowed(view, filter.as_ref().map(|f| &*f.0), src.parse().unwrap())
+    }
+
+    /// Every filter control compiles reaches the gate, including one compiled before the gate
+    /// existed. The peerAPI server task is spawned by `MagicDnsActor::on_start`, which runs on its
+    /// own task and can therefore attach at any point relative to the first netmap; a cell written
+    /// by the updater is readable whenever the reader shows up, so "the gate started late" cannot
+    /// turn into "the gate refuses everyone".
+    #[tokio::test]
+    async fn a_gate_that_attaches_after_the_first_netmap_still_reads_the_filter() {
+        let (updater, filter_rx, filter_tx, _env) = updater_with_cell();
+        let v = view_with_peer();
+
+        // Before any netmap: no filter, so the gate refuses (Go's `f == nil`).
+        assert!(
+            !gate_says_yes(&v, &filter_rx, "100.64.0.1"),
+            "no compiled filter yet must refuse"
+        );
+
+        // Control grants this peer the internet through us on 53.
+        updater
+            .tell(netmap_with(vec![tcp_rule(
+                "100.64.0.1/32",
+                "0.0.0.0/0",
+                53..=53,
+            )]))
+            .await
+            .expect("netmap delivered to the packet-filter updater");
+        wait_for_filter(&filter_rx).await;
+
+        // A receiver created *now* — a peerAPI server task that started after that netmap — reads
+        // the filter that was compiled before it existed.
+        let late_rx = filter_tx.subscribe();
+        assert!(
+            gate_says_yes(&v, &late_rx, "100.64.0.1"),
+            "a gate attaching after the compile must still see the filter"
+        );
+    }
+
+    /// The gate tracks policy: a later netmap that takes the grant away reaches it too, and the
+    /// same peer is refused. Without this direction the test above would pass against a cell that
+    /// is written once and then goes stale.
+    #[tokio::test]
+    async fn a_revoked_grant_reaches_the_gate_too() {
+        let (updater, mut filter_rx, _filter_tx, _env) = updater_with_cell();
+        let v = view_with_peer();
+
+        updater
+            .tell(netmap_with(vec![tcp_rule(
+                "100.64.0.1/32",
+                "0.0.0.0/0",
+                53..=53,
+            )]))
+            .await
+            .expect("first netmap delivered");
+        wait_for_filter(&filter_rx).await;
+        assert!(gate_says_yes(&v, &filter_rx, "100.64.0.1"));
+
+        // Control re-issues the policy with the peer's internet access removed; it keeps tailnet
+        // access, which is how it reaches the peerAPI port at all.
+        filter_rx.mark_unchanged();
+        updater
+            .tell(netmap_with(vec![tcp_rule(
+                "100.64.0.1/32",
+                "100.64.0.0/10",
+                0..=u16::MAX,
+            )]))
+            .await
+            .expect("second netmap delivered");
+        filter_rx.changed().await.expect("the revocation reaches the cell");
+
+        assert!(
+            !gate_says_yes(&v, &filter_rx, "100.64.0.1"),
+            "a revoked grant must reach the gate, not leave it admitting on a stale filter"
+        );
+    }
+
+    /// Why the cell, and not a bus subscription feeding one.
+    ///
+    /// The `Env` bus delivers best-effort (`kameo_actors::DeliveryStrategy::BestEffort`, the default
+    /// it is spawned with): publishing `try_send`s and *skips* any subscriber whose bounded mailbox
+    /// is full. `MagicDnsActor` parks in handlers — its `Query` handler awaits a DNS forward for up
+    /// to five seconds — so it is exactly the kind of subscriber that gets skipped, and nothing
+    /// redelivers afterwards. Here a subscriber parked in its handler misses filters the updater
+    /// published while it was busy, and the gate reading the updater's own cell is unaffected.
+    #[tokio::test]
+    async fn a_parked_bus_subscriber_misses_filters_the_cell_still_carries() {
+        let (updater, mut filter_rx, _filter_tx, env) = updater_with_cell();
+        let v = view_with_peer();
+
+        // A subscriber that parks in its first handler, with the smallest mailbox there is so the
+        // publishes behind it have nowhere to queue.
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let last_seen: TapState = Arc::new(std::sync::Mutex::new(None));
+        let (release_tx, release_rx) = watch::channel(false);
+        let tap = ParkedFilterTap::spawn_with_mailbox(
+            (seen.clone(), last_seen.clone(), release_rx),
+            kameo::mailbox::bounded(1),
+        );
+        env.subscribe::<crate::packetfilter::PacketFilterState>(&tap)
+            .await
+            .expect("tap subscribed to the filter bus");
+
+        // Three policies in a row. Only the last one grants this peer DNS.
+        for rules in [
+            vec![tcp_rule("100.64.0.1/32", "100.64.0.0/10", 0..=u16::MAX)],
+            vec![tcp_rule("100.64.0.1/32", "0.0.0.0/0", 443..=443)],
+            vec![tcp_rule("100.64.0.1/32", "0.0.0.0/0", 53..=53)],
+        ] {
+            filter_rx.mark_unchanged();
+            updater.tell(netmap_with(rules)).await.expect("netmap delivered");
+            filter_rx
+                .changed()
+                .await
+                .expect("each compiled filter reaches the cell");
+        }
+
+        // The tap is registered before any of the three, so the first one reaches it and it parks
+        // there; waiting for that is what makes the count below a measurement of dropped filters
+        // rather than of a subscription that never worked.
+        wait_for_count(&seen, 1).await;
+        let delivered = seen.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            delivered < 3,
+            "the bus dropped nothing ({delivered}/3 delivered to a parked subscriber); \
+             this test only means something if it does"
+        );
+        assert!(
+            gate_says_yes(&v, &filter_rx, "100.64.0.1"),
+            "the gate answers from the newest compiled filter, not from what the bus managed to deliver"
+        );
+
+        // And the same gate, asked against the newest filter that subscriber actually received —
+        // the answer the peerAPI DoH gate gave while it was fed from a bus subscription — refuses
+        // the peer control has granted. The two answers differ, which is the whole defect.
+        let stale = last_seen.lock().unwrap().clone();
+        assert!(
+            !dns_source_allowed(
+                &v,
+                stale.as_ref().map(|f| &*f.0),
+                "100.64.0.1".parse().unwrap()
+            ),
+            "the parked subscriber is supposed to be stuck on an older policy here"
+        );
+
+        release_tx.send_replace(true);
+    }
+
+    /// Wait for `counter` to reach `want`, failing the test rather than hanging.
+    async fn wait_for_count(counter: &std::sync::atomic::AtomicUsize, want: usize) {
+        for _ in 0..200 {
+            if counter.load(std::sync::atomic::Ordering::SeqCst) >= want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "timed out waiting for the bus tap to receive {want}: got {}",
+            counter.load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    /// Wait for the cell to hold a compiled filter, failing the test rather than hanging.
+    async fn wait_for_filter(filter_rx: &crate::packetfilter::LiveFilterRx) {
+        for _ in 0..200 {
+            if filter_rx.borrow().is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for the packet-filter updater to write the live filter cell");
+    }
+
+    /// The newest filter a bus subscriber actually received — the value a cell fed from a bus
+    /// subscription would be holding.
+    type TapState = Arc<std::sync::Mutex<Option<crate::packetfilter::PacketFilterState>>>;
+
+    /// A bus subscriber that parks in its handler, the way `MagicDnsActor` parks while a DNS
+    /// forward is in flight. Records what it actually received.
+    struct ParkedFilterTap {
+        seen: Arc<std::sync::atomic::AtomicUsize>,
+        last_seen: TapState,
+        release: watch::Receiver<bool>,
+    }
+
+    impl kameo::Actor for ParkedFilterTap {
+        type Args = (
+            Arc<std::sync::atomic::AtomicUsize>,
+            TapState,
+            watch::Receiver<bool>,
+        );
+        type Error = crate::Error;
+
+        async fn on_start(
+            (seen, last_seen, release): Self::Args,
+            _slf: kameo::actor::ActorRef<Self>,
+        ) -> Result<Self, Self::Error> {
+            Ok(Self {
+                seen,
+                last_seen,
+                release,
+            })
+        }
+    }
+
+    impl kameo::message::Message<crate::packetfilter::PacketFilterState> for ParkedFilterTap {
+        type Reply = ();
+
+        async fn handle(
+            &mut self,
+            msg: crate::packetfilter::PacketFilterState,
+            _ctx: &mut kameo::message::Context<Self, Self::Reply>,
+        ) {
+            // Scoped: the guard must not be held across the park below.
+            {
+                *self.last_seen.lock().unwrap() = Some(msg);
+            }
+            self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            loop {
+                let released = *self.release.borrow_and_update();
+                if released || self.release.changed().await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
 }
