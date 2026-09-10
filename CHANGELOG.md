@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.51.1](https://github.com/GeiserX/tailscale-rs/compare/v0.51.0...v0.51.1) (2026-09-10)
+
+
+### Bug Fixes
+
+* **dataplane:** stop dropping the replies to our own TCP and ICMP flows ([#419](https://github.com/GeiserX/tailscale-rs/issues/419)) ([3da1d5c](https://github.com/GeiserX/tailscale-rs/commit/3da1d5cfe6f36c09471dad8bd1974519828d4a19))
+
 ## [0.51.0](https://github.com/GeiserX/tailscale-rs/compare/v0.50.1...v0.51.0) (2026-09-09)
 
 
