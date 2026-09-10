@@ -50,6 +50,7 @@ use tokio::{
 use crate::{
     funnel::{FunnelIngressSlot, IngressConn},
     magic_dns::DnsView,
+    packetfilter::LiveFilterRx,
     peerapi_doh::{find_header_end, write_status},
     taildrop::{TaildropError, TaildropStore},
 };
@@ -83,7 +84,10 @@ const MAX_HEADERS: usize = 16 * 1024;
 ///
 /// `view_rx` is the live [`DnsView`] shared with the MagicDNS responder (same control/peer state);
 /// the DoH handler resolves queries against it and the Taildrop handler reads the self-node cap and
-/// peer set from it for the access gate. `forward_exit_egress` gates DoH recursive resolution.
+/// peer set from it for the access gate. `filter_rx` is the live control-derived packet filter, which
+/// the DoH handler consults to decide whether the *querying peer* may use this node's DNS proxy at
+/// all (`peerapi_doh::dns_source_allowed`, Go `isPeerAPIDNSAllowed`).
+/// `forward_exit_egress` gates DoH recursive resolution.
 /// `taildrop` is the configured file store, or `None` when Taildrop is disabled (a `PUT` then `403`s).
 /// `funnel_ingress` is the shared slot the client-side Funnel listener installs its ingress sink
 /// into (see [`crate::funnel`]); a `POST /v0/ingress` is membership-gated, hijacked with
@@ -92,6 +96,7 @@ pub(crate) async fn serve(
     channel: Channel,
     port: u16,
     view_rx: watch::Receiver<Arc<DnsView>>,
+    filter_rx: LiveFilterRx,
     forward_exit_egress: bool,
     taildrop: Option<Arc<TaildropStore>>,
     funnel_ingress: FunnelIngressSlot,
@@ -132,6 +137,7 @@ pub(crate) async fn serve(
 
         let channel = channel.clone();
         let view_rx = view_rx.clone();
+        let filter_rx = filter_rx.clone();
         let taildrop = taildrop.clone();
         let funnel_ingress = funnel_ingress.clone();
         tokio::spawn(async move {
@@ -142,6 +148,7 @@ pub(crate) async fn serve(
                     stream,
                     &channel,
                     &view_rx,
+                    &filter_rx,
                     forward_exit_egress,
                     taildrop,
                     &funnel_ingress,
@@ -162,6 +169,7 @@ async fn route_conn(
     mut stream: TcpStream,
     channel: &Channel,
     view_rx: &watch::Receiver<Arc<DnsView>>,
+    filter_rx: &LiveFilterRx,
     forward_exit_egress: bool,
     taildrop: Option<Arc<TaildropStore>>,
     funnel_ingress: &FunnelIngressSlot,
@@ -246,6 +254,7 @@ async fn route_conn(
                 header_end,
                 channel,
                 view_rx,
+                filter_rx,
                 forward_exit_egress,
             )
             .await

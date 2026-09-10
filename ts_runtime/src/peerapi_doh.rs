@@ -36,7 +36,16 @@
 //! NXDOMAIN guards — tracked as a follow-up, not the blanket change. (Go's OS-stub-resolver forward
 //! target is also unavailable here; this path forwards to the tailnet's configured resolvers.)
 //!
-//! Two server-side rules layer on top:
+//! ## Which peers we answer at all
+//!
+//! Before any of that: a peerAPI DNS query is refused `403` unless the querying peer would be
+//! accepted by the live packet filter for TCP port 53 to an off-tailnet destination — Go's
+//! `isPeerAPIDNSAllowed` (`ipn/ipnlocal/peerapi.go`), evaluated once per connection in
+//! [`dns_source_allowed`]. It is a gate on *which peers*, orthogonal to the divergence above about
+//! *which names*: control's ACL has to actually grant that peer internet access through this node
+//! before we resolve anything for it, recursive or authoritative.
+//!
+//! Two more server-side rules, on the *names* rather than the peer, layer on top:
 //!
 //! - **Exit-node filtered set** ([`DnsConfig::exit_node_filters`]): a name in control's
 //!   `ExitNodeFilteredSet` is `REFUSED` before anything else (Go `dnsConfigForNetmap`'s filter).
@@ -83,9 +92,13 @@ use tokio::{
     time::timeout,
 };
 use ts_dns_wire::{Rcode, decode_query, encode_response};
+use ts_packetfilter::FilterExt;
 
-use crate::magic_dns::{
-    ClientTransport, Decision, DnsView, check_response_size_and_set_tc, decide, forward_query,
+use crate::{
+    magic_dns::{
+        ClientTransport, Decision, DnsView, check_response_size_and_set_tc, decide, forward_query,
+    },
+    packetfilter::LiveFilterRx,
 };
 
 /// Largest HTTP request (headers + body) we will read for one DoH query. A DNS message is at most
@@ -292,12 +305,16 @@ fn parse_response_head(buf: &[u8]) -> std::io::Result<usize> {
 /// the stream while it determined the route, and `header_end` is the offset just past the
 /// `\r\n\r\n` header terminator within `seed`. The DoH parser resumes from there, so no bytes are
 /// lost when the router hands the connection over.
+///
+/// The querying peer is gated once, here, before any resolution: see [`dns_source_allowed`], which
+/// answers `403` for a peer control's ACL does not grant internet access through this node.
 pub(crate) async fn handle_conn(
     mut stream: TcpStream,
     seed: Vec<u8>,
     header_end: usize,
     channel: &Channel,
     view_rx: &watch::Receiver<Arc<DnsView>>,
+    filter_rx: &LiveFilterRx,
     forward_exit_egress: bool,
 ) -> std::io::Result<()> {
     let request = match read_request(&mut stream, seed, header_end).await? {
@@ -319,8 +336,113 @@ pub(crate) async fn handle_conn(
     };
 
     let view = view_rx.borrow().clone();
+    // Both `borrow()` guards are dropped at the end of their own `let` — a `watch::Ref` is not
+    // `Send`, and this task is spawned.
+    let filter = filter_rx.borrow().clone();
+
+    // The source gate, run once for this connection *before* anything is resolved — Go's
+    // `handleDNSQuery` answering `403` when `isPeerAPIDNSAllowed` says no.
+    let src = stream.remote_addr().ip();
+    if !dns_source_allowed(&view, filter.as_ref().map(|f| &*f.0), src) {
+        tracing::debug!(
+            %src,
+            "peerapi doh: 403, the ACL does not grant this peer internet access through us"
+        );
+        return write_status(&mut stream, "403 Forbidden").await;
+    }
+
     let response = resolve(&view, &query, channel, forward_exit_egress).await;
     write_dns_response(&mut stream, &response).await
+}
+
+/// Go `packet.TCPSyn`: the SYN bit of a TCP flags byte. `CheckTCP` builds its probe packet with
+/// exactly this flag set, so the probe is a connection *opening* — the one segment an inbound ACL
+/// has any say over.
+const TCP_SYN_FLAG: u8 = 0x02;
+
+/// The destination a `CheckTCP` probe for a `src` of this family names — Go's
+/// `isPeerAPIDNSAllowed`: `0.0.0.0` for an IPv4 peer, `2000::` for an IPv6 one. Both are
+/// off-tailnet (outside `100.64.0.0/10` / `fd7a:115c:a1e0::/48`) and outside any private range, so
+/// a rule matches them only if it grants this peer the *internet* through us — which is exactly the
+/// question being asked. `2000::` is the base of the IANA global-unicast block, chosen upstream for
+/// that reason.
+fn internet_probe_dst(src: std::net::IpAddr) -> std::net::IpAddr {
+    match src {
+        std::net::IpAddr::V4(_) => std::net::Ipv4Addr::UNSPECIFIED.into(),
+        std::net::IpAddr::V6(_) => std::net::Ipv6Addr::new(0x2000, 0, 0, 0, 0, 0, 0, 0).into(),
+    }
+}
+
+/// Whether the peer at `src` may have its DNS queries answered by this node's peerAPI DoH server at
+/// all — the port of Go's `isPeerAPIDNSAllowed` (`ipn/ipnlocal/peerapi.go`), which `handleDNSQuery`
+/// runs ahead of any resolution and answers `403 DNS access denied` when it refuses.
+///
+/// Upstream needs this check *inside* the handler because peerAPI deliberately bypasses the packet
+/// filter: `net/tstun/wrap.go` flips an ACL-refused inbound SYN back to `Accept` when its
+/// destination is the peerAPI port ("Let peerapi through the filter; its ACLs are handled at L7, not
+/// at the packet level"). This fork has no such packet-level carve-out — a peer only reaches this
+/// port if the ACL already admits it there — but the common tailnet policy is permissive about
+/// *ports* and specific about *internet access*, and it is internet access that a DNS proxy hands
+/// out. So the L7 check is still the only thing that asks the right question, and without it any
+/// peer that can open a TCP connection to the peerAPI port gets recursive resolution through this
+/// node's resolvers (on an exit-egress node) and authoritative MagicDNS answers for this node's
+/// tailnet names (on any node).
+///
+/// Two conditions, both fail-closed:
+///
+/// 1. `src` must resolve to a node in the current netmap — Go's peerAPI listener resolves the
+///    connection's source to a peer (`WhoIs`) before a handler ever runs and drops the connection
+///    when it cannot. Same lookup the Taildrop and ingress gates use
+///    ([`PeerDb::get`][crate::peer_tracker::PeerDb::get] by tailnet IP, i.e.
+///    `PeerTracker::peer_by_tailnet_ip`), so an unknown source is refused before the ACL is asked.
+///    This node's *own* address is not special-cased the way the Taildrop and ingress gates do it:
+///    nothing dials our own peerAPI DoH (the MagicDNS client delegates to the active exit node,
+///    which is a peer), so admitting it would only widen the surface.
+/// 2. The live packet filter must accept a TCP SYN from `src` to
+///    [`internet_probe_dst`]`:53` — Go's `filter.CheckTCP(remoteIP, 0.0.0.0-or-2000::, 53) ==
+///    Accept`. No filter yet (no netmap since start) is a refusal, as it is upstream (`f == nil`).
+///
+/// **Go's self arm is deliberately not ported.** Upstream short-circuits to allow when the peer is
+/// untagged and owned by the same user as this node (`IsSelfUntagged`, tightened from a plain
+/// `isSelf` by commit `a4c790224` so a *tagged* node no longer gets the shortcut). This fork carries
+/// no self/owner notion on the peerAPI path — `Node::user_id` is present but nothing here
+/// establishes "the same user" the way Go's profile state does — so a same-user peer is admitted by
+/// the ACL like any other. That is the strictly safer reading of the two: the arm we skip only ever
+/// *widens* upstream's answer.
+///
+/// Pure (no I/O) so both directions are unit-testable.
+pub(crate) fn dns_source_allowed(
+    view: &DnsView,
+    filter: Option<&(dyn ts_packetfilter::Filter + Send + Sync)>,
+    src: std::net::IpAddr,
+) -> bool {
+    if view.peers.as_ref().and_then(|p| p.get(&src)).is_none() {
+        tracing::debug!(%src, "peerapi doh: source is not a known tailnet peer");
+        return false;
+    }
+
+    // Go: `f := b.filterAtomic.Load(); if f == nil { return false }`.
+    let Some(filter) = filter else {
+        tracing::debug!(%src, "peerapi doh: no packet filter compiled yet; refusing");
+        return false;
+    };
+
+    let info = ts_packetfilter::PacketInfo {
+        src,
+        dst: internet_probe_dst(src),
+        ip_proto: ts_packetfilter::IpProto::TCP,
+        port: 53,
+        l4: ts_packetfilter::L4Header::Tcp {
+            flags: TCP_SYN_FLAG,
+        },
+    };
+
+    // Node capabilities are not threaded into the ACL match anywhere in this fork yet (the
+    // dataplane's rule match passes an empty set too, `ts_dataplane::inbound_filter_verdict`), so a
+    // policy that grants internet access by capability rather than by source prefix will refuse
+    // here. Fail-closed, and it moves in step with the dataplane when caps are wired in.
+    let caps = [];
+    filter.can_access(&info, caps)
 }
 
 /// Resolve a DoH DNS query against `view`, applying the exit-node filtered set and the recursive
@@ -669,6 +791,46 @@ mod tests {
         assert_eq!(msg[3] & 0x0F, 0x01, "FORMERR rcode");
     }
 
+    /// A peer [`Node`][ts_control::Node] named `<hostname>.user.ts.net` at the given tailnet
+    /// prefixes, for the peer db the view resolves sources and names against.
+    fn peer_node(hostname: &str, v4: &str, v6: &str) -> ts_control::Node {
+        use ts_control::{Node, NodeCapMap, StableNodeId, TailnetAddress};
+        Node {
+            id: 1,
+            stable_id: StableNodeId("n1".to_string()),
+            hostname: hostname.to_string(),
+            user_id: 0,
+            tailnet: Some("user.ts.net".to_string()),
+            tags: vec![],
+            addresses: vec![v4.parse().unwrap(), v6.parse().unwrap()],
+            tailnet_address: TailnetAddress {
+                ipv4: v4.parse().unwrap(),
+                ipv6: v6.parse().unwrap(),
+            },
+            node_key: [0u8; 32].into(),
+            node_key_expiry: None,
+            expired: false,
+            online: None,
+            last_seen: None,
+            key_signature: vec![],
+            machine_key: None,
+            disco_key: None,
+            accepted_routes: vec![],
+            underlay_addresses: vec![],
+            derp_region: None,
+            cap: Default::default(),
+            cap_map: NodeCapMap::new(),
+            peerapi_port: None,
+            peerapi_dns_proxy: false,
+            is_wireguard_only: false,
+            exit_node_dns_resolvers: vec![],
+            peer_relay: false,
+            ssh_host_keys: vec![],
+            service_vips: Default::default(),
+            unsigned_peer_api_only: false,
+        }
+    }
+
     use ts_control::DnsConfig;
 
     /// Build a raw DNS query buffer for `labels` (A/IN).
@@ -771,46 +933,7 @@ mod tests {
 
         use crate::peer_tracker::PeerDb;
 
-        let mut node = {
-            use ts_control::{Node, NodeCapMap, StableNodeId, TailnetAddress};
-            Node {
-                id: 1,
-                stable_id: StableNodeId("n1".to_string()),
-                hostname: "host".to_string(),
-                user_id: 0,
-                tailnet: Some("user.ts.net".to_string()),
-                tags: vec![],
-                addresses: vec![
-                    "100.64.0.1/32".parse().unwrap(),
-                    "fd7a::1/128".parse().unwrap(),
-                ],
-                tailnet_address: TailnetAddress {
-                    ipv4: "100.64.0.1/32".parse().unwrap(),
-                    ipv6: "fd7a::1/128".parse().unwrap(),
-                },
-                node_key: [0u8; 32].into(),
-                node_key_expiry: None,
-                expired: false,
-                online: None,
-                last_seen: None,
-                key_signature: vec![],
-                machine_key: None,
-                disco_key: None,
-                accepted_routes: vec![],
-                underlay_addresses: vec![],
-                derp_region: None,
-                cap: Default::default(),
-                cap_map: NodeCapMap::new(),
-                peerapi_port: None,
-                peerapi_dns_proxy: false,
-                is_wireguard_only: false,
-                exit_node_dns_resolvers: vec![],
-                peer_relay: false,
-                ssh_host_keys: vec![],
-                service_vips: Default::default(),
-                unsigned_peer_api_only: false,
-            }
-        };
+        let mut node = peer_node("host", "100.64.0.1/32", "fd7a::1/128");
         node.cap_map
             .insert("dns-subdomain-resolve".to_string(), vec![]);
 
@@ -869,5 +992,192 @@ mod tests {
             }
             ServerDecision::Forward { .. } => panic!("garbage must not forward"),
         }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // The source gate (Go `isPeerAPIDNSAllowed`).
+    //
+    // Both directions are tested on purpose: a gate that never refuses and a gate that always
+    // refuses look identical from one side. Every refusal below is asserted with
+    // `forward_exit_egress = true` and against a query the server *would* have resolved, so what is
+    // being measured is the gate and not the egress opt-in.
+
+    /// A ruleset granting `src_pfx` TCP access to `dst_pfx` on `ports`, as control compiles one.
+    fn tcp_rule(
+        src_pfx: &str,
+        dst_pfx: &str,
+        ports: std::ops::RangeInclusive<u16>,
+    ) -> ts_packetfilter::Rule {
+        ts_packetfilter::Rule {
+            src: ts_packetfilter::SrcMatch {
+                pfxs: vec![src_pfx.parse().unwrap()],
+                caps: vec![],
+            },
+            protos: vec![ts_packetfilter::IpProto::TCP],
+            dst: vec![ts_packetfilter::DstMatch {
+                ports,
+                ips: vec![dst_pfx.parse().unwrap()],
+            }],
+        }
+    }
+
+    /// A live filter carrying `rules`, in the shape the packet-filter updater publishes.
+    fn filter_of(
+        rules: Vec<ts_packetfilter::Rule>,
+    ) -> Arc<dyn ts_packetfilter::Filter + Send + Sync> {
+        let mut f = ts_packetfilter::HashbrownFilter::new();
+        f.insert("acl".to_string(), rules);
+        Arc::new(f)
+    }
+
+    /// A view holding one peer at `100.64.0.1`/`fd7a::1` plus one upstream resolver, so a public
+    /// name is a genuine `Forward` and a refusal can only have come from the gate.
+    fn view_with_peer() -> DnsView {
+        let mut db = crate::peer_tracker::PeerDb::default();
+        db.upsert(&peer_node("host", "100.64.0.1/32", "fd7a::1/128"));
+        let mut v = view(&[]);
+        v.peers = Some(Arc::new(db));
+        v
+    }
+
+    /// What this server does with one `/dns-query` POST. Mirrors `handle_conn`'s sequence at the
+    /// seams the types allow — the netstack `TcpStream` cannot be constructed in a unit test (the
+    /// same limitation `crate::peerapi`'s tests record) — by calling the two production functions
+    /// `handle_conn` calls, in its order: gate first, resolve only if the gate allowed.
+    enum Served {
+        /// The gate refused: `403`, and `server_decide` was never reached.
+        Forbidden,
+        /// The gate allowed, and this is what the server decided about the name.
+        Dns(ServerDecision),
+    }
+
+    fn doh_request_path(
+        view: &DnsView,
+        filter: Option<&(dyn ts_packetfilter::Filter + Send + Sync)>,
+        src: std::net::IpAddr,
+        query: &[u8],
+        forward_exit_egress: bool,
+    ) -> Served {
+        if !dns_source_allowed(view, filter, src) {
+            return Served::Forbidden;
+        }
+        Served::Dns(server_decide(view, query, forward_exit_egress))
+    }
+
+    #[test]
+    fn probe_destination_is_off_tailnet_per_family() {
+        // Go: `netip.AddrFrom4([4]byte{})` for a v4 peer, `2000::` for a v6 one.
+        assert_eq!(
+            internet_probe_dst("100.64.0.1".parse().unwrap()),
+            "0.0.0.0".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(
+            internet_probe_dst("fd7a::1".parse().unwrap()),
+            "2000::".parse::<std::net::IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_peer_the_acl_grants_internet_is_answered() {
+        // Control grants this peer the internet through us on port 53 — Go's
+        // `CheckTCP(peer, 0.0.0.0, 53) == Accept`. The query is resolved as before.
+        let v = view_with_peer();
+        let filter = filter_of(vec![tcp_rule("100.64.0.1/32", "0.0.0.0/0", 53..=53)]);
+        let src: std::net::IpAddr = "100.64.0.1".parse().unwrap();
+
+        assert!(dns_source_allowed(&v, Some(&*filter), src));
+
+        let q = query_for(0x10, &["example", "com"]);
+        match doh_request_path(&v, Some(&*filter), src, &q, true) {
+            Served::Dns(ServerDecision::Forward { .. }) => {}
+            Served::Dns(ServerDecision::Reply(_)) => panic!("expected the forward it always got"),
+            Served::Forbidden => panic!("an ACL-granted peer must still get its answer"),
+        }
+    }
+
+    #[test]
+    fn a_peer_the_acl_denies_gets_403_and_no_resolution() {
+        // The common tailnet policy: this peer may reach every port of every tailnet node — which
+        // is how it reached the peerAPI port at all — but control grants it no internet access
+        // through us. Go refuses its DNS with `403`, and so do we.
+        let v = view_with_peer();
+        let filter = filter_of(vec![tcp_rule(
+            "100.64.0.1/32",
+            "100.64.0.0/10",
+            0..=u16::MAX,
+        )]);
+        let src: std::net::IpAddr = "100.64.0.1".parse().unwrap();
+
+        assert!(!dns_source_allowed(&v, Some(&*filter), src));
+
+        // Exit egress is ON, so the refusal below is the source gate's and not the egress opt-in's:
+        // ungated, this exact query forwards.
+        let q = query_for(0x11, &["example", "com"]);
+        assert!(
+            matches!(server_decide(&v, &q, true), ServerDecision::Forward { .. }),
+            "the name itself is one this node would have resolved"
+        );
+        assert!(matches!(
+            doh_request_path(&v, Some(&*filter), src, &q, true),
+            Served::Forbidden
+        ));
+
+        // And the authoritative half is refused too: the gate is about which peer asked, not which
+        // name it asked for, so this peer does not get MagicDNS answers for our tailnet either.
+        let tailnet_q = query_for(0x12, &["host", "user", "ts", "net"]);
+        assert!(matches!(
+            doh_request_path(&v, Some(&*filter), src, &tailnet_q, true),
+            Served::Forbidden
+        ));
+    }
+
+    #[test]
+    fn a_source_that_is_no_known_peer_is_refused() {
+        // Go's peerAPI resolves the connection's source to a peer before any handler runs and drops
+        // the connection when it cannot. An allow-everything ACL does not rescue an unknown source.
+        let v = view_with_peer();
+        let filter = filter_of(vec![tcp_rule("0.0.0.0/0", "0.0.0.0/0", 0..=u16::MAX)]);
+
+        assert!(!dns_source_allowed(
+            &v,
+            Some(&*filter),
+            "198.51.100.7".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn no_compiled_filter_yet_refuses() {
+        // Go: `f := b.filterAtomic.Load(); if f == nil { return false }`. Before the first netmap
+        // there is nothing to check the peer against, so it is a refusal — never an allow.
+        let v = view_with_peer();
+        assert!(!dns_source_allowed(&v, None, "100.64.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn an_ipv6_peer_is_checked_against_the_global_unicast_probe() {
+        // Same two directions for the v6 arm, where Go probes `2000::` instead of `0.0.0.0`: a rule
+        // covering global unicast admits, a tailnet-only rule does not.
+        let v = view_with_peer();
+        let src: std::net::IpAddr = "fd7a::1".parse().unwrap();
+
+        let internet = filter_of(vec![tcp_rule("fd7a::1/128", "2000::/3", 53..=53)]);
+        assert!(dns_source_allowed(&v, Some(&*internet), src));
+
+        let tailnet_only = filter_of(vec![tcp_rule("fd7a::1/128", "fd7a::/48", 0..=u16::MAX)]);
+        assert!(!dns_source_allowed(&v, Some(&*tailnet_only), src));
+    }
+
+    #[test]
+    fn a_rule_on_another_port_does_not_open_dns() {
+        // The gate asks about port 53 specifically (Go's `CheckTCP(..., 53)`): a peer granted the
+        // internet on 443 alone is not granted this node's resolver.
+        let v = view_with_peer();
+        let filter = filter_of(vec![tcp_rule("100.64.0.1/32", "0.0.0.0/0", 443..=443)]);
+
+        assert!(!dns_source_allowed(
+            &v,
+            Some(&*filter),
+            "100.64.0.1".parse().unwrap()
+        ));
     }
 }

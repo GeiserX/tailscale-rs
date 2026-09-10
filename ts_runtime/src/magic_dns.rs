@@ -1339,6 +1339,11 @@ pub struct MagicDnsActor {
     _joinset: JoinSet<()>,
     /// The latest view, shared with the answer loop.
     view_tx: watch::Sender<Arc<DnsView>>,
+    /// The latest control-derived packet filter, shared with the peerAPI server task for the DoH
+    /// source gate ([`crate::peerapi_doh::dns_source_allowed`]). Kept out of [`DnsView`] because it
+    /// is not DNS data and updates on its own cadence (a netmap can carry a new filter without a new
+    /// DNS config, and the other way round).
+    filter_tx: watch::Sender<Option<crate::packetfilter::PacketFilterState>>,
     /// The runtime [`Env`], retained so each view rebuild (the `StateUpdate` / `PeerState` handlers)
     /// can re-read the live [`Env::accept_dns`] cell. Unlike `enable_ipv6` (snapshotted once at
     /// spawn), `accept_dns` is runtime-settable via `Device::set_accept_dns`, so it must be read at
@@ -1393,6 +1398,11 @@ impl kameo::Actor for MagicDnsActor {
         env.subscribe::<Arc<PeerState>>(&slf).await?;
         env.subscribe::<crate::route_updater::ActiveExitNode>(&slf)
             .await?;
+        // The live packet filter, for the peerAPI DoH source gate (`peerapi_doh::dns_source_allowed`,
+        // Go `isPeerAPIDNSAllowed`). Subscribed here rather than threaded from `Runtime::new` because
+        // this actor already owns the peerAPI server task and the view it serves from.
+        env.subscribe::<crate::packetfilter::PacketFilterState>(&slf)
+            .await?;
 
         // Seed the view with the runtime's IPv6 gate (default off) and the current accept-dns value.
         // Subsequent control/peer updates clone-and-modify this view: `enable_ipv6` (set once here)
@@ -1404,6 +1414,11 @@ impl kameo::Actor for MagicDnsActor {
             accept_dns: env.accept_dns(),
             ..DnsView::default()
         }));
+
+        // The peerAPI DoH source gate reads the *current* filter when a query arrives; the bus has
+        // no replay, so the latest published filter rides a `watch` cell the server task holds a
+        // receiver on. `None` until control's first compiled filter — a refusal, not an allow.
+        let (filter_tx, filter_rx) = watch::channel(None);
 
         let mut joinset = JoinSet::new();
 
@@ -1427,6 +1442,7 @@ impl kameo::Actor for MagicDnsActor {
         if let Some(port) = env.peerapi_port {
             let channel = channel.clone();
             let view_rx = view_rx.clone();
+            let filter_rx = filter_rx.clone();
             let forward_exit_egress = env.forward_exit_egress;
             let taildrop = env.taildrop_store.clone();
             let funnel_ingress = env.funnel_ingress.clone();
@@ -1434,6 +1450,7 @@ impl kameo::Actor for MagicDnsActor {
                 channel,
                 port,
                 view_rx,
+                filter_rx,
                 forward_exit_egress,
                 taildrop,
                 funnel_ingress,
@@ -1443,6 +1460,7 @@ impl kameo::Actor for MagicDnsActor {
         Ok(Self {
             _joinset: joinset,
             view_tx,
+            filter_tx,
             env,
             channel,
         })
@@ -1609,6 +1627,20 @@ impl Message<crate::route_updater::ActiveExitNode> for MagicDnsActor {
             next.exit_doh = exit_doh;
             *view = Arc::new(next);
         });
+    }
+}
+
+impl Message<crate::packetfilter::PacketFilterState> for MagicDnsActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        filter: crate::packetfilter::PacketFilterState,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) {
+        // Last write wins; the peerAPI DoH source gate reads whatever is current when a peer's query
+        // lands, so a policy change reaches it on the next query with no per-connection bookkeeping.
+        self.filter_tx.send_replace(Some(filter));
     }
 }
 
