@@ -39,6 +39,9 @@ tokio = { workspace = true, optional = true, features = ["time", "sync"] }
 [dev-dependencies]
 # Prefixes for the source-attribution table an end-to-end inbound test has to populate.
 ipnet.workspace = true
+# Captures emitted tracing events so a test can assert which *level* a peer-driven message lands
+# on, not just that it happened.
+tracing-test.workspace = true
 
 [lints]
 workspace = true
