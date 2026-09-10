@@ -322,6 +322,7 @@ mod test {
                 dst: "5.6.7.8".parse().unwrap(),
                 port: 0,
                 ip_proto: IpProto::TCP,
+                l4: ts_packetfilter::L4Header::Unknown,
             },
             []
         ));
@@ -397,6 +398,7 @@ mod test {
                 dst: "1.1.1.1".parse().unwrap(),   // both
                 ip_proto: IpProto::UDP,            // both
                 port: 123,                         // second
+                l4: ts_packetfilter::L4Header::Unknown,
             },
             []
         ));
@@ -407,6 +409,7 @@ mod test {
                 dst: "1.1.1.1".parse().unwrap(), // both
                 ip_proto: IpProto::UDP,          // both
                 port: 80,                        // first
+                l4: ts_packetfilter::L4Header::Unknown,
             },
             ["mycap"] // second
         ));
@@ -504,6 +507,7 @@ mod test {
             dst: dst.parse().unwrap(),
             ip_proto: proto,
             port,
+            l4: ts_packetfilter::L4Header::Unknown,
         }
     }
 
@@ -739,6 +743,7 @@ mod test {
                     port: *dst.ports.start(),
                     src: src_pfx.addr(),
                     ip_proto: IpProto::TCP,
+                    l4: ts_packetfilter::L4Header::Unknown,
                 };
                 let cap = rule.src.caps.iter().map(|cap| cap.as_str()).take(1).collect::<Vec<_>>();
 

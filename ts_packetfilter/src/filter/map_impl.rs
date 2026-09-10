@@ -80,6 +80,7 @@ mod test {
         dst: DST,
         ip_proto: PROTO,
         port: PORT,
+        l4: crate::L4Header::Unknown,
     };
 
     fn assert_nomatch<'s>(filters: &dyn Filter, caps: impl IntoIterator<Item = &'s str> + Clone) {
