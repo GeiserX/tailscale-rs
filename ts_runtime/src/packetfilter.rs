@@ -27,6 +27,11 @@ pub struct PacketfilterUpdater {
     /// on the bus (no replay), but `Runtime::whois` needs the *current* grants on demand, so they
     /// ride a `watch` cell whose receiver `Runtime` holds — mirroring `active_exit_rx`/`state_rx`.
     cap_grants_tx: watch::Sender<CapGrants>,
+    /// Sender for the live compiled filter the peerAPI DoH source gate reads on demand
+    /// ([`LiveFilterRx`]). Written here, at the point of compilation, rather than by a bus
+    /// subscriber downstream: the bus is lossy (see [`LiveFilterRx`]), so this cell is what the
+    /// gate reads instead of a `PacketFilterState` subscription of its own.
+    live_filter_tx: LiveFilterTx,
 }
 
 #[derive(Clone)]
@@ -34,22 +39,51 @@ pub struct PacketFilterState(pub Arc<dyn ts_packetfilter::Filter + Send + Sync>)
 
 /// The live inbound packet filter, as an L7 peerAPI gate reads it on demand.
 ///
-/// The bus carries [`PacketFilterState`] with no replay, but the peerAPI DoH gate
-/// ([`peerapi_doh::dns_source_allowed`](crate::peerapi_doh::dns_source_allowed)) has to consult the
-/// *current* filter when a peer's query arrives, so it rides a `watch` cell alongside the shared
-/// `DnsView` — the same shape [`CapGrants`] uses for `Runtime::whois`.
+/// The peerAPI DoH gate ([`peerapi_doh::dns_source_allowed`](crate::peerapi_doh::dns_source_allowed))
+/// has to consult the *current* filter when a peer's query arrives, so it rides a `watch` cell
+/// alongside the shared `DnsView` — the same shape [`CapGrants`] uses for `Runtime::whois`.
+///
+/// **The cell is written by [`PacketfilterUpdater`] itself, never by a bus subscriber.** The bus
+/// loses messages in two ways that a fail-closed gate cannot absorb, because the loss is permanent
+/// until control happens to send another filter:
+///
+/// 1. It has no replay, so a filter published before a subscriber's `Register` reaches the bus
+///    actor is not delivered to it at all. Registration is not ordered against `Runtime::spawn`'s
+///    spawn order — an actor registers from its own `on_start`, on its own task.
+/// 2. It delivers **best-effort** (`kameo_actors::DeliveryStrategy::BestEffort`, the default the
+///    `Env` bus is spawned with): a publish `try_send`s and *skips* any recipient whose bounded
+///    mailbox is full. A subscriber that parks in a handler — [`MagicDnsActor`](crate::magic_dns)
+///    awaits a DNS forward for up to five seconds in its `Query` handler — silently misses the
+///    filter published while it was busy.
+///
+/// A `watch` written by the compiler of the filter has neither problem *on this hop*:
+/// last-write-wins, no mailbox, and a receiver created at any later time reads the current value.
+/// So nothing can be lost between the compiler of the filter and the gate, and the gate is
+/// insulated from its own start-up order.
+///
+/// The hop *into* [`PacketfilterUpdater`] is a different matter and is **unchanged**: control's
+/// `Arc<ts_control::StateUpdate>` reaches it over this same bus, with both failure modes above
+/// still live (the updater even parks in its own handler, awaiting `Env::publish`). A netmap lost
+/// there leaves this cell holding a stale value — or `None` — and the gate refusing. Closing that
+/// hop is deliberately out of scope here: it needs the updater to stop awaiting `Env::publish` on
+/// the hot path (or to be given a wider mailbox), which is a change to the control path rather
+/// than to this gate.
 ///
 /// `None` means no filter has been compiled yet (no netmap since start). That is a **deny** for the
 /// gate, not an "allow until control speaks": Go's `isPeerAPIDNSAllowed` returns false outright when
 /// `b.filterAtomic.Load()` is nil.
 pub(crate) type LiveFilterRx = watch::Receiver<Option<PacketFilterState>>;
 
+/// The writing half of [`LiveFilterRx`], held by [`PacketfilterUpdater`]. Created by
+/// `Runtime::spawn` before either end's actor spawns, so neither end depends on start-up order.
+pub(crate) type LiveFilterTx = watch::Sender<Option<PacketFilterState>>;
+
 impl kameo::Actor for PacketfilterUpdater {
-    type Args = (Env, watch::Sender<CapGrants>);
+    type Args = (Env, watch::Sender<CapGrants>, LiveFilterTx);
     type Error = Error;
 
     async fn on_start(
-        (env, cap_grants_tx): Self::Args,
+        (env, cap_grants_tx, live_filter_tx): Self::Args,
         slf: ActorRef<Self>,
     ) -> Result<Self, Self::Error> {
         env.subscribe::<Arc<ts_control::StateUpdate>>(&slf).await?;
@@ -59,6 +93,7 @@ impl kameo::Actor for PacketfilterUpdater {
             pf_state: Default::default(),
             self_addrs: Vec::new(),
             cap_grants_tx,
+            live_filter_tx,
         })
     }
 }
@@ -114,7 +149,15 @@ impl Message<Arc<ts_control::StateUpdate>> for PacketfilterUpdater {
 
         tracing::trace!(updated_packet_filter = ?self.pf_state.0);
 
-        if let Err(e) = self.env.publish(self.published_filter()).await {
+        let filter = self.published_filter();
+
+        // The L7 gate's copy first, and by assignment rather than by publication: the cell can
+        // neither drop it nor deliver it out of order, so the peerAPI DoH gate can never be left
+        // refusing peers against a filter older than the one the dataplane is enforcing. See
+        // [`LiveFilterRx`] for why the bus alone is not enough for this consumer.
+        self.live_filter_tx.send_replace(Some(filter.clone()));
+
+        if let Err(e) = self.env.publish(filter).await {
             tracing::error!(error = %e, "publishing packet filter state");
         }
     }

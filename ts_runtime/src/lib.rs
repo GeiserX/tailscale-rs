@@ -260,7 +260,15 @@ impl Runtime {
         // through a `watch` cell whose receiver the `Runtime` holds — the bus has no replay, so a
         // `watch` is how `Runtime::whois` reads the current grants on demand.
         let (cap_grants_tx, cap_grants_rx) = watch::channel(Default::default());
-        packetfilter::PacketfilterUpdater::spawn((env.clone(), cap_grants_tx));
+        // The live compiled filter for the peerAPI DoH source gate. Created here — before either
+        // actor spawns — so the updater (sole writer) and the MagicDNS responder (reader, which
+        // hands the receiver to its peerAPI server task) share one cell no matter which `on_start`
+        // runs first. The gate is fail-closed, so a filter that never reaches it means refusing
+        // peers control's ACL admits, and the bus is not a dependable way to carry it (no replay,
+        // and best-effort delivery drops it on a full mailbox — see `packetfilter::LiveFilterRx`,
+        // which also names the one hop this cell does *not* cover: control -> the updater).
+        let (live_filter_tx, live_filter_rx) = watch::channel(None);
+        packetfilter::PacketfilterUpdater::spawn((env.clone(), cap_grants_tx, live_filter_tx));
         src_filter::SourceFilterUpdater::spawn(env.clone());
         // TKA enforcement-authority cell (Go `tkaFilterNetmapLocked`). Created here — before both
         // actors spawn — so the control runner (sole writer, `Sender`) and the peer tracker (reader,
@@ -302,7 +310,8 @@ impl Runtime {
                 // that carries the embedder's explicit `Device::tcp_listen` sockets — so a
                 // fallback handler sees exactly the inbound flows no explicit listener matched.
                 let fallback_tcp = fallback_tcp::FallbackTcpManager::new(channel.clone());
-                let magic_dns = magic_dns::MagicDnsActor::spawn((env.clone(), channel));
+                let magic_dns =
+                    magic_dns::MagicDnsActor::spawn((env.clone(), channel, live_filter_rx));
 
                 (
                     Some(netstack.downgrade()),
