@@ -2,6 +2,18 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.52.0](https://github.com/GeiserX/tailscale-rs/compare/v0.51.1...v0.52.0) (2026-09-10)
+
+
+### Features
+
+* **dataplane:** say why a connection was refused, in both directions ([#421](https://github.com/GeiserX/tailscale-rs/issues/421)) ([cf0e27c](https://github.com/GeiserX/tailscale-rs/commit/cf0e27cc9b75b60d6a55259695e84e60d028a4d5))
+
+
+### Bug Fixes
+
+* **peerapi:** refuse DNS for peers the ACL gives no internet through us ([#423](https://github.com/GeiserX/tailscale-rs/issues/423)) ([fcf1279](https://github.com/GeiserX/tailscale-rs/commit/fcf1279168eaf1e401284e92d257a80f330a4544))
+
 ## [0.51.1](https://github.com/GeiserX/tailscale-rs/compare/v0.51.0...v0.51.1) (2026-09-10)
 
 
