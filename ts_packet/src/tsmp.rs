@@ -4,27 +4,38 @@
 //! **99** ("any private encryption scheme") *inside* the WireGuard tunnel, so a TSMP message is
 //! only ever seen after decryption and never touches the host network stack.
 //!
-//! This module carries both directions of the disco-key advertisement
-//! (Go `packet.TSMPDiscoKeyAdvertisement`, upstream capability version 144): a node announces its
+//! This module carries two of TSMP's messages, both in both directions.
+//!
+//! The **rejected-connection** message (Go `packet.TailscaleRejectedHeader`, TSMP type `'!'`) is
+//! how a node tells a dialer that it dropped the connection and why. A node that drops an inbound
+//! IPv4 TCP SYN on its ACL sends one back carrying the four-tuple and a reason; the dialer that
+//! receives one learns immediately that the connection is refused, instead of waiting out a TCP
+//! timeout with nothing to show for it. See [`TailscaleRejectedHeader::marshal`](crate::tsmp::TailscaleRejectedHeader::marshal) and
+//! [`TailscaleRejectedHeader::parse`](crate::tsmp::TailscaleRejectedHeader::parse).
+//!
+//! The **disco-key advertisement**
+//! (Go `packet.TSMPDiscoKeyAdvertisement`, upstream capability version 144) announces this node's
 //! current disco public key immediately after an eligible WireGuard session is established, which
 //! lets the far side learn (or re-learn) that key without waiting for a netmap update or restarting
 //! WireGuard. A real Go peer sends this to us **unprompted**, and from capability version 144 we
-//! send our own the same way — see [`DiscoKeyAdvertisement::parse`] and
-//! [`DiscoKeyAdvertisement::marshal`].
+//! send our own the same way — see
+//! [`DiscoKeyAdvertisement::parse`](crate::tsmp::DiscoKeyAdvertisement::parse) and
+//! [`DiscoKeyAdvertisement::marshal`](crate::tsmp::DiscoKeyAdvertisement::marshal).
 //!
 //! [`net/packet/tsmp.go`]: https://github.com/tailscale/tailscale/blob/main/net/packet/tsmp.go
 
 use alloc::vec::Vec;
-use core::{fmt, net::IpAddr};
+use core::{
+    fmt,
+    net::{IpAddr, SocketAddr},
+};
 
 /// The IP protocol number TSMP rides on (Go `ipproto.TSMP`). Not IANA-assigned: 99 is "any private
 /// encryption scheme", which Tailscale reuses for inter-node messages.
 pub const IP_PROTO_TSMP: u8 = 99;
 
-/// Type byte of a [`TailscaleRejectedHeader`]-style rejected-connection message
-/// (Go `packet.TSMPTypeRejectedConn`). Not parsed here.
-///
-/// [`TailscaleRejectedHeader`]: https://github.com/tailscale/tailscale/blob/main/net/packet/tsmp.go
+/// Type byte of a [`TailscaleRejectedHeader`] rejected-connection message
+/// (Go `packet.TSMPTypeRejectedConn`).
 pub const TSMP_TYPE_REJECTED_CONN: u8 = b'!';
 
 /// Type byte of a TSMP ping request (Go `packet.TSMPTypePing`). Not parsed here.
@@ -160,19 +171,216 @@ impl DiscoKeyAdvertisement {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarshalError {
     /// `src` and `dst` are in different address families, so neither an IPv4 nor an IPv6 header
-    /// can carry both. See [`DiscoKeyAdvertisement::marshal`].
+    /// can carry both. See [`DiscoKeyAdvertisement::marshal`] and
+    /// [`TailscaleRejectedHeader::marshal`].
     MixedAddressFamilies,
+    /// A [`TailscaleRejectedHeader`] carries no reason (Go's "TailscaleRejectedHeader has no
+    /// reason"). See [`TailscaleRejectedHeader::marshal`].
+    MissingRejectReason,
 }
 
 impl fmt::Display for MarshalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MixedAddressFamilies => f.write_str("wrong address family for src/dst IP"),
+            Self::MissingRejectReason => f.write_str("TailscaleRejectedHeader has no reason"),
         }
     }
 }
 
 impl core::error::Error for MarshalError {}
+
+/// Bit the `MaybeBroken` flag occupies in a rejected-connection message's flags byte
+/// (Go `packet.rejectFlagBitMaybeBroken`).
+const REJECT_FLAG_BIT_MAYBE_BROKEN: u8 = 0x1;
+
+/// Wire length of the rejected-connection body this node marshals: the type byte, the protocol
+/// byte, the reason byte, the two ports and the flags byte. Go `TailscaleRejectedHeader.Len` is
+/// this plus its IP header.
+pub const REJECTED_CONN_LEN: usize = 8;
+
+/// Shortest rejected-connection body Go will parse (`AsTailscaleRejectedHeader`'s `len(p) < 7`).
+/// The flags byte was appended to the message after it first shipped, so a sender that predates it
+/// emits only seven bytes and its `MaybeBroken` reads as `false` — which is why parsing must accept
+/// seven and marshalling must still emit eight.
+pub const REJECTED_CONN_MIN_LEN: usize = 7;
+
+/// Why a peer refused a connection, as carried in a [`TailscaleRejectedHeader`]
+/// (Go `packet.TailscaleRejectReason`).
+///
+/// A single opaque byte, not an enum, because that is what it is on the wire: Go's type is
+/// `type TailscaleRejectReason byte` and its `String` falls back to `0x%02x` for a value it does
+/// not know. Modelling it as a closed set here would silently rewrite a future upstream reason into
+/// "unknown" and lose the byte a log line should print.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RejectReason(pub u8);
+
+impl RejectReason {
+    /// The zero value: no rejection (Go `TailscaleRejectReasonNone`). A header carrying it cannot
+    /// be marshalled — see [`TailscaleRejectedHeader::marshal`].
+    pub const NONE: Self = Self(0);
+    /// The ACLs refused the connection (Go `RejectedDueToACLs`).
+    pub const ACLS: Self = Self(b'A');
+    /// The node has shields up (Go `RejectedDueToShieldsUp`).
+    pub const SHIELDS_UP: Self = Self(b'S');
+    /// A relay node's IP forwarding is disabled (Go `RejectedDueToIPForwarding`).
+    pub const IP_FORWARDING: Self = Self(b'F');
+    /// The target host's own firewall blocked the traffic (Go `RejectedDueToHostFirewall`).
+    pub const HOST_FIREWALL: Self = Self(b'W');
+
+    /// Whether this is the zero value (Go `TailscaleRejectReason.IsZero`).
+    pub const fn is_zero(self) -> bool {
+        self.0 == Self::NONE.0
+    }
+}
+
+impl fmt::Display for RejectReason {
+    /// Go `TailscaleRejectReason.String`, including its `0x%02x` fallback for a reason this client
+    /// does not know.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::ACLS => f.write_str("acl"),
+            Self::SHIELDS_UP => f.write_str("shields"),
+            Self::IP_FORWARDING => f.write_str("host-ip-forwarding-disabled"),
+            Self::HOST_FIREWALL => f.write_str("host-firewall"),
+            Self(other) => write!(f, "0x{other:02x}"),
+        }
+    }
+}
+
+/// A peer telling us it refused a connection, or us telling a peer the same (Go
+/// [`packet.TailscaleRejectedHeader`], TSMP type `'!'`).
+///
+/// On the wire, after the IP header, the body is [`REJECTED_CONN_LEN`] (8) bytes:
+///
+/// ```text
+/// '!' | proto | reason | src port (BE) | dst port (BE) | flags
+///  0     1        2          3..5             5..7         7
+/// ```
+///
+/// **The four-tuple is written from the *rejecter's* point of view and read back from the
+/// *dialer's*, and the two agree.** The rejecter fills `ip_src`/`ip_dst` with the *reversed* IP
+/// pair of the packet it dropped (its own address first) while leaving `src`/`dst` as the rejected
+/// connection's own direction — the dialer's address and port first. [`Self::parse`] rebuilds
+/// `src` from the receiving packet's IP *destination* and `dst` from its IP *source*, which is
+/// exactly the same pair again, so a marshalled header parses back field-for-field identical on the
+/// far side. That is Go's `AsTailscaleRejectedHeader` and it is what lets a dialer match the
+/// message against the flow it opened.
+///
+/// `proto` is the raw IP protocol number (Go's `ipproto.Proto`, a byte) rather than a typed
+/// protocol, so this crate stays dependency-free and `no_std`.
+///
+/// [`packet.TailscaleRejectedHeader`]: https://github.com/tailscale/tailscale/blob/main/net/packet/tsmp.go
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TailscaleRejectedHeader {
+    /// Source address of the enclosing IP header — the node doing the rejecting.
+    pub ip_src: IpAddr,
+    /// Destination address of the enclosing IP header — the node whose connection was rejected.
+    pub ip_dst: IpAddr,
+    /// The rejected connection's source (the dialer's address and port).
+    pub src: SocketAddr,
+    /// The rejected connection's destination (the rejecter's address and port).
+    pub dst: SocketAddr,
+    /// The rejected connection's IP protocol number (Go `ipproto.Proto`; in practice TCP).
+    pub proto: u8,
+    /// Why it was rejected.
+    pub reason: RejectReason,
+    /// Whether the rejection is *non-terminal* (Go `MaybeBroken`): the dialer should treat the flow
+    /// as problematic rather than dead, because the reason may be transient or a misconfiguration
+    /// on the far side.
+    pub maybe_broken: bool,
+}
+
+impl TailscaleRejectedHeader {
+    /// Marshal this header into a complete IP packet, ready to be handed to WireGuard as the
+    /// plaintext of a transport-data message.
+    ///
+    /// Go `packet.Generate(TailscaleRejectedHeader{…}, nil)`: an IPv4 or IPv6 base header (chosen by
+    /// the address family) carrying IP protocol [`IP_PROTO_TSMP`], then the
+    /// [`REJECTED_CONN_LEN`]-byte body. The IP header is the same `IP4Header.Marshal` /
+    /// `IP6Header.Marshal` a disco-key advertisement uses — TTL/hop-limit 64, IP ID 0, no options,
+    /// no fragmentation, and (v4 only) an RFC 1071 header checksum.
+    ///
+    /// # Errors
+    ///
+    /// - [`MarshalError::MissingRejectReason`] when `reason` is [`RejectReason::NONE`]. Go's own
+    ///   refusal: `if h.Reason == 0 { return errors.New("TailscaleRejectedHeader has no reason") }`.
+    ///   A reasonless reject tells the far side nothing it can act on or display.
+    /// - [`MarshalError::MixedAddressFamilies`] when `ip_src` and `ip_dst` are in different
+    ///   families. Go picks the header family from `IPSrc` alone and then discards the
+    ///   `errWrongFamily` its `IP4Header.Marshal` returns for a mismatched `Dst`, emitting a packet
+    ///   with an all-zero header; refusing is the fail-closed reading of the same check. Go's
+    ///   caller takes both addresses from one dropped packet, as this fork's does, so the families
+    ///   match by construction and the divergence is unobservable.
+    pub fn marshal(&self) -> Result<Vec<u8>, MarshalError> {
+        // Go: `if h.Reason == 0 { return errors.New("TailscaleRejectedHeader has no reason") }`.
+        if self.reason.is_zero() {
+            return Err(MarshalError::MissingRejectReason);
+        }
+
+        let mut body = [0u8; REJECTED_CONN_LEN];
+        body[0] = TSMP_TYPE_REJECTED_CONN;
+        body[1] = self.proto;
+        body[2] = self.reason.0;
+        body[3..5].copy_from_slice(&self.src.port().to_be_bytes());
+        body[5..7].copy_from_slice(&self.dst.port().to_be_bytes());
+        // Go builds the flags byte one bit at a time; `MaybeBroken` is the only bit defined.
+        body[7] = if self.maybe_broken {
+            REJECT_FLAG_BIT_MAYBE_BROKEN
+        } else {
+            0
+        };
+
+        match (self.ip_src, self.ip_dst) {
+            (IpAddr::V4(src), IpAddr::V4(dst)) => Ok(generate4(src.octets(), dst.octets(), &body)),
+            (IpAddr::V6(src), IpAddr::V6(dst)) => Ok(generate6(src.octets(), dst.octets(), &body)),
+            _ => Err(MarshalError::MixedAddressFamilies),
+        }
+    }
+
+    /// Parse a complete IP packet (IPv4 or IPv6, as handed up by WireGuard decryption) as a TSMP
+    /// rejected-connection message, or `None` if it is not one.
+    ///
+    /// Go `Parsed.AsTailscaleRejectedHeader` applied to a `Parsed` that `Parsed.Decode` filled in —
+    /// i.e. this folds Go's decode step (which is what rejects a truncated, fragmented or non-TSMP
+    /// packet before the type byte is ever looked at) into the same call, exactly as
+    /// [`DiscoKeyAdvertisement::parse`] does.
+    ///
+    /// Returns `None` — never a partially-filled value — for anything that is not a
+    /// rejected-connection message: a non-TSMP protocol, a truncated packet, a fragment, a body
+    /// shorter than [`REJECTED_CONN_MIN_LEN`], or a TSMP body carrying some other type byte.
+    ///
+    /// A [`RejectReason::NONE`] on the wire still parses: Go does not screen the reason here, and a
+    /// reason byte this client does not know is deliberately preserved rather than flattened, so a
+    /// log line can print it.
+    pub fn parse(ip_packet: &[u8]) -> Option<Self> {
+        let (ip_src, ip_dst, body) = tsmp_body(ip_packet)?;
+
+        // Go: `if len(p) < 7 || p[0] != byte(TSMPTypeRejectedConn) { return }`.
+        if body.len() < REJECTED_CONN_MIN_LEN || body[0] != TSMP_TYPE_REJECTED_CONN {
+            return None;
+        }
+
+        // Go reads the flags byte only `if len(p) > 7`, so a seven-byte body from a sender that
+        // predates the flags byte parses with `MaybeBroken` false rather than failing.
+        let maybe_broken = body
+            .get(7)
+            .is_some_and(|flags| flags & REJECT_FLAG_BIT_MAYBE_BROKEN != 0);
+
+        Some(Self {
+            ip_src,
+            ip_dst,
+            // Go: `Src: netip.AddrPortFrom(pp.Dst.Addr(), …)` / `Dst: …(pp.Src.Addr(), …)`. The IPs
+            // are swapped relative to the packet carrying them because the *connection* ran the
+            // other way round; see the type's own doc.
+            src: SocketAddr::new(ip_dst, u16::from_be_bytes([body[3], body[4]])),
+            dst: SocketAddr::new(ip_src, u16::from_be_bytes([body[5], body[6]])),
+            proto: body[1],
+            reason: RejectReason(body[2]),
+            maybe_broken,
+        })
+    }
+}
 
 /// Build a complete IPv4 packet carrying `payload` as IP protocol [`IP_PROTO_TSMP`]
 /// (Go `packet.Generate(IP4Header{IPProto: ipproto.TSMP, Src, Dst}, payload)`).
@@ -761,6 +969,301 @@ mod tests {
             DiscoKeyAdvertisement::parse(&pkt).map(|a| a.key),
             Some(KEY),
             "a longer body that still carries the type byte and key parses"
+        );
+    }
+
+    /// Go `TailscaleRejectedHeader.Marshal`'s body: the type byte, proto, reason, both ports and
+    /// the flags byte. Independent of the production `marshal`, so the parse tests below cannot
+    /// agree with a bug in it.
+    fn rejected_body(proto: u8, reason: u8, src_port: u16, dst_port: u16, flags: u8) -> Vec<u8> {
+        let mut body = alloc::vec![TSMP_TYPE_REJECTED_CONN, proto, reason];
+        body.extend_from_slice(&src_port.to_be_bytes());
+        body.extend_from_slice(&dst_port.to_be_bytes());
+        body.push(flags);
+        assert_eq!(
+            body.len(),
+            REJECTED_CONN_LEN,
+            "Go's TailscaleRejectedHeader.Len minus the IP header"
+        );
+        body
+    }
+
+    /// The reject a node sends when its ACL refuses an inbound SYN from `100.64.0.9:41234` to its
+    /// own `100.64.0.1:22` — the shape `ts_dataplane` builds.
+    fn acl_reject() -> TailscaleRejectedHeader {
+        TailscaleRejectedHeader {
+            ip_src: "100.64.0.1".parse().unwrap(),
+            ip_dst: "100.64.0.9".parse().unwrap(),
+            src: "100.64.0.9:41234".parse().unwrap(),
+            dst: "100.64.0.1:22".parse().unwrap(),
+            proto: 6,
+            reason: RejectReason::ACLS,
+            maybe_broken: false,
+        }
+    }
+
+    /// The **send** side, against pinned bytes: [`TailscaleRejectedHeader::marshal`] must emit
+    /// exactly what Go's `packet.Generate(TailscaleRejectedHeader{…}, nil)` emits.
+    ///
+    /// The IPv4 prefix `45 00 001c 0000 0000 40 63 <cksum>` is version 4 / IHL 5, DSCP+ECN 0, total
+    /// length 28 (20-byte header + 8-byte body), IP ID 0, no flags or fragment offset, TTL 64,
+    /// proto 99 and the RFC 1071 checksum. The body that follows is Go's `Marshal` field for
+    /// field: `'!'`, the proto byte, the reason byte, both ports big-endian, then the flags byte.
+    #[test]
+    fn marshals_the_reject_bytes_go_marshals() {
+        let packet = acl_reject()
+            .marshal()
+            .expect("a v4 reject with a reason marshals");
+
+        let mut want = unhex("4500001c000000004063");
+        // Checksum from the independent RFC 1071 implementation this module carries, taken over
+        // the same header with a zeroed checksum field.
+        let sum = ref_ip4_checksum(&unhex("4500001c00000000406300006440000164400009"));
+        want.extend_from_slice(&sum.to_be_bytes());
+        want.extend_from_slice(&[100, 64, 0, 1]);
+        want.extend_from_slice(&[100, 64, 0, 9]);
+        want.extend_from_slice(&rejected_body(6, b'A', 41234, 22, 0x00));
+
+        assert_eq!(packet, want, "marshalled reject must be Go's bytes");
+        assert_eq!(packet.len(), IP4_HEADER_LEN + REJECTED_CONN_LEN);
+        assert_eq!(packet[9], IP_PROTO_TSMP, "rides IP protocol 99");
+    }
+
+    /// The `MaybeBroken` bit is the flags byte's low bit, and it is the only bit set.
+    #[test]
+    fn marshals_the_maybe_broken_flag_bit() {
+        let packet = TailscaleRejectedHeader {
+            reason: RejectReason::IP_FORWARDING,
+            maybe_broken: true,
+            ..acl_reject()
+        }
+        .marshal()
+        .expect("marshals");
+
+        assert_eq!(
+            packet[IP4_HEADER_LEN + 7],
+            0x01,
+            "flags byte carries MaybeBroken"
+        );
+        assert_eq!(packet[IP4_HEADER_LEN + 2], b'F', "reason byte");
+    }
+
+    /// IPv6 marshals against Go's `IP6Header`: version 6, zero traffic class and flow label,
+    /// payload length 8, next header 99, hop limit 64 — `600000000008 63 40`.
+    #[test]
+    fn marshals_an_ipv6_reject() {
+        let packet = TailscaleRejectedHeader {
+            ip_src: "fd7a:115c:a1e0::1".parse().unwrap(),
+            ip_dst: "fd7a:115c:a1e0::9".parse().unwrap(),
+            src: "[fd7a:115c:a1e0::9]:41234".parse().unwrap(),
+            dst: "[fd7a:115c:a1e0::1]:22".parse().unwrap(),
+            ..acl_reject()
+        }
+        .marshal()
+        .expect("marshals");
+
+        assert_eq!(&packet[..8], &unhex("6000000000086340")[..]);
+        assert_eq!(packet.len(), IP6_HEADER_LEN + REJECTED_CONN_LEN);
+    }
+
+    /// Go's own usage refusals, both of them. A header with no reason is refused
+    /// (`"TailscaleRejectedHeader has no reason"`), and so is one whose IP addresses are in
+    /// different families — neither header can carry both.
+    #[test]
+    fn refuses_to_marshal_a_reasonless_or_mixed_family_reject() {
+        assert_eq!(
+            TailscaleRejectedHeader {
+                reason: RejectReason::NONE,
+                ..acl_reject()
+            }
+            .marshal(),
+            Err(MarshalError::MissingRejectReason),
+        );
+
+        assert_eq!(
+            TailscaleRejectedHeader {
+                ip_dst: "fd7a:115c:a1e0::9".parse().unwrap(),
+                ..acl_reject()
+            }
+            .marshal(),
+            Err(MarshalError::MixedAddressFamilies),
+        );
+    }
+
+    /// The **receive** side against the **send** side, both production functions: what the rejecter
+    /// marshals is what the dialer parses, field for field. This is the property the whole message
+    /// rests on — the rejecter writes the tuple from its own side of the wire and the dialer must
+    /// read back the flow *it* opened.
+    #[test]
+    fn a_marshalled_reject_parses_back_identically() {
+        let sent = acl_reject();
+        let wire = sent.marshal().expect("marshals");
+
+        let got = TailscaleRejectedHeader::parse(&wire).expect("parses");
+
+        assert_eq!(got, sent);
+        // Spelled out, because this is the part a reader has to trust: the dialer's own address
+        // and ephemeral port come back as `src`, and the peer it dialled as `dst`.
+        assert_eq!(got.src, "100.64.0.9:41234".parse().unwrap());
+        assert_eq!(got.dst, "100.64.0.1:22".parse().unwrap());
+        assert_eq!(got.reason, RejectReason::ACLS);
+        assert!(!got.maybe_broken);
+    }
+
+    /// A seven-byte body — a sender that predates the flags byte — parses, with `MaybeBroken`
+    /// false. Go reads the flags byte only `if len(p) > 7`.
+    #[test]
+    fn parses_a_seven_byte_reject_without_a_flags_byte() {
+        let mut body = rejected_body(6, b'S', 41234, 22, 0x00);
+        body.truncate(REJECTED_CONN_MIN_LEN);
+
+        let pkt = ref_generate4(IP_PROTO_TSMP, [100, 64, 0, 1], [100, 64, 0, 9], &body);
+        let got = TailscaleRejectedHeader::parse(&pkt).expect("a 7-byte reject parses");
+
+        assert_eq!(got.reason, RejectReason::SHIELDS_UP);
+        assert!(!got.maybe_broken, "no flags byte means not maybe-broken");
+
+        // Six bytes is below Go's `len(p) < 7` floor.
+        body.truncate(REJECTED_CONN_MIN_LEN - 1);
+        let short = ref_generate4(IP_PROTO_TSMP, [100, 64, 0, 1], [100, 64, 0, 9], &body);
+        assert!(
+            TailscaleRejectedHeader::parse(&short).is_none(),
+            "a body shorter than 7 bytes is not a reject"
+        );
+    }
+
+    /// The flags byte's other seven bits are reserved: an unknown bit must not be read as
+    /// `MaybeBroken`, and must not stop the message parsing.
+    #[test]
+    fn parses_reserved_flag_bits_without_setting_maybe_broken() {
+        let pkt = ref_generate4(
+            IP_PROTO_TSMP,
+            [100, 64, 0, 1],
+            [100, 64, 0, 9],
+            &rejected_body(6, b'A', 41234, 22, 0xfe),
+        );
+        let got = TailscaleRejectedHeader::parse(&pkt).expect("parses");
+        assert!(!got.maybe_broken);
+
+        let pkt = ref_generate4(
+            IP_PROTO_TSMP,
+            [100, 64, 0, 1],
+            [100, 64, 0, 9],
+            &rejected_body(6, b'A', 41234, 22, 0xff),
+        );
+        assert!(
+            TailscaleRejectedHeader::parse(&pkt)
+                .expect("parses")
+                .maybe_broken,
+            "bit 0 set alongside the reserved bits is still MaybeBroken"
+        );
+    }
+
+    /// The two message types must not be confused for one another, in either direction: a
+    /// disco-key advertisement is not a reject and a reject is not an advertisement, even though
+    /// both are TSMP on the same protocol number.
+    #[test]
+    fn the_two_tsmp_message_types_do_not_parse_as_each_other() {
+        let reject = acl_reject().marshal().expect("marshals");
+        assert!(
+            DiscoKeyAdvertisement::parse(&reject).is_none(),
+            "a reject is not a disco-key advertisement"
+        );
+
+        let advert = DiscoKeyAdvertisement {
+            src: "100.64.0.1".parse().unwrap(),
+            dst: "100.64.0.9".parse().unwrap(),
+            key: KEY,
+        }
+        .marshal()
+        .expect("marshals");
+        assert!(
+            TailscaleRejectedHeader::parse(&advert).is_none(),
+            "a disco-key advertisement is not a reject"
+        );
+    }
+
+    /// Everything `tsmp_body` refuses before a type byte is looked at refuses a reject too: a
+    /// non-TSMP protocol, a truncated packet and a fragment. Same decode gate as the
+    /// advertisement, asserted on this message so a future decode change cannot loosen one half
+    /// without the other going red.
+    #[test]
+    fn a_non_tsmp_truncated_or_fragmented_packet_is_not_a_reject() {
+        let body = rejected_body(6, b'A', 41234, 22, 0x00);
+        let src = [100, 64, 0, 1];
+        let dst = [100, 64, 0, 9];
+
+        let base = ref_generate4(IP_PROTO_TSMP, src, dst, &body);
+        assert!(
+            TailscaleRejectedHeader::parse(&base).is_some(),
+            "control: the unfragmented TSMP packet parses"
+        );
+
+        // Protocol 6 (TCP), not 99.
+        let tcp = ref_generate4(6, src, dst, &body);
+        assert!(
+            TailscaleRejectedHeader::parse(&tcp).is_none(),
+            "a non-TSMP protocol is not a reject"
+        );
+
+        // Cut off before the declared IP total length.
+        let mut truncated = base.clone();
+        truncated.pop();
+        assert!(
+            TailscaleRejectedHeader::parse(&truncated).is_none(),
+            "a packet cut off before its declared IP length is not a reject"
+        );
+
+        // A first fragment with More-Fragments set, and a later fragment.
+        let mut more_frags = base.clone();
+        more_frags[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+        assert!(
+            TailscaleRejectedHeader::parse(&more_frags).is_none(),
+            "a fragmented reject must not parse"
+        );
+
+        let mut later = base.clone();
+        later[6..8].copy_from_slice(&0x000au16.to_be_bytes());
+        assert!(
+            TailscaleRejectedHeader::parse(&later).is_none(),
+            "a later TSMP fragment must not parse"
+        );
+    }
+
+    /// Go `TailscaleRejectReason.String`, including the `0x%02x` fallback that keeps an unknown
+    /// reason byte printable rather than flattening it.
+    #[test]
+    fn reject_reasons_render_as_go_renders_them() {
+        use alloc::string::ToString;
+
+        assert_eq!(RejectReason::ACLS.to_string(), "acl");
+        assert_eq!(RejectReason::SHIELDS_UP.to_string(), "shields");
+        assert_eq!(
+            RejectReason::IP_FORWARDING.to_string(),
+            "host-ip-forwarding-disabled"
+        );
+        assert_eq!(RejectReason::HOST_FIREWALL.to_string(), "host-firewall");
+        assert_eq!(RejectReason(0x7a).to_string(), "0x7a");
+        assert_eq!(RejectReason::NONE.to_string(), "0x00");
+        assert!(RejectReason::NONE.is_zero());
+        assert!(!RejectReason::ACLS.is_zero());
+    }
+
+    /// An unknown reason byte survives the round trip rather than being rewritten, which is what
+    /// lets a log line print a reason this client's build does not know about yet.
+    #[test]
+    fn an_unknown_reason_byte_round_trips() {
+        let sent = TailscaleRejectedHeader {
+            reason: RejectReason(b'Z'),
+            ..acl_reject()
+        };
+        let wire = sent.marshal().expect("marshals");
+        assert_eq!(wire[IP4_HEADER_LEN + 2], b'Z');
+        assert_eq!(
+            TailscaleRejectedHeader::parse(&wire)
+                .expect("parses")
+                .reason,
+            RejectReason(b'Z'),
         );
     }
 }

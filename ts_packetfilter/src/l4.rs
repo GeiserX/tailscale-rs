@@ -49,6 +49,27 @@ pub enum L4Header {
     },
 }
 
+impl L4Header {
+    /// Whether a TCP header was decoded **and** its SYN bit is set — Go's
+    /// `q.TCPFlags & packet.TCPSyn != 0`.
+    ///
+    /// Deliberately *not* the negation of
+    /// [`PacketInfo::is_tcp_non_syn`](crate::PacketInfo::is_tcp_non_syn), and not the same test:
+    /// that carve-out uses Go's `Parsed.IsTCPSyn`, which demands SYN set *and* ACK clear, whereas
+    /// the guard on Go's TSMP rejected-connection reply masks the SYN bit alone. Keeping them
+    /// distinct is what makes a SYN-ACK an admitted "non-SYN" reply while still being a packet Go
+    /// would answer with a reject were it dropped.
+    ///
+    /// [`Unknown`](Self::Unknown) answers `false`: a packet whose L4 header was never read is not
+    /// known to be a SYN, so it produces no reply — which is also where Go ends up, since a header
+    /// it could not decode is demoted to `ipproto.Unknown` with zero `TCPFlags`.
+    ///
+    /// The caller must still check the protocol number itself; this reads only the flags byte.
+    pub const fn tcp_syn_flag_set(self) -> bool {
+        matches!(self, Self::Tcp { flags } if flags & TCP_SYN != 0)
+    }
+}
+
 /// Go `packet.TCPSyn`.
 pub(crate) const TCP_SYN: u8 = 0x02;
 /// Go `packet.TCPAck`.

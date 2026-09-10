@@ -114,6 +114,13 @@ impl kameo::Actor for DataplaneActor {
 
         let persistent_keepalive_interval = env.persistent_keepalive_interval;
 
+        // Go `tstun.Wrapper.PeerAPIPort`. The dataplane reads it for one thing: an inbound SYN to
+        // the peerAPI port that the ACL drops must not be answered with a TSMP rejected-connection
+        // message, because upstream's peerAPI carve-out has already admitted it by that point. It
+        // is fixed for the life of the node (`Config::peerapi_port`), so it is set once here rather
+        // than refreshed from the netmap.
+        dataplane.inner().await.peerapi_port = env.peerapi_port;
+
         // Peers advertise their disco key over TSMP immediately after an eligible WireGuard
         // session is established, so the sink must be installed before the dataplane starts
         // running or the first advertisement is lost.
