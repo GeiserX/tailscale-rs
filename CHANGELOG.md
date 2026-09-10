@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.52.1](https://github.com/GeiserX/tailscale-rs/compare/v0.52.0...v0.52.1) (2026-09-10)
+
+
+### Bug Fixes
+
+* **peerapi:** stop a dropped filter leaving the DoH gate refusing peers ([#425](https://github.com/GeiserX/tailscale-rs/issues/425)) ([302e279](https://github.com/GeiserX/tailscale-rs/commit/302e279e5d59b0c953cf4d57bd2f2faef3c58a9f))
+
 ## [0.52.0](https://github.com/GeiserX/tailscale-rs/compare/v0.51.1...v0.52.0) (2026-09-10)
 
 
