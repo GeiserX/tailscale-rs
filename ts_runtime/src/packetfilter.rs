@@ -32,6 +32,18 @@ pub struct PacketfilterUpdater {
 #[derive(Clone)]
 pub struct PacketFilterState(pub Arc<dyn ts_packetfilter::Filter + Send + Sync>);
 
+/// The live inbound packet filter, as an L7 peerAPI gate reads it on demand.
+///
+/// The bus carries [`PacketFilterState`] with no replay, but the peerAPI DoH gate
+/// ([`peerapi_doh::dns_source_allowed`](crate::peerapi_doh::dns_source_allowed)) has to consult the
+/// *current* filter when a peer's query arrives, so it rides a `watch` cell alongside the shared
+/// `DnsView` — the same shape [`CapGrants`] uses for `Runtime::whois`.
+///
+/// `None` means no filter has been compiled yet (no netmap since start). That is a **deny** for the
+/// gate, not an "allow until control speaks": Go's `isPeerAPIDNSAllowed` returns false outright when
+/// `b.filterAtomic.Load()` is nil.
+pub(crate) type LiveFilterRx = watch::Receiver<Option<PacketFilterState>>;
+
 impl kameo::Actor for PacketfilterUpdater {
     type Args = (Env, watch::Sender<CapGrants>);
     type Error = Error;
