@@ -13,6 +13,11 @@
 //! `for p in …` re-derivation loop has to be documented under *Package mapping*, in the table or
 //! in the list of partials below it.
 //!
+//! A fourth is typographic, and it bites both a reader and this check: the ledger cites pull
+//! requests as `#412`, and a paragraph that wraps so one of those lands at the start of a line
+//! reads as a malformed heading. markdownlint reports it as MD018, and the anchor scan below
+//! used to index it as a heading a `§B, *…*` pointer could legitimately name.
+//!
 //! [`PORTING.md`]: https://github.com/GeiserX/tailscale-rs/blob/main/PORTING.md
 
 use std::collections::BTreeSet;
@@ -73,6 +78,17 @@ fn inconsistencies(text: &str) -> Vec<String> {
         }
     }
 
+    for (number, line) in prose_lines(text) {
+        if !unclosed_hash_run(line) {
+            continue;
+        }
+        problems.push(format!(
+            "line {number} opens with `#` and no space closes it, so it reads as a malformed \
+             heading (markdownlint MD018): \"{}\"",
+            excerpt(line)
+        ));
+    }
+
     let documented = documented_packages(text);
     for pkg in &swept {
         if !documented.contains(pkg) {
@@ -106,30 +122,12 @@ fn section_refs(text: &str) -> Vec<String> {
 /// opens a bullet in the gap list.
 fn anchors(text: &str) -> BTreeSet<String> {
     let mut anchors = BTreeSet::new();
-    let mut fence: Option<(char, usize)> = None;
 
-    for line in text.lines() {
-        // The re-derivation block is shell, where a `#` opens a comment rather than a heading.
-        if let Some((marker, length)) = fence_marker(line) {
-            match fence {
-                None => fence = Some((marker, length)),
-                // A longer fence quotes shorter ones whole, so only a run of the same character
-                // that is at least as long as the opening one closes the block.
-                Some((open_marker, open_length))
-                    if marker == open_marker && length >= open_length =>
-                {
-                    fence = None;
-                }
-                Some(_) => {}
-            }
-            continue;
-        }
-        if fence.is_some() {
-            continue;
-        }
-
-        if let Some(heading) = line.strip_prefix('#') {
-            anchors.insert(heading.trim_start_matches('#').trim().to_owned());
+    for (_, line) in prose_lines(text) {
+        // A `#` that no space closes is not a heading — it is a wrapped `#412` reference — so
+        // nothing may point at it.
+        if let Some(heading) = atx_heading(line) {
+            anchors.insert(heading.to_owned());
             continue;
         }
 
@@ -143,6 +141,71 @@ fn anchors(text: &str) -> BTreeSet<String> {
     }
 
     anchors
+}
+
+/// Every line of `text` that is prose, as a `(line number, line)` pair numbered from 1.
+///
+/// Fenced blocks are not prose: the re-derivation block is shell, where a `#` opens a comment
+/// rather than a heading.
+fn prose_lines(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    let mut fence: Option<(char, usize)> = None;
+
+    text.lines().enumerate().filter_map(move |(index, line)| {
+        if let Some((marker, length)) = fence_marker(line) {
+            match fence {
+                None => fence = Some((marker, length)),
+                // A longer fence quotes shorter ones whole, so only a run of the same character
+                // that is at least as long as the opening one closes the block.
+                Some((open_marker, open_length))
+                    if marker == open_marker && length >= open_length =>
+                {
+                    fence = None;
+                }
+                Some(_) => {}
+            }
+            return None;
+        }
+
+        fence.is_none().then_some((index + 1, line))
+    })
+}
+
+/// The text of `line` if it is an ATX heading, with its hashes and surrounding space removed.
+///
+/// A heading's hash run is closed by a space or by the end of the line, and is indented by at
+/// most three columns — four opens a code block, where the hashes are content.
+fn atx_heading(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    if line.len() - trimmed.len() > 3 {
+        return None;
+    }
+
+    let rest = trimmed.trim_start_matches('#');
+    if rest.len() == trimmed.len() {
+        return None;
+    }
+
+    (rest.is_empty() || rest.starts_with(' ')).then(|| rest.trim())
+}
+
+/// Whether `line` opens with a hash run that no space closes, which markdownlint reports as
+/// MD018.
+///
+/// Column zero only, which is where MD018 looks: an *indented* `#412` is a continuation line
+/// inside a list item, and renders — and lints — as the prose it is.
+fn unclosed_hash_run(line: &str) -> bool {
+    line.starts_with('#') && atx_heading(line).is_none()
+}
+
+/// As much of `line` as names it in a report without quoting a whole wrapped paragraph back.
+fn excerpt(line: &str) -> String {
+    const WIDTH: usize = 32;
+
+    let line = line.trim();
+    match line.char_indices().nth(WIDTH) {
+        Some((end, _)) => format!("{}…", &line[..end]),
+        None => line.to_owned(),
+    }
 }
 
 /// The fence delimiter a line runs, as the character it is made of and how long the run is.
@@ -418,7 +481,51 @@ done
         );
     }
 
-    /// The real ledger has to satisfy all three invariants.
+    /// A paragraph that wraps a `#412` reference onto the start of a line reads as a malformed
+    /// heading, which is the shape markdownlint reports as MD018.
+    #[test]
+    fn rejects_a_reference_that_wraps_to_the_start_of_a_line() {
+        let text = ledger(
+            "New at this revision",
+            "Four rows closed on tree movement alone (#404, #406,\n#412), six at the previous one.",
+        );
+
+        let problems = inconsistencies(&text);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("MD018"), "{problems:?}");
+    }
+
+    /// A wrapped reference is prose, so a `§B, *…*` pointer may not land on it either.
+    #[test]
+    fn a_wrapped_reference_is_not_an_anchor() {
+        let anchors = anchors("#412), six at the previous one\n");
+
+        assert!(anchors.is_empty(), "{anchors:?}");
+    }
+
+    /// A reference indented as a continuation line inside a list item renders as prose and
+    /// lints clean, so it is not a finding.
+    #[test]
+    fn ignores_an_indented_reference() {
+        let text = ledger(
+            "New at this revision",
+            "- **A row**\n  (`ipn/ipnlocal/node_backend.go`) — **already covered**:\n  #412 landed \
+             it after the previous revision was written.",
+        );
+
+        assert_eq!(inconsistencies(&text), Vec::<String>::new());
+    }
+
+    /// Inside the re-derivation block a `#` is shell, so a shebang is not a malformed heading.
+    #[test]
+    fn ignores_an_unclosed_hash_run_inside_a_fence() {
+        let text = ledger("New at this revision", "Nothing here.")
+            .replace("```sh\n", "```sh\n#!/usr/bin/env bash\n");
+
+        assert_eq!(inconsistencies(&text), Vec::<String>::new());
+    }
+
+    /// The real ledger has to satisfy every invariant.
     #[test]
     fn the_real_ledger_is_consistent() {
         let text =
