@@ -88,6 +88,11 @@ const IP6_FRAG_HEADER: u8 = 44;
 /// the base header's Next Header byte straight into `q.IPProto`, and 0 *is* "unknown".
 const IPPROTO_UNKNOWN: IpProto = IpProto::new(0);
 
+/// TCP's IP protocol number as a single byte, for the one place it is written onto the wire rather
+/// than matched against: the `Proto` field of a TSMP rejected-connection message, which is a byte
+/// (Go `ipproto.Proto`) where this fork's [`IpProto`] is `i64`-wide.
+const IPPROTO_TCP_BYTE: u8 = 6;
+
 /// Go's internal `ipproto.Fragment` sentinel (0xff), which `decode6Fragment` assigns to a later
 /// fragment. Seeing it as a real Next Header on the wire is suspicious, so Go's `decode6` switch
 /// maps it back to [`IPPROTO_UNKNOWN`] (`case ipproto.Fragment: q.IPProto = unknown`) — whether it
@@ -369,7 +374,8 @@ enum Fragment {
 ///    which is literally protocol 0.
 /// 4. TSMP (proto 99) is always admitted, bypassing the ACL — Go `case ipproto.TSMP: return Accept`.
 ///    TSMP carries in-band control messages between nodes, so it must reach the local stack
-///    regardless of the ACL rules.
+///    regardless of the ACL rules. The two TSMP messages this fork understands never get here:
+///    [`filter_inbound_from_peer`] consumes them ahead of this call, as Go does.
 /// 5. **A UDP or SCTP reply to a flow this node started** is admitted from `flows` — Go's
 ///    `case ipproto.UDP, ipproto.SCTP` arm, which consults the `flowtrack` LRU and returns
 ///    `Accept, "cached"` *before* the rule match. See [`flowtrack`].
@@ -579,6 +585,125 @@ fn inbound_filter_verdict(
     verdict
 }
 
+/// The knobs [`filter_inbound_from_peer`] reads that come from this node's configuration rather
+/// than from the packet in front of it — everything Go's `tstun.Wrapper` holds on itself for the
+/// TSMP rejected-connection reply.
+#[derive(Debug, Clone, Copy, Default)]
+struct RejectConfig {
+    /// Go `tstun.Wrapper.disableTSMPRejected`: when set, this node tells a peer nothing about an
+    /// ACL drop, exactly as before this existed.
+    disabled: bool,
+    /// Go `tstun.Wrapper.PeerAPIPort`: the TCP port this node's peerAPI listens on, if it runs one.
+    /// A SYN to it never produces a reject — see [`tsmp_reject_for_drop`].
+    peerapi_port: Option<u16>,
+}
+
+/// Everything a filtered inbound batch produces besides the packets it keeps.
+///
+/// Grouped into one out-parameter because all three are appended to across a whole
+/// [`DataPlane::process_inbound_from`] call, never per packet, and because every one of them is a
+/// TSMP message either consumed or synthesized by the filter step.
+#[derive(Debug, Default)]
+struct InboundHarvest {
+    /// Disco keys peers advertised (Go `packet.TSMPDiscoKeyAdvertisement`). See
+    /// [`InboundResult::learned_disco_keys`].
+    learned_disco_keys: Vec<(PeerId, ts_packet::tsmp::DiscoKeyAdvertisement)>,
+    /// Rejected-connection messages peers sent us. See [`InboundResult::rejected_flows`].
+    rejected_flows: Vec<(PeerId, ts_packet::tsmp::TailscaleRejectedHeader)>,
+    /// Rejected-connection messages *this* node is sending back, already marshalled into complete
+    /// IP packets, each addressed to the peer whose packet was dropped. The caller encrypts and
+    /// queues them (Go `tstun.Wrapper.InjectOutbound`).
+    rejects_to_send: Vec<(PeerId, PacketMut)>,
+}
+
+/// The TSMP rejected-connection message to send back for an inbound packet the filter just
+/// dropped, marshalled into a complete IP packet — or `None` when this drop must stay silent.
+///
+/// Go `tstun.Wrapper.filterPacketInboundFromWireGuard`, the block that runs on `outcome !=
+/// filter.Accept`:
+///
+/// ```text
+/// // Tell them, via TSMP, we're dropping them due to the ACL.
+/// // Their host networking stack can translate this into ICMP
+/// // or whatnot as required. But notably, their GUI or tailscale CLI
+/// // can show them a rejection history with reasons.
+/// if p.IPVersion == 4 && p.IPProto == ipproto.TCP && p.TCPFlags&packet.TCPSyn != 0 && !t.disableTSMPRejected {
+/// ```
+///
+/// Every clause of that guard is a refusal that has to come with the message, because each one is a
+/// packet upstream stays **silent** about:
+///
+/// 1. **`disableTSMPRejected`** ([`RejectConfig::disabled`]) — the node-wide off switch.
+/// 2. **IPv4 only.** An IPv6 packet dropped by the ACL produces nothing. Upstream's guard is
+///    `p.IPVersion == 4` and the message itself is family-agnostic, so this is a deliberate
+///    upstream scoping and not a limitation of the encoding.
+/// 3. **TCP only, and only a segment with the SYN bit set.** A dropped UDP datagram, a dropped
+///    non-SYN segment and a dropped ICMP packet are all silent: the message names a *connection*
+///    being refused, and only a SYN is a connection being opened. See
+///    [`ts_packetfilter::L4Header::tcp_syn_flag_set`] for why this is not `is_tcp_non_syn`'s
+///    negation.
+/// 4. **Never for the peerAPI port.** Go's carve-out immediately above — "Let peerapi through the
+///    filter; its ACLs are handled at L7, not at the packet level" — flips an ACL-refused peerAPI
+///    SYN back to `Accept` *before* this block runs, so upstream never emits a reject for one. This
+///    fork has no such carve-out (its peerAPI is reachable only through the ordinary rules), so the
+///    same outcome is reached by suppressing the message here rather than by admitting the packet:
+///    the verdict on the packet is untouched, and, as upstream, the peer is told nothing.
+///
+/// The reason is [`RejectReason::SHIELDS_UP`] when the live filter has shields up (Go
+/// `if t.filter.ShieldsUp() { rj.Reason = packet.RejectedDueToShieldsUp }`) and
+/// [`RejectReason::ACLS`] otherwise. `maybe_broken` stays false: both reasons are terminal
+/// verdicts about this node's own policy, and Go sets neither of the non-terminal reasons here.
+///
+/// [`RejectReason::SHIELDS_UP`]: ts_packet::tsmp::RejectReason::SHIELDS_UP
+/// [`RejectReason::ACLS`]: ts_packet::tsmp::RejectReason::ACLS
+fn tsmp_reject_for_drop(
+    proto: IpProto,
+    src: std::net::SocketAddr,
+    dst: std::net::SocketAddr,
+    l4: ts_packetfilter::L4Header,
+    shields_up: bool,
+    cfg: RejectConfig,
+) -> Option<Vec<u8>> {
+    if cfg.disabled {
+        return None;
+    }
+    // Go `p.IPVersion == 4`. `src` and `dst` come from one IP header, so testing either is testing
+    // the header; both are spelled out because the marshal below refuses a mixed pair anyway.
+    if !src.is_ipv4() || !dst.is_ipv4() {
+        return None;
+    }
+    if proto != IpProto::TCP || !l4.tcp_syn_flag_set() {
+        return None;
+    }
+    if cfg.peerapi_port == Some(dst.port()) {
+        tracing::trace!(?dst, "not rejecting a peerAPI SYN (Go's peerapi carve-out)");
+        return None;
+    }
+
+    let reason = if shields_up {
+        ts_packet::tsmp::RejectReason::SHIELDS_UP
+    } else {
+        ts_packet::tsmp::RejectReason::ACLS
+    };
+
+    // Go: `IPSrc: p.Dst.Addr(), IPDst: p.Src.Addr(), Src: p.Src, Dst: p.Dst`. The IP pair is
+    // reversed — the reject travels back the way the packet came — while the four-tuple keeps the
+    // *rejected connection's* own direction, so the dialer can match it against the flow it opened.
+    ts_packet::tsmp::TailscaleRejectedHeader {
+        ip_src: dst.ip(),
+        ip_dst: src.ip(),
+        src,
+        dst,
+        // Go `Proto: p.IPProto`, which the guard above has already pinned to TCP.
+        proto: IPPROTO_TCP_BYTE,
+        reason,
+        maybe_broken: false,
+    }
+    .marshal()
+    .inspect_err(|e| tracing::debug!(?dst, error = %e, "not sending a TSMP reject"))
+    .ok()
+}
+
 /// Apply the inbound packet filter to one peer's already-source-attributed batch of decrypted
 /// packets, in place, and harvest any TSMP disco-key advertisements it carried.
 ///
@@ -589,13 +714,20 @@ fn inbound_filter_verdict(
 ///    disco-key advertisement (Go `packet.TSMPDiscoKeyAdvertisement`, upstream capability version
 ///    144): a peer announces its disco public key right after an eligible WireGuard session comes
 ///    up, so the receiver learns it without waiting for a netmap update or restarting WireGuard.
-///    A real Go peer sends this unprompted. Every *other* TSMP message (ping, pong,
-///    rejected-connection) is left in the batch and falls through to step 2, which admits it —
-///    exactly as Go's filter does for the TSMP types it does not consume.
+///    A real Go peer sends this unprompted. The other message consumed here is the
+///    **rejected-connection** message (Go `packet.TailscaleRejectedHeader`), which Go consumes in
+///    `wgengine.userspaceEngine.trackOpenPreFilterIn` — also ahead of the ACL, also with
+///    `filter.DropSilently`. Every *remaining* TSMP message (ping, pong, a type this fork does not
+///    know) is left in the batch and falls through to step 2, which admits it — exactly as Go's
+///    filter does for the TSMP types it does not consume.
 /// 2. **The ACL verdict**, [`inbound_filter_verdict`] (Go `runIn4`/`runIn6`).
+/// 3. **The rejected-connection reply**, on a drop: Go answers a dropped IPv4 TCP SYN by injecting
+///    a `packet.TailscaleRejectedHeader` back to the peer, so the far side learns *why* its dial
+///    failed instead of waiting out a TCP timeout. See [`tsmp_reject_for_drop`], which carries the
+///    whole of upstream's guard — including the drops that must stay silent.
 ///
-/// `learned_disco_keys` is appended to, never cleared, so one batch can carry advertisements from
-/// several peers. A learned key is attributed to `peer_id` — the WireGuard peer whose session
+/// `harvest` is appended to, never cleared, so one batch can carry messages from several peers. A
+/// learned key is attributed to `peer_id` — the WireGuard peer whose session
 /// decrypted the packet, and whose source addresses the caller's source filter has already bound.
 /// Go reaches the same peer the long way round, looking the advertisement's source IP up in the
 /// netmap (`wgengine.userspaceEngine.peerForIP`). Either way a peer can only advertise a key for
@@ -605,7 +737,8 @@ fn filter_inbound_from_peer(
     flows: &mut flowtrack::FlowCache,
     peer_id: PeerId,
     packets: &mut Vec<PacketMut>,
-    learned_disco_keys: &mut Vec<(PeerId, ts_packet::tsmp::DiscoKeyAdvertisement)>,
+    reject_cfg: RejectConfig,
+    harvest: &mut InboundHarvest,
 ) {
     packets.retain(|packet| {
         let bytes = packet.as_ref();
@@ -841,8 +974,42 @@ fn filter_inbound_from_peer(
                 );
             } else {
                 tracing::debug!(?peer_id, %src, "learned peer disco key over TSMP");
-                learned_disco_keys.push((peer_id, advert));
+                harvest.learned_disco_keys.push((peer_id, advert));
             }
+            return false;
+        }
+
+        // TSMP rejected-connection message (Go `packet.TailscaleRejectedHeader`): a peer telling us
+        // it refused a connection *we* opened, and why. Go consumes it in
+        // `wgengine.userspaceEngine.trackOpenPreFilterIn`, a pre-filter hook that runs ahead of the
+        // ACL and returns `filter.DropSilently` — the message is an inter-node control message
+        // addressed to the engine, never traffic for the local stack. Consumed in the same position
+        // and dropped the same way here; without this it reaches `smoltcp` as an IP-proto-99
+        // datagram it has no handler for.
+        //
+        // Narrower than Go's hook, which drops *every* TSMP packet it sees: only a well-formed
+        // rejected-connection message is consumed here, so the TSMP types this fork does not
+        // implement keep the unconditional accept `inbound_filter_verdict` has always given them.
+        if proto == IpProto::TSMP
+            && let Some(reject) = ts_packet::tsmp::TailscaleRejectedHeader::parse(bytes)
+        {
+            // Go `wgengine/pendopen.go`:
+            //     e.logf("open-conn-track: flow %v %v > %v rejected due to %v", ...)
+            // Go looks the flow up in its pending-open table first and logs only for a flow it was
+            // actually waiting on (or, on `MaybeBroken`, marks that flow problematic instead of
+            // removing it). This fork keeps no pending-open table, so the message is logged
+            // unconditionally and handed to the caller with `MaybeBroken` intact, for the embedder
+            // to match against whatever it has open.
+            tracing::info!(
+                ?peer_id,
+                maybe_broken = reject.maybe_broken,
+                "open-conn-track: flow {} {} > {} rejected due to {}",
+                reject.proto,
+                reject.src,
+                reject.dst,
+                reject.reason,
+            );
+            harvest.rejected_flows.push((peer_id, reject));
             return false;
         }
 
@@ -851,15 +1018,30 @@ fn filter_inbound_from_peer(
         // unconditional TSMP accept, then the control-derived ACL. The caller's source
         // attribution and `or_in.route` bound this to attributable peers and local
         // destinations (Go's `local4`/`local6` precondition).
-        inbound_filter_verdict(
-            filter,
-            flows,
-            proto,
-            std::net::SocketAddr::new(src, src_port),
-            std::net::SocketAddr::new(dst, dst_port),
-            l4,
-            frag,
-        )
+        let src = std::net::SocketAddr::new(src, src_port);
+        let dst = std::net::SocketAddr::new(dst, dst_port);
+
+        let verdict = inbound_filter_verdict(filter, flows, proto, src, dst, l4, frag);
+
+        // Go, on any non-`Accept` outcome: "Tell them, via TSMP, we're dropping them due to the
+        // ACL. Their host networking stack can translate this into ICMP or whatnot as required. But
+        // notably, their GUI or tailscale CLI can show them a rejection history with reasons."
+        // Almost every drop stays silent — see `tsmp_reject_for_drop` for the guard, and for the
+        // one shape (a peerAPI SYN) upstream silences by admitting rather than by suppressing.
+        if !verdict
+            && let Some(reject) =
+                tsmp_reject_for_drop(proto, src, dst, l4, filter.shields_up(), reject_cfg)
+        {
+            tracing::debug!(
+                ?peer_id,
+                ?src,
+                ?dst,
+                "sending a TSMP reject for a dropped SYN"
+            );
+            harvest.rejects_to_send.push((peer_id, reject.into()));
+        }
+
+        verdict
     });
 }
 
@@ -869,7 +1051,7 @@ fn filter_inbound_from_peer(
 /// WireGuard session with a peer is established, this node announces its own disco public key to
 /// that peer over TSMP, so the peer can learn (or re-learn) the key without waiting for a netmap
 /// update from control. It is the mirror image of the receive half in
-/// [`filter_inbound_from_peer`], and both are unconditional — a real Go peer sends us one whether
+/// `filter_inbound_from_peer`, and both are unconditional — a real Go peer sends us one whether
 /// or not we send one back.
 ///
 /// This is the netmap state Go's [`magicsock.Conn.PriorityMessageForPeer`] reads, snapshotted into
@@ -1230,6 +1412,21 @@ pub struct DataPlane {
     /// before the send side existed, and still fully interoperable, since a peer's own
     /// advertisement is unsolicited. Refreshed from the netmap by the runtime's dataplane actor.
     pub disco_advertisement: Option<Arc<DiscoAdvertisementState>>,
+
+    /// The TCP port this node's peerAPI listens on, if it runs one (Go `tstun.Wrapper.PeerAPIPort`).
+    /// Read only when a dropped packet is about to be answered with a TSMP rejected-connection
+    /// message: a SYN to the peerAPI port never produces one, because upstream's peerAPI carve-out
+    /// has already flipped it back to `Accept` by that point. See `tsmp_reject_for_drop`.
+    ///
+    /// `None` (the default) means no peerAPI, and is also what an embedder that never sets it gets
+    /// — the same position this fork was in before the message existed. Refreshed by the runtime's
+    /// dataplane actor.
+    pub peerapi_port: Option<u16>,
+
+    /// Go `tstun.Wrapper.disableTSMPRejected`: when `true`, an ACL drop tells the peer nothing.
+    /// `false` (the default) is upstream's default and the interoperable one — a Go peer expects
+    /// to be told.
+    pub disable_tsmp_rejected: bool,
 }
 
 impl DataPlane {
@@ -1247,6 +1444,8 @@ impl DataPlane {
             capture: None,
             flows: flowtrack::FlowCache::default(),
             disco_advertisement: None,
+            peerapi_port: None,
+            disable_tsmp_rejected: false,
         }
     }
 
@@ -1356,12 +1555,18 @@ impl DataPlane {
             }
         }
 
-        // TSMP disco-key advertisements learned from this batch (Go `tstun.Wrapper`'s
-        // `discoKeyAdvertisementPub` publisher). Filled in by the packet-filter stage below, which
-        // is the point at which a packet has both been attributed to a peer and decoded far enough
-        // to know it is TSMP.
-        let mut learned_disco_keys: Vec<(PeerId, ts_packet::tsmp::DiscoKeyAdvertisement)> =
-            Vec::new();
+        // The TSMP messages this batch consumes or synthesizes (Go `tstun.Wrapper`'s
+        // `discoKeyAdvertisementPub` publisher, its `trackOpenPreFilterIn` hook, and its
+        // `InjectOutbound` of a rejected-connection reply). Filled in by the packet-filter stage
+        // below, which is the point at which a packet has both been attributed to a peer and been
+        // decoded far enough to know it is TSMP.
+        let mut harvest = InboundHarvest::default();
+
+        // Hoisted out of the filter closure below, which borrows `self.flows` mutably.
+        let reject_cfg = RejectConfig {
+            disabled: self.disable_tsmp_rejected,
+            peerapi_port: self.peerapi_port,
+        };
 
         let to_local = to_local
             .into_iter()
@@ -1403,11 +1608,16 @@ impl DataPlane {
                     &mut self.flows,
                     peer_id,
                     &mut v,
-                    &mut learned_disco_keys,
+                    reject_cfg,
+                    &mut harvest,
                 );
 
                 v
-            });
+            })
+            // Forced here rather than left lazy: the TSMP rejected-connection replies the filter
+            // stage synthesizes have to be encrypted and merged into `to_peers` below, and that
+            // cannot happen while the iterator that produces them is still unconsumed.
+            .collect::<Vec<_>>();
 
         // TSMP disco-key advertisement, send side (Go capability version 144). wireguard-go calls
         // `peer.SendPriorityMessage()` the moment a keypair becomes current for forward
@@ -1418,6 +1628,30 @@ impl DataPlane {
         // (see [`DiscoAdvertisementState::advertisement_for`]) simply gets nothing, and the fresh
         // session is otherwise untouched.
         let mut to_peers = to_peers;
+
+        // TSMP rejected-connection replies, send side (Go `tstun.Wrapper.InjectOutbound`, called
+        // from `filterPacketInboundFromWireGuard` on an ACL drop). Each goes to the peer whose own
+        // packet was dropped — the peer whose session decrypted it, which the source filter has
+        // already bound to that packet's source address, so this is the same node Go reaches by
+        // routing the injected packet on its destination IP.
+        //
+        // These deliberately bypass `process_outbound`'s TSMP refusal: that refusal exists to stop
+        // a *host process* writing TSMP into the tun, and upstream's injected packets skip the
+        // outbound filter for the same reason.
+        if !harvest.rejects_to_send.is_empty() {
+            let mut by_peer: HashMap<ts_tunnel::PeerId, Vec<PacketMut>> = HashMap::new();
+            for (peer, packet) in std::mem::take(&mut harvest.rejects_to_send) {
+                by_peer
+                    .entry(ts_tunnel::PeerId(peer.0))
+                    .or_default()
+                    .push(packet);
+            }
+            let ts_tunnel::SendResult { to_peers: sealed } = self.wireguard.send(by_peer);
+            for (peer, packets) in sealed {
+                to_peers.entry(peer).or_default().extend(packets);
+            }
+        }
+
         if let Some(advert) = self.disco_advertisement.clone() {
             // Held apart from what `recv` already queued for these peers so it can be spliced in
             // FRONT of it below, rather than appended behind it.
@@ -1458,7 +1692,7 @@ impl DataPlane {
             .into_iter()
             .map(|(k, v)| (ts_transport::PeerId(k.0), v));
 
-        let to_local = self.or_in.route(to_local.flatten());
+        let to_local = self.or_in.route(to_local.into_iter().flatten());
         let to_peers = self.ur_out.route(to_peers);
 
         if let Some(next) = self.wireguard.next_event()
@@ -1472,7 +1706,8 @@ impl DataPlane {
         InboundResult {
             to_local,
             to_peers,
-            learned_disco_keys,
+            learned_disco_keys: harvest.learned_disco_keys,
+            rejected_flows: harvest.rejected_flows,
         }
     }
 
@@ -1541,6 +1776,21 @@ pub struct InboundResult {
     /// traffic for the local stack. Zero keys are already filtered out. Empty for a batch that
     /// carried none, which is the overwhelmingly common case.
     pub learned_disco_keys: Vec<(PeerId, ts_packet::tsmp::DiscoKeyAdvertisement)>,
+    /// Connections peers refused, as they told us over TSMP (Go `packet.TailscaleRejectedHeader`,
+    /// which `wgengine.userspaceEngine.trackOpenPreFilterIn` matches against its pending-open
+    /// flows), each paired with the WireGuard peer whose session carried it.
+    ///
+    /// This engine is always the dialing client, so this is the answer to a connection *this node*
+    /// opened: without it a dial into a peer's ACL drop waits out a TCP timeout with no reason
+    /// available anywhere. `src` is this node's own address and ephemeral port and `dst` is the
+    /// peer's, so an embedder can match the message against the flow it opened;
+    /// [`maybe_broken`](ts_packet::tsmp::TailscaleRejectedHeader::maybe_broken) says whether the
+    /// refusal is terminal.
+    ///
+    /// The messages themselves are dropped rather than delivered — they are inter-node control
+    /// messages, and the local stack has no handler for IP protocol 99. Empty for a batch that
+    /// carried none, which is the overwhelmingly common case.
+    pub rejected_flows: Vec<(PeerId, ts_packet::tsmp::TailscaleRejectedHeader)>,
 }
 
 /// The result of processing an event.
@@ -2167,16 +2417,17 @@ mod tests {
     fn ipv6_fragments_are_filtered_end_to_end() {
         let keep = |filter: &(dyn ts_packetfilter::Filter + Send + Sync), packet: Vec<u8>| {
             let mut packets = vec![PacketMut::from(packet)];
-            let mut learned = Vec::new();
+            let mut harvest = InboundHarvest::default();
             filter_inbound_from_peer(
                 filter,
                 &mut flowtrack::FlowCache::default(),
                 PeerId(3),
                 &mut packets,
-                &mut learned,
+                RejectConfig::default(),
+                &mut harvest,
             );
             assert!(
-                learned.is_empty(),
+                harvest.learned_disco_keys.is_empty(),
                 "no TSMP advertisement in these fixtures"
             );
             !packets.is_empty()
@@ -2322,16 +2573,17 @@ mod tests {
         //    fragment naming UDP is parsed, matched and delivered.
         let keep = |filter: &(dyn ts_packetfilter::Filter + Send + Sync), packet: Vec<u8>| {
             let mut packets = vec![PacketMut::from(packet)];
-            let mut learned = Vec::new();
+            let mut harvest = InboundHarvest::default();
             filter_inbound_from_peer(
                 filter,
                 &mut flowtrack::FlowCache::default(),
                 PeerId(5),
                 &mut packets,
-                &mut learned,
+                RejectConfig::default(),
+                &mut harvest,
             );
             assert!(
-                learned.is_empty(),
+                harvest.learned_disco_keys.is_empty(),
                 "no TSMP advertisement in these fixtures"
             );
             !packets.is_empty()
@@ -2384,16 +2636,17 @@ mod tests {
     fn chained_extension_header_cannot_bypass_the_ipv6_fragment_rules() {
         let keep = |filter: &(dyn ts_packetfilter::Filter + Send + Sync), packet: Vec<u8>| {
             let mut packets = vec![PacketMut::from(packet)];
-            let mut learned = Vec::new();
+            let mut harvest = InboundHarvest::default();
             filter_inbound_from_peer(
                 filter,
                 &mut flowtrack::FlowCache::default(),
                 PeerId(4),
                 &mut packets,
-                &mut learned,
+                RejectConfig::default(),
+                &mut harvest,
             );
             assert!(
-                learned.is_empty(),
+                harvest.learned_disco_keys.is_empty(),
                 "no TSMP advertisement in these fixtures"
             );
             !packets.is_empty()
@@ -2556,16 +2809,17 @@ mod tests {
     fn ipv6_extension_header_chain_is_matched_on_the_base_next_header() {
         let keep = |filter: &(dyn ts_packetfilter::Filter + Send + Sync), packet: Vec<u8>| {
             let mut packets = vec![PacketMut::from(packet)];
-            let mut learned = Vec::new();
+            let mut harvest = InboundHarvest::default();
             filter_inbound_from_peer(
                 filter,
                 &mut flowtrack::FlowCache::default(),
                 PeerId(5),
                 &mut packets,
-                &mut learned,
+                RejectConfig::default(),
+                &mut harvest,
             );
             assert!(
-                learned.is_empty(),
+                harvest.learned_disco_keys.is_empty(),
                 "no TSMP advertisement in these fixtures"
             );
             !packets.is_empty()
@@ -2718,16 +2972,17 @@ mod tests {
     fn sctp_destination_port_is_read_before_the_acl() {
         let keep = |filter: &(dyn ts_packetfilter::Filter + Send + Sync), packet: Vec<u8>| {
             let mut packets = vec![PacketMut::from(packet)];
-            let mut learned = Vec::new();
+            let mut harvest = InboundHarvest::default();
             filter_inbound_from_peer(
                 filter,
                 &mut flowtrack::FlowCache::default(),
                 PeerId(11),
                 &mut packets,
-                &mut learned,
+                RejectConfig::default(),
+                &mut harvest,
             );
             assert!(
-                learned.is_empty(),
+                harvest.learned_disco_keys.is_empty(),
                 "no TSMP advertisement in these fixtures"
             );
             !packets.is_empty()
@@ -2858,19 +3113,21 @@ mod tests {
         let key = [0xa5u8; 32];
 
         let mut packets = vec![tsmp_packet4(src, dst, &advertisement_body(key))];
-        let mut learned = Vec::new();
+        let mut harvest = InboundHarvest::default();
         filter_inbound_from_peer(
             &DenyAll,
             &mut flowtrack::FlowCache::default(),
             peer,
             &mut packets,
-            &mut learned,
+            RejectConfig::default(),
+            &mut harvest,
         );
 
         assert!(
             packets.is_empty(),
             "a consumed advertisement must not be delivered to the local stack"
         );
+        let learned = &harvest.learned_disco_keys;
         assert_eq!(learned.len(), 1, "the advertisement must be harvested");
         assert_eq!(
             learned[0].0, peer,
@@ -2884,21 +3141,25 @@ mod tests {
         let mut ping = vec![ts_packet::tsmp::TSMP_TYPE_PING];
         ping.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
         let mut packets = vec![tsmp_packet4(src, dst, &ping)];
-        let mut learned = Vec::new();
+        let mut harvest = InboundHarvest::default();
         filter_inbound_from_peer(
             &DenyAll,
             &mut flowtrack::FlowCache::default(),
             peer,
             &mut packets,
-            &mut learned,
+            RejectConfig::default(),
+            &mut harvest,
         );
         assert_eq!(packets.len(), 1, "a TSMP ping still bypasses the ACL");
-        assert!(learned.is_empty(), "a ping advertises no disco key");
+        assert!(
+            harvest.learned_disco_keys.is_empty(),
+            "a ping advertises no disco key"
+        );
     }
 
     /// The negative case, at the dataplane boundary: a TSMP body that is *nearly* an
     /// advertisement must not be half-parsed into a learned key. None of these may put anything
-    /// in `learned` — a truncated key that was zero-padded, or a zero key that was accepted,
+    /// in the harvest — a truncated key that was zero-padded, or a zero key that was accepted,
     /// would be a wrong disco key bound to a real peer.
     #[test]
     fn malformed_tsmp_disco_key_advertisements_teach_nothing() {
@@ -2931,17 +3192,18 @@ mod tests {
             ),
         ] {
             let mut packets = vec![tsmp_packet4(src, dst, &body)];
-            let mut learned = Vec::new();
+            let mut harvest = InboundHarvest::default();
             filter_inbound_from_peer(
                 &DenyAll,
                 &mut flowtrack::FlowCache::default(),
                 peer,
                 &mut packets,
-                &mut learned,
+                RejectConfig::default(),
+                &mut harvest,
             );
 
             assert!(
-                learned.is_empty(),
+                harvest.learned_disco_keys.is_empty(),
                 "a {name} must not be half-parsed into a learned disco key"
             );
             assert_eq!(
@@ -3612,10 +3874,17 @@ mod tests {
         packet: Vec<u8>,
     ) -> bool {
         let mut packets = vec![PacketMut::from(packet)];
-        let mut learned = Vec::new();
-        filter_inbound_from_peer(filter, flows, PeerId(1), &mut packets, &mut learned);
+        let mut harvest = InboundHarvest::default();
+        filter_inbound_from_peer(
+            filter,
+            flows,
+            PeerId(1),
+            &mut packets,
+            RejectConfig::default(),
+            &mut harvest,
+        );
         assert!(
-            learned.is_empty(),
+            harvest.learned_disco_keys.is_empty(),
             "no TSMP advertisement in these fixtures"
         );
         !packets.is_empty()
@@ -4196,6 +4465,557 @@ mod tests {
                 },
             },
             "`decode6` reads the flags byte past the Fragment header"
+        );
+    }
+
+    /// A dropped inbound packet's four-tuple, as `filter_inbound_from_peer` hands it to
+    /// [`tsmp_reject_for_drop`]: the fixture peer dialling this node's SSH port.
+    fn dropped_syn_tuple() -> (std::net::SocketAddr, std::net::SocketAddr) {
+        (
+            std::net::SocketAddr::new(IPV4_FIXTURE_SRC.into(), 41234),
+            std::net::SocketAddr::new(IPV4_FIXTURE_DST.into(), 22),
+        )
+    }
+
+    /// The happy path of the send half, at the function Go's guard lives in: a dropped IPv4 TCP SYN
+    /// produces a rejected-connection message addressed back at the dialer, carrying the four-tuple
+    /// with the *connection's* own direction and `RejectedDueToACLs`.
+    ///
+    /// The assertion runs the emitted bytes back through the production parser, which is the far
+    /// side's view of them — the peer has to read out the flow it opened, not the one we saw.
+    #[test]
+    fn an_acl_dropped_syn_produces_a_reject_addressed_back_to_the_dialer() {
+        let (src, dst) = dropped_syn_tuple();
+
+        let bytes = tsmp_reject_for_drop(
+            IpProto::TCP,
+            src,
+            dst,
+            ts_packetfilter::L4Header::Tcp { flags: TCP_SYN },
+            false,
+            RejectConfig::default(),
+        )
+        .expect("a dropped IPv4 TCP SYN must be answered");
+
+        let reject = ts_packet::tsmp::TailscaleRejectedHeader::parse(&bytes)
+            .expect("what we emit must parse as a rejected-connection message");
+
+        // Go `IPSrc: p.Dst.Addr(), IPDst: p.Src.Addr()`: the reply travels back the way the SYN
+        // came, so the IP pair is reversed...
+        assert_eq!(reject.ip_src, dst.ip(), "sourced from the address dialled");
+        assert_eq!(reject.ip_dst, src.ip(), "addressed to the dialer");
+        // ...while the four-tuple keeps the rejected connection's own direction, which is what lets
+        // the dialer match it against the flow it opened.
+        assert_eq!(reject.src, src);
+        assert_eq!(reject.dst, dst);
+        assert_eq!(reject.proto, IPPROTO_TCP_BYTE);
+        assert_eq!(reject.reason, ts_packet::tsmp::RejectReason::ACLS);
+        assert!(!reject.maybe_broken, "an ACL deny is a terminal verdict");
+    }
+
+    /// Go: `if t.filter.ShieldsUp() { rj.Reason = packet.RejectedDueToShieldsUp }`. The two reasons
+    /// render differently in a peer's connection history, so a shields-up deny must not be reported
+    /// as an ACL deny.
+    #[test]
+    fn shields_up_is_a_distinct_reject_reason() {
+        let (src, dst) = dropped_syn_tuple();
+        let syn = ts_packetfilter::L4Header::Tcp { flags: TCP_SYN };
+
+        let reason = |shields_up| {
+            ts_packet::tsmp::TailscaleRejectedHeader::parse(
+                &tsmp_reject_for_drop(
+                    IpProto::TCP,
+                    src,
+                    dst,
+                    syn,
+                    shields_up,
+                    RejectConfig::default(),
+                )
+                .expect("emitted"),
+            )
+            .expect("parses")
+            .reason
+        };
+
+        assert_eq!(reason(true), ts_packet::tsmp::RejectReason::SHIELDS_UP);
+        assert_eq!(reason(false), ts_packet::tsmp::RejectReason::ACLS);
+    }
+
+    /// Everything Go stays **silent** about. Each of these is a packet the ACL drops just the same;
+    /// the drop is unchanged and only the reply is withheld, which is what makes them the part of
+    /// the port worth testing.
+    #[test]
+    fn most_drops_produce_no_reject_at_all() {
+        let (src, dst) = dropped_syn_tuple();
+        let syn = ts_packetfilter::L4Header::Tcp { flags: TCP_SYN };
+        let v6_src = std::net::SocketAddr::new(std::net::IpAddr::V6(IPV6_FIXTURE_SRC), 41234);
+        let v6_dst = std::net::SocketAddr::new(std::net::IpAddr::V6(IPV6_FIXTURE_DST), 22);
+
+        for (name, proto, src, dst, l4, cfg) in [
+            // Go `p.TCPFlags&packet.TCPSyn != 0`: a segment with no SYN bit is not a connection
+            // being opened, so there is nothing to refuse.
+            (
+                "a non-SYN segment",
+                IpProto::TCP,
+                src,
+                dst,
+                ts_packetfilter::L4Header::Tcp {
+                    flags: TCP_ACK | TCP_FIN,
+                },
+                RejectConfig::default(),
+            ),
+            (
+                "a RST",
+                IpProto::TCP,
+                src,
+                dst,
+                ts_packetfilter::L4Header::Tcp { flags: TCP_RST },
+                RejectConfig::default(),
+            ),
+            // Go `p.IPProto == ipproto.TCP`: a datagram protocol has no SYN and no connection.
+            (
+                "a UDP datagram",
+                IpProto::UDP,
+                src,
+                dst,
+                ts_packetfilter::L4Header::Unknown,
+                RejectConfig::default(),
+            ),
+            // A UDP datagram whose 14th payload byte happens to have the SYN bit pattern must not
+            // be read as a TCP header: the protocol number decides, as it does in Go's guard.
+            (
+                "a UDP datagram carrying SYN-shaped bytes",
+                IpProto::UDP,
+                src,
+                dst,
+                syn,
+                RejectConfig::default(),
+            ),
+            (
+                "an ICMP echo request",
+                IpProto::ICMP,
+                src,
+                dst,
+                ts_packetfilter::L4Header::Icmp {
+                    icmp_type: 8,
+                    icmp_code: 0,
+                },
+                RejectConfig::default(),
+            ),
+            // Go `p.IPVersion == 4`: an IPv6 drop is silent, even though the message itself is
+            // family-agnostic and `TailscaleRejectedHeader::marshal` would happily emit one.
+            (
+                "an IPv6 SYN",
+                IpProto::TCP,
+                v6_src,
+                v6_dst,
+                syn,
+                RejectConfig::default(),
+            ),
+            // A packet whose L4 header was never decoded — a first IPv4 fragment, say — is not
+            // known to be a SYN. Go reaches the same place: a header it could not decode leaves
+            // `q.TCPFlags` zero.
+            (
+                "a SYN whose TCP header was never decoded",
+                IpProto::TCP,
+                src,
+                dst,
+                ts_packetfilter::L4Header::Unknown,
+                RejectConfig::default(),
+            ),
+            // Go's peerAPI carve-out, which flips an ACL-refused peerAPI SYN back to `Accept`
+            // before the reject block runs. Same outcome reached here by withholding the reply.
+            (
+                "a SYN to the peerAPI port",
+                IpProto::TCP,
+                src,
+                dst,
+                syn,
+                RejectConfig {
+                    disabled: false,
+                    peerapi_port: Some(dst.port()),
+                },
+            ),
+            // Go `!t.disableTSMPRejected`, the node-wide off switch.
+            (
+                "any SYN at all, with rejects disabled",
+                IpProto::TCP,
+                src,
+                dst,
+                syn,
+                RejectConfig {
+                    disabled: true,
+                    peerapi_port: None,
+                },
+            ),
+        ] {
+            assert!(
+                tsmp_reject_for_drop(proto, src, dst, l4, false, cfg).is_none(),
+                "{name} must be dropped silently"
+            );
+        }
+
+        // Control: with the peerAPI on some *other* port, the same SYN is answered — the carve-out
+        // is scoped to the port, not a blanket mute.
+        assert!(
+            tsmp_reject_for_drop(
+                IpProto::TCP,
+                src,
+                dst,
+                syn,
+                false,
+                RejectConfig {
+                    disabled: false,
+                    peerapi_port: Some(dst.port() + 1),
+                },
+            )
+            .is_some(),
+            "a SYN to a port that is not the peerAPI's is still answered"
+        );
+    }
+
+    /// The send half through the real filter step, on real bytes: an ACL that denies everything
+    /// drops the SYN *and* queues a reject for the peer that sent it, while the packets Go stays
+    /// silent about queue nothing. This is the assertion that the guard is wired into the drop
+    /// path at all, not merely correct in isolation.
+    #[test]
+    fn the_filter_step_queues_a_reject_only_for_a_dropped_ipv4_syn() {
+        let peer = PeerId(7);
+
+        // Returns `(survived, harvest)`: whether the ACL admitted the packet, and what the filter
+        // step produced alongside it.
+        let run = |packet: Vec<u8>| {
+            let mut packets = vec![PacketMut::from(packet)];
+            let mut harvest = InboundHarvest::default();
+            filter_inbound_from_peer(
+                &DenyAll,
+                &mut flowtrack::FlowCache::default(),
+                peer,
+                &mut packets,
+                RejectConfig::default(),
+                &mut harvest,
+            );
+            (!packets.is_empty(), harvest)
+        };
+
+        let (survived, harvest) = run(v4_packet(6, 0, false, &tcp_header(41234, 22, TCP_SYN)));
+        assert!(!survived, "the deny-all ACL drops the SYN");
+        assert_eq!(
+            harvest.rejects_to_send.len(),
+            1,
+            "a dropped SYN is answered"
+        );
+        assert_eq!(harvest.rejects_to_send[0].0, peer, "back to the sender");
+        let reject =
+            ts_packet::tsmp::TailscaleRejectedHeader::parse(harvest.rejects_to_send[0].1.as_ref())
+                .expect("the queued packet is a rejected-connection message");
+        assert_eq!(reject.src.port(), 41234);
+        assert_eq!(reject.dst.port(), 22);
+        assert_eq!(reject.reason, ts_packet::tsmp::RejectReason::ACLS);
+
+        // A segment that is not a SYN never produces one. Under this deny-all ACL it is in fact
+        // *admitted*, by the "tcp non-syn" reply carve-out that runs ahead of the rules — which is
+        // the more useful assertion anyway: the reject path must not fire on a packet that was
+        // never dropped in the first place.
+        let (survived, harvest) = run(v4_packet(6, 0, false, &tcp_header(41234, 22, TCP_RST)));
+        assert!(survived, "Go's 'tcp non-syn' carve-out admits it");
+        assert!(harvest.rejects_to_send.is_empty(), "and answers nothing");
+
+        for (name, packet) in [
+            ("a UDP datagram", v4_packet(17, 0, false, &udp_header(22))),
+            (
+                "an IPv6 SYN",
+                ipv6_packet(6, &tcp_header(41234, 22, TCP_SYN)),
+            ),
+        ] {
+            let (survived, harvest) = run(packet);
+            assert!(!survived, "{name} is dropped by the deny-all ACL");
+            assert!(
+                harvest.rejects_to_send.is_empty(),
+                "{name} must be dropped in silence"
+            );
+        }
+    }
+
+    /// The peerAPI ordering, through the real filter step: a SYN to the peerAPI port is dropped by
+    /// the ACL exactly as before — this fork has no L7 carve-out that admits it — but the peer is
+    /// told nothing, because upstream's carve-out has already turned that packet into an `Accept`
+    /// by the time its reject block runs.
+    #[test]
+    fn a_peerapi_syn_is_dropped_without_a_reject() {
+        let mut packets = vec![PacketMut::from(v4_packet(
+            6,
+            0,
+            false,
+            &tcp_header(41234, 8089, TCP_SYN),
+        ))];
+        let mut harvest = InboundHarvest::default();
+        filter_inbound_from_peer(
+            &DenyAll,
+            &mut flowtrack::FlowCache::default(),
+            PeerId(7),
+            &mut packets,
+            RejectConfig {
+                disabled: false,
+                peerapi_port: Some(8089),
+            },
+            &mut harvest,
+        );
+
+        assert!(packets.is_empty(), "the verdict on the packet is unchanged");
+        assert!(
+            harvest.rejects_to_send.is_empty(),
+            "a peerAPI SYN must never produce a reject"
+        );
+    }
+
+    /// The receive half through the real filter step: a peer's rejected-connection message is
+    /// consumed — harvested for the embedder and **dropped**, never handed to the local stack,
+    /// which has no handler for IP protocol 99 (Go `filter.DropSilently`).
+    ///
+    /// The ACL denies everything, so the packet surviving could only have come from the TSMP
+    /// bypass; asserting it does *not* survive is the whole point.
+    #[test]
+    fn a_received_reject_is_consumed_and_not_delivered() {
+        let peer = PeerId(7);
+
+        // The bytes a Go peer puts on the wire when its ACL refuses our dial: it marshals from its
+        // own side, we read it from ours.
+        let wire = ts_packet::tsmp::TailscaleRejectedHeader {
+            ip_src: IPV4_FIXTURE_SRC.into(),
+            ip_dst: IPV4_FIXTURE_DST.into(),
+            src: std::net::SocketAddr::new(IPV4_FIXTURE_DST.into(), 41234),
+            dst: std::net::SocketAddr::new(IPV4_FIXTURE_SRC.into(), 22),
+            proto: IPPROTO_TCP_BYTE,
+            reason: ts_packet::tsmp::RejectReason::ACLS,
+            maybe_broken: false,
+        }
+        .marshal()
+        .expect("marshals");
+
+        let mut packets = vec![PacketMut::from(wire)];
+        let mut harvest = InboundHarvest::default();
+        filter_inbound_from_peer(
+            &DenyAll,
+            &mut flowtrack::FlowCache::default(),
+            peer,
+            &mut packets,
+            RejectConfig::default(),
+            &mut harvest,
+        );
+
+        assert!(
+            packets.is_empty(),
+            "a reject must be consumed, not delivered to the local stack"
+        );
+        assert_eq!(harvest.rejected_flows.len(), 1);
+        assert_eq!(harvest.rejected_flows[0].0, peer);
+        let reject = harvest.rejected_flows[0].1;
+        assert_eq!(
+            reject.src,
+            std::net::SocketAddr::new(IPV4_FIXTURE_DST.into(), 41234),
+            "src is OUR address and ephemeral port — the flow we opened"
+        );
+        assert_eq!(
+            reject.dst,
+            std::net::SocketAddr::new(IPV4_FIXTURE_SRC.into(), 22)
+        );
+        assert_eq!(reject.reason, ts_packet::tsmp::RejectReason::ACLS);
+        assert!(!reject.maybe_broken);
+        assert!(
+            harvest.rejects_to_send.is_empty(),
+            "consuming a reject must not answer it with another one"
+        );
+
+        // The `MaybeBroken` bit reaches the embedder intact: Go treats such a rejection as
+        // non-terminal (it marks the flow problematic instead of removing it), so flattening the
+        // bit would turn a transient problem into a hard failure.
+        let broken = ts_packet::tsmp::TailscaleRejectedHeader {
+            ip_src: IPV4_FIXTURE_SRC.into(),
+            ip_dst: IPV4_FIXTURE_DST.into(),
+            src: std::net::SocketAddr::new(IPV4_FIXTURE_DST.into(), 41234),
+            dst: std::net::SocketAddr::new(IPV4_FIXTURE_SRC.into(), 22),
+            proto: IPPROTO_TCP_BYTE,
+            reason: ts_packet::tsmp::RejectReason::IP_FORWARDING,
+            maybe_broken: true,
+        }
+        .marshal()
+        .expect("marshals");
+        let mut packets = vec![PacketMut::from(broken)];
+        let mut harvest = InboundHarvest::default();
+        filter_inbound_from_peer(
+            &DenyAll,
+            &mut flowtrack::FlowCache::default(),
+            peer,
+            &mut packets,
+            RejectConfig::default(),
+            &mut harvest,
+        );
+        assert!(packets.is_empty());
+        assert!(harvest.rejected_flows[0].1.maybe_broken);
+        assert_eq!(
+            harvest.rejected_flows[0].1.reason,
+            ts_packet::tsmp::RejectReason::IP_FORWARDING
+        );
+    }
+
+    /// A *fragmented* rejected-connection message is refused before the ACL ever sees it, and is
+    /// not consumed either: Go's `decode4` demotes a first TSMP fragment with More-Fragments set to
+    /// `ipproto.Unknown`, which `pre()` drops, and classifies a later fragment as
+    /// `ipproto.Fragment`. Without the whole message in hand it cannot be a valid control packet,
+    /// and half a reject must never be read as a flow being refused.
+    #[test]
+    fn a_fragmented_reject_is_refused_before_the_acl() {
+        let body = {
+            let mut b = vec![
+                ts_packet::tsmp::TSMP_TYPE_REJECTED_CONN,
+                IPPROTO_TCP_BYTE,
+                b'A',
+            ];
+            b.extend_from_slice(&41234u16.to_be_bytes());
+            b.extend_from_slice(&22u16.to_be_bytes());
+            b.push(0);
+            b
+        };
+
+        // Control: unfragmented, the same body is consumed as a reject.
+        let mut packets = vec![PacketMut::from(v4_packet(99, 0, false, &body))];
+        let mut harvest = InboundHarvest::default();
+        filter_inbound_from_peer(
+            &DenyAll,
+            &mut flowtrack::FlowCache::default(),
+            PeerId(7),
+            &mut packets,
+            RejectConfig::default(),
+            &mut harvest,
+        );
+        assert!(packets.is_empty() && harvest.rejected_flows.len() == 1);
+
+        // A first fragment with More-Fragments set, and a later fragment. Neither is parsed as a
+        // reject. What happens to the bytes afterwards is the fragment rule this tree already
+        // had, unchanged: the first fragment is demoted to `unknown` and dropped, the later
+        // fragment takes Go's stateless pass-through (`pre()`'s `case ipproto.Fragment: Accept`).
+        for (name, offset, more, delivered) in [
+            ("first fragment, MF set", 0, true, false),
+            ("later fragment", MIN_FRAG_BLKS, false, true),
+        ] {
+            let mut packets = vec![PacketMut::from(v4_packet(99, offset, more, &body))];
+            let mut harvest = InboundHarvest::default();
+            filter_inbound_from_peer(
+                &DenyAll,
+                &mut flowtrack::FlowCache::default(),
+                PeerId(7),
+                &mut packets,
+                RejectConfig::default(),
+                &mut harvest,
+            );
+            assert!(
+                harvest.rejected_flows.is_empty(),
+                "{name}: half a reject is not a rejected flow"
+            );
+            assert_eq!(
+                packets.len(),
+                usize::from(delivered),
+                "{name}: the existing fragment rule decides what happens to the bytes"
+            );
+        }
+    }
+
+    /// Both halves meeting over a real WireGuard session, which is the only test that proves the
+    /// reject is actually *sent*: A dials B, B's ACL refuses the SYN, and A learns why.
+    ///
+    /// This engine is always the dialing client, so A's side is the one that matters day to day —
+    /// without it a dial into a peer's ACL drop waits out a TCP timeout with no reason anywhere.
+    /// B's side is the peer-observable one: a real Go node dialling into our ACL drop expects to be
+    /// told, and was not.
+    #[test]
+    fn a_refused_dial_is_answered_over_the_wire_and_understood() {
+        let underlay: UnderlayTransportId = 0.into();
+        let wg_peer = ts_tunnel::PeerId(1);
+        let peer = PeerId(1);
+        let a_addr = std::net::IpAddr::from(IPV4_FIXTURE_SRC);
+        let b_addr = std::net::IpAddr::from(IPV4_FIXTURE_DST);
+
+        let (a_static, b_static) = (NodeKeyPair::new(), NodeKeyPair::new());
+        let (mut a, mut b) = (
+            DataPlane::new(a_static.clone()),
+            DataPlane::new(b_static.clone()),
+        );
+
+        for (dp, key, remote) in [
+            (&mut a, b_static.public, b_addr),
+            (&mut b, a_static.public, a_addr),
+        ] {
+            dp.wireguard.upsert_peer(
+                wg_peer,
+                ts_tunnel::PeerConfig {
+                    key,
+                    psk: [0u8; 32].into(),
+                    persistent_keepalive_interval: None,
+                },
+            );
+            dp.ur_out.table.insert(peer, underlay);
+            // Each side attributes the other's tailnet address to the WireGuard peer carrying it,
+            // as the runtime's source filter does.
+            let mut src_filter = ts_bart::Table::default();
+            src_filter.insert(ipnet::IpNet::from(remote), peer);
+            dp.src_filter_in = Arc::new(src_filter);
+        }
+
+        // B refuses everything: this is the ACL drop the message exists to explain.
+        b.packet_filter = Arc::new(DenyAll);
+
+        let take = |out: HashMap<(UnderlayTransportId, PeerId), Vec<PacketMut>>| {
+            out.into_values().flatten().collect::<Vec<_>>()
+        };
+
+        // A dials B. The SYN rides the handshake this send starts.
+        let syn = PacketMut::from(v4_packet(6, 0, false, &tcp_header(41234, 22, TCP_SYN)));
+        let init = a
+            .wireguard
+            .send([(wg_peer, vec![syn])])
+            .to_peers
+            .remove(&wg_peer)
+            .expect("handshake initiation");
+        let resp = take(b.process_inbound(init).to_peers);
+        let from_a = take(a.process_inbound(resp).to_peers);
+
+        // B drops the SYN on its ACL and answers with a rejected-connection message.
+        let at_b = b.process_inbound(from_a);
+        assert!(
+            at_b.to_local.values().all(|v| v.is_empty()),
+            "the SYN itself must not reach B's local stack"
+        );
+        let to_a = take(at_b.to_peers);
+        assert!(
+            !to_a.is_empty(),
+            "B must tell A why it dropped the connection"
+        );
+
+        // A consumes it: it learns the flow was refused and the message never reaches its stack.
+        let at_a = a.process_inbound(to_a);
+        assert!(
+            at_a.to_local.values().all(|v| v.is_empty()),
+            "the reject must be consumed, not delivered to A's local stack"
+        );
+        assert_eq!(at_a.rejected_flows.len(), 1, "A must learn of the refusal");
+        let (from_peer, reject) = at_a.rejected_flows[0];
+        assert_eq!(from_peer, peer);
+        assert_eq!(
+            reject.src,
+            std::net::SocketAddr::new(a_addr, 41234),
+            "the flow A opened, from A's own address and ephemeral port"
+        );
+        assert_eq!(reject.dst, std::net::SocketAddr::new(b_addr, 22));
+        assert_eq!(reject.proto, IPPROTO_TCP_BYTE);
+        assert_eq!(reject.reason, ts_packet::tsmp::RejectReason::ACLS);
+        assert!(!reject.maybe_broken);
+
+        // And A does not answer the reject with a reject of its own — that would be a loop between
+        // two nodes that both deny.
+        assert!(
+            take(at_a.to_peers).is_empty(),
+            "consuming a reject must put nothing back on the wire"
         );
     }
 }

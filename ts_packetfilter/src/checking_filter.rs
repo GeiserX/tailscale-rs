@@ -49,6 +49,11 @@ where
 
         result
     }
+
+    /// Delegated to `Primary`, the filter that actually enforces: `Checked` is only observed.
+    fn shields_up(&self) -> bool {
+        self.0.shields_up()
+    }
 }
 
 impl<Primary, Checked> FilterStorage for CheckingFilter<Primary, Checked>

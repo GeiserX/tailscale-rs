@@ -26,6 +26,21 @@ pub trait Filter {
     fn matches(&self, info: &PacketInfo, caps: CapIter) -> bool {
         self.match_for(info, caps).is_some()
     }
+
+    /// Whether this is a "shields up" filter — one that refuses inbound connections wholesale
+    /// rather than by rule (Go `filter.Filter.ShieldsUp`).
+    ///
+    /// Nothing in the match path reads this. It exists because a caller that *drops* a packet has
+    /// to say **why** when it tells the peer: Go's `tstun.filterPacketInboundFromWireGuard` sends a
+    /// TSMP rejected-connection message carrying `RejectedDueToShieldsUp` instead of
+    /// `RejectedDueToACLs` when `t.filter.ShieldsUp()`, and the two reasons render differently in a
+    /// peer's connection history.
+    ///
+    /// `false` by default, which is right for every filter that is only a ruleset: a rule-based
+    /// deny is an ACL deny. [`ShieldsUpFilter`](crate::ShieldsUpFilter) overrides it.
+    fn shields_up(&self) -> bool {
+        false
+    }
 }
 
 /// A type that can store packet filters organized by named key.
@@ -60,6 +75,10 @@ where
     fn match_for(&self, info: &PacketInfo, caps: CapIter) -> Option<&str> {
         (*self).match_for(info, caps)
     }
+
+    fn shields_up(&self) -> bool {
+        (*self).shields_up()
+    }
 }
 
 impl<T> Filter for &mut T
@@ -68,6 +87,10 @@ where
 {
     fn match_for(&self, info: &PacketInfo, caps: CapIter) -> Option<&str> {
         (**self).match_for(info, caps)
+    }
+
+    fn shields_up(&self) -> bool {
+        (**self).shields_up()
     }
 }
 

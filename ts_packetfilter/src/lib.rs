@@ -206,6 +206,13 @@ impl<F: Filter> Filter for ShieldsUpFilter<F> {
         }
         self.inner.match_for(info, caps)
     }
+
+    /// Go `filter.Filter.ShieldsUp`. This *is* the shields-up filter, so a packet it denies was
+    /// denied because shields are up — which is the reason a TSMP rejected-connection message must
+    /// carry back to the peer.
+    fn shields_up(&self) -> bool {
+        true
+    }
 }
 
 /// Alias representing a BTreeMap-based filter.
@@ -240,6 +247,28 @@ mod reply_tests {
     /// Go `Parsed.IsTCPSyn` is `(q.TCPFlags & TCPSynAck) == TCPSyn`, so "not a SYN" covers the
     /// SYN-ACK that answers an outbound connection, every mid-session segment, and — because that
     /// is what the mask says — a segment with neither bit set.
+    /// Go's TSMP reject guard is `q.TCPFlags & packet.TCPSyn != 0` — the SYN bit alone — which is a
+    /// *different* test from `IsTCPSyn`'s "SYN set and ACK clear". A SYN-ACK satisfies this one and
+    /// not that one, and both readings have to stay separate: the SYN-ACK answering our own dial is
+    /// an admitted reply, but were it dropped Go would still answer it with a reject.
+    #[test]
+    fn tcp_syn_flag_set_masks_the_syn_bit_alone() {
+        assert!(L4Header::Tcp { flags: 0x02 }.tcp_syn_flag_set(), "SYN");
+        assert!(L4Header::Tcp { flags: 0x12 }.tcp_syn_flag_set(), "SYN-ACK");
+        assert!(!L4Header::Tcp { flags: 0x10 }.tcp_syn_flag_set(), "ACK");
+        assert!(!L4Header::Tcp { flags: 0x11 }.tcp_syn_flag_set(), "FIN-ACK");
+        assert!(!L4Header::Tcp { flags: 0x04 }.tcp_syn_flag_set(), "RST");
+        // An L4 header that was never decoded is not known to be a SYN, so it produces no reply.
+        assert!(!L4Header::Unknown.tcp_syn_flag_set());
+        assert!(
+            !L4Header::Icmp {
+                icmp_type: 8,
+                icmp_code: 0
+            }
+            .tcp_syn_flag_set()
+        );
+    }
+
     #[test]
     fn is_tcp_non_syn_follows_gos_syn_ack_mask() {
         for flags in [0x12u8, 0x10, 0x11, 0x04, 0x18, 0x00] {
@@ -372,5 +401,23 @@ mod shields_tests {
             f.match_for(&pkt("100.64.0.1"), &mut core::iter::empty()),
             Some("allow-all")
         );
+    }
+
+    /// Go `filter.Filter.ShieldsUp`: only the shields-up wrapper answers `true`, and it answers it
+    /// even before the first netmap has told it any self addresses. A caller that drops a packet
+    /// reads this to decide which reason a TSMP rejected-connection message carries, so a plain
+    /// ruleset answering anything but `false` would mislabel every ACL deny as a shields-up deny.
+    #[test]
+    fn only_the_shields_up_wrapper_reports_shields_up() {
+        assert!(
+            ShieldsUpFilter {
+                inner: AllowAll,
+                self_addrs: alloc::vec![],
+            }
+            .shields_up()
+        );
+        assert!(!AllowAll.shields_up());
+        assert!(!DropAllFilter.shields_up());
+        assert!(!BTreeFilter::new().shields_up());
     }
 }
