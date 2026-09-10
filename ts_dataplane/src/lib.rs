@@ -141,6 +141,11 @@ enum Ipv6Fragment {
         /// The destination port read from that sub-protocol's header, 0 for a protocol Go does not
         /// port-match (Go `withPort(q.Dst, ...)`).
         dst_port: u16,
+        /// The rest of what Go's `decode6` reads out of that same sub-protocol header: the TCP
+        /// flags byte (`q.TCPFlags = TCPFlag(sub[13])`) or the ICMPv6 type/code. The inbound
+        /// filter's reply carve-outs consult it, so a first fragment carrying the SYN-ACK for this
+        /// node's own connection is admitted on exactly the terms an unfragmented one is.
+        l4: ts_packetfilter::L4Header,
     },
 }
 
@@ -213,8 +218,9 @@ fn decode6_first_fragment(proto: IpProto, sub: &[u8]) -> Ipv6Fragment {
     const MIN_TSMP_SIZE: usize = 7;
 
     // Go's port-ful arms: bounds-check, then read the source port from `sub[0:2]` and the
-    // destination port from `sub[2:4]`.
-    let ported = |min_len: usize| {
+    // destination port from `sub[2:4]`. `l4` is whatever else Go reads out of that same header —
+    // only the TCP arm reads anything (`q.TCPFlags = TCPFlag(sub[13])`).
+    let ported = |min_len: usize, l4: ts_packetfilter::L4Header| {
         if sub.len() < min_len {
             return Ipv6Fragment::Unknown;
         }
@@ -222,10 +228,11 @@ fn decode6_first_fragment(proto: IpProto, sub: &[u8]) -> Ipv6Fragment {
             proto,
             src_port: u16::from_be_bytes([sub[0], sub[1]]),
             dst_port: u16::from_be_bytes([sub[2], sub[3]]),
+            l4,
         }
     };
     // Go's portless arms: bounds-check only, both ports left at 0.
-    let portless = |min_len: usize| {
+    let portless = |min_len: usize, l4: ts_packetfilter::L4Header| {
         if sub.len() < min_len {
             return Ipv6Fragment::Unknown;
         }
@@ -233,15 +240,32 @@ fn decode6_first_fragment(proto: IpProto, sub: &[u8]) -> Ipv6Fragment {
             proto,
             src_port: 0,
             dst_port: 0,
+            l4,
         }
+    };
+    // Go's `IsEchoResponse`/`IsError` read `q.b[q.subofs]` and `q.b[q.subofs+1]` behind
+    // `len(q.b) >= q.subofs+8` — eight bytes, not the four `decode6`'s ICMPv6 arm bounds-checks.
+    // A shorter first fragment is decoded (and matched IPs-only) but is no "response" to upstream
+    // either, so it carries no ICMP header here.
+    let icmp6 = || match (sub.first(), sub.get(1)) {
+        (Some(&icmp_type), Some(&icmp_code)) if sub.len() >= 8 => ts_packetfilter::L4Header::Icmp {
+            icmp_type,
+            icmp_code,
+        },
+        _ => ts_packetfilter::L4Header::Unknown,
+    };
+    // Go `q.TCPFlags = TCPFlag(sub[13])`, guarded by the same 20-byte bounds check `ported` runs.
+    let tcp_flags = || match sub.get(13) {
+        Some(&flags) => ts_packetfilter::L4Header::Tcp { flags },
+        None => ts_packetfilter::L4Header::Unknown,
     };
 
     match proto {
-        IpProto::ICMPV6 => portless(ICMP6_HEADER_LEN),
-        IpProto::TCP => ported(TCP_HEADER_LEN),
-        IpProto::UDP => ported(UDP_HEADER_LEN),
-        IpProto::SCTP => ported(SCTP_HEADER_LEN),
-        IpProto::TSMP => portless(MIN_TSMP_SIZE),
+        IpProto::ICMPV6 => portless(ICMP6_HEADER_LEN, icmp6()),
+        IpProto::TCP => ported(TCP_HEADER_LEN, tcp_flags()),
+        IpProto::UDP => ported(UDP_HEADER_LEN, ts_packetfilter::L4Header::Unknown),
+        IpProto::SCTP => ported(SCTP_HEADER_LEN, ts_packetfilter::L4Header::Unknown),
+        IpProto::TSMP => portless(MIN_TSMP_SIZE, ts_packetfilter::L4Header::Unknown),
         IPPROTO_FRAGMENT_SENTINEL => Ipv6Fragment::Unknown,
         // Go's switch has no default arm: any other protocol keeps its number and port 0, and the
         // ACL matches it IPs-only (`IpProto::is_port_ful`).
@@ -255,6 +279,7 @@ fn decode6_first_fragment(proto: IpProto, sub: &[u8]) -> Ipv6Fragment {
             proto,
             src_port: 0,
             dst_port: 0,
+            l4: ts_packetfilter::L4Header::Unknown,
         },
     }
 }
@@ -348,21 +373,36 @@ enum Fragment {
 /// 5. **A UDP or SCTP reply to a flow this node started** is admitted from `flows` — Go's
 ///    `case ipproto.UDP, ipproto.SCTP` arm, which consults the `flowtrack` LRU and returns
 ///    `Accept, "cached"` *before* the rule match. See [`flowtrack`].
-/// 6. Everything else consults the control-derived ACL via `can_access` — Go's `matches4.match`.
+/// 6. **A TCP segment that is not a SYN**, and **an ICMP echo response or ICMP error**, are
+///    admitted with no rule consulted — Go's `return Accept, "tcp non-syn"` and
+///    `return Accept, "icmp response ok"`, the other two thirds of the reply admission step 5
+///    starts. All three exist for the same reason: the answer to a connection *this node* opened
+///    arrives at an ephemeral port, so no ACL control can write will ever name it. Without them a
+///    policy that grants this node outbound access to a peer without granting that peer inbound
+///    access back hangs every TCP connection on its SYN-ACK and silently eats every ping reply.
+///    The predicates are [`ts_packetfilter::PacketInfo`]'s, and each fails closed when the L4
+///    header was not decoded, so a **SYN** — or any packet whose flags this fork never read —
+///    still faces the rules.
+/// 7. Everything else consults the control-derived ACL via `can_access` — Go's `matches4.match`.
 ///    A protocol Go's `runIn4`/`runIn6` switch has no arm for (an IPv6 Routing or
 ///    Destination-Options header, say) lands in its `default`, which admits IPs-only and only
 ///    under an all-ports rule naming that protocol (`matchProtoAndIPsOnlyIfAllPorts`); that
-///    per-protocol port semantics lives in [`ts_packetfilter::Rule`].
+///    per-protocol port semantics lives in [`ts_packetfilter::Rule`]. ICMP that is *not* a
+///    response reaches the same call and is matched IPs-only there, which is Go's
+///    `else if f.matches4.matchIPsOnly(q, …)`.
 ///
 /// `src` and `dst` carry ports because Go's `packet.Parsed` does (`q.Src`/`q.Dst` are
 /// `netip.AddrPort`) and because the flow cache in step 5 keys on all four fields. The ACL itself
-/// still sees only the destination port, which is all Go's `matches4.match` reads.
+/// still sees only the destination port, which is all Go's `matches4.match` reads. `l4` is the rest
+/// of what Go's `packet.Parsed` holds — `TCPFlags` and the ICMP type/code — and only step 6 reads
+/// it.
 fn inbound_filter_verdict(
     filter: &(dyn ts_packetfilter::Filter + Send + Sync),
     flows: &mut flowtrack::FlowCache,
     proto: IpProto,
     src: std::net::SocketAddr,
     dst: std::net::SocketAddr,
+    l4: ts_packetfilter::L4Header,
     frag: Option<Fragment>,
 ) -> bool {
     if drop_before_rules(dst.ip()) {
@@ -480,7 +520,58 @@ fn inbound_filter_verdict(
         port: dst.port(),
         src: src.ip(),
         dst: dst.ip(),
+        l4,
     };
+
+    // Go `runIn4`/`runIn6`, `case ipproto.TCP`, ahead of the rule match:
+    //
+    //     // For TCP, we want to allow *outgoing* connections, which means we want to allow
+    //     // return packets on those connections. To make this restriction work, we need to
+    //     // allow non-SYN packets (continuation of an existing session) to arrive. This
+    //     // should be okay since a new incoming session can't be initiated without first
+    //     // sending a SYN.
+    //     if !q.IsTCPSyn() {
+    //         return Accept, "tcp non-syn"
+    //     }
+    //
+    // The SYN-ACK answering a connection `process_outbound` opened is a non-SYN, and it lands on
+    // our ephemeral source port, so no rule from control can name it. A SYN is the one segment this
+    // must never admit: it is the only way to *start* an inbound session, and admitting it would
+    // turn the carve-out into an open door. See `PacketInfo::is_tcp_non_syn`, which demands a
+    // decoded flags byte rather than treating "no flags" as "not a SYN".
+    if info.is_tcp_non_syn() {
+        tracing::trace!(
+            ?src,
+            ?dst,
+            "accepting inbound TCP non-SYN (Go 'tcp non-syn')"
+        );
+        return true;
+    }
+
+    // Go `runIn4`'s `case ipproto.ICMPv4` and `runIn6`'s `case ipproto.ICMPv6`, ahead of the same
+    // rule match:
+    //
+    //     if q.IsEchoResponse() || q.IsError() {
+    //         // ICMP responses are allowed.
+    //         return Accept, "icmp response ok"
+    //     } else if f.matches4.matchIPsOnly(q, f.srcIPHasCap) {
+    //         // If any port is open to an IP, allow ICMP to it.
+    //         return Accept, "icmp ok"
+    //     }
+    //
+    // The `else if` is already in place: `ts_packetfilter::Rule` matches ICMP IPs-only, so an echo
+    // *request* — and anything else that is not a response — falls through to `can_access` below
+    // and is admitted only if a rule opens some port to this destination. Only the unconditional
+    // arm is added here.
+    if info.is_icmp_echo_response() || info.is_icmp_error() {
+        tracing::trace!(
+            ?src,
+            ?dst,
+            "accepting inbound ICMP response (Go 'icmp response ok')"
+        );
+        return true;
+    }
+
     // TODO(npry): wire in nodecaps
     let caps = [];
     let verdict = filter.can_access(&info, caps);
@@ -624,6 +715,63 @@ fn filter_inbound_from_peer(
             }
         };
 
+        // The rest of what Go's `packet.Parsed` holds about the L4 header — `q.TCPFlags`, and the
+        // ICMP type/code its `IsEchoResponse`/`IsError` read — for the reply carve-outs
+        // `inbound_filter_verdict` applies ahead of the rules. Taken before the port match below,
+        // which consumes `pkt.transport`.
+        //
+        // Every arm is guarded on `proto`, the number the *base* IP header declared. That is what
+        // Go's `runIn4`/`runIn6` switch on, and it is load-bearing here: etherparse walks an IPv6
+        // extension-header chain through to the real transport, so a packet leading with a Routing
+        // (43) or Destination Options (60) header can hand us a `TransportSlice::Tcp` for a
+        // protocol upstream never treats as TCP. Without the guard, burying a non-SYN segment under
+        // an extension header would be enough to skip the rules entirely.
+        let l4 = match frag {
+            // Go `decode6` parses a first fragment's real sub-protocol header past the Fragment
+            // extension header, TCP flags and ICMPv6 type included.
+            Some(Fragment::V6(Ipv6Fragment::First { l4, .. })) => l4,
+            // A later or malformed fragment has no L4 header to read at all, and the verdict
+            // decides on the classification alone.
+            Some(Fragment::V6(Ipv6Fragment::Later | Ipv6Fragment::Unknown)) => {
+                ts_packetfilter::L4Header::Unknown
+            }
+            // Any IPv4 packet, and any IPv6 packet with no Fragment header. etherparse refuses to
+            // descend into a *fragmenting* payload, so a first IPv4 fragment arrives here with no
+            // transport slice and falls to the `_` arm — no carve-out, ordinary rule match. Go does
+            // read that header; the same etherparse limit already leaves such a packet's ports at
+            // 0, so closing the gap is a wider change than this one and both halves of it fail
+            // closed.
+            Some(Fragment::V4(_)) | None => match &pkt.transport {
+                // Go `decode4`/`decode6`: `q.TCPFlags = TCPFlag(sub[13])`. `TcpSlice::from_slice`
+                // has already bounds-checked a 20-byte header, so the `None` is unreachable — but
+                // it is spelled out rather than indexed, because these bytes are attacker
+                // controlled post-decrypt and `L4Header::Unknown` fails closed where a panic would
+                // take down the dataplane.
+                Some(etherparse::TransportSlice::Tcp(tcp)) if proto == IpProto::TCP => {
+                    match tcp.header_slice().get(13) {
+                        Some(&flags) => ts_packetfilter::L4Header::Tcp { flags },
+                        None => ts_packetfilter::L4Header::Unknown,
+                    }
+                }
+                // Go's `IsEchoResponse`/`IsError` read `q.b[q.subofs]` and `q.b[q.subofs+1]` behind
+                // `len(q.b) >= q.subofs+8`; etherparse's ICMP slices refuse anything shorter than
+                // those same 8 bytes, so reaching this arm at all satisfies upstream's guard.
+                Some(etherparse::TransportSlice::Icmpv4(icmp)) if proto == IpProto::ICMP => {
+                    ts_packetfilter::L4Header::Icmp {
+                        icmp_type: icmp.type_u8(),
+                        icmp_code: icmp.code_u8(),
+                    }
+                }
+                Some(etherparse::TransportSlice::Icmpv6(icmp)) if proto == IpProto::ICMPV6 => {
+                    ts_packetfilter::L4Header::Icmp {
+                        icmp_type: icmp.type_u8(),
+                        icmp_code: icmp.code_u8(),
+                    }
+                }
+                _ => ts_packetfilter::L4Header::Unknown,
+            },
+        };
+
         // Go `decode6` reads a *first* IPv6 fragment's transport ports past the Fragment
         // extension header, so a fragmented datagram matches the same rule as an
         // unfragmented one. etherparse deliberately refuses to descend into a fragmenting
@@ -709,6 +857,7 @@ fn filter_inbound_from_peer(
             proto,
             std::net::SocketAddr::new(src, src_port),
             std::net::SocketAddr::new(dst, dst_port),
+            l4,
             frag,
         )
     });
@@ -949,6 +1098,9 @@ fn outbound_udp_or_sctp_flow(
                     proto,
                     src_port,
                     dst_port,
+                    // The flow cache keys on Go's `flowtrack.Tuple` — proto and both address/port
+                    // pairs — and nothing else, so the L4 header is not part of an outbound flow.
+                    l4: _,
                 } = decode6_fragment(b)
                 else {
                     return None;
@@ -1407,10 +1559,14 @@ mod tests {
     /// Records `(path, bytes)` for each capture-hook invocation in a test.
     type CaptureLog = Arc<Mutex<Vec<(CapturePath, Vec<u8>)>>>;
 
-    /// [`inbound_filter_verdict`] against an **empty** flow cache, which is the verdict for a packet
-    /// that is not a reply to anything this node sent. Every case that predates the reverse-flow
-    /// cache is exactly that case, so they all go through here and stay pinned to the stateless
-    /// decision; the tests that do record an outbound flow call `inbound_filter_verdict` directly.
+    /// [`inbound_filter_verdict`] against an **empty** flow cache and with **no decoded L4 header**,
+    /// which is the verdict for a packet that is not a reply to anything this node sent. Every case
+    /// that predates the reverse-flow cache is exactly that case, so they all go through here and
+    /// stay pinned to the stateless decision; the tests that do record an outbound flow call
+    /// `inbound_filter_verdict` directly.
+    ///
+    /// [`ts_packetfilter::L4Header::Unknown`] is also the assertion that the reply carve-outs fail
+    /// closed: a TCP packet whose flags were never read must still face the rules here, and it does.
     fn stateless_verdict(
         filter: &(dyn ts_packetfilter::Filter + Send + Sync),
         proto: IpProto,
@@ -1425,6 +1581,7 @@ mod tests {
             proto,
             std::net::SocketAddr::new(src, 0),
             std::net::SocketAddr::new(dst, dst_port),
+            ts_packetfilter::L4Header::Unknown,
             frag,
         )
     }
@@ -1785,6 +1942,8 @@ mod tests {
                 // reverse-flow cache is the only thing that consults it.
                 src_port: 54276,
                 dst_port: 443,
+                // UDP is one of Go's port-ful arms and nothing else is read out of its header.
+                l4: ts_packetfilter::L4Header::Unknown,
             },
             "a first fragment is decoded past the Fragment header, ports and all"
         );
@@ -1845,6 +2004,10 @@ mod tests {
                 proto: IpProto::TCP,
                 src_port: 0,
                 dst_port: 443,
+                // Go `q.TCPFlags = TCPFlag(sub[13])`, which is 0 in this all-zero header. A
+                // fragment carrying real flags is exercised by
+                // `ipv6_first_fragment_carries_its_tcp_flags_to_the_reply_carve_out`.
+                l4: ts_packetfilter::L4Header::Tcp { flags: 0 },
             },
             "a complete TCP header in the first fragment is read normally"
         );
@@ -1875,6 +2038,9 @@ mod tests {
                 proto: IpProto::ICMPV6,
                 src_port: 0,
                 dst_port: 0,
+                // Go bounds-checks 4 bytes here but reads the type/code behind `len(q.b) >=
+                // q.subofs+8`, so a 4-byte first fragment is no "response" upstream either.
+                l4: ts_packetfilter::L4Header::Unknown,
             },
             "a first ICMPv6 fragment keeps port 0 and is matched IPs-only"
         );
@@ -1944,6 +2110,7 @@ mod tests {
                 proto: IpProto::UDP,
                 src_port: 0,
                 dst_port,
+                l4: ts_packetfilter::L4Header::Unknown,
             })
         };
         assert!(
@@ -2123,6 +2290,7 @@ mod tests {
                 proto: IPPROTO_UNKNOWN,
                 src_port: 0,
                 dst_port: 0,
+                l4: ts_packetfilter::L4Header::Unknown,
             },
             "a first fragment carries its Fragment header's Next Header, 0 included"
         );
@@ -2142,6 +2310,7 @@ mod tests {
                     proto: IPPROTO_UNKNOWN,
                     src_port: 0,
                     dst_port: 0,
+                    l4: ts_packetfilter::L4Header::Unknown,
                 })),
             ),
             "a first IPv6 fragment declaring protocol 0 is dropped under an allow-all ACL"
@@ -3709,6 +3878,324 @@ mod tests {
             outbound_udp_or_sctp_flow(&[0xde, 0xad, 0xbe, 0xef]),
             None,
             "a non-IP buffer"
+        );
+    }
+
+    /// Go `packet.TCPFin`, the flag bit `tcp_header` writes into the byte Go reads as `q.TCPFlags`.
+    const TCP_FIN: u8 = 0x01;
+    /// Go `packet.TCPSyn`.
+    const TCP_SYN: u8 = 0x02;
+    /// Go `packet.TCPRst`.
+    const TCP_RST: u8 = 0x04;
+    /// Go `packet.TCPAck`.
+    const TCP_ACK: u8 = 0x10;
+
+    /// A minimal 20-byte TCP header: the two ports, a data offset of 5 (no options, which is what
+    /// makes it 20 bytes and what etherparse bounds-checks), and `flags` in `sub[13]` — the byte Go
+    /// `decode4`/`decode6` copy into `q.TCPFlags`. The checksum is left zero; nothing on this path
+    /// verifies it, and neither does Go's decoder.
+    fn tcp_header(src_port: u16, dst_port: u16, flags: u8) -> Vec<u8> {
+        let mut hdr = vec![0u8; 20];
+        hdr[0..2].copy_from_slice(&src_port.to_be_bytes());
+        hdr[2..4].copy_from_slice(&dst_port.to_be_bytes());
+        hdr[12] = 0x50; // data offset 5 (a 20-byte header), no options
+        hdr[13] = flags;
+        hdr
+    }
+
+    /// A minimal 8-byte ICMP/ICMPv6 message: type, code, a zero checksum, and four bytes of
+    /// rest-of-header. Eight is the length Go guards every one of its type/code reads with
+    /// (`len(q.b) >= q.subofs+8`), and etherparse's ICMP slices refuse anything shorter too.
+    fn icmp_header(icmp_type: u8, icmp_code: u8) -> Vec<u8> {
+        let mut hdr = vec![0u8; 8];
+        hdr[0] = icmp_type;
+        hdr[1] = icmp_code;
+        hdr
+    }
+
+    /// Go's TCP reply carve-out, on real bytes through the whole inbound filter: `runIn4`/`runIn6`
+    /// accept an inbound TCP segment that is not a SYN *before* any rule is consulted.
+    ///
+    /// ```text
+    /// if !q.IsTCPSyn() {
+    ///     return Accept, "tcp non-syn"
+    /// }
+    /// ```
+    ///
+    /// Every accept below is taken under a **deny-all** filter, so it can only have come from the
+    /// carve-out. The motivating case is the first one: this node dials out, the peer answers with
+    /// a SYN-ACK aimed at our ephemeral source port, and no ACL control can write will ever name
+    /// that port. Without the carve-out the handshake never completes and the failure reads as a
+    /// network fault rather than as a filter decision.
+    ///
+    /// The refusals are what keep it from being an open door, and they are the point of the test as
+    /// much as the accepts are. A SYN — the one segment that can *start* an inbound session — still
+    /// faces the rules, and so does a non-SYN segment buried under an IPv6 extension header, which
+    /// upstream filters as protocol 43 rather than as TCP. The third refusal, a segment whose flags
+    /// this fork never decoded, is pinned by every case that goes through [`stateless_verdict`]:
+    /// they all carry [`ts_packetfilter::L4Header::Unknown`].
+    ///
+    /// Ported from github.com/tailscale/tailscale `wgengine/filter/filter.go` (`runIn4`, `runIn6`)
+    /// and `net/packet/packet.go` (`IsTCPSyn`, `decode4`, `decode6`) at
+    /// `3945b82f8a9550b54c33e61d4ed2227862d53e8a`.
+    #[test]
+    fn inbound_tcp_non_syn_is_admitted_without_a_rule_but_a_syn_is_not() {
+        let flows = &mut flowtrack::FlowCache::default();
+        // Source port 443, destination port 41234: the shape of a reply to a connection this node
+        // opened. No rule in `DenyAll` names it, and none in a real tailnet ACL could.
+        let v4 = |flags| v4_packet(6, 0, false, &tcp_header(443, 41234, flags));
+        let v6 = |flags| ipv6_packet(6, &tcp_header(443, 41234, flags));
+
+        for (why, flags) in [
+            (
+                "a SYN-ACK — the answer to our own outbound connection",
+                TCP_SYN | TCP_ACK,
+            ),
+            (
+                "a bare ACK — the continuation of an established session",
+                TCP_ACK,
+            ),
+            ("a FIN-ACK closing that session", TCP_FIN | TCP_ACK),
+            ("an RST tearing it down", TCP_RST),
+            // Go's test is `(flags & (SYN|ACK)) == SYN`, so a segment with neither bit set is a
+            // non-SYN as well. Ported as it stands rather than tightened.
+            ("a segment with no flags at all", 0x00),
+        ] {
+            assert!(
+                admitted(&DenyAll, flows, v4(flags)),
+                "{why} is admitted with no rule matching it"
+            );
+            assert!(
+                admitted(&DenyAll, flows, v6(flags)),
+                "{why} is admitted on IPv6 too (Go `runIn6` carries the same arm)"
+            );
+        }
+
+        // The negative that gives the carve-out its value: SYN set and ACK clear is Go's
+        // `IsTCPSyn`, and it is the only way to open an inbound session.
+        assert!(
+            !admitted(&DenyAll, flows, v4(TCP_SYN)),
+            "an inbound SYN with no matching rule is still dropped"
+        );
+        assert!(
+            !admitted(&DenyAll, flows, v6(TCP_SYN)),
+            "an inbound SYN with no matching rule is still dropped on IPv6"
+        );
+        // ...and it is admitted when a rule really does open the port, so the drop above is the
+        // rules speaking and not the carve-out swallowing the packet.
+        assert!(
+            admitted(
+                &acl(IPV4_FIXTURE_NET, &[6], 41234..=41234),
+                flows,
+                v4(TCP_SYN)
+            ),
+            "a rule opening the destination port admits the SYN"
+        );
+
+        // The protocol number the carve-out is scoped to is the one the **base** IP header
+        // declares, which is what Go's `runIn4`/`runIn6` switch dispatches on. etherparse walks an
+        // IPv6 extension-header chain through to the real transport, so a non-SYN segment behind a
+        // Routing header hands this code a TCP transport slice for a packet upstream filters as
+        // protocol 43. Admitting it would make "prepend an extension header" a way past the rules.
+        for ext in [43u8, 60] {
+            assert!(
+                !admitted(
+                    &DenyAll,
+                    flows,
+                    ipv6_with_prepended_ext_header(ext, &v6(TCP_ACK))
+                ),
+                "a non-SYN segment behind extension header {ext} is not TCP to the filter"
+            );
+        }
+    }
+
+    /// Go's ICMP reply carve-out, on real bytes through the whole inbound filter: `runIn4`/`runIn6`
+    /// accept an ICMP echo *response* or an ICMP *error* before any rule is consulted.
+    ///
+    /// ```text
+    /// if q.IsEchoResponse() || q.IsError() {
+    ///     // ICMP responses are allowed.
+    ///     return Accept, "icmp response ok"
+    /// } else if f.matches4.matchIPsOnly(q, f.srcIPHasCap) {
+    ///     // If any port is open to an IP, allow ICMP to it.
+    ///     return Accept, "icmp ok"
+    /// }
+    /// ```
+    ///
+    /// The reply to a ping this node sent is unsolicited as far as any ACL is concerned, and so is
+    /// the Packet Too Big that path-MTU discovery needs; both were silently dropped under a policy
+    /// that does not grant the peer inbound access back.
+    ///
+    /// The negative half is the `else if`, which this fork already had: ICMP that is *not* a
+    /// response must still go to the rules and be matched IPs-only, never admitted as a "response".
+    /// An echo request is the case that matters — it is how an inbound ICMP session starts.
+    ///
+    /// Ported from github.com/tailscale/tailscale `wgengine/filter/filter.go` (`runIn4`, `runIn6`)
+    /// and `net/packet/packet.go` (`IsEchoResponse`, `IsError`) at
+    /// `3945b82f8a9550b54c33e61d4ed2227862d53e8a`.
+    #[test]
+    fn inbound_icmp_responses_are_admitted_without_a_rule_but_requests_are_not() {
+        let flows = &mut flowtrack::FlowCache::default();
+        let v4 = |icmp_type, icmp_code| v4_packet(1, 0, false, &icmp_header(icmp_type, icmp_code));
+        let v6 = |icmp_type, icmp_code| ipv6_packet(58, &icmp_header(icmp_type, icmp_code));
+
+        // Go `IsEchoResponse` and `IsError` on ICMPv4.
+        for (why, icmp_type, icmp_code) in [
+            ("an echo reply — the answer to our own ping", 0x00u8, 0u8),
+            ("destination unreachable", 0x03, 1),
+            ("time exceeded", 0x0b, 0),
+            // Upstream's `ICMP4ParamProblem` is 0x12. IANA's Parameter Problem is 12 (0x0c) and
+            // 0x12 is Address Mask Reply, so the constant names one message and holds another —
+            // ported as it stands, because "fixing" it would admit type 12 traffic upstream drops.
+            (
+                "upstream's ICMP4ParamProblem constant, whatever IANA calls it",
+                0x12,
+                0,
+            ),
+        ] {
+            assert!(
+                admitted(&DenyAll, flows, v4(icmp_type, icmp_code)),
+                "{why} is admitted with no rule matching it"
+            );
+        }
+
+        // ...and on ICMPv6, where the type numbers are entirely different and Packet Too Big is an
+        // error class of its own.
+        for (why, icmp_type, icmp_code) in [
+            ("an ICMPv6 echo reply", 129u8, 0u8),
+            ("ICMPv6 destination unreachable", 1, 3),
+            (
+                "ICMPv6 packet too big — what path-MTU discovery rides on",
+                2,
+                0,
+            ),
+            ("ICMPv6 time exceeded", 3, 0),
+            ("ICMPv6 parameter problem", 4, 0),
+        ] {
+            assert!(
+                admitted(&DenyAll, flows, v6(icmp_type, icmp_code)),
+                "{why} is admitted with no rule matching it"
+            );
+        }
+
+        // The negatives. None of these is a "response", so each falls through to the rules — and a
+        // deny-all filter says no.
+        for (why, packet) in [
+            (
+                "an echo REQUEST is how an inbound session starts",
+                v4(0x08, 0),
+            ),
+            (
+                "an echo reply with a non-zero code is not one (Go tests the code)",
+                v4(0x00, 1),
+            ),
+            (
+                "IANA's Parameter Problem (12) is not upstream's constant (0x12)",
+                v4(0x0c, 0),
+            ),
+            ("an ICMPv6 echo REQUEST", v6(128, 0)),
+            ("an ICMPv6 echo reply with a non-zero code", v6(129, 1)),
+            (
+                "an ICMPv6 router advertisement is neither response nor error",
+                v6(134, 0),
+            ),
+        ] {
+            assert!(!admitted(&DenyAll, flows, packet), "{why}: still dropped");
+        }
+
+        // And what "still faces the rules" means: Go's `matchIPsOnly`, which this fork already
+        // ported. A rule that opens *any* port to this destination admits the echo request, ports
+        // ignored — so the drop above is the deny-all ruleset speaking, not the decode failing.
+        assert!(
+            admitted(&acl(IPV4_FIXTURE_NET, &[1], 443..=443), flows, v4(0x08, 0)),
+            "an echo request is matched IPs-only, so a port-scoped ICMP rule admits it"
+        );
+    }
+
+    /// The reply carve-outs sit inside Go's proto switch, and `pre()` runs *before* that switch. So
+    /// the unconditional multicast and link-local drops outrank both of them: a SYN-ACK or an echo
+    /// reply addressed somewhere `pre()` refuses is still dropped, however much of a reply it is.
+    ///
+    /// This pins the branch ordering, which is the only thing keeping the carve-outs from
+    /// re-opening destinations upstream closes unconditionally.
+    #[test]
+    fn pre_rule_drops_outrank_the_reply_carve_outs() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        let src = ip("100.64.0.9");
+        let verdict = |proto, dst, l4| {
+            inbound_filter_verdict(
+                &AllowAll,
+                &mut flowtrack::FlowCache::default(),
+                proto,
+                std::net::SocketAddr::new(src, 443),
+                std::net::SocketAddr::new(dst, 41234),
+                l4,
+                None,
+            )
+        };
+        let syn_ack = ts_packetfilter::L4Header::Tcp {
+            flags: TCP_SYN | TCP_ACK,
+        };
+        let echo_reply = ts_packetfilter::L4Header::Icmp {
+            icmp_type: 0x00,
+            icmp_code: 0,
+        };
+
+        // The controls: to an ordinary tailnet address both are admitted.
+        assert!(verdict(IpProto::TCP, ip("100.64.0.1"), syn_ack));
+        assert!(verdict(IpProto::ICMP, ip("100.64.0.1"), echo_reply));
+
+        for dst in ["224.0.0.1", "169.254.1.1"] {
+            assert!(
+                !verdict(IpProto::TCP, ip(dst), syn_ack),
+                "a non-SYN segment to {dst} is still dropped by pre()"
+            );
+            assert!(
+                !verdict(IpProto::ICMP, ip(dst), echo_reply),
+                "an echo reply to {dst} is still dropped by pre()"
+            );
+        }
+        // The one link-local address `pre()` allows through is still allowed through.
+        assert!(
+            verdict(IpProto::ICMP, ip("169.254.169.254"), echo_reply),
+            "the cloud-metadata exception is unaffected"
+        );
+    }
+
+    /// A *first* IPv6 fragment is decoded past its Fragment extension header, TCP flags included —
+    /// Go `decode6` reaches `q.TCPFlags = TCPFlag(sub[13])` through exactly the same switch a
+    /// unfragmented segment takes — so the reply carve-out applies to it on the same terms.
+    ///
+    /// Without this a peer that source-fragments could not complete a handshake this node started
+    /// under a restrictive ACL; with it wrong, a fragmented SYN would slip past the rules. Both
+    /// directions are asserted, on real bytes and on the classification itself.
+    #[test]
+    fn ipv6_first_fragment_carries_its_tcp_flags_to_the_reply_carve_out() {
+        let flows = &mut flowtrack::FlowCache::default();
+        let frag = |flags| ipv6_fragment_packet(6, 0, true, &tcp_header(443, 41234, flags));
+
+        assert!(
+            admitted(&DenyAll, flows, frag(TCP_SYN | TCP_ACK)),
+            "a fragmented SYN-ACK takes the non-SYN carve-out like an unfragmented one"
+        );
+        assert!(
+            !admitted(&DenyAll, flows, frag(TCP_SYN)),
+            "a fragmented SYN does not"
+        );
+
+        // The classification carries the byte, not merely the verdict — this is the value the
+        // verdict reads, and the ports are still Go's `sub[0:2]`/`sub[2:4]` beside it.
+        assert_eq!(
+            decode6_first_fragment(IpProto::TCP, &tcp_header(443, 41234, TCP_SYN | TCP_ACK)),
+            Ipv6Fragment::First {
+                proto: IpProto::TCP,
+                src_port: 443,
+                dst_port: 41234,
+                l4: ts_packetfilter::L4Header::Tcp {
+                    flags: TCP_SYN | TCP_ACK
+                },
+            },
+            "`decode6` reads the flags byte past the Fragment header"
         );
     }
 }

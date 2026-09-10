@@ -370,6 +370,7 @@ mod test {
                 ip_proto: PROTO,
                 src: SRC,
                 port: PORT,
+                l4: pf::L4Header::Unknown,
             },
             []
         ));

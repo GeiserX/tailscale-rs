@@ -41,6 +41,7 @@ where
                 src: ip,
                 ip_proto: pf::IpProto::TCP,
                 port: 5678,
+                l4: pf::L4Header::Unknown,
             },
             [],
         )
@@ -136,6 +137,7 @@ macro_rules! sample_bench {
                 dst: IpAddr::from_str($dst).unwrap(),
                 port: $port,
                 ip_proto: $ipproto,
+                l4: pf::L4Header::Unknown,
             };
 
             // verify that the filter does what we expect
