@@ -1131,8 +1131,8 @@ one, and that all three have now happened more than once. Upstream can move (as 
 capability version 146 at this revision, `2ae2808b6` moved the index-eviction row at the previous one,
 `e1d17a6b9` and `f53c28101` moved the disco-key rows before that, and `d9cc55e33` moved the
 `tsnet.Server.HTTPClient` row before that). This tree can move, with upstream nearly still — still the
-dominant source: four §B rows closed at this revision on tree movement alone (#404, #406, #408/#410,
-#412), six at the previous one (#360, #363, #367, #369, #370, #372), three before that
+dominant source: four §B rows closed at this revision on tree movement alone (#404, #406, #408/#410, #412),
+six at the previous one (#360, #363, #367, #369, #370, #372), three before that
 (#339, #342/#343/#345, #347), and three capability-version rows at the one before. Or the **sweep
 itself** can widen, or simply be read more carefully, and surface something that was true all along —
 which is where four of this revision's six new rows came from.
