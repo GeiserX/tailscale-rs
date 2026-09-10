@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.52.3](https://github.com/GeiserX/tailscale-rs/compare/v0.52.2...v0.52.3) (2026-09-10)
+
+
+### Bug Fixes
+
+* **dataplane:** stop dropping the head fragment of a fragmented reply ([#430](https://github.com/GeiserX/tailscale-rs/issues/430)) ([d54996b](https://github.com/GeiserX/tailscale-rs/commit/d54996b28cf22bf5e270cf4a648613867c33399d))
+
 ## [0.52.2](https://github.com/GeiserX/tailscale-rs/compare/v0.52.1...v0.52.2) (2026-09-10)
 
 
