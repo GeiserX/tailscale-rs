@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.52.2](https://github.com/GeiserX/tailscale-rs/compare/v0.52.1...v0.52.2) (2026-09-10)
+
+
+### Bug Fixes
+
+* **dataplane:** stop a peer's TSMP rejects driving the default log ([#428](https://github.com/GeiserX/tailscale-rs/issues/428)) ([60f61b5](https://github.com/GeiserX/tailscale-rs/commit/60f61b571ceee82570b72679e6e68f88cc2afffc))
+
 ## [0.52.1](https://github.com/GeiserX/tailscale-rs/compare/v0.52.0...v0.52.1) (2026-09-10)
 
 
