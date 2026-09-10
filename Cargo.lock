@@ -2035,6 +2035,7 @@ dependencies = [
  "ipnet",
  "tokio",
  "tracing",
+ "tracing-test",
 ]
 
 [[package]]

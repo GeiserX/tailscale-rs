@@ -249,9 +249,11 @@ impl DataPlane {
                     to_local,
                     to_peers,
                     learned_disco_keys: learned,
-                    // Peers' TSMP rejected-connection messages are logged and dropped by the
-                    // filter step that parses them; nothing in this task has a flow table to match
-                    // them against, so there is no second consumer here yet.
+                    // Peers' TSMP rejected-connection messages are logged (at `debug!` — the
+                    // record is peer-supplied and unmatched, so it must not be able to drive an
+                    // operator's default-level log) and dropped by the filter step that parses
+                    // them; nothing in this task has a flow table to match them against, so there
+                    // is no second consumer here yet.
                     rejected_flows: _,
                 } = core.sync.process_inbound_from(Some(peer_id), underlay_up);
 

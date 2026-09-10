@@ -1000,7 +1000,19 @@ fn filter_inbound_from_peer(
             // removing it). This fork keeps no pending-open table, so the message is logged
             // unconditionally and handed to the caller with `MaybeBroken` intact, for the embedder
             // to match against whatever it has open.
-            tracing::info!(
+            //
+            // `debug!`, not the `info!` Go's `logf` amounts to, precisely *because* the
+            // pending-open lookup is missing: Go's log volume is bounded by the flows this node
+            // opened, and an unconditional log's is bounded only by what a peer chooses to send.
+            // Every field below is peer-supplied, and reaching here needs nothing but a WireGuard
+            // session and a well-formed TSMP body — no pending-flow match, no rate limit — so at
+            // `info!` any authenticated peer can drive an operator's default-level log as fast as
+            // the link allows and bury real events under it. The same reasoning already puts the
+            // sibling TSMP branches (the disco-key advertisement above, the reject *send* below)
+            // at `debug!`. Nothing is lost: `rejected_flows` still carries the whole record, and
+            // the embedder is the layer that *can* do Go's match, so it is the layer that gets to
+            // decide a rejection is worth an `info!`.
+            tracing::debug!(
                 ?peer_id,
                 maybe_broken = reject.maybe_broken,
                 "open-conn-track: flow {} {} > {} rejected due to {}",
@@ -4857,6 +4869,79 @@ mod tests {
             harvest.rejected_flows[0].1.reason,
             ts_packet::tsmp::RejectReason::IP_FORWARDING
         );
+    }
+
+    /// A peer cannot drive the default-level log with rejected-connection messages.
+    ///
+    /// Go logs `open-conn-track` only for a flow sitting in its pending-open table, so its volume
+    /// is bounded by the dials *this* node made. This fork keeps no such table and logs every
+    /// well-formed reject it can attribute to a peer, which bounds the volume by what the peer
+    /// chooses to send instead — nothing here matches a pending flow and nothing rate-limits it.
+    /// At `info!` that is an authenticated peer holding the operator's default-level log open;
+    /// `debug!` keeps the diagnostic without putting it there.
+    ///
+    /// The record itself must keep flowing regardless: `rejected_flows` is the path the embedder
+    /// uses to do the pending-open match this layer cannot, so quieting the log must not quiet it.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_flood_of_rejects_stays_off_the_default_log_level() {
+        let peer = PeerId(7);
+        // More than a real flow-refusal burst, few enough to keep the test cheap: what matters is
+        // that the count of default-level lines does not track it.
+        const FLOOD: usize = 32;
+
+        let wire = ts_packet::tsmp::TailscaleRejectedHeader {
+            ip_src: IPV4_FIXTURE_SRC.into(),
+            ip_dst: IPV4_FIXTURE_DST.into(),
+            src: std::net::SocketAddr::new(IPV4_FIXTURE_DST.into(), 41234),
+            dst: std::net::SocketAddr::new(IPV4_FIXTURE_SRC.into(), 22),
+            proto: IPPROTO_TCP_BYTE,
+            reason: ts_packet::tsmp::RejectReason::ACLS,
+            maybe_broken: false,
+        }
+        .marshal()
+        .expect("marshals");
+
+        let mut packets: Vec<PacketMut> =
+            (0..FLOOD).map(|_| PacketMut::from(wire.clone())).collect();
+        let mut harvest = InboundHarvest::default();
+        filter_inbound_from_peer(
+            &DenyAll,
+            &mut flowtrack::FlowCache::default(),
+            peer,
+            &mut packets,
+            RejectConfig::default(),
+            &mut harvest,
+        );
+
+        assert!(packets.is_empty(), "every reject is consumed");
+        assert_eq!(
+            harvest.rejected_flows.len(),
+            FLOOD,
+            "the embedder must still receive every record — quieting the log is not dropping it"
+        );
+
+        logs_assert(|lines: &[&str]| {
+            let tracked: Vec<&&str> = lines
+                .iter()
+                .filter(|l| l.contains("open-conn-track"))
+                .collect();
+            if tracked.len() != FLOOD {
+                return Err(format!(
+                    "expected {FLOOD} open-conn-track lines at debug, got {}",
+                    tracked.len()
+                ));
+            }
+            // `INFO` and above is what an operator sees by default; a peer must not reach it.
+            let loud: Vec<&&&str> = tracked.iter().filter(|l| !l.contains(" DEBUG ")).collect();
+            if let Some(first) = loud.first() {
+                return Err(format!(
+                    "{} of {FLOOD} peer-driven reject line(s) above debug, e.g. {first}",
+                    loud.len()
+                ));
+            }
+            Ok(())
+        });
     }
 
     /// A *fragmented* rejected-connection message is refused before the ACL ever sees it, and is
