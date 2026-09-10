@@ -19,9 +19,9 @@ pub enum L4Header {
     /// This is the fail-closed default, and it is a different statement from Go's zero-valued
     /// `Parsed`: Go always reaches its filter with the header parsed (`decode4`/`decode6` demote a
     /// packet too short to hold one to `ipproto.Unknown`, which `pre()` drops), whereas a caller
-    /// here can legitimately hold a packet whose L4 header it never read — a later IP fragment, or
-    /// a first IPv4 fragment, whose transport bytes are simply not present. Every reply predicate
-    /// answers `false` for this variant, so such a packet takes the ordinary rule match.
+    /// here can legitimately hold a packet whose L4 header it never read — a later IP fragment,
+    /// whose transport bytes are simply not present. Every reply predicate answers `false` for this
+    /// variant, so such a packet takes the ordinary rule match.
     #[default]
     Unknown,
     /// TCP: the flags byte, Go `Parsed.TCPFlags`, read from `sub[13]` by both `decode4` and

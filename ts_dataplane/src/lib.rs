@@ -289,6 +289,96 @@ fn decode6_first_fragment(proto: IpProto, sub: &[u8]) -> Ipv6Fragment {
     }
 }
 
+/// The transport-header fields Go's `decode4` reads out of a **first** IPv4 fragment — the
+/// `(source port, destination port, L4 header)` of the sub-protocol switch it runs under
+/// `if fragOfs == 0`, from the same bytes Go calls `sub`.
+///
+/// `None` is Go's `q.IPProto = unknown` for a fragment too short to hold the whole transport header
+/// it claims to carry, which filter `pre()` drops before any rule is consulted. Upstream spells out
+/// why every arm bounds-checks:
+///
+/// ```text
+/// // This is the first fragment
+/// // Every protocol below MUST check that it has at least one entire
+/// // transport header in order to protect against fragment confusion.
+/// ```
+///
+/// Falling back to port 0 instead would be the fragment-confusion bug itself: a first fragment cut
+/// off before its ports would be matched (and possibly admitted) on a port it never carried, with
+/// the follow-up fragments supplying the real header after the verdict was taken.
+///
+/// This exists for the same reason [`sctp_ports`] does — etherparse cannot supply the header. It
+/// deliberately refuses to descend into a *fragmenting* payload, so `SlicedPacket::transport` is
+/// empty for a first fragment even though the fragment does carry the full header, where Go's
+/// `decode4` parses it exactly as it parses an unfragmented packet's.
+///
+/// Only the protocols whose header `decode4` reads are listed. Everything else keeps its protocol
+/// number and both ports 0 — Go's switch has no `default` arm — which is what
+/// [`IpProto::is_port_ful`] already gives such a packet on the unfragmented path. Go's `ipproto.IGMP`
+/// arm is the one omission: it bounds-checks the IGMP header and reads nothing out of it, and IGMP is
+/// addressed to a multicast group, so [`drop_before_rules`] has already refused any packet that arm
+/// could speak about. `ipproto.TSMP`'s `if moreFrags` refusal lives in [`inbound_filter_verdict`],
+/// which is where this fork already carried it.
+fn decode4_first_fragment(
+    proto: IpProto,
+    sub: &[u8],
+) -> Option<(u16, u16, ts_packetfilter::L4Header)> {
+    /// Go `net/packet.icmp4HeaderLength`.
+    const ICMP4_HEADER_LEN: usize = 4;
+    /// Go `net/packet.tcpHeaderLength`.
+    const TCP_HEADER_LEN: usize = 20;
+    /// Go `net/packet.udpHeaderLength`.
+    const UDP_HEADER_LEN: usize = 8;
+
+    // Go's port-ful arms: bounds-check the whole header, then `sub[0:2]` and `sub[2:4]`.
+    let ported = |min_len: usize, l4: ts_packetfilter::L4Header| {
+        if sub.len() < min_len {
+            return None;
+        }
+        Some((
+            u16::from_be_bytes([sub[0], sub[1]]),
+            u16::from_be_bytes([sub[2], sub[3]]),
+            l4,
+        ))
+    };
+
+    match proto {
+        // Go `q.TCPFlags = TCPFlag(sub[13])`, behind the same 20-byte bounds check.
+        IpProto::TCP => ported(
+            TCP_HEADER_LEN,
+            match sub.get(13) {
+                Some(&flags) => ts_packetfilter::L4Header::Tcp { flags },
+                None => ts_packetfilter::L4Header::Unknown,
+            },
+        ),
+        IpProto::UDP => ported(UDP_HEADER_LEN, ts_packetfilter::L4Header::Unknown),
+        IpProto::SCTP => sctp_ports(sub).map(|(s, d)| (s, d, ts_packetfilter::L4Header::Unknown)),
+        // Go `case ipproto.ICMPv4`: bounds-check four bytes, then `withPort(…, 0)` on both. The
+        // type/code pair its `IsEchoResponse`/`IsError` read is guarded by a *wider* bound —
+        // `len(q.b) >= q.subofs+8` — so a first fragment between 4 and 7 bytes long is decoded and
+        // matched IPs-only, but is no "response" to upstream and carries no header here either.
+        IpProto::ICMP => {
+            if sub.len() < ICMP4_HEADER_LEN {
+                return None;
+            }
+            let l4 = match (sub.first(), sub.get(1)) {
+                (Some(&icmp_type), Some(&icmp_code)) if sub.len() >= 8 => {
+                    ts_packetfilter::L4Header::Icmp {
+                        icmp_type,
+                        icmp_code,
+                    }
+                }
+                _ => ts_packetfilter::L4Header::Unknown,
+            };
+            Some((0, 0, l4))
+        }
+        // Go's internal later-fragment sentinel, seen as a real protocol number on the wire: Go
+        // `case ipproto.Fragment: q.IPProto = unknown`, so this is a drop, not a port-0 pass.
+        IPPROTO_FRAGMENT_SENTINEL => None,
+        _ => Some((0, 0, ts_packetfilter::L4Header::Unknown)),
+    }
+}
+
 /// The `(source, destination)` ports of the SCTP packet whose common header starts at `sub` — Go's
 /// `case ipproto.SCTP` arm, which both `decode4` and `decode6` carry verbatim: bounds-check the
 /// 12-byte common header, then read `sub[0:2]` and `sub[2:4]`.
@@ -368,6 +458,9 @@ enum Fragment {
 ///    read past the Fragment extension header, and `Ipv6Fragment::Unknown` — a truncated or
 ///    short-first fragment, or one whose Fragment header sits behind a chained extension header
 ///    ([`fragment_header_is_chained`]) — is dropped where Go's `pre()` drops `ipproto.Unknown`.
+///    A *first* IPv4 fragment is decoded the same way ([`decode4_first_fragment`], Go `decode4`'s
+///    `fragOfs == 0` switch), so `dst_port` and `l4` here are the fragmented datagram's own and it
+///    faces the rules — and the reply carve-outs below — on the terms an unfragmented one does.
 /// 3. **Unknown protocol** ([`IPPROTO_UNKNOWN`]) — Go `pre()`'s `if q.IPProto == ipproto.Unknown`
 ///    drop. `proto` is whatever the *base* header declared (Go `decode4`'s `b[9]`, `decode6`'s
 ///    `b[6]`), so this is the arm that refuses an IPv6 packet leading with Hop-by-Hop Options,
@@ -848,6 +941,37 @@ fn filter_inbound_from_peer(
             }
         };
 
+        // Go `decode4`, `if fragOfs == 0`: a *first* IPv4 fragment carries the whole transport
+        // header, and Go parses it exactly as it parses an unfragmented packet's — ports, TCP flags
+        // and all. etherparse refuses to descend into a fragmenting payload and leaves
+        // `pkt.transport` empty, so those bytes have to be read out of `sub` the way Go reads them.
+        //
+        // Without this a fragmented inbound datagram reaches the ACL as port 0 and misses the
+        // reverse-flow cache, while its *later* fragments — accepted on their offset alone, as Go
+        // accepts them — arrive and can never be reassembled. `process_outbound` already reads a
+        // first fragment's ports this way (see `outbound_udp_or_sctp_flow`), so the flow this node
+        // opened was recorded and only the reply's head fragment was thrown away.
+        //
+        // Scoped to a fragmented first fragment (MF set, offset 0), which is exactly the shape
+        // etherparse withholds the transport header for; an unfragmented packet keeps the
+        // etherparse-parsed header it has always had.
+        let v4_first_frag = match frag {
+            Some(Fragment::V4(v4)) if v4.more_fragments && v4.offset_blocks == 0 => {
+                let Some(decoded) = decode4_first_fragment(proto, sub) else {
+                    // Go's `q.IPProto = unknown`, dropped by `pre()` before any rule is consulted:
+                    // a first fragment too short to hold the transport header it claims, or one
+                    // carrying Go's internal later-fragment sentinel as its protocol number.
+                    tracing::trace!(
+                        ?dst,
+                        "dropping first IPv4 fragment Go decodes as unknown (fragment confusion)"
+                    );
+                    return false;
+                };
+                Some(decoded)
+            }
+            _ => None,
+        };
+
         // The rest of what Go's `packet.Parsed` holds about the L4 header — `q.TCPFlags`, and the
         // ICMP type/code its `IsEchoResponse`/`IsError` read — for the reply carve-outs
         // `inbound_filter_verdict` applies ahead of the rules. Taken before the port match below,
@@ -868,40 +992,43 @@ fn filter_inbound_from_peer(
             Some(Fragment::V6(Ipv6Fragment::Later | Ipv6Fragment::Unknown)) => {
                 ts_packetfilter::L4Header::Unknown
             }
-            // Any IPv4 packet, and any IPv6 packet with no Fragment header. etherparse refuses to
-            // descend into a *fragmenting* payload, so a first IPv4 fragment arrives here with no
-            // transport slice and falls to the `_` arm — no carve-out, ordinary rule match. Go does
-            // read that header; the same etherparse limit already leaves such a packet's ports at
-            // 0, so closing the gap is a wider change than this one and both halves of it fail
-            // closed.
-            Some(Fragment::V4(_)) | None => match &pkt.transport {
-                // Go `decode4`/`decode6`: `q.TCPFlags = TCPFlag(sub[13])`. `TcpSlice::from_slice`
-                // has already bounds-checked a 20-byte header, so the `None` is unreachable — but
-                // it is spelled out rather than indexed, because these bytes are attacker
-                // controlled post-decrypt and `L4Header::Unknown` fails closed where a panic would
-                // take down the dataplane.
-                Some(etherparse::TransportSlice::Tcp(tcp)) if proto == IpProto::TCP => {
-                    match tcp.header_slice().get(13) {
-                        Some(&flags) => ts_packetfilter::L4Header::Tcp { flags },
-                        None => ts_packetfilter::L4Header::Unknown,
+            // Any IPv4 packet, and any IPv6 packet with no Fragment header.
+            //
+            // A *first* IPv4 fragment has no transport slice — etherparse will not descend into a
+            // fragmenting payload — so its header comes from the Go-shaped decode above instead,
+            // and the reply carve-outs see the same TCP flags or ICMP type they would see on the
+            // unfragmented datagram.
+            Some(Fragment::V4(_)) | None => match v4_first_frag {
+                Some((_, _, l4)) => l4,
+                None => match &pkt.transport {
+                    // Go `decode4`/`decode6`: `q.TCPFlags = TCPFlag(sub[13])`. `TcpSlice::from_slice`
+                    // has already bounds-checked a 20-byte header, so the `None` is unreachable — but
+                    // it is spelled out rather than indexed, because these bytes are attacker
+                    // controlled post-decrypt and `L4Header::Unknown` fails closed where a panic would
+                    // take down the dataplane.
+                    Some(etherparse::TransportSlice::Tcp(tcp)) if proto == IpProto::TCP => {
+                        match tcp.header_slice().get(13) {
+                            Some(&flags) => ts_packetfilter::L4Header::Tcp { flags },
+                            None => ts_packetfilter::L4Header::Unknown,
+                        }
                     }
-                }
-                // Go's `IsEchoResponse`/`IsError` read `q.b[q.subofs]` and `q.b[q.subofs+1]` behind
-                // `len(q.b) >= q.subofs+8`; etherparse's ICMP slices refuse anything shorter than
-                // those same 8 bytes, so reaching this arm at all satisfies upstream's guard.
-                Some(etherparse::TransportSlice::Icmpv4(icmp)) if proto == IpProto::ICMP => {
-                    ts_packetfilter::L4Header::Icmp {
-                        icmp_type: icmp.type_u8(),
-                        icmp_code: icmp.code_u8(),
+                    // Go's `IsEchoResponse`/`IsError` read `q.b[q.subofs]` and `q.b[q.subofs+1]` behind
+                    // `len(q.b) >= q.subofs+8`; etherparse's ICMP slices refuse anything shorter than
+                    // those same 8 bytes, so reaching this arm at all satisfies upstream's guard.
+                    Some(etherparse::TransportSlice::Icmpv4(icmp)) if proto == IpProto::ICMP => {
+                        ts_packetfilter::L4Header::Icmp {
+                            icmp_type: icmp.type_u8(),
+                            icmp_code: icmp.code_u8(),
+                        }
                     }
-                }
-                Some(etherparse::TransportSlice::Icmpv6(icmp)) if proto == IpProto::ICMPV6 => {
-                    ts_packetfilter::L4Header::Icmp {
-                        icmp_type: icmp.type_u8(),
-                        icmp_code: icmp.code_u8(),
+                    Some(etherparse::TransportSlice::Icmpv6(icmp)) if proto == IpProto::ICMPV6 => {
+                        ts_packetfilter::L4Header::Icmp {
+                            icmp_type: icmp.type_u8(),
+                            icmp_code: icmp.code_u8(),
+                        }
                     }
-                }
-                _ => ts_packetfilter::L4Header::Unknown,
+                    _ => ts_packetfilter::L4Header::Unknown,
+                },
             },
         };
 
@@ -944,11 +1071,16 @@ fn filter_inbound_from_peer(
                 };
                 ports
             }
-            _ => match pkt.transport {
-                Some(etherparse::TransportSlice::Udp(udp)) => {
+            // A *first* IPv4 fragment carrying TCP or UDP: Go's `fragOfs == 0` arms read its ports
+            // like any other packet's, and etherparse cannot, because it hands over no transport
+            // slice for a fragmenting payload. Without this the ACL sees port 0 and the
+            // reverse-flow cache is asked about a flow nobody opened.
+            _ => match (v4_first_frag, pkt.transport) {
+                (Some((src_port, dst_port, _)), _) => (src_port, dst_port),
+                (None, Some(etherparse::TransportSlice::Udp(udp))) => {
                     (udp.source_port(), udp.destination_port())
                 }
-                Some(etherparse::TransportSlice::Tcp(tcp)) => {
+                (None, Some(etherparse::TransportSlice::Tcp(tcp))) => {
                     (tcp.source_port(), tcp.destination_port())
                 }
                 _ => (0, 0),
@@ -2053,6 +2185,217 @@ mod tests {
                 frag(MIN_FRAG_BLKS, true)
             ),
             "a later TSMP fragment is accepted via the fragment path (proto-independent)"
+        );
+    }
+
+    /// The head fragment of a fragmented IPv4/UDP datagram from `src` to `dst`: the same 8-byte UDP
+    /// header an unfragmented datagram carries, plus the More-Fragments bit, plus the UDP length
+    /// field a real sender writes — the length of the **whole** reassembled datagram, not of the
+    /// piece on the wire. That is the shape etherparse hands over with `transport == None`, and the
+    /// one Go `decode4` parses under `if fragOfs == 0`.
+    fn v4_udp_first_fragment(
+        src: std::net::SocketAddr,
+        dst: std::net::SocketAddr,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut buf = v4_udp_packet(src, dst, payload);
+        // Fragment offset 0, More Fragments set.
+        buf[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+        let whole_datagram = u16::try_from(8 + payload.len() + 512).unwrap();
+        buf[24..26].copy_from_slice(&whole_datagram.to_be_bytes());
+        buf
+    }
+
+    /// A fragmented reply to a UDP flow *this node* opened is admitted whole — head fragment
+    /// included — with no rule naming it.
+    ///
+    /// A DNS answer larger than the 1280-byte overlay MTU arrives as a head fragment plus later
+    /// ones. The later fragments were already accepted on their offset alone (Go `pre()`'s
+    /// `ipproto.Fragment` pass-through), but the head fragment carries the ports, and it reached
+    /// the reverse-flow cache with both of them 0 — so it missed the entry `process_outbound` had
+    /// just recorded, was dropped as "no matching rule", and the pieces that did arrive could never
+    /// be reassembled. Go `decode4` reads that header (`if fragOfs == 0`, the `case ipproto.UDP`
+    /// arm) exactly as it reads an unfragmented datagram's.
+    ///
+    /// Ported from github.com/tailscale/tailscale `net/packet/packet.go` (`decode4`) and
+    /// `wgengine/filter/filter.go` (`pre`, `runIn4`) at
+    /// `9ea7cba44591e0cd840c6c94d23274dd222059bf`.
+    #[test]
+    fn a_fragmented_reply_to_our_own_udp_flow_is_admitted_head_fragment_included() {
+        let peer = PeerId(1);
+        let me = std::net::IpAddr::from([100, 64, 0, 1]);
+        let them = std::net::IpAddr::from([100, 64, 0, 2]);
+        let sa = |ip, port| std::net::SocketAddr::new(ip, port);
+        let mut dp = dataplane_routing_to(peer, &[them]);
+
+        let query = v4_udp_packet(sa(me, 41234), sa(them, 53), b"query");
+        let head = v4_udp_first_fragment(sa(them, 53), sa(me, 41234), b"answer");
+        // The rest of the same answer: a later fragment at a safe offset, carrying no header at all.
+        let mut tail = head.clone();
+        tail[6..8].copy_from_slice(&MIN_FRAG_BLKS.to_be_bytes());
+
+        assert!(
+            !admitted(&DenyAll, &mut dp.flows, head.clone()),
+            "before we send anything the head fragment is unsolicited, and a deny-all ACL drops it"
+        );
+
+        let out = dp.process_outbound(vec![PacketMut::from(query)]);
+        assert!(
+            !out.to_peers.is_empty(),
+            "the query really did route to the peer, so this is the live outbound path"
+        );
+
+        assert!(
+            admitted(&DenyAll, &mut dp.flows, head),
+            "the head fragment of the reply rides the flow we opened (Go's `Accept, \"cached\"`)"
+        );
+        assert!(
+            admitted(&DenyAll, &mut dp.flows, tail),
+            "its later fragments still pass on their offset alone"
+        );
+        assert!(
+            !admitted(
+                &DenyAll,
+                &mut dp.flows,
+                v4_udp_first_fragment(sa(them, 53), sa(me, 41235), b"x")
+            ),
+            "a head fragment to a port we never sent from is not carried by the entry"
+        );
+    }
+
+    /// A first IPv4 fragment faces the rules — and the reply carve-outs — on the header it really
+    /// carries, and is refused outright when it is too short to carry one.
+    ///
+    /// Go `decode4`, `if fragOfs == 0`: "Every protocol below MUST check that it has at least one
+    /// entire transport header in order to protect against fragment confusion." A fragment cut off
+    /// inside its own transport header is `q.IPProto = unknown`, which filter `pre()` drops before
+    /// any rule is consulted — never a fallback to port 0, which an all-ports rule would admit
+    /// while the follow-up fragments supplied the real header afterwards.
+    ///
+    /// Ported from github.com/tailscale/tailscale `net/packet/packet.go` (`decode4`) at
+    /// `9ea7cba44591e0cd840c6c94d23274dd222059bf`.
+    #[test]
+    fn first_ipv4_fragment_is_decoded_like_go_decode4() {
+        let flows = &mut flowtrack::FlowCache::default();
+        let sa = |ip: std::net::Ipv4Addr, port| std::net::SocketAddr::new(ip.into(), port);
+        let from = sa(IPV4_FIXTURE_SRC, 41234);
+
+        // The ACL matches on the port the fragment carries, both ways round.
+        assert!(
+            admitted(
+                &AllowPort(443),
+                flows,
+                v4_udp_first_fragment(from, sa(IPV4_FIXTURE_DST, 443), b"x")
+            ),
+            "a head fragment to an allowed port is admitted on the port it carries"
+        );
+        assert!(
+            !admitted(
+                &AllowPort(443),
+                flows,
+                v4_udp_first_fragment(from, sa(IPV4_FIXTURE_DST, 8443), b"x")
+            ),
+            "a head fragment to any other port is not — the port is read, not assumed"
+        );
+
+        // And the TCP flags byte with it, so the non-SYN carve-out applies to a fragmented segment
+        // on exactly the terms it applies to an unfragmented one.
+        let tcp_head = |flags| v4_packet(6, 0, true, &tcp_header(443, 41234, flags));
+        assert!(
+            admitted(&DenyAll, flows, tcp_head(TCP_SYN | TCP_ACK)),
+            "a fragmented SYN-ACK takes the non-SYN carve-out"
+        );
+        assert!(
+            !admitted(&DenyAll, flows, tcp_head(TCP_SYN)),
+            "a fragmented SYN still faces the rules"
+        );
+
+        // Go's fragment-confusion refusal, asserted under an ALLOW-ALL ACL: the drop can only be
+        // the bounds check, because there is no rule left to refuse it.
+        for (why, packet) in [
+            (
+                "a UDP head fragment one byte short of its own header",
+                v4_packet(17, 0, true, &udp_header(443)[..7]),
+            ),
+            (
+                "a TCP head fragment one byte short of its own header",
+                v4_packet(6, 0, true, &tcp_header(443, 41234, TCP_ACK)[..19]),
+            ),
+            (
+                "an ICMP head fragment shorter than its four-byte header",
+                v4_packet(1, 0, true, &icmp_header(0, 0)[..3]),
+            ),
+            (
+                "an SCTP head fragment shorter than its common header",
+                v4_packet(132, 0, true, &sctp_header(443, SCTP_HEADER_LEN - 1)),
+            ),
+        ] {
+            assert!(!admitted(&AllowAll, flows, packet), "{why} is dropped");
+        }
+        // The controls: at full length every one of those is admitted by the same ACL, so the
+        // drops above are the bounds checks and not the fixtures.
+        for (why, packet) in [
+            (
+                "UDP",
+                v4_udp_first_fragment(from, sa(IPV4_FIXTURE_DST, 443), b"x"),
+            ),
+            ("TCP", tcp_head(TCP_SYN)),
+            ("ICMP", v4_packet(1, 0, true, &icmp_header(8, 0))),
+            (
+                "SCTP",
+                v4_packet(132, 0, true, &sctp_header(443, SCTP_HEADER_LEN)),
+            ),
+        ] {
+            assert!(
+                admitted(&AllowAll, flows, packet),
+                "a full-length {why} head fragment is admitted"
+            );
+        }
+
+        // The decode itself, beside the verdicts it feeds: Go's `sub[0:2]`/`sub[2:4]` and
+        // `sub[13]`, and its refusals.
+        assert_eq!(
+            decode4_first_fragment(IpProto::UDP, &udp_header(443)),
+            Some((54276, 443, ts_packetfilter::L4Header::Unknown)),
+            "`decode4`'s UDP arm reads both ports"
+        );
+        assert_eq!(
+            decode4_first_fragment(IpProto::TCP, &tcp_header(443, 41234, TCP_SYN | TCP_ACK)),
+            Some((
+                443,
+                41234,
+                ts_packetfilter::L4Header::Tcp {
+                    flags: TCP_SYN | TCP_ACK
+                }
+            )),
+            "`decode4`'s TCP arm reads the flags byte beside the ports"
+        );
+        assert_eq!(
+            decode4_first_fragment(IpProto::ICMP, &icmp_header(0, 0)),
+            Some((
+                0,
+                0,
+                ts_packetfilter::L4Header::Icmp {
+                    icmp_type: 0,
+                    icmp_code: 0
+                }
+            )),
+            "`decode4`'s ICMPv4 arm reads the type/code and leaves both ports 0"
+        );
+        assert_eq!(
+            decode4_first_fragment(IpProto::UDP, &udp_header(443)[..7]),
+            None,
+            "a short UDP header is Go's `unknown`, not a port-0 pass"
+        );
+        assert_eq!(
+            decode4_first_fragment(IPPROTO_FRAGMENT_SENTINEL, &udp_header(443)),
+            None,
+            "Go's internal later-fragment sentinel seen on the wire is `unknown` too"
+        );
+        assert_eq!(
+            decode4_first_fragment(IpProto::new(89), &udp_header(443)),
+            Some((0, 0, ts_packetfilter::L4Header::Unknown)),
+            "a protocol Go's switch has no arm for keeps its number and both ports 0"
         );
     }
 
@@ -4034,8 +4377,18 @@ mod tests {
         );
 
         // Same addresses, same ports, UDP instead of SCTP: the protocol is part of Go's tuple.
+        //
+        // Reinterpreting the SCTP header as a UDP one puts the verification tag where the UDP
+        // length field belongs, and `UdpSlice::from_slice` refuses a length field the slice cannot
+        // satisfy — so the datagram has to be given a real length here, or the drop below is the
+        // parse failing and says nothing at all about the protocol in the tuple.
         let mut as_udp = reply.clone();
         as_udp[9] = 17;
+        as_udp[24..26].copy_from_slice(&u16::try_from(SCTP_HEADER_LEN).unwrap().to_be_bytes());
+        assert!(
+            admitted(&AllowAll, &mut dp.flows, as_udp.clone()),
+            "the fixture is a datagram the filter can parse, so the drop below is the tuple's"
+        );
         assert!(
             !admitted(&DenyAll, &mut dp.flows, as_udp),
             "a UDP datagram does not ride an SCTP entry"
