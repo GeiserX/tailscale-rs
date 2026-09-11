@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.53.1](https://github.com/GeiserX/tailscale-rs/compare/v0.53.0...v0.53.1) (2026-09-11)
+
+
+### Bug Fixes
+
+* **stun:** stop the periodic STUN sweep when the datapath goes idle ([#443](https://github.com/GeiserX/tailscale-rs/issues/443)) ([1632f07](https://github.com/GeiserX/tailscale-rs/commit/1632f0706cf299f8a865d00a14cb93fbf372834b))
+
 ## [0.53.0](https://github.com/GeiserX/tailscale-rs/compare/v0.52.4...v0.53.0) (2026-09-11)
 
 
