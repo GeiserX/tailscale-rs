@@ -839,6 +839,21 @@ fn should_do_periodic_restun(
 /// empty-list no-op when the derp map lists no FixedAddr-v4 STUN servers) is unit-testable without
 /// the actor/timer machinery.
 async fn probe_stun_servers_once(sock: &MagicSock, servers: &[SocketAddr], cursor: &Mutex<usize>) {
+    // Control put this node in TCP-443-only mode: netcheck's UDP arm is not planned at all, so the
+    // round emits nothing and the rotation does not move. Go's netcheck does the same at the same
+    // altitude — `runProbes` skips `makeProbePlan` entirely when the knob is set, and skips the ICMP
+    // latency probes with it, leaving a report built from its HTTPS measurements alone. This tree's
+    // netcheck (`ts_netcheck`) is HTTPS-only by construction — it has no STUN and no ICMP arm at all
+    // — so the DERP-latency report it produces is already exactly that report, and the sweep here is
+    // the whole of the UDP half that has to stop.
+    //
+    // `send_stun_request` refuses again underneath this (with `Error::OnlyTcp443`), which is Go's
+    // shape too: both the plan and the send check the knob. Skipping here as well keeps the refusal
+    // out of the per-server error log, so a skipped probe is never mistaken for a failed one.
+    if sock.only_tcp_443() {
+        return;
+    }
+
     let mut cursor = cursor.lock().await;
     let (window, next) = stun_probe_window(servers, *cursor, sock.stun_in_flight_remaining());
     for s in window {
@@ -1225,30 +1240,66 @@ fn disco_key_rotations(previous: Option<&PeerDb>, current: &PeerDb) -> Vec<Disco
 impl Message<Arc<ts_control::StateUpdate>> for DirectManager {
     type Reply = ();
 
-    /// Track control's `debug-always-stun` node attribute (Go `controlknobs.Knobs.ForceBackgroundSTUN`,
-    /// refreshed from `nm.SelfNode`'s cap map on every netmap), the only override on the periodic STUN
-    /// sweep's idle stop condition.
+    /// Track the two node attributes control aims at this node's UDP underlay, both refreshed from
+    /// `nm.SelfNode`'s cap map on every netmap exactly as Go refreshes its `controlknobs.Knobs`:
     ///
-    /// A response that carries no self node leaves the flag alone rather than clearing it: control
-    /// sends field-level and peer-only updates on the same stream, and reading "this response had no
-    /// self node" as "control withdrew the attribute" would silently flip the knob off mid-session.
-    /// The flag changes only when control actually restates the self node.
+    /// * `debug-always-stun` (Go `Knobs.ForceBackgroundSTUN`) — the only override on the periodic
+    ///   STUN sweep's idle stop condition.
+    /// * `only-tcp-443` (Go `Knobs.OnlyTCP443`, pushed to magicsock by `ipn/ipnlocal`'s
+    ///   `b.MagicConn().SetOnlyTCP443`) — this network alarms on anything that is not TCP/443, so
+    ///   the socket must stop emitting UDP altogether and every peer rides DERP. Pushed onto the
+    ///   [`MagicSock`] here because that is the chokepoint the refusal lives at; when the underlay
+    ///   bind failed (`sock == None`) the node is already DERP-only and there is nothing to silence.
+    ///
+    /// A response that carries no self node leaves both flags alone rather than clearing them:
+    /// control sends field-level and peer-only updates on the same stream, and reading "this
+    /// response had no self node" as "control withdrew the attribute" would silently flip a knob off
+    /// mid-session — for `only-tcp-443` that would put UDP back on a network that alarms on it. A
+    /// response that *does* restate the self node without the attribute is control withdrawing it,
+    /// and UDP resumes with no restart (Go's `SetOnlyTCP443` is live too).
     async fn handle(
         &mut self,
         msg: Arc<ts_control::StateUpdate>,
         _ctx: &mut Context<Self, Self::Reply>,
     ) {
-        let Some(self_node) = msg.node.as_ref() else {
-            return;
-        };
-        let force = self_node.force_background_stun();
-        if self.force_background_stun.swap(force, Ordering::Relaxed) != force {
-            tracing::info!(
-                force_background_stun = force,
-                "control changed the background-STUN override; the periodic sweep's idle stop \
-                 follows it",
-            );
-        }
+        apply_self_node_knobs(
+            msg.node.as_ref(),
+            &self.force_background_stun,
+            self.sock.as_deref(),
+        );
+    }
+}
+
+/// Apply the self node's control knobs for the direct underlay — the body of the
+/// [`ts_control::StateUpdate`] handler above, free-standing and taking exactly what it reads so the
+/// wiring is unit-testable without standing up the actor, the dataplane and the DERP mesh behind
+/// it. Same reason [`should_do_periodic_restun`] and [`probe_stun_servers_once`] are free functions
+/// here.
+///
+/// `self_node` is `None` when the response carried no self node, and then **neither** knob moves —
+/// see the handler's doc for why that is not the same as control withdrawing an attribute.
+/// `sock` is `None` when the underlay bind failed at startup: the node is already DERP-only, so
+/// there is no UDP to silence and nothing to push the TCP-443-only flag onto.
+fn apply_self_node_knobs(
+    self_node: Option<&ts_control::Node>,
+    force_background_stun: &AtomicBool,
+    sock: Option<&MagicSock>,
+) {
+    let Some(self_node) = self_node else {
+        return;
+    };
+
+    let force = self_node.force_background_stun();
+    if force_background_stun.swap(force, Ordering::Relaxed) != force {
+        tracing::info!(
+            force_background_stun = force,
+            "control changed the background-STUN override; the periodic sweep's idle stop \
+             follows it",
+        );
+    }
+
+    if let Some(sock) = sock {
+        sock.set_only_tcp_443(self_node.only_tcp_443());
     }
 }
 
@@ -2044,6 +2095,152 @@ mod tests {
         let cursor = Mutex::new(0);
         probe_stun_servers_once(&sock, &[], &cursor).await;
         assert_eq!(*cursor.lock().await, 0);
+    }
+
+    /// Control's `only-tcp-443` stops the STUN sweep whole: no Binding Request leaves the socket and
+    /// the rotation does not move, so the round is *skipped* rather than spent. Go's netcheck does
+    /// the same at the same altitude — it skips `makeProbePlan` entirely under the knob (and the
+    /// ICMP probes with it), leaving a report built from its HTTPS measurements alone.
+    ///
+    /// Asserted through the socket's in-flight budget, the same observable
+    /// `probe_stun_servers_once_stops_at_the_in_flight_budget` uses: a request that reached the wire
+    /// is one that recorded a transaction. Withdrawing the attribute resumes the sweep with no
+    /// restart, which is the live-setter half of the port.
+    #[tokio::test]
+    async fn only_tcp_443_skips_the_whole_stun_sweep() {
+        let sock = Arc::new(
+            MagicSock::bind(
+                BIND_ADDR.parse().unwrap(),
+                DiscoPrivateKey::random(),
+                NodePrivateKey::random().public_key(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        // Real bound sinks so every `send_to` has a live destination — the only thing that can stop
+        // a request here is the gate.
+        let mut sinks = Vec::new();
+        for _ in 0..3 {
+            sinks.push(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        }
+        let servers: Vec<SocketAddr> = sinks.iter().map(|s| s.local_addr().unwrap()).collect();
+
+        // The budget of a socket with nothing outstanding, read from the production accessor (the
+        // cap itself lives in ts_magicsock and is private there). Every recorded request spends one.
+        let budget = sock.stun_in_flight_remaining();
+        assert!(
+            budget > servers.len(),
+            "the test needs a budget the whole server list fits inside"
+        );
+
+        sock.set_only_tcp_443(true);
+        let cursor = Mutex::new(0);
+        probe_stun_servers_once(&sock, &servers, &cursor).await;
+
+        assert_eq!(
+            sock.stun_in_flight_remaining(),
+            budget,
+            "under only-tcp-443 no Binding Request may be sent, so no transaction is recorded"
+        );
+        assert_eq!(
+            *cursor.lock().await,
+            0,
+            "a skipped round must not advance the rotation — the next real round starts here"
+        );
+
+        // Control withdraws it on a later netmap: the sweep resumes on the same socket.
+        sock.set_only_tcp_443(false);
+        probe_stun_servers_once(&sock, &servers, &cursor).await;
+        assert_eq!(
+            sock.stun_in_flight_remaining(),
+            budget - servers.len(),
+            "withdrawing the attribute restores STUN with no restart"
+        );
+        assert_eq!(
+            *cursor.lock().await,
+            0,
+            "the resumed round wrapped the whole (short) list, parking the cursor back at the head"
+        );
+    }
+
+    /// Control's `only-tcp-443` reaches the underlay socket the way control sends it: as a key on
+    /// the **self** node's cap map, read on every netmap by the handler's body
+    /// ([`apply_self_node_knobs`]) and pushed onto the [`MagicSock`]. This pins the whole wiring —
+    /// the wire key, the accessor and the push — and both directions of it, because Go's
+    /// `SetOnlyTCP443` is live: a netmap that restates the self node without the attribute is
+    /// control withdrawing it, and UDP must come back with no restart.
+    #[tokio::test]
+    async fn only_tcp_443_rides_the_self_node_to_the_underlay_socket() {
+        let sock = MagicSock::bind(
+            BIND_ADDR.parse().unwrap(),
+            DiscoPrivateKey::random(),
+            NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap();
+        let force = AtomicBool::new(false);
+
+        let mut self_node = node_with_keys(
+            DiscoPrivateKey::random().public_key(),
+            NodePrivateKey::random().public_key(),
+            "self",
+        );
+
+        apply_self_node_knobs(Some(&self_node), &force, Some(&sock));
+        assert!(
+            !sock.only_tcp_443(),
+            "a self node without the attribute leaves UDP alone"
+        );
+
+        self_node
+            .cap_map
+            .insert("only-tcp-443".to_string(), Vec::new());
+        apply_self_node_knobs(Some(&self_node), &force, Some(&sock));
+        assert!(
+            sock.only_tcp_443(),
+            "the only-tcp-443 cap-map key is what silences the underlay socket"
+        );
+
+        // A response that carries no self node at all is a field-level or peer-only update, not a
+        // withdrawal: reading it as one would put UDP back on a network that alarms on it.
+        apply_self_node_knobs(None, &force, Some(&sock));
+        assert!(
+            sock.only_tcp_443(),
+            "a netmap with no self node must leave the flag exactly as it was"
+        );
+
+        self_node.cap_map.remove("only-tcp-443");
+        apply_self_node_knobs(Some(&self_node), &force, Some(&sock));
+        assert!(
+            !sock.only_tcp_443(),
+            "control restating the self node without the attribute restores UDP, with no restart"
+        );
+    }
+
+    /// The inert (bind-failed, DERP-only) manager has no socket to push the flag onto, and applying
+    /// the knobs must still be a harmless no-op rather than a panic — the same posture
+    /// [`DirectManager::rebind`] has. The background-STUN knob still lands, as it does not need one.
+    #[test]
+    fn applying_the_self_node_knobs_without_a_socket_is_a_noop() {
+        let force = AtomicBool::new(false);
+        let mut self_node = node_with_keys(
+            DiscoPrivateKey::random().public_key(),
+            NodePrivateKey::random().public_key(),
+            "self",
+        );
+        self_node
+            .cap_map
+            .insert("only-tcp-443".to_string(), Vec::new());
+        self_node
+            .cap_map
+            .insert("debug-always-stun".to_string(), Vec::new());
+
+        apply_self_node_knobs(Some(&self_node), &force, None);
+        assert!(
+            force.load(Ordering::Relaxed),
+            "the background-STUN knob needs no socket and must still be applied"
+        );
     }
 
     /// The periodic STUN sweep is gated on having at least one peer — Go magicsock's
