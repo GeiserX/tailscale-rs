@@ -1150,6 +1150,13 @@ impl Message<Arc<PeerState>> for DirectManager {
         // any other consumers and so the manager recovers no worse than the route-updater's
         // DERP-only path.
         if let Some(sock) = self.sock.as_ref() {
+            // Control's `silent-disco` attribute, off the self node this snapshot was built from.
+            // Pushed BEFORE the reconcile below so a peer whose path state is created by that
+            // reconcile is created already silent, rather than heartbeating until the next netmap.
+            // This is Go's ordering too: `updateNetmapLocked` carries `debugFlagsLocked()` into the
+            // `updateFromNode` that creates or refreshes each endpoint.
+            sock.set_silent_disco(msg.silent_disco);
+
             // A peer whose active disco key changed keeps its path state, minus the trust window —
             // Go `endpoint.changedActiveDiscoLocked`. This must run BEFORE the reconcile and prune
             // below: those are keyed by the peer's *current* disco key, so the old key's entry would

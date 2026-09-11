@@ -233,6 +233,16 @@ pub struct MagicSock {
     /// with the local bound port. Set via [`set_symmetric_nat`](Self::set_symmetric_nat); defaults
     /// `false` (no extra candidate — byte-for-byte the prior behavior).
     symmetric_nat: AtomicBool,
+    /// Whether control has switched this node's disco heartbeat off (the `silent-disco` node
+    /// attribute on the **self** node, Go magicsock's `Conn.silentDiscoOn`).
+    ///
+    /// This is the socket-wide copy: [`set_silent_disco`](Self::set_silent_disco) pushes it onto
+    /// every [`PeerPaths`] entry (Go `Conn.SetSilentDisco` → `forEachEndpoint(setHeartbeatDisabled)`),
+    /// and it is stamped onto entries created later so a peer that joins the netmap afterwards is
+    /// silent too. It is read directly on the data receive path, where it gates the compensating
+    /// trust extension: with the flag clear — the default, and the overwhelmingly common case — that
+    /// path does not take the `paths` lock at all and is byte-for-byte what it was.
+    silent_disco: AtomicBool,
     /// Waiters for an **on-demand** disco ping ([`ping_now`](Self::ping_now)): a `tx_id -> oneshot`
     /// registry the inbound-pong handler notifies with the measured RTT. Each on-demand ping uses a
     /// FRESH random `tx_id` distinct from any the periodic prober ([`send_pings`](Self::send_pings))
@@ -308,6 +318,7 @@ impl MagicSock {
             warned_relay_addrs_all_refused: AtomicBool::new(false),
             enable_ipv6: false,
             symmetric_nat: AtomicBool::new(false),
+            silent_disco: AtomicBool::new(false),
             ping_waiters: Default::default(),
             relay_paths: Default::default(),
             handshake_generation: std::sync::atomic::AtomicU32::new(0),
@@ -619,6 +630,70 @@ impl MagicSock {
         self.symmetric_nat.store(symmetric, Ordering::Relaxed);
     }
 
+    /// Record whether control has asked this node to stop heartbeating its peers — the
+    /// `silent-disco` node attribute on the **self** node, read by `ts_control::Node::silent_disco`
+    /// (not linkable from here: this crate sits below `ts_control` and does not depend on it) and
+    /// pushed here on every netmap update.
+    ///
+    /// Mirrors Go magicsock `Conn.SetSilentDisco`: swap the socket-wide value, and on a real change
+    /// stamp it onto every endpoint (`peerMap.forEachEndpoint(ep.setHeartbeatDisabled)`). Live, not
+    /// start-time — control granting or withdrawing the attribute takes effect on the next netmap
+    /// without a restart, which is the whole point of it being an attribute.
+    ///
+    /// What the flag does to a path is [`PeerPaths::set_heartbeat_disabled`]'s business: no
+    /// best-path heartbeat ping, and inbound data on the best address extends its trust instead.
+    /// Nothing is torn down here — an existing confirmed path keeps its best address, its trust and
+    /// its candidates either way.
+    pub fn set_silent_disco(&self, silent: bool) {
+        if self.silent_disco.swap(silent, Ordering::Relaxed) == silent {
+            return;
+        }
+        let mut paths = lock(&self.paths);
+        for pp in paths.values_mut() {
+            pp.set_heartbeat_disabled(silent);
+        }
+    }
+
+    /// Note that an authenticated WireGuard datagram for `peer` arrived from `from` — Go magicsock
+    /// `endpoint.noteRecvActivity`, called from `Conn.receiveIP` at the same point: where an inbound
+    /// data packet has just been attributed to a peer and a source address.
+    ///
+    /// The whole of its effect is silent disco's compensating arm (see
+    /// [`PeerPaths::note_recv_activity`]): under the `silent-disco` attribute a datagram from the
+    /// peer's best address extends that path's trust, because the heartbeat that would otherwise
+    /// re-confirm it is suppressed. Without the flag it does nothing at all.
+    ///
+    /// The `silent_disco` load short-circuits before the `paths` lock so the default receive path —
+    /// no attribute, which is nearly every node — is exactly what it was: one atomic read per
+    /// datagram, no lock. `note_recv_activity` re-checks the flag under the lock anyway (it is the
+    /// per-peer copy that decides, as in Go), so this is an optimisation, not the gate.
+    fn note_data_recv_activity(&self, peer: &DiscoPublicKey, from: SocketAddr) {
+        if !self.silent_disco.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut paths = lock(&self.paths);
+        if let Some(pp) = paths.get_mut(peer) {
+            pp.note_recv_activity(from, Instant::now());
+        }
+    }
+
+    /// The [`PeerPaths`] entry for `peer` in an already-locked `paths` map, creating it if absent
+    /// with the socket-wide silent-disco setting stamped on.
+    ///
+    /// Every path entry is created through here so a peer first seen *after* control set the
+    /// attribute is as silent as the ones [`set_silent_disco`](Self::set_silent_disco) walked. Go
+    /// gets this from `endpoint.updateFromNode`, which is handed `heartbeatDisabled` both when an
+    /// endpoint is created and on every later netmap.
+    fn peer_paths_entry<'a>(
+        &self,
+        paths: &'a mut HashMap<DiscoPublicKey, PeerPaths>,
+        peer: DiscoPublicKey,
+    ) -> &'a mut PeerPaths {
+        let pp = paths.entry(peer).or_default();
+        pp.set_heartbeat_disabled(self.silent_disco.load(Ordering::Relaxed));
+        pp
+    }
+
     /// Seal a disco `CallMeMaybe` addressed to `receiver`, carrying our candidate endpoints so the
     /// peer will disco-ping us and open a direct path. Sent over DERP by the caller.
     ///
@@ -673,7 +748,8 @@ impl MagicSock {
         // unbounded per-peer attribution-map leak. Keeping the two in lockstep bounds both.
         let accepted = {
             let mut paths = lock(&self.paths);
-            paths.entry(peer).or_default().add_learned_candidates(eps)
+            self.peer_paths_entry(&mut paths, peer)
+                .add_learned_candidates(eps)
         };
 
         let mut a2d = lock(&self.addr_to_disco);
@@ -717,7 +793,8 @@ impl MagicSock {
             }
         }
         let mut paths = self.paths.lock().unwrap();
-        paths.entry(peer).or_default().add_learned_candidates(eps);
+        self.peer_paths_entry(&mut paths, peer)
+            .add_learned_candidates(eps);
     }
 
     /// Reconcile a peer's control-advertised endpoints to exactly `endpoints`.
@@ -736,9 +813,7 @@ impl MagicSock {
 
         let removed = {
             let mut paths = lock(&self.paths);
-            paths
-                .entry(peer)
-                .or_default()
+            self.peer_paths_entry(&mut paths, peer)
                 .reconcile_netmap_candidates(eps.iter().copied())
         };
 
@@ -1137,6 +1212,10 @@ impl MagicSock {
                     tracing::trace!(%from, "dropping data from unknown source address");
                     continue;
                 };
+
+                // Silent disco's compensating half: this datagram is evidence the best path is
+                // alive, and with the heartbeat suppressed it is the only such evidence there is.
+                self.note_data_recv_activity(&from_disco, from);
 
                 let m = crate::metrics::metrics();
                 m.recv_data_udp.inc();
@@ -6032,6 +6111,199 @@ mod tests {
         let unknown = DiscoPrivateKey::random().public_key();
         let sent = sock.send_pings_to_peer_now(&unknown).await.unwrap();
         assert_eq!(sent, 0, "pinging an unknown peer sends nothing");
+    }
+
+    /// Confirm a direct path from `sock` to `peer` at `addr` without any real UDP round trip:
+    /// register a ping we "sent" under a known tx id, then feed the peer's sealed pong through the
+    /// production `handle_disco`. This is the same seam
+    /// `a_direct_path_wins_over_a_confirmed_relay_path` uses; the socket is loopback-bound and
+    /// nothing is put on the wire.
+    async fn confirm_direct_path(
+        sock: &MagicSock,
+        our_disco: &DiscoPrivateKey,
+        peer: &DiscoPrivateKey,
+        addr: SocketAddr,
+    ) {
+        let peer_pub = peer.public_key();
+        sock.add_peer_endpoints_unfiltered(peer_pub, [addr]);
+        let tx_id = disco::random_tx_id();
+        {
+            let mut paths = lock(&sock.paths);
+            paths
+                .get_mut(&peer_pub)
+                .unwrap()
+                .note_ping_sent(tx_id, addr, Instant::now());
+        }
+        let mut pong = disco::seal_pong(peer, &our_disco.public_key(), tx_id, addr).unwrap();
+        let msg = disco::open(our_disco, &mut pong).unwrap();
+        sock.handle_disco(msg, addr).await.unwrap();
+        assert_eq!(
+            sock.best_addr(&peer_pub),
+            Some(addr),
+            "precondition: the pong must have confirmed the direct path"
+        );
+    }
+
+    /// The tick at which the periodic prober's refresh gate first opens for a path confirmed now:
+    /// just inside `TRUST_DURATION`, which is well inside the `REFRESH_BEFORE_EXPIRY` lead (that
+    /// constant is private to `path`, so this picks an instant that is unambiguously past it).
+    fn heartbeat_tick() -> Instant {
+        Instant::now() + crate::path::TRUST_DURATION - Duration::from_millis(100)
+    }
+
+    /// `set_silent_disco` reaches the path state of a peer that already exists — Go
+    /// `Conn.SetSilentDisco`'s `forEachEndpoint(setHeartbeatDisabled)`. The detector is the ping set
+    /// the periodic prober would emit on the heartbeat tick: the best path with the attribute
+    /// clear, nothing at all with it set. Without the push this test still sees the best.
+    #[tokio::test]
+    async fn set_silent_disco_suppresses_an_existing_peers_heartbeat() {
+        let our_disco = DiscoPrivateKey::random();
+        let our_node = ts_keys::NodePrivateKey::random().public_key();
+        let sock = MagicSock::bind(localhost(), our_disco.clone(), our_node)
+            .await
+            .unwrap();
+
+        let peer = DiscoPrivateKey::random();
+        let peer_pub = peer.public_key();
+        let addr: SocketAddr = "127.0.0.1:51820".parse().unwrap();
+        confirm_direct_path(&sock, &our_disco, &peer, addr).await;
+
+        let tick = heartbeat_tick();
+        {
+            let mut paths = lock(&sock.paths);
+            let pp = paths.get_mut(&peer_pub).unwrap();
+            assert!(
+                pp.needs_refresh(tick),
+                "precondition: the prober's gate is open on this tick"
+            );
+            assert_eq!(
+                pp.candidates_to_ping(tick),
+                vec![addr],
+                "with no attribute set, the best path is re-pinged — the 2s cadence is unchanged"
+            );
+        }
+
+        sock.set_silent_disco(true);
+        {
+            let mut paths = lock(&sock.paths);
+            let pp = paths.get_mut(&peer_pub).unwrap();
+            assert!(
+                !pp.needs_refresh(tick),
+                "control set silent-disco: the prober's gate is shut on the very tick it was open \
+                 on a moment ago"
+            );
+            assert!(
+                pp.candidates_to_ping(tick).is_empty(),
+                "and nothing is pinged to this peer"
+            );
+        }
+
+        sock.set_silent_disco(false);
+        {
+            let mut paths = lock(&sock.paths);
+            let pp = paths.get_mut(&peer_pub).unwrap();
+            assert_eq!(
+                pp.candidates_to_ping(tick),
+                vec![addr],
+                "withdrawing the attribute restores the heartbeat without a restart"
+            );
+        }
+    }
+
+    /// A peer whose path state is created *after* control set the attribute is silent too — the
+    /// half `set_silent_disco`'s walk of the existing peers cannot cover, and the common case for a
+    /// node that has had the attribute since before it learned its netmap. Go gets this from
+    /// `updateFromNode`, which is handed the flag when it creates an endpoint as well as when it
+    /// refreshes one.
+    #[tokio::test]
+    async fn silent_disco_is_stamped_on_a_peer_first_seen_after_the_attribute() {
+        let our_disco = DiscoPrivateKey::random();
+        let our_node = ts_keys::NodePrivateKey::random().public_key();
+        let sock = MagicSock::bind(localhost(), our_disco.clone(), our_node)
+            .await
+            .unwrap();
+
+        // The attribute arrives with no peers known at all.
+        sock.set_silent_disco(true);
+
+        let peer = DiscoPrivateKey::random();
+        let peer_pub = peer.public_key();
+        let addr: SocketAddr = "127.0.0.1:51821".parse().unwrap();
+        confirm_direct_path(&sock, &our_disco, &peer, addr).await;
+
+        let tick = heartbeat_tick();
+        let mut paths = lock(&sock.paths);
+        let pp = paths.get_mut(&peer_pub).unwrap();
+        assert!(
+            !pp.needs_refresh(tick),
+            "a peer learned after the attribute must not heartbeat either: on the tick where an \
+             un-silenced peer's gate is open (asserted in the test above), this peer's is shut"
+        );
+    }
+
+    /// The compensating arm at its production call site's doorstep: an inbound data packet from the
+    /// peer's best address re-trusts that path under the attribute, so a peer carrying traffic is
+    /// never demoted to DERP by the suppressed heartbeat. The "trust lapsed" starting state is
+    /// produced by `invalidate_disco_path`, which is exactly the documented best-kept-but-untrusted
+    /// state, so the assertion needs no wall-clock wait.
+    #[tokio::test]
+    async fn inbound_data_re_trusts_the_best_path_under_silent_disco() {
+        let our_disco = DiscoPrivateKey::random();
+        let our_node = ts_keys::NodePrivateKey::random().public_key();
+        let sock = MagicSock::bind(localhost(), our_disco.clone(), our_node)
+            .await
+            .unwrap();
+
+        let peer = DiscoPrivateKey::random();
+        let peer_pub = peer.public_key();
+        let addr: SocketAddr = "127.0.0.1:51822".parse().unwrap();
+        confirm_direct_path(&sock, &our_disco, &peer, addr).await;
+        sock.set_silent_disco(true);
+
+        // Drop the trust window, keeping the best address: the peer is on DERP right now.
+        lock(&sock.paths)
+            .get_mut(&peer_pub)
+            .unwrap()
+            .invalidate_disco_path();
+        assert!(
+            sock.best_addr(&peer_pub).is_none(),
+            "precondition: no trusted direct path, so data would ride DERP"
+        );
+
+        sock.note_data_recv_activity(&peer_pub, addr);
+        assert_eq!(
+            sock.best_addr(&peer_pub),
+            Some(addr),
+            "a datagram on the best address re-trusts the direct path under silent-disco"
+        );
+    }
+
+    /// The same arm is inert without the attribute: with the heartbeat running it is the pong that
+    /// re-confirms a path, and data must not stand in for one — otherwise a silently-dead path
+    /// would stay trusted on the strength of packets already in flight.
+    #[tokio::test]
+    async fn inbound_data_does_not_re_trust_a_path_without_silent_disco() {
+        let our_disco = DiscoPrivateKey::random();
+        let our_node = ts_keys::NodePrivateKey::random().public_key();
+        let sock = MagicSock::bind(localhost(), our_disco.clone(), our_node)
+            .await
+            .unwrap();
+
+        let peer = DiscoPrivateKey::random();
+        let peer_pub = peer.public_key();
+        let addr: SocketAddr = "127.0.0.1:51823".parse().unwrap();
+        confirm_direct_path(&sock, &our_disco, &peer, addr).await;
+
+        lock(&sock.paths)
+            .get_mut(&peer_pub)
+            .unwrap()
+            .invalidate_disco_path();
+
+        sock.note_data_recv_activity(&peer_pub, addr);
+        assert!(
+            sock.best_addr(&peer_pub).is_none(),
+            "with no attribute set, inbound data leaves the trust window alone"
+        );
     }
 
     /// End-to-end wiring guard for the **direct-UDP** CallMeMaybe path: receiving a member's
