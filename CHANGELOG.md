@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.54.0](https://github.com/GeiserX/tailscale-rs/compare/v0.53.1...v0.54.0) (2026-09-11)
+
+
+### Features
+
+* **magicsock:** stop pinging peers control set silent-disco for ([#445](https://github.com/GeiserX/tailscale-rs/issues/445)) ([ee7c674](https://github.com/GeiserX/tailscale-rs/commit/ee7c6740ee0ee8710df358089ba8314c885fc52a))
+
 ## [0.53.1](https://github.com/GeiserX/tailscale-rs/compare/v0.53.0...v0.53.1) (2026-09-11)
 
 
