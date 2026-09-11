@@ -759,6 +759,35 @@ impl Node {
         self.has_node_attr(Self::NODE_ATTR_DISABLE_DELTA_UPDATES)
     }
 
+    /// The node attribute by which control tells this node to stop sending disco heartbeats to its
+    /// peers (Go `tailcfg/nodecap`'s `SilentDisco`, read into `controlknobs.Knobs.SilentDisco` and
+    /// handed to magicsock by `ipn/ipnlocal`'s `b.MagicConn().SetSilentDisco(...)`). Read off the
+    /// **self** node's cap map by [`silent_disco`](Self::silent_disco).
+    ///
+    /// Upstream's own summary of the attribute is one sentence — it "makes the client suppress
+    /// disco heartbeats to its peers" — and the node it is set on is the node that goes quiet, so
+    /// it is the *self* node's cap map that decides, never the peer's.
+    const NODE_ATTR_SILENT_DISCO: &'static str = "silent-disco";
+
+    /// Report whether control has asked this node to stop heartbeating its peers' confirmed direct
+    /// paths.
+    ///
+    /// Mirrors Go magicsock `Conn.debugFlagsLocked`'s `heartbeatDisabled`, which the netmap push
+    /// (`endpoint.updateFromNode`) stamps onto every endpoint. With it set, the periodic
+    /// keep-the-best-path-alive ping is not sent — and, as the compensating half, an inbound packet
+    /// from the current best address extends that path's trust directly, because with no heartbeat
+    /// there is nothing else keeping it trusted.
+    ///
+    /// Absent attribute ⇒ `false` ⇒ the existing heartbeat cadence, which is the default and the
+    /// overwhelmingly common case. Being a plain per-node attribute it needs no capability version:
+    /// a node control has not set it on is unaffected.
+    ///
+    /// Go additionally ORs in a `TS_DEBUG_ENABLE_SILENT_DISCO` envknob at the same place. This tree
+    /// has no envknob layer at all, so the control attribute is the whole input here.
+    pub fn silent_disco(&self) -> bool {
+        self.has_node_attr(Self::NODE_ATTR_SILENT_DISCO)
+    }
+
     /// Report whether `wanted_port` is allowed for Funnel on this node.
     ///
     /// Mirrors Go `ipn.CheckFunnelPort`: scan the cap-map keys for one prefixed by
@@ -2116,6 +2145,29 @@ pub(crate) mod tests {
         assert!(
             !n.delta_updates_disabled(),
             "control withdrawing the attribute returns the node to the incremental path"
+        );
+    }
+
+    #[test]
+    fn silent_disco_reads_the_silent_disco_attribute() {
+        let mut n = node("self", Some("ts.net"));
+        assert!(
+            !n.silent_disco(),
+            "absent attribute → keep heartbeating, which is the default"
+        );
+
+        // The attribute is the bare key; the presence of the key is the whole signal, and its
+        // value (control sends an empty one) is never read.
+        n.cap_map.insert("silent-disco".to_string(), vec![]);
+        assert!(
+            n.silent_disco(),
+            "control granted the attribute → stop heartbeating peers"
+        );
+
+        n.cap_map.remove("silent-disco");
+        assert!(
+            !n.silent_disco(),
+            "control withdrawing the attribute returns the node to the heartbeat cadence"
         );
     }
 

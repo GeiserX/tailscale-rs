@@ -859,6 +859,16 @@ pub(crate) struct PeerState {
     #[allow(unused)]
     pub upserts: HashSet<PeerId>,
     pub peers: Arc<PeerDb>,
+    /// Control's `silent-disco` node attribute, read off the **self** node
+    /// ([`ts_control::Node::silent_disco`]) and carried with the peer snapshot so
+    /// [`crate::direct::DirectManager`] can push it onto the magicsock.
+    ///
+    /// It rides this message rather than a channel of its own because that is the shape it has
+    /// upstream: Go hands `debugFlagsLocked().heartbeatDisabled` to `endpoint.updateFromNode` while
+    /// applying the netmap, so the flag and the peer set land on the endpoints together. A snapshot
+    /// published for some other reason (a disco-key switch, an expiry, a TKA eviction) carries the
+    /// attribute's current value too, which is harmless — the push is idempotent.
+    pub silent_disco: bool,
 }
 
 impl Message<Arc<ts_control::StateUpdate>> for PeerTracker {
@@ -925,6 +935,7 @@ impl Message<Arc<ts_control::StateUpdate>> for PeerTracker {
                         upserts: HashSet::default(),
                         deletions: HashSet::default(),
                         peers: Arc::new(self.peer_db.clone()),
+                        silent_disco: self.silent_disco(),
                     }))
                     .await
                 {
@@ -988,6 +999,7 @@ impl Message<Arc<ts_control::StateUpdate>> for PeerTracker {
                 upserts,
                 deletions,
                 peers: Arc::new(self.peer_db.clone()),
+                silent_disco: self.silent_disco(),
             }))
             .await
         {
@@ -1021,6 +1033,7 @@ impl Message<PeerDiscoKeyAdvertisement> for PeerTracker {
                 upserts: HashSet::from_iter([msg.peer]),
                 deletions: HashSet::default(),
                 peers: Arc::new(self.peer_db.clone()),
+                silent_disco: self.silent_disco(),
             }))
             .await
         {
@@ -1052,6 +1065,7 @@ impl Message<DiscoKeyObserved> for PeerTracker {
                 upserts: HashSet::from_iter([msg.peer]),
                 deletions: HashSet::default(),
                 peers: Arc::new(self.peer_db.clone()),
+                silent_disco: self.silent_disco(),
             }))
             .await
         {
@@ -1102,6 +1116,7 @@ impl Message<ExpiryTimerFired> for PeerTracker {
                 upserts,
                 deletions: HashSet::default(),
                 peers: Arc::new(self.peer_db.clone()),
+                silent_disco: self.silent_disco(),
             }))
             .await
         {
@@ -1139,6 +1154,7 @@ impl Message<TkaAuthorityChanged> for PeerTracker {
                 upserts: HashSet::default(),
                 deletions,
                 peers: Arc::new(self.peer_db.clone()),
+                silent_disco: self.silent_disco(),
             }))
             .await
         {
@@ -1168,6 +1184,7 @@ impl Message<RepublishState> for PeerTracker {
                 upserts: HashSet::default(),
                 deletions: HashSet::default(),
                 peers: Arc::new(self.peer_db.clone()),
+                silent_disco: self.silent_disco(),
             }))
             .await
         {
@@ -1684,6 +1701,19 @@ impl PeerTracker {
         self.prune_endpoint_disco();
 
         upserts
+    }
+
+    /// Whether control has asked this node to stop heartbeating its peers — the `silent-disco`
+    /// attribute on the self node, published with every [`PeerState`] snapshot.
+    ///
+    /// Read off the self node this tracker last saw, which is the one the current response
+    /// refreshed, so an attribute control grants takes effect on the netmap that granted it (the
+    /// timing `delta_updates_disabled` already has here). No self node yet ⇒ `false` ⇒ the existing
+    /// heartbeat cadence, which is the safe default: the cost of heartbeating a node control wanted
+    /// quiet is a ping every 2s, while the cost of going quiet on a guess is a direct path falling
+    /// back to DERP.
+    fn silent_disco(&self) -> bool {
+        self.self_node.as_ref().is_some_and(Node::silent_disco)
     }
 
     /// Stop the armed expiry timer and arm a new one for the soonest future key expiry across the
@@ -3326,6 +3356,105 @@ pub(crate) mod tka_tests {
         .await;
         let peers = settled.expect("the patch-only response is applied under the attribute");
         assert_eq!(peers.len(), 2, "the fall-back to full evicts nobody");
+    }
+
+    /// The node attribute by which control tells this node to stop heartbeating its peers (Go
+    /// `tailcfg/nodecap`'s `SilentDisco`).
+    const SILENT_DISCO: &str = "silent-disco";
+
+    /// A stand-in for the `Arc<PeerState>` subscribers (`DirectManager` among them) that records the
+    /// `silent_disco` flag of every snapshot the tracker publishes, so a test can read what the
+    /// direct manager would have been handed without standing up the socket, the dataplane and the
+    /// DERP mesh behind it.
+    struct SilentDiscoTap {
+        seen: Arc<std::sync::Mutex<Vec<bool>>>,
+    }
+    impl kameo::Actor for SilentDiscoTap {
+        type Args = Arc<std::sync::Mutex<Vec<bool>>>;
+        type Error = Error;
+        async fn on_start(seen: Self::Args, _s: ActorRef<Self>) -> Result<Self, Self::Error> {
+            Ok(Self { seen })
+        }
+    }
+    impl Message<Arc<PeerState>> for SilentDiscoTap {
+        type Reply = ();
+        async fn handle(&mut self, m: Arc<PeerState>, _c: &mut Context<Self, Self::Reply>) {
+            self.seen.lock().expect("tap mutex").push(m.silent_disco);
+        }
+    }
+
+    /// End to end through the live tracker and the bus: control's `silent-disco` attribute on the
+    /// **self** node rides the published peer snapshot, which is how it reaches
+    /// `DirectManager` and, from there, the magicsock. Granting and withdrawing both land, and the
+    /// attribute is read off the self node of the very response that carried it — the same timing
+    /// `disable-delta-updates` has.
+    #[tokio::test]
+    async fn silent_disco_rides_the_published_peer_snapshot() {
+        use kameo::actor::Spawn as _;
+
+        let env = test_env();
+        let (_tka_tx, tka_rx) = watch::channel(None);
+        let tracker = PeerTracker::spawn((env.clone(), tka_rx));
+        let seen: Arc<std::sync::Mutex<Vec<bool>>> = Default::default();
+        let tap = SilentDiscoTap::spawn(seen.clone());
+        env.subscribe::<Arc<PeerState>>(&tap)
+            .await
+            .expect("subscribe the tap");
+
+        // Await one reply so the tracker's `on_start` (which subscribes it to the bus) has run.
+        assert!(
+            tracker
+                .ask(AllPeers)
+                .await
+                .expect("peer tracker started")
+                .is_empty()
+        );
+
+        // A netmap whose self node carries the attribute.
+        env.publish(Arc::new(ts_control::StateUpdate {
+            node: Some(self_node_with(&[SILENT_DISCO])),
+            ..netmap_with_peers(vec![peer_node("a", [1u8; 32], vec![])])
+        }))
+        .await
+        .expect("publish the granting netmap");
+        await_peer_count(&tracker, 1).await;
+
+        let granted = await_tap(&seen, 1).await;
+        assert_eq!(
+            granted.last(),
+            Some(&true),
+            "the attribute on the self node must reach the peer snapshot the direct manager reads"
+        );
+
+        // Control withdraws it on the next netmap: the flag has to come back down, because
+        // magicsock's setter is live and would otherwise leave the node silent forever.
+        env.publish(Arc::new(ts_control::StateUpdate {
+            node: Some(self_node_with(&[])),
+            ..netmap_with_peers(vec![peer_node("a", [1u8; 32], vec![])])
+        }))
+        .await
+        .expect("publish the withdrawing netmap");
+
+        let withdrawn = await_tap(&seen, granted.len() + 1).await;
+        assert_eq!(
+            withdrawn.last(),
+            Some(&false),
+            "withdrawing the attribute must publish the node back onto the heartbeat cadence"
+        );
+    }
+
+    /// Wait for the tap to have recorded at least `want` snapshots, returning them.
+    async fn await_tap(seen: &Arc<std::sync::Mutex<Vec<bool>>>, want: usize) -> Vec<bool> {
+        for _ in 0..1000 {
+            {
+                let got = seen.lock().expect("tap mutex");
+                if got.len() >= want {
+                    return got.clone();
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("the tap never saw {want} published peer snapshot(s)");
     }
 
     /// A `Patch` whose node id is not in the current netmap is ignored (the wire contract: a patch

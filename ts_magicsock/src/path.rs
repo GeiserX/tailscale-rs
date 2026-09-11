@@ -11,6 +11,9 @@
 //! - IPv6 wins ties (matches Go), though IPv6 is disabled in our deployment.
 //! - A best address is *trusted* until `trust_until`; after that it must be re-confirmed by
 //!   a fresh pong or the peer falls back to DERP (the caller's responsibility).
+//! - Control can switch the keep-the-best-path-alive ping off entirely with the `silent-disco`
+//!   node attribute, in which case an inbound packet on the best address is what keeps it trusted
+//!   instead — see [`PeerPaths::set_heartbeat_disabled`].
 
 use core::net::SocketAddr;
 use std::{
@@ -79,6 +82,11 @@ const PING_TIMEOUT: Duration = Duration::from_secs(5);
 /// ~3s to the 6s tick, leaving < 0.5s before `TRUST_DURATION` lapses — one missed tick would take the
 /// path dark, exactly the flap [`REFRESH_BEFORE_EXPIRY`] was added to fix. (Go's best-ping runs on the
 /// 3s `heartbeatInterval`; this fork's 2s `PING_INTERVAL` is a slightly tighter, pre-existing cadence.)
+///
+/// The exemption is therefore also where control's `silent-disco` attribute lands: because it *is*
+/// this fork's heartbeat, switching the heartbeat off is exactly withdrawing it, and the best then
+/// falls back to being floored like any other candidate. See
+/// [`set_heartbeat_disabled`](PeerPaths::set_heartbeat_disabled).
 const DISCO_PING_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Latency at or below which the confirmed best path is "good enough" that we stop full-pinging the
@@ -161,6 +169,25 @@ pub struct PeerPaths {
     /// `UPGRADE_UDP_DIRECT_INTERVAL` periodic re-probe that overrides the `GOOD_ENOUGH_LATENCY`
     /// quiet-down (Go magicsock's `lastFullPing` feeding `wantFullPingLocked`).
     last_full_ping: Option<Instant>,
+    /// Control has told this node to stop heartbeating this peer — Go magicsock's per-endpoint
+    /// `heartbeatDisabled`, which `Conn.debugFlagsLocked` fills from the `silent-disco` node
+    /// attribute and `endpoint.updateFromNode` stamps onto every endpoint.
+    ///
+    /// Two reads, and the second is not optional:
+    ///
+    /// - [`candidates_to_ping`](Self::candidates_to_ping) stops exempting the confirmed best from
+    ///   the `DISCO_PING_INTERVAL` floor. That exemption *is* this fork's heartbeat (see
+    ///   [`DISCO_PING_INTERVAL`]), so dropping it is Go's `heartbeat` returning early and
+    ///   `noteTxActivityExtTriggerLocked` never arming the timer, folded into the one place this
+    ///   tree schedules pings.
+    /// - [`note_recv_activity`](Self::note_recv_activity) extends `trust_until` when a packet
+    ///   arrives from the best address. With the heartbeat gone nothing else re-confirms the path,
+    ///   so without this arm `TRUST_DURATION` would lapse on a path carrying live data and the peer
+    ///   would be demoted to DERP — strictly worse than not porting the flag at all.
+    ///
+    /// Set by the netmap push ([`set_heartbeat_disabled`](Self::set_heartbeat_disabled)); `false`
+    /// (the default) is byte-for-byte the previous behaviour.
+    heartbeat_disabled: bool,
 }
 
 impl PeerPaths {
@@ -236,6 +263,46 @@ impl PeerPaths {
         endpoints: impl IntoIterator<Item = SocketAddr>,
     ) -> Vec<SocketAddr> {
         self.add_candidates(endpoints, CandidateSource::Learned)
+    }
+
+    /// Set whether control has switched this node's disco heartbeat off for this peer — Go
+    /// magicsock `endpoint.setHeartbeatDisabled`, called from `Conn.SetSilentDisco` and from the
+    /// netmap push `endpoint.updateFromNode`.
+    ///
+    /// Idempotent, and it deliberately touches nothing else: turning the flag on does not clear the
+    /// best path, its trust or the candidate set (Go's setter is likewise a bare assignment), and
+    /// turning it off simply restores the heartbeat on the next pinger tick — the path is already
+    /// trusted, so nothing has to be re-discovered either way.
+    pub fn set_heartbeat_disabled(&mut self, disabled: bool) {
+        self.heartbeat_disabled = disabled;
+    }
+
+    /// Record an inbound packet from `src` for this peer — Go magicsock `endpoint.noteRecvActivity`,
+    /// of which this is the `heartbeatDisabled` arm and nothing else.
+    ///
+    /// Ported verbatim, including its narrowness:
+    ///
+    /// ```go
+    /// if de.heartbeatDisabled && de.bestAddr.epAddr == src {
+    ///     de.trustBestAddrUntil = now.Add(trustUDPAddrDuration)
+    /// }
+    /// ```
+    ///
+    /// So: **only** when the heartbeat is disabled (with the heartbeat running, the pong it draws is
+    /// what extends trust, and extending it here as well would keep a silently-dead path trusted on
+    /// the strength of packets that may be in flight from before it died), and **only** for the
+    /// current best address (a packet from some other candidate says nothing about the best). Note
+    /// the comparison is against the *stored* best, not [`best_addr`](Self::best_addr) — Go compares
+    /// `de.bestAddr` without consulting the trust window, so data arriving on a best whose trust has
+    /// just lapsed re-trusts it rather than forcing a DERP round trip to rediscover a path that is
+    /// demonstrably carrying traffic.
+    ///
+    /// Upstream marks the arm provisional ("subject to change as part of silent disco effort"),
+    /// which is the reason to port it as written rather than to improve on it.
+    pub fn note_recv_activity(&mut self, src: SocketAddr, now: Instant) {
+        if self.heartbeat_disabled && self.best == Some(src) {
+            self.trust_until = Some(now + TRUST_DURATION);
+        }
     }
 
     /// Drop the confirmed best path and its trust, **keeping the candidate set**. Used on a socket
@@ -415,8 +482,21 @@ impl PeerPaths {
     /// - On a **full** cycle every non-best candidate is eligible but skipped if pinged within
     ///   `DISCO_PING_INTERVAL` (the 5s discovery floor). A never-pinged candidate has no `last_ping`,
     ///   so it is never floored — it is always probed promptly.
+    ///
+    /// **Silent disco** ([`heartbeat_disabled`](Self::set_heartbeat_disabled)) removes the first of
+    /// those three rules and only the first: the best loses its exemption and is treated as an
+    /// ordinary candidate, floored and quieted like any other. That is the whole suppression, and it
+    /// is where it belongs — the exemption is this fork's fold of Go's separate `pingHeartbeat`, so
+    /// dropping it is Go's `heartbeat` early return. Go keeps its *discovery* pings under the flag
+    /// too (`sendDiscoPingsLocked` is still reachable when trust lapses), which is why the other two
+    /// rules are untouched; in practice they go quiet as well, because
+    /// [`note_recv_activity`](Self::note_recv_activity) keeps an active path trusted and the
+    /// caller's [`needs_refresh`](Self::needs_refresh) gate then never lets this method run.
     pub fn candidates_to_ping(&mut self, now: Instant) -> Vec<SocketAddr> {
-        let best = self.best_addr(now);
+        // Silent disco: no heartbeat, so there is no exempt best this cycle.
+        let best = (!self.heartbeat_disabled)
+            .then(|| self.best_addr(now))
+            .flatten();
         let full_sweep = self.want_full_ping(now);
         if full_sweep {
             self.last_full_ping = Some(now);
@@ -559,7 +639,18 @@ impl PeerPaths {
     /// fresh pong re-confirms the path inside the current trust window and `best_addr` never goes
     /// dark for an active peer (Go magicsock's heartbeat-before-expiry behavior). Always `true` when
     /// there is no trusted path yet (nothing to lose by probing).
+    ///
+    /// Under silent disco ([`set_heartbeat_disabled`](Self::set_heartbeat_disabled)) the lead is
+    /// dropped and the gate opens only once there is no trusted path at all. The lead exists solely
+    /// to get the heartbeat in *ahead of* expiry; with no heartbeat to schedule there is nothing to
+    /// be early for, and keeping it would reopen this gate every trust window on a peer control
+    /// asked this node to go quiet to. What is left is Go's own trigger for the suppressed case —
+    /// `send()` calls `sendDiscoPingsLocked` when `!bestAddr.isValid() || now.After(
+    /// trustBestAddrUntil)` — so a silenced peer whose path really has lapsed still rediscovers one.
     pub fn needs_refresh(&self, now: Instant) -> bool {
+        if self.heartbeat_disabled {
+            return self.best_addr(now).is_none();
+        }
         match self.trust_until {
             Some(until) => now + REFRESH_BEFORE_EXPIRY >= until,
             None => true,
@@ -1491,6 +1582,179 @@ mod tests {
             p.candidate_addrs(),
             vec![addr],
             "but the candidate set survives a rebind too"
+        );
+    }
+
+    /// A peer with one confirmed, trusted, good-enough best path, plus the instant at which the
+    /// caller's `needs_refresh` gate first fires for it — i.e. the tick on which the best-path
+    /// heartbeat would go out. Shared by the silent-disco tests so each one differs only in the
+    /// flag and in what arrives.
+    fn confirmed_best(addr: SocketAddr, t0: Instant) -> (PeerPaths, Instant) {
+        let mut p = PeerPaths::default();
+        p.add_netmap_candidates([addr]);
+        p.note_ping_sent(tx(1), addr, t0);
+        p.note_pong(tx(1), addr, t0 + Duration::from_millis(1));
+        // `needs_refresh` fires REFRESH_BEFORE_EXPIRY ahead of `trust_until`; one ms past that is
+        // the first tick on which the caller would ask for candidates.
+        let refresh_at = t0 + TRUST_DURATION - REFRESH_BEFORE_EXPIRY + Duration::from_millis(1);
+        (p, refresh_at)
+    }
+
+    /// The suppression half of silent disco, and its control: the *only* difference between the two
+    /// halves of this test is the flag. Without it the confirmed best is re-pinged on the refresh
+    /// tick, which is this fork's heartbeat; with it nothing is sent at all. Go
+    /// `endpoint.heartbeat`'s `if de.heartbeatDisabled { return }`, folded into the one place this
+    /// tree decides what to ping.
+    #[test]
+    fn silent_disco_suppresses_the_best_path_heartbeat() {
+        let addr: SocketAddr = "203.0.113.1:41641".parse().unwrap();
+        let t0 = Instant::now();
+
+        let (mut heartbeating, refresh_at) = confirmed_best(addr, t0);
+        assert!(
+            heartbeating.needs_refresh(refresh_at),
+            "precondition: the caller's gate is open, so this tick really does reach \
+             candidates_to_ping — otherwise the silent half below would be vacuous"
+        );
+        assert_eq!(
+            heartbeating.candidates_to_ping(refresh_at),
+            vec![addr],
+            "without the attribute the best path is re-pinged on the refresh tick, unfloored"
+        );
+
+        let (mut silent, _) = confirmed_best(addr, t0);
+        silent.set_heartbeat_disabled(true);
+        assert!(
+            !silent.needs_refresh(refresh_at),
+            "control set silent-disco: the prober's gate stays shut while the path is trusted, \
+             so the peer is not even considered on this tick"
+        );
+        assert!(
+            silent.candidates_to_ping(refresh_at).is_empty(),
+            "and were it considered anyway, no disco ping is emitted to this peer"
+        );
+
+        // Withdrawing the attribute restores the heartbeat on the very next tick — the attribute is
+        // live, not start-time, and nothing had to be rediscovered.
+        silent.set_heartbeat_disabled(false);
+        assert_eq!(
+            silent.candidates_to_ping(refresh_at),
+            vec![addr],
+            "withdrawing the attribute returns the peer to the heartbeat cadence"
+        );
+    }
+
+    /// The compensating half, and the reason it is not optional: with the heartbeat suppressed and
+    /// data flowing, the best path stays trusted — it is NOT demoted to DERP — and still nothing is
+    /// pinged. Every tick here is past the point at which the unported flag alone would have let
+    /// `TRUST_DURATION` lapse on a path that is demonstrably alive.
+    #[test]
+    fn silent_disco_keeps_the_best_trusted_while_data_flows() {
+        let addr: SocketAddr = "203.0.113.1:41641".parse().unwrap();
+        let t0 = Instant::now();
+        let (mut p, _) = confirmed_best(addr, t0);
+        p.set_heartbeat_disabled(true);
+
+        // Data every 2s for 20s — four times the trust window, so a lapse anywhere would show.
+        for secs in [2, 4, 6, 8, 10, 12, 14, 16, 18, 20] {
+            let now = t0 + Duration::from_secs(secs);
+            p.note_recv_activity(addr, now);
+            assert_eq!(
+                p.best_addr(now),
+                Some(addr),
+                "at {secs}s the path carrying data must still be the trusted best, not DERP"
+            );
+            assert!(
+                !p.needs_refresh(now),
+                "at {secs}s inbound data has refreshed trust, so the caller never even asks for \
+                 candidates"
+            );
+            assert!(
+                p.candidates_to_ping(now).is_empty(),
+                "at {secs}s no disco ping may be emitted to this peer"
+            );
+        }
+    }
+
+    /// What the compensating arm is compensating for. With the attribute set and NO inbound data
+    /// the path lapses exactly as it always did and discovery resumes — so the arm above is what
+    /// holds an active path up, not some incidental side effect of the flag.
+    #[test]
+    fn silent_disco_without_inbound_data_still_lets_trust_lapse() {
+        let addr: SocketAddr = "203.0.113.1:41641".parse().unwrap();
+        let t0 = Instant::now();
+        let (mut p, _) = confirmed_best(addr, t0);
+        p.set_heartbeat_disabled(true);
+
+        let lapsed = t0 + TRUST_DURATION + Duration::from_secs(1);
+        assert_eq!(
+            p.best_addr(lapsed),
+            None,
+            "no data arrived, so nothing refreshed trust and the peer falls back to DERP"
+        );
+        assert!(
+            p.needs_refresh(lapsed),
+            "with no trusted path left the prober's gate reopens even under the attribute"
+        );
+        assert_eq!(
+            p.candidates_to_ping(lapsed),
+            vec![addr],
+            "and discovery still probes the candidate, as it does in Go when trust has lapsed"
+        );
+    }
+
+    /// The arm is narrow in both directions, as upstream writes it. Without the attribute inbound
+    /// data does not extend trust at all (the heartbeat's pong is what does that), and with the
+    /// attribute only the *best* address counts — a packet from a rival candidate proves nothing
+    /// about the best.
+    #[test]
+    fn note_recv_activity_only_fires_for_the_best_under_the_attribute() {
+        let best: SocketAddr = "203.0.113.1:41641".parse().unwrap();
+        let rival: SocketAddr = "203.0.113.2:41641".parse().unwrap();
+        let t0 = Instant::now();
+        let lapsed = t0 + TRUST_DURATION + Duration::from_secs(1);
+        let data_at = t0 + Duration::from_secs(5);
+
+        // Heartbeat running: data on the best changes nothing.
+        let (mut heartbeating, _) = confirmed_best(best, t0);
+        heartbeating.note_recv_activity(best, data_at);
+        assert_eq!(
+            heartbeating.best_addr(lapsed),
+            None,
+            "with the heartbeat running, trust is extended by pongs and not by data"
+        );
+
+        // Attribute set, but the data came from a different candidate.
+        let (mut silent, _) = confirmed_best(best, t0);
+        silent.add_netmap_candidates([rival]);
+        silent.set_heartbeat_disabled(true);
+        silent.note_recv_activity(rival, data_at);
+        assert_eq!(
+            silent.best_addr(lapsed),
+            None,
+            "data from a non-best candidate must not extend the best path's trust"
+        );
+    }
+
+    /// Ported verbatim, including the part that looks like an oversight and is not: Go compares
+    /// against `de.bestAddr` without consulting the trust window, so data arriving on a best whose
+    /// trust has *just* lapsed re-trusts it rather than forcing a DERP round trip to rediscover a
+    /// path that is plainly carrying traffic.
+    #[test]
+    fn note_recv_activity_re_trusts_a_best_whose_trust_lapsed() {
+        let addr: SocketAddr = "203.0.113.1:41641".parse().unwrap();
+        let t0 = Instant::now();
+        let (mut p, _) = confirmed_best(addr, t0);
+        p.set_heartbeat_disabled(true);
+
+        let lapsed = t0 + TRUST_DURATION + Duration::from_secs(1);
+        assert_eq!(p.best_addr(lapsed), None, "precondition: trust has lapsed");
+
+        p.note_recv_activity(addr, lapsed);
+        assert_eq!(
+            p.best_addr(lapsed),
+            Some(addr),
+            "a datagram on the stored best re-trusts it for a full TRUST_DURATION"
         );
     }
 }
