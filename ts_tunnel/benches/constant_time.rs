@@ -1,7 +1,9 @@
 //! Constant-time leakage *detection* for the WireGuard transport AEAD path.
 //!
 //! This is a [dudect](https://eprint.iacr.org/2016/1123) t-test harness (Reparaz, Balasch &
-//! Verbauwhede, 2016) built on [`dudect-bencher`]. dudect is a *leakage detector*, not a prover:
+//! Verbauwhede, 2016). The statistics live in the in-tree `dudect` module
+//! (`benches/dudect/mod.rs`), vendored from the `dudect-bencher` crate — that module records why.
+//! dudect is a *leakage detector*, not a prover:
 //! it times an operation across two input distributions (`Class::Left` / `Class::Right`) and runs
 //! Welch's t-test on the timing samples. A large `max_t` is statistical evidence that the two
 //! distributions take measurably different time — i.e. a likely timing side-channel. The
@@ -10,19 +12,16 @@
 //! PROVE its absence. See `docs/CRYPTOGRAPHY.md` §7 ("Constant-time and side-channels").
 //!
 //! Run (release mode is mandatory — the constant-time properties only hold in optimized builds, and
-//! debug-build timing noise swamps the signal). `dudect-bencher`'s `ctbench_main!` parses its own
-//! CLI (`--filter`/`--continuous`/`--out`) and rejects the `--bench` flag that `cargo bench` injects
-//! after `--`, so build with cargo and then run the produced binary directly:
+//! debug-build timing noise swamps the signal):
 //!
 //! ```text
-//! cargo bench -p geiserx_ts_tunnel --bench constant_time --no-run
-//! # cargo prints the built binary path; run it (optionally --continuous for a long run):
-//! "$(ls -t target/release/deps/constant_time-* | grep -v '\.d$' | head -1)"
+//! cargo bench -p geiserx_ts_tunnel --bench constant_time
 //! ```
 //!
-//! (A bare `cargo bench -p geiserx_ts_tunnel --bench constant_time` builds fine but exits non-zero
-//! because cargo appends `--bench`, which dudect's arg parser does not recognise — run the binary
-//! directly as above.)
+//! Each run draws a fresh seed and prints it; set `DUDECT_SEED=0x…` to replay an interesting one.
+//!
+//! Every run opens with a self-check that feeds the detector two synthetic distributions, one clean
+//! and one carrying a deliberate 20ns leak, and aborts if it cannot tell them apart.
 //!
 //! This bench is **informational only**. It is NOT wired into the default CI/test gate: a flaky
 //! `max_t` on a noisy shared runner must never fail the build. Run it on demand on a quiet machine
@@ -70,10 +69,17 @@ use std::cell::RefCell;
 
 use aead::{AeadCore, AeadInPlace, KeyInit, generic_array::typenum::Unsigned};
 use chacha20poly1305::ChaCha20Poly1305;
-use dudect_bencher::{
-    BenchRng, Class, CtRunner, ctbench_main,
-    rand::{Rng, RngExt},
-};
+use rand::{Rng, RngExt, SeedableRng, rngs::StdRng};
+
+mod dudect;
+
+use dudect::{Class, CtRunner};
+
+/// RNG handed to the bench function.
+type BenchRng = StdRng;
+
+/// Environment variable that pins the [`BenchRng`] seed, e.g. `DUDECT_SEED=0xdeadbeef`.
+const SEED_VAR: &str = "DUDECT_SEED";
 
 /// Number of timed samples drawn per bench invocation. dudect's t-statistic stabilizes with sample
 /// count; 100k keeps a single `cargo bench` run to a few seconds while giving the test enough data
@@ -183,4 +189,46 @@ fn aead_decrypt_tag_verify(runner: &mut CtRunner, rng: &mut BenchRng) {
     }
 }
 
-ctbench_main!(aead_decrypt_tag_verify);
+/// Reads the [`SEED_VAR`] override, or draws a fresh seed from the OS.
+///
+/// A fresh seed per run is deliberate: a fixed one would reproduce a seed-specific artifact on
+/// every run forever. The seed is printed so an interesting run can be replayed exactly.
+///
+/// # Panics
+///
+/// Panics if [`SEED_VAR`] is set to something that is not a `u64` (decimal, or `0x`-prefixed hex).
+fn seed() -> u64 {
+    match std::env::var(SEED_VAR) {
+        Err(_) => rand::rng().next_u64(),
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            let parsed = match trimmed
+                .strip_prefix("0x")
+                .or_else(|| trimmed.strip_prefix("0X"))
+            {
+                Some(hex) => u64::from_str_radix(hex, 16),
+                None => trimmed.parse(),
+            };
+            parsed.unwrap_or_else(|e| panic!("{SEED_VAR}={raw:?} is not a u64: {e}"))
+        }
+    }
+}
+
+fn main() {
+    dudect::self_check();
+
+    let seed = seed();
+    let mut rng = BenchRng::seed_from_u64(seed);
+    let mut runner = CtRunner::default();
+    aead_decrypt_tag_verify(&mut runner, &mut rng);
+
+    let summary = runner.summarize();
+    println!("bench aead_decrypt_tag_verify (seed 0x{seed:016x}) ... {summary}");
+
+    let verdict = if summary.max_t.abs() > 5f64 {
+        "above the >5 threshold — investigate"
+    } else {
+        "below the >5 threshold — no leak detected, which is not proof of constant-timeness"
+    };
+    println!("\nmax t = {:+.5}: {verdict}", summary.max_t);
+}
