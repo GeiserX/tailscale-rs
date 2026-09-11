@@ -1303,7 +1303,7 @@ fn apply_self_node_knobs(
     }
 }
 
-/// Disco-ping every candidate of each peer whose path state was just invalidated by a disco-key
+/// Disco-ping every candidate of each peer left without a confirmed path by a disco-key
 /// rotation, now rather than on the next pinger tick. Returns the number of pings that left the
 /// socket (the caller logs it; the count is what the test asserts on).
 ///
@@ -1319,10 +1319,12 @@ fn apply_self_node_knobs(
 /// handler returns.
 ///
 /// It is the same event-driven trigger a `CallMeMaybe` gets, for the same reason: an event has just
-/// told us this peer's path must be re-established now. What it borrows from that trigger is the
-/// *immediacy*, not the floor bypass — `invalidate_disco_path` has already cleared every
-/// `last_ping`, so nothing is floored at this point anyway. Rotations are rare and the fan-out is
-/// bounded by the peer's candidate set, so the pings stay well inside a stock client's disco volume.
+/// told us this peer's path must be re-established now. For a peer whose state was carried over,
+/// what it borrows from that trigger is the *immediacy*, not the floor bypass —
+/// `invalidate_disco_path` has already cleared every `last_ping`, so nothing is floored. For a peer
+/// that reached us under its new key first, nothing cleared those stamps and the bypass does the
+/// work, exactly as it does for a `CallMeMaybe`. Rotations are rare and the fan-out is bounded by
+/// the peer's candidate set, so the pings stay well inside a stock client's disco volume.
 ///
 /// A send failure is logged and skipped, never retried here: the periodic pinger is still running
 /// and will re-probe the peer on its own cadence, so a transient socket error costs the prompt
@@ -1375,16 +1377,16 @@ impl Message<Arc<PeerState>> for DirectManager {
                 let previous = poisoned_read(&self.peer_db);
                 disco_key_rotations(previous.as_deref(), &msg.peers)
             };
-            let mut invalidated = Vec::new();
+            let mut needs_probe = Vec::new();
             for rotation in rotations {
                 tracing::info!(
                     node_key = %rotation.node_key,
                     previous = %rotation.previous,
                     current = %rotation.current,
-                    "peer disco key changed; invalidating its trusted direct path",
+                    "peer disco key changed; dropping the direct path built under the old key",
                 );
                 if sock.changed_active_disco(&rotation.previous, &rotation.current) {
-                    invalidated.push(rotation.current);
+                    needs_probe.push(rotation.current);
                 }
             }
 
@@ -1398,15 +1400,15 @@ impl Message<Arc<PeerState>> for DirectManager {
             }
             sock.retain_peers(&live);
 
-            // Re-probe every peer whose path was just invalidated, now rather than on the next
+            // Re-probe every peer left without a confirmed path, now rather than on the next
             // periodic tick. Deliberately AFTER the reconcile above so the probe targets the
             // candidate set control just authorized: an endpoint this snapshot revoked is already
             // pruned and is not pinged, and one it just added is.
-            let pings = reprobe_rotated_peers(sock, &invalidated).await;
+            let pings = reprobe_rotated_peers(sock, &needs_probe).await;
             if pings > 0 {
                 tracing::debug!(
                     pings,
-                    peers = invalidated.len(),
+                    peers = needs_probe.len(),
                     "re-probing rotated peers now rather than on the next pinger tick",
                 );
             }
