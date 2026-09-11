@@ -2,6 +2,25 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.55.0](https://github.com/GeiserX/tailscale-rs/compare/v0.54.0...v0.55.0) (2026-09-11)
+
+
+### Features
+
+* **magicsock:** stop sending UDP when control sets only-tcp-443 ([#448](https://github.com/GeiserX/tailscale-rs/issues/448)) ([743aea8](https://github.com/GeiserX/tailscale-rs/commit/743aea8f358da4f3e97eb54ecdfcb2a45cdb339a))
+
+
+### Bug Fixes
+
+* **dataplane:** stop eating the app connector's transit-IP reject ([#450](https://github.com/GeiserX/tailscale-rs/issues/450)) ([c7b8522](https://github.com/GeiserX/tailscale-rs/commit/c7b852218ca6298ccde74b460a0d0512c80de41b))
+
+## [0.54.0](https://github.com/GeiserX/tailscale-rs/compare/v0.53.1...v0.54.0) (2026-09-11)
+
+
+### Features
+
+* **magicsock:** stop pinging peers control set silent-disco for ([#445](https://github.com/GeiserX/tailscale-rs/issues/445)) ([ee7c674](https://github.com/GeiserX/tailscale-rs/commit/ee7c6740ee0ee8710df358089ba8314c885fc52a))
+
 ## [0.53.1](https://github.com/GeiserX/tailscale-rs/compare/v0.53.0...v0.53.1) (2026-09-11)
 
 

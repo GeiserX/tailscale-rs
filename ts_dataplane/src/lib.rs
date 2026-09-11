@@ -1114,10 +1114,10 @@ fn filter_inbound_from_peer(
         // TSMP rejected-connection message (Go `packet.TailscaleRejectedHeader`): a peer telling us
         // it refused a connection *we* opened, and why. Go consumes it in
         // `wgengine.userspaceEngine.trackOpenPreFilterIn`, a pre-filter hook that runs ahead of the
-        // ACL and returns `filter.DropSilently` — the message is an inter-node control message
-        // addressed to the engine, never traffic for the local stack. Consumed in the same position
-        // and dropped the same way here; without this it reaches `smoltcp` as an IP-proto-99
-        // datagram it has no handler for.
+        // ACL and returns `filter.DropSilently` for all but one reason — the message is an
+        // inter-node control message addressed to the engine, never traffic for the local stack.
+        // Consumed in the same position and dropped the same way here; without this it reaches
+        // `smoltcp` as an IP-proto-99 datagram it has no handler for.
         //
         // Narrower than Go's hook, which drops *every* TSMP packet it sees: only a well-formed
         // rejected-connection message is consumed here, so the TSMP types this fork does not
@@ -1154,7 +1154,36 @@ fn filter_inbound_from_peer(
                 reject.reason,
             );
             harvest.rejected_flows.push((peer_id, reject));
-            return false;
+
+            // Go, after the log and the notify, and the reason this branch is a `switch` upstream
+            // rather than a bare `res = filter.DropSilently`:
+            //
+            //     switch rh.Reason {
+            //     case packet.RejectedDueToUnknownAppConnectorTransitIP:
+            //         // Keep res = filter.Accept, don't drop this packet because it will
+            //         // be used later for further communication between app connector
+            //         // and client.
+            //     default:
+            //         res = filter.DropSilently
+            //     }
+            //
+            // `'T'` is the one reason that is not a post-mortem. Every other reason reports a
+            // verdict already reached — the flow is over and the message exists only so the dialer
+            // can say why — but an app connector sends `'T'` when it has no real-IP mapping for the
+            // transit IP the client used, and the exchange that re-establishes that binding
+            // continues *through this packet*. Eating it here would be eating one side of a live
+            // conversation, so it falls through to the ordinary proto-switch below, whose
+            // unconditional TSMP accept (Go filter `runIn4`/`runIn6`: `case ipproto.TSMP: return
+            // Accept, "tsmp ok"`) is what upstream's `filter.Accept` runs into next.
+            //
+            // This fork implements no app connector and so never *sends* `'T'`; what matters is
+            // that it is always the dialing client, so a real Go app connector on the tailnet can
+            // send it one, and swallowing it is a divergence a peer can observe. The record still
+            // reaches the embedder on `rejected_flows` either way — the fall-through only adds the
+            // packet itself, which is what a future consumer would need.
+            if reject.reason != ts_packet::tsmp::RejectReason::UNKNOWN_APP_CONNECTOR_TRANSIT_IP {
+                return false;
+            }
         }
 
         // The inbound proto-switch (Go `runIn4`/`runIn6`): Go `pre()` multicast/link-local
@@ -5222,6 +5251,95 @@ mod tests {
             harvest.rejected_flows[0].1.reason,
             ts_packet::tsmp::RejectReason::IP_FORWARDING
         );
+    }
+
+    /// The one reason that is **not** consumed: `RejectedDueToUnknownAppConnectorTransitIP`.
+    ///
+    /// Go's `trackOpenPreFilterIn` switches on the reason before settling its verdict and leaves
+    /// `res = filter.Accept` for `'T'` — "don't drop this packet because it will be used later for
+    /// further communication between app connector and client". Everything else takes
+    /// `filter.DropSilently`. This fork is always the dialing client, so a real Go app connector is
+    /// the thing that sends one of these, and swallowing it breaks the exchange that re-establishes
+    /// the transit-IP binding.
+    ///
+    /// Both halves are asserted against the same peer, the same ACL and two headers that differ in
+    /// one byte, so the survival can only be the reason byte and not some property of the fixture.
+    #[test]
+    fn an_app_connector_transit_ip_reject_is_passed_through_not_consumed() {
+        let peer = PeerId(7);
+
+        let wire = |reason| {
+            ts_packet::tsmp::TailscaleRejectedHeader {
+                ip_src: IPV4_FIXTURE_SRC.into(),
+                ip_dst: IPV4_FIXTURE_DST.into(),
+                src: std::net::SocketAddr::new(IPV4_FIXTURE_DST.into(), 41234),
+                dst: std::net::SocketAddr::new(IPV4_FIXTURE_SRC.into(), 443),
+                proto: IPPROTO_TCP_BYTE,
+                reason,
+                maybe_broken: false,
+            }
+            .marshal()
+            .expect("marshals")
+        };
+
+        let run = |reason| {
+            let mut packets = vec![PacketMut::from(wire(reason))];
+            let mut harvest = InboundHarvest::default();
+            filter_inbound_from_peer(
+                &DenyAll,
+                &mut flowtrack::FlowCache::default(),
+                peer,
+                &mut packets,
+                RejectConfig::default(),
+                &mut harvest,
+            );
+            (packets, harvest)
+        };
+
+        let (packets, harvest) =
+            run(ts_packet::tsmp::RejectReason::UNKNOWN_APP_CONNECTOR_TRANSIT_IP);
+        assert_eq!(
+            packets.len(),
+            1,
+            "a 'T' reject is Go's one `filter.Accept` — it must reach the local stack, \
+             not be eaten by the filter step"
+        );
+        assert_eq!(
+            ts_packet::tsmp::TailscaleRejectedHeader::parse(packets[0].as_ref())
+                .expect("what survives is still the reject the peer sent")
+                .reason,
+            ts_packet::tsmp::RejectReason::UNKNOWN_APP_CONNECTOR_TRANSIT_IP,
+            "and it is passed through unmodified"
+        );
+        // Upstream logs, notifies and *then* switches, so accepting does not cost the embedder the
+        // record — it gets both.
+        assert_eq!(harvest.rejected_flows.len(), 1);
+        assert_eq!(harvest.rejected_flows[0].0, peer);
+        assert_eq!(
+            harvest.rejected_flows[0].1.reason,
+            ts_packet::tsmp::RejectReason::UNKNOWN_APP_CONNECTOR_TRANSIT_IP
+        );
+        assert!(
+            harvest.rejects_to_send.is_empty(),
+            "passing a reject through must not answer it with another one"
+        );
+
+        // The contrast, one byte away: every other reason keeps Go's `filter.DropSilently`.
+        for reason in [
+            ts_packet::tsmp::RejectReason::ACLS,
+            ts_packet::tsmp::RejectReason::SHIELDS_UP,
+            ts_packet::tsmp::RejectReason::IP_FORWARDING,
+            ts_packet::tsmp::RejectReason::HOST_FIREWALL,
+            // Go's `default` arm covers a reason this build has never heard of, too.
+            ts_packet::tsmp::RejectReason(b'Z'),
+        ] {
+            let (packets, harvest) = run(reason);
+            assert!(
+                packets.is_empty(),
+                "a {reason} reject is consumed, never delivered"
+            );
+            assert_eq!(harvest.rejected_flows.len(), 1, "{reason}");
+        }
     }
 
     /// A peer cannot drive the default-level log with rejected-connection messages.
