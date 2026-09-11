@@ -26,7 +26,7 @@ pub use ip_proto::IpProto;
 #[doc(inline)]
 pub use l4::L4Header;
 #[doc(inline)]
-pub use rule::{DstMatch, Rule, Ruleset, SrcMatch};
+pub use rule::{DstMatch, Rule, Ruleset, SrcMatch, permits_unlocked_nodes};
 #[doc(inline)]
 pub use state::apply_update;
 

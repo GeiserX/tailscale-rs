@@ -230,6 +230,26 @@ pub struct Node {
     ///
     /// The clamp is **unconditional** — it does not depend on tailnet lock being enabled locally,
     /// because the point is that an unsigned peer is by definition outside the lock's coverage.
+    ///
+    /// The clamp alone is not enough, because it closes only one of the two doors control has.
+    /// Control can leave the node's `AllowedIPs` at its own addresses — which the clamp permits,
+    /// those *are* its addresses — and write those same addresses into the **packet filter** as an
+    /// allowed source instead. Upstream's answer is to reject the filter outright: a filter that
+    /// grants an unsigned peer network access is treated as invalid ("the server is either broken
+    /// or malicious") and ignored wholesale. That is
+    /// [`ts_packetfilter::permits_unlocked_nodes`], driven by `ts_runtime`'s packet-filter updater
+    /// on every netmap that moves either the filter or the peer set — Go's
+    /// `packetFilterPermitsUnlockedNodes` / `nodeBackend.unlockedNodesPermitted` in
+    /// `ipn/ipnlocal/local.go`.
+    ///
+    /// The **capability** half is still unported: there is no per-peer capability map in this
+    /// domain model, only the node-attribute [`cap_map`](Self::cap_map). When it is ported, note
+    /// that upstream does **not** withhold every capability. `capsAllowedForUnsignedPeer`
+    /// (`ipn/ipnlocal/node_backend.go`) keeps `tailcfg.PeerCapabilityIngress` when the peer has it
+    /// and drops the rest, on upstream's own reasoning that "Tailscale Funnel ingress nodes are
+    /// unsigned by design, and the capability only permits ingress requests over the PeerAPI, which
+    /// unsigned peers can already reach". Withholding it too would refuse Funnel ingress from real
+    /// Tailscale nodes, so the carve-out travels with the port rather than after it.
     pub unsigned_peer_api_only: bool,
 
     /// The routes this node accepts traffic for.
