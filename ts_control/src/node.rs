@@ -667,6 +667,28 @@ impl Node {
         self.has_node_attr(Self::NODE_ATTR_DNS_FORWARDER_DISABLE_TCP_RETRIES)
     }
 
+    /// The node attribute by which control asks this node to keep its periodic STUN sweep running
+    /// even while the datapath is idle (Go `tailcfg/nodecap`'s `NodeAttrDebugForceBackgroundSTUN`,
+    /// surfaced in `control/controlknobs` as `Knobs.ForceBackgroundSTUN`). Read by
+    /// [`force_background_stun`](Self::force_background_stun).
+    const NODE_ATTR_DEBUG_FORCE_BACKGROUND_STUN: &'static str = "debug-always-stun";
+
+    /// Report whether control has asked this node to keep STUNning in the background regardless of
+    /// datapath activity.
+    ///
+    /// This is the single override on the idle stop condition in Go magicsock's
+    /// `shouldDoPeriodicReSTUNLocked`: once the datapath has been idle longer than the session-active
+    /// timeout the periodic sweep stops, *unless* `c.controlKnobs.ForceBackgroundSTUN` is set, in
+    /// which case it keeps running. It overrides nothing else — a node with no peers still does not
+    /// STUN, with or without the attribute, because that arm returns before the idle arm is reached.
+    ///
+    /// Read off the **self** node's cap map, like every other control knob. Absent (the normal case)
+    /// means "let the idle stop apply", which is the quiet default; the attribute is a debugging
+    /// escape hatch control sets deliberately, so there is nothing to fail closed to here.
+    pub fn force_background_stun(&self) -> bool {
+        self.has_node_attr(Self::NODE_ATTR_DEBUG_FORCE_BACKGROUND_STUN)
+    }
+
     /// The node attribute by which control asks this node to collapse its per-peer CGNAT host
     /// routes into the single `100.64.0.0/10` (Go `tailcfg/nodecap`'s `OneCGNATEnable`).
     ///
@@ -2042,6 +2064,23 @@ pub(crate) mod tests {
         assert!(
             n.disable_dns_forwarder_tcp_retries(),
             "the dns-forwarder-disable-tcp-retries attribute turns the TCP retry off"
+        );
+    }
+
+    /// The debug-always-stun attribute is control's only way to keep the periodic STUN sweep running
+    /// once the datapath has gone idle, so its key has to be the literal Go sends
+    /// (`NodeAttrDebugForceBackgroundSTUN`). Absent is the quiet default.
+    #[test]
+    fn force_background_stun_gated_on_the_node_attribute() {
+        let mut n = node("self", Some("ts.net"));
+        assert!(
+            !n.force_background_stun(),
+            "no attribute → the idle stop applies, which is the quiet default"
+        );
+        n.cap_map.insert("debug-always-stun".to_string(), vec![]);
+        assert!(
+            n.force_background_stun(),
+            "the debug-always-stun attribute keeps the background sweep running"
         );
     }
 

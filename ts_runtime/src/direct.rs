@@ -17,7 +17,10 @@
 use core::{net::SocketAddr, time::Duration};
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use kameo::{
@@ -33,7 +36,10 @@ use ts_transport::{
 
 use crate::{
     Env, Error,
-    dataplane::{DataplaneActor, NewUnderlayTransport, UnderlayFromDataplane, UnderlayToDataplane},
+    dataplane::{
+        DatapathActivity, DataplaneActor, NewUnderlayTransport, UnderlayFromDataplane,
+        UnderlayToDataplane,
+    },
     multiderp::{self, Multiderp},
     peer_tracker::{DiscoKeyMatch, PeerDb, PeerState},
 };
@@ -281,6 +287,12 @@ pub struct DirectManager {
     /// the two: it is held for a whole round, not just around the cursor read. See
     /// [`probe_stun_servers_once`].
     stun_cursor: Arc<Mutex<usize>>,
+    /// Control's `debug-always-stun` node attribute (Go `controlknobs.Knobs.ForceBackgroundSTUN`),
+    /// re-read off the self node on every netmap. Shared with the periodic [`run_stun_prober`] task,
+    /// which is the only reader: it is the sole override on that sweep's idle stop condition (see
+    /// [`should_do_periodic_restun`]). An `AtomicBool` rather than a bus message or an actor `ask`
+    /// because the reader is a plain task and the value is one independent bit.
+    force_background_stun: Arc<AtomicBool>,
     #[allow(dead_code)]
     tasks: JoinSet<()>,
 }
@@ -665,6 +677,8 @@ async fn run_stun_prober(
     peer_db: Arc<RwLock<Option<Arc<PeerDb>>>>,
     multiderp: ActorRef<Multiderp>,
     stun_cursor: Arc<Mutex<usize>>,
+    activity: DatapathActivity,
+    force_background_stun: Arc<AtomicBool>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     // Re-randomize the delay every cycle (Go re-arms `periodicReSTUNTimer` with a fresh
@@ -677,10 +691,12 @@ async fn run_stun_prober(
         tokio::select! {
             _ = shutdown.changed() => break,
             _ = tokio::time::sleep(stun_probe_delay()) => {
-                // Skip the sweep while we have no peers (Go's peer-count stop condition — see
-                // [`stun_probe_should_run`]). On-wire-equivalent to Go stopping its periodic timer,
-                // and auto-resumes the moment a peer appears.
-                if !stun_probe_should_run(&peer_db) {
+                // Skip the sweep when any of Go's ported stop conditions holds — no peers, or a
+                // datapath idle past `SESSION_ACTIVE_TIMEOUT` without control's override (see
+                // [`should_do_periodic_restun`]). On-wire-equivalent to Go stopping its periodic
+                // timer, and auto-resumes with no netmap change the moment a peer appears or
+                // traffic returns.
+                if !should_do_periodic_restun(&peer_db, &activity, &force_background_stun) {
                     continue;
                 }
 
@@ -699,18 +715,28 @@ async fn run_stun_prober(
     }
 }
 
-/// Whether the periodic STUN sweep should run this round — the fork's analog of Go magicsock's
-/// `shouldDoPeriodicReSTUNLocked` peer-count gate (`len(c.peerSet) == 0` → don't STUN).
+/// How long the datapath may be idle before the periodic STUN sweep stops — Go magicsock's
+/// `sessionActiveTimeout` (45s, `wgengine/magicsock/magicsock.go`).
+///
+/// Deliberately longer than the ~20-26s sweep cadence, so a node carrying any traffic at all keeps
+/// STUNning and only a genuinely quiet datapath goes silent.
+const SESSION_ACTIVE_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Whether the periodic STUN sweep has a peer to keep a path open for — Go magicsock's
+/// `len(c.peerSet) == 0` stop condition, on its own.
 ///
 /// Returns `true` only when a netmap is loaded *and* it has at least one peer. STUN exists to keep
 /// our NAT mapping open so peers can reach us directly; with no configured peer there is nobody to
 /// reach, so the sweep is pure waste — and, more importantly for parity, a real `tailscaled` falls
 /// quiet on STUN in that state (Go stops its `periodicReSTUNTimer`). A node that keeps emitting
 /// Binding Requests every ~23s with no peer is a visible "no peer traffic but steady STUN"
-/// fingerprint. This is the single highest-signal stop condition; Go's other three (idle past
-/// `sessionActiveTimeout`, network-down/homeless, zero private key) need activity/network-state
-/// plumbing the runtime does not have yet — and the zero-key case is structurally impossible here
-/// (the socket is always bound with a real key before the prober is spawned).
+/// fingerprint.
+///
+/// This is the arm the **on-demand** sweeps ([`DirectManager::re_stun`],
+/// [`DirectManager::rebind_and_reprobe`]) use, and only that arm: Go gates on
+/// `shouldDoPeriodicReSTUNLocked` inside `periodicReSTUN` alone, so an explicit `Conn.ReSTUN` after
+/// a link change re-probes whatever the datapath has been doing. The periodic sweep's full gate is
+/// [`should_do_periodic_restun`], which adds the idle arm on top of this one.
 ///
 /// Factored out of [`run_stun_prober`]'s loop so the gate is unit-testable without the actor/timer
 /// machinery, mirroring [`probe_stun_servers_once`]. Uses the same `peer_db` snapshot discipline as
@@ -718,6 +744,55 @@ async fn run_stun_prober(
 fn stun_probe_should_run(peer_db: &RwLock<Option<Arc<PeerDb>>>) -> bool {
     let db = poisoned_read(peer_db);
     db.as_ref().is_some_and(|db| !db.peers().is_empty())
+}
+
+/// Whether the **periodic** STUN sweep should run this round — the fork's
+/// `shouldDoPeriodicReSTUNLocked`.
+///
+/// Go's version has four stop conditions. Two are ported here:
+///
+/// 1. **No peers** — [`stun_probe_should_run`], above.
+/// 2. **Datapath idle past [`SESSION_ACTIVE_TIMEOUT`]** — `idleFor > sessionActiveTimeout`, where
+///    Go's `idleFunc` is the TUN device's `IdleDuration` (wired in `wgengine/userspace.go`). Here it
+///    is [`DatapathActivity::idle_duration`], fed by the one overlay->dataplane seam every datapath
+///    send crosses. Without this arm a node with peers and no traffic STUNs the derp map's STUN
+///    servers every ~23s for its entire life, which is the same "steady STUN with no peer traffic"
+///    fingerprint arm 1 exists to avoid — a real `tailscaled` falls quiet 45s after the last packet.
+///
+/// The idle arm has exactly one override, ported with it: when control sets the `debug-always-stun`
+/// node attribute ([`Node::force_background_stun`](ts_control::Node::force_background_stun), Go's
+/// `controlknobs.Knobs.ForceBackgroundSTUN`) an idle datapath no longer stops the sweep. It
+/// overrides nothing else — arm 1 returns first, so a peerless node stays quiet either way, exactly
+/// as in Go. The override exists because the idle stop takes away today's behaviour, and this is
+/// control's only way to ask for it back.
+///
+/// Go's other two arms are **not** ported:
+///
+/// * **Zero private key** (`c.privateKey.IsZero()`, "not running") is structurally impossible in
+///   this tree and is recorded here rather than implemented: the underlay socket is bound with a
+///   real disco/node key pair before [`run_stun_prober`] is ever spawned (see the
+///   [`bind_underlay_addr`] call in `on_start`, whose failure path leaves the manager inert with no
+///   prober at all), so there is no state in which this task runs without a key.
+/// * **Network down / homeless** (`c.networkDown()`, `c.homeless`) needs an OS link-state backend
+///   `ts_netmon` does not have yet; it is deliberately left out rather than faked from something
+///   weaker, since guessing "the network is down" wrongly would stop STUN on a working node.
+fn should_do_periodic_restun(
+    peer_db: &RwLock<Option<Arc<PeerDb>>>,
+    activity: &DatapathActivity,
+    force_background_stun: &AtomicBool,
+) -> bool {
+    if !stun_probe_should_run(peer_db) {
+        return false;
+    }
+
+    if activity.idle_duration() > SESSION_ACTIVE_TIMEOUT {
+        // Control asked for the background sweep regardless of idleness (Go's
+        // `ForceBackgroundSTUN` knob). `Relaxed`: the flag is a single independent bool written by
+        // the actor on each netmap and read here on a ~23s cadence; it orders nothing else.
+        return force_background_stun.load(Ordering::Relaxed);
+    }
+
+    true
 }
 
 /// Send one STUN Binding Request per server for as much of `servers` as the socket will admit this
@@ -957,8 +1032,14 @@ impl kameo::Actor for DirectManager {
         slf: ActorRef<Self>,
     ) -> Result<Self, Self::Error> {
         env.subscribe::<Arc<PeerState>>(&slf).await?;
+        // The self node, for control's `debug-always-stun` knob — the only override on the periodic
+        // sweep's idle stop. Peers arrive via `PeerState`; the cap map does not.
+        env.subscribe::<Arc<ts_control::StateUpdate>>(&slf).await?;
 
         let peer_db: Arc<RwLock<Option<Arc<PeerDb>>>> = Default::default();
+        // Off until control says otherwise: the attribute is a debugging escape hatch, and its
+        // absence is the quiet (idle-stops-the-sweep) default.
+        let force_background_stun = Arc::new(AtomicBool::new(false));
         // One rotation shared by the periodic prober task and the actor's on-demand sweeps, so the
         // two advance through the derp map's STUN servers together instead of each restarting at
         // the head (see `probe_stun_servers_once`).
@@ -1022,6 +1103,7 @@ impl kameo::Actor for DirectManager {
                     peer_db,
                     multiderp,
                     stun_cursor,
+                    force_background_stun,
                     tasks,
                 });
             }
@@ -1046,13 +1128,16 @@ impl kameo::Actor for DirectManager {
             env.shutdown.clone(),
         ));
         // Active STUN probing shares the one bound socket; clone the multiderp ref before it is
-        // moved into run_call_me_maybe below. `peer_db` is cloned so the prober can skip the sweep
-        // while there are no peers (Go's `shouldDoPeriodicReSTUNLocked` peer-count stop condition).
+        // moved into run_call_me_maybe below. `peer_db`, the datapath idleness clock and the
+        // `debug-always-stun` flag are cloned in so the prober can evaluate Go's
+        // `shouldDoPeriodicReSTUNLocked` stop conditions itself (see `should_do_periodic_restun`).
         tasks.spawn(run_stun_prober(
             sock.clone(),
             peer_db.clone(),
             multiderp.clone(),
             stun_cursor.clone(),
+            env.datapath_activity.clone(),
+            force_background_stun.clone(),
             env.shutdown.clone(),
         ));
 
@@ -1083,6 +1168,7 @@ impl kameo::Actor for DirectManager {
             peer_db,
             multiderp: multiderp_for_field,
             stun_cursor,
+            force_background_stun,
             tasks,
         })
     }
@@ -1134,6 +1220,36 @@ fn disco_key_rotations(previous: Option<&PeerDb>, current: &PeerDb) -> Vec<Disco
             })
         })
         .collect()
+}
+
+impl Message<Arc<ts_control::StateUpdate>> for DirectManager {
+    type Reply = ();
+
+    /// Track control's `debug-always-stun` node attribute (Go `controlknobs.Knobs.ForceBackgroundSTUN`,
+    /// refreshed from `nm.SelfNode`'s cap map on every netmap), the only override on the periodic STUN
+    /// sweep's idle stop condition.
+    ///
+    /// A response that carries no self node leaves the flag alone rather than clearing it: control
+    /// sends field-level and peer-only updates on the same stream, and reading "this response had no
+    /// self node" as "control withdrew the attribute" would silently flip the knob off mid-session.
+    /// The flag changes only when control actually restates the self node.
+    async fn handle(
+        &mut self,
+        msg: Arc<ts_control::StateUpdate>,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) {
+        let Some(self_node) = msg.node.as_ref() else {
+            return;
+        };
+        let force = self_node.force_background_stun();
+        if self.force_background_stun.swap(force, Ordering::Relaxed) != force {
+            tracing::info!(
+                force_background_stun = force,
+                "control changed the background-STUN override; the periodic sweep's idle stop \
+                 follows it",
+            );
+        }
+    }
 }
 
 impl Message<Arc<PeerState>> for DirectManager {
@@ -1998,6 +2114,129 @@ mod tests {
         );
         // Empty server list (what an unavailable/stale derp map yields) → no sends, returns promptly.
         probe_stun_servers_once(&sock, &[], &Mutex::new(0)).await;
+    }
+
+    /// The datapath idle stop condition — Go magicsock's `idleFor > sessionActiveTimeout` arm of
+    /// `shouldDoPeriodicReSTUNLocked`, whose `idleFunc` is the TUN device's `IdleDuration`.
+    ///
+    /// A node with peers but no traffic must fall quiet 45s after the last datapath send instead of
+    /// STUNning the derp map's STUN servers every ~23s forever; that is the same "steady STUN with no
+    /// peer traffic" fingerprint the peer-count arm exists to avoid. The clock is backdated rather
+    /// than slept through, so this pins the threshold and not the scheduler.
+    #[test]
+    fn periodic_stun_stops_when_the_datapath_has_been_idle_past_the_session_timeout() {
+        let disco = DiscoPrivateKey::random().public_key();
+        let node_key = NodePrivateKey::random().public_key();
+        let with_peer = db_with(node_with_keys(disco, node_key, "n1"));
+        // Control has not set `debug-always-stun`: the idle stop applies.
+        let no_override = AtomicBool::new(false);
+
+        // A datapath that just sent → well inside the window, so the sweep runs.
+        let busy = DatapathActivity::new();
+        assert!(
+            should_do_periodic_restun(&with_peer, &busy, &no_override),
+            "an active datapath with a peer must keep STUNning"
+        );
+
+        // Idle for less than the timeout → still running (the arm is `>`, not `>=`, and 45s is
+        // deliberately longer than the ~20-26s sweep cadence).
+        let nearly_idle =
+            DatapathActivity::idle_for(SESSION_ACTIVE_TIMEOUT - Duration::from_secs(5));
+        assert!(
+            should_do_periodic_restun(&with_peer, &nearly_idle, &no_override),
+            "idle for under sessionActiveTimeout must not stop the sweep"
+        );
+
+        // Idle past the timeout → stopped.
+        let idle = DatapathActivity::idle_for(SESSION_ACTIVE_TIMEOUT + Duration::from_secs(1));
+        assert!(
+            !should_do_periodic_restun(&with_peer, &idle, &no_override),
+            "a datapath idle past sessionActiveTimeout must stop the periodic sweep"
+        );
+
+        // The on-demand sweeps (`re_stun`, `rebind_and_reprobe`) are NOT idle-gated: Go gates only
+        // `periodicReSTUN`, so an explicit re-probe after a link change still runs on a quiet node.
+        assert!(
+            stun_probe_should_run(&with_peer),
+            "the on-demand sweep gate must ignore idleness, as Go's Conn.ReSTUN does"
+        );
+    }
+
+    /// The idle stop's one override — control's `debug-always-stun` node attribute (Go
+    /// `controlknobs.Knobs.ForceBackgroundSTUN`). It is what lets control ask for the pre-idle-stop
+    /// behaviour back, and it overrides the idle arm ONLY: a peerless node stays quiet with the
+    /// attribute set, because Go's peer-count arm returns before the idle arm is reached.
+    #[test]
+    fn debug_always_stun_overrides_the_idle_stop_and_nothing_else() {
+        let disco = DiscoPrivateKey::random().public_key();
+        let node_key = NodePrivateKey::random().public_key();
+        let with_peer = db_with(node_with_keys(disco, node_key, "n1"));
+        let idle = DatapathActivity::idle_for(SESSION_ACTIVE_TIMEOUT + Duration::from_secs(1));
+
+        let forced = AtomicBool::new(true);
+        assert!(
+            should_do_periodic_restun(&with_peer, &idle, &forced),
+            "debug-always-stun must keep the sweep running on an idle datapath"
+        );
+
+        // Same attribute, no peers: still quiet. The override must not resurrect the peer-count arm.
+        let no_peers: Arc<RwLock<Option<Arc<PeerDb>>>> = Default::default();
+        assert!(
+            !should_do_periodic_restun(&no_peers, &idle, &forced),
+            "debug-always-stun must not make a peerless node STUN"
+        );
+    }
+
+    /// The attribute reaches the gate the way control sends it: as a key on the **self** node's cap
+    /// map. This pins the wire key (`debug-always-stun`) end-to-end through the accessor the direct
+    /// manager reads, so a typo in the literal can't silently disable control's only override.
+    #[test]
+    fn the_override_is_read_off_the_self_nodes_cap_map() {
+        let mut self_node = node_with_keys(
+            DiscoPrivateKey::random().public_key(),
+            NodePrivateKey::random().public_key(),
+            "self",
+        );
+        assert!(
+            !self_node.force_background_stun(),
+            "a self node without the attribute leaves the idle stop in force"
+        );
+        self_node
+            .cap_map
+            .insert("debug-always-stun".to_string(), vec![]);
+        assert!(
+            self_node.force_background_stun(),
+            "the debug-always-stun cap-map key is what turns the override on"
+        );
+    }
+
+    /// Traffic resuming re-opens the gate immediately, with no netmap change and no waiting for
+    /// control — the property that keeps the idle stop from costing connectivity. The reset goes
+    /// through the production seam ([`OverlayToDataplane::send`], the one call every datapath send
+    /// from the netstack, the TUN pump and the forwarder makes), not through a test-only poke.
+    #[test]
+    fn traffic_resuming_restarts_the_sweep_without_a_netmap_change() {
+        let disco = DiscoPrivateKey::random().public_key();
+        let node_key = NodePrivateKey::random().public_key();
+        let with_peer = db_with(node_with_keys(disco, node_key, "n1"));
+        let no_override = AtomicBool::new(false);
+
+        let activity = DatapathActivity::idle_for(SESSION_ACTIVE_TIMEOUT + Duration::from_secs(1));
+        assert!(
+            !should_do_periodic_restun(&with_peer, &activity, &no_override),
+            "precondition: the idle datapath has stopped the sweep"
+        );
+
+        // One packet out of the datapath, through the real overlay->dataplane send. `_down` is held
+        // so the channel stays open and the send actually succeeds.
+        let (up, _down) = crate::dataplane::OverlayToDataplane::for_test(activity.clone());
+        up.send(vec![ts_packet::PacketMut::from(vec![0u8; 20])])
+            .expect("the dataplane receiver is still alive");
+
+        assert!(
+            should_do_periodic_restun(&with_peer, &activity, &no_override),
+            "the sweep must resume on the next tick after traffic returns, with the same netmap"
+        );
     }
 
     /// The periodic STUN delay is a uniform random value in `[20s, 26s)`, matching Go magicsock's

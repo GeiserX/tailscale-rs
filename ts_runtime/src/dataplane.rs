@@ -18,8 +18,130 @@ use crate::{
     src_filter::SourceFilterState,
 };
 
+/// How long ago the application datapath last sent a packet towards the tailnet — the fork's
+/// `tstun.Wrapper.IdleDuration`, the activity signal Go `wgengine/userspace.go` wires into
+/// magicsock as `Conn.idleFunc`.
+///
+/// Go measures idleness at its single TUN device, which every path — the OS stack in TUN mode, the
+/// userspace netstack in netstack mode, and forwarded exit/subnet flows — passes through. This tree
+/// has no single device, but it does have a single *seam*: every overlay transport writes to the
+/// dataplane through [`OverlayToDataplane::send`], and that is where the timestamp is taken. So the
+/// application netstack, the TUN pump and the forwarder netstack all feed one clock, exactly as they
+/// would all feed one `tstun.Wrapper` upstream.
+///
+/// Only the **send** direction is recorded, which is what the consumer needs: the periodic STUN
+/// sweep exists to keep this node's NAT mapping open so peers can reach *us*, and it is our own
+/// outbound traffic that both proves someone here still wants that mapping and refreshes it.
+/// Inbound-only traffic keeps arriving over an already-working path.
+///
+/// The clock is monotonic and lock-free: an origin [`Instant`](std::time::Instant) fixed at
+/// construction plus an [`AtomicU64`](std::sync::atomic::AtomicU64) of milliseconds since it. Before
+/// the first send the counter is `0`, so [`idle_duration`](Self::idle_duration) reads as "idle since
+/// the runtime started" — which is also how Go reads its zero `mono.Time`.
+#[derive(Debug, Clone)]
+pub struct DatapathActivity(Arc<DatapathActivityInner>);
+
+#[derive(Debug)]
+struct DatapathActivityInner {
+    /// Fixed at construction; every recorded send is stored as a millisecond offset from it, so the
+    /// whole clock fits in one atomic and can never go backwards.
+    origin: std::time::Instant,
+    /// Milliseconds from `origin` to the last datapath send, or `0` when there has been none.
+    last_send_millis: std::sync::atomic::AtomicU64,
+}
+
+impl DatapathActivity {
+    /// A clock with no send recorded yet, whose origin is now.
+    pub fn new() -> Self {
+        Self(Arc::new(DatapathActivityInner {
+            origin: std::time::Instant::now(),
+            last_send_millis: std::sync::atomic::AtomicU64::new(0),
+        }))
+    }
+
+    /// Record that the datapath just sent towards the tailnet (Go `tstun.Wrapper.noteActivity`).
+    ///
+    /// `Relaxed` is the right ordering: the value is a coarse timestamp read by an unrelated task on
+    /// a ~23s cadence, it is never used to publish other state, and a monotonic store is still
+    /// monotonic without a fence.
+    fn note_send(&self) {
+        let millis = u64::try_from(self.0.origin.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.0
+            .last_send_millis
+            .store(millis, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How long since the last datapath send, or since this clock's origin when there has been none.
+    pub fn idle_duration(&self) -> std::time::Duration {
+        let last = std::time::Duration::from_millis(
+            self.0
+                .last_send_millis
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        // `saturating_sub`: a send recorded concurrently with this read can carry an offset a hair
+        // past the `elapsed()` sampled just above, and "slightly negative idle" must read as zero,
+        // not wrap.
+        self.0.origin.elapsed().saturating_sub(last)
+    }
+
+    /// A clock that already reads as idle for `idle` — the backdated-origin equivalent of letting
+    /// `idle` of wall-clock elapse, so the idle stop condition can be exercised without a sleep.
+    /// [`note_send`](Self::note_send) still resets it, which is what makes the "traffic resumes"
+    /// assertion go through the production path.
+    #[cfg(test)]
+    pub(crate) fn idle_for(idle: std::time::Duration) -> Self {
+        let now = std::time::Instant::now();
+        Self(Arc::new(DatapathActivityInner {
+            origin: now.checked_sub(idle).unwrap_or(now),
+            last_send_millis: std::sync::atomic::AtomicU64::new(0),
+        }))
+    }
+}
+
+impl Default for DatapathActivity {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Queue for packets sent from the overlay to the dataplane.
-pub type OverlayToDataplane = mpsc::UnboundedSender<Vec<PacketMut>>;
+///
+/// A newtype around the raw channel rather than an alias for it, because this is the one seam every
+/// overlay transport's outbound packets cross: wrapping it makes recording datapath activity
+/// (see [`DatapathActivity`]) structural — a future overlay transport gets it by construction rather
+/// than by remembering to call something.
+#[derive(Clone)]
+pub struct OverlayToDataplane {
+    tx: mpsc::UnboundedSender<Vec<PacketMut>>,
+    activity: DatapathActivity,
+}
+
+impl OverlayToDataplane {
+    /// Hand a batch of packets to the dataplane, noting the datapath activity.
+    ///
+    /// The timestamp is taken only when the send succeeds: a closed channel means the dataplane is
+    /// gone (shutdown), and that is not the datapath carrying traffic. `Err` returns the batch, like
+    /// the underlying channel's `send`.
+    pub fn send(
+        &self,
+        packets: Vec<PacketMut>,
+    ) -> Result<(), mpsc::error::SendError<Vec<PacketMut>>> {
+        let sent = self.tx.send(packets);
+        if sent.is_ok() {
+            self.activity.note_send();
+        }
+        sent
+    }
+
+    /// A send half feeding `activity`, paired with its receiver, so a test can drive the real
+    /// [`send`](Self::send) path (and thus the real activity recording) without standing up the
+    /// dataplane actor.
+    #[cfg(test)]
+    pub(crate) fn for_test(activity: DatapathActivity) -> (Self, OverlayFromDataplane) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Self { tx, activity }, rx)
+    }
+}
 
 /// Queue for packets entering the overlay from the dataplane.
 pub type OverlayFromDataplane = mpsc::UnboundedReceiver<Vec<PacketMut>>;
@@ -63,6 +185,10 @@ pub struct DataplaneActor {
     /// it — the self node (our own tailnet addresses) and the peer set (each peer's destination
     /// address) — so it is assembled here and pushed into the dataplane whole on every change.
     disco_advertisement: DiscoAdvertisementState,
+    /// The shared datapath-idleness clock (the same handle as `Env::datapath_activity`), stamped
+    /// into every [`OverlayToDataplane`] this actor hands out so each overlay transport's sends feed
+    /// it. Read by the direct manager's periodic STUN gate.
+    datapath_activity: DatapathActivity,
 }
 
 impl Drop for DataplaneActor {
@@ -78,7 +204,15 @@ impl DataplaneActor {
     pub async fn new_overlay_transport(
         &self,
     ) -> (OverlayTransportId, OverlayToDataplane, OverlayFromDataplane) {
-        self.dataplane.new_overlay_transport().await
+        let (id, tx, rx) = self.dataplane.new_overlay_transport().await;
+        (
+            id,
+            OverlayToDataplane {
+                tx,
+                activity: self.datapath_activity.clone(),
+            },
+            rx,
+        )
     }
 
     #[message]
@@ -113,6 +247,7 @@ impl kameo::Actor for DataplaneActor {
         ));
 
         let persistent_keepalive_interval = env.persistent_keepalive_interval;
+        let datapath_activity = env.datapath_activity.clone();
 
         // Go `tstun.Wrapper.PeerAPIPort`. The dataplane reads it for one thing: an inbound SYN to
         // the peerAPI port that the ACL drops must not be answered with a TSMP rejected-connection
@@ -165,6 +300,7 @@ impl kameo::Actor for DataplaneActor {
             task,
             disco_key_task,
             persistent_keepalive_interval,
+            datapath_activity,
             // Our disco key is generated once per run and never rotates (unlike the node key), so
             // it is snapshotted here rather than re-read per advertisement. Go reads it per call
             // (`Conn.DiscoPublicKey()`) because its disco key *can* be regenerated on rebind.
