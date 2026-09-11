@@ -904,8 +904,7 @@ impl MagicSock {
     /// learned, `CallMeMaybe`-derived addresses among them, which may be the only way to reach a
     /// NATed peer) and forcing re-discovery from whatever control happens to advertise. Moving it
     /// gives the rotation Go's shape: the endpoints stay, the trust and discovery state reset (see
-    /// [`PeerPaths::invalidate_disco_path`]), and every candidate is re-probed on the next pinger
-    /// tick.
+    /// [`PeerPaths::invalidate_disco_path`]), and every candidate is re-probed.
     ///
     /// The `addr -> disco` attribution map moves with it, so inbound data on those addresses is
     /// still attributed to this peer under its new key.
@@ -915,9 +914,21 @@ impl MagicSock {
     /// that only happens when the peer already reached us under its new key (an inbound ping or
     /// `CallMeMaybe` built the entry), which is fresher, new-key-confirmed state that must not be
     /// overwritten by the pre-rotation one.
-    pub fn changed_active_disco(&self, previous: &DiscoPublicKey, current: &DiscoPublicKey) {
+    ///
+    /// Returns whether path state was actually carried over and invalidated — i.e. whether this
+    /// peer now holds a best address it is not allowed to send to until a fresh pong lands. The
+    /// caller uses that to re-probe the peer **immediately**
+    /// ([`send_pings_to_peer_now`](Self::send_pings_to_peer_now)) instead of waiting out the
+    /// periodic pinger, which is how this tree keeps the DERP detour across a rotation to the one
+    /// round trip the port promises; the no-op cases return `false` and want no probe (nothing was
+    /// invalidated, so nothing has to be re-confirmed).
+    pub fn changed_active_disco(
+        &self,
+        previous: &DiscoPublicKey,
+        current: &DiscoPublicKey,
+    ) -> bool {
         if previous == current {
-            return;
+            return false;
         }
 
         // Locked disjointly, never nested (as in `rebind`).
@@ -942,7 +953,7 @@ impl MagicSock {
         if !moved {
             // Nothing was carried over, so leave attribution alone: any entry still pointing at the
             // old key is dropped by the `retain_peers` that follows a netmap update.
-            return;
+            return false;
         }
 
         let mut a2d = lock(&self.addr_to_disco);
@@ -951,6 +962,7 @@ impl MagicSock {
                 *peer = *current;
             }
         }
+        true
     }
 
     /// Drop all path state for peers absent from `live`.
@@ -6012,7 +6024,10 @@ mod tests {
             "precondition: a trusted direct path under the old key"
         );
 
-        sock.changed_active_disco(&old, &new);
+        assert!(
+            sock.changed_active_disco(&old, &new),
+            "a rotation that carried path state over reports it, so the caller re-probes now"
+        );
 
         assert!(
             sock.best_addr(&new).is_none(),
@@ -6055,7 +6070,11 @@ mod tests {
         sock.set_netmap_endpoints(old, [stale]);
         sock.add_peer_endpoints(new, [fresh]);
 
-        sock.changed_active_disco(&old, &new);
+        assert!(
+            !sock.changed_active_disco(&old, &new),
+            "nothing was invalidated, so there is nothing to re-probe: the state under the new \
+             key was confirmed under that key"
+        );
 
         assert_eq!(
             sock.candidate_addrs(&new),
@@ -6076,7 +6095,10 @@ mod tests {
         let addr: SocketAddr = "203.0.113.9:41641".parse().unwrap();
         sock.set_netmap_endpoints(peer, [addr]);
 
-        sock.changed_active_disco(&peer, &peer);
+        assert!(
+            !sock.changed_active_disco(&peer, &peer),
+            "a key that did not change invalidated nothing"
+        );
         assert_eq!(
             sock.candidate_addrs(&peer),
             vec![addr],
@@ -6085,7 +6107,10 @@ mod tests {
 
         let unknown = DiscoPrivateKey::random().public_key();
         let other = DiscoPrivateKey::random().public_key();
-        sock.changed_active_disco(&unknown, &other);
+        assert!(
+            !sock.changed_active_disco(&unknown, &other),
+            "a rotation with no path state behind the old key invalidated nothing"
+        );
         assert!(
             sock.candidate_addrs(&other).is_empty(),
             "a rotation with no path state behind the old key creates none"

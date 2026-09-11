@@ -1303,6 +1303,47 @@ fn apply_self_node_knobs(
     }
 }
 
+/// Disco-ping every candidate of each peer whose path state was just invalidated by a disco-key
+/// rotation, now rather than on the next pinger tick. Returns the number of pings that left the
+/// socket (the caller logs it; the count is what the test asserts on).
+///
+/// This is what keeps a rotation cheap. `PeerPaths::invalidate_disco_path` drops the trust window,
+/// so `MagicSock::best_addr` reports no direct path and the route updater relays the peer over DERP
+/// until a fresh pong lands. Upstream covers that gap differently — `addrForSendLocked`
+/// (`wgengine/magicsock/endpoint.go`) returns the retained-but-untrusted `bestAddr` *and* the DERP
+/// address, so a packet goes over both while the path is re-confirmed — which this tree cannot do:
+/// the dataplane routes each peer through exactly one underlay transport
+/// (`route_updater::overlay_direct`). What it can do is make the re-confirmation prompt. Without
+/// this, nothing re-probes a rotated peer until the next `PING_INTERVAL` tick, so the detour is
+/// up to a ping interval *plus* the round trip; with it, the pong is in flight before the netmap
+/// handler returns.
+///
+/// It is the same event-driven trigger a `CallMeMaybe` gets, for the same reason: an event has just
+/// told us this peer's path must be re-established now. What it borrows from that trigger is the
+/// *immediacy*, not the floor bypass — `invalidate_disco_path` has already cleared every
+/// `last_ping`, so nothing is floored at this point anyway. Rotations are rare and the fan-out is
+/// bounded by the peer's candidate set, so the pings stay well inside a stock client's disco volume.
+///
+/// A send failure is logged and skipped, never retried here: the periodic pinger is still running
+/// and will re-probe the peer on its own cadence, so a transient socket error costs the prompt
+/// re-confirmation, not the path.
+async fn reprobe_rotated_peers(sock: &MagicSock, rotated: &[DiscoPublicKey]) -> usize {
+    let mut sent = 0;
+    for peer in rotated {
+        match sock.send_pings_to_peer_now(peer).await {
+            Ok(n) => sent += n,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "re-probing a peer whose disco key changed; it stays on DERP until the \
+                     periodic pinger re-confirms a path",
+                );
+            }
+        }
+    }
+    sent
+}
+
 impl Message<Arc<PeerState>> for DirectManager {
     type Reply = ();
 
@@ -1334,6 +1375,7 @@ impl Message<Arc<PeerState>> for DirectManager {
                 let previous = poisoned_read(&self.peer_db);
                 disco_key_rotations(previous.as_deref(), &msg.peers)
             };
+            let mut invalidated = Vec::new();
             for rotation in rotations {
                 tracing::info!(
                     node_key = %rotation.node_key,
@@ -1341,7 +1383,9 @@ impl Message<Arc<PeerState>> for DirectManager {
                     current = %rotation.current,
                     "peer disco key changed; invalidating its trusted direct path",
                 );
-                sock.changed_active_disco(&rotation.previous, &rotation.current);
+                if sock.changed_active_disco(&rotation.previous, &rotation.current) {
+                    invalidated.push(rotation.current);
+                }
             }
 
             let mut live = HashSet::new();
@@ -1353,6 +1397,19 @@ impl Message<Arc<PeerState>> for DirectManager {
                 sock.set_netmap_endpoints(disco, node.underlay_addresses.iter().copied());
             }
             sock.retain_peers(&live);
+
+            // Re-probe every peer whose path was just invalidated, now rather than on the next
+            // periodic tick. Deliberately AFTER the reconcile above so the probe targets the
+            // candidate set control just authorized: an endpoint this snapshot revoked is already
+            // pruned and is not pinged, and one it just added is.
+            let pings = reprobe_rotated_peers(sock, &invalidated).await;
+            if pings > 0 {
+                tracing::debug!(
+                    pings,
+                    peers = invalidated.len(),
+                    "re-probing rotated peers now rather than on the next pinger tick",
+                );
+            }
         }
 
         let mut db = poisoned_write(&self.peer_db);
@@ -2566,6 +2623,71 @@ mod tests {
                 previous: old,
                 current: new,
             }],
+        );
+    }
+
+    /// A rotated peer is re-probed the moment its path is invalidated, not on the next pinger tick.
+    ///
+    /// `PeerPaths::invalidate_disco_path` keeps the best address but drops its trust, so the peer
+    /// relays over DERP until a fresh pong lands. Upstream covers that window by dual-sending to the
+    /// retained address and DERP (`addrForSendLocked`); this tree routes a peer through one underlay
+    /// transport at a time and cannot, so the window has to be short instead — which it only is if
+    /// the pings go out on the rotation rather than up to a `PING_INTERVAL` later.
+    ///
+    /// The assertion is the count of datagrams that actually left the socket, one per candidate the
+    /// rotation carried onto the new key. The candidates are control-advertised (the netmap seam
+    /// takes an address as given); a peer-learned loopback address would be dropped by the
+    /// `is_pingable_candidate` sanitizer, which is not what this test is about.
+    #[tokio::test]
+    async fn a_rotated_peer_is_reprobed_immediately() {
+        let sock = MagicSock::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            DiscoPrivateKey::random(),
+            NodePrivateKey::random().public_key(),
+        )
+        .await
+        .expect("the test underlay socket must bind");
+
+        // Two candidates on loopback so the pings have somewhere real to go.
+        let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let advertised = sink.local_addr().unwrap();
+        let second = SocketAddr::new(advertised.ip(), advertised.port().wrapping_add(1).max(1));
+
+        let old = DiscoPrivateKey::random().public_key();
+        let new = DiscoPrivateKey::random().public_key();
+        sock.set_netmap_endpoints(old, [advertised, second]);
+
+        assert!(
+            sock.changed_active_disco(&old, &new),
+            "precondition: the rotation carried the peer's path state onto the new key"
+        );
+
+        let pinged = reprobe_rotated_peers(&sock, &[new]).await;
+        assert_eq!(
+            pinged, 2,
+            "every candidate the rotation carried over is re-probed straight away, so the peer \
+             re-confirms a direct path in one round trip instead of waiting out a pinger tick"
+        );
+    }
+
+    /// The empty and unknown cases are quiet no-ops: nothing to re-probe sends nothing, and a key
+    /// with no path state behind it (the peer left the netmap between the rotation and the sweep)
+    /// is not an error.
+    #[tokio::test]
+    async fn reprobing_nothing_sends_nothing() {
+        let sock = MagicSock::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            DiscoPrivateKey::random(),
+            NodePrivateKey::random().public_key(),
+        )
+        .await
+        .expect("the test underlay socket must bind");
+
+        assert_eq!(reprobe_rotated_peers(&sock, &[]).await, 0);
+        assert_eq!(
+            reprobe_rotated_peers(&sock, &[DiscoPrivateKey::random().public_key()]).await,
+            0,
+            "a peer with no path state is skipped rather than failing the sweep"
         );
     }
 }
