@@ -342,6 +342,17 @@ pub struct Env {
     /// restarting the peerAPI server.
     pub funnel_ingress: crate::funnel::FunnelIngressSlot,
 
+    /// How long the application datapath has been idle — the fork's `tstun.Wrapper.IdleDuration`,
+    /// which Go's `wgengine` hands magicsock as `Conn.idleFunc`.
+    ///
+    /// One shared clock: the dataplane actor stamps this handle into every
+    /// [`OverlayToDataplane`](crate::dataplane::OverlayToDataplane) it hands out, so the application
+    /// netstack, the TUN pump and the forwarder netstack all record into it, and the direct manager
+    /// reads it to decide whether the periodic STUN sweep should still run. It lives on `Env` (not
+    /// behind an actor message) because the reader is a plain background task on a ~23s cadence and
+    /// the writers are the packet hot path: a lock-free atomic read is the whole interface.
+    pub datapath_activity: crate::dataplane::DatapathActivity,
+
     /// Whether the runtime is shutdown.
     ///
     /// This is provided so that actors can check whether a message send has failed because
@@ -458,6 +469,10 @@ impl Env {
             persistent_keepalive_interval,
             ingress_active,
             funnel_ingress: Arc::new(std::sync::Mutex::new(None)),
+            // The idleness clock starts at construction with no send recorded, so a runtime that
+            // never carries a packet reads as idle from `Runtime::spawn` onwards — the same reading
+            // Go gets from its zero-valued `lastActivityAtomic`.
+            datapath_activity: crate::dataplane::DatapathActivity::new(),
         };
 
         (
