@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.55.1](https://github.com/GeiserX/tailscale-rs/compare/v0.55.0...v0.55.1) (2026-09-11)
+
+
+### Bug Fixes
+
+* **runtime:** re-probe a rotated peer now, not on the next pinger tick ([#451](https://github.com/GeiserX/tailscale-rs/issues/451)) ([588ea36](https://github.com/GeiserX/tailscale-rs/commit/588ea361e31d8e5fa965e3cdf09ea196f1e57997))
+
 ## [0.55.0](https://github.com/GeiserX/tailscale-rs/compare/v0.54.0...v0.55.0) (2026-09-11)
 
 
