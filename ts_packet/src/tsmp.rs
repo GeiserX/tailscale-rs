@@ -227,6 +227,15 @@ impl RejectReason {
     pub const IP_FORWARDING: Self = Self(b'F');
     /// The target host's own firewall blocked the traffic (Go `RejectedDueToHostFirewall`).
     pub const HOST_FIREWALL: Self = Self(b'W');
+    /// An app connector has no real-IP mapping for the transit IP the client used, so it has no
+    /// destination to forward the connection to (Go
+    /// `RejectedDueToUnknownAppConnectorTransitIP`).
+    ///
+    /// Unlike every other reason, this one is **not** terminal and not purely informational: it
+    /// asks the client to re-establish the transit-IP ↔ real-IP binding, so upstream's receive
+    /// hook deliberately lets the message through to the local stack instead of consuming it. See
+    /// `ts_dataplane`'s inbound filter for that rule.
+    pub const UNKNOWN_APP_CONNECTOR_TRANSIT_IP: Self = Self(b'T');
 
     /// Whether this is the zero value (Go `TailscaleRejectReason.IsZero`).
     pub const fn is_zero(self) -> bool {
@@ -243,6 +252,9 @@ impl fmt::Display for RejectReason {
             Self::SHIELDS_UP => f.write_str("shields"),
             Self::IP_FORWARDING => f.write_str("host-ip-forwarding-disabled"),
             Self::HOST_FIREWALL => f.write_str("host-firewall"),
+            Self::UNKNOWN_APP_CONNECTOR_TRANSIT_IP => {
+                f.write_str("app-connector-transit-ip-unknown")
+            }
             Self(other) => write!(f, "0x{other:02x}"),
         }
     }
@@ -1110,6 +1122,39 @@ mod tests {
         assert!(!got.maybe_broken);
     }
 
+    /// The app-connector reason is `'T'` on the wire, and reaches the caller as the named constant
+    /// rather than as an unrecognised byte.
+    ///
+    /// It is the one reason whose *identity* changes what a receiver does with the packet — see
+    /// `ts_dataplane`'s inbound filter, which lets this one through to the local stack and consumes
+    /// every other — so a reader that flattened it into "unknown" would silently restore the drop.
+    #[test]
+    fn the_app_connector_transit_ip_reason_is_the_wire_byte_t() {
+        assert_eq!(
+            RejectReason::UNKNOWN_APP_CONNECTOR_TRANSIT_IP,
+            RejectReason(b'T')
+        );
+
+        let body = rejected_body(6, b'T', 41234, 22, 0x00);
+        let pkt = ref_generate4(IP_PROTO_TSMP, [100, 64, 0, 1], [100, 64, 0, 9], &body);
+
+        assert_eq!(
+            TailscaleRejectedHeader::parse(&pkt).expect("parses").reason,
+            RejectReason::UNKNOWN_APP_CONNECTOR_TRANSIT_IP,
+        );
+
+        // And back out again: a node relaying or re-emitting one must not rewrite the byte.
+        let sent = TailscaleRejectedHeader {
+            reason: RejectReason::UNKNOWN_APP_CONNECTOR_TRANSIT_IP,
+            ..acl_reject()
+        };
+        assert_eq!(
+            sent.marshal().expect("marshals")[IP4_HEADER_LEN + 2],
+            b'T',
+            "reason byte"
+        );
+    }
+
     /// A seven-byte body — a sender that predates the flags byte — parses, with `MaybeBroken`
     /// false. Go reads the flags byte only `if len(p) > 7`.
     #[test]
@@ -1243,6 +1288,10 @@ mod tests {
             "host-ip-forwarding-disabled"
         );
         assert_eq!(RejectReason::HOST_FIREWALL.to_string(), "host-firewall");
+        assert_eq!(
+            RejectReason::UNKNOWN_APP_CONNECTOR_TRANSIT_IP.to_string(),
+            "app-connector-transit-ip-unknown"
+        );
         assert_eq!(RejectReason(0x7a).to_string(), "0x7a");
         assert_eq!(RejectReason::NONE.to_string(), "0x00");
         assert!(RejectReason::NONE.is_zero());
