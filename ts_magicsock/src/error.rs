@@ -34,4 +34,19 @@ pub enum Error {
     /// the anti-leak posture fail-closed.
     #[error("no direct path known for peer")]
     NoPath,
+
+    /// UDP is not available on this node: control set the `only-tcp-443` node attribute, so the
+    /// only outbound traffic permitted is TCP on port 443.
+    ///
+    /// Mirrors the `errors.ErrUnsupported` Go magicsock's `sendUDPNetcheck` returns under the same
+    /// attribute, and carries the same meaning to a caller: the probe was **skipped**, not
+    /// attempted and failed. A netcheck-shaped caller must record no failure and no result for it,
+    /// exactly as it would for a probe it never planned.
+    ///
+    /// Deliberately distinct from the *data* path's refusal, which is silent (`MagicSock`'s
+    /// `send_udp` chokepoint reports "not sent" with no error, Go's `sendUDPStd` returning
+    /// `(false, nil)`). Collapsing the two would either mark every peer unreachable or fabricate a
+    /// netcheck result.
+    #[error("udp unavailable: control set only-tcp-443 on this node")]
+    OnlyTcp443,
 }

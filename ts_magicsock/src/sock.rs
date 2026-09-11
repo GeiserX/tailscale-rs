@@ -243,6 +243,20 @@ pub struct MagicSock {
     /// trust extension: with the flag clear — the default, and the overwhelmingly common case — that
     /// path does not take the `paths` lock at all and is byte-for-byte what it was.
     silent_disco: AtomicBool,
+    /// Whether control has told this node that its network tolerates nothing but TCP on port 443
+    /// (the `only-tcp-443` node attribute on the **self** node, Go magicsock's `Conn.onlyTCP443`).
+    ///
+    /// While set, **no datagram leaves this socket**: the send chokepoint
+    /// [`send_udp`](Self::send_udp) refuses silently and [`send_stun_request`](Self::send_stun_request)
+    /// refuses with [`Error::OnlyTcp443`]. Everything the tailnet still needs then rides DERP, which
+    /// is TCP/443 and untouched by this flag — upstream's own summary of the attribute is that it
+    /// "thus implies all traffic is over DERP".
+    ///
+    /// Written by [`set_only_tcp_443`](Self::set_only_tcp_443) off every netmap, so control
+    /// withdrawing the attribute restores UDP with no restart (Go's `Conn.SetOnlyTCP443` is live
+    /// too). `Relaxed` throughout: it is a single independent bool that orders nothing else, read
+    /// on the send path and written on netmap application.
+    only_tcp_443: AtomicBool,
     /// Waiters for an **on-demand** disco ping ([`ping_now`](Self::ping_now)): a `tx_id -> oneshot`
     /// registry the inbound-pong handler notifies with the measured RTT. Each on-demand ping uses a
     /// FRESH random `tx_id` distinct from any the periodic prober ([`send_pings`](Self::send_pings))
@@ -319,6 +333,7 @@ impl MagicSock {
             enable_ipv6: false,
             symmetric_nat: AtomicBool::new(false),
             silent_disco: AtomicBool::new(false),
+            only_tcp_443: AtomicBool::new(false),
             ping_waiters: Default::default(),
             relay_paths: Default::default(),
             handshake_generation: std::sync::atomic::AtomicU32::new(0),
@@ -334,6 +349,54 @@ impl MagicSock {
     /// while an in-progress send/recv keeps using the socket it already cloned.
     fn sock(&self) -> Arc<UdpSocket> {
         lock(&self.sock).clone()
+    }
+
+    /// Write one datagram to the bound underlay socket — the chokepoint every *data-path* UDP send
+    /// in this transport passes through, disco and WireGuard alike, and the one place control's
+    /// `only-tcp-443` attribute has to be honoured for them.
+    ///
+    /// Mirrors Go magicsock's `sendUDPStd`, including the shape of its return: `Ok(true)` when the
+    /// datagram was written, `Ok(false)` when it was **refused** because this node is in
+    /// TCP-443-only mode. The refusal is deliberately not an error, and that is load-bearing —
+    /// upstream returns `(false, nil)` precisely so the caller treats the path as *unused* rather
+    /// than *broken*: no send-error counter moves, no path is marked bad, and nothing is logged at
+    /// a level an operator would read as a fault. With every disco ping refused too, each peer's
+    /// trust window lapses within [`TRUST_DURATION`](crate::TRUST_DURATION) and the route
+    /// layer relays it over DERP, which is TCP/443 and untouched.
+    ///
+    /// The netcheck-shaped send ([`send_stun_request`](Self::send_stun_request)) does **not** come
+    /// through here: it carries Go's *other* refusal kind, an explicit [`Error::OnlyTcp443`], for
+    /// the same reason Go splits `sendUDPStd` from `sendUDPNetcheck`. Collapsing the two would
+    /// either mark every peer unreachable or fabricate a netcheck result.
+    async fn send_udp(&self, buf: &[u8], addr: SocketAddr) -> Result<bool, Error> {
+        if self.only_tcp_443() {
+            return Ok(false);
+        }
+        self.sock().send_to(buf, addr).await?;
+        Ok(true)
+    }
+
+    /// Whether control has put this node in TCP-443-only mode — see
+    /// [`set_only_tcp_443`](Self::set_only_tcp_443).
+    pub fn only_tcp_443(&self) -> bool {
+        self.only_tcp_443.load(Ordering::Relaxed)
+    }
+
+    /// Tell this socket whether control has put the node in TCP-443-only mode (the `only-tcp-443`
+    /// attribute on the **self** node). Go magicsock's `Conn.SetOnlyTCP443`.
+    ///
+    /// Live, not start-time: the netmap handler calls this on every netmap, so control granting the
+    /// attribute silences UDP immediately and control withdrawing it restores UDP with no restart.
+    /// Idempotent; a real change is logged once at `info` because it takes the whole node off the
+    /// direct datapath and onto DERP, which an operator reading latency numbers needs to see.
+    pub fn set_only_tcp_443(&self, on: bool) {
+        if self.only_tcp_443.swap(on, Ordering::Relaxed) != on {
+            tracing::info!(
+                only_tcp_443 = on,
+                "control changed TCP-443-only mode; UDP sends from the underlay socket are \
+                 refused while it is on and every peer rides DERP",
+            );
+        }
     }
 
     /// Re-bind the underlay UDP socket after a network/link change (Wi-Fi switch, sleep/wake), and
@@ -988,9 +1051,14 @@ impl MagicSock {
         let m = crate::metrics::metrics();
         for (peer, addr, tx_id) in to_ping {
             let wire = disco::seal_ping(&self.our_disco, self.our_node_key, &peer, tx_id)?;
-            self.sock().send_to(&wire, addr).await?;
-            m.disco_ping_sent.inc();
-            sent += 1;
+            // A refusal by the TCP-443-only gate is not a send: it must not move `disco_ping_sent`
+            // and must not be reported to the caller as one. The ping stays stamped in the path's
+            // in-flight set, which is upstream's ordering too (`startDiscoPingLocked` records the
+            // attempt before `sendDiscoMessage` decides); with no pong it simply expires.
+            if self.send_udp(&wire, addr).await? {
+                m.disco_ping_sent.inc();
+                sent += 1;
+            }
         }
 
         Ok(sent)
@@ -1038,7 +1106,13 @@ impl MagicSock {
         lock(&self.ping_waiters).insert(tx_id, tx);
 
         let wire = disco::seal_ping(&self.our_disco, self.our_node_key, peer, tx_id)?;
-        self.sock().send_to(&wire, addr).await?;
+        if !self.send_udp(&wire, addr).await? {
+            // TCP-443-only mode: the ping never left, so no pong can ever arrive. Drop the waiter
+            // and report "no answer" now rather than parking the caller for the full timeout — the
+            // outcome (`None`) is the one it would have reached anyway.
+            lock(&self.ping_waiters).remove(&tx_id);
+            return Ok(None);
+        }
         crate::metrics::metrics().disco_ping_sent.inc();
 
         // Await the pong-handler's notification, bounded by `timeout`. On timeout (or a dropped
@@ -1111,15 +1185,23 @@ impl MagicSock {
     pub async fn send_wireguard(&self, peer: &DiscoPublicKey, data: &[u8]) -> Result<(), Error> {
         let m = crate::metrics::metrics();
         if let Some(addr) = self.best_addr(peer) {
-            return match self.sock().send_to(data, addr).await {
-                Ok(_) => {
+            return match self.send_udp(data, addr).await {
+                Ok(true) => {
                     m.send_udp.inc();
                     m.send_udp_bytes.add(data.len() as i64);
                     Ok(())
                 }
+                // Refused by the TCP-443-only gate. Report success-with-nothing-sent, exactly as Go
+                // does (`sendUDPStd` returns `(false, nil)` and `endpoint.send` returns nil with
+                // it): the path is not marked bad, `send_udp_error` does not move, and the caller
+                // does not log a send failure. The peer moves to DERP as soon as its trust window
+                // lapses — within `TRUST_DURATION`, because the disco pings that would refresh it
+                // are refused by the same gate — and the datagrams in that window are the ones
+                // upstream drops too.
+                Ok(false) => Ok(()),
                 Err(e) => {
                     m.send_udp_error.inc();
-                    Err(e.into())
+                    Err(e)
                 }
             };
         }
@@ -1129,11 +1211,15 @@ impl MagicSock {
         // server forwards it to the peer rather than terminating it.
         let wire = disco::geneve_encap_wireguard(vni, data);
         match self.send_relay_datagram(&wire, addr).await {
-            Ok(()) => {
+            Ok(true) => {
                 m.send_peer_relay.inc();
                 m.send_peer_relay_bytes.add(data.len() as i64);
                 Ok(())
             }
+            // Refused by the same gate — a relay leg is UDP too, and in Go it goes through the very
+            // same `sendUDP` chokepoint (its `isGeneveEncap` argument changes the framing, not the
+            // refusal). Same silent shape as the direct leg above.
+            Ok(false) => Ok(()),
             Err(e) => {
                 m.send_udp_error.inc();
                 Err(e)
@@ -1618,8 +1704,11 @@ impl MagicSock {
         m.disco_ping_recv.inc();
         let pong = disco::seal_pong(&self.our_disco, &sender, tx_id, from)?;
         let wire = disco::geneve_encap_disco(vni, false, &pong);
-        self.send_relay_datagram(&wire, from).await?;
-        m.disco_pong_sent.inc();
+        // Refused under only-tcp-443 like every other UDP send, and then `disco_pong_sent` — which
+        // means "a datagram left the socket" — must not move.
+        if self.send_relay_datagram(&wire, from).await? {
+            m.disco_pong_sent.inc();
+        }
 
         // An inbound relayed ping means our answer reached the server and the peer is live on the
         // endpoint; ours may have been dropped while the peer's side was still handshaking. Ping
@@ -1731,7 +1820,11 @@ impl MagicSock {
         }
         let ping = disco::seal_ping(&self.our_disco, self.our_node_key, &peer, tx_id)?;
         let wire = disco::geneve_encap_disco(vni, false, &ping);
-        self.send_relay_datagram(&wire, addr).await?;
+        if !self.send_relay_datagram(&wire, addr).await? {
+            // Refused by the TCP-443-only gate: nothing went out, so this is "not sent" — the same
+            // answer the anti-amplification bound above gives — and `disco_ping_sent` must not move.
+            return Ok(false);
+        }
         crate::metrics::metrics().disco_ping_sent.inc();
         Ok(true)
     }
@@ -1788,17 +1881,22 @@ impl MagicSock {
     /// data send through here keeps the Geneve framing decision in one place — and gives the
     /// end-to-end test a point at which to observe the exact bytes this node emits, which is
     /// otherwise invisible without a second host to receive them.
-    async fn send_relay_datagram(&self, wire: &[u8], addr: SocketAddr) -> Result<(), Error> {
+    ///
+    /// Returns whether the datagram was actually written: it goes out through
+    /// [`send_udp`](Self::send_udp), so a node control has put in TCP-443-only mode refuses it
+    /// silently like every other UDP send.
+    async fn send_relay_datagram(&self, wire: &[u8], addr: SocketAddr) -> Result<bool, Error> {
         #[cfg(test)]
-        {
+        // Not tapped when the TCP-443-only gate will refuse it: the tap exists to show what this
+        // node puts on the wire, and a refused datagram is not on it.
+        if !self.only_tcp_443() {
             let tap = lock(&self.relay_send_tap).clone();
             if let Some(tap) = tap {
                 // A closed receiver just means the test stopped looking; the send still happens.
                 drop(tap.send((addr, wire.to_vec())));
             }
         }
-        self.sock().send_to(wire, addr).await?;
-        Ok(())
+        self.send_udp(wire, addr).await
     }
 
     /// Test-only: start copying every peer-relay datagram this socket emits to the returned
@@ -2009,7 +2107,19 @@ impl MagicSock {
     /// `Ok`) rather than evict a live transaction. A caller with a *list* of servers to sweep
     /// should size its round with [`MagicSock::stun_in_flight_remaining`] first — the drop here is
     /// silent, so a blind fan-out longer than the cap probes only its head.
+    ///
+    /// This is the fork's netcheck-shaped UDP send, so it carries Go `sendUDPNetcheck`'s refusal
+    /// rather than `sendUDPStd`'s: with control's `only-tcp-443` attribute set it returns
+    /// [`Error::OnlyTcp443`] — an **explicit** error, so the sweep records the probe as *skipped*
+    /// rather than as one it attempted and lost. Nothing is mutated on that path: no transaction id
+    /// is minted and none is entered in the in-flight set, so the refusal cannot consume a slot of
+    /// the budget [`stun_in_flight_remaining`](Self::stun_in_flight_remaining) hands out, and a
+    /// later netmap that withdraws the attribute resumes STUN with a clean in-flight set.
     pub async fn send_stun_request(&self, server: SocketAddr) -> Result<(), Error> {
+        if self.only_tcp_443() {
+            return Err(Error::OnlyTcp443);
+        }
+
         if !matches!(server.ip(), IpAddr::V4(_)) {
             // IPv6 underlay is disabled; never open a STUN exchange over IPv6.
             tracing::debug!(%server, "refusing STUN request to non-IPv4 server");
@@ -2171,8 +2281,12 @@ impl MagicSock {
                 // Learn this source as a candidate path for the sender and answer the ping.
                 self.add_peer_endpoints(sender, [from]);
                 let pong = disco::seal_pong(&self.our_disco, &sender, tx_id, from)?;
-                self.sock().send_to(&pong, from).await?;
-                m.disco_pong_sent.inc();
+                // A pong is UDP like any other disco frame, so the TCP-443-only gate refuses it —
+                // silently, and without moving `disco_pong_sent`. The peer that pinged us falls
+                // back to DERP for us exactly as it would for a node it cannot reach directly.
+                if self.send_udp(&pong, from).await? {
+                    m.disco_pong_sent.inc();
+                }
             }
             Inbound::Pong { sender, tx_id, src } => {
                 // Count every inbound pong, solicited or not, before classifying it.
@@ -6303,6 +6417,324 @@ mod tests {
         assert!(
             sock.best_addr(&peer_pub).is_none(),
             "with no attribute set, inbound data leaves the trust window alone"
+        );
+    }
+
+    /// Control's `only-tcp-443` silences the disco prober, and — because Go's setter is live rather
+    /// than start-time — withdrawing it restores the pings with no rebind and no restart.
+    ///
+    /// `send_pings_to_peer_now` is the prober under test rather than `send_pings` because it is the
+    /// one whose ping set does not depend on where in the trust window the path happens to be: it
+    /// sweeps every candidate. The count it returns is how many datagrams actually left the socket,
+    /// which is the whole assertion.
+    #[tokio::test]
+    async fn only_tcp_443_refuses_every_disco_ping_and_is_live() {
+        let our_disco = DiscoPrivateKey::random();
+        let our_node = ts_keys::NodePrivateKey::random().public_key();
+        let sock = MagicSock::bind(localhost(), our_disco.clone(), our_node)
+            .await
+            .unwrap();
+
+        let peer = DiscoPrivateKey::random();
+        let peer_pub = peer.public_key();
+        let addr: SocketAddr = "127.0.0.1:51830".parse().unwrap();
+        confirm_direct_path(&sock, &our_disco, &peer, addr).await;
+
+        assert_eq!(
+            sock.send_pings_to_peer_now(&peer_pub).await.unwrap(),
+            1,
+            "precondition: with no attribute set the candidate is pinged"
+        );
+
+        sock.set_only_tcp_443(true);
+        assert_eq!(
+            sock.send_pings_to_peer_now(&peer_pub).await.unwrap(),
+            0,
+            "under only-tcp-443 no disco ping may leave the socket — and the refusal is not an \
+             error, it is a zero count"
+        );
+
+        sock.set_only_tcp_443(false);
+        assert_eq!(
+            sock.send_pings_to_peer_now(&peer_pub).await.unwrap(),
+            1,
+            "control withdrawing the attribute must restore UDP without a restart"
+        );
+    }
+
+    /// The DERP fallback the attribute exists to produce, at the mechanism that produces it: with
+    /// every disco ping refused, nothing re-confirms the peer's best path, so its trust window
+    /// lapses and `best_addr` goes `None` — which is exactly how the route layer decides to relay a
+    /// peer over DERP. Upstream reaches the same end the same way ("this thus implies all traffic is
+    /// over DERP"); the flag never touches DERP itself.
+    ///
+    /// The lapse is read at a synthetic instant past `TRUST_DURATION` rather than slept through.
+    #[tokio::test]
+    async fn only_tcp_443_lets_a_confirmed_direct_path_lapse_onto_derp() {
+        let our_disco = DiscoPrivateKey::random();
+        let our_node = ts_keys::NodePrivateKey::random().public_key();
+        let sock = MagicSock::bind(localhost(), our_disco.clone(), our_node)
+            .await
+            .unwrap();
+
+        let peer = DiscoPrivateKey::random();
+        let peer_pub = peer.public_key();
+        let addr: SocketAddr = "127.0.0.1:51831".parse().unwrap();
+        confirm_direct_path(&sock, &our_disco, &peer, addr).await;
+        sock.set_only_tcp_443(true);
+
+        // Unlike `silent-disco`, the path table still *wants* to heartbeat: this attribute is a
+        // send-side refusal, not a scheduling change. The prober asks for the ping and gets nothing
+        // on the wire.
+        let tick = heartbeat_tick();
+        assert!(
+            lock(&sock.paths)
+                .get_mut(&peer_pub)
+                .unwrap()
+                .needs_refresh(tick),
+            "precondition: the prober's gate is open — the refusal is at the socket, not here"
+        );
+        assert_eq!(
+            sock.send_pings().await.unwrap(),
+            0,
+            "the periodic prober puts nothing on the wire under the attribute"
+        );
+
+        // With no pong to refresh it, the trust window runs out and the peer rides DERP.
+        let lapsed = Instant::now() + crate::path::TRUST_DURATION + Duration::from_millis(1);
+        assert!(
+            lock(&sock.paths)
+                .get(&peer_pub)
+                .unwrap()
+                .best_addr(lapsed)
+                .is_none(),
+            "an unrefreshed path must lapse, which is what puts this peer on DERP"
+        );
+    }
+
+    /// A refused WireGuard send is not a send *error*: it must not move `send_udp_error`, must not
+    /// move `send_udp` either (nothing was sent), and must not be reported to the caller as a
+    /// failure. This is Go's `sendUDPStd` returning `(false, nil)` — the shape that makes the caller
+    /// leave the path alone instead of marking it broken.
+    #[tokio::test]
+    async fn only_tcp_443_refuses_wireguard_data_without_recording_a_send_error() {
+        let _guard = counter_test_guard().await;
+        let our_disco = DiscoPrivateKey::random();
+        let our_node = ts_keys::NodePrivateKey::random().public_key();
+        let sock = MagicSock::bind(localhost(), our_disco.clone(), our_node)
+            .await
+            .unwrap();
+
+        let peer = DiscoPrivateKey::random();
+        let peer_pub = peer.public_key();
+        let addr: SocketAddr = "127.0.0.1:51832".parse().unwrap();
+        confirm_direct_path(&sock, &our_disco, &peer, addr).await;
+        sock.set_only_tcp_443(true);
+
+        let m = crate::metrics::metrics();
+        let (sent_before, err_before, bytes_before) = (
+            m.send_udp.value(),
+            m.send_udp_error.value(),
+            m.send_udp_bytes.value(),
+        );
+
+        sock.send_wireguard(&peer_pub, b"wireguard payload")
+            .await
+            .expect("a refused send is not an error to the caller");
+
+        assert_eq!(
+            m.send_udp_error.value(),
+            err_before,
+            "a refusal must never be counted as a failed send"
+        );
+        assert_eq!(
+            m.send_udp.value(),
+            sent_before,
+            "and must not be counted as a successful one either — nothing left the socket"
+        );
+        assert_eq!(
+            m.send_udp_bytes.value(),
+            bytes_before,
+            "no bytes went on the wire, so none may be accounted for"
+        );
+    }
+
+    /// An inbound disco ping is still authenticated and still learns the sender's address, but the
+    /// pong that would answer it is refused: a pong is UDP like anything else. `disco_pong_sent`
+    /// must not move — that counter means "a datagram left the socket".
+    #[tokio::test]
+    async fn only_tcp_443_sends_no_pong_for_an_inbound_ping() {
+        let _guard = counter_test_guard().await;
+        let sender_disco = DiscoPrivateKey::random();
+        let sender_node = ts_keys::NodePrivateKey::random().public_key();
+        let our_disco = DiscoPrivateKey::random();
+        let our_node = ts_keys::NodePrivateKey::random().public_key();
+
+        let sock = MagicSock::bind(localhost(), our_disco.clone(), our_node)
+            .await
+            .unwrap()
+            .with_binding_verifier(verifier_for(sender_disco.public_key(), sender_node));
+        sock.set_only_tcp_443(true);
+
+        // A real bound sink so the only reason no pong is emitted is the gate, not a dead peer.
+        let sink = UdpSocket::bind(localhost()).await.unwrap();
+        let from = sink.local_addr().unwrap();
+
+        let m = crate::metrics::metrics();
+        let (pong_sent_before, ping_recv_before) =
+            (m.disco_pong_sent.value(), m.disco_ping_recv.value());
+
+        let mut ping = disco::seal_ping(
+            &sender_disco,
+            sender_node,
+            &our_disco.public_key(),
+            disco::random_tx_id(),
+        )
+        .unwrap();
+        let msg = disco::open(&our_disco, &mut ping).unwrap();
+        sock.handle_disco(msg, from)
+            .await
+            .expect("a refused pong is not an error");
+
+        assert_eq!(
+            m.disco_ping_recv.value(),
+            ping_recv_before + 1,
+            "the inbound ping is still authenticated and accounted for — this is a send-side gate"
+        );
+        assert_eq!(
+            m.disco_pong_sent.value(),
+            pong_sent_before,
+            "no pong may leave the socket under only-tcp-443"
+        );
+    }
+
+    /// `ping_now` under the attribute answers "no reply" straight away instead of parking the caller
+    /// for the whole timeout on a pong that cannot exist, and leaves no waiter behind. The timeout
+    /// is deliberately long: if the gate were missing, this test would take that long to finish.
+    #[tokio::test]
+    async fn only_tcp_443_makes_ping_now_answer_none_without_leaking_a_waiter() {
+        let our_disco = DiscoPrivateKey::random();
+        let our_node = ts_keys::NodePrivateKey::random().public_key();
+        let sock = MagicSock::bind(localhost(), our_disco.clone(), our_node)
+            .await
+            .unwrap();
+
+        let peer = DiscoPrivateKey::random();
+        let peer_pub = peer.public_key();
+        let addr: SocketAddr = "127.0.0.1:51833".parse().unwrap();
+        confirm_direct_path(&sock, &our_disco, &peer, addr).await;
+        sock.set_only_tcp_443(true);
+
+        let started = Instant::now();
+        let answer = sock
+            .ping_now(&peer_pub, Duration::from_secs(30))
+            .await
+            .expect("a refused ping is not an error");
+        assert!(answer.is_none(), "no ping went out, so there is no RTT");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the refusal must be immediate, not a wait for the full timeout"
+        );
+        assert!(
+            sock.ping_waiters_is_empty(),
+            "the waiter registered before the send must be reaped when the send is refused"
+        );
+    }
+
+    /// The netcheck-shaped send carries Go's *other* refusal kind: `send_stun_request` returns an
+    /// explicit [`Error::OnlyTcp443`] (Go `sendUDPNetcheck`'s `errors.ErrUnsupported`), so a sweep
+    /// records the probe as skipped rather than attempted-and-lost. It also mints no transaction id
+    /// and consumes none of the in-flight budget, so nothing is left behind for the netmap that
+    /// withdraws the attribute.
+    #[tokio::test]
+    async fn only_tcp_443_refuses_stun_explicitly_and_mints_no_transaction() {
+        let sock = MagicSock::bind(
+            localhost(),
+            DiscoPrivateKey::random(),
+            ts_keys::NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap();
+
+        let sink = UdpSocket::bind(localhost()).await.unwrap();
+        let server = sink.local_addr().unwrap();
+
+        sock.set_only_tcp_443(true);
+        let err = sock
+            .send_stun_request(server)
+            .await
+            .expect_err("a netcheck probe under only-tcp-443 must refuse explicitly");
+        assert!(
+            matches!(err, Error::OnlyTcp443),
+            "the refusal kind is what tells the sweep 'skipped', not 'failed'; got {err:?}"
+        );
+        assert!(
+            sock.stun_in_flight.lock().unwrap().is_empty(),
+            "a refused probe must record no transaction"
+        );
+        assert_eq!(
+            sock.stun_in_flight_remaining(),
+            MAX_STUN_IN_FLIGHT,
+            "and must consume none of the in-flight budget"
+        );
+
+        // Withdrawn on the next netmap: STUN resumes at once, on the same socket.
+        sock.set_only_tcp_443(false);
+        sock.send_stun_request(server)
+            .await
+            .expect("withdrawing the attribute restores STUN with no restart");
+        assert_eq!(
+            sock.stun_in_flight.lock().unwrap().len(),
+            1,
+            "the resumed request is recorded like any other"
+        );
+    }
+
+    /// The peer-relay leg is UDP too, so it is refused by the same gate — upstream routes it
+    /// through the very same `sendUDP` chokepoint (`isGeneveEncap` changes the framing, not the
+    /// refusal). Asserted on the relay send tap, which is the exact bytes this node puts on the
+    /// wire: after the attribute, a confirmed relay path emits nothing, for data or for its refresh
+    /// ping, and neither refusal is an error.
+    ///
+    /// This is the *datagram* half only. Switching the relay **client** off — declining a
+    /// `CallMeMaybeVia` and the allocations behind it, Go's `relayClientEnabled` — is the other half
+    /// of Go's predicate and is not in this change.
+    #[tokio::test]
+    async fn only_tcp_443_refuses_the_peer_relay_leg() {
+        let our_disco = DiscoPrivateKey::random();
+        let fx = RelayFixture::new(0x0B_CD_EF);
+        let peer_pub = fx.peer.public_key();
+        let (a, mut sends) = relay_client(&our_disco).await;
+        confirm_relay_path(&a, &fx, &our_disco, &mut sends).await;
+
+        // Precondition: the relay path carries data and answers a refresh ping, and it is the only
+        // path this peer has.
+        a.send_wireguard(&peer_pub, b"before").await.unwrap();
+        let (to, _) = sends.try_recv().expect("the relay path must carry data");
+        assert_eq!(to, fx.addr, "data goes through the relay server");
+        assert!(
+            a.send_relay_ping(peer_pub, fx.addr, fx.vni).await.unwrap(),
+            "precondition: the relay refresh ping goes out with no attribute set"
+        );
+        drop(sends.try_recv().expect("that refresh ping is on the wire"));
+
+        a.set_only_tcp_443(true);
+
+        a.send_wireguard(&peer_pub, b"after")
+            .await
+            .expect("a refused relay send is not an error to the caller");
+        assert!(
+            sends.try_recv().is_err(),
+            "under only-tcp-443 nothing may leave on the relay leg either"
+        );
+
+        assert!(
+            !a.send_relay_ping(peer_pub, fx.addr, fx.vni).await.unwrap(),
+            "and the relay refresh ping reports 'not sent' rather than erroring or counting itself"
+        );
+        assert!(
+            sends.try_recv().is_err(),
+            "no relay refresh datagram may reach the wire"
         );
     }
 
