@@ -43,8 +43,8 @@ use crate::{
     dataplane::{OverlayFromDataplane, OverlayToDataplane},
     env::Env,
     magic_dns::{
-        ClientTransport, Decision, DnsView, RecursivePlan, check_response_size_and_set_tc, decide,
-        forward_plan, forward_query,
+        ClientTransport, Decision, DnsView, RecursivePlan, TcpRetry,
+        check_response_size_and_set_tc, decide, forward_plan, forward_query,
     },
     peer_tracker::PeerState,
 };
@@ -613,6 +613,10 @@ enum Intercept {
         /// forwarder couldn't reach is a soft failure, not a cacheable non-existence (carried over
         /// from [`Decision::Forward`]; matches Go forwarder.go:1297-1307).
         servfail: Vec<u8>,
+        /// Whether a truncated upstream answer may be re-asked over TCP
+        /// ([`DnsView::upstream_tcp_retry`]). Read here, while the view borrow is held, for the
+        /// same reason the plan is: the spawned forward no longer has the view.
+        retry: TcpRetry,
         /// The reply's destination (the host stub resolver) — the query's source endpoint.
         src: SocketAddrV4,
     },
@@ -688,6 +692,7 @@ fn plan_intercept(view: &DnsView, pkt: &[u8]) -> Intercept {
                 plan,
                 query,
                 servfail,
+                retry: view.upstream_tcp_retry(),
                 src,
             }
         }
@@ -822,6 +827,7 @@ async fn up_pump(
                             plan,
                             query,
                             servfail,
+                            retry,
                             src,
                         } => {
                             // Bound in-flight forwards: reap one completed task at the cap
@@ -840,6 +846,7 @@ async fn up_pump(
                                 plan,
                                 query,
                                 servfail,
+                                retry,
                                 src,
                             ));
                         }
@@ -859,11 +866,20 @@ async fn run_forward(
     plan: RecursivePlan,
     query: Vec<u8>,
     servfail: Vec<u8>,
+    retry: TcpRetry,
     src: SocketAddrV4,
 ) {
     let response = match plan {
         RecursivePlan::Udp(ups) => {
-            forward_query(&channel, &ups, &query, servfail, ClientTransport::Udp).await
+            forward_query(
+                &channel,
+                &ups,
+                &query,
+                servfail,
+                ClientTransport::Udp,
+                retry,
+            )
+            .await
         }
         RecursivePlan::Doh(addr) => {
             crate::peerapi_doh::forward_doh(&channel, addr, &query, servfail, ClientTransport::Udp)

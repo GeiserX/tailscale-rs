@@ -74,9 +74,9 @@
 //! ## Anti-leak / IPv6-off
 //!
 //! The listener binds the overlay IPv4 only. Recursive forwarding reuses [`forward_query`], which
-//! binds `0.0.0.0:0` on the overlay netstack — never a host socket. A saturated server drops the
-//! flow (fail-closed). Requests are size-capped; one request is answered per connection then it is
-//! closed.
+//! binds `0.0.0.0:0` on the overlay netstack for both of its hops — the UDP query and the TCP retry
+//! of a truncated answer — never a host socket. A saturated server drops the flow (fail-closed).
+//! Requests are size-capped; one request is answered per connection then it is closed.
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
@@ -473,7 +473,17 @@ async fn resolve(
             upstreams,
             query,
             servfail,
-        } => forward_query(channel, &upstreams, &query, servfail, PEER_CLIENT_TRANSPORT).await,
+        } => {
+            forward_query(
+                channel,
+                &upstreams,
+                &query,
+                servfail,
+                PEER_CLIENT_TRANSPORT,
+                view.upstream_tcp_retry(),
+            )
+            .await
+        }
     }
 }
 

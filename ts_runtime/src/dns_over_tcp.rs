@@ -13,6 +13,12 @@
 //! recursive forward all behave identically on both transports. The one deliberate difference is
 //! the `TC` bit — see [`ClientTransport`].
 //!
+//! A retry that arrives here is only worth serving if the hop *this* node makes to the upstream
+//! resolver can also escape the datagram: otherwise the forward goes back out over UDP, the same
+//! truncated answer comes back, and the client is no better off than before it retried. That is
+//! [`forward_query`]'s TCP fallback (`magic_dns::ask_upstream`), and an answer it fetched over TCP
+//! for a TCP client is the one case the forwarder's relay cap leaves whole.
+//!
 //! Framing is RFC 1035 §4.2.2: each message, in both directions, is preceded by a two-byte
 //! big-endian length. Queries on one connection are answered **in order**: RFC 7766 §6.2.1 permits
 //! a server to answer out of order but does not require it, and in-order keeps a connection to a
@@ -62,7 +68,15 @@ async fn answer_query(view: &DnsView, channel: &Channel, query: &[u8]) -> Option
             recursive,
         } => Some(match forward_plan(view, upstreams, recursive) {
             RecursivePlan::Udp(upstreams) => {
-                forward_query(channel, &upstreams, &query, servfail, ClientTransport::Tcp).await
+                forward_query(
+                    channel,
+                    &upstreams,
+                    &query,
+                    servfail,
+                    ClientTransport::Tcp,
+                    view.upstream_tcp_retry(),
+                )
+                .await
             }
             RecursivePlan::Doh(doh_addr) => {
                 crate::peerapi_doh::forward_doh(
@@ -202,10 +216,12 @@ where
         };
 
         // A response that cannot carry a length prefix cannot be sent at all. `decide` builds
-        // authoritative answers well under this, a UDP-forwarded one is capped far below it, and a
-        // DoH-delegated one is capped at exactly 65,535 (`peerapi_doh::MAX_CLIENT_RESPONSE`), so
-        // this is unreachable — but truncating the *prefix* would frame the stream wrong for every
-        // later query, so close instead.
+        // authoritative answers well under this; a forwarded one is capped at
+        // `MAX_UPSTREAM_RESPONSE` unless it came over the upstream TCP hop, in which case it
+        // arrived under a `u16` prefix of its own and so still fits one; and a DoH-delegated one is
+        // capped at exactly 65,535 (`peerapi_doh::MAX_CLIENT_RESPONSE`). So this is unreachable —
+        // but truncating the *prefix* would frame the stream wrong for every later query, so close
+        // instead.
         let Ok(response_len) = u16::try_from(response.len()) else {
             tracing::warn!(
                 len = response.len(),
