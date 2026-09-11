@@ -912,16 +912,25 @@ impl MagicSock {
     /// No-ops when the key did not really change, or when the peer had no path state under the old
     /// key. If path state already exists under `current` the old entry is dropped instead of moved:
     /// that only happens when the peer already reached us under its new key (an inbound ping or
-    /// `CallMeMaybe` built the entry), which is fresher, new-key-confirmed state that must not be
-    /// overwritten by the pre-rotation one.
+    /// `CallMeMaybe` built the entry), which is fresher, new-key state that must not be overwritten
+    /// by the pre-rotation one.
     ///
-    /// Returns whether path state was actually carried over and invalidated — i.e. whether this
-    /// peer now holds a best address it is not allowed to send to until a fresh pong lands. The
-    /// caller uses that to re-probe the peer **immediately**
+    /// Returns whether this peer needs a re-probe **now**: whether it is left holding no direct
+    /// address it is allowed to send to, so its traffic rides DERP until a fresh pong lands. The
+    /// caller uses that to ping the peer immediately
     /// ([`send_pings_to_peer_now`](Self::send_pings_to_peer_now)) instead of waiting out the
     /// periodic pinger, which is how this tree keeps the DERP detour across a rotation to the one
-    /// round trip the port promises; the no-op cases return `false` and want no probe (nothing was
-    /// invalidated, so nothing has to be re-confirmed).
+    /// round trip the port promises.
+    ///
+    /// That is `true` for the carried-over case (the trust window was just dropped), and also for a
+    /// current-key entry that exists but has no confirmed [`PeerPaths::best_addr`] — the common
+    /// shape, because the entry the peer built under its new key is usually candidates-only: an
+    /// inbound ping is learned as a candidate by `add_peer_endpoints` and answered with a pong, but
+    /// nothing there confirms a path *we* may send on, which takes our own ping and its pong. Such a
+    /// peer is exactly the one the immediate probe exists for; leaving it out delayed it to the next
+    /// periodic tick for no reason. The remaining cases return `false` and want no probe: an
+    /// unchanged key, no old-key state to begin with, and a current-key entry that is already
+    /// confirmed under the key the peer is using (there is nothing to re-confirm).
     pub fn changed_active_disco(
         &self,
         previous: &DiscoPublicKey,
@@ -932,28 +941,36 @@ impl MagicSock {
         }
 
         // Locked disjointly, never nested (as in `rebind`).
-        let moved = {
+        let (moved, needs_probe) = {
             let mut paths = lock(&self.paths);
             match paths.remove(previous) {
                 Some(mut state) if !paths.contains_key(current) => {
                     state.invalidate_disco_path();
                     paths.insert(*current, state);
-                    true
+                    (true, true)
                 }
                 Some(_) => {
+                    // The peer got here under its new key first, so its own entry wins — but it is
+                    // only worth skipping the probe for if it actually confirms a path we may send
+                    // on. An inbound ping builds this entry out of candidates alone, which leaves
+                    // the peer on DERP just as surely as the invalidated case above.
+                    let unconfirmed = paths
+                        .get(current)
+                        .is_some_and(|pp| pp.best_addr(Instant::now()).is_none());
                     tracing::debug!(
+                        unconfirmed,
                         "disco key changed but path state already exists under the new key; \
-                         keeping the state confirmed under the key the peer is using"
+                         keeping the state the peer built under the key it is using"
                     );
-                    false
+                    (false, unconfirmed)
                 }
-                None => false,
+                None => (false, false),
             }
         };
         if !moved {
             // Nothing was carried over, so leave attribution alone: any entry still pointing at the
             // old key is dropped by the `retain_peers` that follows a netmap update.
-            return false;
+            return needs_probe;
         }
 
         let mut a2d = lock(&self.addr_to_disco);
@@ -6058,7 +6075,8 @@ mod tests {
 
     /// Path state already confirmed under the NEW key wins: that state was established by disco the
     /// peer sealed with the key it is using now (it pinged us before the netmap caught up), so the
-    /// pre-rotation entry is dropped rather than overwriting it.
+    /// pre-rotation entry is dropped rather than overwriting it — and because that entry does hold a
+    /// trusted direct path, there is nothing to re-probe.
     #[tokio::test]
     async fn changed_active_disco_keeps_state_already_confirmed_under_the_new_key() {
         let sock = plain_sock().await;
@@ -6070,10 +6088,25 @@ mod tests {
         sock.set_netmap_endpoints(old, [stale]);
         sock.add_peer_endpoints(new, [fresh]);
 
+        // Confirm `fresh` under the NEW key, as our own ping and its pong would.
+        let now = Instant::now();
+        let tx_id = disco::random_tx_id();
+        {
+            let mut paths = lock(&sock.paths);
+            let pp = paths.get_mut(&new).expect("the peer has path state");
+            pp.note_ping_sent(tx_id, fresh, now);
+            pp.note_pong(tx_id, fresh, now + Duration::from_millis(5));
+        }
+        assert_eq!(
+            sock.best_addr(&new),
+            Some(fresh),
+            "precondition: a trusted direct path under the new key"
+        );
+
         assert!(
             !sock.changed_active_disco(&old, &new),
-            "nothing was invalidated, so there is nothing to re-probe: the state under the new \
-             key was confirmed under that key"
+            "the peer already has a path it can be sent on under the key it is using, so there \
+             is nothing to re-probe"
         );
 
         assert_eq!(
@@ -6081,10 +6114,66 @@ mod tests {
             vec![fresh],
             "the entry the peer built under its current key is left untouched"
         );
+        assert_eq!(
+            sock.best_addr(&new),
+            Some(fresh),
+            "and its confirmed path keeps its trust window: the rotation is news the peer itself \
+             already acted on"
+        );
         assert!(
             sock.candidate_addrs(&old).is_empty(),
             "the pre-rotation entry is dropped, not merged"
         );
+    }
+
+    /// An entry under the new key that is *candidates only* still needs the immediate re-probe.
+    ///
+    /// This is what an inbound ping under the rotated key leaves behind: `add_peer_endpoints` learns
+    /// the source as a candidate and we pong it, which confirms the path for the *peer* — our own
+    /// side has nothing it may send on until our ping is answered. Treating that entry as
+    /// "confirmed" dropped the peer out of the rotation's re-probe set and left it on DERP until the
+    /// next periodic pinger tick, which is the delay the immediate probe exists to remove.
+    #[tokio::test]
+    async fn changed_active_disco_reprobes_an_unconfirmed_entry_under_the_new_key() {
+        let sock = plain_sock().await;
+        let old = DiscoPrivateKey::random().public_key();
+        let new = DiscoPrivateKey::random().public_key();
+
+        let stale: SocketAddr = "203.0.113.9:41641".parse().unwrap();
+        let pinged_from: SocketAddr = "198.51.100.7:41641".parse().unwrap();
+        sock.set_netmap_endpoints(old, [stale]);
+        // Exactly what `handle_disco` does with an accepted inbound ping: learn the source, no pong
+        // of ours confirms anything.
+        sock.add_peer_endpoints(new, [pinged_from]);
+        assert!(
+            sock.best_addr(&new).is_none(),
+            "precondition: the new key's entry has candidates but no confirmed path"
+        );
+
+        assert!(
+            sock.changed_active_disco(&old, &new),
+            "a peer left with no path it may send on must be re-probed now, not on the next \
+             periodic tick"
+        );
+
+        assert_eq!(
+            sock.candidate_addrs(&new),
+            vec![pinged_from],
+            "the entry the peer built under its current key is still the one kept"
+        );
+        assert!(
+            sock.candidate_addrs(&old).is_empty(),
+            "the pre-rotation entry is dropped, not merged"
+        );
+        {
+            let a2d = lock(&sock.addr_to_disco);
+            assert_eq!(
+                a2d.get(&stale),
+                Some(&old),
+                "nothing was carried over, so the old key's attribution is not rewritten onto the \
+                 new key; `retain_peers` drops it with the netmap update"
+            );
+        }
     }
 
     /// The no-op cases: an unchanged key, and a key with no path state behind it.
