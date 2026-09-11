@@ -731,6 +731,34 @@ impl Node {
         }
     }
 
+    /// The node attribute by which control asks this node to stop processing netmap updates through
+    /// the delta (incremental) path (Go `tailcfg/nodecap`'s `DisableDeltaUpdates`, read into
+    /// `controlknobs.Knobs.DisableDeltaUpdates`). Read off the **self** node's cap map by
+    /// [`delta_updates_disabled`](Self::delta_updates_disabled).
+    ///
+    /// Upstream documents the intent on the knob itself: the client "should not process updates via
+    /// the delta update mechanism and should instead treat all netmap changes as 'full' ones as
+    /// tailscaled did in 1.48.x and earlier". It is control's escape hatch for a delta-encoding bug
+    /// on *either* side of the map protocol — control emitting bad patches, or a client applying
+    /// them wrongly — without waiting for a client release to ship.
+    const NODE_ATTR_DISABLE_DELTA_UPDATES: &'static str = "disable-delta-updates";
+
+    /// Report whether control has asked this node to decline the incremental netmap path and treat
+    /// every netmap change as a full one.
+    ///
+    /// Mirrors the first statement of Go `control/controlclient/map.go`'s `tryHandleIncrementally`:
+    /// `if ms.controlKnobs != nil && ms.controlKnobs.DisableDeltaUpdates.Load() { return false }`.
+    /// Returning `false` there does **not** reject the response and does not drop the mutations it
+    /// carries — it declines the incremental arm so the full netmap rebuild handles the very same
+    /// response. A consumer of this method owes the same shape: fall back, never drop.
+    ///
+    /// Absent attribute ⇒ `false` ⇒ the delta path, which is the default and the overwhelmingly
+    /// common case. Being a plain per-node attribute it needs no capability version: a node control
+    /// has not set it on is unaffected.
+    pub fn delta_updates_disabled(&self) -> bool {
+        self.has_node_attr(Self::NODE_ATTR_DISABLE_DELTA_UPDATES)
+    }
+
     /// Report whether `wanted_port` is allowed for Funnel on this node.
     ///
     /// Mirrors Go `ipn.CheckFunnelPort`: scan the cap-map keys for one prefixed by
@@ -2064,6 +2092,30 @@ pub(crate) mod tests {
             n.one_cgnat(),
             Some(true),
             "`one-cgnat?v=true` alone collapses"
+        );
+    }
+
+    #[test]
+    fn delta_updates_disabled_reads_the_disable_delta_updates_attribute() {
+        let mut n = node("self", Some("ts.net"));
+        assert!(
+            !n.delta_updates_disabled(),
+            "absent attribute → the incremental path, which is the default"
+        );
+
+        // The attribute is the bare key; the presence of the key is the whole signal, and its
+        // value (control sends an empty one) is never read.
+        n.cap_map
+            .insert("disable-delta-updates".to_string(), vec![]);
+        assert!(
+            n.delta_updates_disabled(),
+            "control granted the attribute → decline the incremental path"
+        );
+
+        n.cap_map.remove("disable-delta-updates");
+        assert!(
+            !n.delta_updates_disabled(),
+            "control withdrawing the attribute returns the node to the incremental path"
         );
     }
 
