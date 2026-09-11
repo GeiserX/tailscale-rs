@@ -18,13 +18,14 @@
 //!   a *soft* error — the next upstream on the route (or in the fallback list) is tried, and the
 //!   refusal is relayed to the client only when no upstream did better (see [`forward_query`]).
 //!
-//! Anti-leak / IPv6-off posture: upstream forwarding binds `0.0.0.0:0` (UDP, IPv4 only) and never
-//! opens an IPv6 socket. AAAA handling is gated on [`DnsView::enable_ipv6`] (default off): with the
-//! gate OFF an AAAA query for a tailnet/overlay/self name returns NoError with an empty answer
-//! (NODATA) rather than the overlay v6 address — answering a v6 the IPv4-only client can't route
-//! would only create dead connections and a fingerprint. With the gate ON, AAAA is answered from
-//! overlay data (the v6 overlay addr), as historically. AAAA for tailnet names is never forwarded
-//! to a recursive upstream regardless of the gate.
+//! Anti-leak / IPv6-off posture: upstream forwarding binds `0.0.0.0:0` on the overlay netstack —
+//! UDP for the query, TCP for a truncated answer's retry, IPv4 only either way — and never opens an
+//! IPv6 socket, nor a host socket. AAAA handling is gated on [`DnsView::enable_ipv6`] (default
+//! off): with the gate OFF an AAAA query for a tailnet/overlay/self name returns NoError with an
+//! empty answer (NODATA) rather than the overlay v6 address — answering a v6 the IPv4-only client
+//! can't route would only create dead connections and a fingerprint. With the gate ON, AAAA is
+//! answered from overlay data (the v6 overlay addr), as historically. AAAA for tailnet names is
+//! never forwarded to a recursive upstream regardless of the gate.
 //!
 //! - MagicDNS disabled (`dns_config == None` or `magic_dns == false`), OR the node does not accept
 //!   the tailnet DNS config ([`DnsView::accept_dns`] is `false`, i.e. `--accept-dns` / `CorpDNS`
@@ -54,6 +55,13 @@
 //!   by the `dns_over_tcp` server (TUN mode), which reaches the same [`decide`] through
 //!   the same view — and which is never handed a `TC` bit for size, since a TCP client has no
 //!   datagram to overflow (see [`ClientTransport`]).
+//! - The hop to the **upstream** resolver makes the same retry on the client's behalf: a forwarded
+//!   answer that comes back with `TC` set is re-asked of the same resolver over TCP, over the same
+//!   overlay netstack channel the UDP hop uses and never a host socket ([`ask_upstream`]). Without
+//!   it the client's own TCP retry lands back on a UDP hop and is answered with the same truncated
+//!   message, and a name whose answer does not fit a datagram simply does not resolve through this
+//!   node. Control's `dns-forwarder-disable-tcp-retries` node attribute is the *off* switch
+//!   ([`DnsView::upstream_tcp_retry`]); the retry is on by default.
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -67,6 +75,7 @@ use kameo::{
 };
 use netstack::{CreateSocket, netcore::Channel};
 use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::{Semaphore, watch},
     task::JoinSet,
     time::timeout,
@@ -119,8 +128,14 @@ const MAX_INFLIGHT_FORWARDS: usize = 512;
 /// elicit a legitimately large (1300–4095 byte) UDP answer (big TXT sets, DNSSEC, many-record
 /// round-robins). Capping at the old 1232 truncated those and set TC, forcing a TCP retry — which
 /// nothing served at the time, so the large answer became unreachable. 4095 relays them intact.
-/// (The retry now has a server in TUN mode, `dns_over_tcp`, but the hop to the *upstream* resolver
-/// is still UDP, so this cap is what bounds the answer either way.)
+///
+/// It is a **datagram** bound, and since [`ask_upstream`] gained its TCP retry it is applied as one:
+/// an answer that came over the TCP hop and is going back to a TCP client never crossed a datagram
+/// and is not cut here (see [`cap_response`]). Every other combination is, because a UDP hop could
+/// not have delivered more than the receive ring anyway and a UDP client cannot be answered with
+/// more than one datagram. So an answer over 4095 bytes still reaches a UDP stub resolver as a
+/// `TC`-marked 4095 bytes — which is the retry RFC 1035 §4.2.1 asks it to make, and `dns_over_tcp`
+/// answers that retry whole.
 const MAX_UPSTREAM_RESPONSE: usize = 4095;
 
 /// The MagicDNS service IP. The netstack interface owns this address, so a `udp_bind` here
@@ -338,6 +353,39 @@ impl DnsView {
         }
         Upstreams::None
     }
+
+    /// Whether a truncated answer from an upstream resolver may be re-asked over TCP
+    /// ([`ask_upstream`]).
+    ///
+    /// On unless control's `dns-forwarder-disable-tcp-retries` node attribute is set on the **self**
+    /// node ([`Node::disable_dns_forwarder_tcp_retries`]) — the attribute is the retry's *off*
+    /// switch, not its on switch, so a node with no self-node update yet (and every tailnet that
+    /// never set it) retries. Go reads the same knob at the same point:
+    /// `skipTCP := skipTCPRetry() || (f.controlKnobs != nil &&
+    /// f.controlKnobs.DisableDNSForwarderTCPRetries.Load())`, net/dns/resolver/forwarder.go:677 @
+    /// `023255e8a27ec9f6a21d24e3eda21c052ff72af3`.
+    ///
+    /// Go's other disjunct, `skipTCPRetry()`, is a process-level environment knob and has no
+    /// counterpart here: this tree carries no `envknob` equivalent, and the deployment switch a
+    /// tailnet operator actually reaches for is the node attribute.
+    pub(crate) fn upstream_tcp_retry(&self) -> TcpRetry {
+        match &self.self_node {
+            Some(node) if node.disable_dns_forwarder_tcp_retries() => TcpRetry::Disabled,
+            _ => TcpRetry::Enabled,
+        }
+    }
+}
+
+/// Whether the forwarder may re-ask a **truncated** upstream answer over TCP. Decided per query
+/// from the current view ([`DnsView::upstream_tcp_retry`]) and carried to [`ask_upstream`], which is
+/// the only thing that reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TcpRetry {
+    /// Retry a `TC`-marked UDP answer over TCP, to the same resolver. The default.
+    Enabled,
+    /// Never retry: relay the truncated UDP answer as it came. Control's
+    /// `dns-forwarder-disable-tcp-retries` attribute.
+    Disabled,
 }
 
 /// The upstreams a non-overlay query should be forwarded to (or why it should not be forwarded).
@@ -867,18 +915,32 @@ pub(crate) fn forward_plan(
 /// malformed-but-"complete" message. That flag is only set when truncation actually occurs. The
 /// second check is the *client's* bound, and never chops the body.
 ///
-/// The cap runs *after* the whole datagram has been read (see [`MAX_UPSTREAM_RESPONSE`]), so it
+/// The cap runs *after* the whole message has been read (see [`MAX_UPSTREAM_RESPONSE`]), so it
 /// bounds what we relay, not what we allocate. The netstack's UDP receive ring (4096) is one byte
-/// wider than the cap (4095), so the truncating branch is reachable by exactly one deliverable
-/// datagram size — the full-ring 4096-byte answer — which is the same size Go's `maxResponseBytes+1`
-/// read buffer exists to catch.
+/// wider than the cap (4095), so on the UDP hop the truncating branch is reachable by exactly one
+/// deliverable datagram size — the full-ring 4096-byte answer — which is the same size Go's
+/// `maxResponseBytes+1` read buffer exists to catch.
 ///
-/// The [`MAX_UPSTREAM_RESPONSE`] chop applies on **both** transports and keeps setting `TC` when it
-/// fires: we really did cut the message, and saying otherwise would hand the client a
-/// malformed-but-"complete" answer. It is only the *client's advertised datagram size* that a TCP
-/// client does not have (see [`ClientTransport`]).
-fn cap_response(query: &[u8], mut resp: Vec<u8>, client: ClientTransport) -> Vec<u8> {
-    if resp.len() > MAX_UPSTREAM_RESPONSE {
+/// `via` is the hop the answer came over, and it is why the cap is not unconditional.
+/// [`MAX_UPSTREAM_RESPONSE`] is a **datagram** bound, so it applies to any answer that has to cross
+/// a datagram in either direction: one fetched over the UDP hop ([`UpstreamTransport::Udp`]), or one
+/// relayed to a [`ClientTransport::Udp`] client, which leaves here as a single UDP datagram whatever
+/// it arrived on. The one combination exempt from it is TCP end to end — an answer
+/// [`ask_upstream`] fetched over the TCP hop ([`UpstreamTransport::Tcp`]) *and* handed to a TCP
+/// client, which is the retry path RFC 1035 §4.2.1 exists to provide and the whole point of the
+/// upstream TCP hop: chopping there at 4095 would hand the stub resolver the same truncated answer
+/// it retried over TCP to escape, and the name would still not resolve. Such an answer is bounded
+/// instead by the two-byte length prefix it arrived under (64 KiB), the same bound
+/// `dns_over_tcp`'s framing and [`crate::peerapi_doh`]'s `MAX_CLIENT_RESPONSE` already impose on the
+/// way back out.
+fn cap_response(
+    query: &[u8],
+    mut resp: Vec<u8>,
+    client: ClientTransport,
+    via: UpstreamTransport,
+) -> Vec<u8> {
+    let crosses_a_datagram = client == ClientTransport::Udp || via == UpstreamTransport::Udp;
+    if crosses_a_datagram && resp.len() > MAX_UPSTREAM_RESPONSE {
         resp.truncate(MAX_UPSTREAM_RESPONSE);
         // The header is 12 bytes; the TC bit lives in the second flags byte (header byte 2). A
         // capped datagram is always >= the header length, but guard anyway to never panic.
@@ -1084,10 +1146,12 @@ fn is_soft_error(msg: &[u8]) -> bool {
 /// upstream answered at all.
 ///
 /// Anti-leak: forwarding goes through the overlay netstack `channel` (a fresh `0.0.0.0:0` overlay
-/// UDP socket per query), NEVER a host socket — so the real origin IP can't leak to the resolver,
-/// and split-DNS upstreams reachable only over the tailnet/subnet-router work. Each upstream is
-/// bounded by [`UPSTREAM_TIMEOUT`]. `client` names the transport the *client* we answer used, not
-/// the one we fetched over: the hop upstream is UDP either way.
+/// UDP socket per query, and — when a truncated answer is retried — a fresh `0.0.0.0:0` overlay TCP
+/// connection to the same resolver), NEVER a host socket: the real origin IP can't leak to the
+/// resolver, and split-DNS upstreams reachable only over the tailnet/subnet-router work. Each
+/// upstream is bounded by [`UPSTREAM_TIMEOUT`] per hop. `client` names the transport the *client* we
+/// answer used, not the one we fetched over; `retry` says whether the upstream hop may fall back to
+/// TCP ([`DnsView::upstream_tcp_retry`]).
 ///
 /// The socket work is all this function does; which response is relayed to the client is
 /// [`forward_walk`]'s decision.
@@ -1097,22 +1161,167 @@ pub(crate) async fn forward_query(
     query: &[u8],
     fallback: Vec<u8>,
     client: ClientTransport,
+    retry: TcpRetry,
 ) -> Vec<u8> {
     forward_walk(upstreams, query, fallback, client, |upstream| {
-        ask_upstream(channel, upstream, query)
+        ask_upstream(channel, upstream, query, retry)
     })
     .await
 }
 
-/// Ask one `upstream` for `query` over the overlay and return the first datagram that came back as
-/// `(source address, bytes)`, or `None` when nothing usable arrived (bind, send or receive error,
-/// [`UPSTREAM_TIMEOUT`], or an empty datagram).
+/// Which transport an upstream answer was fetched over. Not a property of the client we answer
+/// (that is [`ClientTransport`]) — it is what [`cap_response`] needs in order to know whether the
+/// answer has already survived a datagram.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpstreamTransport {
+    /// The UDP hop: one datagram, bounded by the netstack's UDP receive ring.
+    Udp,
+    /// The TCP hop: a length-prefixed message, bounded only by its two-byte prefix. Reached only by
+    /// [`ask_upstream`]'s retry of a truncated UDP answer.
+    Tcp,
+}
+
+/// One upstream's answer as [`ask_upstream`] hands it to [`forward_walk`]: the bytes, the address
+/// they arrived from, and the hop they arrived over.
+struct UpstreamAnswer {
+    /// Where the answer came from, **unfiltered** — [`forward_walk`] is what checks it against the
+    /// upstream we asked.
+    from: SocketAddr,
+    /// The DNS response bytes, verbatim.
+    resp: Vec<u8>,
+    /// The hop that carried them (see [`UpstreamTransport`]).
+    via: UpstreamTransport,
+}
+
+/// Ask one `upstream` for `query` over the overlay and return what came back, or `None` when
+/// nothing usable arrived (bind, connect, send or receive error, [`UPSTREAM_TIMEOUT`], or an empty
+/// message).
+///
+/// The query goes out over UDP. If the answer comes back with the `TC` (truncated) bit set, and
+/// `retry` allows it, the **same** query is re-asked of the **same** resolver over TCP and that
+/// answer is returned instead — RFC 1035 §4.2.1, and Go's forwarder does exactly this
+/// (net/dns/resolver/forwarder.go:677 and the `firstUDP` closure below it, @
+/// `023255e8a27ec9f6a21d24e3eda21c052ff72af3`). Three of Go's bounds come with it, and each one
+/// matters:
+///
+/// - **The same resolver, never the next one.** Walking on to the next upstream would send the
+///   query to a resolver the first one already answered — a second party learning a name it was
+///   never asked about. [`forward_walk`] does the walking; this function only ever talks to the
+///   `upstream` it was handed.
+/// - **A failed TCP retry returns the truncated UDP answer**, not `SERVFAIL`. A truncated answer is
+///   still an answer: its header and question are intact and a stub resolver can act on the `TC`
+///   bit. Replacing it with a synthesized failure would be strictly worse than what we already had.
+/// - **A reply that fit is never retried** ([`did_not_fit_the_datagram`]). The retry exists for the
+///   answer that did not fit, and nothing else.
+///
+/// Anti-leak: both hops ride the overlay netstack `channel` — the TCP one via `channel.tcp_connect`
+/// from `0.0.0.0:0`, exactly as the UDP one binds `0.0.0.0:0` there. A host socket would put this
+/// node's real origin IP in front of the resolver and would not reach a split-DNS upstream that
+/// only exists inside the tailnet, so the coupling is not a convenience.
 ///
 /// This is the whole of [`forward_query`]'s I/O, split out from the walk so the policy above it —
 /// anti-poisoning, the soft-error rules, which response is relayed — is decided (and tested) on
-/// bytes rather than on sockets. It vouches for nothing about the datagram it returns: the source
+/// bytes rather than on sockets. It vouches for nothing about the answer it returns: the source
 /// address comes back unfiltered precisely so [`forward_walk`] can check it.
 async fn ask_upstream(
+    channel: &Channel,
+    upstream: SocketAddr,
+    query: &[u8],
+    retry: TcpRetry,
+) -> Option<UpstreamAnswer> {
+    ask_with_tcp_retry(
+        upstream,
+        query,
+        retry,
+        || ask_upstream_udp(channel, upstream, query),
+        || ask_upstream_tcp(channel, upstream, query),
+    )
+    .await
+}
+
+/// The truncation-retry policy of [`ask_upstream`], over the two hops as plain futures: `udp`
+/// returns the `(source address, datagram)` of the UDP hop, `tcp` the message body of the TCP hop.
+///
+/// Split from the sockets for the same reason [`forward_walk`] is: the decision — retry or not,
+/// which answer wins when the retry fails — is the part that can regress silently, and here it is
+/// testable without a netstack.
+async fn ask_with_tcp_retry<UdpFut, TcpFut>(
+    upstream: SocketAddr,
+    query: &[u8],
+    retry: TcpRetry,
+    udp: impl FnOnce() -> UdpFut,
+    tcp: impl FnOnce() -> TcpFut,
+) -> Option<UpstreamAnswer>
+where
+    UdpFut: std::future::Future<Output = Option<(SocketAddr, Vec<u8>)>>,
+    TcpFut: std::future::Future<Output = Option<Vec<u8>>>,
+{
+    let (from, resp) = udp().await?;
+
+    let over_udp = UpstreamAnswer {
+        from,
+        resp,
+        via: UpstreamTransport::Udp,
+    };
+
+    if retry == TcpRetry::Disabled {
+        // Control said no (`dns-forwarder-disable-tcp-retries`): relay whatever UDP gave us.
+        return Some(over_udp);
+    }
+    if !did_not_fit_the_datagram(&over_udp.resp) {
+        return Some(over_udp);
+    }
+    // Only spend a TCP connection on a datagram the walk would actually accept. This repeats
+    // `forward_walk`'s check rather than moving it — the answer still goes back unfiltered — so
+    // that an off-path injector cannot conscript this node into connecting to a resolver by
+    // spraying forged `TC` datagrams it could never have matched the question of.
+    if over_udp.from.ip() != upstream.ip() || !response_matches_query(query, &over_udp.resp) {
+        return Some(over_udp);
+    }
+
+    tracing::debug!(%upstream, "magic dns upstream answer truncated, retrying over tcp");
+    match tcp().await {
+        // The TCP peer is the resolver we connected to, by construction of the handshake, so the
+        // source address is `upstream` itself and `forward_walk`'s source check passes on a fact
+        // rather than on a claim in a datagram header.
+        Some(resp) => Some(UpstreamAnswer {
+            from: upstream,
+            resp,
+            via: UpstreamTransport::Tcp,
+        }),
+        // Go returns the truncated UDP response when the TCP retry fails, and so do we: a truncated
+        // answer is more use to a stub resolver than no answer at all.
+        None => {
+            tracing::debug!(
+                %upstream,
+                "magic dns upstream tcp retry failed, relaying the truncated udp answer"
+            );
+            Some(over_udp)
+        }
+    }
+}
+
+/// Whether `msg` is an upstream answer that did not fit the datagram it came in — the thing the TCP
+/// retry exists for. Two ways to be one, and Go's forwarder retries on both:
+///
+/// - The resolver said so: the `TC` bit, header byte 2, bit `0x02` (RFC 1035 §4.1.1).
+/// - It is longer than this forwarder will relay in one datagram ([`MAX_UPSTREAM_RESPONSE`]), so
+///   [`cap_response`] is about to cut it and set `TC` itself. That is the same "did not fit" Go
+///   detects by reading `sendUDP` into a `maxResponseBytes+1` buffer and then setting `TC` on the
+///   reply it returns — which is the very bit its caller then tests. Retrying on it here keeps the
+///   one deliverable oversize datagram the netstack's 4096-byte receive ring can hand us from being
+///   a name that resolves only as a cut answer.
+///
+/// A message too short to hold a header is neither — it is garbage, and [`forward_walk`] discards
+/// it.
+fn did_not_fit_the_datagram(msg: &[u8]) -> bool {
+    msg.len() > MAX_UPSTREAM_RESPONSE || msg.get(2).is_some_and(|flags_hi| flags_hi & 0x02 != 0)
+}
+
+/// The UDP hop: one `0.0.0.0:0` overlay socket, one datagram out, the first datagram back as
+/// `(source address, bytes)`. `None` on bind/send/recv failure, [`UPSTREAM_TIMEOUT`], or an empty
+/// datagram.
+async fn ask_upstream_udp(
     channel: &Channel,
     upstream: SocketAddr,
     query: &[u8],
@@ -1147,6 +1356,82 @@ async fn ask_upstream(
     }
 }
 
+/// The TCP hop: connect to `upstream` over the overlay from `0.0.0.0:0` and exchange one
+/// length-prefixed message (RFC 1035 §4.2.2). `None` on any failure — connect refused, framing
+/// error, EOF, or [`UPSTREAM_TIMEOUT`] over the whole exchange — which is what sends
+/// [`ask_with_tcp_retry`] back to the truncated UDP answer.
+///
+/// The timeout covers connect **and** transfer together, so a resolver that accepts the connection
+/// and then stalls cannot hold the forward open for longer than a resolver that never answers at
+/// all.
+async fn ask_upstream_tcp(
+    channel: &Channel,
+    upstream: SocketAddr,
+    query: &[u8],
+) -> Option<Vec<u8>> {
+    let local = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
+    let exchange = async {
+        let mut stream = channel
+            .tcp_connect(local, upstream)
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        tcp_exchange(&mut stream, query).await
+    };
+
+    match timeout(UPSTREAM_TIMEOUT, exchange).await {
+        Ok(Ok(resp)) if !resp.is_empty() => Some(resp),
+        Ok(Ok(_)) => None,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, %upstream, "magic dns upstream tcp retry failed");
+            None
+        }
+        Err(_) => {
+            tracing::debug!(%upstream, "magic dns upstream tcp retry timed out");
+            None
+        }
+    }
+}
+
+/// Write `query` and read one response on `stream`, both under the two-byte big-endian length
+/// prefix DNS-over-TCP frames messages with (RFC 1035 §4.2.2).
+///
+/// Generic over the stream so the framing that actually ships is the framing the tests exercise,
+/// without standing up a netstack — the same reason `dns_over_tcp::serve_conn`, which is this
+/// framing read from the other end, is generic.
+///
+/// The prefix and the query go out in **one** write, as RFC 7766 §8 asks, so the length does not
+/// leave as its own two-byte segment ahead of the body. The response allocation is bounded by the
+/// prefix itself: at most 64 KiB, which is every DNS message that can be framed at all.
+async fn tcp_exchange<S>(stream: &mut S, query: &[u8]) -> std::io::Result<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let len = u16::try_from(query.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "query too long to frame over tcp",
+        )
+    })?;
+    let mut framed = Vec::with_capacity(2 + query.len());
+    framed.extend_from_slice(&len.to_be_bytes());
+    framed.extend_from_slice(query);
+    stream.write_all(&framed).await?;
+    stream.flush().await?;
+
+    let mut len_buf = [0u8; 2];
+    stream.read_exact(&mut len_buf).await?;
+    let len = usize::from(u16::from_be_bytes(len_buf));
+    if len == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "zero-length dns response over tcp",
+        ));
+    }
+    let mut resp = vec![0u8; len];
+    stream.read_exact(&mut resp).await?;
+    Ok(resp)
+}
+
 /// Walk `upstreams` in order, asking `ask` for each one's answer, and decide which response the
 /// client gets. [`forward_query`] is the only caller; `ask` is its overlay socket exchange
 /// ([`ask_upstream`]).
@@ -1173,8 +1458,9 @@ async fn ask_upstream(
 /// only ever sent datagrams the anti-poisoning check discarded.
 ///
 /// Every relayed response goes through [`cap_response`], which caps it at [`MAX_UPSTREAM_RESPONSE`]
-/// and — for a [`ClientTransport::Udp`] client — marks it truncated when it exceeds what `query`
-/// advertised it can receive.
+/// unless it was TCP end to end, and — for a [`ClientTransport::Udp`] client — marks it truncated
+/// when it exceeds what `query` advertised it can receive. That is why an [`UpstreamAnswer`] carries
+/// the hop it arrived over all the way to here: the walk never inspects it, it only hands it on.
 async fn forward_walk<F, Fut>(
     upstreams: &[SocketAddr],
     query: &[u8],
@@ -1184,15 +1470,16 @@ async fn forward_walk<F, Fut>(
 ) -> Vec<u8>
 where
     F: FnMut(SocketAddr) -> Fut,
-    Fut: std::future::Future<Output = Option<(SocketAddr, Vec<u8>)>>,
+    Fut: std::future::Future<Output = Option<UpstreamAnswer>>,
 {
     // The first REFUSED/SERVFAIL an upstream answered with, held while the walk continues.
-    let mut first_soft_error: Option<Vec<u8>> = None;
+    let mut first_soft_error: Option<UpstreamAnswer> = None;
 
     for upstream in upstreams {
-        let Some((from, resp)) = ask(*upstream).await else {
+        let Some(answer) = ask(*upstream).await else {
             continue;
         };
+        let UpstreamAnswer { from, resp, via } = answer;
 
         // Anti-poisoning: only accept a datagram that came from the upstream we queried and whose
         // DNS header matches this query (same transaction id, QR=response bit set). An off-path
@@ -1212,18 +1499,18 @@ where
                 rcode = response_rcode(&resp),
                 "magic dns upstream soft error, trying the next upstream"
             );
-            first_soft_error.get_or_insert(resp);
+            first_soft_error.get_or_insert(UpstreamAnswer { from, resp, via });
             continue;
         }
 
-        return cap_response(query, resp, client);
+        return cap_response(query, resp, client, via);
     }
 
     // Nothing better arrived. An upstream that refused or soft-failed still said something the
     // client can act on, so relay its own bytes (extended DNS error and all) ahead of the
     // synthesized `fallback`; `fallback` is only for "nobody answered".
     match first_soft_error {
-        Some(resp) => cap_response(query, resp, client),
+        Some(answer) => cap_response(query, answer.resp, client, answer.via),
         None => fallback,
     }
 }
@@ -1292,6 +1579,9 @@ async fn serve(
                 };
                 let socket = socket.clone();
                 let channel = channel.clone();
+                // Read the retry switch off the same view this query was decided against, before
+                // the spawn takes the query away from it.
+                let retry = view.upstream_tcp_retry();
                 forwards.spawn(async move {
                     let _permit = permit;
                     let resp = match plan {
@@ -1302,6 +1592,7 @@ async fn serve(
                                 &query,
                                 servfail,
                                 ClientTransport::Udp,
+                                retry,
                             )
                             .await
                         }
@@ -1533,6 +1824,7 @@ impl Message<Query> for MagicDnsActor {
                             &query,
                             servfail,
                             ClientTransport::Udp,
+                            view.upstream_tcp_retry(),
                         )
                         .await;
                         (resp, upstreams)
@@ -2768,7 +3060,9 @@ mod tests {
     ///
     /// The script stands in for [`ask_upstream`]'s overlay socket exchange only; every decision
     /// under test — the source/transaction-id check, the REFUSED/SERVFAIL soft-error rules, which
-    /// response is relayed — is made by the production code being called.
+    /// response is relayed — is made by the production code being called. Every scripted answer
+    /// arrives over the UDP hop, which is the hop the walk's own rules are about; the TCP hop is
+    /// [`ask_with_tcp_retry`]'s business and is tested there.
     async fn run_forward_walk(
         script: &[ScriptedUpstream],
         query: &[u8],
@@ -2787,7 +3081,12 @@ mod tests {
                 let answer = script
                     .iter()
                     .find(|(scripted, _)| *scripted == upstream)
-                    .and_then(|(_, answer)| answer.clone());
+                    .and_then(|(_, answer)| answer.clone())
+                    .map(|(from, resp)| UpstreamAnswer {
+                        from,
+                        resp,
+                        via: UpstreamTransport::Udp,
+                    });
                 std::future::ready(answer)
             },
         )
@@ -3250,6 +3549,348 @@ mod tests {
         }
     }
 
+    /// The retry this module exists for: an upstream answer with the `TC` bit set is re-asked over
+    /// TCP, and the TCP answer — not the truncated datagram — is what the walk relays.
+    ///
+    /// Two of Go's bounds are pinned here alongside it. The retry goes to the **same** resolver
+    /// (walking on would hand the query to a resolver the first one already answered), which is why
+    /// this asserts on `from`; and it re-sends the **same** query, which is why the TCP hop records
+    /// the bytes it was asked for.
+    #[tokio::test]
+    async fn a_truncated_udp_answer_is_retried_over_tcp_to_the_same_resolver() {
+        let query = build_query(0x400, &["big", "example", "com"], 16, 1);
+        let upstream = upstream_addr(1);
+        // What the UDP hop can carry: the resolver cut the record set and said so.
+        let mut truncated = upstream_response(&query, 0, 1, b"the part that fit");
+        truncated[2] |= 0x02; // TC
+        // What TCP can carry: the whole set, far past what any datagram here could hold.
+        let whole = upstream_response(&query, 0, 40, &[0xAB; 8000]);
+
+        let retries = std::cell::Cell::new(0);
+        let answer = ask_with_tcp_retry(
+            upstream,
+            &query,
+            TcpRetry::Enabled,
+            || std::future::ready(Some((upstream, truncated.clone()))),
+            || {
+                retries.set(retries.get() + 1);
+                std::future::ready(Some(whole.clone()))
+            },
+        )
+        .await
+        .expect("the upstream answered");
+
+        assert_eq!(
+            answer.resp, whole,
+            "the TCP answer replaces the truncated datagram"
+        );
+        assert_eq!(
+            answer.via,
+            UpstreamTransport::Tcp,
+            "and is labelled as having come over TCP, so the relay cap knows not to chop it"
+        );
+        assert_eq!(
+            answer.from, upstream,
+            "the retry goes to the SAME resolver, never on to the next one"
+        );
+        assert_eq!(
+            retries.get(),
+            1,
+            "one retry, not one per upstream and not one per attempt"
+        );
+    }
+
+    /// Go falls back to the truncated UDP response when the TCP retry fails, rather than to
+    /// SERVFAIL. A truncated answer still has an intact header and question and a `TC` bit the stub
+    /// resolver can act on; a synthesized failure is strictly less than we already had.
+    #[tokio::test]
+    async fn a_failed_tcp_retry_relays_the_truncated_udp_answer() {
+        let query = build_query(0x401, &["big", "example", "com"], 16, 1);
+        let upstream = upstream_addr(1);
+        let mut truncated = upstream_response(&query, 0, 1, b"the part that fit");
+        truncated[2] |= 0x02; // TC
+
+        let answer = ask_with_tcp_retry(
+            upstream,
+            &query,
+            TcpRetry::Enabled,
+            || std::future::ready(Some((upstream, truncated.clone()))),
+            // The resolver refused the connection, reset it, or never framed an answer.
+            || std::future::ready(None),
+        )
+        .await
+        .expect("a failed retry must not lose the answer we already had");
+
+        assert_eq!(
+            answer.resp, truncated,
+            "the truncated UDP answer is relayed, not a synthesized failure"
+        );
+        assert_eq!(
+            answer.via,
+            UpstreamTransport::Udp,
+            "and it is still a datagram answer, so the relay cap still applies to it"
+        );
+    }
+
+    /// A reply that fit is never retried: the retry exists for the answer that did not, and for
+    /// nothing else. A TCP connection per forwarded query would double the work this node makes
+    /// every upstream resolver do.
+    #[tokio::test]
+    async fn an_answer_that_is_not_truncated_is_never_retried() {
+        let query = build_query(0x402, &["example", "com"], 1, 1);
+        let upstream = upstream_addr(1);
+        let fits = upstream_response(&query, 0, 1, b"a small answer");
+
+        let retried = std::cell::Cell::new(false);
+        let answer = ask_with_tcp_retry(
+            upstream,
+            &query,
+            TcpRetry::Enabled,
+            || std::future::ready(Some((upstream, fits.clone()))),
+            || {
+                retried.set(true);
+                std::future::ready(None)
+            },
+        )
+        .await
+        .expect("the upstream answered");
+
+        assert!(
+            !retried.get(),
+            "an untruncated answer must not open a TCP connection"
+        );
+        assert_eq!(answer.resp, fits);
+        assert_eq!(answer.via, UpstreamTransport::Udp);
+    }
+
+    /// The other way an answer did not fit: the upstream sent one this forwarder cannot relay in a
+    /// single datagram ([`MAX_UPSTREAM_RESPONSE`]), with `TC` clear because it fit the resolver's
+    /// own idea of a datagram. [`cap_response`] is about to cut it and set `TC` — so the retry has
+    /// to fire on it too, or that name resolves only ever as a cut answer. Go detects the same
+    /// case by reading into a `maxResponseBytes+1` buffer and setting `TC` on the reply it hands
+    /// its own truncation check.
+    #[tokio::test]
+    async fn an_oversize_answer_is_retried_even_with_tc_clear() {
+        let query = build_edns_query(0x407, &["big", "example", "com"], 16, 1, 4096);
+        let upstream = upstream_addr(1);
+        // The one oversize datagram the netstack's 4096-byte receive ring can deliver, TC clear.
+        let mut full_ring = upstream_response(&query, 0, 1, b"");
+        full_ring.resize(MAX_UPSTREAM_RESPONSE + 1, 0xAB);
+        assert_eq!(
+            full_ring[2] & 0x02,
+            0,
+            "the upstream did not mark it truncated"
+        );
+        let whole = upstream_response(&query, 0, 40, &[0xAB; 8000]);
+
+        let answer = ask_with_tcp_retry(
+            upstream,
+            &query,
+            TcpRetry::Enabled,
+            || std::future::ready(Some((upstream, full_ring.clone()))),
+            || std::future::ready(Some(whole.clone())),
+        )
+        .await
+        .expect("the upstream answered");
+
+        assert_eq!(
+            answer.resp, whole,
+            "an answer too big for one datagram is re-asked over TCP, TC bit or no TC bit"
+        );
+        assert_eq!(answer.via, UpstreamTransport::Tcp);
+    }
+
+    /// `dns-forwarder-disable-tcp-retries` is the retry's **off** switch, and the polarity is the
+    /// whole point: a node control never set it on keeps retrying. Read from the self node through
+    /// the view, and honoured at the one place that would open the connection.
+    #[tokio::test]
+    async fn the_node_attribute_turns_the_tcp_retry_off() {
+        let mut view = view_with_peer();
+        assert_eq!(
+            view.upstream_tcp_retry(),
+            TcpRetry::Enabled,
+            "no self node yet ⇒ the retry is on, because on is the default"
+        );
+
+        let mut node = test_node();
+        view.self_node = Some(node.clone());
+        assert_eq!(
+            view.upstream_tcp_retry(),
+            TcpRetry::Enabled,
+            "a self node without the attribute ⇒ still on"
+        );
+
+        node.cap_map
+            .insert("dns-forwarder-disable-tcp-retries".to_string(), vec![]);
+        view.self_node = Some(node);
+        assert_eq!(
+            view.upstream_tcp_retry(),
+            TcpRetry::Disabled,
+            "the attribute control sets is what turns it off"
+        );
+
+        // And with it off, a truncated answer is relayed as it came — no TCP connection at all.
+        let query = build_query(0x403, &["big", "example", "com"], 16, 1);
+        let upstream = upstream_addr(1);
+        let mut truncated = upstream_response(&query, 0, 1, b"the part that fit");
+        truncated[2] |= 0x02; // TC
+
+        let retried = std::cell::Cell::new(false);
+        let answer = ask_with_tcp_retry(
+            upstream,
+            &query,
+            view.upstream_tcp_retry(),
+            || std::future::ready(Some((upstream, truncated.clone()))),
+            || {
+                retried.set(true);
+                std::future::ready(None)
+            },
+        )
+        .await
+        .expect("the upstream answered");
+
+        assert!(
+            !retried.get(),
+            "the attribute must stop the TCP retry being made at all"
+        );
+        assert_eq!(
+            answer.resp, truncated,
+            "relayed truncated, as control asked"
+        );
+        assert_eq!(answer.via, UpstreamTransport::Udp);
+    }
+
+    /// An off-path injector must not be able to buy a TCP connection to a resolver with a datagram
+    /// it forged. A `TC`-marked datagram from the wrong source, or one that does not echo the
+    /// question we asked, is relayed to [`forward_walk`] exactly as before — which discards it — and
+    /// costs no connection on the way.
+    #[tokio::test]
+    async fn a_forged_truncated_datagram_does_not_buy_a_tcp_connection() {
+        let query = build_query(0x404, &["example", "com"], 1, 1);
+        let upstream = upstream_addr(1);
+
+        let retried = std::cell::Cell::new(false);
+        let mut tcp_hop = || {
+            retried.set(true);
+            std::future::ready(None)
+        };
+
+        let mut from_elsewhere = upstream_response(&query, 0, 1, b"injected");
+        from_elsewhere[2] |= 0x02; // TC
+        let answer = ask_with_tcp_retry(
+            upstream,
+            &query,
+            TcpRetry::Enabled,
+            || std::future::ready(Some((upstream_addr(9), from_elsewhere.clone()))),
+            &mut tcp_hop,
+        )
+        .await
+        .expect("the datagram is still handed on for the walk to discard");
+        assert!(
+            !retried.get(),
+            "a datagram from the wrong source must not be retried"
+        );
+        assert_eq!(answer.via, UpstreamTransport::Udp);
+
+        let other_question = build_query(0x404, &["other", "example", "com"], 1, 1);
+        let mut wrong_question = upstream_response(&other_question, 0, 1, b"injected");
+        wrong_question[2] |= 0x02; // TC
+        let answer = ask_with_tcp_retry(
+            upstream,
+            &query,
+            TcpRetry::Enabled,
+            || std::future::ready(Some((upstream, wrong_question.clone()))),
+            &mut tcp_hop,
+        )
+        .await
+        .expect("the datagram is still handed on for the walk to discard");
+        assert!(
+            !retried.get(),
+            "a datagram answering another question must not be retried"
+        );
+        assert_eq!(answer.via, UpstreamTransport::Udp);
+    }
+
+    /// The relay cap is a datagram bound, so the one path it must not chop is the one that never
+    /// touches a datagram: fetched over the TCP hop, handed to a TCP client. Chopping there would
+    /// hand the stub resolver the same truncated answer it retried over TCP to escape, and the name
+    /// would still not resolve through this node.
+    ///
+    /// The same answer on its way to a **UDP** client is still cut to one datagram and marked `TC`
+    /// — it has to fit the datagram it leaves in — which is what sends that client to
+    /// `dns_over_tcp`, where it is served whole.
+    #[test]
+    fn a_tcp_fetched_answer_is_relayed_whole_to_a_tcp_client() {
+        let query = build_edns_query(0x405, &["big", "example", "com"], 16, 1, 4096);
+        let mut big = query.clone();
+        big[2] |= 0x80; // QR = 1
+        big.resize(MAX_UPSTREAM_RESPONSE + 5000, 0xAB);
+
+        let out = cap_response(
+            &query,
+            big.clone(),
+            ClientTransport::Tcp,
+            UpstreamTransport::Tcp,
+        );
+        assert_eq!(
+            out, big,
+            "TCP end to end: the whole answer, unchopped and unmarked"
+        );
+
+        let out = cap_response(&query, big, ClientTransport::Udp, UpstreamTransport::Tcp);
+        assert_eq!(
+            out.len(),
+            MAX_UPSTREAM_RESPONSE,
+            "the same answer still has to fit the datagram a UDP client is answered in"
+        );
+        assert_ne!(
+            out[2] & 0x02,
+            0,
+            "and is marked truncated, which is what sends that client to the TCP responder"
+        );
+    }
+
+    /// The TCP hop's framing, driven end to end over an in-memory stream: the query goes out under
+    /// a two-byte big-endian length prefix (RFC 1035 §4.2.2) in ONE write, and the answer is read
+    /// back out from under its own prefix. Framing is what a DNS-over-TCP resolver rejects a
+    /// connection for, so it is checked against a reader rather than asserted about.
+    #[tokio::test]
+    async fn tcp_exchange_frames_the_query_and_reads_the_framed_answer() {
+        let query = build_query(0x406, &["big", "example", "com"], 16, 1);
+        let answer = upstream_response(&query, 0, 40, &[0xAB; 8000]);
+
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let resolver = {
+            let query = query.clone();
+            let answer = answer.clone();
+            tokio::spawn(async move {
+                let mut len_buf = [0u8; 2];
+                server.read_exact(&mut len_buf).await.unwrap();
+                let len = usize::from(u16::from_be_bytes(len_buf));
+                assert_eq!(len, query.len(), "the prefix declares the query's length");
+                let mut got = vec![0u8; len];
+                server.read_exact(&mut got).await.unwrap();
+                assert_eq!(got, query, "and the query follows it verbatim");
+
+                let mut framed = u16::try_from(answer.len()).unwrap().to_be_bytes().to_vec();
+                framed.extend_from_slice(&answer);
+                server.write_all(&framed).await.unwrap();
+            })
+        };
+
+        let got = tcp_exchange(&mut client, &query)
+            .await
+            .expect("a well-framed answer is read back");
+        resolver
+            .await
+            .expect("the resolver side saw a framed query");
+
+        assert_eq!(
+            got, answer,
+            "the answer comes back whole — 8000 bytes no datagram here could have carried"
+        );
+    }
+
     /// The `TC` bit a truncated UDP answer sets is what sends a stub resolver to TCP (RFC 1035
     /// §4.2.1). Setting it *again* on the TCP answer sends that resolver straight back into another
     /// retry, so the client's advertised UDP payload size — a property of the datagram it would
@@ -3263,7 +3904,12 @@ mod tests {
         answer[2] |= 0x80; // make it a response (QR=1)
         answer.resize(900, 0xAB); // over 512, under MAX_UPSTREAM_RESPONSE: only the client limit bites
 
-        let udp = cap_response(&query, answer.clone(), ClientTransport::Udp);
+        let udp = cap_response(
+            &query,
+            answer.clone(),
+            ClientTransport::Udp,
+            UpstreamTransport::Udp,
+        );
         assert_ne!(
             udp[2] & 0x02,
             0,
@@ -3271,7 +3917,7 @@ mod tests {
         );
         assert_eq!(udp.len(), 900, "and the body is left intact either way");
 
-        let tcp = cap_response(&query, answer, ClientTransport::Tcp);
+        let tcp = cap_response(&query, answer, ClientTransport::Tcp, UpstreamTransport::Udp);
         assert_eq!(
             tcp[2] & 0x02,
             0,
@@ -3280,9 +3926,10 @@ mod tests {
         assert_eq!(tcp.len(), 900, "and is relayed whole");
     }
 
-    /// The relay cap is a different claim from the client's datagram size, and it holds on both
-    /// transports: when [`MAX_UPSTREAM_RESPONSE`] really did cut the message, `TC` says so. Handing
-    /// a TCP client a chopped body with `TC` clear would be a malformed-but-"complete" answer.
+    /// The relay cap is a different claim from the client's datagram size, and for an answer that
+    /// crossed the UDP hop it holds on both client transports: when [`MAX_UPSTREAM_RESPONSE`] really
+    /// did cut the message, `TC` says so. Handing a TCP client a chopped body with `TC` clear would
+    /// be a malformed-but-"complete" answer.
     #[test]
     fn a_chopped_answer_is_marked_truncated_on_both_transports() {
         let query = build_edns_query(0x311, &["example", "com"], 1, 1, 4096);
@@ -3290,7 +3937,7 @@ mod tests {
         big[2] |= 0x80;
         big.resize(MAX_UPSTREAM_RESPONSE + 500, 0xAB);
 
-        let out = cap_response(&query, big, ClientTransport::Tcp);
+        let out = cap_response(&query, big, ClientTransport::Tcp, UpstreamTransport::Udp);
         assert_eq!(out.len(), MAX_UPSTREAM_RESPONSE, "capped to one datagram");
         assert_ne!(
             out[2] & 0x02,
@@ -3309,7 +3956,7 @@ mod tests {
         big[2] |= 0x80; // make it a response (QR=1)
         big.resize(MAX_UPSTREAM_RESPONSE + 500, 0xAB);
 
-        let out = cap_response(&query, big, ClientTransport::Udp);
+        let out = cap_response(&query, big, ClientTransport::Udp, UpstreamTransport::Udp);
         assert_eq!(out.len(), MAX_UPSTREAM_RESPONSE, "capped to one datagram");
         assert_ne!(out[2] & 0x02, 0, "TC bit set on truncation");
     }
@@ -3322,7 +3969,7 @@ mod tests {
         small[2] |= 0x80;
         let before = small.clone();
 
-        let out = cap_response(&query, small, ClientTransport::Udp);
+        let out = cap_response(&query, small, ClientTransport::Udp, UpstreamTransport::Udp);
         assert_eq!(out, before, "small response unchanged");
         assert_eq!(out[2] & 0x02, 0, "TC bit not set when no truncation");
     }
@@ -3354,7 +4001,12 @@ mod tests {
         largest.resize(MAX_UPSTREAM_RESPONSE, 0xAB);
         let before = largest.clone();
 
-        let out = cap_response(&query, largest, ClientTransport::Udp);
+        let out = cap_response(
+            &query,
+            largest,
+            ClientTransport::Udp,
+            UpstreamTransport::Udp,
+        );
         assert_eq!(out, before, "an answer at the cap must be relayed verbatim");
         assert_eq!(
             out[2] & 0x02,
@@ -3379,7 +4031,12 @@ mod tests {
         full_ring[2] |= 0x80; // QR=1
         full_ring.resize(ring, 0xAB);
 
-        let out = cap_response(&query, full_ring, ClientTransport::Udp);
+        let out = cap_response(
+            &query,
+            full_ring,
+            ClientTransport::Udp,
+            UpstreamTransport::Udp,
+        );
         assert_eq!(
             out.len(),
             4095,
@@ -3398,7 +4055,12 @@ mod tests {
         reply[2] |= 0x80; // QR=1
         reply.resize(900, 0xAB);
 
-        let out = cap_response(&query, reply.clone(), ClientTransport::Udp);
+        let out = cap_response(
+            &query,
+            reply.clone(),
+            ClientTransport::Udp,
+            UpstreamTransport::Udp,
+        );
 
         assert_ne!(
             out[2] & 0x02,
@@ -3423,7 +4085,7 @@ mod tests {
         reply.resize(900, 0xAB);
         let before = reply.clone();
 
-        let out = cap_response(&query, reply, ClientTransport::Udp);
+        let out = cap_response(&query, reply, ClientTransport::Udp, UpstreamTransport::Udp);
 
         assert_eq!(
             out, before,
@@ -3502,7 +4164,7 @@ mod tests {
         reply[2] |= 0x80; // QR=1
         reply.resize(900, 0xAB);
 
-        let out = cap_response(&query, reply, ClientTransport::Udp);
+        let out = cap_response(&query, reply, ClientTransport::Udp, UpstreamTransport::Udp);
         assert_ne!(
             out[2] & 0x02,
             0,
@@ -3520,7 +4182,7 @@ mod tests {
         reply[2] |= 0x80; // QR=1
         reply.resize(300, 0xAB);
 
-        let out = cap_response(&query, reply, ClientTransport::Udp);
+        let out = cap_response(&query, reply, ClientTransport::Udp, UpstreamTransport::Udp);
         assert_ne!(
             out[2] & 0x02,
             0,

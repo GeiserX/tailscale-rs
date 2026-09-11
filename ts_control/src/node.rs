@@ -643,6 +643,30 @@ impl Node {
         self.has_node_attr(Self::NODE_ATTR_DNS_SUBDOMAIN_RESOLVE)
     }
 
+    /// The node attribute control sets to stop the DNS forwarder re-asking a truncated upstream
+    /// answer over TCP (Go `tailcfg/nodecap`'s `NodeAttrDNSForwarderDisableTCPRetries`, surfaced in
+    /// `control/controlknobs` as `Knobs.DisableDNSForwarderTCPRetries`). Read by
+    /// [`Node::disable_dns_forwarder_tcp_retries`].
+    const NODE_ATTR_DNS_FORWARDER_DISABLE_TCP_RETRIES: &'static str =
+        "dns-forwarder-disable-tcp-retries";
+
+    /// Report whether control has told this node **not** to retry a truncated forwarded DNS answer
+    /// over TCP.
+    ///
+    /// The retry is on by default and this attribute is its *off* switch — so, unlike every other
+    /// attribute here, the fail-closed reading is the one that ignores it: a node control has not
+    /// set it on keeps retrying, which is what a stub resolver on this node needs for a name whose
+    /// answer does not fit a datagram. Go reads it the same way round
+    /// (`skipTCP := skipTCPRetry() || (f.controlKnobs != nil &&
+    /// f.controlKnobs.DisableDNSForwarderTCPRetries.Load())`, net/dns/resolver/forwarder.go).
+    ///
+    /// Upstream dates a client's understanding of the attribute to capability version 75
+    /// ([`ts_capabilityversion::CapabilityVersion::V75`]), which this tree's `CURRENT` is well
+    /// above, so control will send it to this node when the tailnet sets it.
+    pub fn disable_dns_forwarder_tcp_retries(&self) -> bool {
+        self.has_node_attr(Self::NODE_ATTR_DNS_FORWARDER_DISABLE_TCP_RETRIES)
+    }
+
     /// The node attribute by which control asks this node to collapse its per-peer CGNAT host
     /// routes into the single `100.64.0.0/10` (Go `tailcfg/nodecap`'s `OneCGNATEnable`).
     ///
@@ -1943,6 +1967,24 @@ pub(crate) mod tests {
         assert!(
             n.resolves_subdomains(),
             "the dns-subdomain-resolve attribute makes this node a subdomain host"
+        );
+    }
+
+    /// The DNS forwarder's TCP retry is ON by default, so the attribute has to be read as the *off*
+    /// switch it is: absent means retry. Getting the polarity backwards would silently disable the
+    /// retry on every tailnet that never set the attribute — the failure the retry exists to remove.
+    #[test]
+    fn dns_forwarder_tcp_retries_disabled_only_by_the_node_attribute() {
+        let mut n = node("peer", Some("ts.net"));
+        assert!(
+            !n.disable_dns_forwarder_tcp_retries(),
+            "no attribute → the retry stays on: this is the off switch, not the on switch"
+        );
+        n.cap_map
+            .insert("dns-forwarder-disable-tcp-retries".to_string(), vec![]);
+        assert!(
+            n.disable_dns_forwarder_tcp_retries(),
+            "the dns-forwarder-disable-tcp-retries attribute turns the TCP retry off"
         );
     }
 
