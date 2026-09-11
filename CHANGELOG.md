@@ -2,6 +2,18 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.53.0](https://github.com/GeiserX/tailscale-rs/compare/v0.52.4...v0.53.0) (2026-09-11)
+
+
+### Features
+
+* **netmap:** let control switch this node off the delta netmap path ([#442](https://github.com/GeiserX/tailscale-rs/issues/442)) ([cb2b2c0](https://github.com/GeiserX/tailscale-rs/commit/cb2b2c056522a2eef9d2e32e81d69e0bdeeebf30))
+
+
+### Bug Fixes
+
+* **dns:** resolve names whose answer does not fit a UDP datagram ([#440](https://github.com/GeiserX/tailscale-rs/issues/440)) ([1e3687a](https://github.com/GeiserX/tailscale-rs/commit/1e3687adffa962407674f8e5458f34d82aa3b32a))
+
 ## [0.52.4](https://github.com/GeiserX/tailscale-rs/compare/v0.52.3...v0.52.4) (2026-09-11)
 
 
