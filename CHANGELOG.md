@@ -2,6 +2,14 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.52.4](https://github.com/GeiserX/tailscale-rs/compare/v0.52.3...v0.52.4) (2026-09-11)
+
+
+### Bug Fixes
+
+* **packetfilter:** ignore an ACL that grants an unlocked peer access ([#436](https://github.com/GeiserX/tailscale-rs/issues/436)) ([402ba86](https://github.com/GeiserX/tailscale-rs/commit/402ba86815c4c706133cc51633e430c431392009))
+* **tun:** bound the host route table by collapsing CGNAT peer routes ([#438](https://github.com/GeiserX/tailscale-rs/issues/438)) ([c133b98](https://github.com/GeiserX/tailscale-rs/commit/c133b98eaf739fbe3cc531be998e08956c145806))
+
 ## [0.52.3](https://github.com/GeiserX/tailscale-rs/compare/v0.52.2...v0.52.3) (2026-09-10)
 
 
