@@ -946,7 +946,11 @@ impl Message<Arc<ts_control::StateUpdate>> for PeerTracker {
             .unwrap_or_default();
 
         if !msg.peer_patches.is_empty() {
-            let (patch_upserts, patch_deletions) = self.apply_peer_patches(&msg.peer_patches, now);
+            // `apply_peer_patch_set`, not `apply_peer_patches`: control can switch this node off
+            // the incremental path with the `disable-delta-updates` node attribute, in which case
+            // the same patches are applied as a full netmap update instead of as mutations.
+            let (patch_upserts, patch_deletions) =
+                self.apply_peer_patch_set(&msg.peer_patches, now);
             // A patch can evict a node the set just upserted (TKA rejection after key rotation), or
             // re-admit/patch one not in the set — reconcile so each id lands in exactly one set.
             for id in &patch_upserts {
@@ -1729,8 +1733,90 @@ impl PeerTracker {
         }));
     }
 
+    /// Apply the response's `MapResponse.PeersChangedPatch` set, choosing the incremental path or
+    /// the fall-back-to-full one according to control's `disable-delta-updates` node attribute.
+    ///
+    /// This is the port of the first statement of Go `control/controlclient/map.go`'s
+    /// `tryHandleIncrementally` — `if ms.controlKnobs != nil &&
+    /// ms.controlKnobs.DisableDeltaUpdates.Load() { return false }` — and of what returning `false`
+    /// there means: the map session does not reject the response and does not drop the mutations it
+    /// carries, it declines the incremental arm so the full netmap rebuild handles the *same*
+    /// response. So a patch-only response under the attribute is still applied, as a full update.
+    ///
+    /// The attribute is read off the **self** node, which the netmap handler refreshes from this
+    /// very response before it gets here, so an attribute control granted on this response takes
+    /// effect on the response that granted it — the same timing the netmap cache's attribute read
+    /// has. No self node yet (nothing has carried one) reads as absent ⇒ the incremental path.
+    fn apply_peer_patch_set(
+        &mut self,
+        patches: &[ts_control::PeerChange],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> (HashSet<PeerId>, HashSet<PeerId>) {
+        if self
+            .self_node
+            .as_ref()
+            .is_some_and(Node::delta_updates_disabled)
+        {
+            tracing::debug!(
+                n = patches.len(),
+                "control set disable-delta-updates; applying this response's peer patches as a \
+                 full netmap update"
+            );
+            return self.rebuild_netmap_with_patches(patches, now);
+        }
+
+        self.apply_peer_patches(patches, now)
+    }
+
+    /// The fall-back-to-full arm of [`apply_peer_patch_set`](Self::apply_peer_patch_set): fold the
+    /// patches in, then re-install the **whole** retained netmap rather than the patched nodes
+    /// alone.
+    ///
+    /// Go reaches the same place by a different route because its map session keeps its own peer
+    /// store: `HandleNonKeepAliveMapResponse` absorbs `PeersChangedPatch` into that store
+    /// (`updateStateFromResponse`) *before* it decides how to hand the result downstream, then —
+    /// when `tryHandleIncrementally` declines — rebuilds the netmap from the store (`ms.netmap()`,
+    /// which re-runs `flagExpiredPeers` over every peer) and installs it whole with
+    /// `UpdateFullNetmap`. Here the peer db *is* that store, so step one is the ordinary patch fold
+    /// and step two is re-installing every peer through the same control-sourced upsert path, which
+    /// is what re-runs the expiry pass over the whole netmap and puts every peer in the published
+    /// upsert set. Upstream names the cost itself — "lots of garbage & work downstream" — and it is
+    /// the point of the escape hatch, not a side effect of it.
+    ///
+    /// Nothing here evicts a peer the incremental path would have kept: the only trust gate is the
+    /// per-patched-node one the fold already runs. Re-verifying the *whole* db against tailnet lock
+    /// (Go's full arm re-runs `tkaFilterNetmapLocked`) is deliberately NOT done, because the nodes
+    /// in the db are this node's own copies rather than control's pristine ones — a peer this node
+    /// flagged expired carries a node key we broke ourselves, so its signature can no longer verify
+    /// and re-filtering would evict it. That is the same carve-out, for the same reason, that
+    /// [`tka_reevaluate_peer_db`](Self::tka_reevaluate_peer_db) already makes.
+    fn rebuild_netmap_with_patches(
+        &mut self,
+        patches: &[ts_control::PeerChange],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> (HashSet<PeerId>, HashSet<PeerId>) {
+        let (mut upserts, deletions) = self.apply_peer_patches(patches, now);
+
+        // Re-install the netmap the fold above just produced, whole. Cloning first keeps the db
+        // borrow off the upsert loop; it is the "garbage" half of upstream's own description.
+        let netmap: Vec<Node> = self.peer_db.peers().values().cloned().collect();
+        for mut node in netmap {
+            // The db carries the EFFECTIVE disco key, which may have been learned over TSMP, so
+            // restate what CONTROL last said before re-installing. Without this, re-installing a
+            // peer whose active key came from a TSMP advertisement would hand that key back as if
+            // control had sent it, and `upsert_from_control` would write it into control's slot —
+            // losing the key control actually gave us. Same reasoning as the patch fold's own
+            // restatement, applied to every peer because every peer is re-installed here.
+            node.disco_key = self.control_disco_key(&node.node_key);
+            upserts.insert(self.upsert_from_control(&node, now));
+        }
+
+        (upserts, deletions)
+    }
+
     /// Apply field-level peer patches (`MapResponse.PeersChangedPatch`), returning the upserted /
-    /// deleted [`PeerId`]s.
+    /// deleted [`PeerId`]s. The incremental arm of
+    /// [`apply_peer_patch_set`](Self::apply_peer_patch_set), and the fold both arms share.
     ///
     /// This is a SEPARATE channel from [`apply_peer_update`](Self::apply_peer_update): Go's
     /// `controlclient` applies the whole-node `Peers*` set first and then `PeersChangedPatch`, so a
@@ -3015,6 +3101,231 @@ pub(crate) mod tka_tests {
             after.derp_region,
             Some(ts_derp::RegionId(core::num::NonZeroU32::new(7).unwrap()))
         );
+    }
+
+    /// The node attribute by which control switches this node off the incremental netmap path
+    /// (Go `tailcfg/nodecap`'s `DisableDeltaUpdates`).
+    const DISABLE_DELTA_UPDATES: &str = "disable-delta-updates";
+
+    /// A second peer, distinct from `peer_node`'s single node in every indexed field: control node
+    /// id, stable id, node key and tailnet addresses. Used as the peer NO patch names, so a test can
+    /// tell "only the patched node was installed" from "the whole netmap was installed".
+    fn other_peer_node(stable_id: &str) -> Node {
+        let mut node = peer_node(stable_id, [2u8; 32], vec![]);
+        node.id = 2;
+        node.addresses = vec![
+            "100.64.0.2/32".parse().unwrap(),
+            "fd7a:115c:a1e0::2/128".parse().unwrap(),
+        ];
+        node.tailnet_address = TailnetAddress {
+            ipv4: "100.64.0.2/32".parse().unwrap(),
+            ipv6: "fd7a:115c:a1e0::2/128".parse().unwrap(),
+        };
+        node
+    }
+
+    /// A self node carrying `attrs` in its capability map — the channel control uses to set node
+    /// attributes, and the one `Node::delta_updates_disabled` reads.
+    fn self_node_with(attrs: &[&str]) -> Node {
+        let mut node = peer_node("self", [9u8; 32], vec![]);
+        for attr in attrs {
+            node.cap_map.insert((*attr).to_string(), vec![]);
+        }
+        node
+    }
+
+    /// A reachability patch (new UDP endpoint) for the peer with control node id `id`.
+    fn endpoint_patch(
+        id: ts_control::NodeId,
+        endpoint: std::net::SocketAddr,
+    ) -> ts_control::PeerChange {
+        ts_control::PeerChange {
+            id,
+            derp_region: None,
+            cap: None,
+            cap_map: None,
+            underlay_addresses: Some(vec![endpoint]),
+            node_key: None,
+            key_signature: None,
+            disco_key: None,
+            node_key_expiry: None,
+            online: None,
+            last_seen: None,
+        }
+    }
+
+    /// The positive assertion the escape hatch is measured against: with `disable-delta-updates`
+    /// ABSENT the patch path is exactly what it was — the patched peer is re-installed and reported,
+    /// and a peer no patch names is left alone. This is the default and the overwhelmingly common
+    /// case, so it is the one that must not move.
+    #[tokio::test]
+    async fn a_patch_without_the_attribute_installs_only_the_patched_peer() {
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Full(vec![
+                peer_node("a", [1u8; 32], vec![]),
+                other_peer_node("b"),
+            ]),
+            local_now(),
+        );
+        // A self node with no attributes at all: control has said nothing about delta updates.
+        tracker.self_node = Some(self_node_with(&[]));
+
+        let new_ep: std::net::SocketAddr = "203.0.113.7:41641".parse().unwrap();
+        let patch = endpoint_patch(1, new_ep);
+        let (upserts, deletions) =
+            tracker.apply_peer_patch_set(std::slice::from_ref(&patch), local_now());
+
+        assert!(deletions.is_empty());
+        assert_eq!(
+            upserts.len(),
+            1,
+            "the incremental path installs the patch's mutation, not the whole netmap"
+        );
+        let (patched_id, patched) = tracker.peer_db.get(&(1 as ts_control::NodeId)).unwrap();
+        assert_eq!(patched.underlay_addresses, vec![new_ep]);
+        assert!(upserts.contains(&patched_id));
+        let (unpatched_id, unpatched) = tracker.peer_db.get(&(2 as ts_control::NodeId)).unwrap();
+        assert!(
+            unpatched.underlay_addresses.is_empty(),
+            "a peer no patch names keeps its own reachability"
+        );
+        assert!(
+            !upserts.contains(&unpatched_id),
+            "and is not reported as installed by the delta path"
+        );
+    }
+
+    /// Control's escape hatch: with `disable-delta-updates` set, a response carrying ONLY
+    /// `PeersChangedPatch` is still applied — as a full netmap update. The attribute declines the
+    /// incremental arm, exactly as Go's `tryHandleIncrementally` returning `false` does; it neither
+    /// rejects the response nor drops the patches, so asserting the patch is *ignored* here would
+    /// pin the opposite of upstream's behaviour.
+    #[tokio::test]
+    async fn disable_delta_updates_applies_a_patch_only_response_as_a_full_update() {
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Full(vec![
+                peer_node("a", [1u8; 32], vec![]),
+                other_peer_node("b"),
+            ]),
+            local_now(),
+        );
+        tracker.self_node = Some(self_node_with(&[DISABLE_DELTA_UPDATES]));
+
+        let new_ep: std::net::SocketAddr = "203.0.113.7:41641".parse().unwrap();
+        let patch = endpoint_patch(1, new_ep);
+        let (upserts, deletions) =
+            tracker.apply_peer_patch_set(std::slice::from_ref(&patch), local_now());
+
+        assert!(deletions.is_empty(), "the fall-back never drops a peer");
+        // Applied, not dropped: the patched field is in the netmap.
+        let (patched_id, patched) = tracker.peer_db.get(&(1 as ts_control::NodeId)).unwrap();
+        assert_eq!(
+            patched.underlay_addresses,
+            vec![new_ep],
+            "the patch is still applied under the attribute"
+        );
+        // And applied as a FULL update: every retained peer is re-installed and reported, not just
+        // the one the patch named.
+        assert_eq!(tracker.peer_db.peers().len(), 2, "no peer is evicted");
+        let (unpatched_id, unpatched) = tracker.peer_db.get(&(2 as ts_control::NodeId)).unwrap();
+        assert_eq!(
+            upserts,
+            HashSet::from_iter([patched_id, unpatched_id]),
+            "the full arm installs the whole netmap, not the patch's mutation"
+        );
+        assert!(
+            unpatched.underlay_addresses.is_empty(),
+            "re-installing a peer no patch named does not invent state for it"
+        );
+    }
+
+    /// Under the attribute the `Peers*`-then-patch order the module documents is unchanged: the
+    /// whole-node set is applied first (by the caller) and the patch lands on top of the node that
+    /// set just upserted, rather than the patch being overwritten by the netmap re-install.
+    #[tokio::test]
+    async fn disable_delta_updates_keeps_the_peer_set_then_patch_ordering() {
+        let (mut tracker, _tka_tx) = PeerTracker::for_test(test_env(), None);
+        tracker.self_node = Some(self_node_with(&[DISABLE_DELTA_UPDATES]));
+
+        // The whole-node delta from this response brings in a peer with no reachability...
+        tracker.apply_peer_update(
+            &ts_control::PeerUpdate::Delta {
+                upsert: vec![peer_node("mover", [1u8; 32], vec![])],
+                remove: vec![],
+            },
+            local_now(),
+        );
+
+        // ...and the patch from the SAME response then sets its endpoints, second.
+        let new_ep: std::net::SocketAddr = "203.0.113.7:41641".parse().unwrap();
+        let patch = endpoint_patch(1, new_ep);
+        let (upserts, _deletions) =
+            tracker.apply_peer_patch_set(std::slice::from_ref(&patch), local_now());
+
+        assert_eq!(upserts.len(), 1, "one peer in the netmap, so one installed");
+        let (_pid, after) = tracker.peer_db.get(&(1 as ts_control::NodeId)).unwrap();
+        assert_eq!(
+            after.underlay_addresses,
+            vec![new_ep],
+            "the patch is applied on top of the peer set, not lost to the re-install"
+        );
+    }
+
+    /// End-to-end through the LIVE actor, which is the only thing that proves the read is wired to
+    /// the right node and the right response: control grants `disable-delta-updates` on the self
+    /// node of the very response that carries the patches, and the patches must still land. A
+    /// self-node attribute read from the wrong place (or one response late) would silently leave
+    /// this node on the incremental path control just asked it to leave.
+    #[tokio::test]
+    async fn disable_delta_updates_takes_effect_on_the_response_that_grants_it() {
+        use kameo::actor::Spawn as _;
+
+        let env = test_env();
+        let (_tka_tx, tka_rx) = watch::channel(None);
+        let tracker = PeerTracker::spawn((env.clone(), tka_rx));
+
+        // Await one reply first so `on_start` (which subscribes the actor to the bus) has run.
+        assert!(
+            tracker
+                .ask(AllPeers)
+                .await
+                .expect("peer tracker started")
+                .is_empty()
+        );
+
+        env.publish(Arc::new(netmap_with_peers(vec![
+            peer_node("a", [1u8; 32], vec![]),
+            other_peer_node("b"),
+        ])))
+        .await
+        .expect("publish netmap");
+        await_peer_count(&tracker, 2).await;
+
+        // One response: the self node granting the attribute, and nothing but `PeersChangedPatch`.
+        let new_ep: std::net::SocketAddr = "203.0.113.7:41641".parse().unwrap();
+        env.publish(Arc::new(ts_control::StateUpdate {
+            node: Some(self_node_with(&[DISABLE_DELTA_UPDATES])),
+            peer_update: None,
+            peer_patches: vec![endpoint_patch(1, new_ep)],
+            ..netmap_with_peers(Vec::new())
+        }))
+        .await
+        .expect("publish the patch-only response");
+
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let peers = tracker.ask(AllPeers).await.expect("peer tracker is alive");
+                if peers.iter().any(|p| p.underlay_addresses == vec![new_ep]) {
+                    return peers;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let peers = settled.expect("the patch-only response is applied under the attribute");
+        assert_eq!(peers.len(), 2, "the fall-back to full evicts nobody");
     }
 
     /// A `Patch` whose node id is not in the current netmap is ignored (the wire contract: a patch
