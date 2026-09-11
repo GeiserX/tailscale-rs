@@ -788,6 +788,34 @@ impl Node {
         self.has_node_attr(Self::NODE_ATTR_SILENT_DISCO)
     }
 
+    /// The node attribute by which control tells this node that the network it sits on tolerates
+    /// nothing but TCP on port 443 (Go `tailcfg/nodecap`'s `OnlyTCP443`, read off `nm.SelfNode` in
+    /// `ipn/ipnlocal` and handed to magicsock by `b.MagicConn().SetOnlyTCP443(...)`). Read off the
+    /// **self** node's cap map by [`only_tcp_443`](Self::only_tcp_443).
+    ///
+    /// Upstream's own words: the client "should not attempt to generate any outbound traffic that
+    /// isn't TCP on port 443", which "thus implies all traffic is over DERP". The node it is set on
+    /// is the node that goes quiet, so it is the *self* node's cap map that decides, never the
+    /// peer's.
+    const NODE_ATTR_ONLY_TCP_443: &'static str = "only-tcp-443";
+
+    /// Report whether control has told this node to emit nothing but TCP/443 — no UDP at all, so
+    /// every tailnet packet rides DERP.
+    ///
+    /// This is the single predicate behind all of upstream's TCP-443-only behaviour: magicsock's
+    /// UDP send chokepoint refuses silently, netcheck's UDP (STUN) probes refuse with
+    /// `errors.ErrUnsupported`, the portmapper is disabled and the peer-relay client is switched
+    /// off. Consumers in this tree read it here rather than each re-deriving it from the cap map.
+    ///
+    /// Absent attribute ⇒ `false` ⇒ UDP as before, which is the default and the overwhelmingly
+    /// common case. Being a plain per-node attribute it needs no capability version: a node control
+    /// has not set it on is unaffected. It is read live off each netmap, never latched at start-up,
+    /// because upstream's setter (`Conn.SetOnlyTCP443`) is live — control withdrawing the attribute
+    /// has to restore UDP without a restart.
+    pub fn only_tcp_443(&self) -> bool {
+        self.has_node_attr(Self::NODE_ATTR_ONLY_TCP_443)
+    }
+
     /// Report whether `wanted_port` is allowed for Funnel on this node.
     ///
     /// Mirrors Go `ipn.CheckFunnelPort`: scan the cap-map keys for one prefixed by
@@ -2168,6 +2196,32 @@ pub(crate) mod tests {
         assert!(
             !n.silent_disco(),
             "control withdrawing the attribute returns the node to the heartbeat cadence"
+        );
+    }
+
+    /// Control's `only-tcp-443` attribute is read off the self node's cap map, and — because
+    /// upstream's `SetOnlyTCP443` is live rather than start-time — withdrawing it reads back as
+    /// `false` on the very next netmap.
+    #[test]
+    fn only_tcp_443_reads_the_only_tcp_443_attribute() {
+        let mut n = node("self", Some("ts.net"));
+        assert!(
+            !n.only_tcp_443(),
+            "absent attribute → UDP as before, which is the default"
+        );
+
+        // The attribute is the bare key; the presence of the key is the whole signal, and its
+        // value (control sends an empty one) is never read.
+        n.cap_map.insert("only-tcp-443".to_string(), vec![]);
+        assert!(
+            n.only_tcp_443(),
+            "control granted the attribute → this node emits nothing but TCP/443"
+        );
+
+        n.cap_map.remove("only-tcp-443");
+        assert!(
+            !n.only_tcp_443(),
+            "control withdrawing the attribute must restore UDP, with no restart"
         );
     }
 
