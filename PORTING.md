@@ -3,12 +3,12 @@
 | | |
 | --- | --- |
 | **Upstream source** | `https://github.com/tailscale/tailscale` (Go) |
-| **Upstream commit this ledger was written against** | `023255e8a27ec9f6a21d24e3eda21c052ff72af3` (2026-09-09, `net/dnscache, feature/dnsresolvecache: only persist DNS resolutions after TLS verification`) |
-| **Upstream `tailcfg.CurrentCapabilityVersion` at that commit** | **146** (2026-09-02) — **unchanged**, the first hold since it moved at the previous pin; see §A |
-| **This repository at ledger time** | `dcd2c13` — workspace version `0.52.3` |
+| **Upstream commit this ledger was written against** | `023255e8a27ec9f6a21d24e3eda21c052ff72af3` (2026-09-09, `net/dnscache, feature/dnsresolvecache: only persist DNS resolutions after TLS verification`) — **unchanged at this revision**, because it is still upstream's default-branch HEAD: there was no newer pin to advance to |
+| **Upstream `tailcfg.CurrentCapabilityVersion` at that commit** | **146** (2026-09-02) — **unchanged**, the second hold running; see §A |
+| **This repository at ledger time** | `340ffdf` — workspace version `0.52.3` |
 | **`ts_capabilityversion::CapabilityVersion::CURRENT` here** | **125** (2025-08-11) — held below 126; see §B, *c2n endpoints behind the declared capability version* |
 | **Gap window this ledger covers** | capability version **131 → 146**, i.e. upstream commits from 2025-10-06 to 2026-09-09 (the window is anchored to when capver 130 landed upstream; the declaration here being 125 rather than 130 does not change what upstream added) |
-| **Previous pin** | `3945b82f8a9550b54c33e61d4ed2227862d53e8a` (2026-09-08). Fourteen upstream commits separate the two, nine of them in mapped packages — three in `net/socks5` alone, two in `tstest`. **This tree is where the movement was, for the fourth revision running**: seventeen commits landed here since `4e8578d`, closing **all six** of the rows the previous revision opened, in the order it wrote them down. See §B, *What changed at this revision*. The five rows that replace them came from nowhere near the new delta — see the sweep-list note under [Re-deriving this ledger](#re-deriving-this-ledger), which gained a package at this revision for the third time |
+| **Previous pin** | `023255e8a27ec9f6a21d24e3eda21c052ff72af3` — **the same commit**. Neither side moved at this revision: `git ls-remote https://github.com/tailscale/tailscale HEAD` answers `023255e8a…`, so `023255e8a..<new pin>` is empty, and the only commit in this tree since `dcd2c13` is the previous revision of this document. Eight rows opened all the same: six from **reading** — the case the closing note under [Re-deriving this ledger](#re-deriving-this-ledger) has been building towards for five revisions — and two from commits that were inside the window and inside a swept package all along, and had simply never been read. The sweep list also gained a package for the fourth time (`control/controlknobs`) |
 
 > This repository is also a fork of the Rust port `tailscale/tailscale-rs` — see
 > [`VENDOR.md`](VENDOR.md) for that provenance. This ledger is about the *other* upstream: the Go
@@ -63,6 +63,7 @@ where that behaviour lives", not "this is a transliteration of that file".
 | `tka` (tailnet lock) | [`ts_tka`](ts_tka/src/lib.rs) + the peer-trust chokepoint in [`ts_runtime`](ts_runtime/src/peer_tracker/mod.rs) |
 | `feature/identityfederation` (WIF/OAuth bootstrap) | [`ts_control::wif`](ts_control/src/wif.rs) |
 | `net/tlsdial`, `net/bakedroots` | [`ts_tls_util`](ts_tls_util/src/lib.rs) |
+| `control/controlknobs` | **no single counterpart** — each control-driven toggle is read where it applies, as a bare node-attribute string at its consumer ([`ts_nodecapability`](ts_nodecapability/src/lib.rs) supplies only the map type, not a list of names) — **new to this mapping at this revision**; it is upstream's one struct of everything control can switch on in a client, and the reason it had no row is that this fork has no equivalent single place to point at |
 
 ### Data plane
 
@@ -81,7 +82,7 @@ where that behaviour lives", not "this is a transliteration of that file".
 | `wgengine/netstack` (gVisor) | [`ts_netstack_smoltcp`](ts_netstack_smoltcp/src/lib.rs), [`…_core`](ts_netstack_smoltcp_core/src/lib.rs), [`…_socket`](ts_netstack_smoltcp_socket/src/lib.rs) |
 | `wgengine/netstack` forwarding (subnet router / exit node) + `net/tsdial` | [`ts_forwarder`](ts_forwarder/src/lib.rs) (plus the fork-only upstream-proxy egress, see [`AGENTS.md`](AGENTS.md)) |
 | peer/route selection (Go keeps this inside `magicsock`/`wgengine`) | [`ts_overlay_router`](ts_overlay_router/src/lib.rs), [`ts_underlay_router`](ts_underlay_router/src/lib.rs) |
-| `net/routemanager` (split out of `wgengine/wgcfg`, `a5102d3fc`) | [`ts_overlay_router`](ts_overlay_router/src/lib.rs) + the route/IP indexes in [`ts_runtime::peer_tracker`](ts_runtime/src/peer_tracker/peer_db.rs) — **new to this mapping at this revision**; it is where upstream now keeps the per-peer data-plane attributes (`PeerRoute.Jailed`, `MasqAddr4`/`MasqAddr6`) that `net/tstun` reads, and two §B rows come out of it |
+| `net/routemanager` (split out of `wgengine/wgcfg`, `a5102d3fc`) | [`ts_overlay_router`](ts_overlay_router/src/lib.rs) + the route/IP indexes in [`ts_runtime::peer_tracker`](ts_runtime/src/peer_tracker/peer_db.rs) — new to this mapping at the **previous** revision; it is where upstream now keeps the per-peer data-plane attributes (`PeerRoute.Jailed`, `MasqAddr4`/`MasqAddr6`) that `net/tstun` reads, and two §B rows come out of it |
 | `wgengine/router`, OS side of `net/dns` | [`ts_host_net`](ts_host_net/src/lib.rs) (Linux `ip`/`resolvectl`, macOS `route`/`scutil`) |
 | `net/dns/resolver` wire encoding | [`ts_dns_wire`](ts_dns_wire/src/lib.rs) + the MagicDNS server in [`ts_runtime::magic_dns`](ts_runtime/src/magic_dns.rs) |
 | `net/netmon` | [`ts_netmon`](ts_netmon/src/lib.rs) |
@@ -176,23 +177,22 @@ Assessments are one of **needs port**, **not applicable**, **already covered**.
 This is the sharpest available axis: `tailcfg.CurrentCapabilityVersion` is upstream's own record of
 every client behaviour change that control can observe. The window is anchored to capver 130, the
 last version this port tracked before the ledger existed; the declaration here is **125**, held
-below 126, see §B. Upstream is at **146** at the new pin — `tailcfg/tailcfg.go:198` — so the window
-is sixteen versions, unchanged from the previous revision. Descriptions are upstream's own
+below 126, see §B. Upstream is at **146** at the pin — `tailcfg/tailcfg.go:198` — so the window is
+sixteen versions, unchanged from the previous revision. Descriptions are upstream's own
 (`tailcfg/tailcfg.go`, `tailcfg/nodecap`).
 
-**No row is new at this revision.** `tailcfg/tailcfg.go:198` still reads
-`CurrentCapabilityVersion CapabilityVersion = 146` at the new pin, and the capability-history
-comment still returns exactly **17** lines, 130 through 146 — the same window the previous revision
-derived. Upstream added one version at the previous pin after four pins of stillness and has added
-none since, so the window is the same sixteen versions.
-**No row changed assessment either**, for the sixth revision running, but the reason is a
-*different* one this time and it is worth naming, because the previous five revisions all said "the
-tree moved somewhere else". Seventeen commits landed in this tree since `4e8578d`, and eight of them
-are ports — but every one of them closes a §B row, not a capability-version row. The one
-capability-version row that could have moved is **133**, and it did not: nothing in those seventeen
-commits touches which addresses MagicDNS is served or registered on. The tree evidence is re-stated
-under the table below. The rows the previous revisions flipped (135, 142, 144) still say why they
-flipped, because that history is what makes the row re-checkable.
+**No row is new at this revision, and the pin it is derived from did not move.** Upstream's default
+branch is still `023255e8a`, so the two §A commands were re-run against the same tree and returned
+the same answers: `tailcfg/tailcfg.go:198` reads `CurrentCapabilityVersion CapabilityVersion = 146`,
+and the capability-history comment returns exactly **17** lines, 130 through 146. Counting them is
+the whole of the check when the pin is unchanged — "upstream added nothing" and "the pattern broke"
+look identical from the outside and differ only in the count.
+**No row changed assessment either**, for the seventh revision running, and this time the reason is
+the plainest one available: nothing moved on either axis. One commit landed in this tree since
+`dcd2c13` and it is the previous revision of this document. Row **133** is still the one open
+capability-version row and is re-checked against the tree below. The rows the previous revisions
+flipped (135, 142, 144) still say why they flipped, because that history is what makes the row
+re-checkable.
 
 | Ver | Date | Upstream change | Assessment |
 | --- | --- | --- | --- |
@@ -211,73 +211,104 @@ flipped, because that history is what makes the row re-checkable.
 | 143 | 2026-07-22 | Client correctly ignores conn25 node attributes when not enabled by environment variable | **not applicable** — no app connector of either generation here, so conn25 attributes are already ignored |
 | 144 | 2026-07-31 | Client sends `packet.TSMPDiscoKeyAdvertisement` around WireGuard handshakes | **already covered** — *changed from "needs port"*: the send half landed in #314 and #318, so both halves are now here. `ts_packet::tsmp` marshals against Go's own `TestTSMPDiscoKeyAdvertisementMarshal` vectors, `ts_tunnel` reports the two moments `wireguard-go` calls `SendPriorityMessage`, and `ts_dataplane` chooses the content (Go `magicsock.Conn.PriorityMessageForPeer`). Unlike 142 this is peer-observable regardless of the declared version — the client sends it unprompted — so it is the one changed row a real Go peer can see |
 | 145 | 2026-08-04 | Client understands `NodeAttrScopeQuad100OnMacOS` | **not applicable** — the attr changes resolver ordering for the *sandboxed* macOS app; `ts_host_net::macos` installs a service-scoped `scutil` DNS dictionary and has no default-resolver behaviour to scope |
-| 146 | 2026-09-02 | Client understands `NodeAttrConnReject` (`debug-conn-reject`); can handle c2n `GET /debug/rejects` | **not applicable (declaration held below it)** — *new at the previous revision* (`85c1efb46`). The attribute turns on an in-memory, LRU-bounded aggregator of recent connection-rejection events (TSMP rejects received, TSMP rejects sent on ACL-blocked inbound flows, pendopen timeouts) keyed by direction/proto/peer/reason, and exposes it over a LocalAPI route and a c2n `GET /debug/rejects`. Both surfaces are out of scope here for reasons already recorded: the c2n route joins 127, 128 and 138 behind the held declaration and takes Go's own `400`/`unknown c2n path` fallthrough, and this fork's LocalAPI serves one route. The attribute is off by default at the control plane, so ignoring it is what a Go client without the feature does. The §B row this version opened at the previous revision — the TSMP rejected-connection messages the aggregator *counts* — is **closed** at this one: both halves landed here in #421. The aggregator on top of them stays out of scope for the reasons above, so this row does not move |
+| 146 | 2026-09-02 | Client understands `NodeAttrConnReject` (`debug-conn-reject`); can handle c2n `GET /debug/rejects` | **not applicable (declaration held below it)** — *new two revisions ago* (`85c1efb46`). The attribute turns on an in-memory, LRU-bounded aggregator of recent connection-rejection events (TSMP rejects received, TSMP rejects sent on ACL-blocked inbound flows, pendopen timeouts) keyed by direction/proto/peer/reason, and exposes it over a LocalAPI route and a c2n `GET /debug/rejects`. Both surfaces are out of scope here for reasons already recorded: the c2n route joins 127, 128 and 138 behind the held declaration and takes Go's own `400`/`unknown c2n path` fallthrough, and this fork's LocalAPI serves one route. The attribute is off by default at the control plane, so ignoring it is what a Go client without the feature does. The §B row this version opened when it was new — the TSMP rejected-connection messages the aggregator *counts* — closed at the previous revision: both halves landed here in #421. The aggregator on top of them stays out of scope for the reasons above, so this row does not move |
 
 Net: of the sixteen versions upstream added, **one still needs a port** — 133, host-OS-facing —
 **four are already covered** (135, 137, 142, 144), and the remaining eleven are not applicable to an
 embedded userspace node (138 and 146 among them, once the declaration was held below the versions
-that promise them). Identical to the previous revision's count, because neither axis moved: upstream
-added no version and this tree's ports all landed in §B. Row 133 was re-checked against the tree at
-this pin and is still open: `ts_host_net::HostDns::nameservers`
-([`ts_host_net/src/lib.rs`](ts_host_net/src/lib.rs)) is still a `Vec<Ipv4Addr>`, its doc comment
-still says "IPv4 nameservers only", and `ts_runtime::tun_actor` still fills it with the single IPv4
-service IP, so there is still no IPv6 MagicDNS address to register. Nothing in this revision's
-seventeen tree commits touched it — they are MagicDNS *subdomain* resolution (#415), exit-node latency
-history (#417), filter reply admission (#418, #419, #430), TSMP rejects (#421, #428) and the
-peerAPI DNS gate (#423, #425), none of which changes which addresses the MagicDNS responder is
-reachable on. In particular #415 is the near miss to name: it widened *which names* MagicDNS answers
-for, not *which addresses* it answers on. The row is still *not* closed by #347 (the quad-100
-absorption fix in §B) either: that made the TUN transport absorb every quad-100 packet whatever its
-port and protocol, which is about traffic already addressed to `100.100.100.100` — it neither serves
-nor registers the IPv6 service IP, which is what 133 asks for.
+that promise them). Identical to the previous revision's count, because neither axis moved
+at all. Row 133 was re-checked against the tree at this revision and is still open:
+`ts_host_net::HostDns::nameservers` ([`ts_host_net/src/lib.rs:44`](ts_host_net/src/lib.rs)) is still
+a `Vec<Ipv4Addr>`, its doc comment still says "IPv4 nameservers only", the Linux backend still fills
+it with the single literal `100.100.100.100`, and `ts_runtime::magic_dns` still binds
+`100.100.100.100:53` only — so there is still no IPv6 MagicDNS address either to serve or to
+register. The row is still *not* closed by #347 (the quad-100 absorption fix in §B): that made the
+TUN transport absorb every quad-100 packet whatever its port and protocol, which is about traffic
+already addressed to `100.100.100.100` — it neither serves nor registers the IPv6 service IP, which
+is what 133 asks for. **Read it with the new `magicdns-aaaa` row in §B**, which is the other half of
+the same subject seen from the tailnet side: 133 is about which *addresses of this node's resolver*
+the host OS is pointed at, and the new row is about which *addresses of peers* that resolver hands
+out. They are independent — either can be ported without the other — but a reader who finds one will
+want the other, and both are gated in this tree on the same local `Config::enable_ipv6` knob rather
+than on what control asked for.
 
 ### B. Behaviour upstream changed in the window that is not capver-gated
 
 Derived from `git log --since=2025-10-06` over the packages that map to crates here, with
 docs/typo/refactor commits filtered out. **The sweep list gained a package at this revision** —
-`net/routemanager`, upstream's incremental route manager (`a5102d3fc`, 2026-07-09), which now holds
-the per-peer data-plane attributes `net/tstun` reads. It had been sitting outside both the mapping
-and the loop since July; two of this revision's five new rows are its fields. That is the third time
-the sweep list has been short, and the third time the fix was to re-read
-[Package mapping](#package-mapping) rather than to trust the loop. Upstream added no other package
-in the interval.
+`control/controlknobs`, upstream's one struct of the client behaviours control can switch on and
+off, read by `wgengine/magicsock`, `net/dns`, `net/tstun` and `ipn`. It is the fourth time the list
+has been short, and the fourth time the fix was to re-read [Package mapping](#package-mapping)
+rather than to trust the loop. Unlike `net/routemanager` at the previous revision it **opened no
+rows**: all fifteen of its commits in the window are already assessed here, most of them as
+capability-version rows in §A, because the knob and the behaviour it gates always land together and
+the behaviour lives in a package that was already swept. It is in the loop now because the rule says
+it should be, not because it paid this time. Upstream added no package in the interval — there was
+no interval.
 
 #### What changed at this revision
 
 Read this first: it is the shortest honest summary of the diff between this ledger revision and the
 last one.
 
-- **All six rows the previous revision opened are closed, because this tree moved.** MagicDNS
-  subdomain resolution (#415), the exit-node suggestion's latency history (#417), the UDP/SCTP
-  reverse-flow cache (#418), the stateless TCP-non-SYN and ICMP-response carve-outs (#419), TSMP
-  rejected-connection messages in both directions (#421, with #428 for the log level a peer can
-  drive) and the peerAPI DNS source gate (#423, with #425 for the dropped-filter case) are all
-  **already covered** now. Each row below says what closed it and names the code, because a closed
-  row still has to be re-checkable — and can reopen.
-- **Upstream added no capability version.** 146 is still the ceiling, so §A is unchanged but for row
-  146's cross-reference, which now points at a closed row instead of an open one.
-- **Five rows opened, and not one of them because upstream moved in this interval.** Fourteen
-  upstream commits separate `3945b82f8` from `023255e8a`; nine land in mapped packages and every one
-  of the nine is assessed *not applicable* below. The five new rows all come out of reading code
-  that has been sitting in swept packages for months or years: `filtertype.Match.SrcCaps` (declared
-  at capver 109, 2024-11), `Node.IsJailed` (capver 81), per-peer masquerade (capver 87), the TSMP
-  ping responder, and the packet-level peerAPI carve-out. **This is the fifth revision running that
-  the sweep's own back-catalogue, not the new delta, was where the rows came from** — see the
-  closing note under [Re-deriving this ledger](#re-deriving-this-ledger).
-- **Three of the five are the same shape, and it is a shape worth naming: a wire field this tree
-  decodes and then ignores.** `Node.IsJailed`, `Node.SelfNodeV4MasqAddrForThisPeer` and its v6
-  sibling are all modelled in `ts_control_serde` and all stop there — nothing carries them into
-  `ts_control::Node`, and nothing in the data plane reads them. Each is behind a capability version
-  *below* the 125 this node declares, so control is entitled to configure all three and to expect
-  them honoured. A decoded-and-dropped field is the failure mode a `git grep` for the field name
-  cannot distinguish from a ported one; the technique that found all three was reading upstream's
-  consumer (`net/tstun/wrap.go`'s `peerConfigTable`) and asking what feeds it here.
-- **One of the five is not a missing feature but a `TODO` under an implemented one.**
-  `ts_packetfilter` implements `cap:`-prefixed ACL sources end to end — `SrcIp::NodeCap`, the rule
-  match, the `CapIter` plumbing — and both call sites hand it an empty capability set
-  (`// TODO(npry): wire in nodecaps`). The declared 125 promises capver 109's `SrcCaps` support. It
-  is the cheapest of the five to close and the easiest to have missed, because every layer but the
-  caller is already right.
+- **Neither side moved.** Upstream's default branch is still `023255e8a`, the commit the previous
+  revision pinned, so the fast-path `git log 023255e8a..<new pin>` is empty and there is no new
+  upstream commit to assess; the only commit in this tree since `dcd2c13` is the previous revision of
+  this document. Every command under [Re-deriving this ledger](#re-deriving-this-ledger) was re-run
+  anyway, because what makes a claim here checkable is the command's answer, not the expectation
+  behind it — and because the full sweep and the mirror-image tree log exist precisely so that a
+  still pin does not mean a still ledger.
+- **The five rows the previous revision opened are all still open**, re-verified against the tree at
+  this revision and unchanged: the `cap:`-sourced ACL rules, `Node.IsJailed`, per-peer masquerade,
+  the TSMP ping responder and the peerAPI packet-level carve-out. Nothing landed against them.
+- **Eight rows opened.** Six came from reading code, which is the sixth revision running in which
+  the sweep's back-catalogue rather than the new delta supplied the intake, and the first in which
+  the delta was *empty*, so there was nothing else it could have been: the wrapped tailnet-lock auth
+  key, the register response's two instructions, MagicDNS `AAAA` under the `magicdns-aaaa`
+  capability, `DERPHomeParams.RegionScore` in home-DERP selection, the `PingRequest` types other than
+  `c2n`, and `MapRequest.TKAHead`.
+- **The other two came from the window, and they are the more uncomfortable pair, because the sweep
+  should already have had them.** `de733c595` (2025-11-09) removed `tailcfg.NetInfo.HairPinning`; it
+  is in `tailcfg`, which has been in the loop from the first revision of this ledger, it is one of
+  that package's sixty commits in the window, and six revisions read past it while
+  `ts_control_serde::NetInfo` went on modelling the field. Go's `Node.InitDisplayNames` is the same
+  shape one step further back — `control/controlclient` has been swept throughout and the three
+  display-name fields it computes have no counterpart here. Neither is a *sweep-list* miss, which is
+  the failure this document has fixed four times; both are **sweep-reading** misses, which is the one
+  it keeps warning about and had no concrete instance of until now. The lesson is restated under
+  [Re-deriving this ledger](#re-deriving-this-ledger).
+- **Four of the six are one layer up from the previous revision's three, and the shape is worth
+  naming: a control-plane *instruction* this node decodes and drops.** The previous revision found
+  three netmap *fields* modelled in `ts_control_serde` that reach nothing. These four are the same
+  failure in the register and map request/response path: `RegisterResponse.NodeKeySignature`,
+  `RegisterResponse.NodeKeyExpired`, `PingRequest.URLIsNoise` and `MapRequest.TKAHead` are all
+  modelled with Go's own doc comments on them and are named nowhere else in the tree. The same
+  mechanical check finds them: take every `pub` field in `ts_control_serde` and grep the rest of the
+  workspace for its name. Seventy-one come back with no reader; most are outbound `Hostinfo`/`NetInfo`
+  reporting facets with nothing to report, and the residue is this list.
+- **Two of the six came from reading a function this ledger already claims parity for, top to
+  bottom** — and the `PingRequest` row is in both lists, which is the point of listing both.
+  `ts_runtime::control_runner::select_home_region` is a careful, commented, byte-faithful port of
+  Go's `addReportHistoryAndSetPreferredDERP` — down to reproducing Go's integer
+  `oldRegionCurLatency/3*2` rather than a float — and it omits the region-score scaling Go applies
+  to *both* sides of every comparison before any of that arithmetic runs. `ts_control::handle_ping`
+  is a careful port of the `c2n` arm of Go's `answerPing` and silently drops every other arm; the
+  *field* it drops is what the grep above finds, and the *arms* it drops are what only the read
+  finds. In both cases the missing piece is invisible in a diff and invisible in a `git grep`, and
+  visible immediately when the upstream function is read beside the Rust one.
+- **The sixth came from a third check, and it is the one to add to the recipe.** `tailcfg/nodecap`
+  is a single file of fifty-five node-attribute string constants — every switch control has over a
+  client. Grep this workspace for each of them, and the ones with no hit are the attributes control
+  may set and this node will ignore. Most are correctly absent (Android, GRO/GSO, Windows, app
+  connectors, the daemon's web client). `magicdns-aaaa` was not: capability version 116 promises it,
+  this node declares 125, and the tree gates the same behaviour on a local flag instead.
+- **Two veins were read and came up empty, and both are recorded below so they are not re-read.**
+  Go's `magicsock.updateNetInfo` fills twelve `NetInfo` facets and this tree carries four; the other
+  eight are *not applicable* for reasons this fork has already decided elsewhere (no portmapper, no
+  ICMP socket, no firewall management, and a deliberately IPv4-only single bound socket). And
+  upstream's traffic-steering exit-node suggestion, which reaches `ipn/ipnlocal` through the
+  unmapped `net/traffic`, is the non-default arm of a `switch` whose default arm is the algorithm
+  this tree already ports. Both are under *Not applicable, from code read at this revision*.
 - **No row changed because of a divergence decision being revisited.** The four deliberate
   divergences recorded at the previous revisions (DNS-after-router-failure, SSH `acceptEnv`, the
   `callMeMaybe` gate, and the peerAPI DoH server's authoritative-answer widening) were re-checked
@@ -285,11 +316,219 @@ last one.
 
 #### Rows
 
+- **A wrapped (tailnet-lock) auth key is sent to control verbatim, and no node-key signature is ever
+  sent** (`tka/sig.go`: `DecodeWrappedAuthkey`, `SignByCredential`; `control/controlclient/direct.go`:
+  the `authKey, isWrapped, wrappedSig, wrappedKey := tka.DecodeWrappedAuthkey(c.authKey, c.logf)`
+  line in `doLogin`, and `RegisterRequest.NodeKeySignature`) — **needs port**, and it is the row with
+  the sharpest failure of the eight: on a tailnet whose lock is on, there is no way for this node to
+  arrive signed.
+  Upstream's pre-auth keys come in two forms. A plain key is `tskey-auth-…`. A key issued for a
+  tailnet whose lock is on is *wrapped*: the same key, then the literal separator `--TL`, then a
+  base64 (raw-std, unpadded) `SigCredential` node-key signature, a `-`, and a base64 ed25519 private
+  key whose signing authority that credential delegates. `DecodeWrappedAuthkey` cuts the string at
+  `--TL` and returns the two halves; every decode failure inside it returns the *whole* string with
+  `isWrapped` false, so a malformed suffix degrades to "this is a plain key" rather than to an error.
+  `doLogin` then does two things with the result that this tree does neither of: it registers with
+  the **stripped** key — the part before `--TL`, which is what control is expecting to see — and,
+  when the key was wrapped, it calls `tka.SignByCredential(wrappedKey, wrappedSig, tryingNewKey.Public())`
+  to build a `SigRotation` whose `Nested` is the credential and whose signature is made by the
+  delegated private key, and attaches it as `RegisterRequest.NodeKeySignature`. That signature is
+  what makes the new node key trusted under the lock from its first contact, with no human running
+  `tailscale lock sign`.
+  Here, the auth key reaches the wire untouched: `ts_control::tokio::register` takes
+  `auth_key: Option<&str>` and sets `auth: auth_key.map(RegisterAuth::from)`, and `RegisterAuth`
+  ([`ts_control_serde/src/register.rs`](ts_control_serde/src/register.rs)) is a one-field borrow of
+  that same `&str`. The literal `--TL` appears nowhere in the tree. `RegisterRequest.node_key_signature`
+  is modelled — with Go's own comment on it — and is never set by any caller. So two things go wrong
+  at once for an embedder handed a wrapped key: the auth key sent to control is not the auth key
+  control issued, and even if control tolerated the suffix the node would register unsigned, which on
+  a locked tailnet is a node its peers will refuse. The peer-side half of the lock is fully
+  implemented here — `ts_tka`'s `verify_signature` accepts `Credential`-rooted chains and skips the
+  `pubkey == node_key` bind for a `Credential` leaf, because `SigCredential` leaves `Pubkey` unused
+  and binding it rejects legitimate credential-provisioned peers — so what is missing is specifically
+  the *self*-signing half, and `ts_tka` already has the pieces:
+  `NodeKeySignature::sign_rotation` builds a rotation wrap, and `ts_runtime`'s `tka_sign` already
+  signs and submits a `Direct` signature over a live Noise channel. What is absent is the decode of
+  the `--TL` suffix and a rotation wrap whose nested signature is a *supplied* credential rather than
+  an inner `Direct` this tree constructs.
+  Bring Go's refusals with it, because they are the whole safety of the feature: a key with no `--TL`
+  is a plain key; a suffix with no `-` delimiter, a suffix half that is not valid unpadded raw-std
+  base64, or a signature blob that does not deserialize all degrade to "plain key" and register
+  unwrapped rather than failing; and `SignByCredential` refuses outright when the wrapped signature is
+  not of kind `SigCredential` (`wrapped signature must be a credential, got %v`), which is the usage
+  refusal to port rather than to infer.
+
+- **The register response's two instructions — re-sign this node key, and regenerate the expired one
+  — are both ignored** (`control/controlclient/direct.go`: `doLoginOrRegen`, the
+  `if len(resp.NodeKeySignature) > 0` and `if resp.NodeKeyExpired` arms of `doLogin`, and the
+  `tka.ResignNKS(persist.NetworkLockKey, tryingNewKey.Public(), opt.OldNodeKeySignature)` call;
+  `tka/sig.go`: `ResignNKS`, `maybeTrimRotationSignatureChain`) — **needs port**, and it is the row
+  most likely to present as a node that simply stops working one day rather than as a node that never
+  worked.
+  Upstream's registration is a two-shot loop, and the shape is `doLoginOrRegen`: call `doLogin`; if it
+  comes back with `mustRegen`, set `opt.Regen` and `opt.OldNodeKeySignature` from what the first call
+  returned and call it exactly once more. Two things in the response set `mustRegen`. **`NodeKeySignature`
+  non-empty** means "here is the signature your *old* node key had; re-sign it for the new one" —
+  `doLogin` returns it, and on the second pass `tka.ResignNKS` unserializes it, returns it verbatim if
+  it already covers the key being registered, otherwise wraps it in a fresh `SigRotation` signed by
+  this node's network-lock private key, and the result goes out as `RegisterRequest.NodeKeySignature`.
+  `maybeTrimRotationSignatureChain` is the bound that makes the wrap safe to repeat: a rotation chain
+  may name at most 15 previous node keys, because CBOR nesting is capped at 16, and past that the
+  chain is rebuilt from the original `Direct` leaf forward. **`NodeKeyExpired`** means the key just
+  offered is expired; Go logs it without PII and returns `mustRegen` so the second pass generates a
+  fresh node key (moving the current one to `OldPrivateNodeKey`), and it treats `regen=true` *with*
+  `NodeKeyExpired` as a contradiction and errors — `weird: regen=true but server says NodeKeyExpired`.
+  Here, `classify_register_response` ([`ts_control/src/tokio/register.rs`](ts_control/src/tokio/register.rs))
+  reads exactly three things: `machine_authorized`, `auth_url` and `error`. `node_key_signature` and
+  `node_key_expired` are both modelled on `RegisterResponse` and are read by nothing in the tree, so
+  each of control's two instructions lands as an unauthorized registration with no auth URL —
+  `MachineNotAuthorized(None)` — and the caller retries the same key with the same missing signature.
+  The node-key rotation machinery it would need is already here: `ts_keys::NodeState` carries
+  `old_node_key` and the register path already logs `re-registering with OldNodeKey set`, and
+  `network_lock_keys` is persisted and its public half already goes out as `RegisterRequest.nl_key` —
+  which is precisely the declaration on the strength of which control sends the signature back.
+  The port is the loop, not the crypto: classify the two fields into the existing typed error set,
+  re-sign or regenerate, and retry **once**. Go's single retry is the behaviour to copy, not an
+  unbounded loop. The refusals to carry: the signature is used verbatim when it already covers the
+  key being registered rather than being needlessly re-wrapped; a chain at the 15-key limit is
+  trimmed rather than extended; a re-sign failure is logged and registration proceeds *without* a
+  signature (Go's `ResignNKS` error path does not abort the register); and `regen` together with
+  `NodeKeyExpired` is an error, not a third attempt.
+
+- **MagicDNS `AAAA` answers are gated on a local flag, not on the `magicdns-aaaa` node capability**
+  (`ipn/ipnlocal/node_backend.go`: `magicDNSAddrs`, `magicDNSHostAddrs`, and the
+  `nm.AllCaps.Contains(nodecap.MagicDNSPeerAAAA)` test in `dnsConfigForNetmap`;
+  `tailcfg/nodecap/nodecap.go`: `MagicDNSPeerAAAA`; capability version 116) — **needs port**, and it
+  is the one row of the eight that diverges in *both* directions: this node can answer `AAAA` where Go
+  would not, and refuse it where Go would answer.
+  Upstream decides a peer's MagicDNS addresses in one function, `magicDNSAddrs`, from the peer's
+  addresses plus two flags. The default rule is deliberately conservative and is commented as such:
+  if the peer has an IPv4 address at all, its IPv6 addresses are dropped from the answer, "as we
+  don't guarantee that the peer node actually can speak IPv6 correctly". Two things lift it.
+  `selfV6Only` — *this* node has v6 addresses and no v4 — returns only the peer's v6, because there
+  is nothing else this node could reach. And `wantAAAA`, set when the **self node** holds the
+  `magicdns-aaaa` capability, keeps the peer's v6 alongside its v4. Capability version 116
+  (2025-05-05, "Client serves MagicDNS `AAAA` if `NodeAttrMagicDNSPeerAAAA` set on self node") is the
+  declaration that the client will do this, and it sits well below the 125 this node declares, so
+  control may set the attribute and expect `AAAA` to start being served.
+  Here the whole decision is one embedder-set boolean. `ts_runtime::magic_dns` answers an `AAAA`
+  question for a tailnet name from `DnsView::enable_ipv6`, which is `ts_control::Config::enable_ipv6`
+  carried through `ts_runtime::env`: with it off (the default) a known peer's `AAAA` returns `NoError`
+  with an empty answer, and with it on the peer's overlay v6 address is returned. Control's
+  capability map is not consulted; the string `magicdns-aaaa` appears nowhere in the tree. The two
+  divergences fall straight out. With `enable_ipv6` on and the attribute *unset*, this node hands out
+  a peer's `AAAA` beside its `A` — which is what Go does only when control asked for it, and Go's
+  comment says why it otherwise does not. With `enable_ipv6` off and the attribute *set*, control has
+  asked for `AAAA` and gets `NODATA`.
+  The port is to make the answer the conjunction Go makes it: keep the local gate, because it is this
+  fork's own anti-leak decision and is load-bearing (with IPv6 off the node opens no IPv6 socket, so
+  an `AAAA` it hands out is an address it cannot then reach), and add the capability as the second
+  condition, with Go's default suppression — drop a peer's v6 when that peer also has a v4 — applying
+  when the capability is absent. The self-v6-only case can be assessed and recorded rather than
+  implemented: a node with only v6 addresses is not a configuration this fork produces today. Assert
+  the negatives: a peer with only a v6 address is answered under the *current* rules already and must
+  not regress; an `AAAA` for a tailnet name that resolves to nothing is still `NXDOMAIN` and is never
+  forwarded upstream (the existing anti-leak test); and the capability is read from the **self** node,
+  not from the peer being resolved.
+
+- **The DERP home region is chosen without control's per-region scores**
+  (`net/netcheck/netcheck.go`: `addReportHistoryAndSetPreferredDERP`; `tailcfg/derpmap.go`:
+  `DERPHomeParams.RegionScore`) — **needs port**, and it is narrow, cheap, and the clearest example in
+  this ledger of a gap that only a top-to-bottom read of an already-ported function can find.
+  Upstream's home-DERP choice is latency plus history plus stickiness, and this tree ports all three
+  faithfully — `ts_runtime::control_runner::select_home_region` reproduces Go's asymmetric comparison
+  (the candidate by smoothed latency, the incumbent by this cycle's raw latency), its 10 ms absolute
+  threshold, and even its integer `oldRegionCurLatency/3*2` in preference to the float form, with the
+  divergence at the exact two-thirds boundary written out in the comment. What it does not do is the
+  step Go takes *first*. Before any comparison, Go fetches `dm.HomeParams().RegionScore()` and scales
+  every region's latency by its score — both the smoothed `bestRecent` map and, separately, each
+  region's latency in the current report, because the reports themselves are deliberately not mutated
+  in case the scores change. A score in `(0, 1)` makes a region proportionally more preferred, a score
+  above 1 penalises it, an absent region is 1.0, and a zero or negative score is ignored — Go's
+  `if score := scores.Get(regionID); score > 0`. A nil map means "no change from the previous value";
+  an empty non-nil map resets every score to 1.0.
+  Here, `DerpMap::home_params` and `HomeParams::region_score`
+  ([`ts_control_serde/src/derp_map.rs`](ts_control_serde/src/derp_map.rs)) are modelled and are read
+  by nothing: `ts_netcheck::RegionResult` carries an id, a latency, a latency-map key and the
+  connected remote, and `select_home_region` sees only that. So control's only lever for steering a
+  client off a region it is deliberately draining does nothing to this node, which keeps choosing on
+  raw latency and reporting the result in `NetInfo.PreferredDERP` — the field control reads back to
+  find out where to route the node's traffic.
+  The port is to scale inside the existing pure function so it stays unit-testable: pass the score map
+  in, apply it to both the smoothed and the raw sides exactly where Go applies it, and leave the
+  hysteresis arithmetic untouched. The cases to pin are Go's guards, not the happy path: a score of 0
+  or below is ignored rather than treated as "infinitely preferred", a region absent from the map is
+  unscaled, an empty map is a reset and a nil map is not, and a score high enough to move the choice
+  must still pass the same stickiness thresholds — scoring changes the inputs to the comparison, never
+  the comparison.
+
+- **Only `c2n` ping requests are answered, and a repeated one is answered again**
+  (`control/controlclient/direct.go`: `answerPing`, `answerHeadPing`, `doPingerPing`,
+  `isUniquePingRequest`, and the `if pr := resp.PingRequest; pr != nil && c.isUniquePingRequest(pr)`
+  guard in the map-response loop; `tailcfg`: `PingRequest.URLIsNoise`, capability version 38) —
+  **needs port**, and the cheap half of it is the half worth doing first.
+  Upstream's `PingRequest` is control asking the node to do something and report back by hitting
+  `pr.URL`, and `answerPing` has four arms. `Types == ""` is a plain **HEAD ping**: `answerHeadPing`
+  issues an HTTP `HEAD` to `pr.URL` under a 15-second timeout and logs the round-trip; it is how
+  control measures that a node is awake and can reach a URL. `Types == "c2n"` is the control-to-node
+  HTTP request this tree implements. Anything else is a comma-separated list of `PingType`s —
+  `disco`, `TSMP`, `ICMP`, `peerapi` — each dispatched to `doPingerPing`, with an explicit
+  `unsupported ping request type: %q` for a name outside that set. Two rules sit around the switch.
+  `useNoise := pr.URLIsNoise || pr.Types == "c2n"` chooses the transport, and a `c2n` request that
+  did *not* come out as Noise is **refused** rather than answered — `refusing to answer c2n ping
+  without noise` — unless a debug envknob says otherwise. And the request is only dispatched at all
+  when `isUniquePingRequest` says its `URL` differs from the last one seen: a `PingRequest` with an
+  empty URL is bogus and dropped, and a repeat of the previous URL is dropped too, so a re-sent or
+  replayed map response does not produce a second answer.
+  `ts_control::handle_ping` ([`ts_control/src/tokio/ping.rs`](ts_control/src/tokio/ping.rs)) walks
+  `ping_request.types` and `continue`s past everything that is not `PingType::C2N` with
+  `ignoring unsupported ping type`. An empty `types` — Go's HEAD ping — is not an unsupported type but
+  an empty loop, so it is dropped with no log at all, which is the least debuggable of the two
+  outcomes. There is no dedup: every map response carrying a `PingRequest` is answered, however many
+  times control sends the same one. `url_is_noise` is modelled on the request and read by nothing,
+  which is harmless *today* only because the one arm implemented is the one Go forces onto Noise
+  regardless. And the response is posted to `control_url.join(ping_request.url.path())` — the path
+  only, rebased onto the control URL — where Go posts to `pr.URL` as given; that is a deliberate-looking
+  narrowing this fork should keep, but it currently keeps it by accident and drops the query string
+  with it, so it belongs in a comment either way.
+  The port splits cleanly. The HEAD arm and the dedup are small, self-contained and need no new
+  subsystem. The `doPingerPing` arms need a pinger this `Device` does not expose — and the `TSMP` one
+  is the send half of the *A TSMP ping gets no pong* row below, which is the reason to read the two
+  rows together and to decide them in that order. Carry the refusals: an empty `pr.URL` is bogus and
+  answered with nothing, a repeated URL is dropped, an unknown type name is logged and skipped rather
+  than failing the whole request, and a `c2n` request is answered only over Noise.
+
+- **The map request never carries `TKAHead`, so control is told this node has no lock state**
+  (`control/controlclient/direct.go`: `SetTKAHead` and the `TKAHead: tkaHead` field of the built
+  `MapRequest`; `control/controlclient/auto.go`: `Auto.SetTKAHead`) — **needs port**, narrow, and
+  recorded with its own bound: nothing in this tree's own tailnet-lock sync depends on it.
+  Upstream keeps the head hash of the local tailnet-lock authority on the `Direct` client and stamps
+  it into **every** map request. `SetTKAHead` reports whether the value actually changed, and `Auto`
+  uses that to force a fresh map request when it does, so control learns of a local head advance
+  promptly rather than on the next unrelated update. It is the mirror of `MapResponse`'s `TKAInfo`:
+  control says where it thinks the chain is, the client says where it actually is.
+  Here, `MapRequest::tka_head` ([`ts_control_serde/src/netmap.rs`](ts_control_serde/src/netmap.rs))
+  is modelled as `&'a str` with Go's own description, and `MapRequestBuilder`
+  ([`ts_control/src/map_request_builder.rs`](ts_control/src/map_request_builder.rs)) has no setter for
+  it, so it takes its `Default` and every map request this node has ever sent carries an empty head.
+  The bound worth stating, so the row is not read as worse than it is: this tree's sync is driven
+  entirely from the *response* side — `ts_runtime::control_runner::maybe_sync_tka` compares control's
+  `TKAInfo.Head` with the local `Authority`'s head and syncs when they differ, which is Go's
+  `tkaSyncIfNeeded` — so an empty request-side head costs correctness nothing here. What it costs is
+  honesty on the wire: a control plane that reads `TKAHead` to decide what to send, or to notice a
+  node whose chain has forked or fallen behind, sees a node that is permanently at genesis, which is
+  exactly the "no peer or control plane can distinguish this from a Go client" line this repository
+  is measured against. The port is a setter on the builder fed from the synced authority's head in
+  its base32 form (`Authority::head` → `AumHash::to_base32`, both already used by the sync path),
+  plus Go's changed-or-not return so a head advance triggers a map request instead of waiting for one.
+  The negative cases: no synced authority means the empty string, not a zero-hash; and an unchanged
+  head must not force a request, or a node with a lock sends map requests in a loop.
+
 - **ACL rules whose source is a capability (`cap:…`) never match**
   (`wgengine/filter/filtertype/filtertype.go`: `Match.SrcCaps`; `wgengine/filter/filter.go`:
   `f.srcIPHasCap`; `ipn/ipnlocal/local.go`: `srcIPHasCapForFilter`; capability versions 100 and 109)
-  — **needs port**, and it is the cheapest of the five new rows to close because every layer but the
-  caller is already right.
+  — **needs port**, and it is the cheapest of the previous revision's five rows to close, because
+  every layer but the caller is already right.
   Upstream lets a policy name its source by *capability* instead of by prefix. `tailcfg.FilterRule`
   carries such a source as the string `cap:<name>`; `MatchesFromFilterRules` splits it out into
   `Match.SrcCaps`; and `runIn4`/`runIn6` pass `f.srcIPHasCap` into every `matches4.match` and
@@ -325,7 +564,8 @@ last one.
 - **A jailed peer gets the ordinary ACL instead of the shields-up filter**
   (`net/routemanager/routemanager.go`: `PeerRoute.Jailed`; `net/tstun/wrap.go`:
   `inboundPacketIsJailed`/`outboundPacketIsJailed`; `ipn/ipnlocal/local.go`: `SetJailedFilter`;
-  capability version 81) — **needs port**, and it is the one new row where the missing behaviour
+  capability version 81) — **needs port**, and it is the one of the previous revision's rows where
+  the missing behaviour
   removes a restriction rather than adding one.
   Control marks a peer `IsJailed` when that peer "should not be allowed to initiate connections" to
   us — upstream's canonical case is a Mullvad-style exit node, a peer this node dials out through
@@ -402,7 +642,7 @@ last one.
 - **A TSMP ping gets no pong**
   (`net/tstun/wrap.go`: `filterPacketInboundFromWireGuard`'s `p.AsTSMPPing()` arm and
   `injectOutboundPong`; `net/packet/tsmp.go`: `TSMPPingRequest`, `TSMPPongReply`;
-  `wgengine/userspace.go`: `OnTSMPPongReceived`) — **needs port**, and it is the new row a real Go
+  `wgengine/userspace.go`: `OnTSMPPongReceived`) — **needs port**, and it is the carried row a real Go
   peer can see without any help from control.
   Upstream answers a TSMP ping in the wrapper, before any filtering: `AsTSMPPing` matches, the node
   notes activity, `injectOutboundPong` builds a `TSMPPongReply` carrying the request's 8-byte
@@ -911,12 +1151,116 @@ last one.
   a reminder of the cheaper half of the same job: a field-by-field re-read of `tailcfg` against
   `ts_control_serde` finds omissions that no amount of tag-semantics reasoning will.
 
+- **`NetInfo.HairPinning` was deleted upstream and is still modelled here** (`tailcfg`:
+  `de733c595`, 2025-11-09, "tailcfg: kill off rest of HairPinning symbols") — **needs port**, where
+  the port is a deletion, and it is the only row at this revision that comes from a commit inside the
+  window — a commit a plain reading of the sweep should have produced at one of the previous six
+  revisions.
+  Upstream stopped populating `NetInfo.HairPinning` in May 2024 (`9eb72bb51`, #12205) and removed the
+  last symbols at `de733c595`: the struct field, its `Clone`, its view accessor and its tests. At the
+  pin the string `HairPinning` does not appear anywhere in `tailscale/tailscale`. It is gone from the
+  wire type, so a Go client neither sends the key nor expects it.
+  `ts_control_serde::NetInfo::hair_pinning` ([`ts_control_serde/src/net_info.rs`](ts_control_serde/src/net_info.rs))
+  is still declared, with the old Go doc comment on it, as `Option<bool>` under
+  `skip_serializing_if = "Option::is_none"`. **There is no divergence on the wire today** and the row
+  says so plainly: nothing in this tree sets the field, so it is always `None`, so it is always
+  absent — which is a field-by-field match with a Go client that no longer has it. What the row is
+  about is the trap and the audit. The trap is that the only thing standing between this tree and an
+  identifiable not-a-Go-client tell is that nobody has written to a `pub` field; a `NetInfo` carrying
+  `"HairPinning"` is a key no Go client has sent since 2024. The audit is the more useful half: this
+  was found by taking every `pub` field in `ts_control_serde` and checking its wire name against every
+  identifier in upstream's Go, which is the mechanical form of the "field-by-field re-read of
+  `tailcfg` against `ts_control_serde`" the `encoding/json/v2` row below has been asking for. Run in
+  both directions at this revision, that check returns exactly this one phantom field outbound, and
+  inbound returns `Node.ComputedName`/`ComputedNameWithHost` (the row below), `Hostinfo.RemoteConfig`
+  (the unported half of `feature/remoteconfig`, already recorded) and `DNSConfig.TempCorpIssue13969`
+  (upstream's own named-for-deletion field). That is a cheap check with a short answer, and it is now
+  part of the recipe.
+
+- **Peer display names are the FQDN, where Go computes three names and shows the short one**
+  (`tailcfg`: `Node.InitDisplayNames`, `Node.DisplayName`, `Node.ComputedName`,
+  `Node.ComputedNameWithHost`; `control/controlclient/map.go` and `direct.go`, which call
+  `InitDisplayNames(magicDNSSuffix)` on the self node and on every changed peer) — **needs port**,
+  narrow, and **status-surface only**: no peer and no control plane observes it, so a reader
+  triaging this list should rank it accordingly.
+  Upstream computes the display names on the *client*, not in control — the comment on the fields says
+  so ("populated from controlclient (not from control)") — and the rule in `InitDisplayNames` is
+  four steps. Trim the tailnet's MagicDNS suffix off `Node.Name`, giving the base name for an ordinary
+  node and the whole FQDN for a shared-in node whose name is under a different tailnet. Take
+  `dnsname.SanitizeHostname(Hostinfo.Hostname)` as the host name, and discard it when it matches the
+  base name case-insensitively. If the base name came out empty, promote the host name into it, or
+  fall back to the node key's string form when there is no host name either. Finally build
+  `ComputedNameWithHost` as `"name (host)"` when a differing host name survived, and as the bare name
+  otherwise. `DisplayName(forOwner)` then picks between the two — the owner of a node sees the form
+  that disambiguates it, everyone else sees the short one.
+  Here, `ts_runtime::status::StatusNode::from_node` ([`ts_runtime/src/status.rs`](ts_runtime/src/status.rs))
+  sets one field by one rule: `node.fqdn_opt(false).unwrap_or_else(|| node.hostname.clone())` — the
+  FQDN if a tailnet component is known, else the bare hostname — and its test asserts exactly that.
+  So where `tailscale status` shows `laptop`, this fork's `StatusNode::display_name` shows
+  `laptop.tailnet-name.ts.net`, and where Go disambiguates two nodes as `laptop` and
+  `laptop (laptop-2)` this fork shows two FQDNs. `Node.ComputedName` and `Node.ComputedNameWithHost`
+  are the two `tailcfg` fields with no counterpart in `ts_control_serde`, which is the other half of
+  the same fact — and note they are `json`-tagged, so control *may* send them, but Go overwrites
+  whatever arrives by calling `InitDisplayNames` itself.
+  The port is `InitDisplayNames` as a function over the domain `Node`, called where the netmap is
+  ingested rather than at each status read, plus the owner/not-owner choice on the way out. Carry the
+  refusals, because they are the whole of the function: a host name equal to the base name
+  case-insensitively is dropped rather than shown in parentheses, an empty base name promotes the host
+  name instead of rendering as empty, and a node with neither falls back to the node key rather than
+  to an empty string.
+
+#### Not applicable, from code read at this revision
+
+The pin did not move, so almost everything at this revision came from reading. These two are what
+the reading turned up that did **not** open a row; they are written down for the same reason a closed
+row is, so the next revision can re-check the judgement instead of re-deriving it.
+
+- **`NetInfo` is reported with four of the twelve facets Go fills**
+  (`wgengine/magicsock/magicsock.go`: `updateNetInfo`) — **not applicable**, on grounds this fork has
+  already settled elsewhere. (The thirteenth field this tree models is `HairPinning`, and that one is
+  a row of its own above.) Go builds a whole `tailcfg.NetInfo`
+  out of each netcheck report: `MappingVariesByDestIP`, `UPnP`, `PMP`, `PCP`, `HavePortMap`, the
+  `DERPLatency` map keyed `"<rid>-v4"`/`"-v6"`, `WorkingIPv6`, `OSHasIPv6`, `WorkingUDP`,
+  `WorkingICMPv4`, `PreferredDERP` and `FirewallMode`, and hands it to a callback that ships it on the
+  next map request — de-duplicated by `BasicallyEqual`, so an unchanged report is not re-uploaded.
+  `ts_control::tokio::client`'s `CarriedNetInfo` carries four of those — `preferred_derp`,
+  `derp_latency`, `working_udp`, `mapping_varies_by_dest_ip` — and applies the whole of it to every
+  map request, which is Go's `hi.NetInfo = c.netinfo.Clone()` invariant and is already tested here.
+  The eight it does not carry each have an answer already recorded in the *no counterpart here* list
+  or in this fork's design: `UPnP`, `PMP`, `PCP` and `HavePortMap` need `net/portmapper`, which is
+  roadmap; `FirewallMode` describes an iptables-vs-nftables choice `ts_host_net` never makes because
+  it installs no firewall rules (the same reason capability version 136 is not applicable);
+  `WorkingIPv6` and `OSHasIPv6` come from a netcheck that probes v6, and this fork's `ts_netcheck` is
+  HTTPS-over-IPv4 only by deliberate anti-leak design — the note at the top of
+  [`ts_netcheck/src/lib.rs`](ts_netcheck/src/lib.rs) records that a STUN prober binding a second
+  socket was removed rather than left dormant; and `WorkingICMPv4` needs an ICMP socket this node does
+  not open. `LinkType` is the one to *not* go looking for: upstream declares it and fills it nowhere,
+  so leaving it absent is parity, not a gap. The thirteenth field this tree models, `HairPinning`, is
+  a different case entirely and **is** a row — upstream deleted it, and the row is above.
+
+- **Traffic-steering exit-node suggestion** (`ipn/ipnlocal/local.go`: `suggestExitNode`,
+  `suggestExitNodeUsingTrafficSteering`; `net/traffic`; `tailcfg/nodecap`: `TrafficSteering`) —
+  **not applicable**, and it is the tidier twin of the `net/routecheck` row below it. Upstream's
+  `suggestExitNode` is a `switch` with two arms: when the self node holds the `traffic-steering`
+  capability it ranks candidates by the priority scores in `net/traffic` (an FNV-based rendezvous
+  hash over peers, memoised per netmap), and its `default` arm is `suggestExitNodeUsingDERP`, the
+  latency-and-region algorithm this tree ports and which the previous revision's #417 finished by
+  adding the per-region latency history. The capability is not implemented here and `net/traffic` has
+  no counterpart, so this node takes Go's own default arm — which is the correct behaviour for a
+  client that does not advertise the capability, exactly as with `client-side-reachability` and
+  `net/routecheck`. Recorded because `net/traffic` is a package upstream added inside the window and
+  a reader doing the new-package check will land on it: it is read by `ipn/ipnlocal`, which *is*
+  mapped, so the check's question ("does anything already swept now read from it?") answers yes and
+  the follow-up question ("and does that reading change a behaviour this tree implements?") answers
+  no, because it is gated behind a capability this node never claims.
+
 #### Not applicable, or already covered, from the commits new at this pin
 
-Recorded so the next re-derivation does not re-read them. Fourteen upstream commits landed between
-`3945b82f8` and `023255e8a`, nine of them in mapped packages. **None opened a row** — the first time
-that has been true of a whole interval, and the reason the five new rows above all come from the
-back-catalogue instead.
+Recorded so the next re-derivation does not re-read them. **No commit is new at this revision**: the
+pin did not move, so this list is the previous revision's, carried unchanged and re-checked. It
+covers the fourteen upstream commits that landed between `3945b82f8` and `023255e8a`, nine of them in
+mapped packages, **none of which opened a row** — the first time that was true of a whole interval,
+and now the second, for the stronger reason that there was no interval.
 
 - **`net/socks5`: nil `Server.Logf`, and a data race on the UDP client address** (`de01da564`,
   `0301c7493`, with `f48358288` for the test) — **not applicable**, both, and for the same
@@ -1072,8 +1416,10 @@ Re-checked against this pin and against this tree; none moved.
 
 #### Carried unchanged from the previous revisions
 
-The rows below were re-checked against this pin and against this tree and did not move. They are
-kept in full because a row whose evidence is elided is a row the next re-derivation has to redo.
+The rows below were re-checked against this pin and against this tree and did not move — and at this
+revision that is every row this document already carried, because nothing landed against any of them.
+They are kept in full because a row whose evidence is elided is a row the next re-derivation has to
+redo.
 
 - **DNS is still configured when router programming fails** (`wgengine`: `cfd101f9d`) — **not
   applicable: deliberate divergence, and it should stay one.** Upstream's `Reconfig` returned on
@@ -1219,7 +1565,7 @@ git -C <tailscale-go> grep -nE '^//[[:space:]]*-[[:space:]]*1[3-9][0-9]:' 023255
 for p in tailcfg disco derp net/packet net/tstun net/netcheck net/stun net/dns \
          net/udprelay net/socks5 net/tsdial net/tlsdial net/bakedroots net/netmon net/art \
          net/routemanager \
-         control/controlclient control/controlbase control/controlhttp \
+         control/controlclient control/controlbase control/controlhttp control/controlknobs \
          wgengine ipn tsd tka types/key types/persist tsnet \
          feature/remoteconfig feature/identityfederation feature/taildrop feature/ssh \
          feature/acme ssh/tailssh util/clientmetric tstime tstest tool/; do
@@ -1228,27 +1574,61 @@ done
 
 # Only what moved since the pin this ledger currently carries — the fast path on a re-derivation
 # that follows soon after the last one. Read it *in addition to* the full sweep, never instead of
-# it: a row's assessment can change because this tree moved, with upstream perfectly still, and the
-# sweep list itself can be wrong (it has been, three times).
+# it: a row's assessment can change because this tree moved, with upstream perfectly still, the
+# sweep list itself can be wrong (it has been, four times), and this range can be EMPTY (it was, at
+# this revision) without the ledger being finished.
+git ls-remote https://github.com/tailscale/tailscale HEAD   # <new-pin>; may already equal the pin
 git -C <tailscale-go> log --oneline 023255e8a..<new-pin>
 
-# And the mirror image of that, which has now been the larger half of the diff four times running:
-# what moved *here* since the tree revision the header table names. Every row the previous revision
-# opened closed at this one for this reason alone, with upstream contributing nothing at all.
-git log --oneline dcd2c13..HEAD
+# And the mirror image of that: what moved *here* since the tree revision the header table names.
+# Four revisions running this was the larger half of the diff; at this one it is a single commit,
+# the previous revision of this document.
+git log --oneline 340ffdf..HEAD
+
+# Wire types, both directions. Cheap, mechanical, and it found two rows at this revision after six
+# revisions of not being run.
+#
+# Outbound: resolve every `pub` field in ts_control_serde to the wire name it actually serializes
+# under -- its #[serde(rename = "...")] if it has one, else the PascalCase of the field name -- and
+# look that name up in upstream's Go. A name upstream no longer has is a field this tree models
+# alone (NetInfo.HairPinning was found this way).
+grep -rhoE '#\[serde\((.*)rename = "[^"]+"' ts_control_serde/src | grep -oE '"[^"]+"$' | tr -d '"' \
+  | sort -u | while read -r n; do
+      git -C <tailscale-go> grep -qw "$n" 023255e8a -- '*.go' || echo "phantom: $n"
+    done
+# (and the same for the un-renamed fields, whose wire name is the PascalCase of the field name)
+
+# Inbound: the reverse -- every json-tagged field of tailcfg's structs checked against those same
+# wire names. A name this tree lacks is a field control may send that nothing here reads.
+git -C <tailscale-go> show 023255e8a:tailcfg/tailcfg.go   # plus derpmap.go, tka.go, c2ntypes.go
+
+# And the coarser version of the same question, which is where five of this revision's rows started:
+# a `pub` field in ts_control_serde whose name appears nowhere else in this workspace is a field this
+# node decodes and drops.
+
+# Node attributes, the same question for control's switches rather than for its fields. Every
+# constant in tailcfg/nodecap is a string control can set on this node; one that appears nowhere in
+# this workspace is a switch this node ignores. Most misses are correct -- check each against the
+# capability-version table and the *no counterpart here* list before opening a row. (This found
+# magicdns-aaaa at this pin.)
+git -C <tailscale-go> show 023255e8a:tailcfg/nodecap/nodecap.go | grep -oE '"[a-z0-9-]+"' \
+  | tr -d '"' | sort -u | while read -r cap; do
+      grep -rqI --include='*.rs' -- "\"$cap\"" . || echo "unhandled node attribute: $cap"
+    done
 ```
 
 The capability-history pattern is deliberately whitespace-tolerant: upstream writes those entries as
 `//   - 133: …`, but the exact indentation is a comment convention, not something `gofmt` enforces,
 and a pattern that pins it would go silently empty the day it changes. Check the row count rather
 than trusting the exit status — at the pinned commit the second command returns **17 lines**, 130
-through 146, i.e. the sixteen-version window of §A plus the 130 row that anchors it. That is the
-same count the previous revision derived, and the check earned its keep for the first time here:
-17 lines with no new version at the end is what "upstream added nothing" looks like, and it is
-indistinguishable from a broken pattern unless you count. An empty or short result means the pattern
-broke, not that upstream added nothing.
+through 146, i.e. the sixteen-version window of §A plus the 130 row that anchors it. That is the same
+count the previous two revisions derived, and counting is now the whole of the check rather than a
+formality: at this revision the pin did not move either, so "upstream added nothing", "I re-ran it
+against the same tree" and "the pattern broke" all produce the same *feeling* and only the count
+tells them apart. An empty or short result means the pattern broke, not that upstream added
+nothing.
 
-**The sweep list is part of the ledger, and it has now been wrong three times.** The rule that
+**The sweep list is part of the ledger, and it has now been wrong four times.** The rule that
 governs it has not changed since it was written down: when [Package mapping](#package-mapping)
 gains an upstream package — a table row or a *partial* entry alike — add it here too, or the mapping
 is a claim the sweep never checks. Three revisions ago the list gained `net/socks5`, `net/tsdial`,
@@ -1259,55 +1639,101 @@ extending it by hand (`net/netmon`, `net/art`, `control/controlhttp`, `types/per
 `util/clientmetric`, `tstime`, `tstest`, `tool/`, `tsd`, and — the consequential ones — the parent
 paths `wgengine` and `ipn`).
 
-**This revision found the third miss, and it is the most instructive of the three, because the rule
-as written would not have caught it.** `net/routemanager` (`a5102d3fc`, 2026-07-09) is upstream's
+**The previous revision found the third miss, and it was the most instructive of the three, because
+the rule as written would not have caught it.** `net/routemanager` (`a5102d3fc`, 2026-07-09) is upstream's
 incremental route manager: it took over the per-peer data-plane attributes that used to be derived
 inside `wgengine/wgcfg`, and `net/tstun`'s `peerConfigTable` now reads `PeerRoute.Jailed`,
 `PeerRoute.MasqAddr4` and `PeerRoute.MasqAddr6` out of it. The mapping had no row for it, so the
 loop had no entry for it, so four commits' worth of behaviour sat outside the sweep for two months —
-and two of this revision's five rows are its fields. The generalisation worth carrying forward: the
+and two of that revision's five rows are its fields. The generalisation worth carrying forward: the
 rule "add a package to the loop when the mapping gains one" only fires when someone *notices* the
 mapping should gain one. **Upstream splitting an existing package is the case that slips**, because
 nothing about the mapping looks stale — `wgengine` was already in the loop, and the behaviour simply
 walked out of it. The check that would have caught this is cheap and is now part of the recipe:
 `git -C <tailscale-go> log --diff-filter=A --oneline <old-pin>..<new-pin> -- '*/*.go'` for new
 top-level packages, and for each one, ask not "does it have a counterpart here" but "does anything
-*already swept* now read from it". `net/connreject` at the previous revision was the same question
+*already swept* now read from it". `net/connreject` two revisions ago was the same question
 answered the other way round — out of scope itself, but the messages it aggregates are sent and
 consumed in swept packages.
-Upstream added no *new* package in this interval, so the four recorded at the previous revision
-stand: `net/connreject` and `feature/connreject` (`85c1efb46`), `feature/androidbin` (`60d9c54b6`)
-and `feature/dnsresolvecache` (`aa2681ac5`), joining `feature/androiddns` (`86b3cd5aa`). All five
-are documented under Package mapping as having no counterpart and are deliberately *not* swept,
-because the sweep exists to catch behaviour a mapped crate already implements.
-`sessionrecording` likewise needs no loop entry of its own, because the client half lives behind
-`ssh/tailssh`'s calling code, which is swept.
 
-`wgengine` was the lesson for the sweep list. **The lesson the previous three revisions drew — that
-a package being *in* the loop does not mean its commits have been *read* — held for a fourth time,
-and this time with nothing left over.** Upstream moved fourteen commits in the interval, nine of
-them in mapped packages, and **not one of the fourteen opened a row**. The ledger still gained five
-rows. Every one came out of reading code that had been sitting in swept packages for months or
-years: `filtertype.Match.SrcCaps` has been declared since capver 109 in 2024-11, `Node.IsJailed`
-since capver 81, per-peer masquerade since capver 64, and Go's TSMP ping responder and peerAPI
-carve-out are older than this ledger. **When the upstream delta is small, that is not a signal to do
-less reading — it is the revision where the reading is the whole job.** Budget for it, not just for
-the `git log`.
+**This revision found the fourth miss, and its interest is the opposite of the third's: the rule as
+written caught it, and it did not pay.** `control/controlknobs` is upstream's single struct of the
+client behaviours control can switch on and off — one `has(nodecap.X)` per line, read by
+`wgengine/magicsock`, `net/dns`, `net/tstun` and `ipn`. It is not new, it is not a split, and the
+only reason the mapping never had a row for it is that this fork has no equivalent single place to
+point at: each attribute is a bare string literal at the consumer that acts on it, and
+`ts_nodecapability` supplies the map type and no names at all. It is in the loop now, and all
+fifteen of its commits in the window were already assessed — the knob and the behaviour it gates land
+in the same commit, and the behaviour is always in an already-swept package, so `controlknobs`
+duplicates rather than extends the sweep's reach. Record that: **a mapping row that is honest is
+worth adding even when adding it pays nothing**, because the next reader should not have to re-derive
+that it pays nothing.
 
-Two techniques paid at this revision and are worth repeating verbatim, because between them they
-produced all five rows:
+New-package runs, for completeness. With the pin unchanged the `--diff-filter=A` check over
+`<old-pin>..<new-pin>` is empty by construction, so it was run over the whole window instead
+(`--since=2025-10-06`), which returns about two hundred directories and, filtered to those with no
+`.go` file before the window, roughly a hundred genuinely new packages. Almost all are `cmd/`,
+`k8s-operator`, `gokrazy`, `tstest` and `feature/` surfaces already recorded as out of scope. Three
+were worth the question "does anything already swept now read from it": `feature/captiveportal`
+(yes — `bb4f45820` moved captive-portal code out of `net/netcheck` and `ipn/ipnlocal`, but the
+subject itself is already in the *no counterpart* list, so the answer changes nothing),
+`net/routecheck` (yes, `ipn/ipnlocal` — already a §B row, *not applicable*) and `net/traffic` (yes,
+`ipn/ipnlocal` — now a §B row of its own, *not applicable*, because it is the non-default arm of a
+switch whose default arm this tree ports). `net/porttrack` is a test helper nothing imports. So the
+four packages recorded at the previous revision stand: `net/connreject` and `feature/connreject`
+(`85c1efb46`), `feature/androidbin` (`60d9c54b6`) and `feature/dnsresolvecache` (`aa2681ac5`),
+joining `feature/androiddns` (`86b3cd5aa`). All five are documented under Package mapping as having
+no counterpart and are deliberately *not* swept, because the sweep exists to catch behaviour a mapped
+crate already implements. `sessionrecording` likewise needs no loop entry of its own, because the
+client half lives behind `ssh/tailssh`'s calling code, which is swept.
 
-1. **Take a wire field this tree decodes and follow it forward.** Three of the five rows are the
-   same shape — a field modelled in `ts_control_serde` that reaches nothing. A `git grep` for the
-   field name finds it and looks like evidence of a port. The question that separates the two is
-   "what *reads* this", and the fastest way to ask it is to open upstream's consumer first: reading
-   `net/tstun/wrap.go`'s `peerConfigTable` gave `Jailed` and both masquerade fields in one pass.
+`wgengine` was the lesson for the sweep list. **The lesson the previous four revisions drew — that a
+package being *in* the loop does not mean its commits have been *read* — stopped being a warning at
+this revision and became two rows.** `de733c595` removed `tailcfg.NetInfo.HairPinning` on 2025-11-09;
+`tailcfg` has been in the loop since the first revision of this ledger, the commit is one of that
+package's sixty in the window, and six revisions read past it while `ts_control_serde` went on
+modelling the field. `Node.InitDisplayNames` is the same failure one step further back: nothing about
+it *changed* in the window, but `control/controlclient` has been swept throughout and its three
+display-name fields have no counterpart here. **A swept package is not a read package**, and the
+difference is now measurable: two of this revision's eight rows.
+
+**And when the upstream delta is empty, that is not a signal to do less reading — it is the revision
+where the reading is the whole job.** Budget for it, not just for the `git log`. At this revision the
+pin did not move at all and the ledger still gained eight rows.
+
+Four techniques paid at this revision and are worth repeating verbatim, because between them they
+produced all eight rows:
+
+1. **Take a wire field this tree decodes and follow it forward.** The previous revision's three rows
+   were this shape — a field modelled in `ts_control_serde` that reaches nothing — and four of this
+   revision's six reading-rows are the same shape one layer up, in the register and map request path
+   (`RegisterResponse.NodeKeySignature`, `RegisterResponse.NodeKeyExpired`, `PingRequest.URLIsNoise`,
+   `MapRequest.TKAHead`). A `git grep` for the field name finds it and looks like evidence of a port.
+   The question that separates the two is "what *reads* this", and it has a mechanical form: take
+   every `pub` field in `ts_control_serde` and grep the workspace, excluding that crate, for its
+   name. Seventy-one come back with no reader; most are `Hostinfo`/`NetInfo` reporting facets with
+   nothing to report, and the residue is where the rows are.
 2. **Take a function this ledger already claims parity for and read it top to bottom at the pin.**
-   That is how the previous revision found the reply-admission rows in `runIn4`, and it is how the
-   `SrcCaps` row was found here: `ts_packetfilter` implements capability sources completely, so
-   everything about it reads as ported until you reach the two callers that pass an empty set. A
-   `TODO` under a finished-looking feature is the hardest kind of gap to see from a diff, and the
-   only way to see it is to read the call site.
+   That is how the previous revisions found the reply-admission rows in `runIn4` and the `SrcCaps`
+   callers, and here it produced `select_home_region` (a faithful port of
+   `addReportHistoryAndSetPreferredDERP`, minus the region-score scaling Go applies before the
+   arithmetic the port reproduces exactly) and `handle_ping` (a faithful port of the `c2n` arm of
+   `answerPing`, and only that arm). The better the port reads, the more likely this is to pay: a
+   sloppy port invites suspicion, a careful one invites trust.
+3. **Walk `tailcfg/nodecap` against this workspace.** Also new at this revision. The package is one
+   file of fifty-five constants, each a string control can set on a node; grep the tree for each
+   string and the misses are the attributes this node silently ignores. Most misses are correct and
+   already recorded in §A or in the *no counterpart here* list, so read the result with that in mind
+   — the yield is low and the cost is a minute. It found `magicdns-aaaa`, which capability version
+   116 promises and which this tree gates on a local flag instead.
+4. **Check the wire types in both directions, mechanically.** Also new at this revision, and it paid
+   immediately: resolve each `ts_control_serde` field to the wire name it actually serializes under
+   and look that name up in upstream's Go, then do the reverse over `tailcfg`'s json-tagged fields.
+   Outbound it found one phantom — `NetInfo.HairPinning`, deleted upstream in the window. Inbound it
+   found `Node.ComputedName`/`ComputedNameWithHost` (a row), `Hostinfo.RemoteConfig` (already
+   recorded as the unported half of `feature/remoteconfig`) and `DNSConfig.TempCorpIssue13969`
+   (upstream's own named-for-deletion field). It is minutes of work and it is the check the
+   `encoding/json/v2` row has been asking for since it was opened.
 
 Two entries are noisy by nature and should be read with that in mind: `ipn` (which subsumes
 `ipn/localapi` and `ipn/ipnlocal`) catches every multi-package commit that also touched
@@ -1317,20 +1743,25 @@ mapping row has no upstream path to sweep at all: `golang.zx2c4.com/wireguard`'s
 `ts_tunnel` re-implements, is an upstream *dependency* rather than a package in this repository —
 track it through upstream's `go.mod` bumps, not through this loop.
 
-When the pin is advanced, bump the header table, re-run the above, and rewrite §A and §B. A row
-whose assessment changes should say *why* it changed — and note that "why" has three sources, not
-one, and that all three have now happened more than once. Upstream can move (`85c1efb46` added
-capability version 146 at the previous revision, `2ae2808b6` moved the index-eviction row before
-that, `e1d17a6b9` and `f53c28101` moved the disco-key rows before that, and `d9cc55e33` moved the
-`tsnet.Server.HTTPClient` row before that) — though it contributed *nothing* at this revision, which
-is a first. This tree can move, with upstream still, and that is now overwhelmingly the dominant
-source: six §B rows closed at this revision on tree movement alone (#415, #417, #418, #419, #421, #423),
-four at the previous one (#404, #406, #408/#410, #412), six before that (#360, #363, #367, #369, #370
-and #372), three before that (#339, #342/#343/#345, #347), and three
-capability-version rows at the one before. Or the **sweep itself** can widen, or simply be read more
-carefully, and surface something that was true all along — which is where **all five** of this
-revision's new rows came from, the first revision at which that source accounted for the whole
-intake.
+When the pin is advanced, bump the header table, re-run the above, and rewrite §A and §B. **And when
+it cannot be advanced, because upstream's default branch is already what the header pins, re-run
+everything anyway and rewrite §A and §B from what came back** — that is this revision, and it is not
+a special case to be handled once: a pin catches up with upstream whenever a re-derivation follows
+soon after the last one, and the value of the document at that moment is entirely in the reading.
+A row whose assessment changes should say *why* it changed — and note that "why" has three sources,
+not one, and that all three have now happened more than once. Upstream can move (`85c1efb46` added
+capability version 146 two revisions ago, `2ae2808b6` moved the index-eviction row before that,
+`e1d17a6b9` and `f53c28101` moved the disco-key rows before that, and `d9cc55e33` moved the
+`tsnet.Server.HTTPClient` row before that) — though it has now contributed *nothing* at two revisions
+running, and at this one it did not move at all. This tree can move, with upstream still, and that
+has been the dominant source: six §B rows closed at the previous revision on tree movement alone
+(#415, #417, #418, #419, #421, #423), four before that (#404, #406, #408/#410, #412), six before that
+(#360, #363, #367, #369, #370 and #372), three before that (#339, #342/#343/#345, #347), and three
+capability-version rows at the one before — but **nothing at all landed against a row at this
+revision**, so all eight of the changes here are openings. Or the **sweep itself** can widen, or
+simply be read more carefully, and surface something that was true all along — which is where all
+eight of this revision's rows came from, six of them from code that never changed and two from
+commits that did change, inside the sweep, and were never read.
 
 One consequence worth stating for whoever advances the pin next: **a row this ledger closes is not a
 row that stops needing evidence.** Every "already covered" bullet above names the tree code that
