@@ -205,10 +205,12 @@ reference**. It is not a free-standing claim about our code.
   see `docs/CRYPTOGRAPHY.md` §“Constant-time” for the per-operation breakdown.
 
 > ⚠️ **dudect harness is present, but no clean-machine `max_t` is committed yet.**
-> [`ts_tunnel/Cargo.toml`](../ts_tunnel/Cargo.toml) declares the `dudect-bencher` dependency and a
-> `[[bench]]` target (`harness = false`), and the harness source now exists at
-> [`ts_tunnel/benches/constant_time.rs`](../ts_tunnel/benches/constant_time.rs) — it builds and
-> runs (a Welch t-test over the ChaCha20-Poly1305 AEAD tag-verify path). It is **informational and
+> [`ts_tunnel/Cargo.toml`](../ts_tunnel/Cargo.toml) declares a `[[bench]]` target
+> (`harness = false`), and the harness source exists at
+> [`ts_tunnel/benches/constant_time.rs`](../ts_tunnel/benches/constant_time.rs) with its t-test in
+> [`ts_tunnel/benches/dudect/mod.rs`](../ts_tunnel/benches/dudect/mod.rs) — it builds and runs (a
+> Welch t-test over the ChaCha20-Poly1305 AEAD tag-verify path, preceded by a self-check that
+> proves the detector still fires on an injected leak). It is **informational and
 > deliberately not CI-gated**: the t-statistic is flaky on shared runners (a noisy box empirically
 > emits `max_t ≈ 20`, which would red-flag essentially every build if gated). The one true residual
 > gap is therefore narrow: **no `max_t` measurement from a quiet machine has been committed yet** —

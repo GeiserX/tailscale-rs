@@ -31,6 +31,16 @@ hostile control plane, and the control plane's capability version is pinned to f
 This is **not** a general-purpose endorsement of the crate for production. See
 [`SECURITY.md`](SECURITY.md).
 
+## Vendored third-party code
+
+- **dudect statistics** — [`ts_tunnel/benches/dudect/mod.rs`](ts_tunnel/benches/dudect/mod.rs)
+  carries the percentile-cropping and Welch t-test from
+  [`dudect-bencher`](https://github.com/rozbb/dudect-bencher) 0.7.0 (© Michael Rosenberg,
+  `MIT OR Apache-2.0`), with the crate's CLI, continuous mode, CSV output and Ctrl-C handling
+  dropped. Vendored rather than depended on: dudect-bencher's newest release still pins `clap` 2,
+  which pulls the unmaintained `atty` (RUSTSEC-2021-0145, no patched release) into `Cargo.lock`.
+  The algorithm is unchanged, so `max_t` stays comparable to numbers from the upstream crate.
+
 ## Updating from upstream
 
 ```sh
