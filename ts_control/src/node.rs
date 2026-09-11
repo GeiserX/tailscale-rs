@@ -667,6 +667,48 @@ impl Node {
         self.has_node_attr(Self::NODE_ATTR_DNS_FORWARDER_DISABLE_TCP_RETRIES)
     }
 
+    /// The node attribute by which control asks this node to collapse its per-peer CGNAT host
+    /// routes into the single `100.64.0.0/10` (Go `tailcfg/nodecap`'s `OneCGNATEnable`).
+    ///
+    /// Note the query string: the key is the literal `one-cgnat?v=true`, not `one-cgnat`. The
+    /// attribute is a tri-state carried as two mutually exclusive keys rather than as a key with a
+    /// value, so the lookup is on the whole literal.
+    const NODE_ATTR_ONE_CGNAT_ENABLE: &'static str = "one-cgnat?v=true";
+
+    /// The node attribute by which control asks this node to keep one host route **per peer** no
+    /// matter how many peers there are (Go `tailcfg/nodecap`'s `OneCGNATDisable`). The other half
+    /// of [`NODE_ATTR_ONE_CGNAT_ENABLE`](Self::NODE_ATTR_ONE_CGNAT_ENABLE)'s tri-state.
+    const NODE_ATTR_ONE_CGNAT_DISABLE: &'static str = "one-cgnat?v=false";
+
+    /// Control's tri-state instruction about collapsing this node's per-peer CGNAT host routes
+    /// into the single `100.64.0.0/10`, read off the **self** node's cap map.
+    ///
+    /// Mirrors Go `ipn/ipnlocal`'s read of `nodecap.OneCGNATEnable` / `nodecap.OneCGNATDisable`
+    /// into `controlknobs.Knobs.OneCGNAT`, which is an `opt.Bool` and not a `bool` precisely so the
+    /// third state exists:
+    ///
+    /// * `Some(true)` — `one-cgnat?v=true`: always collapse.
+    /// * `Some(false)` — `one-cgnat?v=false`: never collapse, one `/32` per peer however many
+    ///   peers there are.
+    /// * `None` — neither attribute present: control has no opinion, and the consumer's own
+    ///   peer-count threshold decides (Go `net/routemanager`'s `cgnatThreshold`).
+    ///
+    /// A node holding BOTH attributes reads as `Some(true)`: the enabling attribute is checked
+    /// first and wins. Control setting both is a policy conflict rather than a state upstream
+    /// specifies, and collapsing is the safe way to break the tie — the `/10` is a superset of the
+    /// `/32`s it replaces, so no peer becomes unreachable, whereas honouring the disabling
+    /// attribute on a tailnet large enough for control to have set the enabling one is exactly the
+    /// unbounded host route table the threshold exists to prevent.
+    pub fn one_cgnat(&self) -> Option<bool> {
+        if self.has_node_attr(Self::NODE_ATTR_ONE_CGNAT_ENABLE) {
+            Some(true)
+        } else if self.has_node_attr(Self::NODE_ATTR_ONE_CGNAT_DISABLE) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
     /// Report whether `wanted_port` is allowed for Funnel on this node.
     ///
     /// Mirrors Go `ipn.CheckFunnelPort`: scan the cap-map keys for one prefixed by
@@ -1943,6 +1985,46 @@ pub(crate) mod tests {
         assert!(
             n.disable_dns_forwarder_tcp_retries(),
             "the dns-forwarder-disable-tcp-retries attribute turns the TCP retry off"
+        );
+    }
+
+    #[test]
+    fn one_cgnat_is_a_tri_state_read_off_the_query_string_keys() {
+        let mut n = node("self", Some("ts.net"));
+        assert_eq!(
+            n.one_cgnat(),
+            None,
+            "neither attribute → control has no opinion, the threshold decides"
+        );
+
+        // The key carries a query string; the bare `one-cgnat` is not the attribute and must not
+        // be mistaken for either half of the tri-state.
+        n.cap_map.insert("one-cgnat".to_string(), vec![]);
+        assert_eq!(
+            n.one_cgnat(),
+            None,
+            "a bare `one-cgnat` key is not one of the two attributes control sets"
+        );
+
+        n.cap_map.insert("one-cgnat?v=false".to_string(), vec![]);
+        assert_eq!(
+            n.one_cgnat(),
+            Some(false),
+            "`one-cgnat?v=false` forces one route per peer"
+        );
+
+        n.cap_map.insert("one-cgnat?v=true".to_string(), vec![]);
+        assert_eq!(
+            n.one_cgnat(),
+            Some(true),
+            "a node holding both attributes collapses: the enabling attribute is checked first"
+        );
+
+        n.cap_map.remove("one-cgnat?v=false");
+        assert_eq!(
+            n.one_cgnat(),
+            Some(true),
+            "`one-cgnat?v=true` alone collapses"
         );
     }
 

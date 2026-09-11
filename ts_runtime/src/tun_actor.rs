@@ -55,6 +55,18 @@ use crate::{
 const MAGIC_DNS_IP: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 100);
 /// The DNS service port.
 const MAGIC_DNS_PORT: u16 = 53;
+/// The tailnet's CGNAT range `100.64.0.0/10` (Go `tsaddr.CGNATRange`). Every node address control
+/// hands out comes from it, so the host route set carries one `/32` out of this range per peer —
+/// and [`collapse_cgnat_routes`] folds them back into this one prefix once there are too many.
+const CGNAT_RANGE: ipnet::Ipv4Net = ipnet::Ipv4Net::new_assert(Ipv4Addr::new(100, 64, 0, 0), 10);
+
+/// How many peer `/32`s out of [`CGNAT_RANGE`] the host route set carries before they are collapsed
+/// into the single `100.64.0.0/10`. Go `net/routemanager`'s `cgnatThreshold`, same value: below it
+/// a per-peer route table is both small enough to program and more precise, above it a host FIB
+/// with one entry per peer stops scaling. Only control's `one-cgnat` attribute moves it
+/// ([`cgnat_threshold`]).
+const CGNAT_THRESHOLD: usize = 10_000;
+
 /// TTL for a synthesized IPv4 packet written back into the TUN (a MagicDNS reply, or the RST that
 /// answers an unserved quad-100 TCP port). The packet is consumed by the local host one hop away
 /// (the TUN endpoint), so the exact value is immaterial; 64 is the conventional default.
@@ -175,6 +187,82 @@ pub(crate) fn tun_config_from_control(
     }
 }
 
+/// The number of CGNAT peer `/32`s the host route set tolerates before collapsing them, given
+/// control's tri-state `one-cgnat` instruction ([`ts_control::Node::one_cgnat`]).
+///
+/// Mirrors Go `net/routemanager`'s `RouteManager.cgnatThreshold`, which returns `1` instead of the
+/// `cgnatThreshold` constant when `TailnetConfig.OneCGNAT` is set — i.e. control asking for the
+/// collapsed route is expressed as a threshold of one, not as a separate branch. The three states:
+///
+/// * `Some(true)` (`one-cgnat?v=true`) — threshold `1`: collapse as soon as there is more than one
+///   peer route.
+/// * `Some(false)` (`one-cgnat?v=false`) — no threshold at all: keep one `/32` per peer however
+///   many peers there are, *even above* [`CGNAT_THRESHOLD`]. This is the reason the attribute is a
+///   tri-state and not a bool: it is control switching the automatic collapse OFF.
+/// * `None` — neither attribute: [`CGNAT_THRESHOLD`], the automatic behaviour.
+fn cgnat_threshold(one_cgnat: Option<bool>) -> usize {
+    match one_cgnat {
+        Some(true) => 1,
+        // Unreachable by a count, so the collapse never fires. Go spells the same thing as a
+        // guard on `OneCGNAT` being explicitly false before it compares against the threshold.
+        Some(false) => usize::MAX,
+        None => CGNAT_THRESHOLD,
+    }
+}
+
+/// Whether `net` is one of the per-peer CGNAT host routes [`collapse_cgnat_routes`] may fold into
+/// `100.64.0.0/10`: a `/32` inside the CGNAT range that is NOT the MagicDNS service IP.
+///
+/// The two exclusions are what keeps the collapse from costing connectivity, and both are
+/// routed-to-self rather than routed-to-a-peer:
+///
+/// * the self `/32` is never in the routed set at all — `host_routes_from_node`'s `push_v4` drops
+///   it, because the TUN device builder owns the on-link prefix;
+/// * the MagicDNS `/32` `100.100.100.100` is inside the CGNAT range, but it is this node's own
+///   service IP, is installed on the MagicDNS gate rather than on any peer, and must stay a
+///   distinct entry — folding it would make the quad-100 route come and go with the peer count.
+fn is_collapsible_cgnat_route(net: ipnet::Ipv4Net) -> bool {
+    net.prefix_len() == 32 && CGNAT_RANGE.contains(&net.addr()) && net.addr() != MAGIC_DNS_IP
+}
+
+/// Collapse the per-peer CGNAT `/32`s in `routed` into the single `100.64.0.0/10` when there are
+/// more than `threshold` of them; leave the set untouched otherwise.
+///
+/// Mirrors Go `net/routemanager`, which keeps the OS route set as one `/32` per peer until the
+/// number of distinct CGNAT routes exceeds `cgnatThreshold`, then installs the one `/10` instead.
+/// The `/10` takes the position of the first `/32` it replaces, so the rest of the set keeps its
+/// order and repeated applies converge on the same list.
+///
+/// What is NOT folded, because it is not a peer's CGNAT host route: a peer's advertised subnet
+/// routes (they are not CGNAT prefixes — a CGNAT subnet route is not a thing control hands out —
+/// and the `/10` would not cover them anyway), the selected exit peer's `/0`, the MagicDNS `/32`
+/// and the self `/32`. See [`is_collapsible_cgnat_route`].
+fn collapse_cgnat_routes(routed: &mut Vec<ipnet::Ipv4Net>, threshold: usize) {
+    let collapsible = routed
+        .iter()
+        .filter(|net| is_collapsible_cgnat_route(**net))
+        .count();
+    if collapsible <= threshold {
+        return;
+    }
+    // If the `/10` is somehow already routed (a peer advertising the CGNAT range as a subnet route
+    // — control does not hand that out, but the fold must not install a second copy of a prefix
+    // either way), drop the `/32`s onto the existing entry instead of adding another.
+    let mut installed = routed.contains(&CGNAT_RANGE);
+    routed.retain_mut(|net| {
+        if !is_collapsible_cgnat_route(*net) {
+            return true;
+        }
+        if installed {
+            return false;
+        }
+        // First foldable route: become the `/10` in place, keeping the set's order stable.
+        installed = true;
+        *net = CGNAT_RANGE;
+        true
+    });
+}
+
 /// Translate the self-node's accepted routes **and the union of every peer's AllowedIPs** into the
 /// host-FIB route set to steer into the TUN (the `ts_runtime` boundary, mirroring
 /// [`tun_config_from_control`]).
@@ -204,6 +292,14 @@ pub(crate) fn tun_config_from_control(
 /// `accept_routes` and `exit_id` are read live by the caller (from [`Env`]) on every apply — both
 /// the build path and the [`PeerState`] re-apply path — so a runtime `set_accept_routes` /
 /// `set_exit_node` toggle re-steers the host FIB on the next peer republish.
+///
+/// CGNAT COLLAPSE (Go `net/routemanager`). One host route per peer does not scale, so the peer
+/// `/32`s out of `100.64.0.0/10` are folded into that single prefix once there are more than
+/// [`CGNAT_THRESHOLD`] of them — and control can override the threshold in either direction with
+/// its tri-state `one-cgnat` node attribute, read off the SELF node here
+/// ([`ts_control::Node::one_cgnat`], [`cgnat_threshold`]). The fold is the last step and touches
+/// only peer CGNAT host routes: the self `/32`, the MagicDNS `/32` and every advertised subnet
+/// route or exit `/0` survive it unchanged ([`collapse_cgnat_routes`]).
 pub(crate) fn host_routes_from_node(
     node: &ts_control::Node,
     peers: Option<&crate::peer_tracker::PeerDb>,
@@ -262,6 +358,11 @@ pub(crate) fn host_routes_from_node(
         let magic_dns_net = ipnet::Ipv4Net::new(MAGIC_DNS_IP, 32).expect("/32 is a valid prefix");
         push_v4(&mut routed, magic_dns_net);
     }
+
+    // CGNAT COLLAPSE. Fold the per-peer `/32`s into the single `100.64.0.0/10` once there are more
+    // of them than the threshold control's `one-cgnat` attribute selects. Last, so it sees the
+    // whole set — and after the MagicDNS push, whose `/32` it deliberately leaves alone.
+    collapse_cgnat_routes(&mut routed, cgnat_threshold(node.one_cgnat()));
 
     ts_host_net::HostRoutes {
         if_name,
@@ -1312,8 +1413,9 @@ mod tests {
     use ts_control::TunConfig;
 
     use super::{
-        Intercept, MAGIC_DNS_IP, MAGIC_DNS_PORT, build_dns_view, host_dns_from_dns_config,
-        host_routes_from_node, plan_intercept, spawn_dns_tcp_netstack, tun_config_from_control,
+        CGNAT_THRESHOLD, Intercept, MAGIC_DNS_IP, MAGIC_DNS_PORT, build_dns_view, cgnat_threshold,
+        collapse_cgnat_routes, host_dns_from_dns_config, host_routes_from_node, plan_intercept,
+        spawn_dns_tcp_netstack, tun_config_from_control,
     };
     use crate::{
         env::{Env, ForwarderConfig},
@@ -1462,11 +1564,13 @@ mod tests {
             tags: vec![],
             addresses: vec![
                 format!("{ipv4}/32").parse().unwrap(),
-                format!("fd7a::{id}/128").parse().unwrap(),
+                // `:x` so an `id` past 0xffff still spells a valid v6 group (the CGNAT-threshold
+                // test builds ten thousand peers).
+                format!("fd7a::{id:x}/128").parse().unwrap(),
             ],
             tailnet_address: TailnetAddress {
                 ipv4: format!("{ipv4}/32").parse().unwrap(),
-                ipv6: format!("fd7a::{id}/128").parse().unwrap(),
+                ipv6: format!("fd7a::{id:x}/128").parse().unwrap(),
             },
             node_key: [id as u8; 32].into(),
             node_key_expiry: None,
@@ -1799,6 +1903,278 @@ mod tests {
             routes.routed.iter().filter(|n| **n == self_subnet).count(),
             1,
             "a subnet advertised by both the self node and a peer must be installed exactly once"
+        );
+    }
+
+    /// A self-node fixture carrying one of the two `one-cgnat` node attributes control sets (or
+    /// neither, for `None`). The key is the whole literal including its query string.
+    fn node_with_one_cgnat(one_cgnat: Option<bool>) -> ts_control::Node {
+        let mut node = fixture_node();
+        if let Some(v) = one_cgnat {
+            let key = if v {
+                "one-cgnat?v=true"
+            } else {
+                "one-cgnat?v=false"
+            };
+            node.cap_map.insert(key.to_string(), vec![]);
+        }
+        node
+    }
+
+    /// `n` plain tailnet peers, addressed consecutively out of the CGNAT range from `100.64.0.2`
+    /// (skipping `100.64.0.1`, which the self-node fixture owns).
+    fn cgnat_peers(n: u32) -> Vec<ts_control::Node> {
+        let base = u32::from(Ipv4Addr::new(100, 64, 0, 2));
+        (0..n)
+            .map(|i| {
+                let addr = Ipv4Addr::from(base + i);
+                tailnet_peer(&format!("p{i}"), i + 2, &addr.to_string(), &[])
+            })
+            .collect()
+    }
+
+    /// THE DEFAULT: with control silent, the host route set stays one `/32` per peer — a handful of
+    /// peers is far below the threshold, so nothing is collapsed and no `/10` is installed.
+    #[test]
+    fn host_routes_keep_one_route_per_peer_when_control_is_silent() {
+        let node = node_with_one_cgnat(None);
+        let peers = cgnat_peers(3);
+        let db = peer_db_from(&peers.iter().collect::<Vec<_>>());
+
+        let routes = host_routes_from_node(&node, Some(&db), "utun9".to_owned(), true, None, true);
+
+        let cgnat: Ipv4Net = "100.64.0.0/10".parse().unwrap();
+        assert!(
+            !routes.routed.contains(&cgnat),
+            "three peers is nowhere near the threshold: no /10 may appear"
+        );
+        for peer in &peers {
+            assert!(
+                routes.routed.contains(&peer.tailnet_address.ipv4),
+                "every peer keeps its own /32 below the threshold"
+            );
+        }
+    }
+
+    /// `one-cgnat?v=true` forces the collapse whatever the peer count: the peer `/32`s become the
+    /// single `100.64.0.0/10`.
+    ///
+    /// The load-bearing negatives are the routes that are NOT peer CGNAT host routes and must
+    /// survive the fold untouched — the MagicDNS `/32` and the self `/32` (both routed-to-self,
+    /// and the self `/32` is never installed at all), an advertised subnet route (not a CGNAT
+    /// prefix, so the `/10` does not cover it) and the selected exit peer's `/0`.
+    #[test]
+    fn host_routes_collapse_to_one_cgnat_when_control_asks() {
+        use ts_control::StableNodeId;
+
+        let node = node_with_one_cgnat(Some(true));
+        let p1 = tailnet_peer("p1", 2, "100.64.0.2", &[]);
+        let p2 = tailnet_peer("p2", 3, "100.64.0.3", &["10.1.0.0/24"]);
+        let exit = tailnet_peer("exit", 4, "100.64.0.4", &["0.0.0.0/0"]);
+        let db = peer_db_from(&[&p1, &p2, &exit]);
+        let exit_id = StableNodeId("exit".to_owned());
+
+        let routes = host_routes_from_node(
+            &node,
+            Some(&db),
+            "utun9".to_owned(),
+            true,
+            Some(&exit_id),
+            true,
+        );
+
+        let cgnat: Ipv4Net = "100.64.0.0/10".parse().unwrap();
+        assert_eq!(
+            routes.routed.iter().filter(|n| **n == cgnat).count(),
+            1,
+            "the collapsed /10 is installed exactly once"
+        );
+        for peer_32 in ["100.64.0.2/32", "100.64.0.3/32", "100.64.0.4/32"] {
+            assert!(
+                !routes.routed.contains(&peer_32.parse().unwrap()),
+                "{peer_32} must be folded into the /10, not installed beside it"
+            );
+        }
+        // Routed-to-self: never folded. The MagicDNS /32 sits inside 100.64.0.0/10 but is this
+        // node's own service IP, and the self /32 is owned by the device builder.
+        assert!(
+            routes
+                .routed
+                .contains(&"100.100.100.100/32".parse().unwrap()),
+            "the MagicDNS /32 must survive the collapse as a distinct route"
+        );
+        assert!(
+            !routes.routed.contains(&"100.64.0.1/32".parse().unwrap()),
+            "the self /32 is still never re-routed"
+        );
+        assert_eq!(
+            routes.self_v4,
+            "100.64.0.1/32".parse::<Ipv4Net>().unwrap(),
+            "the on-link self prefix is untouched by the collapse"
+        );
+        // Not CGNAT prefixes: the collapse must not drop them.
+        assert!(
+            routes.routed.contains(&"10.1.0.0/24".parse().unwrap()),
+            "a peer's advertised subnet route is not part of the collapse"
+        );
+        assert!(
+            routes.routed.contains(&"192.168.1.0/24".parse().unwrap()),
+            "the self node's advertised subnet route is not part of the collapse"
+        );
+        assert!(
+            routes.routed.contains(&"0.0.0.0/0".parse().unwrap()),
+            "the selected exit peer's /0 is not part of the collapse"
+        );
+    }
+
+    /// `one-cgnat?v=true` lowers the threshold to one rather than collapsing unconditionally
+    /// (Go's `cgnatThreshold()` returns `1`), so a tailnet with a single peer still gets that
+    /// peer's `/32` — there is nothing for a `/10` to save.
+    #[test]
+    fn host_routes_one_cgnat_leaves_a_single_peer_route_alone() {
+        let node = node_with_one_cgnat(Some(true));
+        let peer = tailnet_peer("p1", 2, "100.64.0.2", &[]);
+        let db = peer_db_from(&[&peer]);
+
+        let routes = host_routes_from_node(&node, Some(&db), "utun9".to_owned(), true, None, true);
+
+        assert!(
+            routes.routed.contains(&"100.64.0.2/32".parse().unwrap()),
+            "one peer is not MORE than a threshold of one: its /32 stays"
+        );
+        assert!(
+            !routes.routed.contains(&"100.64.0.0/10".parse().unwrap()),
+            "nothing to collapse, so no /10"
+        );
+    }
+
+    /// THE THRESHOLD, and the tri-state's third state. Above `CGNAT_THRESHOLD` peers the route set
+    /// collapses on its own — and `one-cgnat?v=false` refuses that collapse, which is the whole
+    /// reason control models the attribute as a tri-state rather than a bool.
+    #[test]
+    fn host_routes_collapse_above_the_threshold_unless_control_forbids_it() {
+        let peers = cgnat_peers(CGNAT_THRESHOLD as u32 + 1);
+        let db = peer_db_from(&peers.iter().collect::<Vec<_>>());
+        let cgnat: Ipv4Net = "100.64.0.0/10".parse().unwrap();
+
+        // Control silent: the automatic threshold fires.
+        let automatic = host_routes_from_node(
+            &node_with_one_cgnat(None),
+            Some(&db),
+            "utun9".to_owned(),
+            true,
+            None,
+            true,
+        );
+        assert!(
+            automatic.routed.contains(&cgnat),
+            "more than {CGNAT_THRESHOLD} peer routes collapse into the /10 with no attribute set"
+        );
+        assert!(
+            !automatic.routed.contains(&"100.64.0.2/32".parse().unwrap()),
+            "no peer /32 survives the automatic collapse"
+        );
+        assert!(
+            automatic
+                .routed
+                .contains(&"100.100.100.100/32".parse().unwrap()),
+            "the MagicDNS /32 survives the automatic collapse too"
+        );
+
+        // Control says no: one route per peer, above the threshold or not.
+        let forced_per_peer = host_routes_from_node(
+            &node_with_one_cgnat(Some(false)),
+            Some(&db),
+            "utun9".to_owned(),
+            true,
+            None,
+            true,
+        );
+        assert!(
+            !forced_per_peer.routed.contains(&cgnat),
+            "`one-cgnat?v=false` forbids the collapse even above the threshold"
+        );
+        for peer in &peers {
+            assert!(
+                forced_per_peer.routed.contains(&peer.tailnet_address.ipv4),
+                "every peer keeps its own /32 when control forbids the collapse"
+            );
+        }
+    }
+
+    /// The threshold is a strict `>` at exactly `CGNAT_THRESHOLD`, and control's tri-state maps to
+    /// the three thresholds Go's `RouteManager.cgnatThreshold` returns.
+    #[test]
+    fn cgnat_threshold_is_tri_state_and_the_fold_is_strictly_above_it() {
+        assert_eq!(cgnat_threshold(Some(true)), 1);
+        assert_eq!(cgnat_threshold(None), CGNAT_THRESHOLD);
+        assert_eq!(
+            cgnat_threshold(Some(false)),
+            usize::MAX,
+            "an unreachable threshold is how `never collapse` is expressed"
+        );
+
+        let base = u32::from(Ipv4Addr::new(100, 64, 0, 2));
+        let routes: Vec<Ipv4Net> = (0..CGNAT_THRESHOLD as u32)
+            .map(|i| Ipv4Net::new(Ipv4Addr::from(base + i), 32).unwrap())
+            .collect();
+
+        let mut at_threshold = routes.clone();
+        collapse_cgnat_routes(&mut at_threshold, cgnat_threshold(None));
+        assert_eq!(
+            at_threshold, routes,
+            "exactly CGNAT_THRESHOLD routes is not MORE than the threshold: no collapse"
+        );
+
+        let mut over_threshold = routes.clone();
+        over_threshold
+            .push(Ipv4Net::new(Ipv4Addr::from(base + CGNAT_THRESHOLD as u32), 32).unwrap());
+        collapse_cgnat_routes(&mut over_threshold, cgnat_threshold(None));
+        assert_eq!(
+            over_threshold,
+            vec!["100.64.0.0/10".parse::<Ipv4Net>().unwrap()],
+            "one route past the threshold collapses the whole set into the /10"
+        );
+    }
+
+    /// The fold keeps the route set's order and converges: the `/10` takes the position of the
+    /// first `/32` it replaces, and re-folding an already-folded set is a no-op (no second `/10`).
+    #[test]
+    fn collapse_cgnat_routes_is_order_stable_and_idempotent() {
+        let mut routed: Vec<Ipv4Net> = [
+            "192.168.1.0/24",
+            "100.64.0.2/32",
+            "10.1.0.0/24",
+            "100.64.0.3/32",
+            "100.100.100.100/32",
+            "0.0.0.0/0",
+        ]
+        .iter()
+        .map(|n| n.parse().unwrap())
+        .collect();
+
+        collapse_cgnat_routes(&mut routed, cgnat_threshold(Some(true)));
+        let expected: Vec<Ipv4Net> = [
+            "192.168.1.0/24",
+            "100.64.0.0/10",
+            "10.1.0.0/24",
+            "100.100.100.100/32",
+            "0.0.0.0/0",
+        ]
+        .iter()
+        .map(|n| n.parse().unwrap())
+        .collect();
+        assert_eq!(
+            routed, expected,
+            "the /10 replaces the first folded /32 in place; everything else keeps its order"
+        );
+
+        // Fold again (the actor re-applies the whole set on every peer change): unchanged.
+        let once = routed.clone();
+        collapse_cgnat_routes(&mut routed, cgnat_threshold(Some(true)));
+        assert_eq!(
+            routed, once,
+            "re-folding a folded set installs no second /10"
         );
     }
 
