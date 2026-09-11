@@ -337,10 +337,27 @@ impl PeerPaths {
     ///   matters: `recompute_best` picks the lowest-latency *remembered* candidate, so a stale
     ///   pre-rotation measurement left in place could be promoted — and re-trusted for a full
     ///   [`TRUST_DURATION`] — by a pong for some *other* address;
-    /// - each candidate's `last_ping` and `last_full_ping` are cleared, so the next pinger tick is a
-    ///   full sweep that re-probes every candidate immediately instead of waiting out the
-    ///   `DISCO_PING_INTERVAL` floor (Go's `invalidateDiscoPathLocked`, whose point is to
-    ///   re-discover the path now rather than coast until trust lapses on its own).
+    ///
+    ///   Upstream's `invalidateDiscoPathLocked` does **not** clear its latency history
+    ///   (`endpointState.recentPongs`), and the difference is deliberate rather than an omission.
+    ///   Go cannot be bitten the way this tree would be: `handlePongConnLocked` promotes the
+    ///   address that *just* ponged whenever the best is out of trust — `bestUntrusted :=
+    ///   now.After(de.trustBestAddrUntil)`, then `if betterAddr(thisPong, de.bestAddr) ||
+    ///   bestUntrusted` — and `changedActiveDiscoLocked` zeroes exactly that deadline, so the first
+    ///   fresh pong after a rotation wins there regardless of what the history says
+    ///   (`udpRelayEndpointReady`, the sibling that installs a relay path, states the rule
+    ///   outright: "we must set maybeBest as de.bestAddr if de.bestAddr is untrusted. betterAddr
+    ///   does not consider time-based trust"). The retained history is then read by
+    ///   nothing on this path: its only reader is `endpointState.latencyLocked()`, whose only
+    ///   caller is `addrForWireGuardSendLocked` — the wireguard-only endpoint that has no disco key
+    ///   to rotate. Clearing here is what reproduces that same observable selection in a tree whose
+    ///   `recompute_best` is a global scan rather than a comparison against the one pong in hand;
+    ///   the test `disco_key_change_forgets_pre_rotation_latencies` pins it.
+    /// - each candidate's `last_ping` and `last_full_ping` are cleared, so the re-probe is a full
+    ///   sweep of every candidate instead of one that waits out the `DISCO_PING_INTERVAL` floor —
+    ///   whether it is the caller's immediate sweep or the next pinger tick behind it (Go's
+    ///   `invalidateDiscoPathLocked`, whose point is to re-discover the path now rather than coast
+    ///   until trust lapses on its own).
     ///
     /// `best` itself and the candidate set are deliberately **kept**, which is the whole shape of
     /// the upstream call: "keep bestAddr so that we can still send data while we find a new path".
@@ -350,6 +367,18 @@ impl PeerPaths {
     /// this node does not keep *sending* to the retained best the way Go's `addrForSendLocked`
     /// dual-sends to an untrusted `bestAddr`; here the retained address is what the immediate
     /// re-probe targets, and traffic rides DERP for the one round trip it takes to re-confirm.
+    /// (One round trip, not one pinger tick: the caller that invalidates,
+    /// `MagicSock::changed_active_disco`, reports that it did so and `ts_runtime::direct` re-probes
+    /// the peer straight away. Dual-sending is not open to this tree at all — the dataplane routes
+    /// each peer through exactly one underlay transport — so a prompt re-confirmation is the whole
+    /// of what the retention can buy on the data path.)
+    ///
+    /// Keeping `best` is not bookkeeping, either: [`note_recv_activity`](Self::note_recv_activity)
+    /// compares inbound data against the *stored* best, so under control's `silent-disco` attribute
+    /// a peer that is carrying traffic re-trusts its path across the rotation with no pong at all.
+    /// Clear `best` here and that arm goes dead: the `sock.rs` test
+    /// `inbound_data_re_trusts_the_best_path_under_silent_disco` builds its starting state by
+    /// calling this very function, and asserts the retained best is what the data re-trusts.
     ///
     /// Contrast [`invalidate_best`](Self::invalidate_best), the rebind case: there the *local* NAT
     /// mapping changed, so the best address is stale as an address and is cleared outright.
@@ -1531,6 +1560,15 @@ mod tests {
     /// A pre-rotation latency must not be able to re-trust a path without a fresh pong for it: the
     /// disco-key change clears every measurement, so a pong for a *slower* rival makes that rival
     /// the best rather than promoting the remembered (and possibly dead) fast address.
+    ///
+    /// This is upstream's outcome too, reached by a different mechanism, and the equivalence is the
+    /// point of pinning it: Go keeps its `recentPongs` across `invalidateDiscoPathLocked` but
+    /// `handlePongConnLocked` promotes the address that just ponged whenever the best is out of
+    /// trust (`betterAddr(thisPong, de.bestAddr) || bestUntrusted`), and `changedActiveDiscoLocked`
+    /// is precisely what puts it out of trust. So there, as here, the first address to answer after
+    /// a rotation becomes the best whatever the pre-rotation history said. What must never happen
+    /// in either tree is the thing this asserts against: a path trusted again without having
+    /// answered under the key the peer is using now.
     #[test]
     fn disco_key_change_forgets_pre_rotation_latencies() {
         let mut p = PeerPaths::default();
