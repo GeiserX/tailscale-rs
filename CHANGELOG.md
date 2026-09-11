@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.55.2](https://github.com/GeiserX/tailscale-rs/compare/v0.55.1...v0.55.2) (2026-09-11)
+
+
+### Bug Fixes
+
+* **magicsock:** re-probe a rotated peer whose new key has no path yet ([#453](https://github.com/GeiserX/tailscale-rs/issues/453)) ([4060be0](https://github.com/GeiserX/tailscale-rs/commit/4060be071e39f7a79a2400924012e231b095ea31))
+
 ## [0.55.1](https://github.com/GeiserX/tailscale-rs/compare/v0.55.0...v0.55.1) (2026-09-11)
 
 
