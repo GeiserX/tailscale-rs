@@ -19,11 +19,14 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste is archived/unmaintained; transitive via netlink-packet-core -> tun-rs under the tun transport. Not yet fixed upstream" },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is unmaintained (functionality folded into rustls-pki-types >=1.9); transitive via the TLS stack, no published vulnerability. Pre-existing advisory, unrelated to the supply-chain ban below." },
 ]
-# NOTE: the `dudect-bencher` dev-dependency (constant-time leakage bench, ts_tunnel) was reviewed for
-# the old atty/ansi_term advisory chain (RUSTSEC-2021-0145/2024-0375/2021-0139). dudect-bencher 0.7
-# does NOT pull those crates into this tree — verified with `cargo deny --all-features check
-# advisories` (advisories ok, none encountered) — so no ignore entries are needed for it. If a future
-# dudect-bencher bump reintroduces them, add dev-only ignores here with that justification.
+# NOTE: `ts_tunnel`'s constant-time leakage bench no longer depends on `dudect-bencher` -- its
+# t-test is vendored into `ts_tunnel/benches/dudect/mod.rs`. That crate's newest release (0.7.0)
+# still pins `clap` 2, which drags the unmaintained, never-patched `atty` (RUSTSEC-2021-0145) and
+# `ansi_term` (RUSTSEC-2021-0139) into Cargo.lock, and no version bump removes them.
+# An earlier note here claimed cargo-deny had cleared that chain. It had not: `[graph]
+# exclude-dev = true` below hides every dev-dependency from cargo-deny, so the subtree was never in
+# the graph being scanned, while Dependabot reads Cargo.lock directly and did see it. Do not assert
+# a dev-only dependency is advisory-clean from a cargo-deny run made under this config.
 
 [licenses]
 allow = [
