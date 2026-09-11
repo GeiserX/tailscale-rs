@@ -7,7 +7,8 @@
 //! it times an operation across two input distributions (`Class::Left` / `Class::Right`) and runs
 //! Welch's t-test on the timing samples. A large `max_t` is statistical evidence that the two
 //! distributions take measurably different time — i.e. a likely timing side-channel. The
-//! conventional threshold used in this repo is **`max_t > 5` ⇒ likely leak**. Crucially, a *small*
+//! conventional threshold used in this repo is **`|max_t| > 5` ⇒ likely leak** (the sign only says
+//! which class was slower, so the test is on the magnitude). Crucially, a *small*
 //! `max_t` does **not** prove the code is constant-time — dudect can DETECT a leak but can never
 //! PROVE its absence. See `docs/CRYPTOGRAPHY.md` §7 ("Constant-time and side-channels").
 //!
@@ -226,9 +227,9 @@ fn main() {
     println!("bench aead_decrypt_tag_verify (seed 0x{seed:016x}) ... {summary}");
 
     let verdict = if summary.max_t.abs() > 5f64 {
-        "above the >5 threshold — investigate"
+        "|max t| is above the 5 threshold — investigate"
     } else {
-        "below the >5 threshold — no leak detected, which is not proof of constant-timeness"
+        "|max t| is below the 5 threshold — no leak detected, which is not proof of constant-timeness"
     };
     println!("\nmax t = {:+.5}: {verdict}", summary.max_t);
 }

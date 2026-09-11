@@ -398,7 +398,7 @@ line is the exact RUSTSEC-2024-0344 patched floor, but the **data plane now ride
 `x25519-dalek 3.0.0-rc.0`), so the load-bearing pin/validation is that the **rc line carries the
 RUSTSEC-2024-0344 timing fix forward** — re-validate it on 5.0-rc rather than assuming the 4.1.x fix
 transferred. Build constant-time code release-mode only; the verifier is the in-tree dudect harness
-at [`ts_tunnel/benches/constant_time.rs`](../ts_tunnel/benches/constant_time.rs) (`max_t > 5` ⇒
+at [`ts_tunnel/benches/constant_time.rs`](../ts_tunnel/benches/constant_time.rs) (`|max_t| > 5` ⇒
 likely leak — it can detect, never *prove*, constant-timeness).
 
 ---

@@ -82,7 +82,8 @@ impl CtRunner {
 
 /// The result of one dudect run: the largest Welch t-statistic found across all crop thresholds.
 ///
-/// The convention used in this repository is **`max_t` > 5 ⇒ likely leak**. A small `max_t` is
+/// The convention used in this repository is **`|max_t|` > 5 ⇒ likely leak**. The sign only says
+/// which class was slower, so the test is on the magnitude. A small `|max_t|` is
 /// *not* proof of constant-timeness — dudect detects leaks, it never rules them out.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct CtSummary {
@@ -254,7 +255,7 @@ fn update_test_right(test: &mut CtTest, datum: f64) {
 /// A leak detector that can never report a leak is worthless, and a silently broken t-test would
 /// look exactly like a clean result. So this feeds the same code path two *synthetic* sample sets
 /// built from a fixed seed — one where both classes share a distribution, one where the right class
-/// is shifted by 20ns — and requires the null case to stay under the `max_t` > 5 threshold and the
+/// is shifted by 20ns — and requires the null case to stay under the `|max_t|` > 5 threshold and the
 /// shifted case to blow past it. No timing is involved, so the outcome is deterministic.
 ///
 /// # Panics
