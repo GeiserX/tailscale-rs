@@ -1,17 +1,24 @@
 use alloc::string::String;
 
 use ts_control_serde::{C2NVIPServicesResponse, PingType};
-use ts_http_util::{BytesBody, ClientExt, Http2, Request};
+use ts_http_util::{BytesBody, ClientExt, Http2, Method, Request};
 use url::Url;
 
 use crate::StateUpdate;
 
-/// Path requested in HTTP GET via a Control-to-Node (C2N) [`ts_control_serde::PingRequest`] to
-/// invoke the C2N echo handler.
+/// Path requested via a Control-to-Node (C2N) [`ts_control_serde::PingRequest`] to invoke the C2N
+/// echo handler, which writes the request body back.
+///
+/// Method-agnostic, as upstream is: it registers this one as `req("/echo")`, the no-method form its
+/// route table documents as the fallback for any method.
 const C2N_PATH_ECHO: &str = "/echo";
 /// Path requested in HTTP GET via a C2N [`ts_control_serde::PingRequest`] to fetch the VIP services
 /// this node hosts (Go `c2n` `GET /vip-services`). Answered with a JSON
 /// [`C2NVIPServicesResponse`].
+///
+/// Unlike [`C2N_PATH_ECHO`] this route is **method-specific**: upstream registers it as
+/// `req("GET /vip-services")`, so any other method on it is a
+/// [bad-method refusal](C2N_BAD_METHOD), not a response.
 const C2N_PATH_VIP_SERVICES: &str = "/vip-services";
 /// C2N URL path **prefix** under which requests are proxied into this node's LocalAPI, whatever the
 /// LocalAPI version (`v0`, `v1`, …). Go `feature/remoteconfig`'s `c2nPrefix`, registered with
@@ -26,6 +33,15 @@ const C2N_REMOTE_API_STRIP: &str = "/remoteapi";
 const C2N_LOCAL_API_PREFIX: &str = "/localapi/";
 /// HTTP 400 Bad Request response sent for all unimplemented C2N methods/paths.
 const C2N_PATH_UNKNOWN: &str = "HTTP/1.1 400 Bad Request\r\n\r\nunknown c2n path";
+/// HTTP 405 Method Not Allowed response sent when a path this node *does* serve is requested with
+/// a method that path does not serve.
+///
+/// Go `handleC2N` (`ipn/ipnlocal/c2n.go`) keeps `c2nHandlerPaths` — every registered path with its
+/// method dropped — purely to split its final refusal in two: a path in that set answers
+/// `http.Error(w, "bad method", http.StatusMethodNotAllowed)`, and only a path outside it gets
+/// [`C2N_PATH_UNKNOWN`]. The distinction is the useful half of the answer, because it tells control
+/// "this build has the feature, retry it correctly" rather than "this build does not have it".
+const C2N_BAD_METHOD: &str = "HTTP/1.1 405 Method Not Allowed\r\n\r\nbad method";
 /// HTTP 403 Forbidden response sent when control invokes the `/remoteapi/localapi/*` proxy but the
 /// local machine has not opted in via [`crate::Config::remote_config`] (Go
 /// `handleC2NRemoteAPI`'s `http.Error(w, "remote config not enabled by local machine",
@@ -64,11 +80,24 @@ fn build_vip_services_response(config: &crate::Config) -> String {
 /// Route a parsed C2N request to the full HTTP/1.1 response this node sends back to control.
 ///
 /// This mirrors Go's `handleC2N` (`ipn/ipnlocal/c2n.go`), including its dispatch *order*: exact
-/// path matches are tried first, then the prefix handlers registered with
-/// `ipnlocal.RegisterC2NPrefix`, and anything still unmatched falls through to
-/// `http.Error(w, "unknown c2n path", http.StatusBadRequest)`. Only the routes listed below are
-/// registered here; the fallthrough is the contract for everything else, so it is asserted by test
-/// rather than left implicit.
+/// method-and-path matches are tried first, then exact path matches for the routes registered
+/// without a method, then the prefix handlers registered with `ipnlocal.RegisterC2NPrefix`. Only
+/// then does Go refuse, and it refuses in one of two ways — `405 bad method` if the path is one it
+/// serves under some other method, `400 unknown c2n path` otherwise. Only the routes listed below
+/// are registered here; both refusals are the contract for everything else, so they are asserted by
+/// test rather than left implicit.
+///
+/// The method half of a route is part of the port, not decoration. Upstream registers `/echo` with
+/// no method (its `req()` helper's documented "fallback" form, matching any method) but
+/// `/vip-services` as `GET` only, so this node answers an `/echo` of any method and refuses a
+/// non-`GET` `/vip-services` with `405`. The refusals are not interchangeable: a `400` would tell
+/// control this build has no VIP-services support at all, which would be a lie, and a `200` would
+/// tell it a write-shaped request had been accepted.
+///
+/// Go's 405 set is every path in its route table, including the many handlers this tree does not
+/// implement (`/update`, `/sockstats`, `/posture/identity`, …). Those paths are deliberately *not*
+/// in the set here: this node has no handler for them under any method, so `400 unknown c2n path` is
+/// the honest answer and a `405` would claim a feature that is absent.
 ///
 /// The one prefix route is [`C2N_PREFIX_REMOTE_API`] — the LocalAPI proxy — and it exists only when
 /// a [`LocalApi`](crate::LocalApi) is installed on the config, mirroring upstream's
@@ -106,13 +135,18 @@ fn build_vip_services_response(config: &crate::Config) -> String {
 /// the responder agree; see that constant's documentation before raising it.
 async fn build_c2n_response(request: &Request<String>, config: &crate::Config) -> String {
     let c2n_request_path = request.uri().path();
-    // Exact-path handlers first.
+    let c2n_request_method = request.method();
+    // Exact-path handlers first, each matching on the method its upstream registration names.
     match c2n_request_path {
+        // Go registers this one as `req("/echo")` — the no-method form, which its comment documents
+        // as the fallback for *any* method — so every method reaches the echo handler.
         C2N_PATH_ECHO => {
             tracing::trace!(c2n_request_path, "handling c2n echo");
             return format!("{}{}", C2N_RESPONSE_ECHO_PREAMBLE, request.body());
         }
-        C2N_PATH_VIP_SERVICES => {
+        // `req("GET /vip-services")`, so only a GET is served here; anything else falls through to
+        // the bad-method refusal below rather than being answered as though it were a GET.
+        C2N_PATH_VIP_SERVICES if *c2n_request_method == Method::GET => {
             tracing::trace!(c2n_request_path, "handling c2n vip-services fetch");
             return build_vip_services_response(config);
         }
@@ -128,6 +162,18 @@ async fn build_c2n_response(request: &Request<String>, config: &crate::Config) -
             "handling c2n remote-config localapi proxy"
         );
         return handle_c2n_remote_api(request, local_api.as_ref(), config.remote_config).await;
+    }
+    // Last, Go's split refusal: a path this node serves, reached with a method it does not serve, is
+    // a 405 rather than a 400. The set to check against is this node's *own* route table with the
+    // methods dropped (Go's `c2nHandlerPaths`), which here is `/echo` and `/vip-services` — and
+    // `/echo` serves every method, so only `/vip-services` can land on this branch.
+    if c2n_request_path == C2N_PATH_VIP_SERVICES {
+        tracing::debug!(
+            c2n_request_path,
+            %c2n_request_method,
+            "c2n path does not serve this method"
+        );
+        return C2N_BAD_METHOD.to_string();
     }
     tracing::debug!(c2n_request_path, "no handler for c2n path");
     C2N_PATH_UNKNOWN.to_string()
@@ -235,11 +281,12 @@ fn parse_c2n_ping(payload: &str) -> Result<Request<String>, PingError> {
 }
 
 /// Handles [`ts_control_serde::PingRequest`]s from the control plane to this Tailscale node.
-/// Handles Control-to-Node (C2N) `GET /echo` (echo back the body), `GET /vip-services` (report
-/// the VIP services this node hosts, from `config`) and — when a [`LocalApi`](crate::LocalApi) is
-/// installed on `config` — the `/remoteapi/localapi/*` prefix that proxies into this node's
-/// LocalAPI; non-C2N requests are skipped with a warning, while C2N requests for an unhandled path
-/// return a "400 Bad Request" to the control plane.
+/// Handles Control-to-Node (C2N) `/echo` (echo back the body, any method, as upstream registers it),
+/// `GET /vip-services` (report the VIP services this node hosts, from `config`) and — when a
+/// [`LocalApi`](crate::LocalApi) is installed on `config` — the `/remoteapi/localapi/*` prefix that
+/// proxies into this node's LocalAPI; non-C2N requests are skipped with a warning, while C2N
+/// requests for an unhandled path return a "400 Bad Request" to the control plane and a handled path
+/// requested with a method it does not serve returns a "405 Method Not Allowed".
 ///
 /// ## C2N Mechanism
 ///
@@ -256,7 +303,8 @@ fn parse_c2n_ping(payload: &str) -> Result<Request<String>, PingError> {
 /// status - for example, "HTTP/1.1 200 OK <body>" or "HTTP/1.1 400 Bad Request".
 ///
 /// `tailscale-rs` returns an HTTP 400 Bad Request status with an error message to the control
-/// plane for any unimplemented C2N methods/paths.
+/// plane for any unimplemented C2N path, and — as upstream does — an HTTP 405 Method Not Allowed
+/// for a path it does implement under a different method.
 pub async fn handle_ping(
     state: &StateUpdate,
     control_url: &Url,
@@ -618,6 +666,90 @@ mod tests {
         let (status, json) = parse_response(&vip);
         assert_eq!(status, "HTTP/1.1 200 OK");
         assert_eq!(json["VIPServices"][0]["Name"].as_str().unwrap(), "svc:web");
+    }
+
+    /// `/vip-services` is registered upstream as `req("GET /vip-services")` — method-specific — so
+    /// any other method on it takes `handleC2N`'s other refusal:
+    /// `http.Error(w, "bad method", http.StatusMethodNotAllowed)`, reached because the path *is* in
+    /// `c2nHandlerPaths`. Answering a `POST` with the GET body would report this node's services as
+    /// though a write-shaped request had been accepted, and answering it with the `400` would
+    /// instead tell control this build has no VIP-services support at all.
+    ///
+    /// A config with services advertised is used on purpose: a node with nothing to report would
+    /// make a wrongly-routed 200 harder to tell apart from a refusal.
+    #[tokio::test]
+    async fn c2n_vip_services_refuses_a_method_it_does_not_serve() {
+        let config = crate::Config {
+            advertise_services: alloc::vec!["svc:web".to_string()],
+            ..Default::default()
+        };
+
+        for raw in [
+            "POST /vip-services HTTP/1.1\r\nHost: c2n\r\n\r\n",
+            "POST /vip-services HTTP/1.1\r\nHost: c2n\r\nContent-Length: 2\r\n\r\n{}",
+            "PUT /vip-services HTTP/1.1\r\nHost: c2n\r\n\r\n",
+            "DELETE /vip-services HTTP/1.1\r\nHost: c2n\r\n\r\n",
+            // The method check is on the method alone, so a query string does not route around it.
+            "POST /vip-services?refresh=1 HTTP/1.1\r\nHost: c2n\r\n\r\n",
+        ] {
+            let resp = build_c2n_response(&c2n_request(raw), &config).await;
+            assert_eq!(
+                resp, "HTTP/1.1 405 Method Not Allowed\r\n\r\nbad method",
+                "{raw} is a known path with a method it does not serve"
+            );
+        }
+
+        // The GET this node does serve is unaffected, including with a query string.
+        let resp = build_c2n_response(
+            &c2n_request("GET /vip-services?refresh=1 HTTP/1.1\r\nHost: c2n\r\n\r\n"),
+            &config,
+        )
+        .await;
+        let (status, json) = parse_response(&resp);
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert_eq!(json["VIPServices"][0]["Name"].as_str().unwrap(), "svc:web");
+    }
+
+    /// The method check must not spread to `/echo`, which upstream registers with the no-method form
+    /// `req("/echo")` — documented there as the fallback used when no method-specific entry matches,
+    /// i.e. every method. Go's own `handleC2NEcho` writes the request body back whatever the method
+    /// was, so a `POST /echo` must echo and not refuse.
+    #[tokio::test]
+    async fn c2n_echo_serves_every_method() {
+        let config = crate::Config::default();
+
+        for method in ["GET", "POST", "PUT", "DELETE"] {
+            let raw =
+                format!("{method} /echo HTTP/1.1\r\nHost: c2n\r\nContent-Length: 5\r\n\r\nhello");
+            let resp = build_c2n_response(&c2n_request(&raw), &config).await;
+            assert_eq!(
+                resp, "HTTP/1.1 200 OK\r\n\r\nhello",
+                "{method} /echo must echo: upstream registers /echo for every method"
+            );
+        }
+    }
+
+    /// A path this node does not serve keeps the `400`, whatever the method — the 405 branch is
+    /// scoped to this node's own route table, not to upstream's. Go would answer `405` for some of
+    /// these (`/update`, `/sockstats` and `/netfilter-kind` are all in its `c2nHandlerPaths`), but
+    /// here there is no handler for them under any method, so claiming "bad method" would claim a
+    /// feature that is absent; `unknown c2n path` is the true answer.
+    #[tokio::test]
+    async fn c2n_unknown_path_keeps_400_for_every_method() {
+        let config = crate::Config::default();
+        for raw in [
+            "POST /update HTTP/1.1\r\nHost: c2n\r\n\r\n",
+            "GET /update HTTP/1.1\r\nHost: c2n\r\n\r\n",
+            "POST /sockstats HTTP/1.1\r\nHost: c2n\r\n\r\n",
+            "POST /netfilter-kind HTTP/1.1\r\nHost: c2n\r\n\r\n",
+            "PUT /vip-services-other HTTP/1.1\r\nHost: c2n\r\n\r\n",
+        ] {
+            let resp = build_c2n_response(&c2n_request(raw), &config).await;
+            assert_eq!(
+                resp, "HTTP/1.1 400 Bad Request\r\n\r\nunknown c2n path",
+                "{raw} has no handler here under any method"
+            );
+        }
     }
 
     /// Split the HTTP/1.1 response built by [`build_vip_services_response`] into its status line and
