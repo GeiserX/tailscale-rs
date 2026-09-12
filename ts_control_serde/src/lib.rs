@@ -54,8 +54,16 @@ pub use ping::{PingRequest, PingResponse, PingType};
 pub use register::{RegisterAuth, RegisterRequest, RegisterResponse, SignatureType};
 pub use service::{Service, ServiceProto};
 pub use service_vip::{
-    C2NVIPServicesResponse, NODE_ATTR_SERVICE_HOST, NODE_ATTR_SUGGEST_EXIT_NODE, ProtoPortRange,
-    SERVICE_NAME_PREFIX, ServiceIpMappings, ServiceName, VipService, VipServiceOwned,
+    C2NVIPServicesResponse, NODE_ATTR_PREFIX_SERVICES, NODE_ATTR_SERVICE_HOST,
+    NODE_ATTR_SUGGEST_EXIT_NODE, ProtoPortRange, SERVICE_ACTION_ATTRIBUTE_RESOURCE_NAME,
+    SERVICE_ACTION_ATTRIBUTE_SKIP_USERNAME, SERVICE_ACTION_ATTRIBUTE_WEB_CLIENT_URL,
+    SERVICE_ACTION_TYPE_AWS_S3, SERVICE_ACTION_TYPE_COCKROACH_DB,
+    SERVICE_ACTION_TYPE_ELASTIC_SEARCH, SERVICE_ACTION_TYPE_HTTP, SERVICE_ACTION_TYPE_KUBERNETES,
+    SERVICE_ACTION_TYPE_MONGO_DB, SERVICE_ACTION_TYPE_MSSQL, SERVICE_ACTION_TYPE_MYSQL,
+    SERVICE_ACTION_TYPE_POSTGRESQL, SERVICE_ACTION_TYPE_RDP, SERVICE_ACTION_TYPE_SSH,
+    SERVICE_ACTION_TYPE_TCP, SERVICE_ACTION_TYPE_VNC, SERVICE_ACTION_TYPES, SERVICE_NAME_PREFIX,
+    ServiceAction, ServiceActionType, ServiceDetails, ServiceIpMappings, ServiceName, VipService,
+    VipServiceOwned,
 };
 pub use set_dns::{SetDnsRequest, SetDnsResponse};
 pub use ssh_policy::{SSHAction, SSHPolicy, SSHPrincipal, SSHRecorderFailureAction, SSHRule};
