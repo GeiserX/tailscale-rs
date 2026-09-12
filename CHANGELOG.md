@@ -2,6 +2,18 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.56.0](https://github.com/GeiserX/tailscale-rs/compare/v0.55.2...v0.56.0) (2026-09-12)
+
+
+### Features
+
+* **control:** decode the client actions control sends for VIP services ([#459](https://github.com/GeiserX/tailscale-rs/issues/459)) ([2194f0d](https://github.com/GeiserX/tailscale-rs/commit/2194f0d55f312196ece4c25e6c58822ea5fa4756))
+
+
+### Bug Fixes
+
+* **c2n:** answer a non-GET /vip-services with 405, not the service list ([#456](https://github.com/GeiserX/tailscale-rs/issues/456)) ([8aacfe4](https://github.com/GeiserX/tailscale-rs/commit/8aacfe4505dade6ee1f81cafe3cecc87fe0aec17))
+
 ## [0.55.2](https://github.com/GeiserX/tailscale-rs/compare/v0.55.1...v0.55.2) (2026-09-11)
 
 
