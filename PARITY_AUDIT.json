@@ -2,102 +2,53 @@
   "schema": "parity-audit/v1",
   "auditedPrs": [
     {
-      "url": "https://github.com/GeiserX/tailscale-rs/pull/305",
+      "url": "https://github.com/GeiserX/tailscale-rs/pull/436",
       "verdict": "faithful",
-      "notes": "Docs only (PORTING.md). Its factual claims about upstream check out at the pin: tailcfg.CurrentCapabilityVersion is 145, the 131-145 capability rows exist with the dates and subjects quoted, and the re-derive appendix's commands work. No code, so no behaviour to diverge."
+      "notes": "ts_packetfilter::permits_unlocked_nodes matches packetFilterPermitsUnlockedNodes clause for clause: the union is built from the (already route-clamped) AllowedIPs, the comparison is prefix overlap rather than containment, Match.Srcs alone participates so a node-capability source is ignored, and the len(m.Dsts) != 0 test is kept. Go's numUnlocked == 0 early return and the Rust empty-union early return reach the same verdict, including for an unlocked peer with no AllowedIPs. The deny-all-but-retain shape matches Go's packetFilter = nil (which keeps cn.PacketFilter() and declines to install it), and the check runs over the whole ruleset map including the DEFAULT_RULESET_NAME entry that apply_update writes the base filter into, so the main ACL is in scope. The only upstream side effect not reproduced is the invalidPacketFilterWarnable health signal, and this tree has no health-warnable surface at all to carry it, so there is nothing to diverge from; not filed as a finding. Go's tryHandleIncrementally-order and knob timing are not implicated here."
     },
     {
-      "url": "https://github.com/GeiserX/tailscale-rs/pull/306",
-      "verdict": "faithful",
-      "notes": "Docs only. The correction it makes is right: net/dns/config.go serviceIPs returns BOTH the IPv4 and IPv6 MagicDNS service IPs by default and narrows to IPv4 only when ShouldForceRegisterMagicDNSIPv4Only is set, so the old row had the default inverted. Row 133 now reads needs-port, which matches the tree."
-    },
-    {
-      "url": "https://github.com/GeiserX/tailscale-rs/pull/308",
+      "url": "https://github.com/GeiserX/tailscale-rs/pull/438",
       "verdict": "gaps",
-      "notes": "The wire decode (ts_packet::tsmp) is faithful, including Go's len(p) < 33 laxity. The state model is not: upstream keeps the control-learned and TSMP-learned disco keys as separate fields with the TSMP one taking precedence; this tree keeps one field. See findings."
+      "notes": "The collapse itself is right: 10000 as the constant, a strict > comparison, single-IP-in-CGNAT as the collapsible class (Go's classify), and the /10 replacing the /32s it covers. The enable-wins tie-break the commit body records as reasoned rather than transcribed does match upstream (controlknobs.UpdateFromNodeAttributes checks OneCGNATEnable first, then OneCGNATDisable in an else-if), so that recorded QUESTION can be closed. Two divergences in how the tri-state is turned into a threshold: one-cgnat?v=false is modelled as an unreachable threshold where upstream keeps the 10000 ceiling, and the no-attribute case ignores upstream's platform/interface gate entirely. See findings."
     },
     {
-      "url": "https://github.com/GeiserX/tailscale-rs/pull/310",
+      "url": "https://github.com/GeiserX/tailscale-rs/pull/442",
       "verdict": "gaps",
-      "notes": "StatusNode::is_router matches ipnstate.PeerStatus.IsRouter clause for clause, including the AllowedIPs-empty case. Node::is_router narrows Go's comparison against the full Addresses list to one prefix per family; disclosed in the doc comment, and a divergence only on multi-address-per-family input. See findings."
-    },
-    {
-      "url": "https://github.com/GeiserX/tailscale-rs/pull/311",
-      "verdict": "gaps",
-      "notes": "The reasoning for not implementing c2n /debug/netmap, /debug/health and /debug/tka/log is sound, and the routing refactor plus its 400 fallthrough tests match Go's handler set. But the declaration it lands on still asserts capability versions 120 and 121, which this tree did not implement at that commit. See findings."
-    },
-    {
-      "url": "https://github.com/GeiserX/tailscale-rs/pull/307",
-      "verdict": "gaps",
-      "notes": "The segment-boundary rule is correct and the test rewrite genuinely calls the production selector now. The other half of Go's lookup, path.Clean on the request path plus its non-absolute-path refusal, was not ported. See findings."
-    },
-    {
-      "url": "https://github.com/GeiserX/tailscale-rs/pull/312",
-      "verdict": "gaps",
-      "notes": "Codecs check out against disco/disco.go: the 72-byte bind common block, the UDPRelayEndpoint layout and its at-least-one-addr:port rule, the per-type version laxity, and the 4-in-6 unmap on decode. The Geneve control-bit fix is right, Go sets it at 0x80 in byte 1. The relay-address sanitizer is stricter than upstream. See findings."
-    },
-    {
-      "url": "https://github.com/GeiserX/tailscale-rs/pull/313",
-      "verdict": "gaps",
-      "notes": "The unbounded-attribution-map fix has no upstream analogue to diverge from and is a straight improvement. The source-address filter is a deliberate fork restriction that upstream's relayManager does not have, and the PR says so. Recorded as a divergence because it is one. See findings."
-    },
-    {
-      "url": "https://github.com/GeiserX/tailscale-rs/pull/314",
-      "verdict": "faithful",
-      "notes": "Matches magicsock.Conn.PriorityMessageForPeer refusal for refusal (zero self disco key, unknown peer, isWireguardOnly, no selfIPMatchingFamily source) and wireguard-go's own drops in Peer.SendPriorityMessage (no live keypair, empty message, over MaxPriorityMessageContentSize). Both call sites match device/receive.go. Marshal mirrors TSMPDiscoKeyAdvertisement.Marshal including the mixed-family refusal."
-    },
-    {
-      "url": "https://github.com/GeiserX/tailscale-rs/pull/318",
-      "verdict": "faithful",
-      "notes": "Verified against wireguard-go at the revision the pinned tailscale go.mod names. SendPriorityMessage queues straight to the outbound queue, and both call sites run it before the flush that follows: ahead of SendKeepalive on the initiator and ahead of SendStagedPackets on the responder. Splicing the advertisement in front of the batch is the right restoration of that order here."
+      "notes": "The attribute name and the refusal's shape are both right. disable-delta-updates is the literal nodecap string, and the commit's central claim — that the attribute neither rejects the response nor drops the patches, it declines the incremental path so the full path handles the same response — is exactly Go's structure: a false return from tryHandleIncrementally falls through to ms.netmap() plus UpdateFullNetmap. The same-response timing claim also checks out: UpdateFromNodeAttributes runs at map.go:268, before the tryHandleIncrementally call at map.go:284, so an attribute control grants does take effect on the response that granted it. But the port is narrower than the gate it copies (it covers only PeersChangedPatch), and the full arm drops upstream's tailnet-lock re-filter. See findings."
     }
   ],
   "gate": {
     "ran": true,
     "pass": false,
-    "detail": "TS_RS_EXPERIMENT=this_is_unstable_software bin/check on current main (7c39ae0, clean tree), CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=4. Two failures, both reproduce on untouched main and neither is caused by the audited PRs. (1) Step 1, cargo +nightly fmt --check: 22 import-granularity diffs across 10 files. Toolchain artifact, not a repo regression: local nightly rustfmt is 1.10.0-nightly (fd7ed57dfd 2026-08-29), and the gating CI lane runs cargo fmt --check on the pinned stable toolchain (rustfmt 1.9.0-stable), which I ran separately and it exits 0. (2) The clippy run over bins, tests, benches and examples fails: clippy::items_after_test_module in ts_netstack_smoltcp_socket/src/tcp/stream.rs:429, a file untouched by every PR audited here. Steps that did pass when run individually past the set -e stop: cargo run -p checks (the anti-leak check) and the --lib clippy pass. The steps after the clippy failure (doc, deny, machete, nextest, doc-tests, build) were not reached. The PR bodies of #305 and #310 already record both failures as pre-existing."
+    "detail": "Scoped gate on main @ 98881e3 with CARGO_BUILD_JOBS=4 / RUST_TEST_THREADS=4. Green: clippy --workspace --exclude ts_cli_util --lib --all-features -D warnings; clippy over bins/tests/benches/examples with -D warnings -A missing_docs; cargo build --workspace --exclude ts_cli_util --all-targets --all-features (Finished dev profile in 14m 21s, zero errors). nextest -p geiserx_ts_control -p geiserx_ts_runtime --all-features ran 942 tests: 939 passed, 1 failed, 2 never returned. The failure is ts_runtime::direct::tests::probe_stun_servers_once_sends_binding_request (opens a real UDP socket to a STUN server; this uid's egress is dropped) and the two that sit are ts_runtime::serve::tests::serve_path_proxy_replays_consumed_head_to_backend and proxy_with_prefix_writes_prefix_before_bidi_copy (loopback SYN dropped rather than refused, so they hang instead of failing); nextest was killed once only those two remained. All three are documented sandbox-environment failures on this box rather than tree failures, so pass is recorded false on the literal outcome while no code-attributable failure was observed. Not run: cargo deny check all (standing red on any branch here, on banned aws-lc-rs/aws-lc-sys and an unsatisfiable licence requirement) and anything needing ts_cli_util under --all-features (its tracy feature does not compile against the locked tracy-client-sys 0.28.0)."
   },
   "findings": [
     {
-      "prUrl": "https://github.com/GeiserX/tailscale-rs/pull/307",
-      "title": "The serve mux matches the raw request target; Go cleans the path first, so a dot-dot segment still reaches a backend it was never mounted for",
-      "detail": "getServeHandler looks up r.URL.Path exactly, then sets pth = path.Clean(r.URL.Path), refuses to continue if the cleaned path is not absolute (the guard against the '*' and '' request targets spinning the loop), and only then walks the path backwards over its separators. The merged fork keeps the raw target: request_path returns the request-line path with the query stripped and applies no cleaning, and match_path_handler runs mount_claims_path over that string. With mounts at / and /api, a request for /api/../secret is claimed by /api here because the remainder after the mount starts with a slash, while Go cleans it to /secret and routes it to /. That is the same class the PR set out to fix, a request reaching a backend it was never mounted for, left standing in the half of Go's lookup that was not ported. The malformed-target guard is missing too: 'GET * HTTP/1.1' yields the path '*', which no mount claims in Go but which the root mount claims here, since a root mount normalizes to the empty prefix that claims everything.",
-      "upstream": "ipn/ipnlocal/serve.go @ 49e148c4a30b4f8098f69468fd27a7021d85ea02",
+      "prUrl": "https://github.com/GeiserX/tailscale-rs/pull/438",
+      "title": "one-cgnat?v=false disables the CGNAT collapse outright where upstream keeps the 10000 ceiling",
+      "detail": "Upstream carries the decision into the route manager as routemanager.TailnetConfig.OneCGNAT, a plain bool, and RouteManager.cgnatThreshold() returns 1 when it is set and the cgnatThreshold constant (10_000) otherwise. So the disabling attribute only declines the forced collapse; the ceiling still applies, and wantCoarse := len(rm.cgnatPfxs) > rm.cgnatThreshold() still installs the single 100.64.0.0/10 once more than 10000 distinct CGNAT peer routes exist. The merged cgnat_threshold maps Some(false) to usize::MAX (commented 'unreachable so the fold never fires'), so with one-cgnat?v=false set the collapse can never happen at any peer count: a tailnet above the threshold programs one /32 per peer here where a Go client programs a single /10. The merged test host_routes_collapse_above_the_threshold_unless_control_forbids_it pins the divergent half, and the commit body states the inverted rule as fact ('?v=false forces /32-per-peer even above the threshold, and neither attribute leaves the threshold to decide'). This is the unbounded host route table the change set out to bound, still reachable on control's say-so.",
+      "upstream": "net/routemanager/routemanager.go @ 023255e8a27ec9f6a21d24e3eda21c052ff72af3",
       "severity": "major"
     },
     {
-      "prUrl": "https://github.com/GeiserX/tailscale-rs/pull/308",
-      "title": "A TSMP-learned disco key is stored in the same field control writes, so the next netmap update overwrites it with control's stale key",
-      "detail": "Upstream models this as two keys per endpoint. endpointDisco carries controlKey and tsmpKey side by side with a tsmpActive flag, endpointDisco.key() returns tsmpKey whenever tsmpActive is set, and updateTSMPDiscoKey preserves controlKey while writing tsmpKey. HandleDiscoKeyAdvertisement's unchanged-key early return compares the advertisement against epDisco.keyFromTSMP(), the TSMP-learned key specifically, not against the effective one. The merged fork has one field: PeerTracker::learn_disco_key compares against existing.disco_key and writes node.disco_key, and there is no TSMP-versus-control distinction anywhere in ts_runtime/src/peer_tracker. Two consequences. First, apply_peer_update upserts nodes built from control wholesale, so a later netmap Full or Delta carrying the peer's old disco key silently discards the key just learned over TSMP, where upstream keeps preferring the TSMP one. That is precisely the situation the feature exists for, a peer whose key control has not caught up with, so the port loses its own motivating case on the next map poll. Second, the unchanged-key refusal is evaluated against the effective key rather than the TSMP key, so an advertisement that merely restates what control already said is dropped where upstream would record it as the active TSMP key.",
-      "upstream": "wgengine/magicsock/endpoint.go @ 49e148c4a30b4f8098f69468fd27a7021d85ea02",
+      "prUrl": "https://github.com/GeiserX/tailscale-rs/pull/438",
+      "title": "the no-attribute case skips upstream's platform and CGNAT-interface gate",
+      "detail": "With neither one-cgnat attribute present, upstream does not fall through to the 10000 threshold. shouldUseOneCGNATRoute consults the knob first (an explicit true or false is terminal), then returns true for versionOS == \"plan9\", then for versionOS == \"macOS\" or \"android\" probes netmon.HasCGNATInterface() and returns true when no other interface uses the CGNAT range — returning false if that probe errors — and only otherwise false. A true result becomes TailnetConfig.OneCGNAT, i.e. a threshold of 1, so the /10 replaces the per-peer /32s from the second CGNAT route onward. The merged Node::one_cgnat() returns None whenever the attribute is absent and cgnat_threshold(None) is unconditionally CGNAT_THRESHOLD, with no platform or interface input anywhere on the path; the commit body does not mention the gate. On macOS — a platform this workspace builds and tests on — this tree therefore keeps one /32 per peer at every peer count below 10000 where a Go client installs the single /10 and stops reconfiguring the host route set per peer.",
+      "upstream": "ipn/ipnlocal/local.go @ 023255e8a27ec9f6a21d24e3eda21c052ff72af3",
       "severity": "major"
     },
     {
-      "prUrl": "https://github.com/GeiserX/tailscale-rs/pull/310",
-      "title": "Node::is_router compares routes against one prefix per family, where Go compares against every address the node holds",
-      "detail": "tailcfg.Node.IsRouter iterates AllowedIPs and reports true for any prefix not present in the node's full Addresses slice, so a node control gave several prefixes in one family is still not a router on account of any of them. The merged is_router tests each accepted route against tailnet_address.ipv4 or tailnet_address.ipv6, the single first prefix retained per family, so a second same-family address assigned by control reads as a routed prefix and the node is misreported as a router. The doc comment discloses this and the case does not arise with what control assigns today, which is why this is minor rather than major, but it is a divergence from the predicate the PR claims to port. The sibling StatusNode::is_router has no such gap: it reproduces ipnstate.PeerStatus.IsRouter's clause, not-a-single-host-IP or a host IP that is not one of ours, exactly.",
-      "upstream": "tailcfg/tailcfg.go @ 49e148c4a30b4f8098f69468fd27a7021d85ea02",
-      "severity": "minor"
+      "prUrl": "https://github.com/GeiserX/tailscale-rs/pull/442",
+      "title": "the escape hatch diverts only PeersChangedPatch; PeersChanged/PeersRemoved deltas still ride the incremental path",
+      "detail": "Upstream's gate is the first statement of tryHandleIncrementally, and a false return there is not scoped to patches: handleNonKeepAliveMapResponse falls through to ms.netmap() and netmapUpdater.UpdateFullNetmap(nm) for the entire response, whatever it carried, which is what the attribute's own documentation asks for ('treat all netmap changes as \"full\" ones as tailscaled did in 1.48.x and earlier'). In the merged tree the check lives in PeerTracker::apply_peer_patch_set, which the netmap handler reaches only from inside `if !msg.peer_patches.is_empty()`. PeerTracker::apply_peer_update — which applies PeerUpdate::Delta, built in ts_control::tokio::map_stream from MapResponse.PeersChanged and PeersRemoved, this tree's other delta mechanism — runs unconditionally just above it and is untouched by the attribute. So a response carrying only PeersChanged/PeersRemoved never takes the full arm even with the attribute set, and one carrying both applies the delta incrementally before the patches are rebuilt as a full update. Control cannot actually take this node off the delta netmap path, which is the escape hatch's entire purpose.",
+      "upstream": "control/controlclient/map.go @ 023255e8a27ec9f6a21d24e3eda21c052ff72af3",
+      "severity": "major"
     },
     {
-      "prUrl": "https://github.com/GeiserX/tailscale-rs/pull/311",
-      "title": "Declaring capability version 125 still claims 120 and 121, the peer-relay versions this tree did not implement at that commit",
-      "detail": "A capability version is a contiguous claim, which the PR states and which its own test asserts by pinning CURRENT below the first unimplemented version. Upstream's list makes 120 'Client understands peer relay disco messages, and implements peer client and relay server functions' and 121 'Client understands peer relay endpoint alloc with AllocateUDPRelayEndpointRequest and AllocateUDPRelayEndpointResponse'. At the merge of this PR neither was implemented: peer-relay disco arrived later in #312, which by its own account implements only the client half and deliberately excludes serving as a relay and originating an allocation request. So 125 was, and after #312 remains, an overclaim on 120 and 121, the exact defect the PR was opened to remove for 127, 128 and 138. The commit body acknowledges the choice and PORTING.md tracks it, so this is filed as the unresolved half of the PR's own stated goal rather than as an undetected error.",
-      "upstream": "tailcfg/tailcfg.go @ 49e148c4a30b4f8098f69468fd27a7021d85ea02",
-      "severity": "minor"
-    },
-    {
-      "prUrl": "https://github.com/GeiserX/tailscale-rs/pull/312",
-      "title": "The relay-address sanitizer rejects relay servers on private, unique-local and (by default) all IPv6 addresses, which upstream handshakes with normally",
-      "detail": "start_relay_handshake runs every addr:port a CallMeMaybeVia advertises through relay_addr_allowed, which is is_pingable_candidate: for IPv4 it rejects unspecified, loopback, link-local, multicast, broadcast and is_private, and for IPv6 it rejects everything unless enable_ipv6 is set, then rejects unique-local and link-local. Upstream's relayManager applies no such filter to a UDPRelayEndpoint's AddrPorts; it handshakes with what the endpoint advertises. A self-hosted peer relay on a private LAN address, which is a normal deployment of net/udprelay, therefore never yields a path here and the peer stays on DERP, which is the outcome this PR exists to avoid. The restriction is a deliberate fork anti-leak invariant and is documented as such, and the fork's invariants outrank parity by the repo's own rule, so it is recorded rather than disputed. Worth a ledger row so the interop cost is not rediscovered as a bug.",
-      "upstream": "wgengine/magicsock/relaymanager.go @ 49e148c4a30b4f8098f69468fd27a7021d85ea02",
-      "severity": "minor"
-    },
-    {
-      "prUrl": "https://github.com/GeiserX/tailscale-rs/pull/313",
-      "title": "The source address of a peer-relay datagram is filtered before the frame is read, where upstream takes it as given",
-      "detail": "handleRxDiscoMsg passes src.ap straight through to handleRxDiscoMsgRunLoop, which keys handshake work by addrPortVNI{event.from, event.vni} and never tests the source address against any address class. The merged handle_relay_disco applies relay_addr_allowed to from before parsing, so a relay server answering from a private, loopback or link-local source has its challenge dropped and the handshake does not advance. This is the same divergence family as the finding on #312 and is stated plainly in the commit body as a deliberate fork restriction with no upstream counterpart; it is filed because it is a behavioural difference from the function the diff cites, not because the reasoning is wrong. Its practical reach is narrower than the #312 finding, since a relay whose advertised addresses already passed the sanitizer will normally answer from one of them.",
-      "upstream": "wgengine/magicsock/relaymanager.go @ 49e148c4a30b4f8098f69468fd27a7021d85ea02",
+      "prUrl": "https://github.com/GeiserX/tailscale-rs/pull/442",
+      "title": "the full arm omits the tailnet-lock re-filter upstream's full netmap path runs",
+      "detail": "Upstream reaches the full netmap path through tkaFilterNetmapLocked(st.NetMap) (guarded only by envknob.TKASkipSignatureCheck) immediately before setNetMapLocked, so declining the delta path also re-verifies every peer's node-key signature against the lock; the delta path gets the narrower tkaFilterDeltaMutsLocked instead, and upstream's comment says that exists precisely to match 'the full-netmap behavior of tkaFilterNetmapLocked'. rebuild_netmap_with_patches re-installs every retained peer through upsert_from_control without re-running the lock gate, so the only trust check on this arm is the per-patched-node one inside apply_peer_patches. A peer that was admitted earlier and whose signature has since stopped verifying is evicted by upstream on this path and retained here. The commit's DECISIONS section discloses the omission and gives a defensible reason (this tree rewrites an expiry-flagged peer's node key via ts_keys::node_public_with_bad_old_prefix, so a whole-db re-filter would evict it and lose the diagnostic), which is why this is filed as minor rather than as a security regression — but it is still a behaviour divergence on the arm the change introduced, and the reason argues for a narrower gate rather than for none.",
+      "upstream": "ipn/ipnlocal/local.go @ 023255e8a27ec9f6a21d24e3eda21c052ff72af3",
       "severity": "minor"
     }
   ]
