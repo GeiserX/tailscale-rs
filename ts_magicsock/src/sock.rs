@@ -1548,8 +1548,9 @@ impl MagicSock {
     /// framing that no upstream sender produces, and is dropped rather than guessed at.
     ///
     /// `frame` is the inner disco frame (the Geneve header already stripped) and is decrypted in
-    /// place. `from` must pass [`relay_addr_allowed`](Self::relay_addr_allowed) before any of it is
-    /// read: every handler here replies to `from`, so it is a host-sourced send target.
+    /// place. `from` is taken as given, exactly as upstream's `relayManager.handleRxDiscoMsg`
+    /// takes `src.ap`; the one restriction this fork adds is on the *reply*, not on the datagram
+    /// — see [`relay_reply_target_allowed`](Self::relay_reply_target_allowed).
     ///
     /// Errors are logged and swallowed rather than returned: the reply this handler emits goes to
     /// a *peer-supplied* relay address, so a transient send failure there must not propagate out of
@@ -1561,24 +1562,6 @@ impl MagicSock {
         vni: u32,
         control: bool,
     ) {
-        // Every branch below answers to `from`: a challenge is answered and then pinged there, a
-        // relayed ping is ponged there, and a relayed pong makes it attribute inbound data. So
-        // `from` is a peer-relay send target exactly as an advertised relay address is, and it
-        // gets the same sanitizer — the one `start_relay_handshake` already applies to the
-        // addresses a `CallMeMaybeVia` names. Without it the sanitizer is trivially bypassed:
-        // a relay server named by a peer (or anything that can put a datagram sealed by that
-        // server's disco key on our socket with a forged source) picks the source address, and
-        // this node emits host-sourced datagrams at it — loopback, link-local, or the LAN.
-        //
-        // Deliberately stricter than upstream, which keys handshake work by (server disco, VNI)
-        // and takes the challenge's source as given (`relayManager.handleRxDiscoMsg`), for the
-        // same reason `MAX_RELAY_ADDR_PORTS` is: nothing here may turn this host's socket into a
-        // scanner. It costs nothing in interop — a real relay server answers from a routable
-        // address, and this does not require it to be one it advertised.
-        if !self.relay_addr_allowed(&from) {
-            tracing::debug!(%from, "dropping peer-relay disco from a forbidden source address");
-            return;
-        }
         let msg = match disco::open(&self.our_disco, frame) {
             Ok(msg) => msg,
             Err(e) => {
@@ -1586,8 +1569,15 @@ impl MagicSock {
                 return;
             }
         };
+        // The restriction is on the branches that put a datagram back on the wire at `from`, and
+        // only those. Message class decides: a challenge is answered and then pinged at `from`, a
+        // relayed ping is ponged at `from`, so for those two `from` is a host-sourced send target
+        // chosen by whoever wrote the source field. A pong sends nothing and is taken as given.
         let handled = match msg {
             Inbound::BindUdpRelayEndpointChallenge { sender, common } if control => {
+                if !self.relay_reply_target_allowed(&from) {
+                    return;
+                }
                 self.handle_relay_challenge(sender, common, from, vni).await
             }
             Inbound::Ping {
@@ -1595,6 +1585,9 @@ impl MagicSock {
                 claimed_node_key,
                 tx_id,
             } if !control => {
+                if !self.relay_reply_target_allowed(&from) {
+                    return;
+                }
                 self.handle_relay_ping(sender, claimed_node_key, tx_id, from, vni)
                     .await
             }
@@ -1753,6 +1746,14 @@ impl MagicSock {
     /// **not** harvested as a reflexive address here, unlike the direct path: what the peer
     /// observed is the *relay server's* view, not ours, so learning it would advertise an address
     /// that is not ours to control and to every other peer.
+    ///
+    /// `from` — the address the pong itself arrived from — is taken as given, upstream's behaviour
+    /// and for upstream's reason: nothing is ever sent to it. It is recorded only in the
+    /// `(addr, VNI) → peer` map that attributes inbound relayed WireGuard, and only once
+    /// `note_pong` has matched a transaction id from a ping this node sent to an address that
+    /// already passed the relay-address filter. See
+    /// [`relay_reply_target_allowed`](Self::relay_reply_target_allowed) for why the filter stops
+    /// short of this branch.
     fn handle_relay_pong(
         &self,
         sender: DiscoPublicKey,
@@ -1967,8 +1968,9 @@ impl MagicSock {
     /// neighbouring tenants. Handshaking with whatever the endpoint advertises would let any
     /// authenticated tailnet peer aim host-sourced UDP at all of it, one bind message per
     /// advertised address, which is the scanner the anti-leak rules exist to prevent.
-    /// [`handle_relay_disco`](Self::handle_relay_disco) applies this same rule to the challenge's
-    /// *source* address, for the same reason.
+    /// [`relay_reply_target_allowed`](Self::relay_reply_target_allowed) applies this same rule to
+    /// the *source* address of an inbound relay message that would be replied to, for the same
+    /// reason.
     ///
     /// # What it costs, and the one relaxation there is
     ///
@@ -2003,6 +2005,46 @@ impl MagicSock {
             return true;
         }
         self.is_pingable_candidate(addr)
+    }
+
+    /// Whether an inbound peer-relay message sourced from `from` may be **replied to**.
+    ///
+    /// Upstream takes the source of a peer-relay datagram as given:
+    /// [`relayManager.handleRxDiscoMsg`] hands `src.ap` straight to the run loop, which keys
+    /// handshake work by `(server disco, VNI)` and tests the address against no class at all. This
+    /// fork does the same — with one exception, which is this function.
+    ///
+    /// A `BindUdpRelayEndpointChallenge` is answered and then pinged at its own source address, and
+    /// a relayed `Ping` is ponged at its own source address. On those two branches the source field
+    /// of an inbound datagram *is* a host-sourced send target, chosen by whoever wrote it, and a UDP
+    /// source address is forgeable. Without this gate the sanitizer
+    /// [`relay_addr_allowed`](Self::relay_addr_allowed) applies to the addresses a `CallMeMaybeVia`
+    /// advertises is bypassed outright: put a challenge on this node's socket with the source set to
+    /// loopback, to `169.254.169.254`, or to a LAN host, and the node emits a bind answer and a disco
+    /// ping at it. That is the scanner the anti-leak rules exist to prevent, so the same class filter
+    /// runs here.
+    ///
+    /// It is scoped to those two branches and no further. A relayed `Pong` replies to nothing: it
+    /// only records the source in the `(addr, VNI) → peer` map that attributes *inbound* relayed
+    /// WireGuard, and only after `note_pong` matched a transaction id from a ping this node itself
+    /// sent to an already-sanitized address. Nothing this node emits is aimed at a pong's source —
+    /// [`relay_path`](Self::relay_path) returns the confirmed address the ping went *to* — so
+    /// filtering a pong by source would cost upstream parity and buy nothing. A relay server that
+    /// answers a relayed ping from an address in a refused class therefore still confirms the path,
+    /// exactly as it does against a Go client.
+    ///
+    /// The interop cost of what is kept is nil in practice: the handshake only exists because a bind
+    /// message already went to a routable address that passed `relay_addr_allowed`, so a real relay
+    /// server answers from a routable address too. This does not require it to be one the server
+    /// advertised — a relay may answer from another port, or another address of the same host.
+    ///
+    /// [`relayManager.handleRxDiscoMsg`]: https://github.com/tailscale/tailscale/blob/49e148c4a30b4f8098f69468fd27a7021d85ea02/wgengine/magicsock/relaymanager.go
+    fn relay_reply_target_allowed(&self, from: &SocketAddr) -> bool {
+        if self.relay_addr_allowed(from) {
+            return true;
+        }
+        tracing::debug!(%from, "dropping peer-relay disco that would reply to a forbidden source");
+        false
     }
 
     /// The next bind-handshake generation: monotonic and never zero, as upstream requires
@@ -3871,15 +3913,18 @@ mod tests {
         }
     }
 
-    /// The *source* of a peer-relay datagram is a host-sourced send target too, and gets the same
-    /// sanitizer an advertised relay address does.
+    /// The source of a peer-relay message this node would *reply to* is a host-sourced send target,
+    /// and gets the same sanitizer an advertised relay address does.
     ///
-    /// Every handler on this leg replies to `from`: a challenge is answered and then pinged there,
-    /// a relayed ping is ponged there, a relayed pong makes it attribute inbound data. The relay
-    /// server is named by a peer and a UDP source address is forgeable, so without this check the
-    /// sanitizer that `relay_addresses_are_sanitized_before_any_packet_leaves` pins is bypassed by
-    /// simply putting the challenge on the wire with the source set to loopback, the cloud
-    /// metadata address, or a LAN host — and this node emits a bind answer and a disco ping at it.
+    /// A challenge is answered and then pinged at its own source address. The relay server is named
+    /// by a peer and a UDP source address is forgeable, so without this check the sanitizer that
+    /// `relay_addresses_are_sanitized_before_any_packet_leaves` pins is bypassed by simply putting
+    /// the challenge on the wire with the source set to loopback, the cloud metadata address, or a
+    /// LAN host — and this node emits a bind answer and a disco ping at it.
+    ///
+    /// The companion of `a_relayed_pong_from_any_source_still_confirms_the_path`, which pins the
+    /// other half: the branch that replies to nothing keeps upstream's take-the-source-as-given
+    /// behaviour.
     #[tokio::test]
     async fn a_relay_message_from_a_forbidden_source_is_dropped() {
         let our_disco = DiscoPrivateKey::random();
@@ -3929,6 +3974,92 @@ mod tests {
             .try_recv()
             .expect("a challenge from a routable source must be answered");
         assert_eq!(to, elsewhere, "the answer goes back to the challenger");
+    }
+
+    /// A relayed pong confirms the path whatever address it arrives from — upstream's behaviour,
+    /// kept because the reason the other two branches are filtered does not reach this one.
+    ///
+    /// Upstream `relayManager.handleRxDiscoMsg` passes `src.ap` straight through and keys handshake
+    /// work by `(server disco, VNI)`, testing the source against no address class. This node does
+    /// filter that source on the two branches that reply to it (see
+    /// `a_relay_message_from_a_forbidden_source_is_dropped`), because there it is a host-sourced
+    /// send target. A pong is replied to with nothing: its source is recorded only in the map that
+    /// attributes inbound relayed WireGuard, and only after the transaction id matched a ping this
+    /// node sent to `fx.addr` — an address that already passed the relay-address filter. Dropping
+    /// it would strand a handshake that is otherwise complete and push the peer back to DERP for no
+    /// gain, so it is not dropped.
+    ///
+    /// The pong here arrives from an RFC 1918 address, a class `relay_addr_allowed` refuses, while
+    /// every byte this node emits still goes to the sanitized `fx.addr`.
+    #[tokio::test]
+    async fn a_relayed_pong_from_any_source_still_confirms_the_path() {
+        let our_disco = DiscoPrivateKey::random();
+        let mut fx = RelayFixture::new(37);
+        // A routable relay address, so the handshake runs under the production filter.
+        fx.addr = "192.0.2.10:41641".parse().unwrap();
+        let peer_pub = fx.peer.public_key();
+        let a = Arc::new(
+            MagicSock::bind(
+                localhost(),
+                our_disco.clone(),
+                ts_keys::NodePrivateKey::random().public_key(),
+            )
+            .await
+            .unwrap()
+            .with_binding_verifier(allow_all()),
+        );
+        // Note: `allow_loopback_relay` deliberately NOT set — this is the production filter.
+        let mut sends = a.tap_relay_sends();
+        let generation = begin_handshake(&a, &fx, &our_disco, &mut sends).await;
+
+        let mut challenge = fx.challenge(our_disco.public_key(), fx.vni, generation, 3);
+        a.handle_relay_disco(&mut challenge, fx.addr, fx.vni, true)
+            .await;
+        drop(sends.try_recv().expect("an answer must be sent"));
+        let (ping_to, wire) = sends.try_recv().expect("a relayed ping must be sent");
+        assert_eq!(
+            ping_to, fx.addr,
+            "the ping goes to the sanitized relay address"
+        );
+        let mut ping = expect_relay_frame(&wire, fx.vni, false);
+        let tx_id = match disco::open(&fx.peer, &mut ping).unwrap() {
+            Inbound::Ping { tx_id, .. } => tx_id,
+            other => panic!("expected a ping, got {other:?}"),
+        };
+        assert_eq!(
+            a.relay_path(&peer_pub),
+            None,
+            "nothing is confirmed until the pong lands"
+        );
+
+        // The relay forwards the peer's pong from a source in a class `relay_addr_allowed` refuses.
+        let observed: SocketAddr = "10.0.0.5:52000".parse().unwrap();
+        let mut pong = disco::seal_pong(&fx.peer, &our_disco.public_key(), tx_id, fx.addr).unwrap();
+        a.handle_relay_disco(&mut pong, observed, fx.vni, false)
+            .await;
+
+        assert_eq!(
+            a.relay_path(&peer_pub),
+            Some((fx.addr, fx.vni)),
+            "the pong confirms the path it answers, whatever address it arrived from"
+        );
+        {
+            let relay = lock(&a.relay_paths);
+            assert_eq!(
+                relay.peer_for_addr(observed, fx.vni),
+                Some(peer_pub),
+                "the observed source attributes inbound relayed data"
+            );
+            assert_eq!(
+                relay.peer_for_addr(fx.addr, fx.vni),
+                Some(peer_pub),
+                "so does the address we send through"
+            );
+        }
+        assert!(
+            sends.try_recv().is_err(),
+            "a pong is answered with nothing, so its source is never a send target"
+        );
     }
 
     /// A relay that answers from a fresh source port on every refresh pong must not leave an entry
