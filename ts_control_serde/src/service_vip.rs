@@ -6,7 +6,8 @@
 //! ([`NODE_ATTR_SERVICE_HOST`]) node-capability value, which carries a [`ServiceIpMappings`] map.
 //! These same VIP IPs are also injected into the node's `AllowedIPs`.
 //!
-//! Mirrors `tailcfg`'s `ServiceName`, `VIPService`, `ProtoPortRange`, and `ServiceIPMappings`.
+//! Mirrors `tailcfg`'s `ServiceName`, `VIPService`, `ProtoPortRange`, `ServiceIPMappings`,
+//! `ServiceDetails`, `ServiceAction` and `ServiceActionType`.
 
 use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use core::net::IpAddr;
@@ -257,6 +258,185 @@ impl<'a> ServiceIpMappings<'a> {
     }
 }
 
+/// The node-capability key **prefix** under which control describes the VIP services that are
+/// *visible* (reachable) to this node (`tailcfg.NodeAttrPrefixServices`). Each `CapMap` key of the
+/// form `services/<opaque-id>` carries one [`ServiceDetails`] value.
+///
+/// The suffix after the prefix is an opaque, server-chosen identifier: consumers must take the
+/// canonical service name from [`ServiceDetails::name`] rather than parsing it out of the map key.
+/// This is the *consume* counterpart to [`NODE_ATTR_SERVICE_HOST`], which tells a node which VIP
+/// services it *hosts*.
+pub const NODE_ATTR_PREFIX_SERVICES: &str = "services/";
+
+/// The type of a [`ServiceAction`] (`tailcfg.ServiceActionType`): which protocol or application a
+/// client should use when it invokes the action.
+///
+/// Well-known Tailscale types are plain slugs with no URL prefix (`"ssh"`, `"http"`, …) and are
+/// listed in [`SERVICE_ACTION_TYPES`]. Where a type names an application-layer protocol with a
+/// well-known port the slug generally follows the IANA service-name registry, except where the
+/// commonly used protocol name differs (Go keeps `"rdp"` over IANA's `ms-wbt-server`, `"vnc"` over
+/// `rfb`, `"mssql"` over `ms-sql-s`). Third-party types, if upstream ever adds any, must use URL
+/// form (`"example.com/my-custom-type"`) so they cannot collide with the first-party slugs.
+///
+/// Deliberately a transparent string newtype rather than an enum: control may send a type this
+/// build has never heard of, and Go's rule is that *clients should ignore actions with types they
+/// do not recognize* — not that the netmap is malformed. Any slug therefore decodes; ask
+/// [`ServiceActionType::is_known`] whether this build recognizes it.
+#[derive(
+    Default, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize,
+)]
+pub struct ServiceActionType<'a>(#[serde(borrow)] pub &'a str);
+
+/// `tailcfg.ServiceActionTypeAWSS3`: the port is an AWS S3-compatible endpoint, so an AWS
+/// configuration may be pointed at it and S3 clients used.
+pub const SERVICE_ACTION_TYPE_AWS_S3: ServiceActionType<'static> = ServiceActionType("aws-s3");
+/// `tailcfg.ServiceActionTypeCockroachDB`: the port is a CockroachDB server.
+pub const SERVICE_ACTION_TYPE_COCKROACH_DB: ServiceActionType<'static> =
+    ServiceActionType("cockroach");
+/// `tailcfg.ServiceActionTypeElasticSearch`: the port is an Elasticsearch server.
+pub const SERVICE_ACTION_TYPE_ELASTIC_SEARCH: ServiceActionType<'static> =
+    ServiceActionType("elasticsearch");
+/// `tailcfg.ServiceActionTypeHTTP`: the port is an HTTP server.
+pub const SERVICE_ACTION_TYPE_HTTP: ServiceActionType<'static> = ServiceActionType("http");
+/// `tailcfg.ServiceActionTypeKubernetes`: the port is a Kubernetes API server, so a Kubernetes
+/// context may be pointed at the service and Kubernetes clients used.
+pub const SERVICE_ACTION_TYPE_KUBERNETES: ServiceActionType<'static> =
+    ServiceActionType("kubernetes");
+/// `tailcfg.ServiceActionTypeMongoDB`: the port is a MongoDB server.
+pub const SERVICE_ACTION_TYPE_MONGO_DB: ServiceActionType<'static> = ServiceActionType("mongodb");
+/// `tailcfg.ServiceActionTypeMSSQL`: the port is a Microsoft SQL Server.
+pub const SERVICE_ACTION_TYPE_MSSQL: ServiceActionType<'static> = ServiceActionType("mssql");
+/// `tailcfg.ServiceActionTypeMySQL`: the port is a MySQL server.
+pub const SERVICE_ACTION_TYPE_MYSQL: ServiceActionType<'static> = ServiceActionType("mysql");
+/// `tailcfg.ServiceActionTypePostgreSQL`: the port is a PostgreSQL server.
+pub const SERVICE_ACTION_TYPE_POSTGRESQL: ServiceActionType<'static> =
+    ServiceActionType("postgresql");
+/// `tailcfg.ServiceActionTypeRDP`: the port is an RDP server.
+pub const SERVICE_ACTION_TYPE_RDP: ServiceActionType<'static> = ServiceActionType("rdp");
+/// `tailcfg.ServiceActionTypeVNC`: the port is a VNC server.
+pub const SERVICE_ACTION_TYPE_VNC: ServiceActionType<'static> = ServiceActionType("vnc");
+/// `tailcfg.ServiceActionTypeSSH`: the port is an SSH server.
+pub const SERVICE_ACTION_TYPE_SSH: ServiceActionType<'static> = ServiceActionType("ssh");
+/// `tailcfg.ServiceActionTypeTCP`: the port is a generic TCP server.
+pub const SERVICE_ACTION_TYPE_TCP: ServiceActionType<'static> = ServiceActionType("tcp");
+
+/// Every [`ServiceActionType`] this build recognizes, in the order Go's
+/// `ServiceActionType.Valid()` switch lists them. Backs [`ServiceActionType::is_known`] and is
+/// public so a consumer can enumerate what it may be asked to handle.
+pub const SERVICE_ACTION_TYPES: &[ServiceActionType<'static>] = &[
+    SERVICE_ACTION_TYPE_AWS_S3,
+    SERVICE_ACTION_TYPE_COCKROACH_DB,
+    SERVICE_ACTION_TYPE_ELASTIC_SEARCH,
+    SERVICE_ACTION_TYPE_HTTP,
+    SERVICE_ACTION_TYPE_KUBERNETES,
+    SERVICE_ACTION_TYPE_MONGO_DB,
+    SERVICE_ACTION_TYPE_MSSQL,
+    SERVICE_ACTION_TYPE_MYSQL,
+    SERVICE_ACTION_TYPE_POSTGRESQL,
+    SERVICE_ACTION_TYPE_RDP,
+    SERVICE_ACTION_TYPE_VNC,
+    SERVICE_ACTION_TYPE_SSH,
+    SERVICE_ACTION_TYPE_TCP,
+];
+
+impl ServiceActionType<'_> {
+    /// Whether this is one of the [`SERVICE_ACTION_TYPES`] slugs (Go `ServiceActionType.Valid`).
+    ///
+    /// A `false` here is *not* a decode error — it is the signal to ignore this one action and
+    /// keep the rest of the service (and the netmap) intact.
+    pub fn is_known(&self) -> bool {
+        SERVICE_ACTION_TYPES.iter().any(|known| known.0 == self.0)
+    }
+}
+
+/// `tailcfg.ServiceActionAttributeWebClientURL`: a browser-based client for the action is available
+/// at this URL. The value is a JSON string holding an `http(s)` URL.
+pub const SERVICE_ACTION_ATTRIBUTE_WEB_CLIENT_URL: &str = "tailscale.com/cap/web-client-url";
+/// `tailcfg.ServiceActionAttributeResourceName`: the named resource should be selected when the
+/// client opens the application for this action — a database name, for PostgreSQL. The value is a
+/// JSON string.
+pub const SERVICE_ACTION_ATTRIBUTE_RESOURCE_NAME: &str = "tailscale.com/cap/resource-name";
+/// `tailcfg.ServiceActionAttributeSkipUsername`: no username is required, typically because an
+/// application-layer proxy injects credentials on the user's behalf, so a username prompt should be
+/// skipped. The value is a JSON boolean.
+pub const SERVICE_ACTION_ATTRIBUTE_SKIP_USERNAME: &str = "tailscale.com/cap/skip-username";
+
+/// An action a Tailscale client can invoke against a [`ServiceDetails`] (`tailcfg.ServiceAction`).
+///
+/// Decode-only: this fork *consumes* what control publishes about services it can reach and never
+/// advertises actions of its own, so there is no `Serialize` impl to emit a shape upstream would
+/// have to accept.
+#[derive(Default, Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ServiceAction<'a> {
+    /// The action's type slug (`Type` on the wire). Renamed because `type` is a Rust keyword.
+    /// May be a slug this build does not know — see [`ServiceActionType`].
+    #[serde(rename = "Type", borrow, default)]
+    pub action_type: ServiceActionType<'a>,
+    /// The target TCP port. Control guarantees it matches one of the concrete (non-range) TCP
+    /// ports in the enclosing [`ServiceDetails::ports`]; nothing here re-checks that, because a
+    /// mismatch is control's bug and dropping the action would lose information the consumer may
+    /// want to log.
+    #[serde(default)]
+    pub port: u16,
+    /// An optional human-readable label, shown when a client offers several actions to pick from.
+    /// Empty means "infer one from [`ServiceAction::action_type`]".
+    #[serde(borrow, default)]
+    pub display_name: &'a str,
+    /// Optional extra metadata, keyed by attribute name (the
+    /// `SERVICE_ACTION_ATTRIBUTE_*` constants). Which attributes apply depends on
+    /// [`ServiceAction::action_type`].
+    ///
+    /// Values stay as raw JSON (Go's `tailcfg.RawMessage`) because each attribute has its own
+    /// schema — a string for a URL, a boolean for skip-username — and an unrecognized attribute
+    /// must be ignorable rather than fatal.
+    #[serde(borrow, default)]
+    pub attributes: BTreeMap<&'a str, &'a serde_json::value::RawValue>,
+}
+
+/// A VIP service that is *visible* to this node, as published by control under a
+/// [`NODE_ATTR_PREFIX_SERVICES`] capability key (`tailcfg.ServiceDetails`).
+///
+/// Distinct from [`VipService`], which is the *hosting* side of the model (what a node offers, and
+/// what it sends back on c2n `GET /vip-services`). `ServiceDetails` is the consuming side: name,
+/// label, the VIPs to dial, the ports the service accepts, and the client application actions
+/// available on those ports.
+///
+/// Decode-only, for the same reason as [`ServiceAction`].
+#[derive(Default, Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ServiceDetails<'a> {
+    /// The `svc:`-prefixed service name. This, not the capability-map key, is the canonical name.
+    #[serde(borrow)]
+    pub name: ServiceName<'a>,
+    /// An optional human-readable label. Empty means clients fall back to
+    /// [`ServiceDetails::name`].
+    #[serde(borrow, default)]
+    pub display_name: &'a str,
+    /// The IPv4 and IPv6 addresses assigned to this service — the addresses a client dials.
+    #[serde(default)]
+    pub addrs: Vec<IpAddr>,
+    /// The protocol/port combinations the service accepts.
+    #[serde(default)]
+    pub ports: Vec<ProtoPortRange>,
+    /// How a client may interact with the service. Several actions may name the same port, and not
+    /// every port needs one; when this is empty a client may infer default interactions from
+    /// [`ServiceDetails::ports`].
+    #[serde(borrow, default)]
+    pub actions: Vec<ServiceAction<'a>>,
+}
+
+impl<'a> ServiceDetails<'a> {
+    /// The actions whose type this build recognizes, in wire order.
+    ///
+    /// The upstream contract is that a client ignores actions it does not understand, so this is
+    /// the accessor a consumer that is about to *act* should use; iterate
+    /// [`ServiceDetails::actions`] directly to see everything control sent, unknown slugs included.
+    pub fn known_actions(&self) -> impl Iterator<Item = &ServiceAction<'a>> {
+        self.actions.iter().filter(|a| a.action_type.is_known())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,6 +596,160 @@ mod tests {
         assert!(ProtoPortRange::from_str("").is_err());
         assert!(ProtoPortRange::from_str("tcp:nope").is_err());
         assert!(ProtoPortRange::from_str("999999:1").is_err()); // proto > u8
+    }
+
+    /// The exact JSON a Go `tailcfg.ServiceDetails` marshals to, decoded field for field.
+    /// `DisplayName`/`Actions` are `json:",omitzero"` and `Addrs`/`Ports` are `json:",omitempty"`
+    /// upstream, so every one of them is optional on the wire and defaulted here.
+    #[test]
+    fn service_details_parses_go_shape() {
+        let wire = r#"{
+            "Name": "svc:postgres",
+            "DisplayName": "Analytics DB",
+            "Addrs": ["100.65.32.7", "fd7a:115c:a1e0::7"],
+            "Ports": ["tcp:5432", "tcp:22"],
+            "Actions": [
+                {
+                    "Type": "postgresql",
+                    "Port": 5432,
+                    "DisplayName": "Open in psql",
+                    "Attributes": {
+                        "tailscale.com/cap/resource-name": "metrics",
+                        "tailscale.com/cap/skip-username": true,
+                        "tailscale.com/cap/web-client-url": "https://pg.example.com/"
+                    }
+                },
+                { "Type": "ssh", "Port": 22 }
+            ]
+        }"#;
+        let details: ServiceDetails = serde_json::from_str(wire).unwrap();
+
+        assert_eq!(details.name, ServiceName("svc:postgres"));
+        assert_eq!(details.display_name, "Analytics DB");
+        assert_eq!(
+            details.addrs,
+            alloc::vec![
+                "100.65.32.7".parse::<IpAddr>().unwrap(),
+                "fd7a:115c:a1e0::7".parse::<IpAddr>().unwrap()
+            ]
+        );
+        assert_eq!(
+            details.ports,
+            alloc::vec![ppr(6, 5432, 5432), ppr(6, 22, 22)]
+        );
+
+        assert_eq!(details.actions.len(), 2);
+        let pg = &details.actions[0];
+        assert_eq!(pg.action_type, SERVICE_ACTION_TYPE_POSTGRESQL);
+        assert_eq!(pg.port, 5432);
+        assert_eq!(pg.display_name, "Open in psql");
+        // Attribute values stay raw JSON, so each attribute's own schema decodes separately.
+        assert_eq!(
+            pg.attributes[SERVICE_ACTION_ATTRIBUTE_RESOURCE_NAME].get(),
+            r#""metrics""#
+        );
+        assert_eq!(
+            pg.attributes[SERVICE_ACTION_ATTRIBUTE_SKIP_USERNAME].get(),
+            "true"
+        );
+        assert_eq!(
+            serde_json::from_str::<&str>(
+                pg.attributes[SERVICE_ACTION_ATTRIBUTE_WEB_CLIENT_URL].get()
+            )
+            .unwrap(),
+            "https://pg.example.com/"
+        );
+
+        let ssh = &details.actions[1];
+        assert_eq!(ssh.action_type, SERVICE_ACTION_TYPE_SSH);
+        assert_eq!(ssh.port, 22);
+        // `omitzero` fields absent on the wire default rather than fail.
+        assert_eq!(ssh.display_name, "");
+        assert!(ssh.attributes.is_empty());
+    }
+
+    /// The whole point of the consume side: control may publish an action type (or an attribute)
+    /// this build has never heard of, and Go's contract is that clients ignore those — not that the
+    /// service, and with it the netmap carrying it, fails to decode.
+    #[test]
+    fn unknown_action_type_and_attribute_are_tolerated() {
+        let wire = r#"{
+            "Name": "svc:mixed",
+            "Ports": ["tcp:9000", "tcp:22"],
+            "Actions": [
+                { "Type": "ftp", "Port": 9000, "DisplayName": "Some future thing" },
+                {
+                    "Type": "ssh",
+                    "Port": 22,
+                    "Attributes": { "example.com/cap/not-yet-invented": {"a": 1} }
+                }
+            ],
+            "SomeFieldFromALaterControlPlane": 3
+        }"#;
+        let details: ServiceDetails = serde_json::from_str(wire).unwrap();
+
+        // Both actions decoded; the unrecognized one is present but flagged.
+        assert_eq!(details.actions.len(), 2);
+        assert_eq!(details.actions[0].action_type, ServiceActionType("ftp"));
+        assert!(!details.actions[0].action_type.is_known());
+        assert_eq!(details.actions[0].display_name, "Some future thing");
+        assert!(details.actions[1].action_type.is_known());
+
+        // An unknown attribute rides along as raw JSON instead of failing the action.
+        assert_eq!(
+            details.actions[1].attributes["example.com/cap/not-yet-invented"].get(),
+            r#"{"a": 1}"#
+        );
+
+        // `known_actions` is what a consumer that is about to act should walk.
+        let known: Vec<_> = details.known_actions().collect();
+        assert_eq!(known.len(), 1);
+        assert_eq!(known[0].action_type, SERVICE_ACTION_TYPE_SSH);
+    }
+
+    /// Mirrors Go's `TestServiceActionTypeValid`, including its two negative cases.
+    #[test]
+    fn service_action_type_known_set_matches_go() {
+        let known: Vec<&str> = SERVICE_ACTION_TYPES.iter().map(|t| t.0).collect();
+        assert_eq!(
+            known,
+            alloc::vec![
+                "aws-s3",
+                "cockroach",
+                "elasticsearch",
+                "http",
+                "kubernetes",
+                "mongodb",
+                "mssql",
+                "mysql",
+                "postgresql",
+                "rdp",
+                "vnc",
+                "ssh",
+                "tcp",
+            ]
+        );
+        for t in SERVICE_ACTION_TYPES {
+            assert!(t.is_known(), "{t:?}");
+        }
+        assert!(!ServiceActionType("ftp").is_known());
+        assert!(!ServiceActionType("").is_known());
+        // Slugs are exact: no case folding, no URL prefix.
+        assert!(!ServiceActionType("SSH").is_known());
+        assert!(!ServiceActionType("tailscale.com/cap/ssh").is_known());
+    }
+
+    /// A service with no actions at all is the pre-actions shape a current control plane still
+    /// sends, and it must keep decoding.
+    #[test]
+    fn service_details_without_actions_parses() {
+        let details: ServiceDetails =
+            serde_json::from_str(r#"{"Name":"svc:samba","Addrs":["100.65.32.1"]}"#).unwrap();
+        assert_eq!(details.name, ServiceName("svc:samba"));
+        assert!(details.actions.is_empty());
+        assert!(details.ports.is_empty());
+        assert_eq!(details.display_name, "");
+        assert_eq!(details.known_actions().count(), 0);
     }
 
     fn ppr(proto: u8, first: u16, last: u16) -> ProtoPortRange {

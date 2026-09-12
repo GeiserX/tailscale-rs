@@ -916,6 +916,32 @@ impl Node {
         }
         out
     }
+
+    /// The VIP services control has told this node it can *reach* (`tailcfg.ServiceDetails`),
+    /// parsed from every `services/<id>`
+    /// ([`ts_control_serde::NODE_ATTR_PREFIX_SERVICES`]) node-capability value, in capability-key
+    /// order.
+    ///
+    /// This is the consuming half of the VIP services model, and the counterpart to
+    /// [`Node::service_vips`], which is what this node *hosts*. Each entry carries the service's
+    /// canonical name, its VIP addresses, the ports it accepts and the client application actions
+    /// available on those ports. The capability key's suffix is an opaque server-chosen id, so the
+    /// name comes from `ServiceDetails::name` and never from the key.
+    ///
+    /// Fail-closed per value, never per netmap: a capability value that does not parse as a
+    /// `ServiceDetails` is skipped and the remaining services are still returned — the same
+    /// treatment the `service-host` parser gives a malformed `tailcfg.ServiceIPMappings` value. An
+    /// carrying a *type* this build does not know is not a parse failure: it decodes and is
+    /// returned, matching Go's rule that clients ignore actions they do not recognize. Use
+    /// `ts_control_serde::ServiceDetails::known_actions` to walk only the recognized ones.
+    pub fn visible_services(&self) -> Vec<ts_control_serde::ServiceDetails<'_>> {
+        self.cap_map
+            .iter()
+            .filter(|(key, _)| key.starts_with(ts_control_serde::NODE_ATTR_PREFIX_SERVICES))
+            .flat_map(|(_, values)| values.iter())
+            .filter_map(|raw| serde_json::from_str(raw).ok())
+            .collect()
+    }
 }
 
 /// Validate a Tailscale VIP service name (`tailcfg.ServiceName.Validate`): it must carry the
@@ -1500,6 +1526,102 @@ pub(crate) mod tests {
             domain.tailnet_address.ipv4,
             "100.64.0.9/32".parse().unwrap()
         );
+    }
+
+    /// The consume side end to end: a MapResponse-shaped wire Node carrying a
+    /// `services/<opaque-id>` capability decodes into the domain node, and the service — including
+    /// an action type this build has never heard of — is surfaced rather than dropping the node.
+    #[test]
+    fn visible_services_parse_from_the_services_cap() {
+        let json = r#"{
+            "ID": 1,
+            "StableID": "n1",
+            "Name": "host.tail.ts.net.",
+            "User": 1,
+            "Addresses": ["100.64.0.9/32"],
+            "Key": "nodekey:0000000000000000000000000000000000000000000000000000000000000000",
+            "Machine": null,
+            "DiscoKey": null,
+            "AllowedIPs": null,
+            "Endpoints": [],
+            "CapMap": {
+                "services/01HQ": [{
+                    "Name": "svc:postgres",
+                    "DisplayName": "Analytics DB",
+                    "Addrs": ["100.65.32.7"],
+                    "Ports": ["tcp:5432", "tcp:22"],
+                    "Actions": [
+                        {
+                            "Type": "postgresql",
+                            "Port": 5432,
+                            "Attributes": {
+                                "tailscale.com/cap/resource-name": "metrics"
+                            }
+                        },
+                        { "Type": "ftp", "Port": 22 }
+                    ]
+                }],
+                "services/01HR": [{ "Name": "svc:web", "Ports": ["tcp:80"] }]
+            }
+        }"#;
+        let wire: ts_control_serde::Node =
+            serde_json::from_str(json).expect("a node advertising services parses");
+        let domain: Node = (&wire).into();
+
+        let services = domain.visible_services();
+        assert_eq!(services.len(), 2);
+
+        let pg = &services[0];
+        assert_eq!(pg.name.0, "svc:postgres");
+        assert_eq!(pg.display_name, "Analytics DB");
+        assert_eq!(pg.addrs, vec!["100.65.32.7".parse::<IpAddr>().unwrap()]);
+        assert_eq!(pg.ports.len(), 2);
+        // Both actions survive decoding, the unrecognized slug included.
+        assert_eq!(pg.actions.len(), 2);
+        assert_eq!(
+            pg.actions[0].action_type,
+            ts_control_serde::SERVICE_ACTION_TYPE_POSTGRESQL
+        );
+        assert_eq!(
+            pg.actions[0].attributes[ts_control_serde::SERVICE_ACTION_ATTRIBUTE_RESOURCE_NAME]
+                .get(),
+            r#""metrics""#
+        );
+        assert!(!pg.actions[1].action_type.is_known());
+        // …but only the recognized one is offered to a caller about to act on it.
+        assert_eq!(pg.known_actions().count(), 1);
+
+        assert_eq!(services[1].name.0, "svc:web");
+        assert!(services[1].actions.is_empty());
+
+        // The services cap is a consume-side grant only: it does not make this a service host.
+        assert!(!domain.is_service_host());
+    }
+
+    /// A `services/` value that is not a `ServiceDetails` at all costs only itself: the other
+    /// services still come back, and the node is still usable.
+    #[test]
+    fn visible_services_skips_an_unparseable_value() {
+        let mut n = node("peer", Some("ts.net"));
+        n.cap_map.insert(
+            "services/broken".to_string(),
+            vec!["\"not an object\"".to_string()],
+        );
+        n.cap_map.insert(
+            "services/good".to_string(),
+            vec![r#"{"Name":"svc:web","Ports":["tcp:80"]}"#.to_string()],
+        );
+
+        let services = n.visible_services();
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].name.0, "svc:web");
+    }
+
+    /// No services cap at all is the common case and yields nothing, not an error.
+    #[test]
+    fn visible_services_empty_without_the_cap() {
+        let n = node("peer", Some("ts.net"));
+        assert!(n.visible_services().is_empty());
     }
 
     #[test]
