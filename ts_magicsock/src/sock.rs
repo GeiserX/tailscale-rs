@@ -279,12 +279,16 @@ pub struct MagicSock {
     /// non-zero value per handshake; [`next_handshake_generation`](Self::next_handshake_generation)
     /// skips zero on wrap.
     handshake_generation: std::sync::atomic::AtomicU32,
-    /// Test-only: accept relay `addr:port`s that [`is_pingable_candidate`](Self::is_pingable_candidate)
-    /// would reject.
+    /// Test-only: accept a **loopback** relay `addr:port`, which
+    /// [`is_pingable_candidate`](Self::is_pingable_candidate) would reject.
     ///
     /// Same seam, and the same reasoning, as [`add_peer_endpoints_unfiltered`](Self::add_peer_endpoints_unfiltered):
     /// the end-to-end peer-relay test uses a loopback address for its stand-in relay server, which
-    /// the production filter correctly refuses. Never compiled into a release build.
+    /// the production filter correctly refuses. Loopback only: every other class stays refused, so a
+    /// test running under the waiver still gets the production verdict on a private, link-local or
+    /// unspecified address. The stand-in must be loopback rather than a documentation address
+    /// because a socket bound to `127.0.0.1` cannot send off-host on Linux (`EINVAL`), which ends a
+    /// handshake at its first send. Never compiled into a release build.
     #[cfg(test)]
     allow_loopback_relay: AtomicBool,
     /// Test-only: a copy of every datagram the peer-relay leg puts on the wire, as
@@ -1938,7 +1942,7 @@ impl MagicSock {
         rx
     }
 
-    /// Test-only: accept relay addresses the production filter rejects (see
+    /// Test-only: accept loopback relay addresses, which the production filter rejects (see
     /// [`allow_loopback_relay`](Self::allow_loopback_relay)).
     #[cfg(test)]
     fn allow_loopback_relay(&self) {
@@ -2001,7 +2005,7 @@ impl MagicSock {
     /// [`relayManager.handshakeServerEndpoint`]: https://github.com/tailscale/tailscale/blob/49e148c4a30b4f8098f69468fd27a7021d85ea02/wgengine/magicsock/relaymanager.go
     fn relay_addr_allowed(&self, addr: &SocketAddr) -> bool {
         #[cfg(test)]
-        if self.allow_loopback_relay.load(Ordering::Relaxed) {
+        if self.allow_loopback_relay.load(Ordering::Relaxed) && addr.ip().is_loopback() {
             return true;
         }
         self.is_pingable_candidate(addr)
@@ -3989,27 +3993,19 @@ mod tests {
     /// it would strand a handshake that is otherwise complete and push the peer back to DERP for no
     /// gain, so it is not dropped.
     ///
-    /// The pong here arrives from an RFC 1918 address, a class `relay_addr_allowed` refuses, while
-    /// every byte this node emits still goes to the sanitized `fx.addr`.
+    /// The pong here arrives from an RFC 1918 address, a class this socket's `relay_addr_allowed`
+    /// refuses — asserted below, so a source filter re-added on the pong branch fails this test —
+    /// while every byte this node emits still goes to `fx.addr`.
+    ///
+    /// The stand-in relay is on loopback under the loopback-only test waiver, not on a documentation
+    /// address: a socket bound to `127.0.0.1` cannot send off-host on Linux, so the challenge answer
+    /// would fail with `EINVAL` and the relayed ping this test answers would never be sent.
     #[tokio::test]
     async fn a_relayed_pong_from_any_source_still_confirms_the_path() {
         let our_disco = DiscoPrivateKey::random();
-        let mut fx = RelayFixture::new(37);
-        // A routable relay address, so the handshake runs under the production filter.
-        fx.addr = "192.0.2.10:41641".parse().unwrap();
+        let fx = RelayFixture::new(37);
         let peer_pub = fx.peer.public_key();
-        let a = Arc::new(
-            MagicSock::bind(
-                localhost(),
-                our_disco.clone(),
-                ts_keys::NodePrivateKey::random().public_key(),
-            )
-            .await
-            .unwrap()
-            .with_binding_verifier(allow_all()),
-        );
-        // Note: `allow_loopback_relay` deliberately NOT set — this is the production filter.
-        let mut sends = a.tap_relay_sends();
+        let (a, mut sends) = relay_client(&our_disco).await;
         let generation = begin_handshake(&a, &fx, &our_disco, &mut sends).await;
 
         let mut challenge = fx.challenge(our_disco.public_key(), fx.vni, generation, 3);
@@ -4019,7 +4015,7 @@ mod tests {
         let (ping_to, wire) = sends.try_recv().expect("a relayed ping must be sent");
         assert_eq!(
             ping_to, fx.addr,
-            "the ping goes to the sanitized relay address"
+            "the ping goes to the relay address the handshake started with"
         );
         let mut ping = expect_relay_frame(&wire, fx.vni, false);
         let tx_id = match disco::open(&fx.peer, &mut ping).unwrap() {
@@ -4034,6 +4030,10 @@ mod tests {
 
         // The relay forwards the peer's pong from a source in a class `relay_addr_allowed` refuses.
         let observed: SocketAddr = "10.0.0.5:52000".parse().unwrap();
+        assert!(
+            !a.relay_addr_allowed(&observed),
+            "the test waiver admits loopback only, so this source is refused as in production"
+        );
         let mut pong = disco::seal_pong(&fx.peer, &our_disco.public_key(), tx_id, fx.addr).unwrap();
         a.handle_relay_disco(&mut pong, observed, fx.vni, false)
             .await;
