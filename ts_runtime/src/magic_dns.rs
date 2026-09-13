@@ -19,7 +19,7 @@
 //!   refusal is relayed to the client only when no upstream did better (see [`forward_query`]).
 //!
 //! Anti-leak / IPv6-off posture: upstream forwarding binds `0.0.0.0:0` on the overlay netstack —
-//! UDP for the query, TCP for a truncated answer's retry, IPv4 only either way — and never opens an
+//! UDP for the query, TCP for the hop raced against it, IPv4 only either way — and never opens an
 //! IPv6 socket, nor a host socket. AAAA handling is gated on [`DnsView::enable_ipv6`] (default
 //! off): with the gate OFF an AAAA query for a tailnet/overlay/self name returns NoError with an
 //! empty answer (NODATA) rather than the overlay v6 address — answering a v6 the IPv4-only client
@@ -60,8 +60,11 @@
 //!   overlay netstack channel the UDP hop uses and never a host socket ([`ask_upstream`]). Without
 //!   it the client's own TCP retry lands back on a UDP hop and is answered with the same truncated
 //!   message, and a name whose answer does not fit a datagram simply does not resolve through this
-//!   node. Control's `dns-forwarder-disable-tcp-retries` node attribute is the *off* switch
-//!   ([`DnsView::upstream_tcp_retry`]); the retry is on by default.
+//!   node. The TCP hop is also **raced** against a slow or failed UDP hop, as Go's forwarder races
+//!   them: it joins after [`UDP_RACE_TIMEOUT`] (at once for a TCP client, or when the UDP hop has
+//!   already failed), so a resolver whose UDP path drops but whose TCP path answers still resolves.
+//!   Control's `dns-forwarder-disable-tcp-retries` node attribute is the *off* switch for all of it
+//!   ([`DnsView::upstream_tcp_retry`]); the TCP hop is on by default.
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -354,8 +357,8 @@ impl DnsView {
         Upstreams::None
     }
 
-    /// Whether a truncated answer from an upstream resolver may be re-asked over TCP
-    /// ([`ask_upstream`]).
+    /// Whether the forwarder may use TCP to an upstream resolver — to re-ask a truncated answer, or
+    /// to race a slow or failed UDP hop ([`ask_upstream`]).
     ///
     /// On unless control's `dns-forwarder-disable-tcp-retries` node attribute is set on the **self**
     /// node ([`Node::disable_dns_forwarder_tcp_retries`]) — the attribute is the retry's *off*
@@ -376,15 +379,17 @@ impl DnsView {
     }
 }
 
-/// Whether the forwarder may re-ask a **truncated** upstream answer over TCP. Decided per query
-/// from the current view ([`DnsView::upstream_tcp_retry`]) and carried to [`ask_upstream`], which is
-/// the only thing that reads it.
+/// Whether the forwarder may ask an upstream over **TCP** at all — to re-ask a truncated answer, or
+/// to race a slow or failed UDP hop. Decided per query from the current view
+/// ([`DnsView::upstream_tcp_retry`]) and carried to [`ask_upstream`], which is the only thing that
+/// reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TcpRetry {
-    /// Retry a `TC`-marked UDP answer over TCP, to the same resolver. The default.
+    /// Race the TCP hop against the UDP hop, and retry a `TC`-marked UDP answer over TCP, to the
+    /// same resolver. The default.
     Enabled,
-    /// Never retry: relay the truncated UDP answer as it came. Control's
-    /// `dns-forwarder-disable-tcp-retries` attribute.
+    /// UDP only, on every arm: relay whatever the UDP hop brings back, truncated or not, and never
+    /// open a TCP connection. Control's `dns-forwarder-disable-tcp-retries` attribute.
     Disabled,
 }
 
@@ -1146,12 +1151,13 @@ fn is_soft_error(msg: &[u8]) -> bool {
 /// upstream answered at all.
 ///
 /// Anti-leak: forwarding goes through the overlay netstack `channel` (a fresh `0.0.0.0:0` overlay
-/// UDP socket per query, and — when a truncated answer is retried — a fresh `0.0.0.0:0` overlay TCP
+/// UDP socket per query, and — whenever the TCP hop runs — a fresh `0.0.0.0:0` overlay TCP
 /// connection to the same resolver), NEVER a host socket: the real origin IP can't leak to the
 /// resolver, and split-DNS upstreams reachable only over the tailnet/subnet-router work. Each
 /// upstream is bounded by [`UPSTREAM_TIMEOUT`] per hop. `client` names the transport the *client* we
-/// answer used, not the one we fetched over; `retry` says whether the upstream hop may fall back to
-/// TCP ([`DnsView::upstream_tcp_retry`]).
+/// answer used, not the one we fetched over — it sets how long the UDP hop runs alone before TCP
+/// joins it ([`UDP_RACE_TIMEOUT`]) as well as how the answer is capped; `retry` says whether the
+/// upstream hop may use TCP at all ([`DnsView::upstream_tcp_retry`]).
 ///
 /// The socket work is all this function does; which response is relayed to the client is
 /// [`forward_walk`]'s decision.
@@ -1164,7 +1170,7 @@ pub(crate) async fn forward_query(
     retry: TcpRetry,
 ) -> Vec<u8> {
     forward_walk(upstreams, query, fallback, client, |upstream| {
-        ask_upstream(channel, upstream, query, retry)
+        ask_upstream(channel, upstream, query, client, retry)
     })
     .await
 }
@@ -1176,8 +1182,9 @@ pub(crate) async fn forward_query(
 enum UpstreamTransport {
     /// The UDP hop: one datagram, bounded by the netstack's UDP receive ring.
     Udp,
-    /// The TCP hop: a length-prefixed message, bounded only by its two-byte prefix. Reached only by
-    /// [`ask_upstream`]'s retry of a truncated UDP answer.
+    /// The TCP hop: a length-prefixed message, bounded only by its two-byte prefix. Reached only
+    /// through [`ask_upstream`]'s race: the retry of a truncated UDP answer, or the fallback from a
+    /// slow or failed UDP hop.
     Tcp,
 }
 
@@ -1193,26 +1200,53 @@ struct UpstreamAnswer {
     via: UpstreamTransport,
 }
 
+/// How long the UDP hop has the upstream to itself before the TCP hop joins the race, when the
+/// client we answer asked over UDP. A client that asked over TCP gets no head start for UDP at all:
+/// both hops start together.
+///
+/// Go's `udpRaceTimeout` (net/dns/resolver/forwarder.go @
+/// `e2ed432399c9b0fda7aa14e9eb27784d2d893c55`). It is what lets a resolver whose UDP path drops or
+/// stalls, but whose TCP path answers, still resolve — in about two seconds rather than not at all.
+/// It is shorter than [`UPSTREAM_TIMEOUT`] on purpose: waiting that out first would spend the whole
+/// UDP budget before TCP was ever tried.
+const UDP_RACE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Ask one `upstream` for `query` over the overlay and return what came back, or `None` when
-/// nothing usable arrived (bind, connect, send or receive error, [`UPSTREAM_TIMEOUT`], or an empty
-/// message).
+/// nothing usable arrived on either hop (bind, connect, send or receive error, [`UPSTREAM_TIMEOUT`],
+/// or an empty message).
 ///
-/// The query goes out over UDP. If the answer comes back with the `TC` (truncated) bit set, and
-/// `retry` allows it, the **same** query is re-asked of the **same** resolver over TCP and that
-/// answer is returned instead — RFC 1035 §4.2.1, and Go's forwarder does exactly this
-/// (net/dns/resolver/forwarder.go:677 and the `firstUDP` closure below it, @
-/// `023255e8a27ec9f6a21d24e3eda21c052ff72af3`). Three of Go's bounds come with it, and each one
-/// matters:
+/// The query is **raced** over UDP and TCP to the same resolver, as Go's forwarder does: `send`
+/// hands a `firstUDP` and a `thenTCP` closure to `race.New(timeout, firstUDP, thenTCP)`, and
+/// `util/race`'s `Race.Start` runs the first at once and the second when the timeout elapses or
+/// the first fails, whichever comes first; the first good answer wins (net/dns/resolver/forwarder.go
+/// and util/race/race.go @ `e2ed432399c9b0fda7aa14e9eb27784d2d893c55`). [`race_udp_and_tcp`] is
+/// that race; what it means for one query:
 ///
+/// - **A slow or failed UDP hop falls back to TCP.** The TCP hop starts after [`UDP_RACE_TIMEOUT`]
+///   for a [`ClientTransport::Udp`] client, at once for a [`ClientTransport::Tcp`] one, and at once
+///   whenever the UDP hop has already failed.
+/// - **A truncated answer is re-asked over TCP**, RFC 1035 §4.2.1. `firstUDP` maps it to an error so
+///   the race waits for the TCP hop.
 /// - **The same resolver, never the next one.** Walking on to the next upstream would send the
 ///   query to a resolver the first one already answered — a second party learning a name it was
 ///   never asked about. [`forward_walk`] does the walking; this function only ever talks to the
 ///   `upstream` it was handed.
-/// - **A failed TCP retry returns the truncated UDP answer**, not `SERVFAIL`. A truncated answer is
+/// - **A failed TCP hop returns the truncated UDP answer**, not `SERVFAIL`. A truncated answer is
 ///   still an answer: its header and question are intact and a stub resolver can act on the `TC`
 ///   bit. Replacing it with a synthesized failure would be strictly worse than what we already had.
-/// - **A reply that fit is never retried** ([`did_not_fit_the_datagram`]). The retry exists for the
-///   answer that did not fit, and nothing else.
+/// - **An answer that fit wins.** Once the UDP hop has one, the TCP hop is dropped (or, before the
+///   head start runs out, never started) and its answer is never waited for.
+///
+/// One place differs from Go, deliberately: Go does **not** re-ask a truncated answer over TCP for
+/// a UDP client (`firstUDP` returns it as it came "because the client can retry over TCP itself").
+/// Here it is re-asked for every client, as before, because two of this tree's UDP-labelled clients
+/// cannot make that retry: the application netstack serves `100.100.100.100:53` over UDP only (the
+/// `dns_over_tcp` responder is TUN-mode), and `query_dns` is a programmatic caller with no TCP path
+/// at all. Dropping the retry for them would turn names that resolve today into truncated answers.
+///
+/// `retry` is [`DnsView::upstream_tcp_retry`], and [`TcpRetry::Disabled`] shuts the TCP hop out of
+/// the race entirely — no head-start timer, no fallback, no truncation retry — exactly as Go's
+/// `thenTCP` waits on the context and never dials under `skipTCP`.
 ///
 /// Anti-leak: both hops ride the overlay netstack `channel` — the TCP one via `channel.tcp_connect`
 /// from `0.0.0.0:0`, exactly as the UDP one binds `0.0.0.0:0` there. A host socket would put this
@@ -1227,11 +1261,13 @@ async fn ask_upstream(
     channel: &Channel,
     upstream: SocketAddr,
     query: &[u8],
+    client: ClientTransport,
     retry: TcpRetry,
 ) -> Option<UpstreamAnswer> {
-    ask_with_tcp_retry(
+    race_udp_and_tcp(
         upstream,
         query,
+        client,
         retry,
         || ask_upstream_udp(channel, upstream, query),
         || ask_upstream_tcp(channel, upstream, query),
@@ -1239,15 +1275,77 @@ async fn ask_upstream(
     .await
 }
 
-/// The truncation-retry policy of [`ask_upstream`], over the two hops as plain futures: `udp`
-/// returns the `(source address, datagram)` of the UDP hop, `tcp` the message body of the TCP hop.
-///
-/// Split from the sockets for the same reason [`forward_walk`] is: the decision — retry or not,
-/// which answer wins when the retry fails — is the part that can regress silently, and here it is
-/// testable without a netstack.
-async fn ask_with_tcp_retry<UdpFut, TcpFut>(
+/// What the UDP hop produced, as the race reads it.
+enum UdpOutcome {
+    /// A good answer: it wins the race.
+    Answer(UpstreamAnswer),
+    /// A genuine answer that did not fit the datagram ([`did_not_fit_the_datagram`]): the race
+    /// waits for the TCP hop, and falls back to this if that hop fails.
+    Truncated(UpstreamAnswer),
+    /// A datagram from the wrong source, or one that does not echo the question we asked. It is
+    /// not an answer, and it does not start the TCP hop either — see [`race_udp_and_tcp`].
+    Unmatched(UpstreamAnswer),
+    /// Nothing usable came back.
+    Failed,
+}
+
+/// Read the UDP hop's `(source address, datagram)` as a [`UdpOutcome`].
+fn classify_udp(
     upstream: SocketAddr,
     query: &[u8],
+    got: Option<(SocketAddr, Vec<u8>)>,
+) -> UdpOutcome {
+    let Some((from, resp)) = got else {
+        return UdpOutcome::Failed;
+    };
+    let answer = UpstreamAnswer {
+        from,
+        resp,
+        via: UpstreamTransport::Udp,
+    };
+    // This repeats `forward_walk`'s check rather than moving it — the answer still goes back
+    // unfiltered — so that an off-path injector cannot conscript this node into connecting to a
+    // resolver by spraying forged `TC` datagrams it could never have matched the question of.
+    if answer.from.ip() != upstream.ip() || !response_matches_query(query, &answer.resp) {
+        return UdpOutcome::Unmatched(answer);
+    }
+    if did_not_fit_the_datagram(&answer.resp) {
+        UdpOutcome::Truncated(answer)
+    } else {
+        UdpOutcome::Answer(answer)
+    }
+}
+
+/// The race [`ask_upstream`] runs, over the two hops as plain futures: `udp` returns the
+/// `(source address, datagram)` of the UDP hop, `tcp` the message body of the TCP hop. `tcp` is
+/// only called when the TCP hop actually starts, so "was a TCP connection opened" is "was `tcp`
+/// called".
+///
+/// The shape is Go's `Race.Start`, with the UDP hop's result classified as `firstUDP` classifies
+/// it:
+///
+/// 1. The UDP hop starts at once. For a [`ClientTransport::Udp`] client it runs alone for
+///    [`UDP_RACE_TIMEOUT`]; if it settles inside that window, its answer is returned, except that a
+///    **failed** hop starts TCP straight away (Go closes `startFallback`) and a **truncated** one
+///    does too (Go's `truncatedResponseError`).
+/// 2. Otherwise — the head start ran out, or the client asked over TCP and there is none — the TCP
+///    hop starts and both run. The first good answer wins; a hop that fails leaves the race to the
+///    other; a truncated UDP answer is held and returned only if TCP does not produce one.
+///
+/// A datagram that does not match the query ([`UdpOutcome::Unmatched`]) is the one divergence in
+/// how a failed UDP hop is treated. Go's `sendUDP` turns a transaction-id mismatch into an error,
+/// which starts the TCP hop at once; here it never *starts* the TCP hop, so a forged datagram buys
+/// no connection that silence would not have bought anyway. If the TCP hop is already running it
+/// is still waited for, and if it is not the datagram is handed on for [`forward_walk`] to discard,
+/// as it always was.
+///
+/// Split from the sockets for the same reason [`forward_walk`] is: the decision — when TCP starts,
+/// which answer wins — is the part that can regress silently, and here it is testable without a
+/// netstack.
+async fn race_udp_and_tcp<UdpFut, TcpFut>(
+    upstream: SocketAddr,
+    query: &[u8],
+    client: ClientTransport,
     retry: TcpRetry,
     udp: impl FnOnce() -> UdpFut,
     tcp: impl FnOnce() -> TcpFut,
@@ -1256,51 +1354,81 @@ where
     UdpFut: std::future::Future<Output = Option<(SocketAddr, Vec<u8>)>>,
     TcpFut: std::future::Future<Output = Option<Vec<u8>>>,
 {
-    let (from, resp) = udp().await?;
-
-    let over_udp = UpstreamAnswer {
-        from,
-        resp,
-        via: UpstreamTransport::Udp,
-    };
-
-    if retry == TcpRetry::Disabled {
-        // Control said no (`dns-forwarder-disable-tcp-retries`): relay whatever UDP gave us.
-        return Some(over_udp);
-    }
-    if !did_not_fit_the_datagram(&over_udp.resp) {
-        return Some(over_udp);
-    }
-    // Only spend a TCP connection on a datagram the walk would actually accept. This repeats
-    // `forward_walk`'s check rather than moving it — the answer still goes back unfiltered — so
-    // that an off-path injector cannot conscript this node into connecting to a resolver by
-    // spraying forged `TC` datagrams it could never have matched the question of.
-    if over_udp.from.ip() != upstream.ip() || !response_matches_query(query, &over_udp.resp) {
-        return Some(over_udp);
-    }
-
-    tracing::debug!(%upstream, "magic dns upstream answer truncated, retrying over tcp");
-    match tcp().await {
+    let over_tcp = |resp| UpstreamAnswer {
         // The TCP peer is the resolver we connected to, by construction of the handshake, so the
         // source address is `upstream` itself and `forward_walk`'s source check passes on a fact
         // rather than on a claim in a datagram header.
-        Some(resp) => Some(UpstreamAnswer {
-            from: upstream,
+        from: upstream,
+        resp,
+        via: UpstreamTransport::Tcp,
+    };
+
+    let udp = udp();
+    if retry == TcpRetry::Disabled {
+        // Control said no (`dns-forwarder-disable-tcp-retries`): the TCP hop never runs, on any
+        // arm, so whatever UDP gives us — truncated, failed or late — is the whole answer.
+        return udp.await.map(|(from, resp)| UpstreamAnswer {
+            from,
             resp,
-            via: UpstreamTransport::Tcp,
-        }),
-        // Go returns the truncated UDP response when the TCP retry fails, and so do we: a truncated
-        // answer is more use to a stub resolver than no answer at all.
-        None => {
-            tracing::debug!(
-                %upstream,
-                "magic dns upstream tcp retry failed, relaying the truncated udp answer"
-            );
-            Some(over_udp)
+            via: UpstreamTransport::Udp,
+        });
+    }
+    let mut udp = std::pin::pin!(udp);
+
+    // Step 1: the UDP hop's head start. A TCP client gets none.
+    if client == ClientTransport::Udp {
+        let settled = tokio::select! {
+            biased;
+            got = &mut udp => Some(classify_udp(upstream, query, got)),
+            () = tokio::time::sleep(UDP_RACE_TIMEOUT) => None,
+        };
+        match settled {
+            Some(UdpOutcome::Answer(answer) | UdpOutcome::Unmatched(answer)) => {
+                return Some(answer);
+            }
+            Some(UdpOutcome::Truncated(truncated)) => {
+                tracing::debug!(%upstream, "magic dns upstream answer truncated, retrying over tcp");
+                return Some(tcp().await.map(over_tcp).unwrap_or(truncated));
+            }
+            Some(UdpOutcome::Failed) => {
+                tracing::debug!(%upstream, "magic dns upstream udp hop failed, trying tcp");
+                return tcp().await.map(over_tcp);
+            }
+            None => {
+                tracing::debug!(%upstream, "magic dns upstream udp hop slow, racing tcp");
+            }
         }
     }
-}
 
+    // Step 2: both hops run; the first good answer wins.
+    let mut tcp = std::pin::pin!(tcp());
+    tokio::select! {
+        biased;
+        got = &mut udp => match classify_udp(upstream, query, got) {
+            UdpOutcome::Answer(answer) => Some(answer),
+            UdpOutcome::Truncated(held) | UdpOutcome::Unmatched(held) => {
+                Some(tcp.await.map(over_tcp).unwrap_or_else(|| {
+                    tracing::debug!(
+                        %upstream,
+                        "magic dns upstream tcp hop failed, relaying the udp answer"
+                    );
+                    held
+                }))
+            }
+            UdpOutcome::Failed => tcp.await.map(over_tcp),
+        },
+        got = &mut tcp => match got {
+            Some(resp) => Some(over_tcp(resp)),
+            // The TCP hop failed first: the race is the UDP hop's, whatever it brings — including a
+            // truncated answer, which Go returns in place of the error.
+            None => udp.await.map(|(from, resp)| UpstreamAnswer {
+                from,
+                resp,
+                via: UpstreamTransport::Udp,
+            }),
+        },
+    }
+}
 /// Whether `msg` is an upstream answer that did not fit the datagram it came in — the thing the TCP
 /// retry exists for. Two ways to be one, and Go's forwarder retries on both:
 ///
@@ -1358,8 +1486,8 @@ async fn ask_upstream_udp(
 
 /// The TCP hop: connect to `upstream` over the overlay from `0.0.0.0:0` and exchange one
 /// length-prefixed message (RFC 1035 §4.2.2). `None` on any failure — connect refused, framing
-/// error, EOF, or [`UPSTREAM_TIMEOUT`] over the whole exchange — which is what sends
-/// [`ask_with_tcp_retry`] back to the truncated UDP answer.
+/// error, EOF, or [`UPSTREAM_TIMEOUT`] over the whole exchange — which leaves [`race_udp_and_tcp`]
+/// with whatever the UDP hop brings, a truncated answer included.
 ///
 /// The timeout covers connect **and** transfer together, so a resolver that accepts the connection
 /// and then stalls cannot hold the forward open for longer than a resolver that never answers at
@@ -3062,7 +3190,7 @@ mod tests {
     /// under test — the source/transaction-id check, the REFUSED/SERVFAIL soft-error rules, which
     /// response is relayed — is made by the production code being called. Every scripted answer
     /// arrives over the UDP hop, which is the hop the walk's own rules are about; the TCP hop is
-    /// [`ask_with_tcp_retry`]'s business and is tested there.
+    /// [`race_udp_and_tcp`]'s business and is tested there.
     async fn run_forward_walk(
         script: &[ScriptedUpstream],
         query: &[u8],
@@ -3549,6 +3677,16 @@ mod tests {
         }
     }
 
+    /// Both transports a client can reach this node over, for the race rules that hold for either.
+    const BOTH_CLIENTS: [ClientTransport; 2] = [ClientTransport::Udp, ClientTransport::Tcp];
+
+    /// A UDP hop that hears nothing and gives up the way [`ask_upstream_udp`] does: after
+    /// [`UPSTREAM_TIMEOUT`], with `None`. A resolver whose UDP path drops or stalls.
+    async fn silent_udp_hop() -> Option<(SocketAddr, Vec<u8>)> {
+        tokio::time::sleep(UPSTREAM_TIMEOUT).await;
+        None
+    }
+
     /// The retry this module exists for: an upstream answer with the `TC` bit set is re-asked over
     /// TCP, and the TCP answer — not the truncated datagram — is what the walk relays.
     ///
@@ -3566,38 +3704,42 @@ mod tests {
         // What TCP can carry: the whole set, far past what any datagram here could hold.
         let whole = upstream_response(&query, 0, 40, &[0xAB; 8000]);
 
-        let retries = std::cell::Cell::new(0);
-        let answer = ask_with_tcp_retry(
-            upstream,
-            &query,
-            TcpRetry::Enabled,
-            || std::future::ready(Some((upstream, truncated.clone()))),
-            || {
-                retries.set(retries.get() + 1);
-                std::future::ready(Some(whole.clone()))
-            },
-        )
-        .await
-        .expect("the upstream answered");
+        for client in BOTH_CLIENTS {
+            let retries = std::cell::Cell::new(0);
+            let answer = race_udp_and_tcp(
+                upstream,
+                &query,
+                client,
+                TcpRetry::Enabled,
+                || std::future::ready(Some((upstream, truncated.clone()))),
+                || {
+                    retries.set(retries.get() + 1);
+                    std::future::ready(Some(whole.clone()))
+                },
+            )
+            .await
+            .expect("the upstream answered");
 
-        assert_eq!(
-            answer.resp, whole,
-            "the TCP answer replaces the truncated datagram"
-        );
-        assert_eq!(
-            answer.via,
-            UpstreamTransport::Tcp,
-            "and is labelled as having come over TCP, so the relay cap knows not to chop it"
-        );
-        assert_eq!(
-            answer.from, upstream,
-            "the retry goes to the SAME resolver, never on to the next one"
-        );
-        assert_eq!(
-            retries.get(),
-            1,
-            "one retry, not one per upstream and not one per attempt"
-        );
+            assert_eq!(
+                answer.resp, whole,
+                "{client:?}: the TCP answer replaces the truncated datagram"
+            );
+            assert_eq!(
+                answer.via,
+                UpstreamTransport::Tcp,
+                "{client:?}: and is labelled as having come over TCP, so the relay cap knows not to \
+                 chop it"
+            );
+            assert_eq!(
+                answer.from, upstream,
+                "{client:?}: the retry goes to the SAME resolver, never on to the next one"
+            );
+            assert_eq!(
+                retries.get(),
+                1,
+                "{client:?}: one retry, not one per upstream and not one per attempt"
+            );
+        }
     }
 
     /// Go falls back to the truncated UDP response when the TCP retry fails, rather than to
@@ -3610,31 +3752,35 @@ mod tests {
         let mut truncated = upstream_response(&query, 0, 1, b"the part that fit");
         truncated[2] |= 0x02; // TC
 
-        let answer = ask_with_tcp_retry(
-            upstream,
-            &query,
-            TcpRetry::Enabled,
-            || std::future::ready(Some((upstream, truncated.clone()))),
-            // The resolver refused the connection, reset it, or never framed an answer.
-            || std::future::ready(None),
-        )
-        .await
-        .expect("a failed retry must not lose the answer we already had");
+        for client in BOTH_CLIENTS {
+            let answer = race_udp_and_tcp(
+                upstream,
+                &query,
+                client,
+                TcpRetry::Enabled,
+                || std::future::ready(Some((upstream, truncated.clone()))),
+                // The resolver refused the connection, reset it, or never framed an answer.
+                || std::future::ready(None),
+            )
+            .await
+            .expect("a failed retry must not lose the answer we already had");
 
-        assert_eq!(
-            answer.resp, truncated,
-            "the truncated UDP answer is relayed, not a synthesized failure"
-        );
-        assert_eq!(
-            answer.via,
-            UpstreamTransport::Udp,
-            "and it is still a datagram answer, so the relay cap still applies to it"
-        );
+            assert_eq!(
+                answer.resp, truncated,
+                "{client:?}: the truncated UDP answer is relayed, not a synthesized failure"
+            );
+            assert_eq!(
+                answer.via,
+                UpstreamTransport::Udp,
+                "{client:?}: and it is still a datagram answer, so the relay cap still applies to it"
+            );
+        }
     }
 
     /// A reply that fit is never retried: the retry exists for the answer that did not, and for
-    /// nothing else. A TCP connection per forwarded query would double the work this node makes
-    /// every upstream resolver do.
+    /// nothing else. For a UDP client, whose UDP hop has the resolver to itself for
+    /// [`UDP_RACE_TIMEOUT`], a prompt answer that fit means no TCP connection at all — one per
+    /// forwarded query would double the work this node makes every upstream resolver do.
     #[tokio::test]
     async fn an_answer_that_is_not_truncated_is_never_retried() {
         let query = build_query(0x402, &["example", "com"], 1, 1);
@@ -3642,9 +3788,10 @@ mod tests {
         let fits = upstream_response(&query, 0, 1, b"a small answer");
 
         let retried = std::cell::Cell::new(false);
-        let answer = ask_with_tcp_retry(
+        let answer = race_udp_and_tcp(
             upstream,
             &query,
+            ClientTransport::Udp,
             TcpRetry::Enabled,
             || std::future::ready(Some((upstream, fits.clone()))),
             || {
@@ -3661,6 +3808,204 @@ mod tests {
         );
         assert_eq!(answer.resp, fits);
         assert_eq!(answer.via, UpstreamTransport::Udp);
+    }
+
+    /// A TCP client gets no UDP head start — Go's race timeout is 0 for it — so its TCP hop is
+    /// already running when the UDP answer lands. An answer that fit still wins: the TCP hop is
+    /// dropped, not waited for, and its answer never replaces the one UDP brought.
+    #[tokio::test(start_paused = true)]
+    async fn a_tcp_client_races_both_hops_and_an_answer_that_fit_still_wins() {
+        let query = build_query(0x409, &["example", "com"], 1, 1);
+        let upstream = upstream_addr(1);
+        let fits = upstream_response(&query, 0, 1, b"a small answer");
+        let started = tokio::time::Instant::now();
+
+        let tcp_started_at = std::cell::Cell::new(None);
+        let answer = race_udp_and_tcp(
+            upstream,
+            &query,
+            ClientTransport::Tcp,
+            TcpRetry::Enabled,
+            async || {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Some((upstream, fits.clone()))
+            },
+            || {
+                tcp_started_at.set(Some(started.elapsed()));
+                // A TCP hop still connecting when UDP answers.
+                std::future::pending()
+            },
+        )
+        .await
+        .expect("the upstream answered");
+
+        assert_eq!(
+            tcp_started_at.get(),
+            Some(Duration::ZERO),
+            "a TCP client's TCP hop starts alongside the UDP hop, not after a head start"
+        );
+        assert_eq!(answer.resp, fits, "the answer that fit wins the race");
+        assert_eq!(answer.via, UpstreamTransport::Udp);
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(100),
+            "and the race ends when it lands, without waiting on the TCP hop"
+        );
+    }
+
+    /// Behaviour (1) of Go's race: a resolver that never answers over UDP but answers over TCP
+    /// still resolves — once the UDP hop's head start runs out, not once [`UPSTREAM_TIMEOUT`] does.
+    /// Before the race, the UDP hop was waited out in full and returned nothing, so the walk moved on
+    /// to the next resolver or ended in SERVFAIL without TCP ever being tried.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_udp_hop_falls_back_to_tcp_after_the_race_timeout() {
+        let query = build_query(0x40A, &["example", "com"], 1, 1);
+        let upstream = upstream_addr(1);
+        let over_tcp = upstream_response(&query, 0, 1, b"answered over tcp");
+
+        for (client, head_start) in [
+            (ClientTransport::Udp, UDP_RACE_TIMEOUT),
+            (ClientTransport::Tcp, Duration::ZERO),
+        ] {
+            let started = tokio::time::Instant::now();
+            let tcp_started_at = std::cell::Cell::new(None);
+            let answer = race_udp_and_tcp(
+                upstream,
+                &query,
+                client,
+                TcpRetry::Enabled,
+                silent_udp_hop,
+                || {
+                    tcp_started_at.set(Some(started.elapsed()));
+                    std::future::ready(Some(over_tcp.clone()))
+                },
+            )
+            .await
+            .expect("a resolver that answers over TCP resolves");
+
+            assert_eq!(answer.resp, over_tcp, "{client:?}");
+            assert_eq!(answer.via, UpstreamTransport::Tcp, "{client:?}");
+            assert_eq!(answer.from, upstream, "{client:?}: the same resolver");
+            assert_eq!(
+                tcp_started_at.get(),
+                Some(head_start),
+                "{client:?}: TCP joins the race when the UDP hop's head start runs out"
+            );
+            assert!(
+                started.elapsed() < UPSTREAM_TIMEOUT,
+                "{client:?}: the answer must not wait out the UDP hop's own timeout ({:?})",
+                started.elapsed()
+            );
+        }
+    }
+
+    /// A UDP hop that has already **failed** does not sit out its head start: Go's `Race.Start`
+    /// starts the fallback the moment the first function returns an error, and so does this.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_udp_hop_starts_tcp_at_once() {
+        let query = build_query(0x40B, &["example", "com"], 1, 1);
+        let upstream = upstream_addr(1);
+        let over_tcp = upstream_response(&query, 0, 1, b"answered over tcp");
+        let started = tokio::time::Instant::now();
+
+        let answer = race_udp_and_tcp(
+            upstream,
+            &query,
+            ClientTransport::Udp,
+            TcpRetry::Enabled,
+            // Bind or send failed: nothing will come back.
+            || std::future::ready(None),
+            || std::future::ready(Some(over_tcp.clone())),
+        )
+        .await
+        .expect("the TCP hop answered");
+
+        assert_eq!(answer.resp, over_tcp);
+        assert_eq!(answer.via, UpstreamTransport::Tcp);
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "no head start is waited out for a hop that already failed"
+        );
+
+        // And when both hops fail there is no answer, so the walk moves on.
+        let answer = race_udp_and_tcp(
+            upstream,
+            &query,
+            ClientTransport::Udp,
+            TcpRetry::Enabled,
+            || std::future::ready(None),
+            || std::future::ready(None),
+        )
+        .await;
+        assert!(answer.is_none(), "both hops failed: nothing to relay");
+    }
+
+    /// The race is symmetric: a TCP hop that fails first leaves it to the UDP hop, which is waited
+    /// for rather than abandoned.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_tcp_hop_leaves_the_race_to_the_udp_hop() {
+        let query = build_query(0x40C, &["example", "com"], 1, 1);
+        let upstream = upstream_addr(1);
+        let over_udp = upstream_response(&query, 0, 1, b"answered over udp");
+
+        let answer = race_udp_and_tcp(
+            upstream,
+            &query,
+            ClientTransport::Tcp,
+            TcpRetry::Enabled,
+            async || {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Some((upstream, over_udp.clone()))
+            },
+            || std::future::ready(None),
+        )
+        .await
+        .expect("the UDP hop answered after the TCP hop failed");
+
+        assert_eq!(answer.resp, over_udp);
+        assert_eq!(answer.via, UpstreamTransport::Udp);
+    }
+
+    /// The race sits inside the walk, not beside it: a first resolver that is silent over UDP but
+    /// answers over TCP is the resolver that answers. The walk never reaches the second one, and the
+    /// client has its answer after the head start, not after the UDP hop's full timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_resolver_silent_over_udp_answers_the_walk_over_tcp() {
+        let query = build_query(0x40D, &["example", "com"], 1, 1);
+        let first = upstream_addr(1);
+        let second = upstream_addr(2);
+        let over_tcp = upstream_response(&query, 0, 1, b"the first resolver over tcp");
+        let started = tokio::time::Instant::now();
+
+        let asked = std::cell::RefCell::new(Vec::new());
+        let response = forward_walk(
+            &[first, second],
+            &query,
+            servfail_response(),
+            ClientTransport::Udp,
+            |upstream| {
+                asked.borrow_mut().push(upstream);
+                let over_tcp = over_tcp.clone();
+                race_udp_and_tcp(
+                    upstream,
+                    &query,
+                    ClientTransport::Udp,
+                    TcpRetry::Enabled,
+                    silent_udp_hop,
+                    move || std::future::ready(Some(over_tcp)),
+                )
+            },
+        )
+        .await;
+
+        assert_eq!(response, over_tcp);
+        assert_eq!(
+            asked.into_inner(),
+            vec![first],
+            "the resolver that answered over TCP ends the walk"
+        );
+        assert_eq!(started.elapsed(), UDP_RACE_TIMEOUT);
     }
 
     /// The other way an answer did not fit: the upstream sent one this forwarder cannot relay in a
@@ -3683,27 +4028,33 @@ mod tests {
         );
         let whole = upstream_response(&query, 0, 40, &[0xAB; 8000]);
 
-        let answer = ask_with_tcp_retry(
-            upstream,
-            &query,
-            TcpRetry::Enabled,
-            || std::future::ready(Some((upstream, full_ring.clone()))),
-            || std::future::ready(Some(whole.clone())),
-        )
-        .await
-        .expect("the upstream answered");
+        for client in BOTH_CLIENTS {
+            let answer = race_udp_and_tcp(
+                upstream,
+                &query,
+                client,
+                TcpRetry::Enabled,
+                || std::future::ready(Some((upstream, full_ring.clone()))),
+                || std::future::ready(Some(whole.clone())),
+            )
+            .await
+            .expect("the upstream answered");
 
-        assert_eq!(
-            answer.resp, whole,
-            "an answer too big for one datagram is re-asked over TCP, TC bit or no TC bit"
-        );
-        assert_eq!(answer.via, UpstreamTransport::Tcp);
+            assert_eq!(
+                answer.resp, whole,
+                "{client:?}: an answer too big for one datagram is re-asked over TCP, TC bit or no \
+                 TC bit"
+            );
+            assert_eq!(answer.via, UpstreamTransport::Tcp);
+        }
     }
 
-    /// `dns-forwarder-disable-tcp-retries` is the retry's **off** switch, and the polarity is the
-    /// whole point: a node control never set it on keeps retrying. Read from the self node through
-    /// the view, and honoured at the one place that would open the connection.
-    #[tokio::test]
+    /// `dns-forwarder-disable-tcp-retries` is the TCP hop's **off** switch, and the polarity is the
+    /// whole point: a node control never set it on keeps using TCP. Read from the self node through
+    /// the view, and honoured at the one place that would open the connection — on **every** arm of
+    /// the race: not for a truncated answer, not for a silent UDP hop once its head start runs out,
+    /// and not alongside UDP for a TCP client.
+    #[tokio::test(start_paused = true)]
     async fn the_node_attribute_turns_the_tcp_retry_off() {
         let mut view = view_with_peer();
         assert_eq!(
@@ -3729,35 +4080,65 @@ mod tests {
             "the attribute control sets is what turns it off"
         );
 
-        // And with it off, a truncated answer is relayed as it came — no TCP connection at all.
         let query = build_query(0x403, &["big", "example", "com"], 16, 1);
         let upstream = upstream_addr(1);
         let mut truncated = upstream_response(&query, 0, 1, b"the part that fit");
         truncated[2] |= 0x02; // TC
 
-        let retried = std::cell::Cell::new(false);
-        let answer = ask_with_tcp_retry(
-            upstream,
-            &query,
-            view.upstream_tcp_retry(),
-            || std::future::ready(Some((upstream, truncated.clone()))),
-            || {
-                retried.set(true);
-                std::future::ready(None)
-            },
-        )
-        .await
-        .expect("the upstream answered");
+        for client in BOTH_CLIENTS {
+            // With it off, a truncated answer is relayed as it came — no TCP connection at all.
+            let retried = std::cell::Cell::new(false);
+            let answer = race_udp_and_tcp(
+                upstream,
+                &query,
+                client,
+                view.upstream_tcp_retry(),
+                || std::future::ready(Some((upstream, truncated.clone()))),
+                || {
+                    retried.set(true);
+                    std::future::ready(None)
+                },
+            )
+            .await
+            .expect("the upstream answered");
 
-        assert!(
-            !retried.get(),
-            "the attribute must stop the TCP retry being made at all"
-        );
-        assert_eq!(
-            answer.resp, truncated,
-            "relayed truncated, as control asked"
-        );
-        assert_eq!(answer.via, UpstreamTransport::Udp);
+            assert!(
+                !retried.get(),
+                "{client:?}: the attribute must stop the TCP retry being made at all"
+            );
+            assert_eq!(
+                answer.resp, truncated,
+                "{client:?}: relayed truncated, as control asked"
+            );
+            assert_eq!(answer.via, UpstreamTransport::Udp);
+
+            // And a UDP hop that never answers is waited out, not raced: no fallback either.
+            let started = tokio::time::Instant::now();
+            let raced = std::cell::Cell::new(false);
+            let answer = race_udp_and_tcp(
+                upstream,
+                &query,
+                client,
+                view.upstream_tcp_retry(),
+                silent_udp_hop,
+                || {
+                    raced.set(true);
+                    std::future::ready(Some(truncated.clone()))
+                },
+            )
+            .await;
+
+            assert!(
+                !raced.get(),
+                "{client:?}: the attribute must keep the TCP hop out of the race too"
+            );
+            assert!(answer.is_none(), "{client:?}: UDP said nothing, so nothing");
+            assert_eq!(
+                started.elapsed(),
+                UPSTREAM_TIMEOUT,
+                "{client:?}: the UDP hop runs to its own timeout, as it did before the race"
+            );
+        }
     }
 
     /// An off-path injector must not be able to buy a TCP connection to a resolver with a datagram
@@ -3777,9 +4158,10 @@ mod tests {
 
         let mut from_elsewhere = upstream_response(&query, 0, 1, b"injected");
         from_elsewhere[2] |= 0x02; // TC
-        let answer = ask_with_tcp_retry(
+        let answer = race_udp_and_tcp(
             upstream,
             &query,
+            ClientTransport::Udp,
             TcpRetry::Enabled,
             || std::future::ready(Some((upstream_addr(9), from_elsewhere.clone()))),
             &mut tcp_hop,
@@ -3795,9 +4177,10 @@ mod tests {
         let other_question = build_query(0x404, &["other", "example", "com"], 1, 1);
         let mut wrong_question = upstream_response(&other_question, 0, 1, b"injected");
         wrong_question[2] |= 0x02; // TC
-        let answer = ask_with_tcp_retry(
+        let answer = race_udp_and_tcp(
             upstream,
             &query,
+            ClientTransport::Udp,
             TcpRetry::Enabled,
             || std::future::ready(Some((upstream, wrong_question.clone()))),
             &mut tcp_hop,
@@ -3809,6 +4192,72 @@ mod tests {
             "a datagram answering another question must not be retried"
         );
         assert_eq!(answer.via, UpstreamTransport::Udp);
+    }
+
+    /// Where the TCP hop is already running — a TCP client's, which starts with the UDP hop — a
+    /// forged datagram does not end the race either: it is not an answer, so the resolver's own
+    /// TCP answer is what comes back.
+    #[tokio::test]
+    async fn a_forged_datagram_does_not_cut_short_a_running_tcp_hop() {
+        let query = build_query(0x40E, &["example", "com"], 1, 1);
+        let upstream = upstream_addr(1);
+        let injected = upstream_response(&query, 0, 1, b"injected");
+        let over_tcp = upstream_response(&query, 0, 1, b"the resolver over tcp");
+
+        let answer = race_udp_and_tcp(
+            upstream,
+            &query,
+            ClientTransport::Tcp,
+            TcpRetry::Enabled,
+            || std::future::ready(Some((upstream_addr(9), injected.clone()))),
+            || std::future::ready(Some(over_tcp.clone())),
+        )
+        .await
+        .expect("the TCP hop answered");
+
+        assert_eq!(answer.resp, over_tcp);
+        assert_eq!(answer.via, UpstreamTransport::Tcp);
+    }
+
+    /// The other side of the fallback, in the shape of Go's `TestForwarderNetstackUpstream`, which
+    /// bounds its elapsed time by `udpRaceTimeout`: a resolver whose UDP path works must be answered
+    /// over UDP, inside [`UDP_RACE_TIMEOUT`], with no TCP hop started. The race would otherwise hide
+    /// a broken UDP hop behind the right bytes arriving two seconds late over TCP — which is why the
+    /// clock is checked, not only the bytes.
+    #[tokio::test(start_paused = true)]
+    async fn a_working_udp_hop_answers_inside_the_race_timeout_without_tcp() {
+        let query = build_query(0x40F, &["example", "com"], 1, 1);
+        let upstream = upstream_addr(1);
+        let over_udp = upstream_response(&query, 0, 1, b"the resolver over udp");
+        let started = tokio::time::Instant::now();
+
+        let tcp_started = std::cell::Cell::new(false);
+        let answer = race_udp_and_tcp(
+            upstream,
+            &query,
+            ClientTransport::Udp,
+            TcpRetry::Enabled,
+            async || {
+                // A round trip to a resolver that is up.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Some((upstream, over_udp.clone()))
+            },
+            || {
+                tcp_started.set(true);
+                std::future::ready(Some(b"never wanted".to_vec()))
+            },
+        )
+        .await
+        .expect("the upstream answered");
+
+        assert_eq!(answer.resp, over_udp);
+        assert_eq!(answer.via, UpstreamTransport::Udp);
+        assert!(
+            started.elapsed() < UDP_RACE_TIMEOUT,
+            "a working UDP path answers before TCP would ever be tried ({:?})",
+            started.elapsed()
+        );
+        assert!(!tcp_started.get(), "and no TCP connection is opened");
     }
 
     /// The relay cap is a datagram bound, so the one path it must not chop is the one that never
