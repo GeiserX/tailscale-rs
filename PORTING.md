@@ -3,12 +3,12 @@
 | | |
 | --- | --- |
 | **Upstream source** | `https://github.com/tailscale/tailscale` (Go) |
-| **Upstream commit this ledger was written against** | `e2ed432399c9b0fda7aa14e9eb27784d2d893c55` (2026-09-12, `go.toolchain.rev: bump for stack debugging API`) — **held at this revision**: `git ls-remote https://github.com/tailscale/tailscale HEAD` still returned it as upstream's default-branch HEAD on 2026-09-13 |
+| **Upstream commit this ledger was written against** | `e2ed432399c9b0fda7aa14e9eb27784d2d893c55` (2026-09-12, `go.toolchain.rev: bump for stack debugging API`) — **held again**: `git ls-remote https://github.com/tailscale/tailscale HEAD` still returned it as upstream's default-branch HEAD when this revision was derived, on 2026-09-13 |
 | **Upstream `tailcfg.CurrentCapabilityVersion` at that commit** | **147** (2026-09-09) — unchanged; see §A |
-| **This repository at ledger time** | `01244f8` — workspace version `0.56.0` |
+| **This repository at ledger time** | `0c8796a` — workspace version `0.56.1` |
 | **`ts_capabilityversion::CapabilityVersion::CURRENT` here** | **125** (2025-08-11) — held below 126; see §B, *c2n endpoints behind the declared capability version* |
 | **Gap window this ledger covers** | capability version **131 → 147**, i.e. upstream commits from 2025-10-06 to 2026-09-12 (the window is anchored to when capver 130 landed upstream; the declaration here being 125 rather than 130 does not change what upstream added) |
-| **Previous pin** | `e2ed432399c9b0fda7aa14e9eb27784d2d893c55`, with this tree at `608144d` — **neither side moved.** `e2ed43239..` upstream HEAD is empty, and `608144d..HEAD` here is one commit, #460, the previous revision of this document, which touched no code. So everything that changed at this revision came from reading, and all of it from one read: the previous revision closed four rows on ports that [`PARITY_AUDIT.json`](PARITY_AUDIT.json) never audited (#440, #443, #445, #448). Read against the Go they cite, together with #456 and #459, five hold and **one is narrower than upstream** — #440 ports Go's truncation retry but not the UDP/TCP race it sits inside. That is the one new row, in §B |
+| **Previous pin** | `e2ed432399c9b0fda7aa14e9eb27784d2d893c55`, with this tree at `01244f8` — **upstream did not move; this tree did.** `e2ed43239..` upstream HEAD is empty again, and `01244f8..HEAD` here is four commits: #461 (the previous revision of this document), #462 and #464 (the upstream-DNS race, and its follow-up), and #463 (the release). #462 closed the one row the previous revision opened. Auditing it — which is the debt a revision that closes a row owes the next one — opened **three**: Go clamps the EDNS size of the query it forwards and this tree does not, a `SERVFAIL`/`REFUSED` datagram does not start Go's TCP hop here, and the upstream walk is sequential where Go queries every resolver at once. All three are in §B |
 
 > This repository is also a fork of the Rust port `tailscale/tailscale-rs` — see
 > [`VENDOR.md`](VENDOR.md) for that provenance. This ledger is about the *other* upstream: the Go
@@ -183,22 +183,27 @@ below 126, see §B. Upstream is at **147** at the pin — `tailcfg/tailcfg.go:19
 
 **No row is new at this revision.** The pin did not move, and the two §A commands were re-run against
 it anyway: `tailcfg/tailcfg.go:199` still reads `CurrentCapabilityVersion CapabilityVersion = 147`, and
-the capability-history comment returns exactly **18** lines, 130 through 147 — the count the previous
-revision derived when the pin *did* move. An unmoved pin is when that count earns its keep: "upstream
+the capability-history comment returns exactly **18** lines, 130 through 147 — the same count the two
+previous revisions derived. An unmoved pin is when that count earns its keep: "upstream
 added nothing", "I re-ran it against the same tree" and "the pattern broke" all feel the same, and
 only the count tells them apart. An empty or short result still means the pattern broke.
 
-**No row changed assessment.** Rows **133** and **147** are still the two open capability-version
-rows, and both were re-checked against this tree rather than carried on trust: nothing in
-`ts_host_net`, `ts_runtime::magic_dns` or `ts_control`'s register and map paths changed in the
-interval, whose only commit here is #460, the previous revision of this document. Row **137** keeps
+**No row changed assessment, and one row had to be re-checked for a reason it has not had before.**
+Rows **133** and **147** are still the two open capability-version rows. This tree *did* move in the
+interval, but only in `ts_runtime::magic_dns` (#462, #464) and in release metadata (#463), so
+`ts_control`'s register and map paths are untouched and row 147 stands word for word. Row **133** is
+the one to look at twice, because `magic_dns` is its neighbourhood: #462 and #464 change how a
+*forwarded* query reaches an upstream resolver, and 133 is about which *addresses of this node's
+resolver* the host OS is pointed at. Neither commit binds a second service IP, and
+`ts_host_net::HostDns::nameservers` is still `Vec<Ipv4Addr>`, so the row does not move — see the
+re-check below. Row **137** keeps
 its *already covered* verdict and the caveat the previous revision gave it — upstream's register path
 now tests `isRateLimitedResponse(res)`, which also accepts a `503` carrying a `Retry-After` — and that
 widening is still row 147's business rather than 137's. The rows earlier revisions flipped (135, 142,
 144) still say why they flipped, because that history is what makes the row re-checkable.
 
 One cross-check is the cheapest confirmation this section has, and re-run at this revision it returned
-the same **65** unhandled attributes as at the previous one: the node-attribute walk described under
+the same **65** unhandled attributes out of **85** constants, as at the previous two revisions: the node-attribute walk described under
 [Re-deriving this ledger](#re-deriving-this-ledger) reports,
 independently of this table, which attribute strings appear nowhere in this workspace. Every
 attribute named by a row below still comes back **unhandled** — `default-auto-update` (131),
@@ -240,14 +245,17 @@ not applicable to an embedded userspace node (138 and 146 among them, once the d
 below the versions that promise them). The count is unchanged from the previous revision: nothing that
 was open closed, and nothing that was closed reopened.
 
-Row 133 was re-checked against the tree at this revision and is still open:
-`ts_host_net::HostDns::nameservers` ([`ts_host_net/src/lib.rs:44`](ts_host_net/src/lib.rs)) is still
+Row 133 was re-checked against the tree at this revision — this time against a `magic_dns` that
+*changed* — and is still open: `ts_host_net::HostDns::nameservers`
+([`ts_host_net/src/lib.rs:44`](ts_host_net/src/lib.rs)) is still
 a `Vec<Ipv4Addr>`, its doc comment still says "IPv4 nameservers", the Linux backend still fills
 it with the single literal `100.100.100.100`, `ts_runtime::magic_dns` still binds
-`100.100.100.100:53` only, and `force-register-magicdns-ipv4-only` still appears nowhere in the tree
+`100.100.100.100:53` only (`MAGIC_DNS_IP` is an `Ipv4Addr` constant, `magic_dns.rs:146`), and
+`force-register-magicdns-ipv4-only` still appears nowhere in the tree
 — so there is still no IPv6 MagicDNS address either to serve or to register, and no attr to drop back
-from if there were. One commit landed in this tree in the interval — #460, the previous revision of
-this document — and it touched no code; the row is still *not* closed by #347 (the quad-100 absorption fix in §B), which made the TUN
+from if there were. What #462 and #464 changed is the *upstream* hop — the socket this node opens to
+a resolver it forwards to — not the address this node is reachable at, so they neither close the row
+nor narrow it. The row is still *not* closed by #347 (the quad-100 absorption fix in §B), which made the TUN
 transport absorb every quad-100 packet whatever its port and protocol — that is about traffic already
 addressed to `100.100.100.100`, and it neither serves nor registers the IPv6 service IP, which is
 what 133 asks for.
@@ -274,106 +282,167 @@ Row 147, by contrast, is control-facing and belongs to none of this group.
 
 Derived from `git log --since=2025-10-06` over the packages that map to crates here, with
 docs/typo/refactor commits filtered out. **The sweep list is unchanged at this revision and was
-re-run in full** — thirty-eight entries, 857 distinct commits across them at the pin — and, as at the
+re-run in full** — thirty-eight entries, **854** distinct commits across them at the pin — and, as at the
 previous revision, nothing the list itself got wrong: every package in
 [Package mapping](#package-mapping) that has an upstream path has a loop entry, and
 `git log --diff-filter=A --oneline e2ed43239..<new-pin> -- '*/*.go'` is empty by construction,
 because the new pin is the old one. The five times the list *was* short are written up under
 [Re-deriving this ledger](#re-deriving-this-ledger) and those lessons stand unchanged.
 
-**What is different at this revision is that nothing moved and a row still opened.** Neither upstream
-nor this tree changed code in the interval, so the sweep, the node-attribute walk and the wire-type
-checks all returned what they returned last time — and they would have returned it whatever state the
-ports underneath were in. The one new row comes from the fourth source of change named under
-[Re-deriving this ledger](#re-deriving-this-ledger): a port that landed here and is narrower than the
-upstream behaviour it copied. The previous revision closed six rows; four of those closures had never
-been read against upstream. They have now, and one of them was incomplete.
+**That 854 is three fewer than the 857 the previous revision recorded against the same pin, and the
+discrepancy is recorded rather than resolved.** The pin has not moved, so the two numbers cannot both
+be right; re-running the loop here with `TZ=UTC` and with a local zone gives 854 either way, and 845
+under `America/Los_Angeles` — which is the size of effect a `--since` boundary can produce, and it
+does not bridge 854 to 857. No assessment turns on the count. It is written down because the count is
+the only thing that distinguishes "the loop found nothing new" from "the loop broke", and a number
+that silently drifts by three is a number nobody will trust the next time it matters.
 
-A note on wording: rows carried from before the previous revision keep the revision-relative phrasing
+**What is different at this revision is that upstream stood still, this tree moved, and the movement
+paid three rows.** The sweep, the node-attribute walk and the wire-type checks returned what they
+returned last time, because upstream has not changed. The three new rows come from the fourth source
+of change named under [Re-deriving this ledger](#re-deriving-this-ledger): a port that landed here and
+is narrower than the upstream behaviour it copied. #462 closed the row the previous revision opened —
+the first row this ledger has both opened and closed in consecutive revisions — and reading #462
+and #464 against `net/dns/resolver/forwarder.go` at the pin found three behaviours of Go's
+forwarder that the port did not bring with it. **A row that closes on a port written from this ledger's own
+description of it is the case where an audit is most, not least, worth doing**, because the port's
+scope was set by what the row said, and the row is not the upstream.
+
+A note on wording: rows carried from before this revision keep the revision-relative phrasing
 they were written with ("new at this revision", "unchanged at this pin"), and that phrasing refers to
 the revision that wrote the row. Text written at *this* revision is the header table, §A's opening
-paragraphs and its *Net* paragraph, this section's opening, [What changed at this
-revision](#what-changed-at-this-revision), the first row under [Rows](#rows), and [Audited at this
-revision](#audited-at-this-revision).
+paragraphs and its row-133 re-check, this section's opening, [What changed at this
+revision](#what-changed-at-this-revision), the first three rows under [Rows](#rows), [Audited at this
+revision](#audited-at-this-revision) and [Closed at this
+revision](#closed-at-this-revision).
 
 #### What changed at this revision
 
 Read this first: it is the shortest honest summary of the diff between this ledger revision and the
 last one.
 
-- **Neither side moved.** `git ls-remote https://github.com/tailscale/tailscale HEAD` returned
-  `e2ed432399c9b0fda7aa14e9eb27784d2d893c55`, the pin, so `git log --oneline e2ed43239..<new-pin>` is
-  empty. `git log --oneline 608144d..HEAD` is one commit, `01244f8` (#460), the previous revision of
-  this document. Every command under [Re-deriving this ledger](#re-deriving-this-ledger) was re-run
-  anyway, and each returned what the previous revision recorded: **18** capability-history lines;
-  **38** sweep entries; **85** node-attribute constants, **65** unhandled and **20** matched — the same
+- **Upstream did not move; this tree did.** `git ls-remote https://github.com/tailscale/tailscale HEAD`
+  returned `e2ed432399c9b0fda7aa14e9eb27784d2d893c55`, the pin, again, so
+  `git log --oneline e2ed43239..<new-pin>` is empty. `git log --oneline 01244f8..HEAD` is four commits:
+  `31dbdbc` (#461, the previous revision of this document), `2179cf4` (#462), `25da017` (#464) and
+  `0c8796a` (#463, the release). Every command under
+  [Re-deriving this ledger](#re-deriving-this-ledger) was re-run anyway, and each returned what the
+  previous revision recorded, bar one count and one false positive: **18** capability-history lines;
+  **38** sweep entries over **854** distinct commits (the previous revision said 857 — see this
+  section's opening); **85** node-attribute constants, **65** unhandled and **20** matched — the same
   sixteen genuine reads and four known false positives; the renamed half of the outbound wire check
-  empty, and the un-renamed half returning `NetInfo.HairPinning` and nothing else real (see the note
-  on case under that recipe).
-- **One row opened, from an audit rather than from any command.** #440 closed the upstream-resolver
-  TCP-retry row at the previous revision. Read against `net/dns/resolver/forwarder.go` at the commit
-  it cites, it ports Go's truncation arm and not the race that arm sits inside: Go also falls back to
-  TCP when the UDP hop is slow or fails, starts TCP at once for a TCP client, and does *not* retry a
-  UDP client's truncated answer. See the first row below. It does not reopen the closed row — what
-  #440 shipped is correct as far as it goes — it narrows it, as the previous revision's audit narrowed
-  #438 and #442.
-- **Five other merged ports were audited and hold.** #443, #445, #448, #456 and #459 were each read
-  against the Go they cite; the evidence is under [Audited at this
-  revision](#audited-at-this-revision). None opened a row. #448's second upstream meaning was
-  already a row (`disable-relay-client`) and still is.
-- **No row closed, and no carried row changed assessment.** The five open §B rows of the previous
-  revision are carried — `disable-relay-client`, the two `one-cgnat` rows and the two
-  `disable-delta-updates` rows — and each was re-checked against this tree, which has not changed
-  underneath them. So were the four deliberate divergences recorded at earlier revisions
-  (DNS-after-router-failure, SSH `acceptEnv`, the `callMeMaybe` gate, and the peerAPI DoH server's
-  authoritative-answer widening).
-- **One recipe note added; no command changed.** The un-renamed outbound wire-name check has to look
-  names up case-insensitively: the PascalCase of `derp_map` is `DerpMap` and Go spells it `DERPMap`,
-  so a case-sensitive lookup reports sixty "phantoms" that are not. Case-insensitive, over `tailcfg`
-  and `tka`, it reports three: `HairPinning`, the known row, and two false positives — `action_type`,
-  which serializes as `Type` through a rename a one-line extractor misses, and `Endpoint::ty`, which
-  never reaches the wire under its own name because `MapRequest.endpoints` is serialized through a
-  custom module into Go's parallel `Endpoints`/`EndpointTypes` arrays
-  (`ts_control_serde/src/netmap.rs:206`–`:222`).
+  empty over 106 names, and the un-renamed half returning `NetInfo.HairPinning`, `Endpoint::ty` and a
+  **third** name the recipe's lookup scope cannot see, `BootstrapResolution`, which is not a phantom
+  (see the recipe note).
+- **One row closed, in the tree, from this ledger's own description of it.** #462 ported the UDP/TCP
+  race the previous revision opened, and #464 fixed the follow-up it exposed. `ts_runtime::magic_dns`
+  now has `race_udp_and_tcp` (`magic_dns.rs:1352`), `UDP_RACE_TIMEOUT` (`:1212`) and the
+  `TcpRetry::Disabled` shut-out, and it records the one place it deliberately departs from Go. See
+  [Closed at this revision](#closed-at-this-revision).
+- **Three rows opened, all from auditing that closure.** Read against `net/dns/resolver/forwarder.go`
+  at the pin, the port carries Go's race and not three behaviours around it: Go clamps the EDNS
+  requestor size of the query *before* forwarding it and of the UDP answer before returning it
+  (`clampEDNSSize`, `forwarder.go:198`, called at `:1238` and `:875`) and this tree forwards and
+  relays both verbatim; Go's `sendUDP` turns a `SERVFAIL` or `REFUSED` datagram into an *error*
+  (`:850`, `:855`) which starts the TCP hop against the same resolver at once, where this tree scores
+  it as the winning answer and walks on to the next resolver; and Go queries **every** resolver
+  concurrently (`:1282`–`:1305`) where `forward_walk` (`magic_dns.rs:1612`) asks them one at a time.
+  The first three rows below. None of them reopens the closed row.
+- **No carried row changed assessment.** The five §B rows carried from the previous revision —
+  `disable-relay-client`, the two `one-cgnat` rows and the two `disable-delta-updates` rows — were
+  each re-checked against this tree, which did not change underneath any of them: the interval's only
+  code commits are in `ts_runtime::magic_dns`. So were the four deliberate divergences recorded at
+  earlier revisions (DNS-after-router-failure, SSH `acceptEnv`, the `callMeMaybe` gate, and the
+  peerAPI DoH server's authoritative-answer widening), and a fifth is added to that list here: the
+  race's treatment of an unmatched datagram (below).
+- **One recipe corrected; the only command that changed is the tree-delta range, which follows the
+  header table.** The un-renamed outbound wire-name check looks names
+  up in `'tailcfg/*.go' 'tka/*.go'`, and `tailcfg` embeds wire types that upstream defines in sibling
+  packages — `types/dnstype`, `types/opt`, `types/views`, `types/ipproto`, `types/tkatype`,
+  `types/structs`. Run with that scope at this pin it reports `BootstrapResolution` as a phantom; it
+  is `dnstype.Resolver.BootstrapResolution` (`types/dnstype/dnstype.go:37`), which
+  `ts_control_serde::dns::Resolver` (`dns.rs:103`) models field for field. Widen the lookup, or every
+  revision re-derives the same false positive. Chasing it also asked whether those sibling packages
+  are a sixth gap in the sweep list: they are not, but only by luck — see the note under
+  [Re-deriving this ledger](#re-deriving-this-ledger).
 
 #### Rows
 
-- **The upstream DNS hop falls back to TCP only on truncation, where Go races TCP against a slow or
-  failed UDP hop** (`net/dns/resolver/forwarder.go:627` `send`, `:676`–`:744`, `:108`
-  `udpRaceTimeout`; `util/race/race.go:58` `Start`) — **needs port**, and *new at this revision from
-  auditing #440*, not from upstream: `forwarder.go` and `util/race` are byte-identical between
-  `023255e8a`, the commit #440 cites, and the pin. Go's `send` does not ask over UDP and then decide.
-  It hands two closures to `race.New(timeout, firstUDP, thenTCP)` (`:744`), and `Race.Start` runs
-  `firstUDP` at once and `thenTCP` on whichever comes first of `timeout` elapsing (`race.go:70`) or
-  `firstUDP` returning an error (`race.go:102` closes `startFallback`); the first non-error answer
-  wins. Three behaviours fall out of that, and this tree has one of them, run sequentially:
+- **The query forwarded upstream keeps the EDNS size its client asked for, where Go clamps it to
+  4095 first** (`net/dns/resolver/forwarder.go:198` `clampEDNSSize`, called at `:1238` on the query
+  and `:875` on the UDP answer; `net/dns/resolver/tsdns.go:50` `maxResponseBytes`) — **needs port**,
+  and *new at this revision from auditing #462*, not from upstream: `forwarder.go` is byte-identical
+  between the commit #462 cites and the pin. Go rewrites the requestor's UDP payload size **in
+  place**, in the client's own OPT record, down to `maxResponseBytes` (4095) before any resolver is
+  asked, and again on the datagram the resolver returned. The clamp is deliberately partial —
+  `findOPTRecord` (`:152`) only recognises an OPT record at the very end of the message, with
+  `RDLEN == 0` and EDNS version 0, and `clampEDNSSize` returns untouched when it finds none. This
+  tree forwards the query byte for byte: `forward_query` (`ts_runtime/src/magic_dns.rs:1164`) hands
+  `query` straight to `ask_upstream_udp`, and the module docs state the verbatim relay as a design
+  fact (`magic_dns.rs:130`) rather than as a departure from Go. Nothing rewrites the answer's OPT
+  record either. Two things follow. **Resolver-observable:** a stub advertising 8192 makes this node
+  put 8192 on the wire where a Go node puts 4095, so the resolver sizes its reply for a datagram this
+  node cannot receive — the netstack UDP receive ring is 4096 (`netcore::Config::udp_buffer_size`)
+  and smoltcp drops an over-ring datagram at enqueue rather than delivering a short one. **And it
+  interacts with what #462 landed:** since #462 that dropped datagram is a failed UDP hop, so the
+  name still resolves, over a TCP connection to the resolver that a Go node would not have opened,
+  after the 2-second `UDP_RACE_TIMEOUT`. Before #462 it did not resolve at all. The pieces are
+  already here: `find_opt_record` (`magic_dns.rs:1038`) is `findOPTRecord` with the same three
+  restrictions, `MAX_UPSTREAM_RESPONSE` (`:142`) is `maxResponseBytes`, and `cap_response` (`:941`)
+  is the place the answer is already rewritten. The decision to make is whether to clamp both sides
+  as Go does, or only the outbound query — note Go itself leaves the TCP answer alone, and the call
+  is commented out at `forwarder.go:1056`, so "clamp everything" is *not* the upstream behaviour.
+  Test the refusal too: a query whose OPT record is not last, or carries options (`RDLEN != 0`), or
+  is a version this node will not act on, must be forwarded **unmodified**, exactly as
+  `find_opt_record` already refuses to read it.
 
-  1. **A slow or failed UDP hop falls back to TCP.** For a UDP client `timeout` is `udpRaceTimeout`,
-     two seconds (`:738`); for a TCP client it is zero (`:740`), so TCP starts alongside UDP. A
-     resolver whose UDP path drops or stalls but whose TCP path answers is answered in about two
-     seconds. Here `ask_with_tcp_retry` (`ts_runtime/src/magic_dns.rs:1248`) awaits the UDP hop to
-     completion — bounded only by `UPSTREAM_TIMEOUT`, five seconds (`:93`) — and a UDP hop that errors
-     or times out returns `None` before TCP is considered, so the walk moves to the next resolver or
-     ends in `SERVFAIL`. Upstream's own `TestForwarderNetstackUpstream` bounds elapsed time by
-     `udpRaceTimeout` because this fallback can hide a broken UDP path behind correct bytes arriving
-     two seconds late; that is the test shape to copy.
-  2. **A truncated answer is retried over TCP, to the same resolver** (`firstUDP` maps it to
-     `truncatedResponseError`, `:722`). This is what #440 ported, and its bounds are right: the same
-     resolver and never the next, a failed retry relays the truncated answer, an answer that fit is
-     never retried, and both hops ride the overlay `Channel`, never a host socket.
-  3. **A UDP client's truncated answer is *not* retried** (`:707`): Go returns it as it came, because
-     the client can retry over TCP itself. Here `forward_query` (`magic_dns.rs:1158`) gives the
-     client transport to the walk but not to `ask_upstream`, so a truncated answer is re-asked over
-     TCP for a UDP client too — a TCP connection to the resolver that a Go node on the same tailnet
-     does not open.
+- **A `SERVFAIL` or `REFUSED` datagram wins the race here, where in Go it starts the TCP hop against
+  the same resolver** (`net/dns/resolver/forwarder.go:850`, `:855` `sendUDP`; `:767`
+  `rcodeResponseError`; `util/race/race.go:102`) — **needs port**, and *new at this revision from
+  auditing #462*. Go's `sendUDP` does not return a soft-error answer; it returns
+  `rcodeResponseError{rcode, out}`, an **error** carrying the bytes. `firstUDP` propagates it
+  unchanged, and `Race.Start` closes `startFallback` on any error from the first function
+  (`race.go:102`), so `thenTCP` dials the same resolver **immediately** — not after
+  `udpRaceTimeout`. The resolver gets a second chance on a different transport before the query
+  moves anywhere else, and only if TCP also fails do the bytes reach `forwardWithDestChan`'s
+  tally as `firstErr`. Here `classify_udp` (`ts_runtime/src/magic_dns.rs:1300`) reads exactly two
+  things — does the datagram match the query, and did it fit — so a matching, well-fitting `SERVFAIL`
+  is `UdpOutcome::Answer`, wins the race, and `ask_upstream` returns it; `forward_walk` (`:1612`)
+  then applies `is_soft_error` (`:1145`) and moves to the *next* upstream, having never asked this
+  one over TCP. The two behaviours are not the same even in the single-resolver case: Go retries the
+  transport, this tree does not. Note that Go does the same thing on the TCP side (`:1047`, `:1052`),
+  so a resolver that refuses on both transports still ends as a refusal — the difference is only
+  whether the second transport is tried. The port has a natural shape here, because the truncated
+  arm already is it: score a soft-error datagram like `UdpOutcome::Truncated` — hold the bytes,
+  start the TCP hop, and fall back to the held bytes if TCP brings nothing — which leaves
+  `forward_walk`'s soft-error precedence untouched. `TcpRetry::Disabled` must shut this arm out too,
+  as it shuts out the others. Resolver-observable (a connection Go opens and this tree does not) and
+  client-observable (a name that resolves over the refusing resolver's TCP path).
 
-  `skipTCP` (`:677`) gates all of it, not only the truncation arm: under
-  `dns-forwarder-disable-tcp-retries`, `thenTCP` waits on the context and never dials, so a ported race
-  arm must honour `TcpRetry::Disabled` as well. The doc comment on `ask_upstream`
-  (`magic_dns.rs:1203`) says Go's forwarder "does exactly this"; that sentence is the claim this row
-  corrects. Resolver-observable and client-observable — a name resolves or does not on a UDP-hostile
-  path — and not peer-observable. The decision to make is whether to port all three, or to port the
-  fallback and record the UDP-client skip as a deliberate divergence with its reason.
+- **The upstream walk asks one resolver at a time, where Go asks all of them at once**
+  (`net/dns/resolver/forwarder.go:1282`–`:1305`; `:287` `resolverAndDelay`, whose `startDelay` is
+  non-zero only for the DoH upgrades at `:423`–`:439`) — **needs port, or a recorded divergence**,
+  and *new at this revision from auditing #462*. Upstream starts one goroutine per resolver in the
+  list, with no delay between them for any resolver this fork can have, and takes the **first**
+  success off `resc` (`:1314`); the error tally that begins at `:1309` acts only once `numErr`
+  reaches `len(resolvers)` (`:1335`). `forward_walk` (`ts_runtime/src/magic_dns.rs:1612`) is a `for`
+  loop: it awaits each upstream's whole answer before the next upstream is asked at all. Since #462
+  a dead resolver costs more than it used to, not less — for a UDP client the UDP hop gets
+  `UDP_RACE_TIMEOUT` alone (two seconds, `:1212`), the TCP hop then starts and runs its own
+  `UPSTREAM_TIMEOUT` (five seconds, `:96`), so roughly seven seconds pass before the second resolver
+  is tried. Go answers at the healthy resolver's latency. Nothing here bounds the walk as a whole —
+  `serve` spawns the forward and `UPSTREAM_TIMEOUT` is per hop — so on a list of two or more dead
+  resolvers the *client's* stub gives up long before this node reaches the healthy one, and the
+  answer that eventually arrives is sent to a socket nobody is waiting on. **This one may well
+  be right to keep**, and the reason is in the tree already: `ask_upstream`'s doc calls walking on to
+  the next upstream "a second party learning a name it was never asked about", and Go's fan-out hands
+  every configured resolver every query. That is a real privacy difference, and it is this fork's
+  kind of decision. What is missing is not the fan-out — it is the *record*: the divergence is
+  nowhere in this ledger, nowhere in `forward_walk`'s doc comment as a divergence, and the row that
+  closed on `forward_walk` (below, `0b4c0f208`) describes Go's behaviour as a walk, which it is not.
+  So the decision to make is explicit: port the fan-out with Go's tally rules, or keep the sequential
+  walk and write the privacy argument down here and at `forward_walk`, with the latency cost stated.
+  Either way the ledger stops claiming a shape upstream does not have.
 
 - **`disable-relay-client` is ignored, so this node keeps using peer-relay paths control switched
   off** (`wgengine/magicsock/magicsock.go:3000`–`:3002`, `:2331`, `:2858`, `:3050`;
@@ -484,13 +553,47 @@ last one.
 
 #### Audited at this revision
 
-The previous revision closed six rows, and [`PARITY_AUDIT.json`](PARITY_AUDIT.json) audits three merged
-ports (#436, #438, #442). Four of those six closures, and two later ports, had never been read against
-the Go they cite. Each is read here at the pin, and each verdict names the Go and the tree code it
-rests on, so a later revision can re-check it rather than trust it.
+The previous revision closed no rows and audited six merged ports; this revision closes one and audits
+the two commits that closed it. [`PARITY_AUDIT.json`](PARITY_AUDIT.json) audits three older ports
+(#436, #438, #442), and the previous revision's audit of #440, #443, #445, #448, #456 and #459 is
+carried below in full. Those verdicts stand, because nothing in the interval touched the code any
+of them names. Each verdict below names the Go and the tree code it rests on, so a later revision can
+re-check it rather than trust it.
 
-- **#440, the upstream-resolver TCP retry** — **gap: narrower than upstream.** See the first row
-  above.
+- **#462, the UDP/TCP race, and #464, the mismatched-reply follow-up** — **gap: narrower than
+  upstream, in three places.** See the first three rows above. What the two commits *did* port is
+  faithful and is worth stating separately, because a row that narrows a port is easy to misread as a
+  row that reopens it. `race_udp_and_tcp` (`ts_runtime/src/magic_dns.rs:1352`) has Go's structure:
+  the UDP hop starts at once; a `ClientTransport::Udp` client gives it `UDP_RACE_TIMEOUT` alone
+  (`:1212`, Go's `udpRaceTimeout`, `forwarder.go:108`) and a `ClientTransport::Tcp` client gives it
+  none (Go's `timeout = 0`, `forwarder.go:740`); a failed UDP hop starts TCP at once, as
+  `race.go:102` does by closing `startFallback`; a truncated one does too, as
+  `truncatedResponseError` (`forwarder.go:722`) does; the first good answer wins and the loser is
+  dropped. `TcpRetry::Disabled` shuts the TCP hop out of every arm — no head-start timer, no
+  fallback, no truncation retry — which is what Go's `skipTCP` (`forwarder.go:677`) achieves by
+  having `thenTCP` wait on the context and never dial. The anti-leak coupling the original row
+  insisted on is kept: both hops ride the overlay netstack `Channel`, the TCP one via
+  `channel.tcp_connect` from `0.0.0.0:0`, never a host socket. #464's fix matches Go exactly — a TCP
+  message that does not echo the query is scored as a **failed** TCP hop rather than as a winner, so
+  the UDP answer it beat is still relayed, which is what `send` does when it unwraps
+  `truncatedResponseError` out of the joined error (`forwarder.go:751`).
+- **The race's treatment of an unmatched datagram is a deliberate divergence, and it belongs on the
+  list** (`net/dns/resolver/forwarder.go:785` `errTxIDMismatch`, returned at `:841`) — **not a row.**
+  In Go a transaction-id mismatch on the UDP hop is an error like any other, so it closes
+  `startFallback` and dials TCP. Here `UdpOutcome::Unmatched` (`magic_dns.rs:1300`) never *starts*
+  the TCP hop: if the hop is already running it is still waited for, and if it is not the datagram is
+  handed on for `forward_walk` to discard. The reason is stated at the call site and is sound — an
+  off-path injector that can spray datagrams it could never have matched the question of would
+  otherwise conscript this node into opening a TCP connection to the resolver on demand, which is a
+  cheaper amplifier than the silence it replaces. Recorded here rather than opened, and added to the
+  standing list of deliberate divergences, so the next revision does not re-derive the argument.
+
+**Carried from the previous revision's audit, with their evidence intact**, because a verdict whose
+evidence is elided is a verdict the next re-derivation has to redo. Each was re-checked here only for
+whether the tree code it names still exists; nothing in the interval touched any of it.
+
+- **#440, the upstream-resolver TCP retry** — **gap: narrower than upstream.** That gap became the
+  row #462 closed; see [Closed at this revision](#closed-at-this-revision).
 - **#443, the periodic STUN idle stop and `debug-always-stun`** — **faithful** on the arms it ports.
   Go's `shouldDoPeriodicReSTUNLocked` (`wgengine/magicsock/magicsock.go:3603`) stops on network-down
   or homeless, then on no peers or a zero private key, then on `idleFor > sessionActiveTimeout` unless
@@ -526,9 +629,32 @@ rests on, so a later revision can re-check it rather than trust it.
 - **#459, VIP-service client actions** — **faithful** on the decode half, which is all it claims;
   the *Services model extension* entry below records why having no consumer here is correct.
 
+#### Closed at this revision
+
+- **The upstream DNS hop falls back to TCP only on truncation, where Go races TCP against a slow or
+  failed UDP hop** — **closed by #462** (`2179cf4`, "race the upstream TCP hop against a slow or
+  failed UDP hop") **and #464** (`25da017`, "a mismatched TCP reply must not sink the UDP answer").
+  `race_udp_and_tcp` (`ts_runtime/src/magic_dns.rs:1352`) is the race, `UDP_RACE_TIMEOUT` (`:1212`)
+  is Go's `udpRaceTimeout`, `classify_udp` (`:1300`) is `firstUDP`'s classification, and
+  `ClientTransport` decides the head start as Go's `isUDPQuery` does. **Not closed cleanly:** three
+  successor rows above — the EDNS clamp, the soft-error arm of the race, and the sequential walk the
+  race sits inside. The one behaviour of Go's that the port deliberately declines is the third of the
+  three the row named: Go does not re-ask a *UDP client's* truncated answer over TCP, and this tree
+  does, because two of its UDP-labelled clients cannot make that retry themselves (the application
+  netstack serves `100.100.100.100:53` over UDP only, and `query_dns` is a programmatic caller with
+  no TCP path at all). That reason is written at `magic_dns.rs:1245`, it is the shape the row asked
+  for — "port the fallback and record the UDP-client skip as a deliberate divergence with its reason"
+  — and it is accepted here rather than carried as a row.
+- **This is the first row this ledger has opened and closed in consecutive revisions**, and the
+  lesson is in the three successor rows rather than in the speed. The row was written from a reading
+  of `forwarder.go`, the port was written from the row, and the port is exactly as wide as the row
+  was. Three behaviours that the row did not name are therefore still missing. **A row is a summary,
+  and a port scoped to a summary inherits the summary's blind spots** — which is the argument for
+  auditing a closure against upstream even when, especially when, the closure looks clean.
+
 #### Closed at the previous revision
 
-None closed at this revision. Six rows the revision before the previous one opened were ported before
+Six rows the revision before the previous one opened were ported before
 the previous revision was written. Each names the tree code that now
 covers it, because a closed row still needs evidence: the next revision must be able to re-check the
 claim without re-deriving the document, and a closed row reopens if the code it names is refactored
@@ -1364,7 +1490,12 @@ revision does not re-derive them.
   before it can be relayed *or* remembered as the soft error, so an off-path injector cannot plant the
   response a fully-refused forward ends up returning. The socket work (`ask_upstream`) and the decision
   of which response the client gets (`forward_walk`) are now separate functions, which is what makes
-  the walk testable without a network.
+  the walk testable without a network. **One sentence of this row is wrong and is corrected at this
+  revision**, without changing its verdict: "the walk goes on" describes this tree, not upstream.
+  Go does not walk — `forwardWithDestChan` starts every resolver at once (`forwarder.go:1282`) and
+  the soft-error tally is what runs when all of them have failed. The row's own claim, that both
+  codes are soft and that an upstream's bytes are relayed verbatim, is still met. The shape
+  difference is the third row under [Rows](#rows).
 
 - **`UserProfile.Groups` is not modelled** (`tailcfg`: `6a19995f1`) — **already covered**, *changed
   from "needs port"*: #404. Upstream reintroduced `UserProfile.Groups`, "a subset of SCIM groups (e.g.
@@ -1812,8 +1943,11 @@ Re-checked against this pin and against this tree; none moved.
 
 #### Carried unchanged from the previous revisions
 
-The rows below were re-checked against this pin and against this tree and did not move — and at this
-revision that is every row this document already carried, because nothing landed against any of them.
+The rows below were re-checked against this pin and against this tree and did not move. At this
+revision that is every row this document already carried except one: the upstream-DNS race row,
+which #462 and #464 closed and which is written up under [Closed at this
+revision](#closed-at-this-revision). Nothing landed against any of the rest — the interval's only code
+commits are in `ts_runtime::magic_dns`.
 They are kept in full because a row whose evidence is elided is a row the next re-derivation has to
 redo.
 
@@ -1977,22 +2111,25 @@ done
 # Only what moved since the pin this ledger currently carries — the fast path on a re-derivation
 # that follows soon after the last one. Read it *in addition to* the full sweep, never instead of
 # it: a row's assessment can change because this tree moved, with upstream perfectly still, the
-# sweep list itself can be wrong (it has been, five times), and this range can be EMPTY (it was, at
-# two revisions running before the previous one, and is again at this one) without the ledger being
-# finished. At the previous revision it was seven commits and supplied one of five new rows; at THIS
-# revision it was empty, and the one new row came from re-reading merged ports here against upstream.
-# A non-empty delta is not a licence to skip the reading either.
+# sweep list itself can be wrong (it has been, five times), and this range can be EMPTY (it has been
+# at most of the recent revisions, this one included) without the ledger being finished. Two
+# revisions ago it was seven commits and supplied one of five new rows; at the previous revision and
+# at THIS one it was empty, and every new row came from re-reading merged ports here against
+# upstream. A non-empty delta is not a licence to skip the reading either.
 git ls-remote https://github.com/tailscale/tailscale HEAD   # <new-pin>; may already equal the pin
 git -C <tailscale-go> log --oneline e2ed43239..<new-pin>
 
 # And the mirror image of that: what moved *here* since the tree revision the header table names.
-# At the previous revision it was TWENTY-THREE commits, six of which closed rows; at THIS revision it
-# is ONE, the previous rewrite of this document. Read it against the open rows first -- that is the
-# cheapest way to find a row that closed -- and then check that every port in it has been read
-# against upstream, in PARITY_AUDIT.json or under "Audited at this revision" in §B. A port that
-# closed a row and was never audited is where a row that closed INCOMPLETELY hides: this revision's
-# one new row came from auditing four of those.
-git log --oneline 01244f8..HEAD
+# Two revisions ago it was TWENTY-THREE commits, six of which closed rows; at the previous revision
+# it was ONE, that document's own rewrite; at THIS revision it is FOUR, of which two are code and
+# both are in one module. Read it against the open rows first -- that is the cheapest way to find a
+# row that closed -- and then check that every port in it has been read against upstream, in
+# PARITY_AUDIT.json or under "Audited at this revision" in §B. A port that closed a row and was never
+# audited is where a row that closed INCOMPLETELY hides: the previous revision's one new row came
+# from auditing four of those, and ALL THREE of this revision's came from auditing the single port
+# that closed the previous revision's row. Two code commits produced three rows; do not size the
+# reading by the size of the diff.
+git log --oneline 0c8796a..HEAD
 
 # Wire types, both directions. Cheap, mechanical, and it found two rows two revisions ago after six
 # revisions of not being run. Re-run at this pin it returns the one known phantom and nothing new.
@@ -2013,11 +2150,19 @@ grep -rhoE '#\[serde\((.*)rename = "[^"]+"' ts_control_serde/src | grep -oE '"[^
 # six lines above the field, which is enough to make a naive filter skip the only true positive.
 # The cheap manual form, per module:
 #   grep -nE '^\s*pub [a-z_]+\s*:' ts_control_serde/src/<mod>.rs
-# Look the derived name up CASE-INSENSITIVELY (git grep -qiw ... -- 'tailcfg/*.go' 'tka/*.go'). Go
-# spells acronyms in capitals -- DERPMap, AllowedIPs, NodeID -- so a case-sensitive lookup of the
-# PascalCase derivation reports about sixty phantoms that are not. Case-insensitive, at this pin, it
-# reports HairPinning (the known row) and two false positives: action_type, renamed to "Type", and
-# Endpoint::ty, which reaches the wire only as MapRequest's parallel Endpoints/EndpointTypes arrays.
+# Look the derived name up CASE-INSENSITIVELY. Go spells acronyms in capitals -- DERPMap, AllowedIPs,
+# NodeID -- so a case-sensitive lookup of the PascalCase derivation reports about sixty phantoms that
+# are not.
+# AND DO NOT SCOPE THE LOOKUP TO 'tailcfg/*.go' 'tka/*.go', which is what this recipe said until this
+# revision. tailcfg EMBEDS wire types upstream defines in sibling packages -- types/dnstype,
+# types/opt, types/views, types/ipproto, types/tkatype, types/structs -- so a field that reaches the
+# wire inside a tailcfg message can have its Go counterpart outside tailcfg. Scoped that way at this
+# pin the walk reports a THIRD phantom, BootstrapResolution, which is not one: it is
+# dnstype.Resolver.BootstrapResolution (types/dnstype/dnstype.go:37), modelled field for field by
+# ts_control_serde::dns::Resolver (dns.rs:103). Search '*.go' and let the case-insensitivity do the
+# work. So scoped, at this pin it reports HairPinning (the known row) and two false positives:
+# action_type, renamed to "Type", and Endpoint::ty, which reaches the wire only as MapRequest's
+# parallel Endpoints/EndpointTypes arrays.
 
 # Inbound: the reverse -- every json-tagged field of tailcfg's structs checked against those same
 # wire names. A name this tree lacks is a field control may send that nothing here reads.
@@ -2052,13 +2197,25 @@ The capability-history pattern is deliberately whitespace-tolerant: upstream wri
 and a pattern that pins it would go silently empty the day it changes. Check the row count rather
 than trusting the exit status — at the pinned commit the second command returns **18 lines**, 130
 through 147, i.e. the seventeen-version window of §A plus the 130 row that anchors it. Three
-revisions derived **17** against a pin that never moved; the previous revision derived **18** when the
-pin moved by one version; this revision derived **18** again against the same pin. That is why counting is the whole of the check rather than a formality:
+revisions derived **17** against a pin that never moved; the revision after that derived **18** when the
+pin moved by one version; the two since, this one included, have derived **18** again against the
+same pin. That is why counting is the whole of the check rather than a formality:
 when the pin does not move, "upstream added nothing", "I re-ran it against the same tree" and "the
 pattern broke" all produce the same *feeling*, and only the count tells them apart. An empty or short
 result means the pattern broke, not that upstream added nothing.
 
-**Two of the commands above were wrong, and both were rewritten at the previous revision.** They are
+**The same argument applies to the sweep loop's own count, and at this revision that count moved
+without the pin moving.** The loop returns **854** distinct commits here against the **857** the
+previous revision recorded at the identical pin. Both numbers cannot be right, and neither can be
+reconstructed from the document. `TZ` is the obvious suspect and is not the answer: `--since` is
+interpreted in the local zone, and UTC and CEST both give 854 while `America/Los_Angeles` gives 845,
+which is a much larger step than three. Nothing in §B turns on it. It is recorded because the fix is
+one line of discipline: **when a derivation records a count, record the command that produced it
+exactly**, or the next revision cannot tell a real change from a methodology change. The loop as
+printed above, run at the pin, returns 854.
+
+**Two of the commands above were wrong, and both were rewritten at the previous revision; a third was
+too narrow and is widened at this one.** They are
 called out here rather than only in the comments, because a command that returns a plausible short
 answer is worse than one that fails: nobody re-checks it. Both behaved as intended when re-run at
 this pin, and the first of them is why this revision could see six rows close at all — the six
@@ -2081,6 +2238,16 @@ attributes those ports added include two `one-cgnat?v=…` keys that the narrow 
    not spell out. Worse, the obvious way to automate the un-renamed half (skip a field if the lines
    above it mention `rename`) skips `hair_pinning` specifically, because the word appears in a
    comment six lines above it. The recipe now spells the derivation out.
+3. **The un-renamed half's lookup was scoped to the wrong packages, and that is new at this
+   revision.** It searched `'tailcfg/*.go' 'tka/*.go'`, on the reasonable-sounding theory that the
+   outbound wire types are `tailcfg`'s. They are not all `tailcfg`'s: `tailcfg` imports
+   `types/dnstype`, `types/opt`, `types/views`, `types/ipproto`, `types/tkatype` and
+   `types/structs`, and embeds their types in the messages it defines. So the walk reported
+   `BootstrapResolution` as a field this tree models alone, when it is
+   `dnstype.Resolver.BootstrapResolution`. A false *positive* is cheaper than the false negatives
+   above — it costs a reader an hour, not a row — but it is the same failure: **the filter was
+   written from where the author expected the answer to be, not from where the type system says it
+   can be.** Search `'*.go'`.
 
 **The sweep list is part of the ledger, and it has now been wrong five times.** The rule that
 governs it has not changed since it was written down: when [Package mapping](#package-mapping)
@@ -2134,6 +2301,23 @@ not a directory in this repository. Nothing else does. If a package is in the ma
 put the path in the loop and let the assessments come out *not applicable*; that costs one line of
 output per revision and it is re-checkable, which an argument is not.
 
+**A sixth candidate was chased at this revision and is not a miss — but only by luck, and the luck is
+worth naming.** Fixing the outbound wire-check's lookup scope (above) surfaced that `tailcfg` embeds
+wire types from six sibling packages, none of which has a loop entry: `types/dnstype`, `types/opt`,
+`types/views`, `types/ipproto`, `types/tkatype`, `types/structs` — and `types/netmap`, which is the
+struct `ipn/ipnlocal` hands the engine. By the `net/routemanager` rule that is the exact shape of a
+miss: the mapping names `tailcfg`, the behaviour lives next door. Checked commit by commit against the
+sweep's own output, it pays nothing: every commit in the first six is already in the sweep because it
+also touched a swept path, and of `types/netmap`'s nineteen only three are not — `323198b3`
+(`envknob/logknob` removal) and `4a832d8d`/`618dfd40`, a LocalAPI services-map key format and its
+revert, both *not applicable* to a fork whose LocalAPI serves one route. The reason it pays nothing is
+that upstream almost never touches those packages alone, which is **a property of upstream's commit
+habits, not of the sweep list**. Adding the entries would cost seven lines of empty output per
+revision and would stop this from being luck; the argument for not adding them — that they are type
+definitions rather than behaviour — is the same argument that was wrong about `controlknobs`. Left out
+here, with the evidence recorded, so the next revision decides it on facts rather than re-deriving
+them.
+
 New-package runs, for completeness. With the pin unchanged the `--diff-filter=A` check over
 `<old-pin>..<new-pin>` is empty by construction, so the whole-window form (`--since=2025-10-06`) from
 the previous revision stands unchanged and is not re-derived here: it returned about two hundred
@@ -2158,12 +2342,15 @@ correctly assessed, and whose *contents* nobody had opened. **A swept package is
 and a read commit log is not a read package either.**
 
 **And when the upstream delta is empty, that is not a signal to do less reading — it is the revision
-where the reading is the whole job.** Budget for it, not just for the `git log`. Two revisions
-running the pin has not moved at all, and the ledger gained eight rows and then nine.
+where the reading is the whole job.** Budget for it, not just for the `git log`. Across the consecutive revisions at which
+the pin has not moved at all, the ledger gained eight rows, then nine, then one, then three. At this revision the *tree* delta was four commits of which two were code, in one module, and
+those two commits produced every row. **Size the reading by what the diff claims to have finished,
+not by how big it is.**
 
-Five techniques have paid. None of them produced this revision's one row, which came from auditing a
-merged port against the Go it cites — the fourth source of change, below — and none of them could
-have:
+Five techniques have paid. For the second revision running, none of them produced a row: all three
+new rows came from auditing a merged port against the Go it cites — the fourth source of change,
+below — and none of the five could have, because every one of them reports the DNS forwarder as
+*present*, which it is. They are kept in full because their yield is lumpy, not because it is zero:
 
 1. **Take a wire field this tree decodes and follow it forward.** A field modelled in
    `ts_control_serde` that reaches nothing. A `git grep` for the field name finds it and looks like
@@ -2187,9 +2374,12 @@ have:
    The walk tells you where to ask; it does not answer.
 4. **Check the wire types in both directions, mechanically** — outbound, each `ts_control_serde`
    field resolved to the wire name it serializes under and looked up in Go; inbound, the reverse over
-   `tailcfg`'s json-tagged fields. It found `NetInfo.HairPinning` and `Node.ComputedName*` one
-   revision ago. Re-run at this revision it returns exactly the one known phantom and nothing new;
-   the command itself needed fixing first (above).
+   `tailcfg`'s json-tagged fields. It found `NetInfo.HairPinning` and `Node.ComputedName*` two
+   revisions ago. Re-run at this revision it returns the one known phantom, the two known false
+   positives and one *new* false positive that turned out to be a bug in the recipe's lookup scope
+   rather than in the tree (above). Twice now the command has needed fixing before it could be
+   trusted, which is the argument for re-running it at every revision even when it returns nothing:
+   a command nobody runs is a command nobody notices is broken.
 5. **Read the enumerations, not their history.** New at this revision and the highest-yield of the
    five so far: `controlknobs.Knobs` is twenty-seven fields, each a switch control can throw on this
    client, and `UpdateFromNodeAttributes` is the one function that fills them. Reading that file
@@ -2208,10 +2398,11 @@ exception; see the fifth miss above.
 
 When the pin is advanced, bump the header table, re-run the above, and rewrite §A and §B. **And when
 it cannot be advanced, because upstream's default branch is already what the header pins, re-run
-everything anyway and rewrite §A and §B from what came back** — that happened at two revisions
-running before the previous one and again at this one, and it is not a special case to be handled once: a pin catches up with upstream
+everything anyway and rewrite §A and §B from what came back** — that has now happened at
+several consecutive revisions, and it is not a special case to be handled once: a pin catches up with upstream
 whenever a re-derivation follows soon after the last one, and the value of the document at that
-moment is entirely in the reading.
+moment is entirely in the reading. At this revision the reading that paid was not of upstream at all:
+it was of the two commits *this tree* merged in the interval, read against the upstream they cite.
 
 A row whose assessment changes should say *why* it changed — and note that "why" has **four**
 sources, not three. The fourth was added at the previous revision, and at this one it is the only
@@ -2221,12 +2412,13 @@ source that produced anything.
    added 146 four revisions ago, `2ae2808b6` moved the index-eviction row before that, `e1d17a6b9`
    and `f53c28101` moved the disco-key rows before that, and `d9cc55e33` moved the
    `tsnet.Server.HTTPClient` row before that. It contributed nothing at three consecutive revisions,
-   one row at the previous revision and nothing at this one, which is about its long-run rate.
-2. **This tree can move, with upstream still**, and that is the dominant source by a wide margin.
-   **Six §B rows closed at the previous revision** on tree movement alone (#438, #440, #442, #443, #445,
-   #448) — the largest single-revision close in this ledger's history, and the first close of any
-   kind in three revisions; none closed at this revision, where the tree moved by one documentation
-   commit. Six closed two revisions before that (#415, #417, #418, #419, #421,
+   one row two revisions ago, and nothing at the two since, which is about its long-run rate.
+2. **This tree can move, with upstream still**, and it is the only thing that closes rows.
+   **One §B row closed at this revision** on tree movement alone (#462 with #464) — and it is the
+   only row this ledger has opened and closed in consecutive revisions. **Six closed two revisions
+   ago** (#438, #440, #442, #443, #445, #448), the largest single-revision close in this ledger's
+   history; none closed at the previous revision, where the tree moved by one documentation commit.
+   Six closed before that (#415, #417, #418, #419, #421,
    #423), four before that (#404, #406, #408/#410, #412), six before that (#360, #363, #367, #369,
    #370, #372), three before that (#339, #342/#343/#345, #347), and three capability-version rows at
    the one before.
@@ -2234,17 +2426,19 @@ source that produced anything.
    true all along. That is where all seventeen changes across the two previous revisions came from,
    and it remains the technique of last resort when the delta is thin.
 4. **A port that landed here can turn out to be narrower than the upstream behaviour it copied.**
-   Added at the previous revision, when **four of its five new rows** came from re-reading three merged
+   Added two revisions ago, when **four of its five new rows** came from re-reading three merged
    ports against the Go tree they cited, which is what [`PARITY_AUDIT.json`](PARITY_AUDIT.json)
-   records; at this revision it produced the **one** new row, from ports that record does not cover
-   (see *Audited at this revision* in §B). None of the four is visible to the sweep, to the
+   records; at the previous revision it produced the one new row, and at **this** revision it
+   produced **all three** (see *Audited at this revision* in §B). It is now the dominant source by a
+   wide margin, and the reason is structural: none of these rows is visible to the sweep, to the
    node-attribute walk, or to the wire-type checks — every one of those reports the attribute as
    *handled* and the behaviour as *present*, because it is. What is wrong is the decision logic
    underneath, and only reading the merged diff against upstream finds it. **So a revision that
-   closes rows owes the next revision an audit of what it closed**, and closing six rows without one
-   would have shipped a ledger claiming six clean ports where two were incomplete. The previous
-   revision paid that debt for two of its six closures and not for the other four; this revision paid
-   the rest, and one of those four was incomplete too.
+   closes rows owes the next revision an audit of what it closed.** This revision closed one row and
+   the audit of it opened three, which sharpens the rule into something worth stating on its own:
+   **a port written from one of this ledger's rows is scoped by the row, and the row is a summary of
+   upstream, not upstream.** The closer a port looks to the row that asked for it, the more likely
+   the gap is in the row.
 
 One consequence worth stating for whoever advances the pin next: **a row this ledger closes is not a
 row that stops needing evidence.** Every "already covered" and "closed at this revision" bullet above
