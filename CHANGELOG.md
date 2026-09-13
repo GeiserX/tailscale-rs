@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.56.2](https://github.com/GeiserX/tailscale-rs/compare/v0.56.1...v0.56.2) (2026-09-13)
+
+
+### Bug Fixes
+
+* **magicsock:** confirm a relay path from the pong that answers it ([#458](https://github.com/GeiserX/tailscale-rs/issues/458)) ([ee341e3](https://github.com/GeiserX/tailscale-rs/commit/ee341e36f49f4258a4024cfcae71eca167f6830a))
+
 ## [0.56.1](https://github.com/GeiserX/tailscale-rs/compare/v0.56.0...v0.56.1) (2026-09-13)
 
 
