@@ -7,7 +7,7 @@
 | **Upstream `tailcfg.CurrentCapabilityVersion` at that commit** | **147** (2026-09-09) — unchanged; see §A |
 | **This repository at ledger time** | `9675565` — workspace version `0.56.1` |
 | **`ts_capabilityversion::CapabilityVersion::CURRENT` here** | **125** (2025-08-11) — held below 126; see §B, *c2n endpoints behind the declared capability version* |
-| **Gap window this ledger covers** | capability version **131 → 147**, i.e. upstream commits from 2025-10-06 to 2026-09-12 (the window is anchored to when capver 130 landed upstream; the declaration here being 125 rather than 130 does not change what upstream added) |
+| **Gap window this ledger covers** | capability version **131 → 147**, i.e. upstream commits from 2025-10-06 to 2026-09-11 (the window is anchored to when capver 130 landed upstream, and closes at the pinned commit above — the end of the window and the pin's date are one fact, so they move together; the declaration here being 125 rather than 130 does not change what upstream added) |
 | **Previous pin** | `e2ed432399c9b0fda7aa14e9eb27784d2d893c55`, with this tree at `0c8796a` — **neither moved, and this tree did not move in code at all.** `e2ed43239..` upstream HEAD is empty for the third consecutive revision, and `0c8796a..HEAD` here is two commits, both documentation: #465 (the previous revision of this document) and #466 (a correction to two entries in the backlog file it wrote). No Rust changed anywhere in the interval, so none of the four sources of change that need a moving tree could fire. The reading is the whole of this revision, and it went where neither the sweep, the node-attribute walk nor the wire-type checks can see: the **DERP frame-type enumeration**, walked frame by frame against `ts_derp` and its callers. Three rows, all in the relay path — a `PeerGone` frame this node decodes and throws away, a learned DERP route Go prefers over dialling a peer's home region, and `FrameNotePreferred`, which this tree models and never sends. All three are in §B |
 
 > This repository is also a fork of the Rust port `tailscale/tailscale-rs` — see
@@ -2479,9 +2479,9 @@ revisions ago and became rows; two revisions ago it acquired a sharper form, and
 sharper one still — see the note after the five techniques below.** That revision
 found two rows from commits inside the window and inside a swept package that six revisions had read
 past (`de733c595` removing `tailcfg.NetInfo.HairPinning`; `Node.InitDisplayNames`, which never
-changed at all). This revision found seven from a package that was swept, whose commits were all
-correctly assessed, and whose *contents* nobody had opened. **A swept package is not a read package,
-and a read commit log is not a read package either.**
+changed at all). The previous revision found seven from a package that was swept, whose commits
+were all correctly assessed, and whose *contents* nobody had opened. **A swept package is not a
+read package, and a read commit log is not a read package either.**
 
 **And when the upstream delta is empty, that is not a signal to do less reading — it is the revision
 where the reading is the whole job.** Budget for it, not just for the `git log`. Across the consecutive
