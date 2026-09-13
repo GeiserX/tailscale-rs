@@ -3,12 +3,12 @@
 | | |
 | --- | --- |
 | **Upstream source** | `https://github.com/tailscale/tailscale` (Go) |
-| **Upstream commit this ledger was written against** | `e2ed432399c9b0fda7aa14e9eb27784d2d893c55` (2026-09-12, `go.toolchain.rev: bump for stack debugging API`) — **held again**: `git ls-remote https://github.com/tailscale/tailscale HEAD` still returned it as upstream's default-branch HEAD when this revision was derived, on 2026-09-13 |
+| **Upstream commit this ledger was written against** | `e2ed432399c9b0fda7aa14e9eb27784d2d893c55` (2026-09-11, `go.toolchain.rev: bump for stack debugging API`) — **held a third time**: `git ls-remote https://github.com/tailscale/tailscale HEAD` still returned it as upstream's default-branch HEAD when this revision was derived, on 2026-09-13. *The date is corrected at this revision*: the previous two revisions wrote 2026-09-12, and `git log -1 --format=%ad --date=short e2ed43239` says **2026-09-11** (author and committer alike; 20:17 UTC, so no plausible zone rounds it up) |
 | **Upstream `tailcfg.CurrentCapabilityVersion` at that commit** | **147** (2026-09-09) — unchanged; see §A |
-| **This repository at ledger time** | `0c8796a` — workspace version `0.56.1` |
+| **This repository at ledger time** | `9675565` — workspace version `0.56.1` |
 | **`ts_capabilityversion::CapabilityVersion::CURRENT` here** | **125** (2025-08-11) — held below 126; see §B, *c2n endpoints behind the declared capability version* |
 | **Gap window this ledger covers** | capability version **131 → 147**, i.e. upstream commits from 2025-10-06 to 2026-09-12 (the window is anchored to when capver 130 landed upstream; the declaration here being 125 rather than 130 does not change what upstream added) |
-| **Previous pin** | `e2ed432399c9b0fda7aa14e9eb27784d2d893c55`, with this tree at `01244f8` — **upstream did not move; this tree did.** `e2ed43239..` upstream HEAD is empty again, and `01244f8..HEAD` here is four commits: #461 (the previous revision of this document), #462 and #464 (the upstream-DNS race, and its follow-up), and #463 (the release). #462 closed the one row the previous revision opened. Auditing it — which is the debt a revision that closes a row owes the next one — opened **three**: Go clamps the EDNS size of the query it forwards and this tree does not, a `SERVFAIL`/`REFUSED` datagram does not start Go's TCP hop here, and the upstream walk is sequential where Go queries every resolver at once. All three are in §B |
+| **Previous pin** | `e2ed432399c9b0fda7aa14e9eb27784d2d893c55`, with this tree at `0c8796a` — **neither moved, and this tree did not move in code at all.** `e2ed43239..` upstream HEAD is empty for the third consecutive revision, and `0c8796a..HEAD` here is two commits, both documentation: #465 (the previous revision of this document) and #466 (a correction to two entries in the backlog file it wrote). No Rust changed anywhere in the interval, so none of the four sources of change that need a moving tree could fire. The reading is the whole of this revision, and it went where neither the sweep, the node-attribute walk nor the wire-type checks can see: the **DERP frame-type enumeration**, walked frame by frame against `ts_derp` and its callers. Three rows, all in the relay path — a `PeerGone` frame this node decodes and throws away, a learned DERP route Go prefers over dialling a peer's home region, and `FrameNotePreferred`, which this tree models and never sends. All three are in §B |
 
 > This repository is also a fork of the Rust port `tailscale/tailscale-rs` — see
 > [`VENDOR.md`](VENDOR.md) for that provenance. This ledger is about the *other* upstream: the Go
@@ -73,7 +73,7 @@ where that behaviour lives", not "this is a transliteration of that file".
 | `disco` | [`ts_disco_protocol`](ts_disco_protocol/src/lib.rs) |
 | `net/stun` | STUN parsing/probing inside [`ts_magicsock`](ts_magicsock/src/lib.rs) |
 | `net/netcheck` | [`ts_netcheck`](ts_netcheck/src/lib.rs) |
-| `derp`, `derp/derphttp` (client half only) | [`ts_derp`](ts_derp/src/lib.rs) |
+| `derp`, `derp/derphttp` (client half only) | [`ts_derp`](ts_derp/src/lib.rs) — **note added at this revision:** the crate models and decodes all sixteen of `derp.FrameType`'s constants, which is why every structural check here reported it complete; what it does *with* three of them diverges from `magicsock`'s reader, and those are the first three rows of §B |
 | `net/packet` | [`ts_packet`](ts_packet/src/lib.rs) + the decode/classify path in [`ts_dataplane`](ts_dataplane/src/lib.rs) |
 | `wgengine/filter` | [`ts_packetfilter`](ts_packetfilter/src/lib.rs), [`ts_bart_packetfilter`](ts_bart_packetfilter/src/lib.rs), [`ts_packetfilter_state`](ts_packetfilter_state/src/lib.rs) |
 | `wgengine` packet flow + `wgengine/wgcfg` | [`ts_dataplane`](ts_dataplane/src/lib.rs) |
@@ -183,27 +183,26 @@ below 126, see §B. Upstream is at **147** at the pin — `tailcfg/tailcfg.go:19
 
 **No row is new at this revision.** The pin did not move, and the two §A commands were re-run against
 it anyway: `tailcfg/tailcfg.go:199` still reads `CurrentCapabilityVersion CapabilityVersion = 147`, and
-the capability-history comment returns exactly **18** lines, 130 through 147 — the same count the two
+the capability-history comment returns exactly **18** lines, 130 through 147 — the same count the three
 previous revisions derived. An unmoved pin is when that count earns its keep: "upstream
 added nothing", "I re-ran it against the same tree" and "the pattern broke" all feel the same, and
 only the count tells them apart. An empty or short result still means the pattern broke.
 
-**No row changed assessment, and one row had to be re-checked for a reason it has not had before.**
-Rows **133** and **147** are still the two open capability-version rows. This tree *did* move in the
-interval, but only in `ts_runtime::magic_dns` (#462, #464) and in release metadata (#463), so
-`ts_control`'s register and map paths are untouched and row 147 stands word for word. Row **133** is
-the one to look at twice, because `magic_dns` is its neighbourhood: #462 and #464 change how a
-*forwarded* query reaches an upstream resolver, and 133 is about which *addresses of this node's
-resolver* the host OS is pointed at. Neither commit binds a second service IP, and
-`ts_host_net::HostDns::nameservers` is still `Vec<Ipv4Addr>`, so the row does not move — see the
-re-check below. Row **137** keeps
-its *already covered* verdict and the caveat the previous revision gave it — upstream's register path
-now tests `isRateLimitedResponse(res)`, which also accepts a `503` carrying a `Retry-After` — and that
-widening is still row 147's business rather than 137's. The rows earlier revisions flipped (135, 142,
-144) still say why they flipped, because that history is what makes the row re-checkable.
+**No row changed assessment, and this revision is the first at which nothing could have changed one.**
+Rows **133** and **147** are still the two open capability-version rows. The interval's only two commits
+are documentation (#465, #466), so every §A row's tree-side evidence is byte-for-byte what the previous
+revision checked, and every row's upstream-side evidence is at the same pin. That is worth stating rather
+than skipping: an §A section that reports "no change" after a re-derivation it did not run is
+indistinguishable from one that ran it, and the counts below are the only thing that tells the two apart.
+Row **133**, which the previous revision had to re-check because `magic_dns` had moved underneath it,
+needed no such re-check this time and is re-stated below anyway on its unchanged evidence. Row **137**
+keeps its *already covered* verdict and the caveat the previous revision gave it — upstream's register
+path now tests `isRateLimitedResponse(res)`, which also accepts a `503` carrying a `Retry-After` — and
+that widening is still row 147's business rather than 137's. The rows earlier revisions flipped (135,
+142, 144) still say why they flipped, because that history is what makes the row re-checkable.
 
 One cross-check is the cheapest confirmation this section has, and re-run at this revision it returned
-the same **65** unhandled attributes out of **85** constants, as at the previous two revisions: the node-attribute walk described under
+the same **65** unhandled attributes out of **85** constants, as at the previous three revisions: the node-attribute walk described under
 [Re-deriving this ledger](#re-deriving-this-ledger) reports,
 independently of this table, which attribute strings appear nowhere in this workspace. Every
 attribute named by a row below still comes back **unhandled** — `default-auto-update` (131),
@@ -245,17 +244,18 @@ not applicable to an embedded userspace node (138 and 146 among them, once the d
 below the versions that promise them). The count is unchanged from the previous revision: nothing that
 was open closed, and nothing that was closed reopened.
 
-Row 133 was re-checked against the tree at this revision — this time against a `magic_dns` that
-*changed* — and is still open: `ts_host_net::HostDns::nameservers`
+Row 133 was re-derived against the tree at this revision — this time against a tree in which nothing
+at all changed, which is a weaker check than the previous revision's and is recorded as such — and is
+still open: `ts_host_net::HostDns::nameservers`
 ([`ts_host_net/src/lib.rs:44`](ts_host_net/src/lib.rs)) is still
 a `Vec<Ipv4Addr>`, its doc comment still says "IPv4 nameservers", the Linux backend still fills
 it with the single literal `100.100.100.100`, `ts_runtime::magic_dns` still binds
 `100.100.100.100:53` only (`MAGIC_DNS_IP` is an `Ipv4Addr` constant, `magic_dns.rs:146`), and
 `force-register-magicdns-ipv4-only` still appears nowhere in the tree
 — so there is still no IPv6 MagicDNS address either to serve or to register, and no attr to drop back
-from if there were. What #462 and #464 changed is the *upstream* hop — the socket this node opens to
-a resolver it forwards to — not the address this node is reachable at, so they neither close the row
-nor narrow it. The row is still *not* closed by #347 (the quad-100 absorption fix in §B), which made the TUN
+from if there were. The previous revision had to argue that #462 and #464 did not touch the row,
+because they changed `magic_dns`; at this revision no Rust changed at all, so the four pieces of
+evidence above are literally the same bytes it checked. The row is still *not* closed by #347 (the quad-100 absorption fix in §B), which made the TUN
 transport absorb every quad-100 packet whatever its port and protocol — that is about traffic already
 addressed to `100.100.100.100`, and it neither serves nor registers the IPv6 service IP, which is
 what 133 asks for.
@@ -289,84 +289,203 @@ previous revision, nothing the list itself got wrong: every package in
 because the new pin is the old one. The five times the list *was* short are written up under
 [Re-deriving this ledger](#re-deriving-this-ledger) and those lessons stand unchanged.
 
-**That 854 is three fewer than the 857 the previous revision recorded against the same pin, and the
-discrepancy is recorded rather than resolved.** The pin has not moved, so the two numbers cannot both
-be right; re-running the loop here with `TZ=UTC` and with a local zone gives 854 either way, and 845
-under `America/Los_Angeles` — which is the size of effect a `--since` boundary can produce, and it
-does not bridge 854 to 857. No assessment turns on the count. It is written down because the count is
-the only thing that distinguishes "the loop found nothing new" from "the loop broke", and a number
-that silently drifts by three is a number nobody will trust the next time it matters.
+**The 854/857 discrepancy the previous revision recorded is resolved at this one, in the only way it
+could be: by a third run.** The loop as printed under [Re-deriving this ledger](#re-deriving-this-ledger)
+returns **854** again at the unmoved pin — 38 entries, 854 distinct commits — so 854 has now been
+derived twice and 857 once, and 857 is the outlier. The value of writing the number down was never the
+number; it was that a count which drifts is the only cheap signal that the command, and not upstream,
+is what changed. Two agreeing runs of a command printed verbatim is what closes that, and it is why the
+discipline the previous revision proposed — **when a derivation records a count, record the command that
+produced it exactly** — stays in the recipe.
 
-**What is different at this revision is that upstream stood still, this tree moved, and the movement
-paid three rows.** The sweep, the node-attribute walk and the wire-type checks returned what they
-returned last time, because upstream has not changed. The three new rows come from the fourth source
-of change named under [Re-deriving this ledger](#re-deriving-this-ledger): a port that landed here and
-is narrower than the upstream behaviour it copied. #462 closed the row the previous revision opened —
-the first row this ledger has both opened and closed in consecutive revisions — and reading #462
-and #464 against `net/dns/resolver/forwarder.go` at the pin found three behaviours of Go's
-forwarder that the port did not bring with it. **A row that closes on a port written from this ledger's own
-description of it is the case where an audit is most, not least, worth doing**, because the port's
-scope was set by what the row said, and the row is not the upstream.
+**What is different at this revision is that nothing moved on either side, and the reading still paid
+three rows.** Upstream is at the pin for the third consecutive revision; this tree's only two commits
+are documentation. So of the four sources of change named under
+[Re-deriving this ledger](#re-deriving-this-ledger), three could not fire — upstream did not move, the
+tree did not move, and no port merged to audit. Only the third could: **the sweep can be read more
+carefully, or widened, and surface something that was true all along.** What paid was the fifth
+technique, *read the enumerations, not their history*, applied to an enumeration no revision had
+opened: **`derp/derp.go`'s sixteen `FrameType` constants**, taken one at a time and asked not "does
+`ts_derp` model this frame" (it models all sixteen) but "what does this node *do* when it arrives, and
+when does it send one". Three rows, all in the DERP relay path. The generalisation is the one
+`controlknobs` established and this revision confirms on a second enumeration: **a package that
+enumerates something owes you a read of the enumeration**, and modelling every member of it is not the
+same as acting on every member of it. `tailcfg.PeerChange` was walked the same way at this revision and
+paid nothing — all eleven fields are modelled *and* applied — which is what a clean enumeration read
+looks like, and is recorded below so the next revision does not re-derive it.
 
 A note on wording: rows carried from before this revision keep the revision-relative phrasing
 they were written with ("new at this revision", "unchanged at this pin"), and that phrasing refers to
 the revision that wrote the row. Text written at *this* revision is the header table, §A's opening
-paragraphs and its row-133 re-check, this section's opening, [What changed at this
-revision](#what-changed-at-this-revision), the first three rows under [Rows](#rows), [Audited at this
-revision](#audited-at-this-revision) and [Closed at this
-revision](#closed-at-this-revision).
+paragraphs and its row-133 re-derivation, this section's opening, [What changed at this
+revision](#what-changed-at-this-revision), the first three rows under [Rows](#rows), and [Read at this
+revision](#read-at-this-revision). The previous revision's three DNS rows keep their own wording and
+are now the fourth, fifth and sixth rows below.
 
 #### What changed at this revision
 
 Read this first: it is the shortest honest summary of the diff between this ledger revision and the
 last one.
 
-- **Upstream did not move; this tree did.** `git ls-remote https://github.com/tailscale/tailscale HEAD`
-  returned `e2ed432399c9b0fda7aa14e9eb27784d2d893c55`, the pin, again, so
-  `git log --oneline e2ed43239..<new-pin>` is empty. `git log --oneline 01244f8..HEAD` is four commits:
-  `31dbdbc` (#461, the previous revision of this document), `2179cf4` (#462), `25da017` (#464) and
-  `0c8796a` (#463, the release). Every command under
-  [Re-deriving this ledger](#re-deriving-this-ledger) was re-run anyway, and each returned what the
-  previous revision recorded, bar one count and one false positive: **18** capability-history lines;
-  **38** sweep entries over **854** distinct commits (the previous revision said 857 — see this
-  section's opening); **85** node-attribute constants, **65** unhandled and **20** matched — the same
-  sixteen genuine reads and four known false positives; the renamed half of the outbound wire check
-  empty over 106 names, and the un-renamed half returning `NetInfo.HairPinning`, `Endpoint::ty` and a
-  **third** name the recipe's lookup scope cannot see, `BootstrapResolution`, which is not a phantom
-  (see the recipe note).
-- **One row closed, in the tree, from this ledger's own description of it.** #462 ported the UDP/TCP
-  race the previous revision opened, and #464 fixed the follow-up it exposed. `ts_runtime::magic_dns`
-  now has `race_udp_and_tcp` (`magic_dns.rs:1352`), `UDP_RACE_TIMEOUT` (`:1212`) and the
-  `TcpRetry::Disabled` shut-out, and it records the one place it deliberately departs from Go. See
-  [Closed at this revision](#closed-at-this-revision).
-- **Three rows opened, all from auditing that closure.** Read against `net/dns/resolver/forwarder.go`
-  at the pin, the port carries Go's race and not three behaviours around it: Go clamps the EDNS
-  requestor size of the query *before* forwarding it and of the UDP answer before returning it
-  (`clampEDNSSize`, `forwarder.go:198`, called at `:1238` and `:875`) and this tree forwards and
-  relays both verbatim; Go's `sendUDP` turns a `SERVFAIL` or `REFUSED` datagram into an *error*
-  (`:850`, `:855`) which starts the TCP hop against the same resolver at once, where this tree scores
-  it as the winning answer and walks on to the next resolver; and Go queries **every** resolver
-  concurrently (`:1282`–`:1305`) where `forward_walk` (`magic_dns.rs:1612`) asks them one at a time.
-  The first three rows below. None of them reopens the closed row.
-- **No carried row changed assessment.** The five §B rows carried from the previous revision —
-  `disable-relay-client`, the two `one-cgnat` rows and the two `disable-delta-updates` rows — were
-  each re-checked against this tree, which did not change underneath any of them: the interval's only
-  code commits are in `ts_runtime::magic_dns`. So were the four deliberate divergences recorded at
-  earlier revisions (DNS-after-router-failure, SSH `acceptEnv`, the `callMeMaybe` gate, and the
-  peerAPI DoH server's authoritative-answer widening), and a fifth is added to that list here: the
-  race's treatment of an unmatched datagram (below).
-- **One recipe corrected; the only command that changed is the tree-delta range, which follows the
-  header table.** The un-renamed outbound wire-name check looks names
-  up in `'tailcfg/*.go' 'tka/*.go'`, and `tailcfg` embeds wire types that upstream defines in sibling
-  packages — `types/dnstype`, `types/opt`, `types/views`, `types/ipproto`, `types/tkatype`,
-  `types/structs`. Run with that scope at this pin it reports `BootstrapResolution` as a phantom; it
-  is `dnstype.Resolver.BootstrapResolution` (`types/dnstype/dnstype.go:37`), which
-  `ts_control_serde::dns::Resolver` (`dns.rs:103`) models field for field. Widen the lookup, or every
-  revision re-derives the same false positive. Chasing it also asked whether those sibling packages
-  are a sixth gap in the sweep list: they are not, but only by luck — see the note under
-  [Re-deriving this ledger](#re-deriving-this-ledger).
+- **Neither side moved.** `git ls-remote https://github.com/tailscale/tailscale HEAD` returned
+  `e2ed432399c9b0fda7aa14e9eb27784d2d893c55`, the pin, for the third revision running, so
+  `git log --oneline e2ed43239..<new-pin>` is empty. `git log --oneline 0c8796a..HEAD` is two commits,
+  both documentation: `50a0db7` (#465, the previous revision of this document) and `9675565` (#466,
+  a correction to two entries in the backlog file #465 wrote). **No Rust changed in the interval.**
+  That is a stronger statement than "the delta was small", and it is what makes the rest of this list
+  short: no row could close, no carried row's tree-side evidence could move, and there was no merged
+  port to audit.
+- **The mechanical commands were re-run anyway, and every count matched.** **18** capability-history
+  lines, 130 through 147; **38** sweep entries over **854** distinct commits — the same 854 the previous
+  revision derived, which settles the 854/857 question above; **85** node-attribute constants, **65**
+  unhandled and **20** matched, the same sixteen genuine reads and four known false positives. Running
+  them against an unchanged tree at an unchanged pin proves nothing about upstream and everything about
+  the commands: a count that matches is a command that still works. **The two wire-type walks and the
+  three judgement-bearing techniques were not re-derived**, because both sides of what they compare are
+  unchanged; which were skipped and why is stated explicitly under
+  [Re-deriving this ledger](#re-deriving-this-ledger), so the next revision inherits a claim it can
+  check rather than an implication it cannot.
+- **Three rows opened, all from one enumeration nobody had opened.** `derp/derp.go` defines sixteen
+  `FrameType` constants (`derp.go:71`–`:134`). `ts_derp` models all sixteen and decodes all sixteen,
+  which is why every earlier pass over the DERP package read as complete. Asked instead what this node
+  *does* with each, three answers diverge from Go: a `PeerGone` frame is decoded and thrown away where
+  Go uses it to invalidate a route (`wgengine/magicsock/derp.go:665`); the route Go learns from a
+  received frame is consulted here only when the netmap named no home region, where Go prefers it over
+  dialling the peer's home region at all (`derp.go:375`); and `FrameNotePreferred` is modelled and
+  never sent, where Go sends it on every connection to the region it considers home
+  (`derp/derphttp/derphttp_client.go:423`, `:569`). The first three rows below.
+- **One enumeration was walked and came back clean, which is recorded rather than dropped.**
+  `tailcfg.PeerChange` — the eleven fields control may patch onto a peer mid-session — is modelled
+  field for field by `ts_control_serde::netmap::PeerChange` (`netmap.rs:546`) **and** applied field for
+  field by `PeerTracker::apply_peer_patches` (`ts_runtime/src/peer_tracker/mod.rs:1856`), including the
+  two that are easy to model and forget, `Online` and `LastSeen`. A clean enumeration read is worth a
+  paragraph because the alternative is that the next revision spends the same hour on it.
+- **No carried row changed assessment, and this time that claim costs nothing to make.** The eight §B
+  rows carried from the previous revision — the three DNS forwarder rows, `disable-relay-client`, the
+  two `one-cgnat` rows and the two `disable-delta-updates` rows — are stated against tree code that did
+  not change, at a pin that did not move. The same holds for the five deliberate divergences recorded
+  at earlier revisions (DNS-after-router-failure, SSH `acceptEnv`, the `callMeMaybe` gate, the peerAPI
+  DoH server's authoritative-answer widening, and the race's treatment of an unmatched datagram).
+- **Nothing closed, and nothing was audited, for the same reason.** The previous revision closed a row
+  and its audit of that closure opened three. This revision has no closure to audit: the audit source
+  needs a merged port and there was none. The previous revision's audit section is
+  kept verbatim below under [Read at this revision](#read-at-this-revision), because a verdict whose
+  evidence is still true does not stop being useful when the revision that wrote it passes.
+- **No recipe changed.** Of the three commands earlier revisions had to fix, the one re-run here — the
+  node-attribute walk, with its widened character class — behaved exactly as it did last time; the two
+  wire-name walks were not re-run, per the bullet above. The only line of the recipe that moves every
+  revision — the tree-delta range in
+  [Re-deriving this ledger](#re-deriving-this-ledger) — follows the header table as usual.
 
 #### Rows
+
+- **A DERP `PeerGone` frame is decoded and thrown away, so a learned relay route is never invalidated**
+  (`wgengine/magicsock/derp.go:652`–`:665`, `:566`–`:569`; `derp/derp.go:81`–`:88` for the frame's own
+  contract) — **needs port.** Upstream's `runDerpReader` treats `derp.PeerGoneMessage` as a route
+  event: whatever the reason byte says, it calls `c.removeDerpPeerRoute(peer, regionID, dc)`
+  (`derp.go:665`), deleting the `derpRoute[peer]` entry it added at `:626` when that peer's first
+  packet arrived on this connection. It does the same thing wholesale when the connection itself dies
+  — on any `RecvDetail` error it walks `peerPresent` and removes the route for every peer it learned
+  on that connection (`:566`–`:569`). The frame exists for exactly this: `derp/derp.go:81`–`:88` says
+  `FramePeerGone` is sent "so B can forget that a reverse path exists on that connection to get back
+  to A", and it is *also* sent when "A tries to send a CallMeMaybe to B and the server has no record
+  of B" — the `PeerGoneReasonNotHere` case, which Go counts separately
+  (`metricRecvDiscoDERPPeerNotHere`, `derp.go:657`) precisely because it means "this server cannot
+  reach that peer". Here the frame gets as far as being parsed correctly and no further.
+  `ts_derp::Client::recv_one` (`ts_derp/src/client.rs:249`–`:282`) decodes the 32-byte key, decodes the
+  optional reason byte totally, logs at `debug` — and then loops. `recv_one` returns only
+  `(NodePublicKey, PacketMut)` for a `RecvPacket`, so **there is no channel by which a `PeerGone` can
+  leave `ts_derp` at all**, and `grep -rn PeerGone --include='*.rs'` outside that crate returns
+  nothing. The map it should invalidate is `Multiderp::observed_routes`
+  (`ts_runtime/src/multiderp.rs:100`), written on every received frame by `record_observed_route`
+  (`:421`, called at `:559`) and pruned only against the live netmap on a peer-state update (`:751`).
+  So a peer whose route this node learned keeps it until control removes the peer: after the server
+  says the peer is gone — including the `NotHere` case, which is the server stating it has no path —
+  `RouteUpdater` (`ts_runtime/src/route_updater.rs:261`) keeps handing that region's transport id to
+  every WireGuard packet for that peer. Peer-observable, as a black hole rather than an error: the
+  packets are relayed to a server that will drop them, the handshake never completes, and nothing in
+  this node's own logs distinguishes it from a peer that is simply offline. The port has three
+  separable pieces and they should be one change: give `recv_one` a way to surface a control event
+  (or give the region runner in `run_derp_once` the frame directly — it already sees every frame and
+  already knows its own region id, which is what `record_observed_route` needs), remove the observed
+  route on `PeerGone` **scoped to the region the frame arrived on**, exactly as Go's
+  `removeDerpPeerRoute` compares `derpRoute{regionID, dc}` before deleting (`derp.go:56`–`:59`) so a
+  frame from one region cannot clear a route learned on another, and drop every route learned on a
+  connection when that connection fails, as `:566`–`:569` does. Test the scoping and the reason
+  totality, not just the happy path: a `PeerGone` for a peer whose observed route points at a
+  *different* region must leave that route alone; a 32-byte reason-less `PeerGone` must invalidate
+  exactly as a 33-byte one does (`ts_derp` already accepts both, and the existing
+  `reasonless_32_byte_peer_gone_is_accepted_then_continues` test must keep passing); and an unknown
+  future reason byte must invalidate too, because Go's `default` arm removes the route after counting
+  `metricRecvDiscoDERPPeerGoneUnknown`. Assert on the map the production code mutates, not on a
+  re-derivation of it.
+
+- **The DERP route learned from a peer's traffic is used only when the netmap named no home region,
+  where Go prefers it over dialling that peer's home region** (`wgengine/magicsock/derp.go:339`
+  `derpWriteChanForRegion`, the `derpRoute` arm at `:375`; `endpoint.go:1130` for the other use) —
+  **needs port, and it is a decision, not a transcription.** Go asks the question in one place and in a
+  fixed order. `derpWriteChanForRegion(regionID, peer)` is called with the peer's *home* region and:
+  (1) if there is already an active connection to that region, use it (`:364`); (2) **otherwise, if
+  `derpRoute[peer]` names a region this node is already connected to, use that connection instead**
+  (`:375`–`:381`) — the comment is explicit about why, and names the issue it fixed: "perhaps peer's
+  home is Frankfurt, but they dialed our home DERP node in SF to reach us, so we can reply to them
+  using our SF connection rather than dialing Frankfurt. (Issue 150)"; (3) only then open a connection
+  to the home region (`:389`). The separate `fallbackDERPRegionForPeer` (`:82`) is a *third*, narrower
+  use, reached from `endpoint.go:1130` when a peer has neither a valid UDP endpoint nor a DERP home
+  at all. **This tree ported (3) and the third use, and not (2).** `RouteUpdater`
+  (`ts_runtime/src/route_updater.rs:261`) takes `peer.derp_region` whenever the netmap carried one and
+  consults `Multiderp::region_for_peer` only in the `None` arm; `region_for_peer`
+  (`ts_runtime/src/multiderp.rs:250`) and its doc comment (`:237`–`:249`) are written for that arm
+  alone, and `docs/PARITY_ROADMAP.md` records the port (#24, v0.8.1) as "a peer with no netmap home
+  region was denied any underlay route" — which is upstream's *third* use, faithfully done. The
+  consequence is not a dropped packet, it is a connection: `Multiderp` spawns a runner for every
+  region in the derp map (`multiderp.rs:726`) and lets non-home runners idle their connection out, so
+  sending to a peer whose home is Frankfurt wakes a connection to Frankfurt even when this node is
+  already connected to SF and has heard from that peer there. DERP-server-observable (a node appears
+  at a relay a Go client would not have dialled) and cost-observable (one more concurrent DERP
+  connection per remote region in which a peer talks to us). **The decision to make is whether to port
+  it at all**, and there is a real argument on both sides, which is why this is a row rather than a
+  bug. For: it is upstream behaviour, it is peer-visible in aggregate, and the data is already
+  collected here — `record_observed_route` runs for every peer, not only for home-less ones, so only
+  the *consumption* is narrow. Against: this fork's DERP model is a runner per region with an idle
+  timeout, not Go's `activeDerp` map with a `lastWrite` clock, so "already connected" is a question
+  `RouteUpdater` cannot ask today without new plumbing, and preferring an observed route over a
+  netmap-stated home makes this node's relay choice depend on inbound traffic in a way the current
+  design deliberately does not. Whichever way it goes, **write it down at `region_for_peer` and here**:
+  the current doc comment claims "Go `derpRoute` parity" for a port that implements one of Go's three
+  uses of `derpRoute`, and that sentence is how the next reader concludes there is nothing left to do.
+  If it is ported, keep what the existing arm gets right — only a region with a live transport is ever
+  returned (`resolve_region_for_peer`, `:387`) — and test it as Go frames it: a peer whose netmap home
+  is region B, an observed route on region A, a live transport on A and none on B, must relay over A;
+  the same peer with a live transport on B must relay over B, because Go checks the home region first.
+
+- **`FrameNotePreferred` is modelled and never sent, so no DERP server this node connects to is ever
+  told which of them it considers home** (`derp/derp.go:79`; `derp/derp_client.go:344` `NotePreferred`;
+  sent from `derp/derphttp/derphttp_client.go:423` and `:569` on connect, and from
+  `wgengine/magicsock/derp.go:292` and `:423` when the home region changes) — **needs port (narrow),
+  and upstream says what it is worth.** A Go client sends a one-byte `0x07` frame — `0x01` for "you are
+  my home", `0x00` for "you are not" — to each DERP server: on connect when it is the preferred one
+  (`derphttp_client.go:423`, `:569`), and to **every** active connection when the home region moves,
+  including the `false` to the region that just stopped being home (`derp.go:292`,
+  `go ad.c.NotePreferred(i == c.myDerp)`). This tree has the frame type (`FrameType::NotePreferred`,
+  `ts_derp/src/frame/frame_type.rs:28`) and its body (`ts_derp/src/frame/body/note_preferred.rs`), and
+  nothing constructs one: the symbol appears only in those two files and the `mod.rs` re-export.
+  `Multiderp` already knows the answer and already distributes it — `RegionEntry::home_derp`
+  (`ts_runtime/src/multiderp.rs:116`) is a `watch` channel set true for the home region and false for
+  the rest, and `run_derp_once` (`:483`) already awaits changes on it to arm its idle timeout — so the
+  port is to send the frame on that edge and once after the handshake, not to build new state.
+  **State the value honestly, because upstream does:** `derphttp_client.go:1066` says of
+  `NotePreferred`, "It's only used for stats", and the server side bears that out —
+  `derpserver.setPreferred` moves the `curHomeClients` gauge and the `homeMovesIn`/`homeMovesOut`
+  counters and changes nothing about how a packet is delivered. So this is server-observable and not
+  peer-observable: a real Tailscale relay's home-client accounting never counts this node, and this
+  node's home moves never appear in it. That is a small thing to be wrong about and a cheap thing to
+  fix, and the reason it is a row rather than a shrug is the shape it shares with the two rows above —
+  a frame this tree models completely and acts on not at all. Port the edge as well as the connect:
+  Go's `derphttp.Client.NotePreferred` (`:1067`) is idempotent (it returns early when the value is
+  unchanged) and drops the connection for reconnect if the write fails (`:1079`), and a port that only
+  sends `true` on connect, and never the `false` to a former home, tells a relay this node is still
+  homed there forever.
 
 - **The query forwarded upstream keeps the EDNS size its client asked for, where Go clamps it to
   4095 first** (`net/dns/resolver/forwarder.go:198` `clampEDNSSize`, called at `:1238` on the query
@@ -551,14 +670,21 @@ last one.
   It is still a divergence on the arm #442 introduced, and the disclosed reason argues for a
   *narrower* gate (exempt the expiry-flagged rewrite) rather than for no gate.
 
-#### Audited at this revision
+#### Read at this revision
 
-The previous revision closed no rows and audited six merged ports; this revision closes one and audits
-the two commits that closed it. [`PARITY_AUDIT.json`](PARITY_AUDIT.json) audits three older ports
-(#436, #438, #442), and the previous revision's audit of #440, #443, #445, #448, #456 and #459 is
-carried below in full. Those verdicts stand, because nothing in the interval touched the code any
-of them names. Each verdict below names the Go and the tree code it rests on, so a later revision can
-re-check it rather than trust it.
+**No port merged in the interval, so this revision audited nothing and this section is a carry.** The
+audit source of change needs a merged port to read against upstream; `0c8796a..HEAD` is two
+documentation commits, so there was none. What this revision read instead is the DERP frame-type
+enumeration, whose results are the first three rows above, and `tailcfg.PeerChange`, which came back
+clean and is written up under [What changed at this revision](#what-changed-at-this-revision).
+
+Everything below is carried from the previous two revisions with its evidence intact, and every
+verdict still holds for a reason stronger than usual: **none of the tree code any of them names changed,
+because no tree code changed at all.** [`PARITY_AUDIT.json`](PARITY_AUDIT.json) audits three older
+ports (#436, #438, #442); the audits of #462/#464, #440, #443, #445, #448, #456 and #459 follow. Each
+verdict names the Go and the tree code it rests on, so a later revision can re-check it rather than
+trust it. A section that is a carry is still worth reading before opening a row in the same
+neighbourhood — that is what it is for.
 
 - **#462, the UDP/TCP race, and #464, the mismatched-reply follow-up** — **gap: narrower than
   upstream, in three places.** See the first three rows above. What the two commits *did* port is
@@ -588,12 +714,12 @@ re-check it rather than trust it.
   cheaper amplifier than the silence it replaces. Recorded here rather than opened, and added to the
   standing list of deliberate divergences, so the next revision does not re-derive the argument.
 
-**Carried from the previous revision's audit, with their evidence intact**, because a verdict whose
+**Carried from the revision before that, with their evidence intact**, because a verdict whose
 evidence is elided is a verdict the next re-derivation has to redo. Each was re-checked here only for
 whether the tree code it names still exists; nothing in the interval touched any of it.
 
 - **#440, the upstream-resolver TCP retry** — **gap: narrower than upstream.** That gap became the
-  row #462 closed; see [Closed at this revision](#closed-at-this-revision).
+  row #462 closed; see [Closed at the previous revision, kept in full](#closed-at-the-previous-revision-kept-in-full).
 - **#443, the periodic STUN idle stop and `debug-always-stun`** — **faithful** on the arms it ports.
   Go's `shouldDoPeriodicReSTUNLocked` (`wgengine/magicsock/magicsock.go:3603`) stops on network-down
   or homeless, then on no peers or a zero private key, then on `idleFor > sessionActiveTimeout` unless
@@ -631,6 +757,17 @@ whether the tree code it names still exists; nothing in the interval touched any
 
 #### Closed at this revision
 
+**Nothing closed at this revision, and the reason is structural rather than a lull.** A §B row closes
+when this tree gains the behaviour the row describes, and this tree gained no behaviour: the interval's
+two commits are this document and a correction to its backlog file. Recording the empty close is not
+bookkeeping for its own sake — across this ledger's history the close counts run 3, 3, 6, 4, 6, 0, 1
+and now 0, and a revision that closes nothing while opening three is the normal shape of a document
+whose pin has caught up with upstream. The previous revision's close is kept below in full, because
+its three successor rows are still open and a reader who finds one of them wants the closure they came
+out of.
+
+#### Closed at the previous revision, kept in full
+
 - **The upstream DNS hop falls back to TCP only on truncation, where Go races TCP against a slow or
   failed UDP hop** — **closed by #462** (`2179cf4`, "race the upstream TCP hop against a slow or
   failed UDP hop") **and #464** (`25da017`, "a mismatched TCP reply must not sink the UDP answer").
@@ -652,10 +789,9 @@ whether the tree code it names still exists; nothing in the interval touched any
   and a port scoped to a summary inherits the summary's blind spots** — which is the argument for
   auditing a closure against upstream even when, especially when, the closure looks clean.
 
-#### Closed at the previous revision
+#### Closed at earlier revisions
 
-Six rows the revision before the previous one opened were ported before
-the previous revision was written. Each names the tree code that now
+Six rows opened two revisions before the previous one were ported before it was written. Each names the tree code that now
 covers it, because a closed row still needs evidence: the next revision must be able to re-check the
 claim without re-deriving the document, and a closed row reopens if the code it names is refactored
 away. Two of the six closed *incompletely* and have successor rows above; that is recorded here too,
@@ -1943,13 +2079,15 @@ Re-checked against this pin and against this tree; none moved.
 
 #### Carried unchanged from the previous revisions
 
-The rows below were re-checked against this pin and against this tree and did not move. At this
-revision that is every row this document already carried except one: the upstream-DNS race row,
-which #462 and #464 closed and which is written up under [Closed at this
-revision](#closed-at-this-revision). Nothing landed against any of the rest — the interval's only code
-commits are in `ts_runtime::magic_dns`.
+The rows below were re-derived against this pin and against this tree and did not move. At this
+revision that is **every** row this document already carried, with nothing closing and nothing
+reopening, because no Rust changed in the interval and the pin did not move — see [What changed at this
+revision](#what-changed-at-this-revision). The previous revision's one close (the upstream-DNS race
+row) is under [Closed at the previous revision, kept in
+full](#closed-at-the-previous-revision-kept-in-full).
 They are kept in full because a row whose evidence is elided is a row the next re-derivation has to
-redo.
+redo, and because "re-derived and unchanged" is only a checkable claim when the evidence is still on
+the page.
 
 - **DNS is still configured when router programming fails** (`wgengine`: `cfd101f9d`) — **not
   applicable: deliberate divergence, and it should stay one.** Upstream's `Reconfig` returned on
@@ -2112,23 +2250,25 @@ done
 # that follows soon after the last one. Read it *in addition to* the full sweep, never instead of
 # it: a row's assessment can change because this tree moved, with upstream perfectly still, the
 # sweep list itself can be wrong (it has been, five times), and this range can be EMPTY (it has been
-# at most of the recent revisions, this one included) without the ledger being finished. Two
-# revisions ago it was seven commits and supplied one of five new rows; at the previous revision and
-# at THIS one it was empty, and every new row came from re-reading merged ports here against
-# upstream. A non-empty delta is not a licence to skip the reading either.
+# at most of the recent revisions, this one included) without the ledger being finished. Three
+# revisions ago it was seven commits and supplied one of five new rows; it has been empty at the three
+# since. Two of those took every new row from re-reading merged ports here against upstream; THIS one
+# had no merged port either, and took all three from reading an enumeration nobody had opened.
+# A non-empty delta is not a licence to skip the reading either.
 git ls-remote https://github.com/tailscale/tailscale HEAD   # <new-pin>; may already equal the pin
 git -C <tailscale-go> log --oneline e2ed43239..<new-pin>
 
 # And the mirror image of that: what moved *here* since the tree revision the header table names.
-# Two revisions ago it was TWENTY-THREE commits, six of which closed rows; at the previous revision
-# it was ONE, that document's own rewrite; at THIS revision it is FOUR, of which two are code and
-# both are in one module. Read it against the open rows first -- that is the cheapest way to find a
-# row that closed -- and then check that every port in it has been read against upstream, in
-# PARITY_AUDIT.json or under "Audited at this revision" in §B. A port that closed a row and was never
-# audited is where a row that closed INCOMPLETELY hides: the previous revision's one new row came
-# from auditing four of those, and ALL THREE of this revision's came from auditing the single port
-# that closed the previous revision's row. Two code commits produced three rows; do not size the
-# reading by the size of the diff.
+# Three revisions ago it was TWENTY-THREE commits, six of which closed rows; two revisions ago ONE,
+# that document's own rewrite; at the previous revision FOUR, of which two were code and both in one
+# module; at THIS revision it is TWO and NEITHER IS CODE. Read it against the open rows first -- that
+# is the cheapest way to find a row that closed -- and then check that every port in it has been read
+# against upstream, in PARITY_AUDIT.json or under "Read at this revision" in §B. A port that closed a
+# row and was never audited is where a row that closed INCOMPLETELY hides: two revisions ago that
+# audit produced the one new row, and at the previous revision it produced all three.
+# WHEN THIS RANGE HAS NO CODE IN IT, THE AUDIT SOURCE CANNOT FIRE AT ALL, and the revision's whole
+# yield has to come from reading. Budget for that when you see an empty-looking delta; this revision's
+# three rows came from one enumeration, not from the log.
 git log --oneline 0c8796a..HEAD
 
 # Wire types, both directions. Cheap, mechanical, and it found two rows two revisions ago after six
@@ -2168,7 +2308,7 @@ grep -rhoE '#\[serde\((.*)rename = "[^"]+"' ts_control_serde/src | grep -oE '"[^
 # wire names. A name this tree lacks is a field control may send that nothing here reads.
 git -C <tailscale-go> show e2ed43239:tailcfg/tailcfg.go   # plus derpmap.go, tka.go, c2ntypes.go
 
-# And the coarser version of the same question, which is where five of this revision's rows started:
+# And the coarser version of the same question, which is where five rows started two revisions ago:
 # a `pub` field in ts_control_serde whose name appears nowhere else in this workspace is a field this
 # node decodes and drops.
 
@@ -2204,21 +2344,22 @@ when the pin does not move, "upstream added nothing", "I re-ran it against the s
 pattern broke" all produce the same *feeling*, and only the count tells them apart. An empty or short
 result means the pattern broke, not that upstream added nothing.
 
-**The same argument applies to the sweep loop's own count, and at this revision that count moved
-without the pin moving.** The loop returns **854** distinct commits here against the **857** the
-previous revision recorded at the identical pin. Both numbers cannot be right, and neither can be
-reconstructed from the document. `TZ` is the obvious suspect and is not the answer: `--since` is
-interpreted in the local zone, and UTC and CEST both give 854 while `America/Los_Angeles` gives 845,
-which is a much larger step than three. Nothing in §B turns on it. It is recorded because the fix is
-one line of discipline: **when a derivation records a count, record the command that produced it
-exactly**, or the next revision cannot tell a real change from a methodology change. The loop as
-printed above, run at the pin, returns 854.
+**The same argument applies to the sweep loop's own count, and the discrepancy the previous revision
+opened is closed at this one by a third run.** The previous revision recorded **854** against the
+**857** the revision before it had recorded at the identical pin, could not reconstruct either, and
+ruled `TZ` out (`--since` is interpreted in the local zone; UTC and CEST both give 854, while
+`America/Los_Angeles` gives 845, a much larger step than three). Re-run at this revision the loop as
+printed above returns **854** again. Two agreeing derivations against one, so 857 is the outlier and
+the number to carry is 854. Nothing in §B ever turned on it; what the episode bought is the line of
+discipline that resolved it — **when a derivation records a count, record the command that produced it
+exactly** — and the demonstration that the only way to settle a count dispute is to run the recorded
+command again, not to reason about what might have differed.
 
-**Two of the commands above were wrong, and both were rewritten at the previous revision; a third was
-too narrow and is widened at this one.** They are
+**Three of the commands above have been wrong: two were rewritten two revisions ago, and the third was
+widened at the previous revision.** They are
 called out here rather than only in the comments, because a command that returns a plausible short
-answer is worse than one that fails: nobody re-checks it. Both behaved as intended when re-run at
-this pin, and the first of them is why this revision could see six rows close at all — the six
+answer is worse than one that fails: nobody re-checks it. All three behaved as intended when they were
+last run, and the first of them is why two revisions ago the ledger could see six rows close at all — the six
 attributes those ports added include two `one-cgnat?v=…` keys that the narrow class could not match.
 
 1. **The node-attribute walk's character class was too narrow.** `'"[a-z0-9-]+"'` matches only
@@ -2226,8 +2367,8 @@ attributes those ports added include two `one-cgnat?v=…` keys that the narrow 
    not: the four query-string forms (`one-cgnat?v=true`, `one-cgnat?v=false`,
    `linux-netfilter?v=iptables`, `linux-netfilter?v=nftables`), the two `drive:` forms,
    `tailnet.maxKeyDuration`, and the URL-form caps. The walk was added one revision ago and reported
-   forty-seven unhandled attributes both times it was run; it never reported `one-cgnat`, which is a
-   row in §B at this revision. The lesson generalises past this one command: **a filter written to
+   forty-seven unhandled attributes both times it was run; it never reported `one-cgnat`, which became a
+   row in §B two revisions ago. The lesson generalises past this one command: **a filter written to
    match the examples in front of you is a filter that will not report the thing it was written to
    find.** Derive the class from the type's documented grammar, not from the values you happened to
    read.
@@ -2301,7 +2442,7 @@ not a directory in this repository. Nothing else does. If a package is in the ma
 put the path in the loop and let the assessments come out *not applicable*; that costs one line of
 output per revision and it is re-checkable, which an argument is not.
 
-**A sixth candidate was chased at this revision and is not a miss — but only by luck, and the luck is
+**A sixth candidate was chased two revisions ago and is not a miss — but only by luck, and the luck is
 worth naming.** Fixing the outbound wire-check's lookup scope (above) surfaced that `tailcfg` embeds
 wire types from six sibling packages, none of which has a loop entry: `types/dnstype`, `types/opt`,
 `types/views`, `types/ipproto`, `types/tkatype`, `types/structs` — and `types/netmap`, which is the
@@ -2334,7 +2475,8 @@ behaviour a mapped crate already implements, not because anything else covers th
 
 `wgengine` was the lesson for the sweep list. **The lesson the previous revisions drew — that a
 package being *in* the loop does not mean its commits have been *read* — stopped being a warning two
-revisions ago and became rows; at this revision it acquired a sharper form.** The previous revision
+revisions ago and became rows; two revisions ago it acquired a sharper form, and at THIS revision a
+sharper one still — see the note after the five techniques below.** That revision
 found two rows from commits inside the window and inside a swept package that six revisions had read
 past (`de733c595` removing `tailcfg.NetInfo.HairPinning`; `Node.InitDisplayNames`, which never
 changed at all). This revision found seven from a package that was swept, whose commits were all
@@ -2342,15 +2484,26 @@ correctly assessed, and whose *contents* nobody had opened. **A swept package is
 and a read commit log is not a read package either.**
 
 **And when the upstream delta is empty, that is not a signal to do less reading — it is the revision
-where the reading is the whole job.** Budget for it, not just for the `git log`. Across the consecutive revisions at which
-the pin has not moved at all, the ledger gained eight rows, then nine, then one, then three. At this revision the *tree* delta was four commits of which two were code, in one module, and
-those two commits produced every row. **Size the reading by what the diff claims to have finished,
-not by how big it is.**
+where the reading is the whole job.** Budget for it, not just for the `git log`. Across the consecutive
+revisions at which the pin has not moved at all, the ledger gained eight rows, then nine, then one,
+then three, and now three again. At the previous revision the *tree* delta was four commits of which
+two were code, in one module, and those two commits produced every row. **At this revision the tree
+delta contains no code at all, and the yield was the same three.** That is the case worth planning for,
+because it is where the shape of the work changes rather than its size: with nothing to diff and
+nothing to audit, every row has to come from opening something nobody had opened. Pick an enumeration
+and read it. **Size the reading by what the document claims to have finished, not by how big the diff
+is** — and when the diff is empty, by what it has never looked at.
 
-Five techniques have paid. For the second revision running, none of them produced a row: all three
-new rows came from auditing a merged port against the Go it cites — the fourth source of change,
-below — and none of the five could have, because every one of them reports the DNS forwarder as
-*present*, which it is. They are kept in full because their yield is lumpy, not because it is zero:
+Five techniques have paid, and at this revision the fifth produced every row while the first four
+produced none. **Say plainly which were re-run, because "re-checked" and "re-read" are not the same
+claim.** Techniques 1, 2 and 4 read *this tree* against *upstream at the pin*, and at this revision
+neither side changed a byte — so re-running them could not return anything the previous revision had
+not already recorded, and they were not re-derived. Technique 3's mechanical half (the
+`tailcfg/nodecap` grep) **was** re-run, as were all four commands under the recipe above, and every
+count matched; its judgement half was not re-asked. Technique 5 was the work of this revision. A
+future revision at a moved pin owes all five a re-run; a revision at a still pin owes an explicit note
+of which it skipped and why, which is this paragraph. They are kept in full because their yield is
+lumpy, not because it is zero:
 
 1. **Take a wire field this tree decodes and follow it forward.** A field modelled in
    `ts_control_serde` that reaches nothing. A `git grep` for the field name finds it and looks like
@@ -2380,12 +2533,37 @@ below — and none of the five could have, because every one of them reports the
    rather than in the tree (above). Twice now the command has needed fixing before it could be
    trusted, which is the argument for re-running it at every revision even when it returns nothing:
    a command nobody runs is a command nobody notices is broken.
-5. **Read the enumerations, not their history.** New at this revision and the highest-yield of the
-   five so far: `controlknobs.Knobs` is twenty-seven fields, each a switch control can throw on this
-   client, and `UpdateFromNodeAttributes` is the one function that fills them. Reading that file
-   against this tree took minutes and opened eight rows. The generalisation is in the fourth-miss
-   note above: a package whose purpose is to enumerate something owes you a read of the enumeration,
-   and its commit log will never tell you that.
+5. **Read the enumerations, not their history.** The highest-yield of the five, and the only one that
+   has paid at two different revisions. `controlknobs.Knobs` is twenty-seven fields, each a switch
+   control can throw on this client, and `UpdateFromNodeAttributes` is the one function that fills
+   them; reading that file against this tree took minutes and opened eight rows. At **this** revision
+   the same technique applied to `derp/derp.go`'s sixteen `FrameType` constants opened three, and it
+   opened them past a filter that had hidden them from six revisions of sweeping: `ts_derp` models
+   and decodes all sixteen, so every structural check reports the DERP package complete. **The
+   question that pays is not "is this member modelled" but "what does this node DO when this member
+   arrives, and when does it send one".** Asked that way, `PeerGone` is decoded and dropped,
+   `NotePreferred` is never sent, and the route learned from a `RecvPacket` is consulted in one of the
+   three places Go consults it. The generalisation is in the fourth-miss note above: a package whose
+   purpose is to enumerate something owes you a read of the enumeration, and its commit log will never
+   tell you that. **Record the clean reads too.** `tailcfg.PeerChange`'s eleven fields were walked at
+   this revision and are all modelled *and* applied (`ts_control_serde::netmap::PeerChange`,
+   `ts_runtime::peer_tracker::apply_peer_patches`), so that enumeration is done and the next revision
+   should spend its hour elsewhere. Enumerations not yet walked, for whoever is next: `disco`'s nine
+   message types (spot-checked at this revision and apparently complete, not walked), `tailcfg`'s c2n
+   dispatch table (mostly moot behind the held declaration), `ipn.Prefs`, and `netcheck.Report`.
+
+**The sharper form of "a swept package is not a read package", new at this revision.** Earlier
+revisions established that sweeping a package's commits is not reading the package. `derp` adds the
+next step: **modelling every member of a package's enumeration is not acting on every member of it**,
+and it is a much better disguise than an unread commit log. `ts_derp` has all sixteen `FrameType`
+constants, a body type for each, a `TryFrom<u8>` that rejects anything else, and regression tests
+naming `Health`, `Restarting`, `Pong` and three `PeerGone` shapes by number. Every structural check
+this ledger owns — the sweep, the node-attribute walk, both wire-type walks — reports the DERP client
+as complete, and each is right about the question it asks. The question none of them asks is what
+happens *after* the decode, and for three of the sixteen the answer is "a `tracing` call and nothing
+else". **A `tracing::debug!` is the specific shape to look for**: it is what a faithful decoder of a
+frame nobody wired up looks like from the inside, it passes review as handling, and it leaves no
+symbol for a grep to find in the crate that should have consumed it.
 
 Two entries are noisy by nature and should be read with that in mind: `ipn` (which subsumes
 `ipn/localapi` and `ipn/ipnlocal`) catches every multi-package commit that also touched
@@ -2401,36 +2579,45 @@ it cannot be advanced, because upstream's default branch is already what the hea
 everything anyway and rewrite §A and §B from what came back** — that has now happened at
 several consecutive revisions, and it is not a special case to be handled once: a pin catches up with upstream
 whenever a re-derivation follows soon after the last one, and the value of the document at that
-moment is entirely in the reading. At this revision the reading that paid was not of upstream at all:
-it was of the two commits *this tree* merged in the interval, read against the upstream they cite.
+moment is entirely in the reading. Two revisions ago the reading that paid was not of upstream at all:
+it was of the two commits *this tree* merged in the interval, read against the upstream they cite. At
+**this** revision the tree merged no code either, and what paid was reading one upstream enumeration —
+`derp/derp.go`'s frame types — against a crate that models every member of it.
 
 A row whose assessment changes should say *why* it changed — and note that "why" has **four**
 sources, not three. The fourth was added at the previous revision, and at this one it is the only
 source that produced anything.
 
-1. **Upstream can move.** `29cfb0b4c` added capability version 147 at the previous revision; `85c1efb46`
-   added 146 four revisions ago, `2ae2808b6` moved the index-eviction row before that, `e1d17a6b9`
+1. **Upstream can move.** `29cfb0b4c` added capability version 147 two revisions ago; `85c1efb46`
+   added 146 five revisions ago, `2ae2808b6` moved the index-eviction row before that, `e1d17a6b9`
    and `f53c28101` moved the disco-key rows before that, and `d9cc55e33` moved the
    `tsnet.Server.HTTPClient` row before that. It contributed nothing at three consecutive revisions,
-   one row two revisions ago, and nothing at the two since, which is about its long-run rate.
+   one row three revisions ago, and nothing at the three since, which is about its long-run rate.
 2. **This tree can move, with upstream still**, and it is the only thing that closes rows.
-   **One §B row closed at this revision** on tree movement alone (#462 with #464) — and it is the
-   only row this ledger has opened and closed in consecutive revisions. **Six closed two revisions
-   ago** (#438, #440, #442, #443, #445, #448), the largest single-revision close in this ledger's
+   **Nothing closed at this revision**, because no Rust changed in the interval — the one thing that
+   can close a row. **One closed at the previous revision** on tree movement alone (#462 with #464),
+   the only row this ledger has opened and closed in consecutive revisions. **Six closed three
+   revisions ago** (#438, #440, #442, #443, #445, #448), the largest single-revision close in this ledger's
    history; none closed at the previous revision, where the tree moved by one documentation commit.
    Six closed before that (#415, #417, #418, #419, #421,
    #423), four before that (#404, #406, #408/#410, #412), six before that (#360, #363, #367, #369,
    #370, #372), three before that (#339, #342/#343/#345, #347), and three capability-version rows at
    the one before.
 3. **The sweep itself can widen, or simply be read more carefully**, and surface something that was
-   true all along. That is where all seventeen changes across the two previous revisions came from,
-   and it remains the technique of last resort when the delta is thin.
+   true all along. That is where all seventeen changes across two earlier revisions came from, and at
+   **this** revision it is the only source that *could* fire — upstream did not move, the tree did not
+   move, and no port merged — so all three new rows are its, from the DERP frame-type enumeration.
+   Called "the technique of last resort when the delta is thin" by earlier revisions; at a revision
+   with no delta at all it is the technique of first resort, and it should be budgeted as such.
 4. **A port that landed here can turn out to be narrower than the upstream behaviour it copied.**
-   Added two revisions ago, when **four of its five new rows** came from re-reading three merged
+   Added three revisions ago, when **four of its five new rows** came from re-reading three merged
    ports against the Go tree they cited, which is what [`PARITY_AUDIT.json`](PARITY_AUDIT.json)
-   records; at the previous revision it produced the one new row, and at **this** revision it
-   produced **all three** (see *Audited at this revision* in §B). It is now the dominant source by a
-   wide margin, and the reason is structural: none of these rows is visible to the sweep, to the
+   records; two revisions ago it produced the one new row, and at the previous revision **all three**.
+   At **this** revision it produced nothing, and not because it was skipped: it has a precondition the
+   other three sources do not, which is a merged port to read, and the interval contains none. Note
+   that precondition when you plan a revision — this source is the dominant one over the long run and
+   it is silent at exactly the revisions where the pin has caught up and the tree is quiet. The reason
+   it dominates when it can fire is structural: none of these rows is visible to the sweep, to the
    node-attribute walk, or to the wire-type checks — every one of those reports the attribute as
    *handled* and the behaviour as *present*, because it is. What is wrong is the decision logic
    underneath, and only reading the merged diff against upstream finds it. **So a revision that
