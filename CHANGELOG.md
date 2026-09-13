@@ -2,6 +2,14 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.56.1](https://github.com/GeiserX/tailscale-rs/compare/v0.56.0...v0.56.1) (2026-09-13)
+
+
+### Bug Fixes
+
+* **dns:** a mismatched TCP reply must not sink the UDP answer ([#464](https://github.com/GeiserX/tailscale-rs/issues/464)) ([25da017](https://github.com/GeiserX/tailscale-rs/commit/25da017833e3955f9a8c9084fe42c7af0702ea54))
+* **dns:** race the upstream TCP hop against a slow or failed UDP hop ([#462](https://github.com/GeiserX/tailscale-rs/issues/462)) ([2179cf4](https://github.com/GeiserX/tailscale-rs/commit/2179cf4b6455639914fb643c97b9abc4372a8a2c))
+
 ## [0.56.0](https://github.com/GeiserX/tailscale-rs/compare/v0.55.2...v0.56.0) (2026-09-12)
 
 
