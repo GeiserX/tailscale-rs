@@ -430,6 +430,19 @@ fn record_observed_route(
     true
 }
 
+/// The node key of the peer a DERP frame arrived from — Go's `derpNodeSrc`.
+///
+/// The DERP transport is wrapped in [`PeerDbLookup`], so a received batch names its sender as a
+/// [`PeerId`]; this maps that back to the node key the relay actually delivered it under. Extracted
+/// as a free function (rather than going through the `PeerLookup` impl inline) so the relayed-disco
+/// demux reads as "resolve the DERP sender", which is what it is.
+///
+/// `None` means the peer is not in the current netmap snapshot, which is exactly Go's zero
+/// `derpNodeSrc`: an unnameable sender, whose CallMeMaybe{Via} is dropped.
+fn node_key_for_peer(peer_db: &RwLock<Option<Arc<PeerDb>>>, id: PeerId) -> Option<NodePublicKey> {
+    ts_transport::PeerLookup::<PeerId, NodePublicKey>::lookup_key(&PeerDbLookup(peer_db), id)
+}
+
 struct PeerDbLookup<'a>(&'a RwLock<Option<Arc<PeerDb>>>);
 
 impl ts_transport::PeerLookup<PeerId, NodePublicKey> for PeerDbLookup<'_> {
@@ -551,6 +564,15 @@ async fn run_derp_once(
                     for ret in from_derp.batch_iter() {
                         let (peer_id, pkts) = ret?;
 
+                        // The node key of the DERP connection this batch arrived on — Go's
+                        // `derpNodeSrc`. `transport` mapped it down to a `PeerId` on the way in;
+                        // map it back, because a CallMeMaybe{Via} carries no node key of its own
+                        // and the relay source is the only thing its sealing disco key can be
+                        // bound to. `None` (the peer left the netmap between the frame arriving
+                        // and this lookup) is Go's zero `derpNodeSrc`: the frame is still consumed
+                        // as disco, but nothing is learned from it.
+                        let derp_node_src = node_key_for_peer(peer_db, peer_id);
+
                         // Observed-route learning (Go `derpRoute` parity): a frame reached us from
                         // this peer on region `id`, so the peer is listening there. Record it (any
                         // frame counts — disco or WG data) so [`Multiderp::region_for_peer`] can
@@ -560,7 +582,9 @@ async fn run_derp_once(
                             tracing::trace!(parent: &span, %peer_id, region_id = %id, "learned observed derp route for peer");
                         }
 
-                        let data = demux_relayed_disco(pkts, sock.as_deref()).await;
+                        let data =
+                            demux_relayed_disco(pkts, sock.as_deref(), derp_node_src.as_ref())
+                                .await;
                         if data.is_empty() {
                             continue;
                         }
@@ -628,15 +652,21 @@ async fn run_derp_once(
 /// Anti-leak: a relayed frame has no real UDP source, so only the two call-me-maybe messages are
 /// acted on; relayed Pings/Pongs are dropped by `handle_relayed_disco` rather than producing a
 /// pong to a bogus address.
+///
+/// `derp_node_src` is the node key of the peer whose DERP connection delivered this batch (Go's
+/// `derpNodeSrc`). It is forwarded rather than discarded because a CallMeMaybe{Via} carries no node
+/// key: it is the only identity the message's sealing disco key can be bound to, and the only
+/// handle on the sender's capability version. `None` drops both messages.
 async fn demux_relayed_disco(
     pkts: impl IntoIterator<Item = ts_packet::PacketMut>,
     sock: Option<&MagicSock>,
+    derp_node_src: Option<&NodePublicKey>,
 ) -> Vec<ts_packet::PacketMut> {
     let mut data = Vec::new();
     for mut pkt in pkts {
         if ts_magicsock::looks_like_disco(pkt.as_ref())
             && let Some(sock) = sock
-            && sock.handle_relayed_disco(pkt.as_mut()).await
+            && sock.handle_relayed_disco(pkt.as_mut(), derp_node_src).await
         {
             // Consumed as a relayed disco frame; keep it off the dataplane.
             continue;
@@ -908,6 +938,134 @@ mod tests {
         Arc::new(|_: &ts_keys::DiscoPublicKey, _: Option<&NodePublicKey>| true)
     }
 
+    /// A minimal netmap peer carrying `node_key`, for the `PeerId` → node-key round trip.
+    fn relay_peer(node_key: NodePublicKey) -> ts_control::Node {
+        ts_control::Node {
+            id: 1,
+            stable_id: ts_control::StableNodeId("relayed".to_string()),
+            hostname: "peer".to_string(),
+            user_id: 0,
+            tailnet: Some("ts.net".to_string()),
+            tags: vec![],
+            addresses: vec![
+                "100.64.0.9/32".parse().unwrap(),
+                "fd7a::9/128".parse().unwrap(),
+            ],
+            tailnet_address: ts_control::TailnetAddress {
+                ipv4: "100.64.0.9/32".parse().unwrap(),
+                ipv6: "fd7a::9/128".parse().unwrap(),
+            },
+            node_key,
+            node_key_expiry: None,
+            expired: false,
+            online: None,
+            last_seen: None,
+            key_signature: vec![],
+            machine_key: None,
+            disco_key: None,
+            accepted_routes: vec![],
+            underlay_addresses: vec![],
+            derp_region: None,
+            cap: Default::default(),
+            cap_map: Default::default(),
+            peerapi_port: None,
+            peerapi_dns_proxy: false,
+            is_wireguard_only: false,
+            exit_node_dns_resolvers: vec![],
+            peer_relay: false,
+            ssh_host_keys: vec![],
+            service_vips: Default::default(),
+            unsigned_peer_api_only: false,
+        }
+    }
+
+    /// The demux carries the DERP source node key through to the magicsock, rather than dropping it
+    /// on the floor as the `PeerId` mapping would.
+    ///
+    /// The verifier here is the discriminating kind the production route layer installs: it binds
+    /// one disco key to one node key. The same sealed `CallMeMaybe` is demuxed twice — once under
+    /// the sender's own node key, once under another peer's — and only the first learns an
+    /// endpoint. If `derp_node_src` were not threaded through, both runs would look identical from
+    /// inside `handle_relayed_disco` and this could not fail.
+    #[tokio::test]
+    async fn demux_passes_the_derp_source_node_key_to_the_magicsock() {
+        let our_disco = DiscoPrivateKey::random();
+        let our_node = ts_keys::NodePrivateKey::random().public_key();
+        let peer_disco = DiscoPrivateKey::random();
+        let peer_node = ts_keys::NodePrivateKey::random().public_key();
+        let other_node = ts_keys::NodePrivateKey::random().public_key();
+
+        let peer_pub = peer_disco.public_key();
+        let verifier: ts_magicsock::BindingVerifier = Arc::new(
+            move |disco: &ts_keys::DiscoPublicKey, claimed: Option<&NodePublicKey>| {
+                *disco == peer_pub && claimed == Some(&peer_node)
+            },
+        );
+        let sock = MagicSock::bind(localhost(), our_disco.clone(), our_node)
+            .await
+            .unwrap()
+            .with_binding_verifier(verifier);
+
+        let peer_ep: std::net::SocketAddr = "203.0.113.9:41641".parse().unwrap();
+        let cmm =
+            ts_magicsock::seal_call_me_maybe(&peer_disco, &our_disco.public_key(), &[peer_ep])
+                .unwrap();
+
+        // Delivered on the wrong peer's DERP connection: consumed, but nothing learned.
+        let out = demux_relayed_disco(
+            vec![PacketMut::from(&cmm[..])],
+            Some(&sock),
+            Some(&other_node),
+        )
+        .await;
+        assert!(out.is_empty(), "the CallMeMaybe is consumed either way");
+        assert!(
+            sock.candidate_addrs(&peer_pub).is_empty(),
+            "a CallMeMaybe delivered under another peer's node key must learn nothing"
+        );
+
+        // The same bytes on the sender's own DERP connection: learned.
+        let out = demux_relayed_disco(
+            vec![PacketMut::from(&cmm[..])],
+            Some(&sock),
+            Some(&peer_node),
+        )
+        .await;
+        assert!(out.is_empty(), "the CallMeMaybe is consumed either way");
+        assert_eq!(
+            sock.candidate_addrs(&peer_pub),
+            vec![peer_ep],
+            "the same frame from the sender's own node key is learned"
+        );
+    }
+
+    /// [`node_key_for_peer`] is the inverse of the `PeerId` mapping the DERP transport applies on
+    /// the way in: it returns the node key the relay actually delivered under, and `None` for a
+    /// peer id the current netmap snapshot does not know (Go's zero `derpNodeSrc`).
+    #[test]
+    fn node_key_for_peer_resolves_the_derp_sender() {
+        let node_key = ts_keys::NodePrivateKey::random().public_key();
+        let mut db = PeerDb::default();
+        let id = db.upsert(&relay_peer(node_key));
+        let peer_db: RwLock<Option<Arc<PeerDb>>> = RwLock::new(Some(Arc::new(db)));
+
+        assert_eq!(
+            node_key_for_peer(&peer_db, id),
+            Some(node_key),
+            "a known peer id resolves to the node key the relay named"
+        );
+        assert_eq!(
+            node_key_for_peer(&peer_db, PeerId(u32::MAX)),
+            None,
+            "an unknown peer id is Go's zero derpNodeSrc"
+        );
+        assert_eq!(
+            node_key_for_peer(&RwLock::new(None), id),
+            None,
+            "and so is every peer id before a netmap is loaded"
+        );
+    }
+
     /// A `CallMeMaybe` relayed to us over DERP is routed into the magicsock (its endpoints are
     /// learned via `add_peer_endpoints`) and is *not* returned for the dataplane, while an
     /// interleaved WireGuard data frame still reaches the dataplane unchanged. This is the
@@ -922,8 +1080,10 @@ mod tests {
             .unwrap()
             .with_binding_verifier(allow_all());
 
-        // A remote peer's CallMeMaybe carrying a public (pingable) candidate endpoint.
+        // A remote peer's CallMeMaybe carrying a public (pingable) candidate endpoint, delivered
+        // on that peer's own DERP connection (Go `derpNodeSrc`).
         let peer_disco = DiscoPrivateKey::random();
+        let peer_node = ts_keys::NodePrivateKey::random().public_key();
         let peer_ep: std::net::SocketAddr = "203.0.113.7:41641".parse().unwrap();
         let cmm =
             ts_magicsock::seal_call_me_maybe(&peer_disco, &our_disco.public_key(), &[peer_ep])
@@ -933,7 +1093,7 @@ mod tests {
         let wg = PacketMut::from(&[0x04u8, 0, 0, 0, 1, 2, 3, 4][..]);
 
         let batch = vec![PacketMut::from(&cmm[..]), wg];
-        let to_dataplane = demux_relayed_disco(batch, Some(&sock)).await;
+        let to_dataplane = demux_relayed_disco(batch, Some(&sock), Some(&peer_node)).await;
 
         // The CallMeMaybe was consumed; only the data frame is forwarded.
         assert_eq!(
@@ -957,6 +1117,7 @@ mod tests {
     async fn without_direct_sock_all_frames_forwarded() {
         let our_disco = DiscoPrivateKey::random();
         let peer_disco = DiscoPrivateKey::random();
+        let peer_node = ts_keys::NodePrivateKey::random().public_key();
         let cmm = ts_magicsock::seal_call_me_maybe(
             &peer_disco,
             &our_disco.public_key(),
@@ -966,7 +1127,7 @@ mod tests {
         let wg = PacketMut::from(&[0x04u8, 9, 9][..]);
 
         let batch = vec![PacketMut::from(&cmm[..]), wg];
-        let out = demux_relayed_disco(batch, None).await;
+        let out = demux_relayed_disco(batch, None, Some(&peer_node)).await;
 
         assert_eq!(
             out.len(),
@@ -994,7 +1155,12 @@ mod tests {
         let ping =
             ts_magicsock::seal_ping(&peer_disco, peer_node, &our_disco.public_key(), tx).unwrap();
 
-        let out = demux_relayed_disco(vec![PacketMut::from(&ping[..])], Some(&sock)).await;
+        let out = demux_relayed_disco(
+            vec![PacketMut::from(&ping[..])],
+            Some(&sock),
+            Some(&peer_node),
+        )
+        .await;
 
         assert!(
             out.is_empty(),
@@ -1019,6 +1185,7 @@ mod tests {
             .with_binding_verifier(allow_all());
 
         let peer_disco = DiscoPrivateKey::random();
+        let peer_node = ts_keys::NodePrivateKey::random().public_key();
         let loopback: std::net::SocketAddr = "127.0.0.1:41641".parse().unwrap();
         let private: std::net::SocketAddr = "10.1.2.3:41641".parse().unwrap();
         let public: std::net::SocketAddr = "203.0.113.50:41641".parse().unwrap();
@@ -1029,7 +1196,12 @@ mod tests {
         )
         .unwrap();
 
-        let out = demux_relayed_disco(vec![PacketMut::from(&cmm[..])], Some(&sock)).await;
+        let out = demux_relayed_disco(
+            vec![PacketMut::from(&cmm[..])],
+            Some(&sock),
+            Some(&peer_node),
+        )
+        .await;
         assert!(out.is_empty(), "the CallMeMaybe is consumed, not forwarded");
 
         assert_eq!(
