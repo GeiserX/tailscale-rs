@@ -1234,6 +1234,11 @@ const UDP_RACE_TIMEOUT: Duration = Duration::from_secs(2);
 /// - **A failed TCP hop returns the truncated UDP answer**, not `SERVFAIL`. A truncated answer is
 ///   still an answer: its header and question are intact and a stub resolver can act on the `TC`
 ///   bit. Replacing it with a synthesized failure would be strictly worse than what we already had.
+/// - **A TCP message that does not answer this query is a failed TCP hop**, not an answer. The
+///   race checks it with [`response_matches_query`] exactly as it checks the datagram, because the
+///   hop that loses the race is *dropped*: letting a mismatched message win would throw away the
+///   UDP answer — pending, or held truncated — that [`forward_walk`] would otherwise have relayed,
+///   and [`forward_walk`] would then discard the mismatch too and resolve nothing.
 /// - **An answer that fit wins.** Once the UDP hop has one, the TCP hop is dropped (or, before the
 ///   head start runs out, never started) and its answer is never waited for.
 ///
@@ -1256,7 +1261,9 @@ const UDP_RACE_TIMEOUT: Duration = Duration::from_secs(2);
 /// This is the whole of [`forward_query`]'s I/O, split out from the walk so the policy above it —
 /// anti-poisoning, the soft-error rules, which response is relayed — is decided (and tested) on
 /// bytes rather than on sockets. It vouches for nothing about the answer it returns: the source
-/// address comes back unfiltered precisely so [`forward_walk`] can check it.
+/// address comes back unfiltered precisely so [`forward_walk`] can check it. The checks the race
+/// does make are not that check moved here — they only decide which hop *wins*, and every answer
+/// that wins is still handed to [`forward_walk`] to accept or discard on its own terms.
 async fn ask_upstream(
     channel: &Channel,
     upstream: SocketAddr,
@@ -1354,13 +1361,25 @@ where
     UdpFut: std::future::Future<Output = Option<(SocketAddr, Vec<u8>)>>,
     TcpFut: std::future::Future<Output = Option<Vec<u8>>>,
 {
-    let over_tcp = |resp| UpstreamAnswer {
-        // The TCP peer is the resolver we connected to, by construction of the handshake, so the
-        // source address is `upstream` itself and `forward_walk`'s source check passes on a fact
-        // rather than on a claim in a datagram header.
-        from: upstream,
-        resp,
-        via: UpstreamTransport::Tcp,
+    // The TCP hop's message as an answer — or `None` when it is not one. A message that does not
+    // echo this query is no more use than no message at all: `forward_walk` discards it either
+    // way. The difference is what it costs on the way, because the hop that loses this race is
+    // dropped unfinished: let a mismatched message win and the UDP answer it beat is gone, and a
+    // query that would have resolved resolves as SERVFAIL. So it is scored as a failed hop, which
+    // leaves the race to UDP — pending, or held truncated — exactly as a connect error would.
+    let over_tcp = |resp: Vec<u8>| {
+        if !response_matches_query(query, &resp) {
+            tracing::debug!(%upstream, "magic dns dropping mismatched tcp response");
+            return None;
+        }
+        Some(UpstreamAnswer {
+            // The TCP peer is the resolver we connected to, by construction of the handshake, so
+            // the source address is `upstream` itself and `forward_walk`'s source check passes on
+            // a fact rather than on a claim in a datagram header.
+            from: upstream,
+            resp,
+            via: UpstreamTransport::Tcp,
+        })
     };
 
     let udp = udp();
@@ -1388,11 +1407,11 @@ where
             }
             Some(UdpOutcome::Truncated(truncated)) => {
                 tracing::debug!(%upstream, "magic dns upstream answer truncated, retrying over tcp");
-                return Some(tcp().await.map(over_tcp).unwrap_or(truncated));
+                return Some(tcp().await.and_then(over_tcp).unwrap_or(truncated));
             }
             Some(UdpOutcome::Failed) => {
                 tracing::debug!(%upstream, "magic dns upstream udp hop failed, trying tcp");
-                return tcp().await.map(over_tcp);
+                return tcp().await.and_then(over_tcp);
             }
             None => {
                 tracing::debug!(%upstream, "magic dns upstream udp hop slow, racing tcp");
@@ -1407,7 +1426,7 @@ where
         got = &mut udp => match classify_udp(upstream, query, got) {
             UdpOutcome::Answer(answer) => Some(answer),
             UdpOutcome::Truncated(held) | UdpOutcome::Unmatched(held) => {
-                Some(tcp.await.map(over_tcp).unwrap_or_else(|| {
+                Some(tcp.await.and_then(over_tcp).unwrap_or_else(|| {
                     tracing::debug!(
                         %upstream,
                         "magic dns upstream tcp hop failed, relaying the udp answer"
@@ -1415,12 +1434,13 @@ where
                     held
                 }))
             }
-            UdpOutcome::Failed => tcp.await.map(over_tcp),
+            UdpOutcome::Failed => tcp.await.and_then(over_tcp),
         },
-        got = &mut tcp => match got {
-            Some(resp) => Some(over_tcp(resp)),
-            // The TCP hop failed first: the race is the UDP hop's, whatever it brings — including a
-            // truncated answer, which Go returns in place of the error.
+        got = &mut tcp => match got.and_then(over_tcp) {
+            Some(answer) => Some(answer),
+            // The TCP hop failed first — or answered something we did not ask: the race is the UDP
+            // hop's, whatever it brings — including a truncated answer, which Go returns in place
+            // of the error.
             None => udp.await.map(|(from, resp)| UpstreamAnswer {
                 from,
                 resp,
@@ -4217,6 +4237,95 @@ mod tests {
 
         assert_eq!(answer.resp, over_tcp);
         assert_eq!(answer.via, UpstreamTransport::Tcp);
+    }
+
+    /// The TCP hop gets the same scrutiny as the datagram, and for a reason the datagram check does
+    /// not have: the hop that loses this race is **dropped**. A TCP message that does not echo the
+    /// query is one `forward_walk` will discard, so letting it win takes the UDP answer down with
+    /// it — the future is cancelled and the answer never arrives — and a query that resolves over
+    /// UDP comes back SERVFAIL instead. Scored as a failed hop, the race stays with UDP.
+    #[tokio::test(start_paused = true)]
+    async fn a_mismatched_tcp_answer_leaves_the_race_to_the_udp_hop() {
+        let query = build_query(0x410, &["example", "com"], 1, 1);
+        let upstream = upstream_addr(1);
+        let over_udp = upstream_response(&query, 0, 1, b"the resolver over udp");
+        // A resolver answering a question we never asked, framed over the connection we opened for
+        // this one: `response_matches_query` is what tells the two apart.
+        let other_question = build_query(0x410, &["other", "example", "com"], 1, 1);
+        let mismatched = upstream_response(&other_question, 0, 1, b"an answer to something else");
+
+        // A TCP client races both hops from the start, so the mismatched message is ready while the
+        // UDP hop is still in flight — the case where winning would cost the answer.
+        let answer = race_udp_and_tcp(
+            upstream,
+            &query,
+            ClientTransport::Tcp,
+            TcpRetry::Enabled,
+            async || {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Some((upstream, over_udp.clone()))
+            },
+            || std::future::ready(Some(mismatched.clone())),
+        )
+        .await
+        .expect("the UDP hop's answer must survive a mismatched TCP message");
+
+        assert_eq!(
+            answer.resp, over_udp,
+            "the mismatched TCP message must not win a race the UDP hop was still running"
+        );
+        assert_eq!(answer.via, UpstreamTransport::Udp);
+
+        // And with nothing else running, a mismatched message is no answer at all: the walk moves
+        // on to the next resolver rather than relaying it.
+        let answer = race_udp_and_tcp(
+            upstream,
+            &query,
+            ClientTransport::Udp,
+            TcpRetry::Enabled,
+            || std::future::ready(None),
+            || std::future::ready(Some(mismatched.clone())),
+        )
+        .await;
+
+        assert!(
+            answer.is_none(),
+            "a failed UDP hop plus a mismatched TCP message is not an answer"
+        );
+    }
+
+    /// The truncation retry has the same hole and the worst outcome of it: a truncated answer is a
+    /// real answer being *held*, and a mismatched TCP reply that replaced it would lose it outright
+    /// — the same loss a failed TCP retry is already careful not to cause.
+    #[tokio::test]
+    async fn a_mismatched_tcp_retry_relays_the_truncated_udp_answer() {
+        let query = build_query(0x411, &["big", "example", "com"], 16, 1);
+        let upstream = upstream_addr(1);
+        let mut truncated = upstream_response(&query, 0, 1, b"the part that fit");
+        truncated[2] |= 0x02; // TC
+        // Same question, wrong transaction id: a stale answer to the previous query on a reused
+        // connection is the everyday way to get one of these without an attacker.
+        let mut stale = upstream_response(&query, 0, 40, &[0xAB; 600]);
+        stale[0] ^= 0xFF;
+
+        for client in BOTH_CLIENTS {
+            let answer = race_udp_and_tcp(
+                upstream,
+                &query,
+                client,
+                TcpRetry::Enabled,
+                || std::future::ready(Some((upstream, truncated.clone()))),
+                || std::future::ready(Some(stale.clone())),
+            )
+            .await
+            .expect("a mismatched retry must not lose the answer we already had");
+
+            assert_eq!(
+                answer.resp, truncated,
+                "{client:?}: the truncated UDP answer is relayed, not the mismatched TCP message"
+            );
+            assert_eq!(answer.via, UpstreamTransport::Udp, "{client:?}");
+        }
     }
 
     /// The other side of the fallback, in the shape of Go's `TestForwarderNetstackUpstream`, which
