@@ -18,6 +18,12 @@
 //! reads as a malformed heading. markdownlint reports it as MD018, and the anchor scan below
 //! used to index it as a heading a `§B, *…*` pointer could legitimately name.
 //!
+//! A fifth is the header table's two dates. The gap window closes at the pinned upstream commit,
+//! so the window's end date and the pin's own commit date are the same date written twice — and
+//! twice is once too many. When a revision corrected the pin's date it corrected one of the two
+//! and left the other, so the table said the pin was 2026-09-11 and the window ran to
+//! 2026-09-12, three rows apart. Compare them.
+//!
 //! [`PORTING.md`]: https://github.com/GeiserX/tailscale-rs/blob/main/PORTING.md
 
 use std::collections::BTreeSet;
@@ -32,6 +38,12 @@ const MAPPING_HEADING: &str = "## Package mapping";
 
 /// Prose that promises a package is a row in the mapping table.
 const MAPPING_CLAIM: &str = "mapping table";
+
+/// Label of the header-table row that carries the pinned upstream commit and its date.
+const PIN_ROW: &str = "**Upstream commit this ledger was written against**";
+
+/// Label of the header-table row that carries the window the ledger covers.
+const WINDOW_ROW: &str = "**Gap window this ledger covers**";
 
 /// Read the ledger and report every inconsistency it has with itself.
 pub fn run(_args: &Args) -> BoxResult<()> {
@@ -88,6 +100,8 @@ fn inconsistencies(text: &str) -> Vec<String> {
             excerpt(line)
         ));
     }
+
+    problems.extend(window_disagrees_with_pin(text));
 
     let documented = documented_packages(text);
     for pkg in &swept {
@@ -290,6 +304,63 @@ fn paragraphs(text: &str) -> impl Iterator<Item = &str> {
     text.split("\n\n")
 }
 
+/// How the header table's two dates disagree, if they do.
+///
+/// The window the ledger covers ends at the commit the ledger is pinned to, so the pin row's date
+/// and the window row's end date are one fact written twice. Nothing else in the table re-states
+/// the pin's date, so a revision that corrects one of the two has no way to notice it left the
+/// other behind.
+fn window_disagrees_with_pin(text: &str) -> Option<String> {
+    let pin = header_row(text, PIN_ROW).and_then(first_date);
+    let end = header_row(text, WINDOW_ROW).and_then(window_end);
+
+    match (pin, end) {
+        (Some(pin), Some(end)) if pin != end => Some(format!(
+            "the pinned commit is dated {pin} but the gap window runs to {end}; the window closes \
+             at the pin, so a revision that moves or corrects one date has to move the other"
+        )),
+        (Some(_), Some(_)) => None,
+        _ => Some(format!(
+            "the header table no longer carries both a pin date ({PIN_ROW}, first date in the \
+             row) and a window end date ({WINDOW_ROW}, the date after \"to\"), so nothing checks \
+             that the window closes at the pin"
+        )),
+    }
+}
+
+/// The header-table row labelled `label`.
+fn header_row<'a>(text: &'a str, label: &str) -> Option<&'a str> {
+    text.lines()
+        .find(|line| line.starts_with('|') && line.contains(label))
+}
+
+/// The date a `from <date> to <date>` span ends at.
+///
+/// The row says "to" again further along ("anchored to when capver 130 landed"), so take the
+/// first one a date actually follows rather than the first one at all.
+fn window_end(row: &str) -> Option<&str> {
+    row.match_indices(" to ")
+        .find_map(|(at, needle)| row.get(at + needle.len()..).and_then(iso_date_prefix))
+}
+
+/// The first `YYYY-MM-DD` anywhere in `s`.
+fn first_date(s: &str) -> Option<&str> {
+    (0..s.len()).find_map(|at| s.get(at..).and_then(iso_date_prefix))
+}
+
+/// `s` opening with a `YYYY-MM-DD`, as that date.
+fn iso_date_prefix(s: &str) -> Option<&str> {
+    let date = s.get(..10)?;
+    let digits = |span: &str| span.bytes().all(|b| b.is_ascii_digit());
+
+    (digits(&date[..4])
+        && &date[4..5] == "-"
+        && digits(&date[5..7])
+        && &date[7..8] == "-"
+        && digits(&date[8..]))
+    .then_some(date)
+}
+
 /// Every backtick-quoted span in `s`.
 fn backticked(s: &str) -> Vec<String> {
     s.split('`').skip(1).step_by(2).map(str::to_owned).collect()
@@ -301,6 +372,11 @@ mod tests {
 
     /// A miniature ledger with the same shape as the real one.
     const SKELETON: &str = "\
+| | |
+| --- | --- |
+| **Upstream commit this ledger was written against** | `e2ed43239` (2026-09-11, `go.toolchain.rev`) |
+| **Gap window this ledger covers** | capability version **131 → 147**, i.e. upstream commits from 2025-10-06 to 2026-09-11 (anchored to when capver 130 landed) |
+
 ## Package mapping
 
 | Upstream Go | Here |
@@ -523,6 +599,55 @@ done
             .replace("```sh\n", "```sh\n#!/usr/bin/env bash\n");
 
         assert_eq!(inconsistencies(&text), Vec::<String>::new());
+    }
+
+    /// A window that closes at the pin is the shape the table is supposed to have.
+    #[test]
+    fn accepts_a_window_that_closes_at_the_pin() {
+        let text = ledger("New at this revision", "Nothing here.");
+
+        assert_eq!(inconsistencies(&text), Vec::<String>::new());
+    }
+
+    /// Correcting the pin's date and leaving the window's end behind is the drift that happened.
+    #[test]
+    fn rejects_a_window_that_outruns_the_pin() {
+        let text = ledger("New at this revision", "Nothing here.")
+            .replace("to 2026-09-11 (anchored", "to 2026-09-12 (anchored");
+
+        let problems = inconsistencies(&text);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("2026-09-11"), "{problems:?}");
+        assert!(problems[0].contains("2026-09-12"), "{problems:?}");
+    }
+
+    /// The later "to" in the window row is prose, not the end of the span.
+    #[test]
+    fn reads_the_window_end_past_a_later_to() {
+        let row = "capability version **131 → 147**, i.e. upstream commits from 2025-10-06 to \
+                   2026-09-11 (anchored to when capver 130 landed)";
+
+        assert_eq!(window_end(row), Some("2026-09-11"));
+    }
+
+    /// The pin row carries three dates; the pin's own is the first.
+    #[test]
+    fn reads_the_pin_date_and_not_the_dates_beside_it() {
+        let row = "`e2ed43239` (2026-09-11, `bump`) — held: still HEAD on 2026-09-13. The previous \
+                   revisions wrote 2026-09-12";
+
+        assert_eq!(first_date(row), Some("2026-09-11"));
+    }
+
+    /// A table that stops carrying either date silently stops being checkable, so say so.
+    #[test]
+    fn rejects_a_header_that_dropped_a_date() {
+        let text = ledger("New at this revision", "Nothing here.")
+            .replace("from 2025-10-06 to 2026-09-11", "over the whole window");
+
+        let problems = inconsistencies(&text);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("closes at the pin"), "{problems:?}");
     }
 
     /// The real ledger has to satisfy every invariant.
