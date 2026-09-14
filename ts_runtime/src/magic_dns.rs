@@ -1147,8 +1147,8 @@ fn is_soft_error(msg: &[u8]) -> bool {
 }
 
 /// Forward `query` to each upstream in order over the **overlay** netstack, returning the first
-/// well-formed response that is not a *soft* error, or the prebuilt `fallback` buffer if no
-/// upstream answered at all.
+/// well-formed response that is not a *soft* error, or — once every upstream has failed — the
+/// failure [`forward_walk`] chooses to relay, which is often the prebuilt `fallback` buffer.
 ///
 /// Anti-leak: forwarding goes through the overlay netstack `channel` (a fresh `0.0.0.0:0` overlay
 /// UDP socket per query, and — whenever the TCP hop runs — a fresh `0.0.0.0:0` overlay TCP
@@ -1586,24 +1586,30 @@ where
 ///
 /// **REFUSED and SERVFAIL are soft errors, not answers** ([`is_soft_error`]). An upstream that
 /// answers `REFUSED` (RCODE 5) or `SERVFAIL` (RCODE 2) does not end the forward: the walk continues
-/// to the next upstream, and the first such response is remembered and returned only once the list
-/// is exhausted with nothing better. Otherwise a broken or misconfigured resolver that refuses
-/// instantly beats a healthy one still doing the work, and the stub resolver is handed the refusal
-/// as though it were the answer — complete DNS failure exactly where a split-DNS route or a
-/// fallback list names more than one resolver, which is the shape control commonly pushes. Go's
-/// forwarder treats both codes as soft while a query is outstanding against more than one resolver
-/// and returns the first REFUSED only when every resolver refused (net/dns/resolver/forwarder.go @
-/// a8b023c063b608fcead5446f3d885c4fc847c944). Every other RCODE — including NXDOMAIN, which is a
-/// real answer — ends the walk on the spot.
+/// to the next upstream. Otherwise a broken or misconfigured resolver that refuses instantly beats a
+/// healthy one still doing the work, and the stub resolver is handed the refusal as though it were
+/// the answer — complete DNS failure exactly where a split-DNS route or a fallback list names more
+/// than one resolver, which is the shape control commonly pushes. Every other RCODE — including
+/// NXDOMAIN, which is a real answer — ends the walk on the spot.
 ///
 /// The caller supplies `fallback` (a SERVFAIL response for a forwarded off-tailnet name — an
-/// all-upstream failure is a soft "couldn't resolve", not a cacheable non-existence, matching Go
-/// forwarder.go:1297-1307). Keeping it caller-supplied means this fn is rcode-agnostic. A
-/// remembered soft-error response takes **precedence** over it and is relayed verbatim: the
-/// upstream's own bytes can carry an RFC 8914 extended DNS error saying *why* it failed (blocked by
-/// policy, DNSSEC bogus, no reachable authority), which a locally synthesized SERVFAIL throws away.
-/// `fallback` is what a client gets when nothing answered — every upstream timed out, errored, or
-/// only ever sent datagrams the anti-poisoning check discarded.
+/// all-upstream failure is a soft "couldn't resolve", not a cacheable non-existence). Keeping it
+/// caller-supplied means this fn is rcode-agnostic. When the list is exhausted with no answer, the
+/// client gets the **first** failure's own bytes in exactly two cases, and `fallback` otherwise:
+///
+/// - **every** upstream answered REFUSED: the first refusal is relayed verbatim;
+/// - some upstream SERVFAILed or gave nothing usable (timed out, errored, or only sent datagrams the
+///   anti-poisoning check discarded), and the first failure is itself an upstream SERVFAIL: that
+///   SERVFAIL is relayed verbatim.
+///
+/// So a first REFUSED followed by a SERVFAIL or a silent upstream answers `fallback`, not the
+/// refusal: one resolver that could not answer turns the whole forward into "couldn't resolve",
+/// and REFUSED is only the client's answer when refusing is all anyone did. Relaying the upstream's
+/// own bytes where it is allowed keeps any RFC 8914 extended DNS error saying *why* it failed, which
+/// a locally synthesized SERVFAIL throws away. This is Go's `forwardWithDestChan` error tally
+/// (`firstErr` / `sawNonRefused`, net/dns/resolver/forwarder.go @
+/// e2ed432399c9b0fda7aa14e9eb27784d2d893c55, lines 1309-1383), with the walk's order standing in
+/// for Go's arrival order.
 ///
 /// Every relayed response goes through [`cap_response`], which caps it at [`MAX_UPSTREAM_RESPONSE`]
 /// unless it was TCP end to end, and — for a [`ClientTransport::Udp`] client — marks it truncated
@@ -1620,11 +1626,16 @@ where
     F: FnMut(SocketAddr) -> Fut,
     Fut: std::future::Future<Output = Option<UpstreamAnswer>>,
 {
-    // The first REFUSED/SERVFAIL an upstream answered with, held while the walk continues.
-    let mut first_soft_error: Option<UpstreamAnswer> = None;
+    // The first failure the walk met, held while it continues: `Some(answer)` for an upstream's own
+    // REFUSED/SERVFAIL, `None` for an upstream that gave nothing usable. Go's `firstErr`.
+    let mut first_error: Option<Option<UpstreamAnswer>> = None;
+    // Whether any failure was something other than REFUSED. Go's `sawNonRefused`.
+    let mut saw_non_refused = false;
 
     for upstream in upstreams {
         let Some(answer) = ask(*upstream).await else {
+            first_error.get_or_insert(None);
+            saw_non_refused = true;
             continue;
         };
         let UpstreamAnswer { from, resp, via } = answer;
@@ -1636,30 +1647,40 @@ where
         // to become the soft error a fully-refused forward ends up relaying.
         if from.ip() != upstream.ip() || !response_matches_query(query, &resp) {
             tracing::debug!(%upstream, %from, "magic dns dropping unsolicited/mismatched response");
+            first_error.get_or_insert(None);
+            saw_non_refused = true;
             continue;
         }
 
-        // A soft error (REFUSED/SERVFAIL) is not an answer: hold on to the first one and give the
-        // remaining upstreams their turn.
+        // A soft error (REFUSED/SERVFAIL) is not an answer: note it and give the remaining upstreams
+        // their turn.
         if is_soft_error(&resp) {
             tracing::debug!(
                 %upstream,
                 rcode = response_rcode(&resp),
                 "magic dns upstream soft error, trying the next upstream"
             );
-            first_soft_error.get_or_insert(UpstreamAnswer { from, resp, via });
+            if response_rcode(&resp) != Some(RCODE_REFUSED) {
+                saw_non_refused = true;
+            }
+            first_error.get_or_insert(Some(UpstreamAnswer { from, resp, via }));
             continue;
         }
 
         return cap_response(query, resp, client, via);
     }
 
-    // Nothing better arrived. An upstream that refused or soft-failed still said something the
-    // client can act on, so relay its own bytes (extended DNS error and all) ahead of the
-    // synthesized `fallback`; `fallback` is only for "nobody answered".
-    match first_soft_error {
-        Some(answer) => cap_response(query, answer.resp, client, answer.via),
-        None => fallback,
+    // Nothing answered. Relay the first failure's own bytes (extended DNS error and all) when every
+    // upstream refused, or when that first failure is an upstream SERVFAIL; anything else — a first
+    // REFUSED that a later SERVFAIL or silence outranks, or a first failure with no bytes at all —
+    // is the synthesized `fallback`.
+    match first_error {
+        Some(Some(answer))
+            if !saw_non_refused || response_rcode(&answer.resp) == Some(RCODE_SERVFAIL) =>
+        {
+            cap_response(query, answer.resp, client, answer.via)
+        }
+        _ => fallback,
     }
 }
 
@@ -3494,6 +3515,97 @@ mod tests {
 
         assert_eq!(asked, vec![first, second]);
         assert_eq!(got, answer);
+    }
+
+    /// A first REFUSED followed by a SERVFAIL is not an all-refused forward: the client gets the
+    /// synthesized SERVFAIL, neither the held refusal nor the second upstream's SERVFAIL (Go relays
+    /// upstream bytes here only when the *first* failure is the SERVFAIL).
+    #[tokio::test]
+    async fn refused_then_servfail_answers_the_fallback_not_the_refusal() {
+        let query = build_query(0x20a, &["api", "example", "com"], 1, 1);
+        let (first, second) = (upstream_addr(1), upstream_addr(2));
+        let refusal = upstream_response(&query, RCODE_REFUSED, 0, b"first refusal");
+        let servfail = upstream_response(&query, RCODE_SERVFAIL, 0, b"second servfail");
+        let fallback = upstream_response(&query, RCODE_SERVFAIL, 0, b"synthesized");
+
+        let (got, asked) = run_forward_walk(
+            &[
+                (first, Some((first, refusal))),
+                (second, Some((second, servfail))),
+            ],
+            &query,
+            fallback.clone(),
+        )
+        .await;
+
+        assert_eq!(asked, vec![first, second]);
+        assert_eq!(
+            got, fallback,
+            "a SERVFAIL anywhere after a first REFUSED makes the forward a SERVFAIL"
+        );
+    }
+
+    /// The same when the later upstream says nothing at all: a silent upstream is a failure that is
+    /// not a refusal, so the first REFUSED is not relayed.
+    #[tokio::test]
+    async fn refused_then_silent_upstream_answers_the_fallback_not_the_refusal() {
+        let query = build_query(0x20b, &["api", "example", "com"], 1, 1);
+        let (first, second) = (upstream_addr(1), upstream_addr(2));
+        let refusal = upstream_response(&query, RCODE_REFUSED, 0, b"first refusal");
+        let fallback = upstream_response(&query, RCODE_SERVFAIL, 0, b"synthesized");
+
+        let (got, _asked) = run_forward_walk(
+            &[(first, Some((first, refusal))), (second, None)],
+            &query,
+            fallback.clone(),
+        )
+        .await;
+
+        assert_eq!(got, fallback);
+    }
+
+    /// And when the later upstream only sends a datagram the anti-poisoning check discards: that is
+    /// a failure too, and not a refusal.
+    #[tokio::test]
+    async fn refused_then_discarded_datagram_answers_the_fallback_not_the_refusal() {
+        let query = build_query(0x20c, &["api", "example", "com"], 1, 1);
+        let (first, second) = (upstream_addr(1), upstream_addr(2));
+        let refusal = upstream_response(&query, RCODE_REFUSED, 0, b"first refusal");
+        let mut poisoned = upstream_response(&query, 0, 1, b"injected");
+        poisoned[0] ^= 0xFF; // a transaction id we never asked with
+        let fallback = upstream_response(&query, RCODE_SERVFAIL, 0, b"synthesized");
+
+        let (got, _asked) = run_forward_walk(
+            &[
+                (first, Some((first, refusal))),
+                (second, Some((second, poisoned))),
+            ],
+            &query,
+            fallback.clone(),
+        )
+        .await;
+
+        assert_eq!(got, fallback);
+    }
+
+    /// Only the FIRST failure's bytes are ever relayed: when the first upstream is silent and the
+    /// second SERVFAILs, the first failure carries no bytes, so the client gets the synthesized
+    /// SERVFAIL rather than the second upstream's.
+    #[tokio::test]
+    async fn silent_then_servfail_answers_the_fallback_not_the_later_servfail() {
+        let query = build_query(0x20d, &["api", "example", "com"], 1, 1);
+        let (first, second) = (upstream_addr(1), upstream_addr(2));
+        let servfail = upstream_response(&query, RCODE_SERVFAIL, 0, b"second servfail");
+        let fallback = upstream_response(&query, RCODE_SERVFAIL, 0, b"synthesized");
+
+        let (got, _asked) = run_forward_walk(
+            &[(first, None), (second, Some((second, servfail)))],
+            &query,
+            fallback.clone(),
+        )
+        .await;
+
+        assert_eq!(got, fallback);
     }
 
     #[test]
