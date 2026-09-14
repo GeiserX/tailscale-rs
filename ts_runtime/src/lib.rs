@@ -42,6 +42,7 @@ pub mod fallback_tcp;
 mod forwarder_actor;
 /// Client-side Funnel ingress termination (`tsnet`'s `ListenFunnel` data path).
 pub mod funnel;
+pub mod health;
 /// Unified IPN notification bus ([`Notify`] / [`watch_ipn_bus`](Runtime::watch_ipn_bus)), mirroring
 /// Go `ipn` `LocalBackend.WatchNotifications` / the `WatchIPNBus` LocalAPI.
 pub mod ipn_bus;
@@ -689,6 +690,7 @@ impl Runtime {
             peers,
             active_exit_node: self.active_exit_node(),
             magic_dns_suffix,
+            health: self.env.health.strings(),
         })
     }
 

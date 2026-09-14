@@ -353,6 +353,10 @@ pub struct Env {
     /// the writers are the packet hot path: a lock-free atomic read is the whole interface.
     pub datapath_activity: crate::dataplane::DatapathActivity,
 
+    /// The node's raised health warnings (Go `LocalBackend.health`). Shared by every clone, so a
+    /// warning an actor raises is what [`Runtime::status`](crate::Runtime::status) reports.
+    pub health: crate::health::Tracker,
+
     /// Whether the runtime is shutdown.
     ///
     /// This is provided so that actors can check whether a message send has failed because
@@ -473,6 +477,7 @@ impl Env {
             // never carries a packet reads as idle from `Runtime::spawn` onwards — the same reading
             // Go gets from its zero-valued `lastActivityAtomic`.
             datapath_activity: crate::dataplane::DatapathActivity::new(),
+            health: Default::default(),
         };
 
         (

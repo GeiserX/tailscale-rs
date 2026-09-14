@@ -51,6 +51,9 @@ pub struct Status {
     /// **not** from the DNS config and **not** from the tailnet `Domain` name. `None` before the first
     /// netmap, or when the self FQDN has no tailnet component (a bare hostname).
     pub magic_dns_suffix: Option<String>,
+    /// The text of every health warning this node currently raises (Go `ipnstate.Status.Health`).
+    /// Empty means no known problem. See [`health`](crate::health) for the warnings that exist.
+    pub health: Vec<String>,
 }
 
 /// A single node entry in a [`Status`] snapshot.
