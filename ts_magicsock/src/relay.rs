@@ -151,6 +151,9 @@ pub(crate) struct RelayPath {
     /// The relay address we answered a challenge from, if we have. This is where a retry ping goes
     /// while the endpoint is handshook-but-unconfirmed: an endpoint may advertise several
     /// addresses, and only the one that challenged us is known to be live.
+    ///
+    /// It is also the handshake's *identity* on the wire — Go's `addrPortVNI` key — see
+    /// [`is_the_challenger`](Self::is_the_challenger).
     answered_addr: Option<SocketAddr>,
 }
 
@@ -171,6 +174,55 @@ impl RelayPath {
     pub(crate) fn note_answered(&mut self, addr: SocketAddr) {
         self.state = HandshakeState::AnswerSent;
         self.answered_addr = Some(addr);
+    }
+
+    /// Whether `from` is the address whose challenge this handshake answered.
+    ///
+    /// This is Go's `addrPortVNI` key. `relayManager.handleRxDiscoMsgRunLoop` records
+    /// `addrPortVNI{event.from, event.vni}` for a handshake at the moment it accepts that
+    /// handshake's `BindUDPRelayEndpointChallenge` (`wgengine/magicsock/relaymanager.go:611-635`),
+    /// and thereafter routes relayed disco into the handshake only when the message's own source
+    /// and VNI equal that key — anything else is discarded as "No outstanding work tied to this
+    /// [addrPortVNI]" (`:658-663`). The VNI half is the caller's: it reached this path by it.
+    ///
+    /// Before a challenge has been answered there is no key, so nothing matches, which is Go's
+    /// handshake loop ignoring a relayed ping until its answer has been sent (`:983-986`).
+    fn is_the_challenger(&self, from: SocketAddr) -> bool {
+        self.answered_addr == Some(from)
+    }
+
+    /// Whether the bind handshake has been completed by a relayed pong.
+    ///
+    /// Go hands the endpoint off to the ordinary path machinery at exactly that moment: the
+    /// handshake ends with `done.pongReceivedFrom` (`relaymanager.go:735`) and every pong after it
+    /// is matched by transaction id alone, in `endpoint.handlePongConnLocked`
+    /// (`wgengine/magicsock/endpoint.go:1917`). `confirmed` is only ever set, never cleared — a
+    /// lapsed trust window still leaves a completed handshake behind — so it is that hand-off.
+    fn handshake_done(&self) -> bool {
+        self.confirmed.is_some()
+    }
+
+    /// Whether a relayed ping arriving from `from` may be answered with a ping of our own.
+    ///
+    /// Go pongs a relayed ping at its source unconditionally (`relaymanager.go:648`), but the ping
+    /// only reaches the handshake — and so only triggers a ping back — under the handshake's
+    /// `addrPortVNI` key (`:653-657`). A ping from an address that never challenged this node must
+    /// therefore leave no ping of ours in flight toward it: with one there, the pong answering it
+    /// would confirm a path to an address we never handshook with.
+    pub(crate) fn may_ping_back_to(&self, from: SocketAddr) -> bool {
+        self.is_the_challenger(from)
+    }
+
+    /// Whether a relayed pong arriving from `from` may be acted on.
+    ///
+    /// Two regimes, both Go's. While the handshake is outstanding the pong is the handshake's own,
+    /// and reaches it only under the `addrPortVNI` key — which is why the path that becomes usable
+    /// is `done.pongReceivedFrom`, the challenge's source by construction. Once the handshake is
+    /// done the endpoint is refreshed by pongs matched on transaction id alone, and their source is
+    /// taken as given; a relay may legitimately answer from a port other than the one it listens
+    /// on, and nothing is ever sent to a pong's source.
+    pub(crate) fn may_accept_pong_from(&self, from: SocketAddr) -> bool {
+        self.handshake_done() || self.is_the_challenger(from)
     }
 
     /// Record a relayed ping we just sent, so its pong is recognized as solicited.
@@ -325,6 +377,23 @@ impl RelayPaths {
     /// Called once a relayed pong confirms a path, with the address we send through and the source
     /// the pong actually arrived from (a relay may legitimately answer from a different port than
     /// it listens on).
+    ///
+    /// # Why a pong's *differing* source is still recorded
+    ///
+    /// It can only differ after the bind handshake is done. While the handshake is outstanding a
+    /// pong is accepted only from the address whose challenge we answered
+    /// ([`may_accept_pong_from`](RelayPath::may_accept_pong_from)), so the source and the address
+    /// we send through are the same address and there is nothing extra to record. Afterwards the
+    /// endpoint is on Go's refresh rule — matched by transaction id, source taken as given — and
+    /// the differing source is kept, because it is the *only* thing that can attribute the inbound
+    /// half of the path: relayed WireGuard carries no transaction id and no disco, just a Geneve
+    /// VNI and a source address, so a relay answering from another port would leave every inbound
+    /// datagram unattributed and strand a path whose outbound half works. What it can do is
+    /// bounded: it is written only for a pong that matched a single-use transaction id from a ping
+    /// this node sent to the address it confirms, it only ever names a peer that already holds a
+    /// confirmed relay path, attribution is not authentication (the WireGuard layer still has to
+    /// accept the datagram), and the replace-don't-accumulate rule below caps what one peer can
+    /// put in the map at two entries.
     ///
     /// Replacing rather than accumulating is what bounds the map. A confirming pong arrives on
     /// every refresh, roughly every [`TRUST_DURATION`] for as long as the path lives, so a relay
