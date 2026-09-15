@@ -697,9 +697,13 @@ impl Node {
     /// value, so the lookup is on the whole literal.
     const NODE_ATTR_ONE_CGNAT_ENABLE: &'static str = "one-cgnat?v=true";
 
-    /// The node attribute by which control asks this node to keep one host route **per peer** no
-    /// matter how many peers there are (Go `tailcfg/nodecap`'s `OneCGNATDisable`). The other half
-    /// of [`NODE_ATTR_ONE_CGNAT_ENABLE`](Self::NODE_ATTR_ONE_CGNAT_ENABLE)'s tri-state.
+    /// The node attribute by which control asks this node NOT to collapse its per-peer CGNAT host
+    /// routes (Go `tailcfg/nodecap`'s `OneCGNATDisable`). The other half of
+    /// [`NODE_ATTR_ONE_CGNAT_ENABLE`](Self::NODE_ATTR_ONE_CGNAT_ENABLE)'s tri-state.
+    ///
+    /// It declines the **forced** collapse only. It is not a licence for an unbounded host route
+    /// table: the consumer's own peer-count ceiling still applies above it — see
+    /// [`Node::one_cgnat`](Self::one_cgnat).
     const NODE_ATTR_ONE_CGNAT_DISABLE: &'static str = "one-cgnat?v=false";
 
     /// Control's tri-state instruction about collapsing this node's per-peer CGNAT host routes
@@ -710,17 +714,23 @@ impl Node {
     /// third state exists:
     ///
     /// * `Some(true)` — `one-cgnat?v=true`: always collapse.
-    /// * `Some(false)` — `one-cgnat?v=false`: never collapse, one `/32` per peer however many
-    ///   peers there are.
-    /// * `None` — neither attribute present: control has no opinion, and the consumer's own
-    ///   peer-count threshold decides (Go `net/routemanager`'s `cgnatThreshold`).
+    /// * `Some(false)` — `one-cgnat?v=false`: do not force the collapse; keep one `/32` per peer.
+    /// * `None` — neither attribute present: control has no opinion, and the consumer decides for
+    ///   itself (Go `ipn/ipnlocal`'s `shouldUseOneCGNATRoute` consults the platform).
+    ///
+    /// What the third state does NOT do is switch the consumer's peer-count ceiling off. Upstream
+    /// resolves this `opt.Bool` down to a plain `bool` before the route manager sees it, and
+    /// `RouteManager.cgnatThreshold()` then picks between `1` and `cgnatThreshold` (`10_000`) —
+    /// so a node holding `one-cgnat?v=false` still collapses once it has more CGNAT peer routes
+    /// than the ceiling. The tri-state chooses whether to collapse *early*, not whether a host
+    /// route table may grow without bound.
     ///
     /// A node holding BOTH attributes reads as `Some(true)`: the enabling attribute is checked
     /// first and wins. Control setting both is a policy conflict rather than a state upstream
     /// specifies, and collapsing is the safe way to break the tie — the `/10` is a superset of the
     /// `/32`s it replaces, so no peer becomes unreachable, whereas honouring the disabling
-    /// attribute on a tailnet large enough for control to have set the enabling one is exactly the
-    /// unbounded host route table the threshold exists to prevent.
+    /// attribute on a tailnet large enough for control to have set the enabling one would keep a
+    /// per-peer route table far past the point where it is worth programming.
     pub fn one_cgnat(&self) -> Option<bool> {
         if self.has_node_attr(Self::NODE_ATTR_ONE_CGNAT_ENABLE) {
             Some(true)
@@ -2256,7 +2266,7 @@ pub(crate) mod tests {
         assert_eq!(
             n.one_cgnat(),
             Some(false),
-            "`one-cgnat?v=false` forces one route per peer"
+            "`one-cgnat?v=false` declines the forced collapse"
         );
 
         n.cap_map.insert("one-cgnat?v=true".to_string(), vec![]);
