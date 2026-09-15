@@ -45,4 +45,4 @@ pub use endpoint::{SelfEndpoint, SelfEndpointType};
 pub use error::{DiscoError, Error};
 pub use path::{PeerPaths, TRUST_DURATION};
 pub use relay::RelayServerEndpoint;
-pub use sock::{BindingVerifier, DirectTransport, MagicSock, ReceivedData};
+pub use sock::{BindingVerifier, DirectTransport, MagicSock, PeerCapabilityLookup, ReceivedData};

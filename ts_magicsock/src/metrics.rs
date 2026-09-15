@@ -41,11 +41,13 @@ pub(crate) struct MagicsockMetrics {
     /// pair (`solicited`), confirming a direct path. The direct-vs-DERP ratio is derived from this
     /// versus DERP-relay counters (`magicsock_disco_pong_recv_solicited`).
     pub disco_pong_recv_solicited: &'static Metric,
-    /// Inbound disco CallMeMaybe frames ACCEPTED after passing the netmap-membership gate, whose
-    /// advertised endpoints we learned (`magicsock_disco_call_me_maybe_recv`).
+    /// Inbound disco CallMeMaybe frames ACCEPTED: relayed over DERP by the node control binds the
+    /// sealing disco key to, so we learned their advertised endpoints
+    /// (`magicsock_disco_call_me_maybe_recv`).
     pub disco_call_me_maybe_recv: &'static Metric,
-    /// Inbound disco CallMeMaybe frames DROPPED by the netmap-membership gate (sender disco key is
-    /// not a current netmap member, or no verifier installed) (`magicsock_disco_call_me_maybe_recv_rejected`).
+    /// Inbound disco CallMeMaybe frames DROPPED: received on the UDP socket rather than over DERP,
+    /// sealed by a disco key control does not bind to the node that relayed it, or no verifier
+    /// installed (`magicsock_disco_call_me_maybe_recv_rejected`).
     pub disco_call_me_maybe_recv_rejected: &'static Metric,
     /// Disco Pings sent by [`crate::sock::MagicSock::send_pings`], counted per ping actually
     /// emitted over the UDP socket (`magicsock_disco_ping_sent`).
@@ -63,12 +65,14 @@ pub(crate) struct MagicsockMetrics {
     /// only fresh inserts, not duplicates of an address already learned (`magicsock_reflexive_learned`).
     pub reflexive_learned: &'static Metric,
 
-    /// Inbound disco `CallMeMaybeVia` frames ACCEPTED: the sender passed the netmap-membership
-    /// gate, the relay endpoint was allocated for this pair, and we started a bind handshake
+    /// Inbound disco `CallMeMaybeVia` frames ACCEPTED: the relaying peer is relay capable and bound
+    /// to the sealing disco key, the relay endpoint was allocated for this pair, and we started a
+    /// bind handshake
     /// (`magicsock_disco_call_me_maybe_via_recv`).
     pub disco_call_me_maybe_via_recv: &'static Metric,
-    /// Inbound disco `CallMeMaybeVia` frames DROPPED — non-member sender, an endpoint allocated
-    /// for some other pair, no acceptable relay address, or a stale Lamport id
+    /// Inbound disco `CallMeMaybeVia` frames DROPPED — a relaying peer not known to be relay
+    /// capable, a sealing disco key not bound to the relaying peer, an endpoint allocated for some
+    /// other pair, no acceptable relay address, or a stale Lamport id
     /// (`magicsock_disco_call_me_maybe_via_recv_rejected`).
     pub disco_call_me_maybe_via_recv_rejected: &'static Metric,
     /// Individual relay `addr:port`s advertised in a `CallMeMaybeVia` and refused by the

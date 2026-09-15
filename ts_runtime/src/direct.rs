@@ -28,8 +28,11 @@ use kameo::{
     message::{Context, Message},
 };
 use tokio::{sync::Mutex, task::JoinSet};
+use ts_capabilityversion::CapabilityVersion;
 use ts_keys::{DiscoPublicKey, NodePublicKey};
-use ts_magicsock::{BindingVerifier, DirectTransport, MagicSock, SelfEndpoint};
+use ts_magicsock::{
+    BindingVerifier, DirectTransport, MagicSock, PeerCapabilityLookup, SelfEndpoint,
+};
 use ts_transport::{
     BatchRecvIter, PeerId, PeerLookup, UnderlayTransport, UnderlayTransportExt, UnderlayTransportId,
 };
@@ -486,12 +489,15 @@ impl DirectManager {
 /// [`ts_magicsock::BindingVerifier`]). A live read of the peer db (it is replaced as netmaps
 /// arrive), so revocations take effect immediately.
 ///
-/// - For a disco **Ping** (`claimed_node_key == Some`): returns `true` only if a peer with this
-///   disco key exists in the netmap *and* its control-advertised node key equals the claimed one.
-///   A peer must not open a direct path under a node key control did not bind to its disco key.
-/// - For a **CallMeMaybe** (`claimed_node_key == None`, no node key on the wire): returns `true`
-///   only if the disco key is a current netmap member. This stops an unknown/spoofed disco key
-///   from steering us into host-probing attacker-chosen endpoints.
+/// - For a disco **Ping** (`claimed_node_key` is the node key it claims) and a relayed
+///   **CallMeMaybe** / **CallMeMaybeVia** (`claimed_node_key` is the node key whose DERP connection
+///   delivered it): returns `true` only if a peer with this disco key exists in the netmap *and*
+///   its control-advertised node key equals that one. A peer must not open a direct path under a
+///   node key control did not bind to its disco key, nor have a frame another peer sealed accepted
+///   as its own.
+/// - For a **Pong** (`claimed_node_key == None`, no node key on the wire and no DERP sender):
+///   returns `true` only if the disco key is a current netmap member. This stops an
+///   unknown/spoofed disco key from planting a reflexive address.
 ///
 /// **Either** of a peer's two known disco keys is accepted — Go
 /// [`endpoint.checkAndUpdateDiscoKey`], which every inbound disco comparison in
@@ -525,10 +531,11 @@ fn verify_binding(
     };
 
     let bound = match claimed_node_key {
-        // Ping: the claimed node key must be exactly the one control bound to this disco key.
+        // Ping, or a call-me-maybe's DERP sender: the node key must be exactly the one control
+        // bound to this disco key.
         Some(claimed) => node_key == *claimed,
-        // CallMeMaybe: membership is enough — the disco key resolving to a netmap peer above
-        // already proves it.
+        // Pong: membership is enough — the disco key resolving to a netmap peer above already
+        // proves it.
         None => true,
     };
     if !bound {
@@ -542,6 +549,17 @@ fn verify_binding(
     }
 
     true
+}
+
+/// The capability version control advertised for the netmap peer holding `node_key` (its
+/// `Node.Cap`), or `None` when no peer in the current netmap holds that node key.
+fn peer_capability(
+    peer_db: &RwLock<Option<Arc<PeerDb>>>,
+    node_key: &NodePublicKey,
+) -> Option<CapabilityVersion> {
+    let db = poisoned_read(peer_db);
+    let (_, node) = db.as_ref()?.get(node_key)?;
+    Some(node.cap)
 }
 
 /// Read an [`RwLock`] guarding the peer db, recovering from poisoning rather than propagating the
@@ -1079,6 +1097,12 @@ impl kameo::Actor for DirectManager {
         let binding_verifier: BindingVerifier = Arc::new(move |disco, claimed_node_key| {
             verify_binding(&verifier_db, &observed_tx, disco, claimed_node_key)
         });
+        // The peer capability-version lookup: an inbound `CallMeMaybeVia` is acted on only when
+        // the peer that relayed it is relay capable (Go `endpoint.relayCapable`). Live over the
+        // same `peer_db` handle as the verifier.
+        let capability_db = peer_db.clone();
+        let peer_capability: PeerCapabilityLookup =
+            Arc::new(move |node_key| peer_capability(&capability_db, node_key));
 
         // Bind the direct underlay UDP socket. A bind failure is transient/environmental (e.g. no
         // ephemeral ports available); rather than panicking the actor we degrade to **DERP-only**
@@ -1104,7 +1128,8 @@ impl kameo::Actor for DirectManager {
         {
             Ok(sock) => Arc::new(
                 sock.with_enable_ipv6(env.enable_ipv6)
-                    .with_binding_verifier(binding_verifier),
+                    .with_binding_verifier(binding_verifier)
+                    .with_peer_capability_lookup(peer_capability),
             ),
             Err(e) => {
                 tracing::error!(
@@ -1535,11 +1560,49 @@ mod tests {
         );
     }
 
-    /// A CallMeMaybe carries no node key (claimed=None): membership is sufficient. A member disco
-    /// key is accepted; a stranger disco key is rejected. This stops a spoofed disco key from
-    /// steering us into host-probing attacker-chosen endpoints.
+    /// The capability lookup the direct manager installs on the magicsock reads the netmap `Node.Cap`
+    /// of the peer holding a node key, which is what gates an inbound `CallMeMaybeVia` on the
+    /// relaying peer being relay capable. An unknown node key, or no netmap, has none.
     #[test]
-    fn verify_binding_call_me_maybe_is_membership_only() {
+    fn peer_capability_reads_the_netmap_cap_of_the_node_key() {
+        let disco = DiscoPrivateKey::random().public_key();
+        let node_key = NodePrivateKey::random().public_key();
+        let mut node = node_with_keys(disco, node_key, "n1");
+
+        for (cap, relay_capable) in [
+            (CapabilityVersion::V120, false),
+            (CapabilityVersion::V121, true),
+        ] {
+            node.cap = cap;
+            let db = db_with(node.clone());
+            let got = peer_capability(&db, &node_key);
+            assert_eq!(got, Some(cap));
+            assert_eq!(
+                got.is_some_and(CapabilityVersion::is_relay_capable),
+                relay_capable
+            );
+        }
+
+        let db = db_with(node);
+        assert_eq!(
+            peer_capability(&db, &NodePrivateKey::random().public_key()),
+            None,
+            "a node key no peer holds has no capability version"
+        );
+        let empty: Arc<RwLock<Option<Arc<PeerDb>>>> = Default::default();
+        assert_eq!(
+            peer_capability(&empty, &node_key),
+            None,
+            "no netmap, no capability"
+        );
+    }
+
+    /// A relayed CallMeMaybe is checked against the node key whose DERP connection delivered it:
+    /// the peer's own node key is accepted, another netmap peer's is refused even though the disco
+    /// key is a member (Go "from peer via DERP whose netmap discokey != disco source"). A query with
+    /// no node key (a Pong) is membership only: a member disco key is accepted, a stranger's is not.
+    #[test]
+    fn verify_binding_call_me_maybe_is_bound_to_the_derp_sender() {
         let disco = DiscoPrivateKey::random().public_key();
         let node_key = NodePrivateKey::random().public_key();
 
@@ -1547,14 +1610,23 @@ mod tests {
         let (tx, _rx) = observer();
 
         assert!(
+            verify_binding(&db, &tx, &disco, Some(&node_key)),
+            "a CallMeMaybe relayed from the peer's own node key must be accepted"
+        );
+        let other_peer = NodePrivateKey::random().public_key();
+        assert!(
+            !verify_binding(&db, &tx, &disco, Some(&other_peer)),
+            "a CallMeMaybe the peer sealed but another node relayed must be refused"
+        );
+        assert!(
             verify_binding(&db, &tx, &disco, None),
-            "a netmap-member disco key must be accepted for a CallMeMaybe"
+            "a netmap-member disco key must be accepted for a Pong"
         );
 
         let stranger = DiscoPrivateKey::random().public_key();
         assert!(
             !verify_binding(&db, &tx, &stranger, None),
-            "a non-member disco key must be rejected for a CallMeMaybe"
+            "a non-member disco key must be rejected for a Pong"
         );
     }
 
