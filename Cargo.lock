@@ -2061,6 +2061,7 @@ dependencies = [
 name = "geiserx_ts_host_net"
 version = "0.56.2"
 dependencies = [
+ "if-addrs",
  "ipnet",
  "thiserror 2.0.20",
  "tracing",
