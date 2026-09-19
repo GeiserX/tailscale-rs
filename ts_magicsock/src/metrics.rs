@@ -22,12 +22,14 @@ pub(crate) struct MagicsockMetrics {
     /// Bytes received on the direct UDP path (`magicsock_recv_data_bytes_udp`).
     pub recv_data_bytes_udp: &'static Metric,
 
-    /// Inbound disco Pings that PASSED the disco<->node-key binding check and were acted on
-    /// (source learned as a candidate, pong sent). Counts authenticated direct-path open attempts
-    /// from peers (`magicsock_disco_ping_recv`).
+    /// Inbound disco Pings that PASSED the disco<->node-key binding check and were acted on: on
+    /// the UDP socket the source is learned as a candidate and a pong sent; over DERP a pong is
+    /// sealed for the runtime to send back to the source node key, and nothing is learned
+    /// (`magicsock_disco_ping_recv`).
     pub disco_ping_recv: &'static Metric,
-    /// Inbound disco Pings DROPPED fail-closed by the binding check — either the claimed node key
-    /// was not bound to the sender's disco key in the netmap, or no binding verifier was installed.
+    /// Inbound disco Pings DROPPED fail-closed by the binding check — either the node key (claimed
+    /// by the ping, or for a ping over DERP the DERP source node key) was not bound to the sender's
+    /// disco key in the netmap, or no binding verifier was installed.
     /// A nonzero value means peers are attempting direct paths we refuse to authenticate
     /// (`magicsock_disco_ping_recv_rejected`).
     pub disco_ping_recv_rejected: &'static Metric,
