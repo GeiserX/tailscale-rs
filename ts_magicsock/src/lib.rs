@@ -38,11 +38,14 @@ mod stun;
 
 pub use disco::{
     GeneveKind, Inbound, RelayHandshakeCommon, TxId, geneve_encap_disco, geneve_encap_wireguard,
-    geneve_prefix, looks_like_disco, random_tx_id, seal_call_me_maybe, seal_call_me_maybe_via,
-    seal_ping, seal_relay_bind, seal_relay_bind_answer, seal_relay_bind_challenge,
+    geneve_prefix, looks_like_disco, open, random_tx_id, seal_call_me_maybe,
+    seal_call_me_maybe_via, seal_ping, seal_relay_bind, seal_relay_bind_answer,
+    seal_relay_bind_challenge,
 };
 pub use endpoint::{SelfEndpoint, SelfEndpointType};
 pub use error::{DiscoError, Error};
 pub use path::{PeerPaths, TRUST_DURATION};
 pub use relay::RelayServerEndpoint;
-pub use sock::{BindingVerifier, DirectTransport, MagicSock, ReceivedData};
+pub use sock::{
+    BindingVerifier, DerpSource, DirectTransport, MagicSock, ReceivedData, RelayedDisco,
+};
