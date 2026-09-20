@@ -1,6 +1,6 @@
 //! The UDP socket engine: one socket carrying disco + WireGuard, demuxed by magic prefix.
 
-use core::net::{IpAddr, SocketAddr};
+use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -132,11 +132,13 @@ async fn rebind_socket(prefer_port: u16, want_v6: bool) -> std::io::Result<UdpSo
 /// - `Some(claimed_node_key)` for a disco **Ping** — returns `true` only when the netmap currently
 ///   binds exactly that node key to the sender's disco key (a peer must not open a direct path
 ///   under a node key that isn't its own);
-/// - `Some(derp_node_src)` for a **CallMeMaybe**/**CallMeMaybeVia** relayed over DERP. Neither
-///   carries a node key, so the node key is the one whose DERP connection delivered it, and the
-///   same binding is required: the sealing disco key must be one the netmap gives that node. An
-///   unknown/spoofed disco key — or a member's key replayed down somebody else's connection —
-///   cannot make us learn (and then host-probe) attacker-chosen candidate endpoints;
+/// - `Some(derp_node_src)` for anything relayed over DERP — a **CallMeMaybe**/**CallMeMaybeVia**,
+///   or a **Ping** that arrived on a DERP connection. The node key is the one whose DERP
+///   connection delivered the frame (the call-me-maybes carry none of their own, and for a Ping
+///   the authenticated relay source outranks the key the frame claims), and the same binding is
+///   required: the sealing disco key must be one the netmap gives that node. An unknown/spoofed
+///   disco key — or a member's key replayed down somebody else's connection — cannot make us learn
+///   (and then host-probe) attacker-chosen candidate endpoints, nor draw a pong out of us;
 /// - `None` for a **Pong**, which carries no node key and arrives with no DERP sender to bind to —
 ///   returns `true` only when the sender's disco key is a member of the current netmap, which is
 ///   the most that can be asked of it. It gates only the reflexive-address harvest.
@@ -158,6 +160,33 @@ pub type BindingVerifier =
 /// inbound `CallMeMaybeVia`. Install with [`MagicSock::with_peer_cap_version`].
 pub type PeerCapVersionLookup =
     Arc<dyn Fn(&NodePublicKey) -> Option<CapabilityVersion> + Send + Sync>;
+
+/// The address upstream uses to stand for "a DERP region" wherever an `ip:port` is expected
+/// (`tailcfg.DerpMagicIPAddr`); the port is the region id.
+const DERP_MAGIC_IP: Ipv4Addr = Ipv4Addr::new(127, 3, 3, 40);
+
+/// Where a disco frame relayed over DERP came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DerpSource {
+    /// The node key the DERP server delivered the frame from.
+    pub node_key: NodePublicKey,
+    /// The DERP region the frame arrived on.
+    pub region_id: u32,
+}
+
+/// The outcome of [`MagicSock::handle_relayed_disco`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayedDisco {
+    /// The frame was consumed and nothing is to be sent back.
+    Consumed,
+    /// The frame was consumed and `frame` must be sent to `to` over the DERP region it arrived on.
+    Reply {
+        /// The node key to send the reply to.
+        to: NodePublicKey,
+        /// The sealed disco frame to send.
+        frame: Vec<u8>,
+    },
+}
 
 /// A direct UDP transport over a single shared socket.
 ///
@@ -1403,31 +1432,39 @@ impl MagicSock {
     /// Handle a disco frame relayed to us over DERP (not received on the UDP socket).
     ///
     /// A DERP-relayed frame has **no real UDP source address**, so it must never reach the parts
-    /// of `MagicSock::handle_disco` that pong (a Ping reply) or learn a source address from
-    /// `from` — doing so would emit a host-sourced probe to a bogus/unsanitized address. We
-    /// therefore decode the frame and act on only the two messages that are *defined* to arrive
-    /// this way — and, upstream, may arrive *no other* way: [`Inbound::CallMeMaybe`] and
-    /// [`Inbound::CallMeMaybeVia`] (which is why `handle_disco` drops both on the UDP socket).
-    /// The first is handled by
-    /// [`add_peer_endpoints`](Self::add_peer_endpoints) (peer-supplied candidate endpoints, each
-    /// sanitized by `is_pingable_candidate` before it can become a ping target) followed by an
-    /// immediate [`send_pings_to_peer_now`](Self::send_pings_to_peer_now) — those pings go to the
-    /// sanitized candidate set over the real UDP socket (the proper hole-punch target), never to the
-    /// nonexistent relay source. The second starts a peer-relay bind handshake against the relay
-    /// server the peer named, whose relay addresses go through the same sanitizer. Everything else is dropped: a relayed Ping
-    /// would require a pong to a non-existent source, a Pong has no meaning without a matching ping
-    /// we sent on this path, and the bind-handshake messages are only meaningful inside the Geneve
-    /// framing of a real relay leg.
+    /// of `MagicSock::handle_disco` that learn a source address from `from` or send to it — doing
+    /// so would emit a host-sourced probe to a bogus/unsanitized address. It does have an
+    /// authenticated source *node key* (the DERP server only delivers frames from a client that
+    /// proved it holds that key) and the region it arrived on, carried in `src`. We act on three
+    /// messages — two of which, upstream, may arrive *no other* way (which is why `handle_disco`
+    /// drops both call-me-maybes on the UDP socket):
     ///
-    /// `frame` is decrypted in place. Returns `true` if the frame was a disco frame we consumed
-    /// (whether or not it was actionable), so the caller does not also forward it to the
-    /// dataplane as WireGuard data.
+    /// - [`Inbound::CallMeMaybe`] is handled by [`add_peer_endpoints`](Self::add_peer_endpoints)
+    ///   (peer-supplied candidate endpoints, each sanitized by `is_pingable_candidate` before it can
+    ///   become a ping target) followed by an immediate
+    ///   [`send_pings_to_peer_now`](Self::send_pings_to_peer_now) — those pings go to the sanitized
+    ///   candidate set over the real UDP socket (the proper hole-punch target), never to the
+    ///   nonexistent relay source.
+    /// - [`Inbound::CallMeMaybeVia`] starts a peer-relay bind handshake against the relay server
+    ///   the peer named, whose relay addresses go through the same sanitizer.
+    /// - [`Inbound::Ping`] is answered with a pong addressed to `src.node_key` over DERP (upstream
+    ///   `Conn.handlePingLocked` with a non-zero `derpNodeSrc`); see
+    ///   `MagicSock::answer_derp_ping`. Nothing is learned from it.
     ///
-    /// `derp_node_src` is the **node key of the DERP connection the frame was delivered on** — Go's
+    /// Everything else is dropped: a Pong has no meaning without a matching ping we sent on this
+    /// path, and the bind-handshake messages are only meaningful inside the Geneve framing of a
+    /// real relay leg.
+    ///
+    /// `frame` is decrypted in place. The frame is always consumed (a frame carrying the disco
+    /// magic is never WireGuard data), so the caller must not forward it to the dataplane; a
+    /// [`RelayedDisco::Reply`] additionally asks the caller to send a frame back over DERP.
+    ///
+    /// `src.node_key` is the **node key of the DERP connection the frame was delivered on** — Go's
     /// `derpNodeSrc`, taken from the relay server's `recvPacket` source, not from anything inside
-    /// the frame. `None` stands for Go's zero `derpNodeSrc` (the sender is not a node we can name,
-    /// e.g. it is absent from the current netmap), and drops both messages. Two upstream admission
-    /// checks are built on it:
+    /// the frame. Go's zero `derpNodeSrc` — a sender we cannot name, e.g. one absent from the
+    /// current netmap — has no representation here: the caller cannot build a [`DerpSource`]
+    /// without a node key, so such a batch never reaches this function at all (see
+    /// `ts_runtime::multiderp::run_derp_once`). Three upstream admission checks are built on it:
     ///
     /// - **Sender binding.** The disco key that sealed the message must be one of the *sending
     ///   node's* known disco keys, which is what the binding verifier answers when it is given a
@@ -1435,23 +1472,23 @@ impl MagicSock {
     ///   "from peer via DERP whose netmap discokey != disco source"). Membership alone is not
     ///   enough: without the binding, anyone holding a peer's DERP connection could replay a
     ///   CallMeMaybe sealed by *another* member and steer this node's host socket at endpoints that
-    ///   member never advertised.
+    ///   member never advertised. The Ping arm requires the same binding before it pongs; see
+    ///   `MagicSock::answer_derp_ping`.
     /// - **Relay capability**, for `CallMeMaybeVia` only: the sending node's netmap capability
     ///   version must clear Go's peer-relay floor
     ///   ([`CapabilityVersion::is_relay_capable`], `magicsock.capVerIsRelayCapable`), else the
     ///   message is ignored ("is not known to be relay capable"). See
-    ///   [`derp_sender_is_relay_capable`](Self::derp_sender_is_relay_capable).
+    ///   `MagicSock::derp_sender_is_relay_capable`.
     ///
     /// Together these close an amplification/poisoning vector: without them, anyone who learns a
     /// victim disco key could relay a CallMeMaybe over DERP and steer the victim's host socket to
     /// disco-ping attacker-chosen public addresses every cadence. With no verifier (or no
     /// capability lookup) installed we fail closed (drop), mirroring `MagicSock::handle_disco`.
-    pub async fn handle_relayed_disco(
-        &self,
-        frame: &mut [u8],
-        derp_node_src: Option<&NodePublicKey>,
-    ) -> bool {
+    pub async fn handle_relayed_disco(&self, frame: &mut [u8], src: DerpSource) -> RelayedDisco {
+        // Go's `derpNodeSrc`, the one identity a CallMeMaybe{Via} can be bound to.
+        let derp_node_src = &src.node_key;
         match disco::open(&self.our_disco, frame) {
+            Ok(Inbound::Ping { sender, tx_id, .. }) => self.answer_derp_ping(sender, tx_id, src),
             Ok(Inbound::CallMeMaybe { sender, endpoints }) => {
                 let m = crate::metrics::metrics();
                 if self.call_me_maybe_sender_allowed(&sender, derp_node_src) {
@@ -1468,7 +1505,7 @@ impl MagicSock {
                 } else {
                     m.disco_call_me_maybe_recv_rejected.inc();
                 }
-                true
+                RelayedDisco::Consumed
             }
             Ok(Inbound::CallMeMaybeVia { sender, endpoint }) => {
                 // Both gates, in Go's order within the Via arm: the sending node must be relay
@@ -1482,23 +1519,85 @@ impl MagicSock {
                         .disco_call_me_maybe_via_recv_rejected
                         .inc();
                 }
-                true
+                RelayedDisco::Consumed
             }
             Ok(other) => {
-                // A relayed Ping/Pong or a bind-handshake message: deliberately dropped (see the
-                // method docs). It was still a valid disco frame, so report it consumed and keep it
-                // off the dataplane.
+                // A relayed Pong or a bind-handshake message: deliberately dropped (see the method
+                // docs). It was still a valid disco frame, so report it consumed and keep it off
+                // the dataplane.
                 tracing::trace!(
                     ?other,
-                    "dropping disco frame relayed over DERP that is not a call-me-maybe"
+                    "dropping disco frame relayed over DERP that is not a ping or call-me-maybe"
                 );
-                true
+                RelayedDisco::Consumed
             }
             Err(e) => {
                 tracing::trace!(error = %e, "ignoring undecodable relayed disco frame");
                 // Looked like disco but did not open: drop it (do not forward as data). A frame
                 // carrying the disco magic prefix is not WireGuard data.
-                true
+                RelayedDisco::Consumed
+            }
+        }
+    }
+
+    /// Answer a disco ping that arrived over DERP (upstream `Conn.handlePingLocked`,
+    /// `wgengine/magicsock/magicsock.go`, reached from `processDERPReadResult` with `derpNodeSrc`
+    /// set to the frame's source node key).
+    ///
+    /// This is how a peer's `tailscale ping` gets its "pong from … via DERP(region)" while the two
+    /// nodes have no direct path. Upstream sends `Pong{TxID, Src: 127.3.3.40:<region>}` to
+    /// `derpNodeSrc` over that DERP region, and so do we: the reply is returned to the region
+    /// runner that delivered the ping, which sends it on the same connection.
+    ///
+    /// Admission is the same disco<->node-key binding the direct arm requires, checked against the
+    /// **DERP source node key** rather than the key the ping claims. That source key is
+    /// authenticated by the DERP server and is the one upstream's `unambiguousNodeKeyOfPingLocked`
+    /// trusts first; upstream then pongs only when `derpNodeSrc` is a known peer. Asking the
+    /// verifier whether the netmap binds the sender's disco key to that node key covers both: a
+    /// node key that is not a current peer, or a peer relaying a ping sealed under another peer's
+    /// disco key, gets no pong. The ping's own `claimed_node_key` is not consulted — the DERP
+    /// source is stronger evidence of the same fact. With no verifier installed we fail closed.
+    ///
+    /// No candidate path is learned: a DERP frame has no UDP source, and the pong goes to a node
+    /// key, never to an address. A Geneve-encapsulated ping over DERP (which upstream refuses)
+    /// never gets here, because the DERP demux only hands over frames that start with the disco
+    /// magic; see `ts_runtime::multiderp::demux_relayed_disco`.
+    fn answer_derp_ping(
+        &self,
+        sender: DiscoPublicKey,
+        tx_id: disco::TxId,
+        src: DerpSource,
+    ) -> RelayedDisco {
+        let m = crate::metrics::metrics();
+        let bound = match self.binding_verifier.as_ref() {
+            Some(verify) => verify(&sender, Some(&src.node_key)),
+            None => {
+                self.warn_no_verifier_once();
+                false
+            }
+        };
+        if !bound {
+            tracing::debug!(
+                node_key = %src.node_key,
+                region_id = src.region_id,
+                "dropping disco ping over DERP: source node key not bound to sender disco key"
+            );
+            m.disco_ping_recv_rejected.inc();
+            return RelayedDisco::Consumed;
+        }
+
+        m.disco_ping_recv.inc();
+        // Upstream builds the DERP source as `netip.AddrPortFrom(DerpMagicIPAddr,
+        // uint16(regionID))`, truncating the region id to the port width; so do we.
+        let pong_src = SocketAddr::from((DERP_MAGIC_IP, src.region_id as u16));
+        match disco::seal_pong(&self.our_disco, &sender, tx_id, pong_src) {
+            Ok(frame) => RelayedDisco::Reply {
+                to: src.node_key,
+                frame,
+            },
+            Err(e) => {
+                tracing::debug!(error = %e, "sealing pong for disco ping over DERP failed");
+                RelayedDisco::Consumed
             }
         }
     }
@@ -2152,22 +2251,12 @@ impl MagicSock {
     /// call the Ping path makes — the claimed node key just comes from the relay rather than from
     /// the frame.
     ///
-    /// `None` is Go's zero `derpNodeSrc`: no nameable sender, so nothing is acted on. With no
+    /// Go's zero `derpNodeSrc` — no nameable sender — cannot reach here: [`DerpSource`] has no way
+    /// to spell it, and `ts_runtime::multiderp` skips the magicsock for such a batch. With no
     /// verifier installed we fail closed (`false`) — see the
     /// [`binding_verifier`](Self::binding_verifier) field doc — and emit the one-shot no-verifier
     /// warning so a misconfiguration is observable.
-    fn call_me_maybe_sender_allowed(
-        &self,
-        sender: &DiscoPublicKey,
-        derp_node_src: Option<&NodePublicKey>,
-    ) -> bool {
-        let Some(node) = derp_node_src else {
-            tracing::debug!(
-                %sender,
-                "dropping call-me-maybe with no DERP source node key to bind it to"
-            );
-            return false;
-        };
+    fn call_me_maybe_sender_allowed(&self, sender: &DiscoPublicKey, node: &NodePublicKey) -> bool {
         match self.binding_verifier.as_ref() {
             Some(verify) => {
                 let bound = verify(sender, Some(node));
@@ -2203,10 +2292,7 @@ impl MagicSock {
     /// [`peer_cap_version`](Self::peer_cap_version) lookup installed, is not relay capable. The
     /// lookup is the only way a peer's capability version reaches this crate — `MagicSock` holds no
     /// netmap — so its absence is a misconfiguration and is warned about once per socket.
-    fn derp_sender_is_relay_capable(&self, derp_node_src: Option<&NodePublicKey>) -> bool {
-        let Some(node) = derp_node_src else {
-            return false;
-        };
+    fn derp_sender_is_relay_capable(&self, node: &NodePublicKey) -> bool {
         let Some(lookup) = self.peer_cap_version.as_ref() else {
             self.warn_no_cap_lookup_once();
             return false;
@@ -2721,6 +2807,22 @@ mod tests {
         "127.0.0.1:0".parse().unwrap()
     }
 
+    /// A DERP source (Go `derpNodeSrc`) carrying a node key nothing is bound to. For relayed-disco
+    /// tests that install [`allow_all`]: the sender's identity cannot change their outcome, only
+    /// its presence matters.
+    fn derp_src() -> DerpSource {
+        derp_src_of(ts_keys::NodePrivateKey::random().public_key())
+    }
+
+    /// A DERP source for a frame delivered on `node_key`'s own connection — what a real peer's
+    /// frames look like, and what the sender-binding gate is checked against.
+    fn derp_src_of(node_key: NodePublicKey) -> DerpSource {
+        DerpSource {
+            node_key,
+            region_id: 1,
+        }
+    }
+
     /// A verifier that accepts every disco frame. The loopback ping/pong/data tests are not
     /// exercising the binding check (they have no netmap), so they install this to keep the
     /// now-fail-closed Ping/CallMeMaybe handlers answering. Tests that *do* exercise the binding
@@ -2734,12 +2836,6 @@ mod tests {
     /// (it has its own tests), so they install this to get past it.
     fn all_relay_capable() -> PeerCapVersionLookup {
         Arc::new(|_: &NodePublicKey| Some(CapabilityVersion::CURRENT))
-    }
-
-    /// A stand-in DERP source node key (Go `derpNodeSrc`) for relayed-disco tests whose verifier is
-    /// [`allow_all`] — the key's value is irrelevant to them, only its presence is.
-    fn derp_src() -> NodePublicKey {
-        ts_keys::NodePrivateKey::random().public_key()
     }
 
     /// Bind a magicsock with the IPv6 candidate gate `enable`d (or not) for filter tests.
@@ -3419,9 +3515,10 @@ mod tests {
         }
     }
 
-    /// Bind a magicsock ready to act as a peer-relay client: an allow-all binding verifier (the
-    /// netmap-membership gate has its own test), the loopback relay-address waiver, and a tap on
-    /// everything it puts on the peer-relay wire.
+    /// Bind a magicsock ready to act as a peer-relay client: an allow-all binding verifier and an
+    /// all-relay-capable lookup (the sender-binding and relay-capability gates have their own
+    /// tests), the loopback relay-address waiver, and a tap on everything it puts on the
+    /// peer-relay wire.
     async fn relay_client(our_disco: &DiscoPrivateKey) -> (Arc<MagicSock>, RelaySendTapRx) {
         let a = Arc::new(
             MagicSock::bind(
@@ -3462,7 +3559,10 @@ mod tests {
         sends: &mut RelaySendTapRx,
     ) -> u32 {
         let mut frame = fx.call_me_maybe_via(us.public_key());
-        assert!(a.handle_relayed_disco(&mut frame, Some(&derp_src())).await);
+        assert_eq!(
+            a.handle_relayed_disco(&mut frame, derp_src()).await,
+            RelayedDisco::Consumed
+        );
         let (_, wire) = sends.try_recv().expect("a bind message must be sent");
         let mut bind = expect_relay_frame(&wire, fx.vni, true);
         match disco::open(&fx.server, &mut bind).unwrap() {
@@ -3520,8 +3620,9 @@ mod tests {
 
         // 1. The peer's CallMeMaybeVia arrives over DERP.
         let mut frame = fx.call_me_maybe_via(our_disco.public_key());
-        assert!(
-            a.handle_relayed_disco(&mut frame, Some(&derp_src())).await,
+        assert_eq!(
+            a.handle_relayed_disco(&mut frame, derp_src()).await,
+            RelayedDisco::Consumed,
             "a CallMeMaybeVia must be consumed as disco, not passed to the dataplane"
         );
 
@@ -3773,7 +3874,10 @@ mod tests {
             &fx.endpoint(stranger),
         )
         .unwrap();
-        assert!(a.handle_relayed_disco(&mut frame, Some(&derp_src())).await);
+        assert_eq!(
+            a.handle_relayed_disco(&mut frame, derp_src()).await,
+            RelayedDisco::Consumed
+        );
         assert!(
             sends.try_recv().is_err(),
             "no bind message may be sent for an endpoint allocated to another pair"
@@ -3811,7 +3915,10 @@ mod tests {
         ];
         let mut frame =
             disco::seal_call_me_maybe_via(&fx.peer, &our_disco.public_key(), &endpoint).unwrap();
-        assert!(a.handle_relayed_disco(&mut frame, Some(&derp_src())).await);
+        assert_eq!(
+            a.handle_relayed_disco(&mut frame, derp_src()).await,
+            RelayedDisco::Consumed
+        );
         assert!(
             sends.try_recv().is_err(),
             "a forbidden relay address must never be probed from the host socket"
@@ -3854,8 +3961,9 @@ mod tests {
         let mut sends = a.tap_relay_sends();
 
         let mut frame = fx.call_me_maybe_via(our_disco.public_key());
-        assert!(
-            a.handle_relayed_disco(&mut frame, Some(&derp_src())).await,
+        assert_eq!(
+            a.handle_relayed_disco(&mut frame, derp_src()).await,
+            RelayedDisco::Consumed,
             "the frame is still consumed as disco, never handed to the dataplane"
         );
         assert!(
@@ -3938,7 +4046,10 @@ mod tests {
             let mut frame =
                 disco::seal_call_me_maybe_via(&fx.peer, &our_disco.public_key(), &endpoint)
                     .unwrap();
-            assert!(a.handle_relayed_disco(&mut frame, Some(&derp_src())).await);
+            assert_eq!(
+                a.handle_relayed_disco(&mut frame, derp_src()).await,
+                RelayedDisco::Consumed
+            );
         }
 
         assert!(
@@ -4013,7 +4124,10 @@ mod tests {
         endpoint.addr_ports = vec!["10.0.0.5:41641".parse().unwrap(), admitted];
         let mut frame =
             disco::seal_call_me_maybe_via(&fx.peer, &our_disco.public_key(), &endpoint).unwrap();
-        assert!(a.handle_relayed_disco(&mut frame, Some(&derp_src())).await);
+        assert_eq!(
+            a.handle_relayed_disco(&mut frame, derp_src()).await,
+            RelayedDisco::Consumed
+        );
 
         let (to, _wire) = sends
             .try_recv()
@@ -4068,7 +4182,10 @@ mod tests {
             let mut sends = a.tap_relay_sends();
 
             let mut frame = fx.call_me_maybe_via(our_disco.public_key());
-            assert!(a.handle_relayed_disco(&mut frame, Some(&derp_src())).await);
+            assert_eq!(
+                a.handle_relayed_disco(&mut frame, derp_src()).await,
+                RelayedDisco::Consumed
+            );
 
             if enable_ipv6 {
                 // The socket here is IPv4-bound, so the write itself fails and is swallowed; the
@@ -4327,7 +4444,10 @@ mod tests {
         let mut sends = a.tap_relay_sends();
 
         let mut frame = fx.call_me_maybe_via(our_disco.public_key());
-        assert!(a.handle_relayed_disco(&mut frame, Some(&derp_src())).await);
+        assert_eq!(
+            a.handle_relayed_disco(&mut frame, derp_src()).await,
+            RelayedDisco::Consumed
+        );
         assert!(sends.try_recv().is_err(), "no handshake for a non-member");
         assert_eq!(a.relay_path(&fx.peer.public_key()), None);
     }
@@ -4363,8 +4483,9 @@ mod tests {
             let mut sends = a.tap_relay_sends();
 
             let mut frame = fx.call_me_maybe_via(our_disco.public_key());
-            assert!(
-                a.handle_relayed_disco(&mut frame, Some(&derp_src())).await,
+            assert_eq!(
+                a.handle_relayed_disco(&mut frame, derp_src()).await,
+                RelayedDisco::Consumed,
                 "a CallMeMaybeVia is consumed as disco either way"
             );
             let started = sends.try_recv().is_ok();
@@ -4408,7 +4529,10 @@ mod tests {
         let mut sends = a.tap_relay_sends();
 
         let mut frame = fx.call_me_maybe_via(our_disco.public_key());
-        assert!(a.handle_relayed_disco(&mut frame, Some(&derp_src())).await);
+        assert_eq!(
+            a.handle_relayed_disco(&mut frame, derp_src()).await,
+            RelayedDisco::Consumed
+        );
         assert!(
             sends.try_recv().is_err(),
             "no capability lookup means no relay-capable sender, so no handshake"
@@ -4918,8 +5042,9 @@ mod tests {
         let bound_disco = a_disco.public_key();
         let verifier: BindingVerifier = Arc::new(
             move |disco: &DiscoPublicKey, claimed: Option<&NodePublicKey>| {
-                // Ping: require the exact disco<->node-key binding. CallMeMaybe (None): membership
-                // is satisfied by the same disco key being known.
+                // Ping, or anything relayed over DERP: require the exact disco<->node-key
+                // binding. Pong (None): membership is satisfied by the same disco key being
+                // known.
                 match claimed {
                     Some(claimed) => *disco == bound_disco && *claimed == bound_node,
                     None => *disco == bound_disco,
@@ -5527,10 +5652,12 @@ mod tests {
         // Delivered on B's DERP connection: the sealing disco key is not one of B's, so nothing is
         // learned even though the frame itself is perfectly valid.
         let mut wrong_sender = sealed_by_a.clone();
-        let consumed = recv
-            .handle_relayed_disco(&mut wrong_sender, Some(&b_node))
-            .await;
-        assert!(consumed, "frame is disco, must be consumed");
+        assert_eq!(
+            recv.handle_relayed_disco(&mut wrong_sender, derp_src_of(b_node))
+                .await,
+            RelayedDisco::Consumed,
+            "frame is disco, must be consumed"
+        );
         assert!(
             recv.candidate_addrs(&a_pub).is_empty(),
             "a CallMeMaybe sealed by A but delivered from B's node key must learn nothing"
@@ -5540,32 +5667,26 @@ mod tests {
         let mut stranger_frame =
             disco::seal_call_me_maybe(&stranger_disco, &recv_disco.public_key(), &[public_ep])
                 .unwrap();
-        let consumed = recv
-            .handle_relayed_disco(&mut stranger_frame, Some(&a_node))
-            .await;
-        assert!(consumed, "frame is disco, must be consumed");
+        assert_eq!(
+            recv.handle_relayed_disco(&mut stranger_frame, derp_src_of(a_node))
+                .await,
+            RelayedDisco::Consumed,
+            "frame is disco, must be consumed"
+        );
         assert!(
             recv.candidate_addrs(&stranger_disco.public_key())
                 .is_empty(),
             "stranger CallMeMaybe must not be learned"
         );
 
-        // With no DERP source node key at all (Go's zero `derpNodeSrc`) there is nothing to bind
-        // to, so even A's own frame is dropped.
-        let mut no_sender = sealed_by_a.clone();
-        let consumed = recv.handle_relayed_disco(&mut no_sender, None).await;
-        assert!(consumed, "frame is disco, must be consumed");
-        assert!(
-            recv.candidate_addrs(&a_pub).is_empty(),
-            "a CallMeMaybe with no DERP source node key must learn nothing"
-        );
-
         // The same bytes from A's own node key: accepted, endpoint learned.
         let mut right_sender = sealed_by_a;
-        let consumed = recv
-            .handle_relayed_disco(&mut right_sender, Some(&a_node))
-            .await;
-        assert!(consumed, "frame is disco, must be consumed");
+        assert_eq!(
+            recv.handle_relayed_disco(&mut right_sender, derp_src_of(a_node))
+                .await,
+            RelayedDisco::Consumed,
+            "frame is disco, must be consumed"
+        );
         assert_eq!(
             recv.candidate_addrs(&a_pub),
             vec![public_ep],
@@ -5573,18 +5694,16 @@ mod tests {
         );
     }
 
-    /// A relayed disco Ping is dropped (never ponged): a DERP-relayed frame has no real UDP source
-    /// to answer, and `handle_relayed_disco` only acts on CallMeMaybe. The frame is still
-    /// reported consumed so it stays off the dataplane.
+    /// A relayed disco Ping from a bound peer is answered with a pong to its DERP source node key,
+    /// echoing `127.3.3.40:<region>` as the source (upstream `handlePingLocked` over DERP) — and,
+    /// because a DERP frame has no UDP source, it still learns no candidate path.
     #[tokio::test]
-    async fn relayed_ping_is_dropped() {
+    async fn relayed_ping_is_ponged_without_learning_a_path() {
         let sender_disco = DiscoPrivateKey::random();
         let sender_node = ts_keys::NodePrivateKey::random().public_key();
         let recv_disco = DiscoPrivateKey::random();
         let recv_node = ts_keys::NodePrivateKey::random().public_key();
 
-        // An allow-all verifier would accept a Ping if it reached the Ping arm — proving the drop
-        // is structural (CallMeMaybe-only), not a verifier rejection.
         let recv = Arc::new(
             MagicSock::bind(localhost(), recv_disco.clone(), recv_node)
                 .await
@@ -5596,16 +5715,61 @@ mod tests {
         let mut ping =
             disco::seal_ping(&sender_disco, sender_node, &recv_disco.public_key(), tx).unwrap();
 
-        let consumed = recv
-            .handle_relayed_disco(&mut ping, Some(&derp_src()))
-            .await;
-        assert!(
-            consumed,
-            "a relayed disco frame is consumed (kept off dataplane)"
-        );
+        let src = DerpSource {
+            node_key: sender_node,
+            region_id: 7,
+        };
+        let RelayedDisco::Reply { to, mut frame } = recv.handle_relayed_disco(&mut ping, src).await
+        else {
+            panic!("a relayed Ping from a bound peer must be answered");
+        };
+        assert_eq!(to, sender_node, "the pong goes to the DERP source node key");
+        match disco::open(&sender_disco, &mut frame).unwrap() {
+            Inbound::Pong {
+                sender,
+                tx_id,
+                src: pong_src,
+            } => {
+                assert_eq!(sender, recv_disco.public_key());
+                assert_eq!(tx_id, tx);
+                assert_eq!(pong_src, "127.3.3.40:7".parse::<SocketAddr>().unwrap());
+            }
+            other => panic!("expected a pong, got {other:?}"),
+        }
         assert!(
             recv.candidate_addrs(&sender_disco.public_key()).is_empty(),
             "a relayed Ping must not learn a candidate path"
+        );
+    }
+
+    /// With no binding verifier installed a relayed Ping fails closed exactly like a direct one.
+    #[tokio::test]
+    async fn relayed_ping_without_verifier_is_not_ponged() {
+        let sender_disco = DiscoPrivateKey::random();
+        let sender_node = ts_keys::NodePrivateKey::random().public_key();
+        let recv_disco = DiscoPrivateKey::random();
+        let recv = MagicSock::bind(
+            localhost(),
+            recv_disco.clone(),
+            ts_keys::NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap();
+
+        let mut ping = disco::seal_ping(
+            &sender_disco,
+            sender_node,
+            &recv_disco.public_key(),
+            disco::random_tx_id(),
+        )
+        .unwrap();
+        let src = DerpSource {
+            node_key: sender_node,
+            region_id: 1,
+        };
+        assert_eq!(
+            recv.handle_relayed_disco(&mut ping, src).await,
+            RelayedDisco::Consumed
         );
     }
 
@@ -6317,7 +6481,7 @@ mod tests {
         // Accepted: over DERP, from the node key the netmap binds this disco key to.
         let before = CounterSnapshot::take();
         let mut frame = sealed.clone();
-        sock.handle_relayed_disco(&mut frame, Some(&peer_node))
+        sock.handle_relayed_disco(&mut frame, derp_src_of(peer_node))
             .await;
         let after = CounterSnapshot::take();
         assert_eq!(
@@ -6334,7 +6498,7 @@ mod tests {
         // Rejected: the same frame, but delivered under somebody else's DERP node key.
         let before = CounterSnapshot::take();
         let mut frame = sealed.clone();
-        sock.handle_relayed_disco(&mut frame, Some(&other_node))
+        sock.handle_relayed_disco(&mut frame, derp_src_of(other_node))
             .await;
         let after = CounterSnapshot::take();
         assert_eq!(
@@ -7371,10 +7535,11 @@ mod tests {
         let mut frame =
             disco::seal_call_me_maybe(&peer_disco, &our_disco.public_key(), &[public_ep]).unwrap();
 
-        let consumed = recv
-            .handle_relayed_disco(&mut frame, Some(&derp_src()))
-            .await;
-        assert!(consumed, "the relayed CallMeMaybe is consumed");
+        assert_eq!(
+            recv.handle_relayed_disco(&mut frame, derp_src()).await,
+            RelayedDisco::Consumed,
+            "the relayed CallMeMaybe is consumed"
+        );
         assert_eq!(
             recv.candidate_addrs(&peer_disco.public_key()),
             vec![public_ep],

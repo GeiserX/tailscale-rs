@@ -622,7 +622,7 @@ impl PeerLookup<DiscoPublicKey, PeerId> for DiscoPeerLookup {
     fn lookup_key(&self, key: DiscoPublicKey) -> Option<PeerId> {
         let db = poisoned_read(&self.0);
         let db = db.as_ref()?;
-        let (id, _, _) = db.peer_by_known_disco_key(&key)?;
+        let (id, ..) = db.peer_by_known_disco_key(&key)?;
         Some(id)
     }
 }
