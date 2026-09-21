@@ -15,6 +15,7 @@ use tokio::{
     net::UdpSocket,
     sync::{mpsc, oneshot},
 };
+use ts_capabilityversion::CapabilityVersion;
 use ts_keys::{DiscoPrivateKey, DiscoPublicKey, NodePublicKey};
 use ts_packet::PacketMut;
 use ts_transport::{BatchRecvIter, BatchSendIter, UnderlayTransport};
@@ -131,15 +132,34 @@ async fn rebind_socket(prefer_port: u16, want_v6: bool) -> std::io::Result<UdpSo
 /// - `Some(claimed_node_key)` for a disco **Ping** — returns `true` only when the netmap currently
 ///   binds exactly that node key to the sender's disco key (a peer must not open a direct path
 ///   under a node key that isn't its own);
-/// - `None` for a **CallMeMaybe** (which carries no node key) — returns `true` only when the
-///   sender's disco key is a member of the current netmap, so an unknown/spoofed disco key cannot
-///   make us learn (and then host-probe) attacker-chosen candidate endpoints.
+/// - `Some(derp_node_src)` for anything relayed over DERP — a **CallMeMaybe**/**CallMeMaybeVia**,
+///   or a **Ping** that arrived on a DERP connection. The node key is the one whose DERP
+///   connection delivered the frame (the call-me-maybes carry none of their own, and for a Ping
+///   the authenticated relay source outranks the key the frame claims), and the same binding is
+///   required: the sealing disco key must be one the netmap gives that node. An unknown/spoofed
+///   disco key — or a member's key replayed down somebody else's connection — cannot make us learn
+///   (and then host-probe) attacker-chosen candidate endpoints, nor draw a pong out of us;
+/// - `None` for a **Pong**, which carries no node key and arrives with no DERP sender to bind to —
+///   returns `true` only when the sender's disco key is a member of the current netmap, which is
+///   the most that can be asked of it. It gates only the reflexive-address harvest.
 ///
 /// A live read of the netmap-owning layer, so revocations take effect immediately. Used by
 /// `MagicSock::handle_disco` / [`MagicSock::handle_relayed_disco`] to fail closed. See
 /// [`MagicSock::with_binding_verifier`].
 pub type BindingVerifier =
     Arc<dyn Fn(&DiscoPublicKey, Option<&NodePublicKey>) -> bool + Send + Sync>;
+
+/// Resolves a peer's advertised capability version (Go `tailcfg.Node.Cap`) from its node key.
+///
+/// `MagicSock` holds no netmap, so this closure is the only route by which a peer's `Node.Cap`
+/// reaches the disco layer. Returns `None` when the node key is not a peer in the current netmap.
+/// A live read of the netmap-owning layer, so a peer that leaves (or whose capability version
+/// changes) takes effect immediately.
+///
+/// Used by [`MagicSock::handle_relayed_disco`] to apply Go's `capVerIsRelayCapable` gate on an
+/// inbound `CallMeMaybeVia`. Install with [`MagicSock::with_peer_cap_version`].
+pub type PeerCapVersionLookup =
+    Arc<dyn Fn(&NodePublicKey) -> Option<CapabilityVersion> + Send + Sync>;
 
 /// The address upstream uses to stand for "a DERP region" wherever an `ip:port` is expected
 /// (`tailcfg.DerpMagicIPAddr`); the port is the region id.
@@ -220,9 +240,10 @@ pub struct MagicSock {
     /// When present, every inbound disco frame that would cause us to learn a candidate endpoint
     /// (a Ping's source, or a CallMeMaybe's advertised endpoints) is first checked against the
     /// control netmap: a Ping must present the node key control bound to its disco key, and a
-    /// CallMeMaybe's sender disco key must be a current netmap member. Frames that fail are dropped
-    /// (fail closed) — a peer not bound in our netmap must not be able to open a direct path or
-    /// steer host-sourced probes at attacker-chosen addresses.
+    /// DERP-relayed CallMeMaybe's sealing disco key must be one the netmap gives the node whose
+    /// DERP connection delivered it. Frames that fail are dropped (fail closed) — a peer not bound
+    /// in our netmap must not be able to open a direct path or steer host-sourced probes at
+    /// attacker-chosen addresses.
     ///
     /// When **absent** (`None`) we **fail closed**: disco frames that would learn an endpoint or
     /// pong are dropped, because answering them without the binding check is the spoofing surface
@@ -231,9 +252,21 @@ pub struct MagicSock {
     /// netmap-less construction degrades safely (DERP-only) rather than insecurely. Tests that need
     /// the pre-binding ping/pong behavior install an explicit allow-all verifier.
     binding_verifier: Option<BindingVerifier>,
+    /// Optional netmap capability-version lookup (see [`PeerCapVersionLookup`]), wired by the
+    /// netmap-owning route layer.
+    ///
+    /// Only Go's inbound `CallMeMaybeVia` gate reads it: the sending node must be peer-relay
+    /// capable (`capVerIsRelayCapable(n.Cap())`). When **absent** (`None`) we **fail closed** —
+    /// every `CallMeMaybeVia` is dropped, which costs a relay path and nothing else (the peer stays
+    /// on DERP or on a direct path). The production route layer always installs one via
+    /// [`MagicSock::with_peer_cap_version`].
+    peer_cap_version: Option<PeerCapVersionLookup>,
     /// One-shot guard so the "no binding verifier installed" warning is emitted at most once
     /// instead of on every dropped ping.
     warned_no_verifier: AtomicBool,
+    /// One-shot guard so the "no peer capability lookup installed" warning is emitted at most once
+    /// instead of on every dropped `CallMeMaybeVia`.
+    warned_no_cap_lookup: AtomicBool,
     /// One-shot guard so the "every advertised relay address was refused" warning is emitted at
     /// most once per socket instead of once per `CallMeMaybeVia`.
     ///
@@ -359,7 +392,9 @@ impl MagicSock {
             reflexive: Default::default(),
             stun_in_flight: Default::default(),
             binding_verifier: None,
+            peer_cap_version: None,
             warned_no_verifier: AtomicBool::new(false),
+            warned_no_cap_lookup: AtomicBool::new(false),
             warned_relay_addrs_all_refused: AtomicBool::new(false),
             enable_ipv6: false,
             symmetric_nat: AtomicBool::new(false),
@@ -566,11 +601,23 @@ impl MagicSock {
     ///
     /// Called once at startup by the netmap-owning route layer. With a verifier installed, an
     /// inbound disco ping must present the node key control bound to its disco key, and a relayed
-    /// CallMeMaybe's sender must be a netmap member, or the frame is dropped (fail closed). Without
-    /// one the socket fails closed entirely (drops such frames). Builder-style so the `bind` call
-    /// site stays a single expression.
+    /// CallMeMaybe's sealing disco key must be one of the DERP sender's known disco keys, or the
+    /// frame is dropped (fail closed). Without one the socket fails closed entirely (drops such
+    /// frames). Builder-style so the `bind` call site stays a single expression.
     pub fn with_binding_verifier(mut self, verifier: BindingVerifier) -> Self {
         self.binding_verifier = Some(verifier);
+        self
+    }
+
+    /// Install the netmap capability-version lookup (see [`PeerCapVersionLookup`]).
+    ///
+    /// Called once at startup by the netmap-owning route layer, alongside
+    /// [`with_binding_verifier`](Self::with_binding_verifier). It supplies the one netmap fact the
+    /// inbound `CallMeMaybeVia` gate needs — the sending peer's `Node.Cap` — so this crate can
+    /// apply Go's `capVerIsRelayCapable` without holding a netmap. Without one, every inbound
+    /// `CallMeMaybeVia` is dropped (fail closed).
+    pub fn with_peer_cap_version(mut self, lookup: PeerCapVersionLookup) -> Self {
+        self.peer_cap_version = Some(lookup);
         self
     }
 
@@ -1063,8 +1110,8 @@ impl MagicSock {
     /// Force an immediate disco ping to **every** candidate endpoint of one peer, bypassing the
     /// per-candidate `DISCO_PING_INTERVAL` discovery floor. Returns the number of pings sent.
     ///
-    /// This is the event-driven hole-punch trigger: it is called on receipt of a `CallMeMaybe` from
-    /// `peer` (whether direct on the UDP socket or relayed over DERP), mirroring Go magicsock
+    /// This is the event-driven hole-punch trigger: it is called on receipt of a `CallMeMaybe`
+    /// relayed over DERP from `peer` (the only way upstream accepts one), mirroring Go magicsock
     /// `endpoint.handleCallMeMaybe`, which zeroes every endpoint's `lastPing` and immediately calls
     /// `sendDiscoPingsLocked`. A `CallMeMaybe` means the peer just opened its firewall and wants us
     /// to ping *now*, so waiting up to the next periodic 2s tick — or being silenced by the 5s
@@ -1389,7 +1436,8 @@ impl MagicSock {
     /// so would emit a host-sourced probe to a bogus/unsanitized address. It does have an
     /// authenticated source *node key* (the DERP server only delivers frames from a client that
     /// proved it holds that key) and the region it arrived on, carried in `src`. We act on three
-    /// messages:
+    /// messages — two of which, upstream, may arrive *no other* way (which is why `handle_disco`
+    /// drops both call-me-maybes on the UDP socket):
     ///
     /// - [`Inbound::CallMeMaybe`] is handled by [`add_peer_endpoints`](Self::add_peer_endpoints)
     ///   (peer-supplied candidate endpoints, each sanitized by `is_pingable_candidate` before it can
@@ -1401,7 +1449,7 @@ impl MagicSock {
     ///   the peer named, whose relay addresses go through the same sanitizer.
     /// - [`Inbound::Ping`] is answered with a pong addressed to `src.node_key` over DERP (upstream
     ///   `Conn.handlePingLocked` with a non-zero `derpNodeSrc`); see
-    ///   [`answer_derp_ping`](Self::answer_derp_ping). Nothing is learned from it.
+    ///   `MagicSock::answer_derp_ping`. Nothing is learned from it.
     ///
     /// Everything else is dropped: a Pong has no meaning without a matching ping we sent on this
     /// path, and the bind-handshake messages are only meaningful inside the Geneve framing of a
@@ -1411,17 +1459,40 @@ impl MagicSock {
     /// magic is never WireGuard data), so the caller must not forward it to the dataplane; a
     /// [`RelayedDisco::Reply`] additionally asks the caller to send a frame back over DERP.
     ///
-    /// The call-me-maybe senders are checked for netmap membership via the binding verifier before
-    /// anything is learned: neither message carries a node key, so the check is "is this disco key
-    /// a current netmap peer?". This closes an amplification/poisoning vector — without it, anyone
-    /// who learns a victim disco key could relay a CallMeMaybe over DERP and steer the victim's host
-    /// socket to disco-ping attacker-chosen public addresses every cadence. With no verifier
-    /// installed we fail closed (drop), mirroring `MagicSock::handle_disco`.
+    /// `src.node_key` is the **node key of the DERP connection the frame was delivered on** — Go's
+    /// `derpNodeSrc`, taken from the relay server's `recvPacket` source, not from anything inside
+    /// the frame. Go's zero `derpNodeSrc` — a sender we cannot name, e.g. one absent from the
+    /// current netmap — has no representation here: the caller cannot build a [`DerpSource`]
+    /// without a node key, so such a batch never reaches this function at all (see
+    /// `ts_runtime::multiderp::run_derp_once`). Three upstream admission checks are built on it:
+    ///
+    /// - **Sender binding.** The disco key that sealed the message must be one of the *sending
+    ///   node's* known disco keys, which is what the binding verifier answers when it is given a
+    ///   node key (Go `endpoint.checkAndUpdateDiscoKey`, reached after `endpointForNodeKey`;
+    ///   "from peer via DERP whose netmap discokey != disco source"). Membership alone is not
+    ///   enough: without the binding, anyone holding a peer's DERP connection could replay a
+    ///   CallMeMaybe sealed by *another* member and steer this node's host socket at endpoints that
+    ///   member never advertised. The Ping arm requires the same binding before it pongs; see
+    ///   `MagicSock::answer_derp_ping`.
+    /// - **Relay capability**, for `CallMeMaybeVia` only: the sending node's netmap capability
+    ///   version must clear Go's peer-relay floor
+    ///   ([`CapabilityVersion::is_relay_capable`], `magicsock.capVerIsRelayCapable`), else the
+    ///   message is ignored ("is not known to be relay capable"). See
+    ///   `MagicSock::derp_sender_is_relay_capable`.
+    ///
+    /// Together these close an amplification/poisoning vector: without them, anyone who learns a
+    /// victim disco key could relay a CallMeMaybe over DERP and steer the victim's host socket to
+    /// disco-ping attacker-chosen public addresses every cadence. With no verifier (or no
+    /// capability lookup) installed we fail closed (drop), mirroring `MagicSock::handle_disco`.
     pub async fn handle_relayed_disco(&self, frame: &mut [u8], src: DerpSource) -> RelayedDisco {
+        // Go's `derpNodeSrc`, the one identity a CallMeMaybe{Via} can be bound to.
+        let derp_node_src = &src.node_key;
         match disco::open(&self.our_disco, frame) {
             Ok(Inbound::Ping { sender, tx_id, .. }) => self.answer_derp_ping(sender, tx_id, src),
             Ok(Inbound::CallMeMaybe { sender, endpoints }) => {
-                if self.call_me_maybe_sender_allowed(&sender) {
+                let m = crate::metrics::metrics();
+                if self.call_me_maybe_sender_allowed(&sender, derp_node_src) {
+                    m.disco_call_me_maybe_recv.inc();
                     self.add_peer_endpoints(sender, endpoints);
                     // Force an immediate ping of every candidate, bypassing the 5s discovery floor.
                     // The relayed CallMeMaybe is the canonical hard-NAT hole-punch: both peers are
@@ -1431,11 +1502,17 @@ impl MagicSock {
                     if let Err(e) = self.send_pings_to_peer_now(&sender).await {
                         tracing::debug!(error = %e, "relayed call-me-maybe immediate ping failed");
                     }
+                } else {
+                    m.disco_call_me_maybe_recv_rejected.inc();
                 }
                 RelayedDisco::Consumed
             }
             Ok(Inbound::CallMeMaybeVia { sender, endpoint }) => {
-                if self.call_me_maybe_sender_allowed(&sender) {
+                // Both gates, in Go's order within the Via arm: the sending node must be relay
+                // capable before its disco binding is even looked at.
+                if self.derp_sender_is_relay_capable(derp_node_src)
+                    && self.call_me_maybe_sender_allowed(&sender, derp_node_src)
+                {
                     self.start_relay_handshake(sender, endpoint).await;
                 } else {
                     crate::metrics::metrics()
@@ -2163,25 +2240,83 @@ impl MagicSock {
         }
     }
 
-    /// Whether a CallMeMaybe from `sender` may be acted on (its endpoints learned).
+    /// Whether a `CallMeMaybe`/`CallMeMaybeVia` sealed by `sender` and delivered on
+    /// `derp_node_src`'s DERP connection may be acted on.
     ///
-    /// A CallMeMaybe carries no node key, so this is exactly a netmap-membership check — see
-    /// [`disco_sender_is_member`](Self::disco_sender_is_member) for the fail-closed semantics.
-    fn call_me_maybe_sender_allowed(&self, sender: &DiscoPublicKey) -> bool {
-        self.disco_sender_is_member(sender)
+    /// Neither message carries a node key of its own, so upstream takes the sender's identity from
+    /// the *transport*: `derpNodeSrc` names the node whose DERP connection delivered the frame, and
+    /// Go then requires the sealing disco key to be one of that node's known disco keys
+    /// (`endpointForNodeKey` followed by `endpoint.checkAndUpdateDiscoKey`). That conjunction is
+    /// exactly what the binding verifier answers when it is handed a node key, so this is the same
+    /// call the Ping path makes — the claimed node key just comes from the relay rather than from
+    /// the frame.
+    ///
+    /// Go's zero `derpNodeSrc` — no nameable sender — cannot reach here: [`DerpSource`] has no way
+    /// to spell it, and `ts_runtime::multiderp` skips the magicsock for such a batch. With no
+    /// verifier installed we fail closed (`false`) — see the
+    /// [`binding_verifier`](Self::binding_verifier) field doc — and emit the one-shot no-verifier
+    /// warning so a misconfiguration is observable.
+    fn call_me_maybe_sender_allowed(&self, sender: &DiscoPublicKey, node: &NodePublicKey) -> bool {
+        match self.binding_verifier.as_ref() {
+            Some(verify) => {
+                let bound = verify(sender, Some(node));
+                if !bound {
+                    tracing::debug!(
+                        %sender,
+                        %node,
+                        "[unexpected] call-me-maybe from peer via DERP whose netmap discokey != \
+                         disco source"
+                    );
+                }
+                bound
+            }
+            None => {
+                self.warn_no_verifier_once();
+                false
+            }
+        }
+    }
+
+    /// Whether the node whose DERP connection delivered a `CallMeMaybeVia` is known to be
+    /// peer-relay capable — Go's `endpoint.relayCapable`, i.e.
+    /// `capVerIsRelayCapable(n.Cap())` over the peer's netmap
+    /// [`Node.Cap`][ts_capabilityversion::CapabilityVersion].
+    ///
+    /// Upstream refuses the message outright from a peer below the floor ("is not known to be relay
+    /// capable"), because a peer that does not implement peer relay cannot have legitimately
+    /// allocated the endpoint it is naming — so the endpoint is somebody else's, and handshaking
+    /// against it puts host-sourced packets on the wire for an allocation this node was never part
+    /// of.
+    ///
+    /// Fails closed: an unknown node key, or no
+    /// [`peer_cap_version`](Self::peer_cap_version) lookup installed, is not relay capable. The
+    /// lookup is the only way a peer's capability version reaches this crate — `MagicSock` holds no
+    /// netmap — so its absence is a misconfiguration and is warned about once per socket.
+    fn derp_sender_is_relay_capable(&self, node: &NodePublicKey) -> bool {
+        let Some(lookup) = self.peer_cap_version.as_ref() else {
+            self.warn_no_cap_lookup_once();
+            return false;
+        };
+        let capable = lookup(node).is_some_and(CapabilityVersion::is_relay_capable);
+        if !capable {
+            tracing::debug!(
+                %node,
+                "ignoring call-me-maybe-via: sender is not known to be relay capable"
+            );
+        }
+        capable
     }
 
     /// Whether `sender`'s disco key is a current netmap member.
     ///
-    /// A disco frame carrying no node key (a CallMeMaybe, or a Pong) cannot be checked for the
-    /// exact disco<->node-key binding, so the verifier is queried with `None`: it returns `true`
-    /// only if the sender's disco key is a current netmap member. With no verifier installed we
-    /// fail closed (`false`) — see the [`binding_verifier`](Self::binding_verifier) field doc.
-    /// Emits the one-shot no-verifier warning so a misconfiguration is observable.
+    /// A disco frame carrying no node key and no DERP sender to bind it to (a Pong) cannot be
+    /// checked for the exact disco<->node-key binding, so the verifier is queried with `None`: it
+    /// returns `true` only if the sender's disco key is a current netmap member. With no verifier
+    /// installed we fail closed (`false`) — see the [`binding_verifier`](Self::binding_verifier)
+    /// field doc. Emits the one-shot no-verifier warning so a misconfiguration is observable.
     ///
-    /// Shared by [`call_me_maybe_sender_allowed`](Self::call_me_maybe_sender_allowed) and the Pong
-    /// reflexive-harvest gate in [`handle_disco`](Self::handle_disco): a non-member must not be
-    /// able to make us learn (and then advertise) a candidate endpoint or a reflexive `src`.
+    /// Backs the Pong reflexive-harvest gate in [`handle_disco`](Self::handle_disco): a non-member
+    /// must not be able to make us learn (and then advertise) a reflexive `src`.
     fn disco_sender_is_member(&self, sender: &DiscoPublicKey) -> bool {
         match self.binding_verifier.as_ref() {
             Some(verify) => verify(sender, None),
@@ -2197,7 +2332,7 @@ impl MagicSock {
     /// This is the field-facing half of the divergence documented on
     /// [`relay_addr_allowed`](Self::relay_addr_allowed). Without it the refusal is invisible at the
     /// default log level: the per-address drops are `debug!`, and the endpoint-level drop shares
-    /// one counter with three unrelated `CallMeMaybeVia` rejections, so an operator whose
+    /// one counter with four unrelated `CallMeMaybeVia` rejections, so an operator whose
     /// self-hosted relay server sits on an RFC 1918 address sees only that peers keep using DERP
     /// and has nothing to search for. The message names the cause and the fix, and lists the
     /// addresses that were turned away (at most [`MAX_RELAY_ADDR_PORTS`][crate::relay::MAX_RELAY_ADDR_PORTS]
@@ -2231,6 +2366,16 @@ impl MagicSock {
             tracing::warn!(
                 "disco frames dropped: no binding verifier installed; the route layer must call \
                  with_binding_verifier or the socket fails closed (DERP-only)"
+            );
+        }
+    }
+
+    /// Emit the "no peer capability lookup installed" warning at most once.
+    fn warn_no_cap_lookup_once(&self) {
+        if !self.warned_no_cap_lookup.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "call-me-maybe-via dropped: no peer capability-version lookup installed; the route \
+                 layer must call with_peer_cap_version or no peer-relay path is ever accepted"
             );
         }
     }
@@ -2515,24 +2660,27 @@ impl MagicSock {
                     }
                 }
             }
-            Inbound::CallMeMaybe { sender, endpoints } => {
-                // A CallMeMaybe received directly on the UDP socket. Gate it on netmap membership
-                // exactly like the relayed path, so an unknown/spoofed disco key cannot make us
-                // learn (and then host-probe) attacker-chosen candidate endpoints.
-                let m = crate::metrics::metrics();
-                if self.call_me_maybe_sender_allowed(&sender) {
-                    m.disco_call_me_maybe_recv.inc();
-                    self.add_peer_endpoints(sender, endpoints);
-                    // Immediately ping every candidate, bypassing the 5s discovery floor — the peer
-                    // just told us its firewall is open (Go `endpoint.handleCallMeMaybe` zeroes
-                    // `lastPing` then `sendDiscoPingsLocked`). Non-fatal: a send error here must not
-                    // drop the inbound batch, so log and continue (the periodic prober retries).
-                    if let Err(e) = self.send_pings_to_peer_now(&sender).await {
-                        tracing::debug!(error = %e, "call-me-maybe immediate ping failed");
-                    }
-                } else {
-                    m.disco_call_me_maybe_recv_rejected.inc();
-                }
+            Inbound::CallMeMaybe { sender, .. } => {
+                // A CallMeMaybe that arrived on the UDP socket is dropped, unread. Upstream's
+                // `Conn.handleDiscoMessage` takes `derpNodeSrc` as the sender's identity for this
+                // message, and the UDP receive path calls it with a zero one, so the very first
+                // check in the CallMeMaybe arm — "CallMeMaybe{Via} packets should only come via
+                // DERP" — refuses every UDP-borne one before a single endpoint is read.
+                //
+                // The refusal has teeth here, not just parity: the message carries no node key, so
+                // off the DERP path there is nothing to bind the sealing disco key to. Acting on it
+                // would mean learning peer-chosen candidate endpoints — and host-probing them —
+                // on the say-so of a disco key alone, from any source address that can reach this
+                // socket. A real Tailscale peer only ever sends CallMeMaybe over DERP, so nothing
+                // legitimate is lost.
+                crate::metrics::metrics()
+                    .disco_call_me_maybe_recv_rejected
+                    .inc();
+                tracing::debug!(
+                    %sender,
+                    %from,
+                    "[unexpected] call-me-maybe packets should only come via DERP"
+                );
             }
             // Every peer-relay message is Geneve-encapsulated on the wire (upstream
             // `sendDiscoMessage` sets a Geneve header whenever the destination carries a VNI), so
@@ -2659,20 +2807,35 @@ mod tests {
         "127.0.0.1:0".parse().unwrap()
     }
 
-    /// A verifier that accepts every disco frame. The loopback ping/pong/data tests are not
-    /// exercising the binding check (they have no netmap), so they install this to keep the
-    /// now-fail-closed Ping/CallMeMaybe handlers answering. Tests that *do* exercise the binding
-    /// check build a discriminating closure instead.
-    /// A DERP source for a relayed frame whose handling does not depend on who sent it.
+    /// A DERP source (Go `derpNodeSrc`) carrying a node key nothing is bound to. For relayed-disco
+    /// tests that install [`allow_all`]: the sender's identity cannot change their outcome, only
+    /// its presence matters.
     fn derp_src() -> DerpSource {
+        derp_src_of(ts_keys::NodePrivateKey::random().public_key())
+    }
+
+    /// A DERP source for a frame delivered on `node_key`'s own connection — what a real peer's
+    /// frames look like, and what the sender-binding gate is checked against.
+    fn derp_src_of(node_key: NodePublicKey) -> DerpSource {
         DerpSource {
-            node_key: ts_keys::NodePrivateKey::random().public_key(),
+            node_key,
             region_id: 1,
         }
     }
 
+    /// A verifier that accepts every disco frame. The loopback ping/pong/data tests are not
+    /// exercising the binding check (they have no netmap), so they install this to keep the
+    /// now-fail-closed Ping/CallMeMaybe handlers answering. Tests that *do* exercise the binding
+    /// check build a discriminating closure instead.
     fn allow_all() -> BindingVerifier {
         Arc::new(|_: &DiscoPublicKey, _: Option<&NodePublicKey>| true)
+    }
+
+    /// A capability lookup that reports every node key at [`CapabilityVersion::CURRENT`], which is
+    /// above Go's relay floor. The peer-relay tests are not exercising the relay-capability gate
+    /// (it has its own tests), so they install this to get past it.
+    fn all_relay_capable() -> PeerCapVersionLookup {
+        Arc::new(|_: &NodePublicKey| Some(CapabilityVersion::CURRENT))
     }
 
     /// Bind a magicsock with the IPv6 candidate gate `enable`d (or not) for filter tests.
@@ -3352,9 +3515,10 @@ mod tests {
         }
     }
 
-    /// Bind a magicsock ready to act as a peer-relay client: an allow-all binding verifier (the
-    /// netmap-membership gate has its own test), the loopback relay-address waiver, and a tap on
-    /// everything it puts on the peer-relay wire.
+    /// Bind a magicsock ready to act as a peer-relay client: an allow-all binding verifier and an
+    /// all-relay-capable lookup (the sender-binding and relay-capability gates have their own
+    /// tests), the loopback relay-address waiver, and a tap on everything it puts on the
+    /// peer-relay wire.
     async fn relay_client(our_disco: &DiscoPrivateKey) -> (Arc<MagicSock>, RelaySendTapRx) {
         let a = Arc::new(
             MagicSock::bind(
@@ -3364,7 +3528,8 @@ mod tests {
             )
             .await
             .unwrap()
-            .with_binding_verifier(allow_all()),
+            .with_binding_verifier(allow_all())
+            .with_peer_cap_version(all_relay_capable()),
         );
         a.allow_loopback_relay();
         let rx = a.tap_relay_sends();
@@ -3735,7 +3900,8 @@ mod tests {
             )
             .await
             .unwrap()
-            .with_binding_verifier(allow_all()),
+            .with_binding_verifier(allow_all())
+            .with_peer_cap_version(all_relay_capable()),
         );
         // Note: `allow_loopback_relay` deliberately NOT set — this is the production filter.
         let mut sends = a.tap_relay_sends();
@@ -3788,7 +3954,8 @@ mod tests {
             )
             .await
             .unwrap()
-            .with_binding_verifier(allow_all()),
+            .with_binding_verifier(allow_all())
+            .with_peer_cap_version(all_relay_capable()),
         );
         // Note: `allow_loopback_relay` deliberately NOT set — this is the production filter.
         let mut sends = a.tap_relay_sends();
@@ -3825,8 +3992,9 @@ mod tests {
     ///
     /// Without this an operator running a self-hosted `net/udprelay` server on an RFC 1918 address
     /// has nothing to go on — the per-address drops are `debug!`, and the endpoint-level drop is
-    /// indistinguishable in `magicsock_disco_call_me_maybe_via_recv_rejected` from a non-member
-    /// sender, an endpoint allocated for another pair, or a stale Lamport id. The divergence from
+    /// indistinguishable in `magicsock_disco_call_me_maybe_via_recv_rejected` from a sender that is
+    /// not bound to the DERP connection it arrived on, a sender below the relay-capability floor,
+    /// an endpoint allocated for another pair, or a stale Lamport id. The divergence from
     /// upstream (`relayManager.handshakeServerEndpoint` binds to every non-zero `AddrPort`) is
     /// deliberate; being unable to tell it happened is not.
     ///
@@ -3847,7 +4015,8 @@ mod tests {
             )
             .await
             .unwrap()
-            .with_binding_verifier(allow_all()),
+            .with_binding_verifier(allow_all())
+            .with_peer_cap_version(all_relay_capable()),
         );
         // Note: `allow_loopback_relay` deliberately NOT set — this is the production filter.
         let mut sends = a.tap_relay_sends();
@@ -3937,6 +4106,7 @@ mod tests {
             .await
             .unwrap()
             .with_binding_verifier(allow_all())
+            .with_peer_cap_version(all_relay_capable())
             // The admitted address is a global-unicast IPv6 one purely so this test never puts a
             // datagram on the network: the socket is IPv4-bound, so the send itself fails and is
             // swallowed, while the tap still records that the bind message was addressed at all —
@@ -4005,6 +4175,7 @@ mod tests {
                 .await
                 .unwrap()
                 .with_binding_verifier(allow_all())
+                .with_peer_cap_version(all_relay_capable())
                 .with_enable_ipv6(enable_ipv6),
             );
             // Note: `allow_loopback_relay` deliberately NOT set — this is the production filter.
@@ -4069,7 +4240,8 @@ mod tests {
             )
             .await
             .unwrap()
-            .with_binding_verifier(allow_all()),
+            .with_binding_verifier(allow_all())
+            .with_peer_cap_version(all_relay_capable()),
         );
         // Note: `allow_loopback_relay` deliberately NOT set — this is the production filter.
         let mut sends = a.tap_relay_sends();
@@ -4263,7 +4435,10 @@ mod tests {
             .unwrap()
             .with_binding_verifier(Arc::new(
                 move |disco: &DiscoPublicKey, _: Option<&NodePublicKey>| *disco == member,
-            )),
+            ))
+            // Relay-capable, so the refusal under test is the membership one and not the
+            // capability gate (which has its own test).
+            .with_peer_cap_version(all_relay_capable()),
         );
         a.allow_loopback_relay();
         let mut sends = a.tap_relay_sends();
@@ -4274,6 +4449,94 @@ mod tests {
             RelayedDisco::Consumed
         );
         assert!(sends.try_recv().is_err(), "no handshake for a non-member");
+        assert_eq!(a.relay_path(&fx.peer.public_key()), None);
+    }
+
+    /// A `CallMeMaybeVia` is acted on only when the **sending node** is peer-relay capable — Go's
+    /// `endpoint.relayCapable = capVerIsRelayCapable(n.Cap())`, i.e. `Cap >= 121`. A peer one
+    /// version below the floor starts no bind handshake; the same peer at the floor does.
+    ///
+    /// The two runs differ in exactly one input, the capability version the lookup reports, so the
+    /// floor itself is what the assertion is pinned to. A peer that does not implement peer relay
+    /// cannot have allocated the endpoint it is naming, and handshaking against it would put
+    /// host-sourced packets on the wire for an allocation this node was never part of.
+    #[tokio::test]
+    async fn call_me_maybe_via_requires_a_relay_capable_sender() {
+        /// Feed one `CallMeMaybeVia` to a socket whose capability lookup reports `cap` for every
+        /// node, and report whether a bind message reached the wire.
+        async fn handshake_started(cap: CapabilityVersion) -> bool {
+            let our_disco = DiscoPrivateKey::random();
+            let fx = RelayFixture::new(17);
+            let a = Arc::new(
+                MagicSock::bind(
+                    localhost(),
+                    our_disco.clone(),
+                    ts_keys::NodePrivateKey::random().public_key(),
+                )
+                .await
+                .unwrap()
+                // Allow-all binding: the only gate left to vary is the capability one.
+                .with_binding_verifier(allow_all())
+                .with_peer_cap_version(Arc::new(move |_: &NodePublicKey| Some(cap))),
+            );
+            a.allow_loopback_relay();
+            let mut sends = a.tap_relay_sends();
+
+            let mut frame = fx.call_me_maybe_via(our_disco.public_key());
+            assert_eq!(
+                a.handle_relayed_disco(&mut frame, derp_src()).await,
+                RelayedDisco::Consumed,
+                "a CallMeMaybeVia is consumed as disco either way"
+            );
+            let started = sends.try_recv().is_ok();
+            assert_eq!(
+                a.relay_path(&fx.peer.public_key()),
+                None,
+                "either way no relay path is confirmed by the CallMeMaybeVia alone"
+            );
+            started
+        }
+
+        assert!(
+            !handshake_started(CapabilityVersion::V120).await,
+            "a peer at capability version 120 is below Go's relay floor: no bind handshake"
+        );
+        assert!(
+            handshake_started(CapabilityVersion::V121).await,
+            "a peer at capability version 121 is relay capable: the bind handshake starts"
+        );
+    }
+
+    /// With no capability lookup installed the `CallMeMaybeVia` arm fails closed: nothing can
+    /// establish that the sender is relay capable, so no handshake starts. This is the posture a
+    /// netmap-less or misconfigured construction degrades to — the peer stays on DERP, which costs
+    /// a relay path and nothing else.
+    #[tokio::test]
+    async fn call_me_maybe_via_without_a_capability_lookup_fails_closed() {
+        let our_disco = DiscoPrivateKey::random();
+        let fx = RelayFixture::new(19);
+        let a = Arc::new(
+            MagicSock::bind(
+                localhost(),
+                our_disco.clone(),
+                ts_keys::NodePrivateKey::random().public_key(),
+            )
+            .await
+            .unwrap()
+            .with_binding_verifier(allow_all()),
+        );
+        a.allow_loopback_relay();
+        let mut sends = a.tap_relay_sends();
+
+        let mut frame = fx.call_me_maybe_via(our_disco.public_key());
+        assert_eq!(
+            a.handle_relayed_disco(&mut frame, derp_src()).await,
+            RelayedDisco::Consumed
+        );
+        assert!(
+            sends.try_recv().is_err(),
+            "no capability lookup means no relay-capable sender, so no handshake"
+        );
         assert_eq!(a.relay_path(&fx.peer.public_key()), None);
     }
 
@@ -4779,8 +5042,9 @@ mod tests {
         let bound_disco = a_disco.public_key();
         let verifier: BindingVerifier = Arc::new(
             move |disco: &DiscoPublicKey, claimed: Option<&NodePublicKey>| {
-                // Ping: require the exact disco<->node-key binding. CallMeMaybe (None): membership
-                // is satisfied by the same disco key being known.
+                // Ping, or anything relayed over DERP: require the exact disco<->node-key
+                // binding. Pong (None): membership is satisfied by the same disco key being
+                // known.
                 match claimed {
                     Some(claimed) => *disco == bound_disco && *claimed == bound_node,
                     None => *disco == bound_disco,
@@ -5344,21 +5608,33 @@ mod tests {
         pump.abort();
     }
 
-    /// A directly-received CallMeMaybe is gated on netmap membership: a sender disco key the
-    /// verifier rejects has its endpoints dropped; a member's endpoints are learned (after the
-    /// pingable-candidate filter).
+    /// A DERP-borne CallMeMaybe is bound to the node whose DERP connection delivered it, not merely
+    /// to netmap membership.
+    ///
+    /// Peer A's sealed frame is replayed down peer B's connection — both are members, so a
+    /// membership-only gate would accept it — and nothing is learned. The *same bytes* delivered
+    /// under A's own node key are accepted and A's endpoint is learned, so the refusal is the
+    /// binding and not some unrelated rejection. This is Go's "from peer via DERP whose netmap
+    /// discokey != disco source" (`Conn.handleDiscoMessage`), reached via `endpointForNodeKey` +
+    /// `endpoint.checkAndUpdateDiscoKey`.
+    ///
+    /// A stranger disco key — one bound to no node at all — is refused by the same call.
     #[tokio::test]
-    async fn call_me_maybe_gated_on_membership() {
-        let member_disco = DiscoPrivateKey::random();
+    async fn relayed_call_me_maybe_is_bound_to_the_derp_sender() {
+        let a_disco = DiscoPrivateKey::random();
+        let a_node = ts_keys::NodePrivateKey::random().public_key();
+        let b_node = ts_keys::NodePrivateKey::random().public_key();
         let stranger_disco = DiscoPrivateKey::random();
         let recv_disco = DiscoPrivateKey::random();
         let recv_node = ts_keys::NodePrivateKey::random().public_key();
 
-        // Only `member_disco` is a netmap member; CallMeMaybe carries no node key (claimed=None).
-        let member_pub = member_disco.public_key();
+        // The netmap binds A's disco key to A's node key, and nothing else. B is a member too (it
+        // has a node key the DERP server knows), but no disco key of B's appears here — which is
+        // precisely why a frame sealed by A must not be honoured on B's connection.
+        let a_pub = a_disco.public_key();
         let verifier: BindingVerifier = Arc::new(
             move |disco: &DiscoPublicKey, claimed: Option<&NodePublicKey>| {
-                claimed.is_none() && *disco == member_pub
+                *disco == a_pub && claimed == Some(&a_node)
             },
         );
 
@@ -5370,13 +5646,29 @@ mod tests {
         );
 
         let public_ep: SocketAddr = "203.0.113.40:41641".parse().unwrap();
+        let sealed_by_a =
+            disco::seal_call_me_maybe(&a_disco, &recv_disco.public_key(), &[public_ep]).unwrap();
 
-        // Stranger's CallMeMaybe: rejected, nothing learned.
+        // Delivered on B's DERP connection: the sealing disco key is not one of B's, so nothing is
+        // learned even though the frame itself is perfectly valid.
+        let mut wrong_sender = sealed_by_a.clone();
+        assert_eq!(
+            recv.handle_relayed_disco(&mut wrong_sender, derp_src_of(b_node))
+                .await,
+            RelayedDisco::Consumed,
+            "frame is disco, must be consumed"
+        );
+        assert!(
+            recv.candidate_addrs(&a_pub).is_empty(),
+            "a CallMeMaybe sealed by A but delivered from B's node key must learn nothing"
+        );
+
+        // A stranger disco key bound to no node is refused the same way.
         let mut stranger_frame =
             disco::seal_call_me_maybe(&stranger_disco, &recv_disco.public_key(), &[public_ep])
                 .unwrap();
         assert_eq!(
-            recv.handle_relayed_disco(&mut stranger_frame, derp_src())
+            recv.handle_relayed_disco(&mut stranger_frame, derp_src_of(a_node))
                 .await,
             RelayedDisco::Consumed,
             "frame is disco, must be consumed"
@@ -5387,20 +5679,18 @@ mod tests {
             "stranger CallMeMaybe must not be learned"
         );
 
-        // Member's CallMeMaybe: accepted, endpoint learned.
-        let mut member_frame =
-            disco::seal_call_me_maybe(&member_disco, &recv_disco.public_key(), &[public_ep])
-                .unwrap();
+        // The same bytes from A's own node key: accepted, endpoint learned.
+        let mut right_sender = sealed_by_a;
         assert_eq!(
-            recv.handle_relayed_disco(&mut member_frame, derp_src())
+            recv.handle_relayed_disco(&mut right_sender, derp_src_of(a_node))
                 .await,
             RelayedDisco::Consumed,
             "frame is disco, must be consumed"
         );
         assert_eq!(
-            recv.candidate_addrs(&member_disco.public_key()),
+            recv.candidate_addrs(&a_pub),
             vec![public_ep],
-            "member CallMeMaybe endpoint must be learned"
+            "the same frame from A's own node key must still be learned"
         );
     }
 
@@ -6163,36 +6453,70 @@ mod tests {
         );
     }
 
-    /// An accepted (member) CallMeMaybe increments `disco_call_me_maybe_recv`; a rejected
-    /// (non-member) one increments `disco_call_me_maybe_recv_rejected`. Asserted on deltas.
+    /// An accepted CallMeMaybe — over DERP, from the node key its sealing disco key is bound to —
+    /// increments `disco_call_me_maybe_recv`. Each of the two refusals this arm now applies
+    /// increments `disco_call_me_maybe_recv_rejected` instead: one that arrived on the UDP socket,
+    /// and one delivered under the wrong DERP node key. Asserted on deltas.
     #[tokio::test]
     async fn counters_call_me_maybe_accept_vs_reject() {
         // The CallMeMaybe counters are only moved by counter tests (loopback integration tests use
-        // ping/pong, never a direct-UDP CallMeMaybe), so under the serialization guard these deltas
-        // are exact.
+        // ping/pong, never a CallMeMaybe), so under the serialization guard these deltas are exact.
         let _guard = counter_test_guard().await;
-        let member_disco = DiscoPrivateKey::random();
-        let stranger_disco = DiscoPrivateKey::random();
+        let peer_disco = DiscoPrivateKey::random();
+        let peer_node = ts_keys::NodePrivateKey::random().public_key();
+        let other_node = ts_keys::NodePrivateKey::random().public_key();
         let our_disco = DiscoPrivateKey::random();
         let our_node = ts_keys::NodePrivateKey::random().public_key();
 
-        let member_pub = member_disco.public_key();
-        let verifier: BindingVerifier =
-            Arc::new(move |d: &DiscoPublicKey, claimed: Option<&NodePublicKey>| {
-                claimed.is_none() && *d == member_pub
-            });
-        let sock = MagicSock::bind(localhost(), our_disco, our_node)
+        let peer_pub = peer_disco.public_key();
+        let sock = MagicSock::bind(localhost(), our_disco.clone(), our_node)
             .await
             .unwrap()
-            .with_binding_verifier(verifier);
+            .with_binding_verifier(verifier_for(peer_pub, peer_node));
 
         let ep: SocketAddr = "203.0.113.40:41641".parse().unwrap();
+        let sealed =
+            disco::seal_call_me_maybe(&peer_disco, &our_disco.public_key(), &[ep]).unwrap();
 
-        // Accepted: a member's CallMeMaybe on the UDP path.
+        // Accepted: over DERP, from the node key the netmap binds this disco key to.
+        let before = CounterSnapshot::take();
+        let mut frame = sealed.clone();
+        sock.handle_relayed_disco(&mut frame, derp_src_of(peer_node))
+            .await;
+        let after = CounterSnapshot::take();
+        assert_eq!(
+            after.cmm_recv - before.cmm_recv,
+            1,
+            "a bound DERP-borne CallMeMaybe is counted accepted"
+        );
+        assert_eq!(
+            after.cmm_recv_rejected - before.cmm_recv_rejected,
+            0,
+            "an accepted CallMeMaybe must NOT increment the rejected counter"
+        );
+
+        // Rejected: the same frame, but delivered under somebody else's DERP node key.
+        let before = CounterSnapshot::take();
+        let mut frame = sealed.clone();
+        sock.handle_relayed_disco(&mut frame, derp_src_of(other_node))
+            .await;
+        let after = CounterSnapshot::take();
+        assert_eq!(
+            after.cmm_recv_rejected - before.cmm_recv_rejected,
+            1,
+            "a CallMeMaybe from the wrong DERP sender is counted rejected"
+        );
+        assert_eq!(
+            after.cmm_recv - before.cmm_recv,
+            0,
+            "and must NOT increment the accepted counter"
+        );
+
+        // Rejected: arrived on the UDP socket, where upstream never acts on one.
         let before = CounterSnapshot::take();
         sock.handle_disco(
             Inbound::CallMeMaybe {
-                sender: member_disco.public_key(),
+                sender: peer_pub,
                 endpoints: vec![ep],
             },
             ep,
@@ -6201,37 +6525,14 @@ mod tests {
         .unwrap();
         let after = CounterSnapshot::take();
         assert_eq!(
-            after.cmm_recv - before.cmm_recv,
-            1,
-            "a member CallMeMaybe is counted accepted"
-        );
-        assert_eq!(
-            after.cmm_recv_rejected - before.cmm_recv_rejected,
-            0,
-            "a member CallMeMaybe must NOT increment the rejected counter"
-        );
-
-        // Rejected: a stranger's CallMeMaybe.
-        let before = CounterSnapshot::take();
-        sock.handle_disco(
-            Inbound::CallMeMaybe {
-                sender: stranger_disco.public_key(),
-                endpoints: vec![ep],
-            },
-            ep,
-        )
-        .await
-        .unwrap();
-        let after = CounterSnapshot::take();
-        assert_eq!(
             after.cmm_recv_rejected - before.cmm_recv_rejected,
             1,
-            "a stranger CallMeMaybe is counted rejected"
+            "a UDP-borne CallMeMaybe is counted rejected"
         );
         assert_eq!(
             after.cmm_recv - before.cmm_recv,
             0,
-            "a stranger CallMeMaybe must NOT increment the accepted counter"
+            "and must NOT increment the accepted counter"
         );
     }
 
@@ -7165,80 +7466,54 @@ mod tests {
         );
     }
 
-    /// End-to-end wiring guard for the **direct-UDP** CallMeMaybe path: receiving a member's
-    /// CallMeMaybe via `handle_disco` must kick the immediate force-ping (the whole point of the
-    /// PR), and a *non-member*'s must not. This locks the `send_pings_to_peer_now` call site in
-    /// `handle_disco` against silent deletion — without it, removing that call leaves every other
-    /// test green.
+    /// A CallMeMaybe that arrives on the **UDP socket** is dropped unread: no endpoint is learned
+    /// and no ping is sent, even from a sender an allow-all verifier would happily admit.
     ///
-    /// The detector is the per-candidate discovery floor, not a socket capture: the socket is bound
-    /// to loopback, so a ping to a public candidate cannot actually be delivered — but
-    /// `send_pings_to_peer_now` stamps `note_ping_sent` (which records `last_ping`) under the lock
-    /// *before* the send is attempted. So if the kick fired, a subsequent periodic `send_pings`
-    /// finds the candidate floored and re-pings nothing (0); if the kick were removed, the candidate
-    /// is unstamped and `send_pings` would ping it (1). This is deterministic (return counts, no
-    /// timing, no shared global counter).
+    /// Upstream's `Conn.handleDiscoMessage` identifies a CallMeMaybe's sender by `derpNodeSrc`, and
+    /// the UDP receive path passes a zero one, so the arm's first check — "CallMeMaybe{Via} packets
+    /// should only come via DERP" — refuses every UDP-borne one. The allow-all verifier is the
+    /// point of the test: it proves the drop is the arrival-path refusal and not the binding gate.
+    ///
+    /// Both halves are asserted through the production entry point. `candidate_addrs` shows nothing
+    /// was learned; `send_pings` returning 0 shows nothing was pinged — a learned-and-force-pinged
+    /// candidate would have been stamped by `note_ping_sent`, and an unstamped-but-learned one
+    /// would make the sweep return 1, so 0 with an empty candidate set is the only outcome
+    /// consistent with a full drop.
     #[tokio::test]
-    async fn direct_call_me_maybe_kicks_immediate_ping() {
-        let member_disco = DiscoPrivateKey::random();
-        let stranger_disco = DiscoPrivateKey::random();
+    async fn direct_call_me_maybe_is_dropped_as_derp_only() {
+        let sender_disco = DiscoPrivateKey::random();
         let recv_disco = DiscoPrivateKey::random();
         let recv_node = ts_keys::NodePrivateKey::random().public_key();
 
-        // Only `member_disco` is a netmap member; CallMeMaybe carries no node key (claimed=None).
-        let member_pub = member_disco.public_key();
-        let verifier: BindingVerifier = Arc::new(
-            move |disco: &DiscoPublicKey, claimed: Option<&NodePublicKey>| {
-                claimed.is_none() && *disco == member_pub
-            },
-        );
         let recv = MagicSock::bind(localhost(), recv_disco, recv_node)
             .await
             .unwrap()
-            .with_binding_verifier(verifier);
+            .with_binding_verifier(allow_all());
 
-        // A public (pingable) candidate — loopback would be dropped by `is_pingable_candidate`.
+        // A public (pingable) candidate — loopback would be dropped by `is_pingable_candidate`
+        // anyway, so it could not tell a refusal apart from the sanitizer.
         let public_ep: SocketAddr = "203.0.113.40:41641".parse().unwrap();
         let from: SocketAddr = "198.51.100.7:41641".parse().unwrap();
+        let sender_pub = sender_disco.public_key();
 
-        // Member CallMeMaybe → endpoint learned AND immediately pinged (floor now stamped).
         recv.handle_disco(
             Inbound::CallMeMaybe {
-                sender: member_pub,
+                sender: sender_pub,
                 endpoints: vec![public_ep],
             },
             from,
         )
         .await
         .unwrap();
-        assert_eq!(
-            recv.candidate_addrs(&member_pub),
-            vec![public_ep],
-            "the member CallMeMaybe's endpoint must be learned"
+
+        assert!(
+            recv.candidate_addrs(&sender_pub).is_empty(),
+            "a CallMeMaybe on the UDP socket must learn no endpoint"
         );
-        // The immediate kick stamped `last_ping`, so the periodic prober floors it: 0 re-pings.
-        // If the `send_pings_to_peer_now` call were deleted, this candidate would be unstamped and
-        // `send_pings` would ping it (1) — which is exactly the regression this asserts against.
         assert_eq!(
             recv.send_pings().await.unwrap(),
             0,
-            "the CallMeMaybe already force-pinged the candidate, so the periodic sweep floors it"
-        );
-
-        // Stranger CallMeMaybe → rejected: nothing learned, nothing to ping.
-        recv.handle_disco(
-            Inbound::CallMeMaybe {
-                sender: stranger_disco.public_key(),
-                endpoints: vec!["203.0.113.41:41641".parse().unwrap()],
-            },
-            from,
-        )
-        .await
-        .unwrap();
-        assert!(
-            recv.candidate_addrs(&stranger_disco.public_key())
-                .is_empty(),
-            "a non-member CallMeMaybe is rejected — no candidate, no kick"
+            "and there is nothing for the periodic sweep to ping either"
         );
     }
 

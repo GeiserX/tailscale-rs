@@ -2107,6 +2107,7 @@ dependencies = [
 name = "geiserx_ts_magicsock"
 version = "0.56.2"
 dependencies = [
+ "geiserx_ts_capabilityversion",
  "geiserx_ts_disco_protocol",
  "geiserx_ts_keys",
  "geiserx_ts_metrics",
@@ -2297,6 +2298,7 @@ dependencies = [
  "futures",
  "geiserx_ts_bart",
  "geiserx_ts_bart_packetfilter",
+ "geiserx_ts_capabilityversion",
  "geiserx_ts_control",
  "geiserx_ts_control_serde",
  "geiserx_ts_dataplane",
