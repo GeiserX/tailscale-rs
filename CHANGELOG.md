@@ -2,6 +2,14 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.56.4](https://github.com/GeiserX/tailscale-rs/compare/v0.56.3...v0.56.4) (2026-09-22)
+
+
+### Bug Fixes
+
+* **magic_dns:** answer SERVFAIL when a refusal is mixed with other failures ([#487](https://github.com/GeiserX/tailscale-rs/issues/487)) ([5ce2305](https://github.com/GeiserX/tailscale-rs/commit/5ce2305699a1e43338f5c8537beb3e4816ffe83f))
+* **packetfilter:** surface a rejected packet filter as a health warning ([#492](https://github.com/GeiserX/tailscale-rs/issues/492)) ([c10ac63](https://github.com/GeiserX/tailscale-rs/commit/c10ac63f659bdc55544d3bd17d18900e092472ee))
+
 ## [0.56.3](https://github.com/GeiserX/tailscale-rs/compare/v0.56.2...v0.56.3) (2026-09-22)
 
 
