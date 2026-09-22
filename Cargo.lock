@@ -614,7 +614,7 @@ dependencies = [
 
 [[package]]
 name = "checks"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "clap",
  "globwalk",
@@ -1792,7 +1792,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_tailscale"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1833,7 +1833,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_array256"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "geiserx_ts_bitset",
  "heapless",
@@ -1845,7 +1845,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_bart"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "cfg-if",
  "divan",
@@ -1864,7 +1864,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_bart_packetfilter"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "geiserx_ts_array256",
  "geiserx_ts_bart",
@@ -1879,7 +1879,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_bitset"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "cfg-if",
  "divan",
@@ -1889,14 +1889,14 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_capabilityversion"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "geiserx_ts_control"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1939,7 +1939,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_control_noise"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1964,7 +1964,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_control_serde"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1982,7 +1982,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_dataplane"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "etherparse",
  "geiserx_ts_bart",
@@ -2002,7 +2002,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_derp"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "bytes",
  "crypto_box",
@@ -2030,7 +2030,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_disco_protocol"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "aead 0.5.2",
  "crypto_box",
@@ -2044,11 +2044,11 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_dns_wire"
-version = "0.56.2"
+version = "0.56.3"
 
 [[package]]
 name = "geiserx_ts_dynbitset"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "geiserx_ts_bitset",
  "proptest",
@@ -2057,7 +2057,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_elixir"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "geiserx_tailscale",
  "geiserx_ts_control",
@@ -2068,7 +2068,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_ffi"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "cbindgen",
  "geiserx_tailscale",
@@ -2080,7 +2080,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_forwarder"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "bytes",
  "geiserx_ts_netstack_smoltcp",
@@ -2092,14 +2092,14 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_hexdump"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "heapless",
 ]
 
 [[package]]
 name = "geiserx_ts_host_net"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "ipnet",
  "thiserror 2.0.20",
@@ -2108,7 +2108,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_http_util"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "bytes",
  "futures",
@@ -2129,7 +2129,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_keys"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "crypto_box",
  "ed25519-dalek 2.2.0",
@@ -2145,7 +2145,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_magicsock"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "geiserx_ts_disco_protocol",
  "geiserx_ts_keys",
@@ -2163,14 +2163,14 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_metrics"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "portable-atomic",
 ]
 
 [[package]]
 name = "geiserx_ts_netcheck"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "geiserx_ts_control",
  "geiserx_ts_control_serde",
@@ -2188,7 +2188,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_netmon"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "tokio",
  "tracing",
@@ -2196,7 +2196,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_netstack_smoltcp"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "axum",
  "bytes",
@@ -2217,7 +2217,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_netstack_smoltcp_core"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "bytes",
  "flume",
@@ -2231,7 +2231,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_netstack_smoltcp_socket"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "bytes",
  "futures-io",
@@ -2242,7 +2242,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_nodecapability"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "cfg-if",
  "serde",
@@ -2251,7 +2251,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_overlay_router"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "geiserx_ts_bart",
  "geiserx_ts_packet",
@@ -2262,7 +2262,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_packet"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "bytes",
  "crypto_box",
@@ -2271,7 +2271,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_packetfilter"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "hashbrown 0.17.1",
  "ipnet",
@@ -2281,7 +2281,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_packetfilter_serde"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "geiserx_ts_nodecapability",
  "geiserx_ts_peercapability",
@@ -2294,7 +2294,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_packetfilter_state"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "divan",
  "geiserx_ts_bart_packetfilter",
@@ -2307,7 +2307,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_peercapability"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "serde",
  "url",
@@ -2315,7 +2315,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_python"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "geiserx_tailscale",
  "geiserx_ts_control",
@@ -2328,7 +2328,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_runtime"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2376,14 +2376,14 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_time"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "geiserx_ts_tka"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "argon2",
  "blake2 0.10.6",
@@ -2395,7 +2395,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_tls_util"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "rcgen",
  "ring",
@@ -2410,14 +2410,14 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_transport"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "geiserx_ts_packet",
 ]
 
 [[package]]
 name = "geiserx_ts_transport_tun"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "bytes",
  "geiserx_ts_hexdump",
@@ -2433,7 +2433,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_tunnel"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "aead 0.5.2",
  "base64 0.22.1",
@@ -2460,7 +2460,7 @@ dependencies = [
 
 [[package]]
 name = "geiserx_ts_underlay_router"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "geiserx_ts_packet",
  "geiserx_ts_transport",
@@ -6424,7 +6424,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "ts_cli_util"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "cfg-if",
  "clap",
@@ -6443,7 +6443,7 @@ dependencies = [
 
 [[package]]
 name = "ts_devtools"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "bytes",
  "clap",
@@ -6459,7 +6459,7 @@ dependencies = [
 
 [[package]]
 name = "ts_test_util"
-version = "0.56.2"
+version = "0.56.3"
 
 [[package]]
 name = "tun-rs"
