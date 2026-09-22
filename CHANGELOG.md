@@ -2,6 +2,15 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.56.3](https://github.com/GeiserX/tailscale-rs/compare/v0.56.2...v0.56.3) (2026-09-22)
+
+
+### Bug Fixes
+
+* **magicsock:** answer a disco ping that reaches this node over DERP ([#472](https://github.com/GeiserX/tailscale-rs/issues/472)) ([8e2de14](https://github.com/GeiserX/tailscale-rs/commit/8e2de14151ef4f4c7b90f677a6c6bd1c8edf537a))
+* **magicsock:** stop an unchallenged address confirming a relay path ([#474](https://github.com/GeiserX/tailscale-rs/issues/474)) ([2f7bba7](https://github.com/GeiserX/tailscale-rs/commit/2f7bba79279f8148fcae1b20b828bdb24bfaa1e0))
+* **tun:** port Go's one-CGNAT route decision and keep its 10000 ceiling ([#475](https://github.com/GeiserX/tailscale-rs/issues/475)) ([225ea44](https://github.com/GeiserX/tailscale-rs/commit/225ea442d887713427b6f723b86966355d9d69df))
+
 ## [0.56.2](https://github.com/GeiserX/tailscale-rs/compare/v0.56.1...v0.56.2) (2026-09-13)
 
 
