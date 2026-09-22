@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.56.5](https://github.com/GeiserX/tailscale-rs/compare/v0.56.4...v0.56.5) (2026-09-22)
+
+
+### Bug Fixes
+
+* **magicsock:** bind an inbound CallMeMaybe to the peer that relayed it ([#503](https://github.com/GeiserX/tailscale-rs/issues/503)) ([5dcb06f](https://github.com/GeiserX/tailscale-rs/commit/5dcb06f2d293316ecc9d4b665ba5e8e82e5e8b82))
+
 ## [0.56.4](https://github.com/GeiserX/tailscale-rs/compare/v0.56.3...v0.56.4) (2026-09-22)
 
 
