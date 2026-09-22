@@ -697,8 +697,9 @@ impl Node {
     /// value, so the lookup is on the whole literal.
     const NODE_ATTR_ONE_CGNAT_ENABLE: &'static str = "one-cgnat?v=true";
 
-    /// The node attribute by which control asks this node NOT to collapse its per-peer CGNAT host
-    /// routes (Go `tailcfg/nodecap`'s `OneCGNATDisable`). The other half of
+    /// The node attribute by which control asks this node NOT to force the collapsed route (Go
+    /// `tailcfg/nodecap`'s `OneCGNATDisable`): one host route per peer until the consumer's own
+    /// peer-count ceiling, which still applies. The other half of
     /// [`NODE_ATTR_ONE_CGNAT_ENABLE`](Self::NODE_ATTR_ONE_CGNAT_ENABLE)'s tri-state.
     ///
     /// It declines the **forced** collapse only. It is not a licence for an unbounded host route
@@ -713,10 +714,12 @@ impl Node {
     /// into `controlknobs.Knobs.OneCGNAT`, which is an `opt.Bool` and not a `bool` precisely so the
     /// third state exists:
     ///
-    /// * `Some(true)` — `one-cgnat?v=true`: always collapse.
-    /// * `Some(false)` — `one-cgnat?v=false`: do not force the collapse; keep one `/32` per peer.
-    /// * `None` — neither attribute present: control has no opinion, and the consumer decides for
-    ///   itself (Go `ipn/ipnlocal`'s `shouldUseOneCGNATRoute` consults the platform).
+    /// * `Some(true)` — `one-cgnat?v=true`: collapse as soon as there is more than one peer route.
+    /// * `Some(false)` — `one-cgnat?v=false`: do not force the collapse, whatever the platform
+    ///   would default to. It is NOT "never collapse": the consumer's peer-count ceiling (Go
+    ///   `net/routemanager`'s `cgnatThreshold`) still collapses a large enough tailnet.
+    /// * `None` — neither attribute present: control has no opinion, and the consumer's platform
+    ///   default decides (Go `ipn/ipnlocal`'s `shouldUseOneCGNATRoute`), under the same ceiling.
     ///
     /// What the third state does NOT do is switch the consumer's peer-count ceiling off. Upstream
     /// resolves this `opt.Bool` down to a plain `bool` before the route manager sees it, and
@@ -2250,7 +2253,7 @@ pub(crate) mod tests {
         assert_eq!(
             n.one_cgnat(),
             None,
-            "neither attribute → control has no opinion, the threshold decides"
+            "neither attribute → control has no opinion, the platform default decides"
         );
 
         // The key carries a query string; the bare `one-cgnat` is not the attribute and must not
