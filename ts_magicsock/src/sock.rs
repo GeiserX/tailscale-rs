@@ -25,7 +25,7 @@ use crate::{
     endpoint::{SelfEndpoint, SelfEndpointType},
     error::Error,
     path::PeerPaths,
-    relay::{HandshakeState, RelayPaths, RelayServerEndpoint},
+    relay::{HandshakeState, RelayBinding, RelayPaths, RelayServerEndpoint},
 };
 
 /// Maximum UDP datagram we will read. Tailscale uses 1280-byte WireGuard MTU; round up for
@@ -1865,6 +1865,12 @@ impl MagicSock {
     /// Unlike the direct path this deliberately does **not** learn `from` as a candidate endpoint:
     /// `from` is the *relay server's* address, and adding it to [`PeerPaths`] would make us send
     /// naked disco and naked WireGuard to a relay that only understands the Geneve framing.
+    ///
+    /// The pong goes back to `from` whatever state the endpoint is in — upstream pongs a relayed
+    /// ping at its own source unconditionally — but the **ping back** is the outstanding
+    /// handshake's, and so goes out only when `from` is the address that handshake is bound to.
+    /// See [`RelayBinding`] for the rule and [`handle_relay_pong`](Self::handle_relay_pong) for its
+    /// other half.
     async fn handle_relay_ping(
         &self,
         sender: DiscoPublicKey,
@@ -1874,17 +1880,18 @@ impl MagicSock {
         vni: u32,
     ) -> Result<(), Error> {
         let m = crate::metrics::metrics();
-        let known = {
+        let binding = {
             let relay = lock(&self.relay_paths);
             relay
                 .get(&sender)
-                .is_some_and(|path| path.endpoint.vni == vni)
+                .filter(|path| path.endpoint.vni == vni)
+                .map(|path| path.binding())
         };
-        if !known {
+        let Some(binding) = binding else {
             tracing::trace!(%from, "dropping relayed ping: no handshake with this peer on this VNI");
             m.disco_ping_recv_rejected.inc();
             return Ok(());
-        }
+        };
         let Some(claimed_node_key) = claimed_node_key else {
             m.disco_ping_recv_rejected.inc();
             return Ok(());
@@ -1911,11 +1918,29 @@ impl MagicSock {
             m.disco_pong_sent.inc();
         }
 
-        // An inbound relayed ping means our answer reached the server and the peer is live on the
-        // endpoint; ours may have been dropped while the peer's side was still handshaking. Ping
-        // back so we can measure the round trip and confirm the path from our side too (upstream
-        // does the same, and the in-flight cap is what keeps this from becoming a ping storm).
-        self.send_relay_ping(sender, from, vni).await?;
+        // An inbound relayed ping on the address our outstanding handshake is bound to means our
+        // answer reached the server and the peer is live on the endpoint; ours may have been
+        // dropped while the peer's side was still handshaking. Ping back so we can measure the
+        // round trip and confirm the path from our side too (upstream's handshake does the same,
+        // and the in-flight cap is what keeps this from becoming a ping storm).
+        //
+        // Anywhere else, no ping goes out. Upstream reaches its handshake only under the
+        // `addrPortVNI` key the challenge it answered was recorded under: before that key exists
+        // the handshake ignores a relayed ping outright, and once the handshake is done there is
+        // no outstanding work for a relayed ping to reach at all — a confirmed path is kept alive
+        // by this node's own refresh pings, not by the peer's. Pinging an address that never
+        // challenged us would put an in-flight ping on it, and the pong answering that ping would
+        // then confirm a path there.
+        if binding == RelayBinding::Handshake(from) {
+            self.send_relay_ping(sender, from, vni).await?;
+        } else {
+            tracing::trace!(
+                %from,
+                vni,
+                ?binding,
+                "relayed ping ponged but not pinged back: no handshake bound to this source"
+            );
+        }
         Ok(())
     }
 
@@ -1926,13 +1951,22 @@ impl MagicSock {
     /// observed is the *relay server's* view, not ours, so learning it would advertise an address
     /// that is not ours to control and to every other peer.
     ///
-    /// `from` — the address the pong itself arrived from — is taken as given, upstream's behaviour
-    /// and for upstream's reason: nothing is ever sent to it. It is recorded only in the
-    /// `(addr, VNI) → peer` map that attributes inbound relayed WireGuard, and only once
-    /// `note_pong` has matched a transaction id from a ping this node sent to an address that
+    /// While the bind handshake is still outstanding, `from` must be the address whose challenge
+    /// this node answered: that is the `addrPortVNI` key upstream records the handshake under, and
+    /// a pong arriving under any other key is discarded there with "No outstanding work tied to
+    /// this addrPortVNI". Upstream's usable path is that challenge's own source by construction,
+    /// so nothing else may complete the handshake here either — a pong that merely carried a valid
+    /// transaction id would otherwise confirm a path at an address that never challenged us.
+    ///
+    /// Once a path is confirmed the handshake is over and `from` is taken as given, upstream's
+    /// behaviour for its refresh pongs — `endpoint.handlePongConnLocked` matches those by
+    /// transaction id alone — and for upstream's reason: nothing is ever sent to it. It is recorded
+    /// only in the `(addr, VNI) → peer` map that attributes inbound relayed WireGuard, and only
+    /// once `note_pong` has matched a transaction id from a ping this node sent to an address that
     /// already passed the relay-address filter. See
-    /// [`relay_reply_target_allowed`](Self::relay_reply_target_allowed) for why the filter stops
-    /// short of this branch.
+    /// [`relay_reply_target_allowed`](Self::relay_reply_target_allowed) for why the address-class
+    /// filter stops short of this branch, and `set_confirmed_addrs` for why a differing source is
+    /// attributed at all.
     fn handle_relay_pong(
         &self,
         sender: DiscoPublicKey,
@@ -1944,16 +1978,30 @@ impl MagicSock {
         m.disco_pong_recv.inc();
         let now = Instant::now();
         let mut relay = lock(&self.relay_paths);
+        let Some(path) = relay
+            .get_mut(&sender)
+            .filter(|path| path.endpoint.vni == vni)
+        else {
+            return;
+        };
+        // Gate on the source before the transaction id, not after: a pong that is not this
+        // handshake's must not consume the in-flight record of a ping that is still waiting for
+        // its real answer.
+        if !path.accepts_pong_from(from) {
+            tracing::debug!(
+                %from,
+                vni,
+                "dropping relayed pong: no outstanding handshake bound to this source"
+            );
+            return;
+        }
         // Take the match and the usability separately. Whether the pong was *solicited* is
         // decided by `note_pong` alone — the transaction id matched a ping we sent through this
         // endpoint — and folding `usable` into that match would silently reclassify a solicited
         // pong as an unknown one whenever the endpoint happens to hold no trusted address.
-        let matched = match relay.get_mut(&sender) {
-            Some(path) if path.endpoint.vni == vni => path
-                .note_pong(tx_id, now)
-                .map(|(to, latency)| (to, latency, path.usable(now))),
-            _ => None,
-        };
+        let matched = path
+            .note_pong(tx_id, now)
+            .map(|(to, latency)| (to, latency, path.usable(now)));
         let Some((to, latency, usable)) = matched else {
             return;
         };
@@ -2208,9 +2256,15 @@ impl MagicSock {
     /// WireGuard, and only after `note_pong` matched a transaction id from a ping this node itself
     /// sent to an already-sanitized address. Nothing this node emits is aimed at a pong's source —
     /// [`relay_path`](Self::relay_path) returns the confirmed address the ping went *to* — so
-    /// filtering a pong by source would cost upstream parity and buy nothing. A relay server that
-    /// answers a relayed ping from an address in a refused class therefore still confirms the path,
-    /// exactly as it does against a Go client.
+    /// filtering a pong by *address class* would cost upstream parity and buy nothing. A relay
+    /// server that answers a refresh ping from an address in a refused class therefore still
+    /// confirms the path, exactly as it does against a Go client.
+    ///
+    /// That is the class filter, and it is a separate question from *which handshake* an inbound
+    /// relay message belongs to. While a bind handshake is still outstanding, both the pong branch
+    /// and the ping-back half of the ping branch are keyed on the address whose challenge this node
+    /// answered, which is upstream's own rule rather than this fork's — see
+    /// [`RelayBinding`] and [`handle_relay_pong`](Self::handle_relay_pong).
     ///
     /// The interop cost of what is kept is nil in practice: the handshake only exists because a bind
     /// message already went to a routable address that passed `relay_addr_allowed`, so a real relay
@@ -3801,6 +3855,10 @@ mod tests {
     ///
     /// It also does not make the relay server's address a direct candidate: doing so would have us
     /// send naked disco and naked WireGuard to a relay that only speaks the Geneve framing.
+    ///
+    /// And it is ponged and nothing more. Upstream's handshake work is gone once the handshake is
+    /// done, so a relayed ping on a confirmed path reaches nothing that would ping back; this
+    /// node's own refresh pings are what keep the path's trust from lapsing.
     #[tokio::test]
     async fn a_relayed_ping_is_ponged_through_the_relay_and_learns_no_candidate() {
         let our_disco = DiscoPrivateKey::random();
@@ -3829,6 +3887,10 @@ mod tests {
             other => panic!("expected a pong, got {other:?}"),
         }
 
+        assert!(
+            sends.try_recv().is_err(),
+            "a confirmed path has no outstanding handshake for a relayed ping to ping back from"
+        );
         assert!(
             !a.candidate_addrs(&peer_pub).contains(&fx.addr),
             "a relay server address must never become a direct candidate"
@@ -4223,9 +4285,9 @@ mod tests {
     /// the challenge on the wire with the source set to loopback, the cloud metadata address, or a
     /// LAN host — and this node emits a bind answer and a disco ping at it.
     ///
-    /// The companion of `a_relayed_pong_from_any_source_still_confirms_the_path`, which pins the
+    /// The companion of `a_refresh_pong_from_any_source_still_confirms_the_path`, which pins the
     /// other half: the branch that replies to nothing keeps upstream's take-the-source-as-given
-    /// behaviour.
+    /// behaviour once the handshake is over.
     #[tokio::test]
     async fn a_relay_message_from_a_forbidden_source_is_dropped() {
         let our_disco = DiscoPrivateKey::random();
@@ -4278,55 +4340,58 @@ mod tests {
         assert_eq!(to, elsewhere, "the answer goes back to the challenger");
     }
 
-    /// A relayed pong confirms the path whatever address it arrives from — upstream's behaviour,
-    /// kept because the reason the other two branches are filtered does not reach this one.
+    /// Once the handshake is over, a refresh pong confirms the path whatever address it arrives
+    /// from — upstream's behaviour, kept because the reason the other branches are filtered does
+    /// not reach this one.
     ///
-    /// Upstream `relayManager.handleRxDiscoMsg` passes `src.ap` straight through and keys handshake
-    /// work by `(server disco, VNI)`, testing the source against no address class. This node does
-    /// filter that source on the two branches that reply to it (see
+    /// Upstream matches a refresh pong in `endpoint.handlePongConnLocked`, by transaction id alone;
+    /// the relay leg's source is never tested against an address class. This node does filter that
+    /// source on the branches that reply to it (see
     /// `a_relay_message_from_a_forbidden_source_is_dropped`), because there it is a host-sourced
     /// send target. A pong is replied to with nothing: its source is recorded only in the map that
     /// attributes inbound relayed WireGuard, and only after the transaction id matched a ping this
     /// node sent to `fx.addr` — an address that already passed the relay-address filter. Dropping
-    /// it would strand a handshake that is otherwise complete and push the peer back to DERP for no
-    /// gain, so it is not dropped.
+    /// it would strand a live path and push the peer back to DERP for no gain, so it is not
+    /// dropped.
     ///
     /// The pong here arrives from an RFC 1918 address, a class this socket's `relay_addr_allowed`
-    /// refuses — asserted below, so a source filter re-added on the pong branch fails this test —
-    /// while every byte this node emits still goes to `fx.addr`.
+    /// refuses — asserted below, so a source-class filter re-added on the pong branch fails this
+    /// test — while every byte this node emits still goes to `fx.addr`.
+    ///
+    /// This is the *refresh* half only. The handshake's own pong is bound to the address that
+    /// challenged this node, which `a_handshake_pong_from_another_address_does_not_confirm` pins.
     ///
     /// The stand-in relay is on loopback under the loopback-only test waiver, not on a documentation
     /// address: a socket bound to `127.0.0.1` cannot send off-host on Linux, so the challenge answer
     /// would fail with `EINVAL` and the relayed ping this test answers would never be sent.
     #[tokio::test]
-    async fn a_relayed_pong_from_any_source_still_confirms_the_path() {
+    async fn a_refresh_pong_from_any_source_still_confirms_the_path() {
         let our_disco = DiscoPrivateKey::random();
         let fx = RelayFixture::new(37);
         let peer_pub = fx.peer.public_key();
         let (a, mut sends) = relay_client(&our_disco).await;
-        let generation = begin_handshake(&a, &fx, &our_disco, &mut sends).await;
 
-        let mut challenge = fx.challenge(our_disco.public_key(), fx.vni, generation, 3);
-        a.handle_relay_disco(&mut challenge, fx.addr, fx.vni, true)
-            .await;
-        drop(sends.try_recv().expect("an answer must be sent"));
+        // The handshake completes normally: challenge from `fx.addr`, ping to it, pong from it.
+        confirm_relay_path(&a, &fx, &our_disco, &mut sends).await;
+        assert_eq!(a.relay_path(&peer_pub), Some((fx.addr, fx.vni)));
+
+        // A refresh ping through the confirmed address...
+        assert!(
+            a.send_relay_ping(peer_pub, fx.addr, fx.vni).await.unwrap(),
+            "the refresh ping must go out"
+        );
         let (ping_to, wire) = sends.try_recv().expect("a relayed ping must be sent");
         assert_eq!(
             ping_to, fx.addr,
-            "the ping goes to the relay address the handshake started with"
+            "the refresh ping goes to the confirmed address"
         );
         let mut ping = expect_relay_frame(&wire, fx.vni, false);
         let tx_id = match disco::open(&fx.peer, &mut ping).unwrap() {
             Inbound::Ping { tx_id, .. } => tx_id,
             other => panic!("expected a ping, got {other:?}"),
         };
-        assert_eq!(
-            a.relay_path(&peer_pub),
-            None,
-            "nothing is confirmed until the pong lands"
-        );
 
-        // The relay forwards the peer's pong from a source in a class `relay_addr_allowed` refuses.
+        // ...answered by the relay from a source in a class `relay_addr_allowed` refuses.
         let observed: SocketAddr = "10.0.0.5:52000".parse().unwrap();
         assert!(
             !a.relay_addr_allowed(&observed),
@@ -4339,7 +4404,7 @@ mod tests {
         assert_eq!(
             a.relay_path(&peer_pub),
             Some((fx.addr, fx.vni)),
-            "the pong confirms the path it answers, whatever address it arrived from"
+            "the refresh pong confirms the path it answers, whatever address it arrived from"
         );
         {
             let relay = lock(&a.relay_paths);
@@ -4357,6 +4422,172 @@ mod tests {
         assert!(
             sends.try_recv().is_err(),
             "a pong is answered with nothing, so its source is never a send target"
+        );
+    }
+
+    /// While the bind handshake is outstanding, only the address whose challenge this node answered
+    /// may complete it. A pong from anywhere else is discarded even when it carries a transaction
+    /// id of a ping we really sent.
+    ///
+    /// Upstream records `addrPortVNI{from, vni}` against a handshake when it accepts that
+    /// handshake's challenge, and a relayed pong reaches the handshake only under that key —
+    /// otherwise it is dropped as "No outstanding work tied to this addrPortVNI". The path upstream
+    /// then makes usable is `done.pongReceivedFrom`, the challenge's own source by construction.
+    /// Without the key, a pong from an address that never challenged this node confirms a path,
+    /// and the address it confirms becomes a WireGuard destination.
+    ///
+    /// The second half is why the gate runs *before* the transaction id is consumed: the real pong,
+    /// arriving late from the challenger, must still complete the handshake.
+    #[tokio::test]
+    async fn a_handshake_pong_from_another_address_does_not_confirm() {
+        let our_disco = DiscoPrivateKey::random();
+        let fx = RelayFixture::new(53);
+        let peer_pub = fx.peer.public_key();
+        let (a, mut sends) = relay_client(&our_disco).await;
+
+        let generation = begin_handshake(&a, &fx, &our_disco, &mut sends).await;
+        let mut challenge = fx.challenge(our_disco.public_key(), fx.vni, generation, 3);
+        a.handle_relay_disco(&mut challenge, fx.addr, fx.vni, true)
+            .await;
+        drop(sends.try_recv().expect("an answer must be sent"));
+        let (ping_to, wire) = sends.try_recv().expect("a relayed ping must be sent");
+        assert_eq!(
+            ping_to, fx.addr,
+            "the handshake pings the address that challenged it"
+        );
+        let mut ping = expect_relay_frame(&wire, fx.vni, false);
+        let tx_id = match disco::open(&fx.peer, &mut ping).unwrap() {
+            Inbound::Ping { tx_id, .. } => tx_id,
+            other => panic!("expected a ping, got {other:?}"),
+        };
+
+        // A pong with that very transaction id, from an address that never challenged us. It is on
+        // loopback, so the test waiver admits it: the address class is not what refuses it here.
+        let stranger: SocketAddr = "127.0.0.1:41999".parse().unwrap();
+        assert!(a.relay_addr_allowed(&stranger));
+        let mut pong = disco::seal_pong(&fx.peer, &our_disco.public_key(), tx_id, fx.addr).unwrap();
+        a.handle_relay_disco(&mut pong, stranger, fx.vni, false)
+            .await;
+        assert_eq!(
+            a.relay_path(&peer_pub),
+            None,
+            "a pong from an address that did not challenge us must not complete the handshake"
+        );
+        assert_eq!(
+            lock(&a.relay_paths).peer_for_addr(stranger, fx.vni),
+            None,
+            "and must attribute no inbound data to itself"
+        );
+
+        // The challenger's own pong, with the same transaction id, still completes it: the stray
+        // pong above did not consume the in-flight record.
+        let mut pong = disco::seal_pong(&fx.peer, &our_disco.public_key(), tx_id, fx.addr).unwrap();
+        a.handle_relay_disco(&mut pong, fx.addr, fx.vni, false)
+            .await;
+        assert_eq!(
+            a.relay_path(&peer_pub),
+            Some((fx.addr, fx.vni)),
+            "the challenger's pong is the one that confirms"
+        );
+    }
+
+    /// A relayed ping is ponged at its own source whatever the handshake's state — upstream pongs
+    /// it unconditionally — but the ping *back* belongs to the outstanding handshake, so it goes out
+    /// only for the address that handshake is bound to.
+    ///
+    /// The ping back is what makes an unbound source dangerous: it puts an in-flight ping at an
+    /// address that never challenged this node, and the pong answering that ping would then confirm
+    /// a path there. Upstream reaches its handshake only under the `addrPortVNI` key of the
+    /// challenge it answered, so a ping from anywhere else triggers nothing.
+    #[tokio::test]
+    async fn a_relayed_ping_from_an_unbound_address_is_ponged_but_pings_nothing_back() {
+        let our_disco = DiscoPrivateKey::random();
+        let fx = RelayFixture::new(59);
+        let (a, mut sends) = relay_client(&our_disco).await;
+
+        let generation = begin_handshake(&a, &fx, &our_disco, &mut sends).await;
+        let mut challenge = fx.challenge(our_disco.public_key(), fx.vni, generation, 4);
+        a.handle_relay_disco(&mut challenge, fx.addr, fx.vni, true)
+            .await;
+        drop(sends.try_recv().expect("an answer must be sent"));
+        drop(sends.try_recv().expect("the handshake's ping must be sent"));
+
+        // A relayed ping from an address that never challenged us. Loopback, so the reply-target
+        // class filter admits it and the handshake binding is the only thing that can refuse.
+        let stranger: SocketAddr = "127.0.0.1:41999".parse().unwrap();
+        assert!(a.relay_addr_allowed(&stranger));
+        let mut ping =
+            disco::seal_ping(&fx.peer, fx.peer_node, &our_disco.public_key(), [5u8; 12]).unwrap();
+        a.handle_relay_disco(&mut ping, stranger, fx.vni, false)
+            .await;
+
+        let (to, wire) = sends.try_recv().expect("the ping must still be ponged");
+        assert_eq!(to, stranger, "the pong goes back to the ping's own source");
+        let mut pong = expect_relay_frame(&wire, fx.vni, false);
+        assert!(matches!(
+            disco::open(&fx.peer, &mut pong).unwrap(),
+            Inbound::Pong { .. }
+        ));
+        assert!(
+            sends.try_recv().is_err(),
+            "but no ping may go on the wire toward an address that never challenged us"
+        );
+
+        // The same ping from the bound address does ping back, so it is the key that differs and
+        // not some unrelated refusal.
+        let mut ping =
+            disco::seal_ping(&fx.peer, fx.peer_node, &our_disco.public_key(), [6u8; 12]).unwrap();
+        a.handle_relay_disco(&mut ping, fx.addr, fx.vni, false)
+            .await;
+        let (to, _) = sends.try_recv().expect("a pong");
+        assert_eq!(to, fx.addr);
+        let (to, wire) = sends
+            .try_recv()
+            .expect("the bound address must get a ping back");
+        assert_eq!(to, fx.addr);
+        let mut ping_back = expect_relay_frame(&wire, fx.vni, false);
+        assert!(matches!(
+            disco::open(&fx.peer, &mut ping_back).unwrap(),
+            Inbound::Ping { .. }
+        ));
+    }
+
+    /// A relayed ping that arrives before any challenge has been answered is ponged and nothing
+    /// else: upstream's handshake ignores a relayed ping until its own answer has been sent.
+    ///
+    /// There is no address bound to the handshake yet, so there is nothing for the ping to match —
+    /// and pinging back here would aim a probe at whatever wrote the source field before the relay
+    /// server had proved it was even listening.
+    #[tokio::test]
+    async fn a_relayed_ping_before_the_answer_pings_nothing_back() {
+        let our_disco = DiscoPrivateKey::random();
+        let fx = RelayFixture::new(61);
+        let (a, mut sends) = relay_client(&our_disco).await;
+
+        // The bind message has gone out; no challenge has been answered.
+        begin_handshake(&a, &fx, &our_disco, &mut sends).await;
+        assert_eq!(
+            lock(&a.relay_paths)
+                .get(&fx.peer.public_key())
+                .unwrap()
+                .state,
+            HandshakeState::BindSent
+        );
+
+        let mut ping =
+            disco::seal_ping(&fx.peer, fx.peer_node, &our_disco.public_key(), [7u8; 12]).unwrap();
+        a.handle_relay_disco(&mut ping, fx.addr, fx.vni, false)
+            .await;
+
+        let (to, wire) = sends.try_recv().expect("the ping must still be ponged");
+        assert_eq!(to, fx.addr);
+        assert!(matches!(
+            disco::open(&fx.peer, &mut expect_relay_frame(&wire, fx.vni, false)).unwrap(),
+            Inbound::Pong { .. }
+        ));
+        assert!(
+            sends.try_recv().is_err(),
+            "an unanswered handshake must put no ping on the wire"
         );
     }
 
