@@ -20,6 +20,9 @@ chrono = { workspace = true }
 # Our crates.
 ts_bart.workspace = true
 ts_bart_packetfilter.workspace = true
+# The peer capability version (`tailcfg.Node.Cap`) the inbound CallMeMaybeVia gate reads off the
+# netmap before handing it to the magicsock. Already in the graph via `ts_control`.
+ts_capabilityversion.workspace = true
 ts_control.workspace = true
 ts_dataplane.workspace = true
 ts_dns_wire.workspace = true
