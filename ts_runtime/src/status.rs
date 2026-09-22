@@ -51,6 +51,11 @@ pub struct Status {
     /// **not** from the DNS config and **not** from the tailnet `Domain` name. `None` before the first
     /// netmap, or when the self FQDN has no tailnet component (a bare hostname).
     pub magic_dns_suffix: Option<String>,
+    /// The text of every health warning currently raised (Go `ipnstate.Status.Health`). Empty when
+    /// healthy. Today the one warning this runtime raises is Go's `invalid-packet-filter`: control
+    /// sent a packet filter granting an unlocked (tailnet-lock-unsigned) peer access, so this node is
+    /// rejecting all inbound packets.
+    pub health: Vec<String>,
 }
 
 /// A single node entry in a [`Status`] snapshot.
