@@ -2,6 +2,30 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.56.5](https://github.com/GeiserX/tailscale-rs/compare/v0.56.4...v0.56.5) (2026-09-22)
+
+
+### Bug Fixes
+
+* **magicsock:** bind an inbound CallMeMaybe to the peer that relayed it ([#503](https://github.com/GeiserX/tailscale-rs/issues/503)) ([5dcb06f](https://github.com/GeiserX/tailscale-rs/commit/5dcb06f2d293316ecc9d4b665ba5e8e82e5e8b82))
+
+## [0.56.4](https://github.com/GeiserX/tailscale-rs/compare/v0.56.3...v0.56.4) (2026-09-22)
+
+
+### Bug Fixes
+
+* **magic_dns:** answer SERVFAIL when a refusal is mixed with other failures ([#487](https://github.com/GeiserX/tailscale-rs/issues/487)) ([5ce2305](https://github.com/GeiserX/tailscale-rs/commit/5ce2305699a1e43338f5c8537beb3e4816ffe83f))
+* **packetfilter:** surface a rejected packet filter as a health warning ([#492](https://github.com/GeiserX/tailscale-rs/issues/492)) ([c10ac63](https://github.com/GeiserX/tailscale-rs/commit/c10ac63f659bdc55544d3bd17d18900e092472ee))
+
+## [0.56.3](https://github.com/GeiserX/tailscale-rs/compare/v0.56.2...v0.56.3) (2026-09-22)
+
+
+### Bug Fixes
+
+* **magicsock:** answer a disco ping that reaches this node over DERP ([#472](https://github.com/GeiserX/tailscale-rs/issues/472)) ([8e2de14](https://github.com/GeiserX/tailscale-rs/commit/8e2de14151ef4f4c7b90f677a6c6bd1c8edf537a))
+* **magicsock:** stop an unchallenged address confirming a relay path ([#474](https://github.com/GeiserX/tailscale-rs/issues/474)) ([2f7bba7](https://github.com/GeiserX/tailscale-rs/commit/2f7bba79279f8148fcae1b20b828bdb24bfaa1e0))
+* **tun:** port Go's one-CGNAT route decision and keep its 10000 ceiling ([#475](https://github.com/GeiserX/tailscale-rs/issues/475)) ([225ea44](https://github.com/GeiserX/tailscale-rs/commit/225ea442d887713427b6f723b86966355d9d69df))
+
 ## [0.56.2](https://github.com/GeiserX/tailscale-rs/compare/v0.56.1...v0.56.2) (2026-09-13)
 
 
