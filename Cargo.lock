@@ -2101,6 +2101,7 @@ dependencies = [
 name = "geiserx_ts_host_net"
 version = "0.56.5"
 dependencies = [
+ "if-addrs",
  "ipnet",
  "thiserror 2.0.20",
  "tracing",
@@ -2360,7 +2361,6 @@ dependencies = [
  "geiserx_ts_transport_tun",
  "geiserx_ts_tunnel",
  "httparse",
- "if-addrs",
  "ipnet",
  "itertools",
  "kameo",
