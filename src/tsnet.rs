@@ -1379,6 +1379,7 @@ fn status_json(s: &Status) -> Vec<u8> {
         "peers": s.peers.iter().map(status_node_json).collect::<Vec<_>>(),
         "active_exit_node": s.active_exit_node.as_ref().map(|id| id.0.clone()),
         "magic_dns_suffix": s.magic_dns_suffix,
+        // Go `ipnstate.Status.Health`: empty means no known problem.
         "health": s.health,
     });
     serde_json::to_vec(&value).unwrap_or_else(|_| b"{}".to_vec())
