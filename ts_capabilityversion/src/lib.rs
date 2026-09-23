@@ -398,6 +398,11 @@ impl CapabilityVersion {
     /// So this is the floor [`Self::CURRENT`] must stay at or above for this tree's ported
     /// peer-relay client half to be reachable at all by a real Tailscale peer; see that constant
     /// for why the tree sits above the floor despite not implementing all of 120/121.
+    ///
+    /// The second of the two gates is applied here too: `ts_magicsock`'s inbound `CallMeMaybeVia`
+    /// handler runs this over the sending peer's netmap `Node.Cap` (supplied by the runtime, which
+    /// owns the netmap) and drops the message when it does not clear the floor. The first gate has
+    /// no counterpart yet — this tree never originates UDP relay path discovery.
     #[must_use]
     pub const fn is_relay_capable(self) -> bool {
         self.0 >= Self::V121.0
