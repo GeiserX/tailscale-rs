@@ -269,6 +269,27 @@ fn cgnat_threshold(one_cgnat_route: bool) -> usize {
     if one_cgnat_route { 1 } else { CGNAT_THRESHOLD }
 }
 
+/// The one-CGNAT decision as this actor makes it at an apply: control's tri-state attribute off the
+/// SELF node, this build's platform, and the real host-interface probe scoped to our own TUN
+/// `tun_if_name` (the name the kernel gave the device, which on macOS is a `utun<N>` the device
+/// builder picked, not the configured name).
+///
+/// Both apply paths — the device build and the [`PeerState`] re-apply — go through this one
+/// function, so the two cannot drift, and each of them re-decides rather than caching, like Go's
+/// per-reconfig `shouldUseOneCGNATRoute` call: another interface may have taken a CGNAT address
+/// since the last apply, and a stale answer would outlive the interface that justified it.
+///
+/// Splitting the decision ([`should_use_one_cgnat_route`]) from the wiring keeps the decision pure
+/// and host-free; this is the wiring, and it is what the two callers use. The probe itself is
+/// [`ts_host_net::has_cgnat_interface`] — enumerating the host's interfaces is host integration, so
+/// it lives in the crate that already programs the host routing table and resolver, and there is
+/// exactly one copy of Go's `HasCGNATInterface` in the tree.
+fn one_cgnat_route_for(self_node: &ts_control::Node, tun_if_name: &str) -> bool {
+    should_use_one_cgnat_route(self_node.one_cgnat(), std::env::consts::OS, || {
+        ts_host_net::has_cgnat_interface(tun_if_name)
+    })
+}
+
 /// Whether `net` is one of the per-peer CGNAT host routes [`collapse_cgnat_routes`] may fold into
 /// `100.64.0.0/10`: a `/32` inside the CGNAT range that is NOT the MagicDNS service IP.
 ///
@@ -1323,10 +1344,7 @@ impl Message<Arc<ts_control::StateUpdate>> for TunActor {
         // `shouldUseOneCGNATRoute`. The interface probe is deliberately not cached: it runs once
         // per host-FIB apply, which is a peer/netmap change, and a stale answer would outlive the
         // interface that justified it.
-        let one_cgnat_route =
-            should_use_one_cgnat_route(self_node.one_cgnat(), std::env::consts::OS, || {
-                ts_host_net::has_cgnat_interface(&if_name)
-            });
+        let one_cgnat_route = one_cgnat_route_for(self_node, &if_name);
         let routes = host_routes_from_node(
             self_node,
             self.peers.as_deref(),
@@ -1455,10 +1473,7 @@ impl Message<Arc<PeerState>> for TunActor {
             // the build path, like Go's per-reconfig `shouldUseOneCGNATRoute`: the attribute can
             // change under a new netmap, and another CGNAT interface may have come or gone since
             // the device was built.
-            let one_cgnat_route =
-                should_use_one_cgnat_route(self_node.one_cgnat(), std::env::consts::OS, || {
-                    ts_host_net::has_cgnat_interface(if_name)
-                });
+            let one_cgnat_route = one_cgnat_route_for(self_node, if_name);
             let routes = host_routes_from_node(
                 self_node,
                 Some(&state.peers),
@@ -1499,8 +1514,9 @@ mod tests {
 
     use super::{
         CGNAT_THRESHOLD, Intercept, MAGIC_DNS_IP, MAGIC_DNS_PORT, build_dns_view, cgnat_threshold,
-        collapse_cgnat_routes, host_dns_from_dns_config, host_routes_from_node, plan_intercept,
-        should_use_one_cgnat_route, spawn_dns_tcp_netstack, tun_config_from_control,
+        collapse_cgnat_routes, host_dns_from_dns_config, host_routes_from_node,
+        one_cgnat_route_for, plan_intercept, should_use_one_cgnat_route, spawn_dns_tcp_netstack,
+        tun_config_from_control,
     };
     use crate::{
         env::{Env, ForwarderConfig},
@@ -2509,6 +2525,87 @@ mod tests {
             assert!(
                 linux.routed.contains(&peer.tailnet_address.ipv4),
                 "Linux keeps one /32 per peer"
+            );
+        }
+    }
+
+    /// THE WIRING both apply paths use, end to end: a self node carrying one of control's
+    /// `one-cgnat` attributes, through [`one_cgnat_route_for`] (which reads the attribute, this
+    /// build's platform and the real interface probe) and into the host route set.
+    ///
+    /// The two halves are the two things Go ties together and that must not come apart again:
+    ///
+    /// * `one-cgnat?v=true` collapses from the second peer on, whatever the platform;
+    /// * `one-cgnat?v=false` declines the FORCED collapse but does NOT remove Go's ceiling — above
+    ///   `CGNAT_THRESHOLD` peer routes the `/10` still replaces the `/32`s, because
+    ///   `RouteManager.cgnatThreshold` has only the two values `1` and the constant.
+    ///
+    /// Platform-independent by construction: an explicit attribute is terminal in
+    /// [`should_use_one_cgnat_route`], so neither case reaches the host probe and both assert the
+    /// same thing on macOS, Linux and Android. The per-function tests above cover the decision
+    /// itself; this one covers what the callers do with it.
+    #[test]
+    fn control_attribute_reaches_the_route_set_through_the_actor_wiring() {
+        let cgnat: Ipv4Net = "100.64.0.0/10".parse().unwrap();
+
+        // `v=true`: two peers are already more than a threshold of 1.
+        let forced = node_with_one_cgnat(Some(true));
+        let two = cgnat_peers(2);
+        let two_db = peer_db_from(&two.iter().collect::<Vec<_>>());
+        let routes = host_routes_from_node(
+            &forced,
+            Some(&two_db),
+            "utun9".to_owned(),
+            true,
+            None,
+            true,
+            one_cgnat_route_for(&forced, "utun9"),
+        );
+        assert!(
+            routes.routed.contains(&cgnat),
+            "one-cgnat?v=true collapses from the second peer on"
+        );
+
+        // `v=false`: the ceiling survives the disabling attribute. One peer past it collapses.
+        let declined = node_with_one_cgnat(Some(false));
+        let many = cgnat_peers(CGNAT_THRESHOLD as u32 + 1);
+        let many_db = peer_db_from(&many.iter().collect::<Vec<_>>());
+        let routes = host_routes_from_node(
+            &declined,
+            Some(&many_db),
+            "utun9".to_owned(),
+            true,
+            None,
+            true,
+            one_cgnat_route_for(&declined, "utun9"),
+        );
+        assert!(
+            routes.routed.contains(&cgnat),
+            "one-cgnat?v=false declines the forced collapse but keeps the {CGNAT_THRESHOLD} ceiling"
+        );
+        assert!(
+            !routes.routed.contains(&"100.64.0.2/32".parse().unwrap()),
+            "no peer /32 survives that collapse"
+        );
+
+        // ... and below the ceiling the same attribute keeps every peer /32.
+        let routes = host_routes_from_node(
+            &declined,
+            Some(&two_db),
+            "utun9".to_owned(),
+            true,
+            None,
+            true,
+            one_cgnat_route_for(&declined, "utun9"),
+        );
+        assert!(
+            !routes.routed.contains(&cgnat),
+            "below the ceiling one-cgnat?v=false installs no /10"
+        );
+        for peer in &two {
+            assert!(
+                routes.routed.contains(&peer.tailnet_address.ipv4),
+                "below the ceiling one-cgnat?v=false keeps one /32 per peer"
             );
         }
     }
