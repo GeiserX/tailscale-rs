@@ -58,6 +58,9 @@ pub enum HostNetError {
     /// A DNS programming command failed.
     #[error("dns program command failed: {0}")]
     Dns(String),
+    /// Enumerating the host's network interfaces failed.
+    #[error("interface enumeration failed: {0}")]
+    Interfaces(String),
     /// An IO error was encountered.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -81,6 +84,76 @@ pub trait HostNet: Send + Sync {
 
     /// Reverse everything previously installed via `apply_*`.
     fn teardown(&mut self);
+}
+
+/// The tailnet's CGNAT range `100.64.0.0/10` (Go `tsaddr.CGNATRange`).
+///
+/// Every node address control hands out comes from it, so this is both the range
+/// [`has_cgnat_interface`] looks for on interfaces that are not ours and the prefix a caller folds
+/// its per-peer `/32`s into. It lives HERE, in the host-integration crate, and is `pub` so the
+/// route-building caller uses this one definition rather than spelling the literal again — the
+/// same reason this crate's `expand_routes` is shared: the two cannot then drift apart.
+pub const CGNAT_RANGE: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(100, 64, 0, 0), 10);
+
+/// Whether any interface OTHER than `exclude_if_name` is operationally up and carries an IPv4
+/// prefix overlapping `100.64.0.0/10`.
+///
+/// Ports Go `net/netmon`'s `HasCGNATInterface`, which walks the interface list and reports whether
+/// a non-Tailscale, up interface uses the CGNAT range. The caller uses it to decide whether the
+/// single `/10` host route may replace the per-peer `/32`s: if something else on this host already
+/// routes part of CGNAT space, the coarse route would hijack it.
+///
+/// Enumeration is `if_addrs::get_if_addrs` — the same `getifaddrs(3)` wrapper `ts_magicsock` uses
+/// to enumerate local disco candidates, so this adds no crate to the workspace and no process
+/// spawn to the apply path. An enumeration failure is an `Err`, never a silent `false`: the caller
+/// must be able to tell "nothing else uses CGNAT" from "could not look", and it treats the two
+/// differently.
+pub fn has_cgnat_interface(exclude_if_name: &str) -> Result<bool, HostNetError> {
+    let ifaces = if_addrs::get_if_addrs()
+        .map_err(|e| HostNetError::Interfaces(format!("get_if_addrs failed: {e}")))?;
+    Ok(any_cgnat_interface(&ifaces, exclude_if_name))
+}
+
+/// The predicate half of [`has_cgnat_interface`], over an already-enumerated interface list.
+///
+/// Split out so the rule is unit-tested against fixed interface sets on every platform rather than
+/// against whatever the build host happens to have plugged in (the same pure-core/thin-syscall
+/// split the `route`/`scutil` argv builders use).
+///
+/// Three filters, each Go's:
+///
+/// * **not us** — our own TUN always holds a CGNAT `/32` (this node's tailnet address), so counting
+///   it would make the answer unconditionally "yes" and the check a no-op. The exclusion is the
+///   interface name the caller just created, which is exact for OUR interface — the only one it
+///   claims to identify. Go excludes a wider set: its `isTailscaleInterface` name/address heuristic
+///   matches ANY Tailscale-family interface, so a second `tailscaled` on the same host is skipped
+///   there and counted here. The divergence is deliberate and one-directional — it can only make
+///   this node DECLINE the coarse route, never install a `/10` that hijacks another interface — and
+///   a node sharing a host with a second Tailscale implementation keeping its per-peer `/32`s is
+///   the conservative end of that trade.
+/// * **up** — Go skips `!i.IsUp()`. A down interface is not carrying anything for the `/10` to
+///   steal. `is_oper_up` is POSIX `IFF_RUNNING` rather than Go's `IFF_UP`, so an administratively
+///   up interface with no carrier is skipped here and counted there. That difference can only
+///   *permit* the coarse route, and only for an interface that is not currently passing traffic.
+/// * **overlapping** — Go compares with `Prefix.Overlaps`, not `Contains`, so an interface whose
+///   prefix is shorter than `/10` and COVERS the CGNAT range counts as much as one sitting inside
+///   it. IPv6 interface addresses cannot overlap a v4 prefix and are skipped.
+pub(crate) fn any_cgnat_interface(ifaces: &[if_addrs::Interface], exclude_if_name: &str) -> bool {
+    ifaces.iter().any(|iface| {
+        if iface.name == exclude_if_name || !iface.is_oper_up() {
+            return false;
+        }
+        let if_addrs::IfAddr::V4(v4) = &iface.addr else {
+            return false;
+        };
+        // A prefix length the kernel reports as out of range is not a reason to answer "nothing
+        // else uses CGNAT"; fall back to the address as a host route, which still catches the
+        // common case of an address sitting inside the range.
+        let net = Ipv4Net::new(v4.ip, v4.prefixlen)
+            .unwrap_or_else(|_| Ipv4Net::new_assert(v4.ip, 32))
+            .trunc();
+        CGNAT_RANGE.contains(&net.network()) || net.contains(&CGNAT_RANGE.network())
+    })
 }
 
 /// Expand a desired routed set for installation into the host FIB.
@@ -213,6 +286,148 @@ mod tests {
     #[test]
     fn host_net_is_unsupported_for_now() {
         assert!(matches!(host_net().err(), Some(HostNetError::Unsupported)));
+    }
+
+    /// Build an up IPv4 interface fixture. `prefixlen` is what the kernel reports; the netmask is
+    /// derived from it so the two cannot disagree.
+    fn iface(name: &str, ip: &str, prefixlen: u8) -> if_addrs::Interface {
+        iface_with_status(name, ip, prefixlen, if_addrs::IfOperStatus::Up)
+    }
+
+    /// As [`iface`], with the operational status spelled out.
+    fn iface_with_status(
+        name: &str,
+        ip: &str,
+        prefixlen: u8,
+        oper_status: if_addrs::IfOperStatus,
+    ) -> if_addrs::Interface {
+        let ip: Ipv4Addr = ip.parse().unwrap();
+        if_addrs::Interface {
+            name: name.to_owned(),
+            addr: if_addrs::IfAddr::V4(if_addrs::Ifv4Addr {
+                ip,
+                netmask: Ipv4Net::new(ip, prefixlen).unwrap().netmask(),
+                prefixlen,
+                broadcast: None,
+            }),
+            index: None,
+            oper_status,
+            is_p2p: false,
+            #[cfg(windows)]
+            adapter_name: String::new(),
+        }
+    }
+
+    /// A host running this fork: loopback, a LAN interface, and our own TUN holding this node's
+    /// tailnet `/32`. Addresses outside CGNAT space come from the RFC 5737 documentation ranges.
+    fn host_with_our_tun() -> Vec<if_addrs::Interface> {
+        vec![
+            iface("lo0", "127.0.0.1", 8),
+            iface("en0", "192.0.2.17", 24),
+            iface("utun9", "100.64.0.1", 32),
+        ]
+    }
+
+    /// The base case, and the reason the exclusion exists: our own TUN always holds a CGNAT `/32`,
+    /// so without excluding it by name the answer would be "yes" on every node and the coarse
+    /// route would never be selected.
+    #[test]
+    fn cgnat_scan_ignores_our_own_tun() {
+        assert!(
+            !any_cgnat_interface(&host_with_our_tun(), "utun9"),
+            "only our own TUN uses CGNAT space: nothing else can be hijacked by the /10"
+        );
+        assert!(
+            any_cgnat_interface(&host_with_our_tun(), "utun7"),
+            "with our TUN not excluded, its own CGNAT /32 reads as someone else's"
+        );
+    }
+
+    /// Another VPN already routing part of CGNAT space is exactly what the probe is for:
+    /// installing `100.64.0.0/10` would steal its traffic.
+    ///
+    /// The headline fixture is `ppp0`, an interface Go's `isTailscaleInterface` does NOT match
+    /// either, so this pins the rule on a case where this code and upstream agree. The `utun3`
+    /// fixture below is the deliberate divergence documented on [`any_cgnat_interface`]: a
+    /// `utun*` holding a Tailscale address is exactly what `isTailscaleInterface` exists to skip,
+    /// so upstream would ignore it and we count it. Pinned so the difference is a decision on
+    /// record rather than something a later reader discovers.
+    #[test]
+    fn cgnat_scan_finds_another_interfaces_cgnat_address() {
+        let mut foreign = host_with_our_tun();
+        foreign.push(iface("ppp0", "100.72.0.9", 32));
+        assert!(
+            any_cgnat_interface(&foreign, "utun9"),
+            "a non-Tailscale interface inside CGNAT space makes the coarse /10 unsafe"
+        );
+
+        let mut second_tailscale = host_with_our_tun();
+        second_tailscale.push(iface("utun3", "100.72.0.9", 32));
+        assert!(
+            any_cgnat_interface(&second_tailscale, "utun9"),
+            "a SECOND Tailscale-family interface counts here though `isTailscaleInterface` \
+             would skip it upstream: the narrower exclusion can only decline the /10"
+        );
+    }
+
+    /// A down interface is not using the range (Go skips `!i.IsUp()`), and a SUPERNET of CGNAT
+    /// space counts even though none of its own addresses is inside the range (Go compares with
+    /// `Prefix.Overlaps`, not `Contains`).
+    #[test]
+    fn cgnat_scan_honours_oper_status_and_overlapping_supernets() {
+        let mut down = host_with_our_tun();
+        down.push(iface_with_status(
+            "utun3",
+            "100.72.0.9",
+            32,
+            if_addrs::IfOperStatus::Down,
+        ));
+        assert!(
+            !any_cgnat_interface(&down, "utun9"),
+            "a down interface is not using the range"
+        );
+
+        // A /8 around a CGNAT address: its NETWORK address is outside the /10, so only the
+        // second half of the overlap test (the interface prefix covering the range) can catch it.
+        let mut supernet = host_with_our_tun();
+        supernet.push(iface("en6", "100.64.0.9", 8));
+        assert!(
+            any_cgnat_interface(&supernet, "utun9"),
+            "an interface whose prefix covers CGNAT space overlaps it"
+        );
+    }
+
+    /// An IPv6 interface address cannot overlap a v4 prefix, and an empty list is simply "no".
+    #[test]
+    fn cgnat_scan_skips_v6_and_handles_an_empty_list() {
+        assert!(!any_cgnat_interface(&[], "utun9"));
+        let v6 = vec![if_addrs::Interface {
+            name: "en0".to_owned(),
+            addr: if_addrs::IfAddr::V6(if_addrs::Ifv6Addr {
+                ip: "2001:db8::1".parse().unwrap(),
+                netmask: "ffff:ffff:ffff:ffff::".parse().unwrap(),
+                prefixlen: 64,
+                broadcast: None,
+            }),
+            index: None,
+            oper_status: if_addrs::IfOperStatus::Up,
+            is_p2p: false,
+            #[cfg(windows)]
+            adapter_name: String::new(),
+        }];
+        assert!(!any_cgnat_interface(&v6, "utun9"));
+    }
+
+    /// The syscall half really runs on this host: enumeration succeeds and the answer is a plain
+    /// bool, not an error. Asserting only that it is `Ok` keeps the test host-independent (what
+    /// the box has plugged in is not ours to pin) while still exercising the real `getifaddrs`
+    /// path the caller depends on.
+    #[test]
+    fn has_cgnat_interface_enumerates_this_host() {
+        assert!(
+            has_cgnat_interface("ts-rs-no-such-interface").is_ok(),
+            "enumerating the host's interfaces must succeed on a supported platform"
+        );
     }
 
     #[test]
