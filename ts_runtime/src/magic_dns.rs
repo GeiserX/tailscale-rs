@@ -1148,8 +1148,8 @@ fn is_soft_error(msg: &[u8]) -> bool {
 }
 
 /// Forward `query` to each upstream in order over the **overlay** netstack, returning the first
-/// well-formed response that is not a *soft* error, or the prebuilt `fallback` buffer if no
-/// upstream answered at all.
+/// well-formed response that is not a *soft* error, or — once every upstream has failed — the
+/// failure [`forward_walk`] chooses to relay, which is often the prebuilt `fallback` buffer.
 ///
 /// Anti-leak: forwarding goes through the overlay netstack `channel` (a fresh `0.0.0.0:0` overlay
 /// UDP socket per query, and — whenever the TCP hop runs — a fresh `0.0.0.0:0` overlay TCP
@@ -3623,6 +3623,39 @@ mod tests {
         assert_eq!(asked, vec![first, second]);
         assert_eq!(got, fallback);
         assert_ne!(got, servfail);
+    }
+
+    /// The mirror of the case above, and the only branch that still relays an upstream's bytes once
+    /// a non-refusal has been seen: the FIRST failure is an upstream SERVFAIL and the second
+    /// upstream is silent. The held SERVFAIL is relayed verbatim, so its RFC 8914 extended DNS error
+    /// survives rather than being thrown away for the synthesized one.
+    ///
+    /// No other test reaches that branch with `saw_non_refused` set by an upstream that sent
+    /// nothing at all, so this one pins that a later failure carrying no bytes neither replaces the
+    /// held SERVFAIL nor demotes the forward to `fallback`.
+    #[tokio::test]
+    async fn servfail_then_silent_upstream_relays_the_upstream_servfail() {
+        let query = build_query(0x20e, &["api", "example", "com"], 1, 1);
+        let (first, second) = (upstream_addr(1), upstream_addr(2));
+        let servfail = upstream_response(&query, RCODE_SERVFAIL, 0, b"first servfail");
+        let fallback = upstream_response(&query, RCODE_SERVFAIL, 0, b"synthesized");
+
+        let (got, asked) = run_forward_walk(
+            &[(first, Some((first, servfail.clone()))), (second, None)],
+            &query,
+            fallback,
+        )
+        .await;
+
+        assert_eq!(
+            asked,
+            vec![first, second],
+            "the walk must ask both upstreams"
+        );
+        assert_eq!(
+            got, servfail,
+            "the first failure's own SERVFAIL bytes are relayed, not the synthesized fallback"
+        );
     }
 
     #[test]
