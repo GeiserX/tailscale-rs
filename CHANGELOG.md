@@ -2,6 +2,14 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.57.1](https://github.com/GeiserX/tailscale-rs/compare/v0.57.0...v0.57.1) (2026-09-23)
+
+
+### Bug Fixes
+
+* **magic_dns:** merge main into the REFUSED/SERVFAIL precedence branch ([#521](https://github.com/GeiserX/tailscale-rs/issues/521)) ([3560420](https://github.com/GeiserX/tailscale-rs/commit/3560420e0d8a3f69ca50c852577ea0123a7d495c))
+* **magicsock:** land [#489](https://github.com/GeiserX/tailscale-rs/issues/489)'s call-me-maybe refusals on top of main's port ([#527](https://github.com/GeiserX/tailscale-rs/issues/527)) ([b8a2d63](https://github.com/GeiserX/tailscale-rs/commit/b8a2d630a933f0d3d74c7931f098d2b6b17734a3))
+
 ## [0.57.0](https://github.com/GeiserX/tailscale-rs/compare/v0.56.5...v0.57.0) (2026-09-23)
 
 
