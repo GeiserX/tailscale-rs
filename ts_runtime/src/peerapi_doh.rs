@@ -1269,6 +1269,7 @@ mod tests {
             env.clone(),
             cap_grants_tx,
             filter_tx.clone(),
+            watch::channel(false).0,
         ));
         (updater, filter_rx, filter_tx, env)
     }
