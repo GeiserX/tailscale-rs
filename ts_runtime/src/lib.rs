@@ -42,7 +42,6 @@ pub mod fallback_tcp;
 mod forwarder_actor;
 /// Client-side Funnel ingress termination (`tsnet`'s `ListenFunnel` data path).
 pub mod funnel;
-pub mod health;
 /// Unified IPN notification bus ([`Notify`] / [`watch_ipn_bus`](Runtime::watch_ipn_bus)), mirroring
 /// Go `ipn` `LocalBackend.WatchNotifications` / the `WatchIPNBus` LocalAPI.
 pub mod ipn_bus;
@@ -139,6 +138,9 @@ pub struct Runtime {
     /// Receiver for the retained peer-capability grants, fed by the packet-filter updater. Read by
     /// [`Runtime::whois`] to resolve the flow-scoped cap map (Go `apitype.WhoIsResponse.CapMap`).
     cap_grants_rx: watch::Receiver<packetfilter::CapGrants>,
+    /// Receiver for the invalid-packet-filter health flag, fed by the packet-filter updater. Read by
+    /// [`Runtime::status`] to fill [`Status::health`].
+    invalid_filter_rx: packetfilter::InvalidPacketFilterRx,
     /// Live advertised-route preference (explicit subnet routes + the exit-node flag), seeded from
     /// the startup config. [`Runtime::set_advertise_routes`] and [`set_advertise_exit_node`] each
     /// mutate their part under this lock then re-send the composed set, so the two compose.
@@ -269,7 +271,13 @@ impl Runtime {
         // and best-effort delivery drops it on a full mailbox — see `packetfilter::LiveFilterRx`,
         // which also names the one hop this cell does *not* cover: control -> the updater).
         let (live_filter_tx, live_filter_rx) = watch::channel(None);
-        packetfilter::PacketfilterUpdater::spawn((env.clone(), cap_grants_tx, live_filter_tx));
+        let (invalid_filter_tx, invalid_filter_rx) = watch::channel(false);
+        packetfilter::PacketfilterUpdater::spawn((
+            env.clone(),
+            cap_grants_tx,
+            live_filter_tx,
+            invalid_filter_tx,
+        ));
         src_filter::SourceFilterUpdater::spawn(env.clone());
         // TKA enforcement-authority cell (Go `tkaFilterNetmapLocked`). Created here — before both
         // actors spawn — so the control runner (sole writer, `Sender`) and the peer tracker (reader,
@@ -462,6 +470,7 @@ impl Runtime {
             active_exit_rx,
             state_rx,
             cap_grants_rx,
+            invalid_filter_rx,
             advertise,
             prev_suggestion: std::sync::Mutex::new(None),
             taildrop_reaper,
@@ -690,7 +699,7 @@ impl Runtime {
             peers,
             active_exit_node: self.active_exit_node(),
             magic_dns_suffix,
-            health: self.env.health.strings(),
+            health: packetfilter::health_warnings(*self.invalid_filter_rx.borrow()),
         })
     }
 

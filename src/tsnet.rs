@@ -2711,7 +2711,7 @@ mod tests {
             peers: vec![],
             active_exit_node: None,
             magic_dns_suffix: Some("tail0.ts.net".to_string()),
-            health: vec!["something is wrong".to_string()],
+            health: vec!["warning text".to_string()],
         };
         let bytes = status_json(&status);
         let v: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
@@ -2723,7 +2723,7 @@ mod tests {
         assert_eq!(v["magic_dns_suffix"], "tail0.ts.net");
         assert!(v["peers"].as_array().unwrap().is_empty());
         assert!(v["active_exit_node"].is_null());
-        assert_eq!(v["health"], serde_json::json!(["something is wrong"]));
+        assert_eq!(v["health"], serde_json::json!(["warning text"]));
     }
 
     #[tokio::test]
