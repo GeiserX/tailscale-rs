@@ -16,6 +16,12 @@ rust-version.workspace = true
 name = "ts_host_net"
 [dependencies]
 # Unconditionally required dependencies.
+# `if-addrs` enumerates the host's interface addresses (libc `getifaddrs` on POSIX, the
+# `windows-sys` IP-helper on Windows) so `has_cgnat_interface` can answer Go `net/netmon`'s
+# `HasCGNATInterface` question: does some OTHER interface already use `100.64.0.0/10`? Pure syscall
+# wrapper pulling only `libc`/`windows-sys` — already a dependency of `ts_magicsock` at the same
+# version, so this adds no crate to the workspace and nothing to any egress path.
+if-addrs = "0.15"
 ipnet.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
