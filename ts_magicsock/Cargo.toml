@@ -15,6 +15,7 @@ rust-version.workspace = true
 name = "ts_magicsock"
 [dependencies]
 # Our crates.
+ts_capabilityversion.workspace = true
 ts_disco_protocol.workspace = true
 ts_keys.workspace = true
 ts_metrics.workspace = true
