@@ -22,6 +22,15 @@
 //! `ts_host_net/src/` — it never modifies it. A generic `::` scan was deliberately NOT used: Rust
 //! path separators (`foo::bar`, `parse::<T>`) are ubiquitous and would false-positive, and the
 //! v4-only types already make a literal v6 address unconstructable.
+//!
+//! ONE EXCEPTION, and it is test-only: `ts_host_net`'s interface scan takes `if_addrs::Interface`
+//! values straight from the OS, and those DO carry a v6 variant — so a `#[cfg(test)]` fixture in
+//! `ts_host_net/src/lib.rs` builds an `if_addrs::Ifv6Addr` to pin that the scan skips it. That
+//! fixture is not a v6 address in the route/DNS path (nothing v6 reaches `HostRoutes`/`HostDns`,
+//! which have no v6 fields), and it slips past the `Ipv6` token only because `if-addrs` spells its
+//! type `Ifv6Addr`. Do not "tighten" the token to catch it: broadening this to `v6` would flag
+//! that legitimate skip-path and the prose around it, and the invariant this guard protects — no
+//! v6 in the argv builders — is untouched by it.
 
 use crate::{Args, BoxResult};
 
