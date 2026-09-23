@@ -1148,8 +1148,8 @@ fn is_soft_error(msg: &[u8]) -> bool {
 }
 
 /// Forward `query` to each upstream in order over the **overlay** netstack, returning the first
-/// well-formed response that is not a *soft* error, or the prebuilt `fallback` buffer if no
-/// upstream answered at all.
+/// well-formed response that is not a *soft* error, or — once every upstream has failed — the
+/// failure [`forward_walk`] chooses to relay, which is often the prebuilt `fallback` buffer.
 ///
 /// Anti-leak: forwarding goes through the overlay netstack `channel` (a fresh `0.0.0.0:0` overlay
 /// UDP socket per query, and — whenever the TCP hop runs — a fresh `0.0.0.0:0` overlay TCP
