@@ -3,12 +3,12 @@
 | | |
 | --- | --- |
 | **Upstream source** | `https://github.com/tailscale/tailscale` (Go) |
-| **Upstream commit this ledger was written against** | `e2ed432399c9b0fda7aa14e9eb27784d2d893c55` (2026-09-11, `go.toolchain.rev: bump for stack debugging API`) — **held a third time**: `git ls-remote https://github.com/tailscale/tailscale HEAD` still returned it as upstream's default-branch HEAD when this revision was derived, on 2026-09-13. *The date is corrected at this revision*: the previous two revisions wrote 2026-09-12, and `git log -1 --format=%ad --date=short e2ed43239` says **2026-09-11** (author and committer alike; 20:17 UTC, so no plausible zone rounds it up) |
+| **Upstream commit this ledger was written against** | `e2ed432399c9b0fda7aa14e9eb27784d2d893c55` (2026-09-11, `go.toolchain.rev: bump for stack debugging API`) — **held a fourth time**: `git ls-remote https://github.com/tailscale/tailscale HEAD` still returned it as upstream's default-branch HEAD when this revision was derived, on 2026-09-13, and `git log --oneline e2ed43239..origin/main` in a fresh clone is empty. `git log -1 --format=%ad --date=short e2ed43239` says **2026-09-11** (author and committer alike; 20:17 UTC, so no plausible zone rounds it up) |
 | **Upstream `tailcfg.CurrentCapabilityVersion` at that commit** | **147** (2026-09-09) — unchanged; see §A |
-| **This repository at ledger time** | `9675565` — workspace version `0.56.1` |
+| **This repository at ledger time** | `8758325` — workspace version `0.56.2` |
 | **`ts_capabilityversion::CapabilityVersion::CURRENT` here** | **125** (2025-08-11) — held below 126; see §B, *c2n endpoints behind the declared capability version* |
 | **Gap window this ledger covers** | capability version **131 → 147**, i.e. upstream commits from 2025-10-06 to 2026-09-11 (the window is anchored to when capver 130 landed upstream, and closes at the pinned commit above — the end of the window and the pin's date are one fact, so they move together; the declaration here being 125 rather than 130 does not change what upstream added) |
-| **Previous pin** | `e2ed432399c9b0fda7aa14e9eb27784d2d893c55`, with this tree at `0c8796a` — **neither moved, and this tree did not move in code at all.** `e2ed43239..` upstream HEAD is empty for the third consecutive revision, and `0c8796a..HEAD` here is two commits, both documentation: #465 (the previous revision of this document) and #466 (a correction to two entries in the backlog file it wrote). No Rust changed anywhere in the interval, so none of the four sources of change that need a moving tree could fire. The reading is the whole of this revision, and it went where neither the sweep, the node-attribute walk nor the wire-type checks can see: the **DERP frame-type enumeration**, walked frame by frame against `ts_derp` and its callers. Three rows, all in the relay path — a `PeerGone` frame this node decodes and throws away, a learned DERP route Go prefers over dialling a peer's home region, and `FrameNotePreferred`, which this tree models and never sends. All three are in §B |
+| **Previous pin** | `e2ed432399c9b0fda7aa14e9eb27784d2d893c55`, with this tree at `9675565` — **upstream did not move; this tree moved by one port.** `e2ed43239..` upstream HEAD is empty for the fourth consecutive revision. `9675565..HEAD` here is four commits: #467 (the previous revision of this document), #468 (a self-consistency check over this document, in `checks`), #470 (a release) and **#458**, the one behaviour change — `ts_magicsock`'s peer-relay leg now takes a relayed pong's source address as given. Auditing #458 against the `relaymanager.go` it cites opened one row; walking `disco`'s nine message types, the enumeration the previous revision named first among those not yet walked, opened two. All three sit in `ts_magicsock`'s disco ingress, and all three are in §B. The sweep's commit count also moved at the unmoved pin, and this time the cause was found: a date-only `--since` is read at the current time of day |
 
 > This repository is also a fork of the Rust port `tailscale/tailscale-rs` — see
 > [`VENDOR.md`](VENDOR.md) for that provenance. This ledger is about the *other* upstream: the Go
@@ -182,27 +182,32 @@ below 126, see §B. Upstream is at **147** at the pin — `tailcfg/tailcfg.go:19
 (`tailcfg/tailcfg.go`, `tailcfg/nodecap`).
 
 **No row is new at this revision.** The pin did not move, and the two §A commands were re-run against
-it anyway: `tailcfg/tailcfg.go:199` still reads `CurrentCapabilityVersion CapabilityVersion = 147`, and
-the capability-history comment returns exactly **18** lines, 130 through 147 — the same count the three
-previous revisions derived. An unmoved pin is when that count earns its keep: "upstream
+it in a fresh clone: `tailcfg/tailcfg.go:199` still reads `CurrentCapabilityVersion CapabilityVersion = 147`,
+and the capability-history comment returns exactly **18** lines, 130 through 147 — the same count the
+four previous revisions derived. An unmoved pin is when that count earns its keep: "upstream
 added nothing", "I re-ran it against the same tree" and "the pattern broke" all feel the same, and
 only the count tells them apart. An empty or short result still means the pattern broke.
 
-**No row changed assessment, and this revision is the first at which nothing could have changed one.**
-Rows **133** and **147** are still the two open capability-version rows. The interval's only two commits
-are documentation (#465, #466), so every §A row's tree-side evidence is byte-for-byte what the previous
-revision checked, and every row's upstream-side evidence is at the same pin. That is worth stating rather
+**No row changed assessment, and that was checked by path rather than assumed.** Rows **133** and
+**147** are still the two open capability-version rows. Unlike the previous revision, this tree did move
+in code — but the one behaviour change in the interval, #458, edits `ts_magicsock/src/sock.rs` alone,
+and no §A row's tree-side evidence lives in `ts_magicsock`: row 133's is in `ts_host_net` and
+`ts_runtime::magic_dns`, 135's in `ts_control`'s netmap cache, 137's and 147's in `ts_control`'s
+register, map-stream and client modules, 142's in `ts_control`'s c2n responder, and 144's in
+`ts_packet`, `ts_tunnel` and `ts_dataplane`. #468 adds Rust only under `checks`, and #470 moves version
+numbers in the root manifests. `git diff --stat 9675565..HEAD -- ts_host_net ts_control ts_runtime
+ts_packet ts_tunnel ts_dataplane ts_capabilityversion ts_derp ts_control_serde src` is empty, so every
+§A row's evidence on both sides is the bytes the previous revision checked. That is worth stating rather
 than skipping: an §A section that reports "no change" after a re-derivation it did not run is
-indistinguishable from one that ran it, and the counts below are the only thing that tells the two apart.
-Row **133**, which the previous revision had to re-check because `magic_dns` had moved underneath it,
-needed no such re-check this time and is re-stated below anyway on its unchanged evidence. Row **137**
+indistinguishable from one that ran it, and the diff and the counts are what tell the two apart.
+Row **133** is re-stated below on that unchanged evidence. Row **137**
 keeps its *already covered* verdict and the caveat the previous revision gave it — upstream's register
 path now tests `isRateLimitedResponse(res)`, which also accepts a `503` carrying a `Retry-After` — and
 that widening is still row 147's business rather than 137's. The rows earlier revisions flipped (135,
 142, 144) still say why they flipped, because that history is what makes the row re-checkable.
 
 One cross-check is the cheapest confirmation this section has, and re-run at this revision it returned
-the same **65** unhandled attributes out of **85** constants, as at the previous three revisions: the node-attribute walk described under
+the same **65** unhandled attributes out of **85** constants, as at the previous four revisions: the node-attribute walk described under
 [Re-deriving this ledger](#re-deriving-this-ledger) reports,
 independently of this table, which attribute strings appear nowhere in this workspace. Every
 attribute named by a row below still comes back **unhandled** — `default-auto-update` (131),
@@ -244,9 +249,9 @@ not applicable to an embedded userspace node (138 and 146 among them, once the d
 below the versions that promise them). The count is unchanged from the previous revision: nothing that
 was open closed, and nothing that was closed reopened.
 
-Row 133 was re-derived against the tree at this revision — this time against a tree in which nothing
-at all changed, which is a weaker check than the previous revision's and is recorded as such — and is
-still open: `ts_host_net::HostDns::nameservers`
+Row 133 was re-derived against the tree at this revision — against a tree whose one behaviour change
+is in `ts_magicsock`, outside every crate this row names, which is as weak a check as the previous
+revision's and is recorded as such — and is still open: `ts_host_net::HostDns::nameservers`
 ([`ts_host_net/src/lib.rs:44`](ts_host_net/src/lib.rs)) is still
 a `Vec<Ipv4Addr>`, its doc comment still says "IPv4 nameservers", the Linux backend still fills
 it with the single literal `100.100.100.100`, `ts_runtime::magic_dns` still binds
@@ -254,8 +259,9 @@ it with the single literal `100.100.100.100`, `ts_runtime::magic_dns` still bind
 `force-register-magicdns-ipv4-only` still appears nowhere in the tree
 — so there is still no IPv6 MagicDNS address either to serve or to register, and no attr to drop back
 from if there were. The previous revision had to argue that #462 and #464 did not touch the row,
-because they changed `magic_dns`; at this revision no Rust changed at all, so the four pieces of
-evidence above are literally the same bytes it checked. The row is still *not* closed by #347 (the quad-100 absorption fix in §B), which made the TUN
+because they changed `magic_dns`; at this revision none of the crates it names changed (the path-scoped
+`git diff` in the opening of this section is empty), so the four pieces of evidence above are the same
+bytes the previous revision checked. The row is still *not* closed by #347 (the quad-100 absorption fix in §B), which made the TUN
 transport absorb every quad-100 packet whatever its port and protocol — that is about traffic already
 addressed to `100.100.100.100`, and it neither serves nor registers the IPv6 service IP, which is
 what 133 asks for.
@@ -282,102 +288,210 @@ Row 147, by contrast, is control-facing and belongs to none of this group.
 
 Derived from `git log --since=2025-10-06` over the packages that map to crates here, with
 docs/typo/refactor commits filtered out. **The sweep list is unchanged at this revision and was
-re-run in full** — thirty-eight entries, **854** distinct commits across them at the pin — and, as at the
-previous revision, nothing the list itself got wrong: every package in
+re-run in full** — thirty-eight entries, **854** distinct commits across them at the pin once the cutoff
+is written as an instant (below) — and, as at the previous revision, nothing the list itself got wrong:
+every package in
 [Package mapping](#package-mapping) that has an upstream path has a loop entry, and
 `git log --diff-filter=A --oneline e2ed43239..<new-pin> -- '*/*.go'` is empty by construction,
 because the new pin is the old one. The five times the list *was* short are written up under
 [Re-deriving this ledger](#re-deriving-this-ledger) and those lessons stand unchanged.
 
-**The 854/857 discrepancy the previous revision recorded is resolved at this one, in the only way it
-could be: by a third run.** The loop as printed under [Re-deriving this ledger](#re-deriving-this-ledger)
-returns **854** again at the unmoved pin — 38 entries, 854 distinct commits — so 854 has now been
-derived twice and 857 once, and 857 is the outlier. The value of writing the number down was never the
-number; it was that a count which drifts is the only cheap signal that the command, and not upstream,
-is what changed. Two agreeing runs of a command printed verbatim is what closes that, and it is why the
-discipline the previous revision proposed — **when a derivation records a count, record the command that
-produced it exactly** — stays in the recipe.
+**The sweep's count moved again at an unmoved pin, and this time the cause was found rather than
+out-voted.** The loop as it was printed returned **850** distinct commits here, where the previous two
+revisions recorded 854 and the one before them 857: three answers from one command at one commit. The
+previous revision settled 854 against 857 because a third run agreed with the second, which is a vote,
+not a cause. The cause is the argument. **Git reads a date with no time in it — `--since=2025-10-06` —
+as that date at the current time of day**, in the local zone. This run was at 19:05 UTC, and the four
+commits it lost were all committed on 2025-10-06 between 14:49 and 17:48 UTC: `cf520a337`
+(`feature/featuretags: add LazyWG modular feature`), `6db895774` (`tstest/integration: mark
+TestPeerRelayPing as flaky`), `44e1d735c` (the capability-version **129** bump) and `541a4ed5b` (`all:
+use buildfeatures consts in a few more places`). With the cutoff written as an instant,
+`--since='2025-10-06T00:00:00Z'`, the same loop returns **854** — the same set, commit for commit, as
+filtering the full history of each path by committer timestamp against that instant — and it returns it
+at any hour. That also accounts for what the previous revision could not rule in or out by changing
+`TZ`: the zone only matters through the local clock it implies. None of the four commits pays — the
+LazyWG feature tag and the `buildfeatures` constants belong to the `feature/` build-tag reorganisation
+already listed as not applicable, a flaky-test marker has no behaviour, and 129 is below the version
+§A's window is anchored to. **The recipe now writes the cutoff as an instant** (see [Re-deriving this
+ledger](#re-deriving-this-ledger)), so **854** is a count the next revision can reproduce, not one it
+has to agree with.
 
-**What is different at this revision is that nothing moved on either side, and the reading still paid
-three rows.** Upstream is at the pin for the third consecutive revision; this tree's only two commits
-are documentation. So of the four sources of change named under
-[Re-deriving this ledger](#re-deriving-this-ledger), three could not fire — upstream did not move, the
-tree did not move, and no port merged to audit. Only the third could: **the sweep can be read more
-carefully, or widened, and surface something that was true all along.** What paid was the fifth
-technique, *read the enumerations, not their history*, applied to an enumeration no revision had
-opened: **`derp/derp.go`'s sixteen `FrameType` constants**, taken one at a time and asked not "does
-`ts_derp` model this frame" (it models all sixteen) but "what does this node *do* when it arrives, and
-when does it send one". Three rows, all in the DERP relay path. The generalisation is the one
-`controlknobs` established and this revision confirms on a second enumeration: **a package that
-enumerates something owes you a read of the enumeration**, and modelling every member of it is not the
-same as acting on every member of it. `tailcfg.PeerChange` was walked the same way at this revision and
-paid nothing — all eleven fields are modelled *and* applied — which is what a clean enumeration read
-looks like, and is recorded below so the next revision does not re-derive it.
+**What is different at this revision is that this tree moved, by exactly one port, and both of the
+sources a port feeds paid.** Upstream is at the pin for the fourth consecutive revision, so of the four
+sources of change named under [Re-deriving this ledger](#re-deriving-this-ledger) the first could not
+fire, and the second — this tree moving — closed nothing, because #458 fixed a divergence no row
+carried. **The fourth fired**: #458 cites `wgengine/magicsock/relaymanager.go`, and reading it against
+that file at the pin found the port wider than upstream on the handshake's pong — the first new row
+below. **The third fired too**, on the enumeration the previous revision named first among those not yet
+walked: **`disco/disco.go`'s nine `MessageType` constants**, each asked what `magicsock` *does* when it
+arrives rather than whether `ts_disco_protocol` models it (it models all nine, against Go's own test
+vectors). Two rows: a disco ping that arrives over DERP is dropped where Go pongs it, and
+`CallMeMaybe`/`CallMeMaybeVia` are admitted without three of the refusals Go applies first. The
+generalisation the previous revision drew from `derp` — **modelling every member of an enumeration is
+not acting on every member of it** — held on the second enumeration it was tried on, and in the same
+two shapes: a message decoded correctly and then discarded, and a predicate ported with no caller.
 
 A note on wording: rows carried from before this revision keep the revision-relative phrasing
 they were written with ("new at this revision", "unchanged at this pin"), and that phrasing refers to
 the revision that wrote the row. Text written at *this* revision is the header table, §A's opening
 paragraphs and its row-133 re-derivation, this section's opening, [What changed at this
-revision](#what-changed-at-this-revision), the first three rows under [Rows](#rows), and [Read at this
-revision](#read-at-this-revision). The previous revision's three DNS rows keep their own wording and
-are now the fourth, fifth and sixth rows below.
+revision](#what-changed-at-this-revision), the first three rows under [Rows](#rows), the opening of
+[Read at this revision](#read-at-this-revision) and [Closed at this revision](#closed-at-this-revision).
+The previous revision's three DERP rows keep their own wording and are now the fourth, fifth and sixth
+rows below; the three DNS rows written the revision before are the seventh, eighth and ninth.
 
 #### What changed at this revision
 
 Read this first: it is the shortest honest summary of the diff between this ledger revision and the
 last one.
 
-- **Neither side moved.** `git ls-remote https://github.com/tailscale/tailscale HEAD` returned
-  `e2ed432399c9b0fda7aa14e9eb27784d2d893c55`, the pin, for the third revision running, so
-  `git log --oneline e2ed43239..<new-pin>` is empty. `git log --oneline 0c8796a..HEAD` is two commits,
-  both documentation: `50a0db7` (#465, the previous revision of this document) and `9675565` (#466,
-  a correction to two entries in the backlog file #465 wrote). **No Rust changed in the interval.**
-  That is a stronger statement than "the delta was small", and it is what makes the rest of this list
-  short: no row could close, no carried row's tree-side evidence could move, and there was no merged
-  port to audit.
-- **The mechanical commands were re-run anyway, and every count matched.** **18** capability-history
-  lines, 130 through 147; **38** sweep entries over **854** distinct commits — the same 854 the previous
-  revision derived, which settles the 854/857 question above; **85** node-attribute constants, **65**
-  unhandled and **20** matched, the same sixteen genuine reads and four known false positives. Running
-  them against an unchanged tree at an unchanged pin proves nothing about upstream and everything about
-  the commands: a count that matches is a command that still works. **The two wire-type walks and the
-  three judgement-bearing techniques were not re-derived**, because both sides of what they compare are
-  unchanged; which were skipped and why is stated explicitly under
-  [Re-deriving this ledger](#re-deriving-this-ledger), so the next revision inherits a claim it can
-  check rather than an implication it cannot.
-- **Three rows opened, all from one enumeration nobody had opened.** `derp/derp.go` defines sixteen
-  `FrameType` constants (`derp.go:71`–`:134`). `ts_derp` models all sixteen and decodes all sixteen,
-  which is why every earlier pass over the DERP package read as complete. Asked instead what this node
-  *does* with each, three answers diverge from Go: a `PeerGone` frame is decoded and thrown away where
-  Go uses it to invalidate a route (`wgengine/magicsock/derp.go:665`); the route Go learns from a
-  received frame is consulted here only when the netmap named no home region, where Go prefers it over
-  dialling the peer's home region at all (`derp.go:375`); and `FrameNotePreferred` is modelled and
-  never sent, where Go sends it on every connection to the region it considers home
-  (`derp/derphttp/derphttp_client.go:423`, `:569`). The first three rows below.
-- **One enumeration was walked and came back clean, which is recorded rather than dropped.**
-  `tailcfg.PeerChange` — the eleven fields control may patch onto a peer mid-session — is modelled
-  field for field by `ts_control_serde::netmap::PeerChange` (`netmap.rs:546`) **and** applied field for
-  field by `PeerTracker::apply_peer_patches` (`ts_runtime/src/peer_tracker/mod.rs:1856`), including the
-  two that are easy to model and forget, `Online` and `LastSeen`. A clean enumeration read is worth a
-  paragraph because the alternative is that the next revision spends the same hour on it.
-- **No carried row changed assessment, and this time that claim costs nothing to make.** The eight §B
-  rows carried from the previous revision — the three DNS forwarder rows, `disable-relay-client`, the
-  two `one-cgnat` rows and the two `disable-delta-updates` rows — are stated against tree code that did
-  not change, at a pin that did not move. The same holds for the five deliberate divergences recorded
-  at earlier revisions (DNS-after-router-failure, SSH `acceptEnv`, the `callMeMaybe` gate, the peerAPI
-  DoH server's authoritative-answer widening, and the race's treatment of an unmatched datagram).
-- **Nothing closed, and nothing was audited, for the same reason.** The previous revision closed a row
-  and its audit of that closure opened three. This revision has no closure to audit: the audit source
-  needs a merged port and there was none. The previous revision's audit section is
-  kept verbatim below under [Read at this revision](#read-at-this-revision), because a verdict whose
-  evidence is still true does not stop being useful when the revision that wrote it passes.
-- **No recipe changed.** Of the three commands earlier revisions had to fix, the one re-run here — the
-  node-attribute walk, with its widened character class — behaved exactly as it did last time; the two
-  wire-name walks were not re-run, per the bullet above. The only line of the recipe that moves every
-  revision — the tree-delta range in
-  [Re-deriving this ledger](#re-deriving-this-ledger) — follows the header table as usual.
+- **Upstream did not move; this tree moved by one port.** `git ls-remote https://github.com/tailscale/tailscale HEAD`
+  returned `e2ed432399c9b0fda7aa14e9eb27784d2d893c55`, the pin, for the fourth revision running, and a
+  fresh clone's `git log --oneline e2ed43239..origin/main` is empty. `git log --oneline 9675565..HEAD`
+  here is four commits: `f695f73` (#467, the previous revision of this document), `2a9946b` (#468, which
+  made the header table agree with itself and added `checks/src/porting_ledger.rs`, the check that
+  keeps this document's cross-references, sweep list and header dates consistent), `ee341e3` (#458) and
+  `8758325` (#470, the 0.56.2 release). **#458 is the only behaviour change**, confined to
+  `ts_magicsock/src/sock.rs`: the source-address class filter on the peer-relay leg moved from in front
+  of every inbound relayed disco message to the two branches that reply
+  (`MagicSock::relay_reply_target_allowed`), so a relayed pong is now taken from any source.
+- **The mechanical commands were re-run, and one count moved for a reason now written down.** **18**
+  capability-history lines, 130 through 147; **85** node-attribute constants, **65** unhandled; **38**
+  sweep entries over **854** distinct commits with the cutoff written as an instant, and **850** with the
+  date-only cutoff the recipe used to print. That difference is the whole of the 854/857 question, and
+  the paragraph above explains it. **The two wire-type walks were not re-run**: #458 changes no
+  `ts_control_serde` type and upstream did not move, so both sides of what they compare are unchanged.
+  That is stated again, with the other skips, under [Re-deriving this ledger](#re-deriving-this-ledger).
+- **One row opened from auditing #458.** Its commit body argues, correctly, that upstream's
+  `relayManager.handleRxDiscoMsg` tests a relayed datagram's source against no address *class*. What
+  upstream does apply is a *key*: `handleRxDiscoMsgRunLoop` binds a handshake to the `addrPortVNI` its
+  challenge arrived from, and discards a relayed pong from any other source
+  (`wgengine/magicsock/relaymanager.go:658`–`:663`). #458 removed the class filter from the pong branch,
+  nothing here had ever carried the key, and #458's own test pins a handshake pong from an address that
+  never challenged. The first row below.
+- **Two rows opened from the `disco` enumeration.** `disco/disco.go:45`–`:53` defines nine message
+  types. Four — `BindUDPRelayEndpoint`, `BindUDPRelayEndpointAnswer` and the two allocation messages —
+  are received only by a relay server or by a client that asked for an allocation, and this node is
+  neither (recorded under *no counterpart*). `BindUDPRelayEndpointChallenge` and the relayed `Ping` and
+  `Pong` are the #458 row. A direct `Pong` is matched by transaction id, as `endpoint.handlePongConnLocked`
+  matches it. What diverges is the other three arms: a `Ping` that arrives **over DERP** is decoded and
+  discarded, where Go answers it over DERP (`wgengine/magicsock/magicsock.go:2512`, `:2564`, `:2603`) —
+  and a Go peer's `tailscale ping` sends exactly that while the two are on DERP; and `CallMeMaybe` and
+  `CallMeMaybeVia` are acted on without the three refusals Go applies first — DERP only, sealed by the
+  DERP sender's own disco key, and for `Via` a relay-capable sender (`magicsock.go:2312`, `:2346`,
+  `:2341`). The second and third rows below.
+- **No carried row changed assessment.** #458 touches none of the code the nine carried §B rows rest on
+  — the three DERP rows are in `ts_derp` and `ts_runtime::multiderp`, the three DNS rows in
+  `ts_runtime::magic_dns`, the `one-cgnat` and `disable-delta-updates` rows in `ts_runtime` — except
+  that `disable-relay-client`'s evidence is in the same `sock.rs`, at the `CallMeMaybeVia` ingress #458
+  did not edit. Its line citations moved with the file and are corrected in place; its claim did not.
+  That row now has a neighbour: the third new row adds three refusals to the same `CallMeMaybeVia` arm,
+  and the two are cheapest taken together. The five deliberate divergences recorded at earlier revisions
+  stand, and the #458 audit adds two more — the reply-target filter #458 kept on the challenge and
+  relayed-ping branches, and the relayed ping this node does not pong without a handshake — both
+  recorded under [Read at this revision](#read-at-this-revision).
+- **Nothing closed.** #458 fixed a divergence no row carried, so it closes nothing; the *Peer relay*
+  entry in the carried list gains a sentence about it, pointing at the new row.
+- **One recipe line changed.** The sweep loop's cutoff is now written as an instant,
+  `--since='2025-10-06T00:00:00Z'`, and the count comes from that loop. The tree-delta range follows the
+  header table as usual.
 
 #### Rows
+
+- **The peer-relay handshake accepts a relayed ping or pong from any address on its VNI, where Go binds
+  it to the address whose challenge it answered** (`wgengine/magicsock/relaymanager.go:584`
+  `handleRxDiscoMsgRunLoop`, `:611`–`:663`, `:983`–`:986`, `:735`; `wgengine/magicsock/endpoint.go:1917`
+  for the refresh pongs that differ) — **needs port**, and *new at this revision from auditing #458*, not
+  from upstream: `git log --oneline 49e148c4a..e2ed43239 -- wgengine/magicsock/relaymanager.go`, from the
+  commit #458 cites to the pin, is empty. When Go accepts a handshake's `BindUDPRelayEndpointChallenge`
+  it records `addrPortVNI{from, vni}` for that handshake (`:634`–`:635`). A relayed `Pong` reaches the
+  handshake only if its own source and VNI are that key, and is otherwise discarded as "No outstanding
+  work tied to this `addrPortVNI`" (`:658`–`:663`). A relayed `Ping` is always ponged at its source
+  (`:648`), but reaches the handshake — and so draws a ping back — only under the same key (`:653`), and
+  the handshake ignores it until the answer is sent (`:984`). The path that becomes usable is
+  `done.pongReceivedFrom` (`:735`), which is the challenge's source by construction. Once a path is in
+  use the rule is different, and that difference is what #458 read: refresh pongs go through
+  `endpoint.handlePongConnLocked`, which matches them by transaction id alone.
+
+  This tree carries no such key. `RelayPath::answered_addr` (`ts_magicsock/src/relay.rs:154`) records
+  the challenger and is used only to aim retry pings. `handle_relay_ping` (`ts_magicsock/src/sock.rs:1693`)
+  checks that the sender has a relay path on this VNI and then pings back at the relayed ping's own
+  source (`:1743`) in any handshake state, so a ping from an address that never challenged puts an
+  in-flight ping there, and `RelayPath::note_pong` (`relay.rs:205`) confirms whatever address a matched
+  ping went to. `handle_relay_pong` (`sock.rs:1761`) matches on transaction id alone during the handshake
+  as after it, and writes the pong's own source into the inbound attribution map beside the confirmed
+  address (`:1823`). **#458 is right about what it removed and silent about what was never there**: it
+  moved the class filter off the pong branch on the ground that upstream takes the source as given,
+  which holds for refresh pongs and not for the handshake's, and its test
+  `a_relayed_pong_from_any_source_still_confirms_the_path` pins a handshake pong from `10.0.0.5:52000`,
+  an address that did not challenge. Not peer-observable against a real relay server, which answers
+  from the address it challenged from; what differs is which inputs this node's handshake state machine
+  acts on. The port: while the handshake is unconfirmed, key both the ping back and pong acceptance on
+  `(answered_addr, VNI)`; keep ponging an admitted relayed ping at its source whether or not the key
+  matches; keep refresh pongs matched by transaction id; and decide, at `set_confirmed_addrs`, whether a
+  differing pong source still belongs in the attribution map. Re-pin #458's test to upstream's rule
+  rather than deleting it, and keep `a_relay_message_from_a_forbidden_source_is_dropped` passing.
+
+- **A disco ping that arrives over DERP is thrown away, so a Go peer's `tailscale ping` to this node
+  gets no pong while the two are on DERP** (`wgengine/magicsock/magicsock.go:2512` `handlePingLocked`;
+  `wgengine/magicsock/derp.go:734` `processDERPReadResult`, `:747`–`:751`;
+  `wgengine/magicsock/endpoint.go:1038` `discoPing`, `:1058`–`:1059`) — **needs port**, and *new at this
+  revision from the `disco` enumeration*. A Go client running `tailscale ping` starts a `pingCLI` disco
+  ping to the peer's DERP address whenever it has one (`endpoint.go:1058`), alongside any UDP
+  candidates, and reports the first pong. The receiving Go node answers it over DERP.
+  `processDERPReadResult` hands a DERP-borne disco frame to `handleDiscoMessage` with the source address
+  `127.3.3.40:<regionID>` and the frame's source node key as `derpNodeSrc` (`derp.go:747`–`:751`);
+  `handlePingLocked` refuses a Geneve-framed ping over DERP (`magicsock.go:2518`–`:2522`), counts the node
+  only if that node key is a known peer (`:2564`–`:2567`), sends nothing when it is not (`:2590`–`:2593`),
+  and otherwise sends `Pong{TxID, Src: 127.3.3.40:<regionID>}` to `derpNodeSrc` on that DERP address
+  (`:2603`–`:2608`). Here `demux_relayed_disco` (`ts_runtime/src/multiderp.rs:631`) passes DERP-borne
+  disco to `MagicSock::handle_relayed_disco` (`ts_magicsock/src/sock.rs:1385`), which acts on
+  `CallMeMaybe` and `CallMeMaybeVia` and discards everything else (`:1411`), and
+  `relayed_ping_is_dropped` (`sock.rs:5274`) pins the drop. Both doc comments give the same reason — a
+  DERP frame has no real UDP source to pong — and it is a reason about *host-sourced* sends that does not
+  reach this case: Go's pong is addressed to a node key over the DERP connection, never to an IP.
+  **Peer-observable**: a Go peer's `tailscale ping` to this node on DERP prints no
+  `pong from … via DERP(…)` line and times out while the node is working. The parts are in reach: the
+  region runner holds the source node key (`peer_id`, `multiderp.rs:552`) and its own region id where it
+  calls the demux, and `disco::seal_pong` builds the pong. One decision to make and record: this tree's
+  direct-path ping admission is stricter than Go's — `handle_disco` requires the ping's claimed node key
+  to be bound to the sender's disco key — and whether that holds on the DERP arm, and against which node
+  key (Go's `unambiguousNodeKeyOfPingLocked`, `magicsock.go:2478`, trusts `derpNodeSrc` first), is this
+  port's to say. Refusals to bring with it, each tested through the demux: an unknown source node key
+  gets no pong, a Geneve-framed ping over DERP gets no pong, the pong's `Src` is the DERP magic address
+  of the region it arrived on, and no candidate path is learned from a DERP ping, which
+  `relayed_ping_is_dropped` already asserts and must go on asserting.
+
+- **`CallMeMaybe` and `CallMeMaybeVia` are acted on without three refusals Go applies first: DERP only,
+  sealed by the DERP sender's own disco key, and for `Via` a relay-capable sender**
+  (`wgengine/magicsock/magicsock.go:2298`–`:2385`, `:1827` for the UDP arm;
+  `wgengine/magicsock/endpoint.go:1637` `checkAndUpdateDiscoKey`, `:1747` `relayCapable`) — **needs
+  port**, narrow, and *new at this revision from the `disco` enumeration*. Go's `handleDiscoMessage`
+  refuses, in order: a message that did not arrive over DERP with a non-zero source node key, "should only
+  come via DERP" (`:2312`–`:2316`) — the UDP receive path passes a zero `derpNodeSrc` (`:1827`), so a
+  `CallMeMaybe` on the UDP socket is never acted on; a source node key that is not a peer
+  (`:2317`–`:2327`); for `Via`, a peer below capability version 121, "is not known to be relay capable"
+  (`:2341`–`:2344`); and a message sealed by a disco key that is not one of *that* peer's keys, "whose
+  netmap discokey != disco source" (`:2346`–`:2358`, counted as `metricRecvDiscoCallMeMaybeBadDisco` and
+  `metricRecvDiscoCallMeMaybeViaBadDisco`). This tree has none of the three. `handle_disco`
+  (`ts_magicsock/src/sock.rs:2420`) acts on a `CallMeMaybe` received directly on the UDP socket —
+  learning its endpoints and pinging them at once — where Go drops it. `handle_relayed_disco`
+  (`sock.rs:1385`) is handed the frame alone, because `demux_relayed_disco`
+  (`ts_runtime/src/multiderp.rs:631`) drops the source node key its caller holds (`peer_id`, `:552`), so
+  `call_me_maybe_sender_allowed` (`sock.rs:2072`) can ask only whether the sealing disco key belongs to
+  *some* netmap member. And `CapabilityVersion::is_relay_capable` (`ts_capabilityversion/src/lib.rs:402`)
+  is ported, its doc comment names this very `CallMeMaybeVia` gate as one of the two things it gates in
+  Go, and nothing outside that crate's own tests calls it. Not peer-observable: a Go peer sends both
+  messages only over DERP, from its own node key, and sends `Via` only to relay-capable peers. What
+  differs is which inputs this node acts on, and each difference is an upstream refusal that was not
+  ported. The port carries the DERP source node key to the handler (the same plumbing the DERP-ping row
+  above needs), drops `CallMeMaybe` on the UDP arm, binds the sealing disco key to the DERP sender — the
+  binding verifier already answers that question when it is given a node key — and gates `Via` on the
+  sender's capability version, which needs the peer's `Node.Cap` to reach `ts_magicsock`. Read it with
+  the `disable-relay-client` row below, which adds a fourth refusal to the same arm (`:2331`). Tests: a
+  `CallMeMaybe` on the UDP socket learns no endpoint and sends no ping; a DERP-borne one sealed by peer
+  A's disco key but delivered from peer B's node key learns nothing, and the same frame from A still
+  works; a `CallMeMaybeVia` from a peer at version 120 starts no handshake, and one at 121 does.
 
 - **A DERP `PeerGone` frame is decoded and thrown away, so a learned relay route is never invalidated**
   (`wgengine/magicsock/derp.go:652`–`:665`, `:566`–`:569`; `derp/derp.go:81`–`:88` for the frame's own
@@ -580,9 +694,11 @@ last one.
   This tree has the relay client half and no gate on it. `ts_magicsock`'s relay module implements the
   `CallMeMaybeVia` → 3-way bind handshake → relayed ping/pong path
   ([`ts_magicsock/src/relay.rs`](ts_magicsock/src/relay.rs)), and the ingress arms at
-  [`ts_magicsock/src/sock.rs:1384`](ts_magicsock/src/sock.rs), `:1398` and `:2379` admit a
-  `CallMeMaybeVia` on `call_me_maybe_sender_allowed` (`:2026`) alone — a peer-identity check with no
-  node-attribute check beside it. `disable-relay-client` appears nowhere in the workspace.
+  [`ts_magicsock/src/sock.rs:1387`](ts_magicsock/src/sock.rs), `:1401` and `:2420` admit a
+  `CallMeMaybeVia` on `call_me_maybe_sender_allowed` (`:2072`) alone — a peer-identity check with no
+  node-attribute check beside it. `disable-relay-client` appears nowhere in the workspace. (Line
+  numbers corrected at this revision: #458 grew `sock.rs` by 131 lines above them; the code they name
+  did not change.)
 
   **Re-verified at this revision, and unchanged:** `disable-relay-client` still appears nowhere in the
   workspace. **At the previous revision one thing about it changed:** its sibling did. The predicate
@@ -672,19 +788,47 @@ last one.
 
 #### Read at this revision
 
-**No port merged in the interval, so this revision audited nothing and this section is a carry.** The
-audit source of change needs a merged port to read against upstream; `0c8796a..HEAD` is two
-documentation commits, so there was none. What this revision read instead is the DERP frame-type
-enumeration, whose results are the first three rows above, and `tailcfg.PeerChange`, which came back
-clean and is written up under [What changed at this revision](#what-changed-at-this-revision).
+**One port merged in the interval, and this revision audited it.** #458 cites
+`wgengine/magicsock/relaymanager.go` at `49e148c4a`, which is byte-identical at the pin, so it was read
+against the pin directly.
 
-Everything below is carried from the previous two revisions with its evidence intact, and every
-verdict still holds for a reason stronger than usual: **none of the tree code any of them names changed,
-because no tree code changed at all.** [`PARITY_AUDIT.json`](PARITY_AUDIT.json) audits three older
-ports (#436, #438, #442); the audits of #462/#464, #440, #443, #445, #448, #456 and #459 follow. Each
-verdict names the Go and the tree code it rests on, so a later revision can re-check it rather than
-trust it. A section that is a carry is still worth reading before opening a row in the same
-neighbourhood — that is what it is for.
+- **#458, a relayed pong confirms its path from any source** — **gap: wider than upstream, in one
+  place.** See the first row above. What #458 *kept* is recorded here rather than opened, because it
+  is a deliberate divergence with its reason next to the code: `MagicSock::relay_reply_target_allowed`
+  (`ts_magicsock/src/sock.rs`) still runs the relay-address class filter over the source of a
+  `BindUDPRelayEndpointChallenge` and of a relayed `Ping`, the two branches that put a datagram back on
+  the wire at that source. Go answers both at their source unconditionally
+  (`relaymanager.go:648`, `:981`). The fork's reason — a UDP source is forgeable, so without the filter
+  a forged challenge makes this host emit a bind answer and a disco ping at loopback, the link-local
+  metadata address or the LAN — is the anti-leak invariant the quality bar puts above parity, and the
+  interop cost is nil for the reason #458 gives: a handshake exists only once a bind has gone to an
+  address that passed the same filter. **Accepted as a divergence**, and added to the standing list.
+- **A relayed ping from a peer this node has no handshake with is not ponged** (`relaymanager.go:637`–`:651`)
+  — **deliberate divergence, recorded.** Go "always TX[s] a pong", to cover a ping that races
+  `udpRelayEndpointReady`. `handle_relay_ping` (`sock.rs:1693`) drops a relayed ping unless the sender
+  has a relay path on that VNI (`:1702`–`:1712`), and says why: otherwise any datagram sealed by a known
+  disco key makes this node emit Geneve-framed pongs at an address of the sender's choosing. The race
+  Go's comment names does not arise in this shape here, because a `RelayPath` outlives its confirmation
+  rather than being torn down when the handshake finishes, so a peer whose handshake completed is still
+  known when its pings arrive.
+
+**Read at this revision and clean, recorded so the next revision does not redo it.** Of `disco`'s nine
+message types, the four that only a relay server or an allocating client receives have no target here;
+a direct `Pong` is matched by transaction id and harvests `src` only from a netmap member, which is
+`handlePongConnLocked`'s rule plus a membership gate; and a direct `Ping`'s admission is the
+already-recorded stricter node-key binding. Go's duplicate-ping suppression in `handlePingLocked`
+(`addCandidateEndpoint` returning `duplicatePing`, `magicsock.go:2570`) exists because Linux can deliver
+one ping on both the raw disco socket and the UDP socket; `ts_magicsock` has no raw-socket receive path,
+so there is no duplicate to suppress. The remaining three arms are the second and third rows above.
+
+**Carried from the previous revisions, with their evidence intact.**
+[`PARITY_AUDIT.json`](PARITY_AUDIT.json) audits three older ports (#436, #438, #442); the audits
+of #462/#464, #440, #443, #445, #448, #456 and #459 follow. The interval's port, #458, touched none of the
+tree code they name except the two `only-tcp-443` citations in `sock.rs`, whose line numbers moved
+with the file and are corrected in place. Each verdict names the Go
+and the tree code it rests on, so a later revision can re-check it rather than trust it. A section that
+is a carry is still worth reading before opening a row in the same neighbourhood — that is what it is
+for.
 
 - **#462, the UDP/TCP race, and #464, the mismatched-reply follow-up** — **gap: narrower than
   upstream, in three places.** See the first three rows above. What the two commits *did* port is
@@ -716,7 +860,8 @@ neighbourhood — that is what it is for.
 
 **Carried from the revision before that, with their evidence intact**, because a verdict whose
 evidence is elided is a verdict the next re-derivation has to redo. Each was re-checked here only for
-whether the tree code it names still exists; nothing in the interval touched any of it.
+whether the tree code it names still exists; the interval's one port, #458, moved the line numbers of
+the #448 verdict's two `sock.rs` citations and touched nothing else any of them names.
 
 - **#440, the upstream-resolver TCP retry** — **gap: narrower than upstream.** That gap became the
   row #462 closed; see [Closed at the previous revision, kept in full](#closed-at-the-previous-revision-kept-in-full).
@@ -739,8 +884,8 @@ whether the tree code it names still exists; nothing in the interval touched any
   (`wgengine/magicsock/magicsock.go:1622`), `sendUDPNetcheck` refuses with `ErrUnsupported`
   (`:1606`), and netcheck is told `OnlyTCP443` (`:1038`), which skips the STUN probe plan and the ICMP
   probes and keeps the HTTPS latency arm (`net/netcheck/netcheck.go:940`, `:1008`). Here `send_udp`
-  returns without sending (`ts_magicsock/src/sock.rs:372`), `send_stun_request` refuses with
-  `Error::OnlyTcp443` (`sock.rs:2148`), and the STUN sweep skips its round (`ts_runtime/src/direct.rs:853`);
+  returns without sending (`ts_magicsock/src/sock.rs:376`), `send_stun_request` refuses with
+  `Error::OnlyTcp443` (`sock.rs:2194`), and the STUN sweep skips its round (`ts_runtime/src/direct.rs:853`);
   `ts_netcheck` has only an HTTPS arm, so its report is already Go's `OnlyTCP443` report. Two more Go
   reads have no target in this tree — the port mapper (`magicsock.go:686`) and the skip of the
   rebind-on-send-error path (`:921`). The last, inside `relayClientEnabled` (`:3002`), is the
@@ -757,14 +902,16 @@ whether the tree code it names still exists; nothing in the interval touched any
 
 #### Closed at this revision
 
-**Nothing closed at this revision, and the reason is structural rather than a lull.** A §B row closes
-when this tree gains the behaviour the row describes, and this tree gained no behaviour: the interval's
-two commits are this document and a correction to its backlog file. Recording the empty close is not
-bookkeeping for its own sake — across this ledger's history the close counts run 3, 3, 6, 4, 6, 0, 1
-and now 0, and a revision that closes nothing while opening three is the normal shape of a document
-whose pin has caught up with upstream. The previous revision's close is kept below in full, because
-its three successor rows are still open and a reader who finds one of them wants the closure they came
-out of.
+**Nothing closed at this revision, and this time the tree did gain behaviour.** A §B row closes when
+this tree gains the behaviour the row describes. #458 is a real behaviour change, but the divergence it
+removed — a relay-address class filter over a relayed pong's source — was never a row here: no revision
+had read the relay leg's source handling against `relaymanager.go`. So it closes nothing, and its
+audit opened the first row above instead. Recording the empty close is not bookkeeping for its own sake
+— across this ledger's history the close counts run 3, 3, 6, 4, 6, 0, 1, 0 and now 0 — and a port that
+fixes something no row carried is the case that says why: a merged port is worth auditing whether or
+not it closes a row. The *Peer relay* entry in the carried list now names #458 and points at that row.
+The close two revisions ago is kept below in full, because its three successor rows are still open and
+a reader who finds one of them wants the closure they came out of.
 
 #### Closed at the previous revision, kept in full
 
@@ -1685,7 +1832,12 @@ revision does not re-derive them.
   `magicsock.capVerIsRelayCapable(version)`, which is exactly `version >= 121`, so declaring less
   would silently disable the client half that is ported and working. The declaration is bracketed
   from below as well as above — floor 121, ceiling under 126 — with a ported predicate and a test
-  behind the floor.
+  behind the floor. *Added at this revision:* #458 narrowed the relay leg's source-address class filter
+  to the two branches that reply, so a relayed pong now confirms its path from any source. Its audit
+  found the handshake binds to no address at all where Go binds it to the challenger's — the first row
+  of §B's [Rows](#rows) — and the `disco` walk at the same revision found that the predicate behind the
+  floor has no caller on the inbound `CallMeMaybeVia` path, where Go uses it as a refusal; that is the
+  third row there.
 
 - **c2n endpoints behind the declared capability version** — capver 127 (`/debug/netmap`), 128
   (`/debug/health`) and row 138 (`/debug/tka/log`) share one responder
@@ -2081,10 +2233,10 @@ Re-checked against this pin and against this tree; none moved.
 
 The rows below were re-derived against this pin and against this tree and did not move. At this
 revision that is **every** row this document already carried, with nothing closing and nothing
-reopening, because no Rust changed in the interval and the pin did not move — see [What changed at this
-revision](#what-changed-at-this-revision). The previous revision's one close (the upstream-DNS race
-row) is under [Closed at the previous revision, kept in
-full](#closed-at-the-previous-revision-kept-in-full).
+reopening: the pin did not move, and the interval's one port, #458, is confined to `ts_magicsock`'s
+relay leg, which none of these rows names — see [What changed at this
+revision](#what-changed-at-this-revision). The upstream-DNS race row closed two revisions ago is under
+[Closed at the previous revision, kept in full](#closed-at-the-previous-revision-kept-in-full).
 They are kept in full because a row whose evidence is elided is a row the next re-derivation has to
 redo, and because "re-derived and unchanged" is only a checkable claim when the evidence is still on
 the page.
@@ -2236,6 +2388,11 @@ git -C <tailscale-go> grep -nE '^//[[:space:]]*-[[:space:]]*1[3-9][0-9]:' e2ed43
 # What upstream touched per mapped package since capver 130 landed (§B). Every upstream package
 # named in "Package mapping" is in this list; parent paths (wgengine, ipn) are used where the
 # mapping names several children, so a subdirectory upstream adds later cannot fall outside it.
+# WRITE THE CUTOFF AS AN INSTANT. Until this revision the loop said --since=2025-10-06, and git reads a
+# date with no time as that date AT THE CURRENT TIME OF DAY: the same loop at the same pin returned 857,
+# 854 and 850 at three revisions, depending only on when it was run, because four swept commits were
+# committed on 2025-10-06 itself. Written as below it returns 854 at any hour, the same set as filtering
+# each path's full history by committer timestamp (%ct) against that instant.
 for p in tailcfg disco derp net/packet net/tstun net/netcheck net/stun net/dns \
          net/udprelay net/socks5 net/tsdial net/tlsdial net/bakedroots net/netmon net/art \
          net/routemanager \
@@ -2243,33 +2400,36 @@ for p in tailcfg disco derp net/packet net/tstun net/netcheck net/stun net/dns \
          wgengine ipn tsd tka types/key types/persist tsnet \
          feature/remoteconfig feature/identityfederation feature/taildrop feature/ssh \
          feature/acme ssh/tailssh sessionrecording util/clientmetric tstime tstest tool/; do
-  echo "== $p"; git -C <tailscale-go> log --since=2025-10-06 --oneline -- "$p"
+  echo "== $p"; git -C <tailscale-go> log --since='2025-10-06T00:00:00Z' --oneline <pin> -- "$p"
 done
+# The count this ledger records is the number of distinct hashes that loop prints: pipe the loop
+# through  grep -v '^== ' | cut -d' ' -f1 | sort -u | wc -l  and write down the number AND the pin.
 
 # Only what moved since the pin this ledger currently carries — the fast path on a re-derivation
 # that follows soon after the last one. Read it *in addition to* the full sweep, never instead of
 # it: a row's assessment can change because this tree moved, with upstream perfectly still, the
 # sweep list itself can be wrong (it has been, five times), and this range can be EMPTY (it has been
-# at most of the recent revisions, this one included) without the ledger being finished. Three
-# revisions ago it was seven commits and supplied one of five new rows; it has been empty at the three
-# since. Two of those took every new row from re-reading merged ports here against upstream; THIS one
-# had no merged port either, and took all three from reading an enumeration nobody had opened.
+# at most of the recent revisions, this one included) without the ledger being finished. Four
+# revisions ago it was seven commits and supplied one of five new rows; it has been empty at the four
+# since. Two of those took every new row from re-reading merged ports here against upstream, one from
+# reading an enumeration nobody had opened, and THIS one from both.
 # A non-empty delta is not a licence to skip the reading either.
 git ls-remote https://github.com/tailscale/tailscale HEAD   # <new-pin>; may already equal the pin
 git -C <tailscale-go> log --oneline e2ed43239..<new-pin>
 
 # And the mirror image of that: what moved *here* since the tree revision the header table names.
-# Three revisions ago it was TWENTY-THREE commits, six of which closed rows; two revisions ago ONE,
-# that document's own rewrite; at the previous revision FOUR, of which two were code and both in one
-# module; at THIS revision it is TWO and NEITHER IS CODE. Read it against the open rows first -- that
-# is the cheapest way to find a row that closed -- and then check that every port in it has been read
-# against upstream, in PARITY_AUDIT.json or under "Read at this revision" in §B. A port that closed a
-# row and was never audited is where a row that closed INCOMPLETELY hides: two revisions ago that
-# audit produced the one new row, and at the previous revision it produced all three.
+# Four revisions ago it was TWENTY-THREE commits, six of which closed rows; three revisions ago ONE,
+# that document's own rewrite; two revisions ago FOUR, of which two were code and both in one module;
+# at the previous revision TWO and NEITHER WAS CODE; at THIS revision FOUR, of which ONE is a port
+# (#458) and it closed no row. Read it against the open rows first -- that is the cheapest way to find
+# a row that closed -- and then check that every port in it has been read against upstream, in
+# PARITY_AUDIT.json or under "Read at this revision" in §B, WHETHER OR NOT IT CLOSED A ROW. A port
+# that closed a row and was never audited is where a row that closed INCOMPLETELY hides, and a port
+# that closed no row is a port whose upstream nobody had summarised: #458 was the second kind, and its
+# audit opened a row.
 # WHEN THIS RANGE HAS NO CODE IN IT, THE AUDIT SOURCE CANNOT FIRE AT ALL, and the revision's whole
-# yield has to come from reading. Budget for that when you see an empty-looking delta; this revision's
-# three rows came from one enumeration, not from the log.
-git log --oneline 0c8796a..HEAD
+# yield has to come from reading. Budget for that when you see an empty-looking delta.
+git log --oneline 9675565..HEAD
 
 # Wire types, both directions. Cheap, mechanical, and it found two rows two revisions ago after six
 # revisions of not being run. Re-run at this pin it returns the one known phantom and nothing new.
@@ -2338,29 +2498,33 @@ and a pattern that pins it would go silently empty the day it changes. Check the
 than trusting the exit status — at the pinned commit the second command returns **18 lines**, 130
 through 147, i.e. the seventeen-version window of §A plus the 130 row that anchors it. Three
 revisions derived **17** against a pin that never moved; the revision after that derived **18** when the
-pin moved by one version; the two since, this one included, have derived **18** again against the
+pin moved by one version; the three since, this one included, have derived **18** again against the
 same pin. That is why counting is the whole of the check rather than a formality:
 when the pin does not move, "upstream added nothing", "I re-ran it against the same tree" and "the
 pattern broke" all produce the same *feeling*, and only the count tells them apart. An empty or short
 result means the pattern broke, not that upstream added nothing.
 
-**The same argument applies to the sweep loop's own count, and the discrepancy the previous revision
-opened is closed at this one by a third run.** The previous revision recorded **854** against the
-**857** the revision before it had recorded at the identical pin, could not reconstruct either, and
-ruled `TZ` out (`--since` is interpreted in the local zone; UTC and CEST both give 854, while
-`America/Los_Angeles` gives 845, a much larger step than three). Re-run at this revision the loop as
-printed above returns **854** again. Two agreeing derivations against one, so 857 is the outlier and
-the number to carry is 854. Nothing in §B ever turned on it; what the episode bought is the line of
-discipline that resolved it — **when a derivation records a count, record the command that produced it
-exactly** — and the demonstration that the only way to settle a count dispute is to run the recorded
-command again, not to reason about what might have differed.
+**The same argument applies to the sweep loop's own count, and at this revision it paid for itself.**
+Three revisions recorded **857**, **854** and **854** at the identical pin, and the previous one closed
+the question by majority — two agreeing runs against one — having ruled `TZ` out by trying it. Run
+here, the loop as it was then printed returned **850**, and the majority was wrong too: the command was
+not deterministic. Git reads `--since=2025-10-06` as that date *at the current time of day*, so every
+commit committed on 2025-10-06 is in or out of the window depending on when the loop runs. Four swept
+commits were committed that day, between 14:49 and 17:48 UTC, which is enough to produce every count
+ever recorded. `TZ` looked relevant and was not, because it only moves the cutoff through the local
+clock. The loop above now writes the cutoff as an instant and returns **854** at any hour. What the
+episode bought is sharper than the rule the previous revision drew from it: recording the command
+exactly is necessary and not sufficient — **a count is only a check if the command that produced it
+returns the same answer every time it is run**, and a disagreement between runs is a bug in the
+command until shown otherwise, not a vote to be taken.
 
-**Three of the commands above have been wrong: two were rewritten two revisions ago, and the third was
-widened at the previous revision.** They are
+**Four of the commands above have been wrong: two were rewritten three revisions ago, the third was
+widened two revisions ago, and the fourth — the sweep loop's cutoff — was fixed at this one.** They are
 called out here rather than only in the comments, because a command that returns a plausible short
-answer is worse than one that fails: nobody re-checks it. All three behaved as intended when they were
-last run, and the first of them is why two revisions ago the ledger could see six rows close at all — the six
-attributes those ports added include two `one-cgnat?v=…` keys that the narrow class could not match.
+answer is worse than one that fails: nobody re-checks it. All four behaved as intended when they were
+last run, and the first of them is why three revisions ago the ledger could see six rows close at all —
+the six attributes those ports added include two `one-cgnat?v=…` keys that the narrow class could not
+match.
 
 1. **The node-attribute walk's character class was too narrow.** `'"[a-z0-9-]+"'` matches only
    attributes whose key is lowercase letters, digits and hyphens, and upstream has fourteen that are
@@ -2389,6 +2553,15 @@ attributes those ports added include two `one-cgnat?v=…` keys that the narrow 
    above — it costs a reader an hour, not a row — but it is the same failure: **the filter was
    written from where the author expected the answer to be, not from where the type system says it
    can be.** Search `'*.go'`.
+4. **The sweep loop's cutoff depended on the time of day it was run, and that is new at this
+   revision.** `--since=2025-10-06` is a date with no time, which git completes with the current time
+   of day, so the four swept commits committed on 2025-10-06 moved in and out of the count between
+   runs: 857, 854, 854 and 850 at one pin. Two revisions of this document reasoned about the numbers
+   — ruling out `TZ`, then settling by majority — before one listed the commits the two runs
+   disagreed about, which found the cause in minutes. The loop now says
+   `--since='2025-10-06T00:00:00Z'`. The general lesson is the one this list keeps teaching in new
+   forms: **when two runs of one command disagree, diff their outputs before reasoning about their
+   counts.**
 
 **The sweep list is part of the ledger, and it has now been wrong five times.** The rule that
 governs it has not changed since it was written down: when [Package mapping](#package-mapping)
@@ -2486,24 +2659,28 @@ read package, and a read commit log is not a read package either.**
 **And when the upstream delta is empty, that is not a signal to do less reading — it is the revision
 where the reading is the whole job.** Budget for it, not just for the `git log`. Across the consecutive
 revisions at which the pin has not moved at all, the ledger gained eight rows, then nine, then one,
-then three, and now three again. At the previous revision the *tree* delta was four commits of which
-two were code, in one module, and those two commits produced every row. **At this revision the tree
-delta contains no code at all, and the yield was the same three.** That is the case worth planning for,
-because it is where the shape of the work changes rather than its size: with nothing to diff and
+then three, then three, and now three again. Two revisions ago the *tree* delta was four commits of
+which two were code, in one module, and those two commits produced every row. At the previous revision
+the tree delta contained no code at all, and the yield was the same three, from one enumeration. **At
+this revision the tree delta held one port that closed nothing, and the yield split: one row from
+auditing it, two from walking the next enumeration on the list.** The empty-code case is the one worth
+planning for, because it is where the shape of the work changes rather than its size: with nothing to diff and
 nothing to audit, every row has to come from opening something nobody had opened. Pick an enumeration
 and read it. **Size the reading by what the document claims to have finished, not by how big the diff
 is** — and when the diff is empty, by what it has never looked at.
 
-Five techniques have paid, and at this revision the fifth produced every row while the first four
-produced none. **Say plainly which were re-run, because "re-checked" and "re-read" are not the same
-claim.** Techniques 1, 2 and 4 read *this tree* against *upstream at the pin*, and at this revision
-neither side changed a byte — so re-running them could not return anything the previous revision had
-not already recorded, and they were not re-derived. Technique 3's mechanical half (the
-`tailcfg/nodecap` grep) **was** re-run, as were all four commands under the recipe above, and every
-count matched; its judgement half was not re-asked. Technique 5 was the work of this revision. A
-future revision at a moved pin owes all five a re-run; a revision at a still pin owes an explicit note
-of which it skipped and why, which is this paragraph. They are kept in full because their yield is
-lumpy, not because it is zero:
+Five techniques have paid, and at this revision two of them produced every row. **Say plainly which
+were re-run, because "re-checked" and "re-read" are not the same claim.** Techniques 1 and 4 read
+`ts_control_serde` and its readers against upstream's wire types; #458 touches no wire type and the pin
+did not move, so neither side of that comparison changed a byte and they were not re-derived.
+Technique 2 was applied to exactly one piece of code, the one that moved: #458's `handle_relay_disco`
+and the handlers it calls, read top to bottom against `relaymanager.go` at the pin — the audit that
+produced the first row. Technique 3's mechanical half (the `tailcfg/nodecap` grep) **was** re-run, as
+were the capability-version and sweep commands above; every count matched except the sweep's, whose
+cause is written up above, and the judgement half was not re-asked. Technique 5 was applied to `disco`
+and produced the other two rows. A future revision at a moved pin owes all five a re-run; a revision
+at a still pin owes an explicit note of which it skipped and why, which is this paragraph. They are
+kept in full because their yield is lumpy, not because it is zero:
 
 1. **Take a wire field this tree decodes and follow it forward.** A field modelled in
    `ts_control_serde` that reaches nothing. A `git grep` for the field name finds it and looks like
@@ -2548,11 +2725,16 @@ lumpy, not because it is zero:
    tell you that. **Record the clean reads too.** `tailcfg.PeerChange`'s eleven fields were walked at
    this revision and are all modelled *and* applied (`ts_control_serde::netmap::PeerChange`,
    `ts_runtime::peer_tracker::apply_peer_patches`), so that enumeration is done and the next revision
-   should spend its hour elsewhere. Enumerations not yet walked, for whoever is next: `disco`'s nine
-   message types (spot-checked at this revision and apparently complete, not walked), `tailcfg`'s c2n
-   dispatch table (mostly moot behind the held declaration), `ipn.Prefs`, and `netcheck.Report`.
+   should spend its hour elsewhere. **`disco`'s nine message types were walked at the revision after
+   that** — the previous revision had "spot-checked" them as "apparently complete", which is exactly
+   the verdict a structural check gives — and paid two rows, both of the shapes named above: a `Ping`
+   decoded and discarded when it arrives over DERP, and a ported predicate, `is_relay_capable`, with
+   no caller on the path whose refusal it exists for. A spot-check of an enumeration is not a walk of
+   it. Enumerations not yet walked, for whoever is next: `tailcfg`'s c2n dispatch table (mostly moot
+   behind the held declaration), `ipn.Prefs`, and `netcheck.Report`.
 
-**The sharper form of "a swept package is not a read package", new at this revision.** Earlier
+**The sharper form of "a swept package is not a read package", new at the previous revision and
+confirmed on `disco` at this one.** Earlier
 revisions established that sweeping a package's commits is not reading the package. `derp` adds the
 next step: **modelling every member of a package's enumeration is not acting on every member of it**,
 and it is a much better disguise than an unread commit log. `ts_derp` has all sixteen `FrameType`
@@ -2579,50 +2761,57 @@ it cannot be advanced, because upstream's default branch is already what the hea
 everything anyway and rewrite §A and §B from what came back** — that has now happened at
 several consecutive revisions, and it is not a special case to be handled once: a pin catches up with upstream
 whenever a re-derivation follows soon after the last one, and the value of the document at that
-moment is entirely in the reading. Two revisions ago the reading that paid was not of upstream at all:
-it was of the two commits *this tree* merged in the interval, read against the upstream they cite. At
-**this** revision the tree merged no code either, and what paid was reading one upstream enumeration —
-`derp/derp.go`'s frame types — against a crate that models every member of it.
+moment is entirely in the reading. Three revisions ago the reading that paid was not of upstream at
+all: it was of the two commits *this tree* merged in the interval, read against the upstream they cite.
+At the previous revision the tree merged no code, and what paid was reading one upstream enumeration —
+`derp/derp.go`'s frame types — against a crate that models every member of it. At **this** revision
+both paid at once: the one port the tree merged, read against the file it cites, and the next
+enumeration on the list, `disco/disco.go`'s message types.
 
 A row whose assessment changes should say *why* it changed — and note that "why" has **four**
-sources, not three. The fourth was added at the previous revision, and at this one it is the only
-source that produced anything.
+sources, not three. At this revision two of them produced rows: the third (reading an enumeration) and
+the fourth (auditing a merged port).
 
-1. **Upstream can move.** `29cfb0b4c` added capability version 147 two revisions ago; `85c1efb46`
-   added 146 five revisions ago, `2ae2808b6` moved the index-eviction row before that, `e1d17a6b9`
+1. **Upstream can move.** `29cfb0b4c` added capability version 147 three revisions ago; `85c1efb46`
+   added 146 six revisions ago, `2ae2808b6` moved the index-eviction row before that, `e1d17a6b9`
    and `f53c28101` moved the disco-key rows before that, and `d9cc55e33` moved the
    `tsnet.Server.HTTPClient` row before that. It contributed nothing at three consecutive revisions,
-   one row three revisions ago, and nothing at the three since, which is about its long-run rate.
+   one row four revisions ago, and nothing at the four since, which is about its long-run rate.
 2. **This tree can move, with upstream still**, and it is the only thing that closes rows.
-   **Nothing closed at this revision**, because no Rust changed in the interval — the one thing that
-   can close a row. **One closed at the previous revision** on tree movement alone (#462 with #464),
-   the only row this ledger has opened and closed in consecutive revisions. **Six closed three
+   **Nothing closed at this revision, although Rust did change**: #458 is a real behaviour change, but
+   the divergence it removed was never a row, so there was nothing for it to close. Nothing closed at
+   the previous revision either, where no Rust changed at all. **One closed two revisions ago** on tree
+   movement alone (#462 with #464),
+   the only row this ledger has opened and closed in consecutive revisions. **Six closed four
    revisions ago** (#438, #440, #442, #443, #445, #448), the largest single-revision close in this ledger's
-   history; none closed at the previous revision, where the tree moved by one documentation commit.
-   Six closed before that (#415, #417, #418, #419, #421,
-   #423), four before that (#404, #406, #408/#410, #412), six before that (#360, #363, #367, #369,
-   #370, #372), three before that (#339, #342/#343/#345, #347), and three capability-version rows at
-   the one before.
+   history; none closed at the revision after that, where the tree moved by one documentation commit.
+   Six closed before that (#415, #417, #418, #419, #421, #423), four before that (#404, #406,
+   #408/#410, #412), six before that (#360, #363, #367, #369, #370, #372), three before that (#339,
+   #342/#343/#345, #347), and three capability-version rows at the one before.
 3. **The sweep itself can widen, or simply be read more carefully**, and surface something that was
-   true all along. That is where all seventeen changes across two earlier revisions came from, and at
-   **this** revision it is the only source that *could* fire — upstream did not move, the tree did not
-   move, and no port merged — so all three new rows are its, from the DERP frame-type enumeration.
-   Called "the technique of last resort when the delta is thin" by earlier revisions; at a revision
-   with no delta at all it is the technique of first resort, and it should be budgeted as such.
-4. **A port that landed here can turn out to be narrower than the upstream behaviour it copied.**
-   Added three revisions ago, when **four of its five new rows** came from re-reading three merged
-   ports against the Go tree they cited, which is what [`PARITY_AUDIT.json`](PARITY_AUDIT.json)
-   records; two revisions ago it produced the one new row, and at the previous revision **all three**.
-   At **this** revision it produced nothing, and not because it was skipped: it has a precondition the
-   other three sources do not, which is a merged port to read, and the interval contains none. Note
+   true all along. That is where all seventeen changes across two earlier revisions came from, all
+   three of the previous revision's rows (the DERP frame-type enumeration), and **two of this
+   revision's three** (the `disco` message-type enumeration). Called "the technique of last resort when
+   the delta is thin" by earlier revisions; at a revision with little or no delta it is the technique of
+   first resort, and it should be budgeted as such.
+4. **A port that landed here can turn out to be narrower — or wider — than the upstream behaviour it
+   copied.** Added four revisions ago, when **four of its five new rows** came from re-reading three
+   merged ports against the Go tree they cited, which is what [`PARITY_AUDIT.json`](PARITY_AUDIT.json)
+   records; three revisions ago it produced the one new row, two revisions ago **all three**, and at the
+   previous revision nothing, because no port merged. At **this** revision it produced **one**, from
+   #458 — the first time it has fired on a port that closed no row, and the first time the port was
+   *wider* than upstream rather than narrower: #458 accepts a handshake pong Go discards. It has a
+   precondition the other three sources do not, which is a merged port to read. Note
    that precondition when you plan a revision — this source is the dominant one over the long run and
    it is silent at exactly the revisions where the pin has caught up and the tree is quiet. The reason
    it dominates when it can fire is structural: none of these rows is visible to the sweep, to the
    node-attribute walk, or to the wire-type checks — every one of those reports the attribute as
    *handled* and the behaviour as *present*, because it is. What is wrong is the decision logic
    underneath, and only reading the merged diff against upstream finds it. **So a revision that
-   closes rows owes the next revision an audit of what it closed.** This revision closed one row and
-   the audit of it opened three, which sharpens the rule into something worth stating on its own:
+   closes rows owes the next revision an audit of what it closed** — and, since this revision, **a
+   revision whose tree merged a port owes an audit of it whether or not it closed anything.** Two
+   revisions ago a revision closed one row and the audit of it opened three, which sharpens the rule
+   into something worth stating on its own:
    **a port written from one of this ledger's rows is scoped by the row, and the row is a summary of
    upstream, not upstream.** The closer a port looks to the row that asked for it, the more likely
    the gap is in the row.

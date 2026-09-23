@@ -20,6 +20,9 @@ chrono = { workspace = true }
 # Our crates.
 ts_bart.workspace = true
 ts_bart_packetfilter.workspace = true
+# The peer capability version (`tailcfg.Node.Cap`) the inbound CallMeMaybeVia gate reads off the
+# netmap before handing it to the magicsock. Already in the graph via `ts_control`.
+ts_capabilityversion.workspace = true
 ts_control.workspace = true
 ts_dataplane.workspace = true
 ts_dns_wire.workspace = true
@@ -49,6 +52,10 @@ base64.workspace = true
 # TUN-mode only: parse inbound IPv4+UDP TUN packets and build the MagicDNS reply
 # (recomputing IPv4+UDP checksums) for the in-datapath quad-100 DNS intercept.
 etherparse = { version = "0.19", optional = true }
+# TUN-mode only: list host interface addresses for the macOS/Android automatic one-CGNAT route
+# default (Go `netmon.Monitor.HasCGNATInterface`). Already a normal dependency of `ts_magicsock`,
+# so this pulls in no new crate.
+if-addrs = { version = "0.15", optional = true }
 futures.workspace = true
 httparse.workspace = true
 ipnet.workspace = true
@@ -77,7 +84,7 @@ libc = "0.2"
 # Off by default. Enables the TUN-mode overlay transport (ts_transport_tun) so the runtime can
 # run the application data path over a real OS TUN interface instead of the userspace netstack.
 # TUN device creation needs root/CAP_NET_ADMIN; off the ring-only egress path.
-tun = ["dep:ts_transport_tun", "dep:ts_host_net", "dep:etherparse"]
+tun = ["dep:ts_transport_tun", "dep:ts_host_net", "dep:etherparse", "dep:if-addrs"]
 # Off by default. Enables the internal OS network-link monitor: the `NetmonSupervisor` actor that,
 # on a link change (Wi-Fi switch, sleep/wake, default-route change), re-binds the underlay socket
 # and re-probes connectivity (re-ping, immediate STUN, re-netcheck). Gated behind both this feature
