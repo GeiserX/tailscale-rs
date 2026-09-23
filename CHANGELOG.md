@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.57.0](https://github.com/GeiserX/tailscale-rs/compare/v0.56.5...v0.57.0) (2026-09-23)
+
+
+### Features
+
+* **host-net:** give the CGNAT interface probe one home, not two ([#512](https://github.com/GeiserX/tailscale-rs/issues/512)) ([52a001c](https://github.com/GeiserX/tailscale-rs/commit/52a001c25bebe755385d92b153b8d69023d53077))
+
 ## [0.56.5](https://github.com/GeiserX/tailscale-rs/compare/v0.56.4...v0.56.5) (2026-09-22)
 
 
