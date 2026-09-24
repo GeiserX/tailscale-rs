@@ -701,6 +701,10 @@ impl Node {
     /// `tailcfg/nodecap`'s `OneCGNATDisable`): one host route per peer until the consumer's own
     /// peer-count ceiling, which still applies. The other half of
     /// [`NODE_ATTR_ONE_CGNAT_ENABLE`](Self::NODE_ATTR_ONE_CGNAT_ENABLE)'s tri-state.
+    ///
+    /// It declines the **forced** collapse only. It is not a licence for an unbounded host route
+    /// table: the consumer's own peer-count ceiling still applies above it — see
+    /// [`Node::one_cgnat`](Self::one_cgnat).
     const NODE_ATTR_ONE_CGNAT_DISABLE: &'static str = "one-cgnat?v=false";
 
     /// Control's tri-state instruction about collapsing this node's per-peer CGNAT host routes
@@ -717,9 +721,19 @@ impl Node {
     /// * `None` — neither attribute present: control has no opinion, and the consumer's platform
     ///   default decides (Go `ipn/ipnlocal`'s `shouldUseOneCGNATRoute`), under the same ceiling.
     ///
+    /// What the third state does NOT do is switch the consumer's peer-count ceiling off. Upstream
+    /// resolves this `opt.Bool` down to a plain `bool` before the route manager sees it, and
+    /// `RouteManager.cgnatThreshold()` then picks between `1` and `cgnatThreshold` (`10_000`) —
+    /// so a node holding `one-cgnat?v=false` still collapses once it has more CGNAT peer routes
+    /// than the ceiling. The tri-state chooses whether to collapse *early*, not whether a host
+    /// route table may grow without bound.
+    ///
     /// A node holding BOTH attributes reads as `Some(true)`: the enabling attribute is checked
-    /// first and wins. Collapsing is the safe way to break that tie — the `/10` is a superset of
-    /// the `/32`s it replaces, so no peer becomes unreachable.
+    /// first and wins. Control setting both is a policy conflict rather than a state upstream
+    /// specifies, and collapsing is the safe way to break the tie — the `/10` is a superset of the
+    /// `/32`s it replaces, so no peer becomes unreachable, whereas honouring the disabling
+    /// attribute on a tailnet large enough for control to have set the enabling one would keep a
+    /// per-peer route table far past the point where it is worth programming.
     pub fn one_cgnat(&self) -> Option<bool> {
         if self.has_node_attr(Self::NODE_ATTR_ONE_CGNAT_ENABLE) {
             Some(true)
