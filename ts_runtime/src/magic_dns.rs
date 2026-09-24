@@ -3658,6 +3658,31 @@ mod tests {
         );
     }
 
+    /// A discarded datagram counts as a non-refusal failure whatever it claims to carry: a spoofed
+    /// NOERROR answer with a transaction id we never asked with is neither relayed nor mistaken for
+    /// the walk's end, and still stops an earlier refusal from being relayed.
+    #[tokio::test]
+    async fn refusal_then_discarded_answer_is_the_fallback_not_the_refusal() {
+        let query = build_query(0x20E, &["api", "example", "com"], 1, 1);
+        let (first, second) = (upstream_addr(1), upstream_addr(2));
+        let refusal = upstream_response(&query, RCODE_REFUSED, 0, b"first refusal");
+        let mut poisoned = upstream_response(&query, 0, 1, b"injected");
+        poisoned[0] ^= 0xFF; // a transaction id we never asked with
+        let fallback = upstream_response(&query, RCODE_SERVFAIL, 0, b"synthesized");
+
+        let (got, _asked) = run_forward_walk(
+            &[
+                (first, Some((first, refusal))),
+                (second, Some((second, poisoned))),
+            ],
+            &query,
+            fallback.clone(),
+        )
+        .await;
+
+        assert_eq!(got, fallback);
+    }
+
     #[test]
     fn longest_suffix_route_wins() {
         let mut routes = std::collections::BTreeMap::new();
