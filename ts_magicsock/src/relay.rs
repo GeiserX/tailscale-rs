@@ -130,9 +130,13 @@ pub(crate) enum HandshakeState {
 /// ping or pong on that endpoint is matched against the address it came from.
 ///
 /// Upstream `relayManager` keys outstanding handshake work by `addrPortVNI{from, vni}`, recorded
-/// when it accepts the challenge that work answers, and hands a relayed ping or pong to a
-/// handshake only under that key. Once the handshake is done the work is gone: later pongs are
-/// ordinary refresh pongs, which `endpoint.handlePongConnLocked` matches by transaction id alone.
+/// when it accepts the challenge that work answers (`wgengine/magicsock/relaymanager.go:611-635`),
+/// and hands a relayed ping or pong to a handshake only under that key (`:653-663`); before the
+/// challenge is answered the handshake ignores a relayed ping outright (`:983-986`), and the path
+/// it makes usable is `done.pongReceivedFrom` (`:735`), the challenger's by construction. Once
+/// the handshake is done the work is gone: later pongs are ordinary refresh pongs, which
+/// `endpoint.handlePongConnLocked` matches by transaction id alone
+/// (`wgengine/magicsock/endpoint.go:1917`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RelayBinding {
     /// No challenge has been answered yet, so no address is bound to this handshake: nothing
