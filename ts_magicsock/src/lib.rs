@@ -47,5 +47,6 @@ pub use error::{DiscoError, Error};
 pub use path::{PeerPaths, TRUST_DURATION};
 pub use relay::RelayServerEndpoint;
 pub use sock::{
-    BindingVerifier, DerpSource, DirectTransport, MagicSock, ReceivedData, RelayedDisco,
+    BindingVerifier, DerpSource, DirectTransport, MagicSock, PeerCapVersionLookup, ReceivedData,
+    RelayedDisco,
 };
