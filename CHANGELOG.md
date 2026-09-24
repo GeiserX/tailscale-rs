@@ -2,6 +2,36 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.57.1](https://github.com/GeiserX/tailscale-rs/compare/v0.57.0...v0.57.1) (2026-09-23)
+
+
+### Bug Fixes
+
+* **magic_dns:** merge main into the REFUSED/SERVFAIL precedence branch ([#521](https://github.com/GeiserX/tailscale-rs/issues/521)) ([3560420](https://github.com/GeiserX/tailscale-rs/commit/3560420e0d8a3f69ca50c852577ea0123a7d495c))
+* **magicsock:** land [#489](https://github.com/GeiserX/tailscale-rs/issues/489)'s call-me-maybe refusals on top of main's port ([#527](https://github.com/GeiserX/tailscale-rs/issues/527)) ([b8a2d63](https://github.com/GeiserX/tailscale-rs/commit/b8a2d630a933f0d3d74c7931f098d2b6b17734a3))
+
+## [0.57.0](https://github.com/GeiserX/tailscale-rs/compare/v0.56.5...v0.57.0) (2026-09-23)
+
+
+### Features
+
+* **host-net:** give the CGNAT interface probe one home, not two ([#512](https://github.com/GeiserX/tailscale-rs/issues/512)) ([52a001c](https://github.com/GeiserX/tailscale-rs/commit/52a001c25bebe755385d92b153b8d69023d53077))
+
+## [0.56.5](https://github.com/GeiserX/tailscale-rs/compare/v0.56.4...v0.56.5) (2026-09-22)
+
+
+### Bug Fixes
+
+* **magicsock:** bind an inbound CallMeMaybe to the peer that relayed it ([#503](https://github.com/GeiserX/tailscale-rs/issues/503)) ([5dcb06f](https://github.com/GeiserX/tailscale-rs/commit/5dcb06f2d293316ecc9d4b665ba5e8e82e5e8b82))
+
+## [0.56.4](https://github.com/GeiserX/tailscale-rs/compare/v0.56.3...v0.56.4) (2026-09-22)
+
+
+### Bug Fixes
+
+* **magic_dns:** answer SERVFAIL when a refusal is mixed with other failures ([#487](https://github.com/GeiserX/tailscale-rs/issues/487)) ([5ce2305](https://github.com/GeiserX/tailscale-rs/commit/5ce2305699a1e43338f5c8537beb3e4816ffe83f))
+* **packetfilter:** surface a rejected packet filter as a health warning ([#492](https://github.com/GeiserX/tailscale-rs/issues/492)) ([c10ac63](https://github.com/GeiserX/tailscale-rs/commit/c10ac63f659bdc55544d3bd17d18900e092472ee))
+
 ## [0.56.3](https://github.com/GeiserX/tailscale-rs/compare/v0.56.2...v0.56.3) (2026-09-22)
 
 

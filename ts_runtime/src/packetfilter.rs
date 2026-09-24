@@ -43,6 +43,35 @@ pub struct PacketfilterUpdater {
     /// peers network access. While set, the published filter is a deny-all instead of the compiled
     /// one — Go's `packetFilter = nil`. Re-derived on every netmap that moves either side.
     unlocked_nodes_permitted: bool,
+    /// Sender for [`InvalidPacketFilterRx`]: mirrors
+    /// [`unlocked_nodes_permitted`](Self::unlocked_nodes_permitted) out to
+    /// [`Runtime::status`](crate::Runtime::status), which reports it as a health warning.
+    invalid_filter_tx: InvalidPacketFilterTx,
+}
+
+/// The text of the health warning raised while control's packet filter is rejected for granting an
+/// unlocked peer access — Go's `invalidPacketFilterWarnable` (code `invalid-packet-filter`,
+/// `SeverityHigh`) in `ipn/ipnlocal/local.go`, word for word.
+pub const INVALID_PACKET_FILTER_WARNING: &str = "The coordination server sent an invalid packet \
+     filter permitting traffic to unlocked nodes; rejecting all packets for safety";
+
+/// Whether the invalid-packet-filter health warning is currently raised (Go
+/// `health.SetUnhealthy(invalidPacketFilterWarnable)` / `SetHealthy`). A `watch` for the same reason
+/// [`CapGrants`] rides one: `Runtime::status` reads the current value on demand.
+pub(crate) type InvalidPacketFilterRx = watch::Receiver<bool>;
+
+/// The writing half of [`InvalidPacketFilterRx`], held by [`PacketfilterUpdater`].
+pub(crate) type InvalidPacketFilterTx = watch::Sender<bool>;
+
+/// The health warnings [`Status::health`](crate::Status::health) reports, given whether the
+/// invalid-packet-filter warning is raised. Go's `ipnstate.Status.Health` is the text of every
+/// unhealthy warnable; this fork has exactly one.
+pub(crate) fn health_warnings(invalid_packet_filter: bool) -> Vec<String> {
+    if invalid_packet_filter {
+        vec![INVALID_PACKET_FILTER_WARNING.to_string()]
+    } else {
+        Vec::new()
+    }
 }
 
 #[derive(Clone)]
@@ -90,11 +119,16 @@ pub(crate) type LiveFilterRx = watch::Receiver<Option<PacketFilterState>>;
 pub(crate) type LiveFilterTx = watch::Sender<Option<PacketFilterState>>;
 
 impl kameo::Actor for PacketfilterUpdater {
-    type Args = (Env, watch::Sender<CapGrants>, LiveFilterTx);
+    type Args = (
+        Env,
+        watch::Sender<CapGrants>,
+        LiveFilterTx,
+        InvalidPacketFilterTx,
+    );
     type Error = Error;
 
     async fn on_start(
-        (env, cap_grants_tx, live_filter_tx): Self::Args,
+        (env, cap_grants_tx, live_filter_tx, invalid_filter_tx): Self::Args,
         slf: ActorRef<Self>,
     ) -> Result<Self, Self::Error> {
         env.subscribe::<Arc<ts_control::StateUpdate>>(&slf).await?;
@@ -107,6 +141,7 @@ impl kameo::Actor for PacketfilterUpdater {
             live_filter_tx,
             unlocked_allowed_ips: Default::default(),
             unlocked_nodes_permitted: false,
+            invalid_filter_tx,
         })
     }
 }
@@ -213,6 +248,9 @@ impl PacketfilterUpdater {
             tracing::info!("control's packet filter no longer grants an unlocked peer access");
         }
         self.unlocked_nodes_permitted = permitted;
+        // Go raises `invalidPacketFilterWarnable` on the same transition and clears it once the
+        // filter is acceptable again, so the rejection reaches `Status` and not only the log.
+        self.invalid_filter_tx.send_replace(permitted);
         true
     }
 }
@@ -345,15 +383,78 @@ mod unlocked_node_tests {
         }
     }
 
-    /// Stand up the production updater, returning it with the live-filter cell it writes.
-    fn updater() -> (ActorRef<PacketfilterUpdater>, LiveFilterRx) {
+    /// Stand up the production updater, returning it with the live-filter cell and the
+    /// invalid-packet-filter health cell it writes — the same cell `Runtime::status` reads.
+    fn updater_with_health() -> (
+        ActorRef<PacketfilterUpdater>,
+        LiveFilterRx,
+        InvalidPacketFilterRx,
+    ) {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let env =
             crate::env::Env::new(ts_keys::NodeState::generate(), shutdown_rx, forwarder_cfg());
         let (cap_grants_tx, _cap_grants_rx) = watch::channel(Default::default());
         let (filter_tx, filter_rx) = watch::channel(None);
-        let updater = PacketfilterUpdater::spawn((env, cap_grants_tx, filter_tx));
-        (updater, filter_rx)
+        let (health_tx, health_rx) = watch::channel(false);
+        let updater = PacketfilterUpdater::spawn((env, cap_grants_tx, filter_tx, health_tx));
+        (updater, filter_rx, health_rx)
+    }
+
+    /// Go raises `invalidPacketFilterWarnable` when it rejects the filter and clears it when the
+    /// filter is acceptable again. Without it a node dropping all inbound traffic tells the
+    /// operator nothing outside its logs.
+    #[tokio::test]
+    async fn a_rejected_filter_raises_the_health_warning_and_recovery_clears_it() {
+        let (updater, mut filter_rx, health_rx) = updater_with_health();
+
+        deliver(
+            &updater,
+            &mut filter_rx,
+            netmap(
+                Some(ts_control::PeerUpdate::Full(vec![peer(9, false)])),
+                Some(vec![tcp_rule("100.64.0.0/24")]),
+            ),
+        )
+        .await;
+        assert!(
+            health_warnings(*health_rx.borrow()).is_empty(),
+            "an accepted filter raises no warning"
+        );
+
+        deliver(
+            &updater,
+            &mut filter_rx,
+            netmap(
+                Some(ts_control::PeerUpdate::Delta {
+                    upsert: vec![peer(9, true)],
+                    remove: vec![],
+                }),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(
+            health_warnings(*health_rx.borrow()),
+            vec![INVALID_PACKET_FILTER_WARNING.to_string()],
+            "rejecting the filter must raise Go's invalid-packet-filter warning"
+        );
+
+        deliver(
+            &updater,
+            &mut filter_rx,
+            netmap(
+                Some(ts_control::PeerUpdate::Delta {
+                    upsert: vec![],
+                    remove: vec![9],
+                }),
+                None,
+            ),
+        )
+        .await;
+        assert!(
+            health_warnings(*health_rx.borrow()).is_empty(),
+            "the warning clears once the filter is acceptable again"
+        );
     }
 
     /// A peer at `100.64.0.<id>`, `unsigned_peer_api_only` as given. `accepted_routes` mirrors what
@@ -476,7 +577,7 @@ mod unlocked_node_tests {
     /// nothing else it sent in the same filter is trustworthy either.
     #[tokio::test]
     async fn an_acl_granting_an_unlocked_peer_access_is_ignored_wholesale() {
-        let (updater, mut filter_rx) = updater();
+        let (updater, mut filter_rx, health_rx) = updater_with_health();
 
         deliver(
             &updater,
@@ -499,13 +600,20 @@ mod unlocked_node_tests {
             !admits(&filter_rx, "100.64.0.10"),
             "the rest of that filter must go with it, not be kept as a partial ACL"
         );
+        // Dropping every inbound packet must not be visible only in the logs: Go raises
+        // `invalidPacketFilterWarnable`, which reaches `ipnstate.Status.Health`.
+        assert_eq!(
+            health_warnings(*health_rx.borrow()),
+            vec![INVALID_PACKET_FILTER_WARNING.to_string()],
+            "a rejected filter must raise the invalid-packet-filter health warning"
+        );
     }
 
     /// The negative direction, without which the test above would pass against a filter that simply
     /// never installs anything: the identical ACL, with the peer signed, is installed as sent.
     #[tokio::test]
     async fn the_same_acl_is_installed_when_no_peer_is_unlocked() {
-        let (updater, mut filter_rx) = updater();
+        let (updater, mut filter_rx, health_rx) = updater_with_health();
 
         deliver(
             &updater,
@@ -522,6 +630,10 @@ mod unlocked_node_tests {
 
         assert!(admits(&filter_rx, "100.64.0.9"));
         assert!(admits(&filter_rx, "100.64.0.10"));
+        assert!(
+            health_warnings(*health_rx.borrow()).is_empty(),
+            "an accepted filter raises no health warning"
+        );
     }
 
     /// Either side can move first. A filter that was valid when it was compiled becomes invalid the
@@ -529,7 +641,7 @@ mod unlocked_node_tests {
     /// packet filter at all, so a check wired only to the filter update would miss it.
     #[tokio::test]
     async fn an_unlocked_peer_arriving_later_invalidates_the_installed_filter() {
-        let (updater, mut filter_rx) = updater();
+        let (updater, mut filter_rx, health_rx) = updater_with_health();
 
         deliver(
             &updater,
@@ -544,6 +656,7 @@ mod unlocked_node_tests {
             admits(&filter_rx, "100.64.0.9"),
             "a filter with no unlocked peer in the netmap is installed"
         );
+        assert!(!*health_rx.borrow());
 
         // Peers only: control marks the same peer unsigned, and sends no new ACL.
         deliver(
@@ -562,13 +675,17 @@ mod unlocked_node_tests {
             !admits(&filter_rx, "100.64.0.9"),
             "an unlocked peer appearing under an existing ACL must invalidate that ACL"
         );
+        assert!(
+            *health_rx.borrow(),
+            "invalidating an installed filter from a peers-only netmap raises the warning too"
+        );
     }
 
     /// And back again: the filter is set aside, not destroyed, so once the unlocked peer leaves the
     /// netmap the ACL control sent is enforced again without control having to resend it.
     #[tokio::test]
     async fn removing_the_unlocked_peer_restores_the_filter() {
-        let (updater, mut filter_rx) = updater();
+        let (updater, mut filter_rx, health_rx) = updater_with_health();
 
         deliver(
             &updater,
@@ -580,6 +697,7 @@ mod unlocked_node_tests {
         )
         .await;
         assert!(!admits(&filter_rx, "100.64.0.9"));
+        assert!(*health_rx.borrow());
 
         deliver(
             &updater,
@@ -596,6 +714,10 @@ mod unlocked_node_tests {
         assert!(
             admits(&filter_rx, "100.64.0.9"),
             "the compiled filter is set aside while an unlocked peer is present, not dropped"
+        );
+        assert!(
+            !*health_rx.borrow(),
+            "the warning clears once the filter is acceptable again (Go `SetHealthy`)"
         );
     }
 }

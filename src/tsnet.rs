@@ -1379,6 +1379,8 @@ fn status_json(s: &Status) -> Vec<u8> {
         "peers": s.peers.iter().map(status_node_json).collect::<Vec<_>>(),
         "active_exit_node": s.active_exit_node.as_ref().map(|id| id.0.clone()),
         "magic_dns_suffix": s.magic_dns_suffix,
+        // Go `ipnstate.Status.Health`: empty means no known problem.
+        "health": s.health,
     });
     serde_json::to_vec(&value).unwrap_or_else(|_| b"{}".to_vec())
 }
@@ -2709,6 +2711,7 @@ mod tests {
             peers: vec![],
             active_exit_node: None,
             magic_dns_suffix: Some("tail0.ts.net".to_string()),
+            health: vec!["warning text".to_string()],
         };
         let bytes = status_json(&status);
         let v: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
@@ -2720,6 +2723,7 @@ mod tests {
         assert_eq!(v["magic_dns_suffix"], "tail0.ts.net");
         assert!(v["peers"].as_array().unwrap().is_empty());
         assert!(v["active_exit_node"].is_null());
+        assert_eq!(v["health"], serde_json::json!(["warning text"]));
     }
 
     #[tokio::test]
