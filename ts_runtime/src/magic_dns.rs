@@ -1610,6 +1610,7 @@ where
 /// whole failed. "Never answered" is every upstream that timed out, errored, or only ever sent
 /// datagrams the anti-poisoning check discarded; it counts as a failure that is not a refusal, as
 /// Go's transport errors (and its transaction-id mismatch) do.
+/// "First" is the walk's order here; Go takes it by arrival, since it asks every resolver at once.
 ///
 /// Every relayed response goes through [`cap_response`], which caps it at [`MAX_UPSTREAM_RESPONSE`]
 /// unless it was TCP end to end, and — for a [`ClientTransport::Udp`] client — marks it truncated
@@ -3428,6 +3429,76 @@ mod tests {
             "the upstream's own SERVFAIL is relayed verbatim, keeping any extended DNS error"
         );
         assert_ne!(got, fallback, "not the locally synthesized SERVFAIL");
+    }
+
+    /// A first REFUSED is relayed only when every failure was a refusal. When a later upstream
+    /// answered SERVFAIL, Go's tally has seen a non-refusal and the first failure is not a SERVFAIL,
+    /// so the client gets the synthesized SERVFAIL — neither the refusal nor the later SERVFAIL.
+    #[tokio::test]
+    async fn refusal_then_servfail_returns_the_fallback_not_the_refusal() {
+        let query = build_query(0x20a, &["api", "example", "com"], 1, 1);
+        let (first, second) = (upstream_addr(1), upstream_addr(2));
+        let refusal = upstream_response(&query, RCODE_REFUSED, 0, b"first refusal");
+        let servfail = upstream_response(&query, RCODE_SERVFAIL, 0, b"second servfail");
+        let fallback = upstream_response(&query, RCODE_SERVFAIL, 0, b"synthesized");
+
+        let (got, asked) = run_forward_walk(
+            &[
+                (first, Some((first, refusal.clone()))),
+                (second, Some((second, servfail.clone()))),
+            ],
+            &query,
+            fallback.clone(),
+        )
+        .await;
+
+        assert_eq!(asked, vec![first, second]);
+        assert_eq!(
+            got, fallback,
+            "a SERVFAIL anywhere means the first REFUSED is not what the client is told"
+        );
+        assert_ne!(got, refusal);
+        assert_ne!(got, servfail, "only a FIRST failure's SERVFAIL is relayed");
+    }
+
+    /// The same when the later upstream said nothing at all: a timeout is a non-refusal failure, so
+    /// the first REFUSED gives way to the synthesized SERVFAIL.
+    #[tokio::test]
+    async fn refusal_then_silent_upstream_returns_the_fallback_not_the_refusal() {
+        let query = build_query(0x20b, &["api", "example", "com"], 1, 1);
+        let (first, second) = (upstream_addr(1), upstream_addr(2));
+        let refusal = upstream_response(&query, RCODE_REFUSED, 0, b"first refusal");
+        let fallback = upstream_response(&query, RCODE_SERVFAIL, 0, b"synthesized");
+
+        let (got, asked) = run_forward_walk(
+            &[(first, Some((first, refusal.clone()))), (second, None)],
+            &query,
+            fallback.clone(),
+        )
+        .await;
+
+        assert_eq!(asked, vec![first, second]);
+        assert_eq!(got, fallback, "a silent upstream is not a refusal");
+    }
+
+    /// When the first failure is a silence, a later upstream's SERVFAIL is not relayed either: Go
+    /// relays an upstream's bytes only when the FIRST error carries them.
+    #[tokio::test]
+    async fn silent_upstream_then_servfail_returns_the_fallback() {
+        let query = build_query(0x20c, &["api", "example", "com"], 1, 1);
+        let (first, second) = (upstream_addr(1), upstream_addr(2));
+        let servfail = upstream_response(&query, RCODE_SERVFAIL, 0, b"second servfail");
+        let fallback = upstream_response(&query, RCODE_SERVFAIL, 0, b"synthesized");
+
+        let (got, _asked) = run_forward_walk(
+            &[(first, None), (second, Some((second, servfail.clone())))],
+            &query,
+            fallback.clone(),
+        )
+        .await;
+
+        assert_eq!(got, fallback);
+        assert_ne!(got, servfail);
     }
 
     /// A lone upstream that refuses still has its refusal relayed: with nothing else to wait for,
