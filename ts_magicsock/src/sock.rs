@@ -4771,6 +4771,113 @@ mod tests {
         assert_eq!(a.relay_path(&fx.peer.public_key()), None);
     }
 
+    /// Upstream's order inside the `CallMeMaybeVia` arm: the relay-capability refusal runs before
+    /// the disco-key binding check, so a refused frame never reaches the verifier (or, through it,
+    /// the active-disco-key observer). A relaying node key the lookup does not know has no
+    /// capability version, so it is not relay capable either.
+    #[tokio::test]
+    async fn call_me_maybe_via_capability_refusal_precedes_the_binding_check() {
+        let our_disco = DiscoPrivateKey::random();
+        let fx = RelayFixture::new(21);
+        let peer_node = fx.peer_node;
+        let verified = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let a = Arc::new(
+            MagicSock::bind(
+                localhost(),
+                our_disco.clone(),
+                ts_keys::NodePrivateKey::random().public_key(),
+            )
+            .await
+            .unwrap()
+            .with_binding_verifier({
+                let verified = verified.clone();
+                Arc::new(move |_: &DiscoPublicKey, _: Option<&NodePublicKey>| {
+                    verified.fetch_add(1, Ordering::Relaxed);
+                    true
+                })
+            })
+            .with_peer_cap_version(Arc::new(move |node: &NodePublicKey| {
+                (*node == peer_node).then_some(CapabilityVersion::V120)
+            })),
+        );
+        a.allow_loopback_relay();
+        let mut sends = a.tap_relay_sends();
+
+        let mut frame = fx.call_me_maybe_via(our_disco.public_key());
+        assert_eq!(
+            a.handle_relayed_disco(&mut frame, derp_src_of(fx.peer_node))
+                .await,
+            RelayedDisco::Consumed
+        );
+        assert!(
+            sends.try_recv().is_err(),
+            "capability version 120: no handshake"
+        );
+
+        let mut frame = fx.call_me_maybe_via(our_disco.public_key());
+        assert_eq!(
+            a.handle_relayed_disco(&mut frame, derp_src()).await,
+            RelayedDisco::Consumed
+        );
+        assert!(
+            sends.try_recv().is_err(),
+            "an unknown relaying node is not known to be relay capable"
+        );
+
+        assert_eq!(
+            verified.load(Ordering::Relaxed),
+            0,
+            "a capability refusal must never reach the binding verifier"
+        );
+        assert_eq!(a.relay_path(&fx.peer.public_key()), None);
+    }
+
+    /// A `CallMeMaybeVia` sealed by the peer's disco key but relayed over DERP from a different,
+    /// relay-capable node starts no handshake; the same frame from the peer's own node key does.
+    /// Go: "from peer via DERP whose netmap discokey != disco source".
+    #[tokio::test]
+    async fn call_me_maybe_via_is_bound_to_the_derp_sender() {
+        let our_disco = DiscoPrivateKey::random();
+        let fx = RelayFixture::new(23);
+        let other_node = ts_keys::NodePrivateKey::random().public_key();
+        let a = Arc::new(
+            MagicSock::bind(
+                localhost(),
+                our_disco.clone(),
+                ts_keys::NodePrivateKey::random().public_key(),
+            )
+            .await
+            .unwrap()
+            .with_binding_verifier(verifier_for(fx.peer.public_key(), fx.peer_node))
+            .with_peer_cap_version(all_relay_capable()),
+        );
+        a.allow_loopback_relay();
+        let mut sends = a.tap_relay_sends();
+
+        let mut frame = fx.call_me_maybe_via(our_disco.public_key());
+        assert_eq!(
+            a.handle_relayed_disco(&mut frame, derp_src_of(other_node))
+                .await,
+            RelayedDisco::Consumed
+        );
+        assert!(
+            sends.try_recv().is_err(),
+            "a frame the peer sealed must not be acted on when another node relays it"
+        );
+        assert_eq!(a.relay_path(&fx.peer.public_key()), None);
+
+        let mut frame = fx.call_me_maybe_via(our_disco.public_key());
+        assert_eq!(
+            a.handle_relayed_disco(&mut frame, derp_src_of(fx.peer_node))
+                .await,
+            RelayedDisco::Consumed
+        );
+        assert!(
+            sends.try_recv().is_ok(),
+            "the same frame from the peer's own node key starts the handshake"
+        );
+    }
+
     /// The Geneve control bit is load-bearing, not decorative: a challenge that arrives without it
     /// is not the framing a relay server produces, and is dropped rather than acted on.
     #[tokio::test]
@@ -7745,6 +7852,51 @@ mod tests {
             recv.send_pings().await.unwrap(),
             0,
             "and there is nothing for the periodic sweep to ping either"
+        );
+    }
+
+    /// The other half of the UDP-socket refusal: a CallMeMaybe on the UDP socket must not kick a
+    /// ping at a peer's *existing* candidate either. A kick stamps the candidate's discovery floor
+    /// (`send_pings_to_peer_now` calls `note_ping_sent` before the send), so the candidate must
+    /// still be due for a ping afterwards.
+    #[tokio::test]
+    async fn direct_call_me_maybe_kicks_no_ping_at_a_known_candidate() {
+        let peer_disco = DiscoPrivateKey::random();
+        let recv_disco = DiscoPrivateKey::random();
+        let recv_node = ts_keys::NodePrivateKey::random().public_key();
+        let recv = MagicSock::bind(localhost(), recv_disco, recv_node)
+            .await
+            .unwrap()
+            .with_binding_verifier(allow_all());
+
+        let peer_pub = peer_disco.public_key();
+        let known_ep: SocketAddr = "203.0.113.40:41641".parse().unwrap();
+        recv.add_peer_endpoints(peer_pub, [known_ep]);
+
+        let advertised: SocketAddr = "203.0.113.41:41641".parse().unwrap();
+        let from: SocketAddr = "198.51.100.7:41641".parse().unwrap();
+        recv.handle_disco(
+            Inbound::CallMeMaybe {
+                sender: peer_pub,
+                endpoints: vec![known_ep, advertised],
+            },
+            from,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            recv.candidate_addrs(&peer_pub),
+            vec![known_ep],
+            "a CallMeMaybe on the UDP socket must learn no endpoint"
+        );
+        assert_eq!(
+            lock(&recv.paths)
+                .get_mut(&peer_pub)
+                .unwrap()
+                .candidates_to_ping(Instant::now()),
+            vec![known_ep],
+            "a CallMeMaybe on the UDP socket must send no immediate ping"
         );
     }
 
