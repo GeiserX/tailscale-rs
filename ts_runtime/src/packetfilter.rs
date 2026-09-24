@@ -383,13 +383,8 @@ mod unlocked_node_tests {
         }
     }
 
-    /// Stand up the production updater, returning it with the live-filter cell it writes.
-    fn updater() -> (ActorRef<PacketfilterUpdater>, LiveFilterRx) {
-        let (updater, filter_rx, _health_rx) = updater_with_health();
-        (updater, filter_rx)
-    }
-
-    /// As [`updater`], also returning the invalid-packet-filter health cell it writes.
+    /// Stand up the production updater, returning it with the live-filter cell and the
+    /// invalid-packet-filter health cell it writes — the same cell `Runtime::status` reads.
     fn updater_with_health() -> (
         ActorRef<PacketfilterUpdater>,
         LiveFilterRx,
@@ -582,7 +577,7 @@ mod unlocked_node_tests {
     /// nothing else it sent in the same filter is trustworthy either.
     #[tokio::test]
     async fn an_acl_granting_an_unlocked_peer_access_is_ignored_wholesale() {
-        let (updater, mut filter_rx) = updater();
+        let (updater, mut filter_rx, health_rx) = updater_with_health();
 
         deliver(
             &updater,
@@ -605,13 +600,20 @@ mod unlocked_node_tests {
             !admits(&filter_rx, "100.64.0.10"),
             "the rest of that filter must go with it, not be kept as a partial ACL"
         );
+        // Dropping every inbound packet must not be visible only in the logs: Go raises
+        // `invalidPacketFilterWarnable`, which reaches `ipnstate.Status.Health`.
+        assert_eq!(
+            health_warnings(*health_rx.borrow()),
+            vec![INVALID_PACKET_FILTER_WARNING.to_string()],
+            "a rejected filter must raise the invalid-packet-filter health warning"
+        );
     }
 
     /// The negative direction, without which the test above would pass against a filter that simply
     /// never installs anything: the identical ACL, with the peer signed, is installed as sent.
     #[tokio::test]
     async fn the_same_acl_is_installed_when_no_peer_is_unlocked() {
-        let (updater, mut filter_rx) = updater();
+        let (updater, mut filter_rx, health_rx) = updater_with_health();
 
         deliver(
             &updater,
@@ -628,6 +630,10 @@ mod unlocked_node_tests {
 
         assert!(admits(&filter_rx, "100.64.0.9"));
         assert!(admits(&filter_rx, "100.64.0.10"));
+        assert!(
+            health_warnings(*health_rx.borrow()).is_empty(),
+            "an accepted filter raises no health warning"
+        );
     }
 
     /// Either side can move first. A filter that was valid when it was compiled becomes invalid the
@@ -635,7 +641,7 @@ mod unlocked_node_tests {
     /// packet filter at all, so a check wired only to the filter update would miss it.
     #[tokio::test]
     async fn an_unlocked_peer_arriving_later_invalidates_the_installed_filter() {
-        let (updater, mut filter_rx) = updater();
+        let (updater, mut filter_rx, health_rx) = updater_with_health();
 
         deliver(
             &updater,
@@ -650,6 +656,7 @@ mod unlocked_node_tests {
             admits(&filter_rx, "100.64.0.9"),
             "a filter with no unlocked peer in the netmap is installed"
         );
+        assert!(!*health_rx.borrow());
 
         // Peers only: control marks the same peer unsigned, and sends no new ACL.
         deliver(
@@ -668,13 +675,17 @@ mod unlocked_node_tests {
             !admits(&filter_rx, "100.64.0.9"),
             "an unlocked peer appearing under an existing ACL must invalidate that ACL"
         );
+        assert!(
+            *health_rx.borrow(),
+            "invalidating an installed filter from a peers-only netmap raises the warning too"
+        );
     }
 
     /// And back again: the filter is set aside, not destroyed, so once the unlocked peer leaves the
     /// netmap the ACL control sent is enforced again without control having to resend it.
     #[tokio::test]
     async fn removing_the_unlocked_peer_restores_the_filter() {
-        let (updater, mut filter_rx) = updater();
+        let (updater, mut filter_rx, health_rx) = updater_with_health();
 
         deliver(
             &updater,
@@ -686,6 +697,7 @@ mod unlocked_node_tests {
         )
         .await;
         assert!(!admits(&filter_rx, "100.64.0.9"));
+        assert!(*health_rx.borrow());
 
         deliver(
             &updater,
@@ -702,6 +714,10 @@ mod unlocked_node_tests {
         assert!(
             admits(&filter_rx, "100.64.0.9"),
             "the compiled filter is set aside while an unlocked peer is present, not dropped"
+        );
+        assert!(
+            !*health_rx.borrow(),
+            "the warning clears once the filter is acceptable again (Go `SetHealthy`)"
         );
     }
 }
