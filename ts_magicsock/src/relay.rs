@@ -126,6 +126,31 @@ pub(crate) enum HandshakeState {
     AnswerSent,
 }
 
+/// What one endpoint's bind handshake is currently bound to, which decides how an inbound relayed
+/// ping or pong on that endpoint is matched against the address it came from.
+///
+/// Upstream `relayManager` keys outstanding handshake work by `addrPortVNI{from, vni}`, recorded
+/// when it accepts the challenge that work answers (`wgengine/magicsock/relaymanager.go:611-635`),
+/// and hands a relayed ping or pong to a handshake only under that key (`:653-663`); before the
+/// challenge is answered the handshake ignores a relayed ping outright (`:983-986`), and the path
+/// it makes usable is `done.pongReceivedFrom` (`:735`), the challenger's by construction. Once
+/// the handshake is done the work is gone: later pongs are ordinary refresh pongs, which
+/// `endpoint.handlePongConnLocked` matches by transaction id alone
+/// (`wgengine/magicsock/endpoint.go:1917`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelayBinding {
+    /// No challenge has been answered yet, so no address is bound to this handshake: nothing
+    /// arriving on the endpoint is the handshake's own.
+    Unanswered,
+    /// The handshake is outstanding and bound to the address whose challenge it answered. Only a
+    /// relayed ping or pong from that address is this handshake's.
+    Handshake(SocketAddr),
+    /// A pong has confirmed a path, so the handshake is over and does not run again for this
+    /// endpoint — a fresh allocation is what starts a new one. Holds whether or not the confirmed
+    /// address's trust has since lapsed: a lapsed path is refreshed by ping/pong, not re-bound.
+    Confirmed,
+}
+
 /// A relay `addr:port` a relayed pong has confirmed.
 #[derive(Debug, Clone, Copy)]
 struct ConfirmedRelay {
@@ -150,7 +175,8 @@ pub(crate) struct RelayPath {
     confirmed: Option<ConfirmedRelay>,
     /// The relay address we answered a challenge from, if we have. This is where a retry ping goes
     /// while the endpoint is handshook-but-unconfirmed: an endpoint may advertise several
-    /// addresses, and only the one that challenged us is known to be live.
+    /// addresses, and only the one that challenged us is known to be live. It is also what the
+    /// outstanding handshake is *bound* to — see [`binding`](Self::binding).
     answered_addr: Option<SocketAddr>,
 }
 
@@ -168,9 +194,46 @@ impl RelayPath {
     }
 
     /// Record that we answered a challenge from `addr` and are now waiting on the peer.
+    ///
+    /// This is the point upstream records `addrPortVNI{from, vni}` against the handshake, so it is
+    /// also the point the handshake becomes bound to `addr`.
     pub(crate) fn note_answered(&mut self, addr: SocketAddr) {
         self.state = HandshakeState::AnswerSent;
         self.answered_addr = Some(addr);
+    }
+
+    /// What this endpoint's handshake is bound to right now.
+    pub(crate) fn binding(&self) -> RelayBinding {
+        match (self.confirmed.is_some(), self.answered_addr) {
+            (true, _) => RelayBinding::Confirmed,
+            (false, Some(addr)) => RelayBinding::Handshake(addr),
+            (false, None) => RelayBinding::Unanswered,
+        }
+    }
+
+    /// Whether a relayed pong arriving from `from` is one this endpoint may consume.
+    ///
+    /// While the handshake is outstanding only the address it answered may answer it, which is
+    /// upstream's rule: a relayed pong whose `(source, VNI)` is not the key the handshake was
+    /// recorded under is discarded with "No outstanding work tied to this addrPortVNI", and the
+    /// path that upstream then makes usable is the challenge's own source by construction. Without
+    /// this a pong that merely carried a valid transaction id could confirm a path at an address
+    /// that never challenged this node.
+    ///
+    /// Once a path is confirmed the handshake is over and refresh pongs are matched by transaction
+    /// id alone, exactly as `endpoint.handlePongConnLocked` does: a relay server may legitimately
+    /// answer from a port other than the one it listens on, and nothing is ever sent to a pong's
+    /// source.
+    ///
+    /// Call this *before* [`note_pong`](Self::note_pong) rather than folding it in: a pong that is
+    /// not this handshake's must not consume the transaction id of a ping still waiting for its
+    /// real answer.
+    pub(crate) fn accepts_pong_from(&self, from: SocketAddr) -> bool {
+        match self.binding() {
+            RelayBinding::Confirmed => true,
+            RelayBinding::Handshake(addr) => addr == from,
+            RelayBinding::Unanswered => false,
+        }
     }
 
     /// Record a relayed ping we just sent, so its pong is recognized as solicited.
@@ -325,6 +388,22 @@ impl RelayPaths {
     /// Called once a relayed pong confirms a path, with the address we send through and the source
     /// the pong actually arrived from (a relay may legitimately answer from a different port than
     /// it listens on).
+    ///
+    /// # Why a source that differs from the address we send to is still attributed
+    ///
+    /// It has to be, for the data path to work at all: inbound relayed WireGuard is attributed by
+    /// the source it arrives from, and a relay that answers a ping from one port sends data from
+    /// that port too. Drop the differing source and a path that is confirmed and live carries
+    /// nothing inbound.
+    ///
+    /// Nothing is ever *sent* to it, so a wrong entry cannot aim a datagram anywhere: it decides
+    /// only which peer an inbound Geneve datagram is offered to, and that datagram still has to
+    /// satisfy WireGuard's own crypto afterwards. And a source only reaches here on a pong this
+    /// endpoint accepted: while the handshake was outstanding, from the address that challenged us
+    /// (see [`RelayPath::accepts_pong_from`]); afterwards, on a refresh pong sealed by the peer
+    /// carrying a transaction id from a ping this node sent to an already-sanitized address. An
+    /// off-path sender can produce neither. Growth is bounded by replacing rather than
+    /// accumulating, as below.
     ///
     /// Replacing rather than accumulating is what bounds the map. A confirming pong arrives on
     /// every refresh, roughly every [`TRUST_DURATION`] for as long as the path lives, so a relay
