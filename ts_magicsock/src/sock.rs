@@ -1866,11 +1866,14 @@ impl MagicSock {
     /// `from` is the *relay server's* address, and adding it to [`PeerPaths`] would make us send
     /// naked disco and naked WireGuard to a relay that only understands the Geneve framing.
     ///
-    /// The pong goes back to `from` whatever state the endpoint is in — upstream pongs a relayed
-    /// ping at its own source unconditionally — but the **ping back** is the outstanding
-    /// handshake's, and so goes out only when `from` is the address that handshake is bound to.
-    /// See [`RelayBinding`] for the rule and [`handle_relay_pong`](Self::handle_relay_pong) for its
-    /// other half.
+    /// The pong goes back to `from` whatever state the endpoint is in — upstream's
+    /// `relayManager.handleRxDiscoMsgRunLoop` pongs a relayed ping at its own source
+    /// unconditionally (`relaymanager.go:648`) — subject only to
+    /// [`relay_reply_target_allowed`](Self::relay_reply_target_allowed), this fork's own
+    /// restriction on reply targets, applied by the caller. The **ping back** is the outstanding
+    /// handshake's, which upstream reaches only under its `addrPortVNI` key (`:653-657`), and so
+    /// goes out only when `from` is the address that handshake is bound to. See [`RelayBinding`]
+    /// for the rule and [`handle_relay_pong`](Self::handle_relay_pong) for its other half.
     async fn handle_relay_ping(
         &self,
         sender: DiscoPublicKey,
@@ -4479,6 +4482,23 @@ mod tests {
             "and must attribute no inbound data to itself"
         );
 
+        // And from a *routable* address, one `relay_addr_allowed` admits outside the test waiver
+        // too, so it is the handshake key that refuses it and not the address-class filter.
+        let imposter: SocketAddr = "203.0.113.7:41641".parse().unwrap();
+        assert!(
+            a.relay_addr_allowed(&imposter),
+            "the imposter must pass the address-class filter, or this proves the wrong thing"
+        );
+        let mut pong = disco::seal_pong(&fx.peer, &our_disco.public_key(), tx_id, fx.addr).unwrap();
+        a.handle_relay_disco(&mut pong, imposter, fx.vni, false)
+            .await;
+        assert_eq!(a.relay_path(&peer_pub), None, "it confirms nothing either");
+        {
+            let relay = lock(&a.relay_paths);
+            assert_eq!(relay.peer_for_addr(imposter, fx.vni), None);
+            assert_eq!(relay.peer_for_addr(fx.addr, fx.vni), None);
+        }
+
         // The challenger's own pong, with the same transaction id, still completes it: the stray
         // pong above did not consume the in-flight record.
         let mut pong = disco::seal_pong(&fx.peer, &our_disco.public_key(), tx_id, fx.addr).unwrap();
@@ -4524,10 +4544,13 @@ mod tests {
         let (to, wire) = sends.try_recv().expect("the ping must still be ponged");
         assert_eq!(to, stranger, "the pong goes back to the ping's own source");
         let mut pong = expect_relay_frame(&wire, fx.vni, false);
-        assert!(matches!(
-            disco::open(&fx.peer, &mut pong).unwrap(),
-            Inbound::Pong { .. }
-        ));
+        assert!(
+            matches!(
+                disco::open(&fx.peer, &mut pong).unwrap(),
+                Inbound::Pong { tx_id, .. } if tx_id == [5u8; 12]
+            ),
+            "the pong must echo the ping's transaction id"
+        );
         assert!(
             sends.try_recv().is_err(),
             "but no ping may go on the wire toward an address that never challenged us"
@@ -4581,10 +4604,13 @@ mod tests {
 
         let (to, wire) = sends.try_recv().expect("the ping must still be ponged");
         assert_eq!(to, fx.addr);
-        assert!(matches!(
-            disco::open(&fx.peer, &mut expect_relay_frame(&wire, fx.vni, false)).unwrap(),
-            Inbound::Pong { .. }
-        ));
+        assert!(
+            matches!(
+                disco::open(&fx.peer, &mut expect_relay_frame(&wire, fx.vni, false)).unwrap(),
+                Inbound::Pong { tx_id, .. } if tx_id == [7u8; 12]
+            ),
+            "the pong must echo the ping's transaction id"
+        );
         assert!(
             sends.try_recv().is_err(),
             "an unanswered handshake must put no ping on the wire"
