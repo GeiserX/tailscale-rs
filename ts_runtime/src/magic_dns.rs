@@ -1600,7 +1600,7 @@ where
 /// upstream failed, the client gets an upstream's own bytes — which can carry an RFC 8914 extended
 /// DNS error saying *why* it failed — in exactly the two cases Go's `forwardWithDestChan` relays
 /// them (net/dns/resolver/forwarder.go @ e2ed432399c9b0fda7aa14e9eb27784d2d893c55, `firstErr` /
-/// `sawNonRefused`):
+/// `sawNonRefused`, lines 1309-1383):
 ///
 /// - **every** upstream answered REFUSED: the first refusal is relayed;
 /// - otherwise, the first failure is relayed only if it was itself a SERVFAIL answer.
