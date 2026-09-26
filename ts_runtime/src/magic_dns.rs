@@ -706,7 +706,7 @@ fn forward_or_nxdomain(
             soa_for(view, &q.name, canon).as_ref(),
         )
     };
-    let servfail = encode_response(id, q, rd, Rcode::ServFail, &[], None);
+    let servfail = servfail_for_query(buf, id, q);
 
     if is_tailnet_name(view, canon) {
         return Decision::Reply(nxdomain(canon));
@@ -743,6 +743,29 @@ fn forward_or_nxdomain(
             recursive,
         }
     }
+}
+
+/// The SERVFAIL this node synthesizes for an off-tailnet name it could not forward: no upstream to
+/// ask, or — as [`Decision::Forward`]'s fallback — every upstream failed without leaving a response
+/// [`forward_walk`] relays.
+///
+/// Go's `servfailResponse` (net/dns/resolver/forwarder.go @
+/// `e2ed432399c9b0fda7aa14e9eb27784d2d893c55`) builds it from the *query's* parsed header: ID,
+/// opcode, TC, RD, RA, AD and CD stay as the client sent them, and only QR, AA and RCODE are set.
+/// That is not [`encode_response`]'s header, which sets RA whenever RD is and clears the opcode and
+/// CD, so the flags words are copied here instead. For the RD=1, RA=0 query every stub resolver
+/// sends, the visible difference is RA: Go's SERVFAIL leaves it clear. Z is not copied, because
+/// `dnsmessage.Header` has no field to carry it. The question is echoed and nothing else is added
+/// — no OPT record, as in Go.
+fn servfail_for_query(buf: &[u8], id: u16, q: &ts_dns_wire::Question) -> Vec<u8> {
+    let mut resp = encode_response(id, q, false, Rcode::ServFail, &[], None);
+    if let ([_, _, hi, lo, ..], [_, _, query_hi, query_lo, ..]) = (resp.as_mut_slice(), buf) {
+        // QR | opcode (0x78) | AA | TC and RD (0x03) as sent.
+        *hi = 0x80 | (query_hi & 0x78) | 0x04 | (query_hi & 0x03);
+        // RA (0x80), AD (0x20) and CD (0x10) as sent; Z (0x40) dropped; RCODE = SERVFAIL.
+        *lo = (query_lo & 0xB0) | RCODE_SERVFAIL;
+    }
+    resp
 }
 
 /// The DNS query types Go's resolver explicitly leaves unimplemented for a tailnet-authoritative
@@ -1191,6 +1214,7 @@ enum UpstreamTransport {
 
 /// One upstream's answer as [`ask_upstream`] hands it to [`forward_walk`]: the bytes, the address
 /// they arrived from, and the hop they arrived over.
+#[derive(Debug)]
 struct UpstreamAnswer {
     /// Where the answer came from, **unfiltered** — [`forward_walk`] is what checks it against the
     /// upstream we asked.
@@ -1199,6 +1223,38 @@ struct UpstreamAnswer {
     resp: Vec<u8>,
     /// The hop that carried them (see [`UpstreamTransport`]).
     via: UpstreamTransport,
+}
+
+/// How one upstream failed, both hops taken together: Go's per-resolver error, which `Race.Start`
+/// hands back as `errors.Join` of each hop's error, in the order the hops settled
+/// (util/race/race.go @ `e2ed432399c9b0fda7aa14e9eb27784d2d893c55`).
+///
+/// [`forward_walk`] asks two things of that joined error, and these are the two answers. Everything
+/// else a hop can fail with — a timeout, a connect or framing error, a message that does not answer
+/// the query — carries no bytes and no refusal, so it only ever leaves the default behind.
+#[derive(Debug, Default)]
+struct UpstreamFailure {
+    /// The first soft-error response (SERVFAIL or REFUSED, [`is_soft_error`]) either hop brought
+    /// back: what Go's `errors.AsType[rcodeResponseError]` finds first in the joined error.
+    first_soft: Option<UpstreamAnswer>,
+    /// Whether either hop was answered REFUSED: Go's `errors.Is(err, errRefused)`, which is true of
+    /// a joined error when any part of it refused.
+    refused: bool,
+}
+
+impl UpstreamFailure {
+    /// A failure whose first soft error is `soft`.
+    fn soft(soft: UpstreamAnswer) -> Self {
+        let mut failure = Self::default();
+        failure.note(soft);
+        failure
+    }
+
+    /// Add the soft error the next hop to settle came back with.
+    fn note(&mut self, soft: UpstreamAnswer) {
+        self.refused |= response_rcode(&soft.resp) == Some(RCODE_REFUSED);
+        self.first_soft.get_or_insert(soft);
+    }
 }
 
 /// How long the UDP hop has the upstream to itself before the TCP hop joins the race, when the
@@ -1212,9 +1268,8 @@ struct UpstreamAnswer {
 /// UDP budget before TCP was ever tried.
 const UDP_RACE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Ask one `upstream` for `query` over the overlay and return what came back, or `None` when
-/// nothing usable arrived on either hop (bind, connect, send or receive error, [`UPSTREAM_TIMEOUT`],
-/// or an empty message).
+/// Ask one `upstream` for `query` over the overlay and return the answer that came back, or — when
+/// neither hop produced one — how the upstream failed ([`UpstreamFailure`]).
 ///
 /// The query is **raced** over UDP and TCP to the same resolver, as Go's forwarder does: `send`
 /// hands a `firstUDP` and a `thenTCP` closure to `race.New(timeout, firstUDP, thenTCP)`, and
@@ -1228,6 +1283,11 @@ const UDP_RACE_TIMEOUT: Duration = Duration::from_secs(2);
 ///   whenever the UDP hop has already failed.
 /// - **A truncated answer is re-asked over TCP**, RFC 1035 §4.2.1. `firstUDP` maps it to an error so
 ///   the race waits for the TCP hop.
+/// - **A SERVFAIL or REFUSED is a failed hop, not an answer**, on either hop. Go's `sendUDP` and
+///   `sendTCP` both turn RCODE 2 and 5 into an `rcodeResponseError`, so a soft error over UDP starts
+///   the TCP hop at once, and a soft error over TCP leaves the race to the UDP hop. The resolver
+///   answers if either hop does; only when neither does is it a failure, carrying both hops' soft
+///   errors for [`forward_walk`] to weigh.
 /// - **The same resolver, never the next one.** Walking on to the next upstream would send the
 ///   query to a resolver the first one already answered — a second party learning a name it was
 ///   never asked about. [`forward_walk`] does the walking; this function only ever talks to the
@@ -1271,7 +1331,7 @@ async fn ask_upstream(
     query: &[u8],
     client: ClientTransport,
     retry: TcpRetry,
-) -> Option<UpstreamAnswer> {
+) -> Result<UpstreamAnswer, UpstreamFailure> {
     race_udp_and_tcp(
         upstream,
         query,
@@ -1290,6 +1350,10 @@ enum UdpOutcome {
     /// A genuine answer that did not fit the datagram ([`did_not_fit_the_datagram`]): the race
     /// waits for the TCP hop, and falls back to this if that hop fails.
     Truncated(UpstreamAnswer),
+    /// A SERVFAIL or REFUSED that does answer this query ([`is_soft_error`]). A failed hop, as Go's
+    /// `sendUDP` returns it as an `rcodeResponseError`: it starts the TCP hop at once, and it is
+    /// kept, because it is what [`forward_walk`] relays if the TCP hop does no better.
+    SoftError(UpstreamAnswer),
     /// A datagram from the wrong source, or one that does not echo the question we asked. It is
     /// not an answer, and it does not start the TCP hop either — see [`race_udp_and_tcp`].
     Unmatched(UpstreamAnswer),
@@ -1317,10 +1381,39 @@ fn classify_udp(
     if answer.from.ip() != upstream.ip() || !response_matches_query(query, &answer.resp) {
         return UdpOutcome::Unmatched(answer);
     }
-    if did_not_fit_the_datagram(&answer.resp) {
+    // The RCODE is read before the TC bit, as Go's `sendUDP` returns on it before `firstUDP` ever
+    // looks for truncation: a truncated SERVFAIL is a SERVFAIL.
+    if is_soft_error(&answer.resp) {
+        UdpOutcome::SoftError(answer)
+    } else if did_not_fit_the_datagram(&answer.resp) {
         UdpOutcome::Truncated(answer)
     } else {
         UdpOutcome::Answer(answer)
+    }
+}
+
+/// What the TCP hop produced, as the race reads it.
+enum TcpOutcome {
+    /// A good answer: it wins the race.
+    Answer(UpstreamAnswer),
+    /// A SERVFAIL or REFUSED that answers this query: a failed hop, as Go's `sendTCP` returns it as
+    /// an `rcodeResponseError`, kept for [`forward_walk`] as the UDP one is.
+    SoftError(UpstreamAnswer),
+    /// Nothing usable came back — including a message that does not answer this query.
+    Failed,
+}
+
+/// Close out a race no hop won. `failure` is what the hops failed with; `unmatched` is a datagram
+/// the UDP hop brought that does not answer the query, which goes back for [`forward_walk`] to
+/// discard, as it always has — unless a hop failed with a soft error, whose bytes the walk may
+/// relay and which the discard would throw away.
+fn race_lost(
+    failure: UpstreamFailure,
+    unmatched: Option<UpstreamAnswer>,
+) -> Result<UpstreamAnswer, UpstreamFailure> {
+    match unmatched {
+        Some(datagram) if failure.first_soft.is_none() => Ok(datagram),
+        _ => Err(failure),
     }
 }
 
@@ -1330,15 +1423,20 @@ fn classify_udp(
 /// called".
 ///
 /// The shape is Go's `Race.Start`, with the UDP hop's result classified as `firstUDP` classifies
-/// it:
+/// it and the TCP hop's as `sendTCP` does:
 ///
 /// 1. The UDP hop starts at once. For a [`ClientTransport::Udp`] client it runs alone for
 ///    [`UDP_RACE_TIMEOUT`]; if it settles inside that window, its answer is returned, except that a
-///    **failed** hop starts TCP straight away (Go closes `startFallback`) and a **truncated** one
-///    does too (Go's `truncatedResponseError`).
+///    **failed** hop starts TCP straight away (Go closes `startFallback`) — a SERVFAIL or REFUSED
+///    being one — and a **truncated** one does too (Go's `truncatedResponseError`).
 /// 2. Otherwise — the head start ran out, or the client asked over TCP and there is none — the TCP
 ///    hop starts and both run. The first good answer wins; a hop that fails leaves the race to the
 ///    other; a truncated UDP answer is held and returned only if TCP does not produce one.
+///
+/// When neither hop answers, the result is an [`UpstreamFailure`] holding every soft error the
+/// hops brought back, in the order they settled — Go's `errors.Join` of the two hops' errors. A
+/// held truncated answer beats it, as Go's `send` returns a `truncatedResponseError` it finds in the
+/// joined error in place of the error.
 ///
 /// A datagram that does not match the query ([`UdpOutcome::Unmatched`]) is the one divergence in
 /// how a failed UDP hop is treated. Go's `sendUDP` turns a transaction-id mismatch into an error,
@@ -1357,41 +1455,85 @@ async fn race_udp_and_tcp<UdpFut, TcpFut>(
     retry: TcpRetry,
     udp: impl FnOnce() -> UdpFut,
     tcp: impl FnOnce() -> TcpFut,
-) -> Option<UpstreamAnswer>
+) -> Result<UpstreamAnswer, UpstreamFailure>
 where
     UdpFut: std::future::Future<Output = Option<(SocketAddr, Vec<u8>)>>,
     TcpFut: std::future::Future<Output = Option<Vec<u8>>>,
 {
-    // The TCP hop's message as an answer — or `None` when it is not one. A message that does not
-    // echo this query is no more use than no message at all: `forward_walk` discards it either
-    // way. The difference is what it costs on the way, because the hop that loses this race is
-    // dropped unfinished: let a mismatched message win and the UDP answer it beat is gone, and a
-    // query that would have resolved resolves as SERVFAIL. So it is scored as a failed hop, which
-    // leaves the race to UDP — pending, or held truncated — exactly as a connect error would.
-    let over_tcp = |resp: Vec<u8>| {
+    // The TCP hop's message as the race reads it. A message that does not echo this query is no
+    // more use than no message at all: `forward_walk` discards it either way. The difference is
+    // what it costs on the way, because the hop that loses this race is dropped unfinished: let a
+    // mismatched message win and the UDP answer it beat is gone, and a query that would have
+    // resolved resolves as SERVFAIL. So it is scored as a failed hop, which leaves the race to UDP
+    // — pending, or held truncated — exactly as a connect error would.
+    let over_tcp = |got: Option<Vec<u8>>| {
+        let Some(resp) = got else {
+            return TcpOutcome::Failed;
+        };
         if !response_matches_query(query, &resp) {
             tracing::debug!(%upstream, "magic dns dropping mismatched tcp response");
-            return None;
+            return TcpOutcome::Failed;
         }
-        Some(UpstreamAnswer {
+        let answer = UpstreamAnswer {
             // The TCP peer is the resolver we connected to, by construction of the handshake, so
             // the source address is `upstream` itself and `forward_walk`'s source check passes on
             // a fact rather than on a claim in a datagram header.
             from: upstream,
             resp,
             via: UpstreamTransport::Tcp,
-        })
+        };
+        if is_soft_error(&answer.resp) {
+            TcpOutcome::SoftError(answer)
+        } else {
+            TcpOutcome::Answer(answer)
+        }
+    };
+    // The UDP hop has failed — `failure` is how, `unmatched` any datagram it brought that does not
+    // answer the query — and the race is the TCP hop's.
+    let then_tcp = |mut failure: UpstreamFailure,
+                    unmatched: Option<UpstreamAnswer>,
+                    got: Option<Vec<u8>>| match over_tcp(got) {
+        TcpOutcome::Answer(answer) => Ok(answer),
+        TcpOutcome::SoftError(soft) => {
+            failure.note(soft);
+            race_lost(failure, unmatched)
+        }
+        TcpOutcome::Failed => race_lost(failure, unmatched),
+    };
+    // The TCP hop has failed — `failure` is how — or is not in the race at all, and the race is the
+    // UDP hop's, whatever it brings: a truncated answer included, which Go returns in place of the
+    // error.
+    let then_udp =
+        |mut failure: UpstreamFailure, got: Option<(SocketAddr, Vec<u8>)>| match classify_udp(
+            upstream, query, got,
+        ) {
+            UdpOutcome::Answer(answer) | UdpOutcome::Truncated(answer) => Ok(answer),
+            UdpOutcome::SoftError(soft) => {
+                failure.note(soft);
+                Err(failure)
+            }
+            UdpOutcome::Unmatched(datagram) => race_lost(failure, Some(datagram)),
+            UdpOutcome::Failed => Err(failure),
+        };
+    // A truncated UDP answer is held while the TCP hop retries it; anything short of a TCP answer
+    // — a failed hop, a mismatched message, a SERVFAIL or REFUSED — returns the held answer.
+    let retry_truncated = |truncated: UpstreamAnswer, got: Option<Vec<u8>>| match over_tcp(got) {
+        TcpOutcome::Answer(answer) => answer,
+        TcpOutcome::SoftError(_) | TcpOutcome::Failed => {
+            tracing::debug!(
+                %upstream,
+                "magic dns upstream tcp hop failed, relaying the udp answer"
+            );
+            truncated
+        }
     };
 
     let udp = udp();
     if retry == TcpRetry::Disabled {
         // Control said no (`dns-forwarder-disable-tcp-retries`): the TCP hop never runs, on any
-        // arm, so whatever UDP gives us — truncated, failed or late — is the whole answer.
-        return udp.await.map(|(from, resp)| UpstreamAnswer {
-            from,
-            resp,
-            via: UpstreamTransport::Udp,
-        });
+        // arm, so whatever UDP gives us — an answer, truncated or not, a soft error, or nothing —
+        // is the whole result.
+        return then_udp(UpstreamFailure::default(), udp.await);
     }
     let mut udp = std::pin::pin!(udp);
 
@@ -1404,15 +1546,23 @@ where
         };
         match settled {
             Some(UdpOutcome::Answer(answer) | UdpOutcome::Unmatched(answer)) => {
-                return Some(answer);
+                return Ok(answer);
             }
             Some(UdpOutcome::Truncated(truncated)) => {
                 tracing::debug!(%upstream, "magic dns upstream answer truncated, retrying over tcp");
-                return Some(tcp().await.and_then(over_tcp).unwrap_or(truncated));
+                return Ok(retry_truncated(truncated, tcp().await));
+            }
+            Some(UdpOutcome::SoftError(soft)) => {
+                tracing::debug!(
+                    %upstream,
+                    rcode = response_rcode(&soft.resp),
+                    "magic dns upstream udp soft error, trying tcp"
+                );
+                return then_tcp(UpstreamFailure::soft(soft), None, tcp().await);
             }
             Some(UdpOutcome::Failed) => {
                 tracing::debug!(%upstream, "magic dns upstream udp hop failed, trying tcp");
-                return tcp().await.and_then(over_tcp);
+                return then_tcp(UpstreamFailure::default(), None, tcp().await);
             }
             None => {
                 tracing::debug!(%upstream, "magic dns upstream udp hop slow, racing tcp");
@@ -1425,28 +1575,20 @@ where
     tokio::select! {
         biased;
         got = &mut udp => match classify_udp(upstream, query, got) {
-            UdpOutcome::Answer(answer) => Some(answer),
-            UdpOutcome::Truncated(held) | UdpOutcome::Unmatched(held) => {
-                Some(tcp.await.and_then(over_tcp).unwrap_or_else(|| {
-                    tracing::debug!(
-                        %upstream,
-                        "magic dns upstream tcp hop failed, relaying the udp answer"
-                    );
-                    held
-                }))
+            UdpOutcome::Answer(answer) => Ok(answer),
+            UdpOutcome::Truncated(held) => Ok(retry_truncated(held, tcp.await)),
+            UdpOutcome::SoftError(soft) => {
+                then_tcp(UpstreamFailure::soft(soft), None, tcp.await)
             }
-            UdpOutcome::Failed => tcp.await.and_then(over_tcp),
+            UdpOutcome::Unmatched(held) => {
+                then_tcp(UpstreamFailure::default(), Some(held), tcp.await)
+            }
+            UdpOutcome::Failed => then_tcp(UpstreamFailure::default(), None, tcp.await),
         },
-        got = &mut tcp => match got.and_then(over_tcp) {
-            Some(answer) => Some(answer),
-            // The TCP hop failed first — or answered something we did not ask: the race is the UDP
-            // hop's, whatever it brings — including a truncated answer, which Go returns in place
-            // of the error.
-            None => udp.await.map(|(from, resp)| UpstreamAnswer {
-                from,
-                resp,
-                via: UpstreamTransport::Udp,
-            }),
+        got = &mut tcp => match over_tcp(got) {
+            TcpOutcome::Answer(answer) => Ok(answer),
+            TcpOutcome::SoftError(soft) => then_udp(UpstreamFailure::soft(soft), udp.await),
+            TcpOutcome::Failed => then_udp(UpstreamFailure::default(), udp.await),
         },
     }
 }
@@ -1586,11 +1728,12 @@ where
 /// ([`ask_upstream`]).
 ///
 /// **REFUSED and SERVFAIL are soft errors, not answers** ([`is_soft_error`]). An upstream that
-/// answers `REFUSED` (RCODE 5) or `SERVFAIL` (RCODE 2) does not end the forward: the walk continues
-/// to the next upstream, and how the first failure looked is remembered for when the list is
-/// exhausted with nothing better. Otherwise a broken or misconfigured resolver that refuses
-/// instantly beats a healthy one still doing the work, and the stub resolver is handed the refusal
-/// as though it were the answer — complete DNS failure exactly where a split-DNS route or a
+/// answers `REFUSED` (RCODE 5) or `SERVFAIL` (RCODE 2) — on both of [`ask_upstream`]'s hops, since
+/// a soft error over UDP is first retried over TCP to the same resolver — does not end the forward:
+/// the walk continues to the next upstream, and how the first failure looked is remembered for when
+/// the list is exhausted with nothing better. Otherwise a broken or misconfigured resolver that
+/// refuses instantly beats a healthy one still doing the work, and the stub resolver is handed the
+/// refusal as though it were the answer — complete DNS failure exactly where a split-DNS route or a
 /// fallback list names more than one resolver, which is the shape control commonly pushes. Every
 /// other RCODE — including NXDOMAIN, which is a real answer — ends the walk on the spot.
 ///
@@ -1602,20 +1745,28 @@ where
 /// them (net/dns/resolver/forwarder.go @ e2ed432399c9b0fda7aa14e9eb27784d2d893c55, `firstErr` /
 /// `sawNonRefused`, lines 1309-1383):
 ///
-/// - **every** upstream answered REFUSED: the first refusal is relayed;
-/// - otherwise, the first failure is relayed only if it was itself a SERVFAIL answer.
+/// - **every** upstream was refused: the first failure's first soft error is relayed;
+/// - otherwise, the first failure's first soft error is relayed only if it is a SERVFAIL.
 ///
 /// Anything else gets `fallback`. So a REFUSED followed by a SERVFAIL, or by an upstream that never
 /// answered, is a SERVFAIL — the refusal describes one resolver's policy, not why the forward as a
 /// whole failed. "Never answered" is every upstream that timed out, errored, or only ever sent
 /// datagrams the anti-poisoning check discarded; it counts as a failure that is not a refusal, as
 /// Go's transport errors (and its transaction-id mismatch) do.
-/// "First" is the walk's order here; Go takes it by arrival, since it asks every resolver at once.
 ///
-/// Every relayed response goes through [`cap_response`], which caps it at [`MAX_UPSTREAM_RESPONSE`]
+/// An upstream's failure is both of its hops together ([`UpstreamFailure`]), read the way Go reads
+/// the joined error its race returns: the upstream *was refused* when either hop was answered
+/// REFUSED (`errors.Is(err, errRefused)`), and its soft error is whichever hop's settled first
+/// (`errors.AsType[rcodeResponseError]`). So a SERVFAIL over UDP and a REFUSED over TCP is a
+/// refusal whose relayed bytes are the SERVFAIL, as it is in Go.
+/// "First" upstream is the walk's order here; Go takes it by arrival, since it asks every resolver
+/// at once.
+///
+/// Every relayed answer goes through [`cap_response`], which caps it at [`MAX_UPSTREAM_RESPONSE`]
 /// unless it was TCP end to end, and — for a [`ClientTransport::Udp`] client — marks it truncated
 /// when it exceeds what `query` advertised it can receive. That is why an [`UpstreamAnswer`] carries
-/// the hop it arrived over all the way to here: the walk never inspects it, it only hands it on.
+/// the hop it arrived over all the way to here: the walk never inspects it, it only hands it on. A
+/// relayed soft error does not: Go hands it back as it was read ([`relay_soft_error`]).
 async fn forward_walk<F, Fut>(
     upstreams: &[SocketAddr],
     query: &[u8],
@@ -1625,72 +1776,77 @@ async fn forward_walk<F, Fut>(
 ) -> Vec<u8>
 where
     F: FnMut(SocketAddr) -> Fut,
-    Fut: std::future::Future<Output = Option<UpstreamAnswer>>,
+    Fut: std::future::Future<Output = Result<UpstreamAnswer, UpstreamFailure>>,
 {
-    /// How the first failing upstream failed: Go's `firstErr`.
-    enum FirstFailure {
-        Refused(UpstreamAnswer),
-        ServFail(UpstreamAnswer),
-        NoAnswer,
-    }
-
-    let mut first_failure: Option<FirstFailure> = None;
-    // Whether any upstream failed other than by answering REFUSED: Go's `sawNonRefused`.
+    // How the first failing upstream failed: Go's `firstErr`.
+    let mut first_failure: Option<UpstreamFailure> = None;
+    // Whether any upstream failed other than by being refused: Go's `sawNonRefused`.
     let mut saw_non_refused = false;
 
     for upstream in upstreams {
-        let Some(answer) = ask(*upstream).await else {
-            first_failure.get_or_insert(FirstFailure::NoAnswer);
-            saw_non_refused = true;
-            continue;
-        };
-        let UpstreamAnswer { from, resp, via } = answer;
-
-        // Anti-poisoning: only accept a datagram that came from the upstream we queried and whose
-        // DNS header matches this query (same transaction id, QR=response bit set). An off-path
-        // injector racing the real answer is otherwise relayed straight back to the stub resolver
-        // as authoritative — and this check runs FIRST, so an injected refusal is not even eligible
-        // to become the soft error a fully-refused forward ends up relaying.
-        if from.ip() != upstream.ip() || !response_matches_query(query, &resp) {
-            tracing::debug!(%upstream, %from, "magic dns dropping unsolicited/mismatched response");
-            first_failure.get_or_insert(FirstFailure::NoAnswer);
-            saw_non_refused = true;
-            continue;
-        }
-
-        // A soft error (REFUSED/SERVFAIL) is not an answer: note how the first failure looked and
-        // give the remaining upstreams their turn.
-        if is_soft_error(&resp) {
-            tracing::debug!(
-                %upstream,
-                rcode = response_rcode(&resp),
-                "magic dns upstream soft error, trying the next upstream"
-            );
-            let answer = UpstreamAnswer { from, resp, via };
-            if response_rcode(&answer.resp) == Some(RCODE_REFUSED) {
-                first_failure.get_or_insert(FirstFailure::Refused(answer));
-            } else {
-                first_failure.get_or_insert(FirstFailure::ServFail(answer));
-                saw_non_refused = true;
+        let failure = match ask(*upstream).await {
+            // Anti-poisoning: only accept a datagram that came from the upstream we queried and
+            // whose DNS header matches this query (same transaction id, QR=response bit set). An
+            // off-path injector racing the real answer is otherwise relayed straight back to the
+            // stub resolver as authoritative — and this check runs FIRST, so an injected refusal is
+            // not even eligible to become the soft error a fully-refused forward ends up relaying.
+            Ok(UpstreamAnswer { from, resp, .. })
+                if from.ip() != upstream.ip() || !response_matches_query(query, &resp) =>
+            {
+                tracing::debug!(%upstream, %from, "magic dns dropping unsolicited/mismatched response");
+                UpstreamFailure::default()
             }
-            continue;
-        }
+            // [`ask_upstream`] hands soft errors back as failures, but a soft error is not an
+            // answer however it arrives.
+            Ok(answer) if is_soft_error(&answer.resp) => UpstreamFailure::soft(answer),
+            Ok(UpstreamAnswer { resp, via, .. }) => return cap_response(query, resp, client, via),
+            Err(failure) => failure,
+        };
 
-        return cap_response(query, resp, client, via);
+        // A failure is not an answer: note how the first one looked and give the remaining
+        // upstreams their turn.
+        tracing::debug!(
+            %upstream,
+            refused = failure.refused,
+            rcode = failure.first_soft.as_ref().and_then(|soft| response_rcode(&soft.resp)),
+            "magic dns upstream failed, trying the next upstream"
+        );
+        saw_non_refused |= !failure.refused;
+        first_failure.get_or_insert(failure);
     }
 
     // Nothing better arrived. Relay an upstream's own bytes (extended DNS error and all) only where
-    // Go does: the first refusal when every upstream refused, or a first failure that was itself a
-    // SERVFAIL. A refusal mixed with any other failure, or nobody answering, is `fallback`.
-    match first_failure {
-        Some(FirstFailure::Refused(answer)) if !saw_non_refused => {
-            cap_response(query, answer.resp, client, answer.via)
-        }
-        Some(FirstFailure::ServFail(answer)) => {
-            cap_response(query, answer.resp, client, answer.via)
+    // Go does: the first failure's soft error when every upstream was refused, or when that soft
+    // error is itself a SERVFAIL. A refusal mixed with any other failure, or nobody answering, is
+    // `fallback`.
+    match first_failure.and_then(|failure| failure.first_soft) {
+        Some(soft) if !saw_non_refused || response_rcode(&soft.resp) == Some(RCODE_SERVFAIL) => {
+            relay_soft_error(soft, client)
         }
         _ => fallback,
     }
+}
+
+/// An upstream's own SERVFAIL or REFUSED, as [`forward_walk`] relays it when the forward failed.
+///
+/// Go relays `rcodeResponseError.res` as it was read. `sendUDP` and `sendTCP` return it from their
+/// RCODE switch, ahead of the `TC` fix-up, `checkResponseSizeAndSetTC` and `clampEDNSSize` that an
+/// answer goes through, and neither `forwardWithDestChan` nor `Resolver.Query` size-checks it
+/// afterwards (net/dns/resolver/forwarder.go and tsdns.go @
+/// `e2ed432399c9b0fda7aa14e9eb27784d2d893c55`). So, unlike [`cap_response`], this never sets `TC`
+/// — not for the client's advertised EDNS size, and not for anything else.
+///
+/// The one bound it keeps is [`MAX_UPSTREAM_RESPONSE`], applied without `TC`, to a response that
+/// crosses a datagram. Over the UDP hop that bound is Go's own: `sendUDP` cuts what it read to
+/// `maxResponseBytes` before it looks at the RCODE. Fetched over TCP for a UDP client, it is this
+/// node's datagram bound; Go would send the message whole.
+fn relay_soft_error(soft: UpstreamAnswer, client: ClientTransport) -> Vec<u8> {
+    let UpstreamAnswer { mut resp, via, .. } = soft;
+    let crosses_a_datagram = client == ClientTransport::Udp || via == UpstreamTransport::Udp;
+    if crosses_a_datagram && resp.len() > MAX_UPSTREAM_RESPONSE {
+        resp.truncate(MAX_UPSTREAM_RESPONSE);
+    }
+    resp
 }
 
 /// Run the receive/answer loop for the bound socket until it (or the netstack) goes away.
@@ -3239,7 +3395,9 @@ mod tests {
     /// The script stands in for [`ask_upstream`]'s overlay socket exchange only; every decision
     /// under test — the source/transaction-id check, the REFUSED/SERVFAIL soft-error rules, which
     /// response is relayed — is made by the production code being called. Every scripted answer
-    /// arrives over the UDP hop, which is the hop the walk's own rules are about; the TCP hop is
+    /// arrives over the UDP hop, which is the hop the walk's own rules are about, and is read by the
+    /// production race with the TCP hop switched off ([`TcpRetry::Disabled`]), so a scripted soft
+    /// error reaches the walk as the failure [`ask_upstream`] would hand it. The TCP hop is
     /// [`race_udp_and_tcp`]'s business and is tested there.
     async fn run_forward_walk(
         script: &[ScriptedUpstream],
@@ -3256,16 +3414,18 @@ mod tests {
             ClientTransport::Udp,
             |upstream| {
                 asked.borrow_mut().push(upstream);
-                let answer = script
+                let datagram = script
                     .iter()
                     .find(|(scripted, _)| *scripted == upstream)
-                    .and_then(|(_, answer)| answer.clone())
-                    .map(|(from, resp)| UpstreamAnswer {
-                        from,
-                        resp,
-                        via: UpstreamTransport::Udp,
-                    });
-                std::future::ready(answer)
+                    .and_then(|(_, datagram)| datagram.clone());
+                race_udp_and_tcp(
+                    upstream,
+                    query,
+                    ClientTransport::Udp,
+                    TcpRetry::Disabled,
+                    move || std::future::ready(datagram),
+                    || std::future::ready(None),
+                )
             },
         )
         .await;
@@ -3729,6 +3889,61 @@ mod tests {
         );
     }
 
+    /// An upstream's own soft error is relayed as it was read, as Go relays `rcodeResponseError.res`:
+    /// no `TC` for the client's advertised size. This query advertises no EDNS size, so a client
+    /// limit of 512 applies to an *answer*; a REFUSED padded past it — as a long RFC 8914 extended
+    /// error text would pad it — still reaches the client whole and with `TC` clear.
+    #[tokio::test]
+    async fn a_relayed_soft_error_is_not_marked_truncated_for_the_client_size() {
+        let query = build_query(0x41A, &["example", "com"], 1, 1);
+        let only = upstream_addr(1);
+        let refusal = upstream_response(&query, RCODE_REFUSED, 0, &[0xEE; 700]);
+        let fallback = upstream_response(&query, RCODE_SERVFAIL, 0, b"synthesized");
+
+        let (got, _asked) = run_forward_walk(
+            &[(only, Some((only, refusal.clone())))],
+            &query,
+            fallback.clone(),
+        )
+        .await;
+
+        assert_eq!(got, refusal, "relayed byte for byte");
+        assert_eq!(got[2] & 0x02, 0, "TC clear, as Go sends it");
+
+        // The one bound kept is the datagram's, and it is Go's own for the UDP hop: `sendUDP` cuts
+        // what it read to `maxResponseBytes` before the RCODE switch returns — without setting TC.
+        let mut full_ring = upstream_response(&query, RCODE_SERVFAIL, 0, b"");
+        full_ring.resize(MAX_UPSTREAM_RESPONSE + 1, 0xEE);
+        let (got, _asked) =
+            run_forward_walk(&[(only, Some((only, full_ring.clone())))], &query, fallback).await;
+
+        assert_eq!(
+            got,
+            full_ring[..MAX_UPSTREAM_RESPONSE],
+            "cut to one datagram"
+        );
+        assert_eq!(got[2] & 0x02, 0, "and still not marked truncated");
+    }
+
+    /// Off a datagram entirely — fetched over TCP for a TCP client — a relayed soft error is not cut
+    /// at all.
+    #[test]
+    fn a_soft_error_fetched_over_tcp_for_a_tcp_client_is_relayed_whole() {
+        let query = build_query(0x41B, &["example", "com"], 1, 1);
+        let mut big = upstream_response(&query, RCODE_SERVFAIL, 0, b"");
+        big.resize(MAX_UPSTREAM_RESPONSE + 5000, 0xEE);
+
+        let out = relay_soft_error(
+            UpstreamAnswer {
+                from: upstream_addr(1),
+                resp: big.clone(),
+                via: UpstreamTransport::Tcp,
+            },
+            ClientTransport::Tcp,
+        );
+        assert_eq!(out, big);
+    }
+
     /// A discarded datagram counts as a non-refusal failure whatever it claims to carry: a spoofed
     /// NOERROR answer with a transaction id we never asked with is neither relayed nor mistaken for
     /// the walk's end, and still stops an earlier refusal from being relayed.
@@ -3891,6 +4106,56 @@ mod tests {
                 );
             }
             Decision::Forward { .. } => panic!("must not forward when all upstreams are filtered"),
+        }
+    }
+
+    /// The SERVFAIL this node synthesizes is Go's `servfailResponse`: the query's own header with
+    /// QR, AA and RCODE set, and nothing else changed. RA stays as the client sent it — clear, for
+    /// the RD=1 query every stub resolver sends — where a locally built answer would set it; the
+    /// AD and CD bits and the opcode survive; Z is dropped. The same bytes stand in both for "no
+    /// upstream to ask" and, as the forward's fallback, for "every upstream failed".
+    #[test]
+    fn a_synthesized_servfail_copies_the_query_header_as_go_does() {
+        let mut buf = build_query(0x10A, &["example", "com"], 1, 1);
+        buf[2] = 0x01; // RD
+        buf[3] = 0x70; // Z | AD | CD, RA clear
+        let check = |resp: &[u8], what: &str| {
+            assert_eq!(&resp[..2], &buf[..2], "{what}: the query's id");
+            assert_eq!(
+                resp[2], 0x85,
+                "{what}: QR | AA | RD — nothing else in the high byte"
+            );
+            assert_eq!(
+                resp[3], 0x32,
+                "{what}: AD | CD as sent, RA not set, Z dropped, RCODE = SERVFAIL"
+            );
+            assert_eq!(&resp[4..6], &[0, 1], "{what}: one question, echoed");
+            assert_eq!(&resp[6..12], &[0; 6], "{what}: no other records");
+            assert_eq!(&resp[12..], &buf[12..], "{what}: the question as asked");
+        };
+
+        let view = view_with_routes(std::collections::BTreeMap::new(), vec![], vec![]);
+        match decide(&view, &buf).expect("decides") {
+            Decision::Reply(resp) => check(&resp, "no upstream"),
+            Decision::Forward { .. } => panic!("must not forward with no resolvers"),
+        }
+
+        let view = view_with_routes(
+            std::collections::BTreeMap::new(),
+            vec![udp("192.0.2.53:53")],
+            vec![],
+        );
+        match decide(&view, &buf).expect("decides") {
+            Decision::Forward { servfail, .. } => check(&servfail, "forward fallback"),
+            Decision::Reply(_) => panic!("an off-tailnet name with a resolver is forwarded"),
+        }
+
+        // A non-QUERY opcode and a TC bit on the query are copied too.
+        buf[2] = 0x13; // opcode 2 (STATUS) | TC | RD
+        let view = view_with_routes(std::collections::BTreeMap::new(), vec![], vec![]);
+        match decide(&view, &buf).expect("decides") {
+            Decision::Reply(resp) => assert_eq!(resp[2], 0x80 | 0x10 | 0x04 | 0x03),
+            Decision::Forward { .. } => panic!("must not forward with no resolvers"),
         }
     }
 
@@ -4216,7 +4481,7 @@ mod tests {
             || std::future::ready(None),
         )
         .await;
-        assert!(answer.is_none(), "both hops failed: nothing to relay");
+        assert!(answer.is_err(), "both hops failed: nothing to relay");
     }
 
     /// The race is symmetric: a TCP hop that fails first leaves it to the UDP hop, which is waited
@@ -4410,7 +4675,7 @@ mod tests {
                 !raced.get(),
                 "{client:?}: the attribute must keep the TCP hop out of the race too"
             );
-            assert!(answer.is_none(), "{client:?}: UDP said nothing, so nothing");
+            assert!(answer.is_err(), "{client:?}: UDP said nothing, so nothing");
             assert_eq!(
                 started.elapsed(),
                 UPSTREAM_TIMEOUT,
@@ -4547,7 +4812,7 @@ mod tests {
         .await;
 
         assert!(
-            answer.is_none(),
+            answer.is_err(),
             "a failed UDP hop plus a mismatched TCP message is not an answer"
         );
     }
@@ -4625,6 +4890,340 @@ mod tests {
             started.elapsed()
         );
         assert!(!tcp_started.get(), "and no TCP connection is opened");
+    }
+
+    /// A SERVFAIL or REFUSED over UDP is a failed hop, not an answer: Go's `sendUDP` returns it as
+    /// an `rcodeResponseError`, so `Race.Start` starts the TCP hop to the same resolver at once, and
+    /// that hop's answer is the resolver's answer. Before this, the datagram won the race and the TCP
+    /// hop was never tried, so a resolver that soft-fails over UDP but answers over TCP did not
+    /// resolve here.
+    #[tokio::test(start_paused = true)]
+    async fn a_udp_soft_error_starts_the_tcp_hop_at_once_and_its_answer_wins() {
+        let query = build_query(0x412, &["example", "com"], 1, 1);
+        let upstream = upstream_addr(1);
+        let over_tcp = upstream_response(&query, 0, 1, b"answered over tcp");
+
+        for rcode in [RCODE_SERVFAIL, RCODE_REFUSED] {
+            let soft = upstream_response(&query, rcode, 0, b"soft over udp");
+            for client in BOTH_CLIENTS {
+                let started = tokio::time::Instant::now();
+                let tcp_started_at = std::cell::Cell::new(None);
+                let answer = race_udp_and_tcp(
+                    upstream,
+                    &query,
+                    client,
+                    TcpRetry::Enabled,
+                    || std::future::ready(Some((upstream, soft.clone()))),
+                    || {
+                        tcp_started_at.set(Some(started.elapsed()));
+                        std::future::ready(Some(over_tcp.clone()))
+                    },
+                )
+                .await
+                .expect("the TCP hop answered");
+
+                assert_eq!(
+                    answer.resp, over_tcp,
+                    "rcode {rcode}, {client:?}: the TCP answer, not the soft error"
+                );
+                assert_eq!(answer.via, UpstreamTransport::Tcp);
+                assert_eq!(answer.from, upstream, "the same resolver");
+                assert_eq!(
+                    tcp_started_at.get(),
+                    Some(Duration::ZERO),
+                    "rcode {rcode}, {client:?}: no head start is waited out after a soft error"
+                );
+            }
+        }
+    }
+
+    /// When both hops soft-fail the resolver has failed, and the failure is Go's joined error read
+    /// the way `forwardWithDestChan` reads it: refused if EITHER hop refused, and carrying the soft
+    /// error of the hop that settled first.
+    #[tokio::test]
+    async fn both_hops_soft_failing_is_a_failure_carrying_the_first_soft_error() {
+        let query = build_query(0x413, &["example", "com"], 1, 1);
+        let upstream = upstream_addr(1);
+        let servfail = upstream_response(&query, RCODE_SERVFAIL, 0, b"servfail over udp");
+        let refused = upstream_response(&query, RCODE_REFUSED, 0, b"refused over tcp");
+
+        let failure = race_udp_and_tcp(
+            upstream,
+            &query,
+            ClientTransport::Udp,
+            TcpRetry::Enabled,
+            || std::future::ready(Some((upstream, servfail.clone()))),
+            || std::future::ready(Some(refused.clone())),
+        )
+        .await
+        .expect_err("neither hop answered");
+        assert!(
+            failure.refused,
+            "a REFUSED on either hop makes the resolver refused (errors.Is on the joined error)"
+        );
+        assert_eq!(
+            failure.first_soft.map(|soft| soft.resp),
+            Some(servfail.clone()),
+            "the soft error kept is the first to settle — the UDP hop's SERVFAIL"
+        );
+
+        // A soft error and a transport failure: the soft error is all there is to keep, and the
+        // resolver is refused only if that soft error is a refusal.
+        for (rcode, refused) in [(RCODE_SERVFAIL, false), (RCODE_REFUSED, true)] {
+            let soft = upstream_response(&query, rcode, 0, b"soft over udp");
+            let failure = race_udp_and_tcp(
+                upstream,
+                &query,
+                ClientTransport::Udp,
+                TcpRetry::Enabled,
+                || std::future::ready(Some((upstream, soft.clone()))),
+                || std::future::ready(None),
+            )
+            .await
+            .expect_err("neither hop answered");
+            assert_eq!(failure.refused, refused, "rcode {rcode}");
+            assert_eq!(failure.first_soft.map(|soft| soft.resp), Some(soft));
+        }
+    }
+
+    /// The same rule on the other hop: a SERVFAIL or REFUSED over TCP (Go's `sendTCP` returns it as
+    /// an `rcodeResponseError`) leaves the race to the UDP hop, which is waited for rather than
+    /// beaten by the soft error.
+    #[tokio::test(start_paused = true)]
+    async fn a_tcp_soft_error_leaves_the_race_to_the_udp_hop() {
+        let query = build_query(0x414, &["example", "com"], 1, 1);
+        let upstream = upstream_addr(1);
+        let over_udp = upstream_response(&query, 0, 1, b"answered over udp");
+        let soft = upstream_response(&query, RCODE_SERVFAIL, 0, b"servfail over tcp");
+
+        // A TCP client races both hops from the start, so the TCP soft error is in while the UDP
+        // hop is still in flight.
+        let answer = race_udp_and_tcp(
+            upstream,
+            &query,
+            ClientTransport::Tcp,
+            TcpRetry::Enabled,
+            async || {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Some((upstream, over_udp.clone()))
+            },
+            || std::future::ready(Some(soft.clone())),
+        )
+        .await
+        .expect("the UDP hop answered after the TCP hop soft-failed");
+
+        assert_eq!(answer.resp, over_udp);
+        assert_eq!(answer.via, UpstreamTransport::Udp);
+    }
+
+    /// A truncated answer held while TCP retries it is not given up for a soft error over TCP: Go's
+    /// `send` finds the `truncatedResponseError` in the joined error and returns its bytes.
+    #[tokio::test]
+    async fn a_soft_tcp_retry_relays_the_truncated_udp_answer() {
+        let query = build_query(0x415, &["big", "example", "com"], 16, 1);
+        let upstream = upstream_addr(1);
+        let mut truncated = upstream_response(&query, 0, 1, b"the part that fit");
+        truncated[2] |= 0x02; // TC
+        let soft = upstream_response(&query, RCODE_SERVFAIL, 0, b"servfail over tcp");
+
+        for client in BOTH_CLIENTS {
+            let answer = race_udp_and_tcp(
+                upstream,
+                &query,
+                client,
+                TcpRetry::Enabled,
+                || std::future::ready(Some((upstream, truncated.clone()))),
+                || std::future::ready(Some(soft.clone())),
+            )
+            .await
+            .expect("a soft-failed retry must not lose the answer we already had");
+
+            assert_eq!(answer.resp, truncated, "{client:?}");
+            assert_eq!(answer.via, UpstreamTransport::Udp, "{client:?}");
+        }
+    }
+
+    /// With the TCP hop switched off, a soft error over UDP is still a failure and not an answer —
+    /// and no connection is opened to find a better one.
+    #[tokio::test]
+    async fn with_tcp_off_a_udp_soft_error_is_a_failure_and_opens_no_connection() {
+        let query = build_query(0x416, &["example", "com"], 1, 1);
+        let upstream = upstream_addr(1);
+        let refused = upstream_response(&query, RCODE_REFUSED, 0, b"refused over udp");
+
+        for client in BOTH_CLIENTS {
+            let dialled = std::cell::Cell::new(false);
+            let failure = race_udp_and_tcp(
+                upstream,
+                &query,
+                client,
+                TcpRetry::Disabled,
+                || std::future::ready(Some((upstream, refused.clone()))),
+                || {
+                    dialled.set(true);
+                    std::future::ready(None)
+                },
+            )
+            .await
+            .expect_err("a REFUSED is not an answer");
+
+            assert!(!dialled.get(), "{client:?}: TCP is off");
+            assert!(failure.refused, "{client:?}");
+            assert_eq!(
+                failure.first_soft.map(|soft| soft.resp),
+                Some(refused.clone())
+            );
+        }
+    }
+
+    /// One scripted upstream for [`run_forward_walk_over_both_hops`]: its address, the datagram its
+    /// UDP hop brings back, and the message its TCP hop brings back (`None` = nothing came back).
+    type TwoHopUpstream = (SocketAddr, Option<Vec<u8>>, Option<Vec<u8>>);
+
+    /// Run the real [`forward_walk`] over the real [`race_udp_and_tcp`] for a UDP client, with both
+    /// hops of each upstream scripted. Returns the client's bytes and the upstreams asked.
+    async fn run_forward_walk_over_both_hops(
+        script: &[TwoHopUpstream],
+        query: &[u8],
+        fallback: Vec<u8>,
+    ) -> (Vec<u8>, Vec<SocketAddr>) {
+        let upstreams: Vec<SocketAddr> = script.iter().map(|(upstream, ..)| *upstream).collect();
+        let asked = std::cell::RefCell::new(Vec::new());
+
+        let response = forward_walk(
+            &upstreams,
+            query,
+            fallback,
+            ClientTransport::Udp,
+            |upstream| {
+                asked.borrow_mut().push(upstream);
+                let (_, over_udp, over_tcp) = script
+                    .iter()
+                    .find(|(scripted, ..)| *scripted == upstream)
+                    .cloned()
+                    .expect("a scripted upstream");
+                race_udp_and_tcp(
+                    upstream,
+                    query,
+                    ClientTransport::Udp,
+                    TcpRetry::Enabled,
+                    move || std::future::ready(over_udp.map(|resp| (upstream, resp))),
+                    move || std::future::ready(over_tcp),
+                )
+            },
+        )
+        .await;
+
+        (response, asked.into_inner())
+    }
+
+    /// Consequence (1) of the audit: a resolver that soft-fails over UDP but answers over TCP
+    /// resolves, and the walk never hands the query to a second resolver Go would not have asked.
+    #[tokio::test]
+    async fn a_resolver_that_soft_fails_over_udp_but_answers_over_tcp_ends_the_walk() {
+        let query = build_query(0x417, &["example", "com"], 1, 1);
+        let (first, second) = (upstream_addr(1), upstream_addr(2));
+        let over_tcp = upstream_response(&query, 0, 1, b"the first resolver over tcp");
+        let fallback = upstream_response(&query, RCODE_SERVFAIL, 0, b"synthesized");
+
+        for rcode in [RCODE_SERVFAIL, RCODE_REFUSED] {
+            let (got, asked) = run_forward_walk_over_both_hops(
+                &[
+                    (
+                        first,
+                        Some(upstream_response(&query, rcode, 0, b"soft over udp")),
+                        Some(over_tcp.clone()),
+                    ),
+                    (
+                        second,
+                        Some(upstream_response(&query, 0, 1, b"the second resolver")),
+                        None,
+                    ),
+                ],
+                &query,
+                fallback.clone(),
+            )
+            .await;
+
+            assert_eq!(
+                got, over_tcp,
+                "rcode {rcode}: the first resolver's TCP answer"
+            );
+            assert_eq!(
+                asked,
+                vec![first],
+                "rcode {rcode}: the second is never asked"
+            );
+        }
+    }
+
+    /// Consequence (2): the refused tally counts a refusal on either hop. The second resolver's UDP
+    /// SERVFAIL is followed by a TCP REFUSED, which Go counts as refused, so every resolver refused
+    /// and the first refusal is relayed. Scored on the UDP datagram alone, the SERVFAIL made it a
+    /// non-refusal and the client got the synthesized SERVFAIL instead.
+    #[tokio::test]
+    async fn a_refusal_on_either_hop_counts_toward_every_upstream_refusing() {
+        let query = build_query(0x418, &["example", "com"], 1, 1);
+        let (first, second) = (upstream_addr(1), upstream_addr(2));
+        let first_refusal = upstream_response(&query, RCODE_REFUSED, 0, b"first refusal");
+        let fallback = upstream_response(&query, RCODE_SERVFAIL, 0, b"synthesized");
+
+        let (got, asked) = run_forward_walk_over_both_hops(
+            &[
+                (first, Some(first_refusal.clone()), None),
+                (
+                    second,
+                    Some(upstream_response(
+                        &query,
+                        RCODE_SERVFAIL,
+                        0,
+                        b"servfail over udp",
+                    )),
+                    Some(upstream_response(
+                        &query,
+                        RCODE_REFUSED,
+                        0,
+                        b"refused over tcp",
+                    )),
+                ),
+            ],
+            &query,
+            fallback.clone(),
+        )
+        .await;
+
+        assert_eq!(asked, vec![first, second]);
+        assert_eq!(got, first_refusal, "every resolver was refused on some hop");
+        assert_ne!(got, fallback);
+    }
+
+    /// And the relayed bytes are the first soft error to settle, whatever its code: a lone resolver
+    /// that answers SERVFAIL over UDP and REFUSED over TCP is refused, and Go relays the SERVFAIL
+    /// it found first in the joined error.
+    #[tokio::test]
+    async fn an_all_refused_forward_relays_the_first_soft_error_to_settle() {
+        let query = build_query(0x419, &["example", "com"], 1, 1);
+        let only = upstream_addr(1);
+        let servfail = upstream_response(&query, RCODE_SERVFAIL, 0, b"servfail over udp");
+        let fallback = upstream_response(&query, RCODE_SERVFAIL, 0, b"synthesized");
+
+        let (got, _asked) = run_forward_walk_over_both_hops(
+            &[(
+                only,
+                Some(servfail.clone()),
+                Some(upstream_response(
+                    &query,
+                    RCODE_REFUSED,
+                    0,
+                    b"refused over tcp",
+                )),
+            )],
+            &query,
+            fallback,
+        )
+        .await;
+
+        assert_eq!(got, servfail);
     }
 
     /// The relay cap is a datagram bound, so the one path it must not chop is the one that never
