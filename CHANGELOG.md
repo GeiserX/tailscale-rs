@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.57.2](https://github.com/GeiserX/tailscale-rs/compare/v0.57.1...v0.57.2) (2026-09-27)
+
+
+### Bug Fixes
+
+* **dns:** let a resolver that soft-fails over UDP answer over TCP, as Go does ([#555](https://github.com/GeiserX/tailscale-rs/issues/555)) ([6ecaa91](https://github.com/GeiserX/tailscale-rs/commit/6ecaa918201ceb56059b39a37a7b79b56322666e))
+
 ## [0.57.1](https://github.com/GeiserX/tailscale-rs/compare/v0.57.0...v0.57.1) (2026-09-23)
 
 
