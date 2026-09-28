@@ -1,4 +1,5 @@
 #![doc = include_str!("../README.md")]
+// Requires std all the same: `ts_netstack_smoltcp_core` links `flume`, which has no std-less mode.
 #![no_std]
 
 extern crate alloc;

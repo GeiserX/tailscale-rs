@@ -1,4 +1,7 @@
 #![doc = include_str!("../README.md")]
+// This crate's own code uses only `core` and `alloc`, but its command channel is `flume`, which
+// has no std-less mode: the crate as a whole requires std. `no_std` is kept so the crate's own
+// code stays std-free should the channel ever be swapped for one that is.
 #![no_std]
 
 extern crate alloc;
