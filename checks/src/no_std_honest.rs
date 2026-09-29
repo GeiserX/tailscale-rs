@@ -11,6 +11,13 @@
 //! linked into the target), and fails if the walk reaches a crate in [`STD_ONLY`]. The list holds
 //! only crates that require std under every feature set, so feature unification in the resolve
 //! graph cannot produce a false positive for them.
+//!
+//! HOW THIS DIFFERS FROM `no_std_deps`: that check starts from the `#![no_std]` attribute in a
+//! member's `src/lib.rs` and only looks one hop into workspace-local crates, skipping third-party
+//! ones. This check starts from the published `no-std` category in `Cargo.toml` and walks the
+//! whole resolved graph, third-party crates included, looking for a known std-only crate. A crate
+//! can pass one and fail the other: the netstack crates keep `#![no_std]` (and pass
+//! `no_std_deps`) but no longer claim the `no-std` category, because `flume` links std.
 
 use std::collections::{BTreeMap, VecDeque};
 
