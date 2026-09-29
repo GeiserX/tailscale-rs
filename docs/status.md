@@ -43,7 +43,7 @@ These are features that are currently implemented:
     reaches enforcement after `VerifiedAumChain::verify`, so control cannot forge a trusted key to
     admit a peer; it can only toggle the lock). Remaining deferred gaps: establishing/managing a lock
     from this node (multi-node `tka/init` enrollment), disablement-secret verification, and Go's
-    rotation-obsolete (clone/replay) peer dropping. See [SECURITY.md](../SECURITY.md) before relying on it.
+    rotation-obsolete (clone/replay) peer dropping. See [SECURITY.md](https://github.com/GeiserX/tailscale-rs/blob/main/SECURITY.md) before relying on it.
   - Communicate with the Tailscale Go client, `tsnet`, and `libtailscale`
 - Language support
   - Rust API
@@ -99,7 +99,7 @@ Unsupported features
   - Taildrop
   - Tailnet Lock — *enforcement is supported* (per-peer key-signature verification is wired and
     actively fails closed once a lock is synced — an unsigned or unauthorized peer is dropped; see
-    [SECURITY.md](../SECURITY.md)). What is **not** yet supported: establishing/managing a lock from this
+    [SECURITY.md](https://github.com/GeiserX/tailscale-rs/blob/main/SECURITY.md)). What is **not** yet supported: establishing/managing a lock from this
     node (multi-node `tka/init` enrollment), disablement-secret verification, and Go's
     rotation-obsolete (clone/replay) peer dropping.
   - Tailscale Funnel

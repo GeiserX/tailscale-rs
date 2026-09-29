@@ -5,10 +5,10 @@
 <h1 align="center">tailscale-rs</h1>
 
 <p align="center">
+  <a href="https://crates.io/crates/geiserx_tailscale"><img src="https://img.shields.io/crates/v/geiserx_tailscale" alt="crates.io"></a>
   <a href="https://github.com/GeiserX/tailscale-rs/actions/workflows/ci.yml"><img src="https://github.com/GeiserX/tailscale-rs/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSD--3--Clause-blue.svg" alt="License: BSD-3-Clause"></a>
-  <img src="https://img.shields.io/badge/MSRV-1.94.1-orange.svg" alt="MSRV 1.94.1">
-  <img src="https://img.shields.io/badge/edition-2024-blue.svg" alt="Rust edition 2024">
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/GeiserX/tailscale-rs" alt="License"></a>
+  <a href="Cargo.toml"><img src="https://img.shields.io/badge/MSRV-1.94.1-orange.svg" alt="MSRV 1.94.1"></a>
   <a href="https://github.com/tailscale/tailscale-rs"><img src="https://img.shields.io/badge/fork%20of-tailscale%2Ftailscale--rs-purple" alt="fork of tailscale/tailscale-rs"></a>
 </p>
 
@@ -43,12 +43,14 @@ C, Elixir, and Python.
 
 ## Quick start
 
+Inside a binary crate, with Rust 1.94.1 or newer:
+
 ```bash
 cargo add geiserx_tailscale --rename tailscale
 TS_RS_EXPERIMENT=this_is_unstable_software cargo run
 ```
 
-The crate is published as `geiserx_tailscale` and imported as `tailscale`. Every program linked against it needs `TS_RS_EXPERIMENT` set as above. A UDP client sample and the `tsnet` facade are in [Getting started](docs/getting-started.md), and more in [`examples/`](examples/README.md).
+The crate is published as `geiserx_tailscale` and imported as `tailscale`, and every program linked against it needs `TS_RS_EXPERIMENT` set as above. A UDP client sample and the `tsnet` facade are in [Getting started](docs/getting-started.md), and more in [`examples/`](examples/README.md).
 
 ## Documentation
 
