@@ -6,6 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: write
   issues: write
   pull-requests: write
 
@@ -21,4 +22,4 @@ jobs:
           days-before-pr-close: -1
           exempt-issue-labels: pinned
           stale-issue-message: "This issue has had no activity for 14 days and will be closed in 14 more unless someone comments."
-          close-issue-message: "Closed after 28 days without activity. Comment to reopen."
+          close-issue-message: "Closed after 28 days without activity. If it still matters, open a new issue."
