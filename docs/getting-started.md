@@ -5,12 +5,13 @@ The following instructions are for Rust! For other languages, see the language-s
 - [Elixir](../ts_elixir/README.md)
 - [Python](../ts_python/README.md) 
 
-Add this dependency line to your `Cargo.toml`:
+Add the crate with `cargo add geiserx_tailscale --rename tailscale`, which writes the current
+version into your `Cargo.toml`. The line it adds looks like this:
 
 ```toml
 [dependencies]
 # Published as `geiserx_tailscale`; imported as `tailscale`.
-tailscale = { package = "geiserx_tailscale", version = "0.6" }
+tailscale = { package = "geiserx_tailscale", version = "0.57" }
 ```
 
 > Or depend on the latest from git:
@@ -69,7 +70,7 @@ typed returns — so you get Go's lifecycle *shape* without giving up Rust's typ
 
 ```toml
 [dependencies]
-tailscale = { package = "geiserx_tailscale", version = "0.6", features = ["tsnet"] }
+tailscale = { package = "geiserx_tailscale", version = "0.57", features = ["tsnet"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
