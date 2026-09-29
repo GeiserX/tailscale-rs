@@ -1,0 +1,9 @@
+tailscale-rs (GeiserX fork)
+
+This repository is a fork of https://github.com/tailscale/tailscale-rs.
+
+Original code: Copyright (c) 2026 Tailscale Inc & contributors.
+Fork modifications: Copyright (c) 2026 Sergio (GeiserX) & contributors.
+
+All of it is distributed under the BSD 3-Clause License in LICENSE.
+Tailscale's additional patent grant is in PATENTS.
