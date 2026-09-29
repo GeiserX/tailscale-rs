@@ -1,9 +1,9 @@
 # Getting started
 
 The following instructions are for Rust! For other languages, see the language-specific README:
-- [C](../ts_ffi/README.md)
-- [Elixir](../ts_elixir/README.md)
-- [Python](../ts_python/README.md) 
+- [C](https://github.com/GeiserX/tailscale-rs/blob/main/ts_ffi/README.md)
+- [Elixir](https://github.com/GeiserX/tailscale-rs/blob/main/ts_elixir/README.md)
+- [Python](https://github.com/GeiserX/tailscale-rs/blob/main/ts_python/README.md) 
 
 Add the crate with `cargo add geiserx_tailscale --rename tailscale`, which writes the current
 version into your `Cargo.toml`. The line it adds looks like this:
@@ -24,10 +24,10 @@ tailscale = { package = "geiserx_tailscale", version = "0.57.3" }
 Either way, you import it as `tailscale` (e.g. `use tailscale::Device;`) — the crate name on
 crates.io is `geiserx_tailscale`, but the library name is `tailscale`.
 
-Examples of using the `tailscale` crate can be found in [`examples/`](../examples/README.md).
+Examples of using the `tailscale` crate can be found in [`examples/`](https://github.com/GeiserX/tailscale-rs/blob/main/examples/README.md).
 
-For instructions on how to run tests, lints, etc., see [CONTRIBUTING.md](../CONTRIBUTING.md). For the high-level architecture and
-repository layout, see [ARCHITECTURE.md](../ARCHITECTURE.md).
+For instructions on how to run tests, lints, etc., see [CONTRIBUTING.md](https://github.com/GeiserX/tailscale-rs/blob/main/CONTRIBUTING.md). For the high-level architecture and
+repository layout, see [ARCHITECTURE.md](https://github.com/GeiserX/tailscale-rs/blob/main/ARCHITECTURE.md).
 
 ## Code sample
 
@@ -103,7 +103,7 @@ defer srv.Close()
 ln, _ := srv.Listen("tcp", ":80")
 ```
 
-See the runnable [`tsnet_echo` example](../examples/tsnet_echo) — the [`tcp_echo`](../examples/tcp_echo)
+See the runnable [`tsnet_echo` example](https://github.com/GeiserX/tailscale-rs/tree/main/examples/tsnet_echo) — the [`tcp_echo`](https://github.com/GeiserX/tailscale-rs/tree/main/examples/tcp_echo)
 server rewritten against this facade — and the crate's `tsnet` module docs.
 
 ### Go `tsnet.Server` → `tsnet::Server` mapping
