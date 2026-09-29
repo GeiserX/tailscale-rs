@@ -9,6 +9,7 @@ mod ipv4_only_forwarder;
 mod ipv4_only_host_net;
 mod lints_enabled;
 mod no_std_deps;
+mod no_std_honest;
 mod parity_audit;
 mod porting_ledger;
 mod restock_beads;
@@ -31,6 +32,7 @@ pub type CheckFn = fn(&Args) -> BoxResult<()>;
 /// The set of check fns to run.
 pub const CHECK_FNS: &[(&str, CheckFn)] = &[
     ("lints_enabled", lints_enabled::run),
+    ("no_std_honest", no_std_honest::run),
     ("ipv4_only_forwarder", ipv4_only_forwarder::run),
     ("ipv4_only_host_net", ipv4_only_host_net::run),
     ("no_std_deps", no_std_deps::run),

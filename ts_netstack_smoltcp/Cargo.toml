@@ -2,7 +2,7 @@
 name = "geiserx_ts_netstack_smoltcp"
 version.workspace = true
 description = "userspace netstack built on smoltcp"
-categories = ["no-std", "network-programming"]
+categories = ["network-programming"]
 keywords = ["tailscale", "socket", "network", "smoltcp", "netstack"]
 
 repository.workspace = true

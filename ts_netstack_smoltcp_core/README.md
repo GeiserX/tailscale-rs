@@ -33,6 +33,12 @@ The whole thing is integrated along with runtime functionality in `ts_netstack_s
   logic, any commitments re: allocation, a complete polling loop, garbage collection of
   closed TCP connections, or a way to block until e.g. a TCP connection is established.
 
+## Platform support
+
+This crate requires `std`. Its own code is written against `core` and `alloc`, but the
+command channel ([`flume`]) has no std-less mode, so bare-metal and other `no_std`-only
+targets are not supported.
+
 ## Example
 
 ```rust
