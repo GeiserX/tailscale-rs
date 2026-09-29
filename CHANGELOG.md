@@ -2,6 +2,14 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.57.3](https://github.com/GeiserX/tailscale-rs/compare/v0.57.2...v0.57.3) (2026-09-29)
+
+
+### Bug Fixes
+
+* **capver:** declare #![no_std] so ts_control_serde stops linking std ([#559](https://github.com/GeiserX/tailscale-rs/issues/559)) ([e9ffb36](https://github.com/GeiserX/tailscale-rs/commit/e9ffb36be00d8374cc8144153ac8045f21e19716))
+* **netstack:** stop advertising no-std for crates that link std via flume ([#560](https://github.com/GeiserX/tailscale-rs/issues/560)) ([041861c](https://github.com/GeiserX/tailscale-rs/commit/041861c341aed8ab869d2b799ae7258c0e3ff876))
+
 ## [0.57.2](https://github.com/GeiserX/tailscale-rs/compare/v0.57.1...v0.57.2) (2026-09-27)
 
 
