@@ -8,6 +8,7 @@ mod funnel_fail_closed;
 mod ipv4_only_forwarder;
 mod ipv4_only_host_net;
 mod lints_enabled;
+mod no_std_deps;
 mod parity_audit;
 mod porting_ledger;
 mod restock_beads;
@@ -32,6 +33,7 @@ pub const CHECK_FNS: &[(&str, CheckFn)] = &[
     ("lints_enabled", lints_enabled::run),
     ("ipv4_only_forwarder", ipv4_only_forwarder::run),
     ("ipv4_only_host_net", ipv4_only_host_net::run),
+    ("no_std_deps", no_std_deps::run),
     ("funnel_fail_closed", funnel_fail_closed::run),
     ("ssh_isolation", ssh_isolation::run),
     ("porting_ledger", porting_ledger::run),
