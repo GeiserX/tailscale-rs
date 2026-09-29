@@ -21,7 +21,7 @@ important considerations:
 
 For the full security posture — unaudited cryptography, the Tailnet Lock enforcement gap, peerAPI
 capability limitations, at-rest key handling, and how to report a vulnerability — see
-[SECURITY.md](../SECURITY.md).
+[SECURITY.md](https://github.com/GeiserX/tailscale-rs/blob/main/SECURITY.md).
 
 ## Versioning, Releases, and Compatability
 

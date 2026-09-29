@@ -14,5 +14,5 @@ flowchart LR
     DERP -.-> Peer
 ```
 
-For the full module layout and design notes, see [ARCHITECTURE.md](../ARCHITECTURE.md).
+For the full module layout and design notes, see [ARCHITECTURE.md](https://github.com/GeiserX/tailscale-rs/blob/main/ARCHITECTURE.md).
 
