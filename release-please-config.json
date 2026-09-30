@@ -22,6 +22,10 @@
           "type": "toml",
           "path": "Cargo.lock",
           "jsonpath": "$.package[?(!@.source)].version"
+        },
+        {
+          "type": "generic",
+          "path": "docs/getting-started.md"
         }
       ]
     }
