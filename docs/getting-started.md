@@ -1,18 +1,23 @@
 # Getting started
 
 The following instructions are for Rust! For other languages, see the language-specific README:
+
 - [C](https://github.com/GeiserX/tailscale-rs/blob/main/ts_ffi/README.md)
 - [Elixir](https://github.com/GeiserX/tailscale-rs/blob/main/ts_elixir/README.md)
-- [Python](https://github.com/GeiserX/tailscale-rs/blob/main/ts_python/README.md) 
+- [Python](https://github.com/GeiserX/tailscale-rs/blob/main/ts_python/README.md)
 
 Add the crate with `cargo add geiserx_tailscale --rename tailscale`, which writes the current
 version into your `Cargo.toml`. The line it adds looks like this:
+
+<!-- x-release-please-start-version -->
 
 ```toml
 [dependencies]
 # Published as `geiserx_tailscale`; imported as `tailscale`.
 tailscale = { package = "geiserx_tailscale", version = "0.57.3" }
 ```
+
+<!-- x-release-please-end -->
 
 > Or depend on the latest from git:
 >
@@ -68,11 +73,15 @@ feature adds a `tsnet::Server` facade with the shape you already know — settab
 `Close`. It's a **thin ergonomics layer** over the same `Device`/`Config` engine — no new crate, same
 typed returns — so you get Go's lifecycle *shape* without giving up Rust's typed values.
 
+<!-- x-release-please-start-version -->
+
 ```toml
 [dependencies]
 tailscale = { package = "geiserx_tailscale", version = "0.57.3", features = ["tsnet"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
+
+<!-- x-release-please-end -->
 
 ```rust
 use tailscale::tsnet::Server;
@@ -124,5 +133,5 @@ server rewritten against this facade — and the crate's `tsnet` module docs.
 For fork capabilities beyond Go `tsnet` parity (accept-routes, exit nodes, residential-proxy exit
 egress, …) reach the full `Config` via `Server::configure`, or drop to the whole engine surface with
 `Server::device`. The complete field/method mapping (with parity verdicts) and the design rationale
-live in [docs/TSNET_FACADE_DESIGN.md](TSNET_FACADE_DESIGN.md).
+live in [docs/TSNET_FACADE_DESIGN.md](https://github.com/GeiserX/tailscale-rs/blob/main/docs/TSNET_FACADE_DESIGN.md).
 

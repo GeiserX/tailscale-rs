@@ -28,7 +28,7 @@ C, Elixir, and Python.
 > libraries or rely on it for data privacy until I've had a chance to batten down some hatches
 > and complete a third-party audit.
 >
-> See [Caveats](docs/caveats.md) for more details.
+> See [Caveats](https://geiserx.github.io/tailscale-rs/caveats/) for more details.
 
 ## Features
 
@@ -50,14 +50,16 @@ cargo add geiserx_tailscale --rename tailscale
 TS_RS_EXPERIMENT=this_is_unstable_software cargo run
 ```
 
-The crate is published as `geiserx_tailscale` and imported as `tailscale`, and every program linked against it needs `TS_RS_EXPERIMENT` set as above. A UDP client sample and the `tsnet` facade are in [Getting started](docs/getting-started.md), and more in [`examples/`](examples/README.md).
+The crate is published as `geiserx_tailscale` and imported as `tailscale`, and every program linked against it needs `TS_RS_EXPERIMENT` set as above. A UDP client sample and the `tsnet` facade are in [Getting started](https://geiserx.github.io/tailscale-rs/getting-started/), and more in [`examples/`](examples/README.md).
 
 ## Documentation
 
-- [Getting started](docs/getting-started.md): dependency setup, a code sample, the `tsnet` facade and its Go mapping
-- [How it works](docs/how-it-works.md): control plane, WireGuard data plane and DERP
-- [Status](docs/status.md): what is implemented, coming soon and unsupported
-- [Caveats, versioning and platform support](docs/caveats.md), including MSRV and edition
+The documentation is at [geiserx.github.io/tailscale-rs](https://geiserx.github.io/tailscale-rs/), and the API reference on [docs.rs](https://docs.rs/geiserx_tailscale).
+
+- [Getting started](https://geiserx.github.io/tailscale-rs/getting-started/): dependency setup, a code sample, the `tsnet` facade and its Go mapping
+- [Caveats, versioning and platform support](https://geiserx.github.io/tailscale-rs/caveats/), including MSRV and edition
+- [How it works](https://geiserx.github.io/tailscale-rs/how-it-works/): control plane, WireGuard data plane and DERP
+- [Status](https://geiserx.github.io/tailscale-rs/status/): what is implemented, coming soon and unsupported
 - Language bindings: [C](ts_ffi/README.md), [Elixir](ts_elixir/README.md), [Python](ts_python/README.md)
 - [ARCHITECTURE.md](ARCHITECTURE.md), [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), [CHANGELOG.md](CHANGELOG.md)
 - Design notes: [tsnet facade](docs/TSNET_FACADE_DESIGN.md), [tsnet parity](docs/TSNET_PARITY.md), [parity roadmap](docs/PARITY_ROADMAP.md), [cryptography](docs/CRYPTOGRAPHY.md), [releasing](docs/RELEASING.md)

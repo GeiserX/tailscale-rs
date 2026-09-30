@@ -42,3 +42,15 @@ updates:
       applies-to: security-updates
       patterns:
       - '*'
+- package-ecosystem: pip
+  directory: /docs
+  schedule:
+    interval: monthly
+  commit-message:
+    prefix: deps
+  labels:
+  - deps
+  ignore:
+  - dependency-name: '*'
+    update-types:
+    - version-update:semver-major
