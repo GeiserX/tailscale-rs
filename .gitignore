@@ -1,5 +1,6 @@
 /result
 /target
+site/
 # cargo-fuzz crate (ts_tka/fuzz is its own workspace) — its nested build dir + generated corpus/crashes
 ts_tka/fuzz/target/
 ts_tka/fuzz/corpus/
