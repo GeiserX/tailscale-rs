@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.57.4](https://github.com/GeiserX/tailscale-rs/compare/v0.57.3...v0.57.4) (2026-10-01)
+
+
+### Bug Fixes
+
+* **deps:** move russh to 0.63.2 to close four open security advisories ([#577](https://github.com/GeiserX/tailscale-rs/issues/577)) ([fc86238](https://github.com/GeiserX/tailscale-rs/commit/fc862384f2060812e50987c68d89387769387744))
+
 ## [0.57.3](https://github.com/GeiserX/tailscale-rs/compare/v0.57.2...v0.57.3) (2026-09-29)
 
 
