@@ -55,6 +55,10 @@ Issues in Beads are:
 - Branch-aware issue tracking
 - Dolt-native three-way merge resolution
 
+## This repository's tracker
+
+The tracker already exists and lives in the Dolt remote that `sync.remote` in `config.yaml` names. On a fresh clone, run `bd bootstrap` before `bd list` or `bd create`, so bd loads the existing issues. Never run `bd init` here: it creates a new, empty tracker.
+
 ## Get Started with Beads
 
 Try Beads in your own projects:
