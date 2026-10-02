@@ -37,3 +37,7 @@ docs/GOAL.md
 docs/research/
 docs/AUTOPILOT-WORKLOG.md
 docs/DEFERRED-QUESTIONS.md
+
+# Beads: bead text lives in the Dolt tracker only, never in git
+.beads/issues.jsonl
+.beads/interactions.jsonl
