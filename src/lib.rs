@@ -2136,7 +2136,7 @@ mod tests {
     // is exposing the `SecretString` to a plain `String` on the last inch; everything after is the
     // shared `new` path. So we assert that equivalence at the auth-key-resolution level: the secret
     // path must resolve to the exact same key the plain path feeds into `resolve_auth_key`.
-    const SAMPLE_KEY: &str = "tskey-auth-koCgSLP5R811CNTRL-EXAMPLEEXAMPLEEXAMPLEEXAMPLE";
+    const SAMPLE_KEY: &str = "tskey-auth-EXAMPLE-NOTAREALKEY";
 
     // The mapping `new_with_secret` applies (`Option<SecretString>` -> `Option<String>`) must be a
     // byte-for-byte round-trip, so the spawn arg is identical to a direct `new(config, Some(..))`.
