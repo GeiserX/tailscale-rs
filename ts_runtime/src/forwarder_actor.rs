@@ -18,7 +18,6 @@ use tokio::task::JoinSet;
 use ts_forwarder::{
     DirectDialer, Forwarder, HostExitDialer, ProxyExitDialer, RealDialer, RouteTable, RouteUpdater,
 };
-use ts_packet::PacketMut;
 
 use crate::{
     Error,
@@ -120,7 +119,7 @@ impl kameo::Actor for ForwarderActor {
     type Error = Error;
 
     async fn on_start(
-        (env, config, netstack_up, mut netstack_down): Self::Args,
+        (env, config, netstack_up, netstack_down): Self::Args,
         _slf: ActorRef<Self>,
     ) -> Result<Self, Self::Error> {
         let (
@@ -129,7 +128,7 @@ impl kameo::Actor for ForwarderActor {
                 rx: mut netstack_down_rx,
                 tx: netstack_down_tx,
             },
-        ) = netstack::piped(config);
+        ) = crate::netstack_actor::piped_ingress_bounded(config);
         let channel = netstack.command_channel();
 
         let mut joinset = JoinSet::new();
@@ -149,14 +148,10 @@ impl kameo::Actor for ForwarderActor {
             tracing::warn!("forwarder netstack downlink shut down!");
         });
 
-        // Pump packets the dataplane routed to this transport up into the forwarder netstack.
+        // Pump packets the dataplane routed to this transport up into the forwarder netstack,
+        // dropping what its bounded ingress queue has no room for.
         joinset.spawn(async move {
-            while let Some(bufs) = netstack_down.recv().await {
-                for buf in bufs {
-                    let buf: PacketMut = buf;
-                    netstack_down_tx.send_async(buf.as_ref()).await;
-                }
-            }
+            crate::netstack_actor::pump_ingress(netstack_down, netstack_down_tx, "forwarder").await;
 
             tracing::warn!("forwarder netstack uplink shut down!");
         });
