@@ -3,8 +3,11 @@
 //! Go `tsnet` stores an `ipn.ServeConfig` on the node and runs one accept loop per configured
 //! tailnet port, dispatching each accepted connection per its handler (proxy / text / raw TCP
 //! forward / hand-back). This module is the faithful equivalent on the **application** netstack: a
-//! [`ServeManager`](crate::serve::ServeManager) owns the current [`ServeState`](ts_control::ServeState), one accept-loop task
-//! per bound port, and tears every loop down on drop / on the next `set`.
+//! [`ServeManager`](crate::serve::ServeManager) owns the current [`ServeState`](ts_control::ServeState) (Go's `ipn.ServeConfig`,
+//! in its wire shape), one accept-loop task per bound port, and tears every loop down on drop / on
+//! the next `set`. The ports and what each one does come from
+//! [`ServeState::serve_plan`](ts_control::ServeState::serve_plan), which lowers the stored config
+//! onto per-port [`ServeTarget`](ts_control::ServeTarget)s; the manager stores the config and dispatches the plan.
 //!
 //! ## Storage + reconcile (full-replace)
 //!
@@ -144,13 +147,13 @@ impl ServeManager {
     /// reconcile.
     ///
     /// `state` is the new config; `resolved` carries the per-port target + (for TLS ports) the
-    /// pre-built acceptor, keyed identically to `state.ports`. Aborts every existing accept loop and
-    /// spawns one per port in `resolved`. Returns a fresh [`ServeAcceptedReceiver`] delivering
+    /// pre-built acceptor, one entry per port of `state.serve_plan()`. Aborts every existing accept
+    /// loop and spawns one per port in `resolved`. Returns a fresh [`ServeAcceptedReceiver`] delivering
     /// connections for every [`ServeTarget::Accept`] port (empty if there are none).
     ///
-    /// The caller is responsible for `state.validate()` and for obtaining the acceptors (failing the
-    /// whole call closed if a cert can't be issued) before calling this; the manager only binds and
-    /// dispatches.
+    /// The caller is responsible for validating and planning `state` and for obtaining the acceptors
+    /// (failing the whole call closed if a cert can't be issued) before calling this; the manager only
+    /// binds and dispatches.
     pub fn set(
         &self,
         state: ServeState,
@@ -829,7 +832,7 @@ fn match_path_handler<'h>(
 /// or an un-dispatchable nested target ⇒ 404/drop. For a matched nested `Proxy`, the request head consumed
 /// here is replayed to the backend first (via [`proxy_to_backend_with_prefix`]) so the backend sees
 /// the complete request. Backend dial failures inside a nested `Proxy` drop the conn. Nested `Path`
-/// is rejected by `ServeState::validate`, so it is not expected here; it is dropped fail-closed if it
+/// is rejected by target validation, so it is not expected here; it is dropped fail-closed if it
 /// ever reaches dispatch.
 async fn serve_path<S>(port: u16, mut tls: S, handlers: &BTreeMap<String, ServeTarget>)
 where
