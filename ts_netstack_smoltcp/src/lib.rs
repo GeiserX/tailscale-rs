@@ -62,6 +62,28 @@ pub fn piped(config: netcore::Config) -> (Netstack<WakingPipeDev>, WakingPipe) {
     (Netstack::<WakingPipeDev>::new(dev, config), pipe2)
 }
 
+/// Like [`piped`], but the returned end's packets *into* the netstack queue at most `max_packets`
+/// packets and `max_bytes` bytes; see [`WakingPipe::ingress_bounded`].
+///
+/// Feed it with [`WakingPipeSender::try_send`] and drop what it refuses. The netstack's own output
+/// is not bounded.
+#[cfg(feature = "std")]
+pub fn piped_ingress_bounded(
+    config: netcore::Config,
+    max_packets: usize,
+    max_bytes: usize,
+) -> (Netstack<WakingPipeDev>, WakingPipe) {
+    let (pipe1, pipe2) = WakingPipe::ingress_bounded(max_packets, max_bytes);
+
+    let dev = WakingPipeDev {
+        pipe: pipe1,
+        mtu: config.mtu,
+        medium: smoltcp::phy::Medium::Ip,
+    };
+
+    (Netstack::<WakingPipeDev>::new(dev, config), pipe2)
+}
+
 /// Convenience function to create a pair of network stacks connected by a point-to-point
 /// in-memory link.
 #[cfg(feature = "std")]
