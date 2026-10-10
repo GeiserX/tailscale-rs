@@ -167,6 +167,11 @@ pub use ts_control::{CertError, MISSING_CERT_RPC, ServeConfig, ServeState, Serve
 pub use ts_control::{DnsConfig, DnsResolver, ExtraRecord};
 #[doc(inline)]
 pub use ts_control::{ExitProxyConfig, ExitProxyScheme};
+/// The Go-shaped sub-types of [`ServeState`] (Go `ipn.TCPPortHandler`, `ipn.WebServerConfig`, …).
+#[doc(inline)]
+pub use ts_control::{
+    HostPort, HttpHandler, ServeConfigError, ServiceConfig, TcpPortHandler, WebServerConfig,
+};
 pub use ts_control::{
     IdTokenError, LogoutError, ServiceError, ServiceMode, SetDnsError, SetDnsInternalErrorKind,
     SshAccept, SshAction, SshConnIdentity, SshDecision, SshDenyReason, SshPolicy, SshPrincipal,
@@ -1847,8 +1852,8 @@ impl Device {
 
     /// The currently-stored Serve config (like `tsnet`'s `GetServeConfig`).
     ///
-    /// Returns the config last passed to [`Device::set_serve_config`], or an empty
-    /// [`ts_control::ServeState`] (no ports) if none was ever set. Pure read — does not touch the
+    /// Returns the config last passed to [`Device::set_serve_config`], or the empty
+    /// [`ts_control::ServeState`] (Go's `{}`) if none was ever set. Pure read — does not touch the
     /// network.
     pub fn get_serve_config(&self) -> ts_control::ServeState {
         match &*self.serve.lock().unwrap_or_else(|e| e.into_inner()) {
@@ -1860,62 +1865,73 @@ impl Device {
     /// Replace this node's Serve config and (re)bind its tailnet ports (like `tsnet`'s
     /// `SetServeConfig`, REPLACE semantics).
     ///
-    /// `state` becomes the **whole** config (full-replace reconcile: every previously-bound serve
-    /// port's accept loop is torn down and the new config's ports are bound from scratch). For each
-    /// configured port the manager binds an overlay listener on this node's tailnet IPv4 and
-    /// dispatches per [`ts_control::ServeTarget`]:
-    /// - [`Accept`](ts_control::ServeTarget::Accept) — the TLS-terminated stream is handed back over
-    ///   the returned [`ServeAcceptedReceiver`](ts_runtime::serve::ServeAcceptedReceiver) (the
-    ///   in-process stand-in for `ListenTLS`'s `net.Listener`).
-    /// - [`Proxy`](ts_control::ServeTarget::Proxy) — reverse-proxy the decrypted stream to a local
-    ///   host backend.
-    /// - [`Text`](ts_control::ServeTarget::Text) — write a fixed body and close.
-    /// - [`TcpForward`](ts_control::ServeTarget::TcpForward) — forward the **raw** (non-TLS) stream
-    ///   to a local host backend.
+    /// `state` is a Go-shaped `ipn.ServeConfig` and becomes the **whole** config (full-replace
+    /// reconcile: every previously-bound serve port's accept loop is torn down and the new config's
+    /// ports are bound from scratch). Each port binds an overlay listener on this node's tailnet
+    /// IPv4:
+    /// - an `HTTPS` port terminates TLS with the certificate for its `Web` entry's host and routes
+    ///   each request by mount point to a `Proxy` backend (a local host socket) or a `Redirect`;
+    /// - a `TCPForward` port forwards the **raw** (non-TLS) stream to a local host backend.
     ///
-    /// **Fail-closed.** `state.validate()` runs first. Every TLS-terminating port's acceptor is
-    /// obtained up-front via [`Device::listen_tls`] (the ACME-aware cert path); if any cert cannot be
-    /// issued the whole call fails with that [`ts_control::CertError`] and **nothing is bound** — a
-    /// TLS port never downgrades to plaintext.
+    /// **Refusals.** First Go's own `validateServeConfigUpdate` checks against the stored config
+    /// (notably: a port that stays configured may not change its serve type in one update). Then
+    /// anything this runtime cannot yet serve the way Go would — plain HTTP, `TerminateTLS`,
+    /// `Text`, file serving, Services, Funnel and the rest listed on
+    /// [`ts_control::ServeState::serve_plan`] — is refused rather than served differently. Every
+    /// refusal is `InternalErrorKind::BadRequest`, with the reason logged.
+    ///
+    /// **Fail-closed.** Every TLS-terminating port's acceptor is obtained up-front via
+    /// [`Device::listen_tls`] (the ACME-aware cert path); if any cert cannot be issued the whole
+    /// call fails and **nothing is bound** — a TLS port never downgrades to plaintext.
     ///
     /// **Anti-leak.** Listeners bind the overlay netstack only (never a host socket). The
-    /// `Proxy`/`TcpForward` backend dial is a local host socket to the embedder's own backend (like
+    /// `Proxy`/`TCPForward` backend dial is a local host socket to the embedder's own backend (like
     /// Go's reverse-proxy to `127.0.0.1`), intentionally NOT routed through the exit-egress
     /// forwarder. A backend dial failure drops that connection; it never falls back.
     ///
     /// Returns an error in TUN transport mode (there is no application netstack to bind on). The
-    /// previous config's accept loops (and any earlier `ServeAcceptedReceiver`) stop when this
-    /// returns; the new receiver delivers every `Accept`-port connection.
+    /// previous config's accept loops stop when this returns. The returned
+    /// [`ServeAcceptedReceiver`](ts_runtime::serve::ServeAcceptedReceiver) is the runtime's
+    /// in-process hand-back channel; Go's config has no hand-back handler, so for a config set here
+    /// it never yields a connection — use [`Device::listen_tls`] to accept TLS streams yourself.
     pub async fn set_serve_config(
         &self,
         state: ts_control::ServeState,
     ) -> Result<ts_runtime::serve::ServeAcceptedReceiver, Error> {
-        state
-            .validate()
-            .map_err(|_| Error::Internal(InternalErrorKind::BadRequest))?;
+        fn refuse(e: ts_control::ServeConfigError) -> Error {
+            tracing::warn!(error = %e, "refusing serve config");
+            Error::Internal(InternalErrorKind::BadRequest)
+        }
+
+        // Go checks the update against the stored config before it stores anything; checking
+        // here too means a refused update never requests a certificate.
+        ts_control::validate_serve_config_update(&self.get_serve_config(), &state)
+            .map_err(refuse)?;
+        let plan = state.serve_plan().map_err(refuse)?;
 
         // Fail-closed: build every TLS-terminating port's acceptor up-front via the ACME-aware cert
         // path. If any cert can't be issued, return before binding anything (no plaintext downgrade).
         let mut resolved = std::collections::BTreeMap::new();
-        for (port, target) in &state.ports {
-            let acceptor = if target.terminates_tls() {
-                let cfg = ts_control::ServeConfig {
-                    name: state.name.clone(),
-                    port: *port,
-                    target: target.clone(),
-                };
-                Some(self.listen_tls(&cfg).await.map_err(|_| {
-                    // Cert issuance is fail-closed in this fork; surface as a request error rather
-                    // than ever binding a plaintext TLS port.
-                    Error::Internal(InternalErrorKind::BadRequest)
-                })?)
-            } else {
-                None
+        for (port, planned) in plan {
+            let acceptor = match planned.cert_name {
+                Some(name) => {
+                    let cfg = ts_control::ServeConfig {
+                        name,
+                        port,
+                        target: planned.target.clone(),
+                    };
+                    Some(self.listen_tls(&cfg).await.map_err(|_| {
+                        // Cert issuance is fail-closed in this fork; surface as a request error
+                        // rather than ever binding a plaintext TLS port.
+                        Error::Internal(InternalErrorKind::BadRequest)
+                    })?)
+                }
+                None => None,
             };
             resolved.insert(
-                *port,
+                port,
                 ts_runtime::serve::ResolvedPort {
-                    target: target.clone(),
+                    target: planned.target,
                     acceptor,
                 },
             );
@@ -1926,6 +1942,11 @@ impl Device {
         let channel = self.channel()?.clone();
 
         let mut slot = self.serve.lock().unwrap_or_else(|e| e.into_inner());
+        // Another `set_serve_config` may have stored a config while certificates were being
+        // issued; Go holds its lock across the whole update, so re-check against what is stored
+        // now, under the lock that the store happens under.
+        let stored = slot.as_ref().map(|mgr| mgr.get()).unwrap_or_default();
+        ts_control::validate_serve_config_update(&stored, &state).map_err(refuse)?;
         let mgr =
             slot.get_or_insert_with(|| ts_runtime::serve::ServeManager::new(channel, self_ipv4));
         Ok(mgr.set(state, resolved))

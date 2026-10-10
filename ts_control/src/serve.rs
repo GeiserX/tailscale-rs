@@ -1,8 +1,9 @@
 //! TLS termination on the tailnet (`tsnet`'s `Serve` / `ListenTLS`).
 //!
-//! [`ServeConfig`] is a scoped-down mirror of upstream Tailscale's
-//! `ipn.ServeConfig`: it describes terminating TLS for the node's MagicDNS name
-//! on a tailnet port and what to do with the decrypted stream. [`tls_acceptor`]
+//! [`ServeConfig`] describes terminating TLS for the node's MagicDNS name on one
+//! tailnet port and what to do with the decrypted stream (`tsnet`'s `ListenTLS`).
+//! The node's whole stored Serve config is [`ServeState`], which is upstream's
+//! `ipn.ServeConfig` in its Go wire shape (see the `ipn` submodule). [`tls_acceptor`]
 //! turns a [`CertifiedKey`] (obtained via [`crate::cert::get_certificate`]) into
 //! a [`tokio_rustls::TlsAcceptor`] using the same `ring` provider as the rest of
 //! the stack ([`ts_tls_util`]), and [`accept_tls`] wraps an accepted overlay
@@ -37,12 +38,21 @@ use crate::{
     node::Node,
 };
 
+mod ipn;
+
+pub use ipn::{
+    HostPort, HttpHandler, PlannedPort, ServeConfigError, ServeState, ServiceConfig,
+    TcpPortHandler, WebServerConfig, expand_proxy_arg, parse_redirect_with_code,
+    validate_serve_config_update,
+};
+
 /// What to do with a stream once TLS is terminated (or, for [`ServeTarget::TcpForward`], a raw TCP
 /// stream with no TLS).
 ///
 /// Mirrors the handler shapes of upstream `ipn.ServeConfig`'s `HTTPHandler`/`TCPPortHandler`
 /// (`Proxy`/`Text`/`TCPForward`/`Path`/`Redirect`), plus an `Accept` hand-back the in-process Rust
-/// embedder uses in place of Go's `net.Listener`.
+/// embedder uses in place of Go's `net.Listener`. This is what the serve runtime dispatches on one
+/// port; the stored, Go-shaped [`ServeState`] is lowered onto it by [`ServeState::serve_plan`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 #[non_exhaustive]
@@ -76,7 +86,7 @@ pub enum ServeTarget {
         /// (`P` followed by `/`), never an unrelated path that merely starts with the same bytes —
         /// a `/api` mount does not claim `/apifoo`, matching Go's segment-boundary handler lookup.
         /// Longest match wins at dispatch; an unmatched path is a fail-closed 404. Nested `Path` is
-        /// rejected by [`validate`](ServeState::validate) to bound recursion (one level of nesting
+        /// rejected by [`validate`](ServeConfig::validate) to bound recursion (one level of nesting
         /// only).
         handlers: alloc::collections::BTreeMap<String, ServeTarget>,
     },
@@ -85,7 +95,7 @@ pub enum ServeTarget {
     Redirect {
         /// Absolute or relative `Location` header value.
         to: String,
-        /// HTTP redirect status; [`validate`](ServeState::validate) rejects anything outside
+        /// HTTP redirect status; [`validate`](ServeConfig::validate) rejects anything outside
         /// `300..=399`.
         status: u16,
     },
@@ -108,89 +118,46 @@ impl ServeTarget {
     }
 }
 
-/// A complete multi-port Serve configuration for one node (mirrors upstream `ipn.ServeConfig`'s
-/// per-port `TCP` map). Stored on the device and reconciled into one accept loop per port by the
-/// Serve runtime; `set_serve_config` REPLACES the whole config (Go semantics).
-///
-/// All TLS-terminating ports share the node's single MagicDNS [`name`](ServeState::name)
-/// certificate (obtained via the ACME path). `TcpForward` ports need no cert.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct ServeState {
-    /// The node's MagicDNS name the TLS-terminating ports' certificate is for (e.g.
-    /// `host.tailnet.ts.net`). Must be a tailnet name when any TLS-terminating port is configured.
-    pub name: String,
-    /// Map of tailnet (overlay) port → what to serve on it.
-    pub ports: alloc::collections::BTreeMap<u16, ServeTarget>,
-}
-
-impl ServeState {
-    /// Validate the whole config. Fail-closed: rejects port 0, empty proxy/forward targets, and —
-    /// when any TLS-terminating port is present — a non-tailnet `name` (anti-leak: we never mint a
-    /// cert for an off-tailnet name). An empty config (no ports) is valid (serves nothing).
-    pub fn validate(&self) -> Result<(), CertError> {
-        let any_tls = self.ports.values().any(ServeTarget::terminates_tls);
-        if any_tls && !cert::is_tailnet_name(&self.name) {
-            return Err(CertError::NotTailnetName(self.name.clone()));
-        }
-        for (port, target) in &self.ports {
-            if *port == 0 {
-                return Err(CertError::Acme("serve port must be non-zero".into()));
-            }
-            validate_target(target, 0)?;
-        }
-        Ok(())
-    }
-}
-
 /// Maximum depth of nested [`ServeTarget::Path`] handlers. A top-level `Path` (depth 0) may hold
 /// non-`Path` nested targets; a `Path` nested inside another `Path` is rejected. This bounds
 /// validation (and dispatch) recursion so an attacker-supplied config can't blow the stack.
 const MAX_PATH_NESTING_DEPTH: usize = 1;
 
-/// Fail-closed validation for one [`ServeTarget`], shared by [`ServeState::validate`] and
-/// [`ServeConfig::validate`]. `depth` is the current `Path` nesting level (0 at the top).
+/// Fail-closed validation for one [`ServeTarget`], shared by [`ServeConfig::validate`] and
+/// [`ServeState::serve_plan`]. `depth` is the current `Path` nesting level (0 at the top). The
+/// error is the reason, which each caller wraps in its own error type.
 ///
 /// Rejects: empty `Proxy`/`TcpForward` targets; `Redirect` with an out-of-`300..=399` status, an
 /// empty `to`, or a `to` containing CR/LF (the value is written verbatim into a `Location:` response
 /// header, so embedded CR/LF would allow HTTP response-header injection / response splitting);
 /// `Path` with empty `handlers`, a `Path` nested deeper than [`MAX_PATH_NESTING_DEPTH`]
 /// (no unbounded recursion), or any nested target that itself fails validation.
-fn validate_target(target: &ServeTarget, depth: usize) -> Result<(), CertError> {
+fn validate_target(target: &ServeTarget, depth: usize) -> Result<(), String> {
     match target {
-        ServeTarget::Proxy { to } | ServeTarget::TcpForward { to } if to.trim().is_empty() => Err(
-            CertError::Acme("serve proxy/forward target must not be empty".into()),
-        ),
+        ServeTarget::Proxy { to } | ServeTarget::TcpForward { to } if to.trim().is_empty() => {
+            Err("serve proxy/forward target must not be empty".into())
+        }
         ServeTarget::Redirect { to, status } => {
             if to.trim().is_empty() {
-                return Err(CertError::Acme(
-                    "serve redirect target must not be empty".into(),
-                ));
+                return Err("serve redirect target must not be empty".into());
             }
             // The redirect `to` is written verbatim into a `Location:` response header at runtime.
             // A CR or LF would terminate the header line and allow injection of arbitrary headers
             // or a response body (response splitting). Reject it fail-closed.
             if to.contains(['\r', '\n']) {
-                return Err(CertError::Acme(
-                    "serve redirect target must not contain CR/LF".into(),
-                ));
+                return Err("serve redirect target must not contain CR/LF".into());
             }
             if !(300..=399).contains(status) {
-                return Err(CertError::Acme(
-                    "serve redirect status must be in 300..=399".into(),
-                ));
+                return Err("serve redirect status must be in 300..=399".into());
             }
             Ok(())
         }
         ServeTarget::Path { handlers } => {
             if depth >= MAX_PATH_NESTING_DEPTH {
-                return Err(CertError::Acme(
-                    "serve path handlers must not nest more than one level".into(),
-                ));
+                return Err("serve path handlers must not nest more than one level".into());
             }
             if handlers.is_empty() {
-                return Err(CertError::Acme(
-                    "serve path handlers must not be empty".into(),
-                ));
+                return Err("serve path handlers must not be empty".into());
             }
             for nested in handlers.values() {
                 validate_target(nested, depth + 1)?;
@@ -224,7 +191,7 @@ impl ServeConfig {
         if self.port == 0 {
             return Err(CertError::Acme("serve port must be non-zero".into()));
         }
-        validate_target(&self.target, 0)
+        validate_target(&self.target, 0).map_err(CertError::Acme)
     }
 }
 
@@ -536,7 +503,7 @@ mod tests {
     fn validate_rejects_redirect_with_crlf() {
         // CR/LF in the `to` would terminate the `Location:` header line and allow response-header
         // injection / response splitting. Must be rejected (bare CR, bare LF, and CRLF), via the
-        // shared validate_target used by ServeConfig::validate and ServeState::validate.
+        // shared validate_target (ServeState::serve_plan's use of it is tested in `ipn`).
         for bad in [
             "https://host.tail1.ts.net/\r\nSet-Cookie: evil=1",
             "https://host.tail1.ts.net/\rX",
@@ -553,23 +520,6 @@ mod tests {
             assert!(
                 c.validate().is_err(),
                 "ServeConfig must reject CR/LF redirect target: {bad:?}"
-            );
-
-            let mut ports = alloc::collections::BTreeMap::new();
-            ports.insert(
-                443u16,
-                ServeTarget::Redirect {
-                    to: bad.into(),
-                    status: 302,
-                },
-            );
-            let st = ServeState {
-                name: "host.tail1.ts.net".into(),
-                ports,
-            };
-            assert!(
-                st.validate().is_err(),
-                "ServeState must reject CR/LF redirect target: {bad:?}"
             );
         }
 
@@ -622,31 +572,6 @@ mod tests {
             target: ServeTarget::Path { handlers },
         };
         assert!(c.validate().is_err());
-    }
-
-    #[test]
-    fn serve_state_validate_accepts_path_and_redirect() {
-        let mut handlers = alloc::collections::BTreeMap::new();
-        handlers.insert(
-            "/api".to_string(),
-            ServeTarget::Proxy {
-                to: "127.0.0.1:8080".into(),
-            },
-        );
-        let mut ports = alloc::collections::BTreeMap::new();
-        ports.insert(443u16, ServeTarget::Path { handlers });
-        ports.insert(
-            8443u16,
-            ServeTarget::Redirect {
-                to: "/api".into(),
-                status: 307,
-            },
-        );
-        let st = ServeState {
-            name: "host.tail1.ts.net".into(),
-            ports,
-        };
-        assert!(st.validate().is_ok());
     }
 
     #[tokio::test]
