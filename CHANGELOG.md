@@ -2,6 +2,13 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## [0.57.5](https://github.com/GeiserX/tailscale-rs/compare/v0.57.4...v0.57.5) (2026-10-10)
+
+
+### Bug Fixes
+
+* **netstack:** drop ingress on a full rx queue instead of growing it ([#587](https://github.com/GeiserX/tailscale-rs/issues/587)) ([719aa88](https://github.com/GeiserX/tailscale-rs/commit/719aa8891fd777daafab67700d3d05894e49b71f))
+
 ## [0.57.4](https://github.com/GeiserX/tailscale-rs/compare/v0.57.3...v0.57.4) (2026-10-01)
 
 
