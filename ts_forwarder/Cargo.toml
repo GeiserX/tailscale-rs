@@ -17,6 +17,7 @@ name = "ts_forwarder"
 workspace = true
 
 [dependencies]
+etherparse = "0.19"
 ts_netstack_smoltcp = { workspace = true, features = ["tokio"] }
 ipnet.workspace = true
 bytes.workspace = true
