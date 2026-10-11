@@ -6,7 +6,7 @@ use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use futures::StreamExt;
 use kameo::{
-    actor::{ActorRef, Spawn},
+    actor::ActorRef,
     message::{Context, StreamMessage},
     prelude::Message,
 };
@@ -18,10 +18,7 @@ use ts_control::{
 };
 use ts_magicsock::SelfEndpointType;
 
-use crate::{
-    derp_latency::{DerpLatencyMeasurement, DerpLatencyMeasurer},
-    direct::EndpointAdvertisement,
-};
+use crate::{derp_latency::DerpLatencyMeasurement, direct::EndpointAdvertisement};
 
 /// Actor responsible for maintaining the connection to control.
 ///
@@ -344,8 +341,6 @@ impl kameo::Actor for ControlRunner {
                     auth_url_tx.clone(),
                 )
                 .await?;
-
-                DerpLatencyMeasurer::spawn_link(&slf, params.env.clone()).await;
 
                 params.env.subscribe::<DerpLatencyMeasurement>(&slf).await?;
                 params.env.subscribe::<EndpointAdvertisement>(&slf).await?;

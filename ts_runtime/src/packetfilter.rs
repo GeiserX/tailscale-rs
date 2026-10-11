@@ -29,7 +29,7 @@ pub struct PacketfilterUpdater {
     cap_grants_tx: watch::Sender<CapGrants>,
     /// Sender for the live compiled filter the peerAPI DoH source gate reads on demand
     /// ([`LiveFilterRx`]). Written here, at the point of compilation, rather than by a bus
-    /// subscriber downstream: the bus is lossy (see [`LiveFilterRx`]), so this cell is what the
+    /// subscriber downstream: the bus has no replay (see [`LiveFilterRx`]), so this cell is what the
     /// gate reads instead of a `PacketFilterState` subscription of its own.
     live_filter_tx: LiveFilterTx,
     /// The allowed-IP prefixes of every peer control marked `UnsignedPeerAPIOnly`, keyed by node
@@ -83,31 +83,13 @@ pub struct PacketFilterState(pub Arc<dyn ts_packetfilter::Filter + Send + Sync>)
 /// has to consult the *current* filter when a peer's query arrives, so it rides a `watch` cell
 /// alongside the shared `DnsView` — the same shape [`CapGrants`] uses for `Runtime::whois`.
 ///
-/// **The cell is written by [`PacketfilterUpdater`] itself, never by a bus subscriber.** The bus
-/// loses messages in two ways that a fail-closed gate cannot absorb, because the loss is permanent
-/// until control happens to send another filter:
+/// The cell is written directly by [`PacketfilterUpdater`]. The bus now guarantees ordered
+/// delivery to registered consumers, and runtime startup waits for security subscribers before
+/// control can publish. It still has no replay for late readers. This cell gives the L7 gate the
+/// current compiled filter without a second mailbox hop, even while its actor handles a query.
 ///
-/// 1. It has no replay, so a filter published before a subscriber's `Register` reaches the bus
-///    actor is not delivered to it at all. Registration is not ordered against `Runtime::spawn`'s
-///    spawn order — an actor registers from its own `on_start`, on its own task.
-/// 2. It delivers **best-effort** (`kameo_actors::DeliveryStrategy::BestEffort`, the default the
-///    `Env` bus is spawned with): a publish `try_send`s and *skips* any recipient whose bounded
-///    mailbox is full. A subscriber that parks in a handler — [`MagicDnsActor`](crate::magic_dns)
-///    awaits a DNS forward for up to five seconds in its `Query` handler — silently misses the
-///    filter published while it was busy.
-///
-/// A `watch` written by the compiler of the filter has neither problem *on this hop*:
-/// last-write-wins, no mailbox, and a receiver created at any later time reads the current value.
-/// So nothing can be lost between the compiler of the filter and the gate, and the gate is
-/// insulated from its own start-up order.
-///
-/// The hop *into* [`PacketfilterUpdater`] is a different matter and is **unchanged**: control's
-/// `Arc<ts_control::StateUpdate>` reaches it over this same bus, with both failure modes above
-/// still live (the updater even parks in its own handler, awaiting `Env::publish`). A netmap lost
-/// there leaves this cell holding a stale value — or `None` — and the gate refusing. Closing that
-/// hop is deliberately out of scope here: it needs the updater to stop awaiting `Env::publish` on
-/// the hot path (or to be given a wider mailbox), which is a change to the control path rather
-/// than to this gate.
+/// Control-to-updater delivery uses the guaranteed bus. Compilation and publication remain
+/// asynchronous: queued revocations take effect when processed, not atomically at control receipt.
 ///
 /// `None` means no filter has been compiled yet (no netmap since start). That is a **deny** for the
 /// gate, not an "allow until control speaks": Go's `isPeerAPIDNSAllowed` returns false outright when
@@ -398,6 +380,72 @@ mod unlocked_node_tests {
         let (health_tx, health_rx) = watch::channel(false);
         let updater = PacketfilterUpdater::spawn((env, cap_grants_tx, filter_tx, health_tx));
         (updater, filter_rx, health_rx)
+    }
+
+    struct Pause {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl Message<Pause> for PacketfilterUpdater {
+        type Reply = ();
+        async fn handle(&mut self, pause: Pause, _: &mut Context<Self, ()>) {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    /// Exercise a real incremental security consumer, not just a bus test double.
+    #[tokio::test]
+    async fn a_filter_delta_revocation_survives_a_saturated_mailbox() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (_shutdown, shutdown_rx) = watch::channel(false);
+            let env = crate::Env::new(ts_keys::NodeState::generate(), shutdown_rx, forwarder_cfg());
+            let (cap_tx, _cap_rx) = watch::channel(Default::default());
+            let (filter_tx, mut filter_rx) = watch::channel(None);
+            let (health_tx, _health_rx) = watch::channel(false);
+            let updater = PacketfilterUpdater::spawn_with_mailbox(
+                (env.clone(), cap_tx, filter_tx, health_tx),
+                kameo::mailbox::bounded(1),
+            );
+            updater.wait_for_startup_result().await.unwrap();
+            let mut grant = Arc::try_unwrap(netmap(None, None)).unwrap();
+            grant.packetfilter = Some((
+                None,
+                [("exit".to_owned(), Some(vec![tcp_rule("100.64.0.0/24")]))].into(),
+            ));
+            env.publish(Arc::new(grant)).await.unwrap();
+            filter_rx.changed().await.unwrap();
+            assert!(admits(&filter_rx, "100.64.0.9"));
+
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            updater
+                .tell(Pause {
+                    entered: entered.clone(),
+                    release: release.clone(),
+                })
+                .await
+                .unwrap();
+            entered.notified().await;
+            for _ in 0..128 {
+                env.publish(netmap(None, None)).await.unwrap();
+            }
+            let mut revoke = Arc::try_unwrap(netmap(None, None)).unwrap();
+            revoke.packetfilter = Some((None, [("exit".to_owned(), None)].into()));
+            env.publish(Arc::new(revoke)).await.unwrap();
+            while updater.mailbox_sender().capacity() != Some(0) {
+                tokio::task::yield_now().await;
+            }
+            assert!(admits(&filter_rx, "100.64.0.9"));
+            release.notify_one();
+            filter_rx.changed().await.unwrap();
+            assert!(!admits(&filter_rx, "100.64.0.9"));
+            updater.kill();
+            env.bus.kill();
+        })
+        .await
+        .unwrap();
     }
 
     /// Go raises `invalidPacketFilterWarnable` when it rejects the filter and clears it when the

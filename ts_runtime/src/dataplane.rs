@@ -200,6 +200,12 @@ impl Drop for DataplaneActor {
 
 #[kameo::messages]
 impl DataplaneActor {
+    /// Stop packet processing independently of this actor's mailbox or core-state lock.
+    #[message]
+    pub async fn packet_pump_abort_handle(&self) -> tokio::task::AbortHandle {
+        self.task.abort_handle()
+    }
+
     #[message]
     pub async fn new_overlay_transport(
         &self,
