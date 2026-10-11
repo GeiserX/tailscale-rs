@@ -13,7 +13,10 @@ use std::{
     time::Duration,
 };
 
-use ts_forwarder::{DirectDialer, Forwarder, HostExitDialer, PortSpec, RouteTable};
+use ts_forwarder::{
+    DialError, DialedUdp, DirectDialer, FlowClass, Forwarder, HostExitDialer, PortSpec, RealDialer,
+    RouteTable,
+};
 use ts_netstack_smoltcp::{
     CreateSocket, Netstack, WakingPipe, WakingPipeDev,
     netcore::{self, Channel, HasChannel, NetstackControl, smoltcp},
@@ -430,11 +433,29 @@ async fn exit_node_flow_is_dropped_under_direct_dialer() {
     );
 }
 
-/// Requirement (3), opt-in half: the explicit `HostExitDialer` egresses an exit-node
-/// (`0.0.0.0/0`) flow to the intended destination. This is the auditable opt-in a residential
-/// exit node wires deliberately; the splice succeeds and the destination echoes back.
+/// Stands in for the internet in tests: classifies every flow as `Subnet` before handing it to
+/// [`HostExitDialer`], so the loopback test server is reachable while the socket path is unchanged.
+/// (`HostExitDialer` itself refuses loopback for exit-node flows.)
+struct LoopbackInternetDialer;
+
+impl RealDialer for LoopbackInternetDialer {
+    async fn dial_tcp(
+        &self,
+        _class: FlowClass,
+        dst: SocketAddr,
+    ) -> Result<tokio::net::TcpStream, DialError> {
+        HostExitDialer.dial_tcp(FlowClass::Subnet, dst).await
+    }
+
+    async fn dial_udp(&self, _class: FlowClass, dst: SocketAddr) -> Result<DialedUdp, DialError> {
+        HostExitDialer.dial_udp(FlowClass::Subnet, dst).await
+    }
+}
+
+/// Requirement (3), opt-in half: an exit-node (`0.0.0.0/0`) flow is accepted, dialed and spliced
+/// to the intended destination; the destination echoes back.
 #[tokio::test]
-async fn exit_node_flow_egresses_under_host_exit_dialer() {
+async fn exit_node_flow_egresses_under_exit_dialer() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let echo_addr = spawn_echo().await;
@@ -444,7 +465,7 @@ async fn exit_node_flow_egresses_under_host_exit_dialer() {
     let forwarder = Forwarder::new(
         fwd_ch,
         routes,
-        HostExitDialer,
+        LoopbackInternetDialer,
         vec![echo_addr.port()],
         vec![],
     );
@@ -467,6 +488,41 @@ async fn exit_node_flow_egresses_under_host_exit_dialer() {
         .unwrap();
 
     assert_eq!(&buf[..n], b"exit egress");
+}
+
+/// An exit-node user must not reach this host's loopback services through `HostExitDialer`: the
+/// default route covers 127.0.0.1, the listener accepts, but the dial is refused and the local
+/// service never sees a connection.
+#[tokio::test]
+async fn exit_node_flow_to_loopback_is_refused_under_host_exit_dialer() {
+    use tokio::io::AsyncWriteExt;
+
+    let (sink_addr, dial_count) = spawn_counting_sink().await;
+    let (peer_ch, fwd_ch) = spawn_pair().await;
+
+    let routes = RouteTable::new(["0.0.0.0/0".parse().unwrap()]);
+    let forwarder = Forwarder::new(
+        fwd_ch,
+        routes,
+        HostExitDialer,
+        vec![sink_addr.port()],
+        vec![],
+    );
+    tokio::spawn(async move {
+        let _ = forwarder.run().await;
+    });
+
+    let peer_local = SocketAddr::new(PEER_IP.into(), PEER_PORT);
+    let mut client = connect_with_retry(&peer_ch, peer_local, sink_addr).await;
+    client.write_all(b"reach localhost").await.ok();
+
+    // Settle for a negative assertion, as in `exit_node_flow_is_dropped_under_direct_dialer`.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        dial_count.load(Ordering::SeqCst),
+        0,
+        "an exit-node flow must never reach this host's loopback"
+    );
 }
 
 /// All-port mode: a flow to a destination port that is **not** in any explicit forward list is
