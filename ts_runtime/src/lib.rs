@@ -58,6 +58,7 @@ pub mod peer_tracker;
 mod peerapi;
 mod peerapi_doh;
 mod route_updater;
+mod security;
 /// Stored Serve config + accept-loop runtime (`tsnet`'s `Get/SetServeConfig` + serving runtime).
 pub mod serve;
 mod src_filter;
@@ -115,6 +116,7 @@ pub struct Runtime {
     multiderp: ActorRef<Multiderp>,
     env: Env,
     shutdown: watch::Sender<bool>,
+    _security: security::SecurityGuard,
     /// Sender side of the exit-node selector `watch` cell. Held privately here (not on the cloned
     /// `Env`, which keeps only the read side) so that only `Runtime::set_exit_node` can mutate the
     /// selection; the route updater and source filter re-read it via [`Env::exit_node`].
@@ -186,6 +188,10 @@ impl Runtime {
             env::ForwarderConfig::from_control_config(&config),
         );
 
+        let mut security = security::SecurityGuard::new(shutdown_tx.clone());
+        security.watch(&env.bus);
+        security.ready(&env.bus).await?;
+
         // Both userspace netstacks (application + forwarder) share one netstack config. Honor the
         // per-deployment TCP buffer knob, and set the netstack MTU to the overlay/tunnel MTU so the
         // advertised MSS fits the tunnel — leaving it at the netstack's generic 1500 default would
@@ -200,6 +206,9 @@ impl Runtime {
         let netstack_config = netstack_config_from(config.tcp_buffer_size, configured_mtu);
 
         let dataplane = DataplaneActor::spawn(env.clone());
+        security.watch(&dataplane);
+        security.ready(&dataplane).await?;
+        security.packet_pump(dataplane.ask(dataplane::PacketPumpAbortHandle).await?);
 
         let (netstack_id, netstack_up, netstack_down) =
             dataplane.ask(dataplane::NewOverlayTransport).await?;
@@ -219,11 +228,15 @@ impl Runtime {
         let (home_region_tx, home_region_rx) = watch::channel::<Option<ts_derp::RegionId>>(None);
 
         let multiderp = Multiderp::spawn((env.clone(), dataplane.clone(), home_region_rx));
+        security.watch(&multiderp);
+        security.ready(&multiderp).await?;
 
         // Spawn the direct (disco) underlay manager before the route updater. Its `on_start`
         // binds the UDP socket and registers its transport synchronously, so by the time the
         // route updater asks it for the direct transport id it is guaranteed to be available.
         let direct = DirectManager::spawn((env.clone(), dataplane.clone(), multiderp.clone()));
+        security.watch(&direct);
+        security.ready(&direct).await?;
 
         // Spawn the forwarder before the route updater. Its `on_start` builds the forwarder
         // netstack, enables any-IP acceptance, and starts the per-port accept loops synchronously,
@@ -235,6 +248,8 @@ impl Runtime {
             forwarder_up,
             forwarder_down,
         ));
+        security.watch(&forwarder);
+        security.ready(&forwarder).await?;
         // Force `on_start` to finish (any-IP enabled, accept loops live) before the route updater
         // can route the first inbound flow to `forwarder_id`: an `ask` blocks until the actor has
         // started.
@@ -251,7 +266,7 @@ impl Runtime {
         // fail-closed) exit node; it publishes the resolved stable id into this watch cell so
         // `Runtime::status` can report which exit is actually engaged (not just configured).
         let (active_exit_tx, active_exit_rx) = watch::channel(None);
-        route_updater::RouteUpdater::spawn((
+        let route_updater = route_updater::RouteUpdater::spawn((
             multiderp.clone(),
             direct.clone(),
             env.clone(),
@@ -259,6 +274,8 @@ impl Runtime {
             forwarder_id,
             active_exit_tx,
         ));
+        security.watch(&route_updater);
+        security.ready(&route_updater).await?;
         // The packet-filter updater also surfaces the retained cap-grants (for flow-scoped WhoIs)
         // through a `watch` cell whose receiver the `Runtime` holds — the bus has no replay, so a
         // `watch` is how `Runtime::whois` reads the current grants on demand.
@@ -267,18 +284,21 @@ impl Runtime {
         // actor spawns — so the updater (sole writer) and the MagicDNS responder (reader, which
         // hands the receiver to its peerAPI server task) share one cell no matter which `on_start`
         // runs first. The gate is fail-closed, so a filter that never reaches it means refusing
-        // peers control's ACL admits, and the bus is not a dependable way to carry it (no replay,
-        // and best-effort delivery drops it on a full mailbox — see `packetfilter::LiveFilterRx`,
-        // which also names the one hop this cell does *not* cover: control -> the updater).
+        // peers control's ACL admits. The bus has no replay for late readers (see
+        // `packetfilter::LiveFilterRx`).
         let (live_filter_tx, live_filter_rx) = watch::channel(None);
         let (invalid_filter_tx, invalid_filter_rx) = watch::channel(false);
-        packetfilter::PacketfilterUpdater::spawn((
+        let packetfilter = packetfilter::PacketfilterUpdater::spawn((
             env.clone(),
             cap_grants_tx,
             live_filter_tx,
             invalid_filter_tx,
         ));
-        src_filter::SourceFilterUpdater::spawn(env.clone());
+        security.watch(&packetfilter);
+        security.ready(&packetfilter).await?;
+        let source_filter = src_filter::SourceFilterUpdater::spawn(env.clone());
+        security.watch(&source_filter);
+        security.ready(&source_filter).await?;
         // TKA enforcement-authority cell (Go `tkaFilterNetmapLocked`). Created here — before both
         // actors spawn — so the control runner (sole writer, `Sender`) and the peer tracker (reader,
         // `Receiver`) share one `watch` cell. A `watch` (not a bus message) is the transport for this
@@ -287,7 +307,9 @@ impl Runtime {
         // stale `Some`. `None` = no lock synced / disabled (admit all).
         let (tka_authority_tx, tka_authority_rx) =
             watch::channel::<Option<std::sync::Arc<ts_tka::Authority>>>(None);
-        let peer_tracker = PeerTracker::spawn((env.clone(), tka_authority_rx)).downgrade();
+        let peer_tracker = PeerTracker::spawn((env.clone(), tka_authority_rx));
+        security.watch(&peer_tracker);
+        security.ready(&peer_tracker).await?;
 
         // Select the application data path from the transport mode. The forwarder/egress path
         // above is UNCHANGED in both modes — TUN mode only swaps the application data path, never
@@ -310,6 +332,8 @@ impl Runtime {
                     netstack_down,
                 ));
 
+                security.watch(&netstack);
+                security.ready(&netstack).await?;
                 // Fetch the netstack channel while we still hold the strong ActorRef, then spawn
                 // the MagicDNS responder on it. Its ActorRef is retained on `Runtime` so
                 // `query_dns` can drive the live forward path; the serve loop itself is owned by the
@@ -321,6 +345,8 @@ impl Runtime {
                 let fallback_tcp = fallback_tcp::FallbackTcpManager::new(channel.clone());
                 let magic_dns =
                     magic_dns::MagicDnsActor::spawn((env.clone(), channel, live_filter_rx));
+                security.watch(&magic_dns);
+                security.ready(&magic_dns).await?;
 
                 (
                     Some(netstack.downgrade()),
@@ -334,7 +360,7 @@ impl Runtime {
                 // Reuse the same `netstack_up`/`netstack_down` overlay-transport pair that would
                 // have fed the netstack — it is just the application-side overlay seam (the name
                 // is historical). No NetstackActor / MagicDnsActor is spawned.
-                tun_actor::TunActor::spawn((
+                let tun = tun_actor::TunActor::spawn((
                     env.clone(),
                     tun_cfg.clone(),
                     netstack_up,
@@ -352,6 +378,8 @@ impl Runtime {
                     // host routing table is re-steered live (no device rebuild needed).
                     forwarder_channel.clone(),
                 ));
+                security.watch(&tun);
+                security.ready(&tun).await?;
 
                 (None, None, None)
             }
@@ -378,20 +406,18 @@ impl Runtime {
             exit_node: config.advertise_exit_node,
         });
 
-        // Unbounded mailbox (not the default bounded-64): the control runner SELF-messages — a
-        // spawned TKA sync task delivers its result back via `self_ref.tell(TkaSynced)`, and the
-        // netmap stream pump tells `StreamMessage::Next` onto the same mailbox. The stall path: the
-        // netmap handler ends by parking on `env.publish().await` into the bounded-64 *bus* (a slow
-        // bus subscriber, e.g. a busy TKA-enforcing peer tracker, holds the bus full); while it is
-        // parked, a concurrently-finishing sync task's `TkaSynced` self-tell queues behind a full
-        // *ControlRunner* mailbox and blocks waiting for capacity, delaying the verified-authority
-        // (or lock-disable) write to the enforcement cell — i.e. stale TKA enforcement under churn.
-        // kameo gates its self-tell deadlock warning on `is_current()`, which is false for the
-        // detached sync task, so the stall is silent. An unbounded mailbox lets the self-tell and the
-        // stream pump enqueue without ever awaiting capacity (kameo's documented choice for a
-        // self-messaging actor); the runner's inputs are control-paced (the netmap stream + a few RPC
-        // replies; the bus delivers best-effort and never backpressures this mailbox), not an attacker
-        // flood, so unbounded growth is not a practical exposure.
+        // This telemetry subscriber also has a bounded mailbox and multiple subscriptions.
+        // Starting it after control publishes could deadlock its second Register behind
+        // delivery to its first subscription while on_start cannot drain its mailbox.
+        let latency = derp_latency::DerpLatencyMeasurer::spawn(env.clone());
+        security.watch(&latency);
+        security.ready(&latency).await?;
+
+        // Every security subscriber is now registered. Control on_start may replay a cached
+        // map immediately; spawning it earlier would lose state even with guaranteed delivery.
+        // Control self-messages (stream pump and TKA sync results), so keep its mailbox
+        // unbounded too. Publishers never wait for broker handling or subscriber capacity.
+        // A stalled handler can accumulate inputs; supervision covers death, not stalls.
         let control = ControlRunner::spawn_with_mailbox(
             control_runner::Params {
                 config,
@@ -403,6 +429,8 @@ impl Runtime {
             },
             kameo::mailbox::unbounded(),
         );
+
+        security.watch(&control);
 
         // Spawn the taildrop partial-reaper if a store is configured; it sweeps abandoned `.partial`
         // files every `DELETE_DELAY` and exits on shutdown (the handle is aborted in `Drop`).
@@ -456,7 +484,7 @@ impl Runtime {
             control,
             dataplane,
             direct,
-            peer_tracker,
+            peer_tracker: peer_tracker.downgrade(),
             fallback_tcp,
             magic_dns,
             forwarder,
@@ -464,6 +492,7 @@ impl Runtime {
             netstack,
             env,
             shutdown: shutdown_tx,
+            _security: security,
             exit_node_tx: pref_cells.exit_node,
             accept_routes_tx: pref_cells.accept_routes,
             accept_dns_tx: pref_cells.accept_dns,
@@ -1489,16 +1518,15 @@ impl Drop for Runtime {
 
         self.shutdown.send_replace(true);
 
-        // Actors shut down when the last ActorRef to them is dropped (as nothing can send them
-        // messages anymore). If we don't hold an ActorRef in Runtime, in general the only thing
-        // that has one is the MessageBus, which each actor subscribes to for a subset of messages.
-        // Hence, if we shut down the bus, most actors die as well.
+        // The security guard retains supervised actors until it can kill them independently of
+        // full mailboxes. Its Drop also aborts the packet pump and all remaining supervised actors.
+        // Stop the control/dataplane/bus here for the graceful-shutdown path.
 
         // First shut down the actors we have an ActorRef to:
         try_shutdown(&self.control);
         try_shutdown(&self.dataplane);
 
-        // Then shutdown the message bus, stopping the rest of the actors:
+        // Then shut down the message bus; the guard cancels its subscribers on Drop.
         try_shutdown(&self.env.bus);
     }
 }
