@@ -27,6 +27,8 @@
 //! endpoint does, the announcing peer must be a current netmap member, and the relay endpoint must
 //! have been allocated for exactly this pair of disco keys.
 
+mod batch;
+mod connected;
 mod disco;
 mod endpoint;
 mod error;

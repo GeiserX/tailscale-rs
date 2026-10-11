@@ -2155,6 +2155,7 @@ dependencies = [
  "geiserx_ts_packet",
  "geiserx_ts_transport",
  "if-addrs",
+ "libc",
  "rand 0.10.3",
  "socket2",
  "thiserror 2.0.21",

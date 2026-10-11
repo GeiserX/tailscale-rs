@@ -21,6 +21,7 @@ use ts_packet::PacketMut;
 use ts_transport::{BatchRecvIter, BatchSendIter, UnderlayTransport};
 
 use crate::{
+    connected::ConnectedSockets,
     disco::{self, GeneveKind, Inbound, RelayHandshakeCommon},
     endpoint::{SelfEndpoint, SelfEndpointType},
     error::Error,
@@ -100,16 +101,21 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// it's taken. Honors the same family rule as the original bind: IPv4-only `0.0.0.0` by default
 /// (the sacred privacy-proxy invariant), or dual-stack `[::]` with an inert IPv4 fallback when
 /// `want_v6`. Never widens past what the original bind would have chosen.
-async fn rebind_socket(prefer_port: u16, want_v6: bool) -> std::io::Result<UdpSocket> {
+async fn rebind_socket(
+    prefer_port: u16,
+    want_v6: bool,
+    reuse_port: bool,
+) -> std::io::Result<UdpSocket> {
     use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    let bind = |a| bind_underlay(a, reuse_port);
 
     // IPv4-only default — byte-for-byte the historical family.
     if !want_v6 {
         let v4 = |port| SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
-        return match UdpSocket::bind(v4(prefer_port)).await {
+        return match bind(v4(prefer_port)).await {
             Ok(s) => Ok(s),
             // Same port taken (or otherwise unbindable): fall back to an ephemeral port.
-            Err(_) if prefer_port != 0 => UdpSocket::bind(v4(0)).await,
+            Err(_) if prefer_port != 0 => bind(v4(0)).await,
             Err(e) => Err(e),
         };
     }
@@ -117,13 +123,23 @@ async fn rebind_socket(prefer_port: u16, want_v6: bool) -> std::io::Result<UdpSo
     // Dual-stack: try `[::]:prefer_port`, then `[::]:0`, then the inert IPv4 fallback (a host with
     // IPv6 disabled at the kernel) — mirroring `direct.rs::bind_underlay_addr`'s posture.
     let v6 = |port| SocketAddr::from((Ipv6Addr::UNSPECIFIED, port));
-    if let Ok(s) = UdpSocket::bind(v6(prefer_port)).await {
+    if let Ok(s) = bind(v6(prefer_port)).await {
         return Ok(s);
     }
-    if let Ok(s) = UdpSocket::bind(v6(0)).await {
+    if let Ok(s) = bind(v6(0)).await {
         return Ok(s);
     }
-    UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).await
+    bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).await
+}
+
+/// Bind an underlay socket; with `reuse_port` (connected sockets enabled) it is created
+/// `SO_REUSEPORT` so connected per-path sockets can share its port.
+async fn bind_underlay(addr: SocketAddr, reuse_port: bool) -> std::io::Result<UdpSocket> {
+    if reuse_port {
+        UdpSocket::from_std(crate::connected::reuse_port_socket(addr)?.into())
+    } else {
+        UdpSocket::bind(addr).await
+    }
 }
 
 /// Underlay socket buffer size, both directions (Go magicsock's `socketBufferSize`).
@@ -225,6 +241,11 @@ pub struct MagicSock {
     /// extra `arc-swap` dep): the guard is held only long enough to clone the `Arc`, never across
     /// an `.await`.
     sock: Mutex<Arc<UdpSocket>>,
+    /// Connected per-path sockets sharing `sock`'s port (opt-in; see `connected.rs`). Locked
+    /// disjointly from every other lock, never across an `.await`.
+    connected: Mutex<ConnectedSockets>,
+    /// Datagrams the connected sockets' receive pumps hand to [`MagicSock::recv_data`].
+    connected_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<crate::connected::Received>>,
     our_disco: DiscoPrivateKey,
     our_node_key: NodePublicKey,
     paths: Paths,
@@ -400,10 +421,32 @@ impl MagicSock {
         our_disco: DiscoPrivateKey,
         our_node_key: NodePublicKey,
     ) -> Result<Self, Error> {
-        let sock = UdpSocket::bind(bind_addr).await?;
+        Self::bind_with(
+            bind_addr,
+            our_disco,
+            our_node_key,
+            crate::connected::Settings::from_env(),
+        )
+        .await
+    }
+
+    /// [`bind`](Self::bind) with explicit connected-socket settings instead of the environment.
+    pub(crate) async fn bind_with(
+        bind_addr: SocketAddr,
+        our_disco: DiscoPrivateKey,
+        our_node_key: NodePublicKey,
+        settings: crate::connected::Settings,
+    ) -> Result<Self, Error> {
+        let sock = bind_underlay(bind_addr, settings.connected_sockets).await?;
         tune_socket_buffers(&sock);
+        if settings != Default::default() {
+            tracing::info!(?settings, "magicsock: connected sockets / DF enabled");
+        }
+        let (connected, connected_rx) = ConnectedSockets::new(settings);
         Ok(Self {
             sock: Mutex::new(Arc::new(sock)),
+            connected: Mutex::new(connected),
+            connected_rx: tokio::sync::Mutex::new(connected_rx),
             our_disco,
             our_node_key,
             paths: Default::default(),
@@ -457,7 +500,26 @@ impl MagicSock {
         if self.only_tcp_443() {
             return Ok(false);
         }
-        self.sock().send_to(buf, addr).await?;
+        let sock = self.sock();
+        let connected = {
+            let mut c = lock(&self.connected);
+            if c.enabled() {
+                c.socket_for(addr, buf.len(), &sock)
+            } else {
+                None
+            }
+        };
+        if let Some(c) = connected {
+            match c.send(buf).await {
+                Ok(_) => return Ok(true),
+                // E.g. a pending ICMP error reported on the connected socket; this datagram
+                // still goes out of the shared socket.
+                Err(e) => {
+                    tracing::trace!(%addr, error = %e, "connected send failed; using shared socket")
+                }
+            }
+        }
+        sock.send_to(buf, addr).await?;
         Ok(true)
     }
 
@@ -511,7 +573,8 @@ impl MagicSock {
         // family choice `bind` uses.
         let current_port = self.sock().local_addr().map(|a| a.port()).unwrap_or(0);
         let want_v6 = self.enable_ipv6;
-        let new_sock = match rebind_socket(current_port, want_v6).await {
+        let reuse_port = lock(&self.connected).enabled();
+        let new_sock = match rebind_socket(current_port, want_v6, reuse_port).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "rebind: re-bind failed, keeping existing socket");
@@ -524,6 +587,8 @@ impl MagicSock {
         // Swap the socket atomically. The old `Arc<UdpSocket>` drops once outstanding clones release
         // it, which unblocks any `recv_from` parked on it so the recv pump loops onto the new socket.
         *lock(&self.sock) = Arc::new(new_sock);
+        // Connected sockets were bound to the old socket's address; start over.
+        lock(&self.connected).clear();
 
         // The local NAT mapping changed: drop stale reflexive addresses and every confirmed best
         // path (keep candidates — see `PeerPaths::invalidate_best`). Locked disjointly, never nested.
@@ -1367,6 +1432,55 @@ impl MagicSock {
         }
     }
 
+    /// Send a batch of WireGuard datagrams to `peer`: [`send_wireguard`](Self::send_wireguard) for
+    /// each, except that on a direct path with a connected socket and batched I/O enabled they go
+    /// out in as few `sendmsg_x` calls as possible. A packet the batch path couldn't send falls back
+    /// to the per-packet path. Errors are as for `send_wireguard`, with [`Error::NoPath`] already
+    /// handled (the batch is dropped, the peer stays on DERP).
+    pub async fn send_wireguard_batch<P: AsRef<[u8]>>(
+        &self,
+        peer: &DiscoPublicKey,
+        pkts: &[P],
+    ) -> Result<(), Error> {
+        let mut rest = pkts;
+        if pkts.len() > 1
+            && !self.only_tcp_443()
+            && let Some(addr) = self.best_addr(peer)
+        {
+            let sock = self.sock();
+            let connected = {
+                let mut c = lock(&self.connected);
+                if c.batched_io() {
+                    let bytes = pkts.iter().map(|p| p.as_ref().len()).sum();
+                    c.socket_for(addr, bytes, &sock)
+                } else {
+                    None
+                }
+            };
+            if let Some(c) = connected {
+                let sent = crate::batch::send(&c, pkts).await;
+                let m = crate::metrics::metrics();
+                for p in &pkts[..sent] {
+                    m.send_udp.inc();
+                    m.send_udp_bytes.add(p.as_ref().len() as i64);
+                }
+                rest = &pkts[sent..];
+            }
+        }
+        for p in rest {
+            match self.send_wireguard(peer, p.as_ref()).await {
+                Ok(()) => {}
+                // No direct path: drop, fail-closed; the route layer keeps the peer on DERP.
+                Err(Error::NoPath) => {
+                    tracing::trace!(%peer, "no direct path, dropping (peer stays on DERP)");
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
     /// Receive the next WireGuard datagram, handling any disco traffic inline.
     ///
     /// This loops internally: disco pings are answered with pongs, disco pongs update path
@@ -1374,9 +1488,19 @@ impl MagicSock {
     /// only if the socket is closed.
     pub async fn recv_data(&self) -> Result<Option<ReceivedData>, Error> {
         let mut buf = vec![0u8; RECV_BUF];
+        let mut connected_rx = self.connected_rx.lock().await;
 
         loop {
-            let (n, from) = self.sock().recv_from(&mut buf).await?;
+            let sock = self.sock();
+            let (n, from) = tokio::select! {
+                r = sock.recv_from(&mut buf) => r?,
+                Some((data, from)) = connected_rx.recv() => {
+                    // Same truncation as a `recv_from` into `buf`.
+                    let n = data.len().min(buf.len());
+                    buf[..n].copy_from_slice(&data[..n]);
+                    (n, from)
+                }
+            };
             let datagram = &mut buf[..n];
 
             // Active-STUN demux: a Binding Success Response to a request we sent on this same
@@ -2862,17 +2986,10 @@ impl UnderlayTransport for DirectTransport {
         packet_batch: impl BatchSendIter<Self::PeerKey>,
     ) -> Result<(), Self::Error> {
         for (peer, pkts) in packet_batch.batch_iter() {
-            for pkt in pkts {
-                match self.inner.send_wireguard(&peer, pkt.as_ref()).await {
-                    Ok(()) => {}
-                    Err(Error::NoPath) => {
-                        // No direct path: drop here, fail-closed. The route layer keeps this
-                        // peer on DERP; we never dial the host network directly.
-                        tracing::trace!(%peer, "no direct path, dropping (peer stays on DERP)");
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
+            // No direct path drops the batch here (fail-closed); the route layer keeps this peer on
+            // DERP and we never dial the host network directly.
+            let pkts: Vec<_> = pkts.into_iter().collect();
+            self.inner.send_wireguard_batch(&peer, &pkts).await?;
         }
         Ok(())
     }
@@ -5473,6 +5590,115 @@ mod tests {
 
         pump.abort();
         a_pump.abort();
+    }
+
+    /// With connected sockets on, a busy direct path moves to a socket connected to the peer on
+    /// the same port, and data keeps flowing both ways (replies now arrive on the connected
+    /// socket and reach `recv_data` through its pump).
+    #[cfg(target_vendor = "apple")]
+    #[tokio::test]
+    async fn connected_sockets_carry_data_after_threshold() {
+        let settings = crate::connected::Settings {
+            connected_sockets: true,
+            dont_fragment: true,
+            batched_io: true,
+        };
+        let a_disco = DiscoPrivateKey::random();
+        let b_disco = DiscoPrivateKey::random();
+        let node = || ts_keys::NodePrivateKey::random().public_key();
+        let a = Arc::new(
+            MagicSock::bind_with(localhost(), a_disco.clone(), node(), settings)
+                .await
+                .unwrap()
+                .with_binding_verifier(allow_all()),
+        );
+        let b = Arc::new(
+            MagicSock::bind_with(localhost(), b_disco.clone(), node(), settings)
+                .await
+                .unwrap()
+                .with_binding_verifier(allow_all()),
+        );
+        let (a_addr, b_addr) = (a.local_addr().unwrap(), b.local_addr().unwrap());
+        b.add_peer_endpoints_unfiltered(a_disco.public_key(), [a_addr]);
+        a.add_peer_endpoints_unfiltered(b_disco.public_key(), [b_addr]);
+
+        let pump = |s: Arc<MagicSock>| {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let h = tokio::spawn(async move {
+                while let Ok(Some(d)) = s.recv_data().await {
+                    drop(tx.send(d));
+                }
+            });
+            (h, rx)
+        };
+        let (a_pump, mut a_rx) = pump(a.clone());
+        let (b_pump, mut b_rx) = pump(b.clone());
+
+        a.send_pings().await.unwrap();
+        b.send_pings().await.unwrap();
+        let confirmed = async {
+            while a.best_addr(&b_disco.public_key()).is_none()
+                || b.best_addr(&a_disco.public_key()).is_none()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(2), confirmed)
+            .await
+            .unwrap();
+
+        // Push both directions past the threshold, consuming as we go.
+        let chunk = [7u8; 1200];
+        let n = (crate::connected::CONNECT_AFTER_BYTES as usize / chunk.len()) + 8;
+        for _ in 0..n {
+            a.send_wireguard(&b_disco.public_key(), &chunk)
+                .await
+                .unwrap();
+            b.send_wireguard(&a_disco.public_key(), &chunk)
+                .await
+                .unwrap();
+        }
+        assert_eq!(lock(&a.connected).ready_count(), 1);
+        assert_eq!(lock(&b.connected).ready_count(), 1);
+
+        a.send_wireguard(&b_disco.public_key(), b"a-after")
+            .await
+            .unwrap();
+        b.send_wireguard(&a_disco.public_key(), b"b-after")
+            .await
+            .unwrap();
+        async fn until(
+            rx: &mut mpsc::UnboundedReceiver<ReceivedData>,
+            want: &[u8],
+        ) -> ReceivedData {
+            loop {
+                let d = rx.recv().await.expect("pump ended");
+                if d.data.as_ref() == want {
+                    return d;
+                }
+            }
+        }
+        let got = tokio::time::timeout(Duration::from_secs(5), until(&mut b_rx, b"a-after"))
+            .await
+            .expect("B never got data over the connected path");
+        assert_eq!(
+            (got.from_disco, got.from_addr),
+            (a_disco.public_key(), a_addr)
+        );
+        let got = tokio::time::timeout(Duration::from_secs(5), until(&mut a_rx, b"b-after"))
+            .await
+            .expect("A never got data over the connected path");
+        assert_eq!(
+            (got.from_disco, got.from_addr),
+            (b_disco.public_key(), b_addr)
+        );
+
+        // A rebind drops the connected sockets.
+        a.rebind().await.unwrap();
+        assert_eq!(lock(&a.connected).ready_count(), 0);
+
+        a_pump.abort();
+        b_pump.abort();
     }
 
     /// `ping_now` sends a disco ping on demand and returns the FRESH round-trip latency + the
