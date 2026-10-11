@@ -1542,6 +1542,7 @@ mod tests {
                 forward_exit_egress: false,
                 block_incoming: false,
                 exit_proxy: None,
+                exit_node_dns: None,
                 peerapi_port: None,
                 taildrop_dir: None,
                 enable_ipv6: false,

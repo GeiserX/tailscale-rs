@@ -100,6 +100,10 @@ pub struct ForwarderConfig {
     /// since `ts_control` must not depend on `ts_forwarder`.
     pub exit_proxy: Option<ts_forwarder::ProxyConfig>,
 
+    /// Resolver for exit-node DNS aimed at unreachable resolvers. See
+    /// [`Config::exit_node_dns`](ts_control::Config::exit_node_dns).
+    pub exit_node_dns: Option<core::net::SocketAddr>,
+
     /// The IPv4 peerAPI port this node binds to serve exit-node DoH (`/dns-query`) to peers, if any.
     ///
     /// See [`Config::peerapi_port`](ts_control::Config::peerapi_port). `None` (the default) means
@@ -178,6 +182,7 @@ impl ForwarderConfig {
             forward_exit_egress: config.forward_exit_egress,
             block_incoming: config.block_incoming,
             exit_proxy: config.exit_proxy.as_ref().map(exit_proxy_to_forwarder),
+            exit_node_dns: config.exit_node_dns,
             peerapi_port: config.peerapi_port,
             taildrop_dir: config.taildrop_dir.clone(),
             enable_ipv6: config.enable_ipv6,
@@ -288,6 +293,10 @@ pub struct Env {
     ///
     /// See [`ForwarderConfig::exit_proxy`].
     pub exit_proxy: Option<ts_forwarder::ProxyConfig>,
+
+    /// Resolver for exit-node DNS aimed at unreachable resolvers. See
+    /// [`Config::exit_node_dns`](ts_control::Config::exit_node_dns).
+    pub exit_node_dns: Option<core::net::SocketAddr>,
 
     /// The IPv4 peerAPI port this node binds to serve exit-node DoH to peers, if any.
     ///
@@ -427,6 +436,7 @@ impl Env {
             forward_exit_egress,
             block_incoming,
             exit_proxy,
+            exit_node_dns,
             peerapi_port,
             taildrop_dir,
             enable_ipv6,
@@ -469,6 +479,7 @@ impl Env {
             forward_exit_egress,
             block_incoming,
             exit_proxy,
+            exit_node_dns,
             peerapi_port,
             taildrop_store,
             enable_ipv6,
@@ -549,6 +560,7 @@ mod tests {
             forward_exit_egress: false,
             block_incoming: false,
             exit_proxy: None,
+            exit_node_dns: None,
             peerapi_port: None,
             taildrop_dir: None,
             enable_ipv6: false,

@@ -175,6 +175,23 @@ pub struct Config {
     /// the proxy-egress section of the repo's `AGENTS.md`/`CLAUDE.md`.
     pub exit_proxy: Option<ExitProxyConfig>,
 
+    /// Resolver that answers exit-node DNS a client aims at a resolver this node can't reach (its
+    /// LAN or hotspot resolver), typically this host's own resolver. Go exit nodes resolve their
+    /// users' DNS themselves (peerAPI DoH); this gives plain DNS the same result. `None` (default)
+    /// leaves such queries refused. Only used with [`forward_exit_egress`](Config::forward_exit_egress)
+    /// and no [`exit_proxy`](Config::exit_proxy).
+    pub exit_node_dns: Option<core::net::SocketAddr>,
+
+    /// Port of this node's peerAPI on its tailnet IPv4 address, or `None` (default) for none.
+    ///
+    /// With a port set, the node advertises the `peerapi4` and `peerapi-dns-proxy` services. Go
+    /// clients using this node as their exit node then send all their DNS to its peerAPI DoH
+    /// endpoint (`/dns-query`); they assume any node of this capability version can do that, so an
+    /// exit node needs it for its users' DNS to work. Recursive answers require
+    /// [`forward_exit_egress`](Config::forward_exit_egress) and go to
+    /// [`exit_node_dns`](Config::exit_node_dns) when set.
+    pub peerapi_port: Option<u16>,
+
     /// Per-direction TCP send/receive buffer size (bytes) for the userspace netstack, or `None` to
     /// use the netstack default (256 KiB per direction, ~512 KiB per socket).
     ///
@@ -664,9 +681,10 @@ impl From<&Config> for ts_control::Config {
             forward_exit_egress: value.forward_exit_egress,
             block_incoming: value.block_incoming,
             exit_proxy: value.exit_proxy.clone(),
+            exit_node_dns: value.exit_node_dns,
             tcp_buffer_size: value.tcp_buffer_size,
             persistent_keepalive_interval: value.persistent_keepalive_interval,
-            peerapi_port: None,
+            peerapi_port: value.peerapi_port,
             taildrop_dir: value.taildrop_dir.clone(),
             netmap_cache_dir: value.netmap_cache_dir.clone(),
             enable_ipv6: value.enable_ipv6,
@@ -715,6 +733,8 @@ impl Default for Config {
             forward_exit_egress: false,
             block_incoming: false,
             exit_proxy: None,
+            exit_node_dns: None,
+            peerapi_port: None,
             tcp_buffer_size: None,
             persistent_keepalive_interval: Some(ts_control::DEFAULT_PERSISTENT_KEEPALIVE),
             enable_ipv6: false,

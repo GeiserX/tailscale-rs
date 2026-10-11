@@ -316,6 +316,7 @@ pub(crate) async fn handle_conn(
     view_rx: &watch::Receiver<Arc<DnsView>>,
     filter_rx: &LiveFilterRx,
     forward_exit_egress: bool,
+    host_resolver: Option<SocketAddr>,
 ) -> std::io::Result<()> {
     let request = match read_request(&mut stream, seed, header_end).await? {
         Some(r) => r,
@@ -335,9 +336,24 @@ pub(crate) async fn handle_conn(
         DohRequest::Query(bytes) => bytes,
     };
 
-    let view = view_rx.borrow().clone();
+    let mut view = view_rx.borrow().clone();
     // Both `borrow()` guards are dropped at the end of their own `let` — a `watch::Ref` is not
     // `Send`, and this task is spawned.
+
+    // Go's exit-node DNS forwards to the exit host's own resolver whatever the tailnet configures.
+    // With a host resolver and no tailnet default/fallback resolvers, use it as the default, so an
+    // off-tailnet name is forwarded there instead of answered SERVFAIL for lack of an upstream.
+    if let Some(resolver) = host_resolver
+        && view.cfg.resolvers.is_empty()
+        && view.cfg.fallback_resolvers.is_empty()
+    {
+        let mut v = (*view).clone();
+        v.cfg.resolvers = vec![ts_control::DnsResolver {
+            transport: ts_control::ResolverTransport::Udp(resolver),
+            use_with_exit_node: false,
+        }];
+        view = Arc::new(v);
+    }
     let filter = filter_rx.borrow().clone();
 
     // The source gate, run once for this connection *before* anything is resolved — Go's
@@ -351,7 +367,7 @@ pub(crate) async fn handle_conn(
         return write_status(&mut stream, "403 Forbidden").await;
     }
 
-    let response = resolve(&view, &query, channel, forward_exit_egress).await;
+    let response = resolve(&view, &query, channel, forward_exit_egress, host_resolver).await;
     write_dns_response(&mut stream, &response).await
 }
 
@@ -466,9 +482,24 @@ async fn resolve(
     query: &[u8],
     channel: &Channel,
     forward_exit_egress: bool,
+    host_resolver: Option<SocketAddr>,
 ) -> Vec<u8> {
     match server_decide(view, query, forward_exit_egress) {
         ServerDecision::Reply(resp) => resp,
+        // Go's exit-node DNS forwards to the exit host's own (OS) resolver; with one configured,
+        // so do we, over an ordinary host socket. The egress gate above already applied.
+        ServerDecision::Forward {
+            upstreams,
+            query,
+            servfail,
+        } if host_resolver.is_some() => {
+            for upstream in upstreams {
+                if let Some(resp) = host_forward(upstream, &query).await {
+                    return resp;
+                }
+            }
+            servfail
+        }
         ServerDecision::Forward {
             upstreams,
             query,
@@ -485,6 +516,56 @@ async fn resolve(
             .await
         }
     }
+}
+
+/// Ask `resolver` (this host's resolver) for `query` over UDP, retrying over TCP if the answer is
+/// truncated. `None` on timeout or error (the caller answers SERVFAIL).
+async fn host_forward(resolver: SocketAddr, query: &[u8]) -> Option<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const HOST_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(4);
+    let udp = async {
+        let bind: SocketAddr = if resolver.is_ipv4() {
+            (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+        } else {
+            (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+        };
+        let sock = tokio::net::UdpSocket::bind(bind).await.ok()?;
+        sock.connect(resolver).await.ok()?;
+        sock.send(query).await.ok()?;
+        let mut buf = vec![0u8; 65_535];
+        loop {
+            let n = sock.recv(&mut buf).await.ok()?;
+            // Only an answer to this query (same id).
+            if n >= 12 && buf[..2] == query[..2] {
+                return Some(buf[..n].to_vec());
+            }
+        }
+    };
+    let resp = tokio::time::timeout(HOST_TIMEOUT, udp).await.ok()??;
+    let truncated = resp.get(2).is_some_and(|flags| flags & 0x02 != 0);
+    if !truncated {
+        return Some(resp);
+    }
+    let tcp = async {
+        let mut s = tokio::net::TcpStream::connect(resolver).await.ok()?;
+        let len = u16::try_from(query.len()).ok()?;
+        s.write_all(&len.to_be_bytes()).await.ok()?;
+        s.write_all(query).await.ok()?;
+        let mut len = [0u8; 2];
+        s.read_exact(&mut len).await.ok()?;
+        let mut out = vec![0u8; usize::from(u16::from_be_bytes(len))];
+        s.read_exact(&mut out).await.ok()?;
+        Some(out)
+    };
+    // A truncated UDP answer is still a valid answer if TCP fails.
+    Some(
+        tokio::time::timeout(HOST_TIMEOUT, tcp)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(resp),
+    )
 }
 
 /// The server-side decision for a DoH query: either a complete response (authoritative answer,
@@ -1215,6 +1296,7 @@ mod tests {
             forward_exit_egress: false,
             block_incoming: false,
             exit_proxy: None,
+            exit_node_dns: None,
             peerapi_port: None,
             taildrop_dir: None,
             enable_ipv6: false,

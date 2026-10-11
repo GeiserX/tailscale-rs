@@ -177,6 +177,65 @@ impl RealDialer for HostExitDialer {
     }
 }
 
+/// Answers exit-node DNS aimed at resolvers the exit node can't reach with this host's resolver.
+///
+/// A client using an exit node sends its whole default route through the tunnel, including DNS for
+/// its local resolver (a phone hotspot's `172.20.10.1`, a home router's `192.168.1.1`). Those are
+/// forbidden exit destinations, so its lookups would all fail. Go exit nodes avoid this by serving
+/// DNS themselves (peerAPI DoH, resolved with the exit host's resolver). This wrapper gets the same
+/// result for plain DNS: an exit-node flow to port 53 on a forbidden address is dialed to
+/// `upstream` instead, and UDP replies keep the address the client asked, so the client sees its
+/// own resolver answering, with the exit host's view of the internet.
+///
+/// Only DNS is redirected, only to the one operator-chosen `upstream`, and only for destinations
+/// the inner dialer would refuse anyway; everything else goes to the inner dialer unchanged. The
+/// client still never reaches the exit host's LAN.
+#[derive(Clone, Debug)]
+pub struct ExitDnsDialer<D> {
+    inner: D,
+    upstream: SocketAddr,
+}
+
+impl<D> ExitDnsDialer<D> {
+    /// Wrap `inner`, answering redirected DNS from `upstream` (e.g. this host's own resolver).
+    pub fn new(inner: D, upstream: SocketAddr) -> Self {
+        Self { inner, upstream }
+    }
+
+    /// Whether this flow is DNS the client can only get answered via the exit host's resolver.
+    fn redirect(&self, class: FlowClass, dst: SocketAddr) -> bool {
+        class == FlowClass::ExitNode && dst.port() == 53 && exit_dst_is_forbidden(dst)
+    }
+}
+
+impl<D: RealDialer> RealDialer for ExitDnsDialer<D> {
+    async fn dial_tcp(
+        &self,
+        class: FlowClass,
+        dst: SocketAddr,
+    ) -> Result<tokio::net::TcpStream, DialError> {
+        if self.redirect(class, dst) {
+            tracing::debug!(%dst, upstream = %self.upstream, "exit DNS over TCP redirected to upstream");
+            // `upstream` is operator-chosen, not peer-chosen, so it isn't an exit destination.
+            return self.inner.dial_tcp(FlowClass::Subnet, self.upstream).await;
+        }
+        self.inner.dial_tcp(class, dst).await
+    }
+
+    async fn dial_udp(&self, class: FlowClass, dst: SocketAddr) -> Result<DialedUdp, DialError> {
+        if self.redirect(class, dst) {
+            tracing::debug!(%dst, upstream = %self.upstream, "exit DNS redirected to upstream");
+            let mut dialed = self
+                .inner
+                .dial_udp(FlowClass::Subnet, self.upstream)
+                .await?;
+            dialed.spoof_src = dst.ip();
+            return Ok(dialed);
+        }
+        self.inner.dial_udp(class, dst).await
+    }
+}
+
 /// Refuse an exit-node flow aimed at a non-internet destination (see [`exit_dst_is_forbidden`]).
 fn refuse_forbidden_exit_dst(class: FlowClass, dst: SocketAddr) -> Result<(), DialError> {
     if class == FlowClass::ExitNode && exit_dst_is_forbidden(dst) {
@@ -634,6 +693,43 @@ mod tests {
                 "exit UDP to {dst} must be refused"
             );
         }
+    }
+
+    /// Exit DNS for a resolver the exit node can't reach is answered by the upstream resolver, with
+    /// replies still appearing to come from the address the client asked.
+    #[tokio::test]
+    async fn exit_dns_redirects_forbidden_resolvers_to_upstream() {
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let d = ExitDnsDialer::new(HostExitDialer, upstream_addr);
+
+        let asked: SocketAddr = "172.20.10.1:53".parse().unwrap();
+        let dialed = d.dial_udp(FlowClass::ExitNode, asked).await.unwrap();
+        assert_eq!(dialed.spoof_src, asked.ip());
+        dialed.sock.send(b"query").await.unwrap();
+        let mut b = [0u8; 16];
+        let (n, _) = upstream.recv_from(&mut b).await.unwrap();
+        assert_eq!(&b[..n], b"query");
+    }
+
+    /// Only DNS to forbidden resolvers is redirected: other ports stay forbidden, and DNS to a
+    /// public resolver goes where the client sent it.
+    #[tokio::test]
+    async fn exit_dns_redirects_nothing_else() {
+        let d = ExitDnsDialer::new(HostExitDialer, "127.0.0.1:9".parse().unwrap());
+        for dst in ["192.168.50.1:80", "172.20.10.1:5353", "127.0.0.1:22"] {
+            let dst: SocketAddr = dst.parse().unwrap();
+            assert!(matches!(
+                d.dial_udp(FlowClass::ExitNode, dst).await,
+                Err(DialError::ForbiddenDestination(_))
+            ));
+            assert!(matches!(
+                d.dial_tcp(FlowClass::ExitNode, dst).await,
+                Err(DialError::ForbiddenDestination(_))
+            ));
+        }
+        assert!(!d.redirect(FlowClass::ExitNode, "203.0.113.1:53".parse().unwrap()));
+        assert!(!d.redirect(FlowClass::Subnet, "192.168.1.1:53".parse().unwrap()));
     }
 
     /// Public destinations pass the guard (the connect itself is never attempted here).

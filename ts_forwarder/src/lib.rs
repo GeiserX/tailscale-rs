@@ -62,8 +62,8 @@ mod udp;
 
 pub use class::{FlowClass, RouteTable};
 pub use dialer::{
-    DialError, DialedUdp, DirectDialer, HostExitDialer, ProxyConfig, ProxyExitDialer, ProxyScheme,
-    RealDialer,
+    DialError, DialedUdp, DirectDialer, ExitDnsDialer, HostExitDialer, ProxyConfig,
+    ProxyExitDialer, ProxyScheme, RealDialer,
 };
 pub use forwarder::{Forwarder, PortSpec, RouteUpdater};
 pub use ipv6_reject::reject_ipv6;

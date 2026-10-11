@@ -293,6 +293,14 @@ pub struct Config {
     #[serde(default)]
     pub exit_proxy: Option<ExitProxyConfig>,
 
+    /// Resolver that answers exit-node DNS aimed at resolvers this node can't reach (a client's
+    /// LAN or hotspot resolver), e.g. this host's own resolver. `None` leaves such DNS refused like
+    /// any other forbidden exit destination. Only used with
+    /// [`forward_exit_egress`](Config::forward_exit_egress) and no exit proxy. See
+    /// `ts_forwarder::ExitDnsDialer`.
+    #[serde(default)]
+    pub exit_node_dns: Option<core::net::SocketAddr>,
+
     /// The IPv4 peerAPI port this node binds to serve exit-node DoH (DNS-over-HTTPS) proxying for
     /// peers that select it as their exit node (`peerapi4` + `peerapi-dns-proxy` services).
     ///
@@ -828,6 +836,7 @@ impl Default for Config {
             forward_exit_egress: false,
             block_incoming: false,
             exit_proxy: None,
+            exit_node_dns: None,
             peerapi_port: None,
             taildrop_dir: None,
             netmap_cache_dir: None,

@@ -16,8 +16,8 @@ use netstack::{
 };
 use tokio::task::JoinSet;
 use ts_forwarder::{
-    Admit, DirectDialer, Forwarder, HostExitDialer, PortGate, ProxyExitDialer, RealDialer,
-    RouteTable, RouteUpdater,
+    Admit, DirectDialer, ExitDnsDialer, Forwarder, HostExitDialer, PortGate, ProxyExitDialer,
+    RealDialer, RouteTable, RouteUpdater,
 };
 
 use crate::{
@@ -251,6 +251,16 @@ impl kameo::Actor for ForwarderActor {
                     netstack_down_tx.clone(),
                 )
             }
+            DialerChoice::HostExit if env.exit_node_dns.is_some() => spawn_forwarder(
+                &mut joinset,
+                channel.clone(),
+                routes,
+                ExitDnsDialer::new(HostExitDialer, env.exit_node_dns.expect("checked by guard")),
+                all_ports,
+                tcp_ports,
+                udp_ports,
+                netstack_down_tx.clone(),
+            ),
             DialerChoice::HostExit => spawn_forwarder(
                 &mut joinset,
                 channel.clone(),
@@ -309,6 +319,7 @@ impl kameo::Actor for ForwarderActor {
             all_ports,
             exit_egress = env.forward_exit_egress,
             exit_proxy = env.exit_proxy.is_some(),
+            exit_node_dns = ?env.exit_node_dns,
             dialer = ?choice,
             "forwarder started"
         );
@@ -366,6 +377,7 @@ mod tests {
             forward_exit_egress,
             block_incoming: false,
             exit_proxy: None,
+            exit_node_dns: None,
             peerapi_port: None,
             taildrop_dir: None,
             enable_ipv6: false,
