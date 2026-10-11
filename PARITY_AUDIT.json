@@ -2,15 +2,37 @@
   "schema": "parity-audit/v1",
   "auditedPrs": [
     {
-      "url": "https://github.com/GeiserX/tailscale-rs/pull/560",
-      "verdict": "faithful",
-      "notes": "Third audit of squash commit 041861c on main. The diff ports no Go. It removes `no-std` from the crates.io categories of ts_netstack_smoltcp, ts_netstack_smoltcp_core and ts_netstack_smoltcp_socket, because their command channel `flume` needs std. It also adds comments above the unchanged `#![no_std]` attributes, a 'Platform support' section in the core crate's README, and a `no_std_honest` check in `checks`. That check has five unit tests, and each one calls the production `check_metadata` on synthetic metadata. No runtime code, default, error path or platform gate changes. Upstream github.com/tailscale/tailscale was fetched with depth 1 at e2ed432399c9b0fda7aa14e9eb27784d2d893c55, the pin recorded in PORTING.md. Upstream's netstack is wgengine/netstack, built on gVisor. Its file splits (netstack_linux.go, netstack_tcpbuf_ios.go, netstack_userping_apple.go) are OS gates, not a std/no-std split. `grep -rIl -E 'no_std|no-std|flume' --include='*.go'` over the tree returns nothing. With no upstream counterpart there is nothing to diverge from, so there are no findings. This agrees with the audits in #570 and #572."
+      "url": "https://github.com/GeiserX/tailscale-rs/pull/587",
+      "verdict": "gaps",
+      "notes": "Audited squash commit 719aa88 on main. The PR cites no upstream Go file. Its nearest counterpart is upstream's netstack link endpoint, wgengine/netstack/link_endpoint.go and netstack.go, read in a fresh depth-1 clone of github.com/tailscale/tailscale at e2ed432399c9b0fda7aa14e9eb27784d2d893c55 (the pin in PORTING.md). The merged change adds a 4096-packet, 4096*MTU-byte drop-tail queue in front of smoltcp, used by both the application and the forwarder netstack. Egress stays unbounded. Upstream has no inbound link-layer queue at all: tstun calls linkEndpoint.injectInbound, which hands each packet to gVisor's DeliverNetworkPacket on the caller's goroutine. The only bounded queues upstream has are the outbound ones, at 512 packets each, and their Write blocks rather than drops. So the PR bounds the direction upstream leaves unqueued and leaves unbounded the direction upstream bounds. It also counts its drops without exposing the count anywhere. All three findings are minor. Bounding ingress fixes a real unbounded-memory problem, and smoltcp running on its own task is a real architectural difference from gVisor. The new tests call the production pump_ingress and WakingPipe::ingress_bounded."
     }
   ],
   "gate": {
     "ran": true,
-    "pass": true,
-    "detail": "Ran the scoped gate stages on main eabd2cf with CARGO_BUILD_JOBS=4, RUST_TEST_THREADS=4 and TS_RS_EXPERIMENT set. All exited 0: cargo run -p checks; cargo clippy --workspace --exclude ts_cli_util --lib --no-deps --all-features -- -D warnings; the same clippy over bins/tests/benches/examples with -D warnings -A missing_docs; cargo nextest run -p geiserx_ts_control -p geiserx_ts_runtime --all-features --no-fail-fast, 986 run and 986 green in 59s, with 3 skipped; cargo build --workspace --exclude ts_cli_util --all-targets --all-features. The 3 skipped tests were filtered out on purpose because they need sockets this environment blocks: serve_path_proxy_replays_consumed_head_to_backend and proxy_with_prefix_writes_prefix_before_bidi_copy hang on a dropped loopback SYN, and probe_stun_servers_once_sends_binding_request needs outbound UDP. The full bin/check was not run. ts_cli_util's tracy feature does not compile under --all-features, and cargo deny check all refuses aws-lc-rs/aws-lc-sys on every branch, so the set -e script stops before nextest."
+    "pass": false,
+    "detail": "PENDING"
   },
-  "findings": []
+  "findings": [
+    {
+      "prUrl": "https://github.com/GeiserX/tailscale-rs/pull/587",
+      "title": "Inbound overload drops at one shared link-layer ring instead of per endpoint inside the stack",
+      "detail": "Upstream: tstun's inbound path calls Impl.injectInbound, then linkEndpoint.gro or injectInbound. That calls d.DeliverNetworkPacket synchronously on the caller's goroutine, with no inbound queue in the link endpoint. Overload therefore pushes back on the WireGuard receive path, and any shedding happens inside gVisor's stack, where each transport endpoint has its own receive buffer. Merged: pump_ingress try_sends every inbound packet into a single drop-tail queue (INGRESS_QUEUE_PACKETS = 4096 packets, 4096*MTU bytes) that sits in front of smoltcp. One peer that fills it causes every other flow on that netstack to be dropped too. That includes the forwarder netstack, which carries every peer's exit and subnet flows. Upstream has no shared ring of this kind for one sender to fill.",
+      "upstream": "wgengine/netstack/link_endpoint.go @ e2ed432399c9b0fda7aa14e9eb27784d2d893c55",
+      "severity": "minor"
+    },
+    {
+      "prUrl": "https://github.com/GeiserX/tailscale-rs/pull/587",
+      "title": "Netstack egress left unbounded where upstream bounds each outbound queue at 512 packets",
+      "detail": "Upstream: NewImpl builds the link endpoint with newLinkEndpoint(512, ...). Each outbound queue (to WireGuard, to the host, loopback) is a channel of 512, and queue.Write blocks until there is room or the queue closes. A slow consumer therefore holds back gVisor's writer, and the backlog cannot grow. Merged: WakingPipe::ingress_bounded uses flume::unbounded() for the device-to-caller direction, and the TxToken path charges no limit. If the dataplane drains slowly, the netstack-to-dataplane backlog grows without bound. The PR's reason is that smoltcp's TxToken::consume cannot wait. That is real, but it means the merged code diverges from upstream on egress. The PR does not discuss a bounded egress queue that drops when full, which TCP would recover from by retransmission.",
+      "upstream": "wgengine/netstack/netstack.go @ e2ed432399c9b0fda7aa14e9eb27784d2d893c55",
+      "severity": "minor"
+    },
+    {
+      "prUrl": "https://github.com/GeiserX/tailscale-rs/pull/587",
+      "title": "Ingress drops are counted but the count is discarded and no metric exposes it",
+      "detail": "Upstream counts dropped inbound packets in metrics an operator can read. net/tstun/wrap.go increments clientmetric tstun_in_from_wg_drop, and adds to the usermetric inboundDroppedPacketsTotal (with a reason label) when the write to the device fails. The netstack's own drops are published as counter_dropped_packets by Impl.ExpVar in wgengine/netstack/netstack.go. Merged: pump_ingress returns a u64 drop count, but both callers (netstack_actor.rs and forwarder_actor.rs) throw it away. The only other trace is a debug-level log line when a run of drops starts and when it ends. An operator whose node is shedding inbound packets under load has no counter to see it.",
+      "upstream": "net/tstun/wrap.go @ e2ed432399c9b0fda7aa14e9eb27784d2d893c55",
+      "severity": "minor"
+    }
+  ]
 }
