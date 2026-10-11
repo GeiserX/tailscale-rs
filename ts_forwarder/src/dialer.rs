@@ -29,6 +29,11 @@ pub enum DialError {
     #[error("destination not advertised")]
     NotAdvertised,
 
+    /// An exit-node flow targeted a non-internet destination (loopback, private, link-local,
+    /// CGNAT, multicast, ...), which exit egress never reaches.
+    #[error("exit destination forbidden: {0}")]
+    ForbiddenDestination(SocketAddr),
+
     /// UDP egress was requested through an upstream proxy that cannot tunnel UDP (anti-leak).
     ///
     /// HTTP CONNECT cannot carry UDP at all, and SOCKS5 UDP-ASSOCIATE is not implemented here.
@@ -136,6 +141,13 @@ impl RealDialer for DirectDialer {
 /// routing table. Proxy/residential egress via a separate source is a different [`RealDialer`]
 /// implementation, layered on top, out of scope here.
 ///
+/// Exit-node flows to destinations that are not public internet (loopback, RFC 1918, link-local,
+/// the tailnet's CGNAT range, multicast, ...) are refused, see `exit_dst_is_forbidden`. The default
+/// route classifies *every* destination as `ExitNode`, so without this an exit-node user could reach
+/// this host's loopback services, its LAN, or other tailnet nodes via this host's sockets. Go
+/// likewise carves those ranges out of the exit node's default route. Private ranges a peer should
+/// reach are advertised as subnet routes, which are classified `Subnet` and dialed unchanged.
+///
 /// Subnet routes are dialed identically to [`DirectDialer`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HostExitDialer;
@@ -143,17 +155,19 @@ pub struct HostExitDialer;
 impl RealDialer for HostExitDialer {
     async fn dial_tcp(
         &self,
-        _class: FlowClass,
+        class: FlowClass,
         dst: SocketAddr,
     ) -> Result<tokio::net::TcpStream, DialError> {
-        // Both Subnet and ExitNode egress via the host's IPv4 socket. The class is irrelevant to
-        // the mechanism here; the *decision* to permit exit egress was made by choosing this dialer.
+        // Both Subnet and ExitNode egress via the host's IPv4 socket; the *decision* to permit exit
+        // egress was made by choosing this dialer. Exit flows are still confined to the internet.
+        refuse_forbidden_exit_dst(class, dst)?;
         let sock = tokio::net::TcpSocket::new_v4()?;
         sock.bind(unspecified_v4())?;
         Ok(sock.connect(dst).await?)
     }
 
-    async fn dial_udp(&self, _class: FlowClass, dst: SocketAddr) -> Result<DialedUdp, DialError> {
+    async fn dial_udp(&self, class: FlowClass, dst: SocketAddr) -> Result<DialedUdp, DialError> {
+        refuse_forbidden_exit_dst(class, dst)?;
         let sock = tokio::net::UdpSocket::bind(unspecified_v4()).await?;
         sock.connect(dst).await?;
         Ok(DialedUdp {
@@ -161,6 +175,15 @@ impl RealDialer for HostExitDialer {
             spoof_src: dst.ip(),
         })
     }
+}
+
+/// Refuse an exit-node flow aimed at a non-internet destination (see [`exit_dst_is_forbidden`]).
+fn refuse_forbidden_exit_dst(class: FlowClass, dst: SocketAddr) -> Result<(), DialError> {
+    if class == FlowClass::ExitNode && exit_dst_is_forbidden(dst) {
+        tracing::debug!(%dst, "exit dial refused: forbidden exit destination");
+        return Err(DialError::ForbiddenDestination(dst));
+    }
+    Ok(())
 }
 
 /// Which upstream proxy wire protocol to speak during the handshake.
@@ -572,19 +595,58 @@ mod tests {
         assert!(matches!(err, Err(DialError::ExitEgressRefused)));
     }
 
-    /// The opt-in exit dialer must accept an exit-node TCP flow where [`DirectDialer`] structurally
-    /// refuses it. We dial a real loopback listener so the connect actually completes — proving the
-    /// egress is performed, not refused.
+    /// The opt-in exit dialer must not let an exit-node flow reach this host's loopback, even
+    /// though a loopback listener is up and would accept: the default route classifies every
+    /// destination as `ExitNode`, so this is the guard that keeps exit users off local services.
     #[tokio::test]
-    async fn host_exit_dialer_egresses_exit_node_tcp() {
+    async fn host_exit_dialer_refuses_exit_node_tcp_to_loopback() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dst = listener.local_addr().unwrap();
 
-        let stream = HostExitDialer
-            .dial_tcp(FlowClass::ExitNode, dst)
-            .await
-            .expect("host exit dialer should egress exit-node TCP");
-        assert_eq!(stream.peer_addr().unwrap(), dst);
+        let err = HostExitDialer.dial_tcp(FlowClass::ExitNode, dst).await;
+        assert!(matches!(err, Err(DialError::ForbiddenDestination(d)) if d == dst));
+    }
+
+    /// Every non-internet range is refused for exit-node TCP and UDP before any socket is created.
+    #[tokio::test]
+    async fn host_exit_dialer_refuses_forbidden_exit_destinations() {
+        for dst in [
+            "127.0.0.1:22",
+            "10.0.0.1:80",
+            "172.16.0.1:80",
+            "192.168.50.1:80",
+            "169.254.169.254:80",
+            "100.100.100.100:53",
+            "100.64.0.7:443",
+            "224.0.0.251:5353",
+            "255.255.255.255:67",
+            "0.0.0.0:80",
+        ] {
+            let dst: SocketAddr = dst.parse().unwrap();
+            let tcp = HostExitDialer.dial_tcp(FlowClass::ExitNode, dst).await;
+            assert!(
+                matches!(tcp, Err(DialError::ForbiddenDestination(_))),
+                "exit TCP to {dst} must be refused"
+            );
+            let udp = HostExitDialer.dial_udp(FlowClass::ExitNode, dst).await;
+            assert!(
+                matches!(udp, Err(DialError::ForbiddenDestination(_))),
+                "exit UDP to {dst} must be refused"
+            );
+        }
+    }
+
+    /// Public destinations pass the guard (the connect itself is never attempted here).
+    #[test]
+    fn public_exit_destinations_are_not_forbidden() {
+        for dst in [
+            "203.0.113.1:443",
+            "203.0.113.4:53",
+            "203.0.113.5:80",
+            "203.0.113.2:443",
+        ] {
+            assert!(!exit_dst_is_forbidden(dst.parse().unwrap()), "{dst}");
+        }
     }
 
     /// The opt-in exit dialer also egresses subnet flows, identically to [`DirectDialer`].
@@ -600,14 +662,15 @@ mod tests {
         assert_eq!(stream.peer_addr().unwrap(), dst);
     }
 
-    /// The opt-in exit dialer egresses exit-node UDP, spoofing replies from the dialed destination.
+    /// The opt-in exit dialer egresses UDP, spoofing replies from the dialed destination. (Uses a
+    /// subnet flow: a loopback destination is forbidden for exit flows, and the socket path is shared.)
     #[tokio::test]
-    async fn host_exit_dialer_egresses_exit_node_udp() {
+    async fn host_exit_dialer_egresses_udp() {
         let dst = "127.0.0.1:53".parse().unwrap();
         let dialed = HostExitDialer
-            .dial_udp(FlowClass::ExitNode, dst)
+            .dial_udp(FlowClass::Subnet, dst)
             .await
-            .expect("host exit dialer should egress exit-node UDP");
+            .expect("host exit dialer should egress UDP");
         assert_eq!(dialed.spoof_src, dst.ip());
     }
 
@@ -1023,18 +1086,18 @@ mod tests {
         }
 
         // A normal public IP is still ALLOWED.
-        let public: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        let public: SocketAddr = "203.0.113.1:443".parse().unwrap();
         assert!(
             !exit_dst_is_forbidden(public),
-            "public IP 1.1.1.1 must remain an allowed exit destination"
+            "public IP 203.0.113.1 must remain an allowed exit destination"
         );
 
-        // 100.128.0.1 is OUTSIDE 100.64.0.0/10 (the /10 only covers 100.64–100.127), so it is a
+        // 203.0.113.2 is OUTSIDE 100.64.0.0/10 (the /10 only covers 100.64–100.127), so it is a
         // normal public address and must NOT be caught by the CGNAT guard.
-        let cgnat_adjacent: SocketAddr = "100.128.0.1:443".parse().unwrap();
+        let cgnat_adjacent: SocketAddr = "203.0.113.2:443".parse().unwrap();
         assert!(
             !exit_dst_is_forbidden(cgnat_adjacent),
-            "100.128.0.1 is outside 100.64/10 and must remain allowed"
+            "203.0.113.2 is outside 100.64/10 and must remain allowed"
         );
 
         // 223.255.255.255 is the last unicast address BELOW multicast (224/4); it must remain
