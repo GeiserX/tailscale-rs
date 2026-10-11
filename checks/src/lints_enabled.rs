@@ -35,6 +35,9 @@ pub fn run(_args: &Args) -> BoxResult<()> {
             // nightly-only dev tooling excluded from the normal build/test graph. Skip it here
             // rather than force a redundant `[workspace.lints]` into the fuzz manifest.
             "!ts_tka/fuzz",
+            // Vendored third-party crates (`vendor/*`, e.g. smoltcp) keep their upstream manifests
+            // and lint settings so their patches stay reviewable against upstream.
+            "!vendor",
         ],
     )
     .build()?;
