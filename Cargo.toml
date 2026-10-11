@@ -1,5 +1,6 @@
 [workspace]
 resolver = "3"
+exclude = ["vendor/smoltcp"]
 members = [
     "checks",
     "ts_array256",
@@ -384,3 +385,7 @@ required-features = ["tsnet"]
 [[example]]
 name = "ssh_peer_lookup"
 required-features = ["ssh"]
+
+# Pin the narrowly patched TCP loss-recovery implementation; see vendor/smoltcp/PATCHES.md.
+[patch.crates-io]
+smoltcp = { path = "vendor/smoltcp" }
