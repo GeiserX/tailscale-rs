@@ -111,10 +111,12 @@ pub struct Config {
     /// Whether to advertise this node as an exit node.
     ///
     /// This is the equivalent of `tailscale up --advertise-exit-node`. Defaults to `false`. When
-    /// `true`, the default route `0.0.0.0/0` is advertised so that, once approved, other peers may
-    /// route their internet-bound traffic out through this node's real origin IP. Because that
-    /// means *other* peers' traffic egresses via our IP, it is strictly opt-in. `::/0` is never
-    /// advertised (IPv6-off).
+    /// `true`, the default routes `0.0.0.0/0` and `::/0` are advertised (official clients only offer
+    /// an exit node that advertises both) so that, once approved, other peers may route their
+    /// internet-bound traffic out through this node's real origin IP. Because that means *other*
+    /// peers' traffic egresses via our IP, it is strictly opt-in. IPv6 exit traffic is never
+    /// forwarded: the forwarder rejects it (TCP RST / ICMPv6 prohibited) so clients fall back to
+    /// IPv4 immediately.
     pub advertise_exit_node: bool,
 
     /// TCP ports the inbound forwarder accepts and splices to real OS sockets, for every advertised
