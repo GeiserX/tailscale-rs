@@ -472,19 +472,7 @@ impl Message<Arc<PeerState>> for DataplaneActor {
                     continue;
                 };
 
-                wg.upsert_peer(
-                    ts_tunnel::PeerId(upsert.0),
-                    ts_tunnel::PeerConfig {
-                        key: node.node_key,
-                        psk: [0u8; 32].into(),
-                        // Persistent keepalive holds the (often DERP-relayed) path to every peer
-                        // warm so an idle session doesn't age out and wedge the next dial. Applied
-                        // to all peers because this fork's primary deployment is a userspace-netstack
-                        // node whose only path to peers is via the relay. `None` (embedder opt-out)
-                        // disables it. See `Env::persistent_keepalive_interval`.
-                        persistent_keepalive_interval: self.persistent_keepalive_interval,
-                    },
-                );
+                apply_tunnel_peer(wg, upsert, node, self.persistent_keepalive_interval);
             }
 
             for delete in &msg.deletions {
@@ -494,6 +482,29 @@ impl Message<Arc<PeerState>> for DataplaneActor {
 
         tracing::trace!("applied new peer state");
     }
+}
+
+/// Keep expired peers in the control snapshot for status, but remove all tunnel authority.
+fn apply_tunnel_peer(
+    wg: &mut ts_tunnel::Endpoint,
+    id: PeerId,
+    node: &ts_control::Node,
+    persistent_keepalive_interval: Option<std::time::Duration>,
+) {
+    let id = ts_tunnel::PeerId(id.0);
+    if node.expired {
+        wg.remove_peer(id);
+        return;
+    }
+    wg.upsert_peer(
+        id,
+        ts_tunnel::PeerConfig {
+            key: node.node_key,
+            psk: [0u8; 32].into(),
+            // Keep the peer's path warm; None is the embedder's opt-out.
+            persistent_keepalive_interval,
+        },
+    );
 }
 
 #[cfg(test)]
@@ -547,6 +558,35 @@ mod tests {
             service_vips: Default::default(),
             unsigned_peer_api_only: false,
         }
+    }
+
+    #[test]
+    fn expired_peer_update_removes_tunnel_and_recovery_recreates_it() {
+        let mut peer = node("peer", "100.64.0.1/32", "fd7a::1/128", false);
+        let mut wg = ts_tunnel::Endpoint::new(ts_tunnel::NodeKeyPair::new());
+        let id = PeerId(1);
+        let tunnel_id = ts_tunnel::PeerId(id.0);
+        peer.node_key = ts_tunnel::NodeKeyPair::new().public;
+        apply_tunnel_peer(&mut wg, id, &peer, None);
+        assert_eq!(wg.peer_key(tunnel_id), Some(peer.node_key));
+        // Stage a handshake so expiry must also remove its queue, ID and retransmit timer.
+        assert!(
+            !wg.send([(tunnel_id, vec![PacketMut::from(&b"staged"[..])])])
+                .to_peers
+                .is_empty()
+        );
+        assert!(wg.next_event().is_some());
+        peer.expired = true;
+        apply_tunnel_peer(&mut wg, id, &peer, None);
+        assert_eq!(wg.peer_key(tunnel_id), None);
+        assert!(wg.next_event().is_none());
+        assert!(!wg.remove_peer(tunnel_id));
+        apply_tunnel_peer(&mut wg, id, &peer, None); // Repeated expired snapshot is idempotent.
+        assert_eq!(wg.peer_key(tunnel_id), None);
+        peer.expired = false;
+        apply_tunnel_peer(&mut wg, id, &peer, None);
+        assert_eq!(wg.peer_key(tunnel_id), Some(peer.node_key));
+        assert!(wg.next_event().is_none());
     }
 
     /// This node's advertisement source addresses (Go `self.Addresses()` as
