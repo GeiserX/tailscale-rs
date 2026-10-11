@@ -55,6 +55,7 @@ mod all_port;
 mod class;
 mod dialer;
 mod forwarder;
+mod port_gate;
 mod tcp;
 mod udp;
 
@@ -64,3 +65,4 @@ pub use dialer::{
     RealDialer,
 };
 pub use forwarder::{Forwarder, PortSpec, RouteUpdater};
+pub use port_gate::{Admit, PortGate};

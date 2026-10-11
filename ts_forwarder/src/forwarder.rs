@@ -2,12 +2,13 @@
 
 use std::sync::Arc;
 
-use ts_netstack_smoltcp::netcore::Channel;
+use ts_netstack_smoltcp::{WakingPipeSender, netcore::Channel};
 
 use crate::{
-    all_port::{run_tcp_all_ports, run_udp_all_ports},
+    all_port::{run_gated_all_ports, run_tcp_all_ports, run_udp_all_ports},
     class::RouteTable,
     dialer::RealDialer,
+    port_gate::{OpenRequests, PortGate},
     tcp::run_tcp_port,
     udp::run_udp_port,
 };
@@ -50,6 +51,8 @@ pub struct Forwarder<D: RealDialer> {
     routes_rx: tokio::sync::watch::Receiver<RouteTable>,
     tcp: PortSpec,
     udp: PortSpec,
+    /// Gated all-port mode: open requests from the [`PortGate`] in front of the netstack ingress.
+    gated: Option<(PortGate, OpenRequests)>,
 }
 
 impl<D: RealDialer> Forwarder<D> {
@@ -105,7 +108,33 @@ impl<D: RealDialer> Forwarder<D> {
             routes_rx,
             tcp,
             udp,
+            gated: None,
         }
+    }
+
+    /// Construct an all-port forwarder whose ingress goes through a [`PortGate`].
+    ///
+    /// `ingress` is the forwarder netstack's ingress queue. Every inbound packet must be offered
+    /// to the returned gate ([`PortGate::ingress`]) instead of being written to `ingress`
+    /// directly: the gate holds the first packets to a port with no listener yet and releases them
+    /// once it is registered, so no SYN, DNS query or QUIC Initial is lost to a cold port. Ports,
+    /// routes and dialing otherwise behave as in [`Forwarder::all_ports`].
+    pub fn all_ports_gated(
+        channel: Channel,
+        routes: RouteTable,
+        dialer: D,
+        ingress: WakingPipeSender,
+    ) -> (Self, PortGate) {
+        let (gate, requests) = PortGate::new(ingress, crate::all_port::MAX_PORTS);
+        let mut fwd = Self::new_with_spec(
+            channel,
+            routes,
+            dialer,
+            PortSpec::Ports(vec![]),
+            PortSpec::Ports(vec![]),
+        );
+        fwd.gated = Some((gate.clone(), requests));
+        (fwd, gate)
     }
 
     /// A handle for updating the advertised route table while the forwarder runs.
@@ -129,6 +158,15 @@ impl<D: RealDialer> Forwarder<D> {
     pub async fn run(self) -> Result<(), ts_netstack_smoltcp::netcore::Error> {
         let mut tasks = tokio::task::JoinSet::new();
 
+        if let Some((gate, requests)) = self.gated {
+            let channel = self.channel.clone();
+            let routes = self.routes_rx.clone();
+            let dialer = self.dialer.clone();
+            tasks.spawn(async move {
+                run_gated_all_ports(channel, routes, dialer, gate, requests).await
+            });
+        }
+
         match self.tcp {
             PortSpec::Ports(ports) => {
                 for port in ports {
@@ -138,9 +176,9 @@ impl<D: RealDialer> Forwarder<D> {
                     // Explicit-port mode: no global cap. The port set is operator-configured and
                     // bounded, so the per-port caps suffice; a global cap could wrongly throttle a
                     // legitimately busy multi-port config. (All-port mode passes `Some(..)`.)
-                    tasks.spawn(
-                        async move { run_tcp_port(channel, port, routes, dialer, None).await },
-                    );
+                    tasks.spawn(async move {
+                        run_tcp_port(channel, port, routes, dialer, None, None).await
+                    });
                 }
             }
             PortSpec::All => {
@@ -159,9 +197,9 @@ impl<D: RealDialer> Forwarder<D> {
                     let dialer = self.dialer.clone();
                     // Explicit-port mode: no global cap (bounded, operator-chosen port set; the
                     // per-port caps suffice). All-port mode passes `Some(..)`.
-                    tasks.spawn(
-                        async move { run_udp_port(channel, port, routes, dialer, None).await },
-                    );
+                    tasks.spawn(async move {
+                        run_udp_port(channel, port, routes, dialer, None, None, None).await
+                    });
                 }
             }
             PortSpec::All => {

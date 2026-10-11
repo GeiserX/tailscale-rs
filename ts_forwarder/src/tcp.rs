@@ -43,10 +43,14 @@ pub(crate) async fn run_tcp_port<D: RealDialer>(
     routes: tokio::sync::watch::Receiver<RouteTable>,
     dialer: Arc<D>,
     global_inflight: Option<Arc<Semaphore>>,
+    ready: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), ts_netstack_smoltcp::netcore::Error> {
     let listen_addr = std::net::SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), port);
     let listener = channel.tcp_listen(listen_addr).await?;
     tracing::debug!(%port, "tcp forwarder listening");
+    if let Some(ready) = ready {
+        let _ = ready.send(());
+    }
 
     // Bounds concurrent spliced flows on this listener; saturated => drop new flows.
     let inflight = Arc::new(Semaphore::new(MAX_INFLIGHT_SPLICES));
@@ -237,7 +241,7 @@ mod tests {
             let d = dialer.clone();
             let g = global.clone();
             tokio::spawn(async move {
-                let _ = run_tcp_port(ch, port, rx, d, Some(g)).await;
+                let _ = run_tcp_port(ch, port, rx, d, Some(g), None).await;
             });
         }
 
