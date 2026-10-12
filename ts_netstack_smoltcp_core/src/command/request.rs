@@ -149,7 +149,15 @@ pub fn request_nonblocking(
             command,
             resp: resp_tx,
         }) {
-            Ok(_) | Err(flume::TrySendError::Full(_)) => Ok(()),
+            Ok(_) => Ok(()),
+            // Only possible with an explicitly bounded channel (`Config::command_channel_capacity`).
+            Err(flume::TrySendError::Full(request)) => {
+                tracing::warn!(
+                    command = ?request.command,
+                    "netstack command channel full; dropping a fire-and-forget command"
+                );
+                Ok(())
+            }
             Err(flume::TrySendError::Disconnected(_)) => Err(ChannelClosedError),
         }
     }

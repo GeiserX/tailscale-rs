@@ -1142,3 +1142,24 @@ mod handle_aba_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod teardown_delivery_tests {
+    use smoltcp::time::Instant;
+
+    use crate::{Config, HasChannel, Netstack, command::tcp};
+
+    /// Fire-and-forget teardown commands (`Close` on drop, `ShutdownWrite`) can't wait for channel
+    /// space, so the default channel must never be full: with the old bound of 32, the 33rd
+    /// concurrent FIN was silently dropped and its peer waited for the idle timeout.
+    #[test]
+    fn default_channel_never_drops_fire_and_forget_commands() {
+        let stack = Netstack::new(Config::default(), Instant::ZERO);
+        let channel = stack.command_channel();
+        for _ in 0..1000 {
+            crate::request_nonblocking(&channel, None, tcp::stream::Command::ShutdownWrite)
+                .expect("netstack alive");
+        }
+        assert_eq!(stack.command_rx.len(), 1000);
+    }
+}

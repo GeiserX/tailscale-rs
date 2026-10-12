@@ -5,7 +5,12 @@ use core::time::Duration;
 pub struct Config {
     /// Capacity of the command channel.
     ///
-    /// If `None`, the channel is unbounded.
+    /// If `None` (the default), the channel is unbounded. That does not let commands pile up
+    /// without limit: every `request` waits for its own response, so the commands in flight are
+    /// bounded by the number of outstanding socket operations (about two per socket). A bound only
+    /// matters for the fire-and-forget teardown commands (`Close` on drop, TCP `ShutdownWrite`),
+    /// which cannot wait for space, so a full bounded channel drops them: a peer then never gets
+    /// its FIN, and the socket lingers until the idle timeout reaps it.
     pub command_channel_capacity: Option<usize>,
 
     /// Maximum transmission unit of the underlying net device.
@@ -85,7 +90,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            command_channel_capacity: Some(32),
+            command_channel_capacity: None,
 
             mtu: 1500,
 
