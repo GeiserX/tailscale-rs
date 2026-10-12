@@ -126,6 +126,24 @@ async fn rebind_socket(prefer_port: u16, want_v6: bool) -> std::io::Result<UdpSo
     UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).await
 }
 
+/// Underlay socket buffer size, both directions (Go magicsock's `socketBufferSize`).
+const SOCKET_BUFFER_SIZE: usize = 7 << 20;
+
+/// Raise the underlay socket's send and receive buffers to [`SOCKET_BUFFER_SIZE`], as Go's magicsock
+/// does. The defaults are small (macOS: a 9216-byte UDP send buffer, about seven WireGuard packets),
+/// so a burst overflows them and the excess is dropped (`ENOBUFS` on send), which TCP inside the
+/// tunnel then has to recover from. Best effort: the kernel may clamp the size, and a failure only
+/// costs throughput.
+pub(crate) fn tune_socket_buffers(sock: &UdpSocket) {
+    let s = socket2::SockRef::from(sock);
+    if let Err(e) = s.set_send_buffer_size(SOCKET_BUFFER_SIZE) {
+        tracing::debug!(error = %e, "magicsock: could not raise UDP send buffer");
+    }
+    if let Err(e) = s.set_recv_buffer_size(SOCKET_BUFFER_SIZE) {
+        tracing::debug!(error = %e, "magicsock: could not raise UDP receive buffer");
+    }
+}
+
 /// Verifies a disco key's identity against the control netmap before we act on a disco frame.
 ///
 /// Called with the sender's disco key and:
@@ -383,6 +401,7 @@ impl MagicSock {
         our_node_key: NodePublicKey,
     ) -> Result<Self, Error> {
         let sock = UdpSocket::bind(bind_addr).await?;
+        tune_socket_buffers(&sock);
         Ok(Self {
             sock: Mutex::new(Arc::new(sock)),
             our_disco,
@@ -499,6 +518,8 @@ impl MagicSock {
                 return Err(e.into());
             }
         };
+
+        tune_socket_buffers(&new_sock);
 
         // Swap the socket atomically. The old `Arc<UdpSocket>` drops once outstanding clones release
         // it, which unblocks any `recv_from` parked on it so the recv pump loops onto the new socket.

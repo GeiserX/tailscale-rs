@@ -29,6 +29,9 @@ ts_transport.workspace = true
 # only `libc`/`windows-sys`, no TLS stack (verified via `cargo tree`), keeping the egress path clean.
 if-addrs = "0.15"
 rand.workspace = true
+# SO_SNDBUF / SO_RCVBUF on the underlay socket (`tune_socket_buffers`). Already in the lockfile via
+# tokio.
+socket2 = "0.6"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "sync", "rt", "time", "macros"] }
 tracing.workspace = true

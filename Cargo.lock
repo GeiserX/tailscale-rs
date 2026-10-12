@@ -2156,6 +2156,7 @@ dependencies = [
  "geiserx_ts_transport",
  "if-addrs",
  "rand 0.10.3",
+ "socket2",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -2333,6 +2334,7 @@ name = "geiserx_ts_runtime"
 version = "0.57.4"
 dependencies = [
  "base64 0.22.1",
+ "bytes",
  "chrono",
  "ed25519-dalek 2.2.0",
  "etherparse",
