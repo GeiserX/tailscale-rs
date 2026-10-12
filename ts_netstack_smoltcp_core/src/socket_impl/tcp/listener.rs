@@ -152,7 +152,7 @@ impl Netstack {
                         tcp::State::CloseWait => {
                             tracing::trace!("half-open socket moved to CLOSE-WAIT, closing");
                             sock.close();
-                            self.pending_tcp_closes.push(*half_open);
+                            self.pending_tcp_closes.insert(*half_open);
                             if self.pending_tcp_closes.len() > 10000 {
                                 tracing::warn!("large number of pending closes");
                             }
@@ -191,7 +191,7 @@ impl Netstack {
                         tcp::State::CloseWait => {
                             tracing::trace!(?state, "accept socket no longer established, closing");
                             sock.close();
-                            self.pending_tcp_closes.push(accept);
+                            self.pending_tcp_closes.insert(accept);
                             continue;
                         }
                         _ => {
@@ -232,7 +232,8 @@ impl Netstack {
 
                 sock.close();
 
-                self.pending_tcp_closes.push(listener.current_socket_handle);
+                self.pending_tcp_closes
+                    .insert(listener.current_socket_handle);
 
                 let accept_handles = listener
                     .half_open_queue
@@ -243,7 +244,7 @@ impl Netstack {
                     let sock = self.socket_set.get_mut::<tcp::Socket>(pending_accept);
                     sock.close();
 
-                    self.pending_tcp_closes.push(pending_accept);
+                    self.pending_tcp_closes.insert(pending_accept);
                 }
 
                 Response::Ok
@@ -332,7 +333,7 @@ impl Netstack {
                     listening_on = %local_endpoint,
                     "partially-established listening socket reset or closed");
                 self.socket_set.get_mut::<tcp::Socket>(current).close();
-                self.pending_tcp_closes.push(current);
+                self.pending_tcp_closes.insert(current);
             }
         }
 
@@ -419,7 +420,7 @@ impl Netstack {
             // `drain_tcp_closes` without a `FinWait` lifetime: abort moves the socket to `Closed`
             // synchronously, which is exactly the state `drain_tcp_closes` reaps.
             self.socket_set.get_mut::<tcp::Socket>(victim).abort();
-            self.pending_tcp_closes.push(victim);
+            self.pending_tcp_closes.insert(victim);
             // Same diagnostic guard as the accept-path close: under a sustained flood every shed
             // victim lands here, and `drain_tcp_closes` only runs once per poll, so a burst can
             // pile up between drains.
@@ -633,7 +634,7 @@ mod tests {
             "abort() reaches Closed synchronously"
         );
 
-        stack.drain_tcp_closes();
+        stack.drain_tcp_closes(stack.next_orphan_sweep);
 
         // After drain, the handle is gone from both the pending list and the socket set (its
         // buffers are freed). A `get` on a removed handle would panic, so assert via the registry.

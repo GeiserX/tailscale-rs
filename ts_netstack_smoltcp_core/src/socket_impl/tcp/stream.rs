@@ -1,8 +1,5 @@
 use bytes::Bytes;
-use smoltcp::{
-    iface::SocketHandle,
-    socket::{AnySocket, tcp},
-};
+use smoltcp::{iface::SocketHandle, socket::tcp};
 
 use crate::{
     Netstack,
@@ -49,6 +46,7 @@ impl Netstack {
                 }
 
                 let handle = self.add_socket(sock);
+                self.connecting_tcp_sockets.insert(handle);
 
                 Response::WouldBlock {
                     handle: Some(handle),
@@ -117,11 +115,11 @@ impl Netstack {
                 // `Drop`-time `Close` can arrive after the idle/keep-alive timeout drove the socket
                 // to `Closed` and `reap_orphaned_closed_tcp` freed it. The socket is already gone,
                 // so a raw `get_mut` would panic the actor; `missing_socket` is the right answer and
-                // the `pending_tcp_closes.push` is correctly skipped by the early return.
+                // the `pending_tcp_closes.insert` is correctly skipped by the early return.
                 let sock = get_socket_mut!(self, tcp::Socket, Some(handle));
                 sock.close();
 
-                self.pending_tcp_closes.push(handle);
+                self.pending_tcp_closes.insert(handle);
 
                 Response::Ok
             }
@@ -145,29 +143,29 @@ impl Netstack {
 
     /// Drop all TCP sockets that have finished closing.
     #[tracing::instrument(level = "trace", skip_all)]
-    pub(crate) fn drain_tcp_closes(&mut self) {
-        // Take the list out so the `retain` closure doesn't hold a borrow of `*self`: removing a
-        // socket now goes through `remove_socket` (which needs `&mut self` for the gen-map), and a
-        // method call inside a `pending_tcp_closes.retain` closure would conflict with that borrow.
+    pub(crate) fn drain_tcp_closes(&mut self, now: smoltcp::time::Instant) -> bool {
+        let before = self.tcp_socket_count;
+        // Reset connects historically disappeared before the next replay, producing missing_socket.
+        // Check only outstanding connects so the bounded orphan cadence preserves that behavior.
+        let mut connecting = core::mem::take(&mut self.connecting_tcp_sockets);
+        connecting.retain(|&handle| {
+            if !self.socket_matches::<tcp::Socket>(handle) {
+                return false;
+            }
+            let sock = self.socket_set.get::<tcp::Socket>(handle);
+            if sock.state() == tcp::State::Closed && !sock.can_recv() {
+                self.remove_socket(handle);
+                return false;
+            }
+            matches!(sock.state(), tcp::State::SynSent | tcp::State::SynReceived)
+        });
+        self.connecting_tcp_sockets = connecting;
+
+        // Take the deduplicated set out to allow removal through the registry wrapper.
         let mut pending = core::mem::take(&mut self.pending_tcp_closes);
         pending.retain(|&handle| {
-            // `pending_tcp_closes` is a `Vec` with no dedup, and the eight push sites are not
-            // proven disjoint per handle, so the same handle CAN appear twice. The first
-            // occurrence's `remove_socket` then frees the slot, and a naive
-            // `socket_set.get::<tcp::Socket>(handle)` on the second occurrence PANICS (smoltcp's
-            // `get` panics on a removed handle), killing the netstack actor. Guard with the same
-            // existence scan `get_socket_mut!` uses: a handle no longer in the set is already gone
-            // (reaped here, by the orphan reap, or elsewhere) — drop it from `pending` without a
-            // second remove. (tsr-ufm)
-            //
-            // The slot may also have been recycled by a socket of ANOTHER type, in which case the
-            // existence check passes and the typed `get::<tcp::Socket>` below panics instead
-            // (#297). Match on the type as well as the handle.
-            let matches_type = self.socket_set.iter().any(|(h, socket)| {
-                h == handle
-                    && <tcp::Socket as smoltcp::socket::AnySocket<'_>>::downcast(socket).is_some()
-            });
-            if !matches_type {
+            // Covers a removed slot and #297's recycled slot of another socket type.
+            if !self.socket_matches::<tcp::Socket>(handle) {
                 return false;
             }
 
@@ -189,7 +187,11 @@ impl Netstack {
         // own (the iter42 idle/keep-alive timeout firing on a dead/idle accepted stream). The first
         // pass only scans `pending_tcp_closes`, so a socket the consumer never explicitly closed —
         // and never polls — would otherwise pin its slot + ~512 KiB of buffers forever.
-        self.reap_orphaned_closed_tcp();
+        if self.tcp_socket_count > 0 && now >= self.next_orphan_sweep {
+            self.next_orphan_sweep = now + crate::ORPHAN_SWEEP_INTERVAL;
+            self.reap_orphaned_closed_tcp();
+        }
+        self.tcp_socket_count != before
     }
 
     /// Reclaim consumer-owned TCP sockets that reached `Closed` without ever being queued for close.
@@ -199,16 +201,17 @@ impl Netstack {
     /// RST — but the in-memory socket lingers until the consumer next touches its [`TcpStream`]
     /// (`Drop` → `Close` → `pending_tcp_closes`). An idle, non-polling consumer never triggers that,
     /// so [`Netstack::drain_tcp_closes`]'s `pending_tcp_closes`-only scan never reclaims it. This
-    /// second pass closes that gap.
+    /// second pass closes that gap. It runs at most once per 100 ms; `poll_at` includes its
+    /// deadline, and I/O pollers call the drain even without packet progress.
     ///
     /// A reaped handle is freed via [`Netstack::remove_socket`], so its generation is cleared in
-    /// `handle_gens`; any blocked command still referencing it is dropped on replay by the
+    /// `socket_registry`; any blocked command still referencing it is dropped on replay by the
     /// generation guard (iter65, ABA fix). A consumer's *next* first-touch command against the
     /// reaped handle returns `missing_socket` rather than panicking — the four direct handlers in
     /// [`Netstack::process_tcp_stream`] route through `get_socket_mut!` for exactly this.
     ///
     /// The predicate is deliberately conservative — only reap a socket that is ALL of:
-    /// - a TCP socket (the heterogeneous `socket_set` also holds Raw/Icmp/Udp; downcast + skip),
+    /// - a TCP socket (kind checked in the heterogeneous registry),
     /// - **fully** `Closed` (NOT a half-closed `FinWait*`/`CloseWait`/`Closing`/`TimeWait`/`LastAck`
     ///   — per iter48 a half-closed socket's receive side may still be open, so it is not orphaned),
     /// - rx-empty (`!can_recv()`): a timeout-`Closed` socket can still hold unread RX the consumer
@@ -217,6 +220,8 @@ impl Netstack {
     /// - not referenced by any listener (a listener's current/half-open/accept-queue sockets are
     ///   netstack-owned, not consumer-owned — reaping one would desync the listener).
     fn reap_orphaned_closed_tcp(&mut self) {
+        self.metrics.record(crate::Metric::OrphanSweeps, 1);
+
         // Exclusion set: every handle a listener still owns is netstack-internal, never orphaned.
         let mut owned: alloc::collections::BTreeSet<SocketHandle> = Default::default();
         for l in self.tcp_listeners.values() {
@@ -225,22 +230,23 @@ impl Netstack {
             owned.extend(l.accept_queue.iter().copied());
         }
 
-        // Collect victims first (immutable `iter()` borrow), then remove (needs `&mut self`): the
-        // collect must finish — releasing the borrow — before the `remove_socket` loop. smoltcp's
-        // `socket_set.iter()` yields `(SocketHandle, &Socket)` over a heterogeneous set, so downcast
-        // to `tcp::Socket` and skip non-TCP. Never use `socket_set.get::<tcp::Socket>(h)` here: it
-        // panics on a non-TCP or stale handle.
+        // Iterate live registry entries rather than the socket storage high-water mark.
+        // Collect victims before removing them through the wrappers.
         let victims: alloc::vec::Vec<SocketHandle> = self
-            .socket_set
+            .socket_registry
             .iter()
-            .filter_map(|(h, s)| tcp::Socket::downcast(s).map(|t| (h, t)))
-            .filter(|(h, t)| {
-                t.state() == tcp::State::Closed
+            .filter_map(|(&h, entry)| {
+                self.metrics.record(crate::Metric::OrphanSocketVisits, 1);
+                if entry.kind != crate::SocketKind::Tcp {
+                    return None;
+                }
+                let t = self.socket_set.get::<tcp::Socket>(h);
+                (t.state() == tcp::State::Closed
                     && !t.can_recv()
-                    && !owned.contains(h)
-                    && !self.pending_tcp_closes.contains(h)
+                    && !owned.contains(&h)
+                    && !self.pending_tcp_closes.contains(&h))
+                .then_some(h)
             })
-            .map(|(h, _)| h)
             .collect();
 
         for h in victims {
@@ -248,16 +254,17 @@ impl Netstack {
                 handle = ?h,
                 "reaping autonomously-closed consumer-owned TCP socket (tsr-9ue)"
             );
-            // `remove_socket` (not raw `socket_set.remove`) so `handle_gens` stays consistent.
+            // `remove_socket` (not raw `socket_set.remove`) so `socket_registry` stays consistent.
             self.remove_socket(h);
         }
     }
 
     fn check_conn(&mut self, handle: SocketHandle, orig_cmd: TcpStreamCommand) -> Response {
-        let sock = self.socket_set.get_mut::<tcp::Socket>(handle);
+        let sock = get_socket_mut!(self, tcp::Socket, Some(handle));
 
         match sock.state() {
             tcp::State::Established => {
+                self.connecting_tcp_sockets.remove(&handle);
                 tracing::trace!("connection succeeded");
                 TcpStreamResponse::Connected { handle }.into()
             }
@@ -269,7 +276,7 @@ impl Netstack {
 
             _ => {
                 tracing::warn!("connecting socket was reset or closed");
-                self.pending_tcp_closes.push(handle);
+                self.pending_tcp_closes.insert(handle);
                 Response::Error(Error::ConnectionReset)
             }
         }
@@ -281,7 +288,11 @@ mod reap_tests {
     use core::net::SocketAddr;
 
     use bytes::Bytes;
-    use smoltcp::{phy::Medium, socket::tcp, time::Instant};
+    use smoltcp::{
+        phy::Medium,
+        socket::{AnySocket, tcp},
+        time::Instant,
+    };
 
     use super::*;
     use crate::{Config, Netstack, Pipe, PipeDev};
@@ -400,7 +411,7 @@ mod reap_tests {
         assert!(!stack.socket_set.get::<tcp::Socket>(accepted).can_recv());
         assert!(!stack.pending_tcp_closes.contains(&accepted));
 
-        stack.drain_tcp_closes();
+        stack.drain_tcp_closes(stack.next_orphan_sweep);
 
         assert!(
             !present(&stack, accepted),
@@ -455,7 +466,7 @@ mod reap_tests {
             "abort() must not discard unread RX"
         );
 
-        stack.drain_tcp_closes();
+        stack.drain_tcp_closes(stack.next_orphan_sweep);
         assert!(
             present(&stack, accepted),
             "a Closed socket with unread RX must NOT be reaped (data-loss guard)"
@@ -468,7 +479,7 @@ mod reap_tests {
             .recv(|buf| (buf.len(), ()));
         assert!(!stack.socket_set.get::<tcp::Socket>(accepted).can_recv());
 
-        stack.drain_tcp_closes();
+        stack.drain_tcp_closes(stack.next_orphan_sweep);
         assert!(
             !present(&stack, accepted),
             "once RX is drained, the orphaned Closed socket is reaped"
@@ -489,7 +500,7 @@ mod reap_tests {
             "close() on an established socket yields FinWait1 (half-closed)"
         );
 
-        stack.drain_tcp_closes();
+        stack.drain_tcp_closes(stack.next_orphan_sweep);
         assert!(
             present(&stack, accepted),
             "a half-closed (FinWait1) socket must NOT be reaped — its read side may still be open"
@@ -536,7 +547,7 @@ mod reap_tests {
         // The listener's current (LISTEN) socket is also owned; capture it to assert it survives.
         let current = stack.tcp_listeners[&lh].current_socket_handle;
 
-        stack.drain_tcp_closes();
+        stack.drain_tcp_closes(stack.next_orphan_sweep);
 
         assert!(
             present(&stack, half_open),
@@ -566,7 +577,7 @@ mod reap_tests {
         // The `Bound` response already proves this slot holds a UDP socket; the reap's downcast to
         // `tcp::Socket` returns `None` for it, so it is skipped rather than reaped.
 
-        stack.drain_tcp_closes();
+        stack.drain_tcp_closes(stack.next_orphan_sweep);
 
         assert!(
             present(&stack, udp_handle),
@@ -589,7 +600,7 @@ mod reap_tests {
 
         // Reap it (autonomously Closed + drained).
         stack.socket_set.get_mut::<tcp::Socket>(accepted).abort();
-        stack.drain_tcp_closes();
+        stack.drain_tcp_closes(stack.next_orphan_sweep);
         assert!(!present(&stack, accepted), "socket must be reaped first");
 
         let udp_handle = match stack.process_udp(
@@ -714,10 +725,140 @@ mod reap_tests {
             tcp::State::SynSent
         );
 
-        stack.drain_tcp_closes();
+        // The sweep deadline must not hide an earlier SYN/retransmit deadline.
+        assert_eq!(stack.poll_at(Instant::ZERO), Some(Instant::ZERO));
+        stack.drain_tcp_closes(stack.next_orphan_sweep);
         assert!(
             present(&stack, connecting),
             "a SynSent connecting socket is not Closed, so the reap must leave it alone"
         );
+    }
+    #[test]
+    fn orphan_sweeps_are_bounded_and_closed_socket_is_reaped_by_deadline() {
+        let (mut stack, mut dev, accepted) = establish_accepted(8010);
+        stack.socket_set.get_mut::<tcp::Socket>(accepted).abort();
+        let before = stack.metrics.counts();
+        for millis in 0..100 {
+            assert!(!stack.drain_tcp_closes(Instant::from_millis(millis)));
+            assert!(stack.handle_gen(accepted).is_some());
+        }
+        assert_eq!(stack.metrics.counts().orphan_sweeps, before.orphan_sweeps);
+        assert_eq!(
+            stack.metrics.counts().orphan_socket_visits,
+            before.orphan_socket_visits
+        );
+        stack.poll_device_io(Instant::from_millis(100), &mut dev);
+        assert_eq!(stack.handle_gen(accepted), None);
+        assert_eq!(
+            stack.metrics.counts().orphan_sweeps,
+            before.orphan_sweeps + 1
+        );
+        let visits = stack.metrics.counts().orphan_socket_visits;
+        for _ in 0..100 {
+            stack.drain_tcp_closes(Instant::from_millis(100));
+        }
+        assert_eq!(stack.metrics.counts().orphan_socket_visits, visits);
+        assert_eq!(stack.next_orphan_sweep, Instant::from_millis(200));
+    }
+
+    #[test]
+    fn idle_sync_poller_reclaims_without_packet_progress() {
+        let mut stack = Netstack::new(Config::default(), Instant::ZERO);
+        assert_eq!(stack.poll_at(Instant::ZERO), None);
+        let socket = stack.new_tcp_socket();
+        let handle = stack.add_socket(socket);
+        assert_eq!(
+            stack.poll_at(Instant::ZERO),
+            Some(Instant::from_millis(100))
+        );
+        assert_eq!(
+            stack.poll_delay(Instant::from_millis(25)),
+            Some(core::time::Duration::from_millis(75))
+        );
+        assert_eq!(
+            stack.poll_delay(Instant::from_millis(110)),
+            Some(core::time::Duration::ZERO)
+        );
+        let mut dev = loopback_dev();
+        assert!(!stack.poll_device_io(Instant::ZERO, &mut dev));
+        assert!(stack.poll_device_io(Instant::from_millis(100), &mut dev));
+        assert!(stack.handle_gen(handle).is_none());
+        assert_eq!(stack.poll_at(Instant::from_millis(100)), None);
+    }
+
+    #[test]
+    fn idle_async_poller_reclaims_without_device_capacity() {
+        use core::{
+            pin::Pin,
+            task::{Context, Poll, Waker},
+        };
+
+        use crate::AsyncWakeDevice;
+        struct IdleDev(crate::util::NoopCapDev);
+        impl smoltcp::phy::Device for IdleDev {
+            type RxToken<'a> = <crate::util::NoopCapDev as smoltcp::phy::Device>::RxToken<'a>;
+            type TxToken<'a> = <crate::util::NoopCapDev as smoltcp::phy::Device>::TxToken<'a>;
+            fn receive(&mut self, _: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+                None
+            }
+            fn transmit(&mut self, _: Instant) -> Option<Self::TxToken<'_>> {
+                None
+            }
+            fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
+                self.0.capabilities()
+            }
+        }
+        impl AsyncWakeDevice for IdleDev {
+            fn poll_rx(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+                Poll::Pending
+            }
+            fn poll_tx(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+                Poll::Pending
+            }
+        }
+        let mut stack = Netstack::new(Config::default(), Instant::ZERO);
+        let socket = stack.new_tcp_socket();
+        let handle = stack.add_socket(socket);
+        let mut dev = IdleDev(crate::util::NoopCapDev::with_caps(|_| {}));
+        let mut cx = Context::from_waker(Waker::noop());
+        {
+            let mut io = stack.wait_io_async(Instant::ZERO, &mut dev);
+            assert!(Pin::new(&mut io).poll(&mut cx).is_pending());
+        }
+        {
+            let mut io = stack.wait_io_async(Instant::from_millis(100), &mut dev);
+            assert!(Pin::new(&mut io).poll(&mut cx).is_ready());
+        }
+        assert!(stack.handle_gen(handle).is_none());
+        assert_eq!(stack.metrics.counts().orphan_sweeps, 1);
+    }
+    #[test]
+    fn reset_connect_is_reclaimed_promptly_without_an_orphan_sweep() {
+        let mut stack = Netstack::new(
+            Config {
+                loopback: true,
+                ..Default::default()
+            },
+            Instant::ZERO,
+        );
+        let handle = match stack.process_tcp_stream(
+            TcpStreamCommand::Connect {
+                local_endpoint: SocketAddr::from(([127, 0, 0, 1], 50000)),
+                remote_endpoint: SocketAddr::from(([127, 0, 0, 1], 80)),
+            },
+            None,
+        ) {
+            Response::WouldBlock {
+                handle: Some(h), ..
+            } => h,
+            other => panic!("expected blocked connect, got {other:?}"),
+        };
+        assert!(stack.connecting_tcp_sockets.contains(&handle));
+        stack.socket_set.get_mut::<tcp::Socket>(handle).abort();
+        assert!(stack.drain_tcp_closes(Instant::ZERO));
+        assert!(stack.handle_gen(handle).is_none());
+        assert!(stack.connecting_tcp_sockets.is_empty());
+        assert_eq!(stack.metrics.counts().orphan_sweeps, 0);
+        assert_eq!(stack.metrics.counts().orphan_socket_visits, 0);
     }
 }

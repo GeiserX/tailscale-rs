@@ -4,7 +4,7 @@ use core::net::SocketAddr;
 use bytes::Bytes;
 use smoltcp::{
     iface::SocketHandle,
-    socket::{AnySocket, udp},
+    socket::udp,
     wire::{IpListenEndpoint, IpVersion},
 };
 
@@ -170,10 +170,7 @@ impl crate::Netstack {
                 // `remove` panics on a stale handle. A `Close` is never re-queued, but a caller
                 // could send it twice, so guard the double-close rather than panic the netstack.
                 let handle = unwrap_handle!(handle);
-                let matches_type = self
-                    .socket_set
-                    .iter()
-                    .any(|(h, socket)| h == handle && udp::Socket::downcast(socket).is_some());
+                let matches_type = self.socket_matches::<udp::Socket>(handle);
                 if matches_type {
                     self.remove_socket(handle);
                 }

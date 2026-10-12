@@ -13,9 +13,8 @@ pub extern crate flume;
 pub extern crate smoltcp;
 
 use alloc::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     vec,
-    vec::Vec,
 };
 use core::{
     net::IpAddr,
@@ -31,6 +30,8 @@ use smoltcp::{
 mod command;
 mod config;
 mod pipe;
+pub mod pipeline_metrics;
+mod registry;
 mod socket_impl;
 mod stack_control_impl;
 mod util;
@@ -43,14 +44,20 @@ pub use command::{
 };
 pub use config::Config;
 pub use pipe::{Pipe, PipeDev};
+use pipeline_metrics::{Metric, Metrics};
+use registry::{RegisteredSocket, SocketEntry, SocketKind};
 pub use socket_impl::tcp::ListenerHandle as TcpListenerHandle;
 pub use stack_control_impl::NetstackControl;
 use util::NoopCapDev;
 pub use util::{DisplayExt, DisplayToDebug, OptionExt, ResultExt};
 pub use wake_device::AsyncWakeDevice;
 
+/// Maximum delay from an rx-empty consumer socket reaching Closed to reclamation.
+const ORPHAN_SWEEP_INTERVAL: smoltcp::time::Duration = smoltcp::time::Duration::from_millis(100);
+
 /// Internally i/o free userspace network stack built around `smoltcp`.
 pub struct Netstack {
+    metrics: Metrics,
     config: Config,
 
     iface: smoltcp::iface::Interface,
@@ -71,20 +78,26 @@ pub struct Netstack {
     /// command is dropped with `missing_socket` instead of being mis-delivered to the new socket.
     blocked_commands: VecDeque<(Request, Option<u64>)>,
 
-    /// Per-handle generation counter, stamped on every `add` and cleared on every `remove` (see
+    /// Per-handle generation and socket kind, stamped on every `add` and cleared on every `remove` (see
     /// [`Netstack::add_socket`] / [`Netstack::remove_socket`]). A `SocketHandle` is just a slot
     /// index that smoltcp reuses on the next `add` after a `remove`, so the index alone cannot tell
     /// a recycled socket apart from the original; this map supplies the missing generation, checked
-    /// only on the requeue-replay path.
-    handle_gens: BTreeMap<SocketHandle, u64>,
+    /// on replay. Kind validates typed indexed access without walking socket storage.
+    socket_registry: BTreeMap<SocketHandle, SocketEntry>,
 
     /// Monotonic source for the next handle generation. Wraps on overflow (see
     /// [`Netstack::add_socket`]).
     next_gen: u64,
 
+    /// Count maintained by the socket wrappers; avoids a scan to arm maintenance.
+    tcp_socket_count: usize,
+    next_orphan_sweep: smoltcp::time::Instant,
+
     /// Set of TCP socket handles that are expected to close in the future, held onto for
     /// graceful shutdown.
-    pending_tcp_closes: Vec<SocketHandle>,
+    pending_tcp_closes: BTreeSet<SocketHandle>,
+    /// Connects awaiting a result: reset connects retain prompt reclamation without a full sweep.
+    connecting_tcp_sockets: BTreeSet<SocketHandle>,
 
     /// Active TCP listeners.
     ///
@@ -128,15 +141,19 @@ impl Netstack {
         };
 
         Netstack {
+            metrics: Metrics::new(),
             iface,
             socket_set: smoltcp::iface::SocketSet::new(vec![]),
             command_tx: tx,
             command_rx: rx,
             config: ns_config,
             blocked_commands: Default::default(),
-            handle_gens: BTreeMap::new(),
+            socket_registry: BTreeMap::new(),
             next_gen: 0,
+            tcp_socket_count: 0,
+            next_orphan_sweep: now + ORPHAN_SWEEP_INTERVAL,
             pending_tcp_closes: Default::default(),
+            connecting_tcp_sockets: Default::default(),
             tcp_listeners: Default::default(),
             next_tcp_listener_id: 0,
         }
@@ -145,7 +162,7 @@ impl Netstack {
     /// Add a socket to the set, stamping it with a fresh generation.
     ///
     /// This is the single chokepoint for socket creation: it pairs the slot index smoltcp hands
-    /// back with a monotonically-increasing generation in [`Netstack::handle_gens`], so a later
+    /// back with a monotonically-increasing generation in [`Netstack::socket_registry`], so a later
     /// `add` that reuses the same freed slot gets a *different* generation. The requeue-replay path
     /// uses that to tell a recycled socket apart from the one a blocked command originally
     /// referenced.
@@ -153,14 +170,20 @@ impl Netstack {
     /// `next_gen` uses `wrapping_add`: a collision would require 2^64 intervening `add`s *and* the
     /// same slot to be reused with the exact same generation within a single queued command's
     /// lifetime, which is not reachable in practice.
-    pub(crate) fn add_socket<T: smoltcp::socket::AnySocket<'static>>(
-        &mut self,
-        sock: T,
-    ) -> SocketHandle {
+    pub(crate) fn add_socket<T: RegisteredSocket>(&mut self, sock: T) -> SocketHandle {
         let h = self.socket_set.add(sock);
         let g = self.next_gen;
         self.next_gen = self.next_gen.wrapping_add(1);
-        self.handle_gens.insert(h, g);
+        self.socket_registry.insert(
+            h,
+            SocketEntry {
+                generation: g,
+                kind: T::KIND,
+            },
+        );
+        if T::KIND == SocketKind::Tcp {
+            self.tcp_socket_count += 1;
+        }
         h
     }
 
@@ -170,25 +193,54 @@ impl Netstack {
     /// once removed, [`Netstack::handle_gen`] reports `None` for the (now-free) slot until it is
     /// re-added with a new generation.
     pub(crate) fn remove_socket(&mut self, handle: SocketHandle) {
-        self.handle_gens.remove(&handle);
+        if self
+            .socket_registry
+            .remove(&handle)
+            .is_some_and(|entry| entry.kind == SocketKind::Tcp)
+        {
+            self.tcp_socket_count -= 1;
+        }
+        self.pending_tcp_closes.remove(&handle);
+        self.connecting_tcp_sockets.remove(&handle);
         self.socket_set.remove(handle);
     }
 
     /// Current generation of `handle`, or `None` if no live socket occupies that slot.
     pub(crate) fn handle_gen(&self, handle: SocketHandle) -> Option<u64> {
-        self.handle_gens.get(&handle).copied()
+        self.metrics.record(Metric::ValidationLookups, 1);
+        self.socket_registry
+            .get(&handle)
+            .map(|entry| entry.generation)
+    }
+
+    /// O(log n) membership/type validation before smoltcp's panicking indexed getter.
+    pub(crate) fn socket_matches<T: RegisteredSocket>(&self, handle: SocketHandle) -> bool {
+        self.metrics.record(Metric::ValidationLookups, 1);
+        self.socket_registry
+            .get(&handle)
+            .is_some_and(|entry| entry.kind == T::KIND)
     }
 
     /// Report the next time the netstack should be polled.
     pub fn poll_at(&mut self, now: smoltcp::time::Instant) -> Option<smoltcp::time::Instant> {
-        self.iface.poll_at(now, &self.socket_set)
+        let socket_deadline = self.iface.poll_at(now, &self.socket_set);
+        if self.tcp_socket_count == 0 {
+            return socket_deadline;
+        }
+        Some(socket_deadline.map_or(self.next_orphan_sweep, |deadline| {
+            deadline.min(self.next_orphan_sweep)
+        }))
     }
 
     /// Report the amount of time until the netstack should next be polled.
     pub fn poll_delay(&mut self, now: smoltcp::time::Instant) -> Option<core::time::Duration> {
-        self.iface
-            .poll_delay(now, &self.socket_set)
-            .map(|x| x.into())
+        self.poll_at(now).map(|deadline| {
+            if deadline > now {
+                (deadline - now).into()
+            } else {
+                core::time::Duration::ZERO
+            }
+        })
     }
 
     /// Process all commands available in the command queue.
@@ -400,11 +452,8 @@ impl Netstack {
             }
         }
 
-        if changed {
-            self.drain_tcp_closes();
-        }
-
-        changed
+        let reclaimed = self.drain_tcp_closes(now);
+        changed || reclaimed
     }
 
     /// Poll the device for all synchronously-available packets and process them.
@@ -422,10 +471,9 @@ impl Netstack {
     ///
     /// Unlike the synchronous [`poll_device_io`](Self::poll_device_io), this does **not** call
     /// `drain_tcp_closes`: the async driver loop (the netstack `Future`'s `poll`) owns that, calling
-    /// it once per poll after both ingress and egress have run (so a socket smoltcp drove to `Closed`
-    /// here — which always reports `Poll::Ready(true)` — is reaped in the same poll cycle). A future
+    /// it once per poll after ingress/egress, even without I/O progress. A future
     /// caller that drives this method outside that loop **must** call `drain_tcp_closes` itself, or
-    /// autonomously-Closed sockets will linger in `pending_tcp_closes` until the next drain.
+    /// Closed sockets may otherwise linger beyond the reclamation deadline.
     #[tracing::instrument(skip_all, fields(%now), ret, level = "trace")]
     pub fn poll_device_ingress_async(
         &mut self,
@@ -583,7 +631,12 @@ impl Netstack {
                 continue;
             }
 
+            self.metrics.record(Metric::ReplayAttempts, 1);
+            let before = self.blocked_commands.len();
             self.process_one_cmd(req);
+            if self.blocked_commands.len() == before {
+                self.metrics.record(Metric::ReplayCompletions, 1);
+            }
         }
     }
 
@@ -723,8 +776,8 @@ where
             }
         }
 
+        progress_made |= stack.drain_tcp_closes(now);
         if progress_made {
-            stack.drain_tcp_closes();
             Poll::Ready(())
         } else {
             Poll::Pending
@@ -895,7 +948,7 @@ mod handle_aba_tests {
         // different socket" without going through close/rebind. The queued gen (captured at requeue)
         // no longer matches the map.
         let new_gen = stack.handle_gen(handle).unwrap().wrapping_add(1);
-        stack.handle_gens.insert(handle, new_gen);
+        stack.socket_registry.get_mut(&handle).unwrap().generation = new_gen;
 
         stack.pump_blocked_commands();
 
@@ -1057,11 +1110,44 @@ mod handle_aba_tests {
         assert!(stack.blocked_commands.is_empty());
     }
 
-    /// tsr-ufm: `pending_tcp_closes` has no dedup, so the same handle can appear twice. The first
-    /// occurrence's `remove_socket` frees the slot; a naive `socket_set.get::<tcp::Socket>` on the
-    /// second occurrence would PANIC (smoltcp `get` panics on a removed handle), killing the actor.
-    /// `drain_tcp_closes` must instead existence-check each handle and drop the already-gone
-    /// duplicate without a second remove — and still fully reclaim the socket.
+    #[test]
+    fn replay_metrics_count_attempts_and_terminal_responses() {
+        let mut stack = Netstack::new(Config::default(), Instant::ZERO);
+        let handle = bind_udp(&mut stack, 1000);
+        let (recv_req, recv_rx) = req(Some(handle), udp::Command::Recv { max_len: None });
+        stack.process_one_cmd(recv_req);
+        stack.pump_blocked_commands();
+        stack.pump_blocked_commands();
+        assert_eq!(stack.metrics.counts().replay_attempts, 2);
+        assert_eq!(stack.metrics.counts().replay_completions, 0);
+        drop(recv_rx);
+        stack.pump_blocked_commands();
+        // Abandoned receives are skipped before execution and do not count as attempts.
+        assert_eq!(stack.metrics.counts().replay_attempts, 2);
+
+        let (connect, reply) = req(
+            None,
+            crate::tcp::stream::Command::Connect {
+                local_endpoint: core::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+                remote_endpoint: core::net::SocketAddr::from(([127, 0, 0, 1], 80)),
+            },
+        );
+        stack.process_one_cmd(connect);
+        let handle = stack.blocked_commands.front().unwrap().0.handle.unwrap();
+        stack
+            .socket_set
+            .get_mut::<smoltcp::socket::tcp::Socket>(handle)
+            .abort();
+        stack.pump_blocked_commands();
+        assert!(matches!(
+            reply.try_recv(),
+            Ok(Response::Error(Error::ConnectionReset))
+        ));
+        assert_eq!(stack.metrics.counts().replay_attempts, 3);
+        assert_eq!(stack.metrics.counts().replay_completions, 1);
+    }
+
+    /// tsr-ufm: repeated close requests must deduplicate before draining and reclaim once.
     #[test]
     fn duplicate_pending_close_handle_does_not_panic_and_is_reclaimed() {
         let mut stack = Netstack::new(Config::default(), Instant::ZERO);
@@ -1077,12 +1163,14 @@ mod handle_aba_tests {
         let handle = stack.add_socket(sock);
         assert!(stack.handle_gen(handle).is_some());
 
-        // Push the SAME handle twice (the un-deduped Vec the eight push sites feed).
-        stack.pending_tcp_closes.push(handle);
-        stack.pending_tcp_closes.push(handle);
+        // Insert the SAME handle twice, as overlapping close paths can do.
+        stack.pending_tcp_closes.insert(handle);
+        stack.pending_tcp_closes.insert(handle);
 
-        // Must not panic on the second (now-stale) occurrence.
-        stack.drain_tcp_closes();
+        assert_eq!(stack.pending_tcp_closes.len(), 1);
+
+        // Drain the single pending close.
+        stack.drain_tcp_closes(stack.next_orphan_sweep);
 
         assert!(
             !stack.socket_set.iter().any(|(h, _)| h == handle),
@@ -1094,7 +1182,7 @@ mod handle_aba_tests {
         );
         assert!(
             stack.pending_tcp_closes.is_empty(),
-            "both occurrences (the live one + the stale duplicate) must drain"
+            "the deduplicated close must drain"
         );
     }
 
@@ -1111,7 +1199,7 @@ mod handle_aba_tests {
             smoltcp::socket::tcp::SocketBuffer::new(alloc::vec![0u8; 64]),
         );
         let handle = stack.add_socket(sock);
-        stack.pending_tcp_closes.push(handle);
+        stack.pending_tcp_closes.insert(handle);
 
         // The socket is reclaimed elsewhere (orphan reap, an explicit Close, ...) and a UDP bind
         // recycles the slot, handing back an EQUAL handle.
@@ -1127,7 +1215,7 @@ mod handle_aba_tests {
         };
         assert_eq!(udp_handle, handle, "the freed TCP slot must be reused");
 
-        stack.drain_tcp_closes();
+        stack.drain_tcp_closes(stack.next_orphan_sweep);
 
         assert!(
             stack
