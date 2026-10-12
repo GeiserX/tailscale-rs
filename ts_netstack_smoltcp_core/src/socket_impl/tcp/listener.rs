@@ -113,10 +113,15 @@ impl Netstack {
                 .into()
             }
             TcpListenCommand::Accept { handle } => {
-                let Some(listener) = self.tcp_listeners.get_mut(&handle) else {
+                if !self.tcp_listeners.contains_key(&handle) {
                     tracing::error!(?handle, "listener does not exist");
                     return Error::missing_listener().into();
-                };
+                }
+                self.prune_reset_half_open(handle);
+                let listener = self
+                    .tcp_listeners
+                    .get_mut(&handle)
+                    .expect("listener present");
 
                 // Iterate the half-open queue, re-queueing any sockets that are still in
                 // `SYN-RECEIVED`. Move any sockets in `ESTABLISHED` to the `accept_queue`, close
@@ -273,6 +278,7 @@ impl Netstack {
     /// Pump a single listener: promote its current socket out of `LISTEN`, enforce the accept
     /// backlog, and open a fresh `LISTEN` socket to replace it.
     fn pump_one_tcp_listener(&mut self, handle: ListenerHandle) {
+        self.prune_reset_half_open(handle);
         let Some(listener) = self.tcp_listeners.get_mut(&handle) else {
             return;
         };
@@ -349,6 +355,33 @@ impl Netstack {
             .expect("listener present")
             .current_socket_handle = socket_handle;
         tracing::trace!(new_handle = ?socket_handle, "replaced active listen socket");
+    }
+
+    /// Remove half-open sockets that a RST sent back to `LISTEN`.
+    ///
+    /// smoltcp returns a listener-born socket in `SYN-RECEIVED` to `LISTEN` when it gets a RST
+    /// (`vendor/smoltcp/src/socket/tcp.rs`, RFC 793). Such a socket is no longer tracked as a
+    /// connection, but it still listens on this port, and smoltcp hands each SYN to the first
+    /// matching socket. If it stays in the socket set it completes later handshakes that no
+    /// `Accept` ever returns: the client sees a connection that nobody serves. Every listener pump
+    /// (after each socket-changing packet) removes them, before the next SYN can arrive.
+    fn prune_reset_half_open(&mut self, handle: ListenerHandle) {
+        let Some(listener) = self.tcp_listeners.get_mut(&handle) else {
+            return;
+        };
+        let mut reset = alloc::vec::Vec::new();
+        listener.half_open_queue.retain(|&h| {
+            let back_to_listen =
+                self.socket_set.get::<tcp::Socket>(h).state() == tcp::State::Listen;
+            if back_to_listen {
+                reset.push(h);
+            }
+            !back_to_listen
+        });
+        for h in reset {
+            tracing::trace!(?h, "half-open socket reset back to LISTEN; removing");
+            self.remove_socket(h);
+        }
     }
 
     /// If the listener is at or over its accept backlog (half-open + established-unaccepted), abort
@@ -613,5 +646,119 @@ mod tests {
             !stack.socket_set.iter().any(|(h, _)| h == victim),
             "drain removed the victim from the socket set (buffers freed)"
         );
+    }
+
+    /// A client RST during the handshake sends smoltcp's half-open socket back to `LISTEN`. It
+    /// must be removed, not left as a second, untracked listener on the port: that socket would
+    /// complete the next client's handshake and no `Accept` would ever return it.
+    #[test]
+    fn reset_half_open_socket_does_not_capture_the_next_connection() {
+        use core::net::{IpAddr, Ipv4Addr};
+
+        use bytes::Bytes;
+        use smoltcp::{
+            phy::{ChecksumCapabilities, Medium},
+            wire::{
+                IpProtocol, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
+            },
+        };
+
+        use crate::{Pipe, PipeDev};
+
+        const CLIENT: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+        const SERVER: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
+        fn segment(src_port: u16, control: TcpControl, seq: u32, ack: Option<u32>) -> Bytes {
+            let tcp = TcpRepr {
+                src_port,
+                dst_port: 80,
+                control,
+                seq_number: TcpSeqNumber(seq as i32),
+                ack_number: ack.map(|a| TcpSeqNumber(a as i32)),
+                window_len: 65535,
+                window_scale: None,
+                max_seg_size: None,
+                sack_permitted: false,
+                sack_ranges: [None; 3],
+                timestamp: None,
+                payload: &[],
+            };
+            let ip = Ipv4Repr {
+                src_addr: CLIENT,
+                dst_addr: SERVER,
+                next_header: IpProtocol::Tcp,
+                payload_len: tcp.buffer_len(),
+                hop_limit: 64,
+            };
+            let caps = ChecksumCapabilities::default();
+            let mut buf = alloc::vec![0u8; ip.buffer_len() + tcp.buffer_len()];
+            ip.emit(&mut Ipv4Packet::new_unchecked(&mut buf[..]), &caps);
+            tcp.emit(
+                &mut TcpPacket::new_unchecked(&mut buf[ip.buffer_len()..]),
+                &CLIENT.into(),
+                &SERVER.into(),
+                &caps,
+            );
+            Bytes::from(buf)
+        }
+        /// The server's sequence number from the next segment it sent.
+        fn server_seq(phy: &Pipe) -> u32 {
+            let pkt = phy.rx.try_recv().expect("server segment");
+            let ip = Ipv4Packet::new_checked(&pkt[..]).unwrap();
+            TcpPacket::new_checked(ip.payload()).unwrap().seq_number().0 as u32
+        }
+
+        let mut stack = Netstack::new(Config::default(), Instant::ZERO);
+        assert!(stack.direct_set_ips([IpAddr::V4(SERVER)]));
+        let lh = register_listener(&mut stack, 80);
+        let (net, phy) = Pipe::unbounded();
+        let mut dev = PipeDev {
+            pipe: net,
+            medium: Medium::Ip,
+            mtu: 1500,
+        };
+
+        // Client A: SYN, then RST before completing the handshake.
+        phy.tx
+            .try_send(segment(1000, TcpControl::Syn, 100, None))
+            .unwrap();
+        stack.poll_device_io(Instant::ZERO, &mut dev);
+        let _ = server_seq(&phy);
+        phy.tx
+            .try_send(segment(1000, TcpControl::Rst, 101, None))
+            .unwrap();
+        stack.poll_device_io(Instant::ZERO, &mut dev);
+
+        let listening = stack
+            .socket_set
+            .iter()
+            .filter_map(|(_, s)| <tcp::Socket as smoltcp::socket::AnySocket>::downcast(s))
+            .filter(|s| s.state() == tcp::State::Listen)
+            .count();
+        assert_eq!(
+            listening, 1,
+            "a reset half-open socket must not stay listening"
+        );
+
+        // Client B connects normally and must be the connection `Accept` returns.
+        phy.tx
+            .try_send(segment(2000, TcpControl::Syn, 500, None))
+            .unwrap();
+        stack.poll_device_io(Instant::ZERO, &mut dev);
+        let isn = server_seq(&phy);
+        phy.tx
+            .try_send(segment(
+                2000,
+                TcpControl::None,
+                501,
+                Some(isn.wrapping_add(1)),
+            ))
+            .unwrap();
+        stack.poll_device_io(Instant::ZERO, &mut dev);
+        match stack.process_tcp_listen(TcpListenCommand::Accept { handle: lh }, None) {
+            Response::TcpListen(TcpListenResponse::Accepted { remote, .. }) => {
+                assert_eq!(remote, SocketAddr::from((CLIENT, 2000)));
+            }
+            other => panic!("client B's connection must be accepted, got {other:?}"),
+        }
     }
 }
