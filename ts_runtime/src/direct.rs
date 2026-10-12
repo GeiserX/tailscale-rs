@@ -1163,8 +1163,9 @@ impl kameo::Actor for DirectManager {
         let (transport_id, from_dataplane, to_dataplane) =
             dataplane.ask(NewUnderlayTransport).await?;
 
-        let transport =
-            DirectTransport::new(sock.clone()).with_key_lookup(DiscoPeerLookup(peer_db.clone()));
+        let transport = DirectTransport::new(sock.clone())
+            .with_receive_batching(std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() == Ok("1"))
+            .with_key_lookup(DiscoPeerLookup(peer_db.clone()));
 
         tasks.spawn(run_direct(
             transport,

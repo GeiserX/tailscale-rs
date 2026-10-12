@@ -109,6 +109,11 @@ pub fn piped_pair(config: netcore::Config) -> (Netstack<WakingPipeDev>, Netstack
 }
 
 impl<D> Netstack<D> {
+    /// Limit receive work per async poll. Egress continues until idle.
+    pub fn set_ingress_budget(&mut self, budget: Option<usize>) {
+        self.core.set_ingress_budget(budget);
+    }
+
     /// Construct a new netstack with the given device and configuration.
     ///
     /// Uses [`std::time::Instant`] as a clock.

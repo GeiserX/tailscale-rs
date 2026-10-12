@@ -299,6 +299,14 @@ impl kameo::Actor for ForwarderActor {
         // would otherwise accept it. IPv4 goes through the port gate in all-port mode.
         joinset.spawn(async move {
             let mut reject_budget = RejectBudget::new();
+            let batching = std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() == Ok("1");
+            let pass = |b: &[u8]| {
+                if batching {
+                    netstack_down_tx.try_send_deferred(b)
+                } else {
+                    netstack_down_tx.try_send(b)
+                }
+            };
             let admit = |b: &[u8]| {
                 if b.first().is_some_and(|v| v >> 4 == 6) {
                     // Replies skip the bounded netstack ingress, so cap their rate; over budget the
@@ -312,11 +320,28 @@ impl kameo::Actor for ForwarderActor {
                     return true;
                 }
                 match &gate {
-                    Some(gate) => gate.ingress(b) != Admit::Dropped,
-                    None => netstack_down_tx.try_send(b),
+                    Some(gate) => {
+                        (if batching {
+                            gate.ingress_with(b, pass)
+                        } else {
+                            gate.ingress(b)
+                        }) != Admit::Dropped
+                    }
+                    None => pass(b),
                 }
             };
-            crate::netstack_actor::pump_ingress_with(netstack_down, admit, "forwarder").await;
+            crate::netstack_actor::pump_ingress_with_batch_wake(
+                netstack_down,
+                admit,
+                || {
+                    if batching {
+                        netstack_down_tx.notify_receive();
+                    }
+                },
+                "forwarder",
+                batching,
+            )
+            .await;
 
             tracing::warn!("forwarder netstack uplink shut down!");
         });

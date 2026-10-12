@@ -37,8 +37,8 @@ tokio = { workspace = true, features = ["net", "sync", "rt", "time", "macros"] }
 tracing.workspace = true
 zerocopy = { workspace = true, features = ["std"] }
 
-[target.'cfg(target_vendor = "apple")'.dependencies]
-# `setsockopt(IP_DONTFRAG)`, which socket2 doesn't expose on Darwin. Already in the lockfile.
+[target.'cfg(any(target_vendor = "apple", target_os = "linux"))'.dependencies]
+# Darwin IP_DONTFRAG/recvmsg_x and Linux recvmmsg/recvfrom. Already in the lockfile.
 libc = "0.2"
 
 [dev-dependencies]

@@ -73,7 +73,14 @@ pub(crate) fn piped_ingress_bounded(
     netstack::WakingPipe,
 ) {
     let max_bytes = INGRESS_QUEUE_PACKETS.saturating_mul(config.mtu);
-    netstack::piped_ingress_bounded(config, INGRESS_QUEUE_PACKETS, max_bytes)
+    let (mut stack, pipe) =
+        netstack::piped_ingress_bounded(config, INGRESS_QUEUE_PACKETS, max_bytes);
+    if std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() == Ok("1") {
+        // A continuously refilled pipe must not monopolise the driver. Egress is deliberately
+        // unbounded here: a single TCP socket emits only one segment per smoltcp egress pass.
+        stack.set_ingress_budget(Some(128));
+    }
+    (stack, pipe)
 }
 
 /// Move packets the dataplane routed to a netstack into that netstack's ingress queue, dropping
@@ -85,6 +92,7 @@ pub(crate) fn piped_ingress_bounded(
 ///
 /// Drops are logged at `debug!` only, once when a run of drops starts and once when it ends: the
 /// rate is peer-driven, so it must not be able to drive an operator's default-level log.
+#[cfg(test)]
 pub(crate) async fn pump_ingress(
     from_dataplane: OverlayFromDataplane,
     to_netstack: netstack::WakingPipeSender,
@@ -95,16 +103,49 @@ pub(crate) async fn pump_ingress(
 
 /// [`pump_ingress`] with a custom admission step: `admit` takes each packet and returns whether
 /// it was accepted (`false` counts as a drop). It must not wait.
+#[cfg(test)]
 pub(crate) async fn pump_ingress_with(
+    from_dataplane: OverlayFromDataplane,
+    admit: impl FnMut(&[u8]) -> bool,
+    netstack_name: &'static str,
+) -> u64 {
+    pump_ingress_with_budget(from_dataplane, admit, netstack_name, false).await
+}
+
+/// Admission pump with bounded packet work between yields, independent of channel readiness.
+#[cfg(test)]
+pub(crate) async fn pump_ingress_with_budget(
+    from_dataplane: OverlayFromDataplane,
+    admit: impl FnMut(&[u8]) -> bool,
+    netstack_name: &'static str,
+    cooperative: bool,
+) -> u64 {
+    pump_ingress_with_batch_wake(from_dataplane, admit, || {}, netstack_name, cooperative).await
+}
+
+/// RX batching keeps this admission-side bound even without full work budgeting: flush deferred
+/// wakes before yielding, including when one channel message carries more than 128 packets.
+pub(crate) async fn pump_ingress_with_batch_wake(
     mut from_dataplane: OverlayFromDataplane,
     mut admit: impl FnMut(&[u8]) -> bool,
+    mut finish_batch: impl FnMut(),
     netstack_name: &'static str,
+    cooperative: bool,
 ) -> u64 {
     let mut dropped: u64 = 0;
     let mut dropping = false;
+    let mut processed = 0;
 
     while let Some(bufs) = from_dataplane.recv().await {
         for buf in bufs {
+            if processed == 128 {
+                finish_batch();
+                if cooperative {
+                    tokio::task::yield_now().await;
+                }
+                processed = 0;
+            }
+            processed += 1;
             let buf: PacketMut = buf;
             if admit(buf.as_ref()) {
                 if dropping {
@@ -127,6 +168,7 @@ pub(crate) async fn pump_ingress_with(
                 }
             }
         }
+        finish_batch();
     }
 
     dropped
@@ -220,7 +262,25 @@ impl kameo::Actor for NetstackActor {
         });
 
         joinset.spawn(async move {
-            pump_ingress(netstack_down, netstack_down_tx, "application").await;
+            let batching = std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() == Ok("1");
+            pump_ingress_with_batch_wake(
+                netstack_down,
+                |b| {
+                    if batching {
+                        netstack_down_tx.try_send_deferred(b)
+                    } else {
+                        netstack_down_tx.try_send(b)
+                    }
+                },
+                || {
+                    if batching {
+                        netstack_down_tx.notify_receive();
+                    }
+                },
+                "application",
+                batching,
+            )
+            .await;
 
             tracing::warn!("netstack uplink shut down!");
         });

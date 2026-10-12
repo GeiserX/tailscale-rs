@@ -57,6 +57,10 @@ pub async fn run(
     use futures_util::FutureExt;
 
     loop {
+        // Commands must get service even with a perpetually readable device.
+        if netstack.ingress_budget().is_some() {
+            netstack.process_cmds();
+        }
         let now = now();
 
         let delay = netstack.poll_delay(now);
@@ -91,7 +95,25 @@ pub async fn run(
                     netstack.process_cmds();
                 });
             }
-        ]
+        ];
+        if netstack.should_yield() {
+            #[cfg(feature = "tokio")]
+            tokio::task::yield_now().await;
+            #[cfg(not(feature = "tokio"))]
+            {
+                let mut yielded = false;
+                core::future::poll_fn(|cx| {
+                    if yielded {
+                        core::task::Poll::Ready(())
+                    } else {
+                        yielded = true;
+                        cx.waker().wake_by_ref();
+                        core::task::Poll::Pending
+                    }
+                })
+                .await;
+            }
+        }
     }
 }
 

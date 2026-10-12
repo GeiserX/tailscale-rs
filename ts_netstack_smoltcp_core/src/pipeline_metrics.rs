@@ -2,7 +2,7 @@
 //! Environment is read once with `std`; builds without `std` leave counters disabled.
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-static COUNTERS: [AtomicUsize; 11] = [const { AtomicUsize::new(0) }; 11];
+static COUNTERS: [AtomicUsize; 15] = [const { AtomicUsize::new(0) }; 15];
 
 #[derive(Clone, Copy)]
 pub(crate) enum Metric {
@@ -17,6 +17,10 @@ pub(crate) enum Metric {
     SafetyNetSweeps,
     SafetyNetAttempts,
     SafetyNetCompletions,
+    IoPolls,
+    IoReady,
+    IngressBudgetHits,
+    EgressPasses,
 }
 
 /// All netstacks in the process, cumulative since startup. Read deltas over matched windows.
@@ -44,9 +48,17 @@ pub struct Snapshot {
     pub safety_net_attempts: u64,
     /// Terminal safety-net responses: investigate missed wake paths when nonzero.
     pub safety_net_completions: u64,
+    /// Async I/O future polls, including polls returning Pending.
+    pub io_polls: u64,
+    /// Async I/O polls returning Ready.
+    pub io_ready: u64,
+    /// Receive drains hitting their receive-only limit, even if the queue is then empty.
+    pub ingress_budget_hits: u64,
+    /// smoltcp egress passes with a transmit-ready device, including passes emitting nothing.
+    pub egress_passes: u64,
 }
 
-fn from_counts(c: [u64; 11]) -> Snapshot {
+fn from_counts(c: [u64; 15]) -> Snapshot {
     Snapshot {
         replay_attempts: c[0],
         replay_completions: c[1],
@@ -59,6 +71,10 @@ fn from_counts(c: [u64; 11]) -> Snapshot {
         safety_net_sweeps: c[8],
         safety_net_attempts: c[9],
         safety_net_completions: c[10],
+        io_polls: c[11],
+        io_ready: c[12],
+        ingress_budget_hits: c[13],
+        egress_passes: c[14],
     }
 }
 
@@ -83,7 +99,7 @@ fn enabled() -> bool {
 pub(crate) struct Metrics {
     enabled: bool,
     #[cfg(test)]
-    counts: [core::cell::Cell<u64>; 11],
+    counts: [core::cell::Cell<u64>; 15],
 }
 impl Metrics {
     pub fn new() -> Self {
@@ -128,6 +144,10 @@ mod tests {
             Metric::SafetyNetSweeps,
             Metric::SafetyNetAttempts,
             Metric::SafetyNetCompletions,
+            Metric::IoPolls,
+            Metric::IoReady,
+            Metric::IngressBudgetHits,
+            Metric::EgressPasses,
         ] {
             metrics.record(metric, 1);
         }
@@ -145,6 +165,10 @@ mod tests {
             (before.safety_net_sweeps, after.safety_net_sweeps),
             (before.safety_net_attempts, after.safety_net_attempts),
             (before.safety_net_completions, after.safety_net_completions),
+            (before.io_polls, after.io_polls),
+            (before.io_ready, after.io_ready),
+            (before.ingress_budget_hits, after.ingress_budget_hits),
+            (before.egress_passes, after.egress_passes),
         ] {
             if metrics.enabled {
                 assert!(after > before);

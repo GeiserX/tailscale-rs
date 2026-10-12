@@ -106,3 +106,7 @@ required-features = ["tokio"]
 [[test]]
 name = "ping"
 required-features = ["tokio"]
+
+[[test]]
+name = "budget"
+required-features = ["tokio"]

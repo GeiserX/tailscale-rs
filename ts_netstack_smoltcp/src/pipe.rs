@@ -304,6 +304,21 @@ impl WakingPipeSender {
     /// [`WakingPipe::ingress_bounded`], a packet that would take the queue past its byte budget is
     /// refused the same way as one that finds the queue full.
     pub fn try_send(&self, buf: &[u8]) -> bool {
+        self.try_send_inner(buf, true)
+    }
+
+    /// Admit a packet without waking the device. Call `notify_receive` before yielding,
+    /// returning or waiting, including when some of the batch's packets were refused.
+    pub fn try_send_deferred(&self, buf: &[u8]) -> bool {
+        self.try_send_inner(buf, false)
+    }
+
+    /// Publish receive readiness after synchronous batch admission.
+    pub fn notify_receive(&self) {
+        self.remote_waker.wake();
+    }
+
+    fn try_send_inner(&self, buf: &[u8], wake: bool) -> bool {
         if let Some(budget) = &self.budget
             && !budget.try_charge(buf.len())
         {
@@ -312,7 +327,9 @@ impl WakingPipeSender {
 
         match self.tx.try_send(Bytes::copy_from_slice(buf)) {
             Ok(()) => {
-                self.remote_waker.wake();
+                if wake {
+                    self.remote_waker.wake();
+                }
                 true
             }
             Err(flume::TrySendError::Full(..)) => {
@@ -481,7 +498,10 @@ mod tests {
         assert!(a.rx.try_recv().is_none());
     }
 
-    use netcore::smoltcp::phy::{Device, RxToken as _, TxToken as _};
+    use netcore::{
+        AsyncWakeDevice,
+        smoltcp::phy::{Device, RxToken as _, TxToken as _},
+    };
 
     use super::*;
 
@@ -557,6 +577,32 @@ mod tests {
             caller.tx.try_send(&[0; 1000]),
             "the whole budget is free again"
         );
+    }
+
+    #[test]
+    fn deferred_ingress_wakes_once_and_preserves_queue_limits() {
+        struct Count(AtomicUsize);
+        impl std::task::Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let (dev, caller) = WakingPipe::ingress_bounded(2, 3);
+        let mut dev = device(dev);
+        let count = Arc::new(Count(AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(count.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut dev).poll_rx(&mut cx).is_pending());
+        assert!(caller.tx.try_send_deferred(&[1]));
+        assert!(caller.tx.try_send_deferred(&[2, 3]));
+        assert!(!caller.tx.try_send_deferred(&[4]));
+        assert_eq!(count.0.load(Ordering::Relaxed), 0);
+        caller.tx.notify_receive();
+        assert_eq!(count.0.load(Ordering::Relaxed), 1);
+        assert_eq!(dev.pipe.rx.try_recv().unwrap().as_ref(), &[1]);
+        assert_eq!(dev.pipe.rx.try_recv().unwrap().as_ref(), &[2, 3]);
+        assert!(caller.tx.try_send_deferred(&[0; 3]), "all budget returned");
+        caller.tx.notify_receive();
     }
 
     /// The egress direction stays unbounded: smoltcp's `TxToken::consume` cannot wait, so a bounded

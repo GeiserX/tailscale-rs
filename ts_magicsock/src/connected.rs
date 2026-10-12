@@ -39,7 +39,7 @@ const IDLE_EVICT: Duration = Duration::from_secs(120);
 const PUMP_BUF: usize = 65_535;
 
 /// A datagram received on a connected socket, handed to the shared demux.
-pub(crate) type Received = (Vec<u8>, SocketAddr);
+pub(crate) type Received = Vec<crate::receive_batch::Datagram>;
 
 /// Settings read from the environment once, at bind.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -291,17 +291,31 @@ fn spawn_pump(
     to_demux: mpsc::UnboundedSender<Received>,
 ) -> tokio::task::AbortHandle {
     tokio::spawn(async move {
+        let batching = crate::receive_batch::enabled();
+        let mut receiver = batching.then(crate::receive_batch::Receiver::new);
         let mut buf = vec![0u8; PUMP_BUF];
+        let mut turns = 0;
         loop {
-            match sock.recv(&mut buf).await {
-                Ok(n) => {
-                    if to_demux.send((buf[..n].to_vec(), remote)).is_err() {
+            let received = if batching {
+                receiver.as_mut().unwrap().recv(&sock, Some(remote)).await
+            } else {
+                sock.recv(&mut buf)
+                    .await
+                    .map(|n| vec![(buf[..n].to_vec(), remote)])
+            };
+            match received {
+                Ok(batch) => {
+                    if to_demux.send(batch).is_err() {
                         return;
+                    }
+                    turns += 1;
+                    if batching && turns == 4 {
+                        tokio::task::yield_now().await;
+                        turns = 0;
                     }
                 }
                 Err(e) => {
                     tracing::trace!(%remote, error = %e, "magicsock: connected socket recv error");
-                    // Don't spin if the error repeats.
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }
@@ -360,11 +374,12 @@ mod tests {
         );
 
         remote.send_to(b"reply", local).await.unwrap();
-        let (data, from) = tokio::time::timeout(Duration::from_secs(5), demux.recv())
+        let batch = tokio::time::timeout(Duration::from_secs(5), demux.recv())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!((data.as_slice(), from), (&b"reply"[..], remote_addr));
+        let (data, from) = &batch[0];
+        assert_eq!((data.as_slice(), *from), (&b"reply"[..], remote_addr));
 
         // Subsequent sends reuse it; clearing drops it.
         assert!(c.socket_for(remote_addr, 10, &shared).is_some());
