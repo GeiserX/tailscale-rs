@@ -34,6 +34,7 @@ pub mod pipeline_metrics;
 mod registry;
 mod socket_impl;
 mod stack_control_impl;
+mod targeted_replay;
 mod util;
 mod wake_device;
 
@@ -58,6 +59,7 @@ const ORPHAN_SWEEP_INTERVAL: smoltcp::time::Duration = smoltcp::time::Duration::
 /// Internally i/o free userspace network stack built around `smoltcp`.
 pub struct Netstack {
     metrics: Metrics,
+    targeted_replay: Option<targeted_replay::TargetedReplay>,
     config: Config,
 
     iface: smoltcp::iface::Interface,
@@ -142,6 +144,7 @@ impl Netstack {
 
         Netstack {
             metrics: Metrics::new(),
+            targeted_replay: targeted_replay::TargetedReplay::from_env(now),
             iface,
             socket_set: smoltcp::iface::SocketSet::new(vec![]),
             command_tx: tx,
@@ -193,6 +196,7 @@ impl Netstack {
     /// once removed, [`Netstack::handle_gen`] reports `None` for the (now-free) slot until it is
     /// re-added with a new generation.
     pub(crate) fn remove_socket(&mut self, handle: SocketHandle) {
+        self.remove_targeted_queue(handle);
         if self
             .socket_registry
             .remove(&handle)
@@ -224,12 +228,17 @@ impl Netstack {
     /// Report the next time the netstack should be polled.
     pub fn poll_at(&mut self, now: smoltcp::time::Instant) -> Option<smoltcp::time::Instant> {
         let socket_deadline = self.iface.poll_at(now, &self.socket_set);
-        if self.tcp_socket_count == 0 {
-            return socket_deadline;
+        let mut deadline = socket_deadline;
+        if self.tcp_socket_count > 0 {
+            deadline =
+                Some(deadline.map_or(self.next_orphan_sweep, |d| d.min(self.next_orphan_sweep)));
         }
-        Some(socket_deadline.map_or(self.next_orphan_sweep, |deadline| {
-            deadline.min(self.next_orphan_sweep)
-        }))
+        if let Some(replay) = &self.targeted_replay
+            && replay.pending_queues > 0
+        {
+            deadline = Some(deadline.map_or(replay.next_sweep, |d| d.min(replay.next_sweep)));
+        }
+        deadline
     }
 
     /// Report the amount of time until the netstack should next be polled.
@@ -309,15 +318,20 @@ impl Netstack {
     }
 
     /// Process a single command.
-    #[tracing::instrument(level = "trace", skip_all, fields(?command, ?handle))]
-    pub fn process_one_cmd(
+    pub fn process_one_cmd(&mut self, req: Request) {
+        self.execute_cmd(req);
+    }
+
+    /// Returns whether the command completed rather than being requeued.
+    #[tracing::instrument(name = "process_one_cmd", level = "trace", skip_all, fields(?command, ?handle))]
+    fn execute_cmd(
         &mut self,
         Request {
             command,
             handle,
             resp,
         }: Request,
-    ) {
+    ) -> bool {
         let cmd_resp = match command {
             Command::StackControl(cmd) => self.process_stack_control(cmd),
             Command::Udp(udp) => self.process_udp(udp, handle),
@@ -335,14 +349,16 @@ impl Netstack {
                 // (For an already-open handle the two coincide.) A handle-less command yields
                 // `None` and is never gen-checked on replay (it has no socket to recycle).
                 let gen_at_requeue = handle.and_then(|h| self.handle_gen(h));
-                self.blocked_commands.push_back((
-                    Request {
-                        command,
-                        handle,
-                        resp,
-                    },
-                    gen_at_requeue,
-                ));
+                let req = Request {
+                    command,
+                    handle,
+                    resp,
+                };
+                match self.enqueue_targeted(req, gen_at_requeue) {
+                    Ok(()) => {}
+                    Err(req) => self.blocked_commands.push_back((req, gen_at_requeue)),
+                }
+                false
             }
             otherwise => {
                 if let Response::Error(e) = &otherwise {
@@ -352,6 +368,7 @@ impl Netstack {
                 if let Err(resp) = resp.send(otherwise) {
                     tracing::debug!(resp = ?resp.0, "response channel closed");
                 }
+                true
             }
         }
     }
@@ -388,6 +405,7 @@ impl Netstack {
         // Unfortunately poll_egress is O(n) in the number of sockets, but that's an unavoidable
         // cost of correctness given the design of smoltcp.
 
+        self.service_replay_deadline(now);
         let mut changed = false;
 
         self.pump_waiters();
@@ -452,6 +470,8 @@ impl Netstack {
             }
         }
 
+        // Some smoltcp wake paths need replay even if the poll result reports no state change.
+        self.pump_targeted_commands();
         let reclaimed = self.drain_tcp_closes(now);
         changed || reclaimed
     }
@@ -579,6 +599,7 @@ impl Netstack {
         // Accepts however can unblock waiting commands.
         self.pump_tcp_accept();
         self.pump_blocked_commands();
+        self.pump_targeted_commands();
     }
 
     /// Reprocess all blocked socket commands.
@@ -721,6 +742,7 @@ where
             ..
         } = self.get_mut();
 
+        stack.service_replay_deadline(*now);
         stack.pump_waiters();
 
         let now = *now;
@@ -776,6 +798,7 @@ where
             }
         }
 
+        stack.pump_targeted_commands();
         progress_made |= stack.drain_tcp_closes(now);
         if progress_made {
             Poll::Ready(())
@@ -820,6 +843,12 @@ mod handle_aba_tests {
         Command, Config, Error, InternalErrorKind, Netstack, Request, Response,
         command::{Response as CmdResponse, udp},
     };
+
+    fn global_stack(config: Config, now: Instant) -> Netstack {
+        let mut stack = Netstack::new(config, now);
+        stack.targeted_replay = None;
+        stack
+    }
 
     /// Build a `Request` plus the receiver that captures its single response, so a test driving
     /// `process_one_cmd` directly can both queue a command and later inspect what it was answered
@@ -868,7 +897,7 @@ mod handle_aba_tests {
     /// with `missing_socket` and leave the new socket untouched.
     #[test]
     fn recycled_handle_drops_stale_blocked_command_and_preserves_new_socket() {
-        let mut stack = Netstack::new(Config::default(), Instant::ZERO);
+        let mut stack = global_stack(Config::default(), Instant::ZERO);
 
         // Flow A: bind a UDP socket, capture its handle + generation.
         let handle_a = bind_udp(&mut stack, 1000);
@@ -935,7 +964,7 @@ mod handle_aba_tests {
     /// recycle dance above.
     #[test]
     fn gen_mismatch_on_replay_drops_command() {
-        let mut stack = Netstack::new(Config::default(), Instant::ZERO);
+        let mut stack = global_stack(Config::default(), Instant::ZERO);
 
         let handle = bind_udp(&mut stack, 1000);
 
@@ -971,7 +1000,7 @@ mod handle_aba_tests {
 
         use crate::{HasChannel, Pipe, PipeDev};
 
-        let mut stack = Netstack::new(
+        let mut stack = global_stack(
             Config {
                 loopback: true,
                 ..Default::default()
@@ -1058,7 +1087,7 @@ mod handle_aba_tests {
 
         use crate::{HasChannel, Pipe, PipeDev};
 
-        let mut stack = Netstack::new(
+        let mut stack = global_stack(
             Config {
                 loopback: true,
                 ..Default::default()
@@ -1112,7 +1141,7 @@ mod handle_aba_tests {
 
     #[test]
     fn replay_metrics_count_attempts_and_terminal_responses() {
-        let mut stack = Netstack::new(Config::default(), Instant::ZERO);
+        let mut stack = global_stack(Config::default(), Instant::ZERO);
         let handle = bind_udp(&mut stack, 1000);
         let (recv_req, recv_rx) = req(Some(handle), udp::Command::Recv { max_len: None });
         stack.process_one_cmd(recv_req);

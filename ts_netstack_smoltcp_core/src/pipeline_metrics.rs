@@ -2,7 +2,7 @@
 //! Environment is read once with `std`; builds without `std` leave counters disabled.
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-static COUNTERS: [AtomicUsize; 5] = [const { AtomicUsize::new(0) }; 5];
+static COUNTERS: [AtomicUsize; 11] = [const { AtomicUsize::new(0) }; 11];
 
 #[derive(Clone, Copy)]
 pub(crate) enum Metric {
@@ -11,6 +11,12 @@ pub(crate) enum Metric {
     ValidationLookups,
     OrphanSweeps,
     OrphanSocketVisits,
+    DirtyHandlesPumped,
+    TargetedReplayAttempts,
+    TargetedReplayCompletions,
+    SafetyNetSweeps,
+    SafetyNetAttempts,
+    SafetyNetCompletions,
 }
 
 /// All netstacks in the process, cumulative since startup. Read deltas over matched windows.
@@ -26,15 +32,33 @@ pub struct Snapshot {
     pub orphan_sweeps: u64,
     /// Live sockets visited by orphan passes (excludes vacant storage slots).
     pub orphan_socket_visits: u64,
+    /// Distinct dirty socket generations pumped (including spurious wakes).
+    pub dirty_handles_pumped: u64,
+    /// Commands executed from dirty queues.
+    pub targeted_replay_attempts: u64,
+    /// Dirty-queue replays returning a terminal response.
+    pub targeted_replay_completions: u64,
+    /// Full targeted-queue passes at the 50 ms maintenance deadline.
+    pub safety_net_sweeps: u64,
+    /// Commands executed by the safety net after draining dirty queues.
+    pub safety_net_attempts: u64,
+    /// Terminal safety-net responses: investigate missed wake paths when nonzero.
+    pub safety_net_completions: u64,
 }
 
-fn from_counts(c: [u64; 5]) -> Snapshot {
+fn from_counts(c: [u64; 11]) -> Snapshot {
     Snapshot {
         replay_attempts: c[0],
         replay_completions: c[1],
         validation_lookups: c[2],
         orphan_sweeps: c[3],
         orphan_socket_visits: c[4],
+        dirty_handles_pumped: c[5],
+        targeted_replay_attempts: c[6],
+        targeted_replay_completions: c[7],
+        safety_net_sweeps: c[8],
+        safety_net_attempts: c[9],
+        safety_net_completions: c[10],
     }
 }
 
@@ -59,7 +83,7 @@ fn enabled() -> bool {
 pub(crate) struct Metrics {
     enabled: bool,
     #[cfg(test)]
-    counts: [core::cell::Cell<u64>; 5],
+    counts: [core::cell::Cell<u64>; 11],
 }
 impl Metrics {
     pub fn new() -> Self {
@@ -97,13 +121,43 @@ mod tests {
         metrics.record(Metric::ValidationLookups, 2);
         metrics.record(Metric::OrphanSweeps, 1);
         metrics.record(Metric::OrphanSocketVisits, 3);
+        for metric in [
+            Metric::DirtyHandlesPumped,
+            Metric::TargetedReplayAttempts,
+            Metric::TargetedReplayCompletions,
+            Metric::SafetyNetSweeps,
+            Metric::SafetyNetAttempts,
+            Metric::SafetyNetCompletions,
+        ] {
+            metrics.record(metric, 1);
+        }
         let after = snapshot();
+        for (before, after) in [
+            (before.dirty_handles_pumped, after.dirty_handles_pumped),
+            (
+                before.targeted_replay_attempts,
+                after.targeted_replay_attempts,
+            ),
+            (
+                before.targeted_replay_completions,
+                after.targeted_replay_completions,
+            ),
+            (before.safety_net_sweeps, after.safety_net_sweeps),
+            (before.safety_net_attempts, after.safety_net_attempts),
+            (before.safety_net_completions, after.safety_net_completions),
+        ] {
+            if metrics.enabled {
+                assert!(after > before);
+            } else {
+                assert_eq!(after, 0);
+            }
+        }
         if metrics.enabled {
             // Other test threads may also update the process-wide counters.
-            assert!(after.replay_attempts >= before.replay_attempts + 1);
-            assert!(after.replay_completions >= before.replay_completions + 1);
+            assert!(after.replay_attempts > before.replay_attempts);
+            assert!(after.replay_completions > before.replay_completions);
             assert!(after.validation_lookups >= before.validation_lookups + 2);
-            assert!(after.orphan_sweeps >= before.orphan_sweeps + 1);
+            assert!(after.orphan_sweeps > before.orphan_sweeps);
             assert!(after.orphan_socket_visits >= before.orphan_socket_visits + 3);
         } else {
             assert_eq!(after.replay_attempts, 0);

@@ -129,7 +129,16 @@ mod tests {
         assert_eq!(stack.pending_tcp_closes.len(), 512);
         assert_eq!(stack.metrics.counts().orphan_socket_visits, 0);
         assert!(stack.drain_tcp_closes(Instant::ZERO));
-        assert_eq!(stack.metrics.counts().validation_lookups, 512 * 6);
+        // Targeted removal also looks up the generation of its cached waiter queue.
+        let lookups_per_socket = if stack.targeted_replay.is_some() {
+            7
+        } else {
+            6
+        };
+        assert_eq!(
+            stack.metrics.counts().validation_lookups,
+            512 * lookups_per_socket
+        );
         assert_eq!(stack.metrics.counts().orphan_socket_visits, 0);
         assert!(stack.socket_registry.is_empty());
         assert_eq!(stack.tcp_socket_count, 0);

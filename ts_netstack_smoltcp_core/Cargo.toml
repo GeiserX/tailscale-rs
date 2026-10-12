@@ -28,6 +28,7 @@ workspace = true
 default-features = false
 features = [
     "alloc",
+    "async",
     "proto-ipv6",
     "proto-ipv6-fragmentation",
     "proto-ipv4",
@@ -52,6 +53,7 @@ version = "0.13"
 default-features = false
 features = [
     "alloc",
+    "async",
     "proto-ipv6",
     "proto-ipv6-fragmentation",
     "proto-ipv4",
