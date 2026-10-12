@@ -107,6 +107,7 @@ pin-project-lite = "0.2"
 # (the `fallback` feature is what synthesizes `AtomicU64` on 32-bit — do NOT disable it).
 portable-atomic = "1"
 proptest = "1"
+ring = "0.17"
 itertools = "0.14"
 rand = "0.10"
 reqwest = "0.13"
@@ -336,6 +337,7 @@ hyper-util = { workspace = true, features = ["tokio"] }
 workspace = true
 
 [features]
+ring-aead = ["ts_runtime/ring-aead"]
 # Enable the `tsnet` module: a Go-idiomatic `tsnet.Server`-shaped facade over `Device`/`Config`
 # (settable fields → `Config`, lazy start, `Listen`/`Dial`/`Up`/`Close`/`ListenFunnel`/`ListenService`).
 # A thin ergonomics layer only — no new engine, no new crate. Reuses the crate's existing

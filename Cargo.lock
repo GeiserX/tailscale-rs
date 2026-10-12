@@ -2453,6 +2453,7 @@ dependencies = [
  "itertools",
  "proptest",
  "rand 0.10.3",
+ "ring",
  "tokio",
  "tracing",
  "ts_cli_util",

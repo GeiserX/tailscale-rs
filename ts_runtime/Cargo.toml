@@ -80,6 +80,7 @@ rand.workspace = true
 libc = "0.2"
 
 [features]
+ring-aead = ["ts_tunnel/ring-aead"]
 # Off by default. Enables the TUN-mode overlay transport (ts_transport_tun) so the runtime can
 # run the application data path over a real OS TUN interface instead of the userspace netstack.
 # TUN device creation needs root/CAP_NET_ADMIN; off the ring-only egress path.

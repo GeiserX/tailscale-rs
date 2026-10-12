@@ -19,6 +19,7 @@ use crate::{
 };
 
 /// The symmetric session keys produced by a WireGuard handshake.
+#[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 struct SessionKeys {
     initiator_to_responder: chacha20poly1305::Key,
     responder_to_initiator: chacha20poly1305::Key,
@@ -140,9 +141,11 @@ impl HandshakeState {
     /// This is the Split() operation in the Noise spec.
     fn finish(self) -> SessionKeys {
         let (k1, k2) = must_hkdf2(&self.chaining_key, &[]);
+        let k1 = zeroize::Zeroizing::new(k1);
+        let k2 = zeroize::Zeroizing::new(k2);
         SessionKeys {
-            initiator_to_responder: chacha20poly1305::Key::from(k1),
-            responder_to_initiator: chacha20poly1305::Key::from(k2),
+            initiator_to_responder: chacha20poly1305::Key::clone_from_slice(k1.as_ref()),
+            responder_to_initiator: chacha20poly1305::Key::clone_from_slice(k2.as_ref()),
         }
     }
 
@@ -580,6 +583,20 @@ mod tests {
 
     use super::*;
     use crate::session::REJECT_AFTER_TIME_RECV;
+
+    #[test]
+    fn derived_session_keys_wipe_both_directions() {
+        use zeroize::Zeroize;
+        let mut keys = SessionKeys {
+            initiator_to_responder: [0x42; 32].into(),
+            responder_to_initiator: [0x69; 32].into(),
+        };
+        keys.zeroize();
+        assert!(keys.initiator_to_responder.iter().all(|&b| b == 0));
+        assert!(keys.responder_to_initiator.iter().all(|&b| b == 0));
+        fn assert_drop_wipe<T: zeroize::ZeroizeOnDrop>() {}
+        assert_drop_wipe::<SessionKeys>();
+    }
 
     /// The transport send path zero-pads each payload up to a 16-byte boundary before sealing
     /// (wireguard-go parity — see `session::PADDING_MULTIPLE`); the receiver delivers the decrypted

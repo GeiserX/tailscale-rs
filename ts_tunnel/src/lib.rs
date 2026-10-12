@@ -8,6 +8,7 @@ mod messages;
 mod replay;
 mod session;
 mod time;
+mod transport_aead;
 
 pub use ts_keys::{NodeKeyPair, NodePrivateKey, NodePublicKey};
 
