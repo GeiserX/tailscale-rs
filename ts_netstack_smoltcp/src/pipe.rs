@@ -56,6 +56,7 @@ pub struct WakingPipeReceiver {
 #[derive(Clone)]
 pub struct WakingPipeSender {
     tx: flume::Sender<Bytes>,
+    bounded: bool,
 
     /// The waker this end of the pipe polls on in `poll_tx`.
     ///
@@ -196,6 +197,7 @@ impl WakingPipe {
                     budget: None,
                 },
                 tx: WakingPipeSender {
+                    bounded: pipe1.tx.capacity().is_some(),
                     tx: pipe1.tx,
                     remote_waker: pipe2_rx_waker.clone(),
                     self_waker: pipe1_tx_waker.clone(),
@@ -211,6 +213,7 @@ impl WakingPipe {
                     budget: None,
                 },
                 tx: WakingPipeSender {
+                    bounded: pipe2.tx.capacity().is_some(),
                     tx: pipe2.tx,
                     remote_waker: pipe1_rx_waker,
                     self_waker: pipe2_tx_waker,
@@ -349,7 +352,7 @@ impl WakingPipeSender {
 
     /// Report whether we can currently transmit.
     pub fn tx_ready(&self) -> bool {
-        !self.tx.is_full()
+        !self.bounded || !self.tx.is_full()
     }
 }
 
@@ -381,7 +384,7 @@ impl netcore::AsyncWakeDevice for WakingPipeDev {
     }
 }
 
-impl smoltcp::phy::TxToken for WakingPipeSender {
+impl smoltcp::phy::TxToken for &mut WakingPipeSender {
     #[tracing::instrument(
         name = "WakingPipeSender::consume",
         skip_all,
@@ -404,6 +407,16 @@ impl smoltcp::phy::TxToken for WakingPipeSender {
         self.remote_waker.wake();
 
         ret
+    }
+}
+
+// Preserve the existing by-value TxToken API while the device borrows its sender.
+impl smoltcp::phy::TxToken for WakingPipeSender {
+    fn consume<R, F>(mut self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        smoltcp::phy::TxToken::consume(&mut self, len, f)
     }
 }
 
@@ -447,13 +460,16 @@ impl smoltcp::phy::Device for WakingPipeDev {
         Self: 'a;
 
     type TxToken<'a>
-        = WakingPipeSender
+        = &'a mut WakingPipeSender
     where
         Self: 'a;
 
     #[tracing::instrument(skip(self), level = "trace")]
     fn receive(&mut self, timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let tx = self.transmit(timestamp)?;
+        let _ = timestamp;
+        if self.pipe.tx.tx.is_disconnected() {
+            return None;
+        }
 
         let b = if let Some(buf) = self.pipe.rx.buffered_rx.take() {
             buf
@@ -463,7 +479,7 @@ impl smoltcp::phy::Device for WakingPipeDev {
             buf
         };
 
-        Some((RxToken(b), tx))
+        Some((RxToken(b), &mut self.pipe.tx))
     }
 
     #[tracing::instrument(skip(self), level = "trace")]
@@ -472,7 +488,7 @@ impl smoltcp::phy::Device for WakingPipeDev {
             return None;
         }
 
-        Some(self.pipe.tx.clone())
+        Some(&mut self.pipe.tx)
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -532,7 +548,9 @@ mod tests {
             "a third packet overflows the ring"
         );
 
+        assert!(!caller.tx.tx_ready());
         assert_eq!(device_takes(&mut dev), Some(1));
+        assert!(caller.tx.tx_ready());
         assert!(caller.tx.try_send(&[4]), "taking a packet frees its slot");
     }
 
@@ -620,6 +638,7 @@ mod tests {
             tx.consume(1280, |buf| buf[..4].copy_from_slice(&i.to_be_bytes()));
         }
 
+        assert!(dev.pipe.tx.tx_ready(), "unbounded egress is always ready");
         for i in 0..1000u32 {
             let buf = caller.rx.recv().expect("every emitted packet is delivered");
             assert_eq!(buf.len(), 1280);

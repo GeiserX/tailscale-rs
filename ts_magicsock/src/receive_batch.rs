@@ -5,8 +5,42 @@ use std::{io, net::SocketAddr};
 use tokio::{io::Interest, net::UdpSocket};
 
 pub(crate) const MAX_BATCH: usize = 16;
-const BUFFER_LEN: usize = 1600;
-pub(crate) type Datagram = (Vec<u8>, SocketAddr);
+pub(crate) const BUFFER_LEN: usize = 1600;
+pub(crate) type Datagram = (ts_packet::PacketMut, SocketAddr);
+
+/// Single-packet handoffs keep the default path allocation-free at the envelope level.
+pub(crate) enum Received<T> {
+    One(T),
+    Batch(Vec<T>),
+}
+impl<T> Received<T> {
+    pub(crate) fn is_empty(&self) -> bool {
+        matches!(self, Self::Batch(items) if items.is_empty())
+    }
+}
+pub(crate) enum ReceivedIter<T> {
+    One(core::option::IntoIter<T>),
+    Batch(std::vec::IntoIter<T>),
+}
+impl<T> Iterator for ReceivedIter<T> {
+    type Item = T;
+    fn next(&mut self) -> Option<T> {
+        match self {
+            Self::One(i) => i.next(),
+            Self::Batch(i) => i.next(),
+        }
+    }
+}
+impl<T> IntoIterator for Received<T> {
+    type Item = T;
+    type IntoIter = ReceivedIter<T>;
+    fn into_iter(self) -> Self::IntoIter {
+        match self {
+            Self::One(item) => ReceivedIter::One(Some(item).into_iter()),
+            Self::Batch(items) => ReceivedIter::Batch(items.into_iter()),
+        }
+    }
+}
 
 use std::sync::{
     OnceLock,
@@ -69,7 +103,7 @@ impl Receiver {
         {
             let (n, from) = socket.recv_from(&mut self.buffers[0]).await?;
             Ok(vec![(
-                self.buffers[0][..n].to_vec(),
+                ts_packet::PacketMut::from(&self.buffers[0][..n]),
                 remote.unwrap_or(from),
             )])
         }
@@ -165,7 +199,7 @@ mod sys {
             return Err(io::Error::last_os_error());
         }
         Ok(vec![(
-            buffer[..(n as usize).min(buffer.len())].to_vec(),
+            ts_packet::PacketMut::from(&buffer[..(n as usize).min(buffer.len())]),
             match remote {
                 Some(r) => r,
                 None => address(from, len)?,
@@ -275,7 +309,7 @@ mod sys {
                 Some(r) => r,
                 None => address(addresses[i], namelen)?,
             };
-            result.push((buffers[i][..len].to_vec(), from));
+            result.push((ts_packet::PacketMut::from(&buffers[i][..len]), from));
         }
         Ok(result)
     }
@@ -343,7 +377,13 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            assert_eq!(got, vec![(b"first".to_vec(), tx.local_addr().unwrap())]);
+            assert_eq!(
+                got,
+                vec![(
+                    ts_packet::PacketMut::from(&b"first"[..]),
+                    tx.local_addr().unwrap()
+                )]
+            );
             assert!(!receiver.kernel);
             let got = rx
                 .async_io(Interest::READABLE, || {
@@ -351,7 +391,13 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            assert_eq!(got, vec![(b"second".to_vec(), tx.local_addr().unwrap())]);
+            assert_eq!(
+                got,
+                vec![(
+                    ts_packet::PacketMut::from(&b"second"[..]),
+                    tx.local_addr().unwrap()
+                )]
+            );
         }
     }
 
@@ -387,7 +433,7 @@ mod tests {
         assert_eq!(
             got,
             (0..4u8)
-                .map(|i| (vec![i], tx.local_addr().unwrap()))
+                .map(|i| (ts_packet::PacketMut::from(&[i]), tx.local_addr().unwrap()))
                 .collect::<Vec<_>>()
         );
     }

@@ -74,6 +74,7 @@ pub(crate) type PortRef = (Proto, u16, u32);
 
 struct Inner {
     ingress: WakingPipeSender,
+    batch_ingress: bool,
     epoch: Instant,
     tcp: Vec<Slot>,
     udp: Vec<Slot>,
@@ -122,6 +123,7 @@ impl PortGate {
         };
         let inner = Inner {
             ingress,
+            batch_ingress: std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() == Ok("1"),
             epoch: Instant::now(),
             tcp: vec![closed; 1 << 16],
             udp: vec![closed; 1 << 16],
@@ -202,11 +204,23 @@ impl PortGate {
             return 0;
         }
         let held = inner.take_held(proto, port);
-        let refused = held.iter().filter(|p| !inner.ingress.try_send(p)).count();
+        let refused = held
+            .iter()
+            .filter(|p| {
+                !(if inner.batch_ingress {
+                    inner.ingress.try_send_deferred(p)
+                } else {
+                    inner.ingress.try_send(p)
+                })
+            })
+            .count();
         let now = inner.now();
         let slot = &mut inner.slots(proto)[port as usize];
         slot.state = State::Open;
         slot.last = now;
+        if inner.batch_ingress && !held.is_empty() {
+            inner.ingress.notify_receive();
+        }
         tracing::debug!(?proto, %port, generation, released = held.len(), refused, "port gate: open");
         refused
     }

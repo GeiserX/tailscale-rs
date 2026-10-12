@@ -31,7 +31,7 @@ use crate::{
 
 /// Maximum UDP datagram we will read. Tailscale uses 1280-byte WireGuard MTU; round up for
 /// disco and headers.
-const RECV_BUF: usize = 1600;
+const RECV_BUF: usize = crate::receive_batch::BUFFER_LEN;
 
 /// A WireGuard datagram received from a peer over a confirmed direct path, tagged with the
 /// disco key of the peer it came from (resolved to a [`NodePublicKey`] by the caller).
@@ -50,7 +50,9 @@ struct ReceiveState {
     connected: mpsc::UnboundedReceiver<crate::connected::Received>,
     pending: VecDeque<crate::receive_batch::Datagram>,
     ready: VecDeque<ReceivedData>,
+    pending_error: Option<Error>,
     receiver: Option<crate::receive_batch::Receiver>,
+    ordinary_buffer: Vec<u8>,
 }
 
 async fn demux_receive_batch<
@@ -63,8 +65,15 @@ async fn demux_receive_batch<
         let Some(datagram) = state.pending.pop_front() else {
             break;
         };
-        if let Some(data) = demux(datagram).await? {
-            state.ready.push_back(data);
+        match demux(datagram).await {
+            Ok(Some(data)) => state.ready.push_back(data),
+            Ok(None) => {}
+            Err(error) if !state.ready.is_empty() => {
+                // Deliver data preceding a failing control frame before reporting its error.
+                state.pending_error = Some(error);
+                break;
+            }
+            Err(error) => return Err(error),
         }
     }
     Ok(state.ready.drain(..).collect())
@@ -474,6 +483,8 @@ impl MagicSock {
                 connected: connected_rx,
                 pending: VecDeque::new(),
                 ready: VecDeque::new(),
+                pending_error: None,
+                ordinary_buffer: vec![0; RECV_BUF],
                 receiver: crate::receive_batch::enabled().then(crate::receive_batch::Receiver::new),
             }),
             our_disco,
@@ -1521,11 +1532,14 @@ impl MagicSock {
             if let Some(data) = state.ready.pop_front() {
                 return Ok(Some(data));
             }
+            if let Some(error) = state.pending_error.take() {
+                return Err(error);
+            }
             self.fill_receive(&mut state).await?;
-            if let Some(datagram) = state.pending.pop_front() {
-                if let Some(data) = self.demux_datagram(datagram).await? {
-                    return Ok(Some(data));
-                }
+            if let Some(datagram) = state.pending.pop_front()
+                && let Some(data) = self.demux_datagram(datagram).await?
+            {
+                return Ok(Some(data));
             }
         }
     }
@@ -1535,6 +1549,9 @@ impl MagicSock {
     pub async fn recv_data_batch(&self) -> Result<Vec<ReceivedData>, Error> {
         let mut state = self.connected_rx.lock().await;
         if state.ready.is_empty() {
+            if let Some(error) = state.pending_error.take() {
+                return Err(error);
+            }
             self.fill_receive(&mut state).await?;
         }
         demux_receive_batch(&mut state, |datagram| self.demux_datagram(datagram)).await
@@ -1547,17 +1564,17 @@ impl MagicSock {
         let sock = self.sock();
         if let Some(receiver) = &mut state.receiver {
             let batch = tokio::select! {
-                r = receiver.recv(&sock, None) => r?,
+                r = receiver.recv(&sock, None) => crate::receive_batch::Received::Batch(r?),
                 Some(batch) = state.connected.recv() => batch,
             };
             // No await between consuming the kernel/channel batch and saving its tail.
             state.pending.extend(batch);
         } else {
-            let mut buf = vec![0u8; RECV_BUF];
+            let buf = &mut state.ordinary_buffer;
             let batch = tokio::select! {
-                r = sock.recv_from(&mut buf) => {
+                r = sock.recv_from(buf) => {
                     let (n, from) = r?;
-                    vec![(buf[..n].to_vec(), from)]
+                    crate::receive_batch::Received::One((PacketMut::from(&buf[..n]), from))
                 },
                 Some(batch) = state.connected.recv() => batch,
             };
@@ -1614,7 +1631,10 @@ impl MagicSock {
                     return Ok(Some(ReceivedData {
                         from_disco,
                         from_addr: from,
-                        data: PacketMut::from(payload),
+                        data: {
+                            buf.truncate_front(offset);
+                            buf
+                        },
                     }));
                 }
             }
@@ -1643,7 +1663,7 @@ impl MagicSock {
             return Ok(Some(ReceivedData {
                 from_disco,
                 from_addr: from,
-                data: PacketMut::from(&*datagram),
+                data: buf,
             }));
         }
 
@@ -3003,7 +3023,8 @@ pub struct DirectTransport {
     kernel_receive_batching: bool,
     inner: Arc<MagicSock>,
     /// Buffers data received via the background pump so `recv` can hand it to the runtime.
-    inbox: tokio::sync::Mutex<mpsc::UnboundedReceiver<Vec<ReceivedData>>>,
+    inbox:
+        tokio::sync::Mutex<mpsc::UnboundedReceiver<crate::receive_batch::Received<ReceivedData>>>,
     _pump: tokio::task::JoinHandle<()>,
 }
 
@@ -3017,12 +3038,15 @@ impl DirectTransport {
             let mut turns = 0;
             loop {
                 match if kernel_receive_batching {
-                    pump_sock.recv_data_batch().await.map(Some)
+                    pump_sock
+                        .recv_data_batch()
+                        .await
+                        .map(|batch| Some(crate::receive_batch::Received::Batch(batch)))
                 } else {
                     pump_sock
                         .recv_data()
                         .await
-                        .map(|data| data.map(|d| vec![d]))
+                        .map(|data| data.map(crate::receive_batch::Received::One))
                 } {
                     Ok(Some(data)) => {
                         if !data.is_empty() && tx.send(data).is_err() {
@@ -3164,11 +3188,11 @@ mod tests {
             _pump: tokio::spawn(std::future::pending()),
         };
         for n in 0..65u8 {
-            tx.send(vec![ReceivedData {
+            tx.send(crate::receive_batch::Received::One(ReceivedData {
                 from_disco: if n % 2 == 0 { key } else { other },
                 from_addr: localhost(),
                 data: PacketMut::from(&[n][..]),
-            }])
+            }))
             .unwrap();
         }
         let batches = transport.recv().await;
@@ -3202,6 +3226,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_demux_transfers_owned_buffer_and_preserves_truncation() {
+        let sock = plain_sock().await;
+        let peer = ts_keys::DiscoPrivateKey::random().public_key();
+        let source: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        sock.addr_to_disco.lock().unwrap().insert(source, peer);
+        let packet = PacketMut::from(vec![7; RECV_BUF + 100]);
+        let address = packet.as_ref().as_ptr();
+        let data = sock
+            .demux_datagram((packet, source))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            data.data.as_ref().as_ptr(),
+            address,
+            "demux transfers ownership"
+        );
+        assert_eq!(data.data.len(), RECV_BUF);
+        assert!(data.data.as_ref().iter().all(|v| *v == 7));
+        assert_eq!(data.from_disco, peer);
+        assert_eq!(data.from_addr, source);
+    }
+
+    #[tokio::test]
     async fn batch_demux_preserves_sources_and_unknown_frames_are_dropped() {
         let sock = plain_sock().await;
         let a = ts_keys::DiscoPrivateKey::random().public_key();
@@ -3213,9 +3261,10 @@ mod tests {
         {
             let mut state = sock.connected_rx.lock().await;
             for i in 0..20u8 {
-                state
-                    .pending
-                    .push_back((vec![i], if i % 2 == 0 { source_a } else { source_b }));
+                state.pending.push_back((
+                    PacketMut::from(&[i]),
+                    if i % 2 == 0 { source_a } else { source_b },
+                ));
             }
         }
         let first = sock.recv_data_batch().await.unwrap();
@@ -3228,7 +3277,7 @@ mod tests {
             assert_eq!(data.data.as_ref(), &[i as u8]);
         }
         assert!(
-            sock.demux_datagram((vec![1], "127.0.0.1:9999".parse().unwrap()))
+            sock.demux_datagram((PacketMut::from(&[1]), "127.0.0.1:9999".parse().unwrap()))
                 .await
                 .unwrap()
                 .is_none()
@@ -3244,18 +3293,21 @@ mod tests {
         {
             let mut state = sock.connected_rx.lock().await;
             state.pending.extend([
-                (b"ready".to_vec(), source),
-                (b"control".to_vec(), source),
-                (b"tail".to_vec(), source),
+                (PacketMut::from(&b"ready"[..]), source),
+                (PacketMut::from(&b"control"[..]), source),
+                (PacketMut::from(&b"tail"[..]), source),
             ]);
-            let sock_ref = &sock;
-            let demux = |datagram: crate::receive_batch::Datagram| async move {
-                if datagram.0 == b"control" {
+            async fn suspended_control(
+                sock: &MagicSock,
+                datagram: crate::receive_batch::Datagram,
+            ) -> Result<Option<ReceivedData>, Error> {
+                if datagram.0.as_ref() == b"control" {
                     core::future::pending().await
                 } else {
-                    sock_ref.demux_datagram(datagram).await
+                    sock.demux_datagram(datagram).await
                 }
-            };
+            }
+            let demux = |datagram| suspended_control(&sock, datagram);
             assert!(
                 tokio::time::timeout(
                     Duration::from_millis(10),
@@ -3272,6 +3324,37 @@ mod tests {
             result.iter().map(|d| d.data.as_ref()).collect::<Vec<_>>(),
             vec![&b"ready"[..], &b"tail"[..]]
         );
+    }
+
+    #[tokio::test]
+    async fn batch_control_error_delivers_preceding_data_before_error() {
+        let sock = plain_sock().await;
+        let peer = ts_keys::DiscoPrivateKey::random().public_key();
+        let source: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        sock.addr_to_disco.lock().unwrap().insert(source, peer);
+        {
+            let mut state = sock.connected_rx.lock().await;
+            state.pending.extend([
+                (PacketMut::from(&b"data"[..]), source),
+                (PacketMut::from(&b"error"[..]), source),
+            ]);
+            async fn fail_control(
+                sock: &MagicSock,
+                datagram: crate::receive_batch::Datagram,
+            ) -> Result<Option<ReceivedData>, Error> {
+                if datagram.0.as_ref() == b"error" {
+                    Err(Error::NoPath)
+                } else {
+                    sock.demux_datagram(datagram).await
+                }
+            }
+            let result = demux_receive_batch(&mut state, |datagram| fail_control(&sock, datagram))
+                .await
+                .unwrap();
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].data.as_ref(), b"data");
+        }
+        assert!(matches!(sock.recv_data_batch().await, Err(Error::NoPath)));
     }
 
     fn localhost() -> SocketAddr {

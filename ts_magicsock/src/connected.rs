@@ -39,7 +39,7 @@ const IDLE_EVICT: Duration = Duration::from_secs(120);
 const PUMP_BUF: usize = 65_535;
 
 /// A datagram received on a connected socket, handed to the shared demux.
-pub(crate) type Received = Vec<crate::receive_batch::Datagram>;
+pub(crate) type Received = crate::receive_batch::Received<crate::receive_batch::Datagram>;
 
 /// Settings read from the environment once, at bind.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -293,15 +293,27 @@ fn spawn_pump(
     tokio::spawn(async move {
         let batching = crate::receive_batch::enabled();
         let mut receiver = batching.then(crate::receive_batch::Receiver::new);
-        let mut buf = vec![0u8; PUMP_BUF];
+        let mut buf = if batching {
+            Vec::new()
+        } else {
+            vec![0u8; PUMP_BUF]
+        };
         let mut turns = 0;
         loop {
             let received = if batching {
-                receiver.as_mut().unwrap().recv(&sock, Some(remote)).await
-            } else {
-                sock.recv(&mut buf)
+                receiver
+                    .as_mut()
+                    .unwrap()
+                    .recv(&sock, Some(remote))
                     .await
-                    .map(|n| vec![(buf[..n].to_vec(), remote)])
+                    .map(crate::receive_batch::Received::Batch)
+            } else {
+                sock.recv(&mut buf).await.map(|n| {
+                    crate::receive_batch::Received::One((
+                        ts_packet::PacketMut::from(&buf[..n.min(crate::receive_batch::BUFFER_LEN)]),
+                        remote,
+                    ))
+                })
             };
             match received {
                 Ok(batch) => {
@@ -378,8 +390,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let (data, from) = &batch[0];
-        assert_eq!((data.as_slice(), *from), (&b"reply"[..], remote_addr));
+        let (data, from) = batch.into_iter().next().unwrap();
+        assert_eq!((data.as_ref(), from), (&b"reply"[..], remote_addr));
 
         // Subsequent sends reuse it; clearing drops it.
         assert!(c.socket_for(remote_addr, 10, &shared).is_some());
