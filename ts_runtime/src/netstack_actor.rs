@@ -48,6 +48,18 @@ pub struct NetstackActor {
 /// what was dropped and UDP is lossy by contract.
 pub(crate) const INGRESS_QUEUE_PACKETS: usize = 4096;
 
+/// Most packets a netstack egress pump hands the dataplane at once.
+pub(crate) const EGRESS_BATCH: usize = 64;
+
+/// A packet the netstack emitted, as a [`PacketMut`]: zero-copy when the pipe's buffer is uniquely
+/// owned (it always is: the pipe copies each packet in), a copy otherwise.
+pub(crate) fn into_packet(buf: bytes::Bytes) -> PacketMut {
+    match buf.try_into_mut() {
+        Ok(owned) => owned.into(),
+        Err(shared) => PacketMut::from(&shared[..]),
+    }
+}
+
 /// Build a netstack whose ingress queue holds at most [`INGRESS_QUEUE_PACKETS`] packets and that
 /// many MTU-sized packets' worth of bytes.
 ///
@@ -189,8 +201,17 @@ impl kameo::Actor for NetstackActor {
         });
 
         joinset.spawn(async move {
-            while let Some(buf) = netstack_down_rx.recv_async().await {
-                if netstack_up.send(vec![buf.to_vec().into()]).is_err() {
+            while let Some(first) = netstack_down_rx.recv_async().await {
+                // Hand the dataplane whatever is already queued as one batch, so encryption and the
+                // underlay send can work per batch rather than per packet.
+                let mut batch = Vec::with_capacity(EGRESS_BATCH);
+                batch.push(crate::netstack_actor::into_packet(first));
+                while batch.len() < EGRESS_BATCH
+                    && let Some(more) = netstack_down_rx.try_recv()
+                {
+                    batch.push(crate::netstack_actor::into_packet(more));
+                }
+                if netstack_up.send(batch).is_err() {
                     break;
                 }
             }

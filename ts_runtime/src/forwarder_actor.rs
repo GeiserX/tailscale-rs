@@ -181,8 +181,17 @@ impl kameo::Actor for ForwarderActor {
         // Pump packets emitted by the forwarder netstack down into the dataplane (out the overlay).
         let reject_up = netstack_up.clone();
         joinset.spawn(async move {
-            while let Some(buf) = netstack_down_rx.recv_async().await {
-                if netstack_up.send(vec![buf.to_vec().into()]).is_err() {
+            while let Some(first) = netstack_down_rx.recv_async().await {
+                // Hand the dataplane whatever is already queued as one batch, so encryption and the
+                // underlay send can work per batch rather than per packet.
+                let mut batch = Vec::with_capacity(crate::netstack_actor::EGRESS_BATCH);
+                batch.push(crate::netstack_actor::into_packet(first));
+                while batch.len() < crate::netstack_actor::EGRESS_BATCH
+                    && let Some(more) = netstack_down_rx.try_recv()
+                {
+                    batch.push(crate::netstack_actor::into_packet(more));
+                }
+                if netstack_up.send(batch).is_err() {
                     break;
                 }
             }
