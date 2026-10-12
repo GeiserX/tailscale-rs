@@ -47,6 +47,19 @@ pub enum Command {
     Raw(raw::Command),
 }
 
+impl Command {
+    /// Whether this command takes data off a socket, so running it for a caller that has gone away
+    /// would lose that data.
+    pub fn is_receive(&self) -> bool {
+        matches!(
+            self,
+            Command::TcpStream(tcp::stream::Command::Recv { .. })
+                | Command::Udp(udp::Command::Recv { .. })
+                | Command::Raw(raw::Command::Recv { .. })
+        )
+    }
+}
+
 /// Response to a command.
 #[derive(Debug)]
 pub enum Response {

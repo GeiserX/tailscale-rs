@@ -545,6 +545,16 @@ impl Netstack {
         for _ in 0..self.blocked_commands.len() {
             let (req, queued_gen) = self.blocked_commands.pop_front().unwrap();
 
+            // A receive whose caller has gone away (its future was dropped: a `select!` arm that
+            // lost, a `timeout` that fired) must not run: it would take the next datagram or bytes
+            // off the socket and hand them to a closed response channel, silently losing them. The
+            // caller's retry has already queued a fresh receive behind this one, which would
+            // otherwise starve one item per cancellation.
+            if req.resp.is_disconnected() && req.command.is_receive() {
+                tracing::trace!(handle = ?req.handle, "dropping abandoned blocked receive");
+                continue;
+            }
+
             // Generation guard (the ABA fix): if this command's handle was freed and its slot
             // recycled to a *different* socket since it was queued, the handle's current
             // generation differs from (or is absent versus) the one captured at requeue time.
@@ -985,6 +995,66 @@ mod handle_aba_tests {
             stack.blocked_commands.is_empty(),
             "the completed command must not remain queued"
         );
+    }
+
+    /// A blocked receive whose caller went away (its future dropped by a `select!` or `timeout`)
+    /// must not consume the next datagram: the caller's retry, queued behind it, gets the data.
+    #[test]
+    fn abandoned_blocked_recv_does_not_eat_the_next_datagram() {
+        use smoltcp::phy::Medium;
+
+        use crate::{HasChannel, Pipe, PipeDev};
+
+        let mut stack = Netstack::new(
+            Config {
+                loopback: true,
+                ..Default::default()
+            },
+            Instant::ZERO,
+        );
+        let channel = stack.command_channel();
+        let ep = core::net::SocketAddr::from(([127, 0, 0, 1], 1000));
+        let handle = bind_udp(&mut stack, 1000);
+
+        // First receive blocks, then its caller gives up; the retry blocks behind it.
+        let (abandoned, abandoned_rx) = req(Some(handle), udp::Command::Recv { max_len: None });
+        stack.process_one_cmd(abandoned);
+        drop(abandoned_rx);
+        let (retry, retry_rx) = req(Some(handle), udp::Command::Recv { max_len: None });
+        stack.process_one_cmd(retry);
+        assert_eq!(stack.blocked_commands.len(), 2);
+
+        let jh = std::thread::spawn(move || {
+            channel.request_blocking(
+                Some(handle),
+                udp::Command::Send {
+                    endpoint: ep,
+                    local: None,
+                    buf: Bytes::copy_from_slice(b"hello"),
+                },
+            )
+        });
+        let send_cmd = stack.wait_for_cmd_blocking(None).unwrap();
+        stack.process_one_cmd(send_cmd);
+        let (net, phy) = Pipe::unbounded();
+        let mut net = PipeDev {
+            pipe: net,
+            medium: Medium::Ip,
+            mtu: 1536,
+        };
+        stack.poll_device_io(Instant::ZERO, &mut net);
+        let pkt = phy.rx.try_recv().expect("the sent datagram");
+        phy.tx.try_send(pkt).expect("loop the datagram back");
+        stack.poll_device_io(Instant::ZERO, &mut net);
+        jh.join().unwrap().unwrap();
+
+        match retry_rx.try_recv() {
+            Ok(CmdResponse::Udp(udp::Response::RecvFrom { buf, .. })) => {
+                assert_eq!(&buf[..], b"hello")
+            }
+            other => panic!("the live retry must get the datagram, got {other:?}"),
+        }
+        assert!(stack.blocked_commands.is_empty());
     }
 
     /// tsr-ufm: `pending_tcp_closes` has no dedup, so the same handle can appear twice. The first
