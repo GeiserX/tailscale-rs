@@ -6,7 +6,7 @@ use tracing::Instrument;
 /// Run the netstack in the current thread.
 ///
 /// Expect this function to block forever.
-#[tracing::instrument(skip_all, fields(?poll_max_delay))]
+#[tracing::instrument(level = "trace", skip_all, fields(?poll_max_delay))]
 pub fn run_blocking(
     netstack: &mut netcore::Netstack,
     dev: &mut impl smoltcp::phy::Device,
@@ -47,7 +47,7 @@ pub fn run_blocking(
 }
 
 /// Run the netstack indefinitely.
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "trace", skip_all)]
 pub async fn run(
     netstack: &mut netcore::Netstack,
     dev: &mut (impl netcore::AsyncWakeDevice + smoltcp::phy::Device + Unpin),

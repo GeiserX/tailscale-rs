@@ -263,7 +263,7 @@ impl Netstack {
     }
 
     /// Attempt to accept a TCP connection for all TCP listeners.
-    #[tracing::instrument(skip_all)]
+    #[tracing::instrument(level = "trace", skip_all)]
     pub(crate) fn pump_tcp_accept(&mut self) {
         // Iterate listener handles (not `values_mut()`) so the body holds a full `&mut self` and can
         // call `&self`/`&mut self` helpers (`new_tcp_socket`, the backlog enforcement). The listener

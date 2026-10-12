@@ -144,7 +144,7 @@ impl Netstack {
     }
 
     /// Drop all TCP sockets that have finished closing.
-    #[tracing::instrument(skip_all)]
+    #[tracing::instrument(level = "trace", skip_all)]
     pub(crate) fn drain_tcp_closes(&mut self) {
         // Take the list out so the `retain` closure doesn't hold a borrow of `*self`: removing a
         // socket now goes through `remove_socket` (which needs `&mut self` for the gen-map), and a
