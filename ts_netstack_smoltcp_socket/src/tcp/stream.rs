@@ -88,10 +88,10 @@ impl TcpStream {
     /// the intended `shutdown(SHUT_WR)` POSIX behavior (previously, when this was a no-op, a write
     /// after shutdown still succeeded). Reads continue until the peer's FIN.
     ///
-    /// Best-effort delivery: `request_nonblocking` treats a *full* command channel as success and
-    /// drops the command, so under channel saturation the FIN may not be sent — the socket then
-    /// teardown-degrades to the idle/keep-alive timeout reaper instead of a prompt FIN (never a hard
-    /// leak). A channel-*closed* error means the netstack is gone; the socket is already moot.
+    /// Delivery is guaranteed with the default unbounded command channel. With an explicitly bounded
+    /// one (`Config::command_channel_capacity`), a full channel drops the command (logged), the FIN
+    /// is never sent, and the socket waits for the idle/keep-alive timeout reaper. A channel-*closed*
+    /// error means the netstack is gone; the socket is already moot.
     pub fn shutdown_write(&self) {
         if let Err(e) = self
             .sender
