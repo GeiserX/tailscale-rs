@@ -219,6 +219,15 @@ opt-level = "s"
 split-debuginfo = "packed"
 strip = true
 
+# For running and profiling the exit node: release, but optimized for speed rather than size, with
+# line tables and symbols kept so profilers can attribute samples.
+[profile.exitnode]
+inherits = "release"
+opt-level = 3
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+strip = false
+
 [profile.bench]
 debug = true
 opt-level = 3
