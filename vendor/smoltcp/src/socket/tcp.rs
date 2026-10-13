@@ -172,6 +172,7 @@ struct RttEstimator {
     // Using u32 instead of Duration to save space (Duration is i64)
     /// Smoothed RTT
     srtt: u32,
+    min_rtt: u32,
     /// RTT variance.
     rttvar: u32,
     /// Retransmission Time-Out
@@ -186,7 +187,8 @@ impl Default for RttEstimator {
     fn default() -> Self {
         Self {
             have_measurement: false,
-            srtt: 0,   // ignored, will be overwritten on first measurement.
+            srtt: 0, // ignored, will be overwritten on first measurement.
+            min_rtt: u32::MAX,
             rttvar: 0, // ignored, will be overwritten on first measurement.
             rto: RTTE_INITIAL_RTO,
             min_rto: RTTE_MIN_RTO,
@@ -203,6 +205,7 @@ impl RttEstimator {
     }
 
     fn sample(&mut self, new_rtt: u32) {
+        self.min_rtt = self.min_rtt.min(new_rtt);
         if self.have_measurement {
             // RFC 6298 (2.3) When a subsequent RTT measurement R' is made, a host MUST set (...)
             let diff = (self.srtt as i32 - new_rtt as i32).unsigned_abs();
@@ -2320,6 +2323,7 @@ impl<'a> Socket<'a> {
     fn pacing_window(&self) -> Option<usize> {
         (self.pacing_enabled
             && self.rtte.srtt > 5
+            && self.rtte.min_rtt > 5
             && self.congestion_control() != CongestionControl::None)
             .then(|| self.congestion_controller.inner().window())
     }
@@ -2887,6 +2891,11 @@ impl<'a> Socket<'a> {
         if repr.segment_len() > 0 {
             self.rtte
                 .on_send(cx.now(), repr.seq_number + repr.segment_len());
+            // Maintain the sent high-water mark, but do not sample fresh data
+            // ACKed behind a recovery hole, or any selective retransmission.
+            if retransmitting || self.recovery_end.is_some() {
+                self.rtte.on_retransmit();
+            }
             self.congestion_controller
                 .inner_mut()
                 .post_transmit(cx.now(), repr.segment_len());
@@ -6584,6 +6593,21 @@ mod test {
             .unwrap();
     }
 
+    #[cfg(feature = "socket-tcp-reno")]
+    #[test]
+    fn test_pacing_uses_baseline_rtt_despite_cpu_queueing() {
+        let mut s = socket_established();
+        s.set_congestion_control(CongestionControl::Reno);
+        s.set_pacing_enabled(true);
+        s.rtte.sample(1);
+        s.rtte.sample(100);
+        assert!(s.rtte.srtt > 5);
+        assert_eq!(s.pacing_window(), None);
+        s.reset();
+        s.rtte.sample(25);
+        assert!(s.pacing_window().is_some());
+    }
+
     #[test]
     fn test_expired_rto_precedes_unsent_data() {
         let mut s = socket_established();
@@ -6684,6 +6708,7 @@ mod test {
                 ..RECV_TEMPL
             }));
         }
+        s.send_slice(b"gggggg").unwrap();
         for window in [255, 254, 253] {
             send!(s, time 10, TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
@@ -6702,22 +6727,39 @@ mod test {
                 ..RECV_TEMPL
             }));
         }
+        recv!(s, time 11, Ok(TcpRepr {
+            seq_number: base + 36,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: b"gggggg",
+            ..RECV_TEMPL
+        }));
         recv_nothing!(s, time 11);
-        assert_eq!(s.remote_last_seq, base + 36);
-        assert_eq!(s.tx_buffer.len(), 36, "SACK must not free transmit data");
+        assert_eq!(s.remote_last_seq, base + 42);
+        assert_eq!(s.rtte.max_seq_sent, Some(base + 42));
+        assert_eq!(
+            s.rtte.timestamp, None,
+            "recovery must not inflate RTT samples"
+        );
+        assert_eq!(s.tx_buffer.len(), 42, "SACK must not free transmit data");
         send!(s, time 20, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(base + 12),
             ..SEND_TEMPL
         });
         recv_nothing!(s, time 20); // The second hole was already retransmitted.
-        assert_eq!(s.tx_buffer.len(), 24);
+        assert_eq!(s.tx_buffer.len(), 30);
         send!(s, time 21, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(base + 36),
             ..SEND_TEMPL
         });
         assert_eq!(s.recovery_end, None);
+        assert_eq!(s.tx_buffer.len(), 6);
+        send!(s, time 22, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(base + 42),
+            ..SEND_TEMPL
+        });
         assert!(s.tx_buffer.is_empty());
     }
 
