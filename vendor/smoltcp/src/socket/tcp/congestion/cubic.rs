@@ -63,7 +63,7 @@ impl Controller for Cubic {
         if self.cwnd < self.ssthresh {
             self.cwnd = self
                 .cwnd
-                .saturating_add(len)
+                .saturating_add(len.min(2 * self.min_cwnd))
                 .min(self.rwnd)
                 .max(self.min_cwnd);
         }
@@ -171,12 +171,25 @@ mod test {
     use super::*;
 
     #[test]
+    fn cubic_timeout_restart_bounds_stretched_ack() {
+        let mut cubic = Cubic::new();
+        cubic.set_mss(1200);
+        cubic.cwnd = 480000;
+        let now = Instant::from_millis(0);
+        cubic.on_retransmit(now);
+        cubic.on_ack(now, 240000, &RttEstimator::default());
+        assert_eq!(cubic.window(), 3600);
+    }
+
+    #[test]
     fn cubic_slow_start_and_segment_units() {
         let mut cubic = Cubic::new();
         cubic.set_mss(1200);
         let now = Instant::from_millis(0);
         cubic.pre_transmit(now);
-        cubic.on_ack(now, 12000, &RttEstimator::default());
+        for _ in 0..5 {
+            cubic.on_ack(now, 2400, &RttEstimator::default());
+        }
         cubic.pre_transmit(Instant::from_millis(100));
         assert_eq!(cubic.window(), 24000);
         cubic.on_duplicate_ack(now);
