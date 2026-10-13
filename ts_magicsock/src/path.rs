@@ -746,61 +746,35 @@ impl PeerPaths {
         self.best
     }
 
-    /// Recompute the best path after a pong confirmed `confirmed` (the address whose latency was
-    /// just updated). `confirmed` is used to decide whether a *hold* (keeping the current best
-    /// against a near-equal challenger) may also refresh the held best's trust window — see below.
+    /// Update the best path after a pong confirmed `confirmed` (the address whose latency was just
+    /// updated), as Go magicsock `handlePongConnLocked` does: the address that just ponged becomes
+    /// the best if the current best is no longer trusted, or if `better_addr` prefers it to the
+    /// current best; and trust is refreshed only when the best is the address that just ponged.
+    ///
+    /// Only the pong in hand is compared, never a scan of every candidate's remembered latency. A
+    /// remembered latency is never cleared while its candidate stays, so a scan would keep electing
+    /// a dead path on its old reading (a LAN path with its private-address bonus, say), and a live
+    /// rival's pongs could then neither take over nor restore trust: the peer would sit on DERP
+    /// while the rival keeps answering.
     fn recompute_best(&mut self, now: Instant, confirmed: SocketAddr) {
-        // The best confirmed candidate (one with a measured latency) by Go's `betterAddr`. Ties
-        // keep the lower address, so the pick doesn't depend on map iteration order.
-        let mut confirmed_paths: Vec<(SocketAddr, Duration)> = self
-            .candidates
-            .iter()
-            .filter_map(|(addr, c)| c.latency.map(|l| (*addr, l)))
-            .collect();
-        confirmed_paths.sort();
-        let challenger = confirmed_paths
-            .into_iter()
-            .reduce(|best, x| if better_addr(x, best) { x } else { best });
-
-        let Some((challenger_addr, challenger_lat)) = challenger else {
-            // No confirmed candidate — nothing to trust. Leave `best`/`trust_until` as-is (an
-            // expired best is reported as untrusted by `best_addr`; a rebind clears them).
+        let Some(latency) = self.candidates.get(&confirmed).and_then(|c| c.latency) else {
             return;
         };
-
-        // Hysteresis: if the current best is still trusted AND still a confirmed candidate, only
-        // switch to a challenger `better_addr` prefers (Go `betterAddr`). This stops `best`
-        // flapping between near-equal endpoints on RTT jitter.
-        if let (Some(current), Some(until)) = (self.best, self.trust_until)
-            && now < until
-            && current != challenger_addr
-            && let Some(current_lat) = self.candidates.get(&current).and_then(|c| c.latency)
-        {
-            let challenger_wins =
-                better_addr((challenger_addr, challenger_lat), (current, current_lat));
-            if !challenger_wins {
-                // Keep the current best. Only refresh its trust window if the pong that triggered
-                // this recompute was *for the best itself* — a pong for a rival proves some path
-                // works but does NOT prove the best is still alive, so refreshing on a rival's pong
-                // could keep a silently-dead best trusted up to a full `TRUST_DURATION` longer. The
-                // best is independently re-pinged every refresh cycle (`send_pings` pings all
-                // candidates), so its own pong is what legitimately extends trust here.
-                if confirmed == current {
-                    self.trust_until = Some(now + TRUST_DURATION);
-                }
-                return;
-            }
+        let trusted = self.trust_until.is_some_and(|until| now < until);
+        let current = self.best.and_then(|b| {
+            self.candidates
+                .get(&b)
+                .and_then(|c| c.latency)
+                .map(|l| (b, l))
+        });
+        if !trusted || current.is_none_or(|cur| better_addr((confirmed, latency), cur)) {
+            self.best = Some(confirmed);
         }
-
-        // The current best is still the best, but this pong was for another candidate: it proves
-        // that candidate works, not that the best is still alive, so it must not extend the best's
-        // trust (Go only refreshes `trustBestAddrUntil` for the address that ponged).
-        if self.best == Some(challenger_addr) && confirmed != challenger_addr {
-            return;
+        // A pong for a rival proves the rival works, not that the best is still alive, so only the
+        // best's own pong extends its trust (Go `trustBestAddrUntil`).
+        if self.best == Some(confirmed) {
+            self.trust_until = Some(now + TRUST_DURATION);
         }
-
-        self.best = Some(challenger_addr);
-        self.trust_until = Some(now + TRUST_DURATION);
     }
 }
 
@@ -1324,6 +1298,36 @@ mod tests {
         p.note_ping_sent(tx(2), public, now);
         p.note_pong(tx(2), public, now + Duration::from_micros(1_800));
         assert_eq!(p.best_addr(now + Duration::from_millis(3)), Some(lan));
+    }
+
+    /// A LAN path that stops answering must not hold the peer on DERP while a live public path
+    /// keeps answering. The LAN path wins on its private-address bonus while both answer; once it
+    /// goes silent and its trust lapses, the public path's next pong takes over (Go promotes the
+    /// ponging address whenever the best is untrusted).
+    #[test]
+    fn live_public_path_takes_over_from_a_silent_lan_best() {
+        let mut p = PeerPaths::default();
+        let lan: SocketAddr = "192.168.50.76:41644".parse().unwrap();
+        let public: SocketAddr = "203.0.113.34:41644".parse().unwrap();
+        p.add_netmap_candidates([lan, public]);
+        let now = Instant::now();
+        p.note_ping_sent(tx(1), lan, now);
+        p.note_pong(tx(1), lan, now + Duration::from_millis(2));
+        p.note_ping_sent(tx(2), public, now);
+        p.note_pong(tx(2), public, now + Duration::from_micros(1_800));
+        // The LAN path is best here (`lan_path_stays_best_against_faster_public_hairpin`). Not
+        // asserted, so the test also holds on a latency-only selection, which picks the public path.
+
+        // The LAN path goes silent. Only the public path answers, past the LAN path's trust window.
+        let t1 = now + TRUST_DURATION + Duration::from_secs(1);
+        p.note_ping_sent(tx(3), lan, t1);
+        p.note_ping_sent(tx(4), public, t1);
+        p.note_pong(tx(4), public, t1 + Duration::from_micros(1_800));
+        assert_eq!(
+            p.best_addr(t1 + Duration::from_millis(3)),
+            Some(public),
+            "a live public path must take over once the silent LAN best's trust lapses"
+        );
     }
 
     // ---- cadence gates (tsr-7s3, matching Go magicsock) ----
