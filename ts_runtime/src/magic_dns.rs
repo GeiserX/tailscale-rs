@@ -2204,8 +2204,16 @@ impl Message<Arc<ts_control::StateUpdate>> for MagicDnsActor {
         let accept_dns = self.env.accept_dns();
         self.view_tx.send_modify(|view| {
             let mut next = (**view).clone();
-            next.cfg = update.dns_config.clone().unwrap_or_default();
-            next.self_node = update.node.clone();
+            // Most responses are deltas that carry neither the DNS config nor the self node; keep
+            // the last ones seen rather than resetting them (Go keeps both in its netmap until a
+            // response replaces them). Resetting dropped this node's own address, which the peerAPI
+            // Host check needs, and its MagicDNS config on every delta.
+            if let Some(cfg) = &update.dns_config {
+                next.cfg = cfg.clone();
+            }
+            if let Some(node) = &update.node {
+                next.self_node = Some(node.clone());
+            }
             next.accept_dns = accept_dns;
             *view = Arc::new(next);
         });
