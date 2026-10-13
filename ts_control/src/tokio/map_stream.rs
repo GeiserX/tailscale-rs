@@ -197,7 +197,10 @@ const MAX_NETMAP_FRAME: u32 = 16 * 1024 * 1024;
 /// frame's declared *window* / content-size header drives no eager allocation (a frame declaring a
 /// multi-terabyte window with a tiny body decompresses with only kilobytes of working set). Because
 /// the [`decompress_frame`] reader reads through a [`std::io::Read::take`] of `MAX_DECODED_NETMAP + 1`,
-/// the output `Vec` (and with it ruzstd's window) cannot grow past the cap. Peak *transient*
+/// the output `Vec` (and with it ruzstd's window) cannot grow past the cap. That rests on the
+/// decoder refusing a block that decompresses past zstd's own 128 KiB block limit, because a block
+/// is expanded whole before the `take` sees any of it; ruzstd checks this from 0.9.1 on
+/// (RUSTSEC-2026-0344), which is why the workspace requires at least that version. Peak *transient*
 /// allocation is a small constant multiple of the cap (the output `Vec`'s amortized-doubling growth
 /// plus ruzstd's internal window/block buffers), all bounded by the cap, freed when the frame is
 /// dropped, and non-stacking (the map poll drives a single frame reader per node).
@@ -994,6 +997,62 @@ mod tests {
             stream.next().await.is_none(),
             "a frame decompressing past MAX_DECODED_NETMAP must end the stream, not allocate it"
         );
+    }
+
+    /// A zstd frame holding ONE compressed block of `sequences` sequences, hand-assembled because no
+    /// conforming encoder will emit a block this dense. Each sequence is one literal `a` followed by
+    /// a 65539-byte match at offset 1, so the block decompresses to `sequences * 65540` bytes of `a`
+    /// from two bytes of bitstream per sequence.
+    fn one_block_frame(sequences: u8) -> Vec<u8> {
+        // The one-byte forms of the literals header and the sequence count top out here.
+        assert!((1..=31).contains(&sequences));
+
+        let mut block = alloc::vec![
+            // Literals section: RLE, `sequences` copies of the byte that follows.
+            (sequences << 3) | 0b01,
+            b'a',
+            // Sequences section: the count, then all three tables in RLE mode — literals-length
+            // code 1 (one literal), offset code 0 (repeat the last offset, initially 1), and
+            // match-length code 52 (65539 plus 16 extra bits).
+            sequences,
+            0b0101_0100,
+            1,
+            0,
+            52,
+        ];
+        // The bitstream: RLE tables carry no state bits, so each sequence is just its 16 zero
+        // match-length extra bits. It is read backwards from a final byte holding the end mark.
+        block.resize(block.len() + 2 * usize::from(sequences), 0);
+        block.push(1);
+
+        let mut frame = ZSTD_MAGIC.to_vec();
+        // Frame header: no content size, no checksum, no dictionary; then a 1 MiB window, so the
+        // block size limit is the format's own 128 KiB rather than a smaller window.
+        frame.extend_from_slice(&[0x00, 10 << 3]);
+        // Block header: last block, compressed, and the block's size.
+        let header = (block.len() as u32) << 3 | 0b101;
+        frame.extend_from_slice(&header.to_le_bytes()[..3]);
+        frame.extend_from_slice(&block);
+        frame
+    }
+
+    /// The per-block half of the zip-bomb guard (RUSTSEC-2026-0344). zstd caps what one block may
+    /// decompress to at 128 KiB (RFC 8878 `Block_Maximum_Size`), and the decoder has to enforce
+    /// that itself: it expands a whole block before `decompress_frame`'s `take` sees a byte of it,
+    /// so a block that ignores the cap allocates its full output first. `ruzstd` before 0.9.1 did
+    /// not check, and a frame under 128 KB could ask for gigabytes. The frame here stays at 2 MB —
+    /// far inside `MAX_DECODED_NETMAP`, so only the block limit can refuse it.
+    #[test]
+    fn rejects_zstd_block_decompressing_past_the_block_limit() {
+        // One sequence stays inside the limit and decodes, so the frames built here are well-formed
+        // and the refusal below is the limit's doing.
+        let decoded = decompress_frame(&one_block_frame(1)).expect("a block inside the limit");
+        assert_eq!(decoded.len(), 65_540);
+        assert!(decoded.iter().all(|&byte| byte == b'a'));
+
+        let bomb = one_block_frame(31);
+        assert!(bomb.len() < 100);
+        assert_eq!(decompress_frame(&bomb).map(|decoded| decoded.len()), None);
     }
 
     /// Accept-side of the decoded-size bound: a frame that decompresses to a LARGE but in-bounds body
