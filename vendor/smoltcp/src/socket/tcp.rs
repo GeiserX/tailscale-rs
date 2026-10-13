@@ -2250,8 +2250,11 @@ impl<'a> Socket<'a> {
         }
 
         // max sequence number we can send.
-        let max_send_seq =
-            self.local_seq_no + core::cmp::min(self.remote_win_len, self.tx_buffer.len());
+        let max_send_seq = self.local_seq_no
+            + self
+                .remote_win_len
+                .min(self.tx_buffer.len())
+                .min(self.congestion_controller.inner().window());
 
         // Max amount of octets we can send.
         let max_send = if max_send_seq >= self.remote_last_seq {
@@ -2259,9 +2262,6 @@ impl<'a> Socket<'a> {
         } else {
             0
         };
-
-        // Compare max_send with the congestion window.
-        let max_send = max_send.min(self.congestion_controller.inner().window());
 
         // Can we send at least 1 octet?
         let mut can_send = max_send != 0;
@@ -2538,6 +2538,15 @@ impl<'a> Socket<'a> {
                     // http://www.tcpipguide.com/free/t_TCPWindowManagementIssues.htm
                     0
                 };
+
+                // cwnd bounds the entire flight, including on ACK-only dispatches.
+                let in_flight = self.remote_last_seq - self.local_seq_no;
+                win_limit = win_limit.min(
+                    self.congestion_controller
+                        .inner()
+                        .window()
+                        .saturating_sub(in_flight),
+                );
 
                 // To send a zero-window-probe, force the window limit to at least 1 byte.
                 if win_limit == 0 && self.timer.should_zero_window_probe(cx.now()) {
@@ -3025,6 +3034,8 @@ mod test {
         let tx_buffer = SocketBuffer::new(vec![0; tx_len]);
         let mut socket = Socket::new(rx_buffer, tx_buffer);
         socket.set_ack_delay(None);
+        // Most socket tests exercise TCP independently of congestion control.
+        socket.set_congestion_control(CongestionControl::None);
         TestSocket {
             socket,
             cx: iface.inner,
@@ -6298,6 +6309,45 @@ mod test {
             payload:    &b"ABCDEF"[..],
             ..RECV_TEMPL
         }));
+    }
+
+    #[cfg(feature = "socket-tcp-reno")]
+    #[test]
+    fn test_congestion_window_bounds_flight_and_ack_dispatch() {
+        let mut s = socket_established_with_buffer_sizes(8192, 64);
+        s.remote_win_len = 8192;
+        s.set_nagle_enabled(false);
+        s.remote_mss = 1200;
+        s.set_congestion_control(CongestionControl::Reno);
+        s.send_slice(&[0; 4096]).unwrap();
+        let cwnd = s.congestion_controller.inner().window();
+        let mut sent = 0;
+        while sent < cwnd {
+            let mut len = 0;
+            s.socket
+                .dispatch(&mut s.cx, |_, (_, repr)| {
+                    len = repr.payload.len();
+                    Ok::<_, ()>(())
+                })
+                .unwrap();
+            assert!(len > 0);
+            sent += len;
+            assert!(sent <= cwnd);
+        }
+        recv_nothing(&mut s, Instant::from_millis(1));
+        // An incoming byte requires an ACK, but cannot bypass cwnd to send more data.
+        send!(s, time 2, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: b"a",
+            ..SEND_TEMPL
+        });
+        s.socket
+            .dispatch(&mut s.cx, |_, (_, repr)| {
+                assert!(repr.payload.is_empty());
+                Ok::<_, ()>(())
+            })
+            .unwrap();
     }
 
     #[test]
