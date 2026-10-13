@@ -9,6 +9,7 @@ pub struct Reno {
     min_cwnd: usize,
     ssthresh: usize,
     rwnd: usize,
+    ack_credit: usize,
 }
 
 impl Reno {
@@ -18,6 +19,7 @@ impl Reno {
             min_cwnd: 1024 * 2,
             ssthresh: usize::MAX,
             rwnd: 64 * 1024,
+            ack_credit: 0,
         }
     }
 }
@@ -28,30 +30,40 @@ impl Controller for Reno {
     }
 
     fn on_ack(&mut self, _now: Instant, len: usize, _rtt: &RttEstimator) {
-        let len = if self.cwnd < self.ssthresh {
-            // Slow start.
-            len
+        if len == 0 {
+            return;
+        }
+        if self.cwnd < self.ssthresh {
+            self.cwnd = self.cwnd.saturating_add(len.min(self.min_cwnd));
         } else {
-            self.ssthresh = self.cwnd;
-            self.min_cwnd
-        };
-
-        self.cwnd = self
-            .cwnd
-            .saturating_add(len)
-            .min(self.rwnd)
-            .max(self.min_cwnd);
+            // Congestion avoidance grows by one MSS per window acknowledged,
+            // rather than one MSS per ACK (or duplicate ACK).
+            self.ack_credit = self.ack_credit.saturating_add(len);
+            if self.ack_credit >= self.cwnd {
+                self.ack_credit -= self.cwnd;
+                self.cwnd = self.cwnd.saturating_add(self.min_cwnd);
+            }
+        }
+        self.cwnd = self.cwnd.min(self.rwnd).max(self.min_cwnd);
     }
 
     fn on_duplicate_ack(&mut self, _now: Instant) {
-        self.ssthresh = (self.cwnd >> 1).max(self.min_cwnd);
+        self.ssthresh = (self.cwnd / 2).max(2 * self.min_cwnd);
+        self.cwnd = self.ssthresh;
+        self.ack_credit = 0;
     }
 
     fn on_retransmit(&mut self, _now: Instant) {
-        self.cwnd = (self.cwnd >> 1).max(self.min_cwnd);
+        self.ssthresh = (self.cwnd / 2).max(2 * self.min_cwnd);
+        self.cwnd = self.min_cwnd;
+        self.ack_credit = 0;
     }
 
     fn set_mss(&mut self, mss: usize) {
+        // RFC 6928 initial window; do not reset a running connection.
+        if self.ssthresh == usize::MAX && self.ack_credit == 0 && self.cwnd == 2048 {
+            self.cwnd = (10 * mss).min(14600).max(2 * mss);
+        }
         self.min_cwnd = mss;
     }
 
@@ -67,6 +79,31 @@ mod test {
     use crate::time::Instant;
 
     use super::*;
+
+    #[test]
+    fn reno_ack_clock_and_timeout_restart() {
+        let now = Instant::from_millis(0);
+        let mut reno = Reno::new();
+        reno.set_mss(1200);
+        assert_eq!(reno.window(), 12000);
+        reno.on_duplicate_ack(now);
+        assert_eq!(reno.window(), 6000);
+        for _ in 0..100 {
+            reno.on_ack(now, 0, &RttEstimator::default());
+        }
+        assert_eq!(reno.window(), 6000);
+        for _ in 0..4 {
+            reno.on_ack(now, 1200, &RttEstimator::default());
+        }
+        assert_eq!(reno.window(), 6000);
+        reno.on_ack(now, 1200, &RttEstimator::default());
+        assert_eq!(reno.window(), 7200);
+        reno.on_retransmit(now);
+        assert_eq!(reno.window(), 1200);
+        assert_eq!(reno.ssthresh, 3600);
+        reno.on_ack(now, 1200, &RttEstimator::default());
+        assert_eq!(reno.window(), 2400);
+    }
 
     #[test]
     fn test_reno() {
