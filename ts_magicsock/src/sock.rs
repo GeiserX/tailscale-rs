@@ -1162,9 +1162,19 @@ impl MagicSock {
             // and must not be reported to the caller as one. The ping stays stamped in the path's
             // in-flight set, which is upstream's ordering too (`startDiscoPingLocked` records the
             // attempt before `sendDiscoMessage` decides); with no pong it simply expires.
-            if self.send_udp(&wire, addr).await? {
-                m.disco_ping_sent.inc();
-                sent += 1;
+            match self.send_udp(&wire, addr).await {
+                Ok(true) => {
+                    m.disco_ping_sent.inc();
+                    sent += 1;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    // Go starts each discovery ping independently (startDiscoPingLocked).
+                    // A stale/unreachable candidate must not prevent the remaining candidates
+                    // or peers from being probed. Their lastPing was already stamped above;
+                    // aborting here would starve them again on every subsequent sweep.
+                    tracing::debug!(error = %e, %peer, %addr, "sending disco ping; continuing discovery");
+                }
             }
         }
 
@@ -2862,6 +2872,160 @@ mod tests {
 
     fn localhost() -> SocketAddr {
         "127.0.0.1:0".parse().unwrap()
+    }
+
+    /// The cadence gates retry unanswered candidates throughout a 15-minute session;
+    /// neither quiet-down nor upgrade probing applies without a trusted best address.
+    #[test]
+    fn unanswered_candidates_keep_retrying_without_a_netmap_change() {
+        let addr: SocketAddr = "203.0.113.25:41641".parse().unwrap();
+        let mut pp = PeerPaths::default();
+        pp.add_netmap_candidates([addr]);
+        let start = Instant::now();
+        let mut sent = 0;
+        for secs in (0..=900).step_by(2) {
+            let now = start + Duration::from_secs(secs);
+            assert!(pp.needs_refresh(now));
+            let candidates = pp.candidates_to_ping(now);
+            if secs % 6 == 0 {
+                assert_eq!(candidates, vec![addr]);
+                pp.note_ping_sent(disco::random_tx_id(), addr, now);
+                sent += 1;
+            } else {
+                assert!(candidates.is_empty(), "only the 5s discovery floor applies");
+            }
+        }
+        assert_eq!(sent, 151);
+    }
+
+    /// Keep the laptop alive across a node restart, including its stale-key window. An
+    /// unsupported candidate must not starve the working endpoint on subsequent discovery rounds.
+    #[tokio::test]
+    async fn restart_direct_recovers_despite_a_failed_candidate() {
+        async fn receive_one(sock: &MagicSock) -> Inbound {
+            let mut buf = [0; 2048];
+            let (n, _) =
+                tokio::time::timeout(Duration::from_secs(2), sock.sock().recv_from(&mut buf))
+                    .await
+                    .expect("a disco frame must arrive")
+                    .unwrap();
+            disco::open(&sock.our_disco, &mut buf[..n]).unwrap()
+        }
+
+        let node_key = ts_keys::NodePrivateKey::random().public_key();
+        let old_disco = DiscoPrivateKey::random();
+        let laptop_key = ts_keys::NodePrivateKey::random().public_key();
+        let laptop_disco = DiscoPrivateKey::random();
+        let laptop_pub = laptop_disco.public_key();
+        let known_node_disco = Arc::new(std::sync::RwLock::new(old_disco.public_key()));
+        let known = known_node_disco.clone();
+        let laptop = MagicSock::bind(localhost(), laptop_disco, laptop_key)
+            .await
+            .unwrap()
+            .with_binding_verifier(Arc::new(move |disco, claimed| {
+                *disco == *known.read().unwrap() && claimed.is_none_or(|key| *key == node_key)
+            }));
+        let laptop_addr = laptop.local_addr().unwrap();
+        let old = MagicSock::bind(localhost(), old_disco.clone(), node_key)
+            .await
+            .unwrap()
+            .with_binding_verifier(allow_all());
+        let node_addr = old.local_addr().unwrap();
+        old.set_netmap_endpoints(laptop_pub, [laptop_addr]);
+        laptop.set_netmap_endpoints(old_disco.public_key(), [node_addr]);
+        assert_eq!(old.send_pings().await.unwrap(), 1);
+        laptop
+            .handle_disco(receive_one(&laptop).await, node_addr)
+            .await
+            .unwrap();
+        old.handle_disco(receive_one(&old).await, laptop_addr)
+            .await
+            .unwrap();
+        assert_eq!(old.best_addr(&laptop_pub), Some(laptop_addr));
+        assert_eq!(laptop.send_pings().await.unwrap(), 1);
+        old.handle_disco(receive_one(&old).await, laptop_addr)
+            .await
+            .unwrap();
+        laptop
+            .handle_disco(receive_one(&laptop).await, node_addr)
+            .await
+            .unwrap();
+        assert_eq!(laptop.best_addr(&old_disco.public_key()), Some(node_addr));
+
+        // Same node key and UDP port, new disco key; the laptop's socket and path state survive.
+        drop(old);
+        let new_disco = DiscoPrivateKey::random();
+        let new_pub = new_disco.public_key();
+        let restarted = MagicSock::bind(node_addr, new_disco, node_key)
+            .await
+            .unwrap()
+            .with_binding_verifier(allow_all());
+        restarted.set_netmap_endpoints(laptop_pub, [laptop_addr]);
+        assert_eq!(restarted.send_pings().await.unwrap(), 1);
+        let early = receive_one(&laptop).await;
+        assert!(matches!(early, Inbound::Ping { sender, .. } if sender == new_pub));
+        // Go also drops a sender disco key not yet known through netmap/TSMP.
+        laptop.handle_disco(early, node_addr).await.unwrap();
+        assert_eq!(restarted.best_addr(&laptop_pub), None);
+
+        // Control catches up without changing the laptop's key or endpoints.
+        *known_node_disco.write().unwrap() = new_pub;
+        laptop.changed_active_disco(&old_disco.public_key(), &new_pub);
+        assert_eq!(laptop.send_pings_to_peer_now(&new_pub).await.unwrap(), 1);
+        restarted
+            .handle_disco(receive_one(&restarted).await, laptop_addr)
+            .await
+            .unwrap();
+        laptop
+            .handle_disco(receive_one(&laptop).await, node_addr)
+            .await
+            .unwrap();
+        assert_eq!(laptop.best_addr(&new_pub), Some(node_addr));
+        assert_eq!(
+            restarted.best_addr(&laptop_pub),
+            None,
+            "an inbound ping is not a solicited pong"
+        );
+
+        // A retained netmap can contain IPv6 even on our IPv4-only socket. Fix the sweep
+        // order at the emitter seam to model a stable HashMap order with the bad address first.
+        let bad: SocketAddr = "[::1]:41641".parse().unwrap();
+        restarted.set_netmap_endpoints(laptop_pub, [bad, laptop_addr]);
+        let now = Instant::now() + Duration::from_secs(6);
+        let work = {
+            let mut paths = lock(&restarted.paths);
+            let pp = paths.get_mut(&laptop_pub).unwrap();
+            assert!(pp.needs_refresh(now));
+            let mut addrs = pp.candidates_to_ping(now);
+            assert_eq!(
+                addrs.len(),
+                2,
+                "failed early discovery is retried after the 5s floor"
+            );
+            addrs.sort_by_key(|addr| !addr.is_ipv6());
+            addrs
+                .into_iter()
+                .map(|addr| {
+                    let tx = disco::random_tx_id();
+                    pp.note_ping_sent(tx, addr, now);
+                    (laptop_pub, addr, tx)
+                })
+                .collect()
+        };
+        assert_eq!(
+            restarted.emit_disco_pings(work).await.unwrap(),
+            1,
+            "one failed candidate must not abort discovery of the working endpoint"
+        );
+        laptop
+            .handle_disco(receive_one(&laptop).await, node_addr)
+            .await
+            .unwrap();
+        restarted
+            .handle_disco(receive_one(&restarted).await, laptop_addr)
+            .await
+            .unwrap();
+        assert_eq!(restarted.best_addr(&laptop_pub), Some(laptop_addr));
     }
 
     /// A DERP source (Go `derpNodeSrc`) carrying a node key nothing is bound to. For relayed-disco
