@@ -20,15 +20,12 @@ impl<H> PacketMetadata<H> {
     };
 
     fn padding(size: usize) -> PacketMetadata<H> {
-        PacketMetadata {
-            size: size,
-            header: None,
-        }
+        PacketMetadata { size, header: None }
     }
 
     fn packet(size: usize, header: H) -> PacketMetadata<H> {
         PacketMetadata {
-            size: size,
+            size,
             header: Some(header),
         }
     }

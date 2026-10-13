@@ -1,30 +1,17 @@
 //! A bounded burst pacer at cwnd / smoothed RTT. No heap or per-packet timers.
 use crate::time::{Duration, Instant};
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub(super) struct Pacer {
     next: Option<Instant>,
     congested: bool,
 }
 
-impl Default for Pacer {
-    fn default() -> Self {
-        Self {
-            next: None,
-            congested: false,
-        }
-    }
-}
-
 impl Pacer {
     pub fn on_loss(&mut self) {
         self.congested = true;
         self.next = None;
-    }
-
-    fn rate_window(window: usize) -> usize {
-        window
     }
 
     fn burst(&self, window: usize, mss: usize) -> usize {
@@ -42,21 +29,19 @@ impl Pacer {
             .next
             .filter(|&next| next > now)
             .map_or(0, |next| (next - now).total_micros());
-        let scheduled =
-            ahead.saturating_mul(Self::rate_window(window) as u64) / (rtt as u64 * 1000);
-        let budget = burst.saturating_sub(scheduled as usize);
+        let scheduled = ahead.saturating_mul(window as u64) / (rtt as u64 * 1000);
+        let budget = burst.saturating_sub(scheduled.min(burst as u64) as usize);
         if budget >= mss { budget } else { 0 }
     }
 
     pub fn ready_at(&self, now: Instant, window: usize, mss: usize, rtt: u32) -> Instant {
-        let credit = (self.burst(window, mss) - mss) as u64 * rtt as u64 * 1000
-            / Self::rate_window(window) as u64;
+        let credit = (self.burst(window, mss) - mss) as u64 * rtt as u64 * 1000 / window as u64;
         self.next
             .map_or(now, |next| (next - Duration::from_micros(credit)).max(now))
     }
 
     pub fn sent(&mut self, now: Instant, len: usize, window: usize, rtt: u32) {
-        let delay = (len as u64 * rtt as u64 * 1000).div_ceil(Self::rate_window(window) as u64);
+        let delay = (len as u64 * rtt as u64 * 1000).div_ceil(window as u64);
         self.next = Some(self.next.unwrap_or(now).max(now) + Duration::from_micros(delay));
     }
 }
@@ -64,6 +49,15 @@ impl Pacer {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn large_future_debt_cannot_wrap_credit_on_32_bit_targets() {
+        let p = Pacer {
+            next: Some(Instant::from_secs(100)),
+            ..Pacer::default()
+        };
+        assert_eq!(p.allowance(Instant::ZERO, u32::MAX as usize, 1200, 20), 0);
+    }
 
     #[test]
     fn loss_caps_burst_without_capping_uncongested_links() {

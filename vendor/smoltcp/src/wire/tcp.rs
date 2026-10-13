@@ -944,15 +944,15 @@ impl<'a> Repr<'a> {
         Ok(Repr {
             src_port: packet.src_port(),
             dst_port: packet.dst_port(),
-            control: control,
+            control,
             seq_number: packet.seq_number(),
-            ack_number: ack_number,
+            ack_number,
             window_len: packet.window_len(),
-            window_scale: window_scale,
-            max_seg_size: max_seg_size,
-            sack_permitted: sack_permitted,
-            sack_ranges: sack_ranges,
-            timestamp: timestamp,
+            window_scale,
+            max_seg_size,
+            sack_permitted,
+            sack_ranges,
+            timestamp,
             payload: packet.payload(),
         })
     }

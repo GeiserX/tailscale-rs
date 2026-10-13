@@ -101,8 +101,8 @@ impl<'a, T: PrettyPrint> PrettyPrinter<'a, T> {
     /// Format the listing with the recorded parameters when Display::fmt is called.
     pub fn new(prefix: &'static str, buffer: &'a dyn AsRef<[u8]>) -> PrettyPrinter<'a, T> {
         PrettyPrinter {
-            prefix: prefix,
-            buffer: buffer,
+            prefix,
+            buffer,
             phantom: PhantomData,
         }
     }

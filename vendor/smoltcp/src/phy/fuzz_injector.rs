@@ -81,7 +81,7 @@ where
     fn transmit(&mut self, timestamp: Instant) -> Option<Self::TxToken<'_>> {
         self.inner.transmit(timestamp).map(|token| TxToken {
             fuzzer: &mut self.fuzz_tx,
-            token: token,
+            token,
         })
     }
 }
