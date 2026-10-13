@@ -19,6 +19,7 @@ use crate::{
 };
 
 mod congestion;
+mod recovery;
 
 macro_rules! tcp_trace {
     ($($arg:expr),*) => (net_log!(trace, $($arg),*));
@@ -496,6 +497,9 @@ pub struct Socket<'a> {
     remote_last_seq: TcpSeqNumber,
     /// End of the flight being repaired by NewReno fast recovery.
     recovery_end: Option<TcpSeqNumber>,
+    /// Monotonic retransmission cursor within the recovery flight.
+    recovery_cursor: TcpSeqNumber,
+    sack_scoreboard: recovery::Scoreboard,
     /// The last acknowledgement number sent.
     /// I.e. in an idle socket, remote_seq_no+rx_buffer.len().
     remote_last_ack: Option<TcpSeqNumber>,
@@ -593,6 +597,8 @@ impl<'a> Socket<'a> {
             remote_seq_no: TcpSeqNumber::default(),
             remote_last_seq: TcpSeqNumber::default(),
             recovery_end: None,
+            recovery_cursor: TcpSeqNumber::default(),
+            sack_scoreboard: recovery::Scoreboard::new(),
             remote_last_ack: None,
             remote_last_win: 0,
             remote_win_len: 0,
@@ -908,6 +914,8 @@ impl<'a> Socket<'a> {
         self.remote_seq_no = TcpSeqNumber::default();
         self.remote_last_seq = TcpSeqNumber::default();
         self.recovery_end = None;
+        self.recovery_cursor = TcpSeqNumber::default();
+        self.sack_scoreboard.clear();
         self.local_rx_dup_acks = 0;
         self.local_rx_last_ack = None;
         self.remote_last_ack = None;
@@ -2015,6 +2023,7 @@ impl<'a> Socket<'a> {
             TcpControl::Syn => 0,
             _ => self.remote_win_scale.unwrap_or(0),
         };
+        let was_zero_window = self.remote_win_len == 0;
         let new_remote_win_len = (repr.window_len as usize) << (scale as usize);
         let is_window_update = new_remote_win_len != self.remote_win_len;
         self.remote_win_len = new_remote_win_len;
@@ -2072,6 +2081,7 @@ impl<'a> Socket<'a> {
 
                     if self.local_rx_dup_acks == 3 && self.recovery_end.is_none() {
                         self.recovery_end = Some(self.remote_last_seq);
+                        self.recovery_cursor = self.local_seq_no;
                         self.congestion_controller
                             .inner_mut()
                             .on_duplicate_ack(cx.now());
@@ -2091,6 +2101,10 @@ impl<'a> Socket<'a> {
             // We've processed everything in the incoming segment, so advance the local
             // sequence number past it.
             self.local_seq_no = ack_number;
+            if self.remote_has_sack {
+                self.sack_scoreboard
+                    .update(ack_number, self.remote_last_seq, &repr.sack_ranges);
+            }
             // During retransmission, if an earlier segment got lost but later was
             // successfully received, self.local_seq_no can move past self.remote_last_seq.
             // Do not attempt to retransmit the latter segments; not only this is pointless
@@ -2128,11 +2142,31 @@ impl<'a> Socket<'a> {
         if let (Some(end), Some(ack)) = (self.recovery_end, repr.ack_number) {
             if ack >= end {
                 self.recovery_end = None;
-            } else if ack_len > 0 {
+            } else if ack_len > 0 && self.recovery_cursor <= ack {
                 // RFC 6582: a partial ACK repairs one hole, but exposes the next.
                 self.timer.set_for_fast_retransmit();
                 net_debug!("fast recovery partial ACK {}, recover {}", ack, end);
             }
+        }
+
+        if was_zero_window && new_remote_win_len > 0 && self.recovery_end.is_some() {
+            self.timer.set_for_fast_retransmit();
+        }
+
+        // SACK loss evidence remains valid across advertised-window updates
+        // and ACKs carrying reverse-direction data (RFC 6675 section 2).
+        if self.recovery_end.is_none()
+            && self.remote_has_sack
+            && self
+                .sack_scoreboard
+                .is_lost(self.local_seq_no, self.remote_mss)
+        {
+            self.recovery_end = Some(self.remote_last_seq);
+            self.recovery_cursor = self.local_seq_no;
+            self.congestion_controller
+                .inner_mut()
+                .on_duplicate_ack(cx.now());
+            self.timer.set_for_fast_retransmit();
         }
 
         // start/stop the Zero Window Probe timer.
@@ -2242,6 +2276,58 @@ impl<'a> Socket<'a> {
         }
     }
 
+    fn congestion_allowance(&self) -> usize {
+        let flight = if self.recovery_end.is_some() && self.remote_has_sack {
+            self.sack_scoreboard.pipe(
+                self.local_seq_no,
+                self.recovery_cursor,
+                self.remote_last_seq,
+                self.remote_mss,
+            )
+        } else {
+            self.remote_last_seq - self.local_seq_no
+        };
+        self.congestion_controller
+            .inner()
+            .window()
+            .saturating_sub(flight)
+    }
+
+    fn sack_retransmit(&self, cx: &Context) -> Option<(TcpSeqNumber, usize)> {
+        let end = self.recovery_end?;
+        if !self.remote_has_sack {
+            return None;
+        }
+        let ip_header_len = match self.tuple?.local.addr {
+            #[cfg(feature = "proto-ipv4")]
+            IpAddress::Ipv4(_) => crate::wire::IPV4_HEADER_LEN,
+            #[cfg(feature = "proto-ipv6")]
+            IpAddress::Ipv6(_) => crate::wire::IPV6_HEADER_LEN,
+        };
+        let mss = self
+            .remote_mss
+            .min(cx.ip_mtu() - ip_header_len - TCP_HEADER_LEN);
+        let cursor = self.recovery_cursor.max(self.local_seq_no);
+        let (left, right) = self.sack_scoreboard.hole(cursor, end)?;
+        if !self.sack_scoreboard.is_lost(left, mss) {
+            return None;
+        }
+        let pipe = self
+            .sack_scoreboard
+            .pipe(self.local_seq_no, cursor, end, mss);
+        let budget = self
+            .congestion_controller
+            .inner()
+            .window()
+            .saturating_sub(pipe);
+        let win_end = self.local_seq_no + self.remote_win_len;
+        if left >= win_end {
+            return None;
+        }
+        let len = (right - left).min(mss).min(budget).min(win_end - left);
+        (len > 0).then_some((left, len))
+    }
+
     fn seq_to_transmit(&self, cx: &mut Context) -> bool {
         let ip_header_len = match self.tuple.unwrap().local.addr {
             #[cfg(feature = "proto-ipv4")]
@@ -2265,15 +2351,18 @@ impl<'a> Socket<'a> {
         }
 
         // max sequence number we can send.
-        let max_send_seq = self.local_seq_no
-            + self
-                .remote_win_len
-                .min(self.tx_buffer.len())
-                .min(self.congestion_controller.inner().window());
+        let max_send_seq = self.local_seq_no + self.remote_win_len.min(self.tx_buffer.len());
 
         // Repair the original flight before admitting fresh data.
         if self.recovery_end.is_some() {
-            return false;
+            if self.sack_retransmit(cx).is_some() {
+                return true;
+            }
+            if !self.remote_has_sack {
+                return false;
+            }
+            // RFC 6675 NextSeg(2): new data can maintain the ACK clock and
+            // expose a lost tail when no further hole is yet proven lost.
         }
 
         // Max amount of octets we can send.
@@ -2283,6 +2372,7 @@ impl<'a> Socket<'a> {
             0
         };
 
+        let max_send = max_send.min(self.congestion_allowance());
         // Can we send at least 1 octet?
         let mut can_send = max_send != 0;
         // Can we send at least 1 full segment?
@@ -2414,7 +2504,9 @@ impl<'a> Socket<'a> {
             // If a timeout expires, we should abort the connection.
             net_debug!("timeout exceeded");
             self.set_state(State::Closed);
-        } else if !self.seq_to_transmit(cx) && self.timer.should_retransmit(cx.now()) {
+        } else if self.timer.should_retransmit(cx.now())
+            && (matches!(self.timer, Timer::FastRetransmit) || !self.seq_to_transmit(cx))
+        {
             // If a retransmit timer expired, we should resend data starting at the last ACK.
             net_debug!("retransmitting");
 
@@ -2426,6 +2518,8 @@ impl<'a> Socket<'a> {
             if !fast_retransmit {
                 self.remote_last_seq = self.local_seq_no;
                 self.recovery_end = None;
+                // SACK is advisory: a receiver may renege after an RTO.
+                self.sack_scoreboard.clear();
             }
 
             // Fast retransmit invalidates RTT samples (Karn), but only an expired
@@ -2458,6 +2552,12 @@ impl<'a> Socket<'a> {
             return Ok(());
         }
 
+        let sack_retransmit = if fast_retransmit {
+            None
+        } else {
+            self.sack_retransmit(cx)
+        };
+        let retransmitting = fast_retransmit || sack_retransmit.is_some();
         // Decide whether we're sending a packet.
         if self.seq_to_transmit(cx) || (fast_retransmit && self.remote_win_len > 0) {
             // If we have data to transmit and it fits into partner's window, do it.
@@ -2504,7 +2604,7 @@ impl<'a> Socket<'a> {
             seq_number: if fast_retransmit {
                 self.local_seq_no
             } else {
-                self.remote_last_seq
+                sack_retransmit.map_or(self.remote_last_seq, |(seq, _)| seq)
             },
             ack_number: Some(self.remote_seq_no + self.rx_buffer.len()),
             window_len: self.scaled_window(),
@@ -2575,14 +2675,19 @@ impl<'a> Socket<'a> {
                 };
 
                 // cwnd bounds the entire flight, including on ACK-only dispatches.
-                let in_flight = self.remote_last_seq - self.local_seq_no;
-                if !fast_retransmit {
-                    win_limit = win_limit.min(
-                        self.congestion_controller
-                            .inner()
-                            .window()
-                            .saturating_sub(in_flight),
-                    );
+                if !retransmitting {
+                    win_limit = win_limit.min(self.congestion_allowance());
+                }
+
+                if let Some((_, len)) = sack_retransmit {
+                    win_limit = win_limit.min(len);
+                } else if fast_retransmit {
+                    // Do not cross into a SACKed range, even with a changed MSS.
+                    if let Some((_, end)) =
+                        self.sack_scoreboard.hole(send_seq, self.remote_last_seq)
+                    {
+                        win_limit = win_limit.min(end - send_seq);
+                    }
                 }
 
                 // To send a zero-window-probe, force the window limit to at least 1 byte.
@@ -2702,6 +2807,11 @@ impl<'a> Socket<'a> {
         }
 
         // We've sent a packet successfully, so we can update the internal state now.
+        if retransmitting && repr.segment_len() > 0 {
+            self.recovery_cursor = self
+                .recovery_cursor
+                .max(repr.seq_number + repr.segment_len());
+        }
         self.remote_last_seq = self
             .remote_last_seq
             .max(repr.seq_number + repr.segment_len());
@@ -6391,6 +6501,67 @@ mod test {
                 Ok::<_, ()>(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn test_sack_recovery_skips_received_ranges() {
+        let mut s = socket_established();
+        s.remote_mss = 6;
+        s.remote_has_sack = true;
+        let base = LOCAL_SEQ + 1;
+        send!(s, time 0, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(base),
+            ..SEND_TEMPL
+        });
+        s.send_slice(b"aaaaaabbbbbbccccccddddddeeeeeeffffff")
+            .unwrap();
+        for (i, payload) in b"aaaaaabbbbbbccccccddddddeeeeeeffffff"
+            .chunks(6)
+            .enumerate()
+        {
+            recv!(s, time 1, Ok(TcpRepr {
+                seq_number: base + i * 6,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload,
+                ..RECV_TEMPL
+            }));
+        }
+        for window in [255, 254, 253] {
+            send!(s, time 10, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(base),
+                window_len: window,
+                sack_ranges: [Some(((base + 6).0 as u32, (base + 12).0 as u32)),
+                              Some(((base + 18).0 as u32, (base + 36).0 as u32)), None],
+                ..SEND_TEMPL
+            });
+        }
+        for (offset, payload) in [(0, &b"aaaaaa"[..]), (12, &b"cccccc"[..])] {
+            recv!(s, time 11, Ok(TcpRepr {
+                seq_number: base + offset,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload,
+                ..RECV_TEMPL
+            }));
+        }
+        recv_nothing!(s, time 11);
+        assert_eq!(s.remote_last_seq, base + 36);
+        assert_eq!(s.tx_buffer.len(), 36, "SACK must not free transmit data");
+        send!(s, time 20, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(base + 12),
+            ..SEND_TEMPL
+        });
+        recv_nothing!(s, time 20); // The second hole was already retransmitted.
+        assert_eq!(s.tx_buffer.len(), 24);
+        send!(s, time 21, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(base + 36),
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.recovery_end, None);
+        assert!(s.tx_buffer.is_empty());
     }
 
     #[test]
