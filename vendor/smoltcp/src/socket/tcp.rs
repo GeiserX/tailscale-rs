@@ -19,6 +19,7 @@ use crate::{
 };
 
 mod congestion;
+mod pacing;
 mod recovery;
 
 macro_rules! tcp_trace {
@@ -541,6 +542,8 @@ pub struct Socket<'a> {
 
     /// The congestion control algorithm.
     congestion_controller: congestion::AnyController,
+    pacing_enabled: bool,
+    pacer: pacing::Pacer,
 
     /// tsval generator - if some, tcp timestamp is enabled
     tsval_generator: Option<TcpTimestampGenerator>,
@@ -617,6 +620,8 @@ impl<'a> Socket<'a> {
             tsval_generator: None,
             last_remote_tsval: 0,
             congestion_controller: congestion::AnyController::new(),
+            pacing_enabled: false,
+            pacer: pacing::Pacer::default(),
 
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
@@ -636,6 +641,19 @@ impl<'a> Socket<'a> {
     /// Return whether TCP Timestamp is enabled.
     pub fn timestamp_enabled(&self) -> bool {
         self.tsval_generator.is_some()
+    }
+
+    /// Pace data at the congestion window divided by the smoothed RTT.
+    /// Disabled by default. Requires congestion control and an RTT above 5 ms;
+    /// permits a bounded burst to accommodate timer granularity. ACKs are not delayed.
+    pub fn set_pacing_enabled(&mut self, enabled: bool) {
+        self.pacing_enabled = enabled;
+        self.pacer = pacing::Pacer::default();
+    }
+
+    /// Whether data pacing is enabled.
+    pub fn pacing_enabled(&self) -> bool {
+        self.pacing_enabled
     }
 
     /// Set an algorithm for congestion control.
@@ -904,6 +922,7 @@ impl<'a> Socket<'a> {
         self.state = State::Closed;
         self.timer = Timer::new();
         self.rtte = RttEstimator::default();
+        self.pacer = pacing::Pacer::default();
         self.assembler = Assembler::new();
         self.tx_buffer.clear();
         self.rx_buffer.clear();
@@ -2082,6 +2101,7 @@ impl<'a> Socket<'a> {
                     if self.local_rx_dup_acks == 3 && self.recovery_end.is_none() {
                         self.recovery_end = Some(self.remote_last_seq);
                         self.recovery_cursor = self.local_seq_no;
+                        self.pacer.on_loss();
                         self.congestion_controller
                             .inner_mut()
                             .on_duplicate_ack(cx.now());
@@ -2163,6 +2183,7 @@ impl<'a> Socket<'a> {
         {
             self.recovery_end = Some(self.remote_last_seq);
             self.recovery_cursor = self.local_seq_no;
+            self.pacer.on_loss();
             self.congestion_controller
                 .inner_mut()
                 .on_duplicate_ack(cx.now());
@@ -2274,6 +2295,20 @@ impl<'a> Socket<'a> {
             (Some(remote_last_ts), Some(timeout)) => timestamp >= remote_last_ts + timeout,
             (..) => false,
         }
+    }
+
+    fn pacing_window(&self) -> Option<usize> {
+        (self.pacing_enabled
+            && self.rtte.srtt > 5
+            && self.congestion_control() != CongestionControl::None)
+            .then(|| self.congestion_controller.inner().window())
+    }
+
+    fn pacing_allowance(&self, now: Instant) -> usize {
+        self.pacing_window().map_or(usize::MAX, |window| {
+            self.pacer
+                .allowance(now, window, self.remote_mss, self.rtte.srtt)
+        })
     }
 
     fn congestion_allowance(&self) -> usize {
@@ -2504,9 +2539,7 @@ impl<'a> Socket<'a> {
             // If a timeout expires, we should abort the connection.
             net_debug!("timeout exceeded");
             self.set_state(State::Closed);
-        } else if self.timer.should_retransmit(cx.now())
-            && (matches!(self.timer, Timer::FastRetransmit) || !self.seq_to_transmit(cx))
-        {
+        } else if self.timer.should_retransmit(cx.now()) {
             // If a retransmit timer expired, we should resend data starting at the last ACK.
             net_debug!("retransmitting");
 
@@ -2520,6 +2553,7 @@ impl<'a> Socket<'a> {
                 self.recovery_end = None;
                 // SACK is advisory: a receiver may renege after an RTO.
                 self.sack_scoreboard.clear();
+                self.pacer.on_loss();
             }
 
             // Fast retransmit invalidates RTT samples (Karn), but only an expired
@@ -2559,7 +2593,9 @@ impl<'a> Socket<'a> {
         };
         let retransmitting = fast_retransmit || sack_retransmit.is_some();
         // Decide whether we're sending a packet.
-        if self.seq_to_transmit(cx) || (fast_retransmit && self.remote_win_len > 0) {
+        if (self.seq_to_transmit(cx) && self.pacing_allowance(cx.now()) > 0)
+            || (fast_retransmit && self.remote_win_len > 0)
+        {
             // If we have data to transmit and it fits into partner's window, do it.
             tcp_trace!("outgoing segment will send data or flags");
         } else if self.ack_to_transmit() && self.delayed_ack_expired(cx.now()) {
@@ -2690,6 +2726,10 @@ impl<'a> Socket<'a> {
                     }
                 }
 
+                if !fast_retransmit {
+                    win_limit = win_limit.min(self.pacing_allowance(cx.now()));
+                }
+
                 // To send a zero-window-probe, force the window limit to at least 1 byte.
                 if win_limit == 0 && self.timer.should_zero_window_probe(cx.now()) {
                     win_limit = 1;
@@ -2806,6 +2846,12 @@ impl<'a> Socket<'a> {
             return Ok(());
         }
 
+        if !repr.payload.is_empty()
+            && let Some(window) = self.pacing_window()
+        {
+            self.pacer
+                .sent(cx.now(), repr.payload.len(), window, self.rtte.srtt);
+        }
         // We've sent a packet successfully, so we can update the internal state now.
         if retransmitting && repr.segment_len() > 0 {
             self.recovery_cursor = self
@@ -2864,8 +2910,23 @@ impl<'a> Socket<'a> {
             // Socket was aborted, we have an RST packet to transmit.
             PollAt::Now
         } else if self.seq_to_transmit(cx) {
-            // We have a data or flag packet to transmit.
-            PollAt::Now
+            if (self.ack_to_transmit() && self.delayed_ack_expired(cx.now()))
+                || self.window_to_update()
+                || matches!(self.timer, Timer::FastRetransmit)
+            {
+                return PollAt::Now;
+            }
+            // Wake for the next paced segment or an earlier protocol timer.
+            self.pacing_window().map_or(PollAt::Now, |window| {
+                let next = self
+                    .pacer
+                    .ready_at(cx.now(), window, self.remote_mss, self.rtte.srtt);
+                if next <= cx.now() {
+                    PollAt::Now
+                } else {
+                    PollAt::Time(next).min(self.timer.poll_at())
+                }
+            })
         } else if self.window_to_update() {
             // The receive window has been raised significantly.
             PollAt::Now
@@ -6501,6 +6562,63 @@ mod test {
                 Ok::<_, ()>(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn test_expired_rto_precedes_unsent_data() {
+        let mut s = socket_established();
+        s.remote_mss = 6;
+        s.send_slice(b"aaaaaabbbbbb").unwrap();
+        for time in [0, 1000] {
+            recv!(s, time time, Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: b"aaaaaa",
+                ..RECV_TEMPL
+            }));
+        }
+        assert_eq!(s.rtte.retransmission_timeout(), Duration::from_millis(2000));
+    }
+
+    #[cfg(feature = "socket-tcp-reno")]
+    #[test]
+    fn test_pacing_schedules_data_without_delaying_ack() {
+        let mut s = socket_established_with_buffer_sizes(8192, 64);
+        s.remote_win_len = 8192;
+        s.remote_mss = 1200;
+        s.set_nagle_enabled(false);
+        s.set_congestion_control(CongestionControl::Reno);
+        s.congestion_controller.inner_mut().set_mss(1200);
+        s.rtte.sample(20);
+        s.set_pacing_enabled(true);
+        s.send_slice(&[0; 4096]).unwrap();
+        for _ in 0..2 {
+            s.socket
+                .dispatch(&mut s.cx, |_, (_, repr)| {
+                    assert_eq!(repr.payload.len(), 1200);
+                    Ok::<_, ()>(())
+                })
+                .unwrap();
+        }
+        recv_nothing!(s, time 0);
+        send!(s, time 1, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: b"a",
+            window_len: 8192,
+            ..SEND_TEMPL
+        });
+        s.socket
+            .dispatch(&mut s.cx, |_, (_, repr)| {
+                assert!(repr.payload.is_empty());
+                assert_eq!(repr.ack_number, Some(REMOTE_SEQ + 2));
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert_eq!(
+            s.socket.poll_at(&mut s.cx),
+            PollAt::Time(Instant::from_millis(2))
+        );
     }
 
     #[test]
