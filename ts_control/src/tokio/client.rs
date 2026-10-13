@@ -746,29 +746,16 @@ async fn run_once(
     // `HostInfo.ServicesHash`. Empty config -> empty hash -> wire field omitted (unchanged behavior).
     let advertised_vip_services = config.advertised_vip_services();
     let services_hash = crate::services_hash(&advertised_vip_services);
-    let builder = MapRequestBuilder::new(node_keys)
-        .keep_alive(true)
-        .omit_peers(false)
-        .stream(true)
-        .routable_ips(config.advertised_routes())
-        .client_info(&client_name, crate::PKG_VERSION)
-        .host_environment(&host)
-        .request_tags(config.tags.iter().map(String::as_str))
-        .services(config.advertised_services())
-        .services_hash(&services_hash)
-        .wire_ingress(config.wire_ingress)
-        .ingress_enabled(
-            config
-                .ingress_active
-                .load(core::sync::atomic::Ordering::Relaxed),
-        )
-        // App-connector advertise (Go `Prefs.AppConnector.Advertise` -> `Hostinfo.AppConnector`) and
-        // auto-update-apply advertise (Go `Prefs.AutoUpdate.Apply` -> `Hostinfo.AllowsUpdate`). Both
-        // carry on every map poll, like `wire_ingress`, so control persistently sees the advertised
-        // capability rather than only at registration.
-        .app_connector(config.advertise_app_connector)
-        .allows_update(config.auto_update_apply == Some(true))
-        .map_session(&session.handle, session.seq);
+    // Every map request carries the complete Hostinfo; see `with_hostinfo`.
+    let with_hostinfo = |b| with_hostinfo(b, config, &client_name, &host, &services_hash);
+    let builder = with_hostinfo(
+        MapRequestBuilder::new(node_keys)
+            .keep_alive(true)
+            .omit_peers(false)
+            .stream(true)
+            .routable_ips(config.advertised_routes()),
+    )
+    .map_session(&session.handle, session.seq);
     // Carry the whole current NetInfo on the streaming re-register too (Go attaches `c.netinfo` to
     // every `sendMapRequest`), so a reconnect re-advertises the last-known home/UDP/NAT facets
     // instead of dropping them until the next side command.
@@ -792,6 +779,24 @@ async fn run_once(
     let cache = config.netmap_cache_dir.as_ref().map(NetmapCache::new);
     let mut stream = core::pin::pin!(map_stream(reader, cache));
     tracing::info!("netmap stream started");
+
+    // Publish this node's Hostinfo: control ignores it on the streaming request above, so without
+    // this a node keeps whatever Hostinfo it registered with (Go sends the same non-streaming
+    // update from `SendUpdate` once the map poll is up).
+    {
+        let mut builder = with_hostinfo(MapRequestBuilder::new(node_keys))
+            .keep_alive(false)
+            .omit_peers(true)
+            .stream(false)
+            .routable_ips(config.advertised_routes());
+        builder = net_info.apply(builder);
+        if let Some(hostname) = &config.hostname {
+            builder = builder.hostname(hostname);
+        }
+        if let Err(e) = send_map_request(builder.build(), &map_url, &h2_client).await {
+            tracing::warn!(error = %e, "initial hostinfo update failed");
+        }
+    }
 
     loop {
         tokio::select! {
@@ -842,12 +847,12 @@ async fn run_once(
                         // rather than nulling them at control.
                         net_info.preferred_derp = Some(id);
                         net_info.derp_latency = Some(latencies);
-                        let mut builder = MapRequestBuilder::new(node_keys)
+                        let mut builder = with_hostinfo(MapRequestBuilder::new(node_keys))
                             .keep_alive(false)
                             .omit_peers(true)
                             .stream(false)
                             .routable_ips(config.advertised_routes())
-                            .host_environment(&host);
+                            ;
                         builder = net_info.apply(builder);
 
                         if let Some(hostname) = &config.hostname {
@@ -864,13 +869,13 @@ async fn run_once(
                         // before `endpoints` is moved into the builder.
                         net_info.working_udp = Some(net_info_working_udp(&endpoints));
                         net_info.mapping_varies_by_dest_ip = Some(net_info_mapping_varies(&endpoints));
-                        let mut builder = MapRequestBuilder::new(node_keys)
+                        let mut builder = with_hostinfo(MapRequestBuilder::new(node_keys))
                             .keep_alive(false)
                             .omit_peers(true)
                             .stream(false)
                             .routable_ips(config.advertised_routes())
                             .endpoints(endpoints)
-                            .host_environment(&host);
+                            ;
                         builder = net_info.apply(builder);
 
                         if let Some(hostname) = &config.hostname {
@@ -884,12 +889,12 @@ async fn run_once(
                         // The routes come from the command payload, NOT `config.advertised_routes()`:
                         // `config` is a frozen clone captured when this loop started, so a runtime
                         // route change can only reach here through the command itself.
-                        let mut builder = MapRequestBuilder::new(node_keys)
+                        let mut builder = with_hostinfo(MapRequestBuilder::new(node_keys))
                             .keep_alive(false)
                             .omit_peers(true)
                             .stream(false)
                             .routable_ips(routes)
-                            .host_environment(&host);
+                            ;
                         // Re-attach the carried NetInfo so a route update doesn't transiently drop
                         // the home region / NAT facets at control (same hazard the hostname arm
                         // guards for routes).
@@ -907,12 +912,11 @@ async fn run_once(
                         // run-loop's `config` is a frozen clone, so a runtime hostname change can only
                         // reach here through the command. Preserve the advertised routes on this
                         // request so a hostname update doesn't transiently withdraw them.
-                        let builder = MapRequestBuilder::new(node_keys)
+                        let builder = with_hostinfo(MapRequestBuilder::new(node_keys))
                             .keep_alive(false)
                             .omit_peers(true)
                             .stream(false)
                             .routable_ips(config.advertised_routes())
-                            .host_environment(&host)
                             .hostname(&hostname);
                         // Re-attach the carried NetInfo (same not-dropping-it reasoning as routes).
                         let req = net_info.apply(builder).build();
@@ -948,6 +952,34 @@ fn netmap_stream(
 
         x.ok()
     })
+}
+
+/// Add this node's complete Hostinfo to a map request. Control replaces a node's Hostinfo
+/// wholesale with each non-streaming update, so an update that leaves out a field (services,
+/// client version, ...) erases it for every peer; and it ignores Hostinfo on a streaming request
+/// (Go `MapRequest.Stream`, version >= 68). Routes and hostname are set per request.
+fn with_hostinfo<'a>(
+    b: MapRequestBuilder<'a>,
+    config: &'a crate::Config,
+    client_name: &'a str,
+    host: &'a crate::hostinfo::HostInfoData,
+    services_hash: &'a str,
+) -> MapRequestBuilder<'a> {
+    b.client_info(client_name, crate::PKG_VERSION)
+        .host_environment(host)
+        .request_tags(config.tags.iter().map(String::as_str))
+        .services(config.advertised_services())
+        .services_hash(services_hash)
+        .wire_ingress(config.wire_ingress)
+        .ingress_enabled(
+            config
+                .ingress_active
+                .load(core::sync::atomic::Ordering::Relaxed),
+        )
+        // App-connector advertise (Go `Prefs.AppConnector.Advertise` -> `Hostinfo.AppConnector`)
+        // and auto-update-apply advertise (Go `Prefs.AutoUpdate.Apply` -> `Hostinfo.AllowsUpdate`).
+        .app_connector(config.advertise_app_connector)
+        .allows_update(config.auto_update_apply == Some(true))
 }
 
 #[cfg(test)]
