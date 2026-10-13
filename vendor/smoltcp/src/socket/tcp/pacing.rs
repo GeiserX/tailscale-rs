@@ -1,4 +1,4 @@
-//! A bounded burst pacer at cwnd / smoothed RTT. No heap or per-packet timers.
+//! A bounded burst pacer at 1.2 * cwnd / smoothed RTT. No heap or per-packet timers.
 use crate::time::{Duration, Instant};
 
 #[derive(Debug, Default)]
@@ -12,6 +12,10 @@ impl Pacer {
     pub fn on_loss(&mut self) {
         self.congested = true;
         self.next = None;
+    }
+
+    fn rate_window(window: usize) -> usize {
+        window.saturating_add(window / 5)
     }
 
     fn burst(&self, window: usize, mss: usize) -> usize {
@@ -29,19 +33,21 @@ impl Pacer {
             .next
             .filter(|&next| next > now)
             .map_or(0, |next| (next - now).total_micros());
-        let scheduled = ahead.saturating_mul(window as u64) / (rtt as u64 * 1000);
+        let scheduled =
+            ahead.saturating_mul(Self::rate_window(window) as u64) / (rtt as u64 * 1000);
         let budget = burst.saturating_sub(scheduled.min(burst as u64) as usize);
         if budget >= mss { budget } else { 0 }
     }
 
     pub fn ready_at(&self, now: Instant, window: usize, mss: usize, rtt: u32) -> Instant {
-        let credit = (self.burst(window, mss) - mss) as u64 * rtt as u64 * 1000 / window as u64;
+        let credit = (self.burst(window, mss) - mss) as u64 * rtt as u64 * 1000
+            / Self::rate_window(window) as u64;
         self.next
             .map_or(now, |next| (next - Duration::from_micros(credit)).max(now))
     }
 
     pub fn sent(&mut self, now: Instant, len: usize, window: usize, rtt: u32) {
-        let delay = (len as u64 * rtt as u64 * 1000).div_ceil(window as u64);
+        let delay = (len as u64 * rtt as u64 * 1000).div_ceil(Self::rate_window(window) as u64);
         self.next = Some(self.next.unwrap_or(now).max(now) + Duration::from_micros(delay));
     }
 }
@@ -75,9 +81,9 @@ mod test {
         assert_eq!(p.allowance(now, 80000, 1000, 20), 10000);
         p.sent(now, 10000, 80000, 20);
         assert_eq!(p.allowance(now, 80000, 1000, 20), 0);
-        assert_eq!(p.ready_at(now, 80000, 1000, 20), Instant::from_micros(250));
+        assert_eq!(p.ready_at(now, 80000, 1000, 20), Instant::from_micros(209));
         assert_eq!(
-            p.allowance(Instant::from_micros(250), 80000, 1000, 20),
+            p.allowance(Instant::from_micros(209), 80000, 1000, 20),
             1000
         );
         assert_eq!(

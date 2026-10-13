@@ -663,7 +663,7 @@ impl<'a> Socket<'a> {
         Duration::from_millis(self.rtte.min_rto as u64)
     }
 
-    /// Pace data at the congestion window divided by the smoothed RTT.
+    /// Pace data at 1.2 times the congestion window divided by the smoothed RTT.
     /// Disabled by default. Requires congestion control and an RTT above 5 ms;
     /// permits a bounded burst to accommodate timer granularity. ACKs are not delayed.
     pub fn set_pacing_enabled(&mut self, enabled: bool) {
@@ -6680,7 +6680,7 @@ mod test {
             .unwrap();
         assert_eq!(
             s.socket.poll_at(&mut s.cx),
-            PollAt::Time(Instant::from_millis(2))
+            PollAt::Time(Instant::from_micros(1668))
         );
     }
 
