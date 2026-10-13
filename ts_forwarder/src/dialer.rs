@@ -106,6 +106,7 @@ impl RealDialer for DirectDialer {
             FlowClass::Subnet => {
                 // Explicit IPv4 bind to 0.0.0.0:0 (never ::, IPv6 is disabled everywhere).
                 let sock = tokio::net::TcpSocket::new_v4()?;
+                sock.set_nodelay(true)?;
                 sock.bind(unspecified_v4())?;
                 Ok(sock.connect(dst).await?)
             }
@@ -162,6 +163,7 @@ impl RealDialer for HostExitDialer {
         // egress was made by choosing this dialer. Exit flows are still confined to the internet.
         refuse_forbidden_exit_dst(class, dst)?;
         let sock = tokio::net::TcpSocket::new_v4()?;
+        sock.set_nodelay(true)?;
         sock.bind(unspecified_v4())?;
         Ok(sock.connect(dst).await?)
     }
@@ -320,6 +322,7 @@ impl ProxyExitDialer {
         let handshake = async {
             // Connect to the proxy from an explicit IPv4 socket (never ::, IPv6 is disabled).
             let proxy_sock = tokio::net::TcpSocket::new_v4()?;
+            proxy_sock.set_nodelay(true)?;
             proxy_sock.bind(unspecified_v4())?;
             let mut stream = proxy_sock.connect(self.config.addr).await?;
 

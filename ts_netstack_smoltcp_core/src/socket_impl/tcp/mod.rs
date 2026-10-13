@@ -37,6 +37,9 @@ impl Netstack {
         // Keep the initial handshake RTO at 1s, but recover measured-path tails sooner.
         sock.set_pacing_enabled(true);
         sock.set_min_retransmission_timeout(smoltcp::time::Duration::from_millis(200));
+        // Forwarded flows carry the endpoints' own write patterns (TLS records, request/response);
+        // the endpoints already coalesce, so Nagle here only delays small writes by a round trip.
+        sock.set_nagle_enabled(false);
         // `core::time::Duration` → smoltcp's own `Duration` (millisecond granularity is plenty for
         // a 60s/120s policy). Skip either knob when `None` (smoltcp's no-reaping default).
         if let Some(interval) = self.config.tcp_keep_alive_interval {
