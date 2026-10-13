@@ -176,6 +176,7 @@ struct RttEstimator {
     rttvar: u32,
     /// Retransmission Time-Out
     rto: u32,
+    min_rto: u32,
     timestamp: Option<(Instant, TcpSeqNumber)>,
     max_seq_sent: Option<TcpSeqNumber>,
     rto_count: u8,
@@ -188,6 +189,7 @@ impl Default for RttEstimator {
             srtt: 0,   // ignored, will be overwritten on first measurement.
             rttvar: 0, // ignored, will be overwritten on first measurement.
             rto: RTTE_INITIAL_RTO,
+            min_rto: RTTE_MIN_RTO,
             timestamp: None,
             max_seq_sent: None,
             rto_count: 0,
@@ -215,7 +217,7 @@ impl RttEstimator {
 
         // RFC 6298 (2.2), (2.3)
         let margin = RTTE_MIN_MARGIN.max(self.rttvar * RTTE_K);
-        self.rto = (self.srtt + margin).clamp(RTTE_MIN_RTO, RTTE_MAX_RTO);
+        self.rto = (self.srtt + margin).clamp(self.min_rto, RTTE_MAX_RTO);
 
         self.rto_count = 0;
 
@@ -643,6 +645,21 @@ impl<'a> Socket<'a> {
         self.tsval_generator.is_some()
     }
 
+    /// Set the minimum computed retransmission timeout. The default is one
+    /// second (RFC 6298). A smaller floor can help on low-latency paths; the
+    /// initial handshake timeout and exponential backoff remain unchanged.
+    pub fn set_min_retransmission_timeout(&mut self, delay: Duration) {
+        self.rtte.min_rto = delay.total_millis().clamp(1, RTTE_MAX_RTO as u64) as u32;
+        if self.rtte.have_measurement {
+            self.rtte.rto = self.rtte.rto.max(self.rtte.min_rto);
+        }
+    }
+
+    /// Return the configured minimum computed retransmission timeout.
+    pub fn min_retransmission_timeout(&self) -> Duration {
+        Duration::from_millis(self.rtte.min_rto as u64)
+    }
+
     /// Pace data at the congestion window divided by the smoothed RTT.
     /// Disabled by default. Requires congestion control and an RTT above 5 ms;
     /// permits a bounded burst to accommodate timer granularity. ACKs are not delayed.
@@ -921,7 +938,10 @@ impl<'a> Socket<'a> {
 
         self.state = State::Closed;
         self.timer = Timer::new();
-        self.rtte = RttEstimator::default();
+        self.rtte = RttEstimator {
+            min_rto: self.rtte.min_rto,
+            ..RttEstimator::default()
+        };
         self.pacer = pacing::Pacer::default();
         self.assembler = Assembler::new();
         self.tx_buffer.clear();
@@ -6578,6 +6598,25 @@ mod test {
             }));
         }
         assert_eq!(s.rtte.retransmission_timeout(), Duration::from_millis(2000));
+    }
+
+    #[test]
+    fn test_configured_rto_floor_survives_reset_and_preserves_backoff() {
+        let mut s = socket_established();
+        s.set_min_retransmission_timeout(Duration::from_secs(2));
+        assert_eq!(s.rtte.retransmission_timeout(), Duration::from_millis(1000));
+        s.set_min_retransmission_timeout(Duration::from_millis(200));
+        s.reset();
+        assert_eq!(s.min_retransmission_timeout(), Duration::from_millis(200));
+        assert_eq!(s.rtte.retransmission_timeout(), Duration::from_millis(1000));
+        s.rtte.sample(25);
+        assert_eq!(s.rtte.retransmission_timeout(), Duration::from_millis(200));
+        s.rtte.on_retransmit();
+        assert_eq!(s.rtte.retransmission_timeout(), Duration::from_millis(200));
+        s.rtte.on_rto();
+        assert_eq!(s.rtte.retransmission_timeout(), Duration::from_millis(400));
+        s.rtte.sample(500);
+        assert!(s.rtte.retransmission_timeout() > Duration::from_millis(200));
     }
 
     #[cfg(feature = "socket-tcp-reno")]
