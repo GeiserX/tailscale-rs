@@ -2,6 +2,12 @@
 
 Record breaking or significant changes here. All dates are UTC.
 
+## Unreleased
+
+### Bug Fixes
+
+* **netstack:** recover TCP burst loss with selective SACK/NewReno retransmission, enforce the congestion window over the flight, and enable corrected Cubic with pacing and a 200 ms computed RTO floor. Track 32 receive holes for uploads.
+
 ## [0.57.4](https://github.com/GeiserX/tailscale-rs/compare/v0.57.3...v0.57.4) (2026-10-01)
 
 

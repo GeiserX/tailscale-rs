@@ -35,6 +35,8 @@ features = [
     "proto-ipv4-fragmentation",
     "medium-ip",
     "socket-tcp",
+    "socket-tcp-cubic",
+    "assembler-max-segment-count-32",
     "socket-udp",
     "socket-icmp",
     "socket-raw",

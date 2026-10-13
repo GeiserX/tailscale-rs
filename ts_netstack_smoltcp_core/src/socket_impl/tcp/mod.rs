@@ -33,6 +33,10 @@ impl Netstack {
     /// [`TcpStream`]: ::ts_netstack_smoltcp_socket::tcp::stream::TcpStream
     fn new_tcp_socket(&self) -> tcp::Socket<'static> {
         let mut sock = tcp::Socket::new(self.tcp_buffer(), self.tcp_buffer());
+        // The sender must pace congestion-controlled flights into shallow overlay queues.
+        // Keep the initial handshake RTO at 1s, but recover measured-path tails sooner.
+        sock.set_pacing_enabled(true);
+        sock.set_min_retransmission_timeout(smoltcp::time::Duration::from_millis(200));
         // `core::time::Duration` → smoltcp's own `Duration` (millisecond granularity is plenty for
         // a 60s/120s policy). Skip either knob when `None` (smoltcp's no-reaping default).
         if let Some(interval) = self.config.tcp_keep_alive_interval {
