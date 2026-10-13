@@ -1,19 +1,24 @@
 # tsnet → Rust migration: what's left
 
 A complete status of the pure-Rust Tailscale engine (`tailscale` facade + 45 `ts_*` crates) versus
-Go `tsnet`/`tailscaled` v1.100.0. This is the orienting map for "what remains"; the live backlog is
+Go `tsnet`/`tailscaled` v1.100.0, re-measured against v1.102.4 (where `CurrentCapabilityVersion` is
+142, `tailcfg/tailcfg.go:192`) on 2026-10-14. This is the orienting map for "what remains"; the live backlog is
 the beads (`bd list --status open`, prefix `tsr-`) — every open bead is cross-referenced below.
 
 > **Bottom line.** The core path is **production-complete**: a node registers over TS2021-Noise,
 > long-polls the netmap (zstd-framed), brings up MagicSock/disco/DERP + the WireGuard tunnel and the
 > userspace netstack, runs MagicDNS, enforces the packet filter and Tailnet Lock, serves Taildrop /
-> Serve / SSH / Funnel, and recovers from key-expiry and link changes on its own. What remains is
+> Serve / SSH / Funnel, and recovers from key expiry on its own. It does not yet recover from link
+> changes on its own: the link monitor is off by default (`src/config.rs:719`) and, when on, runs a
+> backend that never emits an event (`ts_runtime/src/lib.rs:426-433`), so a network change needs a
+> manual `Device::rebind`. What remains is
 > **edge-clustered**: two genuinely-absent subsystems (NAT port-mapping, app-connector data path), a
 > set of partial subsystems with named hardening/parity gaps, and a tail of small surface polish. None
 > of it blocks the engine's mission (embed a Tailscale node + the residential-proxy exit path).
 
 *Last updated: 2026-06-16. Engine at v0.41.0 (crates.io). Beads: 35 open + 2 in-progress under the P0
-epic `tsr-am9`.*
+epic `tsr-am9`.* *Stale claims corrected in place on 2026-10-14. The current gap list and the open
+backlog are in [PARITY_ROADMAP.md](PARITY_ROADMAP.md#gap-audit-and-open-backlog-at-wind-down-2026-10-14).*
 
 ---
 
@@ -24,33 +29,32 @@ Verdict legend: **PRESENT** = works, no material gap · **PARTIAL** = works with
 
 | Subsystem | Verdict | Notes | Open beads |
 |---|---|---|---|
-| Control protocol (register/auth, map-poll, Noise/TS2021, zstd, capver) | **PRESENT** | + auto-reauth on key expiry, NeedsMachineAuth-transient, zstd map responses, Container/Env hostinfo — all shipped this cycle | parity polish: `tsr-84mh`, `tsr-cbw4`, `tsr-ajyc` |
-| MagicSock / disco / direct paths | **PARTIAL** | STUN/DERP/CallMeMaybe/ping-pong/best-addr work; peer-relay **client** half present (disco 0x04–0x09 codecs, bind handshake, Geneve data path); **portmapper absent**, relay **serving** absent | `tsr-x4yg` (portmapper), `tsr-a9x4` (peer relays), `tsr-dsjq` (full netcheck), `tsr-7s3` (ping cadence), `tsr-qc3o` (NoPath demand-ping), `tsr-51o6` (flaky test) |
+| Control protocol (register/auth, map-poll, Noise/TS2021, zstd, capver) | **PARTIAL** | + auto-reauth on key expiry, NeedsMachineAuth-transient, zstd map responses, Container/Env hostinfo — all shipped this cycle. Complete on an unlocked tailnet. On a locked tailnet the node never sends its own `NodeKeySignature` (2026-10-14 rows C1 to C3), and several MapResponse and PingRequest fields are parsed but not acted on (rows C9 to C14) | parity polish: `tsr-84mh`, `tsr-cbw4`, `tsr-ajyc`. Rows C1 to C3 and C9 to C14 have no bead |
+| MagicSock / disco / direct paths | **PARTIAL** | STUN/DERP/CallMeMaybe/ping-pong/best-addr work; peer-relay receiving side present (disco 0x04–0x09 codecs, bind handshake, Geneve data path for a relay a peer allocated); the relay **client** side that discovers relay servers and allocates one is absent (2026-10-14 row M18); **portmapper absent**, relay **serving** absent | `tsr-x4yg` (portmapper), `tsr-a9x4` (peer relays), `tsr-dsjq` (full netcheck), `tsr-7s3` (ping cadence), `tsr-qc3o` (NoPath demand-ping), `tsr-51o6` (flaky test) |
 | WireGuard tunnel | **PARTIAL** | initiator path complete (handshake/session/rekey/replay/cookie-consume); responder cookie issuance missing | `tsr-rl3n` (responder cookie + IsUnderLoad), `tsr-qn2` (MTU-aware padding) |
-| Netstack (userspace TCP/IP + TUN) | **PARTIAL** | TCP/UDP both modes; needs backpressure + icmp-echo | `tsr-fqus` (unbounded ingress queue, DoS), `tsr-rsu` (auto-icmp-echo), `tsr-4pp` (per-session sharding) |
+| Netstack (userspace TCP/IP + TUN) | **PARTIAL** | TCP/UDP both modes; needs egress backpressure + icmp-echo | `tsr-fqus` (ingress bounded since #587 at 4096 packets and 4096×MTU bytes, `ts_runtime/src/netstack_actor.rs:49-64`; egress still unbounded, `ts_runtime/src/dataplane.rs:115`, `:141`), `tsr-rsu` (auto-icmp-echo), `tsr-4pp` (per-session sharding) |
 | MagicDNS | **PARTIAL** | responder + plain-UDP upstream + recursive (TUN) work; encrypted upstream dropped | `tsr-3l78` (DoH/DoT upstream), `tsr-i2w` (exit-node DoH authoritative-vs-forward) |
-| Packet filter | **PARTIAL** | stateless by design (no conntrack) | `tsr-ohp` (no runIn conntrack — design decision), `tsr-4obf` (IPv6 frag ext-headers, moot while IPv4-only) |
-| Tailnet Lock (TKA) | **PARTIAL** | **actively enforcing, fail-closed**; init/sign/disable/status + `tka_log` shipped; add/remove/local-disable designed-not-built | add/remove/log/local-disable = ENGINE_ASKS #25/#27 (see §4); hardening (disablement-secret verify, rotation-obsolete) tracked under `tsr-am9` |
+| Packet filter | **PARTIAL** | Go's 512-entry flow cache is ported (`ts_dataplane/src/flowtrack.rs:31-35`) and IPv6 fragments are handled (`ts_dataplane/src/lib.rs:122-215`). Open: `cap:` rules never match, jailed peers get the ordinary ACL, TSMP ping gets no pong | `tsr-ohp` and `tsr-4obf` are closed in the tree (commits `bebe07f`, `3da1d5c`, `e7e4759`) and still open as beads |
+| Tailnet Lock (TKA) | **PARTIAL** | **actively enforcing, fail-closed**; init/sign/disable/status + `tka_log` shipped; add/remove/local-disable designed-not-built | add/remove/log/local-disable = ENGINE_ASKS #25/#27 (see §4); hardening (disablement-secret verify) tracked under `tsr-am9`; rotation-obsolete dropping shipped (`ts_runtime/src/peer_tracker/mod.rs:421-453`, commit `c145ddf`) |
 | Taildrop / PeerAPI | **PARTIAL** | full send/receive data path works | `tsr-dlzn` (cap enforcement membership-only), `tsr-cvh` (resume hash-exchange + header gaps) |
-| Serve / Funnel | **PARTIAL** | all handlers (Path/Redirect/Proxy/Text/TcpForward) + funnel client leg ship | `tsr-0xn` (ServeConfig not Go-wire-compatible, 8 deviations), `tsr-am9.11` (Funnel public relay leg — externally blocked) |
+| Serve / Funnel | **PARTIAL** | all handlers (Path/Redirect/Proxy/Text/TcpForward) + funnel client leg ship | `tsr-0xn` closed by `50611ab` (ServeConfig stored in Go's `ipn.ServeConfig` shape; deliberate refusals listed at `ts_control/src/serve/ipn.rs:386-394`), `tsr-am9.11` (Funnel public relay leg — externally blocked) |
 | SSH server | **PARTIAL** | login-shell PTY works | `tsr-v5gw` (no exec/SFTP/port-forward; userLogin principals), `tsr-0h2` (check-mode HoldAndDelegate) |
-| Exit nodes / subnet routes (using) | **PRESENT** | accept-routes + exit-node + `suggest_exit_node` shipped; advertising-side is out of scope by design | — |
+| Exit nodes / subnet routes (using and being) | **PARTIAL** | accept-routes + exit-node + `suggest_exit_node` shipped. Being one ships too: `advertise_routes`, `advertise_exit_node`, `forward_exit_egress`, `exit_proxy` (`src/config.rs:109`, `:118`, `:155`, `:174`) and runtime setters (`src/lib.rs:1574`, `:1592`), served by `ts_forwarder`. The forwarder answers a dead backend with FIN instead of RST and relays no ICMP echo (2026-10-14 rows N1, N4) | rows N1 and N4 have no bead |
 | netmon / link-change | **PARTIAL** | supervisor + debouncer + rebind/re-probe (slice a) shipped; OS event sources pending | `tsr-7wrn` (Linux netlink), `tsr-cnlh` (macOS PF_ROUTE) |
 | App-connector / 4via6 | **ABSENT** | advertise-bool only (`HostInfo.AppConnector`); no domain-routing data path | `tsr-o7m8` |
-| ACME / cert | **PARTIAL** | full issuance works | `tsr-pyc9` (no cert cache → re-issues, rate-limit risk) |
+| ACME / cert | **PARTIAL** | full issuance works, but nothing renews: each TLS listener holds the one certificate it got at start (2026-10-14 row R1) | `tsr-pyc9` (no cert cache → re-issues, rate-limit risk); renewal has no bead |
 
 ```mermaid
 graph TD
     EPIC[tsr-am9 P0: full tsnet parity]
-    EPIC --> P1[P1 — none open]
+    EPIC --> P1[P1 on 2026-10-14: tsr-0hd2, tsr-rev330, tsr-rev590r1, tsr-rev592r1]
     EPIC --> ABS[ABSENT subsystems]
     EPIC --> PART[PARTIAL — hardening + parity gaps]
     ABS --> X4[tsr-x4yg portmapper]
-    ABS --> A9[tsr-a9x4 peer relays / Geneve]
     ABS --> O7[tsr-o7m8 app-connector / 4via6]
-    PART --> SERVE[tsr-0xn Serve wire-compat]
+    PART --> A9[tsr-a9x4 peer relays: client side absent]
     PART --> NETMON[tsr-7wrn / tsr-cnlh netmon OS backends]
-    PART --> DOS[tsr-fqus netstack backpressure]
+    PART --> DOS[tsr-fqus netstack egress backpressure]
     PART --> TKA[ENGINE_ASKS 25/27 TKA verbs]
     PART --> TAIL[~20 P3 polish beads]
 ```
@@ -85,9 +89,9 @@ socket; exit-node proxy egress; `new_with_secret`; `re_stun`; `suggest_exit_node
 
 | Go tsnet / LocalClient | Fork status | Bead |
 |---|---|---|
-| Serve stored-state runtime + accept-loop; `ServeConfig` wire-compat | PARTIAL (handlers ship; 8 wire deviations) | `tsr-0xn` |
-| `Server.Loopback` HTTP-proxy half + SOCKS5 UDP ASSOCIATE + LocalAPI-over-HTTP | PARTIAL (SOCKS5-CONNECT only; native typed accessors instead) | `tsr-ask7` |
-| `Status`/`WhoIs` per-peer `online`/`last_seen` | MISSING (reported `None`; wire delivers them) | `tsr-x72n` |
+| Serve stored-state runtime + accept-loop; `ServeConfig` wire-compat | PARTIAL (handlers ship; stored in Go's wire shape since `50611ab`, with deliberate refusals at `ts_control/src/serve/ipn.rs:386-394`) | `tsr-0xn` (closed) |
+| `Server.Loopback` HTTP-proxy half + SOCKS5 UDP ASSOCIATE + LocalAPI-over-HTTP | PARTIAL (the `tsnet::Server` facade serves a second credential and a status-only LocalAPI, `src/tsnet.rs:469`, `:1577-1590`; no HTTP-proxy half, no UDP ASSOCIATE or BIND) | `tsr-ask7` |
+| `Status`/`WhoIs` per-peer `online`/`last_seen` | PRESENT (kept and reported, `ts_runtime/src/status.rs:20-23`, `:93`, `:96`) | `tsr-x72n` (closed in the tree, bead still open) |
 | `LocalClient.Netcheck` full `netcheck.Report` | PARTIAL (DERP-latency + HTTPS only) | `tsr-dsjq` |
 | `Server.Logf`/`UserLogf`, `Port`-pin equivalence, `RunWebClient`, `Sys()` | MISSING / by-design substitute | `tsr-reh3` |
 | `ListenFunnel` public ingress relay leg | PARTIAL — externally blocked (Tailscale infra) | `tsr-am9.11` |
@@ -104,7 +108,9 @@ after this cycle:
 - #1 `TransportMode`/`TunConfig` re-export · #2 `new_with_secret` · #3 zeroize keys · #4 `rebind` ·
   #5/#6 macOS TUN name/route · #9–#12 live setters / `dns_config` / `netcheck` / shields-up ·
   #13 funnel re-exports · #14 `accept_dns` · #15 `query_dns` · #16 `cert_pair` · #17 TKA mutation
-  (init/sign/disable) · #19 TUN peer-AllowedIPs · #20 Taildrop arrival.
+  (init/sign/disable) · #19 TUN peer-AllowedIPs. (#20 Taildrop arrival was listed here, but no arrival
+  signal exists: `Notify` carries only `state`, `net_map` and `browse_to_url`,
+  `ts_runtime/src/ipn_bus.rs:113-128`, and the daemon's own ask marks it deferred.)
 - **This cycle (v0.40.0 / v0.41.0):** #22 `wireguard_listen_port` (`--port`) · #23 `StatusNode.ssh_host_keys`
   (`tnet ssh` known_hosts) · #26 `Device::re_stun` (`tnet debug restun`) · #24 `suggest_exit_node`
   (`tnet exit-node suggest`) · #21 the up/set pref Config fields (operator/nickname/posture/webclient/
@@ -126,14 +132,15 @@ after this cycle:
 
 **P0** — `tsr-am9` (the umbrella epic; "done" when the children below close).
 
-**P1** — none open (the two P1 bugs this cycle — auto-reauth `tsr-ajvm`, NeedsMachineAuth `tsr-dvu` —
-are merged + closed).
+**P1** — none open at the time of writing (the two P1 bugs this cycle — auto-reauth `tsr-ajvm`,
+NeedsMachineAuth `tsr-dvu` — are merged + closed). Open on 2026-10-14: `tsr-0hd2` (blocked),
+`tsr-rev330`, `tsr-rev590r1`, `tsr-rev592r1`.
 
 **P2 (next-highest leverage):**
 - `tsr-doz6` netmon (in-progress: slice a shipped; `tsr-7wrn` Linux + `tsr-cnlh` macOS backends remain)
 - `tsr-x4yg` portmapper (UPnP-IGD/NAT-PMP/PCP) — EPIC; direct paths behind mapping-NATs stay on DERP
-- `tsr-0xn` Serve Go-wire-compatibility (8 deviations)
-- `tsr-fqus` netstack ingress backpressure (authenticated-peer RAM-exhaustion DoS)
+- `tsr-0xn` Serve Go-wire-compatibility (closed by `50611ab`)
+- `tsr-fqus` netstack backpressure (ingress half closed by #587; egress still unbounded)
 - `tsr-7s3` magicsock ping cadence / path-selection parity (in-progress)
 - `tsr-4pp` netstack per-session sharding (k8s scale)
 
@@ -144,7 +151,8 @@ peerapi gaps, `tsr-dsjq` full netcheck, `tsr-x72n` peer online/last_seen, `tsr-p
 cookie, `tsr-rsu` icmp-echo, `tsr-ohp` conntrack, `tsr-4obf` IPv6 frag, `tsr-qc3o` demand-ping,
 `tsr-qn2` MTU padding, `tsr-u5x` host-FIB re-steer, `tsr-iyv` UDP-flows config, `tsr-84mh`/`tsr-cbw4`/
 `tsr-ajyc` control parity polish, `tsr-3l78`, `tsr-0h2` SSH check-mode, `tsr-1rs`/`tsr-51o6` flaky-test
-hardening, `tsr-j5z4` docs reconciliation.
+hardening, `tsr-j5z4` docs reconciliation. On 2026-10-14 `tsr-x72n`, `tsr-ohp`, `tsr-4obf` and
+`tsr-re6d8674` were closed in the tree but still open as beads.
 
 > For the authoritative, always-current list: `bd list --status open` (and `bd show <id>` for the full
 > write-up of any item). This doc is the orienting map; the beads are the source of truth.
