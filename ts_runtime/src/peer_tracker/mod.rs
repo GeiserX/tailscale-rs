@@ -924,6 +924,15 @@ impl Message<Arc<ts_control::StateUpdate>> for PeerTracker {
             // clock delta may have moved, so the timer still has to be re-aimed.
             self.rearm_expiry_timer(now, ctx.actor_ref());
 
+            // A response carrying the self node is a full netmap even without `Peers`: control
+            // omits the field when the peer list is empty (`omitempty`), so a node that may see no
+            // peers never gets a peer set at all. Its (empty) peer state is known now; don't keep
+            // peer queries waiting for a peer set that will never come.
+            if msg.node.is_some() && !self.seen_state_update {
+                self.service_pending_requests();
+                self.peer_watch.send_replace(self.status_peers());
+            }
+
             // No peer set or patch this response. If a liveness delta still mutated the netmap,
             // publish the refreshed snapshot so watchers (and `GetStatus`) see the new online state.
             if liveness_changed {
@@ -2669,6 +2678,37 @@ pub(crate) mod tka_tests {
         })
         .await;
         settled.unwrap_or_else(|_| panic!("peer tracker never settled at {want} peer(s)"))
+    }
+
+    /// Control omits `Peers` when a node may see no peers (`omitempty`), so a netmap carrying the
+    /// self node and no peer set is that node's complete initial state. Peer queries made before it
+    /// (status, lookups) must be answered — empty — instead of waiting forever for a peer set.
+    #[tokio::test]
+    async fn self_only_netmap_answers_pending_status() {
+        use kameo::actor::Spawn as _;
+
+        let env = test_env();
+        let (_tka_tx, tka_rx) = watch::channel(None);
+        let tracker = PeerTracker::spawn((env.clone(), tka_rx));
+        let pending = tokio::spawn({
+            let tracker = tracker.clone();
+            async move { tracker.ask(GetStatus).await }
+        });
+        // The status query is parked until control's first netmap.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!pending.is_finished());
+
+        let mut update = netmap_with_peers(vec![]);
+        update.peer_update = None;
+        update.node = Some(peer_node("self", [9u8; 32], vec![]));
+        env.publish(Arc::new(update)).await.expect("publish netmap");
+
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+            .await
+            .expect("status query still waiting after a self-only netmap")
+            .unwrap()
+            .expect("peer tracker is alive");
+        assert!(status.is_empty());
     }
 
     /// End-to-end through the LIVE actor, which is the only thing that proves the wiring: the peer
