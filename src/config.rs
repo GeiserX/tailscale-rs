@@ -1029,6 +1029,28 @@ pub enum BadFormatBehavior {
     Overwrite,
 }
 
+/// Older versions wrote the key file with the process umask, so an existing one may be readable by
+/// other local users: make it owner-only.
+#[cfg(unix)]
+async fn restrict_existing_key_file(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(metadata) = tokio::fs::metadata(path).await else {
+        return;
+    };
+    if metadata.permissions().mode() & 0o077 == 0 {
+        return;
+    }
+    match tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await {
+        Ok(()) => {
+            tracing::warn!("key file was readable by other users; restricted it to owner-only")
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "key file is readable by other users and could not be restricted")
+        }
+    }
+}
+
 /// Attempt to load a file from a path. If it doesn't exist, create it with the
 /// specified default value.
 #[tracing::instrument(skip_all, fields(?bad_format_behavior, path = %path.as_ref().display()))]
@@ -1049,6 +1071,9 @@ where
             tracing::error!(error = %e, "creating parent dirs for key file");
             crate::Error::KeyFileWrite
         })?;
+
+    #[cfg(unix)]
+    restrict_existing_key_file(path).await;
 
     match tokio::fs::read(path).await {
         Ok(contents) => match serde_json::from_slice::<KeyState>(&contents) {
@@ -1097,18 +1122,76 @@ async fn try_write(
     path: impl AsRef<Path>,
     value: &impl serde::Serialize,
 ) -> Result<(), crate::Error> {
-    tokio::fs::write(
-        path,
-        serde_json::to_vec(value).map_err(|e| {
-            tracing::error!(error = %e, "serializing key state");
-            crate::Error::KeyFileWrite
-        })?,
-    )
-    .await
-    .map_err(|e| {
-        tracing::error!(error = %e, "saving key state");
+    use tokio::io::AsyncWriteExt;
+
+    let path = path.as_ref();
+    let bytes = serde_json::to_vec(value).map_err(|e| {
+        tracing::error!(error = %e, "serializing key state");
         crate::Error::KeyFileWrite
     })?;
+    let write_error = |e: std::io::Error| {
+        tracing::error!(error = %e, "saving key state");
+        crate::Error::KeyFileWrite
+    };
+
+    // The file holds private keys: create it owner-only, and tighten an existing file that was
+    // written with the process umask by an earlier version.
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path).await.map_err(write_error)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .await
+            .map_err(write_error)?;
+    }
+    file.write_all(&bytes).await.map_err(write_error)?;
+    file.flush().await.map_err(write_error)?;
 
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod key_file_permission_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    /// The key file holds private keys, so it must be owner-only regardless of the umask, and an
+    /// existing world-readable file from an older version must be tightened on load and on write.
+    #[tokio::test]
+    async fn key_file_is_written_owner_only() {
+        let dir = std::env::temp_dir().join(format!("ts-keyfile-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dir));
+        let path = dir.join("keys.json");
+
+        load_key_file(&path, BadFormatBehavior::Error)
+            .await
+            .unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "new key file must be owner-only, got {mode:o}");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        load_key_file(&path, BadFormatBehavior::Error)
+            .await
+            .unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "load must tighten an existing key file, got {mode:o}"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        try_write(&path, &KeyFile::default()).await.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "rewrite must tighten an existing key file, got {mode:o}"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
