@@ -607,6 +607,21 @@ mod tests {
         assert!(matches!(err, Err(DialError::ForbiddenDestination(d)) if d == dst));
     }
 
+    /// The guard must not swallow legitimate exit traffic: an exit-node flow to a public address
+    /// still egresses. A UDP connect needs no listener, so this exercises the real socket path.
+    #[tokio::test]
+    async fn host_exit_dialer_does_not_refuse_public_exit_udp() {
+        let dst: SocketAddr = "203.0.113.1:9".parse().unwrap();
+        let res = HostExitDialer.dial_udp(FlowClass::ExitNode, dst).await;
+        assert!(
+            !matches!(
+                res,
+                Err(DialError::ForbiddenDestination(_)) | Err(DialError::ExitEgressRefused)
+            ),
+            "public exit UDP must not be refused"
+        );
+    }
+
     /// Every non-internet range is refused for exit-node TCP and UDP before any socket is created.
     #[tokio::test]
     async fn host_exit_dialer_refuses_forbidden_exit_destinations() {
@@ -1086,18 +1101,18 @@ mod tests {
         }
 
         // A normal public IP is still ALLOWED.
-        let public: SocketAddr = "203.0.113.1:443".parse().unwrap();
+        let public: SocketAddr = "1.1.1.1:443".parse().unwrap();
         assert!(
             !exit_dst_is_forbidden(public),
-            "public IP 203.0.113.1 must remain an allowed exit destination"
+            "public IP 1.1.1.1 must remain an allowed exit destination"
         );
 
-        // 203.0.113.2 is OUTSIDE 100.64.0.0/10 (the /10 only covers 100.64–100.127), so it is a
+        // 100.128.0.1 is OUTSIDE 100.64.0.0/10 (the /10 only covers 100.64–100.127), so it is a
         // normal public address and must NOT be caught by the CGNAT guard.
-        let cgnat_adjacent: SocketAddr = "203.0.113.2:443".parse().unwrap();
+        let cgnat_adjacent: SocketAddr = "100.128.0.1:443".parse().unwrap();
         assert!(
             !exit_dst_is_forbidden(cgnat_adjacent),
-            "203.0.113.2 is outside 100.64/10 and must remain allowed"
+            "100.128.0.1 is outside 100.64/10 and must remain allowed"
         );
 
         // 223.255.255.255 is the last unicast address BELOW multicast (224/4); it must remain
