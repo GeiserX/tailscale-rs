@@ -54,7 +54,7 @@ pub(super) struct TargetedReplay {
 #[cfg(feature = "std")]
 fn enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("TS_EXPERIMENT_TARGETED_REPLAY").as_deref() == Ok("1"))
+    *ENABLED.get_or_init(|| std::env::var("TS_EXPERIMENT_TARGETED_REPLAY").as_deref() != Ok("0"))
 }
 #[cfg(not(feature = "std"))]
 fn enabled() -> bool {
@@ -1112,7 +1112,7 @@ mod driver_tests {
         #[cfg(feature = "std")]
         assert_eq!(
             enabled(),
-            std::env::var("TS_EXPERIMENT_TARGETED_REPLAY").as_deref() == Ok("1")
+            std::env::var("TS_EXPERIMENT_TARGETED_REPLAY").as_deref() != Ok("0")
         );
     }
 }

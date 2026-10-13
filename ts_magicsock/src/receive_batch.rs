@@ -73,7 +73,11 @@ pub fn snapshot() -> Snapshot {
 }
 
 pub(crate) fn enabled() -> bool {
-    std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() == Ok("1")
+    match std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => cfg!(target_vendor = "apple"),
+    }
 }
 
 pub(crate) struct Receiver {

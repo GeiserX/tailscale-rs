@@ -637,6 +637,15 @@ async fn run_direct(
     to_dataplane: UnderlayToDataplane,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    // The WG core is a single owner even without RX batching. On Linux, keep recvmmsg's
+    // syscall saving but publish smaller FIFO messages, allowing decrypt/admission/ACK work
+    // to overlap instead of running a whole kernel batch before downstream can progress.
+    // Apple retains the measured whole-batch path.
+    let handoff_limit = if cfg!(target_os = "linux") && receive_batching_enabled() {
+        4
+    } else {
+        usize::MAX
+    };
     while !*shutdown.borrow() {
         tokio::select! {
             _ = shutdown.changed() => break,
@@ -646,7 +655,7 @@ async fn run_direct(
                     match ret {
                         Ok((peer_id, pkts)) => {
                             let pkts = pkts.into_iter().collect::<Vec<_>>();
-                            if to_dataplane.send((peer_id, pkts)).is_err() {
+                            if !handoff_received(&to_dataplane, peer_id, pkts, handoff_limit).await {
                                 tracing::error!("underlay receive channel closed");
                                 return;
                             }
@@ -669,6 +678,41 @@ async fn run_direct(
                 }
             }
         }
+    }
+}
+
+fn receive_batching_enabled() -> bool {
+    match std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => cfg!(target_vendor = "apple"),
+    }
+}
+
+/// Split only downstream work; the kernel/pump batch and its owned buffers stay intact.
+/// No detached tasks or new queue: per-peer order and channel failure semantics are unchanged.
+async fn handoff_received(
+    to_dataplane: &UnderlayToDataplane,
+    peer_id: PeerId,
+    packets: Vec<ts_packet::PacketMut>,
+    limit: usize,
+) -> bool {
+    debug_assert!(limit > 0);
+    if packets.len() <= limit {
+        return to_dataplane.send((peer_id, packets)).is_ok();
+    }
+    let mut packets = packets.into_iter();
+    loop {
+        let chunk = packets.by_ref().take(limit).collect();
+        if to_dataplane.send((peer_id, chunk)).is_err() {
+            return false;
+        }
+        if packets.len() == 0 {
+            return true;
+        }
+        // A chunk also bounds netstack deferred-wake latency. Yield after publishing, never
+        // while holding the WG state or an admission lock, and never wait to fill a chunk.
+        tokio::task::yield_now().await;
     }
 }
 
@@ -1164,7 +1208,7 @@ impl kameo::Actor for DirectManager {
             dataplane.ask(NewUnderlayTransport).await?;
 
         let transport = DirectTransport::new(sock.clone())
-            .with_receive_batching(std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() == Ok("1"))
+            .with_receive_batching(receive_batching_enabled())
             .with_key_lookup(DiscoPeerLookup(peer_db.clone()));
 
         tasks.spawn(run_direct(
@@ -1465,6 +1509,64 @@ mod tests {
 
     use super::*;
     use crate::peer_tracker::PeerDb;
+
+    #[tokio::test]
+    async fn receive_handoff_bounds_chunks_and_preserves_peer_fifo_and_tails() {
+        for limit in [4, usize::MAX] {
+            for count in [0, 1, 4, 5, 16, 64, 65] {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                let producer = tokio::spawn(async move {
+                    for peer in [PeerId(1), PeerId(2)] {
+                        let packets = (0..count)
+                            .map(|n| ts_packet::PacketMut::from(vec![n as u8]))
+                            .collect();
+                        assert!(handoff_received(&tx, peer, packets, limit).await);
+                    }
+                });
+                for peer in [PeerId(1), PeerId(2)] {
+                    let mut received = Vec::new();
+                    loop {
+                        let (from, packets) = rx.recv().await.unwrap();
+                        assert_eq!(from, peer);
+                        assert!(packets.len() <= limit);
+                        assert!(!packets.is_empty() || count == 0);
+                        received.extend(packets.into_iter().map(|p| p.as_ref()[0]));
+                        if received.len() == count {
+                            break;
+                        }
+                    }
+                    assert_eq!(received, (0..count as u8).collect::<Vec<_>>());
+                }
+                producer.await.unwrap();
+                assert!(rx.recv().await.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn receive_handoff_yields_between_chunks_and_stops_on_closed_channel() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let producer = tokio::spawn(async move {
+            handoff_received(
+                &tx,
+                PeerId(1),
+                (0..16)
+                    .map(|n| ts_packet::PacketMut::from(vec![n]))
+                    .collect(),
+                4,
+            )
+            .await
+        });
+        let (_, first) = rx.recv().await.unwrap();
+        assert_eq!(first.len(), 4);
+        // The consumer runs before the whole kernel batch is published, even on one worker.
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        drop(rx);
+        assert!(!producer.await.unwrap());
+    }
 
     /// Build a minimal netmap peer with the given disco and node keys.
     fn node_with_keys(disco: DiscoPublicKey, node_key: NodePublicKey, stable: &str) -> Node {

@@ -10,9 +10,37 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 const COALESCE_BYTES: usize = 128 * 1024;
 
+#[derive(Clone, Copy)]
+struct CopyPolicy {
+    overlay_bytes: usize,
+    host_bytes: usize,
+    drain: bool,
+}
+impl CopyPolicy {
+    const APPLE: Self = Self {
+        overlay_bytes: COALESCE_BYTES,
+        host_bytes: COALESCE_BYTES,
+        drain: true,
+    };
+    // Uploads still take one large ready netstack snapshot (including ring wrap). Downloads
+    // publish smaller Send commands to the stack/WG owner, returning window/ACK progress
+    // sooner on a fast host socket. Neither direction speculatively polls another ready read.
+    const LINUX: Self = Self {
+        overlay_bytes: COALESCE_BYTES,
+        host_bytes: 16 * 1024,
+        drain: false,
+    };
+}
+
 pub(crate) fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("TS_EXPERIMENT_SPLICE_COALESCE").as_deref() == Ok("1"))
+    *ENABLED.get_or_init(
+        || match std::env::var("TS_EXPERIMENT_SPLICE_COALESCE").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => cfg!(target_vendor = "apple"),
+        },
+    )
 }
 
 /// No extra storage: reads fill Tokio's bounded copy buffer. A pending overlay command stays
@@ -99,20 +127,38 @@ where
 {
     let metrics = crate::splice_metrics::enabled();
     if coalesce {
-        let mut overlay = Io::new(overlay, true, false);
-        let mut host = Io::new(host, true, metrics);
-        tokio::io::copy_bidirectional_with_sizes(
-            &mut overlay,
-            &mut host,
-            COALESCE_BYTES,
-            COALESCE_BYTES,
-        )
-        .await
+        let policy = if cfg!(target_os = "linux") {
+            CopyPolicy::LINUX
+        } else {
+            CopyPolicy::APPLE
+        };
+        copy_coalesced(overlay, host, policy, metrics).await
     } else if metrics {
         tokio::io::copy_bidirectional(overlay, &mut Io::new(host, false, true)).await
     } else {
         tokio::io::copy_bidirectional(overlay, host).await
     }
+}
+
+async fn copy_coalesced<A, B>(
+    overlay: &mut A,
+    host: &mut B,
+    policy: CopyPolicy,
+    metrics: bool,
+) -> io::Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut overlay = Io::new(overlay, policy.drain, false);
+    let mut host = Io::new(host, policy.drain, metrics);
+    tokio::io::copy_bidirectional_with_sizes(
+        &mut overlay,
+        &mut host,
+        policy.overlay_bytes,
+        policy.host_bytes,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -148,6 +194,107 @@ mod tests {
                 Some(Read::Error) => Poll::Ready(Err(io::ErrorKind::ConnectionReset.into())),
                 None => Poll::Ready(Ok(())),
             }
+        }
+    }
+    #[test]
+    fn linux_returns_each_ready_snapshot_without_polling_the_next_read() {
+        let mut io = Io::new(
+            Script(VecDeque::from([
+                Read::Data(b"ab".to_vec()),
+                Read::Data(b"cd".to_vec()),
+                Read::Pending,
+                Read::Error,
+            ])),
+            CopyPolicy::LINUX.drain,
+            false,
+        );
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut storage = [0; 16];
+        let mut buf = ReadBuf::new(&mut storage);
+        for expected in [b"ab", b"cd"] {
+            buf.clear();
+            assert!(matches!(
+                Pin::new(&mut io).poll_read(&mut cx, &mut buf),
+                Poll::Ready(Ok(()))
+            ));
+            assert_eq!(buf.filled(), expected);
+        }
+        buf.clear();
+        assert!(Pin::new(&mut io).poll_read(&mut cx, &mut buf).is_pending());
+        assert!(
+            matches!(Pin::new(&mut io).poll_read(&mut cx, &mut buf), Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::ConnectionReset)
+        );
+    }
+
+    #[tokio::test]
+    async fn linux_bounds_download_commands_and_writes_before_the_next_snapshot() {
+        struct Endpoint {
+            data: Vec<u8>,
+            offset: usize,
+            written: Vec<u8>,
+            reads: Vec<usize>,
+            events: std::sync::Arc<std::sync::Mutex<Vec<char>>>,
+            id: char,
+        }
+        impl AsyncRead for Endpoint {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                self.reads.push(buf.remaining());
+                let n = buf.remaining().min(self.data.len() - self.offset);
+                if n > 0 {
+                    self.events.lock().unwrap().push(self.id);
+                    buf.put_slice(&self.data[self.offset..self.offset + n]);
+                    self.offset += n;
+                }
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl AsyncWrite for Endpoint {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(self.id.to_ascii_uppercase());
+                self.written.extend_from_slice(buf);
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let endpoint = |id, value| Endpoint {
+            data: vec![value; 2 * COALESCE_BYTES + 37],
+            offset: 0,
+            written: Vec::new(),
+            reads: Vec::new(),
+            events: events.clone(),
+            id,
+        };
+        let mut overlay = endpoint('o', 3);
+        let mut host = endpoint('h', 7);
+        let lengths = copy_coalesced(&mut overlay, &mut host, CopyPolicy::LINUX, false)
+            .await
+            .unwrap();
+        assert_eq!(lengths, (overlay.data.len() as u64, host.data.len() as u64));
+        assert_eq!(overlay.written, host.data);
+        assert_eq!(host.written, overlay.data);
+        assert!(overlay.reads.iter().all(|n| *n <= COALESCE_BYTES));
+        assert!(host.reads.iter().all(|n| *n <= 16 * 1024));
+        assert_eq!(overlay.reads[0], COALESCE_BYTES);
+        assert_eq!(host.reads[0], 16 * 1024);
+        for pair in events.lock().unwrap().chunks_exact(2) {
+            assert!(pair == ['o', 'H'] || pair == ['h', 'O']);
         }
     }
     #[test]
@@ -268,7 +415,7 @@ mod tests {
     #[tokio::test]
     async fn backpressure_and_both_fin_orders_are_lossless() {
         tokio::time::timeout(std::time::Duration::from_secs(20), async {
-            for coalesce in [false, true] {
+            for policy in [None, Some(CopyPolicy::APPLE), Some(CopyPolicy::LINUX)] {
                 for host_first in [false, true] {
                     let (peer, mut overlay) = tokio::io::duplex(517);
                     let (mut host, backend) = tokio::io::duplex(1031);
@@ -276,8 +423,13 @@ mod tests {
                         .map(|i| (i % 251) as u8)
                         .collect();
                     let expected = payload.clone();
-                    let splice =
-                        tokio::spawn(async move { copy(&mut overlay, &mut host, coalesce).await });
+                    let splice = tokio::spawn(async move {
+                        if let Some(policy) = policy {
+                            copy_coalesced(&mut overlay, &mut host, policy, false).await
+                        } else {
+                            copy(&mut overlay, &mut host, false).await
+                        }
+                    });
                     let (mut initiator, mut responder) = if host_first {
                         (backend, peer)
                     } else {
