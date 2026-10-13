@@ -306,6 +306,62 @@ async fn forwarder_splices_subnet_route_to_real_socket() {
     assert_eq!(&buf[..n], b"hello forwarder");
 }
 
+/// Large tails cross the coalescing buffer and TCP window; FIN must follow every byte and the
+/// opposite direction must stay usable after EOF. Small reads exercise retained Recv remainders.
+#[tokio::test]
+async fn large_splice_preserves_tail_and_reply_after_peer_fin() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let payload: Vec<_> = (0..(512 * 1024 + 37)).map(|i| (i % 251) as u8).collect();
+        let expected = payload.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let backend = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut got = Vec::new();
+            let mut buf = [0; 997];
+            loop {
+                let n = stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(got, expected);
+            stream.write_all(&got).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let (peer_ch, fwd_ch) = spawn_pair().await;
+        let forwarder = Forwarder::new(
+            fwd_ch,
+            RouteTable::new(["127.0.0.0/8".parse().unwrap()]),
+            DirectDialer,
+            vec![addr.port()],
+            vec![],
+        );
+        let forwarding = tokio::spawn(async move { forwarder.run().await });
+        let mut client =
+            connect_with_retry(&peer_ch, SocketAddr::new(PEER_IP.into(), PEER_PORT), addr).await;
+        client.write_all(&payload).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut reply = Vec::new();
+        let mut buf = [0; 333];
+        loop {
+            let n = client.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            reply.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(reply, payload);
+        backend.await.unwrap();
+        forwarding.abort();
+    })
+    .await
+    .unwrap();
+}
+
 /// Regression for tsr-syf (half-close): when the real backend finishes responding and half-closes
 /// its write side (`shutdown(SHUT_WR)` -> FIN), that EOF must propagate back through the forwarder
 /// splice to the overlay peer — the peer's `read` must return `Ok(0)`. Before the fix the overlay

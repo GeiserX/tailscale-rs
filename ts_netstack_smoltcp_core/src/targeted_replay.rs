@@ -87,9 +87,10 @@ impl Netstack {
             return Err(req);
         };
         let (rx, tx, kind) = match &req.command {
-            Command::TcpStream(crate::tcp::stream::Command::Recv { .. }) => {
-                (true, false, SocketKind::Tcp)
-            }
+            Command::TcpStream(
+                crate::tcp::stream::Command::Recv { .. }
+                | crate::tcp::stream::Command::RecvCoalesced { .. },
+            ) => (true, false, SocketKind::Tcp),
             Command::TcpStream(crate::tcp::stream::Command::Send { .. }) => {
                 (false, true, SocketKind::Tcp)
             }
@@ -427,6 +428,101 @@ mod tests {
     #[test]
     fn connect_completion_is_targeted_and_accept_stays_global() {
         pair();
+    }
+
+    #[test]
+    fn coalesced_recv_spans_ring_wrap_obeys_limit_and_keeps_fin_and_cancellation() {
+        let (mut stack, mut dev, client, server) = pair_with_buffer(64);
+        request(
+            &mut stack,
+            Some(client),
+            stream::Command::Send {
+                buf: Bytes::copy_from_slice(&[1; 48]),
+            },
+        )
+        .try_recv()
+        .unwrap();
+        pump(&mut stack, &mut dev, Instant::ZERO);
+        assert_recv(
+            &request(
+                &mut stack,
+                Some(server),
+                stream::Command::Recv { max_len: None },
+            ),
+            &[1; 48],
+        );
+        pump(&mut stack, &mut dev, Instant::from_millis(10));
+        let data: Vec<_> = (0..40).collect();
+        request(
+            &mut stack,
+            Some(client),
+            stream::Command::Send {
+                buf: Bytes::from(data.clone()),
+            },
+        )
+        .try_recv()
+        .unwrap();
+        pump(&mut stack, &mut dev, Instant::from_millis(20));
+        assert_eq!(stack.socket_set.get::<tcp::Socket>(server).recv_queue(), 40);
+        // RX head is at offset 48 in a 64-byte ring: the first contiguous span is only 16.
+        assert_recv(
+            &request(
+                &mut stack,
+                Some(server),
+                stream::Command::RecvCoalesced { max_len: 30 },
+            ),
+            &data[..30],
+        );
+        assert_recv(
+            &request(
+                &mut stack,
+                Some(server),
+                stream::Command::RecvCoalesced { max_len: 64 },
+            ),
+            &data[30..],
+        );
+        let canceled = request(
+            &mut stack,
+            Some(server),
+            stream::Command::RecvCoalesced { max_len: 64 },
+        );
+        assert!(canceled.is_empty());
+        drop(canceled);
+        pump(&mut stack, &mut dev, Instant::from_millis(30));
+        request(
+            &mut stack,
+            Some(client),
+            stream::Command::Send {
+                buf: Bytes::from_static(b"tail"),
+            },
+        )
+        .try_recv()
+        .unwrap();
+        pump(&mut stack, &mut dev, Instant::from_millis(40));
+        // An abandoned coalesced receive must not take bytes from the live consumer (F17).
+        assert_recv(
+            &request(
+                &mut stack,
+                Some(server),
+                stream::Command::RecvCoalesced { max_len: 64 },
+            ),
+            b"tail",
+        );
+        let eof = request(
+            &mut stack,
+            Some(server),
+            stream::Command::RecvCoalesced { max_len: 64 },
+        );
+        request(&mut stack, Some(client), stream::Command::ShutdownWrite)
+            .try_recv()
+            .unwrap();
+        pump(&mut stack, &mut dev, Instant::from_millis(40));
+        assert!(matches!(
+            eof.try_recv(),
+            Ok(Response::TcpStream(stream::Response::Finished))
+        ));
+        assert_eq!(stack.metrics.counts().safety_net_sweeps, 0);
+        assert_eq!(stack.metrics.counts().safety_net_completions, 0);
     }
 
     #[test]

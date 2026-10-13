@@ -1,4 +1,4 @@
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use smoltcp::{iface::SocketHandle, socket::tcp};
 
 use crate::{
@@ -79,25 +79,49 @@ impl Netstack {
                 }
             }
 
-            TcpStreamCommand::Recv { max_len } => {
+            cmd @ (TcpStreamCommand::Recv { .. } | TcpStreamCommand::RecvCoalesced { .. }) => {
                 let handle = unwrap_handle!(handle);
                 // See `Send` above: guard against a reaped/closed handle so a first-touch `Recv`
                 // returns a clean `missing_socket` (mapped to EOF at the `TcpStream` boundary)
                 // instead of panicking the actor (tsr-9ue).
                 let sock = get_socket_mut!(self, tcp::Socket, Some(handle));
 
-                match sock.recv(|buf| {
-                    let mut len = buf.len();
-
-                    if let Some(max_len) = max_len {
-                        len = len.min(max_len);
+                let result = if let TcpStreamCommand::RecvCoalesced { max_len } = cmd {
+                    // One command drains the ready RX snapshot across ring wrap. No extra
+                    // runtime round trip and no wait for a future segment to fill the buffer.
+                    let mut out = BytesMut::with_capacity(sock.recv_queue().min(max_len));
+                    loop {
+                        let result = sock.recv(|buf| {
+                            let n = buf.len().min(max_len - out.len());
+                            out.extend_from_slice(&buf[..n]);
+                            (n, n)
+                        });
+                        match result {
+                            Ok(n) if n == 0 || out.len() == max_len || sock.recv_queue() == 0 => {
+                                break Ok(out.freeze());
+                            }
+                            Ok(_) => {}
+                            Err(e) => break Err(e),
+                        }
                     }
+                } else {
+                    let TcpStreamCommand::Recv { max_len } = cmd else {
+                        unreachable!()
+                    };
+                    sock.recv(|buf| {
+                        let mut len = buf.len();
 
-                    (len, Bytes::copy_from_slice(&buf[..len]))
-                }) {
+                        if let Some(max_len) = max_len {
+                            len = len.min(max_len);
+                        }
+
+                        (len, Bytes::copy_from_slice(&buf[..len]))
+                    })
+                };
+                match result {
                     Ok(buf) if buf.is_empty() => Response::WouldBlock {
                         handle: Some(handle),
-                        command: TcpStreamCommand::Recv { max_len }.into(),
+                        command: cmd.into(),
                     },
                     Ok(buf) => TcpStreamResponse::Recv { buf }.into(),
                     Err(tcp::RecvError::Finished) => TcpStreamResponse::Finished.into(),

@@ -54,6 +54,7 @@ impl Command {
         matches!(
             self,
             Command::TcpStream(tcp::stream::Command::Recv { .. })
+                | Command::TcpStream(tcp::stream::Command::RecvCoalesced { .. })
                 | Command::Udp(udp::Command::Recv { .. })
                 | Command::Raw(raw::Command::Recv { .. })
         )

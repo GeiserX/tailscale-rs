@@ -50,6 +50,13 @@ pub enum Command {
         max_len: Option<usize>,
     },
 
+    /// Receive up to `max_len` already queued bytes, including both sides of a wrapped RX ring.
+    /// Waits only when no byte is available; never waits to fill the requested length.
+    RecvCoalesced {
+        /// Maximum payload length.
+        max_len: usize,
+    },
+
     /// Send bytes over the connection.
     ///
     /// Blocks until at least one byte can be sent.
@@ -86,6 +93,10 @@ impl Debug for Command {
                 .field("remote_endpoint", remote_endpoint)
                 .finish(),
             Self::Recv { max_len } => f.debug_struct("Recv").field("max_len", max_len).finish(),
+            Self::RecvCoalesced { max_len } => f
+                .debug_struct("RecvCoalesced")
+                .field("max_len", max_len)
+                .finish(),
             Self::Send { buf } => f.debug_struct("Send").field("buf_len", &buf.len()).finish(),
             Self::Close => f.write_str("Close"),
             Self::ShutdownWrite => f.write_str("ShutdownWrite"),
