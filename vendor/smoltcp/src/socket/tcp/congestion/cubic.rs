@@ -17,6 +17,8 @@ pub struct Cubic {
     rwnd: usize, // Remote window
     last_update: Instant,
     ssthresh: usize,
+    w_est: usize,
+    ack_credit: usize,
 }
 
 impl Cubic {
@@ -29,6 +31,8 @@ impl Cubic {
             rwnd: 64 * 1024,
             last_update: Instant::from_millis(0),
             ssthresh: usize::MAX,
+            w_est: 2048,
+            ack_credit: 0,
         }
     }
 }
@@ -42,6 +46,8 @@ impl Controller for Cubic {
         self.w_max = self.cwnd;
         self.ssthresh = ((self.cwnd as f64 * BETA_CUBIC) as usize).max(2 * self.min_cwnd);
         self.cwnd = self.min_cwnd;
+        self.w_est = self.cwnd;
+        self.ack_credit = 0;
         self.recovery_start = None;
     }
 
@@ -49,6 +55,8 @@ impl Controller for Cubic {
         self.w_max = self.cwnd;
         self.ssthresh = ((self.cwnd as f64 * BETA_CUBIC) as usize).max(2 * self.min_cwnd);
         self.cwnd = self.ssthresh;
+        self.w_est = self.cwnd;
+        self.ack_credit = 0;
         self.recovery_start = Some(now);
     }
 
@@ -59,13 +67,26 @@ impl Controller for Cubic {
     }
 
     fn on_ack(&mut self, _now: Instant, len: usize, _rtt: &crate::socket::tcp::RttEstimator) {
-        // Slow start.
+        if len == 0 {
+            return;
+        }
         if self.cwnd < self.ssthresh {
             self.cwnd = self
                 .cwnd
                 .saturating_add(len.min(2 * self.min_cwnd))
                 .min(self.rwnd)
                 .max(self.min_cwnd);
+            self.w_est = self.cwnd;
+        } else {
+            // RFC 9438 Reno-friendly region: alpha = 3(1-beta)/(1+beta)
+            // = 9/17 for beta=0.7. Accumulate ACK credit for one MSS of W_est.
+            self.ack_credit = self.ack_credit.saturating_add(len);
+            let threshold = self.cwnd / 9 * 17 + ((self.cwnd % 9) * 17).div_ceil(9);
+            if self.ack_credit >= threshold {
+                self.ack_credit -= threshold;
+                self.w_est = self.w_est.saturating_add(self.min_cwnd).min(self.rwnd);
+            }
+            self.cwnd = self.cwnd.max(self.w_est);
         }
     }
 
@@ -108,6 +129,7 @@ impl Controller for Cubic {
         self.last_update = now;
 
         self.cwnd = (cwnd as usize)
+            .max(self.w_est)
             .max(self.ssthresh)
             .max(self.min_cwnd)
             .min(self.rwnd);
@@ -117,6 +139,7 @@ impl Controller for Cubic {
         if self.ssthresh == usize::MAX && self.cwnd == 2048 {
             self.cwnd = (10 * mss).min(14600).max(2 * mss);
             self.w_max = self.cwnd;
+            self.w_est = self.cwnd;
         }
         self.min_cwnd = mss;
     }
@@ -169,6 +192,36 @@ mod test {
     use crate::{socket::tcp::RttEstimator, time::Instant};
 
     use super::*;
+
+    #[test]
+    fn cubic_reno_friendly_growth_is_ack_clocked() {
+        let mut cubic = Cubic::new();
+        cubic.set_mss(1000);
+        cubic.set_remote_window(1000000);
+        cubic.cwnd = 100000;
+        let now = Instant::from_millis(0);
+        cubic.on_duplicate_ack(now);
+        assert_eq!(cubic.window(), 70000);
+        for _ in 0..100 {
+            cubic.on_ack(now, 0, &RttEstimator::default());
+        }
+        assert_eq!(cubic.window(), 70000);
+        cubic.on_ack(
+            now,
+            (70000_usize * 17).div_ceil(9),
+            &RttEstimator::default(),
+        );
+        assert_eq!(cubic.window(), 71000);
+        cubic.pre_transmit(now);
+        assert_eq!(
+            cubic.window(),
+            71000,
+            "cubic curve must preserve the Reno estimate"
+        );
+        cubic.on_retransmit(now);
+        assert_eq!(cubic.window(), 1000);
+        assert_eq!(cubic.ack_credit, 0);
+    }
 
     #[test]
     fn cubic_timeout_restart_bounds_stretched_ack() {
