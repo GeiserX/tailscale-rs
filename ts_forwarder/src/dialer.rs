@@ -266,8 +266,9 @@ fn refuse_forbidden_exit_dst(class: FlowClass, dst: SocketAddr) -> Result<(), Di
     refuse_exit_dst_with(class, dst, AttachedSubnets::current)
 }
 
-/// [`refuse_forbidden_exit_dst`] with the attached-subnet source passed in, so tests can supply a
-/// host. `attached` is only called for an exit flow that passed the fixed ranges, so subnet flows and
+/// [`refuse_forbidden_exit_dst`] with the attached-subnet source passed in, so [`ProxyExitDialer`]
+/// and tests can supply it. Both exit dialers refuse through here, so a peer gets the same answer
+/// whichever way its exit traffic leaves this host. `attached` is only called for an exit flow that passed the fixed ranges, so subnet flows and
 /// already-refused exit flows never enumerate interfaces. If the interfaces cannot be read the flow
 /// is refused: Go also drops its whole default route when `interfaceRoutes` fails.
 fn refuse_exit_dst_with(
@@ -407,17 +408,29 @@ impl core::fmt::Debug for ProxyConfig {
 /// same reason ([`DialError::ProxyUdpUnsupported`]): HTTP CONNECT cannot carry UDP and SOCKS5
 /// UDP-ASSOCIATE is not implemented, and we will not silently direct-dial UDP.
 ///
+/// Exit-node flows are confined to the internet exactly as in [`HostExitDialer`], before the proxy
+/// is contacted: the fixed non-internet ranges and every subnet this host is attached to are
+/// refused with [`DialError::ForbiddenDestination`], and the flow is refused if the host's
+/// interfaces cannot be read. The proxy reaches its targets from wherever it sits, so without this a
+/// peer could have it connect into this host's LAN, or into the proxy's own LAN when the proxy runs
+/// on that same network. Subnet flows are tunnelled unchanged.
+///
 /// The handshake to the proxy is plaintext and needs no TLS, so this type adds no native-TLS
 /// dependency.
 #[derive(Clone, Debug)]
 pub struct ProxyExitDialer {
     config: ProxyConfig,
+    /// Where the exit guard reads this host's attached subnets; the live interfaces outside tests.
+    attached: fn() -> std::io::Result<AttachedSubnets>,
 }
 
 impl ProxyExitDialer {
     /// Build a proxy dialer from an upstream proxy configuration.
     pub fn new(config: ProxyConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            attached: AttachedSubnets::current,
+        }
     }
 
     /// Connect to the upstream proxy and tunnel to `dst`, returning the established stream.
@@ -504,13 +517,9 @@ impl RealDialer for ProxyExitDialer {
     ) -> Result<tokio::net::TcpStream, DialError> {
         // Both Subnet and ExitNode flows tunnel through the upstream proxy; choosing this dialer
         // is the explicit decision to route all egress via the proxy's IP. SSRF guard: an
-        // exit-node flow must not be aimed at the proxy's own private/loopback/metadata network.
-        if class == FlowClass::ExitNode && exit_dst_is_forbidden(dst) {
-            tracing::warn!(%dst, "proxy exit dial refused: forbidden exit destination (SSRF guard)");
-            return Err(DialError::ProxyHandshake(
-                "exit destination forbidden (loopback/private/link-local)".to_owned(),
-            ));
-        }
+        // exit-node flow gets the same internet-only confinement as `HostExitDialer`, checked
+        // before the proxy is contacted.
+        refuse_exit_dst_with(class, dst, self.attached)?;
 
         match self.connect_through_proxy(dst).await {
             Ok(stream) => {
@@ -525,7 +534,10 @@ impl RealDialer for ProxyExitDialer {
         }
     }
 
-    async fn dial_udp(&self, _class: FlowClass, dst: SocketAddr) -> Result<DialedUdp, DialError> {
+    async fn dial_udp(&self, class: FlowClass, dst: SocketAddr) -> Result<DialedUdp, DialError> {
+        // A forbidden exit destination is refused as such, as in `HostExitDialer`, so the guard
+        // already holds should UDP tunnelling ever be added below.
+        refuse_exit_dst_with(class, dst, self.attached)?;
         // Fail closed: no UDP tunnelling is implemented, and a direct UDP dial would leak the
         // real origin IP. See [`DialError::ProxyUdpUnsupported`].
         tracing::debug!(%dst, "proxy UDP dial refused (anti-leak): no UDP tunnel, no direct fallback");
@@ -1413,10 +1425,110 @@ mod tests {
             let dst: SocketAddr = forbidden.parse().unwrap();
             let err = dialer.dial_tcp(FlowClass::ExitNode, dst).await;
             assert!(
-                matches!(err, Err(DialError::ProxyHandshake(_))),
+                matches!(err, Err(DialError::ForbiddenDestination(d)) if d == dst),
                 "exit dial to {forbidden} must be refused"
             );
+            let err = dialer.dial_udp(FlowClass::ExitNode, dst).await.err();
+            assert!(
+                matches!(err, Some(DialError::ForbiddenDestination(d)) if d == dst),
+                "exit UDP to {forbidden} must be refused"
+            );
         }
+    }
+
+    /// A proxy dialer on the exit host of [`exit_host_on_public_lan`], tunnelling via `proxy`.
+    fn proxy_dialer_on_public_lan(proxy: SocketAddr) -> ProxyExitDialer {
+        ProxyExitDialer {
+            config: ProxyConfig {
+                addr: proxy,
+                scheme: ProxyScheme::Socks5,
+                auth: None,
+            },
+            attached: || Ok(exit_host_on_public_lan()),
+        }
+    }
+
+    /// Regression: an exit flow through the upstream proxy must not reach the exit host's own LAN
+    /// when that LAN is a public range, and is refused before the proxy is contacted. The proxy
+    /// here accepts connections, so a dialer that skipped the guard would open a SOCKS5 handshake
+    /// for the LAN address and hang waiting for the reply.
+    #[tokio::test]
+    async fn proxy_exit_flow_to_the_hosts_attached_subnet_is_refused_before_the_proxy() {
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dialer = proxy_dialer_on_public_lan(proxy.local_addr().unwrap());
+        let lan: SocketAddr = "198.51.100.7:443".parse().unwrap();
+
+        let tcp = tokio::time::timeout(
+            Duration::from_secs(2),
+            dialer.dial_tcp(FlowClass::ExitNode, lan),
+        )
+        .await
+        .expect("the LAN dial must be refused at once, not handed to the proxy");
+        assert!(
+            matches!(tcp, Err(DialError::ForbiddenDestination(d)) if d == lan),
+            "{tcp:?}"
+        );
+        let udp = dialer.dial_udp(FlowClass::ExitNode, lan).await.err();
+        assert!(
+            matches!(udp, Some(DialError::ForbiddenDestination(d)) if d == lan),
+            "{udp:?}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), proxy.accept())
+                .await
+                .is_err(),
+            "the proxy must never be contacted"
+        );
+    }
+
+    /// The guard keeps what Go's exit route keeps: the internet and the exit host's own address on
+    /// its LAN, and a subnet flow over that LAN is not an exit flow at all. Each of these gets past
+    /// the guard to the proxy, which here is not listening, so the TCP dial fails at the connect;
+    /// UDP then fails closed because it is never tunnelled.
+    #[tokio::test]
+    async fn proxy_dialer_hands_internet_own_address_and_subnet_flows_to_the_proxy() {
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = dead.local_addr().unwrap();
+        drop(dead);
+        let dialer = proxy_dialer_on_public_lan(proxy);
+        for (class, dst) in [
+            (FlowClass::ExitNode, "8.8.8.8:443"),
+            (FlowClass::ExitNode, "198.51.100.5:443"),
+            (FlowClass::Subnet, "198.51.100.7:443"),
+        ] {
+            let dst: SocketAddr = dst.parse().unwrap();
+            let tcp = dialer.dial_tcp(class, dst).await;
+            assert!(
+                matches!(&tcp, Err(DialError::Io(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused),
+                "{class:?} {dst}: {tcp:?}"
+            );
+            let udp = dialer.dial_udp(class, dst).await.err();
+            assert!(
+                matches!(udp, Some(DialError::ProxyUdpUnsupported)),
+                "{class:?} {dst}: {udp:?}"
+            );
+        }
+    }
+
+    /// Not knowing the host's subnets refuses a proxied exit flow too, before the proxy.
+    #[tokio::test]
+    async fn proxy_exit_flow_is_refused_when_the_interfaces_cannot_be_read() {
+        let dialer = ProxyExitDialer {
+            config: ProxyConfig {
+                addr: "127.0.0.1:1".parse().unwrap(),
+                scheme: ProxyScheme::Socks5,
+                auth: None,
+            },
+            attached: || Err(std::io::Error::other("getifaddrs failed")),
+        };
+        let public: SocketAddr = "8.8.8.8:443".parse().unwrap();
+        let tcp = dialer.dial_tcp(FlowClass::ExitNode, public).await;
+        assert!(
+            matches!(&tcp, Err(DialError::Io(e)) if e.kind() == std::io::ErrorKind::Other),
+            "{tcp:?}"
+        );
+        let udp = dialer.dial_udp(FlowClass::ExitNode, public).await.err();
+        assert!(matches!(udp, Some(DialError::Io(_))), "{udp:?}");
     }
 
     /// SSRF guard ranges: CGNAT/shared `100.64.0.0/10` (the Tailscale range itself), broadcast

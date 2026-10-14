@@ -19,8 +19,8 @@
 //!   bind + connect to a v6 address, which the OS rejects (`AddrNotAvailable`/`InvalidInput`).
 //! - [`HostExitDialer`]: same IPv4-only `new_v4()` bind, so a v6 connect errors at the OS.
 //! - [`ProxyExitDialer`]: an `ExitNode` v6 dst is rejected by the SSRF guard
-//!   (`exit_dst_is_forbidden` treats every v6 as forbidden) before any socket; TCP yields a
-//!   `ProxyHandshake` error and UDP fails closed (`ProxyUdpUnsupported`).
+//!   (`exit_dst_is_forbidden` treats every v6 as forbidden) before any socket, for TCP and UDP
+//!   alike (`ForbiddenDestination`); a v6 subnet UDP flow fails closed (`ProxyUdpUnsupported`).
 
 use std::net::SocketAddr;
 
@@ -107,18 +107,23 @@ async fn proxy_exit_dialer_never_dials_ipv6() {
         auth: None,
     });
     for dst in v6_dsts() {
-        // ExitNode v6 dst: SSRF guard forbids every v6 destination => ProxyHandshake error, no
+        // ExitNode v6 dst: SSRF guard forbids every v6 destination => ForbiddenDestination, no
         // proxy connection, no v6 socket.
         let err = dialer.dial_tcp(FlowClass::ExitNode, dst).await;
         assert!(
-            matches!(err, Err(DialError::ProxyHandshake(_))),
+            matches!(err, Err(DialError::ForbiddenDestination(_))),
             "ProxyExitDialer must refuse exit-node v6 dst {dst} via SSRF guard"
         );
-        // UDP through the proxy always fails closed — no v6 (or v4) UDP tunnel exists.
         let err = dialer.dial_udp(FlowClass::ExitNode, dst).await;
         assert!(
+            matches!(err, Err(DialError::ForbiddenDestination(_))),
+            "ProxyExitDialer must refuse exit-node v6 UDP dst {dst} via SSRF guard"
+        );
+        // UDP through the proxy always fails closed — no v6 (or v4) UDP tunnel exists.
+        let err = dialer.dial_udp(FlowClass::Subnet, dst).await;
+        assert!(
             matches!(err, Err(DialError::ProxyUdpUnsupported)),
-            "ProxyExitDialer must refuse exit-node v6 UDP dst {dst} (fail closed)"
+            "ProxyExitDialer must refuse subnet v6 UDP dst {dst} (fail closed)"
         );
     }
 }

@@ -160,10 +160,9 @@ async fn proxy_dialer_fails_closed_on_dead_proxy() {
 /// `dial_tcp` *before* any proxy connection, so even though the configured proxy address is not
 /// listening, none of these cases touch it — they are fully hermetic.
 ///
-/// The code returns [`DialError::ProxyHandshake`] for a forbidden destination (the message reads
-/// `"exit destination forbidden (loopback/private/link-local)"`); there is no dedicated
-/// `Forbidden` variant. We assert that exact variant. IPv6 destinations are forbidden wholesale
-/// (the IPv6-off posture), so they are included here.
+/// The code returns [`DialError::ForbiddenDestination`] carrying the refused destination, the same
+/// error `HostExitDialer` gives. We assert that exact variant. IPv6 destinations are forbidden
+/// wholesale (the IPv6-off posture), so they are included here.
 #[tokio::test]
 async fn proxy_dialer_refuses_forbidden_exit_destinations() {
     let dialer = ProxyExitDialer::new(ProxyConfig {
@@ -187,8 +186,8 @@ async fn proxy_dialer_refuses_forbidden_exit_destinations() {
         let dst: SocketAddr = raw.parse().unwrap();
         let result = dialer.dial_tcp(FlowClass::ExitNode, dst).await;
         assert!(
-            matches!(result, Err(DialError::ProxyHandshake(_))),
-            "exit dial to forbidden dst {raw} must be refused with ProxyHandshake, got {result:?}"
+            matches!(result, Err(DialError::ForbiddenDestination(d)) if d == dst),
+            "exit dial to forbidden dst {raw} must be refused with ForbiddenDestination, got {result:?}"
         );
     }
 }
