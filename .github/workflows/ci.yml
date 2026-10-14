@@ -181,15 +181,31 @@ jobs:
       # Type-check and lint the workspace for Windows, so the Windows build cannot break unnoticed
       # again (it did with #598, and nothing here built for Windows). `bin/check-windows` holds the
       # commands. cargo-xwin supplies the MSVC CRT and SDK headers ring's build script compiles
-      # against. They are about 1 GB, so they are cached, keyed on the cargo-xwin version.
+      # against. They take about 7 minutes to download, so they are cached, keyed on the cargo-xwin
+      # version, and saved before the check runs: a red check must not throw the download away.
       - name: Install cargo-xwin and the Windows target
         run: |
           cargo binstall --no-confirm cargo-xwin@0.23.1
           ver="$(rustup show active-toolchain | awk '{print $1}')"
           rustup target add --toolchain "${ver}" x86_64-pc-windows-msvc
-          clang --version | head -1
-      - name: Cache the MSVC headers (cargo-xwin)
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+          # The image ships clang and llvm-ar only under versioned names on PATH (`llvm-ar-18`).
+          # cargo-xwin makes its `llvm-lib` from a plain `llvm-ar`, so put clang's own LLVM bin
+          # directory, which has the plain names, on PATH.
+          llvm_bin="$(dirname "$(readlink -f "$(command -v clang)")")"
+          echo "${llvm_bin}" >> "$GITHUB_PATH"
+          "${llvm_bin}/clang" --version | head -1
+          ls "${llvm_bin}/llvm-ar" "${llvm_bin}/llvm-lib"
+      - name: Restore the MSVC headers (cargo-xwin)
+        id: xwin-cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/cargo-xwin
+          key: cargo-xwin-0.23.1-x86_64-pc-windows-msvc
+      - name: Fetch the MSVC headers (cargo-xwin)
+        run: cargo xwin env --target x86_64-pc-windows-msvc > /dev/null
+      - name: Save the MSVC headers (cargo-xwin)
+        if: steps.xwin-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/.cache/cargo-xwin
           key: cargo-xwin-0.23.1-x86_64-pc-windows-msvc
