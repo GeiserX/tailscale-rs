@@ -183,14 +183,44 @@ const SOCKET_BUFFER_SIZE: usize = 7 << 20;
 /// so a burst overflows them and the excess is dropped (`ENOBUFS` on send), which TCP inside the
 /// tunnel then has to recover from. Best effort: the kernel may clamp the size, and a failure only
 /// costs throughput.
+///
+/// On Linux the portable options are capped at `net.core.{w,r}mem_max`, so like Go
+/// (`net/sockopts/sockopts_linux.go`) this first tries `SO_SNDBUFFORCE` / `SO_RCVBUFFORCE`, which
+/// need `CAP_NET_ADMIN`, and falls back to the portable options when that fails.
 pub(crate) fn tune_socket_buffers(sock: &UdpSocket) {
     let s = socket2::SockRef::from(sock);
-    if let Err(e) = s.set_send_buffer_size(SOCKET_BUFFER_SIZE) {
+    #[cfg(target_os = "linux")]
+    let (send_forced, recv_forced) = (
+        force_buffer_size(sock, libc::SO_SNDBUFFORCE),
+        force_buffer_size(sock, libc::SO_RCVBUFFORCE),
+    );
+    #[cfg(not(target_os = "linux"))]
+    let (send_forced, recv_forced) = (false, false);
+    if !send_forced && let Err(e) = s.set_send_buffer_size(SOCKET_BUFFER_SIZE) {
         tracing::debug!(error = %e, "magicsock: could not raise UDP send buffer");
     }
-    if let Err(e) = s.set_recv_buffer_size(SOCKET_BUFFER_SIZE) {
+    if !recv_forced && let Err(e) = s.set_recv_buffer_size(SOCKET_BUFFER_SIZE) {
         tracing::debug!(error = %e, "magicsock: could not raise UDP receive buffer");
     }
+}
+
+/// Set a socket buffer with a Linux `*BUFFORCE` option; `false` if the kernel refused it.
+#[cfg(target_os = "linux")]
+fn force_buffer_size(sock: &UdpSocket, option: libc::c_int) -> bool {
+    use std::os::fd::AsRawFd;
+    let size = SOCKET_BUFFER_SIZE as libc::c_int;
+    // SAFETY: `sock` is an open socket for the duration of the call; the option value points at a
+    // live `c_int` and its exact size is passed.
+    let r = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            option,
+            (&raw const size).cast(),
+            core::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    r == 0
 }
 
 /// Verifies a disco key's identity against the control netmap before we act on a disco frame.
