@@ -160,13 +160,24 @@ jobs:
       - name: Install cargo-deny
         run: command -v cargo-deny || cargo binstall --no-confirm cargo-deny
       # Machine-enforce the ring-only / no-aws-lc supply-chain invariant on every push, on the
-      # ring-only runtime graph this lane builds (default features, no `ssh`). `--no-default-features`
-      # turns `ssh` off so `russh -> aws-lc-rs` is gone, and `--exclude-dev` drops the `reqwest`
-      # default-tls dev-dependency of ts_derp/ts_netcheck. The aws-lc ban in `deny.toml` must hold
-      # here. Do NOT add `--all-features`: that re-introduces aws-lc via russh+reqwest and is the
-      # upstream `arch_independent` job's concern (left intact). `TS_RS_EXPERIMENT` is set at job-level.
+      # runtime graph this lane builds (default features, no `ssh`). `--exclude-dev` drops the
+      # `reqwest` default-tls dev-dependency of ts_derp/ts_netcheck, the one remaining aws-lc path in
+      # the workspace. The aws-lc ban in `deny.toml` must hold here. The `--all-features` audit (with
+      # `ssh`, whose russh is on its ring backend) is the upstream `arch_independent` job's concern
+      # and is run locally by `bin/check`. `TS_RS_EXPERIMENT` is set at job-level.
       - name: Supply-chain audit (cargo deny, ring-only graph)
         run: cargo deny --no-default-features --exclude-dev check all
+      # Every third-party crate in Cargo.lock must be audited, imported from a trusted audit set, or
+      # exempted in `supply-chain/config.toml`. `--locked` uses `supply-chain/imports.lock` as
+      # committed and never fetches, so the result depends only on the tree under test. A dependency
+      # change that fails here needs `cargo vet regenerate exemptions` (or a real audit) committed.
+      - name: Install cargo-vet
+        run: |
+          cargo vet --version 2>/dev/null | grep -qx 'cargo-vet 0.10.2' \
+            || cargo binstall --no-confirm --force cargo-vet@0.10.2
+          cargo vet --version
+      - name: Supply-chain audit (cargo vet)
+        run: cargo vet --locked
 
   build_test:
     # This matrix targets self-hosted runner labels (linux-x86_64-16cpu, macos-26, windows-8vcpu,
