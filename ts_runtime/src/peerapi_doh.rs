@@ -1088,6 +1088,93 @@ mod tests {
         }
     }
 
+    /// The host resolver's reply to `query`: the query with QR set, and TC when `truncated`.
+    fn host_answer(query: &[u8], truncated: bool) -> Vec<u8> {
+        let mut resp = query.to_vec();
+        resp[2] |= 0x80;
+        if truncated {
+            resp[2] |= 0x02;
+        }
+        resp
+    }
+
+    /// A view whose only tailnet resolver is a loopback port nothing answers on, so a query that
+    /// went there instead of to the host resolver comes back SERVFAIL rather than leaving the box.
+    fn view_with_dead_tailnet_resolver() -> DnsView {
+        let mut v = view(&[]);
+        v.cfg.fallback_resolvers = vec![ts_control::DnsResolver {
+            transport: ts_control::ResolverTransport::Udp("127.0.0.1:9".parse().unwrap()),
+            use_with_exit_node: false,
+        }];
+        v
+    }
+
+    /// Run the production `resolve` with `host` as the host resolver. The netstack channel comes
+    /// from a piped netstack that is never run: the host path never touches it.
+    async fn resolve_on_host(query: &[u8], host: SocketAddr) -> Vec<u8> {
+        use netstack::HasChannel;
+
+        let (netstack, _pipe) = netstack::piped(netstack::netcore::Config::default());
+        let view = view_with_dead_tailnet_resolver();
+        resolve(&view, query, &netstack.command_channel(), true, Some(host)).await
+    }
+
+    /// The host resolver's UDP answer is what the asking peer gets.
+    #[tokio::test]
+    async fn a_host_resolver_answers_over_udp() {
+        let resolver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let host = resolver.local_addr().unwrap();
+        let served = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, from) = resolver.recv_from(&mut buf).await.unwrap();
+            let resp = host_answer(&buf[..n], false);
+            resolver.send_to(&resp, from).await.unwrap();
+            resp
+        });
+
+        let got = resolve_on_host(&query_for(0x51, &["example", "com"]), host).await;
+        let sent = timeout(Duration::from_secs(1), served)
+            .await
+            .expect("the host resolver was never asked")
+            .unwrap();
+        assert_eq!(got, sent);
+    }
+
+    /// A truncated UDP answer from the host resolver is asked again over TCP, and the full TCP
+    /// answer is what the asking peer gets.
+    #[tokio::test]
+    async fn a_truncated_host_answer_is_retried_over_tcp() {
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = tcp.local_addr().unwrap();
+        let udp = tokio::net::UdpSocket::bind(host).await.unwrap();
+        let served = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, from) = udp.recv_from(&mut buf).await.unwrap();
+            udp.send_to(&host_answer(&buf[..n], true), from)
+                .await
+                .unwrap();
+
+            let (mut conn, _) = tcp.accept().await.unwrap();
+            let mut len = [0u8; 2];
+            conn.read_exact(&mut len).await.unwrap();
+            let mut query = vec![0u8; usize::from(u16::from_be_bytes(len))];
+            conn.read_exact(&mut query).await.unwrap();
+            let full = host_answer(&query, false);
+            let len = u16::try_from(full.len()).unwrap();
+            conn.write_all(&len.to_be_bytes()).await.unwrap();
+            conn.write_all(&full).await.unwrap();
+            full
+        });
+
+        let got = resolve_on_host(&query_for(0x52, &["example", "com"]), host).await;
+        let full = timeout(Duration::from_secs(1), served)
+            .await
+            .expect("the host resolver was not asked over UDP then TCP")
+            .unwrap();
+        assert_eq!(got, full);
+        assert_eq!(got[2] & 0x02, 0, "the TCP answer, not the truncated one");
+    }
+
     #[test]
     fn a_subdomain_host_answers_here_like_any_other_peer_name() {
         // The DoH server shares `decide`, so the `dns-subdomain-resolve` walk reaches this path
