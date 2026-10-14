@@ -87,7 +87,8 @@ const MAX_HEADERS: usize = 16 * 1024;
 /// peer set from it for the access gate. `filter_rx` is the live control-derived packet filter, which
 /// the DoH handler consults to decide whether the *querying peer* may use this node's DNS proxy at
 /// all (`peerapi_doh::dns_source_allowed`, Go `isPeerAPIDNSAllowed`).
-/// `forward_exit_egress` gates DoH recursive resolution.
+/// `forward_exit_egress` gates DoH recursive resolution; `host_resolver`, when set, is where it goes
+/// (this host's resolver, as Go's exit-node DNS uses the OS resolver) instead of the overlay.
 /// `taildrop` is the configured file store, or `None` when Taildrop is disabled (a `PUT` then `403`s).
 /// `funnel_ingress` is the shared slot the client-side Funnel listener installs its ingress sink
 /// into (see [`crate::funnel`]); a `POST /v0/ingress` is membership-gated, hijacked with
@@ -98,6 +99,7 @@ pub(crate) async fn serve(
     view_rx: watch::Receiver<Arc<DnsView>>,
     filter_rx: LiveFilterRx,
     forward_exit_egress: bool,
+    host_resolver: Option<SocketAddr>,
     taildrop: Option<Arc<TaildropStore>>,
     funnel_ingress: FunnelIngressSlot,
 ) {
@@ -150,6 +152,7 @@ pub(crate) async fn serve(
                     &view_rx,
                     &filter_rx,
                     forward_exit_egress,
+                    host_resolver,
                     taildrop,
                     &funnel_ingress,
                 ),
@@ -171,6 +174,7 @@ async fn route_conn(
     view_rx: &watch::Receiver<Arc<DnsView>>,
     filter_rx: &LiveFilterRx,
     forward_exit_egress: bool,
+    host_resolver: Option<SocketAddr>,
     taildrop: Option<Arc<TaildropStore>>,
     funnel_ingress: &FunnelIngressSlot,
 ) -> std::io::Result<()> {
@@ -256,6 +260,7 @@ async fn route_conn(
                 view_rx,
                 filter_rx,
                 forward_exit_egress,
+                host_resolver,
             )
             .await
         }

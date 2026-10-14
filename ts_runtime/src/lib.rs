@@ -1314,10 +1314,10 @@ impl Runtime {
         self.apply_advertised_routes(composed).await
     }
 
-    /// Advertise (or stop advertising) this node as an **exit node** — the `0.0.0.0/0` default route
-    /// (Go `tailscale set --advertise-exit-node`). Composes with
+    /// Advertise (or stop advertising) this node as an **exit node** — the `0.0.0.0/0` + `::/0`
+    /// default-route pair (Go `tailscale set --advertise-exit-node`). Composes with
     /// [`set_advertise_routes`](Self::set_advertise_routes): toggling the exit node re-sends the
-    /// explicit subnet routes plus (when `enable`) `0.0.0.0/0`, so the two preferences are
+    /// explicit subnet routes plus (when `enable`) the default-route pair, so the two preferences are
     /// independent. Like `set_advertise_routes`, this both re-advertises `Hostinfo.RoutableIPs` to
     /// control AND updates the forwarder's accept/dial set, applied together. Control still gates
     /// whether the advertised exit node is actually *usable* by peers (this only advertises it).
@@ -1607,18 +1607,16 @@ fn filter_advertise_routes(routes: Vec<ipnet::IpNet>) -> Vec<ipnet::IpNet> {
 
 /// Compose the final advertised-route set from the explicit subnet `routes` and the exit-node flag,
 /// mirroring [`ts_control::Config::advertised_routes`]: the IPv4-only, deduplicated subnet prefixes,
-/// plus `0.0.0.0/0` appended when `exit_node` is set. This is the single source of truth both
-/// runtime advertise mutators (`set_advertise_routes`, `set_advertise_exit_node`) feed, so the two
-/// compose instead of clobbering. Factored out so the composition is unit-testable without an actor.
+/// plus the exit-node pair `0.0.0.0/0` + `::/0` appended when `exit_node` is set. This is the
+/// single source of truth both runtime advertise mutators (`set_advertise_routes`,
+/// `set_advertise_exit_node`) feed, so the two compose instead of clobbering. Factored out so the composition is unit-testable without an actor.
 fn compose_advertised_routes(routes: Vec<ipnet::IpNet>, exit_node: bool) -> Vec<ipnet::IpNet> {
     let mut filtered = filter_advertise_routes(routes);
     if exit_node {
-        let default_v4 = ipnet::IpNet::V4(
-            ipnet::Ipv4Net::new(core::net::Ipv4Addr::UNSPECIFIED, 0)
-                .expect("0.0.0.0/0 is a valid prefix"),
-        );
-        if !filtered.contains(&default_v4) {
-            filtered.push(default_v4);
+        for net in ts_control::exit_node_routes() {
+            if !filtered.contains(&net) {
+                filtered.push(net);
+            }
         }
     }
     filtered
@@ -1634,7 +1632,7 @@ fn compose_advertised_routes(routes: Vec<ipnet::IpNet>, exit_node: bool) -> Vec<
 struct AdvertiseState {
     /// The explicit subnet prefixes (pre-filter; the last value passed to `set_advertise_routes`).
     routes: Vec<ipnet::IpNet>,
-    /// Whether this node advertises the exit-node default route (`0.0.0.0/0`).
+    /// Whether this node advertises the exit-node default routes (`0.0.0.0/0` + `::/0`).
     exit_node: bool,
 }
 
@@ -1809,13 +1807,14 @@ mod tests {
         assert!(filter_advertise_routes(vec![v6]).is_empty());
     }
 
-    /// `compose_advertised_routes` folds the exit-node `0.0.0.0/0` onto the filtered subnet routes
+    /// `compose_advertised_routes` folds the exit-node default-route pair onto the filtered subnet routes
     /// when (and only when) the exit-node flag is set — so `set_advertise_routes` and
     /// `set_advertise_exit_node` compose. The two preferences are independent.
     #[test]
     fn compose_advertised_routes_folds_exit_node() {
         let subnet: ipnet::IpNet = "10.0.0.0/24".parse().unwrap();
         let default_v4: ipnet::IpNet = "0.0.0.0/0".parse().unwrap();
+        let default_v6: ipnet::IpNet = "::/0".parse().unwrap();
 
         // Exit node off: just the (filtered) subnet routes.
         assert_eq!(
@@ -1823,22 +1822,22 @@ mod tests {
             vec![subnet],
             "exit-node off ⇒ no default route"
         );
-        // Exit node on: subnet routes PLUS 0.0.0.0/0.
+        // Exit node on: subnet routes PLUS the default-route pair.
         assert_eq!(
             compose_advertised_routes(vec![subnet], true),
-            vec![subnet, default_v4],
-            "exit-node on ⇒ 0.0.0.0/0 appended"
+            vec![subnet, default_v4, default_v6],
+            "exit-node on ⇒ 0.0.0.0/0 + ::/0 appended"
         );
         // Exit node on with NO subnet routes: just the default route.
         assert_eq!(
             compose_advertised_routes(vec![], true),
-            vec![default_v4],
-            "exit-node alone advertises only 0.0.0.0/0"
+            vec![default_v4, default_v6],
+            "exit-node alone advertises only the default-route pair"
         );
         // Idempotent: an explicit 0.0.0.0/0 already in the routes isn't duplicated by the fold.
         assert_eq!(
             compose_advertised_routes(vec![default_v4], true),
-            vec![default_v4],
+            vec![default_v4, default_v6],
             "the exit-node fold dedups against an explicit default route"
         );
     }

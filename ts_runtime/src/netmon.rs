@@ -33,16 +33,16 @@
 //! [`MeasureNow`]: crate::derp_latency::MeasureNow
 //! [`DerpLatencyMeasurer`]: crate::derp_latency::DerpLatencyMeasurer
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use kameo::actor::ActorRef;
-use kameo::message::Message;
+use kameo::{actor::ActorRef, message::Message};
 use ts_netmon::{LinkMonitor, LinkMonitorHandle};
 
-use crate::derp_latency::MeasureNow;
-use crate::direct::{DirectManager, RebindAndReprobe};
-use crate::{Env, Error};
+use crate::{
+    Env, Error,
+    derp_latency::MeasureNow,
+    direct::{DirectManager, RebindAndReprobe},
+};
 
 /// Minimum wall-clock interval between two rebinds. An event arriving within this window of the
 /// **last completed** rebind is **coalesced and deferred** (a pending flag is set, logged at trace);
@@ -231,12 +231,16 @@ async fn run<A>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use kameo::actor::Spawn;
-    use kameo::message::{Context, Message};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use kameo::{
+        actor::Spawn,
+        message::{Context, Message},
+    };
     use tokio::sync::watch;
     use ts_netmon::ManualLinkMonitor;
+
+    use super::*;
 
     /// Build a minimal `Env` for the supervisor tests (only the bus + shutdown matter here).
     fn test_env(shutdown_rx: watch::Receiver<bool>) -> Env {
@@ -254,6 +258,7 @@ mod tests {
                 forward_exit_egress: false,
                 block_incoming: false,
                 exit_proxy: None,
+                exit_node_dns: None,
                 peerapi_port: None,
                 taildrop_dir: None,
                 enable_ipv6: false,

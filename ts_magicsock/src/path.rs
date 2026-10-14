@@ -46,19 +46,65 @@ pub const TRUST_DURATION: Duration = Duration::from_millis(6500);
 /// reciprocal note).
 const REFRESH_BEFORE_EXPIRY: Duration = Duration::from_millis(3500);
 
-/// Hysteresis for switching the trusted best path to a different confirmed candidate: a challenger
-/// must be at least this much faster than the *current* trusted best before we switch to it.
+/// Whether path `a` (address, measured latency) is better than path `b`: Go magicsock `betterAddr`
+/// (wgengine/magicsock/endpoint.go), minus its MTU and Geneve-relay branches, which do not apply to
+/// direct candidates here.
 ///
-/// Mirrors Go magicsock `betterAddr`, which keeps the current best unless the latency improvement
-/// clears a band (it treats an improvement below ~1% as not better). Without this, `recompute_best`
-/// picked the strict latency minimum on every pong, so with two viable public endpoints to a peer
-/// (common once a CallMeMaybe address and a netmap address both confirm) sub-millisecond RTT jitter
-/// made `best` ping-pong between them on every pong — churning the WireGuard send 5-tuple
-/// (`MagicSock` sends to `best_addr`) and resetting `trust_until` to a different endpoint each time.
-/// This is the spatial (which-address) analog of the temporal (when-to-reping) flap that
-/// [`REFRESH_BEFORE_EXPIRY`] fixed. The fork is IPv4-public / ring-only with no MTU/Geneve/private-IP
-/// scoring, so only Go's latency-percentage branch of `betterAddr` is in scope here.
-const BETTER_ADDR_IMPROVEMENT: f64 = 0.01;
+/// Each side gets points for how much faster it is than the slower one, in percent, plus a bonus
+/// for its address kind: loopback +50, link-local +30, private (RFC 1918 / ULA) +20, IPv6 +10. So a
+/// LAN path beats a public one (often a hairpin through the local NAT) unless the public one is
+/// clearly faster. An improvement of 1 point or less with no bonus on the other side is not
+/// better, the hysteresis that stops the best path flapping between near-equal candidates.
+pub(crate) fn better_addr(a: (SocketAddr, Duration), b: (SocketAddr, Duration)) -> bool {
+    let ((a_addr, a_lat), (b_addr, b_lat)) = (a, b);
+    if a_addr == b_addr {
+        return false;
+    }
+    let pct = |fast: Duration, slow: Duration| -> i64 {
+        // `100 - fast*100/slow`, in integer arithmetic like Go's.
+        100 - i64::try_from(fast.as_nanos() * 100 / slow.as_nanos()).unwrap_or(100)
+    };
+    let (mut a_points, mut b_points) = (0i64, 0i64);
+    if a_lat > b_lat && !a_lat.is_zero() {
+        b_points = pct(b_lat, a_lat);
+    } else if !b_lat.is_zero() {
+        a_points = pct(a_lat, b_lat);
+    }
+    let kind = |ip: std::net::IpAddr| -> i64 {
+        let class = if ip.is_loopback() {
+            50
+        } else if is_link_local_unicast(ip) {
+            30
+        } else if is_private(ip) {
+            20
+        } else {
+            0
+        };
+        class + if ip.is_ipv6() { 10 } else { 0 }
+    };
+    a_points += kind(a_addr.ip());
+    b_points += kind(b_addr.ip());
+    if a_points <= 1 && b_points == 0 {
+        return false;
+    }
+    a_points > b_points
+}
+
+/// Go `netip.Addr.IsLinkLocalUnicast`.
+fn is_link_local_unicast(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+    }
+}
+
+/// Go `netip.Addr.IsPrivate`: RFC 1918 and RFC 4193 (fc00::/7).
+fn is_private(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_private(),
+        std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00,
+    }
+}
 
 /// A ping with no pong after this long is presumed lost; its in-flight record is pruned so the
 /// `in_flight` map cannot grow unbounded for a peer whose paths never confirm (it would otherwise
@@ -333,26 +379,9 @@ impl PeerPaths {
     ///   reports no trusted direct path and the peer relays over DERP until a fresh pong lands;
     /// - in-flight probes are dropped — their tx ids were sent to the old key, and a matching pong
     ///   must not re-confirm a path across the rotation;
-    /// - each candidate's measured `latency` is cleared, so no candidate counts as confirmed. This
-    ///   matters: `recompute_best` picks the lowest-latency *remembered* candidate, so a stale
-    ///   pre-rotation measurement left in place could be promoted — and re-trusted for a full
-    ///   [`TRUST_DURATION`] — by a pong for some *other* address;
-    ///
-    ///   Upstream's `invalidateDiscoPathLocked` does **not** clear its latency history
-    ///   (`endpointState.recentPongs`), and the difference is deliberate rather than an omission.
-    ///   Go cannot be bitten the way this tree would be: `handlePongConnLocked` promotes the
-    ///   address that *just* ponged whenever the best is out of trust — `bestUntrusted :=
-    ///   now.After(de.trustBestAddrUntil)`, then `if betterAddr(thisPong, de.bestAddr) ||
-    ///   bestUntrusted` — and `changedActiveDiscoLocked` zeroes exactly that deadline, so the first
-    ///   fresh pong after a rotation wins there regardless of what the history says
-    ///   (`udpRelayEndpointReady`, the sibling that installs a relay path, states the rule
-    ///   outright: "we must set maybeBest as de.bestAddr if de.bestAddr is untrusted. betterAddr
-    ///   does not consider time-based trust"). The retained history is then read by
-    ///   nothing on this path: its only reader is `endpointState.latencyLocked()`, whose only
-    ///   caller is `addrForWireGuardSendLocked` — the wireguard-only endpoint that has no disco key
-    ///   to rotate. Clearing here is what reproduces that same observable selection in a tree whose
-    ///   `recompute_best` is a global scan rather than a comparison against the one pong in hand;
-    ///   the test `disco_key_change_forgets_pre_rotation_latencies` pins it.
+    /// - each candidate's measured `latency` is cleared so diagnostics contain no
+    ///   pre-rotation RTTs. Go retains its latency history, but both implementations select
+    ///   only the address that just ponged and promote it unconditionally when best is untrusted;
     /// - each candidate's `last_ping` and `last_full_ping` are cleared, so the re-probe is a full
     ///   sweep of every candidate instead of one that waits out the `DISCO_PING_INTERVAL` floor —
     ///   whether it is the caller's immediate sweep or the next pinger tick behind it (Go's
@@ -700,59 +729,33 @@ impl PeerPaths {
         self.best
     }
 
-    /// Recompute the best path after a pong confirmed `confirmed` (the address whose latency was
-    /// just updated). `confirmed` is used to decide whether a *hold* (keeping the current best
-    /// against a near-equal challenger) may also refresh the held best's trust window — see below.
+    /// Compare only the address that just ponged with the current best, as Go's
+    /// `handlePongConnLocked` does. Historical RTTs do not prove a path is still alive.
     fn recompute_best(&mut self, now: Instant, confirmed: SocketAddr) {
-        // Lowest latency wins; IPv6 breaks ties (Go parity). Only confirmed candidates
-        // (those with a measured latency) are eligible.
-        let challenger = self
-            .candidates
-            .iter()
-            .filter_map(|(addr, c)| c.latency.map(|l| (*addr, l)))
-            .min_by(|(a_addr, a_lat), (b_addr, b_lat)| {
-                a_lat
-                    .cmp(b_lat)
-                    .then_with(|| b_addr.is_ipv6().cmp(&a_addr.is_ipv6()))
-            });
-
-        let Some((challenger_addr, challenger_lat)) = challenger else {
-            // No confirmed candidate — nothing to trust. Leave `best`/`trust_until` as-is (an
-            // expired best is reported as untrusted by `best_addr`; a rebind clears them).
+        let Some(latency) = self.candidates.get(&confirmed).and_then(|c| c.latency) else {
             return;
         };
-
-        // Hysteresis: if the current best is still trusted AND still a confirmed candidate, only
-        // switch to a different challenger when it is more than `BETTER_ADDR_IMPROVEMENT` faster
-        // (Go `betterAddr`). This stops `best` from flapping between near-equal endpoints on RTT
-        // jitter.
-        if let (Some(current), Some(until)) = (self.best, self.trust_until)
-            && now < until
-            && current != challenger_addr
-            && let Some(current_lat) = self.candidates.get(&current).and_then(|c| c.latency)
-        {
-            // Switch only when the challenger is *strictly* more than 1% faster. The
-            // `current_lat > ZERO` guard means a (degenerate) 0-latency best is never pinned
-            // un-switchably: with a 0 threshold every challenger would otherwise read as "not
-            // faster enough" and the best could never be displaced.
-            let threshold = current_lat.mul_f64(1.0 - BETTER_ADDR_IMPROVEMENT);
-            let challenger_wins = current_lat > Duration::ZERO && challenger_lat < threshold;
-            if !challenger_wins {
-                // Keep the current best. Only refresh its trust window if the pong that triggered
-                // this recompute was *for the best itself* — a pong for a rival proves some path
-                // works but does NOT prove the best is still alive, so refreshing on a rival's pong
-                // could keep a silently-dead best trusted up to a full `TRUST_DURATION` longer. The
-                // best is independently re-pinged every refresh cycle (`send_pings` pings all
-                // candidates), so its own pong is what legitimately extends trust here.
-                if confirmed == current {
-                    self.trust_until = Some(now + TRUST_DURATION);
-                }
-                return;
-            }
+        let previous = self.best;
+        let best_untrusted = self.best_addr(now).is_none();
+        let better = self
+            .best
+            .and_then(|addr| {
+                self.candidates
+                    .get(&addr)
+                    .and_then(|c| c.latency)
+                    .map(|rtt| (addr, rtt))
+            })
+            .is_none_or(|current| better_addr((confirmed, latency), current));
+        if best_untrusted || better {
+            self.best = Some(confirmed);
         }
-
-        self.best = Some(challenger_addr);
-        self.trust_until = Some(now + TRUST_DURATION);
+        // A rival's pong cannot refresh the held best. Once that trust expires, the first
+        // matching pong wins even if the dead best had a much faster RTT.
+        if self.best == Some(confirmed) {
+            self.trust_until = Some(now + TRUST_DURATION);
+        }
+        tracing::debug!(%confirmed, ?latency, ?previous, best = ?self.best, best_untrusted,
+            "magicsock: pong path selection");
     }
 }
 
@@ -813,6 +816,77 @@ mod tests {
             p.best_addr_and_latency(expired),
             None,
             "expired trust drops addr+latency just like best_addr"
+        );
+    }
+
+    /// A port-dependent NAT advertises an unreachable endpoint but sends authenticated pings
+    /// from a different mapping. Only that source accepts our probes after the peer moves.
+    #[test]
+    fn network_move_recovers_via_learned_source_after_trust_expires() {
+        let old = "203.0.113.1:41641".parse().unwrap();
+        let advertised = "203.0.113.2:41641".parse().unwrap();
+        let source = "203.0.113.2:53000".parse().unwrap();
+        let mut paths = PeerPaths::default();
+        let start = Instant::now();
+        paths.add_netmap_candidates([old]);
+        paths.note_ping_sent(tx(1), old, start);
+        paths.note_pong(tx(1), old, start + Duration::from_millis(2));
+
+        // The peer moves. Its ping reaches us (and our pong reaches it), but only a pong
+        // to OUR probe grants outbound trust. Repeated netmaps must keep the learned source.
+        paths.add_learned_candidates([source]);
+        paths.reconcile_netmap_candidates([old, advertised]);
+        let early = start + Duration::from_secs(1);
+        assert!(paths.candidates_to_ping(early).contains(&source));
+        paths.note_ping_sent(tx(2), source, early);
+        paths.note_pong(tx(2), source, early + Duration::from_millis(60));
+        assert_eq!(
+            paths.best_addr(early + Duration::from_millis(60)),
+            Some(old)
+        );
+
+        // Neither the dead old mapping nor the STUN mapping accepts packets. The simulated
+        // NAT only answers probes addressed to its current ping source. Use virtual time.
+        for round in 0..151u8 {
+            let now = start + Duration::from_secs(8 + u64::from(round) * 6);
+            paths.reconcile_netmap_candidates([old, advertised]);
+            let mut answered = false;
+            for (index, addr) in paths.candidates_to_ping(now).into_iter().enumerate() {
+                let mut id = [round.wrapping_add(3); 12];
+                id[11] = index as u8;
+                paths.note_ping_sent(id, addr, now);
+                if addr == source {
+                    paths.note_pong(id, source, now + Duration::from_millis(60));
+                    answered = true;
+                }
+            }
+            assert!(answered, "the learned source must keep being probed");
+            assert_eq!(
+                paths.best_addr(now + Duration::from_millis(60)),
+                Some(source),
+                "a fresh slower pong must replace the expired fast path"
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_pong_never_resurrects_a_dead_historical_rival() {
+        let old = "203.0.113.1:41641".parse().unwrap();
+        let current = "203.0.113.2:41641".parse().unwrap();
+        let mut paths = PeerPaths::default();
+        let start = Instant::now();
+        paths.add_netmap_candidates([old, current]);
+        paths.note_ping_sent(tx(1), old, start);
+        paths.note_pong(tx(1), old, start + Duration::from_millis(10));
+        paths.note_ping_sent(tx(2), current, start);
+        paths.note_pong(tx(2), current, start + Duration::from_millis(2));
+        let later = start + Duration::from_secs(3);
+        paths.note_ping_sent(tx(3), current, later);
+        paths.note_pong(tx(3), current, later + Duration::from_millis(60));
+        assert_eq!(
+            paths.best_addr(later + Duration::from_millis(60)),
+            Some(current),
+            "a pong must only promote the address it confirms"
         );
     }
 
@@ -1088,7 +1162,7 @@ mod tests {
     }
 
     /// Hysteresis: once a best path is confirmed and trusted, a *second* confirmed candidate that is
-    /// only marginally faster (within `BETTER_ADDR_IMPROVEMENT`) must NOT steal `best` — otherwise
+    /// only marginally faster (within `better_addr`'s 1-point band) must NOT steal `best` — otherwise
     /// RTT jitter flaps the WireGuard send 5-tuple between two near-equal public endpoints. Mirrors
     /// Go `betterAddr`.
     #[test]
@@ -1234,6 +1308,48 @@ mod tests {
             None,
             "a rival's pong must not extend the held best's trust window"
         );
+    }
+
+    /// Go `betterAddr`'s address-kind bonus: a private (LAN) path beats a public one of similar
+    /// latency, e.g. the same peer reached through a NAT hairpin; a public path only wins when it is
+    /// clearly faster (by more than the 20-point private bonus).
+    #[test]
+    fn better_addr_prefers_private_over_public_at_similar_latency() {
+        let lan: SocketAddr = "192.168.50.76:41644".parse().unwrap();
+        let public: SocketAddr = "203.0.113.34:41644".parse().unwrap();
+        let ms = Duration::from_millis;
+        assert!(better_addr((lan, ms(10)), (public, ms(9))));
+        assert!(!better_addr((public, ms(9)), (lan, ms(10))));
+        // 30% faster beats the 20-point bonus.
+        assert!(better_addr((public, ms(7)), (lan, ms(10))));
+        // Loopback beats link-local beats private.
+        let lo: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let ll: SocketAddr = "169.254.1.1:1".parse().unwrap();
+        assert!(better_addr((lo, ms(10)), (ll, ms(10))));
+        assert!(better_addr((ll, ms(10)), (lan, ms(10))));
+        // Hysteresis: <= 1% better and no bonus on the other side is not better.
+        let p2: SocketAddr = "203.0.113.2:1".parse().unwrap();
+        assert!(!better_addr(
+            (p2, Duration::from_micros(9_950)),
+            (public, ms(10))
+        ));
+        assert!(better_addr((p2, ms(9)), (public, ms(10))));
+    }
+
+    /// The path selection uses it: a confirmed public hairpin path that is marginally faster does
+    /// not take over from the LAN path.
+    #[test]
+    fn lan_path_stays_best_against_faster_public_hairpin() {
+        let mut p = PeerPaths::default();
+        let lan: SocketAddr = "192.168.50.76:41644".parse().unwrap();
+        let public: SocketAddr = "203.0.113.34:41644".parse().unwrap();
+        p.add_netmap_candidates([lan, public]);
+        let now = Instant::now();
+        p.note_ping_sent(tx(1), lan, now);
+        p.note_pong(tx(1), lan, now + Duration::from_millis(2));
+        p.note_ping_sent(tx(2), public, now);
+        p.note_pong(tx(2), public, now + Duration::from_micros(1_800));
+        assert_eq!(p.best_addr(now + Duration::from_millis(3)), Some(lan));
     }
 
     // ---- cadence gates (tsr-7s3, matching Go magicsock) ----
