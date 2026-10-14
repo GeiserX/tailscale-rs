@@ -311,6 +311,17 @@ tokio = { workspace = true, features = ["fs", "net", "io-util", "sync"] }
 tracing.workspace = true
 url.workspace = true
 
+# Windows: the Win32 security calls that lock the `tailscale` state directory to the current user and
+# Administrators (Go `paths.ensureStateDirPermsWindows`). Already in the graph at this version, as a
+# dependency of tokio, socket2 and others, so no new crate enters it.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 # Dependencies for examples
 clap = { workspace = true, features = ["derive", "env", "string"] }

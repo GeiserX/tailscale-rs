@@ -1853,6 +1853,7 @@ dependencies = [
  "tracing-test",
  "ts_test_util",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
