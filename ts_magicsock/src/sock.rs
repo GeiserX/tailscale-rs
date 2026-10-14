@@ -603,6 +603,14 @@ impl MagicSock {
         Ok(true)
     }
 
+    /// Whether the underlay socket can send to an IPv6 address at all: only a dual-stack `[::]`
+    /// bind can (`enable_ipv6`, and the host let it). The IPv4-only default, and the inert IPv4
+    /// fallback a dual-stack bind takes on a host with IPv6 off, cannot. Read from the socket
+    /// rather than from `enable_ipv6` so the fallback case answers truthfully.
+    fn sends_ipv6(&self) -> bool {
+        self.sock().local_addr().is_ok_and(|a| a.is_ipv6())
+    }
+
     /// Whether control has put this node in TCP-443-only mode — see
     /// [`set_only_tcp_443`](Self::set_only_tcp_443).
     pub fn only_tcp_443(&self) -> bool {
@@ -670,7 +678,8 @@ impl MagicSock {
         // its parked read reloops onto the current conn; a parked tokio receive is woken instead,
         // because a clone it holds cannot be closed from here.
         *lock(&self.sock) = Arc::new(new_sock);
-        self.rebound.send_modify(|generation| *generation = generation.wrapping_add(1));
+        self.rebound
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
         // Connected sockets were bound to the old socket's address; start over.
         lock(&self.connected).clear();
 
@@ -1116,12 +1125,32 @@ impl MagicSock {
     /// longer be re-confirmed as a direct path. If pruning removes the peer's current best path,
     /// the path is cleared and the peer fails closed to DERP until a surviving endpoint
     /// re-confirms. Learned (disco) candidates are left intact.
+    ///
+    /// An IPv6 endpoint is dropped here when the underlay socket is IPv4-only
+    /// ([`sends_ipv6`](Self::sends_ipv6)): the socket can never send to it, so letting it through
+    /// only made every discovery sweep attempt and fail that send. Go keeps such an endpoint and
+    /// has `sendUDPStd` report its failed send as "not sent, no error" while `noV6` is set
+    /// (`magicsock.go`); this tree knows the socket family up front and drops the endpoint
+    /// instead, the way `is_pingable_candidate` already drops a disco-learned one.
     pub fn set_netmap_endpoints(
         &self,
         peer: DiscoPublicKey,
         endpoints: impl IntoIterator<Item = SocketAddr>,
     ) {
-        let eps: Vec<SocketAddr> = endpoints.into_iter().collect();
+        let sends_ipv6 = self.sends_ipv6();
+        let eps: Vec<SocketAddr> = endpoints
+            .into_iter()
+            .filter(|ep| {
+                let ok = sends_ipv6 || !ep.is_ipv6();
+                if !ok {
+                    tracing::debug!(
+                        %ep,
+                        "dropping an IPv6 netmap endpoint: the underlay socket is IPv4-only"
+                    );
+                }
+                ok
+            })
+            .collect();
 
         let removed = {
             let mut paths = lock(&self.paths);
@@ -1321,11 +1350,19 @@ impl MagicSock {
     /// event-driven [`send_pings_to_peer_now`](Self::send_pings_to_peer_now): both snapshot the work
     /// to do under the `paths` lock (stamping each via [`PeerPaths::note_ping_sent`]), then release
     /// the lock and emit here so no lock is held across the socket `await`.
+    ///
+    /// A send that fails does not abort the sweep (Go starts each discovery ping independently,
+    /// `startDiscoPingLocked`): the remaining candidates and peers are still probed, and the failure
+    /// is logged at debug. If *every* send in a sweep fails, the socket itself is the problem (a
+    /// link that went down, a bind that died), and that is logged once per sweep at warn, with the
+    /// count and the last error, so a dead socket is visible without a line per ping.
     async fn emit_disco_pings(
         &self,
         to_ping: Vec<(DiscoPublicKey, SocketAddr, disco::TxId)>,
     ) -> Result<usize, Error> {
         let mut sent = 0;
+        let mut failed = 0;
+        let mut last_error = None;
         let m = crate::metrics::metrics();
         for (peer, addr, tx_id) in to_ping {
             let wire = disco::seal_ping(&self.our_disco, self.our_node_key, &peer, tx_id)?;
@@ -1341,13 +1378,24 @@ impl MagicSock {
                 }
                 Ok(false) => {}
                 Err(e) => {
-                    // Go starts each discovery ping independently (startDiscoPingLocked).
-                    // A stale/unreachable candidate must not prevent the remaining candidates
-                    // or peers from being probed. Their lastPing was already stamped above;
-                    // aborting here would starve them again on every subsequent sweep.
+                    // The candidate's `last_ping` was already stamped by the caller; aborting here
+                    // would starve the rest of the sweep again on every subsequent round.
                     tracing::debug!(error = %e, %peer, %addr, "sending disco ping; continuing discovery");
+                    failed += 1;
+                    last_error = Some(e);
                 }
             }
+        }
+
+        if let Some(error) = last_error
+            && sent == 0
+        {
+            tracing::warn!(
+                failed,
+                error = %error,
+                "every disco ping in this sweep failed to send; the underlay socket is not \
+                 carrying UDP (peers stay on DERP until it does)"
+            );
         }
 
         Ok(sent)
@@ -3526,10 +3574,12 @@ mod tests {
             "an inbound ping is not a solicited pong"
         );
 
-        // A retained netmap can contain IPv6 even on our IPv4-only socket. Fix the sweep
-        // order at the emitter seam to model a stable HashMap order with the bad address first.
+        // A candidate the IPv4-only socket cannot send to, injected through the unfiltered test
+        // seam (the netmap path now drops an IPv6 endpoint before it can reach a sweep; any
+        // address whose send fails models the case). Fix the sweep order at the emitter seam to
+        // model a stable HashMap order with the bad address first.
         let bad: SocketAddr = "[::1]:41641".parse().unwrap();
-        restarted.set_netmap_endpoints(laptop_pub, [bad, laptop_addr]);
+        restarted.add_peer_endpoints_unfiltered(laptop_pub, [bad]);
         let now = Instant::now() + Duration::from_secs(6);
         let work = {
             let mut paths = lock(&restarted.paths);
@@ -8219,7 +8269,10 @@ mod tests {
 
         // The rebound socket is bound to `0.0.0.0`; reach it over loopback.
         let target = SocketAddr::from((core::net::Ipv4Addr::LOCALHOST, after.port()));
-        sender.send_to(b"wireguard-looking data", target).await.unwrap();
+        sender
+            .send_to(b"wireguard-looking data", target)
+            .await
+            .unwrap();
         let got = tokio::time::timeout(Duration::from_secs(2), pump)
             .await
             .expect("the parked receive loop must see a datagram sent to the rebound port")
@@ -8229,6 +8282,68 @@ mod tests {
         assert_eq!(got.from_disco, peer);
         assert_eq!(got.from_addr, sender.local_addr().unwrap());
         assert_eq!(got.data.as_ref(), b"wireguard-looking data");
+    }
+
+    /// A netmap can carry a peer's IPv6 endpoint while this node's underlay socket is IPv4-only
+    /// (the default, and the inert fallback a dual-stack bind takes on a host with IPv6 off). Such
+    /// an endpoint can never be sent to from this socket, so it is dropped where the netmap is
+    /// applied, exactly as the disco-learned candidates are dropped by `is_pingable_candidate`;
+    /// before, it reached the ping sweep and failed there on every discovery round.
+    #[tokio::test]
+    async fn ipv4_only_socket_drops_ipv6_netmap_endpoints() {
+        let sock = plain_sock().await;
+        assert!(
+            sock.local_addr().unwrap().is_ipv4(),
+            "precondition: IPv4-only underlay"
+        );
+        let peer = DiscoPrivateKey::random().public_key();
+        let v6: SocketAddr = "[2001:db8::7]:41641".parse().unwrap();
+        let v4: SocketAddr = "198.51.100.7:41641".parse().unwrap();
+
+        sock.set_netmap_endpoints(peer, [v6, v4]);
+
+        assert_eq!(
+            sock.candidate_addrs(&peer),
+            vec![v4],
+            "an IPv6 netmap endpoint must not become a candidate on an IPv4-only socket"
+        );
+        assert!(
+            !lock(&sock.addr_to_disco).contains_key(&v6),
+            "a dropped endpoint must not be attributed either"
+        );
+    }
+
+    /// When every ping in a sweep fails to send, the socket itself is in trouble (a link that went
+    /// down, a bind that died), and that is worth one warning per sweep: not silence, and not one
+    /// line per ping. A sweep where some pings went out stays quiet (`#606`: a single failing
+    /// candidate must neither abort nor alarm).
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_sweep_where_every_ping_fails_to_send_warns_once() {
+        let sock = plain_sock().await;
+        let peer = DiscoPrivateKey::random().public_key();
+        // Two addresses the IPv4-only socket cannot send to, injected through the unfiltered seam
+        // (the production entry points drop them before any send).
+        let dead: [SocketAddr; 2] = [
+            "[::1]:41641".parse().unwrap(),
+            "[::1]:41642".parse().unwrap(),
+        ];
+        sock.add_peer_endpoints_unfiltered(peer, dead);
+
+        let sent = sock.send_pings_to_peer_now(&peer).await.unwrap();
+        assert_eq!(sent, 0, "precondition: nothing could be sent");
+        logs_assert(|lines: &[&str]| {
+            match lines
+                .iter()
+                .filter(|line| line.contains("every disco ping in this sweep failed to send"))
+                .count()
+            {
+                1 => Ok(()),
+                n => Err(format!(
+                    "a sweep that sends nothing must warn exactly once (two pings failed), got {n}"
+                )),
+            }
+        });
     }
 
     /// `send_pings_to_peer_now` pings **every** candidate immediately, bypassing the per-candidate
