@@ -358,6 +358,12 @@ impl Netstack {
             resp,
         }: Request,
     ) -> bool {
+        // Checked here, ahead of every run, so the first run and both replay paths are covered: a
+        // caller can give up before the actor ever reaches its command.
+        if resp.is_disconnected() && self.settle_abandoned(&command, handle) {
+            return true;
+        }
+
         let cmd_resp = match command {
             Command::StackControl(cmd) => self.process_stack_control(cmd),
             Command::Udp(udp) => self.process_udp(udp, handle),
@@ -393,9 +399,70 @@ impl Netstack {
 
                 if let Err(resp) = resp.send(otherwise) {
                     tracing::debug!(resp = ?resp.0, "response channel closed");
+                    self.reclaim_undelivered(&resp.0);
                 }
                 true
             }
+        }
+    }
+
+    /// Settle a command whose caller has gone away (its future was dropped: a `select!` arm that
+    /// lost, a `timeout` that fired) instead of running it, when running it would hand something
+    /// to a closed response channel. Returns whether the command was settled.
+    ///
+    /// - A receive would take data off the socket and lose it. It is dropped; the data stays for
+    ///   the next receive.
+    /// - An `Accept` would dequeue a connection nobody serves. It is dropped; the connection stays
+    ///   queued for the next `Accept`.
+    /// - A `Connect` that already opened a socket would complete a connection nobody owns. The
+    ///   socket is aborted (the peer gets a RST) and reclaimed. One that never ran opens nothing.
+    ///
+    /// Every other command still runs: fire-and-forget commands (`Close` on drop, `ShutdownWrite`)
+    /// are sent with their response receiver already dropped and must take effect.
+    ///
+    /// A replayed command reaches this only after the generation guard, so `handle` is still the
+    /// socket the command was queued against.
+    fn settle_abandoned(&mut self, command: &Command, handle: Option<SocketHandle>) -> bool {
+        match command {
+            command if command.is_receive() => {
+                tracing::trace!(?handle, "dropping abandoned receive");
+                true
+            }
+            Command::TcpListen(tcp::listen::Command::Accept { handle: listener }) => {
+                tracing::trace!(?listener, "dropping abandoned accept");
+                true
+            }
+            Command::TcpStream(tcp::stream::Command::Connect { .. }) => {
+                tracing::trace!(?handle, "aborting abandoned connect");
+                if let Some(handle) = handle {
+                    self.abort_and_reclaim_tcp(handle);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The caller went away between the check in [`Netstack::execute_cmd`] and the reply. A
+    /// connection in an undelivered reply has no owner, so it is aborted and reclaimed rather than
+    /// left open until its idle timeout.
+    fn reclaim_undelivered(&mut self, resp: &Response) {
+        let handle = match resp {
+            Response::TcpListen(tcp::listen::Response::Accepted { handle, .. })
+            | Response::TcpStream(tcp::stream::Response::Connected { handle }) => *handle,
+            _ => return,
+        };
+        self.abort_and_reclaim_tcp(handle);
+    }
+
+    /// Abort a TCP socket, which sends the peer a RST on the next egress, and queue it for
+    /// `drain_tcp_closes` to remove.
+    fn abort_and_reclaim_tcp(&mut self, handle: SocketHandle) {
+        if self.socket_matches::<smoltcp::socket::tcp::Socket>(handle) {
+            self.socket_set
+                .get_mut::<smoltcp::socket::tcp::Socket>(handle)
+                .abort();
+            self.pending_tcp_closes.insert(handle);
         }
     }
 
@@ -657,16 +724,6 @@ impl Netstack {
         for _ in 0..self.blocked_commands.len() {
             let (req, queued_gen) = self.blocked_commands.pop_front().unwrap();
 
-            // A receive whose caller has gone away (its future was dropped: a `select!` arm that
-            // lost, a `timeout` that fired) must not run: it would take the next datagram or bytes
-            // off the socket and hand them to a closed response channel, silently losing them. The
-            // caller's retry has already queued a fresh receive behind this one, which would
-            // otherwise starve one item per cancellation.
-            if req.resp.is_disconnected() && req.command.is_receive() {
-                tracing::trace!(handle = ?req.handle, "dropping abandoned blocked receive");
-                continue;
-            }
-
             // Generation guard (the ABA fix): if this command's handle was freed and its slot
             // recycled to a *different* socket since it was queued, the handle's current
             // generation differs from (or is absent versus) the one captured at requeue time.
@@ -692,6 +749,14 @@ impl Netstack {
                     tracing::debug!(resp = ?resp.0, "response channel closed");
                 }
 
+                continue;
+            }
+
+            // A command whose caller has gone away is settled without counting as a replay
+            // attempt (see `settle_abandoned`). The caller's retry has usually queued a fresh
+            // command behind this one; running the abandoned one would starve it of one item per
+            // cancellation.
+            if req.resp.is_disconnected() && self.settle_abandoned(&req.command, req.handle) {
                 continue;
             }
 
@@ -1192,6 +1257,67 @@ mod handle_aba_tests {
             other => panic!("the live retry must get the datagram, got {other:?}"),
         }
         assert!(stack.blocked_commands.is_empty());
+    }
+
+    /// A receive whose caller went away before the actor first ran it must not take data that is
+    /// already waiting on the socket: the next receive gets it. (The replay path had this check;
+    /// the first run did not.)
+    #[test]
+    fn abandoned_recv_on_its_first_run_leaves_the_waiting_datagram() {
+        use smoltcp::phy::Medium;
+
+        use crate::{HasChannel, Pipe, PipeDev};
+
+        let mut stack = global_stack(
+            Config {
+                loopback: true,
+                ..Default::default()
+            },
+            Instant::ZERO,
+        );
+        let channel = stack.command_channel();
+        let ep = core::net::SocketAddr::from(([127, 0, 0, 1], 1000));
+        let handle = bind_udp(&mut stack, 1000);
+
+        // Loop one datagram back into the socket while no receive is waiting.
+        let jh = std::thread::spawn(move || {
+            channel.request_blocking(
+                Some(handle),
+                udp::Command::Send {
+                    endpoint: ep,
+                    local: None,
+                    buf: Bytes::copy_from_slice(b"hello"),
+                },
+            )
+        });
+        let send_cmd = stack.wait_for_cmd_blocking(None).unwrap();
+        stack.process_one_cmd(send_cmd);
+        jh.join().unwrap().unwrap();
+        let (net, phy) = Pipe::unbounded();
+        let mut net = PipeDev {
+            pipe: net,
+            medium: Medium::Ip,
+            mtu: 1536,
+        };
+        stack.poll_device_io(Instant::ZERO, &mut net);
+        let pkt = phy.rx.try_recv().expect("the sent datagram");
+        phy.tx.try_send(pkt).expect("loop the datagram back");
+        stack.poll_device_io(Instant::ZERO, &mut net);
+
+        // The caller gives up after sending its receive, before the actor processes it.
+        let (abandoned, abandoned_rx) = req(Some(handle), udp::Command::Recv { max_len: None });
+        drop(abandoned_rx);
+        stack.process_one_cmd(abandoned);
+        assert!(stack.blocked_commands.is_empty());
+
+        match run(
+            &mut stack,
+            Some(handle),
+            udp::Command::Recv { max_len: None },
+        ) {
+            CmdResponse::Udp(udp::Response::RecvFrom { buf, .. }) => assert_eq!(&buf[..], b"hello"),
+            other => panic!("the datagram must still be waiting, got {other:?}"),
+        }
     }
 
     #[test]
