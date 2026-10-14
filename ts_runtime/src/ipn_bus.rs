@@ -27,7 +27,7 @@
 //! `watch` surfaces ([`Runtime::watch_state`](crate::Runtime::watch_state),
 //! [`Runtime::watch_netmap`](crate::Runtime::watch_netmap)). This bus *composes* the same cells (one
 //! source of truth — it cannot diverge from the narrow views) into the merged feed an embedder
-//! porting from Go's `WatchIPNBus` expects. The two cells it reads map onto Go `Notify` fields:
+//! porting from Go's `WatchIPNBus` expects. The cells it reads map onto Go `Notify` fields:
 //!
 //! - [`DeviceState`] → `Notify.State`, and the **registration-time** interactive-login URL carried
 //!   by [`DeviceState::NeedsLogin`] (`Notify.browse_to_url`, derived from that state — control's
@@ -42,6 +42,14 @@
 //!   running-node `PopBrowserURL`; a consumer wanting the current pending URL at subscribe time reads
 //!   the sticky `pop_browser_url` pull API.
 //! - the peer set (`Vec<StatusNode>`) → `Notify.NetMap` (the embedder-facing peer view).
+//! - the control runner's self-node cell → a `Notify.NetMap` tick carrying the current peer set.
+//!   Go re-sends the netmap with `Notify.SelfChange` on every netmap update
+//!   (`ipn/ipnlocal/local.go` `setControlClientStatusLocked`), so a watcher learns when only this
+//!   node moved: a key-expiry extension, a MagicDNS rename, reassigned addresses. Such an update
+//!   leaves the peer cell untouched, so without this source it would reach no watcher. The bus
+//!   ticks when the self node differs from the last one this watcher saw; a repeat of the same
+//!   node sends nothing. A consumer reads the new self node on that tick
+//!   ([`Runtime::status`](crate::Runtime::status)).
 //!
 //! Go's `Notify` has no packet-filter cap-grant field (caps are an internal `WhoIs` input, not an
 //! embedder notification), so the retained cap-grants cell is intentionally **not** surfaced here.
@@ -113,7 +121,9 @@ impl core::ops::BitOr for NotifyWatchOpt {
 pub struct Notify {
     /// The new device connection-state, if it changed (Go `Notify.State`).
     pub state: Option<DeviceState>,
-    /// The new peer set, if the netmap changed (Go `Notify.NetMap`, embedder-facing peer view).
+    /// The current peer set, when the netmap changed (Go `Notify.NetMap`, embedder-facing peer
+    /// view). Set when the peer set moves and also when only this node's own entry moved (Go
+    /// `Notify.SelfChange`); in the second case the peers are the unchanged current set.
     pub net_map: Option<Vec<StatusNode>>,
     /// An interactive-login / consent URL the embedder should open (Go `Notify.BrowseToURL`). Two
     /// sources feed it: the **registration-time** auth URL, derived from [`DeviceState::NeedsLogin`]
@@ -160,6 +170,7 @@ pub(crate) fn spawn_watcher(
     state_rx: watch::Receiver<DeviceState>,
     peer_rx: watch::Receiver<Vec<StatusNode>>,
     browser_rx: watch::Receiver<Option<url::Url>>,
+    self_rx: watch::Receiver<Option<ts_control::Node>>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> IpnBusWatcher {
     let (tx, rx) = mpsc::channel(NOTIFY_BUFFER);
@@ -168,6 +179,7 @@ pub(crate) fn spawn_watcher(
         state_rx,
         peer_rx,
         browser_rx,
+        self_rx,
         shutdown_rx,
         tx,
     ));
@@ -216,6 +228,7 @@ pub(crate) async fn run_bus(
     mut state_rx: watch::Receiver<DeviceState>,
     mut peer_rx: watch::Receiver<Vec<StatusNode>>,
     mut browser_rx: watch::Receiver<Option<url::Url>>,
+    mut self_rx: watch::Receiver<Option<ts_control::Node>>,
     mut shutdown_rx: watch::Receiver<bool>,
     tx: mpsc::Sender<Notify>,
 ) {
@@ -252,6 +265,10 @@ pub(crate) async fn run_bus(
     // the current pending consent URL at subscribe time reads the sticky `pop_browser_url` pull API;
     // the bus streams future transitions.
     browser_rx.borrow_and_update();
+    // The self node this watcher has already been told about. Marking the current value seen keeps
+    // the streaming arm from ticking on the value present at subscribe time; comparing against it
+    // keeps a repeated identical self node (control re-sending it unchanged) from ticking at all.
+    let mut last_self = self_rx.borrow_and_update().clone();
     if !initial.is_empty() && deliver(&tx, initial) {
         return;
     }
@@ -294,6 +311,36 @@ pub(crate) async fn run_bus(
                     return;
                 }
             }
+            changed = self_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                // Go `Notify.SelfChange`: a netmap update that moved only this node (key-expiry
+                // extension, rename, reassigned addresses) leaves the peer cell untouched, so tick
+                // `net_map` with the current peer set. `borrow_and_update` on the peer cell folds a
+                // peer change that is still pending into this frame instead of sending the same set
+                // twice.
+                let moved = {
+                    let node = self_rx.borrow_and_update();
+                    if *node == last_self {
+                        false
+                    } else {
+                        last_self = node.clone();
+                        true
+                    }
+                };
+                if moved {
+                    let peers = peer_rx.borrow_and_update().clone();
+                    let notify = Notify {
+                        state: None,
+                        net_map: Some(peers),
+                        browse_to_url: None,
+                    };
+                    if deliver(&tx, notify) {
+                        return;
+                    }
+                }
+            }
             changed = browser_rx.changed() => {
                 if changed.is_err() {
                     return;
@@ -326,24 +373,37 @@ mod tests {
 
     use super::*;
 
-    /// The hand-made channel senders (state, peer, browser-URL, shutdown) plus the consumer handle
-    /// that [`harness`] returns — the four source senders let a test drive `run_bus`, and the
-    /// `IpnBusWatcher` observes what it emits.
+    /// The hand-made channel senders (state, peer, browser-URL, shutdown, self-node) plus the
+    /// consumer handle that [`harness`] returns — the source senders let a test drive `run_bus`,
+    /// and the `IpnBusWatcher` observes what it emits.
     type Harness = (
         watch::Sender<DeviceState>,
         watch::Sender<Vec<StatusNode>>,
         watch::Sender<Option<url::Url>>,
         watch::Sender<bool>,
+        watch::Sender<Option<ts_control::Node>>,
         IpnBusWatcher,
     );
 
     /// Drive `run_bus` on a task against hand-made channels, returning the senders (state, peer,
-    /// browser-URL, shutdown) and the consumer handle. Mirrors how `device_state` tests drive
+    /// browser-URL, shutdown, self-node) and the consumer handle. The self-node cell starts empty,
+    /// as the control runner's does before the first netmap. Mirrors how `device_state` tests drive
     /// `wait_for_running` off a plain `watch`.
     fn harness(mask: NotifyWatchOpt, state: DeviceState, peers: Vec<StatusNode>) -> Harness {
+        harness_with_self(mask, state, peers, None)
+    }
+
+    /// [`harness`] with the self-node cell already holding `self_node` at subscribe time.
+    fn harness_with_self(
+        mask: NotifyWatchOpt,
+        state: DeviceState,
+        peers: Vec<StatusNode>,
+        self_node: Option<ts_control::Node>,
+    ) -> Harness {
         let (state_tx, state_rx) = watch::channel(state);
         let (peer_tx, peer_rx) = watch::channel(peers);
         let (browser_tx, browser_rx) = watch::channel(None);
+        let (self_tx, self_rx) = watch::channel(self_node);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (tx, rx) = mpsc::channel(NOTIFY_BUFFER);
         tokio::spawn(run_bus(
@@ -351,6 +411,7 @@ mod tests {
             state_rx,
             peer_rx,
             browser_rx,
+            self_rx,
             shutdown_rx,
             tx,
         ));
@@ -359,8 +420,27 @@ mod tests {
             peer_tx,
             browser_tx,
             shutdown_tx,
+            self_tx,
             IpnBusWatcher { rx },
         )
+    }
+
+    /// How long a test waits for a frame it expects. A missing frame then fails the test instead of
+    /// hanging it.
+    const EXPECT_WITHIN: Duration = Duration::from_secs(5);
+
+    /// The next frame, or a test failure naming `what` if none arrives within [`EXPECT_WITHIN`].
+    async fn next_within(w: &mut IpnBusWatcher, what: &str) -> Notify {
+        tokio::time::timeout(EXPECT_WITHIN, w.next())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for: {what}"))
+            .unwrap_or_else(|| panic!("stream ended before: {what}"))
+    }
+
+    /// A self node as control sends it, named `name`. Two calls with different names differ the way
+    /// a MagicDNS rename does; two with the same name are equal.
+    fn self_node(name: &str) -> ts_control::Node {
+        crate::peer_tracker::tka_tests::peer_node(name, [7; 32], Vec::new())
     }
 
     fn login_url() -> url::Url {
@@ -416,7 +496,7 @@ mod tests {
     /// net_map).
     #[tokio::test]
     async fn initial_state_snapshot_emitted_when_masked() {
-        let (_s, _p, _b, _sd, mut w) = harness(
+        let (_s, _p, _b, _sd, _me, mut w) = harness(
             NotifyWatchOpt::INITIAL_STATE,
             DeviceState::Running,
             Vec::new(),
@@ -430,7 +510,7 @@ mod tests {
     /// `NotifyInitialNetMap` front-loads the current peer set (net_map only, no state).
     #[tokio::test]
     async fn initial_netmap_snapshot_emitted_when_masked() {
-        let (_s, _p, _b, _sd, mut w) = harness(
+        let (_s, _p, _b, _sd, _me, mut w) = harness(
             NotifyWatchOpt::INITIAL_NETMAP,
             DeviceState::Running,
             Vec::new(),
@@ -444,7 +524,7 @@ mod tests {
     /// separate events.
     #[tokio::test]
     async fn initial_snapshot_coalesces_both_fields() {
-        let (_s, _p, _b, _sd, mut w) = harness(
+        let (_s, _p, _b, _sd, _me, mut w) = harness(
             NotifyWatchOpt::INITIAL_STATE | NotifyWatchOpt::INITIAL_NETMAP,
             DeviceState::Running,
             Vec::new(),
@@ -457,7 +537,7 @@ mod tests {
     /// An empty mask sends NO initial snapshot; the watcher then receives the next real transition.
     #[tokio::test]
     async fn empty_mask_skips_initial_then_streams_change() {
-        let (state_tx, _p, _b, _sd, mut w) =
+        let (state_tx, _p, _b, _sd, _me, mut w) =
             harness(NotifyWatchOpt::empty(), DeviceState::Connecting, Vec::new());
         // No initial snapshot: nothing within the quiet window.
         assert!(
@@ -480,7 +560,7 @@ mod tests {
         // streaming loop — only then is a post-subscribe send guaranteed to be observed (no sleeps,
         // no spawn-vs-send race). Any change after `.changed()`'s seen-version is detected even if
         // the loop is not yet parked on `.changed()`.
-        let (state_tx, _p, _b, _sd, mut w) = harness(
+        let (state_tx, _p, _b, _sd, _me, mut w) = harness(
             NotifyWatchOpt::INITIAL_STATE,
             DeviceState::Connecting,
             Vec::new(),
@@ -498,7 +578,7 @@ mod tests {
     /// initial snapshot carries `BrowseToURL` only when `state == NeedsLogin`).
     #[tokio::test]
     async fn initial_needs_login_includes_browse_to_url() {
-        let (_s, _p, _b, _sd, mut w) = harness(
+        let (_s, _p, _b, _sd, _me, mut w) = harness(
             NotifyWatchOpt::INITIAL_STATE,
             DeviceState::NeedsLogin(login_url()),
             Vec::new(),
@@ -513,7 +593,7 @@ mod tests {
     async fn peer_change_streams_netmap() {
         // INITIAL_NETMAP snapshot is the barrier (proves the task finished its init borrows and is
         // in the streaming loop) before we send — avoids the spawn-vs-send race.
-        let (_s, peer_tx, _b, _sd, mut w) = harness(
+        let (_s, peer_tx, _b, _sd, _me, mut w) = harness(
             NotifyWatchOpt::INITIAL_NETMAP,
             DeviceState::Running,
             Vec::new(),
@@ -533,7 +613,7 @@ mod tests {
     /// `borrow_and_update` correctly marks the snapshotted values seen (no initial-value busy-loop).
     #[tokio::test]
     async fn no_spurious_reemit_after_initial() {
-        let (state_tx, _p, _b, _sd, mut w) = harness(
+        let (state_tx, _p, _b, _sd, _me, mut w) = harness(
             NotifyWatchOpt::INITIAL_STATE | NotifyWatchOpt::INITIAL_NETMAP,
             DeviceState::Running,
             Vec::new(),
@@ -557,7 +637,7 @@ mod tests {
     /// Flipping the shutdown cell terminates the stream: `next()` returns `None`.
     #[tokio::test]
     async fn shutdown_terminates_stream() {
-        let (_s, _p, _b, shutdown_tx, mut w) =
+        let (_s, _p, _b, shutdown_tx, _me, mut w) =
             harness(NotifyWatchOpt::empty(), DeviceState::Running, Vec::new());
         shutdown_tx.send_replace(true);
         assert_eq!(w.next().await, None, "shutdown must end the stream");
@@ -569,6 +649,7 @@ mod tests {
         let (state_tx, state_rx) = watch::channel(DeviceState::Running);
         let (peer_tx, peer_rx) = watch::channel(Vec::new());
         let (browser_tx, browser_rx) = watch::channel(None);
+        let (self_tx, self_rx) = watch::channel(None);
         let (_shutdown_tx, shutdown_rx) = watch::channel(true);
         let (tx, rx) = mpsc::channel(NOTIFY_BUFFER);
         tokio::spawn(run_bus(
@@ -576,6 +657,7 @@ mod tests {
             state_rx,
             peer_rx,
             browser_rx,
+            self_rx,
             shutdown_rx,
             tx,
         ));
@@ -583,16 +665,16 @@ mod tests {
         assert_eq!(w.next().await, None, "already-shutdown must emit nothing");
         // Keep the source senders alive until after the assertion so termination is attributable to
         // the shutdown flag, not a sender drop.
-        drop((state_tx, peer_tx, browser_tx));
+        drop((state_tx, peer_tx, browser_tx, self_tx));
     }
 
     /// Dropping every source sender (runtime tearing down without the graceful flag) also ends the
     /// stream rather than hanging.
     #[tokio::test]
     async fn source_sender_drop_terminates_stream() {
-        let (state_tx, _p, _b, _sd, mut w) =
+        let (state_tx, _p, _b, _sd, _me, mut w) =
             harness(NotifyWatchOpt::empty(), DeviceState::Running, Vec::new());
-        drop((state_tx, _p, _b, _sd));
+        drop((state_tx, _p, _b, _sd, _me));
         assert_eq!(w.next().await, None, "all senders gone must end the stream");
     }
 
@@ -602,7 +684,7 @@ mod tests {
     /// the merge loop can't silently alter it.
     #[tokio::test]
     async fn streamed_events_are_per_source_not_coalesced() {
-        let (state_tx, peer_tx, _b, _sd, mut w) = harness(
+        let (state_tx, peer_tx, _b, _sd, _me, mut w) = harness(
             NotifyWatchOpt::INITIAL_STATE,
             DeviceState::Connecting,
             Vec::new(),
@@ -636,7 +718,7 @@ mod tests {
     /// more than a single cycle and preserves order.
     #[tokio::test]
     async fn sequential_state_transitions_stream_in_order() {
-        let (state_tx, _p, _b, _sd, mut w) = harness(
+        let (state_tx, _p, _b, _sd, _me, mut w) = harness(
             NotifyWatchOpt::INITIAL_STATE,
             DeviceState::Connecting,
             Vec::new(),
@@ -667,7 +749,7 @@ mod tests {
             DeviceState::Expired,
             DeviceState::Failed(crate::RegistrationError::AuthRejected("bad key".into())),
         ] {
-            let (state_tx, _p, _b, _sd, mut w) = harness(
+            let (state_tx, _p, _b, _sd, _me, mut w) = harness(
                 NotifyWatchOpt::INITIAL_STATE,
                 DeviceState::Connecting,
                 Vec::new(),
@@ -687,7 +769,7 @@ mod tests {
     /// hang (caught by the suite timeout). Proves the non-blocking `try_send` contract.
     #[tokio::test]
     async fn full_buffer_drops_and_never_blocks_producer() {
-        let (state_tx, _p, _b, shutdown_tx, mut w) =
+        let (state_tx, _p, _b, shutdown_tx, _me, mut w) =
             harness(NotifyWatchOpt::empty(), DeviceState::Connecting, Vec::new());
         // Never call w.next(): the per-watcher mpsc fills to NOTIFY_BUFFER then drops the rest.
         // Push well past the buffer depth; yield so the bus task runs each send.
@@ -716,7 +798,7 @@ mod tests {
     /// the sender's `receiver_count` back to 0 once the task returns.
     #[tokio::test]
     async fn consumer_drop_terminates_task() {
-        let (state_tx, _p, _b, _sd, w) =
+        let (state_tx, _p, _b, _sd, _me, w) =
             harness(NotifyWatchOpt::empty(), DeviceState::Connecting, Vec::new());
         // Sanity: the bus task is live and holds a clone of the state receiver.
         assert_eq!(
@@ -744,7 +826,7 @@ mod tests {
     #[tokio::test]
     async fn running_node_browser_url_streams_standalone() {
         // INITIAL_STATE snapshot is the barrier proving the task is in its streaming loop.
-        let (_s, _p, browser_tx, _sd, mut w) = harness(
+        let (_s, _p, browser_tx, _sd, _me, mut w) = harness(
             NotifyWatchOpt::INITIAL_STATE,
             DeviceState::Running,
             Vec::new(),
@@ -772,6 +854,7 @@ mod tests {
         let (peer_tx, peer_rx) = watch::channel(Vec::new());
         // Browser cell already holds a URL at subscribe time.
         let (browser_tx, browser_rx) = watch::channel(Some(consent_url()));
+        let (self_tx, self_rx) = watch::channel(None);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (tx, rx) = mpsc::channel(NOTIFY_BUFFER);
         tokio::spawn(run_bus(
@@ -779,6 +862,7 @@ mod tests {
             state_rx,
             peer_rx,
             browser_rx,
+            self_rx,
             shutdown_rx,
             tx,
         ));
@@ -798,7 +882,7 @@ mod tests {
         browser_tx.send_replace(Some(next2.clone()));
         let n = w.next().await.expect("browser-url change after subscribe");
         assert_eq!(n.browse_to_url, Some(next2));
-        drop((state_tx, peer_tx, shutdown_tx));
+        drop((state_tx, peer_tx, shutdown_tx, self_tx));
     }
 
     /// Mid-session re-auth, end to end through the bus: control returns `MachineNotAuthorized` on a
@@ -811,7 +895,7 @@ mod tests {
     async fn mid_session_reauth_surfaces_browse_to_url_then_clears() {
         // Subscribe with INITIAL_STATE so the first `next()` (the snapshot) is the barrier proving
         // the bus task is in its streaming loop before we drive transitions.
-        let (state_tx, _p, _b, _sd, mut w) = harness(
+        let (state_tx, _p, _b, _sd, _me, mut w) = harness(
             NotifyWatchOpt::INITIAL_STATE,
             DeviceState::Running,
             Vec::new(),
@@ -844,7 +928,7 @@ mod tests {
     /// Two distinct consent URLs in sequence stream as two `browse_to_url` events.
     #[tokio::test]
     async fn sequential_browser_urls_stream_each() {
-        let (_s, _p, browser_tx, _sd, mut w) = harness(
+        let (_s, _p, browser_tx, _sd, _me, mut w) = harness(
             NotifyWatchOpt::INITIAL_STATE,
             DeviceState::Running,
             Vec::new(),
@@ -870,7 +954,7 @@ mod tests {
     /// `streamed_events_are_per_source_not_coalesced` (state+peer), for the browser+state pair.
     #[tokio::test]
     async fn browser_url_and_state_change_interleave() {
-        let (state_tx, _p, browser_tx, _sd, mut w) = harness(
+        let (state_tx, _p, browser_tx, _sd, _me, mut w) = harness(
             NotifyWatchOpt::INITIAL_STATE,
             DeviceState::Running,
             Vec::new(),
@@ -895,5 +979,74 @@ mod tests {
             a.state.is_some() || b.state.is_some(),
             "a state event arrived"
         );
+    }
+
+    /// A netmap update that moves only this node (here a MagicDNS rename) reaches the watcher as
+    /// exactly one `net_map` frame carrying the unchanged peer set, as Go's `Notify.SelfChange`
+    /// does. The peer cell is never touched, so before the self-node source this sent nothing.
+    #[tokio::test]
+    async fn self_only_change_ticks_netmap_once() {
+        let peers = vec![peer("peer-a")];
+        let (_s, _p, _b, _sd, self_tx, mut w) = harness_with_self(
+            NotifyWatchOpt::INITIAL_NETMAP,
+            DeviceState::Running,
+            peers.clone(),
+            Some(self_node("me")),
+        );
+        // The snapshot is the barrier proving the task is in its streaming loop.
+        let snap = w.next().await.expect("initial netmap snapshot");
+        assert_eq!(snap.net_map, Some(peers.clone()));
+
+        self_tx.send_replace(Some(self_node("me-renamed")));
+        let n = next_within(&mut w, "self-only change must tick net_map").await;
+        assert_eq!(
+            n.net_map,
+            Some(peers),
+            "the tick carries the current peer set"
+        );
+        assert_eq!(n.state, None);
+        assert_eq!(n.browse_to_url, None);
+        assert!(
+            tokio::time::timeout(QUIET_WINDOW, w.next()).await.is_err(),
+            "one self-only change must produce exactly one frame"
+        );
+    }
+
+    /// Control re-sending the same self node (the cell is replaced on every netmap that carries
+    /// one) sends nothing. The positive anchor afterwards proves the watcher was live during the
+    /// quiet window, so the silence is the dedup and not a dead stream.
+    #[tokio::test]
+    async fn unchanged_self_node_sends_nothing() {
+        let (_s, _p, _b, _sd, self_tx, mut w) = harness_with_self(
+            NotifyWatchOpt::INITIAL_NETMAP,
+            DeviceState::Running,
+            Vec::new(),
+            Some(self_node("me")),
+        );
+        let _snap = w.next().await.expect("initial netmap snapshot");
+
+        self_tx.send_replace(Some(self_node("me")));
+        assert!(
+            tokio::time::timeout(QUIET_WINDOW, w.next()).await.is_err(),
+            "an identical self node must not tick net_map"
+        );
+
+        self_tx.send_replace(Some(self_node("me-renamed")));
+        let n = next_within(&mut w, "watcher still live after the quiet window").await;
+        assert_eq!(n.net_map, Some(Vec::new()));
+    }
+
+    /// The first self node to arrive after subscribe (the cell starts empty) is a change and ticks.
+    #[tokio::test]
+    async fn first_self_node_after_subscribe_ticks_netmap() {
+        let (_s, _p, _b, _sd, self_tx, mut w) = harness(
+            NotifyWatchOpt::INITIAL_NETMAP,
+            DeviceState::Running,
+            Vec::new(),
+        );
+        let _snap = w.next().await.expect("initial netmap snapshot");
+        self_tx.send_replace(Some(self_node("me")));
+        let n = next_within(&mut w, "first self node must tick net_map").await;
+        assert_eq!(n.net_map, Some(Vec::new()));
     }
 }
