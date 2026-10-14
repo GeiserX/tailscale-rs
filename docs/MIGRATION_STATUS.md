@@ -47,7 +47,7 @@ Verdict legend: **PRESENT** = works, no material gap · **PARTIAL** = works with
 ```mermaid
 graph TD
     EPIC[tsr-am9 P0: full tsnet parity]
-    EPIC --> P1[P1 on 2026-10-14: tsr-0hd2, tsr-rev330, tsr-rev590r1, tsr-rev592r1]
+    EPIC --> P1[P1 on 2026-10-14: tsr-0hd2]
     EPIC --> ABS[ABSENT subsystems]
     EPIC --> PART[PARTIAL — hardening + parity gaps]
     ABS --> X4[tsr-x4yg portmapper]
@@ -133,8 +133,9 @@ after this cycle:
 **P0** — `tsr-am9` (the umbrella epic; "done" when the children below close).
 
 **P1** — none open at the time of writing (the two P1 bugs this cycle — auto-reauth `tsr-ajvm`,
-NeedsMachineAuth `tsr-dvu` — are merged + closed). Open on 2026-10-14: `tsr-0hd2` (blocked),
-`tsr-rev330`, `tsr-rev590r1`, `tsr-rev592r1`.
+NeedsMachineAuth `tsr-dvu` — are merged + closed). Open on 2026-10-14: `tsr-0hd2` (blocked). The
+factory lane is closed and its three P1 review beads are retired: the pull requests they tracked are
+merged or closed.
 
 **P2 (next-highest leverage):**
 - `tsr-doz6` netmon (in-progress: slice a shipped; `tsr-7wrn` Linux + `tsr-cnlh` macOS backends remain)
