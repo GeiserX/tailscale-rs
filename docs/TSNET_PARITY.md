@@ -11,15 +11,17 @@ not restate the subsystem story.
 
 > **Bottom line.** The `Device` facade is a **near-complete `tsnet.Server` superset** on the
 > lifecycle / dial / listen / status surface, and folds Go's separate `LocalClient` into typed
-> methods on `Device` itself. The genuine deltas are a small, well-understood set: the loopback
-> server ships the SOCKS5 half with **one** credential (Go has two + an in-process LocalAPI HTTP
-> server), and five Go affordances built around a **local state directory + a support-log uploader +
-> a subsystem handle** are absent — three of those by deliberate design (`Sys()`, the LocalAPI
-> loopback, the `LocalClient` handle), one genuinely unbuilt (`Dir`/`FileStore`-style on-disk state),
-> and one a support-only convenience (`LogtailWriter`). `ListenSSH` is **present** as a first-class
-> method (a superset), contrary to how it is sometimes filed.
+> methods on `Device` itself. The genuine deltas are a small, well-understood set. On `Device`, the
+> loopback server ships the SOCKS5 half with **one** credential. The `tsnet::Server` facade
+> (`src/tsnet.rs:576`) adds what this matrix first listed as absent: Go's second loopback credential,
+> an in-process LocalAPI server that answers status only, a `LocalClient` handle, and a
+> `Dir`/`Store`/`FileStore` state root that also holds a netmap cache. Still absent: `Sys()` and
+> `GetRootPath` (by design) and `LogtailWriter` (a support-only convenience). `ListenSSH` is
+> **present** as a first-class method (a superset), contrary to how it is sometimes filed.
 
-*Compiled 2026-07-12.*
+*Compiled 2026-07-12. Corrected in place on 2026-10-14 against `f311bba`, where the facade had closed
+rows this matrix listed as absent. The current gap list and backlog are in
+[PARITY_ROADMAP.md](PARITY_ROADMAP.md#gap-audit-and-open-backlog-at-wind-down-2026-10-14).*
 
 **Provenance.** Every line reference is against these exact trees, read directly:
 
@@ -50,11 +52,11 @@ These are the capabilities singled out for this audit. Full technical detail for
 
 | # | Capability (Go) | Verdict | One-line delta | Bead |
 |---|---|---|---|---|
-| 1 | **Loopback dual-credential + in-process LocalAPI server** | **PARTIAL** | SOCKS5 half ships with **one** credential; the second (`localAPICred`) and the in-process LocalAPI **HTTP** server (`/localapi/v0/...`) are not served — typed `Device` accessors substitute. | `tsr-ask7` |
+| 1 | **Loopback dual-credential + in-process LocalAPI server** | **PARTIAL** | On `Device` the SOCKS5 half ships with **one** credential. The `tsnet::Server` facade adds the second credential (`Loopback.local_api_cred`, `src/tsnet.rs:469`) and an in-process LocalAPI server (`src/tsnet.rs:1326-1332`) that answers `GET /localapi/v0/status` only (`:1577-1590`). The rest of the LocalAPI, the HTTP-CONNECT half and SOCKS5 UDP ASSOCIATE/BIND are missing. | `tsr-ask7` |
 | 2 | **`LogtailWriter`** | **ABSENT** | No logtail uploader / support-log `io.Writer`. The whole logtail transport is absent; logging is local `tracing` only. | (under `tsr-reh3`) |
-| 3 | **`Dir` / `FileStore` state-root** | **ABSENT** | No state directory, no `StateStore`/`FileStore` abstraction, no prefs/netmap persistence. Only node **identity keys** persist, via a caller-supplied JSON key file (`default_with_key_file`), loaded once at construction. | (design; see §5.3) |
+| 3 | **`Dir` / `FileStore` state-root** | **PRESENT** (facade) | The `tsnet::Server` facade has a `StateStore` trait (`src/tsnet.rs:140`), `FileStore` (`:152`), `MemStore` (`:191`), `Server.dir` and `Server.store` (`:614`, `:618`), and a netmap cache under the dir (`:709`). One difference: with no dir and no store the identity is fresh every run while `ephemeral` defaults to false, so stale nodes pile up (2026-10-14 row R8). | (see §5.3) |
 | 4 | **`GetRootPath` / `Sys()`** | **ABSENT (by design)** | No state-root getter (there is no root path); `Sys()`'s subsystem handle is replaced by typed accessors (`self_node`/`status`/`watch_netmap`/`whois`/`netcheck`). | `tsr-reh3` |
-| 5 | **First-class `ListenSSH` / `LocalClient` handle** | **SPLIT** — `ListenSSH` **PRESENT** (superset); `LocalClient` handle **ABSENT (by design)** | `Device::listen_ssh` is a first-class turnkey method (+ `serve_ssh`/`serve_ssh_tui`/`authorize_ssh`), feature-gated `ssh`, login-shell PTY only. There is **no** `LocalClient` struct — its methods (Status/WhoIs/Ping/…) live directly on `Device`. | `tsr-v5gw` (SSH exec/SFTP) |
+| 5 | **First-class `ListenSSH` / `LocalClient` handle** | `ListenSSH` **PRESENT** (superset); `LocalClient` handle **PRESENT** (facade) | `Device::listen_ssh` is a first-class turnkey method (+ `serve_ssh`/`serve_ssh_tui`/`authorize_ssh`), feature-gated `ssh`, login-shell PTY only. The `tsnet::Server` facade returns a `LocalClient` from `Server::local_client` (`src/tsnet.rs:945`); on `Device` the LocalClient methods (Status/WhoIs/Ping/…) live directly on `Device`. | `tsr-v5gw` (SSH exec/SFTP) |
 
 ---
 
@@ -68,8 +70,8 @@ construction). The internal (unexported) Go fields are listed after, for complet
 
 | Go field (tsnet.go) | Go type | Rust equivalent (`src/config.rs` unless noted) | Verdict | Notes |
 |---|---|---|---|---|
-| `Dir` :217 | `string` | — | **ABSENT** | No state-root. Only a keys-only JSON file via `Config::default_with_key_file` :438. See §5.3. |
-| `Store` :227 | `ipn.StateStore` | — | **ABSENT** | No `StateStore` trait / pluggable store. `key_state: PersistState` :22 is the only persisted state (identity keys). See §5.3. |
+| `Dir` :217 | `string` | `tsnet::Server.dir` (`src/tsnet.rs:614`) | **PRESENT** (facade) | Roots the identity and a netmap cache (`src/tsnet.rs:709`). `Config` alone still has only the keys-only JSON file via `Config::default_with_key_file` :438. See §5.3. |
+| `Store` :227 | `ipn.StateStore` | `tsnet::Server.store` (`src/tsnet.rs:618`) over the `StateStore` trait (`:140`) | **PRESENT** (facade) | `FileStore` (`:152`) and `MemStore` (`:191`) ship. Go's rule that a memory store needs an ephemeral node is not enforced. See §5.3. |
 | `Hostname` :231 | `string` | `requested_hostname` :47 | **PRESENT** | Also settable live via `Device::set_hostname` (lib.rs:1509) — a superset. |
 | `UserLogf` :236 | `logger.Logf` | — | **ABSENT** | No injectable logger; uses the `tracing` crate. `tsr-reh3`. |
 | `Logf` :241 | `logger.Logf` | — | **ABSENT** | Same. Backend verbosity is `tracing` targets, not a closure. `tsr-reh3`. |
@@ -94,9 +96,9 @@ construction). The internal (unexported) Go fields are listed after, for complet
 | `netstack` :315, `netMon` :316 | Userspace netstack, link monitor | **N/A (internal)** | `ts_netstack_smoltcp`, `ts_netmon`. |
 | `rootPath` :317 | Resolved state dir (see `GetRootPath`) | **ABSENT** | No root path exists. See §5.4. |
 | `proxyCred` :321 | SOCKS5 loopback password | **PRESENT** | Rust's single loopback `cred` (loopback.rs:257). |
-| `localAPICred` :322 | LocalAPI loopback password | **ABSENT** | No LocalAPI over loopback. See §5.1. |
+| `localAPICred` :322 | LocalAPI loopback password | **PRESENT** (facade) | `Loopback.local_api_cred` (`src/tsnet.rs:469`). See §5.1. |
 | `loopbackListener` :323 | SOCKS5 + LocalAPI TCP listener | **PARTIAL** | Rust binds a SOCKS5-only `127.0.0.1` listener (loopback.rs:250); no SOCKS-vs-HTTP demux. |
-| `localAPIListener` :324, `localClient` :325, `localAPIServer` :326 | In-memory LocalAPI pipe + client + HTTP server | **ABSENT (by design)** | No LocalAPI transport at all; `Device` **is** the in-process client. See §5.5b. |
+| `localAPIListener` :324, `localClient` :325, `localAPIServer` :326 | In-memory LocalAPI pipe + client + HTTP server | **PARTIAL** (facade) | The facade runs an in-process LocalAPI server (`src/tsnet.rs:1326-1332`) that answers status only, and hands out a `LocalClient` (`:945`). On `Device` there is no LocalAPI transport; `Device` **is** the in-process client. See §5.5b. |
 | `logbuffer *filch.Filch` :328, `logtail *logtail.Logger` :329, `logid` :330 | On-disk log buffer + uploader + log id | **ABSENT** | No logtail. See §5.2. |
 | `dialer *tsdial.Dialer` :336 | Tailnet dialer backing `Dial`/SOCKS5 | **N/A (internal)** | Rust dials via the netstack `Channel`; surfaced through `Device::dial`/`tcp_connect`. |
 | `listeners` :333, `advertisedServices` :337 | Listener + Service bookkeeping | **N/A (internal)** | Backed by the runtime; surfaced via `tcp_listen`/`listen_service`. |
@@ -113,8 +115,8 @@ protocol (e.g. `Listen` → `tcp_listen` + `listen_packet`).
 |---|---|---|---|
 | `Dial(ctx, network, address)` :356 | `dial(network, addr) -> DialConn` :610; also `dial_tcp` :641, `dial_udp` :667, `connect_by_name` :547, `tcp_connect` :739 | **PRESENT** | Rust offers typed variants + `connect_by_name` (MagicDNS) as a superset. |
 | `HTTPClient()` :399 | `http_connector() -> TailnetConnector` :838 (`src/http.rs`) | **PRESENT** | Hyper connector, feature-gated `hyper`. Same "HTTP over the tailnet" role. |
-| `LocalClient() (*local.Client, …)` :411 | — (no handle; methods on `Device`) | **ABSENT (by design)** | See §5.5b and §4. |
-| `Loopback() (addr, proxyCred, localAPICred, …)` :445 | `loopback() -> (SocketAddr, String, LoopbackHandle)` :772 (`src/loopback.rs`) | **PARTIAL** | One cred, SOCKS5-only, no LocalAPI HTTP. See §5.1. |
+| `LocalClient() (*local.Client, …)` :411 | `tsnet::Server::local_client()` (`src/tsnet.rs:945`); on `Device`, methods directly | **PRESENT** (facade) | See §5.5b and §4. |
+| `Loopback() (addr, proxyCred, localAPICred, …)` :445 | `loopback() -> (SocketAddr, String, LoopbackHandle)` :772 (`src/loopback.rs`); the facade's `Loopback` carries both credentials (`src/tsnet.rs:469`) | **PARTIAL** | `Device`: one cred, SOCKS5-only. Facade: two creds, LocalAPI answers status only. See §5.1. |
 | `Start()` :527 | (implicit) `Device::new(config, auth_key)` :324 | **PRESENT** | Rust connects during async construction; no separate idempotent `Start`. |
 | `Up(ctx) (*ipnstate.Status, …)` :535 | `wait_until_running(timeout) -> Result<(), RegistrationError>` :1626 (+ `watch_state` :1589, `status` :1207) | **PRESENT** (SUPERSET) | Rust returns a **typed** registration outcome (permanent vs recoverable vs transient) instead of a status blob. |
 | `Close()` :603 | `shutdown(timeout) -> bool` :1961 | **PRESENT** | Consumes `self`; returns whether shutdown completed within the timeout. |
@@ -127,7 +129,7 @@ protocol (e.g. `Listen` → `tcp_listen` + `listen_packet`).
 | `ListenTLS(network, addr)` :1361 | `listen_tls(...)` :1746 | **PRESENT** | Real cert issuance via ACME DNS-01 against a `set-dns`-capable control plane (feature `acme`). |
 | `RegisterFallbackTCPHandler(cb)` :1393 | `register_fallback_tcp_handler(cb) -> FallbackTcpHandle` :483 | **PRESENT** | |
 | `ListenFunnel(network, addr, opts…)` :1464 | `listen_funnel(...)` :1874 | **PARTIAL** | Client leg ships and fail-closes; the public ingress relay leg is Tailscale-operated (external-blocked, `tsr-am9.11`). |
-| `ListenService(name, mode)` :1825 | `listen_service(...)` :1940 | **PRESENT** | Consume + advertise; VIP/ServiceMode. |
+| `ListenService(name, mode)` :1825 | `listen_service(...)` :1940 | **PARTIAL** | Consume only: it binds a VIP the netmap already granted (`src/lib.rs:2051-2063`). It does not advertise at runtime or withdraw on close, and `ServiceMode` carries a port only (2026-10-14 rows R4, R5). |
 | `GetRootPath() string` :2201 | — | **ABSENT** | No root path. See §5.4. |
 | `CapturePcap(ctx, file)` :2213 | `capture_pcap(writer)` :1172 (+ `stop_capture` :1196) | **PRESENT** | Rust streams to any `Write` sink and can stop; Go writes to a file until exit. |
 | `Sys() *tsd.System` :2237 | — | **ABSENT (by design)** | Typed accessors substitute. See §5.4. |
@@ -143,7 +145,7 @@ is deliberate (§5.5b). The most-used LocalClient surface:
 
 | Go `local.Client` method (client/local/local.go) | Rust `Device` equivalent (`src/lib.rs`) | Verdict | Notes |
 |---|---|---|---|
-| `Status(ctx)` :715 | `status()` :1207 | **PRESENT** | Per-peer `online`/`last_seen` reported `None` (`tsr-x72n`). |
+| `Status(ctx)` :715 | `status()` :1207 | **PRESENT** | Per-peer `online`/`last_seen` are kept and reported (`ts_runtime/src/status.rs:20-23`); `tsr-x72n` is closed in the tree. |
 | `StatusWithoutPeers(ctx)` :725 | `status()` :1207 (self fields) | **PARTIAL** | No dedicated peerless variant; read self fields off `status()`. |
 | `WhoIs(ctx, remoteAddr)` :320 | `whois(addr) -> Option<WhoIs>` :1383 | **PRESENT** | `WhoIs.user` + `WhoIs.capabilities` populated (v0.6.5). |
 | `WhoIsForIP` :349 / `WhoIsForService` :334 | — | **ABSENT** | VIP/service-scoped WhoIs not surfaced. |
@@ -168,6 +170,10 @@ is deliberate (§5.5b). The most-used LocalClient surface:
 ## 5. The five headline gaps — technical detail
 
 ### 5.1 Loopback dual-credential + in-process LocalAPI server — **PARTIAL** (`tsr-ask7`)
+
+*Corrected 2026-10-14: the text below describes `Device::loopback`. The `tsnet::Server` facade now
+adds the second credential (`src/tsnet.rs:469`) and an in-process LocalAPI that answers status only
+(`src/tsnet.rs:1577-1590`).*
 
 **Go** (`Loopback`, tsnet.go:445–508) mints **two** 16-byte credentials — `proxyCred` (:451–455) and
 `localAPICred` (:457–461) — binds one `127.0.0.1:0` listener, and multiplexes it by first-byte sniff:
@@ -213,6 +219,10 @@ injectable loggers (§2a) are likewise absent. Grouped under `tsr-reh3` ("tsnet 
 
 ### 5.3 `Dir` / `FileStore` state-root — **ABSENT** (design; keys-only persistence)
 
+*Corrected 2026-10-14: this was true of `Device` and `Config` when written. The `tsnet::Server` facade
+now has a `StateStore` trait, `FileStore`, `MemStore`, `dir` and `store`, and keeps a netmap cache under
+the dir (`src/tsnet.rs:140-191`, `:614-618`, `:709`).*
+
 **Go**: `Server.Dir` (tsnet.go:217) resolves to `rootPath` (defaulting to
 `os.UserConfigDir()/tsnet-<binary>`, tsnet.go:809–814); `Store` (:227), if nil, becomes a `FileStore`
 at `Dir/tailscaled.state` (`store.New`, tsnet.go:917–920). Under `Dir` Go persists the full node state
@@ -257,7 +267,8 @@ server is **login-shell PTY only** — no exec, SFTP, or port-forwarding, and no
 transport (`tsr-v5gw`; recorder is a separate engine-ask). This is the only sub-item with a functional
 delta.
 
-**(b) `LocalClient` handle — ABSENT (by design).** Go returns a `*local.Client` handle whose ~40
+**(b) `LocalClient` handle — ABSENT (by design) on `Device`.** *Corrected 2026-10-14: the `tsnet::Server`
+facade now returns one from `Server::local_client` (`src/tsnet.rs:945`).* Go returns a `*local.Client` handle whose ~40
 methods are the LocalAPI surface. This fork has **no `LocalClient` struct**: `Device` *is* the
 in-process client, with the LocalClient methods surfaced directly on it (the whole of §4). The upside
 is no LocalAPI socket, credential, or serialization on the hot path — calls are direct typed method
@@ -281,7 +292,7 @@ adds. Do not file them as missing on the Go side.
 | `Device::watch_state` :1589 / `device_state` :1579 (`DeviceState` stream, typed `RegistrationError`) | Typed lifecycle stream distinguishing permanent / recoverable / transient registration outcomes — richer than `Up`'s status blob. |
 | `Device::tka_status`/`tka_log`/`tka_sign`/`tka_disable`/`tka_init` :1218–1313 | Client-side Tailnet-Lock verification + mutation surface (active, fail-closed enforcement). |
 | Live pref setters `set_accept_routes`/`set_accept_dns`/`set_advertise_routes`/… :1429–1509 | One typed method per pref, settable at runtime. |
-| FFI / Python / Elixir bindings (`ts_ffi`, `ts_python`, `ts_elixir`) | The full `Device` surface propagated to C/Python/Elixir (~90%). |
+| FFI / Python / Elixir bindings (`ts_ffi`, `ts_python`, `ts_elixir`) | Most public `Device` methods propagated to C/Python/Elixir. `ts_ffi` exports 59 functions against 77 public `Device` methods, and `set_exit_node`, `logout`, `watch_ipn_bus`, `suggest_exit_node`, `set_serve_config` and `listen_ssh` have no binding (2026-10-14 row R20). |
 
 ---
 
@@ -292,19 +303,19 @@ with the remaining API-surface gaps already tracked in `MIGRATION_STATUS.md` §3
 
 | Gap | Verdict | Bead |
 |---|---|---|
-| **Loopback: `localAPICred` + in-process LocalAPI HTTP server + HTTP-CONNECT proxy half + SOCKS5 UDP/BIND** | PARTIAL | `tsr-ask7` |
+| **Loopback: LocalAPI beyond status + HTTP-CONNECT proxy half + SOCKS5 UDP/BIND** (the second credential and a status-only LocalAPI ship in the facade) | PARTIAL | `tsr-ask7` |
 | **`LogtailWriter` + `Logf`/`UserLogf` injectable loggers** | ABSENT | `tsr-reh3` |
-| **`Dir` / `Store` / `FileStore` on-disk state-root (prefs + full node state)** | ABSENT | *(none filed; design — §5.3)* |
+| ~~**`Dir` / `Store` / `FileStore` on-disk state-root**~~ | PRESENT in the facade (corrected 2026-10-14) | *(none needed)* |
 | **`GetRootPath`** | ABSENT | `tsr-reh3` |
 | **`Sys()` subsystem handle** | ABSENT (by design) | `tsr-reh3` |
 | **`ListenSSH`: exec / SFTP / port-forward / session-recording** (method itself PRESENT) | PARTIAL | `tsr-v5gw`, `tsr-0h2` |
-| **`LocalClient` typed handle** (methods folded onto `Device`) | ABSENT (by design) | — |
+| ~~**`LocalClient` typed handle**~~ | PRESENT in the facade (`src/tsnet.rs:945`, corrected 2026-10-14) | — |
 | `RunWebClient` embedded web client behavior (pref carried) | PARTIAL | `tsr-reh3` |
 | `Port` pin equivalence nuance | PARTIAL | `tsr-reh3` |
-| Per-peer `Status`/`WhoIs` `online` / `last_seen` | ABSENT (reported `None`; wire delivers them) | `tsr-x72n` |
+| ~~Per-peer `Status`/`WhoIs` `online` / `last_seen`~~ | PRESENT (kept and reported, corrected 2026-10-14) | `tsr-x72n` (closed in the tree) |
 | `WhoIsForIP` / `WhoIsForService` (VIP/service-scoped) | ABSENT | — |
 | `LocalClient.Netcheck` full `netcheck.Report` | PARTIAL (DERP-latency + HTTPS only) | `tsr-dsjq` |
-| Serve stored-state runtime + `ServeConfig` Go-wire-compat | PARTIAL (handlers ship; 8 wire deviations) | `tsr-0xn` |
+| Serve stored-state runtime + `ServeConfig` Go-wire-compat | PARTIAL (handlers ship; Go's `ipn.ServeConfig` wire shape since `50611ab`; deliberate refusals at `ts_control/src/serve/ipn.rs:386-394`) | `tsr-0xn` (closed) |
 | `ListenFunnel` public ingress relay leg | PARTIAL (external-blocked, Tailscale infra) | `tsr-am9.11` |
 | Multi-profile mgmt / `CurrentDERPMap` / `CheckUpdate` / `BugReport` / `DisconnectControl` | ABSENT | — |
 

@@ -1,8 +1,10 @@
 # Status
 
-`tailscale-rs` is a work-in-progress - I'm still rapidly iterating, fixing bugs, and adding new
-features. I aim to keep this section up-to-date, but the [issue tracker](https://github.com/GeiserX/tailscale-rs/issues)
-is the best way to see the latest updates.
+`tailscale-rs` is a work-in-progress. This page was last checked against the code on 2026-10-14, when
+automated work on this repository stopped. The full list of what is still missing against Go
+v1.102.4, the parity claims corrected that day, and the open backlog are in the
+[parity roadmap](https://github.com/GeiserX/tailscale-rs/blob/main/docs/PARITY_ROADMAP.md#gap-audit-and-open-backlog-at-wind-down-2026-10-14). The
+[issue tracker](https://github.com/GeiserX/tailscale-rs/issues) is the best way to see later updates.
 
 ## Implemented
 
@@ -41,10 +43,23 @@ These are features that are currently implemented:
       trusted-key `Authority` is implemented, so once a lock is synced the chokepoint fails **closed** —
       a peer with a missing or unauthorized `key_signature` is **dropped** (the `Authority` only ever
       reaches enforcement after `VerifiedAumChain::verify`, so control cannot forge a trusted key to
-      admit a peer; it can only toggle the lock). Remaining deferred gaps: establishing/managing a lock
-      from this node (multi-node `tka/init` enrollment), disablement-secret verification, and Go's
-      rotation-obsolete (clone/replay) peer dropping. See [SECURITY.md](https://github.com/GeiserX/tailscale-rs/blob/main/SECURITY.md) before relying on it.
+      admit a peer; it can only toggle the lock). Go's rotation-obsolete (clone/replay) peer dropping
+      ships too. Remaining deferred gaps: multi-node `tka/init` enrollment, disablement-secret
+      verification, and the node's own signature: it never sends `NodeKeySignature`, so it cannot join
+      a locked tailnet with a pre-signed auth key and loses its signature at each key rotation. See [SECURITY.md](https://github.com/GeiserX/tailscale-rs/blob/main/SECURITY.md) before relying on it.
     - Communicate with the Tailscale Go client, `tsnet`, and `libtailscale`
+- Node services
+    - Being a subnet router or exit node (`advertise_routes`, `advertise_exit_node`, also settable at
+      runtime); inbound flows are dialed out by the forwarder, and exit egress can go through an
+      upstream proxy (`exit_proxy`)
+    - Taildrop send and receive over a direct path
+    - HTTPS certificates through ACME DNS-01 (`listen_tls`, `get_certificate`, feature `acme`)
+    - Tailscale Serve: the stored config in Go's `ipn.ServeConfig` shape (`set_serve_config`)
+    - Tailscale Funnel, the client leg (`listen_funnel`)
+    - Tailscale SSH server, login shell only (`listen_ssh`, feature `ssh`)
+    - Tailscale Services, the consuming side (`listen_service` binds a service the netmap granted)
+    - Peer relays, the receiving side (answering a relay a peer allocated)
+    - Client metrics as unlabelled counters (`Device::metrics`) and application capabilities in WhoIs
 - Language support
     - Rust API
     - C, Elixir, and Python bindings
@@ -69,11 +84,13 @@ Unsupported features
 </summary>
 
 - Networking
-    - Peer relays
-    - Exit Nodes (being one — advertising a default route; *using* one is supported)
+    - Peer relays, the client side (finding a relay server and allocating one)
+    - Exit Nodes, one gap when being one: a forwarded connection to a dead backend is closed instead
+      of refused
     - Exit node DNS (`ExitNodeDNSResolvers` — routing DNS through the exit node)
     - Private DERP relays
-    - Subnet Routers (being one — advertising routes; *using* one is supported)
+    - Subnet Routers, two gaps when being one: a forwarded connection to a dead backend is closed
+      instead of refused, and pings to hosts on the subnet get no answer
 - Platforms
     - AIX
     - Android
@@ -83,30 +100,30 @@ Unsupported features
     - QNAP
     - Synology DSM
 - Observability
-    - Client Metrics
+    - Client Metrics in Go's labelled `tailscaled_*` form
     - Endpoint Collection
     - Device Posture Collection
     - Log Streaming
     - Network Flow Logs
 - Other Features
-    - Application Capabilities
+    - Application Capabilities in packet-filter rules (`cap:` rules never match)
     - Automatic Key Rotation
-    - HTTPS Certificates
+    - HTTPS certificate renewal (a running TLS listener keeps the certificate it started with)
     - Kubernetes
     - Mullvad VPN
     - Node Sharing
     - Taildrive
-    - Taildrop
+    - Taildrop through a relay, and arrival notifications
     - Tailnet Lock — *enforcement is supported* (per-peer key-signature verification is wired and
       actively fails closed once a lock is synced — an unsigned or unauthorized peer is dropped; see
-      [SECURITY.md](https://github.com/GeiserX/tailscale-rs/blob/main/SECURITY.md)). What is **not** yet supported: establishing/managing a lock from this
-      node (multi-node `tka/init` enrollment), disablement-secret verification, and Go's
-      rotation-obsolete (clone/replay) peer dropping.
-    - Tailscale Funnel
-    - Tailscale Serve — the stored serve-config runtime and accept-loop (the `Path`/`Redirect`/`Proxy`/
-      `Text`/`TcpForward` handlers themselves are implemented)
-    - Tailscale SSH
-    - Tailscale Services
+      [SECURITY.md](https://github.com/GeiserX/tailscale-rs/blob/main/SECURITY.md)). What is **not** yet supported: multi-node `tka/init` enrollment,
+      disablement-secret verification, adding or removing lock keys, and the node's own
+      `NodeKeySignature` on register (pre-signed auth keys, re-signing after rotation).
+    - Tailscale Funnel, the public relay leg (Tailscale-operated)
+    - Tailscale Serve identity headers (`Tailscale-User-*`), and the Serve options this repository
+      refuses on purpose (the stored config and its handlers are implemented)
+    - Tailscale SSH beyond a login shell: exec, SFTP, port forwarding, check mode, session recording
+    - Tailscale Services: advertising at runtime, and Go's TLS and app-capability service modes
     - Webhooks
 - Any other features not listed in "Implemented" or "Coming Soon"
 

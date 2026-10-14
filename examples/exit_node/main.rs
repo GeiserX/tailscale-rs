@@ -1,9 +1,11 @@
 //! Run this process as a userspace **exit node** for a tailnet.
 //!
 //! A minimal, purpose-built runner for experimenting with a residential exit node: it joins the
-//! tailnet with a persisted identity, advertises `0.0.0.0/0` (never `::/0`), forwards every TCP/UDP
-//! port through the userspace netstack and egresses via this host's own sockets. It does not
-//! touch the host's routes, DNS or packet filter, and it does not need root.
+//! tailnet with a persisted identity, advertises `0.0.0.0/0` and `::/0` (official clients only offer
+//! an exit node that advertises both), forwards every IPv4 TCP/UDP port through the userspace
+//! netstack and egresses via this host's own sockets. IPv6 exit traffic is rejected at once, so
+//! clients fall back to IPv4. It does not touch the host's routes, DNS or packet filter, and it does
+//! not need root.
 //!
 //! The auth key is read from a file (never argv or logs) and is only needed for the first
 //! registration; afterwards the identity in `--state-dir` is reused. Alternatively,
@@ -258,13 +260,24 @@ async fn log_status(dev: &Device) {
     }
 }
 
-/// This host's resolver: the first `nameserver` in /etc/resolv.conf (macOS keeps it current).
+/// This host's resolver: the first IPv4 `nameserver` in /etc/resolv.conf (macOS keeps it current)
+/// that is not Tailscale's own. A host running tailscaled lists `100.100.100.100`; sending exit
+/// users' DNS there would hand it to that tailscaled, which Go's exit node avoids the same way
+/// (`HandlePeerDNSQuery`, net/dns/resolver/tsdns.go). Exit egress is IPv4-only, so an IPv6
+/// nameserver, `fd7a:115c:a1e0::53` included, is never picked.
 fn system_resolver() -> Option<std::net::SocketAddr> {
+    const TAILSCALE_SERVICE_IPS: [std::net::IpAddr; 2] = [
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(100, 100, 100, 100)),
+        std::net::IpAddr::V6(std::net::Ipv6Addr::new(
+            0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0, 0x53,
+        )),
+    ];
     let conf = std::fs::read_to_string("/etc/resolv.conf").ok()?;
     conf.lines()
         .filter_map(|l| l.trim().strip_prefix("nameserver"))
-        .filter_map(|ip| ip.trim().parse::<std::net::Ipv4Addr>().ok())
-        .map(|ip| std::net::SocketAddr::from((ip, 53)))
+        .filter_map(|ip| ip.trim().parse::<std::net::IpAddr>().ok())
+        .filter(|ip| ip.is_ipv4() && !TAILSCALE_SERVICE_IPS.contains(ip))
+        .map(|ip| std::net::SocketAddr::new(ip, 53))
         .next()
 }
 

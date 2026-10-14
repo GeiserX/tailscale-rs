@@ -204,9 +204,14 @@ impl<D> ExitDnsDialer<D> {
         Self { inner, upstream }
     }
 
-    /// Whether this flow is DNS the client can only get answered via the exit host's resolver.
+    /// Whether this flow is DNS the client can only get answered via the exit host's resolver:
+    /// port 53 to a forbidden address that could be a resolver. A broadcast, multicast or
+    /// `0.0.0.0/8` destination is never one, and a UDP reply would be spoofed from it.
     fn redirect(&self, class: FlowClass, dst: SocketAddr) -> bool {
-        class == FlowClass::ExitNode && dst.port() == 53 && exit_dst_is_forbidden(dst)
+        class == FlowClass::ExitNode
+            && dst.port() == 53
+            && exit_dst_is_forbidden(dst)
+            && is_unicast(dst.ip())
     }
 }
 
@@ -235,6 +240,19 @@ impl<D: RealDialer> RealDialer for ExitDnsDialer<D> {
             return Ok(dialed);
         }
         self.inner.dial_udp(class, dst).await
+    }
+}
+
+/// Whether `ip` can be a single host's address: not multicast, not `0.0.0.0/8` ("this network",
+/// the unspecified address included), and not `240.0.0.0/4` (reserved, the all-ones broadcast
+/// included); for IPv6, not multicast or unspecified.
+fn is_unicast(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let first = v4.octets()[0];
+            !(v4.is_multicast() || first == 0 || first >= 240)
+        }
+        IpAddr::V6(v6) => !(v6.is_multicast() || v6.is_unspecified()),
     }
 }
 
@@ -669,6 +687,21 @@ mod tests {
         assert!(matches!(err, Err(DialError::ForbiddenDestination(d)) if d == dst));
     }
 
+    /// The guard must not swallow legitimate exit traffic: an exit-node flow to a public address
+    /// still egresses. A UDP connect needs no listener, so this exercises the real socket path.
+    #[tokio::test]
+    async fn host_exit_dialer_does_not_refuse_public_exit_udp() {
+        let dst: SocketAddr = "203.0.113.1:9".parse().unwrap();
+        let res = HostExitDialer.dial_udp(FlowClass::ExitNode, dst).await;
+        assert!(
+            !matches!(
+                res,
+                Err(DialError::ForbiddenDestination(_)) | Err(DialError::ExitEgressRefused)
+            ),
+            "public exit UDP must not be refused"
+        );
+    }
+
     /// Every non-internet range is refused for exit-node TCP and UDP before any socket is created.
     #[tokio::test]
     async fn host_exit_dialer_refuses_forbidden_exit_destinations() {
@@ -733,6 +766,32 @@ mod tests {
         }
         assert!(!d.redirect(FlowClass::ExitNode, "203.0.113.1:53".parse().unwrap()));
         assert!(!d.redirect(FlowClass::Subnet, "192.168.1.1:53".parse().unwrap()));
+    }
+
+    /// DNS to a broadcast, multicast or `0.0.0.0/8` address is not redirected: none of them is a
+    /// resolver, and the reply would be spoofed from it. It stays refused like any forbidden exit.
+    #[tokio::test]
+    async fn exit_dns_redirects_only_unicast_resolvers() {
+        let d = ExitDnsDialer::new(HostExitDialer, "127.0.0.1:9".parse().unwrap());
+        for dst in [
+            "255.255.255.255:53",
+            "224.0.0.251:53",
+            "239.255.255.250:53",
+            "0.0.0.0:53",
+            "0.1.2.3:53",
+            "[ff02::fb]:53",
+        ] {
+            let dst: SocketAddr = dst.parse().unwrap();
+            assert!(!d.redirect(FlowClass::ExitNode, dst), "{dst} redirected");
+            assert!(
+                matches!(
+                    d.dial_udp(FlowClass::ExitNode, dst).await,
+                    Err(DialError::ForbiddenDestination(_))
+                ),
+                "{dst} not refused"
+            );
+        }
+        assert!(d.redirect(FlowClass::ExitNode, "192.168.1.1:53".parse().unwrap()));
     }
 
     /// Public destinations pass the guard (the connect itself is never attempted here).
