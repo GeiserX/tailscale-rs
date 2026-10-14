@@ -195,6 +195,15 @@ async fn connect_with_retry(
     }
 }
 
+// Standalone integration stacks use the same opt-in settings as the runtime constructors.
+fn batch_experiments(stack: &mut Netstack<WakingPipeDev>) {
+    if ts_netstack_smoltcp::netcore::experiment::enabled(
+        ts_netstack_smoltcp::netcore::experiment::RX_BATCH,
+    ) {
+        stack.set_ingress_budget(Some(128));
+    }
+}
+
 /// Spawn a piped pair: `(peer_channel, forwarder_channel)`. The forwarder stack has any-IP
 /// acceptance enabled; the peer stack owns `PEER_IP`.
 async fn spawn_pair() -> (Channel, Channel) {
@@ -214,6 +223,8 @@ async fn spawn_pair() -> (Channel, Channel) {
 
     let mut peer = Netstack::new(dev1, config.clone());
     let mut fwd = Netstack::new(dev2, config);
+    batch_experiments(&mut peer);
+    batch_experiments(&mut fwd);
 
     let peer_ch = peer.command_channel();
     let fwd_ch = fwd.command_channel();
@@ -295,6 +306,62 @@ async fn forwarder_splices_subnet_route_to_real_socket() {
         .unwrap();
 
     assert_eq!(&buf[..n], b"hello forwarder");
+}
+
+/// Large tails cross the coalescing buffer and TCP window; FIN must follow every byte and the
+/// opposite direction must stay usable after EOF. Small reads exercise retained Recv remainders.
+#[tokio::test]
+async fn large_splice_preserves_tail_and_reply_after_peer_fin() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let payload: Vec<_> = (0..(512 * 1024 + 37)).map(|i| (i % 251) as u8).collect();
+        let expected = payload.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let backend = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut got = Vec::new();
+            let mut buf = [0; 997];
+            loop {
+                let n = stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(got, expected);
+            stream.write_all(&got).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let (peer_ch, fwd_ch) = spawn_pair().await;
+        let forwarder = Forwarder::new(
+            fwd_ch,
+            RouteTable::new(["127.0.0.0/8".parse().unwrap()]),
+            DirectDialer,
+            vec![addr.port()],
+            vec![],
+        );
+        let forwarding = tokio::spawn(async move { forwarder.run().await });
+        let mut client =
+            connect_with_retry(&peer_ch, SocketAddr::new(PEER_IP.into(), PEER_PORT), addr).await;
+        client.write_all(&payload).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut reply = Vec::new();
+        let mut buf = [0; 333];
+        loop {
+            let n = client.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            reply.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(reply, payload);
+        backend.await.unwrap();
+        forwarding.abort();
+    })
+    .await
+    .unwrap();
 }
 
 /// Regression for tsr-syf (half-close): when the real backend finishes responding and half-closes
@@ -764,6 +831,8 @@ async fn spawn_gated_forwarder_with_handle<D: RealDialer>(
     };
     let mut peer = Netstack::new(dev(peer_pipe), config.clone());
     let mut fwd = Netstack::new(dev(fwd_pipe), config);
+    batch_experiments(&mut peer);
+    batch_experiments(&mut fwd);
     let peer_ch = peer.command_channel();
     let fwd_ch = fwd.command_channel();
     tokio::spawn(async move { peer.run_tokio().await });
@@ -778,8 +847,23 @@ async fn spawn_gated_forwarder_with_handle<D: RealDialer>(
 
     // Peer -> gate -> forwarder netstack.
     tokio::spawn(async move {
+        let batching = ts_netstack_smoltcp::netcore::experiment::enabled(
+            ts_netstack_smoltcp::netcore::experiment::RX_BATCH,
+        );
         while let Some(p) = from_peer.rx.recv_async().await {
-            gate.ingress(&p);
+            if batching {
+                gate.ingress_with(&p, |p| to_fwd.tx.try_send_deferred(p));
+                for _ in 1..64 {
+                    let Some(p) = from_peer.rx.try_recv() else {
+                        break;
+                    };
+                    gate.ingress_with(&p, |p| to_fwd.tx.try_send_deferred(p));
+                }
+                to_fwd.tx.notify_receive();
+                tokio::task::yield_now().await;
+            } else {
+                gate.ingress(&p);
+            }
         }
     });
     // Forwarder netstack -> peer.

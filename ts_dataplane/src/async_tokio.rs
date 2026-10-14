@@ -170,7 +170,7 @@ impl DataPlane {
     }
 
     /// Run the data plane for a single step.
-    #[tracing::instrument(skip_all)]
+    #[tracing::instrument(level = "trace", skip_all)]
     pub async fn step(&self) {
         enum SelectResult {
             OverlayDown(Vec<PacketMut>),

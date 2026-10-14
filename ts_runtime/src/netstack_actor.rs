@@ -48,6 +48,18 @@ pub struct NetstackActor {
 /// what was dropped and UDP is lossy by contract.
 pub(crate) const INGRESS_QUEUE_PACKETS: usize = 4096;
 
+/// Most packets a netstack egress pump hands the dataplane at once.
+pub(crate) const EGRESS_BATCH: usize = 64;
+
+/// A packet the netstack emitted, as a [`PacketMut`]: zero-copy when the pipe's buffer is uniquely
+/// owned (it always is: the pipe copies each packet in), a copy otherwise.
+pub(crate) fn into_packet(buf: bytes::Bytes) -> PacketMut {
+    match buf.try_into_mut() {
+        Ok(owned) => owned.into(),
+        Err(shared) => PacketMut::from(&shared[..]),
+    }
+}
+
 /// Build a netstack whose ingress queue holds at most [`INGRESS_QUEUE_PACKETS`] packets and that
 /// many MTU-sized packets' worth of bytes.
 ///
@@ -61,7 +73,16 @@ pub(crate) fn piped_ingress_bounded(
     netstack::WakingPipe,
 ) {
     let max_bytes = INGRESS_QUEUE_PACKETS.saturating_mul(config.mtu);
-    netstack::piped_ingress_bounded(config, INGRESS_QUEUE_PACKETS, max_bytes)
+    let (mut stack, pipe) =
+        netstack::piped_ingress_bounded(config, INGRESS_QUEUE_PACKETS, max_bytes);
+    if ts_netstack_smoltcp::netcore::experiment::enabled(
+        ts_netstack_smoltcp::netcore::experiment::RX_BATCH,
+    ) {
+        // A continuously refilled pipe must not monopolise the driver. Egress is deliberately
+        // unbounded here: a single TCP socket emits only one segment per smoltcp egress pass.
+        stack.set_ingress_budget(Some(128));
+    }
+    (stack, pipe)
 }
 
 /// Move packets the dataplane routed to a netstack into that netstack's ingress queue, dropping
@@ -73,6 +94,7 @@ pub(crate) fn piped_ingress_bounded(
 ///
 /// Drops are logged at `debug!` only, once when a run of drops starts and once when it ends: the
 /// rate is peer-driven, so it must not be able to drive an operator's default-level log.
+#[cfg(test)]
 pub(crate) async fn pump_ingress(
     from_dataplane: OverlayFromDataplane,
     to_netstack: netstack::WakingPipeSender,
@@ -83,16 +105,49 @@ pub(crate) async fn pump_ingress(
 
 /// [`pump_ingress`] with a custom admission step: `admit` takes each packet and returns whether
 /// it was accepted (`false` counts as a drop). It must not wait.
+#[cfg(test)]
 pub(crate) async fn pump_ingress_with(
+    from_dataplane: OverlayFromDataplane,
+    admit: impl FnMut(&[u8]) -> bool,
+    netstack_name: &'static str,
+) -> u64 {
+    pump_ingress_with_budget(from_dataplane, admit, netstack_name, false).await
+}
+
+/// Admission pump with bounded packet work between yields, independent of channel readiness.
+#[cfg(test)]
+pub(crate) async fn pump_ingress_with_budget(
+    from_dataplane: OverlayFromDataplane,
+    admit: impl FnMut(&[u8]) -> bool,
+    netstack_name: &'static str,
+    cooperative: bool,
+) -> u64 {
+    pump_ingress_with_batch_wake(from_dataplane, admit, || {}, netstack_name, cooperative).await
+}
+
+/// RX batching keeps this admission-side bound even without full work budgeting: flush deferred
+/// wakes before yielding, including when one channel message carries more than 128 packets.
+pub(crate) async fn pump_ingress_with_batch_wake(
     mut from_dataplane: OverlayFromDataplane,
     mut admit: impl FnMut(&[u8]) -> bool,
+    mut finish_batch: impl FnMut(),
     netstack_name: &'static str,
+    cooperative: bool,
 ) -> u64 {
     let mut dropped: u64 = 0;
     let mut dropping = false;
+    let mut processed = 0;
 
     while let Some(bufs) = from_dataplane.recv().await {
         for buf in bufs {
+            if processed == 128 {
+                finish_batch();
+                if cooperative {
+                    tokio::task::yield_now().await;
+                }
+                processed = 0;
+            }
+            processed += 1;
             let buf: PacketMut = buf;
             if admit(buf.as_ref()) {
                 if dropping {
@@ -115,6 +170,7 @@ pub(crate) async fn pump_ingress_with(
                 }
             }
         }
+        finish_batch();
     }
 
     dropped
@@ -189,8 +245,17 @@ impl kameo::Actor for NetstackActor {
         });
 
         joinset.spawn(async move {
-            while let Some(buf) = netstack_down_rx.recv_async().await {
-                if netstack_up.send(vec![buf.to_vec().into()]).is_err() {
+            while let Some(first) = netstack_down_rx.recv_async().await {
+                // Hand the dataplane whatever is already queued as one batch, so encryption and the
+                // underlay send can work per batch rather than per packet.
+                let mut batch = Vec::with_capacity(EGRESS_BATCH);
+                batch.push(crate::netstack_actor::into_packet(first));
+                while batch.len() < EGRESS_BATCH
+                    && let Some(more) = netstack_down_rx.try_recv()
+                {
+                    batch.push(crate::netstack_actor::into_packet(more));
+                }
+                if netstack_up.send(batch).is_err() {
                     break;
                 }
             }
@@ -199,7 +264,27 @@ impl kameo::Actor for NetstackActor {
         });
 
         joinset.spawn(async move {
-            pump_ingress(netstack_down, netstack_down_tx, "application").await;
+            let batching = ts_netstack_smoltcp::netcore::experiment::enabled(
+                ts_netstack_smoltcp::netcore::experiment::RX_BATCH,
+            );
+            pump_ingress_with_batch_wake(
+                netstack_down,
+                |b| {
+                    if batching {
+                        netstack_down_tx.try_send_deferred(b)
+                    } else {
+                        netstack_down_tx.try_send(b)
+                    }
+                },
+                || {
+                    if batching {
+                        netstack_down_tx.notify_receive();
+                    }
+                },
+                "application",
+                batching,
+            )
+            .await;
 
             tracing::warn!("netstack uplink shut down!");
         });

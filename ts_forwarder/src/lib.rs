@@ -57,6 +57,8 @@ mod dialer;
 mod forwarder;
 mod ipv6_reject;
 mod port_gate;
+mod splice;
+pub mod splice_metrics;
 mod tcp;
 mod udp;
 

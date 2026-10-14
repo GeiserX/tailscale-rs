@@ -115,6 +115,51 @@ fn wycheproof_chacha20poly1305_adversarial_kat() {
                 TestResult::Acceptable => {}
             }
 
+            #[cfg(feature = "ring-aead")]
+            {
+                use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
+                let key = LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, &t.key).unwrap());
+                let nonce: [u8; 12] = t.nonce.as_slice().try_into().unwrap();
+                if t.result == TestResult::Valid {
+                    let mut body = t.pt.to_vec();
+                    let tag = key
+                        .seal_in_place_separate_tag(
+                            Nonce::assume_unique_for_key(nonce),
+                            Aad::from(&t.aad),
+                            &mut body,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        body.as_slice(),
+                        t.ct.as_slice(),
+                        "ring ciphertext tc {}",
+                        t.tc_id
+                    );
+                    assert_eq!(tag.as_ref(), t.tag.as_slice(), "ring tag tc {}", t.tc_id);
+                }
+                let mut body = t.ct.to_vec();
+                body.extend_from_slice(&t.tag);
+                let opened = key.open_in_place(
+                    Nonce::assume_unique_for_key(nonce),
+                    Aad::from(&t.aad),
+                    &mut body,
+                );
+                match t.result {
+                    TestResult::Valid => {
+                        assert_eq!(opened.unwrap(), t.pt.as_slice(), "ring open tc {}", t.tc_id)
+                    }
+                    TestResult::Invalid => {
+                        assert!(opened.is_err(), "ring auth bypass tc {}", t.tc_id);
+                        assert!(
+                            body[..t.ct.len()].iter().all(|&b| b == 0),
+                            "ring retained candidate plaintext tc {}",
+                            t.tc_id
+                        );
+                    }
+                    TestResult::Acceptable => {}
+                }
+            }
+
             ran += 1;
         }
     }
@@ -123,6 +168,11 @@ fn wycheproof_chacha20poly1305_adversarial_kat() {
         "wycheproof ChaCha20Poly1305: ran {ran} test(s) across 96-bit-nonce groups, \
          skipped {skipped_groups} test(s) in non-96-bit-nonce groups, \
          {acceptable_skipped} Acceptable result(s) counted (encryption not asserted)"
+    );
+
+    println!(
+        "ring ChaCha20Poly1305: ran {} vectors",
+        if cfg!(feature = "ring-aead") { ran } else { 0 }
     );
 
     // Guard against a future API change that silently skips everything: the

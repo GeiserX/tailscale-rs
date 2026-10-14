@@ -553,7 +553,7 @@ impl Peer {
         true
     }
 
-    #[tracing::instrument(skip_all, fields(?session_id, n_packets = packets.len()))]
+    #[tracing::instrument(level = "trace", skip_all, fields(?session_id, n_packets = packets.len()))]
     fn recv(
         &mut self,
         endpoint: &mut EndpointState,

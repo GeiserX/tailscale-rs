@@ -26,15 +26,24 @@ chacha20poly1305.workspace = true
 hkdf.workspace = true
 itertools.workspace = true
 rand.workspace = true
+# Already used by the workspace TLS stack. Accelerates transport AEAD with ring's
+# existing assembly backends; no additional crypto provider or production version.
+ring = { workspace = true, optional = true }
 tracing.workspace = true
 x25519-dalek.workspace = true
 zerocopy.workspace = true
 # Wipes WireGuard symmetric key material (the pre-shared `Psk` and the handshake `chaining_key`/
-# `hash` intermediates) from memory on drop. The session AEAD keys are already wiped by
-# `chacha20poly1305::ChaCha20Poly1305`'s own `ZeroizeOnDrop`; this covers the raw `[u8; 32]` secrets
+# `hash` intermediates) from memory on drop. RustCrypto session AEAD keys wipe on drop;
+# ring's opaque keys cannot be wiped through its API (see README.md). Raw derived keys
+# are wiped with either backend. This also covers the raw `[u8; 32]` secrets
 # that never become a `ts_keys` newtype. Mirrors the redact+zeroize hygiene `ts_keys` already applies
 # to the long-lived private keys.
 zeroize.workspace = true
+
+[features]
+default = []
+# Transport data only. Handshake and cookie AEAD remain RustCrypto.
+ring-aead = ["dep:ring"]
 
 [dev-dependencies]
 # Dependencies required for examples.
@@ -57,6 +66,10 @@ wycheproof.workspace = true
 # unmaintained, never-patched `atty` (RUSTSEC-2021-0145). See VENDOR.md.
 [[bench]]
 name = "constant_time"
+harness = false
+
+[[bench]]
+name = "transport_data"
 harness = false
 
 [lints]

@@ -53,3 +53,24 @@ ID, and it is up to the caller to track endpoint location and deliver the packet
 separation of concerns for Tailscale, since we provide more complex underlay network routing with additional features
 (e.g. path discovery with NAT traversal, fallback relaying through DERP) that should be kept separate from the core
 cryptographic state machines.
+## Transport AEAD backend
+
+The optional `ring-aead` Cargo feature selects ring 0.17's accelerated
+`CHACHA20_POLY1305` for transport-data sessions. Handshake and cookie AEAD stay
+RustCrypto. Nonces, empty associated data, ciphertext/tag placement, padding,
+and replay/counter rules are identical. Packet bodies are sealed/opened in
+place; ring uses the existing contiguous ciphertext plus tag on receive. Each
+ring key is boxed once at session setup (one allocation per direction) to avoid
+inflating inline peer state; no key allocation happens on the packet path.
+Failed opens never commit replay state or return a packet, and the ring path
+explicitly wipes its failed-open buffer.
+
+This feature is **opt-in** because ring's opaque `LessSafeKey` has no public
+zeroization API or zeroize-on-drop guarantee. Unlike the RustCrypto backend,
+its internal session key can remain in freed memory after expiry or peer
+removal. Raw key derivation buffers, the derived session-key pair, and cipher
+constructor inputs are still zeroized with either backend; that does not wipe
+ring's private copy. No unsafe access to ring internals is attempted.
+Use `--no-default-features` for the RustCrypto path, or `--features ring-aead`
+when building this crate. The workspace exit-node example can enable it with
+`--features ring-aead` (forwarded through `ts_runtime`).

@@ -4,8 +4,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use aead::AeadInPlace;
-use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
+#[cfg(test)]
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::AeadInPlace};
 use ts_packet::PacketMut;
 use zerocopy::{
     FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes, Unaligned,
@@ -15,6 +15,7 @@ use zerocopy::{
 use crate::{
     messages::{SessionId, TransportDataHeader},
     replay::ReplayWindow,
+    transport_aead::TransportCipher,
 };
 
 type SessionKey = chacha20poly1305::Key;
@@ -201,9 +202,15 @@ impl AsRef<chacha20poly1305::Nonce> for Nonce {
     }
 }
 
+impl Nonce {
+    fn bytes(&self) -> [u8; 12] {
+        self.as_bytes().try_into().expect("12-byte WireGuard nonce")
+    }
+}
+
 /// Established session that can only send.
 pub struct TransmitSession {
-    cipher: ChaCha20Poly1305,
+    cipher: TransportCipher,
     nonce: NonceGenerator,
     id: SessionId,
     created: Instant,
@@ -212,7 +219,7 @@ pub struct TransmitSession {
 impl TransmitSession {
     pub fn new(key: SessionKey, id: SessionId, now: Instant) -> Self {
         TransmitSession {
-            cipher: ChaCha20Poly1305::new(&key),
+            cipher: TransportCipher::new(key),
             nonce: Default::default(),
             id,
             created: now,
@@ -240,9 +247,7 @@ impl TransmitSession {
                 packet.extend_from_slice(&[0u8; PADDING_MULTIPLE][..pad]);
             }
             // Session encryption only fails if the provided packet can't grow, which ours can.
-            self.cipher
-                .encrypt_in_place(nonce.as_ref(), &[], packet)
-                .unwrap();
+            self.cipher.seal(nonce.bytes(), packet).unwrap();
             let header = TransportDataHeader {
                 receiver_id: self.id,
                 nonce: nonce.counter,
@@ -283,7 +288,7 @@ impl TransmitSession {
 
 /// Established session that can only receive.
 pub struct ReceiveSession {
-    cipher: ChaCha20Poly1305,
+    cipher: TransportCipher,
     id: SessionId,
     created: Instant,
     window: ReplayWindow,
@@ -300,7 +305,7 @@ impl Debug for ReceiveSession {
 impl ReceiveSession {
     pub fn new(key: SessionKey, id: SessionId, now: Instant) -> Self {
         ReceiveSession {
-            cipher: ChaCha20Poly1305::new(&key),
+            cipher: TransportCipher::new(key),
             id,
             created: now,
             window: ReplayWindow::default(),
@@ -316,7 +321,7 @@ impl ReceiveSession {
     }
 
     /// Decrypt a wireguard transport data message in place.
-    #[tracing::instrument(skip_all, fields(session_id = ?self.id))]
+    #[tracing::instrument(level = "trace", skip_all, fields(session_id = ?self.id))]
     #[must_use]
     fn decrypt_one(&mut self, pkt: &mut PacketMut) -> bool {
         let Ok((header, _)) = TransportDataHeader::try_ref_from_prefix(pkt.as_ref()) else {
@@ -354,7 +359,7 @@ impl ReceiveSession {
         let nonce = Nonce::from(header.nonce);
         pkt.truncate_front(size_of::<TransportDataHeader>());
 
-        match self.cipher.decrypt_in_place(nonce.as_ref(), &[], pkt) {
+        match self.cipher.open(nonce.bytes(), pkt) {
             Ok(_) => {
                 self.window.set(counter);
                 true
@@ -453,13 +458,11 @@ mod tests {
             );
 
             // (b) Sealing the raw plaintext under that nonce matches Go's reference ciphertext||tag.
-            let cipher = ChaCha20Poly1305::new(&key_bytes.into());
-            let mut body = pt.clone();
-            cipher
-                .encrypt_in_place(nonce.as_ref(), &[], &mut body)
-                .unwrap();
+            let mut body = PacketMut::from(pt.as_slice());
+            session.cipher.seal(nonce.bytes(), &mut body).unwrap();
             assert_eq!(
-                body, expected,
+                body.as_ref(),
+                expected,
                 "vector {i}: ciphertext||tag diverges from Go reference"
             );
         }
@@ -589,6 +592,86 @@ mod tests {
 
         assert!(recv.decrypt_one(&mut pkt[0]));
         assert_eq!(pkt[0].as_ref(), padded.as_slice());
+    }
+
+    #[test]
+    #[cfg(feature = "ring-aead")]
+    fn transport_ring_rustcrypto_cross_open() {
+        let key = [0x69u8; 32];
+        let id = SessionId::from(7);
+        let now = Instant::now();
+        for len in [0usize, 1, 15, 16, 17, 64, 1280, 1312, 1500] {
+            let input: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let mut padded = input.clone();
+            padded.resize(len.next_multiple_of(PADDING_MULTIPLE), 0);
+            for counter in [0, 1, 0x0102_0304_0506_0708, REJECT_AFTER_MESSAGES - 1] {
+                let nonce = Nonce::from(counter);
+                let rustcrypto = ChaCha20Poly1305::new(&key.into());
+                let mut frame = PacketMut::from(padded.as_slice());
+                rustcrypto
+                    .encrypt_in_place(nonce.as_ref(), &[], &mut frame)
+                    .unwrap();
+                let header = TransportDataHeader {
+                    receiver_id: id,
+                    nonce: counter.into(),
+                    ..Default::default()
+                };
+                frame.extend_front_from_slice(header.as_bytes());
+                let expected_frame = frame.as_ref().to_vec();
+
+                let mut recv = ReceiveSession::new(key.into(), id, now);
+                assert!(recv.decrypt_one(&mut frame));
+                assert_eq!(frame.as_ref(), padded);
+
+                let send = TransmitSession::new(key.into(), id, now);
+                send.nonce.set_count(counter);
+                let mut frames = [PacketMut::from(input.as_slice())];
+                send.encrypt(&mut frames);
+                assert_eq!(frames[0].as_ref(), expected_frame);
+                frames[0].truncate_front(size_of::<TransportDataHeader>());
+                rustcrypto
+                    .decrypt_in_place(nonce.as_ref(), &[], &mut frames[0])
+                    .unwrap();
+                assert_eq!(frames[0].as_ref(), padded);
+            }
+        }
+    }
+
+    #[test]
+    fn failed_open_does_not_consume_counter_or_advance_window() {
+        let key = [0x42u8; 32];
+        let id = SessionId::from(17);
+        let now = Instant::now();
+        let send = TransmitSession::new(key.into(), id, now);
+        let mut recv = ReceiveSession::new(key.into(), id, now);
+        let mut frames = [PacketMut::from(&b"authenticated payload"[..])];
+        send.encrypt(&mut frames);
+        let wire = frames[0].as_ref().to_vec();
+
+        let mut bad = PacketMut::from(wire.as_slice());
+        *bad.as_mut().last_mut().unwrap() ^= 1;
+        assert!(!recv.decrypt_one(&mut bad));
+        #[cfg(feature = "ring-aead")]
+        assert!(bad.as_ref().iter().all(|&b| b == 0));
+        #[cfg(not(feature = "ring-aead"))]
+        assert_ne!(&bad.as_ref()[..21], b"authenticated payload");
+
+        // A forged huge counter must not evict valid lower counters.
+        let mut forged = PacketMut::from(wire.as_slice());
+        forged.as_mut()[8..16].copy_from_slice(&(1u64 << 60).to_le_bytes());
+        assert!(!recv.decrypt_one(&mut forged));
+        // Nor may truncation commit a counter or return unauthenticated bytes.
+        for tag_bytes in 0..16 {
+            let mut short = PacketMut::from(&wire[..16 + tag_bytes]);
+            assert!(!recv.decrypt_one(&mut short));
+        }
+        assert!(recv.decrypt_one(&mut frames[0]));
+        assert_eq!(&frames[0].as_ref()[..21], b"authenticated payload");
+        assert!(!recv.decrypt_one(&mut PacketMut::from(wire.as_slice())));
+        assert!(
+            recv.decrypt(vec![PacketMut::from(wire.as_slice())])
+                .is_empty()
+        );
     }
 
     #[test]

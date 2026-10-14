@@ -22,22 +22,15 @@ macro_rules! unwrap_handle {
 /// if the handle no longer refers to a live socket.
 ///
 /// smoltcp 0.13's [`SocketSet::get_mut`][smoltcp::iface::SocketSet::get_mut] **panics** on a stale
-/// or wrong-type handle, and it exposes no fallible getter — the only safe existence check is to
-/// scan [`SocketSet::iter`][smoltcp::iface::SocketSet::iter]. A blocked command (a `Recv`/`Send`
-/// that returned [`Response::WouldBlock`][crate::Response::WouldBlock]) can outlive its socket: a
-/// `Close` (or a dropped owning future) removes the handle while the queued command still
-/// references it, and `pump_blocked_commands` then re-runs the command against a dead handle
-/// (tsr-02e — ping's raw ICMP socket). We must check existence first and never panic the netstack
+/// or wrong-type handle, and it exposes no fallible getter. The generation/kind registry
+/// maintained by `add_socket`/`remove_socket` validates indexed access in O(log n).
+/// A blocked command can outlive its socket (tsr-02e), so always validate first and never panic the netstack
 /// actor (a panic kills the actor, after which every op fails with `InternalChannelClosed`).
 macro_rules! get_socket_mut {
     ($self:expr, $ty:ty, $handle:expr) => {{
         let handle = unwrap_handle!($handle);
 
-        // `iter()` borrows `self.socket_set` immutably; resolve the bool before the mutable
-        // `get_mut` borrow below so the two borrows never overlap.
-        let matches_type = $self.socket_set.iter().any(|(h, socket)| {
-            h == handle && <$ty as smoltcp::socket::AnySocket<'_>>::downcast(socket).is_some()
-        });
+        let matches_type = $self.socket_matches::<$ty>(handle);
 
         if !matches_type {
             tracing::debug!(

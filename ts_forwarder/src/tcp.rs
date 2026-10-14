@@ -131,7 +131,9 @@ async fn splice_one<D: RealDialer>(
         }
     };
 
-    match tokio::io::copy_bidirectional(&mut overlay, &mut real).await {
+    let coalesce = crate::splice::enabled();
+    overlay.set_coalesced_reads(coalesce);
+    match crate::splice::copy(&mut overlay, &mut real, coalesce).await {
         Ok((to_real, to_peer)) => {
             tracing::debug!(%dst, %peer, to_real, to_peer, "tcp splice finished");
         }

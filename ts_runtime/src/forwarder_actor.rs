@@ -181,8 +181,17 @@ impl kameo::Actor for ForwarderActor {
         // Pump packets emitted by the forwarder netstack down into the dataplane (out the overlay).
         let reject_up = netstack_up.clone();
         joinset.spawn(async move {
-            while let Some(buf) = netstack_down_rx.recv_async().await {
-                if netstack_up.send(vec![buf.to_vec().into()]).is_err() {
+            while let Some(first) = netstack_down_rx.recv_async().await {
+                // Hand the dataplane whatever is already queued as one batch, so encryption and the
+                // underlay send can work per batch rather than per packet.
+                let mut batch = Vec::with_capacity(crate::netstack_actor::EGRESS_BATCH);
+                batch.push(crate::netstack_actor::into_packet(first));
+                while batch.len() < crate::netstack_actor::EGRESS_BATCH
+                    && let Some(more) = netstack_down_rx.try_recv()
+                {
+                    batch.push(crate::netstack_actor::into_packet(more));
+                }
+                if netstack_up.send(batch).is_err() {
                     break;
                 }
             }
@@ -290,6 +299,16 @@ impl kameo::Actor for ForwarderActor {
         // would otherwise accept it. IPv4 goes through the port gate in all-port mode.
         joinset.spawn(async move {
             let mut reject_budget = RejectBudget::new();
+            let batching = ts_netstack_smoltcp::netcore::experiment::enabled(
+                ts_netstack_smoltcp::netcore::experiment::RX_BATCH,
+            );
+            let pass = |b: &[u8]| {
+                if batching {
+                    netstack_down_tx.try_send_deferred(b)
+                } else {
+                    netstack_down_tx.try_send(b)
+                }
+            };
             let admit = |b: &[u8]| {
                 if b.first().is_some_and(|v| v >> 4 == 6) {
                     // Replies skip the bounded netstack ingress, so cap their rate; over budget the
@@ -303,11 +322,28 @@ impl kameo::Actor for ForwarderActor {
                     return true;
                 }
                 match &gate {
-                    Some(gate) => gate.ingress(b) != Admit::Dropped,
-                    None => netstack_down_tx.try_send(b),
+                    Some(gate) => {
+                        (if batching {
+                            gate.ingress_with(b, pass)
+                        } else {
+                            gate.ingress(b)
+                        }) != Admit::Dropped
+                    }
+                    None => pass(b),
                 }
             };
-            crate::netstack_actor::pump_ingress_with(netstack_down, admit, "forwarder").await;
+            crate::netstack_actor::pump_ingress_with_batch_wake(
+                netstack_down,
+                admit,
+                || {
+                    if batching {
+                        netstack_down_tx.notify_receive();
+                    }
+                },
+                "forwarder",
+                batching,
+            )
+            .await;
 
             tracing::warn!("forwarder netstack uplink shut down!");
         });

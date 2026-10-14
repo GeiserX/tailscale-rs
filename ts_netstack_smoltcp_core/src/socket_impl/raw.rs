@@ -1,10 +1,7 @@
 use alloc::vec;
 
 use bytes::Bytes;
-use smoltcp::{
-    iface::SocketHandle,
-    socket::{AnySocket, raw},
-};
+use smoltcp::{iface::SocketHandle, socket::raw};
 
 use crate::{
     Netstack, Response,
@@ -100,10 +97,7 @@ impl Netstack {
                 // then remove that live socket instead of doing nothing, and nothing panics at the
                 // point of damage. Check the type too, as the UDP `Close` arm does (#297).
                 let handle = unwrap_handle!(handle);
-                let matches_type = self
-                    .socket_set
-                    .iter()
-                    .any(|(h, socket)| h == handle && raw::Socket::downcast(socket).is_some());
+                let matches_type = self.socket_matches::<raw::Socket>(handle);
                 if matches_type {
                     self.remove_socket(handle);
                 }

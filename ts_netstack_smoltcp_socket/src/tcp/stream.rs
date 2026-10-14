@@ -28,6 +28,8 @@ pub struct TcpStream {
     #[cfg(any(feature = "tokio", feature = "futures-io"))]
     read_remainder: Option<Bytes>,
     #[cfg(any(feature = "tokio", feature = "futures-io"))]
+    coalesced_reads: bool,
+    #[cfg(any(feature = "tokio", feature = "futures-io"))]
     write_fut: Option<PinBoxFut<Result<usize, netcore::Error>>>,
 }
 
@@ -51,6 +53,9 @@ impl TcpStream {
             read_remainder: None,
 
             #[cfg(any(feature = "tokio", feature = "futures-io"))]
+            coalesced_reads: false,
+
+            #[cfg(any(feature = "tokio", feature = "futures-io"))]
             write_fut: None,
         }
     }
@@ -67,6 +72,13 @@ impl Debug for TcpStream {
 }
 
 impl TcpStream {
+    /// Make future AsyncRead requests collect all ready RX bytes up to the caller's capacity,
+    /// including a wrapped ring. No wait to fill; pending requests and remainders are retained.
+    /// Existing in-flight requests keep their original semantics.
+    #[cfg(any(feature = "tokio", feature = "futures-io"))]
+    pub fn set_coalesced_reads(&mut self, enabled: bool) {
+        self.coalesced_reads = enabled;
+    }
     /// Report the local endpoint to which this stream is connected.
     pub const fn local_addr(&self) -> SocketAddr {
         self.local
@@ -236,14 +248,14 @@ impl TcpStream {
             match self.read_fut.as_mut() {
                 None => {
                     let sender = self.sender.clone();
+                    let command = if self.coalesced_reads {
+                        tcp::stream::Command::RecvCoalesced { max_len: cap }
+                    } else {
+                        tcp::stream::Command::Recv { max_len: Some(cap) }
+                    };
 
                     let _ret = self.read_fut.insert(alloc::boxed::Box::pin(async move {
-                        let resp = sender
-                            .request(
-                                Some(handle),
-                                tcp::stream::Command::Recv { max_len: Some(cap) },
-                            )
-                            .await?;
+                        let resp = sender.request(Some(handle), command).await?;
 
                         // A reaped socket (tsr-9ue: the netstack autonomously closed + freed an
                         // idle/dead accepted stream) answers a first-touch `Recv` with

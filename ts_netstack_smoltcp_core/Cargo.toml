@@ -28,12 +28,14 @@ workspace = true
 default-features = false
 features = [
     "alloc",
+    "async",
     "proto-ipv6",
     "proto-ipv6-fragmentation",
     "proto-ipv4",
     "proto-ipv4-fragmentation",
     "medium-ip",
     "socket-tcp",
+    "assembler-max-segment-count-32",
     "socket-udp",
     "socket-icmp",
     "socket-raw",
@@ -52,6 +54,7 @@ version = "0.14"
 default-features = false
 features = [
     "alloc",
+    "async",
     "proto-ipv6",
     "proto-ipv6-fragmentation",
     "proto-ipv4",

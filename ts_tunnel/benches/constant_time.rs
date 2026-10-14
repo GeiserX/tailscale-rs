@@ -66,6 +66,10 @@
 //! constant-time bench therefore belongs alongside `ts_tls_util`, where `subtle` is a direct
 //! dependency. This file scopes the AEAD-verify path only.
 
+//! With `--features ring-aead`, an additional run checks ring's primitive
+//! with the same inputs. Session replay checks and the failed-buffer wipe
+//! are outside the scope of this tag-verification measurement.
+
 use std::cell::RefCell;
 
 use aead::{AeadCore, AeadInPlace, KeyInit, generic_array::typenum::Unsigned};
@@ -215,6 +219,34 @@ fn seed() -> u64 {
     }
 }
 
+#[cfg(feature = "ring-aead")]
+fn ring_decrypt_tag_verify(runner: &mut CtRunner, rng: &mut BenchRng) {
+    use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
+    let key = [0x42; 32];
+    let input_cipher = ChaCha20Poly1305::new(&key.into());
+    let cipher = LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, &key).unwrap());
+    let inputs: Vec<_> = (0..SAMPLES)
+        .map(|_| {
+            let class = if rng.random::<bool>() {
+                Class::Left
+            } else {
+                Class::Right
+            };
+            (class, make_input(&input_cipher, rng, class))
+        })
+        .collect();
+    let scratch = RefCell::new(vec![0; PT_LEN + 16]);
+    for (class, input) in inputs {
+        runner.run_one(class, || {
+            let mut buf = scratch.borrow_mut();
+            buf[..PT_LEN].copy_from_slice(&input.ciphertext);
+            buf[PT_LEN..].copy_from_slice(&input.tag);
+            let nonce = Nonce::assume_unique_for_key(input.nonce.into());
+            let _ = std::hint::black_box(cipher.open_in_place(nonce, Aad::empty(), &mut buf));
+        });
+    }
+}
+
 fn main() {
     dudect::self_check();
 
@@ -232,4 +264,16 @@ fn main() {
         "|max t| is below the 5 threshold — no leak detected, which is not proof of constant-timeness"
     };
     println!("\nmax t = {:+.5}: {verdict}", summary.max_t);
+    #[cfg(feature = "ring-aead")]
+    {
+        let mut rng = BenchRng::seed_from_u64(seed);
+        let mut runner = CtRunner::default();
+        ring_decrypt_tag_verify(&mut runner, &mut rng);
+        let summary = runner.summarize();
+        println!("bench ring_decrypt_tag_verify (seed 0x{seed:016x}) ... {summary}");
+        println!(
+            "ring max t = {:+.5} (informational; |t| > 5 warrants investigation)",
+            summary.max_t
+        );
+    }
 }

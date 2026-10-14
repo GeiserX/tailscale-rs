@@ -14,6 +14,9 @@ rust-version.workspace = true
 [lib]
 name = "ts_runtime"
 [dependencies]
+# Zero-copy hand-off of netstack egress buffers to the dataplane (`netstack_actor::into_packet`).
+# Already in the graph via ts_netstack_smoltcp / ts_packet.
+bytes.workspace = true
 # `StatusNode.last_seen` exposes a `chrono::DateTime<Utc>` on a public field (mirrors
 # `ts_control::Node.last_seen` / Go `PeerStatus.LastSeen`). Already a transitive dep via `ts_control`.
 chrono = { workspace = true }
@@ -77,6 +80,7 @@ rand.workspace = true
 libc = "0.2"
 
 [features]
+ring-aead = ["ts_tunnel/ring-aead"]
 # Off by default. Enables the TUN-mode overlay transport (ts_transport_tun) so the runtime can
 # run the application data path over a real OS TUN interface instead of the userspace netstack.
 # TUN device creation needs root/CAP_NET_ADMIN; off the ring-only egress path.

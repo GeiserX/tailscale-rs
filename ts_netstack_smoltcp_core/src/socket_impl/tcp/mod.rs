@@ -33,6 +33,9 @@ impl Netstack {
     /// [`TcpStream`]: ::ts_netstack_smoltcp_socket::tcp::stream::TcpStream
     fn new_tcp_socket(&self) -> tcp::Socket<'static> {
         let mut sock = tcp::Socket::new(self.tcp_buffer(), self.tcp_buffer());
+        // Forwarded flows carry the endpoints' own write patterns (TLS records, request/response);
+        // the endpoints already coalesce, so Nagle here only delays small writes by a round trip.
+        sock.set_nagle_enabled(false);
         // `core::time::Duration` → smoltcp's own `Duration` (millisecond granularity is plenty for
         // a 60s/120s policy). Skip either knob when `None` (smoltcp's no-reaping default).
         if let Some(interval) = self.config.tcp_keep_alive_interval {

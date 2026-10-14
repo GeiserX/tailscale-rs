@@ -74,6 +74,7 @@ pub(crate) type PortRef = (Proto, u16, u32);
 
 struct Inner {
     ingress: WakingPipeSender,
+    batch_ingress: bool,
     epoch: Instant,
     tcp: Vec<Slot>,
     udp: Vec<Slot>,
@@ -96,6 +97,8 @@ pub enum Admit {
     /// Dropped: the ingress queue was full, or the hold budget / active-port cap was reached.
     Dropped,
 }
+
+type AdmissionCallback<'a> = &'a dyn Fn(&[u8]) -> bool;
 
 /// Ingress gate in front of an all-port forwarder netstack. See the module docs.
 ///
@@ -120,6 +123,9 @@ impl PortGate {
         };
         let inner = Inner {
             ingress,
+            batch_ingress: ts_netstack_smoltcp::netcore::experiment::enabled(
+                ts_netstack_smoltcp::netcore::experiment::RX_BATCH,
+            ),
             epoch: Instant::now(),
             tcp: vec![closed; 1 << 16],
             udp: vec![closed; 1 << 16],
@@ -144,20 +150,32 @@ impl PortGate {
 
     /// Offer one inbound packet to the forwarder netstack.
     pub fn ingress(&self, packet: &[u8]) -> Admit {
+        self.ingress_impl(packet, None)
+    }
+
+    /// Apply the port gate, admitting passed packets through a nonblocking callback.
+    /// Held packets retain their original release path and ordering under the gate lock.
+    pub fn ingress_with(&self, packet: &[u8], admit: impl Fn(&[u8]) -> bool) -> Admit {
+        self.ingress_impl(packet, Some(&admit))
+    }
+
+    fn ingress_impl(&self, packet: &[u8], admit: Option<AdmissionCallback<'_>>) -> Admit {
         let mut inner = self.lock();
 
         let Some((proto, port, initiating)) = classify(packet) else {
-            return inner.pass(packet);
+            return inner.pass(packet, admit);
         };
         let now = inner.now();
         let slot = &mut inner.slots(proto)[port as usize];
         match slot.state {
             State::Open => {
                 slot.last = now;
-                inner.pass(packet)
+                inner.pass(packet, admit)
             }
             State::Opening | State::Closing if initiating => inner.hold(proto, port, packet),
-            State::Opening | State::Closing | State::Closed if !initiating => inner.pass(packet),
+            State::Opening | State::Closing | State::Closed if !initiating => {
+                inner.pass(packet, admit)
+            }
             _ => {
                 if inner.active >= inner.max_active {
                     tracing::debug!(?proto, %port, "port gate: at max active ports; dropping");
@@ -188,11 +206,23 @@ impl PortGate {
             return 0;
         }
         let held = inner.take_held(proto, port);
-        let refused = held.iter().filter(|p| !inner.ingress.try_send(p)).count();
+        let refused = held
+            .iter()
+            .filter(|p| {
+                !(if inner.batch_ingress {
+                    inner.ingress.try_send_deferred(p)
+                } else {
+                    inner.ingress.try_send(p)
+                })
+            })
+            .count();
         let now = inner.now();
         let slot = &mut inner.slots(proto)[port as usize];
         slot.state = State::Open;
         slot.last = now;
+        if inner.batch_ingress && !held.is_empty() {
+            inner.ingress.notify_receive();
+        }
         tracing::debug!(?proto, %port, generation, released = held.len(), refused, "port gate: open");
         refused
     }
@@ -299,12 +329,12 @@ impl Inner {
         held
     }
 
-    fn pass(&self, packet: &[u8]) -> Admit {
-        if self.ingress.try_send(packet) {
-            Admit::Passed
-        } else {
-            Admit::Dropped
-        }
+    fn pass(&self, packet: &[u8], admit: Option<AdmissionCallback<'_>>) -> Admit {
+        let sent = match admit {
+            Some(admit) => admit(packet),
+            None => self.ingress.try_send(packet),
+        };
+        if sent { Admit::Passed } else { Admit::Dropped }
     }
 
     fn hold(&mut self, proto: Proto, port: u16, packet: &[u8]) -> Admit {

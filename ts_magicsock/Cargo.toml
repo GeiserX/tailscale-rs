@@ -29,10 +29,17 @@ ts_transport.workspace = true
 # only `libc`/`windows-sys`, no TLS stack (verified via `cargo tree`), keeping the egress path clean.
 if-addrs = "0.15"
 rand.workspace = true
+# Underlay socket buffers (`tune_socket_buffers`) and reuse-port binding for connected per-path
+# sockets (`connected.rs`). Already in the lockfile via tokio; "all" exposes `set_reuse_port`.
+socket2 = { version = "0.6", features = ["all"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "sync", "rt", "time", "macros"] }
 tracing.workspace = true
 zerocopy = { workspace = true, features = ["std"] }
+
+[target.'cfg(any(target_vendor = "apple", target_os = "linux"))'.dependencies]
+# Darwin IP_DONTFRAG/recvmsg_x and Linux recvmmsg/recvfrom. Already in the lockfile.
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

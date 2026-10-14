@@ -27,11 +27,14 @@
 //! endpoint does, the announcing peer must be a current netmap member, and the relay endpoint must
 //! have been allocated for exactly this pair of disco keys.
 
+mod batch;
+mod connected;
 mod disco;
 mod endpoint;
 mod error;
 mod metrics;
 mod path;
+mod receive_batch;
 mod relay;
 mod sock;
 mod stun;
@@ -45,6 +48,8 @@ pub use disco::{
 pub use endpoint::{SelfEndpoint, SelfEndpointType};
 pub use error::{DiscoError, Error};
 pub use path::{PeerPaths, TRUST_DURATION};
+/// Bounded kernel receive batch counters (Apple recvmsg_x / Linux recvmmsg).
+pub use receive_batch::{Snapshot as ReceiveBatchSnapshot, snapshot as receive_batch_snapshot};
 pub use relay::RelayServerEndpoint;
 pub use sock::{
     BindingVerifier, DerpSource, DirectTransport, MagicSock, PeerCapVersionLookup, ReceivedData,
