@@ -1072,7 +1072,7 @@ impl MagicSock {
                 .add_learned_candidates(eps)
         };
 
-        tracing::debug!(%peer, ?accepted, "magicsock: learned peer candidates");
+        tracing::trace!(%peer, ?accepted, "magicsock: learned peer candidates");
         let mut a2d = lock(&self.addr_to_disco);
         for ep in &accepted {
             // Don't let a learned (disco-supplied) candidate steal an address already attributed to
@@ -1372,7 +1372,7 @@ impl MagicSock {
             // attempt before `sendDiscoMessage` decides); with no pong it simply expires.
             match self.send_udp(&wire, addr).await {
                 Ok(true) => {
-                    tracing::debug!(%peer, %addr, ?tx_id, "magicsock: disco ping sent");
+                    tracing::trace!(%peer, %addr, ?tx_id, "magicsock: disco ping sent");
                     m.disco_ping_sent.inc();
                     sent += 1;
                 }
@@ -3006,7 +3006,7 @@ impl MagicSock {
                 // silently, and without moving `disco_pong_sent`. The peer that pinged us falls
                 // back to DERP for us exactly as it would for a node it cannot reach directly.
                 if self.send_udp(&pong, from).await? {
-                    tracing::debug!(%sender, %from, ?tx_id, "magicsock: disco pong sent");
+                    tracing::trace!(%sender, %from, ?tx_id, "magicsock: disco pong sent");
                     m.disco_pong_sent.inc();
                 }
             }
@@ -3030,7 +3030,7 @@ impl MagicSock {
                     }
                 };
                 let solicited = latency.is_some();
-                tracing::debug!(%sender, %from, ?tx_id, ?latency, solicited,
+                tracing::trace!(%sender, %from, ?tx_id, ?latency, solicited,
                     "magicsock: disco pong received");
                 // Wake any on-demand `ping_now` waiter for this tx_id with the fresh RTT. Gated on
                 // `solicited` (a genuine match) and locked disjointly from `paths` above. The send

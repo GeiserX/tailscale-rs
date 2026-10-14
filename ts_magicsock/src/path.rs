@@ -754,7 +754,19 @@ impl PeerPaths {
         if self.best == Some(confirmed) {
             self.trust_until = Some(now + TRUST_DURATION);
         }
-        tracing::debug!(%confirmed, ?latency, ?previous, best = ?self.best, best_untrusted,
+        // Per-pong detail at trace, like every other per-message line in this crate; the one event
+        // an operator wants at debug is the best path changing (Go logs only that: "node %v now
+        // using %v" in `handlePongConnLocked`).
+        if self.best != previous {
+            tracing::debug!(
+                ?previous,
+                best = ?self.best,
+                ?latency,
+                best_untrusted,
+                "magicsock: best path changed"
+            );
+        }
+        tracing::trace!(%confirmed, ?latency, ?previous, best = ?self.best, best_untrusted,
             "magicsock: pong path selection");
     }
 }
