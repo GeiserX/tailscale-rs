@@ -824,6 +824,40 @@ mod tests {
         }
     }
 
+    /// An Accept whose caller went away must not take a connection nobody will serve: the
+    /// connection stays queued for the next Accept. Covers an Accept that blocked before the
+    /// handshake completed (it is replayed) and one that first runs after it.
+    #[test]
+    fn abandoned_accept_leaves_the_connection_for_the_next_accept() {
+        use smoltcp::wire::TcpControl;
+        for blocked in [true, false] {
+            let mut c = PendingConnection::new();
+            let (resp, reply) = flume::bounded(1);
+            let abandoned = crate::Request {
+                handle: None,
+                command: TcpListenCommand::Accept { handle: c.listener }.into(),
+                resp,
+            };
+            if blocked {
+                c.stack.process_one_cmd(abandoned);
+                assert_eq!(c.stack.blocked_commands.len(), 1, "accept blocks");
+                drop(reply);
+                // The handshake completes and the abandoned Accept is replayed.
+                c.send(TcpControl::None, c.ack, &[]);
+            } else {
+                c.send(TcpControl::None, c.ack, &[]);
+                drop(reply);
+                c.stack.process_one_cmd(abandoned);
+            }
+            assert!(c.stack.blocked_commands.is_empty());
+            assert!(
+                matches!(c.accept(), Response::TcpListen(TcpListenResponse::Accepted { handle, .. })
+                if handle == c.handle),
+                "the next Accept must get the connection (blocked: {blocked})"
+            );
+        }
+    }
+
     #[test]
     fn reset_with_unread_data_is_reclaimed_from_both_queues() {
         use smoltcp::wire::TcpControl;
