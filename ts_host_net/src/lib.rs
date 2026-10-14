@@ -167,6 +167,9 @@ pub(crate) fn any_cgnat_interface(ifaces: &[if_addrs::Interface], exclude_if_nam
 /// space and win by longest-prefix-match over the real `/0` without deleting it
 /// — trivially reversible by removing the two halves. Any non-`/0` prefix passes
 /// through unchanged. Shared by both platform impls so the behavior cannot drift.
+// Only the macOS and Linux implementations program routes and DNS, so on any other target
+// (Windows) this would be dead code. The unit tests below still run on every target.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(crate) fn expand_routes(routed: &[Ipv4Net]) -> Vec<Ipv4Net> {
     let mut out = Vec::with_capacity(routed.len() + 1);
     for net in routed {
@@ -192,6 +195,9 @@ pub(crate) fn expand_routes(routed: &[Ipv4Net]) -> Vec<Ipv4Net> {
 /// `<= 253` bytes, dot-separated labels of `[a-z0-9-]` (`1..=63` bytes each),
 /// and never a leading `-`. Anything else is rejected so `apply_dns` fails
 /// closed rather than feeding the interpreter attacker-shaped input.
+// Only the macOS and Linux implementations program routes and DNS, so on any other target
+// (Windows) this would be dead code. The unit tests below still run on every target.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(crate) fn valid_dns_name(s: &str) -> bool {
     if s.is_empty() || s.len() > 253 || s.starts_with('-') {
         return false;
@@ -210,6 +216,9 @@ pub(crate) fn valid_dns_name(s: &str) -> bool {
 /// embedder-influenced via `TunConfig.name`, so guard it: `1..=15` bytes
 /// (`IFNAMSIZ - 1`), ASCII-alphanumeric only, never a leading `-` (which
 /// `ip`/`route` could parse as an option). Rejecting keeps `apply_*` fail-closed.
+// Only the macOS and Linux implementations program routes and DNS, so on any other target
+// (Windows) this would be dead code. The unit tests below still run on every target.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(crate) fn valid_if_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 15
