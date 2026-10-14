@@ -178,6 +178,10 @@ async fn bind_underlay(addr: SocketAddr, reuse_port: bool) -> std::io::Result<Ud
 /// Underlay socket buffer size, both directions (Go magicsock's `socketBufferSize`).
 const SOCKET_BUFFER_SIZE: usize = 7 << 20;
 
+/// How long a default-mode [`MagicSock::rebind`] waits for the old socket's last clone to be
+/// released before it gives up on keeping the port (see [`MagicSock::wait_for_release`]).
+const REBIND_RELEASE_WAIT: Duration = Duration::from_millis(500);
+
 /// Raise the underlay socket's send and receive buffers to [`SOCKET_BUFFER_SIZE`], as Go's magicsock
 /// does. The defaults are small (macOS: a 9216-byte UDP send buffer, about seven WireGuard packets),
 /// so a burst overflows them and the excess is dropped (`ENOBUFS` on send), which TCP inside the
@@ -294,23 +298,28 @@ pub enum RelayedDisco {
 ///   internally and only yields WireGuard data),
 /// - send WireGuard data with [`MagicSock::send_wireguard`].
 pub struct MagicSock {
-    /// The underlay UDP socket, behind a `Mutex<Arc<…>>` so [`MagicSock::rebind`] can atomically
+    /// The underlay UDP socket, published through a watch channel so [`MagicSock::rebind`] can
     /// swap in a freshly-bound socket on a network/link change (Wi-Fi switch, sleep/wake) without
     /// recreating the `MagicSock` or disturbing peer/disco/path state. Readers take a cheap
-    /// clone via [`MagicSock::sock`] for the duration of a single send/recv. A receive that is
-    /// already parked on the old socket is woken through [`rebound`](Self::rebound) and re-reads
-    /// this on its next turn; the old socket closes once the last clone releases it.
-    /// `std::sync::Mutex` (not an extra `arc-swap` dep): the guard is held only long enough to
-    /// clone the `Arc`, never across an `.await`.
-    sock: Mutex<Arc<UdpSocket>>,
-    /// Bumped by [`MagicSock::rebind`] after it swaps `sock`, to wake a receive loop parked on the
-    /// old socket so it re-reads `sock` and waits on the new one ([`fill_receive`]). Go's
-    /// `RebindingUDPConn` gets the same effect by closing the old conn under its lock, which errors
-    /// a parked read, and `ReadBatch` then re-reads the current conn (`rebinding_conn.go`); a
-    /// `tokio::net::UdpSocket` cannot be closed while a clone is parked on it, so the parked
-    /// receive is told to let go instead. The value is a generation counter, never read as such:
-    /// only its change matters.
-    rebound: tokio::sync::watch::Sender<u64>,
+    /// clone via [`MagicSock::sock`] for the duration of a single send/recv.
+    ///
+    /// `None` only while a rebind is between closing the old socket and binding the new one, so
+    /// the old port can be bound again (`SO_REUSEPORT` aside, a port is free only once its socket
+    /// is closed). Go's `RebindingUDPConn` has the same gap under its lock: `bindSocket` closes
+    /// the old conn and then listens on the same port, a parked read errors out and re-reads the
+    /// current conn, a write during the gap waits on the lock and goes out of the new conn
+    /// (`rebinding_conn.go`). A `tokio::net::UdpSocket` cannot be closed while a clone is parked
+    /// on it, so instead the channel's change wakes the parked receive, which lets its clone go,
+    /// and [`sock`](Self::sock) waits for the new socket to be published. Datagrams that arrive in
+    /// the gap are lost, as in Go.
+    sock: tokio::sync::watch::Sender<Option<Arc<UdpSocket>>>,
+    /// The address `sock` is bound to, kept beside it so [`local_addr`](Self::local_addr) and
+    /// [`sends_ipv6`](Self::sends_ipv6) answer without waiting out a rebind's gap (Go caches the
+    /// port the same way, `RebindingUDPConn.port`). Updated by every publish of `sock`.
+    bound_addr: Mutex<SocketAddr>,
+    /// Serialises [`rebind`](Self::rebind): two link changes close together must not interleave
+    /// their close-then-bind phases on the same port.
+    rebinding: tokio::sync::Mutex<()>,
     /// Connected per-path sockets sharing `sock`'s port (opt-in; see `connected.rs`). Locked
     /// disjointly from every other lock, never across an `.await`.
     connected: Mutex<ConnectedSockets>,
@@ -393,8 +402,9 @@ pub struct MagicSock {
     /// When wired `true` from `ts_runtime::Env::enable_ipv6` (via
     /// [`MagicSock::with_enable_ipv6`]), the filter additionally accepts IPv6 candidates that are
     /// valid global unicast addresses (rejecting loopback, unique-local, link-local, multicast and
-    /// unspecified). This governs *only* which disco candidates are considered pingable — never the
-    /// underlay bind or the exit egress path, both of which stay IPv4-only by their own gates.
+    /// unspecified), provided the socket itself is dual-stack ([`MagicSock::sends_ipv6`]). This
+    /// governs *only* which disco candidates are considered pingable — never the underlay bind or
+    /// the exit egress path, both of which stay IPv4-only by their own gates.
     enable_ipv6: bool,
     /// Whether this node sits behind a symmetric (endpoint-dependent-mapping) NAT, per netcheck's
     /// `MappingVariesByDestIP`. When `true`, [`self_endpoints`](Self::self_endpoints) additionally
@@ -513,9 +523,11 @@ impl MagicSock {
             tracing::info!(?settings, "magicsock: connected sockets / DF enabled");
         }
         let (connected, connected_rx) = ConnectedSockets::new(settings);
+        let bound_addr = sock.local_addr()?;
         Ok(Self {
-            sock: Mutex::new(Arc::new(sock)),
-            rebound: tokio::sync::watch::Sender::new(0),
+            sock: tokio::sync::watch::Sender::new(Some(Arc::new(sock))),
+            bound_addr: Mutex::new(bound_addr),
+            rebinding: tokio::sync::Mutex::new(()),
             connected: Mutex::new(connected),
             connected_rx: tokio::sync::Mutex::new(ReceiveState {
                 connected: connected_rx,
@@ -550,13 +562,34 @@ impl MagicSock {
         })
     }
 
-    /// The current underlay socket. Clones the `Arc` under a short lock (never held across an
-    /// `.await`), so a concurrent [`rebind`](Self::rebind) swaps the socket for *subsequent* calls
-    /// while an in-progress send keeps using the socket it already cloned. A parked receive does
-    /// not keep it: [`fill_receive`](Self::fill_receive) also watches [`rebound`](Self::rebound)
-    /// and re-reads this when it fires.
-    fn sock(&self) -> Arc<UdpSocket> {
-        lock(&self.sock).clone()
+    /// The current underlay socket. Clones the `Arc` out of the watch channel, so a concurrent
+    /// [`rebind`](Self::rebind) swaps the socket for *subsequent* calls while an in-progress send
+    /// keeps using the socket it already cloned. A parked receive does not keep it:
+    /// [`fill_receive`](Self::fill_receive) also watches the channel and lets go when it changes.
+    ///
+    /// Waits while a rebind is between closing the old socket and publishing the new one, so a
+    /// send that lands in the gap goes out of the new socket, as a write does in Go
+    /// (`writeToUDPAddrPortWithInitPconn` retries on the current conn once `bindSocket` releases
+    /// the lock). After a rebind that could bind nothing at all this waits for the next rebind to
+    /// publish a socket, as Go parks its receive funcs on a conn that blocks forever "for a future
+    /// in which we get a link change and we can try binding again".
+    async fn sock(&self) -> Arc<UdpSocket> {
+        let mut rx = self.sock.subscribe();
+        Self::bound_socket(&mut rx).await
+    }
+
+    /// [`sock`](Self::sock) through a receiver the caller keeps, so the receiver has seen the
+    /// socket it returns and `changed()` on it fires only for the next swap.
+    async fn bound_socket(
+        rx: &mut tokio::sync::watch::Receiver<Option<Arc<UdpSocket>>>,
+    ) -> Arc<UdpSocket> {
+        let bound = rx
+            .wait_for(Option::is_some)
+            .await
+            .expect("the sender lives in MagicSock, which outlives every receiver");
+        bound
+            .clone()
+            .expect("wait_for returns only once a socket is published")
     }
 
     /// Write one datagram to the bound underlay socket — the chokepoint every *data-path* UDP send
@@ -580,7 +613,7 @@ impl MagicSock {
         if self.only_tcp_443() {
             return Ok(false);
         }
-        let sock = self.sock();
+        let sock = self.sock().await;
         let connected = {
             let mut c = lock(&self.connected);
             if c.enabled() {
@@ -605,10 +638,10 @@ impl MagicSock {
 
     /// Whether the underlay socket can send to an IPv6 address at all: only a dual-stack `[::]`
     /// bind can (`enable_ipv6`, and the host let it). The IPv4-only default, and the inert IPv4
-    /// fallback a dual-stack bind takes on a host with IPv6 off, cannot. Read from the socket
-    /// rather than from `enable_ipv6` so the fallback case answers truthfully.
+    /// fallback a dual-stack bind takes on a host with IPv6 off, cannot. Read from the bound
+    /// address rather than from `enable_ipv6` so the fallback case answers truthfully.
     fn sends_ipv6(&self) -> bool {
-        self.sock().local_addr().is_ok_and(|a| a.is_ipv6())
+        lock(&self.bound_addr).is_ipv6()
     }
 
     /// Whether control has put this node in TCP-443-only mode — see
@@ -640,10 +673,16 @@ impl MagicSock {
     /// `Conn.Rebind()` + `resetEndpointStates`.
     ///
     /// What it does, and deliberately does NOT do:
-    /// - **Re-binds the UDP socket**, same-port-preferred (the new mapping should keep our advertised
-    ///   port where possible) with an ephemeral fallback if the old port can't be re-bound. IPv4-only
-    ///   unless `enable_ipv6` (then dual-stack `[::]:0` with an inert IPv4 fallback) — byte-for-byte
-    ///   the `bind` family rule, so the sacred IPv4-only invariant is preserved.
+    /// - **Re-binds the UDP socket on the same port** (the new mapping keeps our advertised port)
+    ///   with an ephemeral fallback if the port can't be re-bound. In the default mode this is
+    ///   two-phase, as Go's `bindSocket`: the parked receive loop is told to let go of the old
+    ///   socket, the socket is dropped (closed) so its port is free, the same port is bound again,
+    ///   and the new socket is published. Sends and receives that land in the gap wait for the new
+    ///   socket; datagrams that arrive in the gap are lost, as in Go. With connected sockets on,
+    ///   `SO_REUSEPORT` lets the same port bind beside the old socket, so there is no gap and the
+    ///   old socket serves until the new one is published. IPv4-only unless `enable_ipv6` (then
+    ///   dual-stack `[::]:0` with an inert IPv4 fallback) — byte-for-byte the `bind` family rule,
+    ///   so the sacred IPv4-only invariant is preserved.
     /// - **Clears the reflexive (STUN-learned) set and every peer's confirmed best path** (keeping
     ///   candidate endpoints): the old reflexive addresses and direct paths were valid only for the
     ///   old NAT mapping. Peers fail closed back to DERP until a candidate re-confirms over the new
@@ -653,33 +692,58 @@ impl MagicSock {
     /// - Does **NOT** touch peers, disco keys, the netmap, or DERP — only the socket + the
     ///   mapping-derived state. WireGuard sessions survive (they ride whatever underlay carries them).
     ///
-    /// On a bind error the existing socket is kept (we do not tear down connectivity to chase a
-    /// rebind that failed); the error is returned so the caller can log/retry.
+    /// On a bind error with connected sockets on, the existing socket is kept (we do not tear down
+    /// connectivity to chase a rebind that failed). In the default mode the old socket is already
+    /// closed by then, and `rebind_socket` has tried the same port and an ephemeral one; if both
+    /// failed nothing is bound, sends and receives wait, and the next link change tries again, as
+    /// in Go. Either way the error is returned so the caller can log/retry.
     pub async fn rebind(&self) -> Result<(), Error> {
-        // Prefer re-binding the same local port so our advertised endpoint stays stable; fall back
-        // to an ephemeral port if it's taken. Honor the IPv4-only-by-default invariant via the same
+        let _one_at_a_time = self.rebinding.lock().await;
+        // Re-bind the same local port so our advertised endpoint stays stable; fall back to an
+        // ephemeral port if it can't be. Honor the IPv4-only-by-default invariant via the same
         // family choice `bind` uses.
-        let current_port = self.sock().local_addr().map(|a| a.port()).unwrap_or(0);
+        let current_port = lock(&self.bound_addr).port();
         let want_v6 = self.enable_ipv6;
         let reuse_port = lock(&self.connected).enabled();
-        let new_sock = match rebind_socket(current_port, want_v6, reuse_port).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, "rebind: re-bind failed, keeping existing socket");
-                return Err(e.into());
+        let new_sock = if reuse_port {
+            // `SO_REUSEPORT`: the same port binds beside the old socket, so the swap needs no gap
+            // and the old socket keeps serving until the new one is published.
+            match rebind_socket(current_port, want_v6, true).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "rebind: re-bind failed, keeping existing socket");
+                    return Err(e.into());
+                }
+            }
+        } else {
+            // Two-phase, as Go's `bindSocket`: close the old socket, then listen on the same port.
+            // Taking it out of the channel wakes the receive parked on it (`fill_receive`), which
+            // lets its clone go; a send in flight finishes on its clone. The socket closes, and
+            // its port is free, when the last clone is dropped, so wait for that before binding.
+            if let Some(old) = self.sock.send_replace(None) {
+                self.wait_for_release(old).await;
+            }
+            match rebind_socket(current_port, want_v6, false).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "rebind: re-bind failed; nothing is bound until the next rebind succeeds"
+                    );
+                    return Err(e.into());
+                }
             }
         };
 
         tune_socket_buffers(&new_sock);
 
-        // Swap the socket atomically, then wake any receive parked on the old one so it re-reads
-        // `sock` and waits on the new socket (`fill_receive`); the old `Arc<UdpSocket>` closes once
-        // the last clone releases it. Go closes the old conn under the `RebindingUDPConn` lock and
-        // its parked read reloops onto the current conn; a parked tokio receive is woken instead,
-        // because a clone it holds cannot be closed from here.
-        *lock(&self.sock) = Arc::new(new_sock);
-        self.rebound
-            .send_modify(|generation| *generation = generation.wrapping_add(1));
+        // Publish the new socket: every later `sock()` call, and a receive waiting out the gap,
+        // picks it up. With connected sockets on, this is also what wakes the receive parked on
+        // the old socket, which closes once its last clone is released.
+        if let Ok(addr) = new_sock.local_addr() {
+            *lock(&self.bound_addr) = addr;
+        }
+        self.sock.send_replace(Some(Arc::new(new_sock)));
         // Connected sockets were bound to the old socket's address; start over.
         lock(&self.connected).clear();
 
@@ -698,6 +762,27 @@ impl MagicSock {
 
         tracing::info!("magicsock rebound underlay socket (link change)");
         Ok(())
+    }
+
+    /// Wait until `old`, just taken out of the channel by [`rebind`](Self::rebind), is the last
+    /// clone of the old socket, then drop it so the socket closes and its port is free. The parked
+    /// receive lets go on its next poll and a send in flight on its own clone finishes at once, so
+    /// this normally returns within a scheduler tick. If a clone is still held after
+    /// [`REBIND_RELEASE_WAIT`] the port is not free; the same-port bind then fails and
+    /// `rebind_socket` falls back to an ephemeral port, as every rebind did before the two phases.
+    async fn wait_for_release(&self, old: Arc<UdpSocket>) {
+        let deadline = Instant::now() + REBIND_RELEASE_WAIT;
+        while Arc::strong_count(&old) > 1 {
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    "rebind: the old socket is still in use after {REBIND_RELEASE_WAIT:?}; its \
+                     port cannot be kept"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        drop(old);
     }
 
     /// Enable accepting IPv6 disco candidates on the tailnet overlay (default `false`).
@@ -734,11 +819,17 @@ impl MagicSock {
     ///
     /// Accepted (IPv4): any other (public, routable) IPv4 address.
     ///
-    /// IPv6 is gated by [`MagicSock::with_enable_ipv6`] (default `false`):
-    /// - when `false` — every IPv6 candidate is rejected, byte-for-byte the historical IPv4-only
-    ///   behavior. The primary deployment is an IPv4-only privacy proxy / exit node, so an IPv6
-    ///   candidate can only be noise or an attempt to reach a forbidden surface.
-    /// - when `true` — an IPv6 candidate is accepted **only** if it is a valid global unicast
+    /// IPv6 is gated by [`MagicSock::with_enable_ipv6`] (default `false`) **and** by the socket's
+    /// family ([`sends_ipv6`](Self::sends_ipv6)), the same source of truth
+    /// [`set_netmap_endpoints`](Self::set_netmap_endpoints) uses for netmap endpoints:
+    /// - when the gate is `false` — every IPv6 candidate is rejected, byte-for-byte the historical
+    ///   IPv4-only behavior. The primary deployment is an IPv4-only privacy proxy / exit node, so
+    ///   an IPv6 candidate can only be noise or an attempt to reach a forbidden surface.
+    /// - when the gate is `true` but the socket is IPv4-only (a dual-stack bind that fell back to
+    ///   IPv4 on a host with IPv6 off at the kernel) — every IPv6 candidate is rejected too: the
+    ///   socket cannot send to it, so accepting it only made every discovery sweep try and fail.
+    /// - when the gate is `true` and the socket is dual-stack — an IPv6 candidate is accepted
+    ///   **only** if it is a valid global unicast
     ///   address. Rejected: unspecified (`::`), loopback (`::1`), unique-local (`fc00::/7`,
     ///   `is_unique_local()`), link-local (`fe80::/10`, `is_unicast_link_local()`) and multicast.
     ///   These mirror the IPv4 rejections (a peer must not steer host-sourced probes at loopback,
@@ -756,8 +847,8 @@ impl MagicSock {
             IpAddr::V6(ip) => {
                 // IPv6 candidates are gated off by default (IPv4-only deployment). When the gate
                 // is off, preserve the exact historical behavior: every IPv6 candidate is
-                // rejected.
-                if !self.enable_ipv6 {
+                // rejected. The same when the socket cannot send to one, whatever the gate says.
+                if !self.enable_ipv6 || !self.sends_ipv6() {
                     return false;
                 }
                 // Gate on: accept only a routable global unicast address. `is_unique_local`
@@ -800,9 +891,10 @@ impl MagicSock {
         self
     }
 
-    /// The local address the underlay socket is bound to.
+    /// The local address the underlay socket is bound to. Answers during a rebind's gap too, with
+    /// the address of the socket being replaced (whose port the rebind keeps).
     pub fn local_addr(&self) -> Result<SocketAddr, Error> {
-        Ok(self.sock().local_addr()?)
+        Ok(*lock(&self.bound_addr))
     }
 
     /// Our candidate self-endpoints: the bound local address plus every reflexive address peers
@@ -1579,7 +1671,7 @@ impl MagicSock {
             && !self.only_tcp_443()
             && let Some(addr) = self.best_addr(peer)
         {
-            let sock = self.sock();
+            let sock = self.sock().await;
             let connected = {
                 let mut c = lock(&self.connected);
                 if c.batched_io() {
@@ -1650,16 +1742,17 @@ impl MagicSock {
     }
 
     /// Wait for the next kernel batch (or connected-socket batch) and queue it in `pending`.
-    /// Returns with nothing queued when a [`rebind`](Self::rebind) swaps the socket while this is
-    /// parked on the old one: the caller loops and the next call waits on the new socket. The
-    /// receiver is subscribed *before* the socket is cloned, so a rebind that lands between the
-    /// two is seen either as the new socket or as a wake-up, never missed.
+    /// Returns with nothing queued when a [`rebind`](Self::rebind) takes the socket away while
+    /// this is parked on it: the clone is dropped on the way out (so the socket can close and its
+    /// port be bound again), the caller loops, and the next call waits for the new socket to be
+    /// published and then on it. The socket is read through the same receiver the select watches,
+    /// so a rebind that lands between the read and the select is a wake-up, never missed.
     async fn fill_receive(&self, state: &mut ReceiveState) -> Result<(), Error> {
         if !state.pending.is_empty() {
             return Ok(());
         }
-        let mut rebound = self.rebound.subscribe();
-        let sock = self.sock();
+        let mut rebound = self.sock.subscribe();
+        let sock = Self::bound_socket(&mut rebound).await;
         if let Some(receiver) = &mut state.receiver {
             let batch = tokio::select! {
                 r = receiver.recv(&sock, None) => crate::receive_batch::Received::Batch(r?),
@@ -2869,7 +2962,7 @@ impl MagicSock {
         }
 
         let req = crate::stun::encode_binding_request(tx_id);
-        self.sock().send_to(&req, server).await?;
+        self.sock().await.send_to(&req, server).await?;
         Ok(())
     }
 
@@ -3491,11 +3584,13 @@ mod tests {
     async fn restart_direct_recovers_despite_a_failed_candidate() {
         async fn receive_one(sock: &MagicSock) -> Inbound {
             let mut buf = [0; 2048];
-            let (n, _) =
-                tokio::time::timeout(Duration::from_secs(2), sock.sock().recv_from(&mut buf))
-                    .await
-                    .expect("a disco frame must arrive")
-                    .unwrap();
+            let (n, _) = tokio::time::timeout(
+                Duration::from_secs(2),
+                sock.sock().await.recv_from(&mut buf),
+            )
+            .await
+            .expect("a disco frame must arrive")
+            .unwrap();
             disco::open(&sock.our_disco, &mut buf[..n]).unwrap()
         }
 
@@ -3648,10 +3743,16 @@ mod tests {
         Arc::new(|_: &NodePublicKey| Some(CapabilityVersion::CURRENT))
     }
 
-    /// Bind a magicsock with the IPv6 candidate gate `enable`d (or not) for filter tests.
+    /// Bind a magicsock with the IPv6 candidate gate `enable`d (or not) for filter tests. With the
+    /// gate on, the underlay is bound dual-stack (`[::]:0`), so the socket can send IPv6 and the
+    /// gate is the only thing under test; with it off, the IPv4-only default.
     async fn sock_with_ipv6(enable: bool) -> MagicSock {
         MagicSock::bind(
-            localhost(),
+            if enable {
+                "[::]:0".parse().unwrap()
+            } else {
+                localhost()
+            },
             DiscoPrivateKey::random(),
             ts_keys::NodePrivateKey::random().public_key(),
         )
@@ -3911,11 +4012,16 @@ mod tests {
         assert!(!sock.is_pingable_candidate(&"127.0.0.1:41641".parse().unwrap()));
     }
 
-    /// With the IPv6 gate **on**, only a routable global unicast IPv6 address is accepted; every
-    /// loopback / unique-local / link-local / multicast / unspecified form is still rejected.
+    /// With the IPv6 gate **on** and a dual-stack socket, only a routable global unicast IPv6
+    /// address is accepted; every loopback / unique-local / link-local / multicast / unspecified
+    /// form is still rejected.
     #[tokio::test]
     async fn is_pingable_candidate_gate_on_accepts_only_global_unicast_ipv6() {
         let sock = sock_with_ipv6(true).await;
+        assert!(
+            sock.sends_ipv6(),
+            "precondition: the socket is dual-stack, so the gate alone decides"
+        );
 
         // Global unicast — accepted.
         assert!(
@@ -3942,6 +4048,28 @@ mod tests {
         // IPv4 behavior is identical whether the gate is on or off.
         assert!(sock.is_pingable_candidate(&"203.0.113.7:41641".parse().unwrap()));
         assert!(!sock.is_pingable_candidate(&"10.0.0.5:41641".parse().unwrap()));
+    }
+
+    /// `enable_ipv6` alone does not make an IPv6 candidate pingable: the socket has to be able to
+    /// send to it. A dual-stack bind that fell back to IPv4 (a host with IPv6 off at the kernel)
+    /// runs with `enable_ipv6` set and an IPv4-only socket, and before this a disco-learned IPv6
+    /// candidate was accepted there and then failed at send on every discovery round, the same
+    /// gap `set_netmap_endpoints` closes for netmap endpoints with `sends_ipv6`. The filter now
+    /// reads the same source of truth: the family of the bound socket, and the gate.
+    #[tokio::test]
+    async fn is_pingable_candidate_rejects_ipv6_on_an_ipv4_only_socket_even_with_the_gate_on() {
+        let sock = plain_sock().await.with_enable_ipv6(true);
+        assert!(
+            sock.local_addr().unwrap().is_ipv4() && !sock.sends_ipv6(),
+            "precondition: an IPv4-only underlay with the gate on"
+        );
+        assert!(
+            !sock.is_pingable_candidate(&"[2001:db8::1]:41641".parse().unwrap()),
+            "an IPv4-only socket cannot send to an IPv6 candidate, so it must not be pingable \
+             whatever the gate says"
+        );
+        // IPv4 is unaffected by the gate or the family.
+        assert!(sock.is_pingable_candidate(&"203.0.113.7:41641".parse().unwrap()));
     }
 
     /// With the IPv6 gate **off** (the default IPv4-only deployment) `self_endpoints` must emit NO
@@ -4932,6 +5060,10 @@ mod tests {
             // uses. The gate under test is the filter, not the write.
             .with_enable_ipv6(true),
         );
+        // The filter also asks whether the socket sends IPv6 (`sends_ipv6`, read from the bound
+        // address); tell it yes, so the gate is what decides, while the real socket stays
+        // IPv4-bound and the write still fails.
+        *lock(&a.bound_addr) = "[::]:0".parse().unwrap();
         // Note: `allow_loopback_relay` deliberately NOT set — this is the production filter.
         let mut sends = a.tap_relay_sends();
 
@@ -4996,6 +5128,10 @@ mod tests {
                 .with_peer_cap_version(all_relay_capable())
                 .with_enable_ipv6(enable_ipv6),
             );
+            // The filter also asks whether the socket sends IPv6 (`sends_ipv6`, read from the
+            // bound address); tell it yes, so the gate is what decides, while the real socket
+            // stays IPv4-bound and the write still fails and is swallowed.
+            *lock(&a.bound_addr) = "[::]:0".parse().unwrap();
             // Note: `allow_loopback_relay` deliberately NOT set — this is the production filter.
             let mut sends = a.tap_relay_sends();
 
@@ -6087,10 +6223,11 @@ mod tests {
                 pp.note_pong([1; 12], old_addr, past + Duration::from_nanos(1));
             }
             // Open the old connected socket without a megabyte of irrelevant test traffic.
+            let shared = node.sock().await;
             let connected = lock(&node.connected).socket_for(
                 old_addr,
                 crate::connected::CONNECT_AFTER_BYTES as usize,
-                &node.sock(),
+                &shared,
             );
             assert_eq!(connected.is_some(), enabled);
             assert!(node.best_addr(&peer).is_none());
@@ -6128,10 +6265,11 @@ mod tests {
             assert_eq!(node.best_addr(&peer), Some(source));
             // A stale ready entry remains, yet cannot override the freshly-confirmed address.
             assert_eq!(lock(&node.connected).ready_count(), usize::from(enabled));
+            let shared = node.sock().await;
             let current = lock(&node.connected).socket_for(
                 source,
                 crate::connected::CONNECT_AFTER_BYTES as usize,
-                &node.sock(),
+                &shared,
             );
             assert_eq!(current.is_some(), enabled);
             node.send_wireguard_batch(&peer, &[b"one", b"two"])
@@ -6413,14 +6551,14 @@ mod tests {
         let b_pump = b.clone();
         let pump = tokio::spawn(async move { while let Ok(Some(_)) = b_pump.recv_data().await {} });
 
-        a.sock().send_to(&ping, b_addr).await.unwrap();
+        a.sock().await.send_to(&ping, b_addr).await.unwrap();
 
         // A listens for any pong B might (incorrectly) send back. None should arrive.
         let a_addr = a.local_addr().unwrap();
         let mut buf = vec![0u8; RECV_BUF];
         let got = tokio::time::timeout(
             std::time::Duration::from_millis(300),
-            a.sock().recv_from(&mut buf),
+            a.sock().await.recv_from(&mut buf),
         )
         .await;
         assert!(
@@ -6919,13 +7057,13 @@ mod tests {
         let b_pump = b.clone();
         let pump = tokio::spawn(async move { while let Ok(Some(_)) = b_pump.recv_data().await {} });
 
-        a.sock().send_to(&ping, b_addr).await.unwrap();
+        a.sock().await.send_to(&ping, b_addr).await.unwrap();
 
         // A must not receive a pong: B fails closed without a verifier.
         let mut buf = vec![0u8; RECV_BUF];
         let got = tokio::time::timeout(
             std::time::Duration::from_millis(300),
-            a.sock().recv_from(&mut buf),
+            a.sock().await.recv_from(&mut buf),
         )
         .await;
         assert!(
@@ -8215,6 +8353,7 @@ mod tests {
         // The new socket is live and can send (prove it isn't a closed/dangling fd).
         let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         sock.sock()
+            .await
             .send_to(b"post-rebind", sink.local_addr().unwrap())
             .await
             .expect("the rebound socket must be usable for sending");
@@ -8225,20 +8364,18 @@ mod tests {
             .unwrap();
         assert_eq!(&buf[..n], b"post-rebind");
 
-        // Same-port-preferred: a free ephemeral port should be re-bindable as the same number.
-        // (Not asserted as an equality because the OS may reassign; we only require a valid bind,
-        // already proven above. `port_before` is captured to document the intent.)
-        let _ = port_before;
+        // Same port: the old socket is closed before the port is bound again, so the advertised
+        // endpoint survives the rebind.
+        assert_eq!(after.port(), port_before, "a rebind keeps its port");
     }
 
     /// A receive loop already parked in `recv_data` when `rebind` swaps the socket must carry on
     /// from the NEW socket: a datagram a peer sends to the rebound port has to reach it. The loop
     /// used to keep its own clone of the old socket, which the rebind could neither close nor wake
-    /// (the clone kept it open, and its port taken, which is also why the rebind lands on a new
-    /// port), so nothing sent to the new port ever reached a loop that was already waiting; only a
-    /// loop that happened to start after the rebind saw the new socket. Go's `RebindingUDPConn`
-    /// closes the old conn under its lock and `ReadBatch` re-reads the current one, so a parked
-    /// read there resumes on the new socket.
+    /// (the clone kept it open, and its port taken), so nothing sent to the new port ever reached
+    /// a loop that was already waiting; only a loop that happened to start after the rebind saw
+    /// the new socket. Go's `RebindingUDPConn` closes the old conn under its lock and `ReadBatch`
+    /// re-reads the current one, so a parked read there resumes on the new socket.
     #[tokio::test]
     async fn a_parked_receive_loop_follows_the_socket_across_a_rebind() {
         let sock = Arc::new(plain_sock().await);
@@ -8257,15 +8394,8 @@ mod tests {
             "precondition: the receive loop is parked waiting for a datagram"
         );
 
-        let before = sock.local_addr().unwrap();
         sock.rebind().await.expect("rebind must succeed");
         let after = sock.local_addr().unwrap();
-        assert_ne!(
-            before.port(),
-            after.port(),
-            "precondition: the parked loop still holds the old socket open, so the rebind lands \
-             on a different port (this is what makes the stale clone unreachable)"
-        );
 
         // The rebound socket is bound to `0.0.0.0`; reach it over loopback.
         let target = SocketAddr::from((core::net::Ipv4Addr::LOCALHOST, after.port()));
@@ -8282,6 +8412,54 @@ mod tests {
         assert_eq!(got.from_disco, peer);
         assert_eq!(got.from_addr, sender.local_addr().unwrap());
         assert_eq!(got.data.as_ref(), b"wireguard-looking data");
+    }
+
+    /// In the default mode (no connected sockets, so no `SO_REUSEPORT`) a rebind keeps its port.
+    /// The port is the node's advertised endpoint: a peer's netmap, the NAT mapping and every
+    /// disco candidate carry it, so a rebind that lands on a new port throws all of that away on
+    /// every link change. Go keeps it by closing the old conn before it listens on the same port
+    /// (`bindSocket` in `magicsock.go`); here the old socket is released by the parked receive
+    /// loop and dropped before the same port is bound again. The receive loop is parked, as it
+    /// always is in production, because its clone of the old socket is what kept the port taken.
+    #[tokio::test]
+    async fn a_rebind_keeps_its_port_in_the_default_mode() {
+        let sock = Arc::new(plain_sock().await);
+        assert!(
+            !lock(&sock.connected).enabled(),
+            "precondition: the default mode has no connected sockets, so no SO_REUSEPORT"
+        );
+        let peer = DiscoPrivateKey::random().public_key();
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sock.add_peer_endpoints_unfiltered(peer, [sender.local_addr().unwrap()]);
+
+        let pump_sock = sock.clone();
+        let pump = tokio::spawn(async move { pump_sock.recv_data().await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !pump.is_finished(),
+            "precondition: the receive loop is parked on the pre-rebind socket"
+        );
+
+        let before = sock.local_addr().unwrap();
+        sock.rebind().await.expect("rebind must succeed");
+        let after = sock.local_addr().unwrap();
+        assert_eq!(
+            after.port(),
+            before.port(),
+            "a rebind in the default mode must keep its port (before {before}, after {after})"
+        );
+
+        // And the kept port is live: the parked loop receives what a peer sends to it.
+        let target = SocketAddr::from((core::net::Ipv4Addr::LOCALHOST, after.port()));
+        sender.send_to(b"after the rebind", target).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("the parked receive loop must see a datagram sent to the kept port")
+            .unwrap()
+            .unwrap()
+            .expect("the datagram must be yielded as data");
+        assert_eq!(got.from_disco, peer);
+        assert_eq!(got.data.as_ref(), b"after the rebind");
     }
 
     /// A netmap can carry a peer's IPv6 endpoint while this node's underlay socket is IPv4-only
