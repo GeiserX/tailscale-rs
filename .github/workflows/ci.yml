@@ -149,6 +149,10 @@ jobs:
         run: |
           cargo check -p geiserx_ts_runtime --features tun --all-targets
           cargo clippy -p geiserx_ts_runtime --features tun --no-deps --all-targets -- -D warnings -A missing_docs
+      # Run the `tun` feature's unit tests too. The step above only compiles them, so the TUN-mode
+      # tests in ts_runtime would otherwise never run on a fork.
+      - name: Test the `tun` feature (cargo test --features tun --lib)
+        run: cargo test -p geiserx_ts_runtime --features tun --lib
       - name: Anti-leak firewall checks (cargo run -p checks)
         run: cargo run -p checks
       - name: binstall
