@@ -18,6 +18,9 @@ workspace = true
 
 [dependencies]
 etherparse = "0.19"
+# `if-addrs` reads the exit host's interface subnets (libc `getifaddrs` on POSIX), which exit flows
+# must not reach. The same crate and version `ts_host_net` and `ts_magicsock` already use.
+if-addrs = "0.15"
 ts_netstack_smoltcp = { workspace = true, features = ["tokio"] }
 ipnet.workspace = true
 bytes.workspace = true

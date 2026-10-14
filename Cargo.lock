@@ -2109,6 +2109,7 @@ dependencies = [
  "bytes",
  "etherparse",
  "geiserx_ts_netstack_smoltcp",
+ "if-addrs",
  "ipnet",
  "thiserror 2.0.21",
  "tokio",
