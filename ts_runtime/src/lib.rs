@@ -1425,7 +1425,7 @@ impl Runtime {
     ///
     /// Returns an [`IpnBusWatcher`]; await [`next`](IpnBusWatcher::next) to receive [`Notify`]
     /// events that coalesce device-[`DeviceState`] changes (including the interactive-login URL as
-    /// `browse_to_url`) and netmap peer-set changes into one feed. `mask`
+    /// `browse_to_url`) and netmap changes (the peer set, or this node alone) into one feed. `mask`
     /// ([`NotifyWatchOpt`]) selects which current-state fields are front-loaded as an initial
     /// snapshot on subscribe (`INITIAL_STATE` / `INITIAL_NETMAP`), exactly like Go's
     /// `NotifyInitialState` / `NotifyInitialNetMap`.
@@ -1454,11 +1454,15 @@ impl Runtime {
         // The running-node consent-URL cell lives on the control runner; obtain its receiver the
         // same way (the control actor ref is strong, so no upgrade needed).
         let browser_rx = self.control.ask(control_runner::WatchBrowserUrl).await?;
+        // The self-node cell also lives on the control runner. A change to it alone (no peer
+        // change) still ticks `net_map`, as Go's `Notify.SelfChange` does.
+        let self_rx = self.control.ask(control_runner::WatchSelfNode).await?;
         Ok(ipn_bus::spawn_watcher(
             mask,
             self.state_rx.clone(),
             peer_rx,
             browser_rx,
+            self_rx,
             self.shutdown.subscribe(),
         ))
     }
