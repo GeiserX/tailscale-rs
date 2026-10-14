@@ -552,7 +552,7 @@ mod tests {
     fn parse_oauth_secret_with_query() {
         let s = OAuthSecret::parse("tskey-client-abc?ephemeral=false&preauthorized=true");
         assert_eq!(s.stripped, "tskey-client-abc");
-        assert!(s.ephemeral);
+        assert!(!s.ephemeral);
         assert!(s.preauthorized);
         assert_eq!(s.base_url, DEFAULT_API_BASE_URL);
     }
