@@ -1694,7 +1694,7 @@ mod tests {
                 family: Family::Any
             }
         );
-        assert_eq!(parse_network("tcp4").unwrap().family, Family::V6);
+        assert_eq!(parse_network("tcp4").unwrap().family, Family::V4);
         assert_eq!(parse_network("tcp6").unwrap().family, Family::V6);
         assert_eq!(parse_network("udp").unwrap().transport, Transport::Udp);
         assert_eq!(parse_network("udp4").unwrap().family, Family::V4);
