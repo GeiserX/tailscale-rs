@@ -123,10 +123,9 @@ impl Netstack {
                     .get_mut(&handle)
                     .expect("listener present");
 
-                // Iterate the half-open queue, re-queueing any sockets that are still in
-                // `SYN-RECEIVED`. Move any sockets in `ESTABLISHED` to the `accept_queue`, close
-                // any sockets in `CLOSE-WAIT`, and drop any sockets that moved back to `LISTEN`.
-                // All other states are unexpected.
+                // A peer may send data and FIN before accept runs, including on the final
+                // handshake ACK. CLOSE-WAIT still has a writable transmit half and buffered RX.
+                // Reset/expired sockets are reclaimed explicitly, even when RX is nonempty.
                 listener.half_open_queue.retain(|half_open| {
                     let sock = self.socket_set.get_mut::<tcp::Socket>(*half_open);
                     let state = sock.state();
@@ -144,32 +143,45 @@ impl Netstack {
                             tracing::trace!("half-open socket unchanged, re-queueing");
                             true
                         }
-                        tcp::State::Established => {
-                            tracing::trace!("half-open socket ready, moving to accept queue");
+                        tcp::State::Established | tcp::State::CloseWait => {
+                            tracing::trace!(
+                                ?state,
+                                "half-open socket ready, moving to accept queue"
+                            );
                             listener.accept_queue.push_back(*half_open);
                             false
                         }
-                        tcp::State::CloseWait => {
-                            tracing::trace!("half-open socket moved to CLOSE-WAIT, closing");
-                            sock.close();
+                        tcp::State::Closed => {
+                            tracing::debug!(
+                                ?half_open,
+                                ?state,
+                                "half-open socket closed; reclaiming"
+                            );
                             self.pending_tcp_closes.insert(*half_open);
-                            if self.pending_tcp_closes.len() > 10000 {
-                                tracing::warn!("large number of pending closes");
-                            }
                             false
                         }
-                        tcp::State::Listen => {
-                            tracing::trace!("half-open socket moved to LISTEN, dropping");
-                            false
-                        }
-                        _ => {
-                            tracing::warn!("half-open socket in unexpected state, dropping");
+                        tcp::State::Listen
+                        | tcp::State::SynSent
+                        | tcp::State::FinWait1
+                        | tcp::State::FinWait2
+                        | tcp::State::Closing
+                        | tcp::State::TimeWait
+                        | tcp::State::LastAck => {
+                            // LISTEN is normally removed by prune_reset_half_open. The other
+                            // states require a local close/connect and have no accepting consumer.
+                            tracing::warn!(
+                                ?half_open,
+                                ?state,
+                                "half-open socket in unexpected state; aborting and reclaiming"
+                            );
+                            sock.abort();
+                            self.pending_tcp_closes.insert(*half_open);
                             false
                         }
                     }
                 });
 
-                // De-queue a single socket in the `ESTABLISHED` state from the `accept_queue` and
+                // De-queue a socket in ESTABLISHED or CLOSE-WAIT from the accept queue and
                 // return it to become a `TcpStream`.
                 while let Some(accept) = listener.accept_queue.pop_front() {
                     let sock = self.socket_set.get_mut::<tcp::Socket>(accept);
@@ -185,17 +197,29 @@ impl Netstack {
                     .entered();
 
                     match state {
-                        tcp::State::Established => {
-                            tracing::trace!("accept socket accepted, returning")
+                        tcp::State::Established | tcp::State::CloseWait => {
+                            tracing::trace!(?state, "accept socket accepted, returning")
                         }
-                        tcp::State::CloseWait => {
-                            tracing::trace!(?state, "accept socket no longer established, closing");
-                            sock.close();
+                        tcp::State::Closed => {
+                            tracing::debug!(?accept, ?state, "accept socket closed; reclaiming");
                             self.pending_tcp_closes.insert(accept);
                             continue;
                         }
-                        _ => {
-                            tracing::warn!(?state, "accept socket in unexpected state, dropping");
+                        tcp::State::Listen
+                        | tcp::State::SynSent
+                        | tcp::State::SynReceived
+                        | tcp::State::FinWait1
+                        | tcp::State::FinWait2
+                        | tcp::State::Closing
+                        | tcp::State::TimeWait
+                        | tcp::State::LastAck => {
+                            tracing::warn!(
+                                ?accept,
+                                ?state,
+                                "accept socket in unexpected state; aborting and reclaiming"
+                            );
+                            sock.abort();
+                            self.pending_tcp_closes.insert(accept);
                             continue;
                         }
                     }
@@ -316,8 +340,8 @@ impl Netstack {
                 listener.half_open_queue.push_back(current);
             }
 
-            tcp::State::Established => {
-                tracing::trace!("connection established");
+            tcp::State::Established | tcp::State::CloseWait => {
+                tracing::trace!(?state, "connection established");
                 self.enforce_listen_backlog(handle);
                 let listener = self
                     .tcp_listeners
@@ -647,6 +671,240 @@ mod tests {
             !stack.socket_set.iter().any(|(h, _)| h == victim),
             "drain removed the victim from the socket set (buffers freed)"
         );
+    }
+
+    const CLIENT: core::net::Ipv4Addr = core::net::Ipv4Addr::new(203, 0, 113, 2);
+    const SERVER: core::net::Ipv4Addr = core::net::Ipv4Addr::new(203, 0, 113, 1);
+
+    fn packet(
+        control: smoltcp::wire::TcpControl,
+        seq: u32,
+        ack: Option<u32>,
+        payload: &[u8],
+    ) -> bytes::Bytes {
+        use smoltcp::{
+            phy::ChecksumCapabilities,
+            wire::{IpProtocol, Ipv4Packet, Ipv4Repr, TcpPacket, TcpRepr, TcpSeqNumber},
+        };
+        let tcp = TcpRepr {
+            src_port: 1000,
+            dst_port: 80,
+            control,
+            seq_number: TcpSeqNumber(seq as i32),
+            ack_number: ack.map(|n| TcpSeqNumber(n as i32)),
+            window_len: 65535,
+            window_scale: None,
+            max_seg_size: None,
+            sack_permitted: false,
+            sack_ranges: [None; 3],
+            timestamp: None,
+            payload,
+        };
+        let ip = Ipv4Repr {
+            src_addr: CLIENT,
+            dst_addr: SERVER,
+            next_header: IpProtocol::Tcp,
+            payload_len: tcp.buffer_len(),
+            hop_limit: 64,
+        };
+        let caps = ChecksumCapabilities::default();
+        let mut buf = alloc::vec![0; ip.buffer_len() + tcp.buffer_len()];
+        ip.emit(&mut Ipv4Packet::new_unchecked(&mut buf[..]), &caps);
+        tcp.emit(
+            &mut TcpPacket::new_unchecked(&mut buf[ip.buffer_len()..]),
+            &CLIENT.into(),
+            &SERVER.into(),
+            &caps,
+        );
+        bytes::Bytes::from(buf)
+    }
+
+    struct PendingConnection {
+        stack: Netstack,
+        listener: ListenerHandle,
+        handle: SocketHandle,
+        phy: crate::Pipe,
+        dev: crate::PipeDev,
+        ack: u32,
+    }
+
+    impl PendingConnection {
+        fn new() -> Self {
+            use smoltcp::{
+                phy::Medium,
+                wire::{Ipv4Packet, TcpControl, TcpPacket},
+            };
+            let mut stack = Netstack::new(Config::default(), Instant::ZERO);
+            assert!(stack.direct_set_ips([SERVER.into()]));
+            let listener = register_listener(&mut stack, 80);
+            let (net, phy) = crate::Pipe::unbounded();
+            let mut dev = crate::PipeDev {
+                pipe: net,
+                medium: Medium::Ip,
+                mtu: 1500,
+            };
+            phy.tx
+                .try_send(packet(TcpControl::Syn, 100, None, &[]))
+                .unwrap();
+            stack.poll_device_io(Instant::ZERO, &mut dev);
+            let syn_ack = phy.rx.try_recv().unwrap();
+            let ip = Ipv4Packet::new_checked(&syn_ack[..]).unwrap();
+            let ack = (TcpPacket::new_checked(ip.payload()).unwrap().seq_number().0 as u32)
+                .wrapping_add(1);
+            let handle = stack.tcp_listeners[&listener].half_open_queue[0];
+            Self {
+                stack,
+                listener,
+                handle,
+                phy,
+                dev,
+                ack,
+            }
+        }
+
+        fn send(&mut self, control: smoltcp::wire::TcpControl, ack: u32, payload: &[u8]) {
+            self.phy
+                .tx
+                .try_send(packet(control, 101, Some(ack), payload))
+                .unwrap();
+            self.stack.poll_device_io(Instant::ZERO, &mut self.dev);
+        }
+
+        fn move_to_accept_queue(&mut self) {
+            let listener = self.stack.tcp_listeners.get_mut(&self.listener).unwrap();
+            assert_eq!(listener.half_open_queue.pop_front(), Some(self.handle));
+            listener.accept_queue.push_back(self.handle);
+        }
+
+        fn accept(&mut self) -> Response {
+            self.stack.process_tcp_listen(
+                TcpListenCommand::Accept {
+                    handle: self.listener,
+                },
+                None,
+            )
+        }
+
+        fn assert_reclaimed(&mut self) {
+            assert!(matches!(self.accept(), Response::WouldBlock { .. }));
+            self.stack.drain_tcp_closes(self.stack.next_orphan_sweep);
+            assert!(
+                !self.stack.socket_set.iter().any(|(h, _)| h == self.handle),
+                "dequeued socket must release its buffers"
+            );
+        }
+    }
+
+    #[test]
+    fn fin_before_accept_preserves_request_eof_and_reply() {
+        use smoltcp::wire::TcpControl;
+        for accept_queue in [false, true] {
+            let mut c = PendingConnection::new();
+            if accept_queue {
+                c.send(TcpControl::None, c.ack, &[]);
+                c.move_to_accept_queue();
+            }
+            // Also tests ACK + data + FIN completing the handshake directly into CLOSE-WAIT.
+            c.send(TcpControl::Fin, c.ack, b"request");
+            assert_eq!(
+                c.stack.socket_set.get::<tcp::Socket>(c.handle).state(),
+                tcp::State::CloseWait
+            );
+            assert!(
+                matches!(c.accept(), Response::TcpListen(TcpListenResponse::Accepted { handle, .. })
+                if handle == c.handle),
+                "CLOSE-WAIT must be accepted"
+            );
+            let sock = c.stack.socket_set.get_mut::<tcp::Socket>(c.handle);
+            let mut buf = [0; 32];
+            let n = sock.recv_slice(&mut buf).unwrap();
+            assert_eq!(&buf[..n], b"request");
+            assert_eq!(sock.recv_slice(&mut buf), Err(tcp::RecvError::Finished));
+            assert_eq!(sock.send_slice(b"response"), Ok(8));
+        }
+    }
+
+    #[test]
+    fn reset_with_unread_data_is_reclaimed_from_both_queues() {
+        use smoltcp::wire::TcpControl;
+        for accept_queue in [false, true] {
+            let mut c = PendingConnection::new();
+            c.send(TcpControl::None, c.ack, b"unread");
+            if accept_queue {
+                c.move_to_accept_queue();
+            }
+            // Advance sequence beyond the buffered request for an in-window reset.
+            c.phy
+                .tx
+                .try_send(packet(TcpControl::Rst, 107, Some(c.ack), &[]))
+                .unwrap();
+            c.stack.poll_device_io(Instant::ZERO, &mut c.dev);
+            assert_eq!(
+                c.stack.socket_set.get::<tcp::Socket>(c.handle).state(),
+                tcp::State::Closed
+            );
+            assert!(c.stack.socket_set.get::<tcp::Socket>(c.handle).can_recv());
+            c.assert_reclaimed();
+        }
+    }
+
+    #[test]
+    fn locally_closed_unaccepted_sockets_are_reclaimed_in_every_closing_state() {
+        use smoltcp::wire::TcpControl;
+        for state in [
+            tcp::State::FinWait1,
+            tcp::State::FinWait2,
+            tcp::State::Closing,
+            tcp::State::TimeWait,
+            tcp::State::LastAck,
+        ] {
+            for accept_queue in [false, true] {
+                let mut c = PendingConnection::new();
+                c.send(TcpControl::None, c.ack, &[]);
+                if accept_queue {
+                    c.move_to_accept_queue();
+                }
+                if state == tcp::State::LastAck {
+                    c.send(TcpControl::Fin, c.ack, &[]);
+                }
+                c.stack.socket_set.get_mut::<tcp::Socket>(c.handle).close();
+                match state {
+                    tcp::State::FinWait2 => c.send(TcpControl::None, c.ack.wrapping_add(1), &[]),
+                    tcp::State::Closing => c.send(TcpControl::Fin, c.ack, &[]),
+                    tcp::State::TimeWait => c.send(TcpControl::Fin, c.ack.wrapping_add(1), &[]),
+                    _ => {}
+                }
+                assert_eq!(
+                    c.stack.socket_set.get::<tcp::Socket>(c.handle).state(),
+                    state
+                );
+                c.assert_reclaimed();
+            }
+        }
+    }
+
+    #[test]
+    fn accidental_active_open_in_half_open_queue_is_reclaimed() {
+        let mut stack = Netstack::new(Config::default(), Instant::ZERO);
+        assert!(stack.direct_set_ips([SERVER.into()]));
+        let listener = register_listener(&mut stack, 80);
+        let mut sock = stack.new_tcp_socket();
+        sock.connect(stack.iface.context(), (CLIENT, 443), (SERVER, 1000))
+            .unwrap();
+        assert_eq!(sock.state(), tcp::State::SynSent);
+        let handle = stack.add_socket(sock);
+        stack
+            .tcp_listeners
+            .get_mut(&listener)
+            .unwrap()
+            .half_open_queue
+            .push_back(handle);
+        assert!(matches!(
+            stack.process_tcp_listen(TcpListenCommand::Accept { handle: listener }, None),
+            Response::WouldBlock { .. }
+        ));
+        stack.drain_tcp_closes(stack.next_orphan_sweep);
+        assert!(!stack.socket_set.iter().any(|(h, _)| h == handle));
     }
 
     /// A client RST during the handshake sends smoltcp's half-open socket back to `LISTEN`. It
