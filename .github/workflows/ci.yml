@@ -53,8 +53,9 @@ jobs:
   # Self-hosted Linux/X64 build/test/lint lane (runs on the maintainer's own runner, not paid
   # GitHub-hosted minutes). The inherited `build_test`/`arch_independent` matrices target OTHER
   # self-hosted labels (`linux-x86_64-16cpu`, etc.) that don't exist here and stay owner-gated, so
-  # this lane is the real green signal for the `rust` workflow. ring-only, default features
-  # (no `ssh`/`acme`/`tun`); the musl + feature-specific paths are covered by `musl_static` + local.
+  # this lane is the real green signal for the `rust` workflow. It builds and lints with default
+  # features (no `ssh`/`acme`/`tun`) and runs the tests twice: once with default features and once
+  # with every feature on. The musl paths are covered by `musl_static`.
   hosted_test:
     name: hosted test (self-hosted Linux)
     # Self-hosted Linux/X64 runner (Docker container on the maintainer's infra) — keeps CI off paid
@@ -139,6 +140,10 @@ jobs:
         run: cargo build $COMMON_FLAGS --all-targets
       - name: Test (cargo test)
         run: cargo test $COMMON_FLAGS
+      # Run the tests again with every feature on. The run above uses default features, so the
+      # tests behind `ssh`, `acme`, `tun` and the other optional features never ran on a push.
+      - name: Test all features (cargo test --all-features)
+        run: cargo test $COMMON_FLAGS --all-features
       # Compile + lint the optional `tun` feature on the lib it gates (ts_runtime's TUN-mode
       # datapath). `COMMON_FLAGS` is default-features-only, so `mod tun_actor`
       # (`#[cfg(feature = "tun")]`) is otherwise NEVER built on a fork — a shape change to a type it
