@@ -1,11 +1,12 @@
 //! Batched sends on a connected UDP socket with Darwin's `sendmsg_x` (opt-in, Apple only).
 //!
 //! One `sendmsg_x` call hands the kernel up to [`MAX_BATCH`] datagrams, instead of one `send` per
-//! datagram. It is a private but long-stable libSystem call (present since macOS 10.11; Go's
-//! reference implementation for darwin uses it too). It is only used on *connected* sockets, so
-//! every message has the same destination and needs no address. A runtime failure that suggests
-//! the call is unusable (`ENOSYS`, `EOPNOTSUPP`, `EINVAL`) disables it for the process and the
-//! caller falls back to per-datagram sends.
+//! datagram. It is a private but long-stable libSystem call (present since macOS 10.11). Go
+//! v1.102.4 does not use it; it comes from an open upstream proposal
+//! (<https://github.com/tailscale/tailscale/issues/21602>, wireguard-go PR 107). It is only used
+//! on *connected* sockets, so every message has the same destination and needs no address.
+//! A runtime failure that suggests the call is unusable (`ENOSYS`, `EOPNOTSUPP`, `EINVAL`)
+//! disables it for the process and the caller falls back to per-datagram sends.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

@@ -14,8 +14,10 @@
 //! ordinary path MTU.
 //!
 //! Off by default; `TS_DEBUG_MAGICSOCK_CONNECTED_SOCKETS=1` / `TS_DEBUG_DONT_FRAGMENT=1` turn it
-//! on (the knob names of the Go reference implementation). Any failure to open a connected socket
-//! leaves that address on the shared socket for good.
+//! on. Go v1.102.4 has none of this: the knob names, the 1 MiB threshold and the 256-socket cap
+//! follow an open upstream proposal (<https://github.com/tailscale/tailscale/issues/21602>,
+//! tailscale PR 21603 and wireguard-go PR 107). Any failure to open a connected socket leaves that
+//! address on the shared socket for good.
 
 use core::net::SocketAddr;
 use std::{
@@ -26,10 +28,10 @@ use std::{
 
 use tokio::{net::UdpSocket, sync::mpsc};
 
-/// Bytes sent to one address before it gets a connected socket (Go uses the same 1 MiB).
+/// Bytes sent to one address before it gets a connected socket (the upstream proposal's 1 MiB).
 pub(crate) const CONNECT_AFTER_BYTES: u64 = 1 << 20;
 
-/// Max connected sockets at once (Go: 256).
+/// Max connected sockets at once (the upstream proposal's 256).
 pub(crate) const MAX_CONNECTED: usize = 256;
 
 /// A connected socket unused for this long may be replaced when the table is full.
