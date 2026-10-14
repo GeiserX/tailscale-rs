@@ -35,6 +35,10 @@ features = [
     "proto-ipv4-fragmentation",
     "medium-ip",
     "socket-tcp",
+    # Reno congestion control, as gVisor runs it in Go (wgengine/netstack/netstack.go). Without a
+    # controller feature smoltcp falls back to NoControl and a sender pushes a full receive window
+    # into a lossy path.
+    "socket-tcp-reno",
     "assembler-max-segment-count-32",
     "socket-udp",
     "socket-icmp",
