@@ -51,6 +51,10 @@ pub(super) struct TargetedReplay {
     rx: flume::Receiver<Key>,
     pub(super) next_sweep: Instant,
     pub(super) pending_queues: usize,
+    /// Whether `poll_at` reports `next_sweep`: set when a waiter is queued or the stack is driven
+    /// inside the sweep interval, cleared when a sweep runs. A lost waker can only matter after
+    /// something happened, so a stack with blocked but idle sockets sets no timer of its own.
+    pub(super) armed: bool,
 }
 #[cfg(feature = "std")]
 fn enabled() -> bool {
@@ -69,6 +73,7 @@ impl TargetedReplay {
         let (tx, rx) = flume::unbounded();
         Self {
             pending_queues: 0,
+            armed: false,
             queues: BTreeMap::new(),
             tx,
             rx,
@@ -128,6 +133,11 @@ impl Netstack {
             });
         if queue.requests.is_empty() && !queue.replaying {
             replay.pending_queues += 1;
+        }
+        // A fresh wait arms the sweep; a replay that blocks again does not, or every sweep
+        // would arm the next one.
+        if !queue.replaying {
+            replay.armed = true;
         }
         // Cancellation has no socket wake. Purge on enqueue as well as on the safety sweep,
         // bounding timeout/retry growth even on a socket that never receives anything.
@@ -295,9 +305,11 @@ impl Netstack {
             return;
         };
         if now < replay.next_sweep {
+            replay.armed |= replay.pending_queues > 0;
             return;
         }
         replay.next_sweep = now + SWEEP_INTERVAL;
+        replay.armed = false;
         if replay.pending_queues == 0 {
             return;
         }
@@ -797,6 +809,30 @@ mod tests {
         assert_recv(&recv, b"hello");
         assert_eq!(stack.metrics.counts().safety_net_completions, 1);
         assert_eq!(stack.metrics.counts().safety_net_attempts, 1);
+    }
+
+    #[test]
+    fn the_safety_sweep_is_armed_only_after_activity() {
+        let mut stack = stack();
+        let handle = bind(&mut stack, 1001);
+        let recv = request(
+            &mut stack,
+            Some(handle),
+            crate::udp::Command::Recv { max_len: None },
+        );
+        assert_eq!(stack.poll_at(Instant::ZERO), Some(Instant::from_millis(50)));
+        stack.service_replay_deadline(Instant::from_millis(50));
+        assert_eq!(stack.metrics.counts().safety_net_sweeps, 1);
+        // Still blocked, but nothing happened since the sweep: no timer of its own.
+        assert_eq!(stack.targeted_replay.as_ref().unwrap().pending_queues, 1);
+        assert_eq!(stack.poll_at(Instant::from_millis(50)), None);
+        // A drive inside the interval arms one trailing sweep.
+        stack.service_replay_deadline(Instant::from_millis(60));
+        assert_eq!(
+            stack.poll_at(Instant::from_millis(60)),
+            Some(Instant::from_millis(100))
+        );
+        assert!(recv.is_empty());
     }
 
     #[test]

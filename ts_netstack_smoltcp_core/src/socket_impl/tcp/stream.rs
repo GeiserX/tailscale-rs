@@ -211,9 +211,18 @@ impl Netstack {
         // own (the iter42 idle/keep-alive timeout firing on a dead/idle accepted stream). The first
         // pass only scans `pending_tcp_closes`, so a socket the consumer never explicitly closed —
         // and never polls — would otherwise pin its slot + ~512 KiB of buffers forever.
-        if self.tcp_socket_count > 0 && now >= self.next_orphan_sweep {
-            self.next_orphan_sweep = now + crate::ORPHAN_SWEEP_INTERVAL;
-            self.reap_orphaned_closed_tcp();
+        //
+        // The pass runs at most once per interval. A drive inside the interval arms one trailing
+        // pass at its deadline instead, so a socket closed by that drive is still reclaimed on
+        // time, while an idle stack wakes only for smoltcp's own timers, as main and Go do.
+        if self.tcp_socket_count > 0 {
+            if now >= self.next_orphan_sweep {
+                self.next_orphan_sweep = now + crate::ORPHAN_SWEEP_INTERVAL;
+                self.orphan_sweep_armed = false;
+                self.reap_orphaned_closed_tcp();
+            } else {
+                self.orphan_sweep_armed = true;
+            }
         }
         self.tcp_socket_count != before
     }
@@ -225,8 +234,9 @@ impl Netstack {
     /// RST — but the in-memory socket lingers until the consumer next touches its [`TcpStream`]
     /// (`Drop` → `Close` → `pending_tcp_closes`). An idle, non-polling consumer never triggers that,
     /// so [`Netstack::drain_tcp_closes`]'s `pending_tcp_closes`-only scan never reclaims it. This
-    /// second pass closes that gap. It runs at most once per 100 ms; `poll_at` includes its
-    /// deadline, and I/O pollers call the drain even without packet progress.
+    /// second pass closes that gap. It runs at most once per 100 ms; after a drive that fell inside
+    /// that window `poll_at` includes its deadline, and I/O pollers call the drain even without
+    /// packet progress.
     ///
     /// A reaped handle is freed via [`Netstack::remove_socket`], so its generation is cleared in
     /// `socket_registry`; any blocked command still referencing it is dropped on replay by the
@@ -783,6 +793,32 @@ mod reap_tests {
         }
         assert_eq!(stack.metrics.counts().orphan_socket_visits, visits);
         assert_eq!(stack.next_orphan_sweep, Instant::from_millis(200));
+    }
+
+    #[test]
+    fn an_idle_stack_sets_no_orphan_timer_after_its_sweep() {
+        let (mut stack, mut dev, accepted) = establish_accepted(8012);
+        let sweep = stack.next_orphan_sweep;
+        stack.poll_device_io(sweep, &mut dev);
+        let next = stack.next_orphan_sweep;
+        assert_eq!(next, sweep + crate::ORPHAN_SWEEP_INTERVAL, "the sweep ran");
+        assert!(stack.handle_gen(accepted).is_some());
+        // Nothing happened since that sweep: only smoltcp's own timers may wake the stack.
+        let own = stack.iface.poll_at(sweep, &stack.socket_set);
+        assert_eq!(stack.poll_at(sweep), own);
+
+        // A drive inside the interval arms one trailing sweep at the deadline, and that sweep
+        // disarms it again.
+        let inside = sweep + smoltcp::time::Duration::from_millis(10);
+        stack.poll_device_io(inside, &mut dev);
+        let own = stack.iface.poll_at(inside, &stack.socket_set);
+        assert_eq!(
+            stack.poll_at(inside),
+            Some(own.map_or(next, |d| d.min(next)))
+        );
+        stack.poll_device_io(next, &mut dev);
+        let own = stack.iface.poll_at(next, &stack.socket_set);
+        assert_eq!(stack.poll_at(next), own);
     }
 
     #[test]

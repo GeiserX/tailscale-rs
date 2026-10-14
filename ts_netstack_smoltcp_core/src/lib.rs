@@ -97,6 +97,10 @@ pub struct Netstack {
     /// Count maintained by the socket wrappers; avoids a scan to arm maintenance.
     tcp_socket_count: usize,
     next_orphan_sweep: smoltcp::time::Instant,
+    /// Whether `poll_at` reports `next_orphan_sweep`: set when the stack was driven or a TCP
+    /// socket added while the sweep was rate-limited, cleared when a sweep runs. A socket only
+    /// changes state while the stack is driven, so an idle stack sets no timer of its own.
+    orphan_sweep_armed: bool,
 
     /// Set of TCP socket handles that are expected to close in the future, held onto for
     /// graceful shutdown.
@@ -160,6 +164,7 @@ impl Netstack {
             next_gen: 0,
             tcp_socket_count: 0,
             next_orphan_sweep: now + ORPHAN_SWEEP_INTERVAL,
+            orphan_sweep_armed: false,
             pending_tcp_closes: Default::default(),
             connecting_tcp_sockets: Default::default(),
             tcp_listeners: Default::default(),
@@ -191,6 +196,7 @@ impl Netstack {
         );
         if T::KIND == SocketKind::Tcp {
             self.tcp_socket_count += 1;
+            self.orphan_sweep_armed = true;
         }
         h
     }
@@ -234,12 +240,13 @@ impl Netstack {
     pub fn poll_at(&mut self, now: smoltcp::time::Instant) -> Option<smoltcp::time::Instant> {
         let socket_deadline = self.iface.poll_at(now, &self.socket_set);
         let mut deadline = socket_deadline;
-        if self.tcp_socket_count > 0 {
+        if self.tcp_socket_count > 0 && self.orphan_sweep_armed {
             deadline =
                 Some(deadline.map_or(self.next_orphan_sweep, |d| d.min(self.next_orphan_sweep)));
         }
         if let Some(replay) = &self.targeted_replay
             && replay.pending_queues > 0
+            && replay.armed
         {
             deadline = Some(deadline.map_or(replay.next_sweep, |d| d.min(replay.next_sweep)));
         }
