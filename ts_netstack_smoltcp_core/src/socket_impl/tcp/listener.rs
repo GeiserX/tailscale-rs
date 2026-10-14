@@ -340,16 +340,11 @@ impl Netstack {
                 listener.half_open_queue.push_back(current);
             }
 
-            tcp::State::Established | tcp::State::CloseWait => {
-                tracing::trace!(?state, "connection established");
-                self.enforce_listen_backlog(handle);
-                let listener = self
-                    .tcp_listeners
-                    .get_mut(&handle)
-                    .expect("listener present");
-                listener.accept_queue.push_back(current);
-            }
-
+            // ESTABLISHED and CLOSE-WAIT cannot reach the current socket here. One segment moves a
+            // LISTEN socket no further than SYN-RECEIVED (smoltcp rejects SYN together with FIN as
+            // malformed), smoltcp 0.14 reports a state change for every received frame, and every
+            // ingress path pumps the listeners after each one. So a connection is always seen in
+            // SYN-RECEIVED first and moves on to ESTABLISHED/CLOSE-WAIT from the half-open queue.
             state => {
                 tracing::warn!(
                     current_socket = ?current,
