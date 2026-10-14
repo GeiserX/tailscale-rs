@@ -2072,7 +2072,7 @@ impl kameo::Actor for MagicDnsActor {
                 view_rx,
                 filter_rx,
                 forward_exit_egress,
-                env.exit_node_dns,
+                env.exit_host_resolver(),
                 taildrop,
                 funnel_ingress,
             ));

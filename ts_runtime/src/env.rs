@@ -401,6 +401,18 @@ impl Env {
         *self.accept_dns_rx.borrow()
     }
 
+    /// The host resolver exit-node DNS may use, or `None`.
+    ///
+    /// A lookup on it leaves from this host's real IP, so it is offered only when exit traffic
+    /// leaves from there too: exit egress on and no [`exit_proxy`](Env::exit_proxy). Behind a proxy
+    /// it would show a resolver the very IP the proxy hides, so exit-node DNS stays off host sockets
+    /// (fail-closed). The forwarder applies the same rule by wrapping only its host-exit dialer. See
+    /// [`Config::exit_node_dns`](ts_control::Config::exit_node_dns).
+    pub fn exit_host_resolver(&self) -> Option<core::net::SocketAddr> {
+        self.exit_node_dns
+            .filter(|_| self.forward_exit_egress && self.exit_proxy.is_none())
+    }
+
     /// Build an [`Env`] and the runtime-mutable preference [`watch::Sender`]s separately, so each
     /// `Sender` (the mutation capability) can be retained privately by the runtime while only the
     /// read sides (`exit_node_rx`, `accept_routes_rx`, `accept_dns_rx`) are cloned into the many
@@ -579,6 +591,43 @@ mod tests {
             cfg(accept_routes),
         );
         (env, cells.accept_routes)
+    }
+
+    /// Exit-node DNS gets the host resolver only when exit traffic itself leaves from this host. With
+    /// an exit proxy, a host-socket lookup would leak the origin IP the proxy hides.
+    #[tokio::test]
+    async fn exit_host_resolver_only_without_an_exit_proxy() {
+        let dns: core::net::SocketAddr = "192.0.2.53:53".parse().unwrap();
+        let env_for = |forward_exit_egress: bool, proxied: bool| {
+            let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            let exit_proxy = proxied.then(|| ts_forwarder::ProxyConfig {
+                addr: "192.0.2.1:1080".parse().unwrap(),
+                scheme: ts_forwarder::ProxyScheme::Socks5,
+                auth: None,
+            });
+            Env::new(
+                ts_keys::NodeState::generate(),
+                shutdown_rx,
+                ForwarderConfig {
+                    forward_exit_egress,
+                    exit_proxy,
+                    exit_node_dns: Some(dns),
+                    ..cfg(false)
+                },
+            )
+        };
+
+        assert_eq!(env_for(true, false).exit_host_resolver(), Some(dns));
+        assert_eq!(
+            env_for(true, true).exit_host_resolver(),
+            None,
+            "an exit proxy keeps exit-node DNS off host sockets"
+        );
+        assert_eq!(
+            env_for(false, false).exit_host_resolver(),
+            None,
+            "no exit egress, no host lookups"
+        );
     }
 
     /// The WireGuard listen port threads from `ForwarderConfig` onto the `Env` the direct manager
