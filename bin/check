@@ -42,3 +42,4 @@ cargo vet         $SCOPE_NO_WS --locked
 cargo nextest run $SCOPE                                               --all-features --no-tests=pass
 cargo test        $SCOPE --doc                                         --all-features
 cargo build       $SCOPE --all-targets                                 --all-features
+"$(dirname "$0")/check-windows"

@@ -178,6 +178,23 @@ jobs:
           cargo vet --version
       - name: Supply-chain audit (cargo vet)
         run: cargo vet --locked
+      # Type-check and lint the workspace for Windows, so the Windows build cannot break unnoticed
+      # again (it did with #598, and nothing here built for Windows). `bin/check-windows` holds the
+      # commands. cargo-xwin supplies the MSVC CRT and SDK headers ring's build script compiles
+      # against. They are about 1 GB, so they are cached, keyed on the cargo-xwin version.
+      - name: Install cargo-xwin and the Windows target
+        run: |
+          cargo binstall --no-confirm cargo-xwin@0.23.1
+          ver="$(rustup show active-toolchain | awk '{print $1}')"
+          rustup target add --toolchain "${ver}" x86_64-pc-windows-msvc
+          clang --version | head -1
+      - name: Cache the MSVC headers (cargo-xwin)
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/cargo-xwin
+          key: cargo-xwin-0.23.1-x86_64-pc-windows-msvc
+      - name: Check + lint for Windows (bin/check-windows)
+        run: bin/check-windows
 
   build_test:
     # This matrix targets self-hosted runner labels (linux-x86_64-16cpu, macos-26, windows-8vcpu,

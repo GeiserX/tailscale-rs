@@ -13,6 +13,7 @@ We use a few `cargo` components/plugins in our development workflow you should i
 - `cargo machete`: Install with `cargo install --locked cargo-machete`.
 - `cargo nextest`: [Installation Instructions](https://nexte.st/docs/installation/pre-built-binaries/)
 - `cargo vet`: Install with `cargo install --locked cargo-vet --version 0.10.2` (the version CI pins).
+- `cargo xwin`: Install with `cargo install --locked cargo-xwin --version 0.23.1`, plus `clang` and `rustup target add x86_64-pc-windows-msvc`. `bin/check-windows` uses it to check and lint the workspace for Windows.
 
 Formatting, linting, dependency checking, and testing:
 
