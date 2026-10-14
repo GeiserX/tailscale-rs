@@ -55,11 +55,11 @@ cryptographic or security audit**. The hand-rolled surfaces include:
 - **ACME / JWS** — RFC 8555 certificate issuance and JWS signing (`ts_control/src/acme.rs`).
 - **Exit dialer** — a hand-rolled SOCKS5 (RFC 1928/1929) and HTTP `CONNECT` client (zero extra
   dependencies, to keep the egress path `ring`-only and musl-clean).
-- **Tailnet Lock (TKA) CBOR** — the CTAP2-canonical CBOR encoding in `ts_tka` is **not**
-  cross-validated against Go-produced test vectors. Byte-for-byte wire compatibility with a live
-  Tailscale TKA is asserted by construction, not proven (see the `ts_tka` crate module docs). A
-  *failed* verification is always safe to act on (deny); a *successful* verification should be
-  treated as advisory until vectors land.
+- **Tailnet Lock (TKA) CBOR** — the CTAP2-canonical CBOR encoding in `ts_tka` is checked against
+  Go-produced test vectors: `tka_cbor_matches_go_golden`, `aum_serialize_matches_go_test_serialization_vectors`
+  and `disablement_value_matches_go_golden` (`ts_tka/src/lib.rs:3605`, `:3778`, `:4672`) read the
+  golden files under `tests/vectors/`. Like the rest of this list, it has not been independently
+  audited.
 
 Conservatively, assume there could be a critical flaw in any of these paths. Do not rely on this
 library for data privacy until the audit is complete.
@@ -96,10 +96,10 @@ cryptographically verified chain. Two caveats remain, tracked as deferred work i
   authorized is not yet checked, so a disable is currently taken at face value.
 - **Known under-enforcement gaps versus Go** — both make us *more permissive* or are
   connectivity-only; neither opens a new attack surface, but document them honestly:
-  - **No rotation-obsolete dropping.** Go's `rotationTracker` drops a peer whose key was rotated away
-    even if the old signature still validates (clone/replay defense); we currently admit such a key.
-    This is genuine *under*-enforcement (more permissive than Go) and is not structurally closeable
-    yet — it needs a `node_key_authorized_with_details` path plus a whole-netmap rotation pass.
+  - **Rotation-obsolete dropping now ships.** Go's `rotationTracker` drops a peer whose key was
+    rotated away even if the old signature still validates (clone/replay defense). The same filter
+    runs here (`ts_runtime/src/peer_tracker/mod.rs:421-453`, `RotationTracker` at `:510`, commit
+    `c145ddf`), so this under-enforcement gap is closed.
   - **No `UnsignedPeerAPIOnly` exemption.** Go admits such peers unsigned; we drop them (*more*
     restrictive — a connectivity gap, the safe direction). The node model now carries the field and
     clamps such a peer's accepted routes to its own addresses (matching Go's `upgradeNode`), but the

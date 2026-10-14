@@ -666,6 +666,21 @@ mod tests {
         assert!(matches!(err, Err(DialError::ForbiddenDestination(d)) if d == dst));
     }
 
+    /// The guard must not swallow legitimate exit traffic: an exit-node flow to a public address
+    /// still egresses. A UDP connect needs no listener, so this exercises the real socket path.
+    #[tokio::test]
+    async fn host_exit_dialer_does_not_refuse_public_exit_udp() {
+        let dst: SocketAddr = "203.0.113.1:9".parse().unwrap();
+        let res = HostExitDialer.dial_udp(FlowClass::ExitNode, dst).await;
+        assert!(
+            !matches!(
+                res,
+                Err(DialError::ForbiddenDestination(_)) | Err(DialError::ExitEgressRefused)
+            ),
+            "public exit UDP must not be refused"
+        );
+    }
+
     /// Every non-internet range is refused for exit-node TCP and UDP before any socket is created.
     #[tokio::test]
     async fn host_exit_dialer_refuses_forbidden_exit_destinations() {

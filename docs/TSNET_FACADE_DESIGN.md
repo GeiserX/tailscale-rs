@@ -145,7 +145,7 @@ matrix §2.
 | Go `Server` field | `tsnet::Server` field | → `Config` field / call | Verdict | Notes |
 |---|---|---|---|---|
 | `Hostname string` | `hostname: Option<String>` | `requested_hostname` :47 | **PRESENT** | |
-| `AuthKey string` | `auth_key: Option<String>` | `auth_key` :402 **and** the `auth_key` arg of `Device::new` | **PRESENT** | Env fallback `TS_AUTH_KEY` still honored by the engine. |
+| `AuthKey string` | `auth_key: Option<String>` | `auth_key` :402 **and** the `auth_key` arg of `Device::new` | **PRESENT** | No environment fallback: neither `Device::new` nor the facade reads `TS_AUTH_KEY` or Go's `TS_AUTHKEY`. Only `Config::default_from_env` reads `TS_AUTH_KEY` (`src/config.rs:517-531`). |
 | `ControlURL string` | `control_url: Option<String>` | `control_server_url` :32 (parsed) | **PRESENT** | Bad URL ⇒ `Error::InvalidControlUrl`. `None` ⇒ engine default. |
 | `Ephemeral bool` | `ephemeral: bool` | `ephemeral` :59 | **PRESENT** | **Default nuance:** Go defaults `false`; bare `Config::default()` defaults **`true`** (:657). The facade forces Go's default by always writing `config.ephemeral = self.ephemeral` (default `false`). |
 | `AdvertiseTags []string` | `advertise_tags: Vec<String>` | `requested_tags` :50 | **PRESENT** | |
@@ -156,8 +156,8 @@ matrix §2.
 | `IDToken string` | `id_token: Option<String>` | `id_token` :422 | **PRESENT** | |
 | `Audience string` | `audience: Option<String>` | `audience` :429 | **PRESENT** | |
 | `Tun tun.Device` | `tun: Option<TunSpec>` | `use_tun(name, mtu)` :455 → `transport_mode` :265 | **PRESENT** (diff. shape) | Rust selects TUN by name/MTU, not a caller `tun.Device`. |
-| `Dir string` | `dir: Option<PathBuf>` | → `key_state` :22 via key file (§8) | **PARTIAL** (identity only) | Real gap designed over `key_state`; see §8. |
-| `Store ipn.StateStore` | `store: Option<Arc<dyn StateStore>>` | → `key_state` :22 (§8) | **PARTIAL** (identity only) | Pluggable store trait; see §8. |
+| `Dir string` | `dir: Option<PathBuf>` | → `key_state` :22 via key file (§8) | **PARTIAL** (identity and netmap cache) | Holds the identity and a netmap cache (`src/tsnet.rs:709`), not Go's full node state; see §8. |
+| `Store ipn.StateStore` | `store: Option<Arc<dyn StateStore>>` | → `key_state` :22 (§8) | **PARTIAL** (identity and netmap cache) | Pluggable store trait; the netmap cache sits under `dir` (`src/tsnet.rs:709`); see §8. |
 | `Logf` / `UserLogf logger.Logf` | — (omitted) | — | **ABSENT** | No injectable logger; backend uses `tracing`. Accepting-and-dropping a closure would be dishonest, so it is left off (matrix §2a, `tsr-reh3`). |
 
 ### The escape hatch: `configure`
