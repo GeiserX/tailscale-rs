@@ -55,7 +55,7 @@ plane, R for the runtime facade), so a bead or a commit can cite one.
   matching and shields-up (`ts_dataplane/src/lib.rs:35`, `:122-215`, `:608`, `:641`, `:665`;
   `ts_dataplane/src/flowtrack.rs:35`). The netstack and forwarder are the weaker half. A forwarded TCP
   connection to a dead backend looks accepted and then closes, where Go answers with a reset (row N1).
-  smoltcp runs with no congestion control, where Go runs Reno (row N2). In TUN mode with an exit node,
+  smoltcp ran with no congestion control, where Go runs Reno (row N2, now fixed). In TUN mode with an exit node,
   nothing stops the node routing its own WireGuard and DERP traffic into the tunnel (row N3, not run).
   Netstack mode is the default and is not affected by N3. Go's Linux router features (SNAT, netfilter
   chains, IP forwarding) do not apply: forwarding here is in user space (`ts_forwarder/src/lib.rs:1-7`).
@@ -124,10 +124,10 @@ refused, `control_runner.rs:1430`).
 | M9 | `NotePreferred` is sent to every connected DERP on a home change (`derp.go:292`; `derp/derphttp/derphttp_client.go:423`) | Frame codec only (`ts_derp/src/frame/body/note_preferred.rs:8`). Never sent: a grep for `NotePreferred` in `ts_derp/src/client.rs` and `ts_runtime/src/multiderp.rs` finds nothing | minor | Server-side preference and metrics differ. |
 | M11 | WireGuard data from an unknown source address goes to wireguard-go through `lazyEndpoint`, so a roamed peer is re-learned (`magicsock.go:4402`, `:1838`) | Dropped: "dropping data from unknown source address" (`ts_magicsock/src/sock.rs:1397-1405`) | minor | A peer whose NAT port changed loses direct traffic until its trust lapses to DERP. |
 | M12 | A send error to the best address clears it at once with `noteBadEndpoint` (`endpoint.go:1655`) | Not found. A grep for `bad_endpoint\|noteBadEndpoint` finds nothing | minor | Rust waits for trust to expire. |
-| M13 | Each disco ping is sent on its own, so one failure does not stop the others (`endpoint.go:1299`, `:1367-1392`) | `emit_disco_pings` returns on the first `send_udp` error with `?` (`sock.rs:1165`), which skips the rest of the sweep and the relay pings | minor | Present at `f311bba`. Fixed on main by #606 (`ec5dc27`), merged later on 2026-10-14. Bead `tsr-hnd606` can close. |
+| M13 | Each disco ping is sent on its own, so one failure does not stop the others (`endpoint.go:1299`, `:1367-1392`) | `emit_disco_pings` returns on the first `send_udp` error with `?` (`sock.rs:1165`), which skips the rest of the sweep and the relay pings | minor | Present at `f311bba`. Fixed on main by #606 (`ec5dc27`), merged later on 2026-10-14. |
 | M14 | Rebind plus ReSTUN on socket errors such as EPERM or a down network, at most once per 5 s (`magicsock.go:1605-1619`; `magicsock_notplan9.go:17`) | Not found. A grep for `should_rebind\|maybe_rebind_on_error\|EPERM` over the underlay crates finds nothing | minor | |
 | M15 | With an unspecified bind, every interface address is advertised with the bound port. Loopback is used only if nothing else exists (`magicsock.go:1411-1430`) | IPv4 advertises the literal bound `0.0.0.0:port` as `Local` (`sock.rs:643-649`), unfiltered up to control (`direct.rs:942-951`, `control_runner.rs:2123-2135`, `ts_control/src/tokio/client.rs:218-228`). IPv6 interfaces are listed only when `enable_ipv6` is set (`sock.rs:675-700`) | minor | Peers receive a useless `0.0.0.0` candidate. |
-| M17 | `betterAddr` points: latency percentage, +10 for IPv6, and a margin above 1 point (`endpoint.go:1856-1946`) | Latency only, with a 1% hysteresis. IPv6 only breaks exact ties (`path.rs:61`, `:706-718`) | minor | Open PR #604, bead `tsr-hnd604`. Still present at `f311bba`. |
+| M17 | `betterAddr` points: latency percentage, +10 for IPv6, and a margin above 1 point (`endpoint.go:1856-1946`) | Latency only, with a 1% hysteresis. IPv6 only breaks exact ties (`path.rs:61`, `:706-718`) | minor | PR #604 closed unmerged. Still present at `f311bba`. |
 | M20 | Wall-clock jump poll every 15 s to catch sleep and wake (`net/netmon/netmon.go:33`, `:704-714`) | Not found in `ts_netmon/src/lib.rs` or `ts_runtime/src/netmon.rs`. A grep for `wall\|time.jump` finds only the debouncer's own cap (`ts_netmon/src/lib.rs:19`) | minor | Not covered by `tsr-7wrn` or `tsr-cnlh`. |
 | M21 | `SetNetworkUp` pauses STUN and endpoint work while offline (`magicsock.go:2717`) | Not found. A grep for `network_up\|set_network_up` finds nothing | minor | Depends on a real link monitor. |
 | M22 | Peer path MTU discovery (`peermtu.go:38`, `:86`) | Not found. A grep for `pmtud\|wire_mtu\|peer_mtu` finds nothing | minor | Go gates it behind a knob. |
@@ -154,7 +154,7 @@ purpose.
 | Row | Go v1.102.4 behaviour (file:line) | Rust at f311bba (file:line, or "not found" and the grep) | Severity | Note |
 |---|---|---|---|---|
 | N1 | Forwarded TCP dials the backend before completing the client handshake, then completes it (`wgengine/netstack/netstack.go:1782-1786`, then `r.Complete(false)` at `:1601`). A failed dial gets a RST (`:1732-1733`). The dial is cancelled when the client gives up (`:1750-1768`) | The smoltcp listener completes the handshake at accept (`ts_forwarder/src/tcp.rs:55`) and only then dials (`tcp.rs:113-127`). On a failed or timed-out dial the overlay stream is dropped, and drop sends `Close` (`ts_netstack_smoltcp_socket/src/tcp/stream.rs:345-353`), which is smoltcp `close()`, a FIN (`ts_netstack_smoltcp_core/src/socket_impl/tcp/stream.rs:122`). The dial has a fixed 10 s cap (`tcp.rs:14`) | blocks-parity | A client behind a subnet router or exit node sees connect succeed and then EOF instead of connection refused, and every forwarded port looks open to a scan. No bead. |
-| N2 | gVisor TCP runs Reno congestion control (`netstack.go:375-376`), with SACK on (`:356`) and RACK off (`:365`) | No congestion control. `ts_netstack_smoltcp_core/Cargo.toml:26-43` enables neither `socket-tcp-reno` nor `socket-tcp-cubic`: `grep -rn "socket-tcp-reno\|socket-tcp-cubic" --include=Cargo.toml .` returns nothing. smoltcp then falls back to `NoControl`: https://github.com/smoltcp-rs/smoltcp/blob/v0.13.1/src/socket/tcp/congestion.rs | blocks-parity | With no congestion window, a sender pushes a full receive window into a lossy path. Turning it on is one Cargo feature. No bead. |
+| N2 | gVisor TCP runs Reno congestion control (`netstack.go:375-376`), with SACK on (`:356`) and RACK off (`:365`) | No congestion control. `ts_netstack_smoltcp_core/Cargo.toml:26-43` enables neither `socket-tcp-reno` nor `socket-tcp-cubic`: `grep -rn "socket-tcp-reno\|socket-tcp-cubic" --include=Cargo.toml .` returns nothing. smoltcp then falls back to `NoControl`: https://github.com/smoltcp-rs/smoltcp/blob/v0.13.1/src/socket/tcp/congestion.rs | blocks-parity | Present at `f311bba`. Reno fixed on main by #627: the `socket-tcp-reno` feature is on and `new_tcp_socket` sets every socket to Reno (`ts_netstack_smoltcp_core/src/socket_impl/tcp/mod.rs`). A 500 kB transfer through an 8-slot dropping ingress queue now takes tens of milliseconds, where it timed out at 60 s before. Sender-side SACK recovery is still missing: smoltcp 0.14.0 negotiates SACK and sends SACK blocks as a receiver, but its sender never reads them. |
 | N3 | The underlay sockets bypass the tunnel's routes. Linux uses SO_MARK (`net/netns/netns_linux.go:48`, `:113`) with policy rules (`wgengine/router/osrouter/router_linux.go:1505`). macOS uses IP_BOUND_IF (`net/netns/netns_darwin.go:295-298`) | Not found: `grep -rn -i "bind_device\|IP_BOUND_IF\|SO_MARK\|set_mark\|fwmark\|netns" --include='*.rs' .` returns nothing. TUN mode installs an exit node's `/0` as `0.0.0.0/1` plus `128.0.0.0/1` (`ts_host_net/src/lib.rs:159-176`), and on macOS installs `/0` directly (`ts_runtime/src/tun_actor.rs:369-370`) | blocks-parity | TUN mode only. With an exit node selected, the host route table sends the magicsock UDP and DERP TCP toward the peer into the tunnel too. Not run, so the loop is unverified. No bead. |
 | N4 | An ICMP echo to a subnet-route or 4via6 destination is answered by a relayed system ping (`netstack.go:1458-1507`; `userPing` at `:1359`) | Not found: `grep -rln -i "user_ping\|userping\|system ping\|/sbin/ping" --include='*.rs' .` returns nothing, and `ts_forwarder/src` has no ICMP path (`grep -n -i "icmp\|ping" ts_forwarder/src/*.rs` hits only test byte strings in `dialer.rs`) | blocks-parity | Separate from the own-IP echo in `tsr-rsu`. Pinging a host behind a subnet router from this repository gets no answer. No bead. |
 | N5 | The UDP forwarder accepts every datagram and never sends ICMP port unreachable (`acceptUDPNoICMP`, `netstack.go:646`, `:1945-1948`) | Not suppressed. smoltcp 0.13.1 answers an unmatched datagram with PortUnreachable unless a raw socket took it (`src/iface/interface/udp.rs` upstream). `grep -rn "PortUnreachable" --include='*.rs' .` returns nothing here. With an explicit port list, a datagram to an unlisted port on a forwarded destination gets an unreachable spoofed from that destination | minor | Follows from the explicit-port design (`src/config.rs:119-128`). The raw UDP observer in all-port mode (`ts_forwarder/src/all_port.rs:184`) is the exception. |
@@ -172,6 +172,25 @@ the egress queue is still unbounded (`ts_runtime/src/dataplane.rs:115`, `:141`),
 pings to its own IP (`tsr-rsu`), netstack sharding (`tsr-4pp`), 4via6 (`tsr-o7m8`) and a fixed
 `MAX_UDP_FLOWS` (`tsr-iyv`, `ts_forwarder/src/udp.rs:39`). The first four are in
 [PORTING.md](../PORTING.md) at lines 1263, 1300, 1338 and 1378.
+
+#### smoltcp sender patches
+
+The exit-node performance work in #598 was built on a branch that vendored smoltcp 0.13.1 and patched
+its TCP sender. The first patch was the fast-retransmit RTO backoff fix. Thirteen more followed: the
+congestion window enforced over bytes in flight, NewReno partial-ACK repair without go-back-N,
+ACK-clocked Reno growth with a slow-start restart after a retransmission timeout, Cubic slow-start and
+growth fixes, a bounded SACK scoreboard for selective recovery, RTT-based pacing, and a per-socket
+minimum computed RTO used for a 200 ms floor.
+
+None of them reached main. The backoff fix shipped upstream in smoltcp 0.14.0, which #616 took from
+crates.io. When the branch took main to land #598, the vendored copy and the other patches were
+dropped: they cannot build against crates.io smoltcp, and a `[patch.crates-io]` entry never reaches
+users of the published crates. #598 merged without them.
+
+They remain in the history of the `exit-node-perf` branch of
+https://github.com/kasper0406/geiserx-tailscale-rs, before commit `a158b68`, which dropped them. Their
+home is upstream smoltcp. Nothing in this repository carries them. The Reno controller this repository
+runs since row N2 was fixed is smoltcp 0.14.0's own, without these patches.
 
 ### Runtime facade and node service gaps
 
@@ -237,9 +256,7 @@ Look at these first:
 - **P0 `tsr-am9`**, the tsnet full-parity epic. It is done when the gaps above are closed or decided.
 - **P1 `tsr-0hd2`** (blocked): the 25 s WireGuard keepalive that Go never sends (row M19). It waits on a
   live idle-then-dial test with the keepalive off.
-- **P1 `tsr-rev330`**: review findings on #330 (CWE-284, security misconfiguration).
-- **P1 `tsr-rev590r1` and `tsr-rev592r1`**: reviewer questions on #590 and #592, unanswered.
-- **In progress `tsr-7s3`**: ping cadence and path selection (row M1, and M17 with PR #604).
+- **In progress `tsr-7s3`**: ping cadence and path selection (rows M1 and M17, whose PR #604 closed unmerged).
 - **In progress `tsr-doz6`**: link-change detection. Slice a shipped. The Linux and macOS backends are
   `tsr-7wrn` and `tsr-cnlh`.
 
@@ -261,44 +278,23 @@ Some open beads are already closed by the tree. Close them when the tracker is n
 - `tsr-a9x4`'s title says peer relays are absent. The receiving side is there; only the client side that
   allocates a relay is missing (row M18).
 
-Most blocks-parity rows have no bead: C1, C2, C3, C6, M2, M3, N1, N2, N3, N4, R2, R3, R4 and R5. File one
+Most blocks-parity rows have no bead: C1, C2, C3, C6, M2, M3, N1, N3, N4, R2, R3, R4 and R5. File one
 for each before picking them up.
 
-Thirty-three beads track pull requests, not code. Twenty `tsr-hnd*` beads each name an open pull
-request that stalled: #447, #564, #566 to #569, #571, #579, #581, #586 and #597 to #606. Five
-`tsr-cfl*` beads name a pull request that conflicts with main, two `tsr-fix*` beads one with failing
-checks, five `tsr-fgt*` beads one that nothing owns, and `tsr-dep476` a Dependabot update that cannot
-merge. Pull requests #597 to #606 carry real fixes for rows in the tables above: exit-node support, the
+Pull requests #597 to #606 carried real fixes for rows in the tables above: exit-node support, the
 lost FIN, the smoltcp retransmit fix, session revocation, Hostinfo, exit-flow confinement, `betterAddr`
-scoring, the key-file mode and probing after a failed send. Three of them merged later on 2026-10-14,
-after the `f311bba` pin: #602 (`a3e70ac`), #605 (`dd5ad83`) and #606 (`ec5dc27`). Their beads
-`tsr-hnd602`, `tsr-hnd605` and `tsr-hnd606` can close.
+scoring, the key-file mode and probing after a failed send. All of them merged after the `f311bba` pin
+except two: #616 replaced #600 by taking the fix from smoltcp 0.14.0, and #604 closed unmerged.
 
 | Bead | Priority | Type | Status | Title |
 |---|---|---|---|---|
 | `tsr-am9` | P0 | epic | open | tsnet full-parity: rewrite Go tsnet completely into Rust |
 | `tsr-0hd2` | P1 | bug | blocked | magicsock: fork sets WG PersistentKeepalive=25s on every peer; Go v1.100.0 leaves it 0 (disabled) |
-| `tsr-rev330` | P1 | bug | open | Review findings from GeiserX/tailscale-rs#330: Security Misconfiguration (CWE-284) |
-| `tsr-rev590r1` | P1 | bug | open | Answer the reviewer on GeiserX/tailscale-rs#590 (round 1) |
-| `tsr-rev592r1` | P1 | bug | open | Answer the reviewer on GeiserX/tailscale-rs#592 (round 1) |
 | `tsr-7s3` | P2 | bug | in progress | magicsock: ping cadence + path-selection diverge from Go (no goodEnoughLatency/sessionActiveTimeout/upgradeUDPDirect/betterAddr-bonuses; 2s vs 5s ping floor) |
 | `tsr-doz6` | P2 | bug | in progress | runtime: no netmon/link-change detection, rebind is embedder-driven; node degrades to DERP on net change (highest-leverage) |
 | `tsr-4pp` | P2 | task | open | Shard the netstack per ~50-100 sessions in k8s |
 | `tsr-7wrn` | P2 | bug | open | tsr-doz6 slice b: Linux netlink LinkMonitor backend |
-| `tsr-cfl590` | P2 | bug | open | GeiserX/tailscale-rs#590 conflicts with main, merge main into factory/parity-audit-4032-r1-s1n0/audit-pr-587-ingress-bound and resolve it |
-| `tsr-cfl592` | P2 | bug | open | GeiserX/tailscale-rs#592 conflicts with main, merge main into factory/parity-audit-4128-r1-s1n0/audit-pr-587-parity and resolve it |
-| `tsr-cfl593` | P2 | bug | open | GeiserX/tailscale-rs#593 conflicts with main, merge main into factory/tsr-fix592-c4173-r1-s1n0/fix-592-ruzstd-advisory and resolve it |
-| `tsr-cfl607` | P2 | bug | open | GeiserX/tailscale-rs#607 conflicts with main, merge main into factory/tsr-fix596-c4185-r1-s1n0/fix-596-ruzstd-rustsec and resolve it |
-| `tsr-cfl609` | P2 | bug | open | GeiserX/tailscale-rs#609 conflicts with main, merge main into factory/tsr-fix595-c4186-r1-s1n0/fix-595-ruzstd-rustsec and resolve it |
 | `tsr-cnlh` | P2 | bug | open | tsr-doz6 slice c: macOS PF_ROUTE LinkMonitor backend |
-| `tsr-dep476` | P2 | bug | open | Dependabot #476 cannot merge: deps: bump the minor-and-patch group with 6 updates |
-| `tsr-fgt473` | P2 | bug | open | Factory #473 has been DIRTY for 36 hour(s) and nothing owns its disposal |
-| `tsr-fgt477` | P2 | bug | open | Factory #477 has been BLOCKED for 36 hour(s) and nothing owns its disposal |
-| `tsr-fgt478` | P2 | bug | open | Factory #478 has been BLOCKED for 36 hour(s) and nothing owns its disposal |
-| `tsr-fgt480` | P2 | bug | open | Factory #480 has been BLOCKED for 36 hour(s) and nothing owns its disposal |
-| `tsr-fgt481` | P2 | bug | open | Factory #481 has been BLOCKED for 36 hour(s) and nothing owns its disposal |
-| `tsr-fix595` | P2 | bug | open | GeiserX/tailscale-rs#595 has been failing its checks, fix them on factory/parity-audit-4176-r1-s1n0/audit-parity-587-588 |
-| `tsr-fix596` | P2 | bug | open | GeiserX/tailscale-rs#596 has been failing its checks, fix them on factory/tsr-cfl592-c4179-r1-s1n0/conflict-592 |
 | `tsr-re0d2b5d` | P2 | bug | open | Honour disable-relay-client instead of opening relay paths control switched off |
 | `tsr-x4yg` | P2 | bug | open | magicsock: no portmapper (UPnP-IGD/NAT-PMP/PCP), direct paths behind mapping-NATs stay on DERP (EPIC) |
 | `tsr-0h2` | P3 | feature | open | Daemon ask: SSH check-mode (HoldAndDelegate) round-trip |
@@ -317,26 +313,6 @@ after the `f311bba` pin: #602 (`a3e70ac`), #605 (`dd5ad83`) and #606 (`ec5dc27`)
 | `tsr-cvh` | P3 | bug | open | peerapi: GET /v0/put/ resume hash-exchange missing + taildrop response Content-Type + ingress Src-header/cap gaps |
 | `tsr-dlzn` | P3 | bug | open | peerapi: capability enforcement is membership-only, not FILE_SHARING_SEND/ingress-cap-scoped (broader trust than Go) |
 | `tsr-dsjq` | P3 | bug | open | netcheck: not a full Go netcheck.Report (no UDP/NAT-hardness/MappingVaries/hairpin at cold start) |
-| `tsr-hnd447` | P3 | bug | open | #447 is stuck: deps(ts_tunnel): close the atty advisory that no version bump can fix |
-| `tsr-hnd564` | P3 | bug | open | #564 is stuck: chore(license): let GitHub detect BSD-3-Clause instead of NOASSERTION |
-| `tsr-hnd566` | P3 | bug | open | #566 is stuck: docs(banner): six banner designs to pick from |
-| `tsr-hnd567` | P3 | bug | open | #567 is stuck: ci(stale): let the stale job save its progress and stop promising reopen-by-comment |
-| `tsr-hnd568` | P3 | bug | open | #568 is stuck: docs(readme): keep the README short and move the details into docs |
-| `tsr-hnd569` | P3 | bug | open | #569 is stuck: docs: make the getting-started dependency resolve to the published crate |
-| `tsr-hnd571` | P3 | bug | open | #571 is stuck: docs: use a license badge that tracks LICENSE and add the crate version |
-| `tsr-hnd579` | P3 | bug | open | #579 is stuck: chore(beads): keep the tracker in a private Gitea repository, so every copy can sync without publishing it |
-| `tsr-hnd581` | P3 | bug | open | #581 is stuck: chore(beads): give agents the tracker hooks and instructions this repo was missing |
-| `tsr-hnd586` | P3 | bug | open | #586 is stuck: chore(beads): name the tracker's remote by an alias, so this repo no longer says where it is |
-| `tsr-hnd597` | P3 | bug | open | #597 is stuck: Exit-node support for official clients (+ fixes) |
-| `tsr-hnd598` | P3 | bug | open | #598 is stuck: Exit-node data-path performance (builds on #597) |
-| `tsr-hnd599` | P3 | bug | open | #599 is stuck: fix(netstack): lost FIN/Close, abandoned receives, reset listener sockets, blocking try_recv |
-| `tsr-hnd600` | P3 | bug | open | #600 is stuck: fix(netstack): backport smoltcp fast-retransmit RTO fix |
-| `tsr-hnd601` | P3 | bug | open | #601 is stuck: fix: revoke sessions on key change, drop expired peers, ordered security updates |
-| `tsr-hnd602` | P3 | bug | open | #602 is stuck: fix: self-only netmaps, complete Hostinfo, DNS view across deltas |
-| `tsr-hnd603` | P3 | bug | open | #603 is stuck: fix(forwarder): confine host exit flows to internet destinations |
-| `tsr-hnd604` | P3 | bug | open | #604 is stuck: fix(magicsock): match Go betterAddr path scoring |
-| `tsr-hnd605` | P3 | bug | open | #605 is stuck: fix(config): write the key file owner-only |
-| `tsr-hnd606` | P3 | bug | open | #606 is stuck: fix(magicsock): keep probing after a candidate send fails |
 | `tsr-i2w` | P3 | bug | open | exit-node DoH answers MagicDNS authoritatively vs Go forward-only HandlePeerDNSQuery |
 | `tsr-iyv` | P3 | task | open | forwarder: make MAX_UDP_FLOWS configurable for high-fan-out DNS exits (LOW) |
 | `tsr-j5z4` | P3 | bug | open | docs(readme): reconcile README/SECURITY.md/rustdoc, TKA+exit-DNS understated, default-build TLS overstated, portmapper unlisted |
@@ -352,6 +328,10 @@ after the `f311bba` pin: #602 (`a3e70ac`), #605 (`dd5ad83`) and #606 (`ec5dc27`)
 | `tsr-v5gw` | P3 | bug | open | ssh: login-shell-only, no exec/SFTP/port-forward; userLogin principals never match (silent ACL divergence) |
 | `tsr-x72n` | P3 | bug | open | status/whois: per-peer online/last_seen + WhoIs.user not retained (reported None), wire delivers them |
 
+The factory lane is closed and its beads are retired: the rows that tracked its pull requests, review
+rounds, conflicts and Dependabot updates are gone from this table, and every pull request they named is
+merged or closed.
+
 ### How to resume
 
 1. Pull the tracker before anything else. It syncs only from the private remote named by `sync.remote`
@@ -360,8 +340,8 @@ after the `f311bba` pin: #602 (`a3e70ac`), #605 (`dd5ad83`) and #606 (`ec5dc27`)
    `bd show <id>`. The beads are the source of truth. The table above is a copy that will drift.
 2. The tracker export frozen at the stop, and the runbook for winding the factory down and starting it
    again, are kept privately with the factory, not in this repository.
-3. Clear the pull-request beads first: answer the P1 reviewer beads, then merge, rebase or close each
-   stalled pull request. Several of them fix rows above, so merging one can close a row.
+3. Check the rows above against main first. Several pull requests merged after the `f311bba` pin, so
+   some rows may already be closed.
 4. Close the beads the tree already closed (listed above) and file a bead for each blocks-parity row
    that has none.
 5. Re-check a row against the code before porting it. The line numbers above are anchors at
@@ -537,8 +517,8 @@ sense, while keeping the anti-leak/egress posture (see `AGENTS.md`).
 ### Actually remaining (the real backlog)
 
 - **Netstack sharding** (was Tier-3 #9; bead `tsr-4pp`) — the one fully-unbuilt numbered item. One
-  shared smoltcp poll loop serves all flows; shard per ~50–100 sessions. smoltcp has no SACK/auto-tune,
-  and it runs with no congestion control at all (2026-10-14 row N2), so **benchmark over a real exit
+  shared smoltcp poll loop serves all flows; shard per ~50–100 sessions. smoltcp has no sender-side SACK
+  recovery and no buffer auto-tuning, and runs Reno since row N2 was fixed, so **benchmark over a real exit
   before committing the dataplane** (deliberately gated, not neglected).
 - **Tailnet-Lock (TKA) enforcement hardening** (part of old #20; issue #7) — core enforcement now
   **ships active and fail-closed**, matching Go's `tkaFilterNetmapLocked`: a verified `Authority`

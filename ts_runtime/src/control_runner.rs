@@ -1241,6 +1241,16 @@ mod msg_impl {
             self.pop_browser_url.subscribe()
         }
 
+        /// Subscribe to the self-node cell: the latest self node control sent, `None` until the
+        /// first one arrives. [`Runtime::watch_ipn_bus`](crate::Runtime::watch_ipn_bus) watches it
+        /// so a netmap update that moves only this node (key-expiry extension, rename, reassigned
+        /// addresses) still reaches bus watchers as a `net_map` tick, as Go's `Notify.SelfChange`
+        /// does.
+        #[message(derive(Clone))]
+        pub fn watch_self_node(&self) -> watch::Receiver<Option<Node>> {
+            self.self_node.subscribe()
+        }
+
         /// The latest network-conditions report (preferred DERP region + per-region latencies). An
         /// immediate answer (does not block); empty before the first DERP-latency measurement. The
         /// facade surfaces this for `Device::netcheck` (the daemon's `tnet netcheck`).
