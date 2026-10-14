@@ -123,11 +123,9 @@ impl PortGate {
         };
         let inner = Inner {
             ingress,
-            batch_ingress: match std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() {
-                Ok("1") => true,
-                Ok("0") => false,
-                _ => cfg!(target_vendor = "apple"),
-            },
+            batch_ingress: ts_netstack_smoltcp::netcore::experiment::enabled(
+                ts_netstack_smoltcp::netcore::experiment::RX_BATCH,
+            ),
             epoch: Instant::now(),
             tcp: vec![closed; 1 << 16],
             udp: vec![closed; 1 << 16],

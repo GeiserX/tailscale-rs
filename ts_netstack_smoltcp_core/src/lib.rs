@@ -29,6 +29,7 @@ use smoltcp::{
 
 mod command;
 mod config;
+pub mod experiment;
 mod pipe;
 pub mod pipeline_metrics;
 mod registry;

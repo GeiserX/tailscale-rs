@@ -197,11 +197,9 @@ async fn connect_with_retry(
 
 // Standalone integration stacks use the same opt-in settings as the runtime constructors.
 fn batch_experiments(stack: &mut Netstack<WakingPipeDev>) {
-    if match std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() {
-        Ok("1") => true,
-        Ok("0") => false,
-        _ => cfg!(target_vendor = "apple"),
-    } {
+    if ts_netstack_smoltcp::netcore::experiment::enabled(
+        ts_netstack_smoltcp::netcore::experiment::RX_BATCH,
+    ) {
         stack.set_ingress_budget(Some(128));
     }
 }
@@ -849,11 +847,9 @@ async fn spawn_gated_forwarder_with_handle<D: RealDialer>(
 
     // Peer -> gate -> forwarder netstack.
     tokio::spawn(async move {
-        let batching = match std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() {
-            Ok("1") => true,
-            Ok("0") => false,
-            _ => cfg!(target_vendor = "apple"),
-        };
+        let batching = ts_netstack_smoltcp::netcore::experiment::enabled(
+            ts_netstack_smoltcp::netcore::experiment::RX_BATCH,
+        );
         while let Some(p) = from_peer.rx.recv_async().await {
             if batching {
                 gate.ingress_with(&p, |p| to_fwd.tx.try_send_deferred(p));

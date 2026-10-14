@@ -34,13 +34,11 @@ impl CopyPolicy {
 
 pub(crate) fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(
-        || match std::env::var("TS_EXPERIMENT_SPLICE_COALESCE").as_deref() {
-            Ok("1") => true,
-            Ok("0") => false,
-            _ => cfg!(target_vendor = "apple"),
-        },
-    )
+    *ENABLED.get_or_init(|| {
+        ts_netstack_smoltcp::netcore::experiment::enabled(
+            ts_netstack_smoltcp::netcore::experiment::SPLICE_COALESCE,
+        )
+    })
 }
 
 /// No extra storage: reads fill Tokio's bounded copy buffer. A pending overlay command stays

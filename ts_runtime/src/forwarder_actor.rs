@@ -299,11 +299,9 @@ impl kameo::Actor for ForwarderActor {
         // would otherwise accept it. IPv4 goes through the port gate in all-port mode.
         joinset.spawn(async move {
             let mut reject_budget = RejectBudget::new();
-            let batching = match std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() {
-                Ok("1") => true,
-                Ok("0") => false,
-                _ => cfg!(target_vendor = "apple"),
-            };
+            let batching = ts_netstack_smoltcp::netcore::experiment::enabled(
+                ts_netstack_smoltcp::netcore::experiment::RX_BATCH,
+            );
             let pass = |b: &[u8]| {
                 if batching {
                     netstack_down_tx.try_send_deferred(b)

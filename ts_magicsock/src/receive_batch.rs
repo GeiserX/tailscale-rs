@@ -72,12 +72,13 @@ pub fn snapshot() -> Snapshot {
     }
 }
 
+/// Whether kernel receive batching is on: off unless `TS_EXPERIMENT_RX_BATCH=1`, on every
+/// platform. Go v1.102.4 batches receives only on Linux (`net/batching/conn_default.go`), and
+/// Apple's `recvmsg_x` is a private call, so it stays an experiment. The netstack side reads the
+/// same variable through `ts_netstack_smoltcp_core::experiment`, which this crate does not
+/// depend on.
 pub(crate) fn enabled() -> bool {
-    match std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() {
-        Ok("1") => true,
-        Ok("0") => false,
-        _ => cfg!(target_vendor = "apple"),
-    }
+    std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() == Ok("1")
 }
 
 pub(crate) struct Receiver {

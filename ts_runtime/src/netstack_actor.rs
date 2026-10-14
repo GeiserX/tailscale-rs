@@ -75,11 +75,9 @@ pub(crate) fn piped_ingress_bounded(
     let max_bytes = INGRESS_QUEUE_PACKETS.saturating_mul(config.mtu);
     let (mut stack, pipe) =
         netstack::piped_ingress_bounded(config, INGRESS_QUEUE_PACKETS, max_bytes);
-    if match std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() {
-        Ok("1") => true,
-        Ok("0") => false,
-        _ => cfg!(target_vendor = "apple"),
-    } {
+    if ts_netstack_smoltcp::netcore::experiment::enabled(
+        ts_netstack_smoltcp::netcore::experiment::RX_BATCH,
+    ) {
         // A continuously refilled pipe must not monopolise the driver. Egress is deliberately
         // unbounded here: a single TCP socket emits only one segment per smoltcp egress pass.
         stack.set_ingress_budget(Some(128));
@@ -266,11 +264,9 @@ impl kameo::Actor for NetstackActor {
         });
 
         joinset.spawn(async move {
-            let batching = match std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() {
-                Ok("1") => true,
-                Ok("0") => false,
-                _ => cfg!(target_vendor = "apple"),
-            };
+            let batching = ts_netstack_smoltcp::netcore::experiment::enabled(
+                ts_netstack_smoltcp::netcore::experiment::RX_BATCH,
+            );
             pump_ingress_with_batch_wake(
                 netstack_down,
                 |b| {

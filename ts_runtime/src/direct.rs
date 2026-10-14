@@ -637,10 +637,10 @@ async fn run_direct(
     to_dataplane: UnderlayToDataplane,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    // The WG core is a single owner even without RX batching. On Linux, keep recvmmsg's
-    // syscall saving but publish smaller FIFO messages, allowing decrypt/admission/ACK work
-    // to overlap instead of running a whole kernel batch before downstream can progress.
-    // Apple retains the measured whole-batch path.
+    // The WG core is a single owner even without RX batching. With the opt-in RX batching
+    // experiment on Linux, keep recvmmsg's syscall saving but publish smaller FIFO messages,
+    // allowing decrypt/admission/ACK work to overlap instead of running a whole kernel batch
+    // before downstream can progress. Apple hands off the whole batch.
     let handoff_limit = if cfg!(target_os = "linux") && receive_batching_enabled() {
         4
     } else {
@@ -682,11 +682,9 @@ async fn run_direct(
 }
 
 fn receive_batching_enabled() -> bool {
-    match std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() {
-        Ok("1") => true,
-        Ok("0") => false,
-        _ => cfg!(target_vendor = "apple"),
-    }
+    ts_netstack_smoltcp::netcore::experiment::enabled(
+        ts_netstack_smoltcp::netcore::experiment::RX_BATCH,
+    )
 }
 
 /// Split only downstream work; the kernel/pump batch and its owned buffers stay intact.
