@@ -176,11 +176,14 @@ impl StateStore for FileStore {
         }
     }
 
+    /// Go `FileStore.WriteState`: the directory is created owner-only (`paths.MkStateDir`) and the
+    /// file is replaced atomically and owner-only (`atomicfile.WriteFile(path, bs, 0600)`), so a
+    /// crash mid-write leaves the previous identity rather than a truncated one.
     fn write_state(&self, _id: &str, value: &[u8]) -> std::io::Result<()> {
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
+            crate::state_file::mk_state_dir(parent)?;
         }
-        std::fs::write(&self.path, value)
+        crate::state_file::write_atomic(&self.path, value)
     }
 }
 
@@ -2253,6 +2256,43 @@ mod tests {
             Some(&b"identity-blob"[..]),
             "a fresh FileStore over the same dir reloads the persisted value"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Go's `FileStore` creates its directory `0700` and writes the state file `0600` by replacing
+    /// it with a temporary file: a reader holding the old file still sees all of it, and no stray
+    /// temporary file is left next to the state file.
+    #[cfg(unix)]
+    #[test]
+    fn file_store_writes_owner_only_and_replaces_atomically() {
+        use std::{
+            io::Read as _,
+            os::unix::fs::{MetadataExt as _, PermissionsExt as _},
+        };
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        let dir = scratch_dir("filestore-atomic");
+        let store = FileStore::new(dir.clone());
+        let path = dir.join(STATE_FILE);
+        store.write_state(STATE_KEY, b"old-identity").unwrap();
+        assert_eq!(mode(&dir), 0o700, "a fresh state dir is owner-only");
+        assert_eq!(mode(&path), 0o600, "the state file is owner-only");
+
+        let mut old_file = std::fs::File::open(&path).unwrap();
+        let old_inode = old_file.metadata().unwrap().ino();
+        store.write_state(STATE_KEY, b"new").unwrap();
+
+        let mut seen = Vec::new();
+        old_file.read_to_end(&mut seen).unwrap();
+        assert_eq!(seen, b"old-identity", "the old file was rewritten in place");
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), old_inode);
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert_eq!(mode(&path), 0o600);
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [STATE_FILE], "no temporary file may be left behind");
         std::fs::remove_dir_all(&dir).ok();
     }
 

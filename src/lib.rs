@@ -212,6 +212,7 @@ pub mod http;
 mod loopback;
 #[cfg(feature = "ssh")]
 pub mod ssh;
+mod state_file;
 #[cfg(feature = "tsnet")]
 pub mod tsnet;
 

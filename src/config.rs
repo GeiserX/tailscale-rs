@@ -1087,7 +1087,9 @@ where
 {
     let path = path.as_ref();
 
-    tokio::fs::create_dir_all(path.parent().unwrap())
+    // Go `paths.MkStateDir`: the directory holding the key file is created owner-only.
+    let dir = path.parent().unwrap().to_owned();
+    blocking(move || crate::state_file::mk_state_dir(&dir))
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "creating parent dirs for key file");
@@ -1144,36 +1146,29 @@ async fn try_write(
     path: impl AsRef<Path>,
     value: &impl serde::Serialize,
 ) -> Result<(), crate::Error> {
-    use tokio::io::AsyncWriteExt;
-
-    let path = path.as_ref();
+    let path = path.as_ref().to_owned();
     let bytes = serde_json::to_vec(value).map_err(|e| {
         tracing::error!(error = %e, "serializing key state");
         crate::Error::KeyFileWrite
     })?;
-    let write_error = |e: std::io::Error| {
-        tracing::error!(error = %e, "saving key state");
-        crate::Error::KeyFileWrite
-    };
 
-    // The file holds private keys: create it owner-only, and tighten an existing file that was
-    // written with the process umask by an earlier version.
-    let mut options = tokio::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options.open(path).await.map_err(write_error)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .await
-            .map_err(write_error)?;
-    }
-    file.write_all(&bytes).await.map_err(write_error)?;
-    file.flush().await.map_err(write_error)?;
+    // The file holds private keys. Write it the way Go's `atomicfile.WriteFile` does: owner-only,
+    // into a temporary file that is renamed over the old one, so a crash mid-write leaves the old
+    // keys intact instead of a truncated file that forces a re-registration. The rename also
+    // replaces an older file written with the process umask by an owner-only one.
+    blocking(move || crate::state_file::write_atomic(&path, &bytes))
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "saving key state");
+            crate::Error::KeyFileWrite
+        })
+}
 
-    Ok(())
+/// Run a blocking filesystem call off the async runtime, as `tokio::fs` does.
+async fn blocking(f: impl FnOnce() -> std::io::Result<()> + Send + 'static) -> std::io::Result<()> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e)))
 }
 
 #[cfg(all(test, unix))]
@@ -1213,6 +1208,72 @@ mod key_file_permission_tests {
             mode, 0o600,
             "rewrite must tighten an existing key file, got {mode:o}"
         );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Go creates the state directory owner-only (`paths.MkStateDir`), so the key file's directory
+    /// must be `0700` whatever the umask, including every parent the load had to create.
+    #[tokio::test]
+    async fn fresh_key_file_dir_is_owner_only() {
+        let root = std::env::temp_dir().join(format!("ts-keydir-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&root));
+        let dir = root.join("state");
+
+        load_key_file(dir.join("keys.json"), BadFormatBehavior::Error)
+            .await
+            .unwrap();
+        for d in [&root, &dir] {
+            let mode = std::fs::metadata(d).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode,
+                0o700,
+                "{} must be owner-only, got {mode:o}",
+                d.display()
+            );
+        }
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A rewrite must never be observable half-done: the new keys land in a separate file that
+    /// replaces the old one in one rename, so a reader holding the old file still sees the whole
+    /// old contents, and nothing but the key file is left in the directory.
+    #[tokio::test]
+    async fn key_file_rewrite_replaces_the_file_in_one_step() {
+        use std::{io::Read as _, os::unix::fs::MetadataExt as _};
+
+        let dir = std::env::temp_dir().join(format!("ts-keyswap-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dir));
+        let path = dir.join("keys.json");
+
+        load_key_file(&path, BadFormatBehavior::Error)
+            .await
+            .unwrap();
+        let old_bytes = std::fs::read(&path).unwrap();
+        let mut old_file = std::fs::File::open(&path).unwrap();
+        let old_inode = old_file.metadata().unwrap().ino();
+
+        try_write(&path, &KeyFile::default()).await.unwrap();
+
+        let new_bytes = std::fs::read(&path).unwrap();
+        assert_ne!(new_bytes, old_bytes, "fresh keys were written");
+        let mut seen = Vec::new();
+        old_file.read_to_end(&mut seen).unwrap();
+        assert_eq!(
+            seen, old_bytes,
+            "the old file was rewritten in place, not replaced"
+        );
+        assert_ne!(
+            std::fs::metadata(&path).unwrap().ino(),
+            old_inode,
+            "the key file must be a new file renamed into place"
+        );
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["keys.json"], "no temporary file may be left behind");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
