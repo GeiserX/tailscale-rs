@@ -12,7 +12,7 @@ We use a few `cargo` components/plugins in our development workflow you should i
 - `cargo deny`: Install with `cargo install --locked cargo-deny`.
 - `cargo machete`: Install with `cargo install --locked cargo-machete`.
 - `cargo nextest`: [Installation Instructions](https://nexte.st/docs/installation/pre-built-binaries/)
-- `cargo vet`: Install with `cargo install --locked cargo-vet`.
+- `cargo vet`: Install with `cargo install --locked cargo-vet --version 0.10.2` (the version CI pins).
 
 Formatting, linting, dependency checking, and testing:
 
@@ -30,7 +30,7 @@ $ cargo deny check
 # Detect any unused dependencies in the workspace:
 $ cargo machete --with-metadata
 # Determine how many of our third-party dependencies have been audited:
-$ cargo vet 
+$ cargo vet --locked
 # Run all the tests in the codebase, including in doc comments:
 # NOTE: cargo nextest doesn't support doc tests at time of writing
 $ cargo nextest run --locked --workspace --all-features && cargo test --locked --workspace --doc --all-features
@@ -38,7 +38,7 @@ $ cargo nextest run --locked --workspace --all-features && cargo test --locked -
 
 Or you can run `bin/check`, which runs all of the above.
 
-The GitHub Actions CI/CD pipeline will fail if any of the formatting/linting/dependency/testing checks fail, except `cargo vet`, which is not run in the pipeline.
+The GitHub Actions CI/CD pipeline will fail if any of the formatting/linting/dependency/testing checks fail, including `cargo vet --locked`. When a dependency change makes `cargo vet` fail, audit the new crate or run `cargo vet regenerate exemptions` and commit the updated `supply-chain/` files.
 
 ## Issues
 
