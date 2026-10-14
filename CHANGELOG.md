@@ -4,9 +4,9 @@ Record breaking or significant changes here. All dates are UTC.
 
 ## Unreleased
 
-### Bug Fixes
+### Performance
 
-* **netstack:** recover TCP burst loss with selective SACK/NewReno retransmission, enforce the congestion window over the flight, and enable corrected Cubic with pacing and a 200 ms computed RTO floor. Track 32 receive holes for uploads.
+* **exit node:** forwarded TCP flows run without Nagle, the underlay UDP sockets ask for Go's 7 MiB buffers, netstack egress goes out in batches of up to 64 packets, and the netstack tracks 32 receive holes for uploads. Kernel receive batching, splice coalescing, targeted replay and Apple connected UDP sockets are opt-in experiments, off unless their variable is `1`.
 
 ## [0.57.4](https://github.com/GeiserX/tailscale-rs/compare/v0.57.3...v0.57.4) (2026-10-01)
 
