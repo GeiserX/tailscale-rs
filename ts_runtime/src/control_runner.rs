@@ -685,6 +685,28 @@ fn sticky_update_pop_browser_url(
     }
 }
 
+/// Track control's DNS config (Go `netmap.NetworkMap.DNS`) and its cert domains
+/// (`nm.DNS.CertDomains`) across netmap responses.
+///
+/// Most responses are deltas that carry no DNS config; absent means "no change", not "none". Go's
+/// map session keeps the last one it saw (`ms.lastDNSConfig`, replaced only when
+/// `resp.DNSConfig != nil`) and builds every netmap from it. Clearing the cells on a delta left
+/// `tnet dns status` empty and the cert-domain list empty after the first delta, so certificate
+/// issuance refused every domain. A present config replaces both cells, even when it is empty.
+///
+/// Factored out of the netmap-update handler so it is unit-testable against plain `watch` channels
+/// (mirrors [`sticky_update_pop_browser_url`]).
+fn retain_dns_config(
+    dns_config: &watch::Sender<Option<ts_control::DnsConfig>>,
+    cert_domains: &watch::Sender<Vec<String>>,
+    incoming: Option<&ts_control::DnsConfig>,
+) {
+    if let Some(cfg) = incoming {
+        cert_domains.send_replace(cfg.cert_domains.clone());
+        dns_config.send_replace(Some(cfg.clone()));
+    }
+}
+
 /// Map a mid-session re-auth URL surfaced by the control client onto the device-state cell.
 ///
 /// The control client's live map-poll loop publishes an `Option<url::Url>` into a `watch` cell when
@@ -1871,20 +1893,14 @@ impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
                     self.maybe_sync_tka(tka, ctx.actor_ref().clone()).await;
                 }
 
-                // Track the cert-domain list from the netmap DNS config (Go `nm.DNS.CertDomains`).
-                // An update with no DNS config, or one carrying no cert domains, means "none" — Go
-                // reads an empty slice off an absent config too, so mirror that as an empty `Vec`.
-                let cert_domains = msg
-                    .dns_config
-                    .as_ref()
-                    .map(|d| d.cert_domains.clone())
-                    .unwrap_or_default();
-                self.cert_domains.send_replace(cert_domains);
-
-                // Track the full DNS config for `Device::dns_config` (the daemon's `tnet dns status`).
-                // `None` when control sent no DNS config on this update — distinct from a present but
-                // empty config (Go `netmap.NetworkMap.DNS`).
-                self.dns_config.send_replace(msg.dns_config.clone());
+                // Track the DNS config for `Device::dns_config` (the daemon's `tnet dns status`) and
+                // its cert-domain list for `Device::cert_domains`. See `retain_dns_config`: a delta
+                // without a DNS config leaves both as they were.
+                retain_dns_config(
+                    &self.dns_config,
+                    &self.cert_domains,
+                    msg.dns_config.as_ref(),
+                );
 
                 // Track the interactive-login URL for `Device::pop_browser_url` /
                 // `Runtime::watch_ipn_bus`. See `sticky_update_pop_browser_url` for the Go-faithful
@@ -2294,6 +2310,40 @@ mod reauth_bridge_tests {
             bridge_reauth_url_to_state(&tx, Some(&u));
             assert_eq!(*rx.borrow(), DeviceState::NeedsLogin(u.clone()));
         }
+    }
+}
+
+#[cfg(test)]
+mod retain_dns_config_tests {
+    use tokio::sync::watch;
+
+    use super::retain_dns_config;
+
+    fn cfg(cert_domains: &[&str]) -> ts_control::DnsConfig {
+        ts_control::DnsConfig {
+            magic_dns: true,
+            cert_domains: cert_domains.iter().map(|d| (*d).to_owned()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// A delta without a DNS config keeps the config and cert domains from the last response that
+    /// carried one (Go `ms.lastDNSConfig`); a later config replaces both, even an empty one.
+    #[test]
+    fn delta_without_dns_config_keeps_the_last_one() {
+        let (dns_tx, dns_rx) = watch::channel(None);
+        let (cert_tx, cert_rx) = watch::channel(Vec::new());
+
+        let full = cfg(&["host.tail0123.ts.net"]);
+        retain_dns_config(&dns_tx, &cert_tx, Some(&full));
+        retain_dns_config(&dns_tx, &cert_tx, None);
+        assert_eq!(*dns_rx.borrow(), Some(full));
+        assert_eq!(*cert_rx.borrow(), vec!["host.tail0123.ts.net".to_owned()]);
+
+        let emptied = cfg(&[]);
+        retain_dns_config(&dns_tx, &cert_tx, Some(&emptied));
+        assert_eq!(*dns_rx.borrow(), Some(emptied));
+        assert!(cert_rx.borrow().is_empty());
     }
 }
 

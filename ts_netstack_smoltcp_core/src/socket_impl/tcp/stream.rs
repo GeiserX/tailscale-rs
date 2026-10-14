@@ -297,7 +297,10 @@ impl Netstack {
         let sock = get_socket_mut!(self, tcp::Socket, Some(handle));
 
         match sock.state() {
-            tcp::State::Established => {
+            // The peer can answer and close (data, then FIN) before this replay runs. The socket
+            // is then in CLOSE-WAIT with the reply buffered and its send half still open: the
+            // connect succeeded, exactly as for a listener socket accepted in CLOSE-WAIT.
+            tcp::State::Established | tcp::State::CloseWait => {
                 self.connecting_tcp_sockets.remove(&handle);
                 tracing::trace!("connection succeeded");
                 TcpStreamResponse::Connected { handle }.into()
@@ -314,6 +317,243 @@ impl Netstack {
                 Response::Error(Error::ConnectionReset)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod connect_tests {
+    use core::net::{Ipv4Addr, SocketAddr};
+
+    use smoltcp::{
+        phy::{ChecksumCapabilities, Medium},
+        time::Instant,
+        wire::{IpProtocol, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber},
+    };
+
+    use super::*;
+    use crate::{Config, Netstack, Pipe, PipeDev, Request};
+
+    const LOCAL: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 1);
+    const PEER: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 2);
+    const PEER_ISN: u32 = 5000;
+
+    fn connect_cmd() -> TcpStreamCommand {
+        TcpStreamCommand::Connect {
+            local_endpoint: SocketAddr::from((LOCAL, 50000)),
+            remote_endpoint: SocketAddr::from((PEER, 80)),
+        }
+    }
+
+    /// A segment from the peer to the connecting socket.
+    fn from_peer(control: TcpControl, seq: u32, ack: u32, payload: &[u8]) -> Bytes {
+        let tcp = TcpRepr {
+            src_port: 80,
+            dst_port: 50000,
+            control,
+            seq_number: TcpSeqNumber(seq as i32),
+            ack_number: Some(TcpSeqNumber(ack as i32)),
+            window_len: 65535,
+            window_scale: None,
+            max_seg_size: None,
+            sack_permitted: false,
+            sack_ranges: [None; 3],
+            timestamp: None,
+            payload,
+        };
+        let ip = Ipv4Repr {
+            src_addr: PEER,
+            dst_addr: LOCAL,
+            next_header: IpProtocol::Tcp,
+            payload_len: tcp.buffer_len(),
+            hop_limit: 64,
+        };
+        let caps = ChecksumCapabilities::default();
+        let mut buf = alloc::vec![0; ip.buffer_len() + tcp.buffer_len()];
+        ip.emit(&mut Ipv4Packet::new_unchecked(&mut buf[..]), &caps);
+        tcp.emit(
+            &mut TcpPacket::new_unchecked(&mut buf[ip.buffer_len()..]),
+            &PEER.into(),
+            &LOCAL.into(),
+            &caps,
+        );
+        Bytes::from(buf)
+    }
+
+    /// Control flag and sequence number of a segment the connecting socket sent.
+    fn parse_sent(pkt: &[u8]) -> (TcpControl, u32) {
+        let ip = Ipv4Packet::new_checked(pkt).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        let control = if tcp.rst() {
+            TcpControl::Rst
+        } else if tcp.syn() {
+            TcpControl::Syn
+        } else if tcp.fin() {
+            TcpControl::Fin
+        } else {
+            TcpControl::None
+        };
+        (control, tcp.seq_number().0 as u32)
+    }
+
+    fn present(stack: &Netstack, handle: SocketHandle) -> bool {
+        stack.socket_set.iter().any(|(h, _)| h == handle)
+    }
+
+    /// A Connect that has sent its SYN and is blocked waiting for the peer.
+    struct Connecting {
+        stack: Netstack,
+        handle: SocketHandle,
+        reply: flume::Receiver<Response>,
+        phy: Pipe,
+        dev: PipeDev,
+        /// Acknowledgement of the connecting socket's SYN.
+        ack: u32,
+    }
+
+    impl Connecting {
+        fn start() -> Self {
+            let mut stack = Netstack::new(Config::default(), Instant::ZERO);
+            stack.targeted_replay = None;
+            assert!(stack.direct_set_ips([LOCAL.into()]));
+            let (resp, reply) = flume::bounded(1);
+            stack.process_one_cmd(Request {
+                handle: None,
+                command: connect_cmd().into(),
+                resp,
+            });
+            let handle = stack
+                .blocked_commands
+                .front()
+                .expect("connect blocks until the peer answers")
+                .0
+                .handle
+                .expect("connect opened a socket");
+            let (net, phy) = Pipe::unbounded();
+            let mut dev = PipeDev {
+                pipe: net,
+                medium: Medium::Ip,
+                mtu: 1500,
+            };
+            stack.poll_device_io(Instant::ZERO, &mut dev);
+            let (control, isn) = parse_sent(&phy.rx.try_recv().expect("the SYN"));
+            assert_eq!(control, TcpControl::Syn);
+            Self {
+                stack,
+                handle,
+                reply,
+                phy,
+                dev,
+                ack: isn.wrapping_add(1),
+            }
+        }
+
+        /// Deliver the peer's segments in one ingress pass, so all of them land before the
+        /// blocked Connect is replayed.
+        fn deliver(&mut self, segments: &[Bytes]) {
+            for seg in segments {
+                self.phy.tx.try_send(seg.clone()).unwrap();
+            }
+            self.stack.poll_device_io(Instant::ZERO, &mut self.dev);
+        }
+
+        fn syn_ack(&self) -> Bytes {
+            from_peer(TcpControl::Syn, PEER_ISN, self.ack, &[])
+        }
+    }
+
+    /// The peer's SYN-ACK, its reply and its FIN can all arrive before the blocked Connect is
+    /// replayed. The socket is then in CLOSE-WAIT; Connect must succeed with the reply readable,
+    /// EOF after it, and the send half writable.
+    #[test]
+    fn connect_completes_when_the_peer_replies_and_closes_first() {
+        let mut c = Connecting::start();
+        c.deliver(&[
+            c.syn_ack(),
+            from_peer(TcpControl::None, PEER_ISN + 1, c.ack, b"reply"),
+            from_peer(TcpControl::Fin, PEER_ISN + 6, c.ack, &[]),
+        ]);
+
+        match c.reply.try_recv() {
+            Ok(Response::TcpStream(TcpStreamResponse::Connected { handle })) => {
+                assert_eq!(handle, c.handle)
+            }
+            other => panic!("connect must complete, got {other:?}"),
+        }
+        let sock = c.stack.socket_set.get_mut::<tcp::Socket>(c.handle);
+        assert_eq!(sock.state(), tcp::State::CloseWait);
+        let mut buf = [0; 32];
+        let n = sock.recv_slice(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"reply");
+        assert_eq!(sock.recv_slice(&mut buf), Err(tcp::RecvError::Finished));
+        assert_eq!(sock.send_slice(b"request"), Ok(7));
+    }
+
+    /// A Connect whose caller went away while it was blocked must not complete a connection
+    /// nobody owns: the socket is aborted, the peer gets a RST, and the socket is reclaimed.
+    #[test]
+    fn abandoned_blocked_connect_is_aborted_and_reclaimed() {
+        let Connecting {
+            mut stack,
+            handle,
+            reply,
+            phy,
+            mut dev,
+            ack,
+        } = Connecting::start();
+        drop(reply);
+        phy.tx
+            .try_send(from_peer(TcpControl::Syn, PEER_ISN, ack, &[]))
+            .unwrap();
+        stack.poll_device_io(Instant::ZERO, &mut dev);
+
+        assert!(stack.blocked_commands.is_empty());
+        assert!(
+            !present(&stack, handle),
+            "the abandoned connection must be reclaimed"
+        );
+        let sent: alloc::vec::Vec<_> = phy.rx.try_iter().map(|p| parse_sent(&p).0).collect();
+        assert!(
+            sent.contains(&TcpControl::Rst),
+            "the peer must get a RST, sent {sent:?}"
+        );
+    }
+
+    /// A Connect whose caller went away before the actor first ran it opens no socket at all.
+    #[test]
+    fn abandoned_connect_that_never_ran_opens_no_socket() {
+        let mut stack = Netstack::new(Config::default(), Instant::ZERO);
+        stack.targeted_replay = None;
+        assert!(stack.direct_set_ips([LOCAL.into()]));
+        let (resp, reply) = flume::bounded(1);
+        drop(reply);
+        stack.process_one_cmd(Request {
+            handle: None,
+            command: connect_cmd().into(),
+            resp,
+        });
+        assert!(stack.blocked_commands.is_empty());
+        assert_eq!(stack.tcp_socket_count, 0, "no socket may be opened");
+    }
+
+    /// The caller can also go away after the check and before the reply is sent. A connection
+    /// whose reply could not be delivered is aborted and reclaimed.
+    #[test]
+    fn undelivered_connection_is_aborted_and_reclaimed() {
+        let mut c = Connecting::start();
+        c.deliver(&[c.syn_ack()]);
+        assert!(matches!(
+            c.reply.try_recv(),
+            Ok(Response::TcpStream(TcpStreamResponse::Connected { .. }))
+        ));
+
+        c.stack
+            .reclaim_undelivered(&TcpStreamResponse::Connected { handle: c.handle }.into());
+        assert_eq!(
+            c.stack.socket_set.get::<tcp::Socket>(c.handle).state(),
+            tcp::State::Closed
+        );
+        c.stack.drain_tcp_closes(c.stack.next_orphan_sweep);
+        assert!(!present(&c.stack, c.handle));
     }
 }
 

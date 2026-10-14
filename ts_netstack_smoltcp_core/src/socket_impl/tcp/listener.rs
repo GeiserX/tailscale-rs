@@ -340,16 +340,11 @@ impl Netstack {
                 listener.half_open_queue.push_back(current);
             }
 
-            tcp::State::Established | tcp::State::CloseWait => {
-                tracing::trace!(?state, "connection established");
-                self.enforce_listen_backlog(handle);
-                let listener = self
-                    .tcp_listeners
-                    .get_mut(&handle)
-                    .expect("listener present");
-                listener.accept_queue.push_back(current);
-            }
-
+            // ESTABLISHED and CLOSE-WAIT cannot reach the current socket here. One segment moves a
+            // LISTEN socket no further than SYN-RECEIVED (smoltcp rejects SYN together with FIN as
+            // malformed), smoltcp 0.14 reports a state change for every received frame, and every
+            // ingress path pumps the listeners after each one. So a connection is always seen in
+            // SYN-RECEIVED first and moves on to ESTABLISHED/CLOSE-WAIT from the half-open queue.
             state => {
                 tracing::warn!(
                     current_socket = ?current,
@@ -385,11 +380,13 @@ impl Netstack {
     /// Remove half-open sockets that a RST sent back to `LISTEN`.
     ///
     /// smoltcp returns a listener-born socket in `SYN-RECEIVED` to `LISTEN` when it gets a RST
-    /// (`vendor/smoltcp/src/socket/tcp.rs`, RFC 793). Such a socket is no longer tracked as a
-    /// connection, but it still listens on this port, and smoltcp hands each SYN to the first
-    /// matching socket. If it stays in the socket set it completes later handshakes that no
-    /// `Accept` ever returns: the client sees a connection that nobody serves. Every listener pump
-    /// (after each socket-changing packet) removes them, before the next SYN can arrive.
+    /// (RFC 793; the `(State::SynReceived, TcpControl::Rst)` arm of `Socket::process` in smoltcp
+    /// 0.14.0, <https://github.com/smoltcp-rs/smoltcp/blob/v0.14.0/src/socket/tcp.rs>). Such a
+    /// socket is no longer tracked as a connection, but it still listens on this port, and smoltcp
+    /// hands each SYN to the first matching socket. If it stays in the socket set it completes
+    /// later handshakes that no `Accept` ever returns: the client sees a connection that nobody
+    /// serves. Every listener pump (after each socket-changing packet) removes them, before the
+    /// next SYN can arrive.
     fn prune_reset_half_open(&mut self, handle: ListenerHandle) {
         let Some(listener) = self.tcp_listeners.get_mut(&handle) else {
             return;
@@ -821,6 +818,40 @@ mod tests {
             assert_eq!(&buf[..n], b"request");
             assert_eq!(sock.recv_slice(&mut buf), Err(tcp::RecvError::Finished));
             assert_eq!(sock.send_slice(b"response"), Ok(8));
+        }
+    }
+
+    /// An Accept whose caller went away must not take a connection nobody will serve: the
+    /// connection stays queued for the next Accept. Covers an Accept that blocked before the
+    /// handshake completed (it is replayed) and one that first runs after it.
+    #[test]
+    fn abandoned_accept_leaves_the_connection_for_the_next_accept() {
+        use smoltcp::wire::TcpControl;
+        for blocked in [true, false] {
+            let mut c = PendingConnection::new();
+            let (resp, reply) = flume::bounded(1);
+            let abandoned = crate::Request {
+                handle: None,
+                command: TcpListenCommand::Accept { handle: c.listener }.into(),
+                resp,
+            };
+            if blocked {
+                c.stack.process_one_cmd(abandoned);
+                assert_eq!(c.stack.blocked_commands.len(), 1, "accept blocks");
+                drop(reply);
+                // The handshake completes and the abandoned Accept is replayed.
+                c.send(TcpControl::None, c.ack, &[]);
+            } else {
+                c.send(TcpControl::None, c.ack, &[]);
+                drop(reply);
+                c.stack.process_one_cmd(abandoned);
+            }
+            assert!(c.stack.blocked_commands.is_empty());
+            assert!(
+                matches!(c.accept(), Response::TcpListen(TcpListenResponse::Accepted { handle, .. })
+                if handle == c.handle),
+                "the next Accept must get the connection (blocked: {blocked})"
+            );
         }
     }
 

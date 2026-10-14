@@ -1,9 +1,11 @@
 //! The single anti-leak chokepoint: where overlay flows become real OS sockets.
 
 use std::{
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
 };
+
+use ipnet::Ipv4Net;
 
 use crate::class::FlowClass;
 
@@ -146,8 +148,10 @@ impl RealDialer for DirectDialer {
 /// the tailnet's CGNAT range, multicast, ...) are refused, see `exit_dst_is_forbidden`. The default
 /// route classifies *every* destination as `ExitNode`, so without this an exit-node user could reach
 /// this host's loopback services, its LAN, or other tailnet nodes via this host's sockets. Go
-/// likewise carves those ranges out of the exit node's default route. Private ranges a peer should
-/// reach are advertised as subnet routes, which are classified `Subnet` and dialed unchanged.
+/// likewise carves those ranges out of the exit node's default route. Exit flows into a subnet this
+/// host is attached to are refused too, even when it is a public range (a cloud LAN), except to the
+/// host's own addresses; see `AttachedSubnets`. Ranges a peer should reach are advertised as subnet
+/// routes, which are classified `Subnet` and dialed unchanged.
 ///
 /// Subnet routes are dialed identically to [`DirectDialer`].
 #[derive(Clone, Copy, Debug, Default)]
@@ -256,13 +260,100 @@ fn is_unicast(ip: IpAddr) -> bool {
     }
 }
 
-/// Refuse an exit-node flow aimed at a non-internet destination (see [`exit_dst_is_forbidden`]).
+/// Refuse an exit-node flow aimed at a non-internet destination (see [`exit_dst_is_forbidden`]) or
+/// at a subnet this host is attached to (see [`AttachedSubnets`]), read from the host right now.
 fn refuse_forbidden_exit_dst(class: FlowClass, dst: SocketAddr) -> Result<(), DialError> {
-    if class == FlowClass::ExitNode && exit_dst_is_forbidden(dst) {
+    refuse_exit_dst_with(class, dst, AttachedSubnets::current)
+}
+
+/// [`refuse_forbidden_exit_dst`] with the attached-subnet source passed in, so tests can supply a
+/// host. `attached` is only called for an exit flow that passed the fixed ranges, so subnet flows and
+/// already-refused exit flows never enumerate interfaces. If the interfaces cannot be read the flow
+/// is refused: Go also drops its whole default route when `interfaceRoutes` fails.
+fn refuse_exit_dst_with(
+    class: FlowClass,
+    dst: SocketAddr,
+    attached: impl FnOnce() -> std::io::Result<AttachedSubnets>,
+) -> Result<(), DialError> {
+    if class != FlowClass::ExitNode {
+        return Ok(());
+    }
+    if exit_dst_is_forbidden(dst) {
         tracing::debug!(%dst, "exit dial refused: forbidden exit destination");
         return Err(DialError::ForbiddenDestination(dst));
     }
-    Ok(())
+    // `exit_dst_is_forbidden` refuses every IPv6 destination, so this is always IPv4.
+    let IpAddr::V4(ip) = dst.ip() else {
+        return Err(DialError::ForbiddenDestination(dst));
+    };
+    match attached() {
+        Ok(attached) if attached.forbids(ip) => {
+            tracing::debug!(%dst, "exit dial refused: on a subnet this host is attached to");
+            Err(DialError::ForbiddenDestination(dst))
+        }
+        Ok(_) => Ok(()),
+        Err(e) => {
+            tracing::warn!(%dst, error = %e, "exit dial refused: cannot read this host's interfaces (fail closed)");
+            Err(DialError::Io(e))
+        }
+    }
+}
+
+/// The subnets this host is attached to, which exit-node flows must not reach.
+///
+/// Ports Go's exit-node default route (`interfaceRoutes` and `shrinkDefaultRoute` in
+/// `ipn/ipnlocal/local.go`): the exit route is `0.0.0.0/0` minus every interface prefix, plus the
+/// host's own addresses, minus the fixed non-internet ranges. So an exit user gets the internet and
+/// may reach the exit host's own public address, but not the rest of the LAN it sits on, even when
+/// that LAN is a public range. A LAN peers should reach is advertised as a subnet route. Like Go,
+/// every interface counts whatever its state, and Tailscale addresses and single-address prefixes
+/// (`/32`) are skipped. Only IPv4 is kept: exit egress is IPv4-only.
+#[derive(Debug, Default)]
+struct AttachedSubnets {
+    /// Each attached prefix, truncated to its network.
+    nets: Vec<Ipv4Net>,
+    /// This host's own address on each of those prefixes; exit flows may still reach these.
+    host_ips: Vec<Ipv4Addr>,
+}
+
+impl AttachedSubnets {
+    /// Read this host's interfaces now. Go recomputes the set on every link change, so a read per
+    /// exit dial is never staler than Go's and needs no change watcher.
+    fn current() -> std::io::Result<Self> {
+        Ok(Self::from_interfaces(&if_addrs::get_if_addrs()?))
+    }
+
+    fn from_interfaces(ifaces: &[if_addrs::Interface]) -> Self {
+        let mut out = Self::default();
+        for iface in ifaces {
+            let if_addrs::IfAddr::V4(v4) = &iface.addr else {
+                continue;
+            };
+            if is_tailscale_v4(v4.ip) || v4.prefixlen >= 32 {
+                continue;
+            }
+            let Ok(net) = Ipv4Net::new(v4.ip, v4.prefixlen) else {
+                continue;
+            };
+            out.nets.push(net.trunc());
+            out.host_ips.push(v4.ip);
+        }
+        out
+    }
+
+    /// Whether `ip` lies on an attached subnet without being one of this host's own addresses.
+    fn forbids(&self, ip: Ipv4Addr) -> bool {
+        self.nets.iter().any(|net| net.contains(&ip)) && !self.host_ips.contains(&ip)
+    }
+}
+
+/// Go `tsaddr.IsTailscaleIPv4`: in the CGNAT range `100.64.0.0/10` but not ChromeOS's VM range
+/// `100.115.92.0/23`.
+fn is_tailscale_v4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    let is_cgnat = o[0] == 100 && (o[1] & 0xc0) == 0x40;
+    let is_chromeos_vm = o[0] == 100 && o[1] == 115 && (o[2] & 0xfe) == 92;
+    is_cgnat && !is_chromeos_vm
 }
 
 /// Which upstream proxy wire protocol to speak during the handshake.
@@ -654,7 +745,7 @@ fn base64_encode(input: &[u8]) -> String {
 
 /// `0.0.0.0:0` — the IPv4 wildcard bind address. Never `::`, IPv6 is disabled everywhere.
 fn unspecified_v4() -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
 }
 
 #[cfg(test)]
@@ -804,6 +895,116 @@ mod tests {
             "203.0.113.2:443",
         ] {
             assert!(!exit_dst_is_forbidden(dst.parse().unwrap()), "{dst}");
+        }
+    }
+
+    /// An exit host on `198.51.100.0/24`, a public range, like a cloud LAN. It also has loopback, a
+    /// Tailscale address, a public `/32` and an IPv6 address, none of which may add a subnet.
+    fn exit_host_on_public_lan() -> AttachedSubnets {
+        fn v4(name: &str, ip: &str, prefixlen: u8) -> if_addrs::Interface {
+            let ip: Ipv4Addr = ip.parse().unwrap();
+            if_addrs::Interface {
+                name: name.to_owned(),
+                addr: if_addrs::IfAddr::V4(if_addrs::Ifv4Addr {
+                    ip,
+                    netmask: Ipv4Net::new(ip, prefixlen).unwrap().netmask(),
+                    prefixlen,
+                    broadcast: None,
+                }),
+                index: None,
+                oper_status: if_addrs::IfOperStatus::Up,
+                is_p2p: false,
+                #[cfg(windows)]
+                adapter_name: String::new(),
+            }
+        }
+        let mut v6 = v4("en0", "198.51.100.5", 24);
+        v6.addr = if_addrs::IfAddr::V6(if_addrs::Ifv6Addr {
+            ip: "2001:db8::5".parse().unwrap(),
+            netmask: "ffff:ffff:ffff:ffff::".parse().unwrap(),
+            prefixlen: 64,
+            broadcast: None,
+        });
+        AttachedSubnets::from_interfaces(&[
+            v4("lo0", "127.0.0.1", 8),
+            v4("en0", "198.51.100.5", 24),
+            v4("tailscale0", "100.101.102.103", 10),
+            v4("en1", "203.0.113.9", 32),
+            v6,
+        ])
+    }
+
+    /// The set holds the attached prefixes Go's `interfaceRoutes` keeps and nothing else.
+    #[test]
+    fn attached_subnets_keep_what_go_interface_routes_keeps() {
+        let host = exit_host_on_public_lan();
+        assert_eq!(
+            host.nets,
+            [
+                "127.0.0.0/8".parse::<Ipv4Net>().unwrap(),
+                "198.51.100.0/24".parse().unwrap()
+            ]
+        );
+        assert!(host.forbids("198.51.100.7".parse().unwrap()));
+        assert!(host.forbids("198.51.100.255".parse().unwrap()));
+        assert!(
+            !host.forbids("198.51.100.5".parse().unwrap()),
+            "own address"
+        );
+        assert!(
+            !host.forbids("203.0.113.9".parse().unwrap()),
+            "single-address prefix"
+        );
+        assert!(
+            !host.forbids("100.64.0.1".parse().unwrap()),
+            "Tailscale prefix"
+        );
+        assert!(!host.forbids("8.8.8.8".parse().unwrap()));
+    }
+
+    /// Regression: an exit user must not reach the exit host's own LAN when that LAN is a public
+    /// range, which the fixed non-internet ranges miss. The host's own address and the internet stay
+    /// reachable, and a subnet route over the same LAN still dials.
+    #[test]
+    fn exit_flow_to_the_hosts_attached_public_subnet_is_refused() {
+        let check = |class, dst: &str| {
+            let dst: SocketAddr = dst.parse().unwrap();
+            refuse_exit_dst_with(class, dst, || Ok(exit_host_on_public_lan()))
+        };
+        assert!(matches!(
+            check(FlowClass::ExitNode, "198.51.100.7:443"),
+            Err(DialError::ForbiddenDestination(_))
+        ));
+        assert!(check(FlowClass::ExitNode, "198.51.100.5:443").is_ok());
+        assert!(check(FlowClass::ExitNode, "8.8.8.8:443").is_ok());
+        assert!(check(FlowClass::Subnet, "198.51.100.7:443").is_ok());
+    }
+
+    /// Not knowing the host's subnets refuses the exit flow instead of dialing it; subnet flows and
+    /// flows the fixed ranges refuse never read the interfaces at all.
+    #[test]
+    fn exit_flow_is_refused_when_the_interfaces_cannot_be_read() {
+        let unreadable = || Err(std::io::Error::other("getifaddrs failed"));
+        let public: SocketAddr = "8.8.8.8:443".parse().unwrap();
+        assert!(matches!(
+            refuse_exit_dst_with(FlowClass::ExitNode, public, unreadable),
+            Err(DialError::Io(_))
+        ));
+        let unread = || -> std::io::Result<AttachedSubnets> { panic!("interfaces read") };
+        assert!(refuse_exit_dst_with(FlowClass::Subnet, public, unread).is_ok());
+        let lan: SocketAddr = "10.0.0.1:80".parse().unwrap();
+        assert!(matches!(
+            refuse_exit_dst_with(FlowClass::ExitNode, lan, unread),
+            Err(DialError::ForbiddenDestination(_))
+        ));
+    }
+
+    /// The host's real interfaces can be read, and its own addresses are never refused.
+    #[test]
+    fn this_hosts_own_addresses_are_never_attached_subnet_refusals() {
+        let host = AttachedSubnets::current().expect("read this host's interfaces");
+        for ip in &host.host_ips {
+            assert!(!host.forbids(*ip), "{ip}");
         }
     }
 
