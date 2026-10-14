@@ -507,9 +507,20 @@ mod tests {
     /// End-to-end through the REAL `NetmonSupervisor` actor and a REAL `ManualLinkMonitor`, driving
     /// a REAL `DirectManager` (full underlay stack: dataplane + multiderp + direct). Fires ONE
     /// synthetic link event and asserts the reaction actually happened: the underlay socket is
-    /// rebound (its local port changes) AND a `MeasureNow`-driven re-measure path is exercised (the
-    /// supervisor publishes `MeasureNow` on the bus). This proves the whole slice-(a) pipeline with
-    /// no OS code — the manual monitor stands in for the (later-slice) OS backend.
+    /// rebound AND a `MeasureNow`-driven re-measure path is exercised (the supervisor publishes
+    /// `MeasureNow` on the bus). This proves the whole slice-(a) pipeline with no OS code — the
+    /// manual monitor stands in for the (later-slice) OS backend.
+    ///
+    /// A rebind is a NEW socket on the SAME port, as Go's `Rebind` (`rebind(keepCurrentPort)`,
+    /// `wgengine/magicsock/magicsock.go:3840-3846`) followed by `ReSTUN`
+    /// (`wgengine/userspace.go:1201-1205`): the advertised port survives the link change and the
+    /// probes run again on the fresh socket. So the port is asserted UNCHANGED, and the new socket
+    /// is proved by what only a rebind does: the STUN transaction sent from the old socket before
+    /// the event is dropped (its reply could never arrive on the new socket, `MagicSock::rebind`),
+    /// and the kept port is live again, since a STUN request sent after the event reaches the sink
+    /// from that same port. The test env has no peers and no DERP map, so the re-ping and STUN
+    /// sweep inside `RebindAndReprobe` have nothing to probe; the re-measure the supervisor kicks
+    /// (`MeasureNow`) is the reprobe this test can see.
     #[tokio::test]
     async fn supervisor_reacts_end_to_end_with_manual_monitor() {
         let (_sd_tx, sd_rx) = watch::channel(false);
@@ -531,11 +542,40 @@ mod tests {
             .ask(crate::direct::SockHandle)
             .await
             .expect("direct manager up");
-        let port_before = sock_before.as_ref().map(|s| {
-            s.local_addr()
-                .expect("bound socket has a local addr")
+        let sock_before = sock_before.expect("the underlay socket must be bound (not inert)");
+        let port_before = sock_before
+            .local_addr()
+            .expect("bound socket has a local addr")
+            .port();
+
+        // A STUN sink on loopback that never answers, so a request to it stays in flight until the
+        // rebind drops it. The request also shows which port the underlay socket sends from.
+        let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sink_addr = sink.local_addr().unwrap();
+        async fn stun_from(sink: &tokio::net::UdpSocket) -> u16 {
+            let mut buf = [0u8; 64];
+            tokio::time::timeout(Duration::from_secs(2), sink.recv_from(&mut buf))
+                .await
+                .expect("a STUN request must reach the sink")
+                .unwrap()
+                .1
                 .port()
-        });
+        }
+        let budget_idle = sock_before.stun_in_flight_remaining();
+        sock_before
+            .send_stun_request(sink_addr)
+            .await
+            .expect("a STUN request goes out of the underlay socket");
+        assert_eq!(
+            stun_from(&sink).await,
+            port_before,
+            "precondition: the request left the underlay socket on its bound port"
+        );
+        assert_eq!(
+            sock_before.stun_in_flight_remaining(),
+            budget_idle - 1,
+            "precondition: one STUN transaction is in flight on the old socket"
+        );
 
         // Tap MeasureNow on the bus.
         let measures = Arc::new(AtomicUsize::new(0));
@@ -560,23 +600,34 @@ mod tests {
         // The re-netcheck kick must reach the bus exactly once.
         wait_until(&measures, 1, "MeasureNow published end-to-end").await;
 
-        // The rebind kick must have swapped the underlay socket: a fresh ephemeral port.
+        // The rebind kick must have swapped the underlay socket for a new one on the same port.
         let sock_after = direct
             .ask(crate::direct::SockHandle)
             .await
             .expect("direct manager up");
-        let port_after = sock_after.as_ref().map(|s| {
-            s.local_addr()
-                .expect("bound socket has a local addr")
-                .port()
-        });
-        assert!(
-            port_before.is_some() && port_after.is_some(),
-            "the underlay socket must be bound before and after (not inert)"
+        let sock_after = sock_after.expect("the underlay socket must still be bound (not inert)");
+        let port_after = sock_after
+            .local_addr()
+            .expect("bound socket has a local addr")
+            .port();
+        assert_eq!(
+            port_after, port_before,
+            "RebindAndReprobe must keep the underlay socket's port, as Go's Rebind keeps it"
         );
-        assert_ne!(
-            port_before, port_after,
-            "RebindAndReprobe must have rebound the underlay socket to a new ephemeral port"
+        assert_eq!(
+            sock_after.stun_in_flight_remaining(),
+            budget_idle,
+            "RebindAndReprobe must have rebound the underlay socket: the STUN transaction sent \
+             from the old socket is dropped, since its reply cannot arrive on the new one"
+        );
+        sock_after
+            .send_stun_request(sink_addr)
+            .await
+            .expect("a STUN request goes out of the new underlay socket");
+        assert_eq!(
+            stun_from(&sink).await,
+            port_before,
+            "and the new socket is live on the kept port"
         );
 
         // A single coalesced event must not produce a second re-netcheck.
