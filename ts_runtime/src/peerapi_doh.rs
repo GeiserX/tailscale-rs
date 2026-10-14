@@ -513,7 +513,11 @@ async fn resolve(
 async fn host_forward(resolver: SocketAddr, query: &[u8]) -> Option<Vec<u8>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    const HOST_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(4);
+    // One budget for the UDP ask and its TCP retry together: Go's peerAPI DNS handler gives the
+    // whole query 5 s (`arbitraryTimeout`, ipn/ipnlocal/peerapi.go), which is also how long the
+    // asking peer waits for us ([`CLIENT_TIMEOUT`]).
+    const HOST_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + HOST_TIMEOUT;
     let udp = async {
         let bind: SocketAddr = if resolver.is_ipv4() {
             (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
@@ -532,7 +536,7 @@ async fn host_forward(resolver: SocketAddr, query: &[u8]) -> Option<Vec<u8>> {
             }
         }
     };
-    let resp = tokio::time::timeout(HOST_TIMEOUT, udp).await.ok()??;
+    let resp = tokio::time::timeout_at(deadline, udp).await.ok()??;
     let truncated = resp.get(2).is_some_and(|flags| flags & 0x02 != 0);
     if !truncated {
         return Some(resp);
@@ -550,7 +554,7 @@ async fn host_forward(resolver: SocketAddr, query: &[u8]) -> Option<Vec<u8>> {
     };
     // A truncated UDP answer is still a valid answer if TCP fails.
     Some(
-        tokio::time::timeout(HOST_TIMEOUT, tcp)
+        tokio::time::timeout_at(deadline, tcp)
             .await
             .ok()
             .flatten()
