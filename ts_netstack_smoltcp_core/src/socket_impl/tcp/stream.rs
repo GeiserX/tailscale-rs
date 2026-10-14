@@ -297,7 +297,10 @@ impl Netstack {
         let sock = get_socket_mut!(self, tcp::Socket, Some(handle));
 
         match sock.state() {
-            tcp::State::Established => {
+            // The peer can answer and close (data, then FIN) before this replay runs. The socket
+            // is then in CLOSE-WAIT with the reply buffered and its send half still open: the
+            // connect succeeded, exactly as for a listener socket accepted in CLOSE-WAIT.
+            tcp::State::Established | tcp::State::CloseWait => {
                 self.connecting_tcp_sockets.remove(&handle);
                 tracing::trace!("connection succeeded");
                 TcpStreamResponse::Connected { handle }.into()
@@ -456,6 +459,33 @@ mod connect_tests {
         fn syn_ack(&self) -> Bytes {
             from_peer(TcpControl::Syn, PEER_ISN, self.ack, &[])
         }
+    }
+
+    /// The peer's SYN-ACK, its reply and its FIN can all arrive before the blocked Connect is
+    /// replayed. The socket is then in CLOSE-WAIT; Connect must succeed with the reply readable,
+    /// EOF after it, and the send half writable.
+    #[test]
+    fn connect_completes_when_the_peer_replies_and_closes_first() {
+        let mut c = Connecting::start();
+        c.deliver(&[
+            c.syn_ack(),
+            from_peer(TcpControl::None, PEER_ISN + 1, c.ack, b"reply"),
+            from_peer(TcpControl::Fin, PEER_ISN + 6, c.ack, &[]),
+        ]);
+
+        match c.reply.try_recv() {
+            Ok(Response::TcpStream(TcpStreamResponse::Connected { handle })) => {
+                assert_eq!(handle, c.handle)
+            }
+            other => panic!("connect must complete, got {other:?}"),
+        }
+        let sock = c.stack.socket_set.get_mut::<tcp::Socket>(c.handle);
+        assert_eq!(sock.state(), tcp::State::CloseWait);
+        let mut buf = [0; 32];
+        let n = sock.recv_slice(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"reply");
+        assert_eq!(sock.recv_slice(&mut buf), Err(tcp::RecvError::Finished));
+        assert_eq!(sock.send_slice(b"request"), Ok(7));
     }
 
     /// A Connect whose caller went away while it was blocked must not complete a connection
