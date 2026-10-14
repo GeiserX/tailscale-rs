@@ -2,15 +2,21 @@
 //!
 //! Mirrors the core of Go magicsock's `endpoint`/`addrSet`: for each peer we track a set of
 //! candidate UDP endpoints (learned from the control netmap and from disco `CallMeMaybe`),
-//! send disco pings to them, and promote the endpoint that pongs first/lowest-latency to be
-//! the peer's "best address". WireGuard data for that peer is then sent to the best address.
+//! send disco pings to them, and promote the endpoint whose pong wins to be the peer's "best
+//! address". WireGuard data for that peer is then sent to the best address.
 //!
-//! Selection rules (subset of Go's, sufficient for the known-public-VPS topology):
-//! - A path becomes *usable* when we receive a pong for a ping we sent to it.
-//! - The best address is the usable path with the lowest measured round-trip latency.
-//! - IPv6 wins ties (matches Go), though IPv6 is disabled in our deployment.
+//! Selection rules, as Go's `handlePongConnLocked` applies them (`endpoint.go`):
+//! - A path is *confirmed* when we receive a pong for a ping we sent to it.
+//! - Only the path that just ponged is compared with the current best, through [`better_addr`]
+//!   (Go `betterAddr`: latency with hysteresis, plus a bonus for a private, link-local or IPv6
+//!   address). No other candidate's remembered latency takes part: a remembered reading does not
+//!   prove a path is still alive, so scanning them would keep re-electing a dead path.
+//! - The pong's path becomes the best when it is better than the current best, or when the
+//!   current best is no longer trusted (the next confirmed pong replaces an untrusted best,
+//!   whatever its old reading was).
 //! - A best address is *trusted* until `trust_until`; after that it must be re-confirmed by
-//!   a fresh pong or the peer falls back to DERP (the caller's responsibility).
+//!   a fresh pong or the peer falls back to DERP (the caller's responsibility). Only the best's
+//!   own pong renews its trust; a rival's pong proves the rival works, not that the best is alive.
 //! - Control can switch the keep-the-best-path-alive ping off entirely with the `silent-disco`
 //!   node attribute, in which case an inbound packet on the best address is what keeps it trusted
 //!   instead — see [`PeerPaths::set_heartbeat_disabled`].
@@ -729,6 +735,13 @@ impl PeerPaths {
         self.best
     }
 
+    /// A candidate's measured latency as stored. Test-only: pins that a disco-key change clears
+    /// it ([`invalidate_disco_path`](Self::invalidate_disco_path)).
+    #[cfg(test)]
+    fn stored_latency(&self, addr: SocketAddr) -> Option<Duration> {
+        self.candidates.get(&addr).and_then(|c| c.latency)
+    }
+
     /// Compare only the address that just ponged with the current best, as Go's
     /// `handlePongConnLocked` does. Historical RTTs do not prove a path is still alive.
     fn recompute_best(&mut self, now: Instant, confirmed: SocketAddr) {
@@ -754,7 +767,19 @@ impl PeerPaths {
         if self.best == Some(confirmed) {
             self.trust_until = Some(now + TRUST_DURATION);
         }
-        tracing::debug!(%confirmed, ?latency, ?previous, best = ?self.best, best_untrusted,
+        // Per-pong detail at trace, like every other per-message line in this crate; the one event
+        // an operator wants at debug is the best path changing (Go logs only that: "node %v now
+        // using %v" in `handlePongConnLocked`).
+        if self.best != previous {
+            tracing::debug!(
+                ?previous,
+                best = ?self.best,
+                ?latency,
+                best_untrusted,
+                "magicsock: best path changed"
+            );
+        }
+        tracing::trace!(%confirmed, ?latency, ?previous, best = ?self.best, best_untrusted,
             "magicsock: pong path selection");
     }
 }
@@ -1352,6 +1377,38 @@ mod tests {
         assert_eq!(p.best_addr(now + Duration::from_millis(3)), Some(lan));
     }
 
+    /// A LAN path that stops answering must not hold the peer on DERP while a live public path
+    /// keeps answering. The LAN path wins on its private-address bonus while both answer; once it
+    /// goes silent and its trust lapses, the public path's next pong takes over (Go promotes the
+    /// ponging address whenever the best is untrusted). A selection that re-elected the LAN path
+    /// from its remembered latency and bonus left the peer on DERP here, with the public path
+    /// answering every ping.
+    #[test]
+    fn live_public_path_takes_over_from_a_silent_lan_best() {
+        let mut p = PeerPaths::default();
+        let lan: SocketAddr = "192.168.50.76:41644".parse().unwrap();
+        let public: SocketAddr = "203.0.113.34:41644".parse().unwrap();
+        p.add_netmap_candidates([lan, public]);
+        let now = Instant::now();
+        p.note_ping_sent(tx(1), lan, now);
+        p.note_pong(tx(1), lan, now + Duration::from_millis(2));
+        p.note_ping_sent(tx(2), public, now);
+        p.note_pong(tx(2), public, now + Duration::from_micros(1_800));
+        // The LAN path is best here (`lan_path_stays_best_against_faster_public_hairpin`). Not
+        // asserted, so the test also holds on a latency-only selection, which picks the public path.
+
+        // The LAN path goes silent. Only the public path answers, past the LAN path's trust window.
+        let t1 = now + TRUST_DURATION + Duration::from_secs(1);
+        p.note_ping_sent(tx(3), lan, t1);
+        p.note_ping_sent(tx(4), public, t1);
+        p.note_pong(tx(4), public, t1 + Duration::from_micros(1_800));
+        assert_eq!(
+            p.best_addr(t1 + Duration::from_millis(3)),
+            Some(public),
+            "a live public path must take over once the silent LAN best's trust lapses"
+        );
+    }
+
     // ---- cadence gates (tsr-7s3, matching Go magicsock) ----
 
     /// An unconfirmed candidate is pinged at most once per `DISCO_PING_INTERVAL` (5s), not every
@@ -1674,17 +1731,18 @@ mod tests {
     }
 
     /// A pre-rotation latency must not be able to re-trust a path without a fresh pong for it: the
-    /// disco-key change clears every measurement, so a pong for a *slower* rival makes that rival
-    /// the best rather than promoting the remembered (and possibly dead) fast address.
+    /// disco-key change clears every measurement (asserted directly), and a pong for a *slower*
+    /// rival then makes that rival the best rather than promoting the remembered (and possibly
+    /// dead) fast address.
     ///
-    /// This is upstream's outcome too, reached by a different mechanism, and the equivalence is the
-    /// point of pinning it: Go keeps its `recentPongs` across `invalidateDiscoPathLocked` but
-    /// `handlePongConnLocked` promotes the address that just ponged whenever the best is out of
-    /// trust (`betterAddr(thisPong, de.bestAddr) || bestUntrusted`), and `changedActiveDiscoLocked`
-    /// is precisely what puts it out of trust. So there, as here, the first address to answer after
-    /// a rotation becomes the best whatever the pre-rotation history said. What must never happen
-    /// in either tree is the thing this asserts against: a path trusted again without having
-    /// answered under the key the peer is using now.
+    /// The selection part is upstream's outcome by upstream's mechanism: `handlePongConnLocked`
+    /// compares only the address that just ponged with the best and promotes it whenever the best
+    /// is out of trust (`betterAddr(thisPong, de.bestAddr) || bestUntrusted`), and
+    /// `changedActiveDiscoLocked` is precisely what puts it out of trust; `recompute_best` does the
+    /// same, so a remembered latency can never take part. Go keeps its `recentPongs` across
+    /// `invalidateDiscoPathLocked` and this tree clears them, which only diagnostics can tell
+    /// apart. What must never happen in either tree is the thing this asserts against: a path
+    /// trusted again without having answered under the key the peer is using now.
     #[test]
     fn disco_key_change_forgets_pre_rotation_latencies() {
         let mut p = PeerPaths::default();
@@ -1698,6 +1756,15 @@ mod tests {
         assert_eq!(p.best_addr(now + Duration::from_millis(3)), Some(fast));
 
         p.invalidate_disco_path();
+        assert_eq!(
+            p.stored_latency(fast),
+            None,
+            "a disco-key change must clear every pre-rotation latency"
+        );
+        assert!(
+            p.candidate_addrs().contains(&fast),
+            "...while the candidate itself stays, to be re-probed under the new key"
+        );
 
         // Only `slow` answers under the new key.
         let t = now + Duration::from_millis(10);

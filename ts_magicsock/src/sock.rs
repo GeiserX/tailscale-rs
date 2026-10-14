@@ -297,13 +297,20 @@ pub struct MagicSock {
     /// The underlay UDP socket, behind a `Mutex<Arc<…>>` so [`MagicSock::rebind`] can atomically
     /// swap in a freshly-bound socket on a network/link change (Wi-Fi switch, sleep/wake) without
     /// recreating the `MagicSock` or disturbing peer/disco/path state. Readers take a cheap
-    /// clone via [`MagicSock::sock`] for the duration of a single send/recv; the background recv
-    /// pump re-reads it each loop iteration, so it picks up a rebind on its next `recv_from` (the
-    /// old socket is dropped once outstanding clones release it, which unblocks a parked
-    /// `recv_from` — matching Go's `RebindingUDPConn` close-and-reloop). `std::sync::Mutex` (not an
-    /// extra `arc-swap` dep): the guard is held only long enough to clone the `Arc`, never across
-    /// an `.await`.
+    /// clone via [`MagicSock::sock`] for the duration of a single send/recv. A receive that is
+    /// already parked on the old socket is woken through [`rebound`](Self::rebound) and re-reads
+    /// this on its next turn; the old socket closes once the last clone releases it.
+    /// `std::sync::Mutex` (not an extra `arc-swap` dep): the guard is held only long enough to
+    /// clone the `Arc`, never across an `.await`.
     sock: Mutex<Arc<UdpSocket>>,
+    /// Bumped by [`MagicSock::rebind`] after it swaps `sock`, to wake a receive loop parked on the
+    /// old socket so it re-reads `sock` and waits on the new one ([`fill_receive`]). Go's
+    /// `RebindingUDPConn` gets the same effect by closing the old conn under its lock, which errors
+    /// a parked read, and `ReadBatch` then re-reads the current conn (`rebinding_conn.go`); a
+    /// `tokio::net::UdpSocket` cannot be closed while a clone is parked on it, so the parked
+    /// receive is told to let go instead. The value is a generation counter, never read as such:
+    /// only its change matters.
+    rebound: tokio::sync::watch::Sender<u64>,
     /// Connected per-path sockets sharing `sock`'s port (opt-in; see `connected.rs`). Locked
     /// disjointly from every other lock, never across an `.await`.
     connected: Mutex<ConnectedSockets>,
@@ -508,6 +515,7 @@ impl MagicSock {
         let (connected, connected_rx) = ConnectedSockets::new(settings);
         Ok(Self {
             sock: Mutex::new(Arc::new(sock)),
+            rebound: tokio::sync::watch::Sender::new(0),
             connected: Mutex::new(connected),
             connected_rx: tokio::sync::Mutex::new(ReceiveState {
                 connected: connected_rx,
@@ -544,7 +552,9 @@ impl MagicSock {
 
     /// The current underlay socket. Clones the `Arc` under a short lock (never held across an
     /// `.await`), so a concurrent [`rebind`](Self::rebind) swaps the socket for *subsequent* calls
-    /// while an in-progress send/recv keeps using the socket it already cloned.
+    /// while an in-progress send keeps using the socket it already cloned. A parked receive does
+    /// not keep it: [`fill_receive`](Self::fill_receive) also watches [`rebound`](Self::rebound)
+    /// and re-reads this when it fires.
     fn sock(&self) -> Arc<UdpSocket> {
         lock(&self.sock).clone()
     }
@@ -591,6 +601,14 @@ impl MagicSock {
         }
         sock.send_to(buf, addr).await?;
         Ok(true)
+    }
+
+    /// Whether the underlay socket can send to an IPv6 address at all: only a dual-stack `[::]`
+    /// bind can (`enable_ipv6`, and the host let it). The IPv4-only default, and the inert IPv4
+    /// fallback a dual-stack bind takes on a host with IPv6 off, cannot. Read from the socket
+    /// rather than from `enable_ipv6` so the fallback case answers truthfully.
+    fn sends_ipv6(&self) -> bool {
+        self.sock().local_addr().is_ok_and(|a| a.is_ipv6())
     }
 
     /// Whether control has put this node in TCP-443-only mode — see
@@ -654,9 +672,14 @@ impl MagicSock {
 
         tune_socket_buffers(&new_sock);
 
-        // Swap the socket atomically. The old `Arc<UdpSocket>` drops once outstanding clones release
-        // it, which unblocks any `recv_from` parked on it so the recv pump loops onto the new socket.
+        // Swap the socket atomically, then wake any receive parked on the old one so it re-reads
+        // `sock` and waits on the new socket (`fill_receive`); the old `Arc<UdpSocket>` closes once
+        // the last clone releases it. Go closes the old conn under the `RebindingUDPConn` lock and
+        // its parked read reloops onto the current conn; a parked tokio receive is woken instead,
+        // because a clone it holds cannot be closed from here.
         *lock(&self.sock) = Arc::new(new_sock);
+        self.rebound
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
         // Connected sockets were bound to the old socket's address; start over.
         lock(&self.connected).clear();
 
@@ -1049,7 +1072,7 @@ impl MagicSock {
                 .add_learned_candidates(eps)
         };
 
-        tracing::debug!(%peer, ?accepted, "magicsock: learned peer candidates");
+        tracing::trace!(%peer, ?accepted, "magicsock: learned peer candidates");
         let mut a2d = lock(&self.addr_to_disco);
         for ep in &accepted {
             // Don't let a learned (disco-supplied) candidate steal an address already attributed to
@@ -1102,12 +1125,32 @@ impl MagicSock {
     /// longer be re-confirmed as a direct path. If pruning removes the peer's current best path,
     /// the path is cleared and the peer fails closed to DERP until a surviving endpoint
     /// re-confirms. Learned (disco) candidates are left intact.
+    ///
+    /// An IPv6 endpoint is dropped here when the underlay socket is IPv4-only (`sends_ipv6`):
+    /// the socket can never send to it, so letting it through
+    /// only made every discovery sweep attempt and fail that send. Go keeps such an endpoint and
+    /// has `sendUDPStd` report its failed send as "not sent, no error" while `noV6` is set
+    /// (`magicsock.go`); this tree knows the socket family up front and drops the endpoint
+    /// instead, the way `is_pingable_candidate` already drops a disco-learned one.
     pub fn set_netmap_endpoints(
         &self,
         peer: DiscoPublicKey,
         endpoints: impl IntoIterator<Item = SocketAddr>,
     ) {
-        let eps: Vec<SocketAddr> = endpoints.into_iter().collect();
+        let sends_ipv6 = self.sends_ipv6();
+        let eps: Vec<SocketAddr> = endpoints
+            .into_iter()
+            .filter(|ep| {
+                let ok = sends_ipv6 || !ep.is_ipv6();
+                if !ok {
+                    tracing::debug!(
+                        %ep,
+                        "dropping an IPv6 netmap endpoint: the underlay socket is IPv4-only"
+                    );
+                }
+                ok
+            })
+            .collect();
 
         let removed = {
             let mut paths = lock(&self.paths);
@@ -1307,11 +1350,19 @@ impl MagicSock {
     /// event-driven [`send_pings_to_peer_now`](Self::send_pings_to_peer_now): both snapshot the work
     /// to do under the `paths` lock (stamping each via [`PeerPaths::note_ping_sent`]), then release
     /// the lock and emit here so no lock is held across the socket `await`.
+    ///
+    /// A send that fails does not abort the sweep (Go starts each discovery ping independently,
+    /// `startDiscoPingLocked`): the remaining candidates and peers are still probed, and the failure
+    /// is logged at debug. If *every* send in a sweep fails, the socket itself is the problem (a
+    /// link that went down, a bind that died), and that is logged once per sweep at warn, with the
+    /// count and the last error, so a dead socket is visible without a line per ping.
     async fn emit_disco_pings(
         &self,
         to_ping: Vec<(DiscoPublicKey, SocketAddr, disco::TxId)>,
     ) -> Result<usize, Error> {
         let mut sent = 0;
+        let mut failed = 0;
+        let mut last_error = None;
         let m = crate::metrics::metrics();
         for (peer, addr, tx_id) in to_ping {
             let wire = disco::seal_ping(&self.our_disco, self.our_node_key, &peer, tx_id)?;
@@ -1321,19 +1372,30 @@ impl MagicSock {
             // attempt before `sendDiscoMessage` decides); with no pong it simply expires.
             match self.send_udp(&wire, addr).await {
                 Ok(true) => {
-                    tracing::debug!(%peer, %addr, ?tx_id, "magicsock: disco ping sent");
+                    tracing::trace!(%peer, %addr, ?tx_id, "magicsock: disco ping sent");
                     m.disco_ping_sent.inc();
                     sent += 1;
                 }
                 Ok(false) => {}
                 Err(e) => {
-                    // Go starts each discovery ping independently (startDiscoPingLocked).
-                    // A stale/unreachable candidate must not prevent the remaining candidates
-                    // or peers from being probed. Their lastPing was already stamped above;
-                    // aborting here would starve them again on every subsequent sweep.
+                    // The candidate's `last_ping` was already stamped by the caller; aborting here
+                    // would starve the rest of the sweep again on every subsequent round.
                     tracing::debug!(error = %e, %peer, %addr, "sending disco ping; continuing discovery");
+                    failed += 1;
+                    last_error = Some(e);
                 }
             }
+        }
+
+        if let Some(error) = last_error
+            && sent == 0
+        {
+            tracing::warn!(
+                failed,
+                error = %error,
+                "every disco ping in this sweep failed to send; the underlay socket is not \
+                 carrying UDP (peers stay on DERP until it does)"
+            );
         }
 
         Ok(sent)
@@ -1587,15 +1649,22 @@ impl MagicSock {
         demux_receive_batch(&mut state, |datagram| self.demux_datagram(datagram)).await
     }
 
+    /// Wait for the next kernel batch (or connected-socket batch) and queue it in `pending`.
+    /// Returns with nothing queued when a [`rebind`](Self::rebind) swaps the socket while this is
+    /// parked on the old one: the caller loops and the next call waits on the new socket. The
+    /// receiver is subscribed *before* the socket is cloned, so a rebind that lands between the
+    /// two is seen either as the new socket or as a wake-up, never missed.
     async fn fill_receive(&self, state: &mut ReceiveState) -> Result<(), Error> {
         if !state.pending.is_empty() {
             return Ok(());
         }
+        let mut rebound = self.rebound.subscribe();
         let sock = self.sock();
         if let Some(receiver) = &mut state.receiver {
             let batch = tokio::select! {
                 r = receiver.recv(&sock, None) => crate::receive_batch::Received::Batch(r?),
                 Some(batch) = state.connected.recv() => batch,
+                _ = rebound.changed() => return Ok(()),
             };
             // No await between consuming the kernel/channel batch and saving its tail.
             state.pending.extend(batch);
@@ -1607,6 +1676,7 @@ impl MagicSock {
                     crate::receive_batch::Received::One((PacketMut::from(&buf[..n]), from))
                 },
                 Some(batch) = state.connected.recv() => batch,
+                _ = rebound.changed() => return Ok(()),
             };
             state.pending.extend(batch);
         }
@@ -2936,7 +3006,7 @@ impl MagicSock {
                 // silently, and without moving `disco_pong_sent`. The peer that pinged us falls
                 // back to DERP for us exactly as it would for a node it cannot reach directly.
                 if self.send_udp(&pong, from).await? {
-                    tracing::debug!(%sender, %from, ?tx_id, "magicsock: disco pong sent");
+                    tracing::trace!(%sender, %from, ?tx_id, "magicsock: disco pong sent");
                     m.disco_pong_sent.inc();
                 }
             }
@@ -2960,7 +3030,7 @@ impl MagicSock {
                     }
                 };
                 let solicited = latency.is_some();
-                tracing::debug!(%sender, %from, ?tx_id, ?latency, solicited,
+                tracing::trace!(%sender, %from, ?tx_id, ?latency, solicited,
                     "magicsock: disco pong received");
                 // Wake any on-demand `ping_now` waiter for this tx_id with the fresh RTT. Gated on
                 // `solicited` (a genuine match) and locked disjointly from `paths` above. The send
@@ -3504,10 +3574,12 @@ mod tests {
             "an inbound ping is not a solicited pong"
         );
 
-        // A retained netmap can contain IPv6 even on our IPv4-only socket. Fix the sweep
-        // order at the emitter seam to model a stable HashMap order with the bad address first.
+        // A candidate the IPv4-only socket cannot send to, injected through the unfiltered test
+        // seam (the netmap path now drops an IPv6 endpoint before it can reach a sweep; any
+        // address whose send fails models the case). Fix the sweep order at the emitter seam to
+        // model a stable HashMap order with the bad address first.
         let bad: SocketAddr = "[::1]:41641".parse().unwrap();
-        restarted.set_netmap_endpoints(laptop_pub, [bad, laptop_addr]);
+        restarted.add_peer_endpoints_unfiltered(laptop_pub, [bad]);
         let now = Instant::now() + Duration::from_secs(6);
         let work = {
             let mut paths = lock(&restarted.paths);
@@ -8157,6 +8229,121 @@ mod tests {
         // (Not asserted as an equality because the OS may reassign; we only require a valid bind,
         // already proven above. `port_before` is captured to document the intent.)
         let _ = port_before;
+    }
+
+    /// A receive loop already parked in `recv_data` when `rebind` swaps the socket must carry on
+    /// from the NEW socket: a datagram a peer sends to the rebound port has to reach it. The loop
+    /// used to keep its own clone of the old socket, which the rebind could neither close nor wake
+    /// (the clone kept it open, and its port taken, which is also why the rebind lands on a new
+    /// port), so nothing sent to the new port ever reached a loop that was already waiting; only a
+    /// loop that happened to start after the rebind saw the new socket. Go's `RebindingUDPConn`
+    /// closes the old conn under its lock and `ReadBatch` re-reads the current one, so a parked
+    /// read there resumes on the new socket.
+    #[tokio::test]
+    async fn a_parked_receive_loop_follows_the_socket_across_a_rebind() {
+        let sock = Arc::new(plain_sock().await);
+        let peer = DiscoPrivateKey::random().public_key();
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // Attribute the sender's address to `peer`, so its (non-disco) datagram is yielded as
+        // WireGuard data rather than dropped as an unknown source.
+        sock.add_peer_endpoints_unfiltered(peer, [sender.local_addr().unwrap()]);
+
+        // Park a receive loop on the pre-rebind socket.
+        let pump_sock = sock.clone();
+        let pump = tokio::spawn(async move { pump_sock.recv_data().await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !pump.is_finished(),
+            "precondition: the receive loop is parked waiting for a datagram"
+        );
+
+        let before = sock.local_addr().unwrap();
+        sock.rebind().await.expect("rebind must succeed");
+        let after = sock.local_addr().unwrap();
+        assert_ne!(
+            before.port(),
+            after.port(),
+            "precondition: the parked loop still holds the old socket open, so the rebind lands \
+             on a different port (this is what makes the stale clone unreachable)"
+        );
+
+        // The rebound socket is bound to `0.0.0.0`; reach it over loopback.
+        let target = SocketAddr::from((core::net::Ipv4Addr::LOCALHOST, after.port()));
+        sender
+            .send_to(b"wireguard-looking data", target)
+            .await
+            .unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("the parked receive loop must see a datagram sent to the rebound port")
+            .unwrap()
+            .unwrap()
+            .expect("the datagram must be yielded as data, not a closed socket");
+        assert_eq!(got.from_disco, peer);
+        assert_eq!(got.from_addr, sender.local_addr().unwrap());
+        assert_eq!(got.data.as_ref(), b"wireguard-looking data");
+    }
+
+    /// A netmap can carry a peer's IPv6 endpoint while this node's underlay socket is IPv4-only
+    /// (the default, and the inert fallback a dual-stack bind takes on a host with IPv6 off). Such
+    /// an endpoint can never be sent to from this socket, so it is dropped where the netmap is
+    /// applied, exactly as the disco-learned candidates are dropped by `is_pingable_candidate`;
+    /// before, it reached the ping sweep and failed there on every discovery round.
+    #[tokio::test]
+    async fn ipv4_only_socket_drops_ipv6_netmap_endpoints() {
+        let sock = plain_sock().await;
+        assert!(
+            sock.local_addr().unwrap().is_ipv4(),
+            "precondition: IPv4-only underlay"
+        );
+        let peer = DiscoPrivateKey::random().public_key();
+        let v6: SocketAddr = "[2001:db8::7]:41641".parse().unwrap();
+        let v4: SocketAddr = "198.51.100.7:41641".parse().unwrap();
+
+        sock.set_netmap_endpoints(peer, [v6, v4]);
+
+        assert_eq!(
+            sock.candidate_addrs(&peer),
+            vec![v4],
+            "an IPv6 netmap endpoint must not become a candidate on an IPv4-only socket"
+        );
+        assert!(
+            !lock(&sock.addr_to_disco).contains_key(&v6),
+            "a dropped endpoint must not be attributed either"
+        );
+    }
+
+    /// When every ping in a sweep fails to send, the socket itself is in trouble (a link that went
+    /// down, a bind that died), and that is worth one warning per sweep: not silence, and not one
+    /// line per ping. A sweep where some pings went out stays quiet (`#606`: a single failing
+    /// candidate must neither abort nor alarm).
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_sweep_where_every_ping_fails_to_send_warns_once() {
+        let sock = plain_sock().await;
+        let peer = DiscoPrivateKey::random().public_key();
+        // Two addresses the IPv4-only socket cannot send to, injected through the unfiltered seam
+        // (the production entry points drop them before any send).
+        let dead: [SocketAddr; 2] = [
+            "[::1]:41641".parse().unwrap(),
+            "[::1]:41642".parse().unwrap(),
+        ];
+        sock.add_peer_endpoints_unfiltered(peer, dead);
+
+        let sent = sock.send_pings_to_peer_now(&peer).await.unwrap();
+        assert_eq!(sent, 0, "precondition: nothing could be sent");
+        logs_assert(|lines: &[&str]| {
+            match lines
+                .iter()
+                .filter(|line| line.contains("every disco ping in this sweep failed to send"))
+                .count()
+            {
+                1 => Ok(()),
+                n => Err(format!(
+                    "a sweep that sends nothing must warn exactly once (two pings failed), got {n}"
+                )),
+            }
+        });
     }
 
     /// `send_pings_to_peer_now` pings **every** candidate immediately, bypassing the per-candidate
