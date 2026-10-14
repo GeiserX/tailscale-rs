@@ -5936,6 +5936,118 @@ mod tests {
         a_pump.abort();
     }
 
+    /// Exercise a changed peer mapping with the Apple connected and batched send paths on/off.
+    /// Loopback candidacy uses the existing test seam; production source filtering is tested
+    /// separately. The old socket stays open and connected, but never answers again.
+    #[cfg(target_vendor = "apple")]
+    #[tokio::test]
+    async fn network_move_with_stale_connected_socket_recovers_on_and_off() {
+        async fn receive(sock: &UdpSocket) -> (Vec<u8>, SocketAddr) {
+            let mut buf = vec![0; 2048];
+            let (n, from) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
+                .await
+                .expect("datagram must arrive at the current mapping")
+                .unwrap();
+            buf.truncate(n);
+            (buf, from)
+        }
+        for enabled in [false, true] {
+            let settings = crate::connected::Settings {
+                connected_sockets: enabled,
+                dont_fragment: enabled,
+                batched_io: enabled,
+            };
+            let node_disco = DiscoPrivateKey::random();
+            let peer_disco = DiscoPrivateKey::random();
+            let peer = peer_disco.public_key();
+            let peer_node = ts_keys::NodePrivateKey::random().public_key();
+            let node = MagicSock::bind_with(
+                localhost(),
+                node_disco.clone(),
+                ts_keys::NodePrivateKey::random().public_key(),
+                settings,
+            )
+            .await
+            .unwrap()
+            .with_binding_verifier(allow_all());
+            let local = node.local_addr().unwrap();
+            let old = UdpSocket::bind(localhost()).await.unwrap();
+            let moved = UdpSocket::bind(localhost()).await.unwrap();
+            let advertised = UdpSocket::bind(localhost()).await.unwrap();
+            let old_addr = old.local_addr().unwrap();
+            let source = moved.local_addr().unwrap();
+            node.set_netmap_endpoints(peer, [old_addr, advertised.local_addr().unwrap()]);
+            {
+                let mut paths = lock(&node.paths);
+                let pp = paths.get_mut(&peer).unwrap();
+                let past = Instant::now() - Duration::from_secs(10);
+                pp.note_ping_sent([1; 12], old_addr, past);
+                pp.note_pong([1; 12], old_addr, past + Duration::from_nanos(1));
+            }
+            // Open the old connected socket without a megabyte of irrelevant test traffic.
+            let connected = lock(&node.connected).socket_for(
+                old_addr,
+                crate::connected::CONNECT_AFTER_BYTES as usize,
+                &node.sock(),
+            );
+            assert_eq!(connected.is_some(), enabled);
+            assert!(node.best_addr(&peer).is_none());
+
+            let ping = disco::seal_ping(&peer_disco, peer_node, &node_disco.public_key(), [2; 12])
+                .unwrap();
+            moved.send_to(&ping, local).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), node.recv_data_batch())
+                .await
+                .unwrap()
+                .unwrap();
+            let (mut pong, from) = receive(&moved).await;
+            assert_eq!(
+                from, local,
+                "reply must use the node's original address and port"
+            );
+            assert!(
+                matches!(disco::open(&peer_disco, &mut pong).unwrap(), Inbound::Pong { tx_id, .. } if tx_id == [2; 12])
+            );
+            node.add_peer_endpoints_unfiltered(peer, [source]);
+            node.set_netmap_endpoints(peer, [old_addr, advertised.local_addr().unwrap()]);
+            assert_eq!(node.send_pings().await.unwrap(), 3);
+            let (mut ping, from) = receive(&moved).await;
+            assert_eq!(from, local);
+            let Inbound::Ping { tx_id, .. } = disco::open(&peer_disco, &mut ping).unwrap() else {
+                panic!("expected probe");
+            };
+            let pong =
+                disco::seal_pong(&peer_disco, &node_disco.public_key(), tx_id, from).unwrap();
+            moved.send_to(&pong, from).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), node.recv_data_batch())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(node.best_addr(&peer), Some(source));
+            // A stale ready entry remains, yet cannot override the freshly-confirmed address.
+            assert_eq!(lock(&node.connected).ready_count(), usize::from(enabled));
+            let current = lock(&node.connected).socket_for(
+                source,
+                crate::connected::CONNECT_AFTER_BYTES as usize,
+                &node.sock(),
+            );
+            assert_eq!(current.is_some(), enabled);
+            node.send_wireguard_batch(&peer, &[b"one", b"two"])
+                .await
+                .unwrap();
+            assert_eq!(receive(&moved).await, (b"one".to_vec(), local));
+            assert_eq!(receive(&moved).await, (b"two".to_vec(), local));
+            moved.send_to(b"reply", local).await.unwrap();
+            let data = tokio::time::timeout(Duration::from_secs(2), node.recv_data())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(data.from_addr, source);
+            assert_eq!(data.data.as_ref(), b"reply");
+        }
+    }
+
     /// With connected sockets on, a busy direct path moves to a socket connected to the peer on
     /// the same port, and data keeps flowing both ways (replies now arrive on the connected
     /// socket and reach `recv_data` through its pump).
