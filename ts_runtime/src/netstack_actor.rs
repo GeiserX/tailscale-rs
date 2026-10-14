@@ -74,8 +74,18 @@ pub(crate) fn piped_ingress_bounded(
 /// Drops are logged at `debug!` only, once when a run of drops starts and once when it ends: the
 /// rate is peer-driven, so it must not be able to drive an operator's default-level log.
 pub(crate) async fn pump_ingress(
-    mut from_dataplane: OverlayFromDataplane,
+    from_dataplane: OverlayFromDataplane,
     to_netstack: netstack::WakingPipeSender,
+    netstack_name: &'static str,
+) -> u64 {
+    pump_ingress_with(from_dataplane, |b| to_netstack.try_send(b), netstack_name).await
+}
+
+/// [`pump_ingress`] with a custom admission step: `admit` takes each packet and returns whether
+/// it was accepted (`false` counts as a drop). It must not wait.
+pub(crate) async fn pump_ingress_with(
+    mut from_dataplane: OverlayFromDataplane,
+    mut admit: impl FnMut(&[u8]) -> bool,
     netstack_name: &'static str,
 ) -> u64 {
     let mut dropped: u64 = 0;
@@ -84,7 +94,7 @@ pub(crate) async fn pump_ingress(
     while let Some(bufs) = from_dataplane.recv().await {
         for buf in bufs {
             let buf: PacketMut = buf;
-            if to_netstack.try_send(buf.as_ref()) {
+            if admit(buf.as_ref()) {
                 if dropping {
                     dropping = false;
                     tracing::debug!(

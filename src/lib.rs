@@ -1581,8 +1581,8 @@ impl Device {
     /// Advertise (or stop advertising) this node as an **exit node** at runtime — Go `tailscale set
     /// --advertise-exit-node`. The runtime equivalent of
     /// [`Config::advertise_exit_node`](crate::Config::advertise_exit_node): when `enable` it adds the
-    /// `0.0.0.0/0` default route to what this node advertises (and forwards), when `false` it removes
-    /// it.
+    /// `0.0.0.0/0` + `::/0` default routes to what this node advertises (IPv4 is forwarded, IPv6
+    /// rejected), when `false` it removes them.
     ///
     /// Composes with [`set_advertise_routes`](Device::set_advertise_routes): the explicit subnet
     /// routes and the exit-node advertisement are independent — toggling one preserves the other.

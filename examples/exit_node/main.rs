@@ -1,0 +1,310 @@
+//! Run this process as a userspace **exit node** for a tailnet.
+//!
+//! A minimal, purpose-built runner for experimenting with a residential exit node: it joins the
+//! tailnet with a persisted identity, advertises `0.0.0.0/0` and `::/0` (official clients only offer
+//! an exit node that advertises both), forwards every IPv4 TCP/UDP port through the userspace
+//! netstack and egresses via this host's own sockets. IPv6 exit traffic is rejected at once, so
+//! clients fall back to IPv4. It does not touch the host's routes, DNS or packet filter, and it does
+//! not need root.
+//!
+//! The auth key is read from a file (never argv or logs) and is only needed for the first
+//! registration; afterwards the identity in `--state-dir` is reused. Alternatively,
+//! `--interactive` prints a login URL to approve in a browser.
+//!
+//! ```sh
+//! TS_RS_EXPERIMENT=this_is_unstable_software \
+//!   cargo run --release --example exit_node -- \
+//!     --state-dir ./state/rust-exit --auth-key-file ~/.config/ts-exit/authkey
+//! ```
+//!
+//! The advertised route still has to be approved in the admin console (or by an `autoApprovers`
+//! policy) before peers can select this node.
+
+use std::{error::Error, path::PathBuf, time::Duration};
+
+use clap::Parser;
+use tailscale::{Config, Device, RegistrationError, config::BadFormatBehavior};
+use tokio::signal::unix::{SignalKind, signal};
+use tracing_subscriber::filter::LevelFilter;
+
+#[derive(clap::Parser)]
+#[command(version, about)]
+struct Args {
+    /// Directory holding this node's persisted identity (`keys.json`). Created if missing.
+    #[arg(long)]
+    state_dir: PathBuf,
+
+    /// File containing the auth key. Only read if the identity is not yet registered.
+    #[arg(long)]
+    auth_key_file: Option<PathBuf>,
+
+    /// Register without an auth key: print control's login URL and wait (up to 1 h) for it to
+    /// be approved in a browser, like `tailscale up` does. The node is owned by the approving
+    /// user rather than tagged.
+    #[arg(long, conflicts_with = "auth_key_file")]
+    interactive: bool,
+
+    /// Hostname to request.
+    #[arg(long, default_value = "rust-exit")]
+    hostname: String,
+
+    /// Tags to request (must match the auth key's tags), e.g. `tag:rust-exit`.
+    #[arg(long = "tag")]
+    tags: Vec<String>,
+
+    /// UDP port for WireGuard + disco. Defaults away from the official client's 41641.
+    #[arg(long, default_value_t = 41642)]
+    port: u16,
+
+    /// Don't advertise the exit-node route; join the tailnet only (tunnel-only tests).
+    #[arg(long)]
+    no_advertise: bool,
+
+    /// Resolver that answers exit-node users' DNS aimed at resolvers this node can't reach (their
+    /// LAN/hotspot resolver). Defaults to the first `nameserver` in /etc/resolv.conf.
+    #[arg(long)]
+    exit_dns: Option<std::net::SocketAddr>,
+
+    /// Don't answer such DNS at all (it is then refused like any private destination).
+    #[arg(long, conflicts_with = "exit_dns")]
+    no_exit_dns: bool,
+
+    /// Tailnet port for the peerAPI, which serves exit-node DNS (DoH) to the node's users; 0 disables
+    /// it. Go clients send all their DNS there when using this node as exit node.
+    #[arg(long, default_value_t = 41643)]
+    peerapi_port: u16,
+
+    /// Per-direction userspace TCP buffer in bytes (netstack default: 256 KiB).
+    #[arg(long)]
+    tcp_buffer_size: Option<usize>,
+
+    /// Serve a tunnel-only benchmark on this port of the node's tailnet address (0 = off). A client
+    /// that sends `d` gets an endless stream of zeros; `u` has everything discarded; `e` is echoed.
+    #[arg(long, default_value_t = 0)]
+    sink_port: u16,
+
+    /// Tokio worker threads. One per core (tokio's default) spends CPU on cross-thread wakeups;
+    /// too few lets bulk flows starve the serial packet pipeline, whose bounded ingress queue then
+    /// drops packets (1-3 s TCP stalls). Tunnel benchmark, 8 parallel flows: 4 workers had the
+    /// lowest CPU per GB with no stalls; 2 stalled; 10 cost 40% more CPU.
+    #[arg(long, default_value_t = 4)]
+    worker_threads: usize,
+
+    /// Seconds between status lines (peers, direct vs DERP path). 0 disables.
+    #[arg(long, default_value_t = 30)]
+    status_interval: u64,
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let args = Args::parse();
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(args.worker_threads.max(1))
+        .enable_all()
+        .build()?
+        .block_on(run(args))
+}
+
+async fn run(args: Args) -> Result<(), Box<dyn Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(LevelFilter::INFO.into())
+                .from_env_lossy(),
+        )
+        .init();
+
+    tokio::fs::create_dir_all(&args.state_dir).await?;
+    let key_file = args.state_dir.join("keys.json");
+    let first_run = !tokio::fs::try_exists(&key_file).await?;
+
+    let auth_key = match (&args.auth_key_file, first_run) {
+        (Some(p), _) => Some(tokio::fs::read_to_string(p).await?.trim().to_owned()),
+        (None, true) if !args.interactive => {
+            return Err("first run needs --auth-key-file or --interactive".into());
+        }
+        (None, _) => None,
+    };
+
+    let exit_dns = if args.no_exit_dns {
+        None
+    } else {
+        args.exit_dns.or_else(system_resolver)
+    };
+    tracing::info!(?exit_dns, "exit-node DNS for unreachable resolvers");
+
+    let config = Config {
+        key_state: tailscale::config::load_key_file(&key_file, BadFormatBehavior::Error).await?,
+        client_name: Some("ts-exit-node".to_owned()),
+        requested_hostname: Some(args.hostname.clone()),
+        requested_tags: args.tags.clone(),
+        // A persistent exit node must survive brief disconnects without being GC'd by control.
+        ephemeral: false,
+        // The tailnet DNS config backs the exit-node DoH service. Userspace mode never touches the
+        // host resolver either way.
+        accept_dns: true,
+        advertise_exit_node: !args.no_advertise,
+        forward_all_ports: !args.no_advertise,
+        forward_exit_egress: !args.no_advertise,
+        // Egress to the exit node's LAN stays off, like Go's default for exit-node users.
+        exit_node_allow_lan_access: false,
+        exit_node_dns: exit_dns,
+        peerapi_port: (args.peerapi_port != 0).then_some(args.peerapi_port),
+        tcp_buffer_size: args.tcp_buffer_size,
+        wireguard_listen_port: Some(args.port),
+        netmap_cache_dir: None,
+        ..Config::default()
+    };
+
+    let dev = Device::new(&config, auth_key).await?;
+    // Interactive login: `wait_until_running` reports `NeedsLogin(url)` right away rather than
+    // waiting, so show the URL and keep waiting until it is approved (or the hour runs out).
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs(if args.interactive { 3600 } else { 90 });
+    let mut shown = None;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match dev.wait_until_running(Some(left)).await {
+            Ok(()) => break,
+            Err(RegistrationError::NeedsLogin(url)) if args.interactive && !left.is_zero() => {
+                if shown.as_ref() != Some(&url) {
+                    tracing::info!(%url, "open this URL to log the node in");
+                    shown = Some(url);
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let (v4, v6) = dev.tailscale_ips().await?;
+    tracing::info!(
+        ?v4,
+        ?v6,
+        advertise_exit_node = !args.no_advertise,
+        "running"
+    );
+
+    if args.sink_port != 0 {
+        let listener = dev
+            .tcp_listen(std::net::SocketAddr::from((
+                std::net::Ipv4Addr::UNSPECIFIED,
+                args.sink_port,
+            )))
+            .await?;
+        tracing::info!(port = args.sink_port, "benchmark sink listening");
+        tokio::spawn(async move {
+            while let Ok(conn) = listener.accept().await {
+                tokio::spawn(serve_sink(conn));
+            }
+        });
+    }
+
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut ticker = (args.status_interval > 0)
+        .then(|| tokio::time::interval(Duration::from_secs(args.status_interval)));
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            _ = sigterm.recv() => break,
+            _ = async { ticker.as_mut().unwrap().tick().await }, if ticker.is_some() => {
+                log_status(&dev).await;
+            }
+        }
+    }
+
+    tracing::info!("shutting down");
+    let clean = dev.shutdown(Some(Duration::from_secs(5))).await;
+    tracing::info!(clean, "stopped");
+    Ok(())
+}
+
+async fn log_status(dev: &Device) {
+    // Never let a status query stall the main loop (and with it signal handling).
+    let status = match tokio::time::timeout(Duration::from_secs(5), dev.status()).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "status");
+            return;
+        }
+        Err(_) => {
+            let t = Duration::from_secs(2);
+            let self_node = tokio::time::timeout(t, dev.self_node()).await.is_ok();
+            let peer_tracker =
+                tokio::time::timeout(t, dev.peers_with_route("203.0.113.1".parse().unwrap()))
+                    .await
+                    .is_ok();
+            tracing::warn!(self_node, peer_tracker, "status query timed out");
+            return;
+        }
+    };
+    match &status.self_node {
+        Some(me) => tracing::info!(
+            routes = ?me.allowed_routes,
+            exit_node = me.is_exit_node,
+            peers = status.peers.len(),
+            health = ?status.health,
+            "self"
+        ),
+        None => {
+            tracing::info!(peers = status.peers.len(), health = ?status.health, "self (no self node yet)")
+        }
+    }
+    // Online state is often unknown in this engine (None), so only skip peers known offline.
+    for p in status.peers.iter().filter(|p| p.online != Some(false)) {
+        let path = match (&p.cur_addr, &p.relay) {
+            (Some(a), _) => format!("direct {a}"),
+            (None, Some(r)) => format!("derp {r}"),
+            (None, None) => "idle".to_owned(),
+        };
+        tracing::info!(peer = %p.display_name, ip = %p.ipv4, online = ?p.online, %path, "peer");
+    }
+}
+
+/// This host's resolver: the first IPv4 `nameserver` in /etc/resolv.conf (macOS keeps it current)
+/// that is not Tailscale's own. A host running tailscaled lists `100.100.100.100`; sending exit
+/// users' DNS there would hand it to that tailscaled, which Go's exit node avoids the same way
+/// (`HandlePeerDNSQuery`, net/dns/resolver/tsdns.go). Exit egress is IPv4-only, so an IPv6
+/// nameserver, `fd7a:115c:a1e0::53` included, is never picked.
+fn system_resolver() -> Option<std::net::SocketAddr> {
+    const TAILSCALE_SERVICE_IPS: [std::net::IpAddr; 2] = [
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(100, 100, 100, 100)),
+        std::net::IpAddr::V6(std::net::Ipv6Addr::new(
+            0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0, 0x53,
+        )),
+    ];
+    let conf = std::fs::read_to_string("/etc/resolv.conf").ok()?;
+    conf.lines()
+        .filter_map(|l| l.trim().strip_prefix("nameserver"))
+        .filter_map(|ip| ip.trim().parse::<std::net::IpAddr>().ok())
+        .filter(|ip| ip.is_ipv4() && !TAILSCALE_SERVICE_IPS.contains(ip))
+        .map(|ip| std::net::SocketAddr::new(ip, 53))
+        .next()
+}
+
+/// One benchmark connection: `d` streams zeros to the client, `u` discards what it sends, `e`
+/// echoes it (latency probes).
+async fn serve_sink(mut conn: tailscale::netstack::TcpStream) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = vec![0u8; 64 * 1024];
+    let Ok(n) = conn.read(&mut buf[..1]).await else {
+        return;
+    };
+    match (n, buf[0]) {
+        (1, b'd') => {
+            buf.fill(0);
+            while conn.write_all(&buf).await.is_ok() {}
+        }
+        (1, b'u') => while matches!(conn.read(&mut buf).await, Ok(n) if n > 0) {},
+        (1, b'e') => loop {
+            match conn.read(&mut buf).await {
+                Ok(n) if n > 0 => {
+                    if conn.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        },
+        _ => {}
+    }
+}

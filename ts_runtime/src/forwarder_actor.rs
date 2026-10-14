@@ -16,7 +16,8 @@ use netstack::{
 };
 use tokio::task::JoinSet;
 use ts_forwarder::{
-    DirectDialer, Forwarder, HostExitDialer, ProxyExitDialer, RealDialer, RouteTable, RouteUpdater,
+    Admit, DirectDialer, ExitDnsDialer, Forwarder, HostExitDialer, PortGate, ProxyExitDialer,
+    RealDialer, RouteTable, RouteUpdater,
 };
 
 use crate::{
@@ -38,8 +39,10 @@ pub struct ForwarderActor {
 /// Generic over the concrete [`RealDialer`] so the fail-closed [`DirectDialer`] and the opt-in
 /// [`HostExitDialer`] share one run-loop body — only the dialer type differs, so the two gate arms
 /// can't drift. When `all_ports` is set the explicit `tcp_ports`/`udp_ports` sets are ignored and
-/// the forwarder runs in all-port mode (raw-socket port observer); otherwise it forwards exactly
-/// the configured port sets.
+/// the forwarder runs in gated all-port mode, returning the [`PortGate`] every inbound IPv4 packet
+/// must be offered to (instead of writing it to `ingress`); otherwise it forwards exactly the
+/// configured port sets.
+#[allow(clippy::too_many_arguments)]
 fn spawn_forwarder<D: RealDialer>(
     joinset: &mut JoinSet<()>,
     channel: Channel,
@@ -48,10 +51,17 @@ fn spawn_forwarder<D: RealDialer>(
     all_ports: bool,
     tcp_ports: Vec<u16>,
     udp_ports: Vec<u16>,
-) -> RouteUpdater {
-    let forwarder = match forwarder_mode(all_ports) {
-        ForwarderMode::AllPorts => Forwarder::all_ports(channel, routes, dialer),
-        ForwarderMode::Ports => Forwarder::new(channel, routes, dialer, tcp_ports, udp_ports),
+    ingress: netstack::WakingPipeSender,
+) -> (RouteUpdater, Option<PortGate>) {
+    let (forwarder, gate) = match forwarder_mode(all_ports) {
+        ForwarderMode::AllPorts => {
+            let (f, g) = Forwarder::all_ports_gated(channel, routes, dialer, ingress);
+            (f, Some(g))
+        }
+        ForwarderMode::Ports => (
+            Forwarder::new(channel, routes, dialer, tcp_ports, udp_ports),
+            None,
+        ),
     };
     // Grab the live route-update handle BEFORE `run()` consumes the forwarder, so the actor can
     // push a new `RouteTable` (a runtime `set_advertise_routes`) onto the running forwarder. New
@@ -62,7 +72,38 @@ fn spawn_forwarder<D: RealDialer>(
             tracing::error!(error = %e, "forwarder run loop exited");
         }
     });
-    route_updater
+    (route_updater, gate)
+}
+
+/// Token bucket for IPv6 rejections (TCP RST / ICMPv6) the forwarder sends back to peers:
+/// [`RejectBudget::PER_SEC`] per second, bursting to the same.
+struct RejectBudget {
+    tokens: f64,
+    last: std::time::Instant,
+}
+
+impl RejectBudget {
+    const PER_SEC: f64 = 1000.0;
+
+    fn new() -> Self {
+        Self {
+            tokens: Self::PER_SEC,
+            last: std::time::Instant::now(),
+        }
+    }
+
+    fn take(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let refill = now.duration_since(self.last).as_secs_f64() * Self::PER_SEC;
+        self.tokens = (self.tokens + refill).min(Self::PER_SEC);
+        self.last = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Which concrete dialer the forwarder is wired with — the anti-leak gate's only output.
@@ -93,7 +134,7 @@ fn dialer_choice(forward_exit_egress: bool, has_exit_proxy: bool) -> DialerChoic
 /// Whether the forwarder runs in all-port mode or forwards an explicit port set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForwarderMode {
-    /// All TCP/UDP ports per advertised route (raw-socket port observer).
+    /// All TCP/UDP ports per advertised route (gated on-demand listeners).
     AllPorts,
     /// Exactly the configured TCP/UDP port sets.
     Ports,
@@ -138,6 +179,7 @@ impl kameo::Actor for ForwarderActor {
         });
 
         // Pump packets emitted by the forwarder netstack down into the dataplane (out the overlay).
+        let reject_up = netstack_up.clone();
         joinset.spawn(async move {
             while let Some(buf) = netstack_down_rx.recv_async().await {
                 if netstack_up.send(vec![buf.to_vec().into()]).is_err() {
@@ -146,14 +188,6 @@ impl kameo::Actor for ForwarderActor {
             }
 
             tracing::warn!("forwarder netstack downlink shut down!");
-        });
-
-        // Pump packets the dataplane routed to this transport up into the forwarder netstack,
-        // dropping what its bounded ingress queue has no room for.
-        joinset.spawn(async move {
-            crate::netstack_actor::pump_ingress(netstack_down, netstack_down_tx, "forwarder").await;
-
-            tracing::warn!("forwarder netstack uplink shut down!");
         });
 
         // Enable any-IP acceptance BEFORE the forwarder starts accepting, so the first inbound flow
@@ -197,7 +231,7 @@ impl kameo::Actor for ForwarderActor {
         let n_udp_ports = udp_ports.len();
 
         let choice = dialer_choice(env.forward_exit_egress, env.exit_proxy.is_some());
-        let route_updater = match choice {
+        let (route_updater, gate) = match choice {
             DialerChoice::Proxy => {
                 // `dialer_choice` returns `Proxy` only when `exit_proxy.is_some()`, so this clone
                 // is always present; expressed as an expect so a future gate change can't silently
@@ -214,8 +248,19 @@ impl kameo::Actor for ForwarderActor {
                     all_ports,
                     tcp_ports,
                     udp_ports,
+                    netstack_down_tx.clone(),
                 )
             }
+            DialerChoice::HostExit if env.exit_node_dns.is_some() => spawn_forwarder(
+                &mut joinset,
+                channel.clone(),
+                routes,
+                ExitDnsDialer::new(HostExitDialer, env.exit_node_dns.expect("checked by guard")),
+                all_ports,
+                tcp_ports,
+                udp_ports,
+                netstack_down_tx.clone(),
+            ),
             DialerChoice::HostExit => spawn_forwarder(
                 &mut joinset,
                 channel.clone(),
@@ -224,6 +269,7 @@ impl kameo::Actor for ForwarderActor {
                 all_ports,
                 tcp_ports,
                 udp_ports,
+                netstack_down_tx.clone(),
             ),
             DialerChoice::Direct => spawn_forwarder(
                 &mut joinset,
@@ -233,8 +279,38 @@ impl kameo::Actor for ForwarderActor {
                 all_ports,
                 tcp_ports,
                 udp_ports,
+                netstack_down_tx.clone(),
             ),
         };
+
+        // Pump packets the dataplane routed to this transport up into the forwarder netstack,
+        // dropping what its bounded ingress queue has no room for. This forwarder dials IPv4 only,
+        // so every IPv6 packet is answered here with a TCP RST / ICMPv6 prohibited (or dropped if
+        // it can't be answered safely) and never reaches the netstack, whose wildcard listeners
+        // would otherwise accept it. IPv4 goes through the port gate in all-port mode.
+        joinset.spawn(async move {
+            let mut reject_budget = RejectBudget::new();
+            let admit = |b: &[u8]| {
+                if b.first().is_some_and(|v| v >> 4 == 6) {
+                    // Replies skip the bounded netstack ingress, so cap their rate; over budget the
+                    // packet is still consumed, just not answered.
+                    if reject_budget.take()
+                        && let Some(reply) = ts_forwarder::reject_ipv6(b)
+                        && reject_up.send(vec![reply.into()]).is_err()
+                    {
+                        tracing::debug!("dataplane gone; IPv6 rejection not sent");
+                    }
+                    return true;
+                }
+                match &gate {
+                    Some(gate) => gate.ingress(b) != Admit::Dropped,
+                    None => netstack_down_tx.try_send(b),
+                }
+            };
+            crate::netstack_actor::pump_ingress_with(netstack_down, admit, "forwarder").await;
+
+            tracing::warn!("forwarder netstack uplink shut down!");
+        });
 
         tracing::debug!(
             n_routes,
@@ -243,6 +319,7 @@ impl kameo::Actor for ForwarderActor {
             all_ports,
             exit_egress = env.forward_exit_egress,
             exit_proxy = env.exit_proxy.is_some(),
+            exit_node_dns = ?env.exit_node_dns,
             dialer = ?choice,
             "forwarder started"
         );
@@ -275,6 +352,14 @@ impl ForwarderActor {
 
 #[cfg(test)]
 mod tests {
+    /// The IPv6 rejection budget allows a burst of `PER_SEC`, then refuses until it refills.
+    #[test]
+    fn reject_budget_caps_burst() {
+        let mut b = super::RejectBudget::new();
+        let allowed = (0..3000).filter(|_| b.take()).count();
+        assert!((1000..1010).contains(&allowed), "allowed {allowed}");
+    }
+
     use super::*;
     use crate::env::ForwarderConfig;
 
@@ -292,6 +377,7 @@ mod tests {
             forward_exit_egress,
             block_incoming: false,
             exit_proxy: None,
+            exit_node_dns: None,
             peerapi_port: None,
             taildrop_dir: None,
             enable_ipv6: false,

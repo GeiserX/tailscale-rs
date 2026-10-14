@@ -293,6 +293,14 @@ pub struct Config {
     #[serde(default)]
     pub exit_proxy: Option<ExitProxyConfig>,
 
+    /// Resolver that answers exit-node DNS aimed at resolvers this node can't reach (a client's
+    /// LAN or hotspot resolver), e.g. this host's own resolver. `None` leaves such DNS refused like
+    /// any other forbidden exit destination. Only used with
+    /// [`forward_exit_egress`](Config::forward_exit_egress) and no exit proxy. See
+    /// `ts_forwarder::ExitDnsDialer`.
+    #[serde(default)]
+    pub exit_node_dns: Option<core::net::SocketAddr>,
+
     /// The IPv4 peerAPI port this node binds to serve exit-node DoH (DNS-over-HTTPS) proxying for
     /// peers that select it as their exit node (`peerapi4` + `peerapi-dns-proxy` services).
     ///
@@ -666,9 +674,12 @@ impl Config {
     /// [`advertise_routes`](Config::advertise_routes) with the exit-node default route when
     /// [`advertise_exit_node`](Config::advertise_exit_node) is set.
     ///
-    /// IPv6 prefixes are filtered out (IPv6-off posture): we never forward IPv6, so advertising an
-    /// IPv6 route would create a black hole. The exit-node default route is therefore `0.0.0.0/0`
-    /// only, never `::/0`. The result is deduplicated and order-preserving; an empty result means
+    /// IPv6 subnet prefixes are filtered out (IPv6-off posture): we never forward IPv6, so
+    /// advertising an IPv6 subnet would create a black hole. The exit-node default route is the
+    /// pair `0.0.0.0/0` + `::/0`, as Go advertises it: official clients only offer a peer as an exit
+    /// node when it advertises both (`tsaddr.ContainsExitRoutes`). IPv6 exit traffic is still never
+    /// forwarded; the forwarder answers it with a TCP RST / ICMPv6 prohibited so clients fall back
+    /// to IPv4 at once. The result is deduplicated and order-preserving; an empty result means
     /// "advertise nothing", and callers omit the wire field entirely.
     pub fn advertised_routes(&self) -> Vec<ipnet::IpNet> {
         let mut routes: Vec<ipnet::IpNet> = Vec::new();
@@ -688,11 +699,9 @@ impl Config {
         }
 
         if self.advertise_exit_node {
-            let default_v4 = ipnet::IpNet::V4(
-                ipnet::Ipv4Net::new(core::net::Ipv4Addr::UNSPECIFIED, 0)
-                    .expect("0.0.0.0/0 is a valid prefix"),
-            );
-            push_unique(default_v4);
+            for net in exit_node_routes() {
+                push_unique(net);
+            }
         }
 
         routes
@@ -827,6 +836,7 @@ impl Default for Config {
             forward_exit_egress: false,
             block_incoming: false,
             exit_proxy: None,
+            exit_node_dns: None,
             peerapi_port: None,
             taildrop_dir: None,
             netmap_cache_dir: None,
@@ -853,6 +863,20 @@ impl Default for Config {
             allow_http_key_fetch: false,
         }
     }
+}
+
+/// The default-route pair an exit node advertises: `0.0.0.0/0` and `::/0`.
+pub fn exit_node_routes() -> [ipnet::IpNet; 2] {
+    [
+        ipnet::IpNet::V4(
+            ipnet::Ipv4Net::new(core::net::Ipv4Addr::UNSPECIFIED, 0)
+                .expect("0.0.0.0/0 is a valid prefix"),
+        ),
+        ipnet::IpNet::V6(
+            ipnet::Ipv6Net::new(core::net::Ipv6Addr::UNSPECIFIED, 0)
+                .expect("::/0 is a valid prefix"),
+        ),
+    ]
 }
 
 #[cfg(test)]
@@ -886,12 +910,12 @@ mod tests {
     }
 
     #[test]
-    fn exit_node_adds_default_v4_route() {
+    fn exit_node_adds_default_route_pair() {
         let cfg = Config {
             advertise_exit_node: true,
             ..Default::default()
         };
-        assert_eq!(cfg.advertised_routes(), vec![v4("0.0.0.0/0")]);
+        assert_eq!(cfg.advertised_routes(), vec![v4("0.0.0.0/0"), v6("::/0")]);
     }
 
     #[test]
@@ -905,14 +929,20 @@ mod tests {
     }
 
     #[test]
-    fn exit_node_never_advertises_v6_default() {
+    fn v6_default_is_advertised_only_as_part_of_exit_node() {
+        // An explicit ::/0 subnet route is dropped like any other IPv6 prefix...
+        let cfg = Config {
+            advertise_routes: vec![v6("::/0")],
+            ..Default::default()
+        };
+        assert!(cfg.advertised_routes().is_empty());
+        // ...and the exit-node pair is not duplicated by it.
         let cfg = Config {
             advertise_routes: vec![v6("::/0")],
             advertise_exit_node: true,
             ..Default::default()
         };
-        // ::/0 is dropped; only the v4 default route is advertised.
-        assert_eq!(cfg.advertised_routes(), vec![v4("0.0.0.0/0")]);
+        assert_eq!(cfg.advertised_routes(), vec![v4("0.0.0.0/0"), v6("::/0")]);
     }
 
     #[test]
@@ -1206,7 +1236,7 @@ mod tests {
         // Explicit 0.0.0.0/0 plus the exit-node default route collapse to one entry.
         assert_eq!(
             cfg.advertised_routes(),
-            vec![v4("0.0.0.0/0"), v4("10.0.0.0/24")]
+            vec![v4("0.0.0.0/0"), v4("10.0.0.0/24"), v6("::/0")]
         );
     }
 }
