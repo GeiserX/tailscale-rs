@@ -782,24 +782,32 @@ async fn run_once(
 
     // Publish this node's Hostinfo: control ignores it on the streaming request above, so without
     // this a node keeps whatever Hostinfo it registered with (Go sends the same non-streaming
-    // update from `SendUpdate` once the map poll is up).
-    {
-        let mut builder = with_hostinfo(MapRequestBuilder::new(node_keys))
-            .keep_alive(false)
-            .omit_peers(true)
-            .stream(false)
-            .routable_ips(config.advertised_routes());
-        builder = net_info.apply(builder);
-        if let Some(hostname) = &config.hostname {
-            builder = builder.hostname(hostname);
-        }
-        if let Err(e) = send_map_request(builder.build(), &map_url, &h2_client).await {
+    // update from `SendUpdate` once the map poll is up). Go sends it from its own update
+    // goroutine, so it runs alongside the netmap loop here rather than before it: a slow control
+    // server must not hold up the first netmap on every reconnect. It is dropped with the poll.
+    // The carried NetInfo is cloned because the loop below mutates it.
+    let startup_net_info = net_info.clone();
+    let mut builder = with_hostinfo(MapRequestBuilder::new(node_keys))
+        .keep_alive(false)
+        .omit_peers(true)
+        .stream(false)
+        .routable_ips(config.advertised_routes());
+    builder = startup_net_info.apply(builder);
+    if let Some(hostname) = &config.hostname {
+        builder = builder.hostname(hostname);
+    }
+    let startup_request = builder.build();
+    let mut hostinfo_update = core::pin::pin!(async {
+        if let Err(e) = send_map_request(startup_request, &map_url, &h2_client).await {
             tracing::warn!(error = %e, "initial hostinfo update failed");
         }
-    }
+    });
+    let mut hostinfo_sent = false;
 
     loop {
         tokio::select! {
+            () = &mut hostinfo_update, if !hostinfo_sent => hostinfo_sent = true,
+
             state_update = stream.next() => {
                 let Some(state_update) = state_update else {
                     break;
@@ -851,8 +859,7 @@ async fn run_once(
                             .keep_alive(false)
                             .omit_peers(true)
                             .stream(false)
-                            .routable_ips(config.advertised_routes())
-                            ;
+                            .routable_ips(config.advertised_routes());
                         builder = net_info.apply(builder);
 
                         if let Some(hostname) = &config.hostname {
@@ -874,8 +881,7 @@ async fn run_once(
                             .omit_peers(true)
                             .stream(false)
                             .routable_ips(config.advertised_routes())
-                            .endpoints(endpoints)
-                            ;
+                            .endpoints(endpoints);
                         builder = net_info.apply(builder);
 
                         if let Some(hostname) = &config.hostname {
@@ -893,8 +899,7 @@ async fn run_once(
                             .keep_alive(false)
                             .omit_peers(true)
                             .stream(false)
-                            .routable_ips(routes)
-                            ;
+                            .routable_ips(routes);
                         // Re-attach the carried NetInfo so a route update doesn't transiently drop
                         // the home region / NAT facets at control (same hazard the hostname arm
                         // guards for routes).
@@ -1448,6 +1453,50 @@ mod tests {
                 .is_none(),
             "empty carried NetInfo must leave net_info absent on the wire"
         );
+    }
+
+    /// Every non-streaming update carries the complete Hostinfo, not only the host facts: control
+    /// replaces a node's Hostinfo wholesale with each one, so a field left out (tags, the peerAPI
+    /// service, the client name, ...) is erased for every peer.
+    #[test]
+    fn update_request_carries_the_complete_hostinfo() {
+        let node_keys = ts_keys::NodeState::generate();
+        let config = crate::Config {
+            client_name: Some("test".to_owned()),
+            tags: vec!["tag:web".to_owned()],
+            peerapi_port: Some(4242),
+            wire_ingress: true,
+            advertise_app_connector: true,
+            auto_update_apply: Some(true),
+            ..Default::default()
+        };
+        let client_name = config.format_client_name();
+        let host = crate::hostinfo::HostInfoData::detect();
+        let req = with_hostinfo(
+            MapRequestBuilder::new(&node_keys),
+            &config,
+            &client_name,
+            &host,
+            "services-hash",
+        )
+        .stream(false)
+        .build();
+
+        let hi = req.host_info.as_ref().expect("hostinfo present");
+        assert_eq!(hi.app, client_name);
+        assert_eq!(hi.ipn_version, host.ipn_version);
+        assert_eq!(hi.os, host.os);
+        assert_eq!(hi.request_tags.as_deref(), Some(&["tag:web"][..]));
+        assert!(
+            hi.services
+                .as_ref()
+                .is_some_and(|s| s.iter().any(|s| s.port == 4242)),
+            "peerAPI service advertised"
+        );
+        assert_eq!(hi.services_hash, "services-hash");
+        assert!(hi.wire_ingress);
+        assert_eq!(hi.app_connector, Some(true));
+        assert!(hi.allows_update);
     }
 
     fn region(n: u32) -> ts_derp::RegionId {

@@ -748,6 +748,24 @@ fn build_dns_view(
     }
 }
 
+/// Rebuild the [`DnsView`] for a control `StateUpdate`, keeping the peer db and IPv6 gate from
+/// `prev`, and also its DNS config and self node when the update leaves them out.
+///
+/// Most responses are deltas that carry neither; absent means "no change". Go keeps both in its
+/// netmap until a response replaces them (`ms.lastDNSConfig`, `ms.lastNode`), and the netstack
+/// `MagicDnsActor` does the same. Taking them from the update alone reset the view on every delta,
+/// so MagicDNS in TUN mode stopped answering after the first one.
+fn rebuild_dns_view(env: &Env, update: &ts_control::StateUpdate, prev: &DnsView) -> DnsView {
+    let mut next = build_dns_view(env, update, prev.peers.clone(), prev.enable_ipv6);
+    if update.dns_config.is_none() {
+        next.cfg = prev.cfg.clone();
+    }
+    if update.node.is_none() {
+        next.self_node = prev.self_node.clone();
+    }
+    next
+}
+
 /// Outcome of classifying an inbound TUN packet against the in-datapath MagicDNS responder.
 /// Produced by the PURE [`plan_intercept`] (no I/O, unit-testable without a TUN device) and acted on
 /// by the UP pump: the slow [`Decision::Forward`] path is handed back as [`Self::Forward`] for the
@@ -1267,12 +1285,7 @@ impl Message<Arc<ts_control::StateUpdate>> for TunActor {
         // node is re-resolved against the (preserved) peer db so `exit_doh` tracks the active exit.
         let env = &self.env;
         self.dns_view.send_modify(|view| {
-            *view = Arc::new(build_dns_view(
-                env,
-                &msg,
-                view.peers.clone(),
-                view.enable_ipv6,
-            ));
+            *view = Arc::new(rebuild_dns_view(env, &msg, view));
         });
 
         let Some(self_node) = &msg.node else {
@@ -1515,12 +1528,12 @@ mod tests {
     use super::{
         CGNAT_THRESHOLD, Intercept, MAGIC_DNS_IP, MAGIC_DNS_PORT, build_dns_view, cgnat_threshold,
         collapse_cgnat_routes, host_dns_from_dns_config, host_routes_from_node,
-        one_cgnat_route_for, plan_intercept, should_use_one_cgnat_route, spawn_dns_tcp_netstack,
-        tun_config_from_control,
+        one_cgnat_route_for, plan_intercept, rebuild_dns_view, should_use_one_cgnat_route,
+        spawn_dns_tcp_netstack, tun_config_from_control,
     };
     use crate::{
         env::{Env, ForwarderConfig},
-        magic_dns::{Decision, RecursivePlan, decide, recursive_plan},
+        magic_dns::{Decision, DnsView, RecursivePlan, decide, recursive_plan},
         peer_tracker::PeerDb,
     };
 
@@ -3216,6 +3229,32 @@ mod tests {
             peer_seen_change: Default::default(),
             control_time: None,
         }
+    }
+
+    /// A delta carrying neither a DNS config nor the self node keeps both from the previous view
+    /// (Go keeps them in its netmap until a response replaces them); a later full response still
+    /// replaces them.
+    #[tokio::test]
+    async fn rebuild_dns_view_keeps_dns_config_and_self_node_across_deltas() {
+        let env = test_env(None);
+        let full = dns_update(vec![]);
+        let view = rebuild_dns_view(&env, &full, &DnsView::default());
+        assert!(view.cfg.magic_dns);
+
+        let mut delta = dns_update(vec![]);
+        delta.dns_config = None;
+        delta.node = None;
+        let view = rebuild_dns_view(&env, &delta, &view);
+        assert_eq!(Some(&view.cfg), full.dns_config.as_ref(), "dns config kept");
+        assert_eq!(view.self_node, full.node, "self node kept");
+
+        let mut replaced = dns_update(vec![]);
+        replaced.dns_config = Some(ts_control::DnsConfig::default());
+        let view = rebuild_dns_view(&env, &replaced, &view);
+        assert!(
+            !view.cfg.magic_dns,
+            "a present config replaces the kept one"
+        );
     }
 
     /// `build_dns_view` mirrors `MagicDnsActor`'s construction: cfg + self_node from the update,
