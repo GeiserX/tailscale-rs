@@ -227,9 +227,10 @@ flowchart LR
   to admit-all. Because the `Authority` only reaches this path after `VerifiedAumChain::verify`, a
   malicious control plane cannot forge a trusted key to admit a peer — it can only toggle the lock.
   Self is structurally never filtered (the self node never enters the peer db), so a node cannot lock
-  itself out. Remaining deferred gaps (tracked in `SECURITY.md` / `docs/PARITY_ROADMAP.md`):
-  disablement-secret verification, and Go's rotation-obsolete (clone/replay) peer dropping; both make
-  us *more* permissive than Go, neither opens a new attack surface. (Distinct from
+  itself out. Go's rotation-obsolete (clone/replay) peer dropping ships too
+  (`ts_runtime/src/peer_tracker/mod.rs:421-453`). Remaining deferred gap (tracked in `SECURITY.md` /
+  `docs/PARITY_ROADMAP.md`): disablement-secret verification, which makes us *more* permissive than
+  Go and opens no new attack surface. (Distinct from
   *shields-up*/`block_incoming`, which is an unconditional inbound-connection refusal at the packet
   filter, unrelated to TKA trust.)
 

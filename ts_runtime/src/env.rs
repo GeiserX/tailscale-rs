@@ -4,7 +4,10 @@ use kameo::{
     actor::{ActorRef, Spawn},
     message::Message,
 };
-use kameo_actors::message_bus::{MessageBus, Publish, Register};
+use kameo_actors::{
+    DeliveryStrategy,
+    message_bus::{MessageBus, Publish, Register},
+};
 use tokio::sync::watch;
 
 use crate::{Error, error::ResultExt};
@@ -448,7 +451,12 @@ impl Env {
         });
 
         let env = Self {
-            bus: MessageBus::spawn_default(),
+            // Publishers must never wait for subscriber capacity: handlers themselves publish.
+            // The broker serializes delivery and waits for bounded subscriber mailboxes.
+            bus: MessageBus::spawn_with_mailbox(
+                MessageBus::new(DeliveryStrategy::Guaranteed),
+                kameo::mailbox::unbounded(),
+            ),
             keys: Arc::new(keys),
             shutdown,
             accept_routes_rx,
@@ -496,12 +504,15 @@ impl Env {
         Self::new_with_runtime_txs(keys, shutdown, forwarding).0
     }
 
+    /// Acknowledges installation in the broker. Complete bounded actors' subscriptions
+    /// before starting publishers for their registered types: on_start cannot drain a
+    /// full mailbox while waiting for a second Register. Runtime's startup barrier enforces this.
     pub async fn subscribe<M>(&self, slf: &ActorRef<impl Message<M>>) -> Result<(), Error>
     where
         M: Clone + Send + 'static,
     {
         self.bus
-            .tell(Register(slf.clone().recipient::<M>()))
+            .ask(Register(slf.clone().recipient::<M>()))
             .await
             .with_actor_info(&self.bus)?;
 

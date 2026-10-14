@@ -17,6 +17,7 @@ it means building a new `Device`.
 | **Advertised subnet routes** | `Device::set_advertise_routes(Vec<ipnet::IpNet>)` | Applies both halves together: re-advertises `Hostinfo.RoutableIPs` to control on the live map-poll connection (so control grants the subnet-router role), AND swaps the forwarder's accept/dial route table (so the node forwards what it advertises). New flows see the new set; in-flight flows keep their routing. IPv4-only/deduped (IPv6 dropped, IPv6-off posture). Explicit subnet prefixes only; the exit-node `0.0.0.0/0` is a separate live pref (next row), composed with these. (`src/lib.rs` → `ts_runtime::Runtime::set_advertise_routes` → `control_runner::SetAdvertiseRoutes` + `forwarder_actor::UpdateRoutes`.) |
 | **Advertise exit node** | `Device::set_advertise_exit_node(bool)` | Adds/removes the `0.0.0.0/0` default route from what this node advertises + forwards, via the same wire + forwarder machinery as the subnet routes. Composes with `set_advertise_routes` (independent prefs, both fold into `Hostinfo.RoutableIPs`). Only advertises eligibility — control/peer still decide whether to route through it. (`src/lib.rs` → `ts_runtime::Runtime::set_advertise_exit_node`.) |
 | **Serve config** (ports / TLS / Funnel targets) | `Device::set_serve_config(ServeState)` | Validates, then builds each TLS-terminating port's acceptor up-front (ACME-aware, fail-closed — no plaintext downgrade if a cert can't be issued) and (re)binds the serve listeners live. `get_serve_config()` reads the current state. |
+| **Hostname** | `Device::set_hostname(String)` | Re-reports `Hostinfo.Hostname` to control on the live connection, with no rebuild and no reconnect. Control reflects the new name in the netmap. No data-path effect, and the value persists across a later re-registration. (`src/lib.rs:1604`.) |
 | **Logout / deregister** | `Device::logout()` | Re-registers with a past expiry; the device stays up but transitions state. Not a pref mutation per se, but a live state change (no rebuild). |
 
 State and identity that update live **from control** (not via a setter — they track the netmap
@@ -31,8 +32,8 @@ updated `Config`:
 
 - **Transport mode** — `TransportMode::Netstack` vs `Tun(TunConfig{ name, mtu })` (`Config::use_tun`).
   The data path (netstack vs kernel TUN) is wired at startup.
-- **Auth key** / control server URL / hostname / advertised tags (`Config` fields consumed during
-  registration).
+- **Auth key** / control server URL / advertised tags (`Config` fields consumed during
+  registration). Hostname used to be listed here; it is live-settable (see the table above).
 - **Exit-egress proxy** — `Config::exit_proxy` (`ExitProxyConfig`) and `forward_exit_egress`. The
   forwarder's dialer choice is fixed at construction (fail-closed anti-leak chokepoint).
 - **`enable_ipv6`**, **`tcp_buffer_size`**, and the other `Config`/`ForwarderConfig` transport knobs.
