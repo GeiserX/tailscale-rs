@@ -735,6 +735,13 @@ impl PeerPaths {
         self.best
     }
 
+    /// A candidate's measured latency as stored. Test-only: pins that a disco-key change clears
+    /// it ([`invalidate_disco_path`](Self::invalidate_disco_path)).
+    #[cfg(test)]
+    fn stored_latency(&self, addr: SocketAddr) -> Option<Duration> {
+        self.candidates.get(&addr).and_then(|c| c.latency)
+    }
+
     /// Compare only the address that just ponged with the current best, as Go's
     /// `handlePongConnLocked` does. Historical RTTs do not prove a path is still alive.
     fn recompute_best(&mut self, now: Instant, confirmed: SocketAddr) {
@@ -1370,6 +1377,38 @@ mod tests {
         assert_eq!(p.best_addr(now + Duration::from_millis(3)), Some(lan));
     }
 
+    /// A LAN path that stops answering must not hold the peer on DERP while a live public path
+    /// keeps answering. The LAN path wins on its private-address bonus while both answer; once it
+    /// goes silent and its trust lapses, the public path's next pong takes over (Go promotes the
+    /// ponging address whenever the best is untrusted). A selection that re-elected the LAN path
+    /// from its remembered latency and bonus left the peer on DERP here, with the public path
+    /// answering every ping.
+    #[test]
+    fn live_public_path_takes_over_from_a_silent_lan_best() {
+        let mut p = PeerPaths::default();
+        let lan: SocketAddr = "192.168.50.76:41644".parse().unwrap();
+        let public: SocketAddr = "203.0.113.34:41644".parse().unwrap();
+        p.add_netmap_candidates([lan, public]);
+        let now = Instant::now();
+        p.note_ping_sent(tx(1), lan, now);
+        p.note_pong(tx(1), lan, now + Duration::from_millis(2));
+        p.note_ping_sent(tx(2), public, now);
+        p.note_pong(tx(2), public, now + Duration::from_micros(1_800));
+        // The LAN path is best here (`lan_path_stays_best_against_faster_public_hairpin`). Not
+        // asserted, so the test also holds on a latency-only selection, which picks the public path.
+
+        // The LAN path goes silent. Only the public path answers, past the LAN path's trust window.
+        let t1 = now + TRUST_DURATION + Duration::from_secs(1);
+        p.note_ping_sent(tx(3), lan, t1);
+        p.note_ping_sent(tx(4), public, t1);
+        p.note_pong(tx(4), public, t1 + Duration::from_micros(1_800));
+        assert_eq!(
+            p.best_addr(t1 + Duration::from_millis(3)),
+            Some(public),
+            "a live public path must take over once the silent LAN best's trust lapses"
+        );
+    }
+
     // ---- cadence gates (tsr-7s3, matching Go magicsock) ----
 
     /// An unconfirmed candidate is pinged at most once per `DISCO_PING_INTERVAL` (5s), not every
@@ -1717,6 +1756,15 @@ mod tests {
         assert_eq!(p.best_addr(now + Duration::from_millis(3)), Some(fast));
 
         p.invalidate_disco_path();
+        assert_eq!(
+            p.stored_latency(fast),
+            None,
+            "a disco-key change must clear every pre-rotation latency"
+        );
+        assert!(
+            p.candidate_addrs().contains(&fast),
+            "...while the candidate itself stays, to be re-probed under the new key"
+        );
 
         // Only `slow` answers under the new key.
         let t = now + Duration::from_millis(10);

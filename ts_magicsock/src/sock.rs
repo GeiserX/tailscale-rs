@@ -1126,8 +1126,8 @@ impl MagicSock {
     /// the path is cleared and the peer fails closed to DERP until a surviving endpoint
     /// re-confirms. Learned (disco) candidates are left intact.
     ///
-    /// An IPv6 endpoint is dropped here when the underlay socket is IPv4-only
-    /// ([`sends_ipv6`](Self::sends_ipv6)): the socket can never send to it, so letting it through
+    /// An IPv6 endpoint is dropped here when the underlay socket is IPv4-only (`sends_ipv6`):
+    /// the socket can never send to it, so letting it through
     /// only made every discovery sweep attempt and fail that send. Go keeps such an endpoint and
     /// has `sendUDPStd` report its failed send as "not sent, no error" while `noV6` is set
     /// (`magicsock.go`); this tree knows the socket family up front and drops the endpoint
