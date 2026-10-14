@@ -42,29 +42,38 @@ allow = [
     "Unlicense",
     "Zlib",
 ]
+# cbindgen is a build-dependency of ts_ffi: its build script runs it to write the C header, and
+# none of its code is compiled into any artifact. MPL-2.0 is allowed for that crate alone, never as
+# a blanket entry in `allow`.
+exceptions = [
+    { allow = ["MPL-2.0"], crate = "cbindgen" },
+]
 private = { ignore = true }
 
 [bans]
 multiple-versions = "allow"
 wildcards = "allow"
-# Machine-enforce the ring-only / no-aws-lc supply-chain invariant on the egress graph.
+# Machine-enforce the ring-only / no-aws-lc supply-chain invariant.
 # aws-lc enters this workspace ONLY via (a) `russh` behind the off-by-default `ssh` feature
 # (runtime, opt-in) and (b) `reqwest` default-tls as a *dev-dependency* of ts_derp/ts_netcheck.
-# The `hosted_test` CI lane runs `cargo deny --no-default-features --exclude-dev check all`, which
-# turns `ssh` off (russh gone) and drops the dev-dep reqwest path, so this ban must hold on the
-# runtime no-ssh graph without breaking the build. Upstream's `arch_independent` job still runs
-# `--all-features` (where aws-lc legitimately appears via ssh+dev) and is unaffected by this ban
-# because that job's invocation excludes neither.
+# Path (b) never reaches cargo-deny: `[graph] exclude-dev = true` below drops it for every
+# invocation. Path (a) is allowed through `wrappers`: aws-lc-rs may be pulled in only by `russh`,
+# and aws-lc-sys only by aws-lc-rs. Any other crate that starts depending on either one, a
+# workspace crate included, trips the ban under every invocation: the `hosted_test` lane's
+# `cargo deny --no-default-features --exclude-dev check all` (where `ssh` is off and aws-lc is
+# absent) and the `--all-features` audit (where `ssh` is on). What `wrappers` cannot see is a
+# feature: making `russh` non-optional, or enabling `ssh` by default, would pass this ban, so the
+# `ssh` feature staying opt-in is guarded by review, not by this file.
 deny = [
-    { name = "aws-lc-rs" },
-    { name = "aws-lc-sys" },
+    { crate = "aws-lc-rs", wrappers = ["russh"], reason = "ring-only egress graph; aws-lc is allowed only on the opt-in ssh path" },
+    { crate = "aws-lc-sys", wrappers = ["aws-lc-rs"], reason = "ring-only egress graph; aws-lc is allowed only on the opt-in ssh path" },
 ]
 
 [graph]
 # Feature selection is driven by each `cargo deny` invocation's CLI flags rather than forced on
 # here. Forcing `all-features = true` in this config would make the `hosted_test` lane's
-# `--no-default-features` a no-op (the `ssh` feature would stay on, pulling `russh -> aws-lc-rs`
-# back into the graph and tripping the ban below). The upstream `arch_independent` job still passes
+# `--no-default-features` a no-op (the `ssh` feature would stay on, so that lane would stop checking
+# the shipped no-ssh graph). The upstream `arch_independent` job still passes
 # `--all-features` explicitly on its CLI, so license/advisory coverage there is unchanged.
 all-features = false
 # Exclude dev-dependencies from the dependency graph so the aws-lc ban (above) is not tripped by
