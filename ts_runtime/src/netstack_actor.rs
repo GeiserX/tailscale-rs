@@ -527,10 +527,12 @@ mod tests {
     /// Dropping at the ingress queue is safe for TCP: with a ring so shallow that a burst overflows
     /// it, a transfer still arrives whole, because the sender retransmits what was dropped.
     ///
-    /// The sender here is smoltcp, which recovers a lost burst by retransmission timeout with
-    /// exponential backoff, so each overflow costs it seconds. The sizes are picked so the opening
-    /// burst (about 16 segments into 8 slots) overflows once; a larger transfer through this ring
-    /// still completes, just slower than a unit test should be.
+    /// The sender here is smoltcp running Reno, as gVisor does in Go. Slow start grows the window
+    /// until a burst overflows the 8 slots, and Reno recovers each loss by fast retransmit and a
+    /// halved window, so 500 kB arrives in tens of milliseconds. Without congestion control the
+    /// sender pushed the whole receive window into the ring on every round, recovered only by
+    /// retransmission timeout with exponential backoff, and could not move even 100 kB inside the
+    /// 60 s limit below.
     #[tokio::test]
     async fn tcp_transfer_completes_through_a_dropping_ingress_queue() {
         use core::net::{SocketAddr, SocketAddrV4};
@@ -540,7 +542,7 @@ mod tests {
 
         const CLIENT: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(100, 64, 0, 1), 40000);
         const SERVER: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(100, 64, 0, 2), 8080);
-        const LEN: usize = 20_000;
+        const LEN: usize = 500_000;
 
         let config = netstack::netcore::Config {
             mtu: 1280,
