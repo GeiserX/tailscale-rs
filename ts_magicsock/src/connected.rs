@@ -17,7 +17,7 @@
 //! on. Go v1.102.4 has none of this: the knob names, the 1 MiB threshold and the 256-socket cap
 //! follow an open upstream proposal (<https://github.com/tailscale/tailscale/issues/21602>,
 //! tailscale PR 21603 and wireguard-go PR 107). Any failure to open a connected socket leaves that
-//! address on the shared socket for good.
+//! address on the shared socket until the address is pruned or the socket rebinds.
 
 use core::net::SocketAddr;
 use std::{
@@ -33,6 +33,16 @@ pub(crate) const CONNECT_AFTER_BYTES: u64 = 1 << 20;
 
 /// Max connected sockets at once (the upstream proposal's 256).
 pub(crate) const MAX_CONNECTED: usize = 256;
+
+/// Most addresses tracked at once. Past this, a new address first drops every address that has
+/// no connected socket (byte counts and failed opens), so the table cannot grow with every
+/// remote ever sent to.
+const MAX_TRACKED: usize = 4 * MAX_CONNECTED;
+
+/// Received batches queued from the connected sockets' pumps to the shared demux. A full queue
+/// stops the pumps, so the excess waits in (and past that is dropped by) the kernel's socket
+/// buffers rather than growing in memory.
+const DEMUX_QUEUE: usize = 256;
 
 /// A connected socket unused for this long may be replaced when the table is full.
 const IDLE_EVICT: Duration = Duration::from_secs(120);
@@ -90,12 +100,12 @@ pub(crate) struct ConnectedSockets {
     settings: Settings,
     entries: HashMap<SocketAddr, Entry>,
     ready: usize,
-    to_demux: mpsc::UnboundedSender<Received>,
+    to_demux: mpsc::Sender<Received>,
 }
 
 impl ConnectedSockets {
-    pub(crate) fn new(settings: Settings) -> (Self, mpsc::UnboundedReceiver<Received>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+    pub(crate) fn new(settings: Settings) -> (Self, mpsc::Receiver<Received>) {
+        let (tx, rx) = mpsc::channel(DEMUX_QUEUE);
         (
             Self {
                 settings,
@@ -127,6 +137,9 @@ impl ConnectedSockets {
     ) -> Option<Arc<UdpSocket>> {
         if !self.settings.connected_sockets {
             return None;
+        }
+        if self.entries.len() >= MAX_TRACKED && !self.entries.contains_key(&addr) {
+            self.entries.retain(|_, e| matches!(e, Entry::Ready { .. }));
         }
         let entry = self.entries.entry(addr).or_insert(Entry::Counting(0));
         let sent = match entry {
@@ -290,7 +303,7 @@ fn set_dont_fragment(_: &socket2::Socket) -> std::io::Result<()> {
 fn spawn_pump(
     sock: Arc<UdpSocket>,
     remote: SocketAddr,
-    to_demux: mpsc::UnboundedSender<Received>,
+    to_demux: mpsc::Sender<Received>,
 ) -> tokio::task::AbortHandle {
     tokio::spawn(async move {
         let batching = crate::receive_batch::enabled();
@@ -319,7 +332,7 @@ fn spawn_pump(
             };
             match received {
                 Ok(batch) => {
-                    if to_demux.send(batch).is_err() {
+                    if to_demux.send(batch).await.is_err() {
                         return;
                     }
                     turns += 1;
@@ -399,6 +412,19 @@ mod tests {
         assert!(c.socket_for(remote_addr, 10, &shared).is_some());
         c.clear();
         assert_eq!(c.ready_count(), 0);
+    }
+
+    /// Byte counts for addresses that never got a connected socket are dropped once the table
+    /// is full, so it stays bounded however many remotes are sent to.
+    #[tokio::test]
+    async fn tracked_addresses_stay_bounded() {
+        let (mut c, _rx) = ConnectedSockets::new(on());
+        let shared = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for port in 1..=(3 * MAX_TRACKED as u16) {
+            let remote = SocketAddr::from(([127, 0, 0, 1], port));
+            assert!(c.socket_for(remote, 1, &shared).is_none());
+            assert!(c.entries.len() <= MAX_TRACKED);
+        }
     }
 
     #[tokio::test]

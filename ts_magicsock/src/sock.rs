@@ -47,7 +47,7 @@ pub struct ReceivedData {
 }
 
 struct ReceiveState {
-    connected: mpsc::UnboundedReceiver<crate::connected::Received>,
+    connected: mpsc::Receiver<crate::connected::Received>,
     pending: VecDeque<crate::receive_batch::Datagram>,
     ready: VecDeque<ReceivedData>,
     pending_error: Option<Error>,
