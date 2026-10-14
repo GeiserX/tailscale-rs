@@ -8,6 +8,42 @@ Record breaking or significant changes here. All dates are UTC.
 
 * **exit node:** forwarded TCP flows run without Nagle, the underlay UDP sockets ask for Go's 7 MiB buffers, netstack egress goes out in batches of up to 64 packets, and the netstack tracks 32 receive holes for uploads. Kernel receive batching, splice coalescing, targeted replay and Apple connected UDP sockets are opt-in experiments, off unless their variable is `1`.
 
+## [0.57.5](https://github.com/GeiserX/tailscale-rs/compare/v0.57.4...v0.57.5) (2026-10-14)
+
+
+### Bug Fixes
+
+* **config:** write the key file owner-only ([#605](https://github.com/GeiserX/tailscale-rs/issues/605)) ([dd5ad83](https://github.com/GeiserX/tailscale-rs/commit/dd5ad83a8909191a7570786893cb1b490f28389c))
+* **deps:** require ruzstd 0.9.1 so one zstd block cannot exhaust memory ([#594](https://github.com/GeiserX/tailscale-rs/issues/594)) ([f311bba](https://github.com/GeiserX/tailscale-rs/commit/f311bba16b359bd53821fc5271e5298cc3b42575))
+* **forwarder:** confine host exit flows to internet destinations ([97eba1f](https://github.com/GeiserX/tailscale-rs/commit/97eba1fd9a0b54e6c0e42886c69973f5a18609e8))
+* **forwarder:** confine host exit flows to internet destinations ([#603](https://github.com/GeiserX/tailscale-rs/issues/603)) ([97eba1f](https://github.com/GeiserX/tailscale-rs/commit/97eba1fd9a0b54e6c0e42886c69973f5a18609e8))
+* **magicsock:** keep probing after a candidate send fails ([#606](https://github.com/GeiserX/tailscale-rs/issues/606)) ([ec5dc27](https://github.com/GeiserX/tailscale-rs/commit/ec5dc27fe33dd0872077f8e6a874e2210f0cd580))
+* **magicsock:** let a fresh pong replace an untrusted best path ([#613](https://github.com/GeiserX/tailscale-rs/issues/613)) ([219f83d](https://github.com/GeiserX/tailscale-rs/commit/219f83d4fb108a1b2727ff80829c36d12eafc346))
+* **magicsock:** match Go betterAddr path scoring ([219f83d](https://github.com/GeiserX/tailscale-rs/commit/219f83d4fb108a1b2727ff80829c36d12eafc346))
+* **netstack:** accept connections half-closed before accept; reclaim dropped sockets ([#614](https://github.com/GeiserX/tailscale-rs/issues/614)) ([edd428f](https://github.com/GeiserX/tailscale-rs/commit/edd428fed8f3bf1424cbbeedff5c65a72efbf100))
+* **netstack:** drop ingress on a full rx queue instead of growing it ([#587](https://github.com/GeiserX/tailscale-rs/issues/587)) ([719aa88](https://github.com/GeiserX/tailscale-rs/commit/719aa8891fd777daafab67700d3d05894e49b71f))
+* **netstack:** guarantee FIN and Close delivery by default ([edd428f](https://github.com/GeiserX/tailscale-rs/commit/edd428fed8f3bf1424cbbeedff5c65a72efbf100))
+* **netstack:** guarantee FIN and Close delivery by default ([58c89eb](https://github.com/GeiserX/tailscale-rs/commit/58c89ebf9e89ddd1e039f8abdf0670d9bff7e84c))
+* **netstack:** lost FIN/Close, abandoned receives, reset listener sockets, blocking try_recv ([#599](https://github.com/GeiserX/tailscale-rs/issues/599)) ([58c89eb](https://github.com/GeiserX/tailscale-rs/commit/58c89ebf9e89ddd1e039f8abdf0670d9bff7e84c))
+* **netstack:** make waking pipe try_recv non-blocking ([edd428f](https://github.com/GeiserX/tailscale-rs/commit/edd428fed8f3bf1424cbbeedff5c65a72efbf100))
+* **netstack:** make waking pipe try_recv non-blocking ([58c89eb](https://github.com/GeiserX/tailscale-rs/commit/58c89ebf9e89ddd1e039f8abdf0670d9bff7e84c))
+* **netstack:** preserve data after abandoned receives ([edd428f](https://github.com/GeiserX/tailscale-rs/commit/edd428fed8f3bf1424cbbeedff5c65a72efbf100))
+* **netstack:** preserve data after abandoned receives ([58c89eb](https://github.com/GeiserX/tailscale-rs/commit/58c89ebf9e89ddd1e039f8abdf0670d9bff7e84c))
+* **netstack:** remove reset half-open listener sockets ([edd428f](https://github.com/GeiserX/tailscale-rs/commit/edd428fed8f3bf1424cbbeedff5c65a72efbf100))
+* **netstack:** remove reset half-open listener sockets ([58c89eb](https://github.com/GeiserX/tailscale-rs/commit/58c89ebf9e89ddd1e039f8abdf0670d9bff7e84c))
+* **netstack:** take smoltcp 0.14.0 so fast retransmit stops backing off the RTO ([#616](https://github.com/GeiserX/tailscale-rs/issues/616)) ([da83e9b](https://github.com/GeiserX/tailscale-rs/commit/da83e9bf65d7a478f234f8d28a68bb99ae19d869))
+* revoke sessions on key change, drop expired peers, ordered security updates ([#601](https://github.com/GeiserX/tailscale-rs/issues/601)) ([5076798](https://github.com/GeiserX/tailscale-rs/commit/5076798f11c61d952c72adbfdcd05d5b346a0031))
+* **runtime:** order security updates and supervise forwarding consumers ([5076798](https://github.com/GeiserX/tailscale-rs/commit/5076798f11c61d952c72adbfdcd05d5b346a0031))
+* **runtime:** remove expired peers from tunnel and routes ([5076798](https://github.com/GeiserX/tailscale-rs/commit/5076798f11c61d952c72adbfdcd05d5b346a0031))
+* self-only netmaps, complete Hostinfo, DNS view across deltas ([#602](https://github.com/GeiserX/tailscale-rs/issues/602)) ([a3e70ac](https://github.com/GeiserX/tailscale-rs/commit/a3e70ace958d054da6b6d3f97b44ad0432b46f61))
+* **serve:** store the Serve config in Go's ipn.ServeConfig wire shape ([#588](https://github.com/GeiserX/tailscale-rs/issues/588)) ([50611ab](https://github.com/GeiserX/tailscale-rs/commit/50611ab35e1b17d9bfcc6010c1ef561d036d3954))
+* **tunnel:** revoke sessions after static key or PSK changes ([5076798](https://github.com/GeiserX/tailscale-rs/commit/5076798f11c61d952c72adbfdcd05d5b346a0031))
+
+
+### Performance Improvements
+
+* **exit-node:** faster exit-node data path, with unmeasured experiments opt-in ([#598](https://github.com/GeiserX/tailscale-rs/issues/598)) ([740933a](https://github.com/GeiserX/tailscale-rs/commit/740933a7197e7484d6d2e442af1502097054a612))
+
 ## [0.57.4](https://github.com/GeiserX/tailscale-rs/compare/v0.57.3...v0.57.4) (2026-10-01)
 
 
