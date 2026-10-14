@@ -33,8 +33,10 @@
 //! resolver. A forward-only rewrite that simply dropped the authoritative step would forward those
 //! tailnet-reverse queries upstream and leak the probed IP. A faithful narrowing must therefore
 //! forward only the *peer-name / ExtraRecord* authoritative cases while keeping the CGNAT/`ip6.arpa`
-//! NXDOMAIN guards — tracked as a follow-up, not the blanket change. (Go's OS-stub-resolver forward
-//! target is also unavailable here; this path forwards to the tailnet's configured resolvers.)
+//! NXDOMAIN guards — tracked as a follow-up, not the blanket change. The forward *target* does follow
+//! Go once the exit host's resolver is known ([`Env::exit_host_resolver`][crate::env::Env::exit_host_resolver]):
+//! every name we forward goes to it, split-DNS names included. Without one, this path forwards to the
+//! tailnet's configured resolvers over the overlay.
 //!
 //! ## Which peers we answer at all
 //!
@@ -55,8 +57,9 @@
 //!   that governs the TCP exit path: a cloud exit node (default `forward_exit_egress == false`)
 //!   never resolves a peer's public name through its real host resolver, so the cloud host's real
 //!   IP can't leak. A residential node that sets `forward_exit_egress = true` opts into serving
-//!   recursion, and that recursion goes out over the **overlay** netstack (same as MagicDNS), never
-//!   a bare host socket.
+//!   recursion. That recursion goes to the exit host's own resolver over a host socket when one is
+//!   configured and no exit proxy is (the same egress the node's exit traffic takes), and otherwise
+//!   out over the **overlay** netstack (same as MagicDNS).
 //!
 //! ## Two paths for a forwarded client's DNS (tsr-c39)
 //!
@@ -73,9 +76,10 @@
 //!
 //! ## Anti-leak / IPv6-off
 //!
-//! The listener binds the overlay IPv4 only. Recursive forwarding reuses [`forward_query`], which
-//! binds `0.0.0.0:0` on the overlay netstack for both of its hops — the UDP query and the TCP hop
-//! raced against it — never a host socket. A saturated server drops the flow (fail-closed).
+//! The listener binds the overlay IPv4 only. Without a host resolver, recursive forwarding reuses
+//! [`forward_query`], which binds `0.0.0.0:0` on the overlay netstack for both of its hops — the UDP
+//! query and the TCP hop raced against it — never a host socket. With one, the only host socket this
+//! path opens is to that resolver. A saturated server drops the flow (fail-closed).
 //! Requests are size-capped; one request is answered per connection then it is closed.
 
 use std::{
@@ -336,24 +340,9 @@ pub(crate) async fn handle_conn(
         DohRequest::Query(bytes) => bytes,
     };
 
-    let mut view = view_rx.borrow().clone();
+    let view = view_rx.borrow().clone();
     // Both `borrow()` guards are dropped at the end of their own `let` — a `watch::Ref` is not
     // `Send`, and this task is spawned.
-
-    // Go's exit-node DNS forwards to the exit host's own resolver whatever the tailnet configures.
-    // With a host resolver and no tailnet default/fallback resolvers, use it as the default, so an
-    // off-tailnet name is forwarded there instead of answered SERVFAIL for lack of an upstream.
-    if let Some(resolver) = host_resolver
-        && view.cfg.resolvers.is_empty()
-        && view.cfg.fallback_resolvers.is_empty()
-    {
-        let mut v = (*view).clone();
-        v.cfg.resolvers = vec![ts_control::DnsResolver {
-            transport: ts_control::ResolverTransport::Udp(resolver),
-            use_with_exit_node: false,
-        }];
-        view = Arc::new(v);
-    }
     let filter = filter_rx.borrow().clone();
 
     // The source gate, run once for this connection *before* anything is resolved — Go's
@@ -484,10 +473,11 @@ async fn resolve(
     forward_exit_egress: bool,
     host_resolver: Option<SocketAddr>,
 ) -> Vec<u8> {
-    match server_decide(view, query, forward_exit_egress) {
+    match server_decide(view, query, forward_exit_egress, host_resolver) {
         ServerDecision::Reply(resp) => resp,
         // Go's exit-node DNS forwards to the exit host's own (OS) resolver; with one configured,
-        // so do we, over an ordinary host socket. The egress gate above already applied.
+        // `server_decide` made it the only upstream, and we ask it over an ordinary host socket. The
+        // egress gate there already applied.
         ServerDecision::Forward {
             upstreams,
             query,
@@ -573,7 +563,8 @@ async fn host_forward(resolver: SocketAddr, query: &[u8]) -> Option<Vec<u8>> {
 ///
 /// Unlike [`decide`], this also applies the two exit-node-server rules: the
 /// [`ExitNodeFilteredSet`][DnsConfig::exit_node_filters] (`REFUSED`) and the recursive-egress gate
-/// (`REFUSED` unless `forward_exit_egress`). Pure (no I/O) so both rules are unit-testable.
+/// (`REFUSED` unless `forward_exit_egress`). With a `host_resolver`, it is the one upstream for
+/// every name forwarded (Go's resolver order). Pure (no I/O) so all three are unit-testable.
 enum ServerDecision {
     Reply(Vec<u8>),
     Forward {
@@ -586,7 +577,15 @@ enum ServerDecision {
     },
 }
 
-fn server_decide(view: &DnsView, query: &[u8], forward_exit_egress: bool) -> ServerDecision {
+/// RCODE 2. [`decide`] answers it only for an off-tailnet name it has no upstream for.
+const RCODE_SERVFAIL: u8 = 2;
+
+fn server_decide(
+    view: &DnsView,
+    query: &[u8],
+    forward_exit_egress: bool,
+    host_resolver: Option<SocketAddr>,
+) -> ServerDecision {
     let Ok(decoded) = decode_query(query) else {
         // We can't parse it; answer FORMERR with a best-effort echo of the id if present.
         let id = if query.len() >= 2 {
@@ -617,6 +616,21 @@ fn server_decide(view: &DnsView, query: &[u8], forward_exit_egress: bool) -> Ser
     match decide(view, query) {
         // Malformed (already handled above) — decide drops it; answer FORMERR defensively.
         None => ServerDecision::Reply(encode_formerr(decoded.id)),
+        // `decide` answers SERVFAIL only for an off-tailnet name it has nowhere to forward: the
+        // tailnet configures no resolver for it, or only IPv6 ones. The host resolver is somewhere,
+        // so forward it there like any other off-tailnet name. Go's `HandlePeerDNSQuery` does the
+        // same: the tailnet's resolvers are its fallback, not a precondition.
+        Some(Decision::Reply(resp))
+            if forward_exit_egress
+                && host_resolver.is_some()
+                && resp.get(3).is_some_and(|b| b & 0x0F == RCODE_SERVFAIL) =>
+        {
+            ServerDecision::Forward {
+                upstreams: host_resolver.into_iter().collect(),
+                query: query.to_vec(),
+                servfail: resp,
+            }
+        }
         Some(Decision::Reply(resp)) => ServerDecision::Reply(resp),
         Some(Decision::Forward {
             upstreams,
@@ -639,6 +653,15 @@ fn server_decide(view: &DnsView, query: &[u8], forward_exit_egress: bool) -> Ser
                     None,
                 ));
             }
+            // Go's `HandlePeerDNSQuery` sends every allowed name to the exit host's own resolver,
+            // split-DNS names included, and uses the tailnet's resolvers only when the host has
+            // none. A split-DNS resolver such as `10.0.0.53` is an address on the tailnet's side:
+            // dialled from a host socket it would reach whatever holds `10.0.0.53` on the exit
+            // host's LAN.
+            let upstreams = match host_resolver {
+                Some(resolver) => vec![resolver],
+                None => upstreams,
+            };
             ServerDecision::Forward {
                 upstreams,
                 query,
@@ -971,7 +994,7 @@ mod tests {
     fn filtered_name_is_refused() {
         let v = view(&["blocked.example.com"]);
         let q = query_for(0x1, &["blocked", "example", "com"]);
-        match server_decide(&v, &q, true) {
+        match server_decide(&v, &q, true, None) {
             ServerDecision::Reply(resp) => assert_eq!(rcode(&resp), 5, "REFUSED"),
             ServerDecision::Forward { .. } => panic!("filtered name must not forward"),
         }
@@ -983,7 +1006,7 @@ mod tests {
         // into exit egress — fail-closed, no leak of the real host IP.
         let v = view(&[]);
         let q = query_for(0x2, &["example", "com"]);
-        match server_decide(&v, &q, false) {
+        match server_decide(&v, &q, false, None) {
             ServerDecision::Reply(resp) => assert_eq!(rcode(&resp), 5, "REFUSED"),
             ServerDecision::Forward { .. } => panic!("must not forward when egress disabled"),
         }
@@ -993,7 +1016,7 @@ mod tests {
     fn recursive_query_forwards_when_egress_enabled() {
         let v = view(&[]);
         let q = query_for(0x3, &["example", "com"]);
-        match server_decide(&v, &q, true) {
+        match server_decide(&v, &q, true, None) {
             ServerDecision::Forward { upstreams, .. } => {
                 assert_eq!(upstreams, vec!["9.9.9.9:53".parse().unwrap()]);
             }
@@ -1007,8 +1030,56 @@ mod tests {
         // is answered regardless of the egress gate — it never forwards.
         let v = view(&[]);
         let q = query_for(0x4, &["host", "user", "ts", "net"]);
-        match server_decide(&v, &q, false) {
+        match server_decide(&v, &q, false, None) {
             ServerDecision::Reply(resp) => assert_eq!(rcode(&resp), 3, "NXDOMAIN, not REFUSED"),
+            ServerDecision::Forward { .. } => panic!("tailnet name must not forward"),
+        }
+    }
+
+    /// With a host resolver, every name the server would forward goes to it, as in Go's
+    /// `HandlePeerDNSQuery`: a split-DNS name (its resolver is an address on the tailnet's side, not
+    /// the exit host's LAN), a public name, and a name the tailnet has no resolver for. Tailnet names
+    /// stay authoritative, and with egress off nothing is forwarded.
+    #[test]
+    fn a_host_resolver_takes_every_forwarded_name() {
+        let host: SocketAddr = "192.0.2.53:53".parse().unwrap();
+        let mut split = view(&[]);
+        split.cfg.routes.insert(
+            "corp.example".to_string(),
+            vec![ts_control::DnsResolver {
+                transport: ts_control::ResolverTransport::Udp("10.0.0.53:53".parse().unwrap()),
+                use_with_exit_node: false,
+            }],
+        );
+        let mut bare = view(&[]);
+        bare.cfg.fallback_resolvers.clear();
+
+        for (what, v, labels) in [
+            ("split-DNS name", &split, &["db", "corp", "example"][..]),
+            ("public name", &split, &["example", "com"][..]),
+            ("name with no tailnet resolver", &bare, &["example", "com"][..]),
+        ] {
+            let q = query_for(0x7, labels);
+            match server_decide(v, &q, true, Some(host)) {
+                ServerDecision::Forward { upstreams, .. } => {
+                    assert_eq!(upstreams, vec![host], "{what}");
+                }
+                ServerDecision::Reply(resp) => {
+                    panic!("{what}: answered rcode {} instead of forwarded", rcode(&resp))
+                }
+            }
+            assert!(
+                matches!(
+                    server_decide(v, &q, false, Some(host)),
+                    ServerDecision::Reply(_)
+                ),
+                "{what}: forwarded with exit egress off"
+            );
+        }
+
+        let q = query_for(0x8, &["host", "user", "ts", "net"]);
+        match server_decide(&split, &q, true, Some(host)) {
+            ServerDecision::Reply(resp) => assert_eq!(rcode(&resp), 3, "tailnet name: NXDOMAIN"),
             ServerDecision::Forward { .. } => panic!("tailnet name must not forward"),
         }
     }
@@ -1034,7 +1105,7 @@ mod tests {
         v.peers = Some(Arc::new(db));
 
         let q = query_for(0x9, &["my", "host", "user", "ts", "net"]);
-        match server_decide(&v, &q, false) {
+        match server_decide(&v, &q, false, None) {
             ServerDecision::Reply(resp) => {
                 assert_eq!(rcode(&resp), 0, "NoError from the subdomain host");
                 assert_eq!(
@@ -1076,7 +1147,7 @@ mod tests {
 
     #[test]
     fn unparseable_body_is_formerr() {
-        match server_decide(&view(&[]), &[0xAB, 0xCD, 0xFF], true) {
+        match server_decide(&view(&[]), &[0xAB, 0xCD, 0xFF], true, None) {
             ServerDecision::Reply(resp) => {
                 assert_eq!(&resp[0..2], &[0xAB, 0xCD]);
                 assert_eq!(rcode(&resp), 1, "FORMERR");
@@ -1152,7 +1223,7 @@ mod tests {
         if !dns_source_allowed(view, filter, src) {
             return Served::Forbidden;
         }
-        Served::Dns(server_decide(view, query, forward_exit_egress))
+        Served::Dns(server_decide(view, query, forward_exit_egress, None))
     }
 
     #[test]
@@ -1205,7 +1276,7 @@ mod tests {
         // ungated, this exact query forwards.
         let q = query_for(0x11, &["example", "com"]);
         assert!(
-            matches!(server_decide(&v, &q, true), ServerDecision::Forward { .. }),
+            matches!(server_decide(&v, &q, true, None), ServerDecision::Forward { .. }),
             "the name itself is one this node would have resolved"
         );
         assert!(matches!(
