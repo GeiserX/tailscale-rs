@@ -48,7 +48,7 @@ tracing-panic = { version = "0.1", features = ["capture-backtrace"] }
 ts_cli_util.workspace = true
 
 [dev-dependencies.smoltcp]
-version = "0.13"
+version = "0.14"
 default-features = false
 features = [
     "alloc",
