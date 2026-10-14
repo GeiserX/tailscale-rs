@@ -380,11 +380,13 @@ impl Netstack {
     /// Remove half-open sockets that a RST sent back to `LISTEN`.
     ///
     /// smoltcp returns a listener-born socket in `SYN-RECEIVED` to `LISTEN` when it gets a RST
-    /// (`vendor/smoltcp/src/socket/tcp.rs`, RFC 793). Such a socket is no longer tracked as a
-    /// connection, but it still listens on this port, and smoltcp hands each SYN to the first
-    /// matching socket. If it stays in the socket set it completes later handshakes that no
-    /// `Accept` ever returns: the client sees a connection that nobody serves. Every listener pump
-    /// (after each socket-changing packet) removes them, before the next SYN can arrive.
+    /// (RFC 793; the `(State::SynReceived, TcpControl::Rst)` arm of `Socket::process` in smoltcp
+    /// 0.14.0, <https://github.com/smoltcp-rs/smoltcp/blob/v0.14.0/src/socket/tcp.rs>). Such a
+    /// socket is no longer tracked as a connection, but it still listens on this port, and smoltcp
+    /// hands each SYN to the first matching socket. If it stays in the socket set it completes
+    /// later handshakes that no `Accept` ever returns: the client sees a connection that nobody
+    /// serves. Every listener pump (after each socket-changing packet) removes them, before the
+    /// next SYN can arrive.
     fn prune_reset_half_open(&mut self, handle: ListenerHandle) {
         let Some(listener) = self.tcp_listeners.get_mut(&handle) else {
             return;
