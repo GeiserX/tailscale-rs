@@ -252,7 +252,7 @@ impl WakingPipeReceiver {
             return Some(buf);
         }
 
-        let ret = self.rx.recv().ok();
+        let ret = self.rx.try_recv().ok();
         self.taken(ret.as_ref());
 
         ret
@@ -471,6 +471,16 @@ impl smoltcp::phy::Device for WakingPipeDev {
 
 #[cfg(test)]
 mod tests {
+    /// `try_recv` on an empty pipe returns `None` instead of blocking.
+    #[test]
+    fn try_recv_does_not_block_on_empty_pipe() {
+        let (mut a, b) = WakingPipe::unbounded();
+        assert!(a.rx.try_recv().is_none());
+        b.tx.send(b"x");
+        assert_eq!(a.rx.try_recv().as_deref(), Some(&b"x"[..]));
+        assert!(a.rx.try_recv().is_none());
+    }
+
     use netcore::smoltcp::phy::{Device, RxToken as _, TxToken as _};
 
     use super::*;
