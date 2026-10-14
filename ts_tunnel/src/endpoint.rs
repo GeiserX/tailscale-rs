@@ -914,7 +914,7 @@ impl Peer {
         self.session.deactivate(endpoint);
 
         endpoint.ids.remove_handshake_session(&self.handshake);
-        self.handshake = Handshake::none();
+        core::mem::replace(&mut self.handshake, Handshake::none()).cancel();
 
         // Stop every timer for a removed peer: a stale event would otherwise fire on this peer id
         // later (spurious if the id is reused). Mirrors Go `timersStop` on peer removal.
@@ -1020,17 +1020,30 @@ impl Endpoint {
     /// with the given config.
     ///
     /// Returns the old [`PeerConfig`] if there was one.
+    /// Changing the static key or PSK discards all sessions, pending handshakes, queued packets
+    /// and timers. Other configuration updates preserve the peer's cryptographic state.
     ///
     /// # Panics
     ///
     /// If the [`NodePublicKey`] in the new [`PeerConfig`] collides with an existing key
     /// for a different [`PeerId`].
     pub fn upsert_peer(&mut self, id: PeerId, mut cfg: PeerConfig) -> Option<PeerConfig> {
+        // Check before touching the old peer so a collision cannot leave its indexes inconsistent.
+        assert!(
+            self.state
+                .ids
+                .get_by_nodekey(&cfg.key)
+                .is_none_or(|owner| owner == id),
+            "nodekey collision"
+        );
         match self.peers.get_mut(&id) {
             Some(peer) => {
-                if peer.config.key != cfg.key {
-                    self.state.ids.remove_peer(&peer.config.key);
-                    self.state.ids.add_peer(id, &cfg.key);
+                if peer.config.key != cfg.key || peer.config.psk.as_ref() != cfg.psk.as_ref() {
+                    let mut old = core::mem::replace(peer, Peer::new(id, cfg));
+                    old.shutdown(&mut self.state);
+                    self.state.ids.remove_peer(&old.config.key);
+                    assert!(self.state.ids.add_peer(id, &peer.config.key));
+                    return Some(old.config);
                 }
 
                 // Capture the OLD effective interval BEFORE swapping in the new config.
@@ -1996,6 +2009,231 @@ mod tests {
         (a_ep, b_ep, a_peer, b_peer)
     }
 
+    fn send_test_data(ep: &mut Endpoint, id: PeerId, payload: &[u8]) -> Vec<PacketMut> {
+        ep.send([(id, vec![PacketMut::from(payload)])])
+            .to_peers
+            .remove(&id)
+            .unwrap()
+    }
+
+    fn complete_test_handshake(from: &mut Endpoint, to: &mut Endpoint, id: PeerId) {
+        let init = send_test_data(from, id, b"new identity");
+        let response = to.recv(init).to_peers.remove(&id).unwrap();
+        let data = from.recv(response).to_peers.remove(&id).unwrap();
+        let delivered = to.recv(data).to_local.remove(&id).unwrap();
+        assert_eq!(delivered, vec![pad16(b"new identity")]);
+    }
+
+    #[test]
+    fn static_key_change_revokes_old_transport_and_accepts_new_peer() {
+        let (mut a, mut b, id, _) = establish_session(Some(Duration::from_secs(25)), b"old");
+        let c_key = NodeKeyPair::new();
+        let psk = a.peers[&id].config.psk.clone();
+        let old = a
+            .upsert_peer(
+                id,
+                PeerConfig {
+                    key: c_key.public,
+                    psk: psk.clone(),
+                    persistent_keepalive_interval: Some(Duration::from_secs(25)),
+                },
+            )
+            .unwrap();
+        assert_eq!(old.key, b.state.my_key.public);
+        assert!(a.state.ids.sessions.is_empty());
+        assert!(a.next_event().is_none());
+        assert!(
+            a.recv(send_test_data(&mut b, id, b"old transport"))
+                .to_local
+                .is_empty()
+        );
+
+        // Old static key is no longer registered, even for a fresh initiation.
+        let mut old_peer = Endpoint::new(b.state.my_key.clone());
+        old_peer.upsert_peer(
+            id,
+            PeerConfig {
+                key: a.state.my_key.public,
+                psk: psk.clone(),
+                persistent_keepalive_interval: None,
+            },
+        );
+        assert!(
+            a.recv(send_test_data(&mut old_peer, id, b"old handshake"))
+                .to_peers
+                .is_empty()
+        );
+
+        let mut c = Endpoint::new(c_key);
+        c.upsert_peer(
+            id,
+            PeerConfig {
+                key: a.state.my_key.public,
+                psk,
+                persistent_keepalive_interval: None,
+            },
+        );
+        // Also checks MAC1 is generated for C rather than the replaced peer B.
+        complete_test_handshake(&mut c, &mut a, id);
+    }
+
+    #[test]
+    fn psk_change_revokes_old_transport_and_requires_new_handshake() {
+        let (mut a, mut b, id, _) = establish_session(None, b"old");
+        let key = b.state.my_key.public;
+        a.upsert_peer(
+            id,
+            PeerConfig {
+                key,
+                psk: [7; 32].into(),
+                persistent_keepalive_interval: None,
+            },
+        );
+        assert!(a.state.ids.sessions.is_empty());
+        assert!(
+            a.recv(send_test_data(&mut b, id, b"old PSK"))
+                .to_local
+                .is_empty()
+        );
+        b.upsert_peer(
+            id,
+            PeerConfig {
+                key: a.state.my_key.public,
+                psk: [7; 32].into(),
+                persistent_keepalive_interval: None,
+            },
+        );
+        complete_test_handshake(&mut b, &mut a, id);
+    }
+
+    #[test]
+    fn identity_change_frees_previous_and_pending_ids_and_cancels_all_timers() {
+        let (mut a, mut b, id, _) = establish_session(Some(Duration::from_secs(25)), b"old");
+        let previous_id = a.state.ids.allocate_session(id);
+        let SessionState::Active { recv_prev, .. } = &mut a.peers.get_mut(&id).unwrap().session
+        else {
+            panic!("expected active session");
+        };
+        *recv_prev = Some(Box::new(ReceiveSession::new(
+            random_session_key(),
+            previous_id,
+            Instant::now(),
+        )));
+        let mut out = EventResult::default();
+        a.peers
+            .get_mut(&id)
+            .unwrap()
+            .start_handshake(&mut a.state, &mut out, false);
+        let delayed_response = b
+            .recv(out.to_peers.remove(&id).unwrap())
+            .to_peers
+            .remove(&id)
+            .unwrap();
+        assert_eq!(a.state.ids.sessions.len(), 3, "current, previous, pending");
+        a.upsert_peer(
+            id,
+            PeerConfig {
+                key: b.state.my_key.public,
+                psk: [8; 32].into(),
+                persistent_keepalive_interval: Some(Duration::from_secs(25)),
+            },
+        );
+        assert!(a.state.ids.sessions.is_empty());
+        assert!(
+            a.next_event().is_none(),
+            "old retransmit timer must be cancelled too"
+        );
+        let received = a.recv(delayed_response);
+        assert!(received.to_peers.is_empty() && received.to_local.is_empty());
+        assert!(
+            a.dispatch_events(Instant::now() + Duration::from_secs(60))
+                .to_peers
+                .is_empty()
+        );
+        assert!(matches!(&a.peers[&id].session, SessionState::None(q) if q.0.is_empty()));
+    }
+
+    #[test]
+    fn non_identity_update_preserves_live_session() {
+        let (mut a, mut b, id, _) = establish_session(None, b"old");
+        let ids = a.state.ids.sessions.clone();
+        a.upsert_peer(
+            id,
+            PeerConfig {
+                key: b.state.my_key.public,
+                psk: a.peers[&id].config.psk.clone(),
+                persistent_keepalive_interval: Some(Duration::from_secs(25)),
+            },
+        );
+        assert_eq!(a.state.ids.sessions, ids);
+        assert!(
+            !a.recv(send_test_data(&mut b, id, b"still authorized"))
+                .to_local
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn identity_change_discards_staged_payload() {
+        let mut ep = Endpoint::new(NodeKeyPair::new());
+        let id = PeerId(1);
+        let key = NodeKeyPair::new().public;
+        ep.upsert_peer(
+            id,
+            PeerConfig {
+                key,
+                psk: [0; 32].into(),
+                persistent_keepalive_interval: None,
+            },
+        );
+        send_test_data(&mut ep, id, b"belongs to old identity");
+        assert!(matches!(&ep.peers[&id].session, SessionState::None(q) if q.0.len() == 1));
+        ep.upsert_peer(
+            id,
+            PeerConfig {
+                key,
+                psk: [1; 32].into(),
+                persistent_keepalive_interval: None,
+            },
+        );
+        assert!(matches!(&ep.peers[&id].session, SessionState::None(q) if q.0.is_empty()));
+        assert!(ep.state.ids.sessions.is_empty());
+        assert!(ep.next_event().is_none());
+    }
+
+    #[test]
+    fn colliding_key_update_panics_before_modifying_existing_peer() {
+        let (mut a, mut b, id, _) = establish_session(None, b"old");
+        let other = NodeKeyPair::new().public;
+        a.upsert_peer(
+            PeerId(2),
+            PeerConfig {
+                key: other,
+                psk: [0; 32].into(),
+                persistent_keepalive_interval: None,
+            },
+        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            a.upsert_peer(
+                id,
+                PeerConfig {
+                    key: other,
+                    psk: [0; 32].into(),
+                    persistent_keepalive_interval: None,
+                },
+            );
+        }));
+        assert!(result.is_err());
+        assert_eq!(a.peer_key(id), Some(b.state.my_key.public));
+        assert_eq!(a.state.ids.get_by_nodekey(&b.state.my_key.public), Some(id));
+        assert_eq!(a.state.ids.get_by_nodekey(&other), Some(PeerId(2)));
+        assert!(
+            !a.recv(send_test_data(&mut b, id, b"unchanged after collision"))
+                .to_local
+                .is_empty()
+        );
+    }
+
     /// A marshalled TSMP disco-key advertisement (Go `packet.TSMPDiscoKeyAdvertisement.Marshal`) —
     /// the one message this fork sends as a WireGuard priority message. Built here so the tunnel
     /// tests carry the real payload rather than an arbitrary blob: its exact shape is what has to
@@ -2623,7 +2861,8 @@ mod tests {
         // Start with a live session that has a persistent keepalive armed.
         let (mut a_ep, _b_ep, a_peer, _b_peer) = establish_session(Some(interval), b"hello");
         let peer_key = a_ep.peer_key(a_peer).expect("peer key");
-        let psk = rand::random::<crate::config::Psk>();
+        // This is an interval-only update; changing the PSK must discard the live session.
+        let psk = a_ep.peers[&a_peer].config.psk.clone();
 
         // Some -> None on the live peer must CANCEL the timer.
         a_ep.upsert_peer(

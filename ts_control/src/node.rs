@@ -475,9 +475,9 @@ impl Node {
     /// advertised subnet routes (`--accept-routes` / `RouteAll` in the Go client) and which peer
     /// (if any) is the selected exit node (`--exit-node` / `ExitNodeID` in the Go client).
     ///
-    /// This node's own addresses (the peer's `/32` and `/128`) are always installed so the peer
-    /// itself stays reachable. Larger advertised subnet routes are only installed when
-    /// `accept_routes` is set; otherwise they are dropped (fail-closed). The same filtered set
+    /// Expired peers have no installed routes. A live node's own addresses (`/32` and `/128`) are
+    /// always installed so the peer itself stays reachable. Larger advertised subnet routes are
+    /// only installed when `accept_routes` is set; otherwise they are dropped (fail-closed). The same filtered set
     /// governs both outbound routing to the peer and inbound source validation, exactly as
     /// WireGuard cryptokey routing couples them in the Go client.
     ///
@@ -499,6 +499,9 @@ impl Node {
         // Computed eagerly so the returned iterator doesn't borrow `exit_node`.
         let is_selected_exit = exit_node == Some(&self.stable_id);
         self.accepted_routes.iter().filter(move |route| {
+            if self.expired {
+                return false;
+            }
             if route.prefix_len() == 0 {
                 // Default route: installed only when this peer is the selected exit node. Both the
                 // outbound route table and the inbound source filter call this, so the exit peer
@@ -2017,6 +2020,29 @@ pub(crate) mod tests {
         let me = StableId("exit1".to_string());
         let sel: Vec<_> = n.routes_to_install(false, Some(&me)).copied().collect();
         assert_eq!(sel, vec![self4, default4, default6]);
+    }
+
+    #[test]
+    fn routes_to_install_excludes_expired_peers_including_selected_exit() {
+        let mut n = node("host", Some("ts.net"));
+        n.accepted_routes = [
+            "100.64.0.1/32",
+            "fd7a::1/128",
+            "192.168.1.0/24",
+            "0.0.0.0/0",
+            "::/0",
+        ]
+        .into_iter()
+        .map(|route| route.parse().unwrap())
+        .collect();
+        n.expired = true;
+        for accept_routes in [false, true] {
+            for selected in [None, Some(&n.stable_id)] {
+                assert_eq!(n.routes_to_install(accept_routes, selected).count(), 0);
+            }
+        }
+        n.expired = false;
+        assert_eq!(n.routes_to_install(true, Some(&n.stable_id)).count(), 5);
     }
 
     fn exit_node_with(id: &str, ipv4: &str, hostname: &str, tailnet: Option<&str>) -> Node {

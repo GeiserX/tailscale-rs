@@ -398,6 +398,13 @@ impl Handshake {
         }
     }
 
+    /// Discard pending roles and cancel the initiation timer. The caller must free their IDs.
+    pub(crate) fn cancel(self) {
+        if let Some((_, timeout, _)) = self.initiated {
+            timeout.cancel();
+        }
+    }
+
     /// Record a freshly-sent initiation as the initiator role, leaving the responder role
     /// untouched.
     ///
