@@ -87,13 +87,15 @@ The full program, the dependency lines and the plain `Device` API without the fa
 - MagicDNS and split DNS, fail-closed by default.
 - Using subnet routers and exit nodes (opt-in), with the exit node changeable at runtime.
 - Tailscale Serve handlers, and Tailnet Lock peer signature enforcement (partial).
+- Acting as a subnet router or exit node, Taildrop, Funnel's client leg, and an SSH server with a login shell.
 
-The full list, with what is coming and what is not supported, is on [Status](status.md). How a node reaches the control plane and its peers is on [How it works](how-it-works.md).
+The full list, with what is coming and what is not supported, is on [Status](status.md). What is still missing against Go, area by area, and the open backlog are in the [parity roadmap](https://github.com/GeiserX/tailscale-rs/blob/main/docs/PARITY_ROADMAP.md#gap-audit-and-open-backlog-at-wind-down-2026-10-14). How a node reaches the control plane and its peers is on [How it works](how-it-works.md).
 
 ## What it does not do yet
 
-- Act as an exit node or a subnet router for other nodes. Using one works.
-- Peer relays, private DERP relays, Taildrop, Taildrive and automatic key rotation.
+- Forward exactly like Go as an exit node or subnet router: a forwarded connection to a dead backend is closed instead of refused.
+- Renew an HTTPS certificate while a TLS listener runs.
+- Peer relays as a client, private DERP relays, Taildrive and automatic key rotation.
 - Hole-punch symmetric NATs; behind some NATs a flow stays relayed through DERP, which caps its throughput.
 - Run on Android, iOS or the BSDs. It runs on Linux (x86_64, ARM64), macOS (ARM64) and Windows (x86_64), with Rust 1.94.1 or newer. See [Caveats](caveats.md#platform-support).
 

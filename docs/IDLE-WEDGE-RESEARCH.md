@@ -63,9 +63,12 @@ Two parts, both required:
 
 1. **Persistent-keepalive (25s):** when no outgoing traffic for N seconds, emit one
    empty authenticated data packet (`encapsulate(&[])`) to hold the path/NAT/relay
-   mapping warm. Per-peer, opt-in (Tailscale sets 25s when control marks the peer
-   `KeepAlive=true`; 25s < the ~30s UDP NAT floor). Reset on any outgoing
-   authenticated packet.
+   mapping warm. Per-peer, opt-in (25s < the ~30s UDP NAT floor). Reset on any outgoing
+   authenticated packet. Correction, 2026-10-14: Tailscale does not do this. Go v1.102.4 sets no
+   WireGuard persistent keepalive (`PersistentKeepalive` has 0 hits in the Go tree, and
+   `wgengine/wgcfg/nmcfg` does not exist). The tailcfg `KeepAlive` fields are control-stream
+   keepalives on MapRequest and MapResponse (`tailcfg/tailcfg.go:1420`, `:2021`). The 25s default
+   here is a deliberate divergence, tracked as bead `tsr-0hd2`.
 2. **Periodic timer tick:** a clock-driven driver that services the endpoint even
    with zero traffic (boringtun's `update_timers(&mut self, dst) -> TunnResult`,
    polled ~250ms–1s, reads the clock internally). Without this the keepalive timer
@@ -73,8 +76,9 @@ Two parts, both required:
 
 **Reference:** boringtun `src/noise/timers.rs` `update_timers` (the closest Rust prior
 art) + wireguard-go `device/timers.go` `timersAnyAuthenticatedPacketTraversal` /
-`expiredPersistentKeepalive`. Tailscale `wgengine/wgcfg/nmcfg`: `if peer.KeepAlive {
-cpeer.PersistentKeepalive = 25 }`.
+`expiredPersistentKeepalive`. This line used to cite Tailscale `wgengine/wgcfg/nmcfg` as setting
+`PersistentKeepalive = 25` for `KeepAlive` peers. That package does not exist at Go v1.102.4, and the
+Go tree sets no WireGuard keepalive (see the correction in part 1).
 
 ### Scope / what this does NOT fix
 
