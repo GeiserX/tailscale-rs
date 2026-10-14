@@ -8,6 +8,17 @@ Record breaking or significant changes here. All dates are UTC.
 
 * **exit node:** forwarded TCP flows run without Nagle, the underlay UDP sockets ask for Go's 7 MiB buffers, netstack egress goes out in batches of up to 64 packets, and the netstack tracks 32 receive holes for uploads. Kernel receive batching, splice coalescing, targeted replay and Apple connected UDP sockets are opt-in experiments, off unless their variable is `1`.
 
+## [0.57.6](https://github.com/GeiserX/tailscale-rs/compare/v0.57.5...v0.57.6) (2026-10-14)
+
+
+### Bug Fixes
+
+* **forwarder:** keep exit users off the exit host's own LAN as Go does ([#617](https://github.com/GeiserX/tailscale-rs/issues/617)) ([e93013d](https://github.com/GeiserX/tailscale-rs/commit/e93013d1bc1890a44e89d1692b35c744c4e3849f))
+* **magicsock:** a parked receive loop follows the socket across a rebind ([#622](https://github.com/GeiserX/tailscale-rs/issues/622)) ([8f061b5](https://github.com/GeiserX/tailscale-rs/commit/8f061b5332638ff21962eec90e501392e9b04b63))
+* **netstack:** an abandoned Accept, Connect or Receive no longer loses the connection or its data ([#619](https://github.com/GeiserX/tailscale-rs/issues/619)) ([d89bf68](https://github.com/GeiserX/tailscale-rs/commit/d89bf688fe65863a5a8f51d63cd7b6447e755b71))
+* **runtime:** keep MagicDNS and cert domains across netmap deltas in TUN mode ([#618](https://github.com/GeiserX/tailscale-rs/issues/618)) ([32a14ee](https://github.com/GeiserX/tailscale-rs/commit/32a14eec1617dedbb41d1b0d2c305e557dc950e9))
+* **state:** write key files atomically so a crash cannot truncate them ([#623](https://github.com/GeiserX/tailscale-rs/issues/623)) ([173cc4d](https://github.com/GeiserX/tailscale-rs/commit/173cc4ddab7228e188bb7bc98b14f9112c30835e))
+
 ## [0.57.5](https://github.com/GeiserX/tailscale-rs/compare/v0.57.4...v0.57.5) (2026-10-14)
 
 
