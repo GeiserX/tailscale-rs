@@ -268,7 +268,9 @@ async fn log_status(dev: &Device) {
 fn system_resolver() -> Option<std::net::SocketAddr> {
     const TAILSCALE_SERVICE_IPS: [std::net::IpAddr; 2] = [
         std::net::IpAddr::V4(std::net::Ipv4Addr::new(100, 100, 100, 100)),
-        std::net::IpAddr::V6(std::net::Ipv6Addr::new(0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0, 0x53)),
+        std::net::IpAddr::V6(std::net::Ipv6Addr::new(
+            0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0, 0x53,
+        )),
     ];
     let conf = std::fs::read_to_string("/etc/resolv.conf").ok()?;
     conf.lines()

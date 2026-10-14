@@ -1061,7 +1061,11 @@ mod tests {
         for (what, v, labels) in [
             ("split-DNS name", &split, &["db", "corp", "example"][..]),
             ("public name", &split, &["example", "com"][..]),
-            ("name with no tailnet resolver", &bare, &["example", "com"][..]),
+            (
+                "name with no tailnet resolver",
+                &bare,
+                &["example", "com"][..],
+            ),
         ] {
             let q = query_for(0x7, labels);
             match server_decide(v, &q, true, Some(host)) {
@@ -1069,7 +1073,10 @@ mod tests {
                     assert_eq!(upstreams, vec![host], "{what}");
                 }
                 ServerDecision::Reply(resp) => {
-                    panic!("{what}: answered rcode {} instead of forwarded", rcode(&resp))
+                    panic!(
+                        "{what}: answered rcode {} instead of forwarded",
+                        rcode(&resp)
+                    )
                 }
             }
             assert!(
@@ -1367,7 +1374,10 @@ mod tests {
         // ungated, this exact query forwards.
         let q = query_for(0x11, &["example", "com"]);
         assert!(
-            matches!(server_decide(&v, &q, true, None), ServerDecision::Forward { .. }),
+            matches!(
+                server_decide(&v, &q, true, None),
+                ServerDecision::Forward { .. }
+            ),
             "the name itself is one this node would have resolved"
         );
         assert!(matches!(
