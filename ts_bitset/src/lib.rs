@@ -783,7 +783,7 @@ const fn len(val: u64) -> usize {
 mod test {
     use std::vec::Vec;
 
-    use proptest::prelude::{Rng, Strategy};
+    use proptest::prelude::{RngExt, Strategy};
 
     use super::*;
 
