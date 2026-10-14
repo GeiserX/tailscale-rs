@@ -297,13 +297,20 @@ pub struct MagicSock {
     /// The underlay UDP socket, behind a `Mutex<Arc<…>>` so [`MagicSock::rebind`] can atomically
     /// swap in a freshly-bound socket on a network/link change (Wi-Fi switch, sleep/wake) without
     /// recreating the `MagicSock` or disturbing peer/disco/path state. Readers take a cheap
-    /// clone via [`MagicSock::sock`] for the duration of a single send/recv; the background recv
-    /// pump re-reads it each loop iteration, so it picks up a rebind on its next `recv_from` (the
-    /// old socket is dropped once outstanding clones release it, which unblocks a parked
-    /// `recv_from` — matching Go's `RebindingUDPConn` close-and-reloop). `std::sync::Mutex` (not an
-    /// extra `arc-swap` dep): the guard is held only long enough to clone the `Arc`, never across
-    /// an `.await`.
+    /// clone via [`MagicSock::sock`] for the duration of a single send/recv. A receive that is
+    /// already parked on the old socket is woken through [`rebound`](Self::rebound) and re-reads
+    /// this on its next turn; the old socket closes once the last clone releases it.
+    /// `std::sync::Mutex` (not an extra `arc-swap` dep): the guard is held only long enough to
+    /// clone the `Arc`, never across an `.await`.
     sock: Mutex<Arc<UdpSocket>>,
+    /// Bumped by [`MagicSock::rebind`] after it swaps `sock`, to wake a receive loop parked on the
+    /// old socket so it re-reads `sock` and waits on the new one ([`fill_receive`]). Go's
+    /// `RebindingUDPConn` gets the same effect by closing the old conn under its lock, which errors
+    /// a parked read, and `ReadBatch` then re-reads the current conn (`rebinding_conn.go`); a
+    /// `tokio::net::UdpSocket` cannot be closed while a clone is parked on it, so the parked
+    /// receive is told to let go instead. The value is a generation counter, never read as such:
+    /// only its change matters.
+    rebound: tokio::sync::watch::Sender<u64>,
     /// Connected per-path sockets sharing `sock`'s port (opt-in; see `connected.rs`). Locked
     /// disjointly from every other lock, never across an `.await`.
     connected: Mutex<ConnectedSockets>,
@@ -508,6 +515,7 @@ impl MagicSock {
         let (connected, connected_rx) = ConnectedSockets::new(settings);
         Ok(Self {
             sock: Mutex::new(Arc::new(sock)),
+            rebound: tokio::sync::watch::Sender::new(0),
             connected: Mutex::new(connected),
             connected_rx: tokio::sync::Mutex::new(ReceiveState {
                 connected: connected_rx,
@@ -544,7 +552,9 @@ impl MagicSock {
 
     /// The current underlay socket. Clones the `Arc` under a short lock (never held across an
     /// `.await`), so a concurrent [`rebind`](Self::rebind) swaps the socket for *subsequent* calls
-    /// while an in-progress send/recv keeps using the socket it already cloned.
+    /// while an in-progress send keeps using the socket it already cloned. A parked receive does
+    /// not keep it: [`fill_receive`](Self::fill_receive) also watches [`rebound`](Self::rebound)
+    /// and re-reads this when it fires.
     fn sock(&self) -> Arc<UdpSocket> {
         lock(&self.sock).clone()
     }
@@ -654,9 +664,13 @@ impl MagicSock {
 
         tune_socket_buffers(&new_sock);
 
-        // Swap the socket atomically. The old `Arc<UdpSocket>` drops once outstanding clones release
-        // it, which unblocks any `recv_from` parked on it so the recv pump loops onto the new socket.
+        // Swap the socket atomically, then wake any receive parked on the old one so it re-reads
+        // `sock` and waits on the new socket (`fill_receive`); the old `Arc<UdpSocket>` closes once
+        // the last clone releases it. Go closes the old conn under the `RebindingUDPConn` lock and
+        // its parked read reloops onto the current conn; a parked tokio receive is woken instead,
+        // because a clone it holds cannot be closed from here.
         *lock(&self.sock) = Arc::new(new_sock);
+        self.rebound.send_modify(|generation| *generation = generation.wrapping_add(1));
         // Connected sockets were bound to the old socket's address; start over.
         lock(&self.connected).clear();
 
@@ -1587,15 +1601,22 @@ impl MagicSock {
         demux_receive_batch(&mut state, |datagram| self.demux_datagram(datagram)).await
     }
 
+    /// Wait for the next kernel batch (or connected-socket batch) and queue it in `pending`.
+    /// Returns with nothing queued when a [`rebind`](Self::rebind) swaps the socket while this is
+    /// parked on the old one: the caller loops and the next call waits on the new socket. The
+    /// receiver is subscribed *before* the socket is cloned, so a rebind that lands between the
+    /// two is seen either as the new socket or as a wake-up, never missed.
     async fn fill_receive(&self, state: &mut ReceiveState) -> Result<(), Error> {
         if !state.pending.is_empty() {
             return Ok(());
         }
+        let mut rebound = self.rebound.subscribe();
         let sock = self.sock();
         if let Some(receiver) = &mut state.receiver {
             let batch = tokio::select! {
                 r = receiver.recv(&sock, None) => crate::receive_batch::Received::Batch(r?),
                 Some(batch) = state.connected.recv() => batch,
+                _ = rebound.changed() => return Ok(()),
             };
             // No await between consuming the kernel/channel batch and saving its tail.
             state.pending.extend(batch);
@@ -1607,6 +1628,7 @@ impl MagicSock {
                     crate::receive_batch::Received::One((PacketMut::from(&buf[..n]), from))
                 },
                 Some(batch) = state.connected.recv() => batch,
+                _ = rebound.changed() => return Ok(()),
             };
             state.pending.extend(batch);
         }
@@ -8157,6 +8179,56 @@ mod tests {
         // (Not asserted as an equality because the OS may reassign; we only require a valid bind,
         // already proven above. `port_before` is captured to document the intent.)
         let _ = port_before;
+    }
+
+    /// A receive loop already parked in `recv_data` when `rebind` swaps the socket must carry on
+    /// from the NEW socket: a datagram a peer sends to the rebound port has to reach it. The loop
+    /// used to keep its own clone of the old socket, which the rebind could neither close nor wake
+    /// (the clone kept it open, and its port taken, which is also why the rebind lands on a new
+    /// port), so nothing sent to the new port ever reached a loop that was already waiting; only a
+    /// loop that happened to start after the rebind saw the new socket. Go's `RebindingUDPConn`
+    /// closes the old conn under its lock and `ReadBatch` re-reads the current one, so a parked
+    /// read there resumes on the new socket.
+    #[tokio::test]
+    async fn a_parked_receive_loop_follows_the_socket_across_a_rebind() {
+        let sock = Arc::new(plain_sock().await);
+        let peer = DiscoPrivateKey::random().public_key();
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // Attribute the sender's address to `peer`, so its (non-disco) datagram is yielded as
+        // WireGuard data rather than dropped as an unknown source.
+        sock.add_peer_endpoints_unfiltered(peer, [sender.local_addr().unwrap()]);
+
+        // Park a receive loop on the pre-rebind socket.
+        let pump_sock = sock.clone();
+        let pump = tokio::spawn(async move { pump_sock.recv_data().await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !pump.is_finished(),
+            "precondition: the receive loop is parked waiting for a datagram"
+        );
+
+        let before = sock.local_addr().unwrap();
+        sock.rebind().await.expect("rebind must succeed");
+        let after = sock.local_addr().unwrap();
+        assert_ne!(
+            before.port(),
+            after.port(),
+            "precondition: the parked loop still holds the old socket open, so the rebind lands \
+             on a different port (this is what makes the stale clone unreachable)"
+        );
+
+        // The rebound socket is bound to `0.0.0.0`; reach it over loopback.
+        let target = SocketAddr::from((core::net::Ipv4Addr::LOCALHOST, after.port()));
+        sender.send_to(b"wireguard-looking data", target).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("the parked receive loop must see a datagram sent to the rebound port")
+            .unwrap()
+            .unwrap()
+            .expect("the datagram must be yielded as data, not a closed socket");
+        assert_eq!(got.from_disco, peer);
+        assert_eq!(got.from_addr, sender.local_addr().unwrap());
+        assert_eq!(got.data.as_ref(), b"wireguard-looking data");
     }
 
     /// `send_pings_to_peer_now` pings **every** candidate immediately, bypassing the per-candidate
