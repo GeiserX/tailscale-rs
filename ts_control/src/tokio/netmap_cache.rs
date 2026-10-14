@@ -623,7 +623,9 @@ mod tests {
         dir
     }
 
-    /// A cache over `dir` — the cold-start shape (a fresh `NetmapCache`, nothing in memory).
+    /// A cache over `dir` — the cold-start shape (a fresh `NetmapCache`, nothing in memory). Only
+    /// the Unix permission tests use it, so it is Unix-only too.
+    #[cfg(unix)]
     fn cache_at(dir: &Path) -> NetmapCache {
         NetmapCache::new(dir)
     }
