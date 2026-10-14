@@ -254,18 +254,37 @@ fn open(local: SocketAddr, remote: SocketAddr, dont_fragment: bool) -> std::io::
 
 /// A nonblocking UDP socket with `SO_REUSEADDR` + `SO_REUSEPORT`, bound to `addr`. The shared
 /// socket must be created this way too, or the connected sockets can't share its port.
+///
+/// Unix only: `SO_REUSEPORT` is what lets several sockets share one UDP port and steers each
+/// datagram to the connected socket that matches it, and Windows has nothing equivalent (its
+/// `SO_REUSEADDR` lets a second bind succeed but delivers every datagram to one socket). Go's
+/// magicsock sets no reuse option on any platform; on Windows it listens on a plain UDP socket
+/// (`listenPacket`). So on a non-Unix target this refuses with `Unsupported` rather than bind a
+/// socket that could never share the port; [`Settings::from_env`] already keeps the mode off
+/// outside Apple, so only an explicit `bind_with` can reach this.
 pub(crate) fn reuse_port_socket(addr: SocketAddr) -> std::io::Result<socket2::Socket> {
-    use socket2::{Domain, Protocol, Socket, Type};
-    let s = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
-    if addr.is_ipv6() {
-        // Match `UdpSocket::bind`'s dual-stack default on `[::]`.
-        s.set_only_v6(false)?;
+    #[cfg(not(unix))]
+    {
+        let _ = addr;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "connected sockets need SO_REUSEPORT, which this platform does not have",
+        ))
     }
-    s.set_reuse_address(true)?;
-    s.set_reuse_port(true)?;
-    s.set_nonblocking(true)?;
-    s.bind(&addr.into())?;
-    Ok(s)
+    #[cfg(unix)]
+    {
+        use socket2::{Domain, Protocol, Socket, Type};
+        let s = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+        if addr.is_ipv6() {
+            // Match `UdpSocket::bind`'s dual-stack default on `[::]`.
+            s.set_only_v6(false)?;
+        }
+        s.set_reuse_address(true)?;
+        s.set_reuse_port(true)?;
+        s.set_nonblocking(true)?;
+        s.bind(&addr.into())?;
+        Ok(s)
+    }
 }
 
 #[cfg(target_vendor = "apple")]

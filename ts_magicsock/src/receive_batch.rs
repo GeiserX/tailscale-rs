@@ -2,7 +2,9 @@
 //! no syscall can consume data and then return Pending before handing it to the caller.
 use std::{io, net::SocketAddr};
 
-use tokio::{io::Interest, net::UdpSocket};
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+use tokio::io::Interest;
+use tokio::net::UdpSocket;
 
 pub(crate) const MAX_BATCH: usize = 16;
 pub(crate) const BUFFER_LEN: usize = 1600;
@@ -42,14 +44,14 @@ impl<T> IntoIterator for Received<T> {
     }
 }
 
-use std::sync::{
-    OnceLock,
-    atomic::{AtomicU64, Ordering},
-};
-static METRICS: OnceLock<bool> = OnceLock::new();
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+static METRICS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static BATCHES: [AtomicU64; 17] = [const { AtomicU64::new(0) }; 17];
 static FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static TRUNCATED: AtomicU64 = AtomicU64::new(0);
+/// Only the kernel batch path counts anything; elsewhere the counters stay at zero.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 fn metrics_enabled() -> bool {
     *METRICS.get_or_init(|| std::env::var("TS_DEBUG_PIPELINE_METRICS").as_deref() == Ok("1"))
 }
@@ -83,12 +85,16 @@ pub(crate) fn enabled() -> bool {
 
 pub(crate) struct Receiver {
     buffers: [Vec<u8>; MAX_BATCH],
+    /// Whether the kernel batch syscall is still worth trying; cleared on the first unsupported
+    /// error. Only the platforms with such a syscall read it.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     kernel: bool,
 }
 impl Receiver {
     pub(crate) fn new() -> Self {
         Self {
             buffers: core::array::from_fn(|_| vec![0; BUFFER_LEN]),
+            #[cfg(any(target_vendor = "apple", target_os = "linux"))]
             kernel: true,
         }
     }
