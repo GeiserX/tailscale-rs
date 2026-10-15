@@ -8,6 +8,17 @@ Record breaking or significant changes here. All dates are UTC.
 
 * **exit node:** forwarded TCP flows run without Nagle, the underlay UDP sockets ask for Go's 7 MiB buffers, netstack egress goes out in batches of up to 64 packets, and the netstack tracks 32 receive holes for uploads. Kernel receive batching, splice coalescing, targeted replay and Apple connected UDP sockets are opt-in experiments, off unless their variable is `1`.
 
+## [0.57.7](https://github.com/GeiserX/tailscale-rs/compare/v0.57.6...v0.57.7) (2026-10-15)
+
+
+### Bug Fixes
+
+* **forwarder:** keep exit users off the LAN on the proxy path too ([#624](https://github.com/GeiserX/tailscale-rs/issues/624)) ([6bb383a](https://github.com/GeiserX/tailscale-rs/commit/6bb383a7ba0a50e79409dc9c91723775cf07e2cf))
+* **magicsock:** a rebind keeps its port, the v6 gate follows the socket, and the crate builds on Windows ([#626](https://github.com/GeiserX/tailscale-rs/issues/626)) ([f7176dc](https://github.com/GeiserX/tailscale-rs/commit/f7176dc372b474aac2daf9822056db00dc1d0ca4))
+* **netstack:** run Reno congestion control as Go's gVisor does ([#627](https://github.com/GeiserX/tailscale-rs/issues/627)) ([be51756](https://github.com/GeiserX/tailscale-rs/commit/be5175645c02ea09d89197b8a98bbfd102b1b16f))
+* **runtime:** a self-only netmap change now reaches IPN bus watchers, as Go's SelfChange does ([#630](https://github.com/GeiserX/tailscale-rs/issues/630)) ([be5eb65](https://github.com/GeiserX/tailscale-rs/commit/be5eb6517ac2a30d15a03377a8701208f8af6b68))
+* **state:** lock the Windows state directory to the owner and Administrators as Go does ([#625](https://github.com/GeiserX/tailscale-rs/issues/625)) ([40bb717](https://github.com/GeiserX/tailscale-rs/commit/40bb7171ab9523c605bec027eedde9141fc46bf9))
+
 ## [0.57.6](https://github.com/GeiserX/tailscale-rs/compare/v0.57.5...v0.57.6) (2026-10-14)
 
 
