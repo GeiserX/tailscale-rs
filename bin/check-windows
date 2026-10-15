@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+#
+# Type-check and lint the workspace for Windows (x86_64-pc-windows-msvc) from a Linux or macOS
+# machine, so the Windows build cannot break without anyone noticing. CI's hosted test job runs this,
+# and so does `bin/check`.
+#
+# A check never links, so no MSVC linker is needed. Build scripts that compile C (ring's) do need the
+# MSVC CRT and Windows SDK headers. `cargo xwin env` downloads them on first use (about 1 GB, cached
+# in XWIN_CACHE_DIR, default ~/.cache/cargo-xwin) and prints the clang-cl compiler settings, which
+# this script loads. It then drops the target rustflags cargo-xwin also sets: they only carry
+# lld-link flags a check does not use, and cargo hands them to build scripts, where ts_ffi's cbindgen
+# runs a nested host `cargo metadata` that fails on them.
+#
+# Needs: cargo-xwin (`cargo install --locked cargo-xwin --version 0.23.1`), clang on PATH, and
+# `rustup target add x86_64-pc-windows-msvc`.
+
+set -euo pipefail
+
+readonly TARGET=x86_64-pc-windows-msvc
+
+eval "$(cargo xwin env --target "${TARGET}")"
+unset CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS RUSTFLAGS
+
+set -x
+
+cargo check  --target "${TARGET}" --keep-going --workspace --all-targets
+cargo clippy --target "${TARGET}" --keep-going --workspace --all-targets --no-deps -- -D warnings -A missing_docs

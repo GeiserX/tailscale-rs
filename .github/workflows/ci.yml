@@ -53,8 +53,9 @@ jobs:
   # Self-hosted Linux/X64 build/test/lint lane (runs on the maintainer's own runner, not paid
   # GitHub-hosted minutes). The inherited `build_test`/`arch_independent` matrices target OTHER
   # self-hosted labels (`linux-x86_64-16cpu`, etc.) that don't exist here and stay owner-gated, so
-  # this lane is the real green signal for the `rust` workflow. ring-only, default features
-  # (no `ssh`/`acme`/`tun`); the musl + feature-specific paths are covered by `musl_static` + local.
+  # this lane is the real green signal for the `rust` workflow. It builds and lints with default
+  # features (no `ssh`/`acme`/`tun`) and runs the tests twice: once with default features and once
+  # with every feature on. The musl paths are covered by `musl_static`.
   hosted_test:
     name: hosted test (self-hosted Linux)
     # Self-hosted Linux/X64 runner (Docker container on the maintainer's infra) — keeps CI off paid
@@ -139,6 +140,10 @@ jobs:
         run: cargo build $COMMON_FLAGS --all-targets
       - name: Test (cargo test)
         run: cargo test $COMMON_FLAGS
+      # Run the tests again with every feature on. The run above uses default features, so the
+      # tests behind `ssh`, `acme`, `tun` and the other optional features never ran on a push.
+      - name: Test all features (cargo test --all-features)
+        run: cargo test $COMMON_FLAGS --all-features
       # Compile + lint the optional `tun` feature on the lib it gates (ts_runtime's TUN-mode
       # datapath). `COMMON_FLAGS` is default-features-only, so `mod tun_actor`
       # (`#[cfg(feature = "tun")]`) is otherwise NEVER built on a fork — a shape change to a type it
@@ -178,6 +183,39 @@ jobs:
           cargo vet --version
       - name: Supply-chain audit (cargo vet)
         run: cargo vet --locked
+      # Type-check and lint the workspace for Windows, so the Windows build cannot break unnoticed
+      # again (it did with #598, and nothing here built for Windows). `bin/check-windows` holds the
+      # commands. cargo-xwin supplies the MSVC CRT and SDK headers ring's build script compiles
+      # against. They take about 7 minutes to download, so they are cached, keyed on the cargo-xwin
+      # version, and saved before the check runs: a red check must not throw the download away.
+      - name: Install cargo-xwin and the Windows target
+        run: |
+          cargo binstall --no-confirm cargo-xwin@0.23.1
+          ver="$(rustup show active-toolchain | awk '{print $1}')"
+          rustup target add --toolchain "${ver}" x86_64-pc-windows-msvc
+          # The image ships clang and llvm-ar only under versioned names on PATH (`llvm-ar-18`).
+          # cargo-xwin makes its `llvm-lib` from a plain `llvm-ar`, so put clang's own LLVM bin
+          # directory, which has the plain names, on PATH.
+          llvm_bin="$(dirname "$(readlink -f "$(command -v clang)")")"
+          echo "${llvm_bin}" >> "$GITHUB_PATH"
+          "${llvm_bin}/clang" --version | head -1
+          ls "${llvm_bin}/llvm-ar" "${llvm_bin}/llvm-lib"
+      - name: Restore the MSVC headers (cargo-xwin)
+        id: xwin-cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/cargo-xwin
+          key: cargo-xwin-0.23.1-x86_64-pc-windows-msvc
+      - name: Fetch the MSVC headers (cargo-xwin)
+        run: cargo xwin env --target x86_64-pc-windows-msvc > /dev/null
+      - name: Save the MSVC headers (cargo-xwin)
+        if: steps.xwin-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/cargo-xwin
+          key: cargo-xwin-0.23.1-x86_64-pc-windows-msvc
+      - name: Check + lint for Windows (bin/check-windows)
+        run: bin/check-windows
 
   build_test:
     # This matrix targets self-hosted runner labels (linux-x86_64-16cpu, macos-26, windows-8vcpu,

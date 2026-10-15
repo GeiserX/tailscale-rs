@@ -24,6 +24,7 @@ use std::{error::Error, path::PathBuf, time::Duration};
 
 use clap::Parser;
 use tailscale::{Config, Device, RegistrationError, config::BadFormatBehavior};
+#[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::filter::LevelFilter;
 
@@ -198,14 +199,24 @@ async fn run(args: Args) -> Result<(), Box<dyn Error>> {
         });
     }
 
+    // Service managers stop a process with SIGTERM on Unix. Windows has no SIGTERM, so there the
+    // node stops on Ctrl-C alone.
+    #[cfg(unix)]
     let mut sigterm = signal(SignalKind::terminate())?;
+    let terminate = async {
+        #[cfg(unix)]
+        sigterm.recv().await;
+        #[cfg(not(unix))]
+        std::future::pending::<()>().await;
+    };
+    tokio::pin!(terminate);
     let mut ticker = (args.status_interval > 0)
         .then(|| tokio::time::interval(Duration::from_secs(args.status_interval)));
 
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
-            _ = sigterm.recv() => break,
+            _ = &mut terminate => break,
             _ = async { ticker.as_mut().unwrap().tick().await }, if ticker.is_some() => {
                 log_status(&dev).await;
             }
