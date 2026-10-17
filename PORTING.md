@@ -86,6 +86,7 @@ where that behaviour lives", not "this is a transliteration of that file".
 | `wgengine/router`, OS side of `net/dns` | [`ts_host_net`](ts_host_net/src/lib.rs) (Linux `ip`/`resolvectl`, macOS `route`/`scutil`) |
 | `net/dns/resolver` wire encoding | [`ts_dns_wire`](ts_dns_wire/src/lib.rs) + the MagicDNS server in [`ts_runtime::magic_dns`](ts_runtime/src/magic_dns.rs) |
 | `net/netmon` | [`ts_netmon`](ts_netmon/src/lib.rs) |
+| `net/portmapper`, `feature/portmapper` — NAT-PMP and PCP (UPnP-IGD is roadmap) | [`ts_portmapper`](ts_portmapper/src/lib.rs) (the lifecycle client, codecs, gateway lookup and `GatewayCap`) + the driver in [`ts_runtime::portmap`](ts_runtime/src/portmap.rs); `--portmap-probe` in [`examples/exit_node`](examples/exit_node/main.rs). Deviations: [`docs/PORTMAPPER.md`](docs/PORTMAPPER.md) |
 | `net/art` + `github.com/gaissmai/bart` | [`ts_bart`](ts_bart/src/lib.rs) (+ [`ts_array256`](ts_array256/src/lib.rs), [`ts_bitset`](ts_bitset/src/lib.rs), [`ts_dynbitset`](ts_dynbitset/src/lib.rs)) |
 
 ### Runtime, API and utilities
@@ -118,7 +119,8 @@ cut with its eyes open. Items already tracked in
   the 3-way bind handshake and the Geneve-framed relay data path); this node never serves as a
   relay itself, and does not send `AllocateUDPRelayEndpointRequest` — a relay-capable peer
   allocates on our behalf and announces the endpoint with a `CallMeMaybeVia`.
-- `net/portmapper`, `feature/portmapper`, `feature/debugportmapper` — UPnP / PCP / NAT-PMP *(roadmap)*.
+- `feature/debugportmapper`, and UPnP-IGD (the third protocol of `net/portmapper`, whose NAT-PMP
+  and PCP halves are mapped above) — the debug CLI and SSDP/SOAP mapping *(roadmap)*.
 - `appc`, `feature/conn25`, `types/appctype` — app connectors (classic and conn25) *(roadmap)*.
 - `drive`, `feature/drive` — Taildrive.
 - `ipn/ipnserver`, `cmd/tailscaled`, `cmd/tailscale` — the daemon and its CLI. This is an embedded
@@ -2002,8 +2004,8 @@ rows were ported in the interval.
   - already §A rows, assessed there and not repeated: `DisableHostsFileUpdates` (132),
     `ForceRegisterMagicDNSIPv4Only` (133, the one open §A row), `EmitRuntimeMetrics` (139), the four
     GRO/GSO knobs (140), `NeverGSOEqualTail` (141), `ScopeQuad100OnMacOS` (145).
-  - no subsystem to switch: `DisableUPnP` and `ProbeUDPLifetime` (no portmapper, no UDP-lifetime
-    probing — *roadmap*), `PeerMTUEnable` (no path-MTU discovery on this datapath),
+  - no subsystem to switch: `DisableUPnP` and `ProbeUDPLifetime` (no UPnP in the port mapper,
+    which speaks NAT-PMP and PCP only, and no UDP-lifetime probing — *roadmap*), `PeerMTUEnable` (no path-MTU discovery on this datapath),
     `LinuxForceIPTables` / `LinuxForceNfTables` (`ts_host_net` installs no firewall rules),
     `AppCStoreRoutes` (no app connector — *roadmap*), `DisableCaptivePortalDetection` (no
     captive-portal detection), `DisableSplitDNSWhenNoCustomResolvers` (an iOS battery optimisation
@@ -2030,7 +2032,7 @@ rows were ported in the interval.
   socket-binding caps, and the debug caps `debug-no-wg-trim` (no lazy WireGuard config here) and
   `debug-disable-subnets-if-pac` (no WPAD detection).
 
-- **`NetInfo` is reported with four of the twelve facets Go fills**
+- **`NetInfo` is reported with seven of the twelve facets Go fills**
   (`wgengine/magicsock/magicsock.go`: `updateNetInfo`) — **not applicable**, on grounds this fork has
   already settled elsewhere. (The thirteenth field this tree models is `HairPinning`, and that one is
   a row of its own above.) Go builds a whole `tailcfg.NetInfo`
@@ -2038,12 +2040,14 @@ rows were ported in the interval.
   `DERPLatency` map keyed `"<rid>-v4"`/`"-v6"`, `WorkingIPv6`, `OSHasIPv6`, `WorkingUDP`,
   `WorkingICMPv4`, `PreferredDERP` and `FirewallMode`, and hands it to a callback that ships it on the
   next map request — de-duplicated by `BasicallyEqual`, so an unchanged report is not re-uploaded.
-  `ts_control::tokio::client`'s `CarriedNetInfo` carries four of those — `preferred_derp`,
-  `derp_latency`, `working_udp`, `mapping_varies_by_dest_ip` — and applies the whole of it to every
-  map request, which is Go's `hi.NetInfo = c.netinfo.Clone()` invariant and is already tested here.
-  The eight it does not carry each have an answer already recorded in the *no counterpart here* list
-  or in this fork's design: `UPnP`, `PMP`, `PCP` and `HavePortMap` need `net/portmapper`, which is
-  roadmap; `FirewallMode` describes an iptables-vs-nftables choice `ts_host_net` never makes because
+  `ts_control::tokio::client`'s `CarriedNetInfo` models eight of those — `preferred_derp`,
+  `derp_latency`, `working_udp`, `mapping_varies_by_dest_ip`, and from the port mapper `UPnP`,
+  `PMP`, `PCP` and `HavePortMap` — and applies the whole of it to every map request, which is Go's
+  `hi.NetInfo = c.netinfo.Clone()` invariant and is already tested here. `UPnP` is never set (so
+  seven are reported): it is never probed, so it is never claimed false. `HavePortMap` here means an *advertised* mapping, so
+  control never sees it without a port-mapped endpoint (see
+  [`docs/PORTMAPPER.md`](docs/PORTMAPPER.md)). The four it does not carry each have an answer
+  already recorded in the *no counterpart here* list or in this fork's design: `FirewallMode` describes an iptables-vs-nftables choice `ts_host_net` never makes because
   it installs no firewall rules (the same reason capability version 136 is not applicable);
   `WorkingIPv6` and `OSHasIPv6` come from a netcheck that probes v6, and this fork's `ts_netcheck` is
   HTTPS-over-IPv4 only by deliberate anti-leak design — the note at the top of

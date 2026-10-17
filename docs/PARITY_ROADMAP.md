@@ -140,8 +140,8 @@ refused, `control_runner.rs:1430`).
 | M19 | No WireGuard persistent keepalive anywhere. A grep for `PersistentKeepalive` over the whole Go tree finds 0 hits, and `wgengine/wgcfg/nmcfg` does not exist | A 25 s keepalive is on by default for every peer (`ts_control/src/config.rs:102-114`, `:837`) | product-decision | The idle-wedge fix. A deliberate divergence that the code comment called Go parity. Bead `tsr-0hd2` (blocked). |
 | M25 | Static endpoints from config (`magicsock.go:1002`, `:1407`) and cloud-metadata public IPs (`magicsock.go:1373`) | Not found. A grep for `static_endpoints\|GetPublicIPs\|cloud_info` finds nothing | product-decision | A metadata query is an extra egress. |
 
-Still open from earlier docs and beads: the portmapper (`tsr-x4yg`, nothing under
-`portmap\|upnp\|nat_pmp\|pcp_`), the netmon OS backends (`tsr-7wrn`, `tsr-cnlh`; only
+Still open from earlier docs and beads: the portmapper's UPnP-IGD half (`tsr-x4yg`; NAT-PMP and
+PCP are in `ts_portmapper`), the netmon OS backends (`tsr-7wrn`, `tsr-cnlh`; only
 `ManualLinkMonitor` and `NoopLinkMonitor` exist, `ts_netmon/src/lib.rs:260`, `:297`), a full netcheck
 report (`tsr-dsjq`; `ts_netcheck/src` holds only `derp_latency.rs` and `https.rs`), the NoPath demand
 ping (`tsr-qc3o`, `sock.rs:2832-2836`), `disable-relay-client` (`tsr-re0d2b5d`), Mullvad and
@@ -296,7 +296,7 @@ except two: #616 replaced #600 by taking the fix from smoltcp 0.14.0, and #604 c
 | `tsr-7wrn` | P2 | bug | open | tsr-doz6 slice b: Linux netlink LinkMonitor backend |
 | `tsr-cnlh` | P2 | bug | open | tsr-doz6 slice c: macOS PF_ROUTE LinkMonitor backend |
 | `tsr-re0d2b5d` | P2 | bug | open | Honour disable-relay-client instead of opening relay paths control switched off |
-| `tsr-x4yg` | P2 | bug | open | magicsock: no portmapper (UPnP-IGD/NAT-PMP/PCP), direct paths behind mapping-NATs stay on DERP (EPIC) |
+| `tsr-x4yg` | P2 | bug | open | magicsock portmapper (EPIC): NAT-PMP and PCP done (`ts_portmapper`, `ts_runtime::portmap`); UPnP-IGD (phase 2) open, so UPnP-only routers stay on DERP |
 | `tsr-0h2` | P3 | feature | open | Daemon ask: SSH check-mode (HoldAndDelegate) round-trip |
 | `tsr-1rs` | P3 | task | open | harden flaky udp_forwarder_splices test (real-UDP round-trip on loaded CI) |
 | `tsr-3l78` | P3 | bug | open | magic-dns: DoH/DoT/HttpWireguard upstream resolvers parsed-then-dropped, encrypted-upstream split-DNS silently ignored |
@@ -460,7 +460,8 @@ Most recent wave:
   `tka_disable`, `src/lib.rs:1347-1403`). Still missing: add and remove keys, local disable, recovery
   AUMs, affected-sigs and wrap-preauth-key (2026-10-14 row C8), and the node's own `NodeKeySignature`
   on register (rows C1 to C3).
-- **UPnP / PCP / NAT-PMP portmapper** — gateway port-mapping for better direct connectivity.
+- **UPnP-IGD port mapping** — NAT-PMP and PCP are done ([`ts_portmapper`](../ts_portmapper/src/lib.rs));
+  UPnP-IGD (SSDP discovery, SOAP mapping) is phase 2.
 - **App connector** — `4via6`-style application connectors.
 - **`4via6`** subnet-route encoding.
 - ~~**Serve get/set_serve_config + accept-loop runtime**~~: shipped. `Device::set_serve_config`

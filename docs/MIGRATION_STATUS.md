@@ -30,7 +30,7 @@ Verdict legend: **PRESENT** = works, no material gap · **PARTIAL** = works with
 | Subsystem | Verdict | Notes | Open beads |
 |---|---|---|---|
 | Control protocol (register/auth, map-poll, Noise/TS2021, zstd, capver) | **PARTIAL** | + auto-reauth on key expiry, NeedsMachineAuth-transient, zstd map responses, Container/Env hostinfo — all shipped this cycle. Complete on an unlocked tailnet. On a locked tailnet the node never sends its own `NodeKeySignature` (2026-10-14 rows C1 to C3), and several MapResponse and PingRequest fields are parsed but not acted on (rows C9 to C14) | parity polish: `tsr-84mh`, `tsr-cbw4`, `tsr-ajyc`. Rows C1 to C3 and C9 to C14 have no bead |
-| MagicSock / disco / direct paths | **PARTIAL** | STUN/DERP/CallMeMaybe/ping-pong/best-addr work; peer-relay receiving side present (disco 0x04–0x09 codecs, bind handshake, Geneve data path for a relay a peer allocated); the relay **client** side that discovers relay servers and allocates one is absent (2026-10-14 row M18); **portmapper absent**, relay **serving** absent | `tsr-x4yg` (portmapper), `tsr-a9x4` (peer relays), `tsr-dsjq` (full netcheck), `tsr-7s3` (ping cadence), `tsr-qc3o` (NoPath demand-ping), `tsr-51o6` (flaky test) |
+| MagicSock / disco / direct paths | **PARTIAL** | STUN/DERP/CallMeMaybe/ping-pong/best-addr work; peer-relay receiving side present (disco 0x04–0x09 codecs, bind handshake, Geneve data path for a relay a peer allocated); the relay **client** side that discovers relay servers and allocates one is absent (2026-10-14 row M18); **portmapper: NAT-PMP and PCP present** (`ts_portmapper` + `ts_runtime::portmap`; UPnP-IGD absent), relay **serving** absent | `tsr-x4yg` (portmapper; UPnP is phase 2), `tsr-a9x4` (peer relays), `tsr-dsjq` (full netcheck), `tsr-7s3` (ping cadence), `tsr-qc3o` (NoPath demand-ping), `tsr-51o6` (flaky test) |
 | WireGuard tunnel | **PARTIAL** | initiator path complete (handshake/session/rekey/replay/cookie-consume); responder cookie issuance missing | `tsr-rl3n` (responder cookie + IsUnderLoad), `tsr-qn2` (MTU-aware padding) |
 | Netstack (userspace TCP/IP + TUN) | **PARTIAL** | TCP/UDP both modes; needs egress backpressure + icmp-echo | `tsr-fqus` (ingress bounded since #587 at 4096 packets and 4096×MTU bytes, `ts_runtime/src/netstack_actor.rs:49-64`; egress still unbounded, `ts_runtime/src/dataplane.rs:115`, `:141`), `tsr-rsu` (auto-icmp-echo), `tsr-4pp` (per-session sharding) |
 | MagicDNS | **PARTIAL** | responder + plain-UDP upstream + recursive (TUN) work; encrypted upstream dropped | `tsr-3l78` (DoH/DoT upstream), `tsr-i2w` (exit-node DoH authoritative-vs-forward) |
@@ -139,7 +139,7 @@ merged or closed.
 
 **P2 (next-highest leverage):**
 - `tsr-doz6` netmon (in-progress: slice a shipped; `tsr-7wrn` Linux + `tsr-cnlh` macOS backends remain)
-- `tsr-x4yg` portmapper (UPnP-IGD/NAT-PMP/PCP) — EPIC; direct paths behind mapping-NATs stay on DERP
+- `tsr-x4yg` portmapper — EPIC. NAT-PMP and PCP landed (phases 0–1: lifecycle client, runtime driver, `PortMapped` endpoint, NetInfo `PMP`/`PCP`/`HavePortMap`); UPnP-IGD (phase 2) is still open, so a router with UPnP only stays on DERP
 - `tsr-0xn` Serve Go-wire-compatibility (closed by `50611ab`)
 - `tsr-fqus` netstack backpressure (ingress half closed by #587; egress still unbounded)
 - `tsr-7s3` magicsock ping cadence / path-selection parity (in-progress)
