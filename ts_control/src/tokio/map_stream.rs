@@ -10,7 +10,10 @@ use ts_packetfilter as pf;
 use ts_packetfilter_state as pf_state;
 use url::Url;
 
-use super::{map_watchdog::MAP_RESPONSE_TIMEOUT as MAP_READ_WATCHDOG, netmap_cache::NetmapCache};
+use super::{
+    map_watchdog::{FramePart, MAP_RESPONSE_TIMEOUT as MAP_READ_WATCHDOG, MapPollWatchdog},
+    netmap_cache::NetmapCache,
+};
 use crate::{DialPlan, NodeId};
 
 #[derive(Debug, thiserror::Error, Clone, Copy, Eq, PartialEq)]
@@ -239,7 +242,7 @@ const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 ///
 /// Returns `None` on a malformed or oversized zstd frame, or one declaring a window above
 /// [`MAX_ZSTD_WINDOW`], which the caller turns into "end the stream
-/// and reconnect" — the same recovery as every other frame-read failure in [`map_stream`].
+/// and reconnect" — the same recovery as every other frame-read failure in [`map_stream_with_watchdog`].
 fn decompress_frame(frame: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     use std::io::Read as _;
 
@@ -282,6 +285,14 @@ fn decompress_frame(frame: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     Some(decoded)
 }
 
+#[cfg(test)]
+pub fn map_stream(
+    reader: impl AsyncRead + Unpin,
+    cache: Option<NetmapCache>,
+) -> impl Stream<Item = StateUpdate> {
+    map_stream_inner(reader, cache, None)
+}
+
 /// The live netmap poll: decode each length-prefixed frame off `reader` into a [`StateUpdate`].
 ///
 /// When `cache` is `Some`, every decoded frame is also offered to [`NetmapCache::observe`], which
@@ -289,88 +300,154 @@ fn decompress_frame(frame: &[u8]) -> Option<alloc::vec::Vec<u8>> {
 /// previously persisted one, or do nothing. `None` disables persistence entirely (no storage
 /// configured), which is what Go does when the node has no writable state directory, and makes the
 /// stream byte-for-byte the pre-cache one.
-pub fn map_stream(
+pub(super) fn map_stream_with_watchdog(
     reader: impl AsyncRead + Unpin,
     cache: Option<NetmapCache>,
+    watchdog: &MapPollWatchdog,
 ) -> impl Stream<Item = StateUpdate> {
-    futures_util::stream::unfold((reader, cache), async |(mut reader, cache)| {
-        // One deadline for the complete response: a late prefix must not extend the body wait.
-        let deadline = tokio::time::Instant::now() + MAP_READ_WATCHDOG;
-        // Watchdog the length read: this is where the stream idles between frames, so a silently
-        // dead long poll blocks here. A timeout ends the stream (returns `None`) → reconnect.
-        let msg_len = match tokio::time::timeout_at(deadline, reader.read_u32_le()).await {
-            Ok(res) => res
-                .inspect_err(|e| {
-                    tracing::error!(error = %e, "could not read netmap length");
-                })
-                .ok()?,
-            Err(_elapsed) => {
-                tracing::warn!(
-                    watchdog_secs = MAP_READ_WATCHDOG.as_secs(),
-                    "no netmap frame within the keep-alive watchdog; ending stream to reconnect"
+    map_stream_inner(reader, cache, Some(watchdog))
+}
+
+// Observe each successful read, including bytes buffered by an incomplete read_exact.
+// Never inspect or retain the bytes in the watchdog itself.
+async fn read_exact_observed(
+    reader: &mut (impl AsyncRead + Unpin),
+    mut buf: &mut [u8],
+    watchdog: Option<&MapPollWatchdog>,
+) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        let count = reader.read(buf).await?;
+        if count == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        if let Some(watchdog) = watchdog {
+            watchdog.frame_bytes_received(count);
+        }
+        buf = &mut buf[count..];
+    }
+    Ok(())
+}
+
+fn map_stream_inner(
+    reader: impl AsyncRead + Unpin,
+    cache: Option<NetmapCache>,
+    watchdog: Option<&MapPollWatchdog>,
+) -> impl Stream<Item = StateUpdate> {
+    futures_util::stream::unfold(
+        (reader, cache, watchdog),
+        async |(mut reader, cache, watchdog)| {
+            // One deadline for the complete response: a late prefix must not extend the body wait.
+            let deadline = tokio::time::Instant::now() + MAP_READ_WATCHDOG;
+            // Watchdog the length read: this is where the stream idles between frames, so a silently
+            // dead long poll blocks here. A timeout ends the stream (returns `None`) → reconnect.
+            if let Some(watchdog) = watchdog {
+                watchdog.reading_frame_part(FramePart::Prefix, 4);
+            }
+            let mut prefix = [0; 4];
+            match tokio::time::timeout_at(
+                deadline,
+                read_exact_observed(&mut reader, &mut prefix, watchdog),
+            )
+            .await
+            {
+                Ok(res) => res
+                    .inspect_err(|e| {
+                        tracing::error!(error = %e, "could not read netmap length");
+                    })
+                    .ok()?,
+                Err(_elapsed) => {
+                    if let Some(watchdog) = watchdog {
+                        watchdog.log_timeout();
+                    } else {
+                        tracing::warn!(
+                            watchdog_secs = MAP_READ_WATCHDOG.as_secs(),
+                            "no netmap frame within the keep-alive watchdog; ending stream to reconnect"
+                        );
+                    }
+                    return None;
+                }
+            };
+
+            let msg_len = u32::from_le_bytes(prefix);
+
+            // Bound the frame before allocating: a `u32` length of `0xFFFF_FFFF` would otherwise force a
+            // ~4 GiB zeroed allocation (OOM). End the stream on an over-large frame rather than abort.
+            if msg_len > MAX_NETMAP_FRAME {
+                tracing::error!(
+                    ?msg_len,
+                    max = MAX_NETMAP_FRAME,
+                    "netmap frame too large; ending stream"
                 );
                 return None;
             }
-        };
 
-        // Bound the frame before allocating: a `u32` length of `0xFFFF_FFFF` would otherwise force a
-        // ~4 GiB zeroed allocation (OOM). End the stream on an over-large frame rather than abort.
-        if msg_len > MAX_NETMAP_FRAME {
-            tracing::error!(
-                ?msg_len,
-                max = MAX_NETMAP_FRAME,
-                "netmap frame too large; ending stream"
-            );
-            return None;
-        }
+            let mut buf = PacketMut::new(msg_len as usize);
+            tracing::trace!(?msg_len, "reading netmap");
 
-        let mut buf = PacketMut::new(msg_len as usize);
-        tracing::trace!(?msg_len, "reading netmap");
-
-        // Watchdog the body read too: once the length is in, the body should follow promptly. A
-        // stall here (announced length, body never delivered) is the same dead-connection signal.
-        match tokio::time::timeout_at(deadline, reader.read_exact(buf.as_mut())).await {
-            Ok(res) => res
-                .inspect_err(|e| {
-                    tracing::error!(error = %e, "could not read netmap");
-                })
-                .ok()?,
-            Err(_elapsed) => {
-                tracing::warn!(
-                    watchdog_secs = MAP_READ_WATCHDOG.as_secs(),
-                    "netmap body did not arrive within the watchdog; ending stream to reconnect"
-                );
-                return None;
+            // Watchdog the body read too: once the length is in, the body should follow promptly. A
+            // stall here (announced length, body never delivered) is the same dead-connection signal.
+            if let Some(watchdog) = watchdog {
+                watchdog.reading_frame_part(FramePart::Body, msg_len as usize);
             }
-        };
+            match tokio::time::timeout_at(
+                deadline,
+                read_exact_observed(&mut reader, buf.as_mut(), watchdog),
+            )
+            .await
+            {
+                Ok(res) => res
+                    .inspect_err(|e| {
+                        tracing::error!(error = %e, "could not read netmap");
+                    })
+                    .ok()?,
+                Err(_elapsed) => {
+                    if let Some(watchdog) = watchdog {
+                        watchdog.log_timeout();
+                    } else {
+                        tracing::warn!(
+                            watchdog_secs = MAP_READ_WATCHDOG.as_secs(),
+                            "netmap body did not arrive within the watchdog; ending stream to reconnect"
+                        );
+                    }
+                    return None;
+                }
+            };
 
-        // We advertise `Compress = "zstd"` on every map request, so control frames each `MapResponse`
-        // as an independent zstd frame (Go `control/controlclient/direct.go` does the same and
-        // unconditionally `zstdframe.AppendDecode`s the reply). Decompress before deserializing,
-        // bounding the decompressed size against a zstd bomb. A frame that is NOT zstd-framed (a
-        // control plane that ignored our `Compress` request and replied uncompressed) is parsed
-        // as-is — graceful degradation, never a silent stall, at no wire-fingerprint cost (the
-        // request is byte-identical to Go's either way). A malformed/oversized zstd frame ends the
-        // stream (`None`) so the caller reconnects, mirroring the other frame-read failure paths.
-        let decoded = decompress_frame(buf.as_ref())?;
+            if let Some(watchdog) = watchdog {
+                watchdog.processing_frame();
+            }
 
-        let update = state_update_from_frame(&decoded)?;
+            // We advertise `Compress = "zstd"` on every map request, so control frames each `MapResponse`
+            // as an independent zstd frame (Go `control/controlclient/direct.go` does the same and
+            // unconditionally `zstdframe.AppendDecode`s the reply). Decompress before deserializing,
+            // bounding the decompressed size against a zstd bomb. A frame that is NOT zstd-framed (a
+            // control plane that ignored our `Compress` request and replied uncompressed) is parsed
+            // as-is — graceful degradation, never a silent stall, at no wire-fingerprint cost (the
+            // request is byte-identical to Go's either way). A malformed/oversized zstd frame ends the
+            // stream (`None`) so the caller reconnects, mirroring the other frame-read failure paths.
+            let decoded = decompress_frame(buf.as_ref())?;
 
-        // Offer the frame to the netmap cache before yielding it. The cache reads the self node's
-        // attributes out of this very frame, so an attribute that was just granted takes effect on
-        // the frame that granted it and one that was just removed drops the cache on the frame that
-        // removed it — Go applies the same test on every netmap it installs.
-        if let Some(cache) = cache.as_ref() {
-            cache.observe(&update, &decoded).await;
-        }
+            let update = state_update_from_frame(&decoded)?;
+            if let Some(watchdog) = watchdog {
+                watchdog.frame_received();
+            }
 
-        Some((update, (reader, cache)))
-    })
+            // Offer the frame to the netmap cache before yielding it. The cache reads the self node's
+            // attributes out of this very frame, so an attribute that was just granted takes effect on
+            // the frame that granted it and one that was just removed drops the cache on the frame that
+            // removed it — Go applies the same test on every netmap it installs.
+            if let Some(cache) = cache.as_ref() {
+                cache.observe(&update, &decoded).await;
+            }
+
+            Some((update, (reader, cache, watchdog)))
+        },
+    )
 }
 
 /// Decode one decompressed map-poll frame (the raw `MapResponse` JSON) into a [`StateUpdate`].
 ///
-/// The single netmap decode in the crate: the live map poll ([`map_stream`]) feeds it every frame
+/// The single netmap decode in the crate: the live map poll ([`map_stream_with_watchdog`]) feeds it every frame
 /// it reads off the wire, and the cold-start netmap cache ([`NetmapCache::load_state_update`])
 /// feeds it the frame it persisted, so a replayed netmap is built by exactly the code that built
 /// it when it arrived. `None` on a frame that is not decodable as a `MapResponse`, which the live
