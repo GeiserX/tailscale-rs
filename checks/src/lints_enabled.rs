@@ -35,6 +35,8 @@ pub fn run(_args: &Args) -> BoxResult<()> {
             // nightly-only dev tooling excluded from the normal build/test graph. Skip it here
             // rather than force a redundant `[workspace.lints]` into the fuzz manifest.
             "!ts_tka/fuzz",
+            // Same for the port mapper's parser fuzz crate.
+            "!ts_portmapper/fuzz",
         ],
     )
     .build()?;

@@ -5,6 +5,9 @@ site/
 ts_tka/fuzz/target/
 ts_tka/fuzz/corpus/
 ts_tka/fuzz/artifacts/
+ts_portmapper/fuzz/target/
+ts_portmapper/fuzz/corpus/
+ts_portmapper/fuzz/artifacts/
 # produced by cargo-bisect-rustc
 target-bisector-*/
 .idea/
