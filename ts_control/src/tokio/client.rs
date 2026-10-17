@@ -15,8 +15,8 @@ use crate::{
     ControlDialer, Error,
     map_request_builder::MapRequestBuilder,
     tokio::{
-        map_stream::{StateUpdate, map_stream, send_map_request},
-        map_watchdog::MapPollWatchdog,
+        map_stream::{StateUpdate, map_stream_with_watchdog, send_map_request},
+        map_watchdog::{MapPollWatchdog, PollPhase},
         netmap_cache::NetmapCache,
         ping::handle_ping,
     },
@@ -721,6 +721,7 @@ async fn run_once(
     auth_url_tx: &watch::Sender<Option<Url>>,
     watchdog: &MapPollWatchdog,
 ) -> Result<(), Error> {
+    watchdog.set_phase(PollPhase::Connect);
     let h2_client = control_dialer
         .full_connect_next(
             control_url,
@@ -733,6 +734,7 @@ async fn run_once(
     // `MachineNotAuthorized(Some(url))`: surface that URL to the embedder (→ "needs login") via
     // `surface_reauth_url`, then still propagate the error so `run` backs off and retries — Go's
     // `authRoutine` keeps the URL and keeps polling, and a later successful re-register recovers.
+    watchdog.set_phase(PollPhase::Register);
     match crate::tokio::register(config, control_url, auth_key, None, node_keys, &h2_client).await {
         Ok(()) => {
             // Re-register succeeded — clear any pending re-auth URL NOW (not at stream end), so a
@@ -786,6 +788,7 @@ async fn run_once(
 
     let map_url = control_url.join("machine/map").unwrap();
 
+    watchdog.set_phase(PollPhase::MapResponseHeaders);
     let reader = send_map_request(request, &map_url, &h2_client).await?;
 
     // The netmap cache is maintained from inside the stream, on the raw frame bytes, because that
@@ -793,7 +796,7 @@ async fn run_once(
     // message. `None` when the embedder configured no cache directory, which makes the stream
     // byte-for-byte the pre-cache one.
     let cache = config.netmap_cache_dir.as_ref().map(NetmapCache::new);
-    let mut stream = core::pin::pin!(map_stream(reader, cache));
+    let mut stream = core::pin::pin!(map_stream_with_watchdog(reader, cache, watchdog));
     tracing::info!("netmap stream started");
 
     // Publish this node's Hostinfo: control ignores it on the streaming request above, so without
@@ -814,13 +817,16 @@ async fn run_once(
     }
     let startup_request = builder.build();
     let mut hostinfo_update = core::pin::pin!(async {
+        watchdog.startup_request_started();
         if let Err(e) = send_map_request(startup_request, &map_url, &h2_client).await {
             tracing::warn!(error = %e, "initial hostinfo update failed");
         }
+        watchdog.startup_request_finished();
     });
     let mut hostinfo_sent = false;
 
     loop {
+        watchdog.resume_stream();
         tokio::select! {
             () = &mut hostinfo_update, if !hostinfo_sent => hostinfo_sent = true,
 
@@ -854,7 +860,9 @@ async fn run_once(
                 // message instead of cold-restarting.
                 advance_session(session, &state_update);
 
+                watchdog.set_phase(PollPhase::C2nPing);
                 let _ = handle_ping(&state_update, control_url, &h2_client, config).await;
+                watchdog.set_phase(PollPhase::ProcessingResponse);
 
                 if let Some(dial_plan) = &state_update.dial_plan
                     && control_dialer.update_dial_plan(dial_plan)
@@ -887,6 +895,7 @@ async fn run_once(
                         }
                         let req = builder.build();
 
+                        watchdog.set_phase(PollPhase::SetDerpHomeRegion);
                         drop(send_map_request(req, &map_url, &h2_client).await?);
                     },
                     Command::SetEndpoints { endpoints } => {
@@ -909,6 +918,7 @@ async fn run_once(
                         }
                         let req = builder.build();
 
+                        watchdog.set_phase(PollPhase::SetEndpoints);
                         drop(send_map_request(req, &map_url, &h2_client).await?);
                     },
                     Command::SetRoutableIPs { routes } => {
@@ -930,6 +940,7 @@ async fn run_once(
                         }
                         let req = builder.build();
 
+                        watchdog.set_phase(PollPhase::SetRoutableIps);
                         drop(send_map_request(req, &map_url, &h2_client).await?);
                     },
                     Command::SetHostname { hostname } => {
@@ -946,6 +957,7 @@ async fn run_once(
                         // Re-attach the carried NetInfo (same not-dropping-it reasoning as routes).
                         let req = net_info.apply(builder).build();
 
+                        watchdog.set_phase(PollPhase::SetHostname);
                         drop(send_map_request(req, &map_url, &h2_client).await?);
                     },
                     Command::Reauth => {
@@ -1580,6 +1592,7 @@ mod tests {
 
 #[cfg(test)]
 mod watchdog_reconnect_tests {
+    use crate::tokio::map_stream::map_stream;
     use core::sync::atomic::{AtomicBool, Ordering};
 
     use tokio::{io::AsyncWriteExt, time::Instant};
