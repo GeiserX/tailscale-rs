@@ -969,6 +969,12 @@ mod msg_impl {
 
     #[kameo::messages]
     impl ControlRunner {
+        /// Whether the current map poll has received a response and is still live.
+        #[message]
+        pub fn control_connected(&self) -> bool {
+            self.client.is_connected()
+        }
+
         /// Fetch the IPv4 address for this tailscale device.
         #[message(ctx)]
         pub fn ipv4(

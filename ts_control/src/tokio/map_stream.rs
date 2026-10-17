@@ -10,7 +10,7 @@ use ts_packetfilter as pf;
 use ts_packetfilter_state as pf_state;
 use url::Url;
 
-use super::netmap_cache::NetmapCache;
+use super::{map_watchdog::MAP_RESPONSE_TIMEOUT as MAP_READ_WATCHDOG, netmap_cache::NetmapCache};
 use crate::{DialPlan, NodeId};
 
 #[derive(Debug, thiserror::Error, Clone, Copy, Eq, PartialEq)]
@@ -218,15 +218,6 @@ const MAX_DECODED_NETMAP: u64 = 64 * 1024 * 1024;
 /// the window is not allocated up front, so [`MAX_DECODED_NETMAP`] stays the allocation bound.
 const MAX_ZSTD_WINDOW: u64 = 1 << 29;
 
-/// Long-poll read watchdog: if no frame (not even a keep-alive) arrives within this window, end the
-/// stream so the caller reconnects. Control sends a keep-alive roughly every minute on a streaming
-/// map poll, so silence past this bound means the connection is dead-but-not-closed (a half-open
-/// socket after NAT/firewall state eviction, a silently-dropping middlebox, or a control server
-/// that hung without sending FIN/RST). Without it, `read_u32_le`/`read_exact` await forever and the
-/// node silently stops receiving netmap updates (missed peer/DERP/key-expiry/ACL/TKA changes) with
-/// no reconnect ever attempted. Mirrors Go `controlclient` `direct.go`'s `watchdogTimeout = 120s`.
-const MAP_READ_WATCHDOG: core::time::Duration = core::time::Duration::from_secs(120);
-
 /// The 4-byte zstd frame magic (`0xFD2FB528`, little-endian on the wire). Used to distinguish a
 /// `Compress = "zstd"` framed response from an uncompressed one, so a control plane that ignored the
 /// `Compress` request (and replied in plain JSON) still decodes instead of wedging the poll.
@@ -303,16 +294,18 @@ pub fn map_stream(
     cache: Option<NetmapCache>,
 ) -> impl Stream<Item = StateUpdate> {
     futures_util::stream::unfold((reader, cache), async |(mut reader, cache)| {
+        // One deadline for the complete response: a late prefix must not extend the body wait.
+        let deadline = tokio::time::Instant::now() + MAP_READ_WATCHDOG;
         // Watchdog the length read: this is where the stream idles between frames, so a silently
         // dead long poll blocks here. A timeout ends the stream (returns `None`) → reconnect.
-        let msg_len = match tokio::time::timeout(MAP_READ_WATCHDOG, reader.read_u32_le()).await {
+        let msg_len = match tokio::time::timeout_at(deadline, reader.read_u32_le()).await {
             Ok(res) => res
                 .inspect_err(|e| {
                     tracing::error!(error = %e, "could not read netmap length");
                 })
                 .ok()?,
             Err(_elapsed) => {
-                tracing::error!(
+                tracing::warn!(
                     watchdog_secs = MAP_READ_WATCHDOG.as_secs(),
                     "no netmap frame within the keep-alive watchdog; ending stream to reconnect"
                 );
@@ -336,14 +329,14 @@ pub fn map_stream(
 
         // Watchdog the body read too: once the length is in, the body should follow promptly. A
         // stall here (announced length, body never delivered) is the same dead-connection signal.
-        match tokio::time::timeout(MAP_READ_WATCHDOG, reader.read_exact(buf.as_mut())).await {
+        match tokio::time::timeout_at(deadline, reader.read_exact(buf.as_mut())).await {
             Ok(res) => res
                 .inspect_err(|e| {
                     tracing::error!(error = %e, "could not read netmap");
                 })
                 .ok()?,
             Err(_elapsed) => {
-                tracing::error!(
+                tracing::warn!(
                     watchdog_secs = MAP_READ_WATCHDOG.as_secs(),
                     "netmap body did not arrive within the watchdog; ending stream to reconnect"
                 );
@@ -695,6 +688,31 @@ mod tests {
             stream.next().await.is_none(),
             "watchdog must end the stream when the body never completes"
         );
+    }
+
+    // Receiving only a length is not a MapResponse and must not buy another 120s.
+    #[tokio::test(start_paused = true)]
+    async fn map_stream_watchdog_uses_one_deadline_for_length_and_body() {
+        use tokio::io::AsyncWriteExt;
+        let (reader, mut writer) = tokio::io::duplex(64);
+        let _writer = tokio::spawn(async move {
+            tokio::time::sleep(core::time::Duration::from_secs(119)).await;
+            writer.write_all(&64u32.to_le_bytes()).await.unwrap();
+            core::future::pending::<()>().await;
+        });
+        let mut stream = core::pin::pin!(map_stream(reader, None));
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            MAP_READ_WATCHDOG + core::time::Duration::from_secs(1),
+            stream.next(),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "partial frame extended the watchdog past 120s"
+        );
+        assert!(result.unwrap().is_none());
+        assert_eq!(started.elapsed(), MAP_READ_WATCHDOG);
     }
 
     #[tokio::test]

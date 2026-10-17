@@ -65,7 +65,7 @@ pub(crate) type InvalidPacketFilterTx = watch::Sender<bool>;
 
 /// The health warnings [`Status::health`](crate::Status::health) reports, given whether the
 /// invalid-packet-filter warning is raised. Go's `ipnstate.Status.Health` is the text of every
-/// unhealthy warnable; this fork has exactly one.
+/// unhealthy warnable; this helper supplies the packet-filter warning.
 pub(crate) fn health_warnings(invalid_packet_filter: bool) -> Vec<String> {
     if invalid_packet_filter {
         vec![INVALID_PACKET_FILTER_WARNING.to_string()]

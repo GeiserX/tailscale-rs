@@ -52,9 +52,8 @@ pub struct Status {
     /// netmap, or when the self FQDN has no tailnet component (a bare hostname).
     pub magic_dns_suffix: Option<String>,
     /// The text of every health warning currently raised (Go `ipnstate.Status.Health`). Empty when
-    /// healthy. Today the one warning this runtime raises is Go's `invalid-packet-filter`: control
-    /// sent a packet filter granting an unlocked (tailnet-lock-unsigned) peer access, so this node is
-    /// rejecting all inbound packets.
+    /// healthy. Includes a disconnected control map poll and Go's `invalid-packet-filter`
+    /// warning for a filter granting an unlocked peer access.
     pub health: Vec<String>,
 }
 
@@ -388,6 +387,15 @@ pub(crate) fn build_file_targets(peers: Vec<Node>, self_user_id: UserId) -> Vec<
         name(a).cmp(&name(b))
     });
     targets
+}
+
+/// Report control liveness alongside the independently retained packet-filter warning.
+pub(crate) fn health_warnings(invalid_packet_filter: bool, control_connected: bool) -> Vec<String> {
+    let mut warnings = crate::packetfilter::health_warnings(invalid_packet_filter);
+    if !control_connected {
+        warnings.push("Disconnected from coordination server; retrying map poll".to_string());
+    }
+    warnings
 }
 
 #[cfg(test)]
@@ -859,5 +867,23 @@ mod tests {
         assert_eq!(report, NetcheckReport::default());
         assert_eq!(report.preferred_derp, None);
         assert!(report.region_latencies.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod control_health_tests {
+    use super::health_warnings;
+
+    #[test]
+    fn disconnected_control_warns_without_hiding_a_rejected_filter() {
+        assert!(health_warnings(false, true).is_empty());
+        let disconnected = health_warnings(false, false);
+        assert_eq!(disconnected.len(), 1);
+        assert!(disconnected[0].contains("Disconnected from coordination server"));
+        let both = health_warnings(true, false);
+        assert_eq!(both.len(), 2);
+        assert_eq!(both[0], crate::packetfilter::INVALID_PACKET_FILTER_WARNING);
+        assert_eq!(both[1], disconnected[0]);
+        assert_eq!(health_warnings(true, true), vec![both[0].clone()]);
     }
 }

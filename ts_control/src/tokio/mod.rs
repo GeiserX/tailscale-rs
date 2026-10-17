@@ -25,6 +25,7 @@ mod connect;
 mod id_token;
 mod logout;
 mod map_stream;
+mod map_watchdog;
 mod netmap_cache;
 mod ping;
 mod prefixed_reader;
