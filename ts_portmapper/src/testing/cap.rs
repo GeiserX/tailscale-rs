@@ -18,7 +18,7 @@ use crate::{
     Gateway, PXP_PORT,
     cap::{
         BindMode, CapError, ExchangeStats, Flow, LanDest, PolicyHandle, ProbeListener,
-        PxpTransport, SendGate, exchange_on, sealed,
+        PxpTransport, SendEvidence, SendGate, exchange_on, sealed,
     },
 };
 
@@ -33,6 +33,7 @@ pub struct TestCap {
     aliases: Vec<(SocketAddr, SocketAddrV4)>,
     gate: SendGate,
     inject_send_error: Mutex<Option<i32>>,
+    inject_bind_error: Mutex<Option<i32>>,
     panic_next: std::sync::atomic::AtomicBool,
 }
 
@@ -90,6 +91,7 @@ impl TestCap {
             gateway,
             gate: SendGate::new(policy, None),
             inject_send_error: Mutex::new(None),
+            inject_bind_error: Mutex::new(None),
             panic_next: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -104,6 +106,14 @@ impl TestCap {
     pub fn inject_send_error(&self, raw_os_error: Option<i32>) {
         *self
             .inject_send_error
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = raw_os_error;
+    }
+
+    /// Fail socket setup before any send attempt, without touching a real interface.
+    pub fn inject_bind_error(&self, raw_os_error: Option<i32>) {
+        *self
+            .inject_bind_error
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = raw_os_error;
     }
@@ -143,16 +153,23 @@ impl PxpTransport for TestCap {
         BindMode::LoopbackTest
     }
 
-    async fn exchange(
+    async fn exchange_with_evidence(
         &self,
         dest: LanDest,
         reqs: &[&[u8]],
         deadline: Instant,
         on_reply: &mut (dyn FnMut(&[u8]) -> Flow + Send),
+        evidence: Option<&SendEvidence>,
     ) -> Result<ExchangeStats, CapError> {
         let LanDest::Pxp = dest;
         self.gate.check()?;
-        self.injected()?;
+        if let Some(code) = *self
+            .inject_bind_error
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+        {
+            return Err(CapError::io("bind", &io::Error::from_raw_os_error(code)));
+        }
         assert!(
             !self
                 .panic_next
@@ -162,10 +179,20 @@ impl PxpTransport for TestCap {
         let sock = tokio::net::UdpSocket::bind((self.bind_ip, 0))
             .await
             .map_err(|e| CapError::io("bind", &e))?;
+        if let Err(err) = self.injected() {
+            // Simulate an OS failure of the first send, after setup and the final permit.
+            self.gate.send(|| {
+                if let Some(evidence) = evidence {
+                    evidence.enter(0);
+                }
+                Ok(0)
+            })?;
+            return Err(err);
+        }
         let expected = SocketAddrV4::new(self.gateway.gw, PXP_PORT);
         let present = |src| self.present(src);
         exchange_on(
-            &sock, &self.gate, self.to, expected, &present, reqs, deadline, on_reply,
+            &sock, &self.gate, self.to, expected, &present, reqs, deadline, on_reply, evidence,
         )
         .await
     }
@@ -173,6 +200,13 @@ impl PxpTransport for TestCap {
     fn send_nowait(&self, dest: LanDest, req: &[u8]) -> Result<(), CapError> {
         let LanDest::Pxp = dest;
         self.gate.check()?;
+        if let Some(code) = *self
+            .inject_bind_error
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+        {
+            return Err(CapError::io("bind", &io::Error::from_raw_os_error(code)));
+        }
         self.injected()?;
         let s =
             std::net::UdpSocket::bind((self.bind_ip, 0)).map_err(|e| CapError::io("bind", &e))?;

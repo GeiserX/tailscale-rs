@@ -36,48 +36,63 @@ async fn run_on<R: Send + 'static>(
 
 #[cfg(test)]
 mod tests {
+    use crate::test_time::{FrozenTime, finish_at_deadline};
+    use std::{
+        sync::Arc,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+
     #[tokio::test]
     async fn os_wait_is_bounded_when_worker_keeps_running() {
-        let result = super::run(|| {
-            std::thread::sleep(std::time::Duration::from_millis(1500));
+        // A private pool and an explicit gate avoid a sleeping detached worker consuming a
+        // production-pool slot after this test has returned.
+        static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let _frozen = FrozenTime::new();
+        let (entered, received) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let job = tokio::spawn(super::run_on(&SLOTS, move || {
+            let _ = entered.send(());
+            let _ = wait.recv();
             42
-        })
-        .await;
+        }));
+        received.await.unwrap();
+        assert_eq!(SLOTS.available_permits(), 0);
+        tokio::time::advance(Duration::from_millis(1001)).await;
         assert_eq!(
-            result, None,
+            job.await.unwrap(),
+            None,
             "a slow OS call must not hold its async waiter indefinitely"
         );
+        assert_eq!(
+            SLOTS.available_permits(),
+            0,
+            "timed-out OS work keeps its slot"
+        );
+        drop(release); // also unblocks the worker if an assertion unwinds
+        while SLOTS.available_permits() != 1 {
+            tokio::task::yield_now().await;
+        }
     }
-}
-
-#[cfg(test)]
-mod worker_tests {
-    static TEST_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
     #[tokio::test]
     async fn cancelled_workers_keep_slots_and_recover() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::{Arc, Condvar, Mutex};
-        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+        let _frozen = FrozenTime::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let finished = Arc::new(AtomicUsize::new(0));
+        let mut releases = Vec::new();
         let mut jobs = Vec::new();
         for _ in 0..4 {
-            let gate = gate.clone();
             let tx = tx.clone();
-            let finished = finished.clone();
-            jobs.push(tokio::spawn(super::run_on(&TEST_SLOTS, move || {
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            releases.push(release);
+            jobs.push(tokio::spawn(super::run_on(&SLOTS, move || {
                 tx.send(()).unwrap();
-                let ready = gate.0.lock().unwrap();
-                drop(gate.1.wait_while(ready, |open| !*open).unwrap());
-                finished.fetch_add(1, Ordering::SeqCst);
+                let _ = wait.recv();
             })));
         }
         for _ in 0..4 {
-            tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
+            rx.recv().await.unwrap();
         }
         for job in &jobs {
             job.abort();
@@ -87,21 +102,24 @@ mod worker_tests {
         }
         let fifth_started = Arc::new(AtomicUsize::new(0));
         let count = fifth_started.clone();
-        let blocked =
-            super::run_on(&TEST_SLOTS, move || count.fetch_add(1, Ordering::SeqCst)).await;
-        *gate.0.lock().unwrap() = true;
-        gate.1.notify_all();
+        let blocked = finish_at_deadline(
+            super::run_on(&SLOTS, move || count.fetch_add(1, Ordering::SeqCst)),
+            Duration::from_secs(1),
+        )
+        .await;
         assert!(blocked.is_none());
         assert_eq!(
             fifth_started.load(Ordering::SeqCst),
             0,
             "aborted waiters must not release running OS slots"
         );
-        while finished.load(Ordering::SeqCst) != 4 {
+        drop(releases);
+        // Observe permit return itself, rather than a flag set just before its destructor.
+        while SLOTS.available_permits() != 4 {
             tokio::task::yield_now().await;
         }
         assert_eq!(
-            super::run_on(&TEST_SLOTS, || 42).await,
+            super::run_on(&SLOTS, || 42).await,
             Some(42),
             "completion must return slots without a lost wakeup"
         );

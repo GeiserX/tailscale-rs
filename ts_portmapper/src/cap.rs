@@ -30,7 +30,7 @@ use std::{
     net::{SocketAddr, SocketAddrV4},
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -263,6 +263,56 @@ pub struct ExchangeStats {
     pub recv_error: Option<CapError>,
 }
 
+/// Per-MAP evidence shared with the lifecycle reservation, including after cancellation.
+/// Constructed internally; only the sealed transports can record a syscall attempt. The
+/// NAT-PMP public-address request does not count as a MAP. Socket/route/permit failures do not
+/// record evidence. Once recorded, evidence is never cleared, even when the syscall fails.
+#[derive(Debug)]
+pub struct SendEvidence {
+    map_index: usize,
+    logical_origin: Instant,
+    runtime_origin: Instant,
+    attempted_ns: AtomicU64,
+}
+
+impl SendEvidence {
+    pub(crate) fn new(map_index: usize, now: Instant) -> Self {
+        Self {
+            map_index,
+            logical_origin: now,
+            runtime_origin: Instant::now(),
+            attempted_ns: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn enter(&self, index: usize) {
+        if index == self.map_index {
+            let elapsed = Instant::now().saturating_duration_since(self.runtime_origin);
+            // Zero means never attempted. Retrying a WouldBlock must advance the possible
+            // grant from the latest attempt, even when an earlier attempt already marked it.
+            let ns = elapsed.as_nanos().min(u128::from(u64::MAX - 1)) as u64;
+            self.attempted_ns.fetch_max(ns + 1, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn possible_until(&self) -> Option<Instant> {
+        let ns = self.attempted_ns.load(Ordering::SeqCst).checked_sub(1)?;
+        let elapsed = Duration::from_nanos(ns);
+        let logical = self
+            .logical_origin
+            .checked_add(elapsed)
+            .unwrap_or(self.logical_origin);
+        let runtime = self
+            .runtime_origin
+            .checked_add(elapsed)
+            .unwrap_or(self.runtime_origin);
+        Some(crate::oneshot::lease_deadline(
+            logical.max(runtime),
+            u32::MAX,
+        ))
+    }
+}
+
 /// The checks every send passes first.
 pub(crate) struct SendGate {
     policy: PolicyHandle,
@@ -355,8 +405,9 @@ pub(crate) async fn exchange_on(
     reqs: &[&[u8]],
     deadline: Instant,
     on_reply: &mut (dyn FnMut(&[u8]) -> Flow + Send),
+    evidence: Option<&SendEvidence>,
 ) -> Result<ExchangeStats, CapError> {
-    for req in reqs {
+    for (index, req) in reqs.iter().enumerate() {
         loop {
             gate.check()?;
             tokio::time::timeout_at(deadline, sock.writable())
@@ -368,6 +419,9 @@ pub(crate) async fn exchange_on(
             let sent = gate.send(|| {
                 if Instant::now() >= deadline {
                     return Err(io::ErrorKind::TimedOut.into());
+                }
+                if let Some(evidence) = evidence {
+                    evidence.enter(index);
                 }
                 sock.try_send_to(req, to)
             });
@@ -479,6 +533,19 @@ pub trait PxpTransport: sealed::Sealed + Send + Sync {
         reqs: &[&[u8]],
         deadline: Instant,
         on_reply: &mut (dyn FnMut(&[u8]) -> Flow + Send),
+    ) -> impl Future<Output = Result<ExchangeStats, CapError>> + Send {
+        self.exchange_with_evidence(dest, reqs, deadline, on_reply, None)
+    }
+
+    /// The exchange implementation, optionally recording the MAP syscall boundary. Evidence
+    /// is operation-scoped and must be recorded after all gates, immediately before the syscall.
+    fn exchange_with_evidence(
+        &self,
+        dest: LanDest,
+        reqs: &[&[u8]],
+        deadline: Instant,
+        on_reply: &mut (dyn FnMut(&[u8]) -> Flow + Send),
+        evidence: Option<&SendEvidence>,
     ) -> impl Future<Output = Result<ExchangeStats, CapError>> + Send;
 
     /// One unacknowledged, non-blocking send (best-effort release from `Drop`; no runtime
@@ -786,12 +853,13 @@ impl PxpTransport for GatewayCap {
         self.bind_mode
     }
 
-    async fn exchange(
+    async fn exchange_with_evidence(
         &self,
         dest: LanDest,
         reqs: &[&[u8]],
         deadline: Instant,
         on_reply: &mut (dyn FnMut(&[u8]) -> Flow + Send),
+        evidence: Option<&SendEvidence>,
     ) -> Result<ExchangeStats, CapError> {
         // Refuse before creating a socket at all.
         self.gate.check()?;
@@ -806,7 +874,7 @@ impl PxpTransport for GatewayCap {
                 .map(|ip| SocketAddrV4::new(ip, a.port())),
         };
         exchange_on(
-            &sock, &self.gate, to, expected, &present, reqs, deadline, on_reply,
+            &sock, &self.gate, to, expected, &present, reqs, deadline, on_reply, evidence,
         )
         .await
     }
@@ -1229,6 +1297,7 @@ pub(crate) mod send_tests {
             let entered = Arc::new(tokio::sync::Notify::new());
             let open = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
             let (hit, barrier) = (entered.clone(), open.clone());
+            let evidence = SendEvidence::new(0, Instant::now());
             let policy = PolicyHandle::new(true);
             let gate = SendGate::new(
                 policy.clone(),
@@ -1261,6 +1330,7 @@ pub(crate) mod send_tests {
                 &reqs,
                 Instant::now() + Duration::from_secs(2),
                 &mut on_reply,
+                Some(&evidence),
             ));
             tokio::select! {
                 _ = entered.notified() => {},
@@ -1274,11 +1344,77 @@ pub(crate) mod send_tests {
             *open.0.lock().unwrap() = true;
             open.1.notify_one();
             assert!(matches!(exchange.await, Err(CapError::Denied(_))));
+            assert!(
+                evidence.possible_until().is_none(),
+                "route denial is not send evidence"
+            );
             assert_eq!(
                 recv.recv(&mut [0u8; 32]).unwrap_err().kind(),
                 io::ErrorKind::WouldBlock
             );
         }
+    }
+
+    #[tokio::test]
+    async fn map_syscall_error_still_records_possible_ownership() {
+        let _frozen = crate::test_time::FrozenTime::new();
+        let sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let gate = SendGate::new(PolicyHandle::new(true), None);
+        let evidence = SendEvidence::new(0, Instant::now());
+        // A native IPv6 destination on an IPv4 socket fails in the syscall; no LAN traffic.
+        let to = SocketAddr::V6(std::net::SocketAddrV6::new(
+            std::net::Ipv6Addr::LOCALHOST,
+            9,
+            0,
+            0,
+        ));
+        let expected = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9);
+        let present = |a| match a {
+            SocketAddr::V4(a) => Some(a),
+            _ => None,
+        };
+        let mut ignore = |_: &[u8]| Flow::Continue;
+        let result = exchange_on(
+            &sock,
+            &gate,
+            to,
+            expected,
+            &present,
+            &[b"map"],
+            Instant::now() + Duration::from_secs(1),
+            &mut ignore,
+            Some(&evidence),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(CapError::Io { op: "send", .. })),
+            "{result:?}"
+        );
+        assert!(
+            evidence.possible_until().is_some(),
+            "syscall errors cannot prove absence"
+        );
+        let first = evidence.possible_until().unwrap();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let retry = exchange_on(
+            &sock,
+            &gate,
+            to,
+            expected,
+            &present,
+            &[b"map"],
+            Instant::now() + Duration::from_secs(1),
+            &mut ignore,
+            Some(&evidence),
+        )
+        .await;
+        assert!(matches!(retry, Err(CapError::Io { op: "send", .. })));
+        assert!(
+            evidence.possible_until().unwrap() >= first + Duration::from_secs(2),
+            "latest attempt must advance the possible grant"
+        );
     }
 
     type Hook = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
@@ -1337,6 +1473,7 @@ pub(crate) mod send_tests {
         let send = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
+        let evidence = SendEvidence::new(0, Instant::now());
         let policy = PolicyHandle::new(true);
         let gate = SendGate::new(policy.clone(), None);
         let expected = match dest {
@@ -1359,6 +1496,7 @@ pub(crate) mod send_tests {
             &requests,
             Instant::now() + Duration::from_millis(20),
             &mut on_reply,
+            Some(&evidence),
         ));
         poll_fn(|cx| {
             assert!(exchange.as_mut().poll(cx).is_pending());
@@ -1377,6 +1515,10 @@ pub(crate) mod send_tests {
             gate.invalidate();
         }
         drop(exchange.await);
+        assert!(
+            evidence.possible_until().is_none(),
+            "no MAP syscall crossed the fence"
+        );
         assert_eq!(
             recv.recv(&mut buf).unwrap_err().kind(),
             io::ErrorKind::WouldBlock,
@@ -1412,6 +1554,10 @@ pub(crate) mod send_tests {
         });
     }
     pub(crate) struct ClearHook;
+    pub(crate) fn set_send_hook(hook: impl FnMut() + 'static) -> ClearHook {
+        BEFORE_SEND.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        ClearHook
+    }
     impl Drop for ClearHook {
         fn drop(&mut self) {
             BEFORE_SEND.with(|hook| drop(hook.borrow_mut().take()));
@@ -1427,6 +1573,7 @@ pub(crate) mod send_tests {
             .await
             .unwrap();
         send.writable().await.unwrap();
+        let evidence = SendEvidence::new(usize::from(between), Instant::now());
         let policy = PolicyHandle::new(true);
         let gate = Arc::new(SendGate::new(policy.clone(), None));
         let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1479,6 +1626,7 @@ pub(crate) mod send_tests {
             reqs,
             Instant::now() + Duration::from_millis(20),
             &mut on_reply,
+            Some(&evidence),
         )
         .await;
         assert!(
@@ -1492,6 +1640,10 @@ pub(crate) mod send_tests {
             "must receive zero datagrams after the fence returns"
         );
         assert!(matches!(result, Err(CapError::Denied(_))));
+        assert!(
+            evidence.possible_until().is_none(),
+            "a PMP address request is not MAP evidence"
+        );
     }
 
     #[tokio::test]

@@ -12,6 +12,7 @@
 
 mod cap;
 mod clock;
+mod lifecycle;
 mod router;
 #[cfg(test)]
 mod tests;
@@ -20,6 +21,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 
 pub use cap::TestCap;
 pub use clock::LeaseClock;
+pub use lifecycle::{ManualClock, PanicLookup, ScriptedLookup, TestCaps};
 pub use router::{
     AssignPort, Barrier, Corruption, Counters, DecodedRequest, EpochMode, FakeRouter, MappingEntry,
     RequestKind, ResultOverride, RouterEndpoint, RouterOptions,
@@ -45,4 +47,13 @@ pub async fn send_datagrams(
         s.send_to(&payload, to).await?;
     }
     s.local_addr()
+}
+
+/// Read-only cleanup diagnostics for integration tests; no ledger mutation is exposed.
+#[derive(Debug, Clone, Copy)]
+pub struct CleanupSnapshot {
+    /// Unacknowledged delete attempts.
+    pub delete_tries: u32,
+    /// Whether an operation currently reserves this entry for deletion.
+    pub deleting: bool,
 }

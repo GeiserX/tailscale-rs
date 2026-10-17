@@ -19,17 +19,25 @@
 //!   `/proc/net/route`, `Unsupported` elsewhere).
 //! - [`pmp`] and [`pcp`]: pure, strictly validating codecs.
 //! - [`oneshot`]: single-attempt probe, map and delete.
+//! - [`client`]: the lifecycle client (create, renew, expire, release) with generation-guarded
+//!   transitions; [`schedule`] and `owned` are its pure scheduling and owned-rule ledger.
 //! - [`probe_tool`]: the `--portmap-probe` diagnostic used to validate a deployment.
 //! - `testing` (feature `test-harness`): a fake NAT-PMP/PCP router and `TestCap`, a loopback
 //!   transport that production code cannot construct.
 
 mod blocking;
 mod cap;
+pub mod client;
+pub mod clock;
 pub mod gateway;
 pub mod oneshot;
+mod owned;
 pub mod pcp;
 pub mod pmp;
 pub mod probe_tool;
+pub mod schedule;
+#[cfg(test)]
+mod test_time;
 #[cfg(any(test, feature = "test-harness"))]
 pub mod testing;
 
@@ -47,8 +55,14 @@ pub const TEST_HARNESS_ENABLED: bool = cfg!(feature = "test-harness");
 
 pub use cap::{
     BindMode, CapError, DenyReason, EXCHANGE_TIMEOUT, ExchangeStats, Flow, GatewayCap, LanDest,
-    MAX_EXAMINED, NetGen, PolicyHandle, ProbeListener, PxpTransport, RECV_BUF, errno_name,
+    MAX_EXAMINED, NetGen, PolicyHandle, ProbeListener, PxpTransport, RECV_BUF, SendEvidence,
+    errno_name,
 };
+pub use client::{
+    CapFactory, Client, Config, DisableReason, NetCheck, PortMapper, PortmapEndpoint, PortmapState,
+    ProbeFacets, ScheduleSnapshot, SystemCaps,
+};
+pub use clock::{Clock, SystemClock};
 pub use gateway::{Gateway, GatewayLookup, LookupError};
 
 /// The UDP port NAT-PMP and PCP servers listen on (RFC 6886 §3, RFC 6887 §19.1).
@@ -114,3 +128,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod ownership_model;

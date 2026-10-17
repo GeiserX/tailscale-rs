@@ -435,10 +435,32 @@ pub async fn map<T: PxpTransport>(
     lifetime: NonZeroU32,
     prev: Option<&Mapping>,
 ) -> Result<Mapping, MapError> {
+    map_inner(t, rule, lifetime, prev, None).await
+}
+
+pub(crate) async fn map_with_evidence<T: PxpTransport>(
+    t: &T,
+    rule: &Rule,
+    lifetime: NonZeroU32,
+    prev: Option<&Mapping>,
+    evidence: &crate::SendEvidence,
+) -> Result<Mapping, MapError> {
+    map_inner(t, rule, lifetime, prev, Some(evidence)).await
+}
+
+async fn map_inner<T: PxpTransport>(
+    t: &T,
+    rule: &Rule,
+    lifetime: NonZeroU32,
+    prev: Option<&Mapping>,
+    evidence: Option<&crate::SendEvidence>,
+) -> Result<Mapping, MapError> {
     let prev = prev.filter(|p| p.rule() == *rule);
     match rule {
-        Rule::Pmp { internal } => map_pmp(t, *internal, lifetime, prev).await,
-        Rule::Pcp { internal, nonce } => map_pcp(t, *internal, lifetime, prev, nonce.clone()).await,
+        Rule::Pmp { internal } => map_pmp(t, *internal, lifetime, prev, evidence).await,
+        Rule::Pcp { internal, nonce } => {
+            map_pcp(t, *internal, lifetime, prev, nonce.clone(), evidence).await
+        }
     }
 }
 
@@ -447,6 +469,7 @@ async fn map_pmp<T: PxpTransport>(
     internal: NonZeroU16,
     lifetime: NonZeroU32,
     prev: Option<&Mapping>,
+    evidence: Option<&crate::SendEvidence>,
 ) -> Result<Mapping, MapError> {
     let suggested = prev.map_or(0, |p| p.external.port());
     let addr_req = pmp::public_address_request();
@@ -497,7 +520,7 @@ async fn map_pmp<T: PxpTransport>(
         }
     };
     let stats = t
-        .exchange(LanDest::Pxp, &reqs, deadline(), &mut on_reply)
+        .exchange_with_evidence(LanDest::Pxp, &reqs, deadline(), &mut on_reply, evidence)
         .await?;
     if let Some(f) = map_refused {
         return Err(f);
@@ -531,6 +554,7 @@ async fn map_pcp<T: PxpTransport>(
     lifetime: NonZeroU32,
     prev: Option<&Mapping>,
     nonce: pcp::Nonce,
+    evidence: Option<&crate::SendEvidence>,
 ) -> Result<Mapping, MapError> {
     let suggested = prev.map_or(0, |p| p.external.port());
     let req = pcp::map_request(t.gateway().self_ip, internal, suggested, lifetime, &nonce);
@@ -552,7 +576,7 @@ async fn map_pcp<T: PxpTransport>(
         }
     };
     let stats = t
-        .exchange(LanDest::Pxp, &[&req], deadline(), &mut on_reply)
+        .exchange_with_evidence(LanDest::Pxp, &[&req], deadline(), &mut on_reply, evidence)
         .await?;
     finish_notes(&stats, &mut notes);
     match outcome {
