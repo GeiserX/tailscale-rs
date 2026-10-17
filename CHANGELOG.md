@@ -13,6 +13,18 @@ Record breaking or significant changes here. All dates are UTC.
 
 * **exit node:** forwarded TCP flows run without Nagle, the underlay UDP sockets ask for Go's 7 MiB buffers, netstack egress goes out in batches of up to 64 packets, and the netstack tracks 32 receive holes for uploads. Kernel receive batching, splice coalescing, targeted replay and Apple connected UDP sockets are opt-in experiments, off unless their variable is `1`.
 
+## [0.57.8](https://github.com/GeiserX/tailscale-rs/compare/v0.57.7...v0.57.8) (2026-10-17)
+
+
+### Bug Fixes
+
+* **control:** report stalled map-poll phase and progress ([988028a](https://github.com/GeiserX/tailscale-rs/commit/988028af71aff017eea94e00cf4e07f8b8f4f1ce))
+* **control:** report which map-poll phase stalled ([#636](https://github.com/GeiserX/tailscale-rs/issues/636)) ([988028a](https://github.com/GeiserX/tailscale-rs/commit/988028af71aff017eea94e00cf4e07f8b8f4f1ce))
+* **control:** watchdog the whole map poll and report disconnections ([69713c9](https://github.com/GeiserX/tailscale-rs/commit/69713c9012cb1031e221afee64dccaabf816c70e))
+* **control:** watchdog the whole map poll and report disconnections ([#634](https://github.com/GeiserX/tailscale-rs/issues/634)) ([69713c9](https://github.com/GeiserX/tailscale-rs/commit/69713c9012cb1031e221afee64dccaabf816c70e))
+* **magicsock:** keep the receive pump running after a receive error ([33439f2](https://github.com/GeiserX/tailscale-rs/commit/33439f2b9e41636aa857b3453968c04ca4a03883))
+* **magicsock:** keep the receive pump running after a receive error ([#637](https://github.com/GeiserX/tailscale-rs/issues/637)) ([33439f2](https://github.com/GeiserX/tailscale-rs/commit/33439f2b9e41636aa857b3453968c04ca4a03883))
+
 ## [0.57.7](https://github.com/GeiserX/tailscale-rs/compare/v0.57.6...v0.57.7) (2026-10-15)
 
 
