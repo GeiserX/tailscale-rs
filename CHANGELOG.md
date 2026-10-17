@@ -6,7 +6,7 @@ Record breaking or significant changes here. All dates are UTC.
 
 ### Bug Fixes
 
-* **control:** restart a map poll after 120 seconds without a response, including stalled setup and side requests; report a health warning until responses resume.
+* **control:** restart a map poll after 120 seconds without a response, including stalled setup and side requests; name the stalled phase and report progress in timeout warnings, and report a health warning until responses resume.
 * **magicsock:** keep the direct receive pump running after a receive error, backing off while errors repeat; one `EHOSTUNREACH` or failed disco pong send no longer leaves every peer on DERP until restart.
 
 ### Performance
