@@ -12,6 +12,7 @@ mod no_std_deps;
 mod no_std_honest;
 mod parity_audit;
 mod porting_ledger;
+mod portmapper_lan_only;
 mod restock_beads;
 mod ssh_isolation;
 
@@ -38,6 +39,7 @@ pub const CHECK_FNS: &[(&str, CheckFn)] = &[
     ("no_std_deps", no_std_deps::run),
     ("funnel_fail_closed", funnel_fail_closed::run),
     ("ssh_isolation", ssh_isolation::run),
+    ("portmapper_lan_only", portmapper_lan_only::run),
     ("porting_ledger", porting_ledger::run),
     ("parity_audit", parity_audit::run),
     ("restock_beads", restock_beads::run),
