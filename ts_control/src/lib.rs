@@ -36,6 +36,7 @@ mod expiry;
 mod hostinfo;
 #[cfg_attr(not(feature = "async_tokio"), expect(dead_code))]
 mod map_request_builder;
+mod net_facets;
 mod node;
 #[cfg(feature = "async_tokio")]
 mod serve;
@@ -60,7 +61,7 @@ pub use cert::{
 #[doc(inline)]
 pub use config::{
     Config, DEFAULT_CONTROL_SERVER, DEFAULT_PERSISTENT_KEEPALIVE, ExitProxyConfig, ExitProxyScheme,
-    LocalApi, TransportMode, TunConfig, exit_node_routes, services_hash,
+    LocalApi, PortMapperOptions, TransportMode, TunConfig, exit_node_routes, services_hash,
 };
 pub use control_dialer::{ControlDialer, TcpDialer, complete_connection};
 pub use derp::{Map as DerpMap, Region as DerpRegion, convert_derp_map};
@@ -71,6 +72,7 @@ pub use expiry::{
     FLAG_EXPIRED_PEERS_EPOCH_UNIX, FlaggedPeer, MIN_CLOCK_DELTA_SECS, PEER_KEY_EXPIRED,
     flag_expired_peers_epoch,
 };
+pub use net_facets::{PortMapFacets, StunFacts};
 pub use node::{
     ExitNodeSelector, Id as NodeId, Node, NodeCapMap, PeerChange, StableId as StableNodeId,
     TailnetAddress, UserProfile, is_tailscale_ip, validate_service_name,

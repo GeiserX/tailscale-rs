@@ -241,6 +241,13 @@ async fn make_ts_device() -> Result<Device, Error> {
     // runtime (read in `Device::new`); a global `.cargo/config.toml [env]` was rejected because
     // it would defeat the deliberate `TS_RS_EXPERIMENT` opt-in for ordinary builds.
     unsafe { std::env::set_var("TS_RS_EXPERIMENT", "this_is_unstable_software") };
+    // SAFETY: as above. Tests never touch the LAN gateway: the port mapper stays off (also set in
+    // the config below; the env knob covers every device this process builds).
+    unsafe { std::env::set_var("TS_DISABLE_PORTMAPPER", "1") };
 
-    Device::new(&Config::default(), Some(ts_test_util::auth_key().unwrap())).await
+    let config = Config {
+        disable_port_mapper: true,
+        ..Config::default()
+    };
+    Device::new(&config, Some(ts_test_util::auth_key().unwrap())).await
 }

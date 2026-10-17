@@ -147,6 +147,13 @@ pub struct ForwarderConfig {
     /// spawned (byte-for-byte today's behavior). Fixed for the life of the runtime.
     pub network_monitor: bool,
 
+    /// The NAT port mapper's settings, or `None` when it is off (config `disable_port_mapper`,
+    /// `TS_DISABLE_PORTMAPPER`, or a build without the `portmapper` feature): then no client,
+    /// driver or socket exists and the NetInfo facets stay unset.
+    ///
+    /// Shared test configurations set this to `None`, so no test touches the real network.
+    pub port_mapper: Option<PortMapperSettings>,
+
     /// The WireGuard persistent-keepalive interval applied to every peer, or `None` to disable.
     ///
     /// See [`Config::persistent_keepalive_interval`](ts_control::Config::persistent_keepalive_interval).
@@ -188,9 +195,59 @@ impl ForwarderConfig {
             enable_ipv6: config.enable_ipv6,
             wireguard_listen_port: config.wireguard_listen_port,
             network_monitor: config.network_monitor,
+            port_mapper: (!config.disable_port_mapper).then(|| PortMapperSettings {
+                options: config.port_mapper.clone(),
+                #[cfg(feature = "portmapper")]
+                factory: None,
+            }),
             persistent_keepalive_interval: config.persistent_keepalive_interval,
             ingress_active: config.ingress_active.clone(),
         }
+    }
+
+    /// Apply the environment knobs read once at runtime construction (Go caches its `envknob`
+    /// values the same way): `TS_DISABLE_PORTMAPPER` turns the port mapper off like the config
+    /// option. `getenv` is injected so tests do not touch the process environment.
+    ///
+    /// Values parse like Go's `strconv.ParseBool`. An unparsable value is taken as "disabled" (Go
+    /// refuses to start on one; the zero-I/O reading is the safe one) and logged.
+    pub fn apply_env_knobs(&mut self, getenv: impl Fn(&str) -> Option<String>) {
+        let Some(v) = getenv("TS_DISABLE_PORTMAPPER") else {
+            return;
+        };
+        let disable = match v.as_str() {
+            "1" | "t" | "T" | "TRUE" | "true" | "True" => true,
+            "0" | "f" | "F" | "FALSE" | "false" | "False" | "" => false,
+            other => {
+                tracing::warn!(
+                    value = other,
+                    "TS_DISABLE_PORTMAPPER is not a boolean; disabling the port mapper"
+                );
+                true
+            }
+        };
+        if disable && self.port_mapper.is_some() {
+            tracing::info!("port mapper disabled by TS_DISABLE_PORTMAPPER");
+            self.port_mapper = None;
+        }
+    }
+}
+
+/// The port mapper's runtime settings (see [`ForwarderConfig::port_mapper`]).
+#[derive(Clone)]
+pub struct PortMapperSettings {
+    /// The options from the config.
+    pub options: ts_control::PortMapperOptions,
+    /// Builds the client instead of the production one (tests inject a harness-backed client).
+    #[cfg(feature = "portmapper")]
+    pub factory: Option<crate::portmap::MapperFactory>,
+}
+
+impl core::fmt::Debug for PortMapperSettings {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PortMapperSettings")
+            .field("options", &self.options)
+            .finish_non_exhaustive()
     }
 }
 
@@ -329,6 +386,10 @@ pub struct Env {
     /// spawn the supervisor; not consulted again at runtime.
     pub network_monitor: bool,
 
+    /// The NAT port mapper's settings, or `None` when it is off. See
+    /// [`ForwarderConfig::port_mapper`]. Read once by the direct manager at startup.
+    pub port_mapper: Option<PortMapperSettings>,
+
     /// The WireGuard persistent-keepalive interval applied to every peer, or `None` to disable.
     ///
     /// See [`ForwarderConfig::persistent_keepalive_interval`]. Read by the dataplane actor when it
@@ -454,6 +515,7 @@ impl Env {
             enable_ipv6,
             wireguard_listen_port,
             network_monitor,
+            port_mapper,
             persistent_keepalive_interval,
             ingress_active,
         } = forwarding;
@@ -497,6 +559,7 @@ impl Env {
             enable_ipv6,
             wireguard_listen_port,
             network_monitor,
+            port_mapper,
             persistent_keepalive_interval,
             ingress_active,
             funnel_ingress: Arc::new(std::sync::Mutex::new(None)),
@@ -578,6 +641,7 @@ mod tests {
             enable_ipv6: false,
             wireguard_listen_port: None,
             network_monitor: false,
+            port_mapper: None,
             persistent_keepalive_interval: None,
             ingress_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }

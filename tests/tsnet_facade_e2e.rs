@@ -41,6 +41,9 @@ fn gated() -> Option<String> {
     // SAFETY: set before this test spawns any worker thread that reads the env; the var is the
     // runtime gate for the experimental build (read in `Device::new`).
     unsafe { std::env::set_var("TS_RS_EXPERIMENT", "this_is_unstable_software") };
+    // SAFETY: as above. Tests never touch the LAN gateway: the facade has no config field for it,
+    // so the port mapper is turned off with Go's env knob for every device this process builds.
+    unsafe { std::env::set_var("TS_DISABLE_PORTMAPPER", "1") };
     match ts_test_util::auth_key() {
         Some(k) => Some(k),
         None => {

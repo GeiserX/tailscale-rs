@@ -2130,6 +2130,7 @@ pub(crate) mod tka_tests {
                 enable_ipv6: false,
                 wireguard_listen_port: None,
                 network_monitor: false,
+                port_mapper: None,
                 persistent_keepalive_interval: None,
                 ingress_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },

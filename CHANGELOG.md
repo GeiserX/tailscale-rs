@@ -7,6 +7,7 @@ Record breaking or significant changes here. All dates are UTC.
 ### Features
 
 * **portmapper:** add `ts_portmapper`, a NAT-PMP and PCP client modelled on Go's `net/portmapper`, which only ever sends to the LAN gateway's port 5351.
+* **runtime:** map the underlay UDP port on the LAN gateway with NAT-PMP or PCP and advertise the mapping to peers, as Go does; `Config::disable_port_mapper` or `TS_DISABLE_PORTMAPPER` turns it off.
 
 ### Performance
 

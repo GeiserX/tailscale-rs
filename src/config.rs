@@ -8,6 +8,9 @@ use ts_keys::PersistState;
 
 use crate::keys::NodeState;
 
+/// The port mapper's options (see [`Config::port_mapper`]).
+pub use ts_control::PortMapperOptions;
+
 const CONTROL_URL_VAR: &str = "TS_CONTROL_URL";
 const HOSTNAME_VAR: &str = "TS_HOSTNAME";
 const AUTHKEY_VAR: &str = "TS_AUTH_KEY";
@@ -271,6 +274,20 @@ pub struct Config {
     /// Governs **only** the bound port — never the bind family: the IPv4-only-by-default,
     /// fail-closed underlay posture (`enable_ipv6` alone widens the family) is unchanged.
     pub wireguard_listen_port: Option<u16>,
+
+    /// Turn the NAT port mapper off (Go `magicsock.Options.DisablePortMapper`). Defaults to
+    /// `false`: like Go, the node asks the LAN gateway for an inbound UDP mapping with NAT-PMP or
+    /// PCP, so peers behind a hard NAT can reach it directly. With `true` (or
+    /// `TS_DISABLE_PORTMAPPER` set in the environment) no client, driver or socket exists and no
+    /// port-mapping NetInfo is sent. Builds without the `portmapper` feature never map.
+    ///
+    /// A port-mapped endpoint exposes the host's public address to tailnet peers, as STUN
+    /// endpoints do; a proxy-egress (`exit_proxy`) deployment may want it off.
+    pub disable_port_mapper: bool,
+
+    /// The port mapper's options: a validated gateway override, whether to advertise a non-public
+    /// external address (default yes, Go), and whether to renew while idle (default no, Go).
+    pub port_mapper: PortMapperOptions,
 
     /// How this node's **application** overlay data path is realized.
     ///
@@ -690,6 +707,8 @@ impl From<&Config> for ts_control::Config {
             enable_ipv6: value.enable_ipv6,
             network_monitor: value.network_monitor,
             wireguard_listen_port: value.wireguard_listen_port,
+            disable_port_mapper: value.disable_port_mapper,
+            port_mapper: value.port_mapper.clone(),
             transport_mode: value.transport_mode.clone(),
             wire_ingress: value.wire_ingress,
             // A fresh runtime-local flag (default `false`): the runtime flips it when
@@ -740,6 +759,8 @@ impl Default for Config {
             enable_ipv6: false,
             network_monitor: false,
             wireguard_listen_port: None,
+            disable_port_mapper: false,
+            port_mapper: ts_control::PortMapperOptions::default(),
             transport_mode: ts_control::TransportMode::default(),
             wire_ingress: false,
             advertise_services: vec![],
@@ -788,6 +809,12 @@ mod tests {
             enable_ipv6: true,
             network_monitor: true,
             wireguard_listen_port: Some(41641),
+            disable_port_mapper: true,
+            port_mapper: ts_control::PortMapperOptions {
+                gateway_override: Some(("192.168.1.1".parse().unwrap(), None)),
+                advertise_nonpublic_external: false,
+                renew_while_idle: true,
+            },
             wire_ingress: true,
             transport_mode: ts_control::TransportMode::Tun(ts_control::TunConfig {
                 name: Some("tailscale0".to_owned()),
@@ -849,6 +876,10 @@ mod tests {
             Some(41641),
             "wireguard_listen_port crosses the boundary"
         );
+        assert!(control.disable_port_mapper, "disable_port_mapper crosses");
+        assert!(control.port_mapper.renew_while_idle);
+        assert!(!control.port_mapper.advertise_nonpublic_external);
+        assert!(control.port_mapper.gateway_override.is_some());
         assert!(control.wire_ingress);
         assert_eq!(control.advertise_services, vec!["svc:samba".to_owned()]);
         assert_eq!(
@@ -955,6 +986,20 @@ mod tests {
     /// The WireGuard listen port defaults to `None` (OS-chosen ephemeral, today's behavior) and
     /// crosses the control boundary unchanged. A daemon that wants Go's `--port 41641` sets it
     /// explicitly; the engine never pins a port by default.
+    /// The library default is Go's: the port mapper is on, advertises everything and renews
+    /// lazily.
+    #[test]
+    fn port_mapper_defaults_are_go_like() {
+        let cfg = Config::default();
+        assert!(!cfg.disable_port_mapper);
+        assert!(cfg.port_mapper.advertise_nonpublic_external);
+        assert!(!cfg.port_mapper.renew_while_idle);
+        assert!(cfg.port_mapper.gateway_override.is_none());
+        let control: ts_control::Config = (&cfg).into();
+        assert!(!control.disable_port_mapper);
+        assert_eq!(control.port_mapper, cfg.port_mapper);
+    }
+
     #[test]
     fn from_config_default_wireguard_listen_port_is_none() {
         let cfg = Config::default();

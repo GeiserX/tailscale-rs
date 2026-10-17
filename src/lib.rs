@@ -195,8 +195,8 @@ pub use ts_runtime::taildrop::WaitingFile;
 #[doc(inline)]
 pub use ts_runtime::{
     DeviceState, DnsQueryResult, ExitNodeSuggestion, FileTarget, IpnBusWatcher, NetcheckReport,
-    Notify, NotifyWatchOpt, RegionLatency, RegistrationError, Status, StatusNode, TkaLogEntry,
-    WhoIs,
+    Notify, NotifyWatchOpt, PortMapFacets, PortMapStatus, RegionLatency, RegistrationError, Status,
+    StatusNode, TkaLogEntry, WhoIs,
 };
 /// The interactive-login URL type returned by [`Device::pop_browser_url`].
 #[doc(inline)]
@@ -1297,6 +1297,14 @@ impl Device {
     /// does not yet carry the wire-level liveness/login fields; see `ts_runtime::status` docs.)
     pub async fn status(&self) -> Result<Status, Error> {
         self.runtime.status().await.map_err(Into::into)
+    }
+
+    /// The NAT port mapper's state: the NetInfo facets sent to control (with Go's netcheck
+    /// `portmap=` summary) and the current mapping, if any. `None` when the port mapper does not
+    /// run (`Config::disable_port_mapper`, `TS_DISABLE_PORTMAPPER`, or a build without the
+    /// `portmapper` feature).
+    pub fn port_map_status(&self) -> Option<PortMapStatus> {
+        self.runtime.port_map_status()
     }
 
     /// Fetch the current Tailnet Lock (TKA) status pushed by control, if any.

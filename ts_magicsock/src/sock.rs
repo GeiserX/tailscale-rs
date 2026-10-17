@@ -341,6 +341,11 @@ pub struct MagicSock {
     /// in `CallMeMaybe` so peers behind NAT can reach us. Learned only on this one socket — never
     /// a second egress.
     reflexive: Arc<Mutex<HashSet<SocketAddr>>>,
+    /// The NAT port mapping for this socket's port (Go `EndpointPortmapped`), with the instant its
+    /// local trust ends. Set by the runtime's port-mapper driver; dropped from
+    /// [`self_endpoints`](Self::self_endpoints) once expired, and cleared by
+    /// [`rebind`](Self::rebind) because the mapping targets the old socket's port.
+    portmapped: Mutex<Option<(SocketAddr, Instant)>>,
     /// Outstanding STUN Binding Requests, keyed by the transaction id we sent. The value is the
     /// [`Instant`] we sent at, so stale transactions can be pruned (see [`STUN_TX_TTL`]).
     ///
@@ -542,6 +547,7 @@ impl MagicSock {
             paths: Default::default(),
             addr_to_disco: Default::default(),
             reflexive: Default::default(),
+            portmapped: Mutex::new(None),
             stun_in_flight: Default::default(),
             binding_verifier: None,
             peer_cap_version: None,
@@ -750,6 +756,9 @@ impl MagicSock {
         // The local NAT mapping changed: drop stale reflexive addresses and every confirmed best
         // path (keep candidates — see `PeerPaths::invalidate_best`). Locked disjointly, never nested.
         lock(&self.reflexive).clear();
+        // The port mapping targeted the old socket's port. The port mapper re-installs it when the
+        // network and port are unchanged.
+        *lock(&self.portmapped) = None;
         {
             let mut paths = lock(&self.paths);
             for peer in paths.values_mut() {
@@ -897,6 +906,13 @@ impl MagicSock {
         Ok(*lock(&self.bound_addr))
     }
 
+    /// Whether an underlay socket is bound right now. `false` while a rebind is between closing
+    /// the old socket and binding the new one, and after a rebind that failed to bind (then
+    /// [`local_addr`](Self::local_addr) still reports the old address, which nothing listens on).
+    pub fn is_bound(&self) -> bool {
+        self.sock.borrow().is_some()
+    }
+
     /// Our candidate self-endpoints: the bound local address plus every reflexive address peers
     /// have observed our traffic arriving from.
     ///
@@ -912,14 +928,23 @@ impl MagicSock {
     /// unspecified `[::]:port`. With the default `enable_ipv6 == false` no IPv6 local candidate is
     /// emitted and the result is byte-for-byte the prior IPv4-only set.
     pub fn self_endpoints(&self) -> Vec<SelfEndpoint> {
-        let mut eps = Vec::new();
+        self.self_endpoints_with_stun().0
+    }
+
+    /// [`self_endpoints`](Self::self_endpoints), plus the reflexive (STUN) addresses it was built
+    /// from **before** de-duplication. A reflexive address equal to the port-mapped one is listed
+    /// once, as [`SelfEndpointType::PortMapped`], but it is still evidence that UDP works and still
+    /// counts towards "mapping varies by destination"; callers that derive those facts use the
+    /// second element.
+    pub fn self_endpoints_with_stun(&self) -> (Vec<SelfEndpoint>, Vec<SocketAddr>) {
+        // Candidates are gathered per kind, then emitted in Go's priority order (portmapped,
+        // STUN, STUN4LocalPort, local; `magicsock.determineEndpoints`) and de-duplicated by
+        // address, the first (highest-priority) kind winning.
+        let mut locals = Vec::new();
 
         let local = self.local_addr().ok();
         if let Some(local) = local {
-            eps.push(SelfEndpoint {
-                addr: local,
-                ty: SelfEndpointType::Local,
-            });
+            locals.push(local);
         }
 
         // Local IPv6 candidate enumeration (gated on `enable_ipv6`; default `false` ⇒ this whole
@@ -955,13 +980,7 @@ impl MagicSock {
                         if !self.is_pingable_candidate(&cand) {
                             continue;
                         }
-                        if eps.iter().any(|e| e.addr == cand) {
-                            continue;
-                        }
-                        eps.push(SelfEndpoint {
-                            addr: cand,
-                            ty: SelfEndpointType::Local,
-                        });
+                        locals.push(cand);
                     }
                 }
                 Err(e) => {
@@ -982,40 +1001,65 @@ impl MagicSock {
             (all, v4)
         };
 
-        for addr in &all_reflexive {
-            eps.push(SelfEndpoint {
-                addr: *addr,
-                ty: SelfEndpointType::Stun,
-            });
-        }
-
         // Hard-NAT guess (Go `EndpointSTUN4LocalPort`): behind a symmetric NAT the reflexive port a
         // peer learns varies per-destination and is useless to a third peer, but the router may have
         // a static mapping to our fixed *local* port. So advertise `(reflexive_ipv4, local_port)` as
         // an extra best-effort candidate. Only when symmetric NAT is detected, only for IPv4
         // reflexive addresses, and only when it differs from an already-listed reflexive endpoint.
+        let mut guesses = Vec::new();
         if self.is_symmetric_nat(&v4_reflexive)
             && let Some(local) = local
         {
             let local_port = local.port();
-            for refl in v4_reflexive {
+            for refl in &v4_reflexive {
                 let guess = SocketAddr::new(refl.ip(), local_port);
-                // Skip if the reflexive endpoint already uses the local port (not a symmetric remap)
-                // or if we'd duplicate an existing candidate.
+                // Skip if the reflexive endpoint already uses the local port (not a symmetric remap).
                 if guess.port() == refl.port() {
                     continue;
                 }
-                if eps.iter().any(|e| e.addr == guess) {
-                    continue;
-                }
-                eps.push(SelfEndpoint {
-                    addr: guess,
-                    ty: SelfEndpointType::Stun4LocalPort,
-                });
+                guesses.push(guess);
             }
         }
 
-        eps
+        let portmapped = self.portmapped();
+
+        let mut eps: Vec<SelfEndpoint> = Vec::new();
+        let ordered = portmapped
+            .into_iter()
+            .map(|a| (a, SelfEndpointType::PortMapped))
+            .chain(all_reflexive.iter().map(|a| (*a, SelfEndpointType::Stun)))
+            .chain(
+                guesses
+                    .into_iter()
+                    .map(|a| (a, SelfEndpointType::Stun4LocalPort)),
+            )
+            .chain(locals.into_iter().map(|a| (a, SelfEndpointType::Local)));
+        for (addr, ty) in ordered {
+            if !eps.iter().any(|e| e.addr == addr) {
+                eps.push(SelfEndpoint { addr, ty });
+            }
+        }
+
+        (eps, all_reflexive)
+    }
+
+    /// Install (or with `None`, clear) the port-mapped endpoint and the instant its local trust
+    /// ends. The runtime's port-mapper driver calls this on every mapping change.
+    pub fn set_portmapped(&self, mapping: Option<(SocketAddr, Instant)>) {
+        *lock(&self.portmapped) = mapping;
+    }
+
+    /// The port-mapped endpoint, if one is installed and its trust has not ended.
+    pub fn portmapped(&self) -> Option<SocketAddr> {
+        let mut pm = lock(&self.portmapped);
+        match *pm {
+            Some((addr, expires)) if Instant::now() < expires => Some(addr),
+            Some(_) => {
+                *pm = None;
+                None
+            }
+            None => None,
+        }
     }
 
     /// Whether to treat this node as behind a symmetric (endpoint-dependent-mapping) NAT, which is
@@ -6976,10 +7020,14 @@ mod tests {
         assert_eq!(stun.len(), 1, "exactly one reflexive endpoint: {eps:?}");
         // On loopback the reflexive address B observed is A's own bound address.
         assert_eq!(stun[0].addr, a_addr, "reflexive addr is A's loopback src");
-        assert!(
-            eps.iter().any(|e| e.ty == SelfEndpointType::Local),
-            "local endpoint still present"
+        // The local address equals the reflexive one here, so it is listed once, as the
+        // higher-priority STUN kind (Go's `determineEndpoints` de-duplicates the same way).
+        assert_eq!(
+            eps.iter().filter(|e| e.addr == a_addr).count(),
+            1,
+            "one entry per address: {eps:?}"
         );
+        assert!(!eps.iter().any(|e| e.ty == SelfEndpointType::Local));
 
         a_pump.abort();
         b_pump.abort();
@@ -7142,6 +7190,85 @@ mod tests {
             }
             other => panic!("expected CallMeMaybe, got {other:?}"),
         }
+    }
+
+    /// `self_endpoints` lists the port mapping first, then STUN, STUN4LocalPort and
+    /// local, de-duplicated by address with the higher-priority kind winning; the STUN facts keep
+    /// a reflexive address that equals the port mapping.
+    #[tokio::test]
+    async fn self_endpoints_priority_and_dedup() {
+        let sock = MagicSock::bind(
+            localhost(),
+            DiscoPrivateKey::random(),
+            ts_keys::NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap();
+        let local = sock.local_addr().unwrap();
+        let pm: SocketAddr = "203.0.113.7:41641".parse().unwrap();
+        let other: SocketAddr = "203.0.113.7:50000".parse().unwrap();
+        lock(&sock.reflexive).insert(pm);
+        lock(&sock.reflexive).insert(other);
+        sock.set_portmapped(Some((pm, Instant::now() + Duration::from_secs(60))));
+        let (eps, stun) = sock.self_endpoints_with_stun();
+        let types: Vec<SelfEndpointType> = eps.iter().map(|e| e.ty).collect();
+        assert_eq!(eps[0].addr, pm);
+        assert_eq!(eps[0].ty, SelfEndpointType::PortMapped);
+        assert_eq!(eps.iter().filter(|e| e.addr == pm).count(), 1, "{eps:?}");
+        assert!(
+            eps.iter()
+                .any(|e| e.addr == other && e.ty == SelfEndpointType::Stun)
+        );
+        assert_eq!(*types.last().unwrap(), SelfEndpointType::Local);
+        assert_eq!(eps.last().unwrap().addr, local);
+        // Priority: no lower kind before a higher one.
+        let rank = |t: &SelfEndpointType| match t {
+            SelfEndpointType::PortMapped => 0,
+            SelfEndpointType::Stun => 1,
+            SelfEndpointType::Stun4LocalPort => 2,
+            SelfEndpointType::Local => 3,
+        };
+        assert!(
+            types.windows(2).all(|w| rank(&w[0]) <= rank(&w[1])),
+            "{types:?}"
+        );
+        // Both reflexive addresses are still STUN evidence.
+        assert_eq!(stun.len(), 2);
+        assert!(stun.contains(&pm));
+        // The CallMeMaybe gate's candidate list carries the port mapping too.
+        let b = DiscoPrivateKey::random();
+        let mut frame = sock.seal_call_me_maybe(&b.public_key()).unwrap();
+        match disco::open(&b, &mut frame).unwrap() {
+            Inbound::CallMeMaybe { endpoints, .. } => assert_eq!(endpoints[0], pm),
+            other => panic!("expected CallMeMaybe, got {other:?}"),
+        }
+    }
+
+    /// The port mapping drops out once its trust ends, and a rebind clears it at once.
+    #[tokio::test]
+    async fn portmapped_endpoint_expires_and_rebind_clears_it() {
+        let sock = MagicSock::bind(
+            localhost(),
+            DiscoPrivateKey::random(),
+            ts_keys::NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap();
+        let pm: SocketAddr = "203.0.113.7:41641".parse().unwrap();
+        sock.set_portmapped(Some((pm, Instant::now())));
+        assert!(sock.portmapped().is_none(), "expired");
+        assert!(sock.self_endpoints().iter().all(|e| e.addr != pm));
+        sock.set_portmapped(Some((pm, Instant::now() + Duration::from_secs(60))));
+        assert_eq!(sock.portmapped(), Some(pm));
+        sock.rebind().await.unwrap();
+        assert!(sock.portmapped().is_none(), "rebind clears it");
+        sock.set_portmapped(Some((pm, Instant::now() + Duration::from_secs(60))));
+        sock.set_portmapped(None);
+        assert!(
+            sock.self_endpoints()
+                .iter()
+                .all(|e| e.ty != SelfEndpointType::PortMapped)
+        );
     }
 
     #[tokio::test]

@@ -148,9 +148,28 @@ const ADVERTISE_INTERVAL: Duration = Duration::from_secs(5);
 /// forward to the control server so peers can learn where to attempt direct connections.
 ///
 /// All addresses originate from the single bound underlay socket — there is no second egress.
-#[derive(Clone)]
+/// The port-mapped endpoint is an address on the LAN gateway that forwards to that socket.
+#[derive(Clone, Debug, PartialEq)]
 pub struct EndpointAdvertisement {
+    /// The endpoints in priority order (portmapped, STUN, STUN4LocalPort, local), each address
+    /// once.
     pub endpoints: Arc<Vec<SelfEndpoint>>,
+    /// `WorkingUDP` / `MappingVariesByDestIP`, from the reflexive set before de-duplication.
+    pub stun: ts_control::StunFacts,
+    /// The port-mapping facets, or `None` when no port mapper runs.
+    pub port_map: Option<ts_control::PortMapFacets>,
+}
+
+impl EndpointAdvertisement {
+    /// The advertisement for the socket's current endpoints and these port-mapping facets.
+    pub(crate) fn current(sock: &MagicSock, port_map: Option<ts_control::PortMapFacets>) -> Self {
+        let (endpoints, reflexive) = sock.self_endpoints_with_stun();
+        Self {
+            endpoints: Arc::new(endpoints),
+            stun: ts_control::StunFacts::from_reflexive(&reflexive),
+            port_map,
+        }
+    }
 }
 
 /// The IPv4 bind address for the direct underlay socket (unit tests).
@@ -296,6 +315,11 @@ pub struct DirectManager {
     /// [`should_do_periodic_restun`]). An `AtomicBool` rather than a bus message or an actor `ask`
     /// because the reader is a plain task and the value is one independent bit.
     force_background_stun: Arc<AtomicBool>,
+    /// The NAT port-mapper driver's handle, when the port mapper runs (see [`crate::portmap`]).
+    /// Rebinds invalidate through it synchronously; `re_stun`, the first peer and a lifted
+    /// `only-tcp-443` kick it.
+    #[cfg(feature = "portmapper")]
+    portmap: Option<crate::portmap::PortmapHandle>,
     #[allow(dead_code)]
     tasks: JoinSet<()>,
 }
@@ -383,7 +407,11 @@ impl DirectManager {
     #[message]
     pub async fn rebind(&self) -> Result<(), ts_magicsock::Error> {
         match self.sock.as_ref() {
-            Some(sock) => sock.rebind().await,
+            Some(sock) => {
+                let r = sock.rebind().await;
+                self.portmap_note_rebind(sock);
+                r
+            }
             None => Ok(()),
         }
     }
@@ -426,7 +454,11 @@ impl DirectManager {
         };
 
         // 1. Swap the socket + reset stale local mapping (clears best paths, keeps candidates).
-        sock.rebind().await?;
+        //    The port mapping is invalidated (or, same network and port, re-installed) before
+        //    anything else runs.
+        let rebound = sock.rebind().await;
+        self.portmap_note_rebind(sock);
+        rebound?;
 
         // 2. Re-ping all candidates now on the new socket (every best is None post-rebind, so this
         //    re-pings everything under the normal cadence gates). A send error is non-fatal: the
@@ -464,7 +496,28 @@ impl DirectManager {
             return Ok(());
         };
         self.stun_sweep_once(sock).await;
+        // Go's `ReSTUN` re-runs endpoint determination, which asks the port mapper too.
+        #[cfg(feature = "portmapper")]
+        if let Some(pm) = &self.portmap {
+            pm.kick();
+        }
         Ok(())
+    }
+
+    /// Tell the port mapper about a rebind, synchronously: the port of whatever socket is bound
+    /// now, or that nothing is. A failed rebind does not mean "no socket": with connected sockets
+    /// on (`SO_REUSEPORT`) the old socket keeps serving, and its mapping stays valid.
+    fn portmap_note_rebind(&self, sock: &MagicSock) {
+        #[cfg(feature = "portmapper")]
+        if let Some(pm) = &self.portmap {
+            let port = sock
+                .is_bound()
+                .then(|| sock.local_addr().ok().map(|a| a.port()))
+                .flatten();
+            pm.note_rebind(port);
+        }
+        #[cfg(not(feature = "portmapper"))]
+        let _ = sock;
     }
 
     /// One immediate STUN sweep from the bound socket, gated like the periodic prober (skip while
@@ -482,6 +535,27 @@ impl DirectManager {
                 }
             }
         }
+    }
+}
+
+/// Ask the direct manager for the port mapper's client, when it runs: the runtime releases its
+/// router rules on shutdown through it and reads its state for status.
+#[cfg(feature = "portmapper")]
+#[derive(Debug, Clone, Copy)]
+pub struct PortmapClient;
+
+#[cfg(feature = "portmapper")]
+impl Message<PortmapClient> for DirectManager {
+    type Reply = Option<Arc<dyn ts_portmapper::PortMapper>>;
+
+    async fn handle(
+        &mut self,
+        _: PortmapClient,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.portmap
+            .as_ref()
+            .map(crate::portmap::PortmapHandle::mapper)
     }
 }
 
@@ -961,6 +1035,11 @@ fn stun_probe_window(
 /// change, so control can be told where peers may reach us directly. Only republishes on a real
 /// change to avoid spamming control with redundant side-band map requests.
 ///
+/// A change is a change in the ordered endpoint list, in the STUN facts or in the port-mapping
+/// facets (Go's `BasicallyEqual` for these fields). The list is published in priority order, not
+/// sorted. A port-mapper state change (`port_map_rx`) wakes the loop at once instead of waiting for
+/// the 5 s tick, which stays as the fallback for reflexive addresses learned from pongs.
+///
 /// Reflexive (STUN-equivalent) endpoints come solely from the disco pong-harvest path on the one
 /// bound socket (peers echo our public `src`); we deliberately do **not** run a netcheck-style
 /// multi-socket prober for self-endpoint discovery. Such a prober binds its own sockets (including
@@ -968,37 +1047,47 @@ fn stun_probe_window(
 /// both a different NAT path and a potential IPv6 leak — which is why the old `ts_netcheck`
 /// `StunProber` was removed entirely rather than left dormant in the production binary. Pong-harvest
 /// is the leak-safe, parity-correct source for Tier 1.
-async fn run_advertiser(
+async fn run_advertiser<F, Fut>(
     sock: Arc<MagicSock>,
-    env: Env,
+    mut port_map_rx: tokio::sync::watch::Receiver<Option<ts_control::PortMapFacets>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
-) {
+    publish: F,
+) where
+    F: Fn(EndpointAdvertisement) -> Fut,
+    Fut: core::future::Future<Output = ()>,
+{
     let mut interval = tokio::time::interval(ADVERTISE_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last: Vec<SelfEndpoint> = Vec::new();
+    let mut last: Option<EndpointAdvertisement> = None;
+    let mut port_map_open = true;
 
     while !*shutdown.borrow() {
         tokio::select! {
             _ = shutdown.changed() => break,
-            _ = interval.tick() => {
-                let mut eps = sock.self_endpoints();
-                eps.sort_by_key(|e| (e.addr, e.ty as u8));
-                if eps == last {
-                    continue;
-                }
-                last = eps.clone();
-
-                if let Err(e) = env
-                    .publish(EndpointAdvertisement {
-                        endpoints: Arc::new(eps),
-                    })
-                    .await
-                {
-                    tracing::error!(error = %e, "publishing endpoint advertisement");
-                }
+            _ = interval.tick() => {}
+            r = port_map_rx.changed(), if port_map_open => {
+                // The driver is gone (port mapper off or stopped): keep the tick only.
+                port_map_open = r.is_ok();
             }
         }
+        let adv = EndpointAdvertisement::current(&sock, *port_map_rx.borrow_and_update());
+        if last.as_ref() == Some(&adv) {
+            continue;
+        }
+        last = Some(adv.clone());
+        publish(adv).await;
     }
+}
+
+/// Whether `eps` holds a candidate a remote peer could reach across the internet: a STUN
+/// reflexive address or a port mapping (Go counts `EndpointPortmapped` as one too).
+fn has_reflexive_candidate(eps: &[SelfEndpoint]) -> bool {
+    eps.iter().any(|e| {
+        matches!(
+            e.ty,
+            ts_magicsock::SelfEndpointType::Stun | ts_magicsock::SelfEndpointType::PortMapped
+        )
+    })
 }
 
 /// Periodically send a `CallMeMaybe` over DERP to each peer that has no confirmed direct path
@@ -1032,10 +1121,7 @@ async fn run_call_me_maybe(
                 // local LAN address is useless to relay over DERP. Skip the whole cadence until we
                 // have one, so peers that can never go direct don't incur perpetual relay load.
                 // Snapshot self_endpoints once per tick (it locks the reflexive set internally).
-                let have_reflexive = sock
-                    .self_endpoints()
-                    .iter()
-                    .any(|e| e.ty == ts_magicsock::SelfEndpointType::Stun);
+                let have_reflexive = has_reflexive_candidate(&sock.self_endpoints());
                 if !have_reflexive {
                     continue;
                 }
@@ -1197,6 +1283,8 @@ impl kameo::Actor for DirectManager {
                     multiderp,
                     stun_cursor,
                     force_background_stun,
+                    #[cfg(feature = "portmapper")]
+                    portmap: None,
                     tasks,
                 });
             }
@@ -1216,10 +1304,22 @@ impl kameo::Actor for DirectManager {
             env.shutdown.clone(),
         ));
         tasks.spawn(run_pinger(sock.clone(), env.shutdown.clone()));
+        // The port mapper's facets for the advertiser. Without a port mapper the sender is
+        // dropped here and the advertiser keeps its tick only (facets stay `None`).
+        let (port_map_tx, port_map_rx) = tokio::sync::watch::channel(None);
+        let advertiser_env = env.clone();
         tasks.spawn(run_advertiser(
             sock.clone(),
-            env.clone(),
+            port_map_rx,
             env.shutdown.clone(),
+            move |adv| {
+                let env = advertiser_env.clone();
+                async move {
+                    if let Err(e) = env.publish(adv).await {
+                        tracing::error!(error = %e, "publishing endpoint advertisement");
+                    }
+                }
+            },
         ));
         // Active STUN probing shares the one bound socket; clone the multiderp ref before it is
         // moved into run_call_me_maybe below. `peer_db`, the datapath idleness clock and the
@@ -1256,6 +1356,35 @@ impl kameo::Actor for DirectManager {
             env.shutdown.clone(),
         ));
 
+        #[cfg(feature = "portmapper")]
+        let portmap = env.port_mapper.as_ref().map(|settings| {
+            let mapper = match &settings.factory {
+                Some(f) => f(),
+                None => crate::portmap::system_client(&settings.options),
+            };
+            let handle = crate::portmap::PortmapHandle::new(mapper);
+            let peers_db = peer_db.clone();
+            let gate_db = peer_db.clone();
+            let activity = env.datapath_activity.clone();
+            let force = force_background_stun.clone();
+            tasks.spawn(crate::portmap::run_driver(crate::portmap::DriverArgs {
+                handle: handle.clone(),
+                sock: sock.clone(),
+                has_peers: Arc::new(move || stun_probe_should_run(&peers_db)),
+                restun_gate: Arc::new(move || {
+                    should_do_periodic_restun(&gate_db, &activity, &force)
+                }),
+                port_map_tx,
+                renew_while_idle: settings.options.renew_while_idle,
+                restun_delay: stun_probe_delay,
+                poll: crate::portmap::POLL_INTERVAL,
+                shutdown: env.shutdown.clone(),
+            }));
+            handle
+        });
+        #[cfg(not(feature = "portmapper"))]
+        drop(port_map_tx);
+
         Ok(Self {
             sock: Some(sock),
             transport_id: Some(transport_id),
@@ -1263,6 +1392,8 @@ impl kameo::Actor for DirectManager {
             multiderp: multiderp_for_field,
             stun_cursor,
             force_background_stun,
+            #[cfg(feature = "portmapper")]
+            portmap,
             tasks,
         })
     }
@@ -1346,6 +1477,12 @@ impl Message<Arc<ts_control::StateUpdate>> for DirectManager {
             &self.force_background_stun,
             self.sock.as_deref(),
         );
+        // `only-tcp-443` stops the port mapper's LAN sends too, synchronously and deletes
+        // included (Go passes `onlyTCP443` to the portmapper as its disable-all knob).
+        #[cfg(feature = "portmapper")]
+        if let (Some(node), Some(pm)) = (msg.node.as_ref(), &self.portmap) {
+            pm.set_only_tcp_443(node.only_tcp_443());
+        }
     }
 }
 
@@ -1493,8 +1630,21 @@ impl Message<Arc<PeerState>> for DirectManager {
             }
         }
 
-        let mut db = poisoned_write(&self.peer_db);
-        *db = Some(msg.peers.clone());
+        let had_peers = stun_probe_should_run(&self.peer_db);
+        {
+            let mut db = poisoned_write(&self.peer_db);
+            *db = Some(msg.peers.clone());
+        }
+        // The first peer is a reason to (re)establish the port mapping now.
+        #[cfg(feature = "portmapper")]
+        if !had_peers
+            && stun_probe_should_run(&self.peer_db)
+            && let Some(pm) = &self.portmap
+        {
+            pm.kick();
+        }
+        #[cfg(not(feature = "portmapper"))]
+        let _ = had_peers;
     }
 }
 
@@ -2402,6 +2552,96 @@ mod tests {
     /// the wire key, the accessor and the push — and both directions of it, because Go's
     /// `SetOnlyTCP443` is live: a netmap that restates the self node without the attribute is
     /// control withdrawing it, and UDP must come back with no restart.
+    /// The advertiser publishes the priority-ordered list, republishes on a change in
+    /// the port-mapping facets alone, not on an unchanged state, and a port-mapper change wakes it
+    /// well before the 5 s tick.
+    #[tokio::test]
+    async fn advertiser_follows_port_map_changes_promptly() {
+        let sock = Arc::new(
+            MagicSock::bind(
+                "127.0.0.1:0".parse().unwrap(),
+                DiscoPrivateKey::random(),
+                NodePrivateKey::random().public_key(),
+            )
+            .await
+            .unwrap(),
+        );
+        let (pm_tx, pm_rx) = tokio::sync::watch::channel(None);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(run_advertiser(sock.clone(), pm_rx, shutdown_rx, move |a| {
+            let out = out_tx.clone();
+            async move {
+                out.send(a).ok();
+            }
+        }));
+        let first = out_rx.recv().await.unwrap();
+        assert_eq!(first.endpoints.len(), 1);
+        assert_eq!(first.port_map, None);
+        assert!(!first.stun.working_udp);
+
+        let wait = Duration::from_secs(1);
+        let pm: SocketAddr = "203.0.113.7:41641".parse().unwrap();
+        let facets = ts_control::PortMapFacets {
+            upnp: None,
+            pmp: Some(true),
+            pcp: Some(true),
+            have_port_map: true,
+        };
+        sock.set_portmapped(Some((
+            pm,
+            std::time::Instant::now() + Duration::from_secs(60),
+        )));
+        pm_tx.send_replace(Some(facets));
+        let adv = tokio::time::timeout(wait, out_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(adv.endpoints[0].addr, pm);
+        assert_eq!(
+            adv.endpoints[0].ty,
+            ts_magicsock::SelfEndpointType::PortMapped
+        );
+        assert_eq!(adv.port_map, Some(facets));
+        // A port mapping alone is not evidence that UDP works.
+        assert!(!adv.stun.working_udp);
+
+        // Unchanged: no republish.
+        pm_tx.send_replace(Some(facets));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), out_rx.recv())
+                .await
+                .is_err()
+        );
+        // Facets only: republished.
+        pm_tx.send_replace(Some(ts_control::PortMapFacets {
+            pcp: Some(false),
+            ..facets
+        }));
+        let adv = tokio::time::timeout(wait, out_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(adv.port_map.unwrap().pcp, Some(false));
+        task.abort();
+    }
+
+    /// A port mapping alone opens the CallMeMaybe gate, like a STUN address; a local
+    /// address alone does not.
+    #[test]
+    fn call_me_maybe_gate_counts_a_port_mapping() {
+        let ep = |ty| SelfEndpoint {
+            addr: "203.0.113.7:41641".parse().unwrap(),
+            ty,
+        };
+        use ts_magicsock::SelfEndpointType::{Local, PortMapped, Stun, Stun4LocalPort};
+        assert!(has_reflexive_candidate(&[ep(PortMapped)]));
+        assert!(has_reflexive_candidate(&[ep(Local), ep(Stun)]));
+        assert!(!has_reflexive_candidate(&[ep(Local)]));
+        assert!(!has_reflexive_candidate(&[ep(Stun4LocalPort)]));
+        assert!(!has_reflexive_candidate(&[]));
+    }
+
     #[tokio::test]
     async fn only_tcp_443_rides_the_self_node_to_the_underlay_socket() {
         let sock = MagicSock::bind(

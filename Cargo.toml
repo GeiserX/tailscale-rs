@@ -189,7 +189,7 @@ ts_http_util = { path = "ts_http_util", package = "geiserx_ts_http_util", versio
 ts_portmapper = { path = "ts_portmapper", package = "geiserx_ts_portmapper", version = "0.57.8" } # x-release-please-version
 ts_tka = { path = "ts_tka", package = "geiserx_ts_tka", version = "0.57.8" } # x-release-please-version
 ts_tls_util = { path = "ts_tls_util", package = "geiserx_ts_tls_util", version = "0.57.8" } # x-release-please-version
-ts_runtime = { path = "ts_runtime", package = "geiserx_ts_runtime", version = "0.57.8" } # x-release-please-version
+ts_runtime = { path = "ts_runtime", package = "geiserx_ts_runtime", version = "0.57.8", default-features = false } # x-release-please-version
 ts_test_util = { path = "ts_test_util" }
 ts_time = { path = "ts_time", package = "geiserx_ts_time", version = "0.57.8" } # x-release-please-version
 ts_transport = { path = "ts_transport", package = "geiserx_ts_transport", version = "0.57.8" } # x-release-please-version
@@ -350,7 +350,12 @@ hyper-util = { workspace = true, features = ["tokio"] }
 workspace = true
 
 [features]
+default = ["portmapper"]
 ring-aead = ["ts_runtime/ring-aead"]
+# On by default (Go parity): the NAT port mapper (NAT-PMP/PCP) for direct paths through hard NATs.
+# `Config::disable_port_mapper` and `TS_DISABLE_PORTMAPPER` turn it off at runtime; without this
+# feature it is not compiled at all.
+portmapper = ["ts_runtime/portmapper"]
 # Enable the `tsnet` module: a Go-idiomatic `tsnet.Server`-shaped facade over `Device`/`Config`
 # (settable fields → `Config`, lazy start, `Listen`/`Dial`/`Up`/`Close`/`ListenFunnel`/`ListenService`).
 # A thin ergonomics layer only — no new engine, no new crate. Reuses the crate's existing

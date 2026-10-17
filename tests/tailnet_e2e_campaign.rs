@@ -33,6 +33,9 @@ fn gated() -> Option<String> {
     }
     // SAFETY: set before any worker threads read the env; gates the experimental build at runtime.
     unsafe { std::env::set_var("TS_RS_EXPERIMENT", "this_is_unstable_software") };
+    // SAFETY: as above. Tests never touch the LAN gateway: the port mapper stays off for every
+    // device this process builds.
+    unsafe { std::env::set_var("TS_DISABLE_PORTMAPPER", "1") };
     match ts_test_util::auth_key() {
         Some(k) => Some(k),
         None => {
@@ -49,7 +52,10 @@ fn is_cgnat(ip: Ipv4Addr) -> bool {
 
 async fn join(label: &str) -> Device {
     let auth = gated().expect("gated() checked by caller");
-    let mut config = Config::default();
+    let mut config = Config {
+        disable_port_mapper: true,
+        ..Config::default()
+    };
     let suffix: u32 = rand::random();
     config.requested_hostname = Some(format!("tsrs-e2e-{label}-{suffix:08x}"));
     let dev = timeout(JOIN_TIMEOUT, Device::new(&config, Some(auth)))
@@ -249,6 +255,7 @@ async fn s6_ipv4_only_config() {
     let Some(auth) = gated() else { return };
     let suffix: u32 = rand::random();
     let config = Config {
+        disable_port_mapper: true,
         enable_ipv6: false,
         requested_hostname: Some(format!("tsrs-e2e-v4only-{suffix:08x}")),
         ..Config::default()
@@ -393,6 +400,7 @@ async fn s9_wait_until_running_reports_running() {
     let Some(auth) = gated() else { return };
     let suffix: u32 = rand::random();
     let config = Config {
+        disable_port_mapper: true,
         requested_hostname: Some(format!("tsrs-e2e-waitrun-{suffix:08x}")),
         ..Config::default()
     };

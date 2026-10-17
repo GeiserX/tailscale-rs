@@ -1,13 +1,26 @@
 # NAT port mapper (NAT-PMP and PCP)
 
-[`ts_portmapper`](../ts_portmapper/src/lib.rs) asks the LAN gateway for an inbound UDP mapping to
-the node's underlay port, as Go Tailscale's `net/portmapper` does, so that a peer behind a hard
-NAT can reach the node directly instead of over DERP. NAT-PMP (RFC 6886) and PCP (RFC 6887) are
-implemented. UPnP-IGD is not (bead `tsr-x4yg`, phase 2).
+The node asks its LAN gateway for an inbound UDP mapping to its underlay port, as Go Tailscale's
+`net/portmapper` does. It then advertises the mapping as endpoint type 3 (`PortMapped`), so a peer
+behind a hard NAT can reach it directly instead of over DERP. NAT-PMP (RFC 6886) and PCP
+(RFC 6887) are implemented. UPnP-IGD is not (bead `tsr-x4yg`, phase 2).
 
-The crate holds the lifecycle client, the codecs, the gateway lookup and `GatewayCap`, the only
-code that sends packets. (The gateway lookup's kernel source-address check connects a UDP socket
-but never sends on it.) Nothing in the node runs it yet.
+- Crate: [`ts_portmapper`](../ts_portmapper/src/lib.rs). It holds the lifecycle client, the
+  codecs, the gateway lookup and `GatewayCap`, the only code that sends packets. (The gateway
+  lookup's kernel source-address check connects a UDP socket but never sends on it.)
+- Driver: [`ts_runtime::portmap`](../ts_runtime/src/portmap.rs), spawned by the direct manager.
+
+## Turning it off
+
+| Source | Effect |
+|---|---|
+| `Config::disable_port_mapper` (Go `DisablePortMapper`) | No client, no driver, no socket; NetInfo facets unset |
+| `TS_DISABLE_PORTMAPPER` (Go name), read once at startup | Same |
+| Control `only-tcp-443` | Live: every LAN send stops at once, deletes included; facets `PMP`/`PCP` are false |
+| Cargo feature `portmapper` off | Not compiled; facets unset |
+
+The feature is on by default, as in Go. Tests keep it off: every shared runtime test configuration
+sets `port_mapper: None`, and the `portmapper_test_isolation` check enforces the rest.
 
 ## Deviations from Go
 
@@ -17,6 +30,8 @@ but never sends on it.) Nothing in the node runs it yet.
 - **Renewal while idle (`renew_while_idle`).** The default is Go's: renewal rides on activity (the
   periodic ReSTUN and other kicks). With the option on, a due mapping is renewed even while idle,
   as long as there are peers. With no peers a mapping is never renewed and expires.
+- **`HavePortMap` means an advertised mapping**, so control never sees it without a type-3
+  endpoint.
 - **Notifications for every protocol.** Success, loss, expiry and disable publish for NAT-PMP and
   PCP alike. In Go only PCP successes publish.
 - **Strict replies.** Replies are accepted only from exactly `gateway:5351`, and every field is

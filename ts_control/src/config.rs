@@ -8,6 +8,36 @@ lazy_static::lazy_static! {
     pub static ref DEFAULT_CONTROL_SERVER: Url = Url::parse("https://controlplane.tailscale.com/").unwrap();
 }
 
+/// The port mapper's options (NAT-PMP/PCP; Go `net/portmapper`). Transport-only, like the other
+/// dataplane fields: `ts_control` never reads it and does not depend on the port mapper.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct PortMapperOptions {
+    /// Use this gateway (and optionally this host address on its subnet) instead of discovering
+    /// it from the routing table. It replaces discovery only: it is validated (private, on-link,
+    /// a usable interface) exactly like a discovered one.
+    pub gateway_override: Option<(core::net::Ipv4Addr, Option<core::net::Ipv4Addr>)>,
+    /// Advertise an external address that is private, shared (CGNAT) or otherwise not publicly
+    /// reachable. `true` (the default) is Go's behaviour; with `false` such a mapping is still kept
+    /// and renewed but never offered to peers, and `HavePortMap` stays false.
+    pub advertise_nonpublic_external: bool,
+    /// Renew the mapping when it is due even while the datapath is idle, as long as the node has
+    /// peers. `false` (the default) is Go's behaviour: renewal rides on activity (the periodic
+    /// ReSTUN and other kicks), so an idle node's mapping may expire. With no peers a mapping is
+    /// never renewed either way.
+    pub renew_while_idle: bool,
+}
+
+impl Default for PortMapperOptions {
+    fn default() -> Self {
+        Self {
+            gateway_override: None,
+            advertise_nonpublic_external: true,
+            renew_while_idle: false,
+        }
+    }
+}
+
 /// Upstream-proxy wire protocol for [`ExitProxyConfig`]. Mirrors `ts_forwarder::ProxyScheme`;
 /// kept as a separate type here because `ts_control` must not depend on `ts_forwarder` (the
 /// runtime converts between them at the boundary).
@@ -397,6 +427,17 @@ pub struct Config {
     /// underlay posture is unchanged.
     #[serde(default)]
     pub wireguard_listen_port: Option<u16>,
+
+    /// Turn the NAT port mapper (NAT-PMP/PCP) off: no client, no driver, no socket, and no
+    /// port-mapping NetInfo facets (Go `magicsock.Options.DisablePortMapper`). Defaults to `false`
+    /// (on, as in Go). `TS_DISABLE_PORTMAPPER` in the environment has the same effect. Like the
+    /// other dataplane fields it is not read inside `ts_control`.
+    #[serde(default)]
+    pub disable_port_mapper: bool,
+
+    /// The port mapper's options. See [`PortMapperOptions`].
+    #[serde(default)]
+    pub port_mapper: PortMapperOptions,
 
     /// WireGuard persistent-keepalive interval applied to every peer, or `None` to disable persistent
     /// keepalives (`PersistentKeepalive`; Tailscale uses 25s).
@@ -844,6 +885,8 @@ impl Default for Config {
             enable_ipv6: false,
             network_monitor: false,
             wireguard_listen_port: None,
+            disable_port_mapper: false,
+            port_mapper: PortMapperOptions::default(),
             persistent_keepalive_interval: default_persistent_keepalive(),
             transport_mode: TransportMode::default(),
             wire_ingress: false,
