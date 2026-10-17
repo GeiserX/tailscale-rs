@@ -16,6 +16,7 @@ use crate::{
     map_request_builder::MapRequestBuilder,
     tokio::{
         map_stream::{StateUpdate, map_stream, send_map_request},
+        map_watchdog::MapPollWatchdog,
         netmap_cache::NetmapCache,
         ping::handle_ping,
     },
@@ -78,6 +79,7 @@ pub struct AsyncControlClient {
     base_url: Url,
     state_tx: broadcast::Sender<Arc<StateUpdate>>,
     command_tx: mpsc::Sender<Command>,
+    connected_rx: watch::Receiver<bool>,
     _tasks: JoinSet<()>,
 }
 
@@ -155,6 +157,7 @@ impl AsyncControlClient {
 
         let (state_tx, state_rx) = broadcast::channel(32);
         let (command_tx, command_rx) = mpsc::channel(32);
+        let (connected_tx, connected_rx) = watch::channel(false);
 
         tasks.spawn({
             let state_tx = state_tx.clone();
@@ -172,6 +175,7 @@ impl AsyncControlClient {
                     auth_key,
                     config,
                     auth_url_tx,
+                    connected_tx,
                 )
                 .await
             }
@@ -182,10 +186,17 @@ impl AsyncControlClient {
                 base_url: control_url.clone(),
                 state_tx,
                 command_tx,
+                connected_rx,
                 _tasks: tasks,
             },
             netmap_stream(state_rx),
         ))
+    }
+
+    /// Whether the current map poll has received a response and has not disconnected.
+    /// Reconnection attempts and registration do not count until a map response arrives.
+    pub fn is_connected(&self) -> bool {
+        self.connected_rx.has_changed().is_ok() && *self.connected_rx.borrow()
     }
 
     /// Set the DERP home region for this node.
@@ -557,6 +568,7 @@ pub async fn run(
     auth_key: Option<String>,
     config: crate::Config,
     auth_url_tx: watch::Sender<Option<Url>>,
+    connected_tx: watch::Sender<bool>,
 ) {
     let mut dialer = ControlDialer::default();
     let mut session = MapSession::default();
@@ -584,22 +596,25 @@ pub async fn run(
         // Paired with `rotate_node_key`'s preserve-if-`Some` guard, this keeps the ORIGINAL pre-expiry
         // key pinned across repeated rotations *before* a success, and re-anchors correctly *after* one.
         let mut register_succeeded = false;
-        let outcome = run_once(
-            &state_tx,
-            &mut command_rx,
-            &control_url,
-            &node_keys,
-            auth_key.as_deref(),
-            &config,
-            &mut dialer,
-            &mut session,
-            &mut net_info,
-            &mut received_frame,
-            &mut reauth_requested,
-            &mut register_succeeded,
-            &auth_url_tx,
-        )
-        .await;
+        let watchdog = MapPollWatchdog::new(connected_tx.clone());
+        let outcome = watchdog
+            .run(run_once(
+                &state_tx,
+                &mut command_rx,
+                &control_url,
+                &node_keys,
+                auth_key.as_deref(),
+                &config,
+                &mut dialer,
+                &mut session,
+                &mut net_info,
+                &mut received_frame,
+                &mut reauth_requested,
+                &mut register_succeeded,
+                &auth_url_tx,
+                &watchdog,
+            ))
+            .await;
 
         // Release the rotation anchor on a successful re-register (before the reauth/backoff branches
         // below): once control accepts the node key, that key IS the node's identity, so a later
@@ -704,6 +719,7 @@ async fn run_once(
     reauth_requested: &mut bool,
     register_succeeded: &mut bool,
     auth_url_tx: &watch::Sender<Option<Url>>,
+    watchdog: &MapPollWatchdog,
 ) -> Result<(), Error> {
     let h2_client = control_dialer
         .full_connect_next(
@@ -812,6 +828,10 @@ async fn run_once(
                 let Some(state_update) = state_update else {
                     break;
                 };
+
+                // Every complete response, including KeepAlive, proves poll liveness.
+                // Do this before awaiting side work, which must not disable the watchdog.
+                watchdog.response_received();
 
                 // A *substantive* (non-keep-alive) frame proves the full
                 // connect→register→poll→netmap path works, so record it and `run` resets the
@@ -1541,6 +1561,7 @@ mod tests {
         let (command_tx, mut command_rx) = mpsc::channel(4);
         let (state_tx, _state_rx) = broadcast::channel(4);
         let mut client = AsyncControlClient {
+            connected_rx: watch::channel(false).1,
             base_url: "https://control.example/".parse().unwrap(),
             state_tx,
             command_tx,
@@ -1554,5 +1575,92 @@ mod tests {
             matches!(cmd, Command::Reauth),
             "reauth() must enqueue Command::Reauth, got {cmd:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod watchdog_reconnect_tests {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    use tokio::{io::AsyncWriteExt, time::Instant};
+
+    use super::*;
+
+    struct PollResource(Arc<AtomicBool>);
+
+    impl Drop for PollResource {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Drive the production watchdog and reconnect schedule with a real framed reader.
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_reconnects_stalled_reader_or_side_rpc_and_recovers_health() {
+        for stall_in_side_rpc in [false, true] {
+            let (connected_tx, connected_rx) = watch::channel(false);
+            let mut backoff = ControlBackoff::default();
+            let started = Instant::now();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let mut attempts = 0;
+            for attempt in 0..2 {
+                assert!(
+                    !*connected_rx.borrow(),
+                    "disconnected until a response arrives"
+                );
+                attempts += 1;
+                let watchdog = MapPollWatchdog::new(connected_tx.clone());
+                let (reader, mut writer) = tokio::io::duplex(1024);
+                let body = br#"{"Seq":1}"#;
+                writer
+                    .write_all(&(body.len() as u32).to_le_bytes())
+                    .await
+                    .unwrap();
+                writer.write_all(body).await.unwrap();
+                dropped.store(false, Ordering::SeqCst);
+                let resource = PollResource(dropped.clone());
+                let mut received_frame = false;
+                let poll = async {
+                    let _resource = resource;
+                    let mut stream = core::pin::pin!(map_stream(reader, None));
+                    let response = stream.next().await.unwrap();
+                    watchdog.response_received();
+                    received_frame = frame_resets_backoff(&response);
+                    assert!(*connected_rx.borrow(), "response clears the warning");
+                    if attempt == 0 {
+                        if stall_in_side_rpc {
+                            // A pending endpoint update / C2N reply suspends the body's read timer.
+                            core::future::pending::<()>().await;
+                        } else {
+                            // Keep the writer open: silence without FIN/RST or keep-alives.
+                            assert!(stream.next().await.is_none());
+                        }
+                    }
+                    Ok(())
+                };
+                let outcome = watchdog.run(poll).await;
+                assert!(!*connected_rx.borrow());
+                assert!(
+                    dropped.load(Ordering::SeqCst),
+                    "poll resources must be cancelled"
+                );
+                if attempt == 0 {
+                    if stall_in_side_rpc {
+                        assert!(matches!(
+                            outcome,
+                            Err(Error::NetworkError(crate::Operation::MapRequest))
+                        ));
+                    }
+                    assert_eq!(started.elapsed(), core::time::Duration::from_secs(120));
+                    let delay =
+                        reconnect_delay_after_poll(received_frame, &mut backoff, &mut rand::rng());
+                    tokio::time::sleep(delay).await;
+                } else {
+                    assert!(outcome.is_ok());
+                }
+            }
+            assert_eq!(attempts, 2);
+            assert!(started.elapsed() < core::time::Duration::from_secs(121));
+        }
     }
 }

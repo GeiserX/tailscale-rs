@@ -723,12 +723,13 @@ impl Runtime {
             })
             .collect();
 
+        let control_connected = self.control.ask(control_runner::ControlConnected).await?;
         Ok(Status {
             self_node,
             peers,
             active_exit_node: self.active_exit_node(),
             magic_dns_suffix,
-            health: packetfilter::health_warnings(*self.invalid_filter_rx.borrow()),
+            health: status::health_warnings(*self.invalid_filter_rx.borrow(), control_connected),
         })
     }
 
