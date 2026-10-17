@@ -42,7 +42,8 @@ zerocopy = { workspace = true, features = ["std"] }
 libc = "0.2"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["full"] }
+# `test-util` provides the paused clock the receive-pump backoff tests run on.
+tokio = { workspace = true, features = ["full", "test-util"] }
 tracing-test.workspace = true
 
 [lints]

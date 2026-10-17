@@ -3206,6 +3206,71 @@ impl AsRef<MagicSock> for MagicSock {
     }
 }
 
+/// One receive-pump turn: a datagram or kernel batch, or `None` once the socket is closed.
+type PumpReceived = Result<Option<crate::receive_batch::Received<ReceivedData>>, Error>;
+
+/// Longest wait between receive attempts while the underlay keeps returning errors.
+const RECV_PUMP_MAX_BACKOFF: Duration = Duration::from_secs(1);
+
+/// The wait before the next receive attempt after `consecutive` errors in a row: none after the
+/// first, then 1 ms doubling up to [`RECV_PUMP_MAX_BACKOFF`].
+fn recv_pump_backoff(consecutive: u32) -> Option<Duration> {
+    let doublings = consecutive.checked_sub(2)?.min(10);
+    Some(Duration::from_millis(1 << doublings).min(RECV_PUMP_MAX_BACKOFF))
+}
+
+/// Forward everything `recv` yields to `tx`, the loop behind [`DirectTransport`]'s receive pump.
+///
+/// A receive error is not fatal. An ICMP-induced `EHOSTUNREACH`, a failed disco pong send or any
+/// other error from the receive path is logged and retried, backing off per
+/// [`recv_pump_backoff`] while errors repeat, so one error cannot stop direct receive for the
+/// life of the socket and a persistently failing socket cannot spin. The loop ends only when the
+/// receiving side of `tx` is gone or `recv` reports the socket closed (`Ok(None)`).
+///
+/// `yield_between_batches` yields to the scheduler after every four forwarded batches, so a
+/// kernel batch receive that is always ready cannot starve other tasks on the worker.
+async fn receive_pump(
+    mut recv: impl AsyncFnMut() -> PumpReceived,
+    tx: mpsc::UnboundedSender<crate::receive_batch::Received<ReceivedData>>,
+    yield_between_batches: bool,
+) {
+    let mut turns = 0;
+    let mut errors: u32 = 0;
+    loop {
+        match recv().await {
+            Ok(Some(data)) => {
+                if errors > 0 {
+                    tracing::debug!(errors, "magicsock recv pump recovered");
+                    errors = 0;
+                }
+                if !data.is_empty() && tx.send(data).is_err() {
+                    break;
+                }
+                turns += 1;
+                if yield_between_batches && turns == 4 {
+                    tokio::task::yield_now().await;
+                    turns = 0;
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                errors = errors.saturating_add(1);
+                if errors.is_power_of_two() {
+                    tracing::warn!(error = %e, consecutive = errors, "magicsock recv pump error");
+                }
+                if let Some(wait) = recv_pump_backoff(errors) {
+                    tokio::select! {
+                        () = tokio::time::sleep(wait) => {}
+                        () = tx.closed() => break,
+                    }
+                } else if tx.is_closed() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// A [`MagicSock`]-backed [`UnderlayTransport`] whose peer key is the peer's disco key.
 ///
 /// `send` dispatches each datagram over the peer's confirmed direct path (or drops it with a
@@ -3227,10 +3292,9 @@ impl DirectTransport {
         let (tx, rx) = mpsc::unbounded_channel();
         let kernel_receive_batching = crate::receive_batch::enabled();
         let pump_sock = inner.clone();
-        let pump = tokio::spawn(async move {
-            let mut turns = 0;
-            loop {
-                match if kernel_receive_batching {
+        let pump = tokio::spawn(receive_pump(
+            async move || {
+                if kernel_receive_batching {
                     pump_sock
                         .recv_data_batch()
                         .await
@@ -3240,25 +3304,11 @@ impl DirectTransport {
                         .recv_data()
                         .await
                         .map(|data| data.map(crate::receive_batch::Received::One))
-                } {
-                    Ok(Some(data)) => {
-                        if !data.is_empty() && tx.send(data).is_err() {
-                            break;
-                        }
-                        turns += 1;
-                        if kernel_receive_batching && turns == 4 {
-                            tokio::task::yield_now().await;
-                            turns = 0;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "magicsock recv pump error");
-                        break;
-                    }
                 }
-            }
-        });
+            },
+            tx,
+            kernel_receive_batching,
+        ));
 
         Self {
             receive_batching: kernel_receive_batching,
@@ -3416,6 +3466,159 @@ mod tests {
                 .collect::<Vec<_>>(),
             [64]
         );
+    }
+
+    fn host_unreachable() -> Error {
+        Error::Io(std::io::ErrorKind::HostUnreachable.into())
+    }
+
+    fn pump_data(payload: &[u8]) -> crate::receive_batch::Received<ReceivedData> {
+        crate::receive_batch::Received::One(ReceivedData {
+            from_disco: DiscoPrivateKey::random().public_key(),
+            from_addr: localhost(),
+            data: PacketMut::from(payload),
+        })
+    }
+
+    /// Spawn [`receive_pump`] over a scripted receive source. Each call to the source takes the
+    /// next scripted result; once the script runs out the call never completes. Returns the call
+    /// count, the receiving end of the pump's channel and the pump task.
+    fn spawn_scripted_pump(
+        script: impl IntoIterator<Item = PumpReceived, IntoIter: Send + 'static>,
+    ) -> (
+        Arc<std::sync::atomic::AtomicUsize>,
+        mpsc::UnboundedReceiver<crate::receive_batch::Received<ReceivedData>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+        let mut script = script.into_iter();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let pump = tokio::spawn(receive_pump(
+            async move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                match script.next() {
+                    Some(result) => result,
+                    None => core::future::pending().await,
+                }
+            },
+            tx,
+            false,
+        ));
+        (calls, rx, pump)
+    }
+
+    /// One receive error (an ICMP-induced `EHOSTUNREACH`, a failed pong send) must not end the
+    /// pump: data received after it still reaches the transport.
+    #[tokio::test(start_paused = true)]
+    async fn receive_pump_keeps_delivering_after_an_error() {
+        let (_, mut rx, _pump) = spawn_scripted_pump([
+            Err(host_unreachable()),
+            Ok(Some(pump_data(b"after-one-error"))),
+            Err(host_unreachable()),
+            Err(Error::NoPath),
+            Ok(Some(pump_data(b"after-two-errors"))),
+        ]);
+        for expected in [&b"after-one-error"[..], b"after-two-errors"] {
+            let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("pump stalled after an error")
+                .expect("pump ended after an error");
+            let got: Vec<_> = got.into_iter().collect();
+            assert_eq!(got.len(), 1);
+            assert_eq!(got[0].data.as_ref(), expected);
+        }
+    }
+
+    /// A source that fails on every call is retried, but not in a tight loop: the first error is
+    /// retried at once, then the wait doubles from 1 ms to a 1 s cap.
+    #[tokio::test(start_paused = true)]
+    async fn receive_pump_backs_off_while_errors_persist() {
+        // Bounded so a pump that spins without waiting ends the script (and the test) quickly
+        // instead of hanging the paused clock.
+        let (calls, _rx, _pump) =
+            spawn_scripted_pump(std::iter::repeat_with(|| Err(host_unreachable())).take(1000));
+        let calls_now = || calls.load(Ordering::Relaxed);
+
+        // t = 0 and the immediate retry, then waits of 1, 2, 4, ... 512 ms (1.023 s in all),
+        // then one call a second.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(
+            calls_now(),
+            12,
+            "two immediate calls and ten doubling waits"
+        );
+
+        let before = calls_now();
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(calls_now() - before, 10, "capped at one retry a second");
+    }
+
+    /// The pump ends once nothing can read what it forwards: promptly while it is backing off
+    /// from errors, and on the next delivery otherwise. It also ends when the source reports the
+    /// socket closed.
+    #[tokio::test(start_paused = true)]
+    async fn receive_pump_exits_when_the_receiver_is_dropped() {
+        // Backing off between errors: well into the 1 s waits when the receiver goes.
+        let (_, rx, pump) =
+            spawn_scripted_pump(std::iter::repeat_with(|| Err(host_unreachable())).take(1000));
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        drop(rx);
+        tokio::time::timeout(Duration::from_millis(1), pump)
+            .await
+            .expect("pump kept backing off after the receiver was dropped")
+            .unwrap();
+
+        // Delivering data.
+        let (_, rx, pump) =
+            spawn_scripted_pump(std::iter::repeat_with(|| Ok(Some(pump_data(b"x")))).take(1000));
+        drop(rx);
+        tokio::time::timeout(Duration::from_millis(1), pump)
+            .await
+            .expect("pump kept receiving after the receiver was dropped")
+            .unwrap();
+
+        // The source reports the socket closed.
+        let (calls, _rx, pump) = spawn_scripted_pump([Ok(None)]);
+        tokio::time::timeout(Duration::from_millis(1), pump)
+            .await
+            .expect("pump kept receiving from a closed socket")
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// End to end through [`DirectTransport::new`] and a real socket: the pump's first receive
+    /// fails, and a WireGuard datagram a known peer sends afterwards still comes out of `recv`.
+    #[tokio::test]
+    async fn direct_transport_receives_after_a_receive_error() {
+        use ts_transport::{BatchRecvIter, UnderlayTransport};
+
+        let sock = Arc::new(plain_sock().await);
+        let peer = DiscoPrivateKey::random().public_key();
+        let peer_sock = UdpSocket::bind(localhost()).await.unwrap();
+        let peer_addr = peer_sock.local_addr().unwrap();
+        sock.addr_to_disco.lock().unwrap().insert(peer_addr, peer);
+        // The receive path reports this before reading the socket, as it does an error from a
+        // control frame demuxed in an earlier batch.
+        sock.connected_rx.lock().await.pending_error = Some(host_unreachable());
+        let transport = DirectTransport::new(sock.clone());
+
+        peer_sock
+            .send_to(b"after-error", sock.local_addr().unwrap())
+            .await
+            .unwrap();
+        let batch = tokio::time::timeout(Duration::from_secs(2), transport.recv())
+            .await
+            .expect("timed out waiting for transport recv");
+        let mut got = batch.batch_iter();
+        let (from, packets) = got
+            .next()
+            .expect("the pump ended after the receive error")
+            .unwrap();
+        assert_eq!(from, peer);
+        let packets: Vec<_> = packets.into_iter().collect();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].as_ref(), b"after-error");
     }
 
     #[tokio::test]
