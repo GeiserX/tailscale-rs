@@ -1828,6 +1828,7 @@ dependencies = [
  "geiserx_ts_metrics",
  "geiserx_ts_netstack_smoltcp",
  "geiserx_ts_packet",
+ "geiserx_ts_portmapper",
  "geiserx_ts_runtime",
  "geiserx_ts_tka",
  "hyper",
