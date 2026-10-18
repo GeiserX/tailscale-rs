@@ -48,7 +48,7 @@ pub use disco::{
 };
 pub use endpoint::{SelfEndpoint, SelfEndpointType};
 pub use error::{DiscoError, Error};
-pub use path::{PeerPaths, TRUST_DURATION};
+pub use path::{PeerPaths, SESSION_ACTIVE_TIMEOUT, TRUST_DURATION};
 /// Bounded kernel receive batch counters (Apple recvmsg_x / Linux recvmmsg).
 pub use receive_batch::{Snapshot as ReceiveBatchSnapshot, snapshot as receive_batch_snapshot};
 pub use relay::RelayServerEndpoint;
