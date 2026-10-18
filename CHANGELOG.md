@@ -23,6 +23,25 @@ Record breaking or significant changes here. All dates are UTC.
 
 * **exit node:** forwarded TCP flows run without Nagle, the underlay UDP sockets ask for Go's 7 MiB buffers, netstack egress goes out in batches of up to 64 packets, and the netstack tracks 32 receive holes for uploads. Kernel receive batching, splice coalescing, targeted replay and Apple connected UDP sockets are opt-in experiments, off unless their variable is `1`.
 
+## [0.58.0](https://github.com/GeiserX/tailscale-rs/compare/v0.57.8...v0.58.0) (2026-10-18)
+
+
+### Features
+
+* **exit_node:** port-mapper flags and a one-shot --portmap-probe ([#645](https://github.com/GeiserX/tailscale-rs/issues/645)) ([b6bf137](https://github.com/GeiserX/tailscale-rs/commit/b6bf137a134312eddb2b520968c7450cba3c0fc7))
+* **portmapper:** add ts_portmapper, a NAT-PMP and PCP client ([#643](https://github.com/GeiserX/tailscale-rs/issues/643)) ([dcd5ec2](https://github.com/GeiserX/tailscale-rs/commit/dcd5ec2351992c7d63f059779673b2a41e0bde54))
+* **runtime:** map the underlay port with NAT-PMP or PCP, as Go does ([#644](https://github.com/GeiserX/tailscale-rs/issues/644)) ([572d377](https://github.com/GeiserX/tailscale-rs/commit/572d377610a3acce54c8ac0a652285c1dc9a5b7f))
+
+
+### Bug Fixes
+
+* **magicsock:** a failed disco pong send no longer fails the receive ([#638](https://github.com/GeiserX/tailscale-rs/issues/638)) ([6f4501e](https://github.com/GeiserX/tailscale-rs/commit/6f4501e64edaa44aab63ca69a47dc756c23b69a8))
+* **magicsock:** advertise interface addresses, not the wildcard bind ([#640](https://github.com/GeiserX/tailscale-rs/issues/640)) ([f1c8373](https://github.com/GeiserX/tailscale-rs/commit/f1c8373b4dbfee08b96f32613e303f062f4cd0a6))
+* **magicsock:** age reflexive addresses and keep hairpin pong sources out ([#642](https://github.com/GeiserX/tailscale-rs/issues/642)) ([00e481d](https://github.com/GeiserX/tailscale-rs/commit/00e481d1ccc1b7ece2537dc2e81a2590930fa2af))
+* **magicsock:** count only sent bytes toward a connected socket, and close one that stops working ([#641](https://github.com/GeiserX/tailscale-rs/issues/641)) ([e76a9cc](https://github.com/GeiserX/tailscale-rs/commit/e76a9ccaccc21c85276c7bb7593e04424732ec59))
+* **magicsock:** discover paths only for peers with traffic, as Go does ([#647](https://github.com/GeiserX/tailscale-rs/issues/647)) ([87fbbb0](https://github.com/GeiserX/tailscale-rs/commit/87fbbb06d3aeef671dfef82618a17fd53879b9be))
+* **magicsock:** learn private and hairpin ping sources as Go does ([#639](https://github.com/GeiserX/tailscale-rs/issues/639)) ([96cdc2d](https://github.com/GeiserX/tailscale-rs/commit/96cdc2d31c4c74d8faf7f9d84f536e85552fe948))
+
 ## [0.57.8](https://github.com/GeiserX/tailscale-rs/compare/v0.57.7...v0.57.8) (2026-10-17)
 
 
