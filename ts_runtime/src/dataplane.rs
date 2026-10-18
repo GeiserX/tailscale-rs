@@ -155,10 +155,17 @@ pub type OverlayFromDataplane = mpsc::UnboundedReceiver<Vec<PacketMut>>;
 /// data with data or a keepalive of its own, so in Go received data keeps a session active too.
 /// This tree's tunnel does not always answer, so received data is counted directly.
 ///
-/// WireGuard keepalives are not counted. This fork sends a persistent keepalive to every peer
-/// with a session ([`Env::persistent_keepalive_interval`]), where upstream does so only for peers
-/// control marks `KeepAlive`. Counting them would keep every such session active, and so its
-/// discovery running, long after the last data.
+/// Only transport data with a payload counts. Go stamps `lastSendExt` for every packet
+/// wireguard-go sends, handshakes included (wgengine/magicsock/endpoint.go:1072, v1.102.4), but
+/// upstream (v1.102.4) sets no WireGuard persistent keepalive on any peer: wgcfg.Config carries no
+/// peers (wgengine/wgcfg/config.go:16-25) and SetPeerConfigFunc supplies only allowed IPs
+/// (wgengine/userspace.go:689), so an idle Go session exchanges nothing and never rekeys. This
+/// fork sends a persistent keepalive to every peer with a session
+/// ([`Env::persistent_keepalive_interval`]), and the initiator rekeys the keypair on the first
+/// packet received after it is 165 s old (ts_tunnel `keep_key_fresh_receiving`), so counting
+/// keepalives, or the handshakes they cause, would restart discovery for every idle session every
+/// few minutes. The cost is that discovery for a fresh session starts on its first data packet,
+/// one handshake round trip over DERP later than in Go.
 ///
 /// The direct manager takes the peers with new traffic ([`next`](Self::next)) and marks them
 /// active on the magicsock, which starts discovery for a peer that was idle. A peer is reported at
@@ -187,9 +194,10 @@ struct PeerActivityState {
 const PEER_ACTIVITY_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl PeerActivity {
-    /// Record WireGuard traffic with `peer`. Ignored when `packets` holds nothing but keepalives.
+    /// Record WireGuard traffic with `peer`. Ignored unless `packets` holds transport data with a
+    /// payload: keepalives and handshakes are not traffic.
     pub fn note(&self, peer: PeerId, packets: &[PacketMut]) {
-        if !packets.iter().any(|p| !is_wireguard_keepalive(p.as_ref())) {
+        if !packets.iter().any(|p| is_wireguard_data(p.as_ref())) {
             return;
         }
         let now = tokio::time::Instant::now();
@@ -240,10 +248,11 @@ impl PeerActivity {
     }
 }
 
-/// Whether `packet` is a WireGuard keepalive: a transport-data message (type 4) with an empty
-/// payload, which is its 16-byte header plus the 16-byte AEAD tag (WireGuard §5.4.6 and §6.5).
-fn is_wireguard_keepalive(packet: &[u8]) -> bool {
-    packet.len() == 32 && packet[0] == 4
+/// Whether `packet` is WireGuard transport data with a payload: a transport-data message (type 4)
+/// longer than a keepalive, which is its 16-byte header plus the 16-byte AEAD tag around an empty
+/// payload (WireGuard §5.4.6 and §6.5). Handshake messages (types 1-3) are not data.
+fn is_wireguard_data(packet: &[u8]) -> bool {
+    packet.len() > 32 && packet[0] == 4
 }
 
 /// Queue for packets leaving the underlay to the dataplane.
@@ -748,10 +757,11 @@ mod tests {
     }
 
     /// Data in either direction counts as traffic with a peer; a WireGuard keepalive does not,
-    /// since this fork keeps one going to every peer with a session. A peer is reported once per
-    /// report interval however many batches it sends.
+    /// since this fork keeps one going to every peer with a session, and neither does a handshake,
+    /// since those keepalives cause periodic rekeys. A peer is reported once per report interval
+    /// however many batches it sends.
     #[tokio::test(start_paused = true)]
-    async fn peer_activity_counts_data_but_not_keepalives() {
+    async fn peer_activity_counts_data_but_not_keepalives_or_handshakes() {
         let activity = PeerActivity::default();
         let peer = PeerId(7);
         let packet = |len: usize| PacketMut::from([vec![4u8, 0, 0, 0], vec![0; len - 4]].concat());
@@ -766,6 +776,20 @@ mod tests {
             reported(&activity).await,
             None,
             "a keepalive is not traffic"
+        );
+
+        activity.note(peer, &[PacketMut::from(vec![1u8; 148])]);
+        assert_eq!(
+            reported(&activity).await,
+            None,
+            "a handshake initiation is not traffic"
+        );
+
+        activity.note(peer, &[PacketMut::from(vec![2u8; 92])]);
+        assert_eq!(
+            reported(&activity).await,
+            None,
+            "a handshake response is not traffic"
         );
 
         activity.note(peer, &[packet(32), packet(48)]);

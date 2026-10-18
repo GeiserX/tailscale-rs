@@ -401,9 +401,10 @@ impl DirectManager {
     ///
     /// 1. [`MagicSock::rebind`] — swap the socket; clear reflexive + every confirmed best path
     ///    (keeping candidates), so peers fail closed to DERP and re-probe over the new socket.
-    /// 2. [`MagicSock::send_pings`] — re-ping all candidates **now** on the freshly-swapped socket,
-    ///    so a still-reachable peer re-confirms its direct path immediately instead of after up to a
-    ///    full `PING_INTERVAL`.
+    /// 2. [`MagicSock::send_pings`] — re-ping the candidates of every peer with recent traffic
+    ///    **now** on the freshly-swapped socket (idle peers are probed when their traffic resumes,
+    ///    as after Go's noteConnectivityChange), so a still-reachable active peer re-confirms its
+    ///    direct path immediately instead of after up to a full `PING_INTERVAL`.
     /// 3. An immediate STUN sweep to the derp map's v4 STUN servers (same source + gate as the
     ///    periodic [`run_stun_prober`]): re-learn our reflexive/public address on the new socket
     ///    now, rather than waiting out the jittered ~23s timer.
@@ -432,9 +433,9 @@ impl DirectManager {
         // 1. Swap the socket + reset stale local mapping (clears best paths, keeps candidates).
         sock.rebind().await?;
 
-        // 2. Re-ping all candidates now on the new socket (every best is None post-rebind, so this
-        //    re-pings everything under the normal cadence gates). A send error is non-fatal: the
-        //    periodic pinger backstops it.
+        // 2. Re-ping candidates now on the new socket (every best is None post-rebind, so this
+        //    re-pings every candidate of every active peer under the normal cadence gates; idle
+        //    peers wait for traffic). A send error is non-fatal: the periodic pinger backstops it.
         if let Err(e) = sock.send_pings().await {
             tracing::trace!(error = %e, "rebind-and-reprobe: re-ping after rebind");
         }
@@ -1175,6 +1176,11 @@ async fn run_call_me_maybe(
 /// for the next 45s. A peer that was idle until now is also probed here at once, so its first
 /// packets leave DERP within a round trip rather than after the next pinger and `CallMeMaybe`
 /// ticks.
+///
+/// Unlike Go, which re-runs discovery on every send while the direct path is untrusted
+/// (endpoint.go:1066-1071), only the idle-to-active edge is handled here; a trust lapse during an
+/// active session is picked up by the next pinger tick (`PING_INTERVAL`, 2 s) and the
+/// `CallMeMaybe` loop (5 s), so the extra delay over Go is at most about 2 s.
 async fn run_discovery_on_traffic(
     sock: Arc<MagicSock>,
     peer_db: Arc<RwLock<Option<Arc<PeerDb>>>>,
@@ -1194,6 +1200,13 @@ async fn run_discovery_on_traffic(
 }
 
 /// One peer's report for [`run_discovery_on_traffic`].
+///
+/// The `CallMeMaybe` goes only when at least one ping went out, as Go's `sendDiscoPingsLocked`
+/// requires (`sentAny`, endpoint.go:1394). It is not gated on a reflexive address: Go sends the
+/// `CallMeMaybe` with whatever endpoints it last learned (magicsock.go:2680-2685), re-STUNing first
+/// only when they are older than 27 s (magicsock.go:2662-2677). The re-STUN is left to the
+/// periodic prober here; the periodic `CallMeMaybe` loop keeps its reflexive gate so a peer that
+/// can never go direct is not prompted every 5 s.
 async fn discover_on_traffic(
     sock: &MagicSock,
     peer_db: &RwLock<Option<Arc<PeerDb>>>,
@@ -1220,11 +1233,17 @@ async fn discover_on_traffic(
         return;
     }
 
-    match sock.send_discovery_pings(&disco, now).await {
-        Ok(sent) => tracing::trace!(%disco, sent, "traffic resumed; starting path discovery"),
-        Err(e) => tracing::debug!(error = %e, %disco, "starting path discovery on traffic"),
-    }
-    if have_reflexive(sock) {
+    let sent = match sock.send_discovery_pings(&disco, now).await {
+        Ok(sent) => {
+            tracing::trace!(%disco, sent, "traffic resumed; starting path discovery");
+            sent
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, %disco, "starting path discovery on traffic");
+            0
+        }
+    };
+    if sent > 0 {
         send_call_me_maybe(sock, relay, node_key, disco, netmap_region).await;
     }
 }
@@ -3198,11 +3217,11 @@ mod tests {
             stopped,
         ));
 
-        // A WireGuard handshake initiation for the idle peer, taken by an underlay (DERP: the peer
-        // has no direct path) the way the dataplane hands it over.
+        // The first data packet for the idle peer, taken by an underlay the way the dataplane hands
+        // it over.
         let (mut from_dataplane, dataplane) = UnderlayFromDataplane::for_test(activity);
-        let initiation = ts_packet::PacketMut::from(vec![1u8; 148]);
-        dataplane.send((peer, vec![initiation])).unwrap();
+        let data = ts_packet::PacketMut::from([vec![4u8, 0, 0, 0], vec![0; 60]].concat());
+        dataplane.send((peer, vec![data])).unwrap();
         assert_eq!(from_dataplane.recv().await.unwrap().0, peer);
 
         tokio::time::timeout(Duration::from_millis(100), async {

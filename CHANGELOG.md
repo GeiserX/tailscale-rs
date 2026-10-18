@@ -6,7 +6,7 @@ Record breaking or significant changes here. All dates are UTC.
 
 ### Bug Fixes
 
-* **magicsock:** discover direct paths only for peers with traffic, as Go does. A peer is pinged and sent CallMeMaybe while data has flowed to or from it in the last 45 seconds, and at once when traffic resumes. Idle peers stay on DERP. An inbound CallMeMaybe still pings at once.
+* **magicsock:** discover direct paths only for peers with traffic, as Go does. A peer is pinged and sent CallMeMaybe while WireGuard data has flowed to or from it in the last 45 seconds (keepalives and handshakes do not count), and at once when traffic resumes. Idle peers stay on DERP. An inbound CallMeMaybe still pings at once.
 
 ### Performance
 
