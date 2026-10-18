@@ -174,6 +174,11 @@ const UPGRADE_UDP_DIRECT_INTERVAL: Duration = Duration::from_secs(60);
 /// `MAX_REFLEXIVE_ADDRS` (16) — so 32 admits roughly two full legitimate advertisements before
 /// clamping, while bounding abuse. Netmap candidates are not counted (control-authoritative,
 /// already bounded by reconcile).
+///
+/// Go expires these instead (`endpointState.shouldDeleteLocked`, wgengine/magicsock/endpoint.go:456-468:
+/// 45 s since `lastGotPing`, `sessionActiveTimeout` at magicsock.go:4024; `CallMeMaybe` endpoints
+/// are replaced per message, endpoint.go:1994-1999) and only additionally prunes past 100 endpoints
+/// (endpoint.go:1630). This tree does not expire them, and the 32 cap stands in for that expiry.
 const MAX_LEARNED_CANDIDATES_PER_PEER: usize = 32;
 
 /// Where a candidate endpoint came from, which decides how it is reconciled.
@@ -184,6 +189,9 @@ enum CandidateSource {
     Netmap,
     /// Learned from authenticated disco traffic (an inbound ping's source, or a CallMeMaybe).
     /// Preserved across netmap updates — only dropped when the whole peer leaves the netmap.
+    /// Go expires these (`shouldDeleteLocked`, 45 s since `lastGotPing`; `CallMeMaybe` endpoints
+    /// replaced per message); this tree does not, and [`MAX_LEARNED_CANDIDATES_PER_PEER`] stands
+    /// in for that expiry.
     #[default]
     Learned,
 }

@@ -6,7 +6,7 @@ Record breaking or significant changes here. All dates are UTC.
 
 ### Bug Fixes
 
-* **magicsock:** learn a peer's private, carrier-grade NAT or hairpin address from its authenticated disco pings and `CallMeMaybe`, as Go does, and accept WireGuard data from it; a peer reachable only through the router's hairpin no longer stays on DERP. Relay addresses keep the stricter filter.
+* **magicsock:** learn a peer's private, carrier-grade NAT or hairpin address from its authenticated disco pings and `CallMeMaybe`, as Go does, and accept WireGuard data from that address (this tree gates data on a learned address; Go accepts data from any source and finds the peer cryptographically); a peer reachable only through the router's hairpin no longer stays on DERP. Relay addresses keep the stricter filter.
 
 ### Performance
 

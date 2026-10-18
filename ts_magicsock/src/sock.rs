@@ -1230,6 +1230,14 @@ impl MagicSock {
             // peer's known endpoint and hijack inbound-data attribution. First writer wins for
             // learned candidates; only the authoritative netmap path ([`set_netmap_endpoints`]) may
             // reassign an address across peers.
+            //
+            // This is a divergence from Go, whose `peerMap.setNodeKeyForEpAddr`
+            // (wgengine/magicsock/peermap.go:187-205) is last-writer-wins and is written only from
+            // a ping (magicsock.go:2581-2584) and a solicited pong (endpoint.go:1759); Go never
+            // stores a `CallMeMaybe` endpoint in that map. Attributing data to a `CallMeMaybe`
+            // endpoint here is this tree's own choice. A misattribution costs only the under-load
+            // cookie reply (ts_tunnel `Endpoint::recv_from`) and the silent-disco trust stamp,
+            // because the tunnel routes data by WireGuard session id.
             match a2d.get(ep) {
                 Some(existing) if *existing != peer => {
                     tracing::debug!(
