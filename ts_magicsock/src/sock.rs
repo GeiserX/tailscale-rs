@@ -996,7 +996,11 @@ impl MagicSock {
         // guess loop below: the critical section is the cheap copy, not the candidate assembly.
         let (all_reflexive, v4_reflexive): (Vec<SocketAddr>, Vec<SocketAddr>) = {
             let reflexive = lock(&self.reflexive);
-            let all: Vec<SocketAddr> = reflexive.iter().copied().collect();
+            let mut all: Vec<SocketAddr> = reflexive.iter().copied().collect();
+            // A deterministic order for the STUN group, so the advertiser's ordered comparison
+            // does not see a change when a re-filled set iterates differently (Go compares
+            // endpoint sets order-insensitively, `endpointSetsEqual`).
+            all.sort();
             let v4: Vec<SocketAddr> = all.iter().filter(|a| a.is_ipv4()).copied().collect();
             (all, v4)
         };

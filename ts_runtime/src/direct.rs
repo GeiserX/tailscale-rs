@@ -1036,8 +1036,9 @@ fn stun_probe_window(
 /// change to avoid spamming control with redundant side-band map requests.
 ///
 /// A change is a change in the ordered endpoint list, in the STUN facts or in the port-mapping
-/// facets (Go's `BasicallyEqual` for these fields). The list is published in priority order, not
-/// sorted. A port-mapper state change (`port_map_rx`) wakes the loop at once instead of waiting for
+/// facets. Go compares endpoints with the order-insensitive `endpointSetsEqual` and the NetInfo
+/// facts with `BasicallyEqual`; the STUN group here is sorted so the ordered comparison is stable.
+/// The list is published in priority order. A port-mapper state change (`port_map_rx`) wakes the loop at once instead of waiting for
 /// the 5 s tick, which stays as the fallback for reflexive addresses learned from pongs.
 ///
 /// Reflexive (STUN-equivalent) endpoints come solely from the disco pong-harvest path on the one
@@ -1080,7 +1081,8 @@ async fn run_advertiser<F, Fut>(
 }
 
 /// Whether `eps` holds a candidate a remote peer could reach across the internet: a STUN
-/// reflexive address or a port mapping (Go counts `EndpointPortmapped` as one too).
+/// reflexive address or a port mapping. (This gate is a Rust addition; Go's `enqueueCallMeMaybe`
+/// sends whatever endpoints it last determined.)
 fn has_reflexive_candidate(eps: &[SelfEndpoint]) -> bool {
     eps.iter().any(|e| {
         matches!(
@@ -1478,7 +1480,9 @@ impl Message<Arc<ts_control::StateUpdate>> for DirectManager {
             self.sock.as_deref(),
         );
         // `only-tcp-443` stops the port mapper's LAN sends too, synchronously and deletes
-        // included (Go passes `onlyTCP443` to the portmapper as its disable-all knob).
+        // included. Go passes `onlyTCP443` as the portmapper's disable-all knob, which blocks
+        // only new creates and probes: Go keeps advertising the cached mapping and still releases
+        // it on Close.
         #[cfg(feature = "portmapper")]
         if let (Some(node), Some(pm)) = (msg.node.as_ref(), &self.portmap) {
             pm.set_only_tcp_443(node.only_tcp_443());
