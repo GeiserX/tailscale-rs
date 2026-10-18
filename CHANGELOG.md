@@ -4,6 +4,10 @@ Record breaking or significant changes here. All dates are UTC.
 
 ## Unreleased
 
+### Bug Fixes
+
+* **magicsock:** reflexive addresses record whether STUN or a peer's pong reported them and stop being advertised 5 min 10 s after they were last seen, as Go's endpoint tracker does. When the set is full, a new address replaces the stalest entry that only peers reported, and a peer's observation never displaces a live STUN result. A pong-reported address is kept only if a peer would accept it as a candidate and it is outside `100.64.0.0/10`, so router-side hairpin addresses are no longer advertised or counted as symmetric-NAT evidence.
+
 ### Performance
 
 * **exit node:** forwarded TCP flows run without Nagle, the underlay UDP sockets ask for Go's 7 MiB buffers, netstack egress goes out in batches of up to 64 packets, and the netstack tracks 32 receive holes for uploads. Kernel receive batching, splice coalescing, targeted replay and Apple connected UDP sockets are opt-in experiments, off unless their variable is `1`.
