@@ -12,6 +12,9 @@ Record breaking or significant changes here. All dates are UTC.
 * **magicsock:** a socket bound to `0.0.0.0` advertises the host's interface addresses, selected as Go does, instead of `0.0.0.0` itself; no unspecified, multicast or broadcast endpoint, nor loopback unless the socket is bound to loopback, reaches control or a CallMeMaybe.
 * **magicsock:** reflexive addresses record whether STUN or a peer's pong reported them and stop being advertised once a STUN sweep finds them unseen for 5 min 10 s (Go's endpoint tracker lifetime and trigger; an idle node keeps advertising its last set). When the set is full, a new address replaces the stalest entry that only peers reported, and a peer's observation never displaces a live STUN result. A pong-reported address is kept only if a peer would accept it as a candidate and it is outside `100.64.0.0/10`, so router-side hairpin addresses are no longer advertised or counted as symmetric-NAT evidence.
 * **magicsock:** learn a peer's private, carrier-grade NAT or hairpin address from its authenticated disco pings and `CallMeMaybe`, as Go does, and accept WireGuard data from that address (this tree gates data on a learned address; Go accepts data from any source and finds the peer cryptographically); a peer reachable only through the router's hairpin no longer stays on DERP. Relay addresses keep the stricter filter.
+### Features
+
+* **portmapper:** add `ts_portmapper`, a NAT-PMP and PCP client modelled on Go's `net/portmapper`, which only ever sends to the LAN gateway's port 5351.
 
 ### Performance
 

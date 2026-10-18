@@ -2344,6 +2344,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "geiserx_ts_portmapper"
+version = "0.57.8"
+dependencies = [
+ "getrandom 0.4.3",
+ "if-addrs",
+ "libc",
+ "proptest",
+ "socket2",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-test",
+]
+
+[[package]]
 name = "geiserx_ts_python"
 version = "0.57.8"
 dependencies = [

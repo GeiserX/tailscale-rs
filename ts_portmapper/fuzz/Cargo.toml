@@ -1,0 +1,49 @@
+# cargo-fuzz crate for the port mapper's parsers (same layout as ts_tka/fuzz).
+#
+# Its OWN workspace (the empty `[workspace]` table below), by cargo-fuzz convention: it is not a
+# member of the parent workspace, so the nightly-only libfuzzer machinery never enters the normal
+# build. Run from this directory: `cargo +nightly fuzz run parse_pcp_map`.
+[package]
+name = "ts_portmapper-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+geiserx_ts_portmapper = { path = ".." }
+
+[workspace]
+
+[[bin]]
+name = "parse_pmp"
+path = "fuzz_targets/parse_pmp.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "parse_pcp"
+path = "fuzz_targets/parse_pcp.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "parse_pcp_map"
+path = "fuzz_targets/parse_pcp_map.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "parse_rt_dump"
+path = "fuzz_targets/parse_rt_dump.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "parse_proc_net_route"
+path = "fuzz_targets/parse_proc_net_route.rs"
+test = false
+doc = false

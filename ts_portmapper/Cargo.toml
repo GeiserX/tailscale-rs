@@ -1,0 +1,52 @@
+[package]
+name = "geiserx_ts_portmapper"
+version.workspace = true
+description = "tailscale NAT port mapper (NAT-PMP and PCP)"
+categories = ["network-programming"]
+keywords = ["tailscale", "nat-pmp", "pcp", "portmapper"]
+
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "ts_portmapper"
+
+[dependencies]
+# Every dependency below is already in the workspace lock, so this crate adds no new crate to the
+# graph. Deliberately no HTTP, TLS or route crate: the `portmapper_lan_only` check enforces that.
+thiserror.workspace = true
+# `net` for the UDP exchange sockets, `time` for the absolute exchange deadline, `macros` for the
+# probe's `select!`, `rt` for the runtime check before registering a socket; `sync` is used by the
+# fake-router harness. All are already in the graph.
+tokio = { workspace = true, features = ["net", "time", "sync", "rt", "macros"] }
+# Interface binding (`IP_BOUND_IF` on macOS, `SO_BINDTODEVICE` on Linux) for the LAN sockets. The
+# `all` feature is what exposes the binding calls; `ts_magicsock` already enables it.
+socket2 = { version = "0.6", features = ["all"] }
+# Interface address enumeration for the gateway's on-link check (already used by `ts_host_net`,
+# `ts_forwarder` and `ts_magicsock`).
+if-addrs = "0.15"
+# PCP mapping nonces come from the OS CSPRNG (RFC 6887 §11.1). Already pulled in by `ts_keys`.
+getrandom = "0.4"
+# Lifecycle logging (obtained, renewed, lost, released). Already in the workspace graph.
+tracing.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# macOS: `sysctl(NET_RT_DUMP2)` for the routing table; Linux: `if_nametoindex`. Both: uid/euid for
+# the probe's diagnostics line.
+libc = "0.2"
+
+[dev-dependencies]
+proptest.workspace = true
+tracing-test = { workspace = true, features = ["no-env-filter"] }
+tokio = { workspace = true, features = ["test-util", "macros", "rt", "rt-multi-thread"] }
+
+[features]
+# Exposes the fake NAT-PMP/PCP router and `TestCap`, the loopback test transport, to other crates'
+# tests. Never enable it from a normal (non-dev) dependency: the `portmapper_lan_only` check fails
+# if any crate does.
+test-harness = []
+
+[lints]
+workspace = true

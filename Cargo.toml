@@ -38,6 +38,7 @@ members = [
     "ts_packetfilter_serde",
     "ts_packetfilter_state",
     "ts_peercapability",
+    "ts_portmapper",
     "ts_python",
     "ts_runtime",
     "ts_test_util",
@@ -185,6 +186,7 @@ ts_packetfilter_serde = { path = "ts_packetfilter_serde", package = "geiserx_ts_
 ts_packetfilter_state = { path = "ts_packetfilter_state", package = "geiserx_ts_packetfilter_state", version = "0.57.8" } # x-release-please-version
 ts_peercapability = { path = "ts_peercapability", package = "geiserx_ts_peercapability", version = "0.57.8" } # x-release-please-version
 ts_http_util = { path = "ts_http_util", package = "geiserx_ts_http_util", version = "0.57.8" } # x-release-please-version
+ts_portmapper = { path = "ts_portmapper", package = "geiserx_ts_portmapper", version = "0.57.8" } # x-release-please-version
 ts_tka = { path = "ts_tka", package = "geiserx_ts_tka", version = "0.57.8" } # x-release-please-version
 ts_tls_util = { path = "ts_tls_util", package = "geiserx_ts_tls_util", version = "0.57.8" } # x-release-please-version
 ts_runtime = { path = "ts_runtime", package = "geiserx_ts_runtime", version = "0.57.8" } # x-release-please-version

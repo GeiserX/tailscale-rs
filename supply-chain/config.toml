@@ -115,6 +115,9 @@ audit-as-crates-io = false
 [policy.geiserx_ts_peercapability]
 audit-as-crates-io = false
 
+[policy.geiserx_ts_portmapper]
+audit-as-crates-io = false
+
 [policy.geiserx_ts_python]
 audit-as-crates-io = false
 
