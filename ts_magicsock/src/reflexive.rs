@@ -6,9 +6,11 @@
 //! per-path reply information (`wgengine/magicsock/endpoint.go` `handlePongConnLocked`,
 //! `pongReply.pongSrc`) and never publishes it. This fork also advertises pong observations so a
 //! node still learns its public address when no STUN server is reachable. The set therefore keeps
-//! each address's provenance, ages entries out like Go's `endpointTracker`
-//! (`wgengine/magicsock/endpoint_tracker.go`), and when full lets a new address replace the
-//! stalest one, never letting a peer observation displace a STUN result.
+//! each address's provenance, ages entries out with Go's `endpointTracker` lifetime and trigger
+//! (`wgengine/magicsock/endpoint_tracker.go`), and bounds the set with this fork's own rule: 16
+//! addresses in total, a new address replacing the stalest peer-only entry, a peer observation
+//! never displacing a live STUN result. Go instead keeps up to 6 entries per IP and pops the
+//! oldest (`endpoint_tracker.go:37`, `:222-224`).
 
 use core::net::SocketAddr;
 use std::{
@@ -24,9 +26,12 @@ use std::{
 pub(crate) const MAX_REFLEXIVE_ADDRS: usize = 16;
 
 /// How long an address stays advertised after it was last observed: Go's
-/// `endpointTrackerLifetime` ("slightly longer than a full netcheck period"). STUN re-probes
-/// every ~23 s and every solicited pong re-observes its address, so a live mapping never lapses;
-/// a mapping the NAT has dropped stops being advertised within this window.
+/// `endpointTrackerLifetime` (`wgengine/magicsock/endpoint_tracker.go:22`, "slightly longer than
+/// a full netcheck period"); an entry is live up to and including this long after its last
+/// observation, Go's `now.After(until)`. Expiry is evaluated only when a STUN sweep runs
+/// ([`ReflexiveSet::sweep`]), as Go evaluates it only inside `determineEndpoints`
+/// (`wgengine/magicsock/magicsock.go:1405`); an idle node, whose sweeps have stopped, keeps
+/// advertising what it last published (`magicsock.go:995`).
 pub(crate) const REFLEXIVE_LIFETIME: Duration = Duration::from_secs(5 * 60 + 10);
 
 /// How a reflexive address was learned.
@@ -71,17 +76,20 @@ impl Entry {
 #[derive(Debug, Default)]
 pub(crate) struct ReflexiveSet {
     entries: HashMap<SocketAddr, Entry>,
+    /// When the previous STUN sweep started; see [`sweep`](Self::sweep).
+    last_sweep: Option<Instant>,
 }
 
 impl ReflexiveSet {
     /// Record that `source` observed `addr` at `now`. Returns `true` when `addr` is new.
     ///
-    /// Expired entries are dropped first. When the set is still full, the stalest peer-only
-    /// entry (no live STUN observation) makes room; for a STUN result, failing that, the stalest
-    /// STUN entry. A peer observation never replaces an entry with a live STUN observation, so
-    /// peers cannot flush what STUN learned.
+    /// Noting never expires anything: a pong arriving as traffic resumes after a long idle must
+    /// not withdraw the STUN results an idle node kept advertising (expiry belongs to
+    /// [`sweep`](Self::sweep)). When the set is full, the stalest peer-only entry (no live STUN
+    /// observation) makes room; for a STUN result, failing that, the stalest entry. A peer
+    /// observation never replaces an entry with a live STUN observation, so peers cannot flush
+    /// what STUN learned.
     pub(crate) fn note(&mut self, addr: SocketAddr, source: ReflexiveSource, now: Instant) -> bool {
-        self.entries.retain(|_, e| e.is_live(now));
         if let Some(entry) = self.entries.get_mut(&addr) {
             entry.observe(source, now);
             return false;
@@ -113,30 +121,45 @@ impl ReflexiveSet {
         true
     }
 
-    /// The addresses still live at `now`, sorted.
-    pub(crate) fn live(&self, now: Instant) -> Vec<SocketAddr> {
-        let mut live: Vec<SocketAddr> = self
-            .entries
-            .iter()
-            .filter(|(_, e)| e.is_live(now))
-            .map(|(a, _)| *a)
-            .collect();
-        live.sort();
-        live
+    /// Drop every entry not observed within [`REFLEXIVE_LIFETIME`] of `now`.
+    pub(crate) fn prune(&mut self, now: Instant) {
+        self.entries.retain(|_, e| e.is_live(now));
     }
 
-    /// How `addr` is known at `now`, or `None` if it is not live.
+    /// A STUN sweep is starting at `now`: apply the expiry decision of the previous sweep, i.e.
+    /// [`prune`](Self::prune) as of the instant that sweep started.
+    ///
+    /// Go decides expiry inside `endpointTracker.update` after the sweep's netcheck, extending
+    /// what the sweep re-observed before removing the rest (`endpoint_tracker.go:126-136`), so a
+    /// still-valid mapping is never withdrawn. Our STUN responses arrive asynchronously after the
+    /// requests go out, so pruning at `now` would briefly withdraw such a mapping until its
+    /// response landed. Pruning as of the previous sweep's start keeps every address that sweep
+    /// re-observed (its responses arrived after it started) and drops exactly what Go's
+    /// determination for that sweep dropped. The divergence: the drop is applied one sweep later.
+    pub(crate) fn sweep(&mut self, now: Instant) {
+        if let Some(prev) = self.last_sweep.replace(now) {
+            self.prune(prev);
+        }
+    }
+
+    /// Every stored address, sorted. No time filter: Go advertises its last determination until
+    /// the next one (`wgengine/magicsock/magicsock.go:995`).
+    pub(crate) fn addrs(&self) -> Vec<SocketAddr> {
+        let mut addrs: Vec<SocketAddr> = self.entries.keys().copied().collect();
+        addrs.sort();
+        addrs
+    }
+
+    /// How `addr` is known at `now`, or `None` if it is not stored.
     #[cfg(test)]
     pub(crate) fn source(&self, addr: &SocketAddr, now: Instant) -> Option<ReflexiveSource> {
-        self.entries
-            .get(addr)
-            .filter(|e| e.is_live(now))
-            .map(|e| e.source(now))
+        self.entries.get(addr).map(|e| e.source(now))
     }
 
     /// Forget every address (the socket was rebound, so its mappings are gone).
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
+        self.last_sweep = None;
     }
 
     /// The number of stored addresses, live or not yet pruned.

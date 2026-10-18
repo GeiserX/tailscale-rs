@@ -916,12 +916,6 @@ impl MagicSock {
     /// unspecified `[::]:port`. With the default `enable_ipv6 == false` no IPv6 local candidate is
     /// emitted and the result is byte-for-byte the prior IPv4-only set.
     pub fn self_endpoints(&self) -> Vec<SelfEndpoint> {
-        self.self_endpoints_at(Instant::now())
-    }
-
-    /// [`self_endpoints`](Self::self_endpoints) as of `now`: reflexive addresses not observed
-    /// within [`REFLEXIVE_LIFETIME`](crate::reflexive::REFLEXIVE_LIFETIME) of `now` are left out.
-    fn self_endpoints_at(&self, now: Instant) -> Vec<SelfEndpoint> {
         let mut eps = Vec::new();
 
         let local = self.local_addr().ok();
@@ -985,10 +979,11 @@ impl MagicSock {
 
         // Collect the reflexive set into owned `Vec`s and drop the guard before the O(n²) dedup/
         // guess loop below: the critical section is the cheap copy, not the candidate assembly.
-        // Only live entries: an address no STUN response or pong has reported for
-        // `REFLEXIVE_LIFETIME` is no longer advertised, nor counted as symmetric-NAT evidence.
+        // Every stored entry, unfiltered: expiry happens only at a STUN sweep
+        // ([`expire_reflexive`](Self::expire_reflexive)), so an idle node keeps advertising its
+        // last-known addresses as Go does (`wgengine/magicsock/magicsock.go:995`).
         let (all_reflexive, v4_reflexive): (Vec<SocketAddr>, Vec<SocketAddr>) = {
-            let all = lock(&self.reflexive).live(now);
+            let all = lock(&self.reflexive).addrs();
             let v4: Vec<SocketAddr> = all.iter().filter(|a| a.is_ipv4()).copied().collect();
             (all, v4)
         };
@@ -1027,6 +1022,24 @@ impl MagicSock {
         }
 
         eps
+    }
+
+    /// A STUN sweep is starting: expire reflexive addresses no sweep has re-observed within
+    /// [`REFLEXIVE_LIFETIME`](crate::reflexive::REFLEXIVE_LIFETIME) (see
+    /// [`ReflexiveSet::sweep`](crate::reflexive::ReflexiveSet::sweep) for why the cut is taken
+    /// at the previous sweep's start).
+    ///
+    /// Go evaluates `endpointTracker` expiry only inside `determineEndpoints`
+    /// (`wgengine/magicsock/magicsock.go:1405`), i.e. once per STUN sweep, so an idle node keeps
+    /// advertising its last endpoints (`magicsock.go:995`). Called by the STUN prober before each
+    /// periodic and on-demand sweep.
+    pub fn expire_reflexive(&self) {
+        self.expire_reflexive_at(Instant::now());
+    }
+
+    /// [`expire_reflexive`](Self::expire_reflexive) for a sweep starting at `now`.
+    fn expire_reflexive_at(&self, now: Instant) {
+        lock(&self.reflexive).sweep(now);
     }
 
     /// Whether to treat this node as behind a symmetric (endpoint-dependent-mapping) NAT, which is
@@ -2913,8 +2926,8 @@ impl MagicSock {
             return;
         }
         let inserted = lock(&self.reflexive).note(addr, source, now);
-        // Count only an admission (off the lock), not a refresh of a live address or a rejected
-        // one. An address admitted again after it expired or was replaced counts again.
+        // Count only an admission (off the lock), not a refresh of a stored address or a rejected
+        // one. An address admitted again after a sweep expired it or it was replaced counts again.
         if inserted {
             crate::metrics::metrics().reflexive_learned.inc();
         }
@@ -7022,7 +7035,7 @@ mod tests {
             sock.note_reflexive_at(hairpin.parse().unwrap(), ReflexiveSource::PeerPong, t0);
         }
         assert!(sock.reflexive.lock().unwrap().is_empty());
-        let eps = sock.self_endpoints_at(t0);
+        let eps = sock.self_endpoints();
         assert!(
             eps.iter().all(|e| e.ty == SelfEndpointType::Local),
             "{eps:?}"
@@ -7050,15 +7063,26 @@ mod tests {
         let t1 = t0 + Duration::from_secs(1);
         sock.note_reflexive_at(stun_a, ReflexiveSource::Stun, t1);
         assert_eq!(sock.reflexive.lock().unwrap().len(), MAX_REFLEXIVE_ADDRS);
-        assert!(stun(&sock.self_endpoints_at(t1)).contains(&stun_a));
+        assert!(stun(&sock.self_endpoints()).contains(&stun_a));
 
-        // After the lifetime with no new observation, and before anything else is noted, the peer
-        // observations are no longer advertised, nor a reason to emit hard-NAT guesses. An entry
-        // is live up to and including `REFLEXIVE_LIFETIME` after its last observation.
-        let eps = sock.self_endpoints_at(t0 + REFLEXIVE_LIFETIME);
-        assert_eq!(stun(&eps).len(), MAX_REFLEXIVE_ADDRS, "{eps:?}");
+        // Past the lifetime with no sweep in between (an idle node), everything is still
+        // advertised: Go reads its last determination unfiltered (`magicsock.go:995`).
         let t2 = t0 + REFLEXIVE_LIFETIME + Duration::from_nanos(1);
-        let eps = sock.self_endpoints_at(t2);
+        let eps = sock.self_endpoints();
+        assert_eq!(stun(&eps).len(), MAX_REFLEXIVE_ADDRS, "{eps:?}");
+
+        // An expiry at the lifetime keeps everything: an entry is live up to and including
+        // `REFLEXIVE_LIFETIME` after its last observation.
+        sock.reflexive
+            .lock()
+            .unwrap()
+            .prune(t0 + REFLEXIVE_LIFETIME);
+        assert_eq!(stun(&sock.self_endpoints()).len(), MAX_REFLEXIVE_ADDRS);
+
+        // One past it, the peer observations are no longer advertised, nor a reason to emit
+        // hard-NAT guesses.
+        sock.reflexive.lock().unwrap().prune(t2);
+        let eps = sock.self_endpoints();
         assert_eq!(stun(&eps), [stun_a], "{eps:?}");
         assert!(
             !eps.iter().any(|e| e.ty == SelfEndpointType::Stun4LocalPort),
@@ -7075,7 +7099,7 @@ mod tests {
         // 16 addresses had ever been seen).
         let stun_b: SocketAddr = "203.0.113.6:52000".parse().unwrap();
         sock.note_reflexive_at(stun_b, ReflexiveSource::Stun, t2);
-        assert_eq!(stun(&sock.self_endpoints_at(t2)), [stun_a, stun_b]);
+        assert_eq!(stun(&sock.self_endpoints()), [stun_a, stun_b]);
 
         // A set full of STUN results: a peer observation cannot displace any of them.
         let t3 = t2 + Duration::from_secs(1);
@@ -7085,9 +7109,9 @@ mod tests {
         for addr in &stun_full {
             sock.note_reflexive_at(*addr, ReflexiveSource::Stun, t3);
         }
-        let before = sock.reflexive.lock().unwrap().live(t3);
+        let before = sock.reflexive.lock().unwrap().addrs();
         sock.note_reflexive_at(pong_src, ReflexiveSource::PeerPong, t3);
-        assert_eq!(sock.reflexive.lock().unwrap().live(t3), before);
+        assert_eq!(sock.reflexive.lock().unwrap().addrs(), before);
 
         // An address both sources report keeps STUN's protection only while its STUN observation
         // is live. Later, kept alive by pongs alone, it is a peer observation that a new peer
@@ -7100,7 +7124,8 @@ mod tests {
             Some(ReflexiveSource::Stun)
         );
         let t5 = t3 + REFLEXIVE_LIFETIME + Duration::from_secs(1);
-        assert_eq!(stun(&sock.self_endpoints_at(t5)), [both]);
+        sock.reflexive.lock().unwrap().prune(t5);
+        assert_eq!(stun(&sock.self_endpoints()), [both]);
         assert_eq!(
             sock.reflexive.lock().unwrap().source(&both, t5),
             Some(ReflexiveSource::PeerPong)
@@ -7112,11 +7137,54 @@ mod tests {
             sock.note_reflexive_at(addr, ReflexiveSource::Stun, t5);
         }
         sock.note_reflexive_at(pong_src, ReflexiveSource::PeerPong, t5);
-        let live = sock.reflexive.lock().unwrap().live(t5);
+        let live = sock.reflexive.lock().unwrap().addrs();
         assert!(
             live.contains(&pong_src) && !live.contains(&both),
             "{live:?}"
         );
+    }
+
+    /// Reflexive expiry runs only at a STUN sweep, never on read, so an idle node (whose sweeps
+    /// have stopped) keeps advertising its last addresses, as Go does: Go expires cached
+    /// endpoints only inside `determineEndpoints` (`wgengine/magicsock/magicsock.go:1405`) and
+    /// advertises its last determination until the next (`magicsock.go:995`). Before the fix the
+    /// read filtered on the clock, so 5 min 10 s into idleness every STUN endpoint was withdrawn
+    /// from control.
+    #[tokio::test]
+    async fn reflexive_addresses_expire_only_at_a_stun_sweep() {
+        use crate::reflexive::REFLEXIVE_LIFETIME;
+
+        let sock = plain_sock().await;
+        let stun = |sock: &MagicSock| -> Vec<SocketAddr> {
+            sock.self_endpoints()
+                .into_iter()
+                .filter(|e| e.ty == SelfEndpointType::Stun)
+                .map(|e| e.addr)
+                .collect()
+        };
+        let stale: SocketAddr = "203.0.113.5:51000".parse().unwrap();
+        let kept: SocketAddr = "203.0.113.5:51001".parse().unwrap();
+        let t0 = Instant::now();
+        sock.expire_reflexive_at(t0);
+        sock.note_reflexive_at(stale, ReflexiveSource::Stun, t0);
+        sock.note_reflexive_at(kept, ReflexiveSource::Stun, t0);
+
+        // Idle for twice the lifetime, no sweep, and a pong as traffic resumes: still advertised.
+        let t1 = t0 + 2 * REFLEXIVE_LIFETIME;
+        let pong: SocketAddr = "198.51.100.200:40000".parse().unwrap();
+        sock.note_reflexive_at(pong, ReflexiveSource::PeerPong, t1);
+        assert_eq!(stun(&sock), [pong, stale, kept]);
+
+        // The first sweep after the idle applies the previous sweep's decision, when both were
+        // fresh, so nothing is withdrawn while its STUN responses are in flight.
+        sock.expire_reflexive_at(t1);
+        assert_eq!(stun(&sock), [pong, stale, kept]);
+        // That sweep re-observes `kept` only.
+        sock.note_reflexive_at(kept, ReflexiveSource::Stun, t1 + Duration::from_millis(50));
+
+        // The next sweep drops what the previous one did not re-observe.
+        sock.expire_reflexive_at(t1 + Duration::from_secs(23));
+        assert_eq!(stun(&sock), [pong, kept]);
     }
 
     /// The disco-pong reflexive harvest is gated on netmap membership: a pong sealed by a disco key
