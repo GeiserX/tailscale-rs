@@ -306,9 +306,13 @@ impl SendEvidence {
             .runtime_origin
             .checked_add(elapsed)
             .unwrap_or(self.runtime_origin);
+        // An unanswered MAP's possible grant is bounded by the requested lifetime: a NAT-PMP
+        // gateway SHOULD NOT grant longer than requested (RFC 6886 §3.3). Go trusts no
+        // unanswered MAP at all (net/portmapper/portmapper.go:394-411), so this is already
+        // stricter than Go, and a tombstone for a network we left cannot hold its slot for ever.
         Some(crate::oneshot::lease_deadline(
             logical.max(runtime),
-            u32::MAX,
+            crate::schedule::REQUESTED_LIFETIME,
         ))
     }
 }

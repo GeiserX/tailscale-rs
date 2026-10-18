@@ -1,7 +1,7 @@
-//! PCP MAP reply parser (port of Go's `FuzzParsePCPMapResponse`): exactly one of a mapping or an
-//! error (by construction), a MAP parser never accepts another opcode, a success always satisfies
-//! the documented invariants, and only a full-length response that echoes our nonce is ever a
-//! success or an authoritative router error.
+//! PCP MAP reply parser (port of upstream Go's `FuzzParsePCPMapResponse`, on tailscale main after
+//! v1.102.4): exactly one of a mapping or an error (by construction), a MAP parser never accepts
+//! another opcode, a success always satisfies the documented invariants, and only a full-length
+//! response that echoes our nonce is ever a success or an authoritative router error.
 #![no_main]
 
 use std::num::NonZeroU16;

@@ -865,11 +865,14 @@ impl<T: PxpTransport + 'static> Lifecycle<T> {
         let before = self.data.facets;
         if want.pmp {
             if r.pmp {
-                self.data.probe.pmp_seen_at = Some(now);
-                self.data.probe.pmp_public_ip = r.pmp_public_ip;
+                // The reset check runs before the fresh answer is recorded, since a reset clears
+                // what it would record (Go: "must be before we write to c.pmp*",
+                // net/portmapper/portmapper.go:1138-1141).
                 if let Some(e) = r.pmp_epoch {
                     rolled_back |= self.router_reset(Proto::Pmp, e, started, gateway);
                 }
+                self.data.probe.pmp_seen_at = Some(now);
+                self.data.probe.pmp_public_ip = r.pmp_public_ip;
             }
             self.data.facets.pmp = Some(r.pmp);
         } else if protos.pmp {
@@ -877,10 +880,11 @@ impl<T: PxpTransport + 'static> Lifecycle<T> {
         }
         if want.pcp {
             if r.pcp {
-                self.data.probe.pcp_seen_at = Some(now);
+                // Before the write, as Go does (net/portmapper/portmapper.go:1098-1101).
                 if let Some(e) = r.pcp_epoch {
                     rolled_back |= self.router_reset(Proto::Pcp, e, started, gateway);
                 }
+                self.data.probe.pcp_seen_at = Some(now);
             }
             self.data.facets.pcp = Some(r.pcp);
             if let Some(code @ (pcp::ResultCode::NotAuthorized | pcp::ResultCode::AddressMismatch)) =
