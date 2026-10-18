@@ -338,6 +338,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-test = "0.2"
 
 ts_keys.workspace = true
+# `examples/exit_node --portmap-probe`: the one-shot NAT-PMP/PCP check.
+ts_portmapper.workspace = true
 ts_test_util.workspace = true
 
 # The in-process fake tsrecorder the SSH session-recording tests run against: `hyper`'s h2c server
@@ -414,3 +416,8 @@ required-features = ["tsnet"]
 [[example]]
 name = "ssh_peer_lookup"
 required-features = ["ssh"]
+
+# Run the argument-parsing tests in `cargo test` (examples default to `test = false`).
+[[example]]
+name = "exit_node"
+test = true

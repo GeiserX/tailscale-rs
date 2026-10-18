@@ -19,6 +19,16 @@
 //!
 //! The advertised route still has to be approved in the admin console (or by an `autoApprovers`
 //! policy) before peers can select this node.
+//!
+//! `--portmap-probe` runs a one-shot NAT-PMP/PCP check instead of the node, before any identity,
+//! state or control connection exists: it maps a dedicated test port on the LAN gateway, each
+//! protocol separately, optionally holds it open to count inbound datagrams, deletes it and exits
+//! (0: every protocol mapped and deleted, 2: some, 1: none or no usable gateway). Its output may
+//! contain the router's public address.
+//!
+//! ```sh
+//! cargo run --release --example exit_node -- --portmap-probe --portmap-hold 60
+//! ```
 
 use std::{error::Error, path::PathBuf, time::Duration};
 
@@ -32,8 +42,8 @@ use tracing_subscriber::filter::LevelFilter;
 #[command(version, about)]
 struct Args {
     /// Directory holding this node's persisted identity (`keys.json`). Created if missing.
-    #[arg(long)]
-    state_dir: PathBuf,
+    #[arg(long, required_unless_present = "portmap_probe")]
+    state_dir: Option<PathBuf>,
 
     /// File containing the auth key. Only read if the identity is not yet registered.
     #[arg(long)]
@@ -94,10 +104,181 @@ struct Args {
     /// Seconds between status lines (peers, direct vs DERP path). 0 disables.
     #[arg(long, default_value_t = 30)]
     status_interval: u64,
+
+    /// Run the one-shot NAT-PMP/PCP probe on a dedicated test port and exit. Needs no state
+    /// directory, keys or control connection. Refused when TS_DISABLE_PORTMAPPER is set, as Go's
+    /// debug portmap is.
+    #[arg(long)]
+    portmap_probe: bool,
+
+    /// Probe: which protocols to map, each separately.
+    #[arg(long, value_enum, default_value_t = PortmapProto::Both, requires = "portmap_probe")]
+    portmap_proto: PortmapProto,
+
+    /// Probe: the test socket's UDP port (0 = ephemeral). Never `--port`, 41641 or 41642.
+    #[arg(long, default_value_t = 0, requires = "portmap_probe")]
+    portmap_test_port: u16,
+
+    /// Probe: requested lease in seconds.
+    #[arg(
+        long,
+        default_value_t = ts_portmapper::probe_tool::DEFAULT_LIFETIME,
+        value_parser = clap::value_parser!(u32).range(1..=7200),
+        requires = "portmap_probe"
+    )]
+    portmap_lifetime: u32,
+
+    /// Probe: seconds to hold each mapping open, counting inbound datagrams (no payloads). Must be
+    /// shorter than --portmap-lifetime (default 120).
+    #[arg(
+        long,
+        default_value_t = 0,
+        value_parser = clap::value_parser!(u64).range(0..=600),
+        requires = "portmap_probe"
+    )]
+    portmap_hold: u64,
+
+    /// Probe: seconds to keep retrying the gateway lookup (once a second; routing-table reads
+    /// only) when there is no usable default route yet, e.g. a launchd job at boot.
+    #[arg(
+        long,
+        default_value_t = 0,
+        value_parser = clap::value_parser!(u64).range(0..=120),
+        requires = "portmap_probe"
+    )]
+    portmap_wait: u64,
+
+    /// Use this gateway (`GW` or `GW,SELF`) instead of the default route's, for the node's port
+    /// mapper and for the probe. It is validated like a discovered one (private, on-link).
+    #[arg(long, value_name = "GW[,SELF]")]
+    portmap_gateway: Option<ts_portmapper::gateway::GatewayOverride>,
+
+    /// Turn the NAT port mapper (NAT-PMP/PCP) off. Equivalent to `TS_DISABLE_PORTMAPPER=1`.
+    #[arg(long, conflicts_with = "portmap_probe")]
+    no_portmapper: bool,
+
+    /// Advertise a port-mapped address even when it is private or CGNAT (a double NAT), as Go
+    /// does. By default this runner keeps and renews such a mapping but does not offer it to
+    /// peers. A private or CGNAT external address is not reachable from outside that NAT, so
+    /// advertising it only costs peers failed disco probes.
+    #[arg(long, conflicts_with = "portmap_probe")]
+    portmap_advertise_nonpublic: bool,
+
+    /// Renew the port mapping only on activity, as Go does. By default this runner renews it when
+    /// due even while idle, as long as it has peers, so an idle exit node stays directly
+    /// reachable.
+    #[arg(long, conflicts_with = "portmap_probe")]
+    portmap_lazy_renew: bool,
+}
+
+impl Args {
+    /// The node's port-mapper options: this runner's defaults are suppression of non-public
+    /// external addresses and idle renewal with peers; the flags revert either to Go's behaviour.
+    fn port_mapper_options(&self) -> tailscale::config::PortMapperOptions {
+        tailscale::config::PortMapperOptions {
+            gateway_override: self.portmap_gateway.map(|g| (g.gw, g.self_ip)),
+            advertise_nonpublic_external: self.portmap_advertise_nonpublic,
+            renew_while_idle: !self.portmap_lazy_renew,
+        }
+    }
+}
+
+/// `--portmap-proto` values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum PortmapProto {
+    Pmp,
+    Pcp,
+    Both,
+}
+
+impl Args {
+    /// The probe's options from the command line.
+    fn probe_options(&self) -> ts_portmapper::probe_tool::ProbeOptions {
+        ts_portmapper::probe_tool::ProbeOptions {
+            protos: ts_portmapper::oneshot::ProtoSet {
+                pmp: self.portmap_proto != PortmapProto::Pcp,
+                pcp: self.portmap_proto != PortmapProto::Pmp,
+            },
+            test_port: self.portmap_test_port,
+            lifetime: self.portmap_lifetime,
+            hold: Duration::from_secs(self.portmap_hold),
+            gateway_override: self.portmap_gateway,
+            node_port: self.port,
+            wait: Duration::from_secs(self.portmap_wait),
+        }
+    }
+}
+
+/// Run `--portmap-probe`: no `Device`, no identity, no control. Interrupts (Ctrl-C, SIGTERM) end
+/// the gateway wait or the hold early and skip the remaining maps; the delete for anything sent
+/// still runs. The handlers are installed before the probe starts, so an interrupt at any point
+/// is caught rather than killing the process. Returns the process exit code.
+fn run_portmap_probe(args: &Args) -> Result<i32, Box<dyn Error>> {
+    // The probe's report goes to stdout; logs, if any, to stderr.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(LevelFilter::INFO.into())
+                .from_env_lossy(),
+        )
+        .init();
+    let opts = args.probe_options();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        // Register the handlers now (not lazily on first poll): from here on SIGINT and SIGTERM
+        // are recorded instead of killing the process mid-exchange.
+        #[cfg(unix)]
+        let interrupt = {
+            let mut int = signal(SignalKind::interrupt())?;
+            let mut term = signal(SignalKind::terminate())?;
+            async move {
+                tokio::select! {
+                    _ = int.recv() => {}
+                    _ = term.recv() => {}
+                }
+            }
+        };
+        #[cfg(not(unix))]
+        let interrupt = {
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            tokio::spawn(async move {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    tx.send(()).ok();
+                }
+            });
+            async move {
+                rx.await.ok();
+            }
+        };
+        let mut stdout = std::io::stdout();
+        Ok::<_, Box<dyn Error>>(ts_portmapper::probe_tool::run(&opts, interrupt, &mut stdout).await)
+    })
+}
+
+/// Whether `TS_DISABLE_PORTMAPPER` turns the port mapper off, parsed with the same table as
+/// `ts_runtime`'s env knob (Go's `strconv.ParseBool`; an unparsable value counts as disabled).
+fn portmap_disabled_by_env(getenv: impl Fn(&str) -> Option<String>) -> bool {
+    match getenv("TS_DISABLE_PORTMAPPER").as_deref() {
+        None | Some("0" | "f" | "F" | "FALSE" | "false" | "False" | "") => false,
+        Some(_) => true,
+    }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
+    if args.portmap_probe {
+        // Go's `tailscale debug portmap` fails with ErrPortMappingDisabled under this knob
+        // (net/portmapper/portmapper.go:85-88, 876-878): refuse before any gateway lookup.
+        if portmap_disabled_by_env(|k| std::env::var(k).ok()) {
+            eprintln!("error msg=portmap-disabled env=TS_DISABLE_PORTMAPPER");
+            std::process::exit(1);
+        }
+        let code = run_portmap_probe(&args)?;
+        std::process::exit(code);
+    }
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(args.worker_threads.max(1))
         .enable_all()
@@ -114,8 +295,12 @@ async fn run(args: Args) -> Result<(), Box<dyn Error>> {
         )
         .init();
 
-    tokio::fs::create_dir_all(&args.state_dir).await?;
-    let key_file = args.state_dir.join("keys.json");
+    let state_dir = args
+        .state_dir
+        .clone()
+        .ok_or("--state-dir is required unless --portmap-probe is given")?;
+    tokio::fs::create_dir_all(&state_dir).await?;
+    let key_file = state_dir.join("keys.json");
     let first_run = !tokio::fs::try_exists(&key_file).await?;
 
     let auth_key = match (&args.auth_key_file, first_run) {
@@ -153,6 +338,8 @@ async fn run(args: Args) -> Result<(), Box<dyn Error>> {
         tcp_buffer_size: args.tcp_buffer_size,
         wireguard_listen_port: Some(args.port),
         netmap_cache_dir: None,
+        disable_port_mapper: args.no_portmapper,
+        port_mapper: args.port_mapper_options(),
         ..Config::default()
     };
 
@@ -248,12 +435,33 @@ async fn log_status(dev: &Device) {
             return;
         }
     };
+    // Go's NetInfo `portmap=` summary (`tailcfg.NetInfo.portMapSummary`, e.g. `active-_MC`);
+    // `active-` here means an advertised mapping, where Go's means any held mapping. Plus the
+    // mapping when one is held.
+    let (portmap, portmap_ext) = match dev.port_map_status() {
+        Some(pm) => (
+            pm.summary(),
+            pm.external.map(|e| {
+                format!(
+                    "{e}{}",
+                    if pm.advertised {
+                        ""
+                    } else {
+                        " (not advertised)"
+                    }
+                )
+            }),
+        ),
+        None => ("off".to_owned(), None),
+    };
     match &status.self_node {
         Some(me) => tracing::info!(
             routes = ?me.allowed_routes,
             exit_node = me.is_exit_node,
             peers = status.peers.len(),
             health = ?status.health,
+            %portmap,
+            ext = portmap_ext.as_deref().unwrap_or("-"),
             "self"
         ),
         None => {
@@ -317,5 +525,142 @@ async fn serve_sink(mut conn: tailscale::netstack::TcpStream) {
             }
         },
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Args, clap::Error> {
+        Args::try_parse_from(std::iter::once("exit_node").chain(args.iter().copied()))
+    }
+
+    /// The probe needs no state directory; the node still does.
+    #[test]
+    fn probe_runs_without_state_dir() {
+        let a = parse(&["--portmap-probe"]).unwrap();
+        assert!(a.portmap_probe && a.state_dir.is_none());
+        let o = a.probe_options();
+        assert!(o.protos.pmp && o.protos.pcp);
+        assert_eq!((o.test_port, o.lifetime, o.node_port), (0, 120, 41642));
+        assert!(o.validate().is_ok());
+        assert!(parse(&[]).is_err());
+        assert!(parse(&["--state-dir", "/tmp/x"]).is_ok());
+    }
+
+    /// `TS_DISABLE_PORTMAPPER` refuses the probe, parsed like the runtime's knob.
+    #[test]
+    fn probe_refused_under_ts_disable_portmapper() {
+        let env = |v: Option<&'static str>| {
+            move |k: &str| {
+                assert_eq!(k, "TS_DISABLE_PORTMAPPER");
+                v.map(str::to_owned)
+            }
+        };
+        for v in ["1", "t", "true", "TRUE", "yes"] {
+            assert!(portmap_disabled_by_env(env(Some(v))), "{v}");
+        }
+        for v in [None, Some("0"), Some("false"), Some("")] {
+            assert!(!portmap_disabled_by_env(env(v)), "{v:?}");
+        }
+    }
+
+    #[test]
+    fn probe_flags_require_the_probe() {
+        for flags in [
+            &["--state-dir", "s", "--portmap-hold", "5"][..],
+            &["--state-dir", "s", "--portmap-proto", "pmp"],
+            &["--state-dir", "s", "--portmap-test-port", "5000"],
+            &["--state-dir", "s", "--portmap-wait", "5"],
+        ] {
+            assert!(parse(flags).is_err(), "{flags:?}");
+        }
+    }
+
+    #[test]
+    fn probe_flag_ranges_and_reserved_ports() {
+        assert!(parse(&["--portmap-probe", "--portmap-lifetime", "0"]).is_err());
+        assert!(parse(&["--portmap-probe", "--portmap-lifetime", "7201"]).is_err());
+        assert!(parse(&["--portmap-probe", "--portmap-hold", "601"]).is_err());
+        assert!(parse(&["--portmap-probe", "--portmap-wait", "121"]).is_err());
+        let a = parse(&["--portmap-probe", "--portmap-wait", "30"]).unwrap();
+        assert_eq!(a.probe_options().wait, Duration::from_secs(30));
+        for port in ["41641", "41642"] {
+            let a = parse(&["--portmap-probe", "--portmap-test-port", port]).unwrap();
+            assert!(a.probe_options().validate().is_err(), "{port}");
+        }
+        let a = parse(&[
+            "--portmap-probe",
+            "--port",
+            "50000",
+            "--portmap-test-port",
+            "50000",
+        ])
+        .unwrap();
+        assert!(a.probe_options().validate().is_err());
+        let a = parse(&[
+            "--portmap-probe",
+            "--portmap-proto",
+            "pcp",
+            "--portmap-gateway",
+            "192.168.1.1,192.168.1.20",
+            "--portmap-hold",
+            "60",
+        ])
+        .unwrap();
+        let o = a.probe_options();
+        assert!(!o.protos.pmp && o.protos.pcp);
+        assert_eq!(o.hold, Duration::from_secs(60));
+        assert_eq!(
+            o.gateway_override.unwrap().self_ip,
+            Some("192.168.1.20".parse().unwrap())
+        );
+        assert!(parse(&["--portmap-probe", "--portmap-gateway", "nope"]).is_err());
+        // The hold must be shorter than the lifetime (default 120 s).
+        let a = parse(&["--portmap-probe", "--portmap-hold", "120"]).unwrap();
+        let err = a.probe_options().validate().unwrap_err();
+        assert!(
+            err.contains("hold must be shorter than the lifetime"),
+            "{err}"
+        );
+    }
+
+    /// The runner's port-mapper defaults (suppress non-public, renew while idle) and the flags
+    /// that revert each to Go's behaviour; the gateway override serves the node too.
+    #[test]
+    fn port_mapper_flags() {
+        let a = parse(&["--state-dir", "s"]).unwrap();
+        assert!(!a.no_portmapper);
+        let o = a.port_mapper_options();
+        assert!(!o.advertise_nonpublic_external);
+        assert!(o.renew_while_idle);
+        assert!(o.gateway_override.is_none());
+        let a = parse(&[
+            "--state-dir",
+            "s",
+            "--portmap-advertise-nonpublic",
+            "--portmap-lazy-renew",
+            "--portmap-gateway",
+            "192.168.1.1,192.168.1.20",
+        ])
+        .unwrap();
+        let o = a.port_mapper_options();
+        assert!(o.advertise_nonpublic_external && !o.renew_while_idle);
+        assert_eq!(
+            o.gateway_override,
+            Some((
+                "192.168.1.1".parse().unwrap(),
+                Some("192.168.1.20".parse().unwrap())
+            ))
+        );
+        assert!(
+            parse(&["--state-dir", "s", "--no-portmapper"])
+                .unwrap()
+                .no_portmapper
+        );
+        assert!(parse(&["--portmap-probe", "--no-portmapper"]).is_err());
     }
 }
