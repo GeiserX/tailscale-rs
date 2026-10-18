@@ -919,9 +919,11 @@ impl MagicSock {
     /// Our candidate self-endpoints: the bound local address plus every reflexive address peers
     /// have observed our traffic arriving from.
     ///
-    /// Returned for advertisement to control and for `CallMeMaybe`. All addresses were observed on
-    /// the single bound underlay socket — there is no second egress. Reflexive addresses accrue as
-    /// pongs arrive, so before any direct path is confirmed this returns just the local candidates.
+    /// Returned for advertisement to control and for `CallMeMaybe`. Local candidates are the bind
+    /// address, or on a wildcard bind the host's interface addresses on the bound port; reflexive
+    /// addresses were observed on the single bound underlay socket — there is no second egress.
+    /// Reflexive addresses accrue as pongs arrive, so before any direct path is confirmed this
+    /// returns just the local candidates.
     ///
     /// A socket bound to a concrete address offers that address. A socket bound to the IPv4
     /// unspecified address (`0.0.0.0:port`, the runtime's default) offers the host's interface
@@ -946,12 +948,16 @@ impl MagicSock {
         let wildcard = local.is_some_and(|l| l.ip().is_unspecified());
 
         // Read the interfaces once, and only when something below needs them. On error, offer no
-        // interface-derived candidate: never the wildcard in its place.
+        // interface-derived candidate: never the wildcard in its place. This diverges from Go,
+        // which aborts the whole endpoint update and keeps its previous set
+        // (magicsock.go:1412-1415, updateEndpoints 945-951); self_endpoints keeps no previous set,
+        // so the reflexive endpoints are still published and only the interface-derived
+        // candidates are missing until the next tick.
         let ifaces = if wildcard || self.enable_ipv6 {
             match (self.interface_addrs)() {
                 Ok(ifaces) => ifaces,
                 Err(e) => {
-                    tracing::debug!(
+                    tracing::warn!(
                         error = %e,
                         "self_endpoints: interface enumeration failed; advertising no interface \
                          addresses"
@@ -1169,9 +1175,8 @@ impl MagicSock {
     /// peer will disco-ping us and open a direct path. Sent over DERP by the caller.
     ///
     /// The endpoint set is exactly [`MagicSock::self_endpoints`] — the same addresses already
-    /// advertised to control — and every one of them was observed on this single bound socket. No
-    /// host-identifying address beyond what control already receives is disclosed, preserving the
-    /// anti-leak posture.
+    /// advertised to control (Go builds its CallMeMaybe from the same `lastEndpoints`,
+    /// magicsock.go:2683-2687). No address beyond what control already receives is disclosed.
     pub fn seal_call_me_maybe(&self, receiver: &DiscoPublicKey) -> Result<Vec<u8>, Error> {
         let endpoints: Vec<SocketAddr> =
             self.self_endpoints().into_iter().map(|e| e.addr).collect();
