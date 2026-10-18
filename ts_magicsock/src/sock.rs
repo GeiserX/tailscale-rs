@@ -2,7 +2,7 @@
 
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -26,6 +26,7 @@ use crate::{
     endpoint::{SelfEndpoint, SelfEndpointType},
     error::Error,
     path::PeerPaths,
+    reflexive::{ReflexiveSet, ReflexiveSource},
     relay::{HandshakeState, RelayBinding, RelayPaths, RelayServerEndpoint},
 };
 
@@ -82,17 +83,6 @@ async fn demux_receive_batch<
 /// Shared, per-peer path state keyed by the peer's disco key.
 type Paths = Arc<Mutex<HashMap<DiscoPublicKey, PeerPaths>>>;
 
-/// Cap on the number of distinct reflexive (STUN-equivalent) addresses we retain.
-///
-/// Reflexive addresses are learned from the `src` a peer echoes in a disco pong. A
-/// malicious-but-authenticated peer could pong with many spoofed `src` values to inflate this set
-/// without bound (each is advertised to control and in every `CallMeMaybe`). A real node sits
-/// behind a small number of NAT mappings, so a modest cap bounds the memory and the advertised
-/// endpoint set while never dropping a legitimately-needed reflexive address in practice. When the
-/// cap is reached, further novel addresses are ignored (fail-safe: we keep the ones we already
-/// trust rather than churn).
-const MAX_REFLEXIVE_ADDRS: usize = 16;
-
 /// Cap on the number of outstanding (unanswered) STUN Binding Requests we track at once.
 ///
 /// Each in-flight request holds a transaction id we will accept a response for; bounding the set
@@ -100,7 +90,7 @@ const MAX_REFLEXIVE_ADDRS: usize = 16;
 /// without limit. When the cap is reached after pruning expired entries, a new request is dropped
 /// fail-safe (we keep the ones already in flight) rather than evicting a live one.
 ///
-/// Sharing the value 16 with [`MAX_REFLEXIVE_ADDRS`] is a coincidence, not a relation — they bound
+/// Sharing the value 16 with [`MAX_REFLEXIVE_ADDRS`](crate::reflexive::MAX_REFLEXIVE_ADDRS) is a coincidence, not a relation — they bound
 /// independent sets (outstanding requests vs. learned reflexive addresses); do not unify them.
 const MAX_STUN_IN_FLIGHT: usize = 16;
 
@@ -372,11 +362,11 @@ pub struct MagicSock {
     /// it that way; do not hold two at once, or the inconsistent acquisition order across methods
     /// becomes a deadlock.
     addr_to_disco: Arc<Mutex<HashMap<SocketAddr, DiscoPublicKey>>>,
-    /// Reflexive (STUN-equivalent) addresses peers have observed our traffic arriving from,
-    /// learned from the `src` echoed in disco pongs. These are advertised to control and offered
-    /// in `CallMeMaybe` so peers behind NAT can reach us. Learned only on this one socket — never
-    /// a second egress.
-    reflexive: Arc<Mutex<HashSet<SocketAddr>>>,
+    /// Reflexive addresses: where STUN servers and peers' pongs saw this socket's traffic come
+    /// from, each with its provenance and last observation (see [`ReflexiveSet`]). Live entries are
+    /// advertised to control and offered in `CallMeMaybe` so peers behind NAT can reach us.
+    /// Learned only on this one socket — never a second egress.
+    reflexive: Arc<Mutex<ReflexiveSet>>,
     /// Outstanding STUN Binding Requests, keyed by the transaction id we sent. The value is the
     /// [`Instant`] we sent at, so stale transactions can be pruned (see [`STUN_TX_TTL`]).
     ///
@@ -961,6 +951,20 @@ impl MagicSock {
         }
     }
 
+    /// Whether a pong-observed reflexive address may be advertised: one a remote peer would accept
+    /// as a candidate ([`is_pingable_candidate`](Self::is_pingable_candidate): no private, loopback,
+    /// link-local, multicast, broadcast or unspecified address), and not RFC 6598 shared address
+    /// space (`100.64.0.0/10`), which only an observer inside the same carrier NAT can see.
+    /// An IPv4-mapped IPv6 address is judged as the IPv4 address it carries.
+    fn is_global_peer_observation(&self, addr: &SocketAddr) -> bool {
+        let addr = SocketAddr::new(addr.ip().to_canonical(), addr.port());
+        let shared_space = match addr.ip() {
+            IpAddr::V4(v4) => v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64,
+            IpAddr::V6(_) => false,
+        };
+        !shared_space && self.is_pingable_candidate(&addr)
+    }
+
     /// Install the disco<->node-key binding verifier (see [`BindingVerifier`]).
     ///
     /// Called once at startup by the netmap-owning route layer. With a verifier installed, an
@@ -1110,9 +1114,11 @@ impl MagicSock {
 
         // Collect the reflexive set into owned `Vec`s and drop the guard before the O(n²) dedup/
         // guess loop below: the critical section is the cheap copy, not the candidate assembly.
+        // Every stored entry, unfiltered: expiry happens only at a STUN sweep
+        // ([`expire_reflexive`](Self::expire_reflexive)), so an idle node keeps advertising its
+        // last-known addresses as Go does (`wgengine/magicsock/magicsock.go:995`).
         let (all_reflexive, v4_reflexive): (Vec<SocketAddr>, Vec<SocketAddr>) = {
-            let reflexive = lock(&self.reflexive);
-            let all: Vec<SocketAddr> = reflexive.iter().copied().collect();
+            let all = lock(&self.reflexive).addrs();
             let v4: Vec<SocketAddr> = all.iter().filter(|a| a.is_ipv4()).copied().collect();
             (all, v4)
         };
@@ -1156,6 +1162,24 @@ impl MagicSock {
         let bound_to_loopback = local.is_some_and(|l| l.ip().is_loopback());
         eps.retain(|e| crate::local_addrs::is_advertisable(e.addr.ip(), bound_to_loopback));
         eps
+    }
+
+    /// A STUN sweep is starting: expire reflexive addresses no sweep has re-observed within
+    /// [`REFLEXIVE_LIFETIME`](crate::reflexive::REFLEXIVE_LIFETIME) (see
+    /// [`ReflexiveSet::sweep`](crate::reflexive::ReflexiveSet::sweep) for why the cut is taken
+    /// at the previous sweep's start).
+    ///
+    /// Go evaluates `endpointTracker` expiry only inside `determineEndpoints`
+    /// (`wgengine/magicsock/magicsock.go:1405`), i.e. once per STUN sweep, so an idle node keeps
+    /// advertising its last endpoints (`magicsock.go:995`). Called by the STUN prober before each
+    /// periodic and on-demand sweep.
+    pub fn expire_reflexive(&self) {
+        self.expire_reflexive_at(Instant::now());
+    }
+
+    /// [`expire_reflexive`](Self::expire_reflexive) for a sweep starting at `now`.
+    fn expire_reflexive_at(&self, now: Instant) {
+        lock(&self.reflexive).sweep(now);
     }
 
     /// Whether to treat this node as behind a symmetric (endpoint-dependent-mapping) NAT, which is
@@ -3135,28 +3159,34 @@ impl MagicSock {
         }
     }
 
-    /// Record `addr` as a reflexive (STUN-equivalent) endpoint we may advertise, bounded by
-    /// [`MAX_REFLEXIVE_ADDRS`].
+    /// Record that `source` observed this socket's traffic arriving from `addr`, a reflexive
+    /// endpoint we may advertise, bounded by
+    /// [`MAX_REFLEXIVE_ADDRS`](crate::reflexive::MAX_REFLEXIVE_ADDRS) and aged per [`ReflexiveSet`].
     ///
     /// This is the single insertion point shared by the disco pong-harvest path (the peer echoes
     /// the `src` it saw our ping arrive from) and the active-STUN path
-    /// ([`MagicSock::handle_stun_response`]), so both observe the same cap and the same dedup via
-    /// the `HashSet`. When the cap is reached a novel address is ignored fail-safe (we keep the
-    /// addresses already trusted rather than churn). Locked disjointly from every other map.
-    fn note_reflexive(&self, addr: SocketAddr) {
-        let inserted = {
-            let mut reflexive = lock(&self.reflexive);
-            if reflexive.contains(&addr) {
-                false
-            } else if reflexive.len() < MAX_REFLEXIVE_ADDRS {
-                reflexive.insert(addr)
-            } else {
-                tracing::debug!(%addr, "reflexive address set full, ignoring new endpoint");
-                false
-            }
-        };
-        // Count only a genuinely new reflexive address (off the lock), not a duplicate or a
-        // cap-rejected one — `reflexive_learned` measures distinct learned addresses.
+    /// ([`MagicSock::handle_stun_response`]). Locked disjointly from every other map.
+    ///
+    /// A pong's `src` is recorded only when it is an address a remote peer would accept as a
+    /// candidate ([`is_pingable_candidate`](Self::is_pingable_candidate)) and not in the shared
+    /// `100.64.0.0/10` space. A pong that hairpinned through our own router (the peer is on our
+    /// LAN, or reached us at our public address from behind the same NAT) reports a LAN-side
+    /// address such as `192.168.1.1:1024`; advertising it to every peer is wrong, and it is no
+    /// evidence of how the NAT maps traffic to the internet. Go advertises no pong `src` at all
+    /// (see [`crate::reflexive`]).
+    fn note_reflexive(&self, addr: SocketAddr, source: ReflexiveSource) {
+        self.note_reflexive_at(addr, source, Instant::now());
+    }
+
+    /// [`note_reflexive`](Self::note_reflexive) at `now`.
+    fn note_reflexive_at(&self, addr: SocketAddr, source: ReflexiveSource, now: Instant) {
+        if source == ReflexiveSource::PeerPong && !self.is_global_peer_observation(&addr) {
+            tracing::debug!(%addr, "not advertising a pong-observed address that is not global");
+            return;
+        }
+        let inserted = lock(&self.reflexive).note(addr, source, now);
+        // Count only an admission (off the lock), not a refresh of a stored address or a rejected
+        // one. An address admitted again after a sweep expired it or it was replaced counts again.
         if inserted {
             crate::metrics::metrics().reflexive_learned.inc();
         }
@@ -3288,7 +3318,7 @@ impl MagicSock {
         match crate::stun::parse_binding_response(buf, tx_id) {
             Some(v4) => {
                 // A valid IPv4 reflexive mapping observed on the one bound socket.
-                self.note_reflexive(SocketAddr::V4(v4));
+                self.note_reflexive(SocketAddr::V4(v4), ReflexiveSource::Stun);
                 true
             }
             None => {
@@ -3415,15 +3445,15 @@ impl MagicSock {
                 //      `src` is the peer-claimed reflexive field and is independent of the pong's UDP
                 //      source, so a `from == to` check never protected it — the member gate does.)
                 // A real peer's solicited pong from a netmap member still harvests its reflexive
-                // `src` — this is how the fork learns its public address; the legitimate
-                // NAT-traversal path is unchanged. Locked disjointly from `paths` above (never
-                // nested).
+                // `src` — this is how the fork learns its public address when STUN cannot — but
+                // `note_reflexive` keeps only a global address, recorded as a peer observation
+                // that ages out. Locked disjointly from `paths` above (never nested).
                 if solicited {
                     // A solicited pong matched an outstanding ping we sent — this confirms a direct
                     // path and feeds the direct-vs-DERP ratio.
                     crate::metrics::metrics().disco_pong_recv_solicited.inc();
                     if self.disco_sender_is_member(&sender) {
-                        self.note_reflexive(src);
+                        self.note_reflexive(src, ReflexiveSource::PeerPong);
                     }
                 }
             }
@@ -3684,6 +3714,7 @@ mod tests {
     use core::net::SocketAddrV4;
 
     use super::*;
+    use crate::reflexive::MAX_REFLEXIVE_ADDRS;
 
     #[tokio::test]
     async fn receive_bridge_coalesces_ready_packets_with_a_bound_and_peer_fifo() {
@@ -7416,11 +7447,12 @@ mod tests {
         b_task.abort();
     }
 
-    /// Before any pong, `self_endpoints` reports only the bound local address (no reflexive addr
-    /// is known yet). After A pings B and B pongs, A has learned its reflexive address from the
-    /// echoed `src` and reports it as a `Stun` endpoint — all on the one bound socket.
+    /// A real ping/pong exchange over loopback: A's ping is ponged and confirms the path, but the
+    /// `src` B echoes is A's loopback address, which is not a global address, so A does not
+    /// advertise it. (A global `src` from a member's solicited pong is learned: see
+    /// `pong_from_non_member_does_not_harvest_reflexive`.)
     #[tokio::test]
-    async fn self_endpoints_learns_reflexive_from_pong() {
+    async fn self_endpoints_does_not_learn_loopback_pong_src() {
         let a_disco = DiscoPrivateKey::random();
         let b_disco = DiscoPrivateKey::random();
         let a_node = ts_keys::NodePrivateKey::random().public_key();
@@ -7466,37 +7498,207 @@ mod tests {
         a.note_peer_activity(&b_disco.public_key(), Instant::now());
         a.send_pings().await.unwrap();
 
-        // Wait until A has learned a reflexive endpoint (driven by B's pong echoing A's src).
-        let learned = async {
-            loop {
-                if a.self_endpoints()
-                    .iter()
-                    .any(|e| e.ty == SelfEndpointType::Stun)
-                {
-                    break;
-                }
+        // Wait until B's pong has confirmed the path, so it has been through the harvest.
+        let confirmed = async {
+            while a.best_addr(&b_disco.public_key()).is_none() {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         };
-        tokio::time::timeout(std::time::Duration::from_secs(2), learned)
+        tokio::time::timeout(std::time::Duration::from_secs(2), confirmed)
             .await
-            .expect("timed out waiting to learn a reflexive endpoint");
+            .expect("timed out waiting for B's pong");
 
         let eps = a.self_endpoints();
-        let stun: Vec<_> = eps
-            .iter()
-            .filter(|e| e.ty == SelfEndpointType::Stun)
-            .collect();
-        assert_eq!(stun.len(), 1, "exactly one reflexive endpoint: {eps:?}");
-        // On loopback the reflexive address B observed is A's own bound address.
-        assert_eq!(stun[0].addr, a_addr, "reflexive addr is A's loopback src");
-        assert!(
-            eps.iter().any(|e| e.ty == SelfEndpointType::Local),
-            "local endpoint still present"
-        );
+        assert_eq!(eps.len(), 1, "only the local endpoint: {eps:?}");
+        assert_eq!(eps[0].ty, SelfEndpointType::Local);
+        assert!(a.reflexive.lock().unwrap().is_empty());
 
         a_pump.abort();
         b_pump.abort();
+    }
+
+    /// Reflexive addresses carry their provenance, age out, and a full set makes room for new
+    /// ones. Router-side addresses a hairpinned pong reports are never recorded, so they are
+    /// neither advertised nor counted as symmetric-NAT evidence. Before the fix every pong `src`
+    /// went into an immortal first-16 set: hairpin addresses were advertised, and once the set
+    /// filled a new public mapping was ignored until a rebind.
+    #[tokio::test]
+    async fn reflexive_provenance_expiry_and_capacity() {
+        use crate::reflexive::REFLEXIVE_LIFETIME;
+
+        let sock = plain_sock().await;
+        let stun = |eps: &[SelfEndpoint]| -> Vec<SocketAddr> {
+            eps.iter()
+                .filter(|e| e.ty == SelfEndpointType::Stun)
+                .map(|e| e.addr)
+                .collect()
+        };
+        let t0 = Instant::now();
+
+        // Hairpin and other non-global pong sources: nothing recorded, nothing advertised, no
+        // hard-NAT guess derived from them.
+        for hairpin in [
+            "192.168.50.1:1024",
+            "192.168.50.1:1038",
+            "192.168.50.1:1041",
+            "192.168.50.1:41642",
+            "10.1.2.3:41642",
+            "100.64.1.2:41642",
+            "127.0.0.1:41642",
+        ] {
+            sock.note_reflexive_at(hairpin.parse().unwrap(), ReflexiveSource::PeerPong, t0);
+        }
+        assert!(sock.reflexive.lock().unwrap().is_empty());
+        let eps = sock.self_endpoints();
+        assert!(
+            eps.iter().all(|e| e.ty == SelfEndpointType::Local),
+            "{eps:?}"
+        );
+
+        // A global pong source is recorded as a peer observation.
+        let pong_src: SocketAddr = "198.51.100.200:40000".parse().unwrap();
+        sock.note_reflexive_at(pong_src, ReflexiveSource::PeerPong, t0);
+        assert_eq!(
+            sock.reflexive.lock().unwrap().source(&pong_src, t0),
+            Some(ReflexiveSource::PeerPong)
+        );
+
+        // Fill the set with peer observations at t0.
+        let stale: Vec<SocketAddr> = (1..MAX_REFLEXIVE_ADDRS as u16)
+            .map(|i| SocketAddr::new("198.51.100.7".parse().unwrap(), 40000 + i))
+            .collect();
+        for addr in &stale {
+            sock.note_reflexive_at(*addr, ReflexiveSource::PeerPong, t0);
+        }
+        assert_eq!(sock.reflexive.lock().unwrap().len(), MAX_REFLEXIVE_ADDRS);
+
+        // Full set, still fresh: a STUN result replaces the stalest peer observation.
+        let stun_a: SocketAddr = "203.0.113.5:51000".parse().unwrap();
+        let t1 = t0 + Duration::from_secs(1);
+        sock.note_reflexive_at(stun_a, ReflexiveSource::Stun, t1);
+        assert_eq!(sock.reflexive.lock().unwrap().len(), MAX_REFLEXIVE_ADDRS);
+        assert!(stun(&sock.self_endpoints()).contains(&stun_a));
+
+        // Past the lifetime with no sweep in between (an idle node), everything is still
+        // advertised: Go reads its last determination unfiltered (`magicsock.go:995`).
+        let t2 = t0 + REFLEXIVE_LIFETIME + Duration::from_nanos(1);
+        let eps = sock.self_endpoints();
+        assert_eq!(stun(&eps).len(), MAX_REFLEXIVE_ADDRS, "{eps:?}");
+
+        // An expiry at the lifetime keeps everything: an entry is live up to and including
+        // `REFLEXIVE_LIFETIME` after its last observation.
+        sock.reflexive
+            .lock()
+            .unwrap()
+            .prune(t0 + REFLEXIVE_LIFETIME);
+        assert_eq!(stun(&sock.self_endpoints()).len(), MAX_REFLEXIVE_ADDRS);
+
+        // One past it, the peer observations are no longer advertised, nor a reason to emit
+        // hard-NAT guesses.
+        sock.reflexive.lock().unwrap().prune(t2);
+        let eps = sock.self_endpoints();
+        assert_eq!(stun(&eps), [stun_a], "{eps:?}");
+        assert!(
+            !eps.iter().any(|e| e.ty == SelfEndpointType::Stun4LocalPort),
+            "{eps:?}"
+        );
+        assert_eq!(
+            sock.reflexive.lock().unwrap().source(&stun_a, t2),
+            Some(ReflexiveSource::Stun)
+        );
+        assert_eq!(sock.reflexive.lock().unwrap().source(&pong_src, t2), None);
+        sock.note_reflexive_at(stun_a, ReflexiveSource::Stun, t2);
+
+        // A new mapping after the stale entries expired is learned (it used to be ignored once
+        // 16 addresses had ever been seen).
+        let stun_b: SocketAddr = "203.0.113.6:52000".parse().unwrap();
+        sock.note_reflexive_at(stun_b, ReflexiveSource::Stun, t2);
+        assert_eq!(stun(&sock.self_endpoints()), [stun_a, stun_b]);
+
+        // A set full of STUN results: a peer observation cannot displace any of them.
+        let t3 = t2 + Duration::from_secs(1);
+        let stun_full: Vec<SocketAddr> = (0..MAX_REFLEXIVE_ADDRS as u16)
+            .map(|i| SocketAddr::new("203.0.113.9".parse().unwrap(), 50000 + i))
+            .collect();
+        for addr in &stun_full {
+            sock.note_reflexive_at(*addr, ReflexiveSource::Stun, t3);
+        }
+        let before = sock.reflexive.lock().unwrap().addrs();
+        sock.note_reflexive_at(pong_src, ReflexiveSource::PeerPong, t3);
+        assert_eq!(sock.reflexive.lock().unwrap().addrs(), before);
+
+        // An address both sources report keeps STUN's protection only while its STUN observation
+        // is live. Later, kept alive by pongs alone, it is a peer observation that a new peer
+        // observation may replace.
+        let both = stun_full[0];
+        let t4 = t3 + REFLEXIVE_LIFETIME / 2;
+        sock.note_reflexive_at(both, ReflexiveSource::PeerPong, t4);
+        assert_eq!(
+            sock.reflexive.lock().unwrap().source(&both, t4),
+            Some(ReflexiveSource::Stun)
+        );
+        let t5 = t3 + REFLEXIVE_LIFETIME + Duration::from_secs(1);
+        sock.reflexive.lock().unwrap().prune(t5);
+        assert_eq!(stun(&sock.self_endpoints()), [both]);
+        assert_eq!(
+            sock.reflexive.lock().unwrap().source(&both, t5),
+            Some(ReflexiveSource::PeerPong)
+        );
+        // Refill with STUN results so the set is full again at t5, then a new peer observation
+        // replaces `both`, the only peer observation.
+        for i in 0..MAX_REFLEXIVE_ADDRS as u16 - 1 {
+            let addr = SocketAddr::new("203.0.113.10".parse().unwrap(), 50000 + i);
+            sock.note_reflexive_at(addr, ReflexiveSource::Stun, t5);
+        }
+        sock.note_reflexive_at(pong_src, ReflexiveSource::PeerPong, t5);
+        let live = sock.reflexive.lock().unwrap().addrs();
+        assert!(
+            live.contains(&pong_src) && !live.contains(&both),
+            "{live:?}"
+        );
+    }
+
+    /// Reflexive expiry runs only at a STUN sweep, never on read, so an idle node (whose sweeps
+    /// have stopped) keeps advertising its last addresses, as Go does: Go expires cached
+    /// endpoints only inside `determineEndpoints` (`wgengine/magicsock/magicsock.go:1405`) and
+    /// advertises its last determination until the next (`magicsock.go:995`). Before the fix the
+    /// read filtered on the clock, so 5 min 10 s into idleness every STUN endpoint was withdrawn
+    /// from control.
+    #[tokio::test]
+    async fn reflexive_addresses_expire_only_at_a_stun_sweep() {
+        use crate::reflexive::REFLEXIVE_LIFETIME;
+
+        let sock = plain_sock().await;
+        let stun = |sock: &MagicSock| -> Vec<SocketAddr> {
+            sock.self_endpoints()
+                .into_iter()
+                .filter(|e| e.ty == SelfEndpointType::Stun)
+                .map(|e| e.addr)
+                .collect()
+        };
+        let stale: SocketAddr = "203.0.113.5:51000".parse().unwrap();
+        let kept: SocketAddr = "203.0.113.5:51001".parse().unwrap();
+        let t0 = Instant::now();
+        sock.expire_reflexive_at(t0);
+        sock.note_reflexive_at(stale, ReflexiveSource::Stun, t0);
+        sock.note_reflexive_at(kept, ReflexiveSource::Stun, t0);
+
+        // Idle for twice the lifetime, no sweep, and a pong as traffic resumes: still advertised.
+        let t1 = t0 + 2 * REFLEXIVE_LIFETIME;
+        let pong: SocketAddr = "198.51.100.200:40000".parse().unwrap();
+        sock.note_reflexive_at(pong, ReflexiveSource::PeerPong, t1);
+        assert_eq!(stun(&sock), [pong, stale, kept]);
+
+        // The first sweep after the idle applies the previous sweep's decision, when both were
+        // fresh, so nothing is withdrawn while its STUN responses are in flight.
+        sock.expire_reflexive_at(t1);
+        assert_eq!(stun(&sock), [pong, stale, kept]);
+        // That sweep re-observes `kept` only.
+        sock.note_reflexive_at(kept, ReflexiveSource::Stun, t1 + Duration::from_millis(50));
+
+        // The next sweep drops what the previous one did not re-observe.
+        sock.expire_reflexive_at(t1 + Duration::from_secs(23));
+        assert_eq!(stun(&sock), [pong, kept]);
     }
 
     /// The disco-pong reflexive harvest is gated on netmap membership: a pong sealed by a disco key
@@ -8994,7 +9196,7 @@ mod tests {
         // Dedup is pinned deterministically on the per-socket set (no global-counter race): the set
         // already holds `mapped`, and re-noting it leaves the size unchanged.
         let size_before = s.reflexive.lock().unwrap().len();
-        s.note_reflexive(SocketAddr::V4(mapped));
+        s.note_reflexive(SocketAddr::V4(mapped), ReflexiveSource::Stun);
         let size_after = s.reflexive.lock().unwrap().len();
         assert_eq!(
             size_before, size_after,
@@ -9214,7 +9416,7 @@ mod tests {
         let sock = plain_sock().await;
 
         // Seed mapping-derived state: a reflexive address, and a peer with a candidate endpoint.
-        sock.note_reflexive("203.0.113.9:41641".parse().unwrap());
+        sock.note_reflexive("203.0.113.9:41641".parse().unwrap(), ReflexiveSource::Stun);
         assert!(
             !lock(&sock.reflexive).is_empty(),
             "precondition: a reflexive addr is learned"

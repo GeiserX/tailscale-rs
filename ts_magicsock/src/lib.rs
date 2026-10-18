@@ -36,6 +36,7 @@ mod local_addrs;
 mod metrics;
 mod path;
 mod receive_batch;
+mod reflexive;
 mod relay;
 mod sock;
 mod stun;

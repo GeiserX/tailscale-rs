@@ -480,6 +480,9 @@ impl DirectManager {
     /// per-server fan-out live in one place.
     async fn stun_sweep_once(&self, sock: &MagicSock) {
         if stun_probe_should_run(&self.peer_db) {
+            // Go's `ReSTUN` re-runs `determineEndpoints`, the only place its endpoint tracker
+            // expires anything (`wgengine/magicsock/magicsock.go:1405`, `:3695`).
+            sock.expire_reflexive();
             match self.multiderp.ask(multiderp::StunServersV4).await {
                 Ok((servers,)) => probe_stun_servers_once(sock, &servers, &self.stun_cursor).await,
                 Err(e) => {
@@ -781,6 +784,11 @@ async fn run_stun_prober(
                 if !should_do_periodic_restun(&peer_db, &activity, &force_background_stun) {
                     continue;
                 }
+
+                // Expire reflexive addresses at the sweep, as Go's `determineEndpoints` does
+                // (`wgengine/magicsock/magicsock.go:1405`). Skipped sweeps expire nothing, so an
+                // idle node keeps advertising its last addresses.
+                sock.expire_reflexive();
 
                 // Best-effort: if multiderp is unavailable just skip this round (pong-harvest
                 // still runs), matching how the other loops treat multiderp send errors.
