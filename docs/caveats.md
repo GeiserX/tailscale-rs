@@ -48,3 +48,42 @@ The following platforms and architectures are supported:
 - macOS (`ARM64`)
 - Windows (`x86_64`)
 
+### macOS: Local Network Privacy
+
+On macOS 15 and later, a process needs the Local Network permission before it can send to other
+devices on its own LAN. When a UDP send is blocked, it fails with `EHOSTUNREACH`. Apple's
+[TN3179](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy)
+says macOS allows local network access automatically for any daemon started by `launchd`, any
+program running as root, and command-line tools run from Terminal or over SSH (with their child
+processes). The exception for `launchd` daemons does not apply to `launchd` agents.
+
+A `launchd` daemon that sets `UserName` to a non-root user has still been reported blocked, and it
+cannot show the permission prompt. This was reported against macOS 26.6.2 (issue #646). It
+contradicts the technote, and we have not found an Apple statement that explains it. Sends to the
+default gateway and to hosts outside the LAN still work. The reporter also observed that replies on
+a UDP flow the LAN peer started get through; Apple's technote does not document that.
+
+What this means for a node built on this library:
+
+- Peers on the same LAN may not get a direct path, so they stay on DERP. Peers elsewhere are not
+  affected.
+- Go's `tailscaled install-system-daemon` installs a root LaunchDaemon, so it never runs into this.
+  The Tailscale Mac app asks the user for the permission. Neither Go nor this library works around
+  it in code.
+
+To avoid it, do one of these:
+
+1. Run the daemon as root: leave `UserName` out of the plist. This is what Go's `tailscaled` and
+   [tailscaled-rs](https://github.com/GeiserX/tailscaled-rs) ship.
+2. On macOS 15.5 or later, mark your LAN as allowed for every program on the Mac, then restart:
+
+   ```bash
+   sudo defaults write com.apple.network.local-network AllowedEthernetLocalNetworkAddresses -array "192.168.1.0/24"
+   sudo defaults write com.apple.network.local-network AllowedWiFiLocalNetworkAddresses -array "192.168.1.0/24"
+   ```
+
+   Replace `192.168.1.0/24` with your LAN. This setting applies to the whole Mac, so only use it
+   on a machine you manage.
+3. Pending PR #639: if your router supports hairpin NAT, LAN peers can reach each other directly
+   through the router's public address. That needs private and hairpin ping sources to be learned,
+   which #639 adds.

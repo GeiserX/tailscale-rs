@@ -2,9 +2,10 @@
 //!
 //! The underlay normally sends every datagram with `send_to` on one shared, unconnected socket.
 //! On macOS that costs a route/PCB lookup per packet and, for IPv4, a random IP ID; under load
-//! it is also where Macs get stuck at a low packet rate (tailscale/tailscale#21602). Once a
-//! remote address has carried [`CONNECT_AFTER_BYTES`], this opens a second socket on the **same
-//! local port** (`SO_REUSEPORT` on both), `connect`s it to that address and sends through it.
+//! it is also where Macs get stuck at a low packet rate (tailscale/tailscale#21602). Once the
+//! kernel has accepted [`CONNECT_AFTER_BYTES`] for one remote address, this opens a second socket
+//! on the **same local port** (`SO_REUSEPORT` on both), `connect`s it to that address and sends
+//! through it. Failed sends do not count: a flow the host cannot send on never gets a socket.
 //! The kernel then delivers that remote's datagrams to the connected socket (the most specific
 //! match), so each one gets a receive pump feeding the same demux as the shared socket. Nothing
 //! the peer sees changes: same source address and port.
@@ -18,11 +19,19 @@
 //! follow an open upstream proposal (<https://github.com/tailscale/tailscale/issues/21602>,
 //! tailscale PR 21603 and wireguard-go PR 107). Any failure to open a connected socket leaves that
 //! address on the shared socket until the address is pruned or the socket rebinds.
+//!
+//! A connected socket that stops working goes back to the shared socket, and counting starts
+//! over: after [`MAX_SEND_FAILURES`] sends in a row fail on it, or when the shared socket hears
+//! from its address although the connected socket has received nothing for [`SILENT_REVERT`]
+//! (it was opened on a local address the peer no longer reaches).
 
 use core::net::SocketAddr;
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -46,6 +55,17 @@ const DEMUX_QUEUE: usize = 256;
 
 /// A connected socket unused for this long may be replaced when the table is full.
 const IDLE_EVICT: Duration = Duration::from_secs(120);
+
+/// Consecutive failed sends after which a connected socket goes back to the shared socket. One
+/// failure can be a stale ICMP error the kernel reports on the next send, so it takes several.
+/// Every error counts, transient ones such as ENOBUFS included: closing a working socket costs only
+/// its receive queue and another [`CONNECT_AFTER_BYTES`] before it reopens, which is cheaper than
+/// keeping a dead one.
+pub(crate) const MAX_SEND_FAILURES: u32 = 5;
+
+/// A connected socket that has received nothing for this long while the shared socket hears from
+/// its address goes back to the shared socket. Longer than WireGuard's 10 s keepalive.
+pub(crate) const SILENT_REVERT: Duration = Duration::from_secs(30);
 
 /// Largest datagram a receive pump reads.
 const PUMP_BUF: usize = 65_535;
@@ -84,12 +104,19 @@ impl Settings {
 }
 
 enum Entry {
-    /// Still on the shared socket; bytes sent so far.
+    /// Still on the shared socket; bytes the kernel accepted so far.
     Counting(u64),
     Ready {
         sock: Arc<UdpSocket>,
         pump: tokio::task::AbortHandle,
         last_used: Instant,
+        /// Consecutive failed sends on `sock`.
+        failures: u32,
+        /// Set by the pump on every receive; cleared when the shared socket hears from this
+        /// address (see [`ConnectedSockets::note_shared_recv`]).
+        received: Arc<AtomicBool>,
+        /// Since when `sock` is known to have received nothing.
+        quiet_since: Instant,
     },
     /// Opening failed; stay on the shared socket.
     Failed,
@@ -126,37 +153,38 @@ impl ConnectedSockets {
         self.settings.connected_sockets && self.settings.batched_io && crate::batch::usable()
     }
 
-    /// The socket to send `len` bytes to `addr` on, or `None` for the `shared` socket. Counts
-    /// the bytes, and opens a connected socket on `shared`'s local address once `addr` has crossed
-    /// the threshold. Must be called from within a Tokio runtime.
-    pub(crate) fn socket_for(
-        &mut self,
-        addr: SocketAddr,
-        len: usize,
-        shared: &UdpSocket,
-    ) -> Option<Arc<UdpSocket>> {
+    /// The connected socket to send to `addr` on, or `None` for the shared socket. Report the
+    /// outcome of a send on it to [`note_send_result`](Self::note_send_result).
+    pub(crate) fn socket_for(&mut self, addr: SocketAddr) -> Option<Arc<UdpSocket>> {
+        match self.entries.get_mut(&addr)? {
+            Entry::Ready {
+                sock, last_used, ..
+            } => {
+                *last_used = Instant::now();
+                Some(sock.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// The kernel accepted `len` bytes for `addr` on the `shared` socket. Counts them, and opens a
+    /// connected socket on `shared`'s local address once `addr` has crossed the threshold. Call it
+    /// only after a send succeeded, and only while `shared` is the published socket. Must be
+    /// called from within a Tokio runtime.
+    pub(crate) fn note_sent(&mut self, addr: SocketAddr, len: usize, shared: &UdpSocket) {
         if !self.settings.connected_sockets {
-            return None;
+            return;
         }
         if self.entries.len() >= MAX_TRACKED && !self.entries.contains_key(&addr) {
             self.entries.retain(|_, e| matches!(e, Entry::Ready { .. }));
         }
         let entry = self.entries.entry(addr).or_insert(Entry::Counting(0));
-        let sent = match entry {
-            Entry::Ready {
-                sock, last_used, ..
-            } => {
-                *last_used = Instant::now();
-                return Some(sock.clone());
-            }
-            Entry::Failed => return None,
-            Entry::Counting(sent) => {
-                *sent += len as u64;
-                *sent
-            }
+        let Entry::Counting(sent) = entry else {
+            return;
         };
-        if sent < CONNECT_AFTER_BYTES || !self.make_room() {
-            return None;
+        *sent += len as u64;
+        if *sent < CONNECT_AFTER_BYTES || !self.make_room() {
+            return;
         }
         let opened = shared
             .local_addr()
@@ -164,25 +192,86 @@ impl ConnectedSockets {
         match opened {
             Ok((sock, local)) => {
                 let sock = Arc::new(sock);
-                let pump = spawn_pump(sock.clone(), addr, self.to_demux.clone());
+                let received = Arc::new(AtomicBool::new(false));
+                let pump = spawn_pump(sock.clone(), addr, self.to_demux.clone(), received.clone());
+                let now = Instant::now();
                 self.entries.insert(
                     addr,
                     Entry::Ready {
-                        sock: sock.clone(),
+                        sock,
                         pump,
-                        last_used: Instant::now(),
+                        last_used: now,
+                        failures: 0,
+                        received,
+                        quiet_since: now,
                     },
                 );
                 self.ready += 1;
                 tracing::debug!(%addr, %local, connected = self.ready, "magicsock: connected socket opened");
-                Some(sock)
             }
             Err(e) => {
                 tracing::debug!(%addr, error = %e, "magicsock: connected socket failed; staying on shared socket");
                 self.entries.insert(addr, Entry::Failed);
-                None
             }
         }
+    }
+
+    /// A send to `addr` on its connected socket `sock` succeeded (`ok`) or failed. After
+    /// [`MAX_SEND_FAILURES`] failures in a row, `addr` goes back to the shared socket.
+    pub(crate) fn note_send_result(&mut self, addr: SocketAddr, sock: &Arc<UdpSocket>, ok: bool) {
+        let Some(Entry::Ready {
+            sock: current,
+            failures,
+            ..
+        }) = self.entries.get_mut(&addr)
+        else {
+            return;
+        };
+        // A socket since replaced (removed and reopened) says nothing about the current one.
+        if !Arc::ptr_eq(current, sock) {
+            return;
+        }
+        if ok {
+            *failures = 0;
+            return;
+        }
+        *failures += 1;
+        if *failures >= MAX_SEND_FAILURES {
+            self.revert(addr, "its sends keep failing");
+        }
+    }
+
+    /// The shared socket received from `addr` at `now`. If `addr` has a connected socket, the
+    /// kernel should have delivered there; when that socket has received nothing for
+    /// [`SILENT_REVERT`], `addr` goes back to the shared socket.
+    pub(crate) fn note_shared_recv(&mut self, addr: SocketAddr, now: Instant) {
+        let Some(Entry::Ready {
+            received,
+            quiet_since,
+            ..
+        }) = self.entries.get_mut(&addr)
+        else {
+            return;
+        };
+        if received.swap(false, Ordering::Relaxed) {
+            *quiet_since = now;
+        } else if now.saturating_duration_since(*quiet_since) >= SILENT_REVERT {
+            self.revert(
+                addr,
+                "it receives nothing while the shared socket hears its peer",
+            );
+        }
+    }
+
+    /// Close `addr`'s connected socket and count it from zero on the shared socket.
+    fn revert(&mut self, addr: SocketAddr, why: &str) {
+        self.remove(addr);
+        tracing::info!(%addr, why, connected = self.ready, "magicsock: connected socket closed; back on the shared socket");
+    }
+
+    /// Whether any connected socket is open.
+    pub(crate) fn any_ready(&self) -> bool {
+        self.ready > 0
     }
 
     /// Whether another connected socket fits, evicting the longest-idle one past
@@ -231,6 +320,25 @@ impl ConnectedSockets {
     #[cfg(test)]
     pub(crate) fn ready_count(&self) -> usize {
         self.ready
+    }
+
+    /// Test-only: the bytes counted for `addr` on the shared socket (`None` once it has a
+    /// connected socket, or a failed one).
+    #[cfg(all(test, unix))]
+    pub(crate) fn counted(&self, addr: SocketAddr) -> Option<u64> {
+        match self.entries.get(&addr) {
+            None => Some(0),
+            Some(Entry::Counting(n)) => Some(*n),
+            Some(_) => None,
+        }
+    }
+
+    /// Test-only: pretend `addr`'s connected socket has been quiet for `by` longer.
+    #[cfg(all(test, unix))]
+    pub(crate) fn age_quiet(&mut self, addr: SocketAddr, by: Duration) {
+        if let Some(Entry::Ready { quiet_since, .. }) = self.entries.get_mut(&addr) {
+            *quiet_since = quiet_since.checked_sub(by).unwrap();
+        }
     }
 }
 
@@ -323,6 +431,7 @@ fn spawn_pump(
     sock: Arc<UdpSocket>,
     remote: SocketAddr,
     to_demux: mpsc::Sender<Received>,
+    heard: Arc<AtomicBool>,
 ) -> tokio::task::AbortHandle {
     tokio::spawn(async move {
         let batching = crate::receive_batch::enabled();
@@ -351,6 +460,7 @@ fn spawn_pump(
             };
             match received {
                 Ok(batch) => {
+                    heard.store(true, Ordering::Relaxed);
                     if to_demux.send(batch).await.is_err() {
                         return;
                     }
@@ -402,10 +512,11 @@ mod tests {
         let chunk = 1200;
         let mut sends = 0;
         let sock = loop {
-            sends += 1;
-            if let Some(s) = c.socket_for(remote_addr, chunk, &shared) {
+            if let Some(s) = c.socket_for(remote_addr) {
                 break s;
             }
+            sends += 1;
+            c.note_sent(remote_addr, chunk, &shared);
             assert!(sends as u64 * (chunk as u64) <= CONNECT_AFTER_BYTES + chunk as u64);
         };
         assert_eq!(c.ready_count(), 1);
@@ -428,7 +539,7 @@ mod tests {
         assert_eq!((data.as_ref(), from), (&b"reply"[..], remote_addr));
 
         // Subsequent sends reuse it; clearing drops it.
-        assert!(c.socket_for(remote_addr, 10, &shared).is_some());
+        assert!(c.socket_for(remote_addr).is_some());
         c.clear();
         assert_eq!(c.ready_count(), 0);
     }
@@ -441,7 +552,8 @@ mod tests {
         let shared = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         for port in 1..=(3 * MAX_TRACKED as u16) {
             let remote = SocketAddr::from(([127, 0, 0, 1], port));
-            assert!(c.socket_for(remote, 1, &shared).is_none());
+            c.note_sent(remote, 1, &shared);
+            assert!(c.socket_for(remote).is_none());
             assert!(c.entries.len() <= MAX_TRACKED);
         }
     }
@@ -452,7 +564,8 @@ mod tests {
         let shared = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let remote = "127.0.0.1:2".parse().unwrap();
         for _ in 0..2000 {
-            assert!(c.socket_for(remote, 1500, &shared).is_none());
+            c.note_sent(remote, 1500, &shared);
+            assert!(c.socket_for(remote).is_none());
         }
     }
 
@@ -464,7 +577,8 @@ mod tests {
         let remote = "127.0.0.1:9".parse().unwrap();
         let (mut c, _rx) = ConnectedSockets::new(on());
         for _ in 0..1000 {
-            assert!(c.socket_for(remote, 1500, &plain).is_none());
+            c.note_sent(remote, 1500, &plain);
+            assert!(c.socket_for(remote).is_none());
         }
         assert_eq!(c.ready_count(), 0);
         assert!(matches!(c.entries.get(&remote), Some(Entry::Failed)));
