@@ -58,6 +58,9 @@ const IDLE_EVICT: Duration = Duration::from_secs(120);
 
 /// Consecutive failed sends after which a connected socket goes back to the shared socket. One
 /// failure can be a stale ICMP error the kernel reports on the next send, so it takes several.
+/// Every error counts, transient ones such as ENOBUFS included: closing a working socket costs only
+/// its receive queue and another [`CONNECT_AFTER_BYTES`] before it reopens, which is cheaper than
+/// keeping a dead one.
 pub(crate) const MAX_SEND_FAILURES: u32 = 5;
 
 /// A connected socket that has received nothing for this long while the shared socket hears from

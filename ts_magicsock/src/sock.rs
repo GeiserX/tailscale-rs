@@ -6734,10 +6734,8 @@ mod tests {
         use crate::connected::{
             CONNECT_AFTER_BYTES, MAX_SEND_FAILURES, SILENT_REVERT, reuse_port_socket,
         };
-        async fn receive(node: &MagicSock, peer: &UdpSocket, payload: &[u8]) {
-            peer.send_to(payload, node.local_addr().unwrap())
-                .await
-                .unwrap();
+        async fn receive(node: &MagicSock, peer: &UdpSocket, to: SocketAddr, payload: &[u8]) {
+            peer.send_to(payload, to).await.unwrap();
             let data = tokio::time::timeout(Duration::from_secs(2), node.recv_data())
                 .await
                 .expect("the shared socket must deliver the peer's datagram")
@@ -6781,14 +6779,15 @@ mod tests {
             .lock()
             .unwrap()
             .insert(peer_addr, peer_disco);
-        receive(&node, &peer, b"early").await;
-        assert_eq!(
-            ready(),
-            1,
-            "a new connected socket gets time to hear its peer"
-        );
+        // The connected socket hears its peer (its local address is stale's port): it is kept
+        // however long it had been quiet before.
+        receive(&node, &peer, stale.local_addr().unwrap(), b"heard").await;
         lock(&node.connected).age_quiet(peer_addr, SILENT_REVERT);
-        receive(&node, &peer, b"late").await;
+        receive(&node, &peer, node.local_addr().unwrap(), b"early").await;
+        assert_eq!(ready(), 1, "a connected socket that hears its peer is kept");
+        assert_eq!(lock(&node.connected).counted(peer_addr), None);
+        lock(&node.connected).age_quiet(peer_addr, SILENT_REVERT);
+        receive(&node, &peer, node.local_addr().unwrap(), b"late").await;
         assert_eq!(
             ready(),
             0,
