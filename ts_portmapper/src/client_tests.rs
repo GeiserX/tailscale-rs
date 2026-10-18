@@ -917,7 +917,10 @@ async fn router_errors_back_off() {
     r.settle().await;
     let wait = r.client.schedule().next_attempt.unwrap() - r.clock.now();
     // The second consecutive failure: 30 s ±20 %, no 30 min hold.
-    assert!(wait >= secs(23) && wait <= secs(37), "NOT_AUTHORIZED: {wait:?}");
+    assert!(
+        wait >= secs(23) && wait <= secs(37),
+        "NOT_AUTHORIZED: {wait:?}"
+    );
     r.shutdown().await;
 
     // ANNOUNCE refused: PCP present but unusable.
@@ -1188,7 +1191,11 @@ async fn remap_right_after_the_rollback_probe() {
         assert!(first.is_some(), "pmp={pmp}");
         let held_pcp = r.router.counters().num_pcp_map_recv;
         let held_pmp = r.router.counters().num_pmp_map_recv;
-        assert_eq!((held_pmp > 0, held_pcp > 0), (pmp, !pmp), "mapped over the expected protocol");
+        assert_eq!(
+            (held_pmp > 0, held_pcp > 0),
+            (pmp, !pmp),
+            "mapped over the expected protocol"
+        );
         r.router.reboot();
         r.advance(secs(601));
         r.client.probe().await.unwrap();
@@ -2159,9 +2166,11 @@ async fn completed_stale_attempt_cannot_publish_after_invalidation() {
     }
 }
 
-/// An unobserved grant may exceed the request: tombstones must not expire at the request alone.
+/// An unobserved grant may exceed the request (PCP may grant more), but a tombstone keeps its
+/// slot only for the requested lifetime from its send: after that the client maps again, and the
+/// router's longer rule is left to its own expiry, as after a crash.
 #[tokio::test]
-async fn lost_long_grants_still_count_after_requested_lifetime() {
+async fn lost_long_grants_free_their_slots_after_requested_lifetime() {
     let r = rig_with(Opts {
         router: RouterOptions {
             pmp: false,
@@ -2190,10 +2199,10 @@ async fn lost_long_grants_still_count_after_requested_lifetime() {
     r.settle().await;
     assert_eq!(
         r.router.mappings().len(),
-        4,
-        "unknown long grants still occupy their slots"
+        5,
+        "the fifth create went ahead; the long grants stay on the router until they expire"
     );
-    assert_eq!(r.client.owned_rules(), 4);
+    assert!(r.client.owned_rules() <= 1, "the old tombstones retired");
     r.shutdown().await;
 }
 
@@ -3176,16 +3185,19 @@ async fn network_down_fences_a_late_recovery_validation() {
     assert_eq!(cleanup.await.unwrap(), 0);
     drop(frozen);
     entered.expect("exhausted entry must reach fresh validation before retry");
-    for _ in 0..5 {
-        r.advance(secs(7200));
-        client.cleanup().await;
-    }
+    client.cleanup().await;
     assert!(client.owned_snapshot().iter().all(|e| !e.releasable()));
     assert_eq!(
         client.owned_rules(),
         1,
         "network loss is not retirement evidence"
     );
+    // Only the end of the possible grant (the requested lifetime from the last send) retires it.
+    for _ in 0..5 {
+        r.advance(secs(7200));
+        client.cleanup().await;
+    }
+    assert_eq!(client.owned_rules(), 0, "the possible grant ran out");
     assert!(!client.have_mapping());
     client.close(secs(1)).await;
     assert_eq!(
@@ -4866,7 +4878,10 @@ async fn left_networks_with_lost_replies_free_their_slots() {
         }
         r.advance(secs(3));
     }
-    assert!(mapped, "a fifth network maps once the old grants have run out");
+    assert!(
+        mapped,
+        "a fifth network maps once the old grants have run out"
+    );
     r.shutdown().await;
 }
 

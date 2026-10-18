@@ -79,8 +79,10 @@ but never sends on it.) Nothing in the node runs it yet.
   NAT-PMP's public-address request alone cannot create a mapping. A matched success records the
   actual grant. An unanswered MAP keeps its slot for the requested lifetime (7200 s) from the
   latest syscall attempt: a NAT-PMP gateway should not grant longer than requested (RFC 6886
-  §3.3), and Go trusts no unanswered MAP at all. Four unresolved rules can therefore stop further
-  creates for up to two hours, never for the rest of the process. Wall-clock jumps withdraw
+  §3.3), and Go trusts no unanswered MAP at all. A PCP server may grant longer; such an unobserved
+  longer grant is forgotten after 7200 s and left to the router's own expiry, as after a crash.
+  Four unresolved rules can therefore stop further creates for up to two hours, never for the
+  rest of the process. Wall-clock jumps withdraw
   advertisement trust but do not shorten possible ownership.
 - **Network down.** Nothing is deleted, since a delete could reach the wrong router. Such rules are
   left to expire. A create for the same rule on the same network adopts them, because PCP refuses a
