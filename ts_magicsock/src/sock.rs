@@ -445,6 +445,10 @@ pub struct MagicSock {
     /// governs *only* which disco candidates are considered pingable — never the underlay bind or
     /// the exit egress path, both of which stay IPv4-only by their own gates.
     enable_ipv6: bool,
+    /// Where [`self_endpoints`](Self::self_endpoints) reads the host's interface addresses: to
+    /// expand a wildcard bind into the addresses peers can dial, and for the gated local IPv6
+    /// candidates. `getifaddrs` in production; tests inject a fixed list.
+    interface_addrs: crate::local_addrs::InterfaceAddrSource,
     /// Whether this node sits behind a symmetric (endpoint-dependent-mapping) NAT, per netcheck's
     /// `MappingVariesByDestIP`. When `true`, [`self_endpoints`](Self::self_endpoints) additionally
     /// advertises a hard-NAT [`SelfEndpointType::Stun4LocalPort`] guess pairing a reflexive IPv4
@@ -595,6 +599,7 @@ impl MagicSock {
             warned_relay_addrs_all_refused: AtomicBool::new(false),
             pong_send_failures: Mutex::default(),
             enable_ipv6: false,
+            interface_addrs: Arc::new(crate::local_addrs::system_interface_addrs),
             symmetric_nat: AtomicBool::new(false),
             silent_disco: AtomicBool::new(false),
             only_tcp_443: AtomicBool::new(false),
@@ -872,6 +877,20 @@ impl MagicSock {
         self
     }
 
+    /// Test-only: read interface addresses from `source` instead of `getifaddrs`, so wildcard
+    /// expansion is deterministic.
+    #[cfg(test)]
+    pub(crate) fn with_interface_addrs(
+        mut self,
+        source: impl Fn() -> std::io::Result<Vec<crate::local_addrs::InterfaceAddr>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.interface_addrs = Arc::new(source);
+        self
+    }
+
     /// Whether a peer-supplied candidate endpoint is safe to probe with a disco ping.
     ///
     /// Disco datagrams are emitted from the node's single real host socket, so a candidate
@@ -975,37 +994,88 @@ impl MagicSock {
     /// Our candidate self-endpoints: the bound local address plus every reflexive address peers
     /// have observed our traffic arriving from.
     ///
-    /// Returned for advertisement to control and for `CallMeMaybe`. All addresses were observed on
-    /// the single bound underlay socket — there is no second egress. The local address is always
-    /// present (available from bind); reflexive addresses accrue as pongs arrive, so before any
-    /// direct path is confirmed this returns just the local address.
+    /// Returned for advertisement to control and for `CallMeMaybe`. Local candidates are the bind
+    /// address, or on a wildcard bind the host's interface addresses on the bound port; reflexive
+    /// addresses were observed on the single bound underlay socket — there is no second egress.
+    /// Reflexive addresses accrue as pongs arrive, so before any direct path is confirmed this
+    /// returns just the local candidates.
+    ///
+    /// A socket bound to a concrete address offers that address. A socket bound to the IPv4
+    /// unspecified address (`0.0.0.0:port`, the runtime's default) offers the host's interface
+    /// addresses on its port instead, selected as Go's `netmon.LocalAddresses` does (see
+    /// [`local_addresses`](crate::local_addrs::local_addresses)), because `0.0.0.0` names no host
+    /// a peer can send to. A dual-stack `[::]:port` bind drops its unspecified address and relies on
+    /// the IPv6 enumeration below: whether it also receives IPv4 depends on the platform's
+    /// `IPV6_V6ONLY` default.
     ///
     /// When `enable_ipv6` is set, the host's real global-unicast IPv6 interface addresses are also
     /// enumerated and advertised as [`SelfEndpointType::Local`] candidates (each paired with the
     /// bound socket's port), filtered through the same `is_pingable_candidate` rules a peer
-    /// applies — without this, a dual-stack `[::]:0` bind only ever yields the undialable
-    /// unspecified `[::]:port`. With the default `enable_ipv6 == false` no IPv6 local candidate is
-    /// emitted and the result is byte-for-byte the prior IPv4-only set.
+    /// applies. With the default `enable_ipv6 == false` no IPv6 local candidate is emitted.
+    ///
+    /// No endpoint of any type carries an unspecified, multicast or broadcast address, or a
+    /// loopback address unless the socket itself is bound to loopback
+    /// ([`is_advertisable`](crate::local_addrs::is_advertisable)).
     pub fn self_endpoints(&self) -> Vec<SelfEndpoint> {
         let mut eps = Vec::new();
 
         let local = self.local_addr().ok();
+        let wildcard = local.is_some_and(|l| l.ip().is_unspecified());
+
+        // Read the interfaces once, and only when something below needs them. On error, offer no
+        // interface-derived candidate: never the wildcard in its place. This diverges from Go,
+        // which aborts the whole endpoint update and keeps its previous set
+        // (magicsock.go:1412-1415, updateEndpoints 945-951); self_endpoints keeps no previous set,
+        // so the reflexive endpoints are still published and only the interface-derived
+        // candidates are missing until the next tick.
+        let ifaces = if wildcard || self.enable_ipv6 {
+            match (self.interface_addrs)() {
+                Ok(ifaces) => ifaces,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "self_endpoints: interface enumeration failed; advertising no interface \
+                         addresses"
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
         if let Some(local) = local {
-            eps.push(SelfEndpoint {
-                addr: local,
-                ty: SelfEndpointType::Local,
-            });
+            if !wildcard {
+                // Bound to one address: offer it, not the addresses of other interfaces (Go: "Do
+                // not offer addresses on other local interfaces"). The gated IPv6 enumeration
+                // below is separate and unchanged.
+                eps.push(SelfEndpoint {
+                    addr: local,
+                    ty: SelfEndpointType::Local,
+                });
+            } else if local.is_ipv4() {
+                // Go `determineEndpoints` (`magicsock.go`, "localAddr.IP.IsUnspecified()"): one
+                // Local endpoint per interface address on the bound port. IPv4 only, because this
+                // socket cannot send IPv6.
+                for ip in crate::local_addrs::local_addresses(&ifaces) {
+                    if ip.is_ipv4() {
+                        eps.push(SelfEndpoint {
+                            addr: SocketAddr::new(ip, local.port()),
+                            ty: SelfEndpointType::Local,
+                        });
+                    }
+                }
+            }
         }
 
         // Local IPv6 candidate enumeration (gated on `enable_ipv6`; default `false` ⇒ this whole
         // block is skipped and the candidate set is byte-for-byte the prior IPv4-only behavior).
         //
-        // For a dual-stack `[::]:0` underlay bind, `local_addr()` above yields the UNSPECIFIED
-        // address `[::]:port`, which a peer cannot dial — so no usable local v6 candidate would
-        // ever be advertised and a direct v6 path could never form. STUN is v4-only here, so v6
-        // reflexive addresses only ever arrive via peer pongs; this fills the local-candidate gap
-        // by advertising the host's real global-unicast IPv6 interface addresses paired with the
-        // bound socket's port.
+        // A dual-stack `[::]:0` underlay bind has no dialable address of its own, so without this
+        // no usable local v6 candidate would ever be advertised and a direct v6 path could never
+        // form. STUN is v4-only here, so v6 reflexive addresses only ever arrive via peer pongs;
+        // this fills the local-candidate gap by advertising the host's real global-unicast IPv6
+        // interface addresses paired with the bound socket's port.
         //
         // Each enumerated v6 address is filtered through the SAME `is_pingable_candidate` the
         // peer-accept side uses (built into a `SocketAddr` on the local port), so the set of v6
@@ -1020,31 +1090,21 @@ impl MagicSock {
             && let Some(local) = local
         {
             let local_port = local.port();
-            match if_addrs::get_if_addrs() {
-                Ok(ifaces) => {
-                    for iface in ifaces {
-                        let IpAddr::V6(v6) = iface.ip() else {
-                            continue;
-                        };
-                        let cand = SocketAddr::new(IpAddr::V6(v6), local_port);
-                        if !self.is_pingable_candidate(&cand) {
-                            continue;
-                        }
-                        if eps.iter().any(|e| e.addr == cand) {
-                            continue;
-                        }
-                        eps.push(SelfEndpoint {
-                            addr: cand,
-                            ty: SelfEndpointType::Local,
-                        });
-                    }
+            for iface in &ifaces {
+                let IpAddr::V6(v6) = iface.ip else {
+                    continue;
+                };
+                let cand = SocketAddr::new(IpAddr::V6(v6), local_port);
+                if !self.is_pingable_candidate(&cand) {
+                    continue;
                 }
-                Err(e) => {
-                    tracing::debug!(
-                        error = %e,
-                        "self_endpoints: get_if_addrs failed; advertising no local IPv6 candidates"
-                    );
+                if eps.iter().any(|e| e.addr == cand) {
+                    continue;
                 }
+                eps.push(SelfEndpoint {
+                    addr: cand,
+                    ty: SelfEndpointType::Local,
+                });
             }
         }
 
@@ -1090,6 +1150,11 @@ impl MagicSock {
             }
         }
 
+        // The one filter in front of both consumers: control's endpoint list and every
+        // `CallMeMaybe` are built from this result. A reflexive address is peer-reported, so it
+        // passes through here too.
+        let bound_to_loopback = local.is_some_and(|l| l.ip().is_loopback());
+        eps.retain(|e| crate::local_addrs::is_advertisable(e.addr.ip(), bound_to_loopback));
         eps
     }
 
@@ -1185,9 +1250,8 @@ impl MagicSock {
     /// peer will disco-ping us and open a direct path. Sent over DERP by the caller.
     ///
     /// The endpoint set is exactly [`MagicSock::self_endpoints`] — the same addresses already
-    /// advertised to control — and every one of them was observed on this single bound socket. No
-    /// host-identifying address beyond what control already receives is disclosed, preserving the
-    /// anti-leak posture.
+    /// advertised to control (Go builds its CallMeMaybe from the same `lastEndpoints`,
+    /// magicsock.go:2683-2687). No address beyond what control already receives is disclosed.
     pub fn seal_call_me_maybe(&self, receiver: &DiscoPublicKey) -> Result<Vec<u8>, Error> {
         let endpoints: Vec<SocketAddr> =
             self.self_endpoints().into_iter().map(|e| e.addr).collect();
@@ -7562,6 +7626,127 @@ mod tests {
             sock.reflexive.lock().unwrap().is_empty(),
             "an unsolicited pong (no matching in-flight ping) must not harvest its src"
         );
+    }
+
+    /// A socket bound to `0.0.0.0` must advertise the host's interface addresses, never the
+    /// wildcard itself: control and every `CallMeMaybe` are built from `self_endpoints`, and a peer
+    /// handed `0.0.0.0:port` pings its own unspecified address (Go logs `sendto: no route to host`
+    /// on every discovery cycle). Interfaces are injected so the expansion is deterministic.
+    #[tokio::test]
+    async fn wildcard_expands_before_advertisement() {
+        use crate::local_addrs::InterfaceAddr;
+        use std::sync::atomic::AtomicUsize;
+
+        fn iface(name: &str, ip: &str, up: bool) -> InterfaceAddr {
+            InterfaceAddr {
+                name: name.into(),
+                ip: ip.parse().unwrap(),
+                prefix_len: 24,
+                up,
+                loopback_iface: name.starts_with("lo"),
+            }
+        }
+        fn unusable(addr: &SocketAddr) -> bool {
+            let ip = addr.ip();
+            ip.is_unspecified() || ip.is_loopback() || ip.is_multicast()
+        }
+        async fn bind_with_ifaces(
+            bind: &str,
+            ifaces: std::io::Result<Vec<InterfaceAddr>>,
+            calls: Arc<AtomicUsize>,
+        ) -> MagicSock {
+            let ifaces = ifaces.map_err(|e| e.kind());
+            MagicSock::bind(
+                bind.parse().unwrap(),
+                DiscoPrivateKey::random(),
+                ts_keys::NodePrivateKey::random().public_key(),
+            )
+            .await
+            .unwrap()
+            .with_interface_addrs(move || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                ifaces.clone().map_err(std::io::Error::from)
+            })
+        }
+        let host = || {
+            vec![
+                iface("lo0", "127.0.0.1", true),
+                iface("lo0", "::1", true),
+                iface("en0", "fe80::1", true),
+                iface("en0", "192.168.50.76", true),
+                iface("en0", "2001:db8:1::1", true),
+                iface("en5", "169.254.10.20", true),
+                iface("en7", "192.168.60.5", false),
+                iface("utun4", "100.101.102.103", true),
+                iface("zt0", "10.147.17.5", true),
+            ]
+        };
+
+        // Wildcard bind: the usable LAN address on the bound port, nothing else local. A bogus
+        // peer-reported reflexive (`0.0.0.0`) is dropped too; a real one is kept.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sock = bind_with_ifaces("0.0.0.0:0", Ok(host()), calls.clone()).await;
+        let port = sock.local_addr().unwrap().port();
+        {
+            let mut r = sock.reflexive.lock().unwrap();
+            r.insert("0.0.0.0:41642".parse().unwrap());
+            r.insert("203.0.113.5:51000".parse().unwrap());
+        }
+        let eps = sock.self_endpoints();
+        let locals: Vec<SocketAddr> = eps
+            .iter()
+            .filter(|e| e.ty == SelfEndpointType::Local)
+            .map(|e| e.addr)
+            .collect();
+        assert_eq!(
+            locals,
+            [SocketAddr::new("192.168.50.76".parse().unwrap(), port)],
+            "{eps:?}"
+        );
+        assert!(!eps.iter().any(|e| unusable(&e.addr)), "{eps:?}");
+        assert!(
+            eps.iter().any(|e| e.ty == SelfEndpointType::Stun
+                && e.addr == "203.0.113.5:51000".parse().unwrap()),
+            "{eps:?}"
+        );
+
+        // The CallMeMaybe a peer decrypts carries exactly that set.
+        let peer = DiscoPrivateKey::random();
+        let mut frame = sock.seal_call_me_maybe(&peer.public_key()).unwrap();
+        match disco::open(&peer, &mut frame).unwrap() {
+            Inbound::CallMeMaybe { endpoints, .. } => {
+                let want: Vec<SocketAddr> = eps.iter().map(|e| e.addr).collect();
+                assert_eq!(endpoints, want);
+                assert!(!endpoints.iter().any(unusable), "{endpoints:?}");
+            }
+            other => panic!("expected CallMeMaybe, got {other:?}"),
+        }
+
+        // Only loopback and IPv4 link-local: Go's fallback offers the link-local address.
+        let only_link_local = vec![
+            iface("lo0", "127.0.0.1", true),
+            iface("en0", "169.254.10.20", true),
+        ];
+        let sock = bind_with_ifaces("0.0.0.0:0", Ok(only_link_local), calls.clone()).await;
+        let port = sock.local_addr().unwrap().port();
+        let addrs: Vec<SocketAddr> = sock.self_endpoints().iter().map(|e| e.addr).collect();
+        assert_eq!(
+            addrs,
+            [SocketAddr::new("169.254.10.20".parse().unwrap(), port)]
+        );
+
+        // Enumeration failure: no local candidate, and still never the wildcard.
+        let failed = Err(std::io::Error::other("getifaddrs failed"));
+        let sock = bind_with_ifaces("0.0.0.0:0", failed, calls.clone()).await;
+        let eps = sock.self_endpoints();
+        assert!(eps.is_empty(), "{eps:?}");
+
+        // A concrete bind offers only its own address and never reads the interfaces.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sock = bind_with_ifaces("127.0.0.1:0", Ok(host()), calls.clone()).await;
+        let addrs: Vec<SocketAddr> = sock.self_endpoints().iter().map(|e| e.addr).collect();
+        assert_eq!(addrs, [sock.local_addr().unwrap()]);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

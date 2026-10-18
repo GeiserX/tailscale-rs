@@ -32,6 +32,7 @@ mod connected;
 mod disco;
 mod endpoint;
 mod error;
+mod local_addrs;
 mod metrics;
 mod path;
 mod receive_batch;
