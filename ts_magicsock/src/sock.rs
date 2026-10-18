@@ -120,8 +120,11 @@ const STUN_TX_TTL: Duration = Duration::from_secs(5);
 
 /// At most one warning per this window for disco pongs that failed to send; the rest go to debug
 /// and are counted in the next warning. A peer pings an unreachable candidate every few seconds,
-/// so a line per failure would flood the log (Go's daemon rate-limits the same line,
-/// `RateLimitedFn` in `cmd/tailscaled/tailscaled.go`).
+/// so a line per failure would flood the log. This throttle is ours, not Go's: Go logs every
+/// failure (`sendDiscoMessage`, `wgengine/magicsock/magicsock.go:2076-2078`) and tailscaled's
+/// `RateLimitedFn` (`cmd/tailscaled/tailscaled.go:509`) exempts every `"magicsock: disco: "`
+/// line (`types/logger/logger.go:142`); tsnet applies no limiter at all. Go also skips the log
+/// while `networkDown()`; the engine has no link-monitor signal, so it does not.
 const PONG_SEND_FAILURE_LOG_WINDOW: Duration = Duration::from_secs(60);
 
 /// Time-based budget for one repeated warning: the first failure warns, later ones inside
@@ -517,7 +520,7 @@ pub struct MagicSock {
     /// sending to, standing in for a host the kernel refuses to reach. Never compiled into a
     /// release build.
     #[cfg(test)]
-    unreachable: Mutex<HashSet<SocketAddr>>,
+    unreachable: Mutex<std::collections::HashSet<SocketAddr>>,
 }
 
 /// Test-only: the sending half of [`MagicSock::relay_send_tap`], as `(destination, bytes)`.
@@ -3161,9 +3164,11 @@ impl MagicSock {
                 // A pong is UDP like any other disco frame, so the TCP-443-only gate refuses it —
                 // silently, and without moving `disco_pong_sent`. The peer that pinged us falls
                 // back to DERP for us exactly as it would for a node it cannot reach directly.
-                // A failed send is the reply's failure, not the receive's: it is logged and the
-                // receive goes on, as Go sends the pong on its own goroutine
-                // (`handlePingLocked`) and only logs `sendDiscoMessage`'s error.
+                // A failed send is the reply's failure, not the receive's: it is logged and the receive
+                // goes on. Go isolates it by sending the pong on its own goroutine (`handlePingLocked`,
+                // `wgengine/magicsock/magicsock.go:2640`) and only logging `sendDiscoMessage`'s error
+                // (`magicsock.go:2076-2078`). Here the send still runs inline, so only the error is
+                // detached from the receive, not the send's latency.
                 match self.send_udp(&pong, from).await {
                     Ok(true) => {
                         tracing::trace!(%sender, %from, ?tx_id, "magicsock: disco pong sent");
