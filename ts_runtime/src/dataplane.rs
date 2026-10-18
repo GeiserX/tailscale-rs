@@ -146,11 +146,185 @@ impl OverlayToDataplane {
 /// Queue for packets entering the overlay from the dataplane.
 pub type OverlayFromDataplane = mpsc::UnboundedReceiver<Vec<PacketMut>>;
 
-/// Queue for packets leaving the underlay to the dataplane.
-pub type UnderlayToDataplane = mpsc::UnboundedSender<(PeerId, Vec<PacketMut>)>;
+/// Which peers have had WireGuard traffic lately — the input to Go magicsock's per-endpoint
+/// `lastSendExt`, which `endpoint.send` stamps for every packet WireGuard hands it.
+///
+/// Recorded where every underlay crosses the dataplane: [`UnderlayFromDataplane::recv`] for
+/// packets leaving towards a peer and [`UnderlayToDataplane::send`] for packets arriving from one,
+/// over DERP or a direct path alike. Upstream only stamps sends, but wireguard-go answers received
+/// data with data or a keepalive of its own, so in Go received data keeps a session active too.
+/// This tree's tunnel does not always answer, so received data is counted directly.
+///
+/// Only transport data with a payload counts. Go stamps `lastSendExt` for every packet
+/// wireguard-go sends, handshakes included (wgengine/magicsock/endpoint.go:1072, v1.102.4), but
+/// upstream (v1.102.4) sets no WireGuard persistent keepalive on any peer: wgcfg.Config carries no
+/// peers (wgengine/wgcfg/config.go:16-25) and SetPeerConfigFunc supplies only allowed IPs
+/// (wgengine/userspace.go:689), so an idle Go session exchanges nothing and never rekeys. This
+/// fork sends a persistent keepalive to every peer with a session
+/// ([`Env::persistent_keepalive_interval`]), and the initiator rekeys the keypair on the first
+/// packet received after it is 165 s old (ts_tunnel `keep_key_fresh_receiving`), so counting
+/// keepalives, or the handshakes they cause, would restart discovery for every idle session every
+/// few minutes. The cost is that discovery for a fresh session starts on its first data packet,
+/// one handshake round trip over DERP later than in Go.
+///
+/// The direct manager takes the peers with new traffic ([`next`](Self::next)) and marks them
+/// active on the magicsock, which starts discovery for a peer that was idle. A peer is reported at
+/// most once per [`PEER_ACTIVITY_REPORT_INTERVAL`], which bounds the hot-path cost to one lock and
+/// one map lookup per batch; the activity window it feeds is 45s.
+#[derive(Debug, Clone, Default)]
+pub struct PeerActivity(Arc<PeerActivityInner>);
 
-/// Queue for packets entering an underlay from the dataplane.
-pub type UnderlayFromDataplane = mpsc::UnboundedReceiver<(PeerId, Vec<PacketMut>)>;
+#[derive(Debug, Default)]
+struct PeerActivityInner {
+    state: std::sync::Mutex<PeerActivityState>,
+    /// Wakes [`PeerActivity::next`]. `notify_one` stores a permit when nobody is waiting, so a
+    /// report made between the consumer's check and its wait is not lost.
+    notify: tokio::sync::Notify,
+}
+
+#[derive(Debug, Default)]
+struct PeerActivityState {
+    /// When each peer's traffic was last reported.
+    reported: HashMap<PeerId, tokio::time::Instant>,
+    /// Peers reported but not yet taken by [`PeerActivity::next`].
+    pending: Vec<PeerId>,
+}
+
+/// The least time between two reports of the same peer's traffic.
+const PEER_ACTIVITY_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+impl PeerActivity {
+    /// Record WireGuard traffic with `peer`. Ignored unless `packets` holds transport data with a
+    /// payload: keepalives and handshakes are not traffic.
+    pub fn note(&self, peer: PeerId, packets: &[PacketMut]) {
+        if !packets.iter().any(|p| is_wireguard_data(p.as_ref())) {
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        {
+            let mut state = self.lock();
+            if state
+                .reported
+                .get(&peer)
+                .is_some_and(|t| now.saturating_duration_since(*t) < PEER_ACTIVITY_REPORT_INTERVAL)
+            {
+                return;
+            }
+            state.reported.insert(peer, now);
+            if !state.pending.contains(&peer) {
+                state.pending.push(peer);
+            }
+        }
+        self.0.notify.notify_one();
+    }
+
+    /// Wait for traffic, then take every peer reported since the last call.
+    pub async fn next(&self) -> Vec<PeerId> {
+        loop {
+            {
+                let mut state = self.lock();
+                if !state.pending.is_empty() {
+                    return core::mem::take(&mut state.pending);
+                }
+            }
+            self.0.notify.notified().await;
+        }
+    }
+
+    /// Forget peers for which `live` is false, so a departed peer's entry does not linger.
+    pub fn retain(&self, live: impl Fn(PeerId) -> bool) {
+        let mut state = self.lock();
+        state.reported.retain(|peer, _| live(*peer));
+        state.pending.retain(|peer| live(*peer));
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, PeerActivityState> {
+        // The state is two independent collections with no invariant a panicking writer could
+        // break, so a poisoned lock is safe to keep using.
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// Whether `packet` is WireGuard transport data with a payload: a transport-data message (type 4)
+/// longer than a keepalive, which is its 16-byte header plus the 16-byte AEAD tag around an empty
+/// payload (WireGuard §5.4.6 and §6.5). Handshake messages (types 1-3) are not data.
+fn is_wireguard_data(packet: &[u8]) -> bool {
+    packet.len() > 32 && packet[0] == 4
+}
+
+/// Queue for packets leaving the underlay to the dataplane.
+///
+/// A newtype around the raw channel, like [`OverlayToDataplane`], so recording per-peer traffic
+/// ([`PeerActivity`]) is structural: every underlay transport records it by construction.
+#[derive(Debug, Clone)]
+pub struct UnderlayToDataplane {
+    tx: mpsc::UnboundedSender<(PeerId, Vec<PacketMut>)>,
+    activity: PeerActivity,
+}
+
+impl UnderlayToDataplane {
+    /// Hand packets received from `peer` to the dataplane, noting the peer's traffic. As with
+    /// [`OverlayToDataplane::send`], nothing is noted when the dataplane has gone away.
+    pub fn send(
+        &self,
+        (peer, packets): (PeerId, Vec<PacketMut>),
+    ) -> Result<(), mpsc::error::SendError<(PeerId, Vec<PacketMut>)>> {
+        if self.tx.is_closed() {
+            return Err(mpsc::error::SendError((peer, packets)));
+        }
+        self.activity.note(peer, &packets);
+        self.tx.send((peer, packets))
+    }
+
+    /// Whether the dataplane end has gone away.
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
+    /// A send half recording into `activity`, paired with its receiver, for tests.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        activity: PeerActivity,
+    ) -> (Self, mpsc::UnboundedReceiver<(PeerId, Vec<PacketMut>)>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Self { tx, activity }, rx)
+    }
+}
+
+/// Queue for packets entering an underlay from the dataplane, noting per-peer traffic as each
+/// batch is taken (see [`PeerActivity`]).
+#[derive(Debug)]
+pub struct UnderlayFromDataplane {
+    rx: mpsc::UnboundedReceiver<(PeerId, Vec<PacketMut>)>,
+    activity: PeerActivity,
+}
+
+impl UnderlayFromDataplane {
+    /// The next batch of packets to send to a peer, or `None` once the dataplane has gone away.
+    /// Cancel-safe, like the channel it wraps.
+    pub async fn recv(&mut self) -> Option<(PeerId, Vec<PacketMut>)> {
+        let (peer, packets) = self.rx.recv().await?;
+        self.activity.note(peer, &packets);
+        Some((peer, packets))
+    }
+
+    /// Whether the dataplane end has gone away.
+    pub fn is_closed(&self) -> bool {
+        self.rx.is_closed()
+    }
+
+    /// A receiver recording into `activity`, paired with its send half, for tests.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        activity: PeerActivity,
+    ) -> (Self, mpsc::UnboundedSender<(PeerId, Vec<PacketMut>)>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Self { rx, activity }, tx)
+    }
+}
 
 /// A peer's disco public key, learned from a TSMP disco-key advertisement it sent us inside the
 /// WireGuard tunnel (Go `packet.TSMPDiscoKeyAdvertisement`, upstream capability version 144).
@@ -189,6 +363,9 @@ pub struct DataplaneActor {
     /// into every [`OverlayToDataplane`] this actor hands out so each overlay transport's sends feed
     /// it. Read by the direct manager's periodic STUN gate.
     datapath_activity: DatapathActivity,
+    /// The shared per-peer traffic record (the same handle as `Env::peer_activity`), stamped into
+    /// every underlay channel this actor hands out. Read by the direct manager.
+    peer_activity: PeerActivity,
 }
 
 impl Drop for DataplaneActor {
@@ -229,7 +406,18 @@ impl DataplaneActor {
         UnderlayFromDataplane,
         UnderlayToDataplane,
     ) {
-        self.dataplane.new_underlay_transport().await
+        let (id, rx, tx) = self.dataplane.new_underlay_transport().await;
+        (
+            id,
+            UnderlayFromDataplane {
+                rx,
+                activity: self.peer_activity.clone(),
+            },
+            UnderlayToDataplane {
+                tx,
+                activity: self.peer_activity.clone(),
+            },
+        )
     }
 
     /// Install (`Some`) or clear (`None`) the debug packet-capture hook on the running dataplane.
@@ -254,6 +442,7 @@ impl kameo::Actor for DataplaneActor {
 
         let persistent_keepalive_interval = env.persistent_keepalive_interval;
         let datapath_activity = env.datapath_activity.clone();
+        let peer_activity = env.peer_activity.clone();
 
         // Go `tstun.Wrapper.PeerAPIPort`. The dataplane reads it for one thing: an inbound SYN to
         // the peerAPI port that the ACL drops must not be answered with a TSMP rejected-connection
@@ -307,6 +496,7 @@ impl kameo::Actor for DataplaneActor {
             disco_key_task,
             persistent_keepalive_interval,
             datapath_activity,
+            peer_activity,
             // Our disco key is generated once per run and never rotates (unlike the node key), so
             // it is snapshotted here rather than re-read per advertisement. Go reads it per call
             // (`Conn.DiscoPublicKey()`) because its disco key *can* be regenerated on rebind.
@@ -564,6 +754,57 @@ mod tests {
             service_vips: Default::default(),
             unsigned_peer_api_only: false,
         }
+    }
+
+    /// Data in either direction counts as traffic with a peer; a WireGuard keepalive does not,
+    /// since this fork keeps one going to every peer with a session, and neither does a handshake,
+    /// since those keepalives cause periodic rekeys. A peer is reported once per report interval
+    /// however many batches it sends.
+    #[tokio::test(start_paused = true)]
+    async fn peer_activity_counts_data_but_not_keepalives_or_handshakes() {
+        let activity = PeerActivity::default();
+        let peer = PeerId(7);
+        let packet = |len: usize| PacketMut::from([vec![4u8, 0, 0, 0], vec![0; len - 4]].concat());
+        let reported = async |activity: &PeerActivity| {
+            tokio::time::timeout(std::time::Duration::from_millis(10), activity.next())
+                .await
+                .ok()
+        };
+
+        activity.note(peer, &[packet(32)]);
+        assert_eq!(
+            reported(&activity).await,
+            None,
+            "a keepalive is not traffic"
+        );
+
+        activity.note(peer, &[PacketMut::from(vec![1u8; 148])]);
+        assert_eq!(
+            reported(&activity).await,
+            None,
+            "a handshake initiation is not traffic"
+        );
+
+        activity.note(peer, &[PacketMut::from(vec![2u8; 92])]);
+        assert_eq!(
+            reported(&activity).await,
+            None,
+            "a handshake response is not traffic"
+        );
+
+        activity.note(peer, &[packet(32), packet(48)]);
+        assert_eq!(reported(&activity).await, Some(vec![peer]), "data is");
+
+        activity.note(peer, &[packet(48)]);
+        assert_eq!(
+            reported(&activity).await,
+            None,
+            "reported at most once per interval"
+        );
+
+        tokio::time::advance(PEER_ACTIVITY_REPORT_INTERVAL).await;
+        activity.note(peer, &[packet(48)]);
+        assert_eq!(reported(&activity).await, Some(vec![peer]));
     }
 
     #[test]
