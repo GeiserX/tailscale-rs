@@ -163,6 +163,14 @@ const GOOD_ENOUGH_LATENCY: Duration = Duration::from_millis(5);
 /// path without per-2s-tick chatter.
 const UPGRADE_UDP_DIRECT_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How long after the last traffic with a peer this node keeps discovering and heartbeating its
+/// paths — Go magicsock `sessionActiveTimeout` (45s, `magicsock.go`).
+///
+/// Go only runs `endpoint.heartbeat` while `now.Sub(de.lastSendExt) <= sessionActiveTimeout`
+/// (`endpoint.go`). Once a peer goes quiet, no more discovery pings or `CallMeMaybe`s are sent to
+/// it, its direct path's trust lapses, and it rides DERP until traffic resumes.
+pub const SESSION_ACTIVE_TIMEOUT: Duration = Duration::from_secs(45);
+
 /// Maximum number of [`CandidateSource::Learned`] candidate endpoints tracked per peer.
 ///
 /// Anti-amplification (the per-peer accumulation bound complementing the per-message
@@ -248,6 +256,10 @@ pub struct PeerPaths {
     /// Set by the netmap push ([`set_heartbeat_disabled`](Self::set_heartbeat_disabled)); `false`
     /// (the default) is byte-for-byte the previous behaviour.
     heartbeat_disabled: bool,
+    /// When this peer last had traffic, or an explicit ping — Go magicsock's `lastSendExt`. `None`
+    /// until the first one. Discovery and the heartbeat run only while this is within
+    /// [`SESSION_ACTIVE_TIMEOUT`]; see [`pings_due`](Self::pings_due).
+    last_active: Option<Instant>,
 }
 
 impl PeerPaths {
@@ -363,6 +375,44 @@ impl PeerPaths {
         if self.heartbeat_disabled && self.best == Some(src) {
             self.trust_until = Some(now + TRUST_DURATION);
         }
+    }
+
+    /// Record traffic with this peer, or an explicit ping to it — Go magicsock
+    /// `endpoint.noteTxActivityExtTriggerLocked`, which stamps `lastSendExt` and arms the
+    /// heartbeat.
+    ///
+    /// Returns `true` when the peer was idle until now (never active, or quiet for longer than
+    /// [`SESSION_ACTIVE_TIMEOUT`]). The caller then starts discovery straight away rather than on
+    /// the next pinger tick, as Go's `endpoint.send` does when it has no trusted direct path.
+    pub fn note_active(&mut self, now: Instant) -> bool {
+        let was_active = self.is_active(now);
+        self.last_active = Some(self.last_active.map_or(now, |t| t.max(now)));
+        !was_active
+    }
+
+    /// Whether this peer has had traffic within [`SESSION_ACTIVE_TIMEOUT`] — the condition Go's
+    /// `endpoint.heartbeat` checks before it pings anything (`endpoint.go`).
+    pub fn is_active(&self, now: Instant) -> bool {
+        self.last_active
+            .is_some_and(|t| now.saturating_duration_since(t) <= SESSION_ACTIVE_TIMEOUT)
+    }
+
+    /// The candidates the periodic pinger should ping now: Go magicsock's `endpoint.heartbeat`.
+    ///
+    /// Nothing while the peer is idle ([`is_active`](Self::is_active)): Go stops heartbeating a
+    /// session once it has been quiet for [`SESSION_ACTIVE_TIMEOUT`], so neither the best path nor
+    /// any other candidate is pinged, and the best path's trust lapses until traffic resumes.
+    /// Otherwise the best-path refresh gate ([`needs_refresh`](Self::needs_refresh)) and Go's
+    /// discovery cadence ([`candidates_to_ping`](Self::candidates_to_ping)) apply as before.
+    ///
+    /// Event-driven pings do not come through here and are not gated on activity: an inbound
+    /// `CallMeMaybe` ([`force_ping_sweep`](Self::force_ping_sweep)) pings an idle peer too, as Go's
+    /// `handleCallMeMaybe` does.
+    pub fn pings_due(&mut self, now: Instant) -> Vec<SocketAddr> {
+        if !self.is_active(now) || !self.needs_refresh(now) {
+            return Vec::new();
+        }
+        self.candidates_to_ping(now)
     }
 
     /// Drop the confirmed best path and its trust, **keeping the candidate set**. Used on a socket
@@ -1984,6 +2034,60 @@ mod tests {
             p.best_addr(lapsed),
             Some(addr),
             "a datagram on the stored best re-trusts it for a full TRUST_DURATION"
+        );
+    }
+
+    /// Go `endpoint.heartbeat` (`endpoint.go`): while a peer has traffic its best path is re-pinged
+    /// and never loses trust; once the traffic has been gone for `SESSION_ACTIVE_TIMEOUT` the
+    /// heartbeat ends, nothing more is pinged, and the path's trust lapses so the peer rides DERP
+    /// until traffic resumes.
+    #[test]
+    fn an_active_peer_keeps_its_direct_path_through_heartbeats_until_it_goes_idle() {
+        let addr: SocketAddr = "203.0.113.1:41641".parse().unwrap();
+        let mut p = PeerPaths::default();
+        p.add_netmap_candidates([addr]);
+
+        let t0 = Instant::now();
+        let traffic_stops = Duration::from_secs(60);
+        let heartbeat_ends = traffic_stops + SESSION_ACTIVE_TIMEOUT;
+        let rtt = Duration::from_millis(1);
+        let mut next_tx = 0u8;
+        let mut last_ping = None;
+
+        // The periodic pinger's 2s ticks, for three minutes.
+        for secs in (0..=180).step_by(2) {
+            let at = Duration::from_secs(secs);
+            let now = t0 + at;
+            if at <= traffic_stops {
+                p.note_active(now);
+            }
+            for to in p.pings_due(now) {
+                next_tx = next_tx.wrapping_add(1);
+                p.note_ping_sent(tx(next_tx), to, now);
+                p.note_pong(tx(next_tx), to, now + rtt);
+                last_ping = Some(at);
+            }
+
+            let trusted = p.best_addr(now + rtt).is_some();
+            if at <= heartbeat_ends {
+                assert!(
+                    trusted,
+                    "an active peer's direct path must stay trusted at {at:?}"
+                );
+            }
+            if at > heartbeat_ends + TRUST_DURATION {
+                assert!(
+                    !trusted,
+                    "an idle peer's path must not be kept alive by heartbeats at {at:?}"
+                );
+            }
+        }
+
+        let last_ping = last_ping.expect("the active peer was heartbeated");
+        assert!(
+            last_ping <= heartbeat_ends,
+            "the heartbeat must stop {SESSION_ACTIVE_TIMEOUT:?} after the traffic does; last ping \
+             at {last_ping:?}"
         );
     }
 }
