@@ -118,6 +118,39 @@ const RELAY_REFRESH_LEAD: Duration = Duration::from_millis(3500);
 /// long a transaction id is a usable injection target.
 const STUN_TX_TTL: Duration = Duration::from_secs(5);
 
+/// At most one warning per this window for disco pongs that failed to send; the rest go to debug
+/// and are counted in the next warning. A peer pings an unreachable candidate every few seconds,
+/// so a line per failure would flood the log. This throttle is ours, not Go's: Go logs every
+/// failure (`sendDiscoMessage`, `wgengine/magicsock/magicsock.go:2076-2078`) and tailscaled's
+/// `RateLimitedFn` (`cmd/tailscaled/tailscaled.go:509`) exempts every `"magicsock: disco: "`
+/// line (`types/logger/logger.go:142`); tsnet applies no limiter at all. Go also skips the log
+/// while `networkDown()`; the engine has no link-monitor signal, so it does not.
+const PONG_SEND_FAILURE_LOG_WINDOW: Duration = Duration::from_secs(60);
+
+/// Time-based budget for one repeated warning: the first failure warns, later ones inside
+/// [`PONG_SEND_FAILURE_LOG_WINDOW`] are only counted.
+#[derive(Debug, Default)]
+struct WarnBudget {
+    last_warned: Option<Instant>,
+    suppressed: u64,
+}
+
+impl WarnBudget {
+    /// Record one failure at `now`. Returns `Some(suppressed)` (failures since the last warning)
+    /// when this one should be logged as a warning, `None` when it is inside the window.
+    fn admit(&mut self, now: Instant, window: Duration) -> Option<u64> {
+        if self
+            .last_warned
+            .is_some_and(|t| now.saturating_duration_since(t) < window)
+        {
+            self.suppressed += 1;
+            return None;
+        }
+        self.last_warned = Some(now);
+        Some(core::mem::take(&mut self.suppressed))
+    }
+}
+
 /// Acquire a [`Mutex`] guard, recovering from poisoning instead of propagating the panic.
 ///
 /// These locks guard plain maps/sets with no cross-field invariant that a mid-update panic could
@@ -394,6 +427,9 @@ pub struct MagicSock {
     /// and then left to the counters. See
     /// [`warn_relay_addrs_all_refused_once`](Self::warn_relay_addrs_all_refused_once).
     warned_relay_addrs_all_refused: AtomicBool,
+    /// Log budget for disco pongs that failed to send (see
+    /// [`note_pong_send_failure`](Self::note_pong_send_failure)).
+    pong_send_failures: Mutex<WarnBudget>,
     /// Gate for accepting IPv6 disco candidates on the tailnet overlay (default `false`).
     ///
     /// The primary deployment is an IPv4-only privacy proxy / cloud exit node, so this defaults
@@ -480,6 +516,11 @@ pub struct MagicSock {
     /// build, and it only ever copies; the real send still happens.
     #[cfg(test)]
     relay_send_tap: Mutex<Option<RelaySendTap>>,
+    /// Test-only: destinations [`send_udp`](Self::send_udp) fails with `EHOSTUNREACH` instead of
+    /// sending to, standing in for a host the kernel refuses to reach. Never compiled into a
+    /// release build.
+    #[cfg(test)]
+    unreachable: Mutex<std::collections::HashSet<SocketAddr>>,
 }
 
 /// Test-only: the sending half of [`MagicSock::relay_send_tap`], as `(destination, bytes)`.
@@ -548,6 +589,7 @@ impl MagicSock {
             warned_no_verifier: AtomicBool::new(false),
             warned_no_cap_lookup: AtomicBool::new(false),
             warned_relay_addrs_all_refused: AtomicBool::new(false),
+            pong_send_failures: Mutex::default(),
             enable_ipv6: false,
             symmetric_nat: AtomicBool::new(false),
             silent_disco: AtomicBool::new(false),
@@ -559,6 +601,8 @@ impl MagicSock {
             allow_loopback_relay: AtomicBool::new(false),
             #[cfg(test)]
             relay_send_tap: Mutex::new(None),
+            #[cfg(test)]
+            unreachable: Mutex::default(),
         })
     }
 
@@ -612,6 +656,10 @@ impl MagicSock {
     async fn send_udp(&self, buf: &[u8], addr: SocketAddr) -> Result<bool, Error> {
         if self.only_tcp_443() {
             return Ok(false);
+        }
+        #[cfg(test)]
+        if lock(&self.unreachable).contains(&addr) {
+            return Err(Error::Io(std::io::ErrorKind::HostUnreachable.into()));
         }
         let sock = self.sock().await;
         let connected = {
@@ -2856,6 +2904,24 @@ impl MagicSock {
         }
     }
 
+    /// Log a disco pong that failed to send (e.g. `EHOSTUNREACH` to an on-link host the OS will
+    /// not let us reach): a warning at most once per [`PONG_SEND_FAILURE_LOG_WINDOW`], carrying
+    /// how many were suppressed since the last one, and debug otherwise.
+    fn note_pong_send_failure(&self, sender: &DiscoPublicKey, to: SocketAddr, error: &Error) {
+        let admitted =
+            lock(&self.pong_send_failures).admit(Instant::now(), PONG_SEND_FAILURE_LOG_WINDOW);
+        match admitted {
+            Some(suppressed) => tracing::warn!(
+                %sender,
+                %to,
+                %error,
+                suppressed,
+                "magicsock: disco pong failed to send; still receiving"
+            ),
+            None => tracing::debug!(%sender, %to, %error, "magicsock: disco pong failed to send"),
+        }
+    }
+
     /// Emit the "no binding verifier installed" warning at most once.
     fn warn_no_verifier_once(&self) {
         if !self.warned_no_verifier.swap(true, Ordering::Relaxed) {
@@ -3098,9 +3164,18 @@ impl MagicSock {
                 // A pong is UDP like any other disco frame, so the TCP-443-only gate refuses it —
                 // silently, and without moving `disco_pong_sent`. The peer that pinged us falls
                 // back to DERP for us exactly as it would for a node it cannot reach directly.
-                if self.send_udp(&pong, from).await? {
-                    tracing::trace!(%sender, %from, ?tx_id, "magicsock: disco pong sent");
-                    m.disco_pong_sent.inc();
+                // A failed send is the reply's failure, not the receive's: it is logged and the receive
+                // goes on. Go isolates it by sending the pong on its own goroutine (`handlePingLocked`,
+                // `wgengine/magicsock/magicsock.go:2640`) and only logging `sendDiscoMessage`'s error
+                // (`magicsock.go:2076-2078`). Here the send still runs inline, so only the error is
+                // detached from the receive, not the send's latency.
+                match self.send_udp(&pong, from).await {
+                    Ok(true) => {
+                        tracing::trace!(%sender, %from, ?tx_id, "magicsock: disco pong sent");
+                        m.disco_pong_sent.inc();
+                    }
+                    Ok(false) => {}
+                    Err(e) => self.note_pong_send_failure(&sender, from, &e),
                 }
             }
             Inbound::Pong { sender, tx_id, src } => {
@@ -3619,6 +3694,87 @@ mod tests {
         let packets: Vec<_> = packets.into_iter().collect();
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].as_ref(), b"after-error");
+    }
+
+    /// A pong that fails to send (`EHOSTUNREACH`, as to an on-link host the OS will not let us
+    /// reach) is the reply's failure, not the receive's: the WireGuard datagram the peer sends
+    /// next still comes out of both receive calls, and no error does.
+    #[tokio::test]
+    async fn pong_send_failure_does_not_fail_receive() {
+        let sender_disco = DiscoPrivateKey::random();
+        let sender_node = ts_keys::NodePrivateKey::random().public_key();
+        let our_disco = DiscoPrivateKey::random();
+        let sock = MagicSock::bind(
+            localhost(),
+            our_disco.clone(),
+            ts_keys::NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap()
+        .with_binding_verifier(verifier_for(sender_disco.public_key(), sender_node));
+        let to = sock.local_addr().unwrap();
+        let peer = UdpSocket::bind(localhost()).await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        sock.addr_to_disco
+            .lock()
+            .unwrap()
+            .insert(peer_addr, sender_disco.public_key());
+        lock(&sock.unreachable).insert(peer_addr);
+
+        for batched in [false, true] {
+            let ping = disco::seal_ping(
+                &sender_disco,
+                sender_node,
+                &our_disco.public_key(),
+                disco::random_tx_id(),
+            )
+            .unwrap();
+            peer.send_to(&ping, to).await.unwrap();
+            peer.send_to(b"after-ping", to).await.unwrap();
+            let received = tokio::time::timeout(Duration::from_secs(2), async {
+                if !batched {
+                    return sock.recv_data().await.map(Option::unwrap);
+                }
+                loop {
+                    // The ping's batch is consumed as control traffic and yields nothing.
+                    if let Some(data) = sock.recv_data_batch().await?.into_iter().next() {
+                        return Ok(data);
+                    }
+                }
+            })
+            .await
+            .expect("timed out waiting for the datagram after the ping");
+            let data = received.expect("a failed pong send must not fail the receive");
+            assert_eq!(data.data.as_ref(), b"after-ping", "batched: {batched}");
+            assert_eq!(data.from_disco, sender_disco.public_key());
+        }
+    }
+
+    /// A peer pinging an unreachable candidate every 5 s for five minutes gets one warning a
+    /// minute, each counting the failures suppressed since the last.
+    #[test]
+    fn pong_send_failure_log_is_rate_limited() {
+        let start = Instant::now();
+        let mut budget = WarnBudget::default();
+        let warnings: Vec<_> = (0..300)
+            .step_by(5)
+            .filter_map(|secs| {
+                budget
+                    .admit(
+                        start + Duration::from_secs(secs),
+                        PONG_SEND_FAILURE_LOG_WINDOW,
+                    )
+                    .map(|suppressed| (secs, suppressed))
+            })
+            .collect();
+        assert_eq!(
+            warnings,
+            [(0, 0), (60, 11), (120, 11), (180, 11), (240, 11)]
+        );
+        assert_eq!(
+            budget.suppressed, 11,
+            "the last minute waits for the next warning"
+        );
     }
 
     #[tokio::test]
