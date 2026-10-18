@@ -20,8 +20,9 @@ pub(crate) const MAX_OWNED: usize = 4;
 /// Initial unacknowledged deletes before switching to infrequent recovery attempts.
 pub(crate) const MAX_DELETE_TRIES: u32 = 3;
 /// After the initial attempts, at most one delete per rule per ten minutes, with fresh gateway
-/// validation each time. Unknown grants never age out at the requested lifetime: they keep an
-/// admission slot until per-rule evidence (a matched reply/delete or accepted reset) resolves it.
+/// validation each time. An unanswered MAP keeps its admission slot for the requested lifetime
+/// from its last send attempt (RFC 6886 §3.3), unless per-rule evidence (a matched reply/delete
+/// or accepted reset) resolves it first.
 pub(crate) const DELETE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Where an owned rule stands.

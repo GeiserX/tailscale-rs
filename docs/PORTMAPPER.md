@@ -16,8 +16,8 @@ behind a hard NAT can reach it directly instead of over DERP. NAT-PMP (RFC 6886)
 | Source | Effect |
 |---|---|
 | `Config::disable_port_mapper` (Go `DisablePortMapper`) | No client, no driver, no socket; NetInfo facets unset |
-| `TS_DISABLE_PORTMAPPER` (Go name), read once at startup | Same |
-| Control `only-tcp-443` | Live: every LAN send stops at once, deletes included; facets `PMP`/`PCP` are false |
+| `TS_DISABLE_PORTMAPPER` (Go name), read once at startup | No client, no driver, no socket; NetInfo facets unset. Go keeps the client and reports `UPnP`/`PMP`/`PCP` as false |
+| Control `only-tcp-443` | Live: every LAN send stops at once, deletes included; facets `PMP`/`PCP` are false. Go only blocks new creates and probes (see Deviations) |
 | Cargo feature `portmapper` off | Not compiled; facets unset |
 
 The feature is on by default, as in Go. Tests keep it off: every shared runtime test configuration
@@ -35,13 +35,18 @@ sets `port_mapper: None`, and the `portmapper_test_isolation` check enforces the
   `--portmap-lazy-renew` reverts the runner to Go's behaviour.
 - **`HavePortMap` means an advertised mapping**, so control never sees it without a type-3
   endpoint.
-- **Notifications for every protocol.** Success, loss, expiry and disable publish for NAT-PMP and
-  PCP alike. In Go only PCP successes publish.
+- **Notifications.** Go publishes every successful mapping (NAT-PMP, PCP, UPnP, including a
+  reused one) and never a loss, expiry or disable. Here loss, expiry and disable publish too, for
+  both protocols.
 - **Strict replies.** Replies are accepted only from exactly `gateway:5351`, and every field is
   validated: version, opcode, R bit, length, internal port, protocol and nonce. Go's probe checks
   only the source port.
 - **NAT-PMP delete.** The suggested external port is 0, as RFC 6886 §3.4 requires. Go sends the
   current one.
+- **PCP nonce and delete.** The nonce is kept for renewal and delete and every MAP reply must echo
+  it (RFC 6887 §11.1, §15.1). Go v1.102.4 draws a fresh nonce for every request, including the
+  delete, and never checks the reply nonce. The PCP delete suggests port 0 and `::ffff:0.0.0.0`;
+  Go sends the current external address and port.
 - **Renewal protocol.** A usable mapping keeps its owning protocol, even if another service
   becomes available. PMP and PCP may share one router rule, so switching and then deleting the
   old rule could delete its replacement.
@@ -58,6 +63,28 @@ sets `port_mapper: None`, and the `portmapper_test_isolation` check enforces the
   external address is rejected; Go accepts it.
 - **Epoch.** Go's rule applies to probe replies only. An epoch that goes backwards drops the
   mapping without a release.
+- **PCP seen.** A PCP ANNOUNCE reply counts as "PCP seen" and is checked for an epoch rollback
+  only when its result is SUCCESS. Go records any ANNOUNCE reply, NOT_AUTHORIZED and
+  ADDRESS_MISMATCH included, and then prefers PCP for the next MAP.
+- **Attempt spacing.** Go retries a failed create on the next ReSTUN with no backoff (only a 5 s
+  skip after a probe that found nothing). Here consecutive failures space attempts
+  10/30/60/120/300/600 s (±20 %), no two attempts start within 2 s, and a PCP error lifetime is
+  honoured up to 30 min; while that backoff holds, a probe after one that found nothing is
+  skipped too. This bounds LAN traffic to a refusing or absent router.
+- **`only-tcp-443`.** Every LAN send stops, the mapping is withdrawn and nothing is deleted until
+  the knob is lifted. Go only blocks new creates and probes; it keeps the cached mapping advertised
+  and still releases it on Close.
+- **Same-port rebind.** The endpoint is withdrawn at once and restored after the network
+  re-validates; Go's `SetLocalPort` is a no-op for an unchanged port and keeps the mapping.
+- **No endpoint tracker.** An expired or rebound mapping leaves the endpoint list immediately; Go
+  keeps advertising a vanished endpoint for 5 min 10 s.
+- **Network poll.** The default route is re-read every 10 s instead of subscribing to the OS link
+  monitor (not ported yet).
+- **Resume detection.** A wall-vs-monotonic disagreement over 30 s on the 10 s poll; Go's netmon
+  polls the wall clock every 15 s and reacts to a jump over 22.5 s.
+- **Probe and MAP exchange.** The probe returns as soon as NAT-PMP and PCP are both decided (Go
+  waits the full 250 ms unless UPnP also answered), and the NAT-PMP MAP always sends the
+  public-address request alongside (Go sends it only when it has no recent public address).
 
 ## Router state, stated honestly
 
@@ -79,11 +106,13 @@ sets `port_mapper: None`, and the `portmapper_test_isolation` check enforces the
   after socket setup, route validation and the final send permit. A fresh never-sent identity
   retires without DELETE; an unsent adoption/renewal retains its previous grant and nonce/protocol.
   NAT-PMP's public-address request alone cannot create a mapping. A matched success records the
-  actual grant. After a MAP attempt without a success reply, the grant could exceed the request,
-  so the tombstone conservatively uses the full wire maximum (`u32::MAX` seconds, about 136 years)
-  from the latest syscall attempt.
-  Four unresolved rules can therefore stop further creates for this process. Wall-clock jumps
-  withdraw advertisement trust but do not shorten possible ownership.
+  actual grant. An unanswered MAP keeps its slot for the requested lifetime (7200 s) from the
+  latest syscall attempt: a NAT-PMP gateway should not grant longer than requested (RFC 6886
+  §3.3), and Go trusts no unanswered MAP at all. A PCP server may grant longer; such an unobserved
+  longer grant is forgotten after 7200 s and left to the router's own expiry, as after a crash.
+  Four unresolved rules can therefore stop further creates for up to two hours, never for the
+  rest of the process. Wall-clock jumps withdraw
+  advertisement trust but do not shorten possible ownership.
 - **Network down.** Nothing is deleted, since a delete could reach the wrong router. Such rules are
   left to expire. A create for the same rule on the same network adopts them, because PCP refuses a
   second nonce for a live rule.

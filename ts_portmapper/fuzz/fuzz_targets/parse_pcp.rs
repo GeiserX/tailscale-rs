@@ -1,4 +1,5 @@
-//! PCP header and ANNOUNCE parsers (port of Go's `FuzzParsePCPResponse`, with invariants).
+//! PCP header and ANNOUNCE parsers (port of upstream Go's `FuzzParsePCPResponse`, on tailscale
+//! main after v1.102.4, with invariants).
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;

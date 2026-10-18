@@ -862,8 +862,9 @@ async fn drop_path_release_needs_no_runtime() {
 // ---------------------------------------------------------------------------------------------
 // Router errors, hostile replies, backoff
 
-/// Router refusals map to no mapping and backoff; NOT_AUTHORIZED holds ≥ 30 min; a PCP
-/// error lifetime is honoured; ANNOUNCE refusals report `pcp = false`.
+/// Router refusals map to no mapping and backoff; NOT_AUTHORIZED takes the ordinary backoff (no
+/// long hold, as Go has none); a PCP error lifetime is honoured; ANNOUNCE refusals report
+/// `pcp = false`.
 #[tokio::test]
 async fn router_errors_back_off() {
     for code in 1..=5u16 {
@@ -875,11 +876,7 @@ async fn router_errors_back_off() {
         assert!(r.map().await.is_none());
         assert_eq!(r.client.owned_rules(), 0, "a refused create left nothing");
         let wait = r.client.schedule().next_attempt.unwrap() - r.clock.now();
-        if code == 2 {
-            assert!(wait >= secs(30 * 60) - secs(1), "{code}: {wait:?}");
-        } else {
-            assert!(wait >= secs(7) && wait <= secs(13), "{code}: {wait:?}");
-        }
+        assert!(wait >= secs(7) && wait <= secs(13), "{code}: {wait:?}");
         // No hot loop: many ticks inside the backoff send nothing.
         for _ in 0..50 {
             r.client.tick().await;
@@ -919,7 +916,11 @@ async fn router_errors_back_off() {
     r.client.tick().await;
     r.settle().await;
     let wait = r.client.schedule().next_attempt.unwrap() - r.clock.now();
-    assert!(wait >= secs(30 * 60) - secs(1), "NOT_AUTHORIZED: {wait:?}");
+    // The second consecutive failure: 30 s ±20 %, no 30 min hold.
+    assert!(
+        wait >= secs(23) && wait <= secs(37),
+        "NOT_AUTHORIZED: {wait:?}"
+    );
     r.shutdown().await;
 
     // ANNOUNCE refused: PCP present but unusable.
@@ -1167,6 +1168,54 @@ async fn epoch_rollback_drops_without_release() {
         r.client.tick().await;
         r.settle().await;
         assert!(r.client.have_mapping());
+        r.shutdown().await;
+    }
+}
+
+/// The probe that detects a router restart still counts as seeing the service, so the remap goes
+/// ahead at once on the same protocol without another probe (Go invalidates before it records the
+/// fresh answer, net/portmapper/portmapper.go:1098-1101, 1138-1141).
+#[tokio::test]
+async fn remap_right_after_the_rollback_probe() {
+    for pmp in [false, true] {
+        let r = rig_with(Opts {
+            router: RouterOptions {
+                pmp,
+                ..RouterOptions::default()
+            },
+            ..Opts::default()
+        })
+        .await;
+        r.router.set_epoch(5000);
+        let first = r.map().await;
+        assert!(first.is_some(), "pmp={pmp}");
+        let held_pcp = r.router.counters().num_pcp_map_recv;
+        let held_pmp = r.router.counters().num_pmp_map_recv;
+        assert_eq!(
+            (held_pmp > 0, held_pcp > 0),
+            (pmp, !pmp),
+            "mapped over the expected protocol"
+        );
+        r.router.reboot();
+        r.advance(secs(601));
+        r.client.probe().await.unwrap();
+        assert!(!r.client.have_mapping(), "pmp={pmp}: rollback detected");
+        let probes = {
+            let c = r.router.counters();
+            c.num_pcp_disco_recv
+        };
+        // No further probe: the remap starts from the rollback probe's answer.
+        assert_eq!(r.client.get_cached_mapping_or_start_creating_one(), None);
+        r.settle().await;
+        assert!(r.client.have_mapping(), "pmp={pmp}: remapped at once");
+        let c = r.router.counters();
+        assert_eq!(c.num_pcp_disco_recv, probes, "pmp={pmp}: no second probe");
+        if pmp {
+            assert_eq!(c.num_pmp_map_recv, held_pmp + 1, "remapped over NAT-PMP");
+            assert_eq!(c.num_pcp_map_recv, held_pcp, "not switched to PCP");
+        } else {
+            assert_eq!(c.num_pcp_map_recv, held_pcp + 1, "remapped over PCP");
+        }
         r.shutdown().await;
     }
 }
@@ -2117,9 +2166,11 @@ async fn completed_stale_attempt_cannot_publish_after_invalidation() {
     }
 }
 
-/// An unobserved grant may exceed the request: tombstones must not expire at the request alone.
+/// An unobserved grant may exceed the request (PCP may grant more), but a tombstone keeps its
+/// slot only for the requested lifetime from its send: after that the client maps again, and the
+/// router's longer rule is left to its own expiry, as after a crash.
 #[tokio::test]
-async fn lost_long_grants_still_count_after_requested_lifetime() {
+async fn lost_long_grants_free_their_slots_after_requested_lifetime() {
     let r = rig_with(Opts {
         router: RouterOptions {
             pmp: false,
@@ -2148,10 +2199,10 @@ async fn lost_long_grants_still_count_after_requested_lifetime() {
     r.settle().await;
     assert_eq!(
         r.router.mappings().len(),
-        4,
-        "unknown long grants still occupy their slots"
+        5,
+        "the fifth create went ahead; the long grants stay on the router until they expire"
     );
-    assert_eq!(r.client.owned_rules(), 4);
+    assert!(r.client.owned_rules() <= 1, "the old tombstones retired");
     r.shutdown().await;
 }
 
@@ -3134,16 +3185,19 @@ async fn network_down_fences_a_late_recovery_validation() {
     assert_eq!(cleanup.await.unwrap(), 0);
     drop(frozen);
     entered.expect("exhausted entry must reach fresh validation before retry");
-    for _ in 0..5 {
-        r.advance(secs(7200));
-        client.cleanup().await;
-    }
+    client.cleanup().await;
     assert!(client.owned_snapshot().iter().all(|e| !e.releasable()));
     assert_eq!(
         client.owned_rules(),
         1,
         "network loss is not retirement evidence"
     );
+    // Only the end of the possible grant (the requested lifetime from the last send) retires it.
+    for _ in 0..5 {
+        r.advance(secs(7200));
+        client.cleanup().await;
+    }
+    assert_eq!(client.owned_rules(), 0, "the possible grant ran out");
     assert!(!client.have_mapping());
     client.close(secs(1)).await;
     assert_eq!(
@@ -4782,6 +4836,55 @@ async fn unsent_adoption_preserves_prior_expiry() {
     }
 }
 
+/// A roaming host that leaves four networks, each with one MAP whose reply was lost, is not shut
+/// out of port mapping for the rest of the process: each tombstone holds its slot only for the
+/// requested lifetime from its send attempt.
+#[tokio::test]
+async fn left_networks_with_lost_replies_free_their_slots() {
+    let r = rig().await;
+    // Deletes are never acknowledged, so a tombstone cannot be cleaned up while still present.
+    r.router.set_drop_deletes(true);
+    r.router.knobs_for(Some(RequestKind::PmpMap));
+    let gws: Vec<Ipv4Addr> = (1..=5).map(|n| Ipv4Addr::new(10, 0, n, 1)).collect();
+    for gw in &gws {
+        r.caps.add(*gw, r.router.endpoint());
+    }
+    let mut prev = GW1;
+    for (i, gw) in gws.iter().enumerate() {
+        r.caps.set_present(prev, false);
+        r.lookup.set(gateway(*gw));
+        assert_eq!(r.client.check_network().await, NetCheck::Changed, "{gw}");
+        r.advance(secs(3));
+        if i < 4 {
+            r.router.commit_then_drop_next(1);
+            assert!(r.map().await.is_none(), "{gw}: reply lost");
+            assert_eq!(r.client.owned_rules(), i + 1, "{gw}: tombstone kept");
+        }
+        prev = *gw;
+    }
+    // The fifth network: the ledger is full until the tombstones' possible grants end.
+    let before = r.maps();
+    assert!(r.map().await.is_none());
+    assert_eq!(r.maps(), before, "ledger full: no MAP sent");
+    assert_eq!(r.client.owned_rules(), 4);
+    r.advance(secs(7200));
+    let mut mapped = false;
+    for _ in 0..5 {
+        r.client.tick().await;
+        r.settle().await;
+        if r.client.have_mapping() {
+            mapped = true;
+            break;
+        }
+        r.advance(secs(3));
+    }
+    assert!(
+        mapped,
+        "a fifth network maps once the old grants have run out"
+    );
+    r.shutdown().await;
+}
+
 #[tokio::test]
 async fn send_evidence_survives_cancellation() {
     for pcp in [false, true] {
@@ -4828,7 +4931,9 @@ async fn send_evidence_survives_cancellation() {
             if sent {
                 let entry = r.client.owned_snapshot()[0].clone();
                 assert_eq!(entry.rule, rule);
-                assert!(entry.router_expiry() >= r.clock.now() + secs(u64::from(u32::MAX) - 1));
+                // Bounded by the requested lifetime from the send attempt (RFC 6886 §3.3).
+                assert!(entry.router_expiry() >= r.clock.now() + secs(7200 - 1));
+                assert!(entry.router_expiry() < r.clock.now() + secs(7201));
                 assert!(!entry.mapping() && !entry.deleting());
             }
             assert_eq!(delete_requests(&r.router), 0);

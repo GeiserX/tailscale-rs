@@ -402,7 +402,9 @@ pub async fn probe<T: PxpTransport>(t: &T, protos: ProtoSet) -> Result<ProbeRepo
                     report.pcp = a.result == pcp::ResultCode::Success;
                     report.pcp_result = Some(a.result);
                     report.pcp_epoch = Some(a.epoch);
-                    // Any ANNOUNCE reply decides PCP (Go's early-exit rule).
+                    // Any ANNOUNCE reply decides PCP (like Go's pcpHeard); unlike Go, which
+                    // waits out the deadline unless UPnP also answered, the probe returns once
+                    // both protocols are decided.
                     pcp_decided = true;
                 }
                 Err(m) => note(&mut notes, format!("pcp: {m}")),

@@ -44,17 +44,18 @@ pub struct PortMapFacets {
 }
 
 impl PortMapFacets {
-    /// Go's netcheck `portmap=` summary: `?` when nothing was checked, otherwise one letter per
-    /// protocol (`U`, `M`, `C`) that is present, nothing for one that is absent, and `_` for one
-    /// not checked (`conciseOptBool`). An advertised mapping prefixes `active-`.
+    /// Go's NetInfo `portmap=` summary (`tailcfg.NetInfo.portMapSummary`): `?` when there is no
+    /// mapping and nothing was checked, otherwise one letter per protocol (`U`, `M`, `C`) that is
+    /// present, nothing for one that is absent, and `_` for one not checked (`conciseOptBool`). A
+    /// mapping prefixes `active-`; here that means an advertised mapping, where Go's means any
+    /// held mapping.
     pub fn summary(&self) -> String {
+        if !self.have_port_map && self.upnp.is_none() && self.pmp.is_none() && self.pcp.is_none() {
+            return "?".into();
+        }
         let mut s = String::new();
         if self.have_port_map {
             s.push_str("active-");
-        }
-        if self.upnp.is_none() && self.pmp.is_none() && self.pcp.is_none() {
-            s.push('?');
-            return s;
         }
         for (v, c) in [(self.upnp, 'U'), (self.pmp, 'M'), (self.pcp, 'C')] {
             match v {
@@ -90,7 +91,8 @@ mod tests {
         assert!(v6.working_udp && !v6.mapping_varies);
     }
 
-    /// Port of netcheck `TestReportString`'s portmap cases, plus the `active-` prefix.
+    /// Port of netcheck `TestReportString`'s portmap cases, plus the `active-` prefix of Go's
+    /// `NetInfo.portMapSummary`.
     #[test]
     fn summary_matches_go() {
         let f = |upnp, pmp, pcp, have| PortMapFacets {
@@ -113,5 +115,7 @@ mod tests {
             "active-_MC"
         );
         assert_eq!(f(None, Some(false), Some(false), false).summary(), "_");
+        // A mapping with nothing checked: Go prints `active-___`, not `active-?`.
+        assert_eq!(f(None, None, None, true).summary(), "active-___");
     }
 }
