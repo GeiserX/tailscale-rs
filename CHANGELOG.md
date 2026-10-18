@@ -4,6 +4,10 @@ Record breaking or significant changes here. All dates are UTC.
 
 ## Unreleased
 
+### Bug Fixes
+
+* **magicsock:** a socket bound to `0.0.0.0` advertises the host's interface addresses, selected as Go does, instead of `0.0.0.0` itself; no unspecified, multicast or broadcast endpoint, nor loopback unless the socket is bound to loopback, reaches control or a CallMeMaybe.
+
 ### Performance
 
 * **exit node:** forwarded TCP flows run without Nagle, the underlay UDP sockets ask for Go's 7 MiB buffers, netstack egress goes out in batches of up to 64 packets, and the netstack tracks 32 receive holes for uploads. Kernel receive batching, splice coalescing, targeted replay and Apple connected UDP sockets are opt-in experiments, off unless their variable is `1`.
