@@ -4,6 +4,10 @@ Record breaking or significant changes here. All dates are UTC.
 
 ## Unreleased
 
+### Bug Fixes
+
+* **magicsock:** discover direct paths only for peers with traffic, as Go does. A peer is pinged and sent CallMeMaybe while data has flowed to or from it in the last 45 seconds, and at once when traffic resumes. Idle peers stay on DERP. An inbound CallMeMaybe still pings at once.
+
 ### Performance
 
 * **exit node:** forwarded TCP flows run without Nagle, the underlay UDP sockets ask for Go's 7 MiB buffers, netstack egress goes out in batches of up to 64 packets, and the netstack tracks 32 receive holes for uploads. Kernel receive batching, splice coalescing, targeted replay and Apple connected UDP sockets are opt-in experiments, off unless their variable is `1`.

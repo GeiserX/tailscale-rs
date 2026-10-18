@@ -1370,21 +1370,28 @@ impl MagicSock {
     ///
     /// Call this periodically and on path-trust expiry to keep direct paths alive.
     pub async fn send_pings(&self) -> Result<usize, Error> {
-        let now = Instant::now();
+        self.send_pings_at(Instant::now()).await
+    }
 
+    /// [`send_pings`](Self::send_pings) as of `now`, for a caller that drives the pinger from its
+    /// own clock.
+    ///
+    /// Only peers with recent traffic are pinged ([`PeerPaths::pings_due`]): this is Go magicsock's
+    /// `endpoint.heartbeat`, which runs only while the session is active. An idle peer gets no
+    /// heartbeat and no discovery until [`note_peer_activity`](Self::note_peer_activity) reports
+    /// traffic again, or it sends us a `CallMeMaybe`.
+    pub async fn send_pings_at(&self, now: Instant) -> Result<usize, Error> {
         // Snapshot the work to do without holding the lock across awaits.
         let mut to_ping: Vec<(DiscoPublicKey, SocketAddr, disco::TxId)> = Vec::new();
         {
             let mut paths = lock(&self.paths);
             for (peer, pp) in paths.iter_mut() {
-                if !pp.needs_refresh(now) {
-                    continue;
-                }
-                // Apply Go's cadence gates (5s discovery floor on non-best candidates, good-enough
-                // quiet-down, 60s upgrade re-probe) so the on-wire ping rate matches a stock client
-                // rather than pinging every candidate every 2s tick. The confirmed best is always
-                // included so its trust still refreshes on the `REFRESH_BEFORE_EXPIRY` schedule.
-                for addr in pp.candidates_to_ping(now) {
+                // Apply Go's cadence gates (heartbeat only while active, 5s discovery floor on
+                // non-best candidates, good-enough quiet-down, 60s upgrade re-probe) so the on-wire
+                // ping rate matches a stock client rather than pinging every candidate every 2s
+                // tick. The confirmed best of an active peer is always included so its trust still
+                // refreshes on the `REFRESH_BEFORE_EXPIRY` schedule.
+                for addr in pp.pings_due(now) {
                     let tx_id = disco::random_tx_id();
                     pp.note_ping_sent(tx_id, addr, now);
                     to_ping.push((*peer, addr, tx_id));
@@ -1397,6 +1404,59 @@ impl MagicSock {
         // back to DERP exactly like a direct one.
         let relayed = self.send_relay_pings().await?;
         Ok(direct + relayed)
+    }
+
+    /// Record traffic with `peer` at `now` — data sent to it or received from it, over any path —
+    /// so its paths are discovered and kept alive for the next
+    /// [`SESSION_ACTIVE_TIMEOUT`](crate::SESSION_ACTIVE_TIMEOUT). Go magicsock
+    /// `endpoint.noteTxActivityExtTriggerLocked`, which `endpoint.send` calls for every WireGuard
+    /// packet.
+    ///
+    /// Returns `true` when the peer was idle until now. The caller should then start discovery at
+    /// once with [`send_discovery_pings`](Self::send_discovery_pings) (and a `CallMeMaybe`), as
+    /// Go's `endpoint.send` does, instead of leaving the first packets on DERP until the next
+    /// pinger tick.
+    pub fn note_peer_activity(&self, peer: &DiscoPublicKey, now: Instant) -> bool {
+        let mut paths = lock(&self.paths);
+        self.peer_paths_entry(&mut paths, *peer).note_active(now)
+    }
+
+    /// Whether `peer` has had traffic within
+    /// [`SESSION_ACTIVE_TIMEOUT`](crate::SESSION_ACTIVE_TIMEOUT) of `now`. Proactive discovery —
+    /// the periodic pings and `CallMeMaybe` — is only for active peers.
+    pub fn is_peer_active(&self, peer: &DiscoPublicKey, now: Instant) -> bool {
+        let paths = lock(&self.paths);
+        paths.get(peer).is_some_and(|pp| pp.is_active(now))
+    }
+
+    /// Start discovery for one peer that has just become active — the
+    /// `sendDiscoPingsLocked(now, true)` Go's `endpoint.send` runs when it has no trusted direct
+    /// path. Pings every candidate not pinged within the 5s discovery floor and returns the number
+    /// sent; sends nothing when the peer already has a trusted direct path or is unknown.
+    pub async fn send_discovery_pings(
+        &self,
+        peer: &DiscoPublicKey,
+        now: Instant,
+    ) -> Result<usize, Error> {
+        let to_ping: Vec<(DiscoPublicKey, SocketAddr, disco::TxId)> = {
+            let mut paths = lock(&self.paths);
+            let Some(pp) = paths.get_mut(peer) else {
+                return Ok(0);
+            };
+            if pp.best_addr(now).is_some() {
+                return Ok(0);
+            }
+            pp.candidates_to_ping(now)
+                .into_iter()
+                .map(|addr| {
+                    let tx_id = disco::random_tx_id();
+                    pp.note_ping_sent(tx_id, addr, now);
+                    (*peer, addr, tx_id)
+                })
+                .collect()
+        };
+
+        self.emit_disco_pings(to_ping).await
     }
 
     /// Force an immediate disco ping to **every** candidate endpoint of one peer, bypassing the
@@ -1520,6 +1580,10 @@ impl MagicSock {
             let Some(pp) = paths.get_mut(peer) else {
                 return Ok(None);
             };
+            // An explicit ping counts as activity, so the peer's paths are discovered and kept
+            // alive for the next `SESSION_ACTIVE_TIMEOUT` (Go `startDiscoPingLocked` calls
+            // `noteTxActivityExtTriggerLocked` for a `pingCLI`).
+            pp.note_active(now);
             let Some(addr) = pp
                 .best_addr(now)
                 .or_else(|| pp.candidate_addrs().first().copied())
@@ -1937,7 +2001,12 @@ impl MagicSock {
                     // The relayed CallMeMaybe is the canonical hard-NAT hole-punch: both peers are
                     // behind NAT, so this "ping me now" signal arriving over DERP is precisely when
                     // a prompt simultaneous-open matters most. Non-fatal on send error (the periodic
-                    // prober retries); the frame is still consumed either way.
+                    // prober retries while the peer is active); the frame is still consumed either
+                    // way.
+                    //
+                    // Not gated on activity, and it does not make the peer active: Go's
+                    // `handleCallMeMaybe` pings an idle endpoint too, but leaves `lastSendExt` (and
+                    // so the heartbeat) alone.
                     if let Err(e) = self.send_pings_to_peer_now(&sender).await {
                         tracing::debug!(error = %e, "relayed call-me-maybe immediate ping failed");
                     }
@@ -3818,6 +3887,7 @@ mod tests {
         let node_addr = old.local_addr().unwrap();
         old.set_netmap_endpoints(laptop_pub, [laptop_addr]);
         laptop.set_netmap_endpoints(old_disco.public_key(), [node_addr]);
+        old.note_peer_activity(&laptop_pub, Instant::now());
         assert_eq!(old.send_pings().await.unwrap(), 1);
         laptop
             .handle_disco(receive_one(&laptop).await, node_addr)
@@ -3827,6 +3897,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(old.best_addr(&laptop_pub), Some(laptop_addr));
+        laptop.note_peer_activity(&old_disco.public_key(), Instant::now());
         assert_eq!(laptop.send_pings().await.unwrap(), 1);
         old.handle_disco(receive_one(&old).await, laptop_addr)
             .await
@@ -3846,6 +3917,7 @@ mod tests {
             .unwrap()
             .with_binding_verifier(allow_all());
         restarted.set_netmap_endpoints(laptop_pub, [laptop_addr]);
+        restarted.note_peer_activity(&laptop_pub, Instant::now());
         assert_eq!(restarted.send_pings().await.unwrap(), 1);
         let early = receive_one(&laptop).await;
         assert!(matches!(early, Inbound::Ping { sender, .. } if sender == new_pub));
@@ -6337,6 +6409,7 @@ mod tests {
 
         // A learns B's endpoint and pings it.
         a.add_peer_endpoints_unfiltered(b_disco.public_key(), [b_addr]);
+        a.note_peer_activity(&b_disco.public_key(), Instant::now());
         let sent = a.send_pings().await.unwrap();
         assert_eq!(sent, 1, "should ping B's one endpoint");
 
@@ -6452,6 +6525,7 @@ mod tests {
             );
             node.add_peer_endpoints_unfiltered(peer, [source]);
             node.set_netmap_endpoints(peer, [old_addr, advertised.local_addr().unwrap()]);
+            node.note_peer_activity(&peer, Instant::now());
             assert_eq!(node.send_pings().await.unwrap(), 3);
             let (mut ping, from) = receive(&moved).await;
             assert_eq!(from, local);
@@ -6533,7 +6607,9 @@ mod tests {
         let (a_pump, mut a_rx) = pump(a.clone());
         let (b_pump, mut b_rx) = pump(b.clone());
 
+        a.note_peer_activity(&b_disco.public_key(), Instant::now());
         a.send_pings().await.unwrap();
+        b.note_peer_activity(&a_disco.public_key(), Instant::now());
         b.send_pings().await.unwrap();
         let confirmed = async {
             while a.best_addr(&b_disco.public_key()).is_none()
@@ -6878,6 +6954,7 @@ mod tests {
 
         // A learns B's endpoint and pings it (carrying A's real node key, matching the binding).
         a.add_peer_endpoints_unfiltered(b_disco.public_key(), [b_addr]);
+        a.note_peer_activity(&b_disco.public_key(), Instant::now());
         let sent = a.send_pings().await.unwrap();
         assert_eq!(sent, 1, "should ping B's one endpoint");
 
@@ -6950,6 +7027,7 @@ mod tests {
 
         // Loopback is rejected by the production filter; use the test-only unfiltered seam.
         a.add_peer_endpoints_unfiltered(b_disco.public_key(), [b_addr]);
+        a.note_peer_activity(&b_disco.public_key(), Instant::now());
         a.send_pings().await.unwrap();
 
         // Wait until A has learned a reflexive endpoint (driven by B's pong echoing A's src).
@@ -7197,6 +7275,7 @@ mod tests {
 
         // A learns B's endpoint and pings it; the pumps confirm the path.
         a_sock.add_peer_endpoints_unfiltered(b_disco.public_key(), [b_addr]);
+        a_sock.note_peer_activity(&b_disco.public_key(), Instant::now());
         a_sock.send_pings().await.unwrap();
 
         let confirm = async {
@@ -7285,6 +7364,70 @@ mod tests {
         );
 
         pump.abort();
+    }
+
+    /// Go `endpoint.handleCallMeMaybe`: a `CallMeMaybe` relayed over DERP pings the sender's
+    /// candidates at once even when there has been no traffic with it. It does not count as
+    /// traffic, though, so it starts no heartbeat and the idle peer is not pinged again afterwards.
+    #[tokio::test]
+    async fn an_inbound_call_me_maybe_pings_an_idle_peer_without_starting_its_heartbeat() {
+        let peer_disco = DiscoPrivateKey::random();
+        let peer_node = ts_keys::NodePrivateKey::random().public_key();
+        let peer = peer_disco.public_key();
+        let recv_disco = DiscoPrivateKey::random();
+        let recv = MagicSock::bind(
+            localhost(),
+            recv_disco.clone(),
+            ts_keys::NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap()
+        .with_binding_verifier(allow_all());
+
+        // A netmap endpoint on loopback, where a sink sees the pings. The CallMeMaybe itself
+        // advertises nothing, so every probe stays on loopback.
+        let sink = tokio::net::UdpSocket::bind(localhost()).await.unwrap();
+        recv.set_netmap_endpoints(peer, [sink.local_addr().unwrap()]);
+        let start = Instant::now();
+        assert!(
+            !recv.is_peer_active(&peer, start),
+            "precondition: no traffic with the peer"
+        );
+
+        let mut cmm =
+            disco::seal_call_me_maybe(&peer_disco, &recv_disco.public_key(), &[]).unwrap();
+        assert_eq!(
+            recv.handle_relayed_disco(&mut cmm, derp_src_of(peer_node))
+                .await,
+            RelayedDisco::Consumed
+        );
+
+        let mut buf = [0u8; 1500];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), sink.recv_from(&mut buf))
+            .await
+            .expect("an inbound CallMeMaybe must ping an idle peer at once")
+            .unwrap();
+        assert!(
+            matches!(
+                disco::open(&peer_disco, &mut buf[..n]).unwrap(),
+                Inbound::Ping { .. }
+            ),
+            "the sink must receive a disco ping"
+        );
+
+        // Two minutes of pinger ticks after the CallMeMaybe send nothing more.
+        for secs in (2..=120).step_by(2) {
+            let now = start + Duration::from_secs(secs);
+            assert_eq!(
+                recv.send_pings_at(now).await.unwrap(),
+                0,
+                "a CallMeMaybe must not start a heartbeat for an idle peer ({secs}s later)"
+            );
+        }
+        assert!(
+            !recv.is_peer_active(&peer, start),
+            "a CallMeMaybe is not traffic with the peer"
+        );
     }
 
     /// A DERP-borne CallMeMaybe is bound to the node whose DERP connection delivered it, not merely
@@ -8246,6 +8389,7 @@ mod tests {
         sock.add_peer_endpoints_unfiltered(peer, [target, other]);
 
         let before = CounterSnapshot::take();
+        sock.note_peer_activity(&peer, Instant::now());
         let sent = sock.send_pings().await.unwrap();
         let after = CounterSnapshot::take();
         assert!(
@@ -8748,6 +8892,7 @@ mod tests {
         sock.add_peer_endpoints_unfiltered(peer, [target, other]);
 
         // First periodic sweep pings both candidates and stamps their `last_ping`.
+        sock.note_peer_activity(&peer, Instant::now());
         let first = sock.send_pings().await.unwrap();
         assert_eq!(first, 2, "the first periodic sweep pings both candidates");
 
@@ -9056,8 +9201,10 @@ mod tests {
                 .needs_refresh(tick),
             "precondition: the prober's gate is open — the refusal is at the socket, not here"
         );
+        // The peer has traffic, so the heartbeat is due rather than skipped as idle.
+        sock.note_peer_activity(&peer_pub, tick);
         assert_eq!(
-            sock.send_pings().await.unwrap(),
+            sock.send_pings_at(tick).await.unwrap(),
             0,
             "the periodic prober puts nothing on the wire under the attribute"
         );
@@ -9071,6 +9218,13 @@ mod tests {
                 .best_addr(lapsed)
                 .is_none(),
             "an unrefreshed path must lapse, which is what puts this peer on DERP"
+        );
+
+        sock.set_only_tcp_443(false);
+        assert_eq!(
+            sock.send_pings_at(tick).await.unwrap(),
+            1,
+            "control withdrawing the attribute restores the heartbeat"
         );
     }
 
@@ -9344,6 +9498,7 @@ mod tests {
             recv.candidate_addrs(&sender_pub).is_empty(),
             "a CallMeMaybe on the UDP socket must learn no endpoint"
         );
+        recv.note_peer_activity(&sender_pub, Instant::now());
         assert_eq!(
             recv.send_pings().await.unwrap(),
             0,
@@ -9424,6 +9579,7 @@ mod tests {
             vec![public_ep],
             "the relayed CallMeMaybe's endpoint must be learned"
         );
+        recv.note_peer_activity(&peer_disco.public_key(), Instant::now());
         assert_eq!(
             recv.send_pings().await.unwrap(),
             0,
