@@ -23,9 +23,10 @@
 //! This keeps the real origin IP from leaking when direct connectivity is unavailable.
 //!
 //! A relay server learns our public address, but so does any peer we disco-ping: relay addresses
-//! are peer-supplied and pass through the same `is_pingable_candidate` sanitizer a `CallMeMaybe`
-//! endpoint does, the announcing peer must be a current netmap member, and the relay endpoint must
-//! have been allocated for exactly this pair of disco keys.
+//! are peer-supplied and pass through the `is_pingable_candidate` sanitizer, which is stricter
+//! than the one a `CallMeMaybe` endpoint passes (it also refuses private addresses), the
+//! announcing peer must be a current netmap member, and the relay endpoint must have been
+//! allocated for exactly this pair of disco keys.
 
 mod batch;
 mod connected;
