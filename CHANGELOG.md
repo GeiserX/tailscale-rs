@@ -8,6 +8,7 @@ Record breaking or significant changes here. All dates are UTC.
 
 * **magicsock:** a disco pong that fails to send (e.g. `EHOSTUNREACH` to an unreachable LAN host) is logged, at most one warning a minute, and no longer surfaces as a receive error.
 * **magicsock:** with connected sockets on, only datagrams the kernel accepted count toward opening one, and a connected socket whose sends keep failing, or that hears nothing while the shared socket hears its peer, closes and the address goes back to the shared socket; failed sends to an unreachable LAN host no longer open a socket that drops that peer's traffic.
+* **magicsock:** discover direct paths only for peers with traffic, as Go does. A peer is pinged and sent CallMeMaybe while WireGuard data has flowed to or from it in the last 45 seconds (keepalives and handshakes do not count), and at once when traffic resumes. Idle peers stay on DERP. An inbound CallMeMaybe still pings at once.
 
 ### Performance
 

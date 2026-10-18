@@ -365,6 +365,12 @@ pub struct Env {
     /// the writers are the packet hot path: a lock-free atomic read is the whole interface.
     pub datapath_activity: crate::dataplane::DatapathActivity,
 
+    /// Which peers have had WireGuard traffic lately (see
+    /// [`PeerActivity`](crate::dataplane::PeerActivity)). The dataplane actor stamps it into every
+    /// underlay channel it hands out; the direct manager reads it to run path discovery only for
+    /// peers with traffic, as Go magicsock does.
+    pub peer_activity: crate::dataplane::PeerActivity,
+
     /// Whether the runtime is shutdown.
     ///
     /// This is provided so that actors can check whether a message send has failed because
@@ -504,6 +510,8 @@ impl Env {
             // never carries a packet reads as idle from `Runtime::spawn` onwards — the same reading
             // Go gets from its zero-valued `lastActivityAtomic`.
             datapath_activity: crate::dataplane::DatapathActivity::new(),
+            // No traffic with any peer yet.
+            peer_activity: crate::dataplane::PeerActivity::default(),
         };
 
         (
