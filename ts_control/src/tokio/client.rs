@@ -1,7 +1,4 @@
-use alloc::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use alloc::{collections::BTreeMap, sync::Arc};
 
 use futures_util::{Stream, StreamExt};
 use tokio::{
@@ -50,6 +47,10 @@ struct CarriedNetInfo {
     /// Whether the NAT maps the socket to different reflexive addr:ports per destination (symmetric
     /// NAT) — Go `NetInfo.MappingVariesByDestIP`. Set by `SetEndpoints`.
     mapping_varies_by_dest_ip: Option<bool>,
+    /// The port-mapping facets (Go `NetInfo.UPnP`/`PMP`/`PCP`/`HavePortMap`), set by
+    /// `SetEndpoints` when the runtime runs a port mapper. `None` (no port mapper) sends none of
+    /// them, like Go without a portmapper.
+    port_map: Option<crate::PortMapFacets>,
 }
 
 impl CarriedNetInfo {
@@ -68,6 +69,21 @@ impl CarriedNetInfo {
         }
         if let Some(varies) = self.mapping_varies_by_dest_ip {
             builder = builder.mapping_varies_by_dest_ip(varies);
+        }
+        if let Some(pm) = self.port_map {
+            if let Some(v) = pm.upnp {
+                builder = builder.upnp(v);
+            }
+            if let Some(v) = pm.pmp {
+                builder = builder.pmp(v);
+            }
+            if let Some(v) = pm.pcp {
+                builder = builder.pcp(v);
+            }
+            // Go's `HavePortMap` is `omitzero`: false is never on the wire.
+            if pm.have_port_map {
+                builder = builder.have_port_map(true);
+            }
         }
         builder
     }
@@ -224,15 +240,26 @@ impl AsyncControlClient {
     }
 
     /// Advertise this node's magicsock UDP endpoints (ip:port candidates) to the control server
-    /// so peers can learn where to attempt direct connections.
+    /// so peers can learn where to attempt direct connections, with the NetInfo facts that go with
+    /// them: `stun` (computed from the reflexive set before de-duplication) and `port_map` (`None`
+    /// when no port mapper runs).
     #[tracing::instrument(skip_all, fields(map_url = %self.map_url(), n_endpoints), level = "trace")]
-    pub async fn set_endpoints(&mut self, endpoints: Vec<ts_control_serde::Endpoint>) {
+    pub async fn set_endpoints(
+        &mut self,
+        endpoints: Vec<ts_control_serde::Endpoint>,
+        stun: crate::StunFacts,
+        port_map: Option<crate::PortMapFacets>,
+    ) {
         tracing::Span::current().record("n_endpoints", endpoints.len());
         tracing::trace!("reporting magicsock endpoints to control server");
 
         if let Err(e) = self
             .command_tx
-            .send(Command::SetEndpoints { endpoints })
+            .send(Command::SetEndpoints {
+                endpoints,
+                stun,
+                port_map,
+            })
             .await
         {
             tracing::error!(error = %e, "setting endpoints");
@@ -318,6 +345,10 @@ pub enum Command {
     },
     SetEndpoints {
         endpoints: Vec<ts_control_serde::Endpoint>,
+        /// `WorkingUDP` / `MappingVariesByDestIP`, from the reflexive set.
+        stun: crate::StunFacts,
+        /// `UPnP` / `PMP` / `PCP` / `HavePortMap`, or `None` without a port mapper.
+        port_map: Option<crate::PortMapFacets>,
     },
     /// Re-advertise this node's routable IP prefixes (`Hostinfo.RoutableIPs`) mid-session — the wire
     /// half of a runtime `set_advertise_routes`. The routes travel IN the command (not read from the
@@ -527,37 +558,6 @@ fn clear_reauth_url(auth_url_tx: &watch::Sender<Option<Url>>) {
             false
         }
     });
-}
-
-/// `NetInfo.WorkingUDP`: UDP works iff the node has learned a STUN reflexive endpoint. Mirrors Go,
-/// where a learned STUN endpoint is the evidence UDP reaches the internet. Pure, for unit testing.
-fn net_info_working_udp(endpoints: &[ts_control_serde::Endpoint]) -> bool {
-    endpoints
-        .iter()
-        .any(|e| e.ty == ts_control_serde::EndpointType::Stun)
-}
-
-/// `NetInfo.MappingVariesByDestIP`: the NAT maps the one bound socket to different reflexive
-/// addr:ports per destination (symmetric NAT) iff at least two DISTINCT **IPv4** STUN reflexive
-/// addresses were observed — the wire-side mirror of magicsock `MagicSock::is_symmetric_nat`
-/// (`v4_reflexive.len() >= 2`, `sock.rs`).
-///
-/// IPv4-only on purpose: magicsock's symmetric-NAT determinant is v4-only (its test
-/// `stun4localport_ignores_ipv6_reflexive` asserts two IPv6 reflexives must NOT trip it), so counting
-/// v6 reflexives here would make the wire signal disagree with the node's own NAT model — a
-/// cross-component incoherence. The fork is IPv4-only anyway, so v6 reflexives are not expected, but
-/// filtering keeps the two in lockstep regardless. Pure, for unit testing.
-fn net_info_mapping_varies(endpoints: &[ts_control_serde::Endpoint]) -> bool {
-    let mut seen = BTreeSet::new();
-    for e in endpoints {
-        if e.ty == ts_control_serde::EndpointType::Stun && e.endpoint.is_ipv4() {
-            seen.insert(e.endpoint);
-            if seen.len() >= 2 {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 pub async fn run(
@@ -898,13 +898,14 @@ async fn run_once(
                         watchdog.set_phase(PollPhase::SetDerpHomeRegion);
                         drop(send_map_request(req, &map_url, &h2_client).await?);
                     },
-                    Command::SetEndpoints { endpoints } => {
-                        // Derive the NAT facets from the advertised endpoint set, mirroring magicsock:
-                        // working_udp = a STUN reflexive was learned (UDP works); mapping_varies =
-                        // >= 2 DISTINCT reflexive addrs (symmetric NAT, `is_symmetric_nat`). Computed
-                        // before `endpoints` is moved into the builder.
-                        net_info.working_udp = Some(net_info_working_udp(&endpoints));
-                        net_info.mapping_varies_by_dest_ip = Some(net_info_mapping_varies(&endpoints));
+                    Command::SetEndpoints { endpoints, stun, port_map } => {
+                        // The NAT facets come with the endpoints, computed by the runtime from the
+                        // reflexive set before de-duplication (a reflexive address equal to the
+                        // port-mapped one still counts): working_udp = a STUN reflexive was
+                        // learned; mapping_varies = >= 2 DISTINCT IPv4 reflexive addrs.
+                        net_info.working_udp = Some(stun.working_udp);
+                        net_info.mapping_varies_by_dest_ip = Some(stun.mapping_varies);
+                        net_info.port_map = port_map;
                         let mut builder = with_hostinfo(MapRequestBuilder::new(node_keys))
                             .keep_alive(false)
                             .omit_peers(true)
@@ -1376,53 +1377,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn working_udp_true_iff_a_stun_endpoint_is_present() {
-        use ts_control_serde::EndpointType::{Local, Stun};
-        // A learned STUN reflexive ⇒ UDP works.
-        assert!(net_info_working_udp(&[
-            ep("192.168.1.2:41641", Local),
-            ep("203.0.113.7:41641", Stun),
-        ]));
-        // Only local endpoints ⇒ no evidence UDP reaches the internet.
-        assert!(!net_info_working_udp(&[ep("192.168.1.2:41641", Local)]));
-        // No endpoints at all.
-        assert!(!net_info_working_udp(&[]));
-    }
-
-    #[test]
-    fn mapping_varies_iff_two_distinct_stun_reflexives() {
-        use ts_control_serde::EndpointType::{Local, Stun, Stun4LocalPort};
-        // Two DISTINCT STUN reflexive addrs ⇒ symmetric NAT (mirrors is_symmetric_nat len>=2).
-        assert!(net_info_mapping_varies(&[
-            ep("203.0.113.7:41641", Stun),
-            ep("198.51.100.9:51000", Stun),
-        ]));
-        // Same reflexive addr twice ⇒ NOT varying (distinct count is 1).
-        assert!(!net_info_mapping_varies(&[
-            ep("203.0.113.7:41641", Stun),
-            ep("203.0.113.7:41641", Stun),
-        ]));
-        // One STUN + a non-Stun reflexive guess + a local ⇒ only 1 distinct Stun ⇒ not varying.
-        assert!(!net_info_mapping_varies(&[
-            ep("203.0.113.7:41641", Stun),
-            ep("203.0.113.7:50000", Stun4LocalPort),
-            ep("192.168.1.2:41641", Local),
-        ]));
-        // IPv4-only, matching magicsock: two DISTINCT IPv6 STUN reflexives must NOT trip it (the
-        // fork's is_symmetric_nat is v4-only; counting v6 would disagree with the node's NAT model).
-        assert!(!net_info_mapping_varies(&[
-            ep("[2001:db8::1]:41641", Stun),
-            ep("[2001:db8::2]:41641", Stun),
-        ]));
-        // A v4 pair still trips it even alongside v6 reflexives (the v6 ones are simply ignored).
-        assert!(net_info_mapping_varies(&[
-            ep("[2001:db8::1]:41641", Stun),
-            ep("203.0.113.7:41641", Stun),
-            ep("198.51.100.9:51000", Stun),
-        ]));
-    }
-
     /// THE load-bearing invariant: carried NetInfo is sent WHOLE on every request, never partial.
     /// After a `SetDerpHomeRegion` sets the home region, a subsequent `SetEndpoints` (which sets the
     /// UDP/NAT facets) must STILL carry the home region — otherwise control would see `PreferredDERP`
@@ -1447,8 +1401,10 @@ mod tests {
             ep("203.0.113.7:41641", Stun),
             ep("198.51.100.9:51000", Stun),
         ];
-        carried.working_udp = Some(net_info_working_udp(&endpoints));
-        carried.mapping_varies_by_dest_ip = Some(net_info_mapping_varies(&endpoints));
+        let stun =
+            crate::StunFacts::from_reflexive(&[endpoints[0].endpoint, endpoints[1].endpoint]);
+        carried.working_udp = Some(stun.working_udp);
+        carried.mapping_varies_by_dest_ip = Some(stun.mapping_varies);
 
         // ...and the request it builds must carry the WHOLE NetInfo (home region NOT dropped).
         let builder = carried.apply(MapRequestBuilder::new(&node_keys));
@@ -1469,6 +1425,56 @@ mod tests {
         assert!(ni.derp_latency.is_some(), "derp latency must persist too");
         assert_eq!(ni.working_udp, Some(true));
         assert_eq!(ni.mapping_varies_by_dest_ip, Some(true));
+    }
+
+    /// The port-mapping facets ride on every request built from the carried state (the
+    /// streaming re-register after a reconnect included, since the state lives in `run`); UPnP stays
+    /// unset; `HavePortMap` false is omitted like Go's `omitzero`; a port-map-only endpoint list does
+    /// not make `WorkingUDP` true.
+    #[allow(clippy::field_reassign_with_default)]
+    #[test]
+    fn carried_port_map_facets_ride_on_every_request() {
+        use ts_control_serde::EndpointType::{Local, PortMapped};
+        let node_keys = ts_keys::NodeState::generate();
+        let mut carried = CarriedNetInfo::default();
+        // A port-map-only advertisement: no reflexive address at all.
+        let _endpoints = [
+            ep("203.0.113.7:41641", PortMapped),
+            ep("192.168.1.2:41641", Local),
+        ];
+        let stun = crate::StunFacts::from_reflexive(&[]);
+        carried.working_udp = Some(stun.working_udp);
+        carried.mapping_varies_by_dest_ip = Some(stun.mapping_varies);
+        carried.port_map = Some(crate::PortMapFacets {
+            upnp: None,
+            pmp: Some(true),
+            pcp: Some(false),
+            have_port_map: true,
+        });
+        for _request in 0..3 {
+            let req = carried.apply(MapRequestBuilder::new(&node_keys)).build();
+            let ni = req.host_info.as_ref().unwrap().net_info.as_ref().unwrap();
+            assert_eq!(ni.pmp, Some(true));
+            assert_eq!(ni.pcp, Some(false));
+            assert_eq!(ni.have_port_map, Some(true));
+            assert_eq!(ni.upnp, None, "never probed, never claimed");
+            assert_eq!(ni.working_udp, Some(false));
+            let json = serde_json::to_string(ni).unwrap();
+            assert!(json.contains(r#""PMP":true"#) && json.contains(r#""HavePortMap":true"#));
+            assert!(!json.contains("UPnP"), "{json}");
+        }
+        carried.port_map = Some(crate::PortMapFacets {
+            have_port_map: false,
+            ..carried.port_map.unwrap()
+        });
+        let req = carried.apply(MapRequestBuilder::new(&node_keys)).build();
+        let ni = req.host_info.as_ref().unwrap().net_info.as_ref().unwrap();
+        assert_eq!(ni.have_port_map, None, "false is omitted");
+        // No port mapper: none of the facets.
+        carried.port_map = None;
+        let req = carried.apply(MapRequestBuilder::new(&node_keys)).build();
+        let ni = req.host_info.as_ref().unwrap().net_info.as_ref().unwrap();
+        assert_eq!((ni.pmp, ni.pcp, ni.have_port_map), (None, None, None));
     }
 
     /// An all-`None` carried state applies nothing: the builder emits no NetInfo at all (wire-

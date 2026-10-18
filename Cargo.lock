@@ -2400,6 +2400,7 @@ dependencies = [
  "geiserx_ts_packet",
  "geiserx_ts_packetfilter",
  "geiserx_ts_packetfilter_state",
+ "geiserx_ts_portmapper",
  "geiserx_ts_tka",
  "geiserx_ts_transport",
  "geiserx_ts_transport_tun",

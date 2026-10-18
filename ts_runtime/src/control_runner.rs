@@ -2144,29 +2144,35 @@ fn select_home_region(
     }
 }
 
+/// The wire form of our endpoints, in the advertised (priority) order.
+pub(crate) fn wire_endpoints(eps: &[ts_magicsock::SelfEndpoint]) -> Vec<Endpoint> {
+    eps.iter()
+        .map(|ep| Endpoint {
+            endpoint: ep.addr,
+            ty: match ep.ty {
+                SelfEndpointType::Local => EndpointType::Local,
+                SelfEndpointType::Stun => EndpointType::Stun,
+                SelfEndpointType::Stun4LocalPort => EndpointType::Stun4LocalPort,
+                SelfEndpointType::PortMapped => EndpointType::PortMapped,
+            },
+        })
+        .collect()
+}
+
 impl Message<EndpointAdvertisement> for ControlRunner {
     type Reply = ();
 
     async fn handle(&mut self, msg: EndpointAdvertisement, _ctx: &mut Context<Self, Self::Reply>) {
-        let endpoints: Vec<Endpoint> = msg
-            .endpoints
-            .iter()
-            .map(|ep| Endpoint {
-                endpoint: ep.addr,
-                ty: match ep.ty {
-                    SelfEndpointType::Local => EndpointType::Local,
-                    SelfEndpointType::Stun => EndpointType::Stun,
-                    SelfEndpointType::Stun4LocalPort => EndpointType::Stun4LocalPort,
-                },
-            })
-            .collect();
+        let endpoints = wire_endpoints(&msg.endpoints);
 
         tracing::debug!(
             n_endpoints = endpoints.len(),
             "advertising endpoints to control"
         );
 
-        self.client.set_endpoints(endpoints).await;
+        self.client
+            .set_endpoints(endpoints, msg.stun, msg.port_map)
+            .await;
     }
 }
 

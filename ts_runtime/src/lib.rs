@@ -57,6 +57,8 @@ mod packetfilter;
 pub mod peer_tracker;
 mod peerapi;
 mod peerapi_doh;
+#[cfg(feature = "portmapper")]
+mod portmap;
 mod route_updater;
 mod security;
 /// Stored Serve config + accept-loop runtime (`tsnet`'s `Get/SetServeConfig` + serving runtime).
@@ -80,6 +82,7 @@ pub use exit_node_suggest::{ExitNodeSuggestion, SuggestExitNodeError};
 pub use ipn_bus::{IpnBusWatcher, Notify, NotifyWatchOpt};
 pub use status::{FileTarget, NetcheckReport, RegionLatency, Status, StatusNode, WhoIs};
 pub use tka_sync::TkaLogEntry;
+pub use ts_control::{PortMapFacets, StunFacts};
 pub use ts_dataplane::{CaptureHook, CapturePath};
 
 use crate::peer_tracker::PeerTracker;
@@ -166,6 +169,52 @@ pub struct Runtime {
     #[cfg(feature = "network-monitor")]
     #[allow(dead_code)]
     netmon_supervisor: Option<ActorRef<netmon::NetmonSupervisor>>,
+    /// The NAT port mapper's client, when it runs, behind its release guard:
+    /// [`graceful_shutdown`](Self::graceful_shutdown) closes it (bounded, deletes acknowledged),
+    /// and dropping the guard, which every drop of the runtime does, sends one unacknowledged
+    /// delete per rule with no runtime needed (a no-op after the close).
+    #[cfg(feature = "portmapper")]
+    portmap: portmap::PortmapRelease,
+}
+
+/// The port mapper's state, for status lines (Go's netcheck `portmap=` plus the mapping).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortMapStatus {
+    /// The NetInfo facets as sent to control.
+    pub facets: ts_control::PortMapFacets,
+    /// The current mapping's external address, if one is held (advertised or not).
+    pub external: Option<core::net::SocketAddrV4>,
+    /// The protocol holding it (`"pmp"` or `"pcp"`).
+    pub proto: Option<&'static str>,
+    /// Whether the mapping is offered to peers.
+    pub advertised: bool,
+}
+
+impl PortMapStatus {
+    /// Go's `portmap=` summary, e.g. `active-_MC`.
+    pub fn summary(&self) -> String {
+        self.facets.summary()
+    }
+}
+
+/// How long [`Runtime::graceful_shutdown`] gives the port mapper to release its router rules, at
+/// most (always within the caller's timeout).
+#[cfg(feature = "portmapper")]
+const PORTMAP_RELEASE_BUDGET: Duration = Duration::from_secs(1);
+
+/// The port mapper's share of a shutdown with `timeout`: at most [`PORTMAP_RELEASE_BUDGET`], never
+/// more than `timeout`.
+#[cfg(feature = "portmapper")]
+fn portmap_budget(timeout: Option<Duration>) -> Duration {
+    timeout.map_or(PORTMAP_RELEASE_BUDGET, |t| t.min(PORTMAP_RELEASE_BUDGET))
+}
+
+/// The first step of [`Runtime::graceful_shutdown`]: close the port mapper within its budget.
+#[cfg(feature = "portmapper")]
+async fn close_portmap(pm: Option<&Arc<dyn ts_portmapper::PortMapper>>, timeout: Option<Duration>) {
+    if let Some(pm) = pm {
+        pm.close(portmap_budget(timeout)).await;
+    }
 }
 
 impl Runtime {
@@ -182,11 +231,10 @@ impl Runtime {
         // `new_with_runtime_txs` returns each `Sender` (mutation capability) grouped in `pref_cells`
         // so they are retained privately on the `Runtime`, while only the `Receiver`s (the readers'
         // contract) live on the cloned `Env`. Initial values come from `ForwarderConfig`.
-        let (env, pref_cells) = Env::new_with_runtime_txs(
-            keys,
-            shutdown_rx,
-            env::ForwarderConfig::from_control_config(&config),
-        );
+        // Environment knobs are read once, here (Go caches its `envknob`s too).
+        let mut forwarding = env::ForwarderConfig::from_control_config(&config);
+        forwarding.apply_env_knobs(|k| std::env::var(k).ok());
+        let (env, pref_cells) = Env::new_with_runtime_txs(keys, shutdown_rx, forwarding);
 
         let mut security = security::SecurityGuard::new(shutdown_tx.clone());
         security.watch(&env.bus);
@@ -237,6 +285,8 @@ impl Runtime {
         let direct = DirectManager::spawn((env.clone(), dataplane.clone(), multiderp.clone()));
         security.watch(&direct);
         security.ready(&direct).await?;
+        #[cfg(feature = "portmapper")]
+        let portmap = portmap::PortmapRelease::new(direct.ask(direct::PortmapClient).await?);
 
         // Spawn the forwarder before the route updater. Its `on_start` builds the forwarder
         // netstack, enables any-IP acceptance, and starts the per-port accept loops synchronously,
@@ -505,7 +555,30 @@ impl Runtime {
             taildrop_reaper,
             #[cfg(feature = "network-monitor")]
             netmon_supervisor,
+            #[cfg(feature = "portmapper")]
+            portmap,
         })
+    }
+
+    /// The port mapper's state, or `None` when it does not run (disabled, or a build without the
+    /// `portmapper` feature).
+    pub fn port_map_status(&self) -> Option<PortMapStatus> {
+        #[cfg(feature = "portmapper")]
+        {
+            let pm = self.portmap.get()?;
+            let state = pm.subscribe().borrow().clone();
+            Some(PortMapStatus {
+                facets: portmap::facets(&state),
+                external: state.mapping.map(|m| m.external),
+                proto: state.mapping.map(|m| match m.proto {
+                    ts_portmapper::oneshot::Proto::Pmp => "pmp",
+                    ts_portmapper::oneshot::Proto::Pcp => "pcp",
+                }),
+                advertised: state.advertised().is_some(),
+            })
+        }
+        #[cfg(not(feature = "portmapper"))]
+        None
     }
 
     /// Register a fallback TCP handler consulted for every inbound TCP flow that matches no
@@ -1474,8 +1547,16 @@ impl Runtime {
     /// more violently and with possible resource leaks.
     pub async fn graceful_shutdown(self, timeout: Option<Duration>) -> bool {
         self.shutdown.send_replace(true);
+        // The port mapper's release is the first step of the timed shutdown (`close_portmap`):
+        // `close` stops new mapping work before it awaits anything, then deletes its router rules
+        // over its own LAN sockets (never the underlay socket). Its budget is at most 1 s and
+        // never more than `timeout`, so the whole shutdown stays within `timeout`.
+        async fn _shutdown_all(runtime: Runtime, timeout: Option<Duration>) {
+            #[cfg(feature = "portmapper")]
+            runtime.portmap.close(timeout).await;
+            #[cfg(not(feature = "portmapper"))]
+            let _ = timeout;
 
-        async fn _shutdown_all(runtime: Runtime) {
             // See the note in `Drop` for why we only need to stop these actors to bring down the
             // whole runtime.
 
@@ -1490,7 +1571,7 @@ impl Runtime {
             ];
         }
 
-        let fut = _shutdown_all(self);
+        let fut = _shutdown_all(self, timeout);
 
         match timeout {
             Some(timeout) => tokio::time::timeout(timeout, fut).await.is_ok(),
@@ -1504,6 +1585,12 @@ impl Runtime {
 
 impl Drop for Runtime {
     fn drop(&mut self) {
+        // Best-effort release of the port mapper's router rules first: one unacknowledged delete
+        // per rule, no runtime and no reply wait. A no-op after `graceful_shutdown` closed it.
+        // (The guard does the same when it is dropped, so no path out of here skips it.)
+        #[cfg(feature = "portmapper")]
+        self.portmap.release_now();
+
         // Stop the taildrop reaper so it cannot outlive the runtime (the `reauth_bridge` pattern). It
         // also self-exits when `shutdown` flips below, but aborting is immediate and covers the
         // already-shutdown early-return path too.

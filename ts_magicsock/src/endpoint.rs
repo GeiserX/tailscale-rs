@@ -5,7 +5,9 @@
 //! anti-leak note):
 //! - the locally bound address ([`SelfEndpointType::Local`]), known the instant we bind, and
 //! - reflexive addresses learned from disco pong `src` echoes ([`SelfEndpointType::Stun`]),
-//!   which are the STUN-equivalent mappings a peer observed our traffic arriving from.
+//!   which are the STUN-equivalent mappings a peer observed our traffic arriving from, and
+//! - a NAT port mapping the LAN gateway granted for the bound port
+//!   ([`SelfEndpointType::PortMapped`]), installed by the runtime's port mapper.
 
 use core::net::SocketAddr;
 
@@ -23,6 +25,10 @@ pub enum SelfEndpointType {
     /// reachable. Mirrors Go's `EndpointSTUN4LocalPort`. A best-effort candidate, only emitted when
     /// symmetric NAT is detected.
     Stun4LocalPort,
+    /// An inbound mapping the LAN gateway granted through NAT-PMP or PCP (Go
+    /// `EndpointPortmapped`): the router's external address and the port it maps to our bound
+    /// port. The highest-priority candidate.
+    PortMapped,
 }
 
 /// One candidate address we believe we are reachable on, tagged with how we learned it.

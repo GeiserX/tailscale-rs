@@ -96,6 +96,31 @@ impl<'a> MapRequestBuilder<'a> {
         self
     }
 
+    /// Set the [`NetInfo::upnp`] field (Go `NetInfo.UPnP`): whether UPnP-IGD is present on the LAN.
+    pub fn upnp(mut self, value: bool) -> Self {
+        self.net_info_mut().upnp = Some(value);
+        self
+    }
+
+    /// Set the [`NetInfo::pmp`] field (Go `NetInfo.PMP`): whether NAT-PMP is present on the LAN.
+    pub fn pmp(mut self, value: bool) -> Self {
+        self.net_info_mut().pmp = Some(value);
+        self
+    }
+
+    /// Set the [`NetInfo::pcp`] field (Go `NetInfo.PCP`): whether PCP is present on the LAN.
+    pub fn pcp(mut self, value: bool) -> Self {
+        self.net_info_mut().pcp = Some(value);
+        self
+    }
+
+    /// Set the [`NetInfo::have_port_map`] field (Go `NetInfo.HavePortMap`): whether the node holds
+    /// an open (and here: advertised) port mapping.
+    pub fn have_port_map(mut self, value: bool) -> Self {
+        self.net_info_mut().have_port_map = Some(value);
+        self
+    }
+
     /// Set the [`NetInfo::derp_latency`] field (inside [`MapRequest::host_info`] ->
     /// [`HostInfo::net_info`]).
     pub fn derp_latencies(mut self, value: impl IntoIterator<Item = (&'a str, f64)>) -> Self {

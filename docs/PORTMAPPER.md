@@ -1,13 +1,26 @@
 # NAT port mapper (NAT-PMP and PCP)
 
-[`ts_portmapper`](../ts_portmapper/src/lib.rs) asks the LAN gateway for an inbound UDP mapping to
-the node's underlay port, as Go Tailscale's `net/portmapper` does, so that a peer behind a hard
-NAT can reach the node directly instead of over DERP. NAT-PMP (RFC 6886) and PCP (RFC 6887) are
-implemented. UPnP-IGD is not (bead `tsr-x4yg`, phase 2).
+The node asks its LAN gateway for an inbound UDP mapping to its underlay port, as Go Tailscale's
+`net/portmapper` does. It then advertises the mapping as endpoint type 3 (`PortMapped`), so a peer
+behind a hard NAT can reach it directly instead of over DERP. NAT-PMP (RFC 6886) and PCP
+(RFC 6887) are implemented. UPnP-IGD is not (bead `tsr-x4yg`, phase 2).
 
-The crate holds the lifecycle client, the codecs, the gateway lookup and `GatewayCap`, the only
-code that sends packets. (The gateway lookup's kernel source-address check connects a UDP socket
-but never sends on it.) Nothing in the node runs it yet.
+- Crate: [`ts_portmapper`](../ts_portmapper/src/lib.rs). It holds the lifecycle client, the
+  codecs, the gateway lookup and `GatewayCap`, the only code that sends packets. (The gateway
+  lookup's kernel source-address check connects a UDP socket but never sends on it.)
+- Driver: [`ts_runtime::portmap`](../ts_runtime/src/portmap.rs), spawned by the direct manager.
+
+## Turning it off
+
+| Source | Effect |
+|---|---|
+| `Config::disable_port_mapper` (Go `DisablePortMapper`) | No client, no driver, no socket; NetInfo facets unset |
+| `TS_DISABLE_PORTMAPPER` (Go name), read once at startup | No client, no driver, no socket; NetInfo facets unset. Go keeps the client and reports `UPnP`/`PMP`/`PCP` as false |
+| Control `only-tcp-443` | Live: every LAN send stops at once, deletes included; facets `PMP`/`PCP` are false. Go only blocks new creates and probes (see Deviations) |
+| Cargo feature `portmapper` off | Not compiled; facets unset |
+
+The feature is on by default, as in Go. Tests keep it off: every shared runtime test configuration
+sets `port_mapper: None`, and the `portmapper_test_isolation` check enforces the rest.
 
 ## Deviations from Go
 
@@ -17,6 +30,8 @@ but never sends on it.) Nothing in the node runs it yet.
 - **Renewal while idle (`renew_while_idle`).** The default is Go's: renewal rides on activity (the
   periodic ReSTUN and other kicks). With the option on, a due mapping is renewed even while idle,
   as long as there are peers. With no peers a mapping is never renewed and expires.
+- **`HavePortMap` means an advertised mapping**, so control never sees it without a type-3
+  endpoint.
 - **Notifications.** Go publishes every successful mapping (NAT-PMP, PCP, UPnP, including a
   reused one) and never a loss, expiry or disable. Here loss, expiry and disable publish too, for
   both protocols.
@@ -53,6 +68,17 @@ but never sends on it.) Nothing in the node runs it yet.
   10/30/60/120/300/600 s (±20 %), no two attempts start within 2 s, and a PCP error lifetime is
   honoured up to 30 min; while that backoff holds, a probe after one that found nothing is
   skipped too. This bounds LAN traffic to a refusing or absent router.
+- **`only-tcp-443`.** Every LAN send stops, the mapping is withdrawn and nothing is deleted until
+  the knob is lifted. Go only blocks new creates and probes; it keeps the cached mapping advertised
+  and still releases it on Close.
+- **Same-port rebind.** The endpoint is withdrawn at once and restored after the network
+  re-validates; Go's `SetLocalPort` is a no-op for an unchanged port and keeps the mapping.
+- **No endpoint tracker.** An expired or rebound mapping leaves the endpoint list immediately; Go
+  keeps advertising a vanished endpoint for 5 min 10 s.
+- **Network poll.** The default route is re-read every 10 s instead of subscribing to the OS link
+  monitor (not ported yet).
+- **Resume detection.** A wall-vs-monotonic disagreement over 30 s on the 10 s poll; Go's netmon
+  polls the wall clock every 15 s and reacts to a jump over 22.5 s.
 - **Probe and MAP exchange.** The probe returns as soon as NAT-PMP and PCP are both decided (Go
   waits the full 250 ms unless UPnP also answered), and the NAT-PMP MAP always sends the
   public-address request alongside (Go sends it only when it has no recent public address).

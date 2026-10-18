@@ -64,11 +64,17 @@ async fn live_tailnet_join() {
     // runtime (read in `Device::new`); a global `.cargo/config.toml [env]` was rejected because
     // it would defeat the deliberate `TS_RS_EXPERIMENT` opt-in for ordinary builds.
     unsafe { std::env::set_var("TS_RS_EXPERIMENT", "this_is_unstable_software") };
+    // SAFETY: as above. Tests never touch the LAN gateway: the port mapper stays off.
+    unsafe { std::env::set_var("TS_DISABLE_PORTMAPPER", "1") };
 
     // Build a default config: control defaults to `https://controlplane.tailscale.com/` — real
     // Tailscale, exactly what we want to validate against. Use an identifiable, unique hostname so
     // the node is easy to spot and deregister out-of-band.
-    let mut config = Config::default();
+    let mut config = Config {
+        // Tests never touch the LAN gateway.
+        disable_port_mapper: true,
+        ..Config::default()
+    };
     let rand_suffix: u32 = rand::random();
     let hostname = format!("tsrs-livetest-{rand_suffix:08x}");
     config.requested_hostname = Some(hostname.clone());
