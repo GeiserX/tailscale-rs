@@ -2812,7 +2812,7 @@ mod tests {
     /// The assertion is the count of datagrams that actually left the socket, one per candidate the
     /// rotation carried onto the new key. The candidates are control-advertised (the netmap seam
     /// takes an address as given); a peer-learned loopback address would be dropped by the
-    /// `is_pingable_candidate` sanitizer, which is not what this test is about.
+    /// `is_learnable_candidate` sanitizer, which is not what this test is about.
     #[tokio::test]
     async fn a_rotated_peer_is_reprobed_immediately() {
         let sock = MagicSock::bind(
