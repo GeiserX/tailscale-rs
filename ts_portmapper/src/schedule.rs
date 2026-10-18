@@ -5,7 +5,9 @@
 //!
 //! - [`Schedule::next_attempt_at`]: the earliest time **any** create or renew may start, whatever
 //!   the trigger (driver timer, kick, rebind, ReSTUN, `get_cached…`). Failures push it out by a
-//!   jittered backoff; router refusals push it further.
+//!   jittered backoff; a PCP error lifetime may push it further. Go has no backoff (a failed create
+//!   is retried on the next ReSTUN, `net/portmapper/portmapper.go:477-514`); this spacing is a
+//!   stated deviation in `docs/PORTMAPPER.md`.
 //! - [`Lease::renew_after`]: when a healthy mapping should be renewed.
 //! - [`Lease::expires_at`]: the end of local trust. After it the mapping is dropped and its endpoint
 //!   withdrawn, whether or not anything else happens.
@@ -38,8 +40,6 @@ pub const BACKOFF_STEPS: [Duration; 6] = [
 ];
 /// The least time between any two attempt starts, even across a network change.
 pub const ATTEMPT_FLOOR: Duration = Duration::from_secs(2);
-/// How long a "not authorized" refusal holds off the next attempt.
-pub const NOT_AUTHORIZED_HOLD: Duration = Duration::from_secs(30 * 60);
 /// The longest hold taken from a PCP error lifetime (RFC 6887 §7.4, §11.4).
 pub const MAX_ERROR_HOLD: Duration = Duration::from_secs(30 * 60);
 
@@ -110,7 +110,9 @@ pub(crate) fn earlier(t: Instant, by: Duration, now: Instant) -> Instant {
 pub enum Failure {
     /// Timeout, no responder, no services, an OS error or a malformed exchange.
     Transient,
-    /// NAT-PMP result 2 or PCP `NOT_AUTHORIZED`: hold off for at least [`NOT_AUTHORIZED_HOLD`].
+    /// NAT-PMP result 2 or PCP `NOT_AUTHORIZED`: the ordinary backoff, no longer hold, so a router
+    /// on which port mapping is switched on is mapped within the normal ladder (Go retries on the
+    /// next ReSTUN with no hold, `net/portmapper/portmapper.go:477-494, 505-514`).
     NotAuthorized,
     /// Another router refusal; `hold` is a PCP error lifetime, if any.
     Refused {
@@ -173,10 +175,8 @@ impl Schedule {
         self.failures = self.failures.saturating_add(1);
         let mut hold = jittered(backoff(self.failures), jitter);
         match why {
-            Failure::Transient => {}
-            Failure::NotAuthorized => hold = hold.max(NOT_AUTHORIZED_HOLD),
+            Failure::Transient | Failure::NotAuthorized | Failure::Refused { hold: None } => {}
             Failure::Refused { hold: Some(h) } => hold = hold.max(h.min(MAX_ERROR_HOLD)),
-            Failure::Refused { hold: None } => {}
         }
         self.next_attempt_at = Some(now.checked_add(hold).unwrap_or(now));
     }
@@ -293,8 +293,9 @@ mod tests {
         assert_eq!(s.next_attempt_at, Some(t0 + secs(10)));
         s.note_failure(t0, Failure::Transient, 1.0);
         assert_eq!(s.next_attempt_at, Some(t0 + secs(30)));
+        // NOT_AUTHORIZED takes the ordinary ladder: no long hold.
         s.note_failure(t0, Failure::NotAuthorized, 1.0);
-        assert_eq!(s.next_attempt_at, Some(t0 + NOT_AUTHORIZED_HOLD));
+        assert_eq!(s.next_attempt_at, Some(t0 + secs(60)));
 
         let mut s = Schedule::default();
         // A PCP error lifetime above the backoff holds, capped at 30 min.

@@ -823,8 +823,9 @@ mod tests {
         assert_eq!(format!("{a:?}"), "Nonce(..)");
     }
 
-    /// The seeds of Go's `FuzzParsePCPResponse` and `FuzzParsePCPMapResponse`
-    /// (`net/portmapper/fuzz_test.go`), with stronger expectations: a MAP parser rejects the
+    /// The seeds of upstream Go's `FuzzParsePCPResponse` and `FuzzParsePCPMapResponse`
+    /// (`net/portmapper/fuzz_test.go` on tailscale main, added after v1.102.4), with stronger
+    /// expectations: a MAP parser rejects the
     /// ANNOUNCE-opcode seed and the IPv6 external address, and the result is always exactly one of
     /// a mapping or an error (guaranteed by `Result`).
     #[test]

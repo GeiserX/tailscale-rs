@@ -17,13 +17,18 @@ but never sends on it.) Nothing in the node runs it yet.
 - **Renewal while idle (`renew_while_idle`).** The default is Go's: renewal rides on activity (the
   periodic ReSTUN and other kicks). With the option on, a due mapping is renewed even while idle,
   as long as there are peers. With no peers a mapping is never renewed and expires.
-- **Notifications for every protocol.** Success, loss, expiry and disable publish for NAT-PMP and
-  PCP alike. In Go only PCP successes publish.
+- **Notifications.** Go publishes every successful mapping (NAT-PMP, PCP, UPnP, including a
+  reused one) and never a loss, expiry or disable. Here loss, expiry and disable publish too, for
+  both protocols.
 - **Strict replies.** Replies are accepted only from exactly `gateway:5351`, and every field is
   validated: version, opcode, R bit, length, internal port, protocol and nonce. Go's probe checks
   only the source port.
 - **NAT-PMP delete.** The suggested external port is 0, as RFC 6886 §3.4 requires. Go sends the
   current one.
+- **PCP nonce and delete.** The nonce is kept for renewal and delete and every MAP reply must echo
+  it (RFC 6887 §11.1, §15.1). Go v1.102.4 draws a fresh nonce for every request, including the
+  delete, and never checks the reply nonce. The PCP delete suggests port 0 and `::ffff:0.0.0.0`;
+  Go sends the current external address and port.
 - **Renewal protocol.** A usable mapping keeps its owning protocol, even if another service
   becomes available. PMP and PCP may share one router rule, so switching and then deleting the
   old rule could delete its replacement.
@@ -40,6 +45,17 @@ but never sends on it.) Nothing in the node runs it yet.
   external address is rejected; Go accepts it.
 - **Epoch.** Go's rule applies to probe replies only. An epoch that goes backwards drops the
   mapping without a release.
+- **PCP seen.** A PCP ANNOUNCE reply counts as "PCP seen" and is checked for an epoch rollback
+  only when its result is SUCCESS. Go records any ANNOUNCE reply, NOT_AUTHORIZED and
+  ADDRESS_MISMATCH included, and then prefers PCP for the next MAP.
+- **Attempt spacing.** Go retries a failed create on the next ReSTUN with no backoff (only a 5 s
+  skip after a probe that found nothing). Here consecutive failures space attempts
+  10/30/60/120/300/600 s (±20 %), no two attempts start within 2 s, and a PCP error lifetime is
+  honoured up to 30 min; while that backoff holds, a probe after one that found nothing is
+  skipped too. This bounds LAN traffic to a refusing or absent router.
+- **Probe and MAP exchange.** The probe returns as soon as NAT-PMP and PCP are both decided (Go
+  waits the full 250 ms unless UPnP also answered), and the NAT-PMP MAP always sends the
+  public-address request alongside (Go sends it only when it has no recent public address).
 
 ## Router state, stated honestly
 
@@ -61,11 +77,11 @@ but never sends on it.) Nothing in the node runs it yet.
   after socket setup, route validation and the final send permit. A fresh never-sent identity
   retires without DELETE; an unsent adoption/renewal retains its previous grant and nonce/protocol.
   NAT-PMP's public-address request alone cannot create a mapping. A matched success records the
-  actual grant. After a MAP attempt without a success reply, the grant could exceed the request,
-  so the tombstone conservatively uses the full wire maximum (`u32::MAX` seconds, about 136 years)
-  from the latest syscall attempt.
-  Four unresolved rules can therefore stop further creates for this process. Wall-clock jumps
-  withdraw advertisement trust but do not shorten possible ownership.
+  actual grant. An unanswered MAP keeps its slot for the requested lifetime (7200 s) from the
+  latest syscall attempt: a NAT-PMP gateway should not grant longer than requested (RFC 6886
+  §3.3), and Go trusts no unanswered MAP at all. Four unresolved rules can therefore stop further
+  creates for up to two hours, never for the rest of the process. Wall-clock jumps withdraw
+  advertisement trust but do not shorten possible ownership.
 - **Network down.** Nothing is deleted, since a delete could reach the wrong router. Such rules are
   left to expire. A create for the same rule on the same network adopts them, because PCP refuses a
   second nonce for a live rule.
