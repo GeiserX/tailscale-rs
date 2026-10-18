@@ -416,3 +416,8 @@ required-features = ["tsnet"]
 [[example]]
 name = "ssh_peer_lookup"
 required-features = ["ssh"]
+
+# Run the argument-parsing tests in `cargo test` (examples default to `test = false`).
+[[example]]
+name = "exit_node"
+test = true

@@ -9,7 +9,8 @@ behind a hard NAT can reach it directly instead of over DERP. NAT-PMP (RFC 6886)
   codecs, the gateway lookup and `GatewayCap`, the only code that sends packets. (The gateway
   lookup's kernel source-address check connects a UDP socket but never sends on it.)
 - Driver: [`ts_runtime::portmap`](../ts_runtime/src/portmap.rs), spawned by the direct manager.
-- One-shot field check: `examples/exit_node --portmap-probe`.
+- One-shot field check: `examples/exit_node --portmap-probe`. Like Go's `tailscale debug
+  portmap`, it is refused when `TS_DISABLE_PORTMAPPER` is set.
 
 ## Turning it off
 
@@ -27,8 +28,9 @@ sets `port_mapper: None`, and the `portmapper_test_isolation` check enforces the
 
 - **Advertising (`advertise_nonpublic_external`).** The library default is Go's: advertise every
   external address. The exit-node runner turns it off. A private or CGNAT external address (a
-  double NAT) is then kept and renewed, but not advertised. `--portmap-advertise-nonpublic` reverts
-  the runner to Go's behaviour.
+  double NAT) is then kept and renewed, but not advertised: it is not reachable from outside that
+  NAT, so advertising it only costs peers failed disco probes. `--portmap-advertise-nonpublic`
+  reverts the runner to Go's behaviour.
 - **Renewal while idle (`renew_while_idle`).** The library default is Go's: renewal rides on
   activity (the periodic ReSTUN and other kicks). The runner renews a due mapping even while idle,
   as long as it has peers. With no peers a mapping is never renewed and expires.

@@ -106,7 +106,8 @@ struct Args {
     status_interval: u64,
 
     /// Run the one-shot NAT-PMP/PCP probe on a dedicated test port and exit. Needs no state
-    /// directory, keys or control connection.
+    /// directory, keys or control connection. Refused when TS_DISABLE_PORTMAPPER is set, as Go's
+    /// debug portmap is.
     #[arg(long)]
     portmap_probe: bool,
 
@@ -127,7 +128,8 @@ struct Args {
     )]
     portmap_lifetime: u32,
 
-    /// Probe: seconds to hold each mapping open, counting inbound datagrams (no payloads).
+    /// Probe: seconds to hold each mapping open, counting inbound datagrams (no payloads). Must be
+    /// shorter than --portmap-lifetime (default 120).
     #[arg(
         long,
         default_value_t = 0,
@@ -157,7 +159,8 @@ struct Args {
 
     /// Advertise a port-mapped address even when it is private or CGNAT (a double NAT), as Go
     /// does. By default this runner keeps and renews such a mapping but does not offer it to
-    /// peers.
+    /// peers. A private or CGNAT external address is not reachable from outside that NAT, so
+    /// advertising it only costs peers failed disco probes.
     #[arg(long, conflicts_with = "portmap_probe")]
     portmap_advertise_nonpublic: bool,
 
@@ -255,9 +258,24 @@ fn run_portmap_probe(args: &Args) -> Result<i32, Box<dyn Error>> {
     })
 }
 
+/// Whether `TS_DISABLE_PORTMAPPER` turns the port mapper off, parsed with the same table as
+/// `ts_runtime`'s env knob (Go's `strconv.ParseBool`; an unparsable value counts as disabled).
+fn portmap_disabled_by_env(getenv: impl Fn(&str) -> Option<String>) -> bool {
+    match getenv("TS_DISABLE_PORTMAPPER").as_deref() {
+        None | Some("0" | "f" | "F" | "FALSE" | "false" | "False" | "") => false,
+        Some(_) => true,
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
     if args.portmap_probe {
+        // Go's `tailscale debug portmap` fails with ErrPortMappingDisabled under this knob
+        // (net/portmapper/portmapper.go:85-88, 876-878): refuse before any gateway lookup.
+        if portmap_disabled_by_env(|k| std::env::var(k).ok()) {
+            eprintln!("error msg=portmap-disabled env=TS_DISABLE_PORTMAPPER");
+            std::process::exit(1);
+        }
         let code = run_portmap_probe(&args)?;
         std::process::exit(code);
     }
@@ -417,7 +435,9 @@ async fn log_status(dev: &Device) {
             return;
         }
     };
-    // Go's netcheck `portmap=` summary (e.g. `active-_MC`), plus the mapping when one is held.
+    // Go's NetInfo `portmap=` summary (`tailcfg.NetInfo.portMapSummary`, e.g. `active-_MC`);
+    // `active-` here means an advertised mapping, where Go's means any held mapping. Plus the
+    // mapping when one is held.
     let (portmap, portmap_ext) = match dev.port_map_status() {
         Some(pm) => (
             pm.summary(),
@@ -531,6 +551,23 @@ mod tests {
         assert!(parse(&["--state-dir", "/tmp/x"]).is_ok());
     }
 
+    /// `TS_DISABLE_PORTMAPPER` refuses the probe, parsed like the runtime's knob.
+    #[test]
+    fn probe_refused_under_ts_disable_portmapper() {
+        let env = |v: Option<&'static str>| {
+            move |k: &str| {
+                assert_eq!(k, "TS_DISABLE_PORTMAPPER");
+                v.map(str::to_owned)
+            }
+        };
+        for v in ["1", "t", "true", "TRUE", "yes"] {
+            assert!(portmap_disabled_by_env(env(Some(v))), "{v}");
+        }
+        for v in [None, Some("0"), Some("false"), Some("")] {
+            assert!(!portmap_disabled_by_env(env(v)), "{v:?}");
+        }
+    }
+
     #[test]
     fn probe_flags_require_the_probe() {
         for flags in [
@@ -582,6 +619,13 @@ mod tests {
             Some("192.168.1.20".parse().unwrap())
         );
         assert!(parse(&["--portmap-probe", "--portmap-gateway", "nope"]).is_err());
+        // The hold must be shorter than the lifetime (default 120 s).
+        let a = parse(&["--portmap-probe", "--portmap-hold", "120"]).unwrap();
+        let err = a.probe_options().validate().unwrap_err();
+        assert!(
+            err.contains("hold must be shorter than the lifetime"),
+            "{err}"
+        );
     }
 
     /// The runner's port-mapper defaults (suppress non-public, renew while idle) and the flags
