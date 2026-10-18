@@ -131,8 +131,8 @@ fn default_true() -> bool {
 
 /// Default WireGuard persistent-keepalive interval: 25s.
 ///
-/// Matches Tailscale, which sets `PersistentKeepalive = 25` on a peer when control marks it
-/// `KeepAlive=true`. 25s sits just under the ~30s lower bound for UDP NAT/firewall mapping
+/// A deliberate divergence: upstream sets no WireGuard persistent keepalive on any peer
+/// (wgengine/wgcfg/config.go:16-25); 25s is WireGuard's conventional value. 25s sits just under the ~30s lower bound for UDP NAT/firewall mapping
 /// timeouts, so the mapping (and any DERP relay path) is refreshed before it can expire.
 pub const DEFAULT_PERSISTENT_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(25);
 

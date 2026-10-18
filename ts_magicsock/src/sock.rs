@@ -2,7 +2,7 @@
 
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -26,6 +26,7 @@ use crate::{
     endpoint::{SelfEndpoint, SelfEndpointType},
     error::Error,
     path::PeerPaths,
+    reflexive::{ReflexiveSet, ReflexiveSource},
     relay::{HandshakeState, RelayBinding, RelayPaths, RelayServerEndpoint},
 };
 
@@ -82,17 +83,6 @@ async fn demux_receive_batch<
 /// Shared, per-peer path state keyed by the peer's disco key.
 type Paths = Arc<Mutex<HashMap<DiscoPublicKey, PeerPaths>>>;
 
-/// Cap on the number of distinct reflexive (STUN-equivalent) addresses we retain.
-///
-/// Reflexive addresses are learned from the `src` a peer echoes in a disco pong. A
-/// malicious-but-authenticated peer could pong with many spoofed `src` values to inflate this set
-/// without bound (each is advertised to control and in every `CallMeMaybe`). A real node sits
-/// behind a small number of NAT mappings, so a modest cap bounds the memory and the advertised
-/// endpoint set while never dropping a legitimately-needed reflexive address in practice. When the
-/// cap is reached, further novel addresses are ignored (fail-safe: we keep the ones we already
-/// trust rather than churn).
-const MAX_REFLEXIVE_ADDRS: usize = 16;
-
 /// Cap on the number of outstanding (unanswered) STUN Binding Requests we track at once.
 ///
 /// Each in-flight request holds a transaction id we will accept a response for; bounding the set
@@ -100,7 +90,7 @@ const MAX_REFLEXIVE_ADDRS: usize = 16;
 /// without limit. When the cap is reached after pruning expired entries, a new request is dropped
 /// fail-safe (we keep the ones already in flight) rather than evicting a live one.
 ///
-/// Sharing the value 16 with [`MAX_REFLEXIVE_ADDRS`] is a coincidence, not a relation — they bound
+/// Sharing the value 16 with [`MAX_REFLEXIVE_ADDRS`](crate::reflexive::MAX_REFLEXIVE_ADDRS) is a coincidence, not a relation — they bound
 /// independent sets (outstanding requests vs. learned reflexive addresses); do not unify them.
 const MAX_STUN_IN_FLIGHT: usize = 16;
 
@@ -117,6 +107,39 @@ const RELAY_REFRESH_LEAD: Duration = Duration::from_millis(3500);
 /// treated as stale/spoofed (its txid is pruned before lookup) and learns nothing. Bounds how
 /// long a transaction id is a usable injection target.
 const STUN_TX_TTL: Duration = Duration::from_secs(5);
+
+/// At most one warning per this window for disco pongs that failed to send; the rest go to debug
+/// and are counted in the next warning. A peer pings an unreachable candidate every few seconds,
+/// so a line per failure would flood the log. This throttle is ours, not Go's: Go logs every
+/// failure (`sendDiscoMessage`, `wgengine/magicsock/magicsock.go:2076-2078`) and tailscaled's
+/// `RateLimitedFn` (`cmd/tailscaled/tailscaled.go:509`) exempts every `"magicsock: disco: "`
+/// line (`types/logger/logger.go:142`); tsnet applies no limiter at all. Go also skips the log
+/// while `networkDown()`; the engine has no link-monitor signal, so it does not.
+const PONG_SEND_FAILURE_LOG_WINDOW: Duration = Duration::from_secs(60);
+
+/// Time-based budget for one repeated warning: the first failure warns, later ones inside
+/// [`PONG_SEND_FAILURE_LOG_WINDOW`] are only counted.
+#[derive(Debug, Default)]
+struct WarnBudget {
+    last_warned: Option<Instant>,
+    suppressed: u64,
+}
+
+impl WarnBudget {
+    /// Record one failure at `now`. Returns `Some(suppressed)` (failures since the last warning)
+    /// when this one should be logged as a warning, `None` when it is inside the window.
+    fn admit(&mut self, now: Instant, window: Duration) -> Option<u64> {
+        if self
+            .last_warned
+            .is_some_and(|t| now.saturating_duration_since(t) < window)
+        {
+            self.suppressed += 1;
+            return None;
+        }
+        self.last_warned = Some(now);
+        Some(core::mem::take(&mut self.suppressed))
+    }
+}
 
 /// Acquire a [`Mutex`] guard, recovering from poisoning instead of propagating the panic.
 ///
@@ -292,7 +315,7 @@ pub enum RelayedDisco {
 /// A direct UDP transport over a single shared socket.
 ///
 /// Construct with [`MagicSock::bind`], then:
-/// - register peers with [`MagicSock::add_peer_endpoints`] as the netmap provides them,
+/// - register peers with [`MagicSock::set_netmap_endpoints`] as the netmap provides them,
 /// - drive discovery with [`MagicSock::send_pings`] (periodically),
 /// - pump inbound traffic by calling [`MagicSock::recv_data`] in a loop (it handles disco
 ///   internally and only yields WireGuard data),
@@ -323,6 +346,9 @@ pub struct MagicSock {
     /// Connected per-path sockets sharing `sock`'s port (opt-in; see `connected.rs`). Locked
     /// disjointly from every other lock, never across an `.await`.
     connected: Mutex<ConnectedSockets>,
+    /// Whether connected sockets are on: `connected`'s fixed setting, readable without its lock,
+    /// so the default mode takes no extra lock per send or receive.
+    connected_sockets: bool,
     /// Datagrams the connected sockets' receive pumps hand to [`MagicSock::recv_data`].
     connected_rx: tokio::sync::Mutex<ReceiveState>,
     our_disco: DiscoPrivateKey,
@@ -336,11 +362,11 @@ pub struct MagicSock {
     /// it that way; do not hold two at once, or the inconsistent acquisition order across methods
     /// becomes a deadlock.
     addr_to_disco: Arc<Mutex<HashMap<SocketAddr, DiscoPublicKey>>>,
-    /// Reflexive (STUN-equivalent) addresses peers have observed our traffic arriving from,
-    /// learned from the `src` echoed in disco pongs. These are advertised to control and offered
-    /// in `CallMeMaybe` so peers behind NAT can reach us. Learned only on this one socket — never
-    /// a second egress.
-    reflexive: Arc<Mutex<HashSet<SocketAddr>>>,
+    /// Reflexive addresses: where STUN servers and peers' pongs saw this socket's traffic come
+    /// from, each with its provenance and last observation (see [`ReflexiveSet`]). Live entries are
+    /// advertised to control and offered in `CallMeMaybe` so peers behind NAT can reach us.
+    /// Learned only on this one socket — never a second egress.
+    reflexive: Arc<Mutex<ReflexiveSet>>,
     /// The NAT port mapping for this socket's port (Go `EndpointPortmapped`), with the instant its
     /// local trust ends. Set by the runtime's port-mapper driver; dropped from
     /// [`self_endpoints`](Self::self_endpoints) once expired, and cleared by
@@ -399,18 +425,27 @@ pub struct MagicSock {
     /// and then left to the counters. See
     /// [`warn_relay_addrs_all_refused_once`](Self::warn_relay_addrs_all_refused_once).
     warned_relay_addrs_all_refused: AtomicBool,
+    /// Log budget for disco pongs that failed to send (see
+    /// [`note_pong_send_failure`](Self::note_pong_send_failure)).
+    pong_send_failures: Mutex<WarnBudget>,
     /// Gate for accepting IPv6 disco candidates on the tailnet overlay (default `false`).
     ///
     /// The primary deployment is an IPv4-only privacy proxy / cloud exit node, so this defaults
-    /// to `false` and the disco-candidate filter ([`is_pingable_candidate`]) then keeps its exact
+    /// to `false` and the disco-candidate filters ([`is_pingable_candidate`] and
+    /// [`is_learnable_candidate`](MagicSock::is_learnable_candidate)) then keep their exact
     /// historical IPv4-only behavior: every IPv6 candidate is rejected, byte-for-byte as before.
     /// When wired `true` from `ts_runtime::Env::enable_ipv6` (via
-    /// [`MagicSock::with_enable_ipv6`]), the filter additionally accepts IPv6 candidates that are
-    /// valid global unicast addresses (rejecting loopback, unique-local, link-local, multicast and
-    /// unspecified), provided the socket itself is dual-stack ([`MagicSock::sends_ipv6`]). This
-    /// governs *only* which disco candidates are considered pingable — never the underlay bind or
-    /// the exit egress path, both of which stay IPv4-only by their own gates.
+    /// [`MagicSock::with_enable_ipv6`]), the filters additionally accept IPv6 candidates that are
+    /// valid global unicast addresses (rejecting loopback, link-local, multicast and unspecified;
+    /// only `is_learnable_candidate` also accepts unique-local), provided the socket itself is
+    /// dual-stack ([`MagicSock::sends_ipv6`]). This governs *only* which disco candidates are
+    /// considered pingable — never the underlay bind or the exit egress path, both of which stay
+    /// IPv4-only by their own gates.
     enable_ipv6: bool,
+    /// Where [`self_endpoints`](Self::self_endpoints) reads the host's interface addresses: to
+    /// expand a wildcard bind into the addresses peers can dial, and for the gated local IPv6
+    /// candidates. `getifaddrs` in production; tests inject a fixed list.
+    interface_addrs: crate::local_addrs::InterfaceAddrSource,
     /// Whether this node sits behind a symmetric (endpoint-dependent-mapping) NAT, per netcheck's
     /// `MappingVariesByDestIP`. When `true`, [`self_endpoints`](Self::self_endpoints) additionally
     /// advertises a hard-NAT [`SelfEndpointType::Stun4LocalPort`] guess pairing a reflexive IPv4
@@ -485,6 +520,11 @@ pub struct MagicSock {
     /// build, and it only ever copies; the real send still happens.
     #[cfg(test)]
     relay_send_tap: Mutex<Option<RelaySendTap>>,
+    /// Test-only: destinations [`send_udp`](Self::send_udp) fails with `EHOSTUNREACH` instead of
+    /// sending to, standing in for a host the kernel refuses to reach. Never compiled into a
+    /// release build.
+    #[cfg(test)]
+    unreachable: Mutex<std::collections::HashSet<SocketAddr>>,
 }
 
 /// Test-only: the sending half of [`MagicSock::relay_send_tap`], as `(destination, bytes)`.
@@ -534,6 +574,7 @@ impl MagicSock {
             bound_addr: Mutex::new(bound_addr),
             rebinding: tokio::sync::Mutex::new(()),
             connected: Mutex::new(connected),
+            connected_sockets: settings.connected_sockets,
             connected_rx: tokio::sync::Mutex::new(ReceiveState {
                 connected: connected_rx,
                 pending: VecDeque::new(),
@@ -554,7 +595,9 @@ impl MagicSock {
             warned_no_verifier: AtomicBool::new(false),
             warned_no_cap_lookup: AtomicBool::new(false),
             warned_relay_addrs_all_refused: AtomicBool::new(false),
+            pong_send_failures: Mutex::default(),
             enable_ipv6: false,
+            interface_addrs: Arc::new(crate::local_addrs::system_interface_addrs),
             symmetric_nat: AtomicBool::new(false),
             silent_disco: AtomicBool::new(false),
             only_tcp_443: AtomicBool::new(false),
@@ -565,6 +608,8 @@ impl MagicSock {
             allow_loopback_relay: AtomicBool::new(false),
             #[cfg(test)]
             relay_send_tap: Mutex::new(None),
+            #[cfg(test)]
+            unreachable: Mutex::default(),
         })
     }
 
@@ -619,17 +664,23 @@ impl MagicSock {
         if self.only_tcp_443() {
             return Ok(false);
         }
+        #[cfg(test)]
+        if lock(&self.unreachable).contains(&addr) {
+            return Err(Error::Io(std::io::ErrorKind::HostUnreachable.into()));
+        }
         let sock = self.sock().await;
         let connected = {
             let mut c = lock(&self.connected);
             if c.enabled() {
-                c.socket_for(addr, buf.len(), &sock)
+                c.socket_for(addr)
             } else {
                 None
             }
         };
         if let Some(c) = connected {
-            match c.send(buf).await {
+            let sent = c.send(buf).await;
+            lock(&self.connected).note_send_result(addr, &c, sent.is_ok());
+            match sent {
                 Ok(_) => return Ok(true),
                 // E.g. a pending ICMP error reported on the connected socket; this datagram
                 // still goes out of the shared socket.
@@ -639,7 +690,28 @@ impl MagicSock {
             }
         }
         sock.send_to(buf, addr).await?;
+        self.note_shared_sent(addr, buf.len(), &sock);
         Ok(true)
+    }
+
+    /// Count `len` bytes the kernel accepted for `addr` on `sock` toward a connected socket.
+    /// Skipped when a [`rebind`](Self::rebind) has published another socket since: a connected
+    /// socket opened now would share the old socket's port. The check is made under the
+    /// `connected` lock, which a rebind takes to clear the table after publishing, so a socket
+    /// opened here is never left behind by one.
+    fn note_shared_sent(&self, addr: SocketAddr, len: usize, sock: &Arc<UdpSocket>) {
+        if !self.connected_sockets {
+            return;
+        }
+        let mut c = lock(&self.connected);
+        let current = self
+            .sock
+            .borrow()
+            .as_ref()
+            .is_some_and(|s| Arc::ptr_eq(s, sock));
+        if current {
+            c.note_sent(addr, len, sock);
+        }
     }
 
     /// Whether the underlay socket can send to an IPv6 address at all: only a dual-stack `[::]`
@@ -806,25 +878,42 @@ impl MagicSock {
         self
     }
 
-    /// Whether a peer-supplied candidate endpoint is safe to probe with a disco ping.
+    /// Test-only: read interface addresses from `source` instead of `getifaddrs`, so wildcard
+    /// expansion is deterministic.
+    #[cfg(test)]
+    pub(crate) fn with_interface_addrs(
+        mut self,
+        source: impl Fn() -> std::io::Result<Vec<crate::local_addrs::InterfaceAddr>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.interface_addrs = Arc::new(source);
+        self
+    }
+
+    /// Whether a peer-relay address is safe to send a host-sourced disco frame to. Also the filter
+    /// for the IPv6 interface addresses [`self_endpoints`](Self::self_endpoints) advertises.
     ///
-    /// Disco datagrams are emitted from the node's single real host socket, so a candidate
-    /// address advertised by a remote peer (in a `CallMeMaybe`, or as a ping/data source) is an
-    /// attacker-controllable target: an authenticated-but-malicious tailnet peer could otherwise
+    /// Disco datagrams are emitted from the node's single real host socket, so a relay address
+    /// named by a peer (in a `CallMeMaybeVia`, or as the source of a relay message we reply to) is
+    /// an attacker-controllable target: an authenticated-but-malicious tailnet peer could otherwise
     /// make this node spray host-sourced UDP probes at arbitrary hosts (an SSRF-style internal
     /// scan, or a reachability oracle via pong timing). This filter is the choke point that drops
     /// addresses that must never be probed, fail-closed (drop on any doubt).
+    ///
+    /// A peer's own *direct* candidates (an authenticated disco ping's source, or a `CallMeMaybe`
+    /// endpoint) use the looser [`is_learnable_candidate`](Self::is_learnable_candidate) instead,
+    /// which admits private addresses as Go does, so LAN and hairpin paths can form.
     ///
     /// Rejected (IPv4):
     /// - unspecified (`0.0.0.0`);
     /// - loopback (`127.0.0.0/8`) — would let a peer probe this host's own services;
     /// - link-local (`169.254.0.0/16`);
     /// - multicast and broadcast (`255.255.255.255`);
-    /// - RFC1918 private ranges (`10/8`, `172.16/12`, `192.168/16`). This fork's topology is
-    ///   known-public-VPS (see `path.rs`); there is no supported direct-LAN connectivity path, so
-    ///   private candidates are dropped rather than letting a peer steer host-sourced probes onto
-    ///   the local network. If LAN connectivity ever becomes a supported path, relax *only* this
-    ///   clause and keep every other rejection.
+    /// - RFC1918 private ranges (`10/8`, `172.16/12`, `192.168/16`). On a cloud VPS exit node the
+    ///   private network is the provider's, so a relay address there is refused (see
+    ///   [`relay_addr_allowed`](Self::relay_addr_allowed)).
     ///
     /// Accepted (IPv4): any other (public, routable) IPv4 address.
     ///
@@ -876,6 +965,68 @@ impl MagicSock {
         }
     }
 
+    /// Whether a pong-observed reflexive address may be advertised: a global address by
+    /// [`is_pingable_candidate`](Self::is_pingable_candidate) (no private, loopback,
+    /// link-local, multicast, broadcast or unspecified address), and not RFC 6598 shared address
+    /// space (`100.64.0.0/10`), which only an observer inside the same carrier NAT can see.
+    /// An IPv4-mapped IPv6 address is judged as the IPv4 address it carries.
+    fn is_global_peer_observation(&self, addr: &SocketAddr) -> bool {
+        let addr = SocketAddr::new(addr.ip().to_canonical(), addr.port());
+        let shared_space = match addr.ip() {
+            IpAddr::V4(v4) => v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64,
+            IpAddr::V6(_) => false,
+        };
+        !shared_space && self.is_pingable_candidate(&addr)
+    }
+
+    /// Whether an address a peer offered as one of its own direct endpoints may be learned as a
+    /// candidate path: the source of a disco ping that passed the binding check, or an endpoint
+    /// in a `CallMeMaybe` that arrived over DERP from the node bound to its sealing disco key.
+    ///
+    /// Go learns both with no address-class filter: `handlePingLocked` hands the ping's source to
+    /// `endpoint.addCandidateEndpoint`, and `endpoint.handleCallMeMaybe` drops only IPv6
+    /// link-local endpoints (`wgengine/magicsock/magicsock.go`, `endpoint.go`). A router's
+    /// hairpin address, a LAN address and a carrier-grade NAT address (`100.64.0.0/10`) are
+    /// therefore all paths a Go client can use, and so are they here. This is what
+    /// [`is_pingable_candidate`](Self::is_pingable_candidate) used to refuse: an authenticated
+    /// ping from `192.168.x.y` was answered but never learned, and the peer stayed on DERP.
+    ///
+    /// Rejected. Only IPv6 link-local in a `CallMeMaybe` is rejected by Go too; the rest is this
+    /// fork's:
+    /// - unspecified, multicast and broadcast: never a real peer's source or endpoint;
+    /// - loopback: a peer must not steer probes at this host's own services;
+    /// - link-local (`169.254.0.0/16`, `fe80::/10`): on a cloud host this includes the metadata
+    ///   service, and an IPv6 link-local endpoint needs an interface scope that a `CallMeMaybe`
+    ///   cannot carry (why Go's `handleCallMeMaybe` skips it).
+    ///
+    /// IPv6 is gated exactly as in `is_pingable_candidate` (the `enable_ipv6` gate and a socket
+    /// that can send IPv6); past the gate a unique-local address is accepted like RFC 1918.
+    ///
+    /// Learning a candidate only makes it a ping target: it becomes the path data is sent on only
+    /// after a pong answers one of *our* pings to it (see [`PeerPaths::note_pong`]). The number a
+    /// peer can add is bounded by `MAX_INBOUND_CALLMEMAYBE_ENDPOINTS` per message and
+    /// `MAX_LEARNED_CANDIDATES_PER_PEER` in total.
+    fn is_learnable_candidate(&self, addr: &SocketAddr) -> bool {
+        match addr.ip() {
+            IpAddr::V4(ip) => {
+                !(ip.is_unspecified()
+                    || ip.is_loopback()
+                    || ip.is_link_local()
+                    || ip.is_multicast()
+                    || ip.is_broadcast())
+            }
+            IpAddr::V6(ip) => {
+                if !self.enable_ipv6 || !self.sends_ipv6() {
+                    return false;
+                }
+                !(ip.is_unspecified()
+                    || ip.is_loopback()
+                    || ip.is_multicast()
+                    || ip.is_unicast_link_local())
+            }
+        }
+    }
+
     /// Install the disco<->node-key binding verifier (see [`BindingVerifier`]).
     ///
     /// Called once at startup by the netmap-owning route layer. With a verifier installed, an
@@ -916,17 +1067,28 @@ impl MagicSock {
     /// Our candidate self-endpoints: the bound local address plus every reflexive address peers
     /// have observed our traffic arriving from.
     ///
-    /// Returned for advertisement to control and for `CallMeMaybe`. All addresses were observed on
-    /// the single bound underlay socket — there is no second egress. The local address is always
-    /// present (available from bind); reflexive addresses accrue as pongs arrive, so before any
-    /// direct path is confirmed this returns just the local address.
+    /// Returned for advertisement to control and for `CallMeMaybe`. Local candidates are the bind
+    /// address, or on a wildcard bind the host's interface addresses on the bound port; reflexive
+    /// addresses were observed on the single bound underlay socket — there is no second egress.
+    /// Reflexive addresses accrue as pongs arrive, so before any direct path is confirmed this
+    /// returns just the local candidates.
+    ///
+    /// A socket bound to a concrete address offers that address. A socket bound to the IPv4
+    /// unspecified address (`0.0.0.0:port`, the runtime's default) offers the host's interface
+    /// addresses on its port instead, selected as Go's `netmon.LocalAddresses` does (see
+    /// [`local_addresses`](crate::local_addrs::local_addresses)), because `0.0.0.0` names no host
+    /// a peer can send to. A dual-stack `[::]:port` bind drops its unspecified address and relies on
+    /// the IPv6 enumeration below: whether it also receives IPv4 depends on the platform's
+    /// `IPV6_V6ONLY` default.
     ///
     /// When `enable_ipv6` is set, the host's real global-unicast IPv6 interface addresses are also
     /// enumerated and advertised as [`SelfEndpointType::Local`] candidates (each paired with the
-    /// bound socket's port), filtered through the same `is_pingable_candidate` rules a peer
-    /// applies — without this, a dual-stack `[::]:0` bind only ever yields the undialable
-    /// unspecified `[::]:port`. With the default `enable_ipv6 == false` no IPv6 local candidate is
-    /// emitted and the result is byte-for-byte the prior IPv4-only set.
+    /// bound socket's port), filtered through `is_pingable_candidate`. With the default
+    /// `enable_ipv6 == false` no IPv6 local candidate is emitted.
+    ///
+    /// No endpoint of any type carries an unspecified, multicast or broadcast address, or a
+    /// loopback address unless the socket itself is bound to loopback
+    /// ([`is_advertisable`](crate::local_addrs::is_advertisable)).
     pub fn self_endpoints(&self) -> Vec<SelfEndpoint> {
         self.self_endpoints_with_stun().0
     }
@@ -943,25 +1105,61 @@ impl MagicSock {
         let mut locals = Vec::new();
 
         let local = self.local_addr().ok();
+        let wildcard = local.is_some_and(|l| l.ip().is_unspecified());
+
+        // Read the interfaces once, and only when something below needs them. On error, offer no
+        // interface-derived candidate: never the wildcard in its place. This diverges from Go,
+        // which aborts the whole endpoint update and keeps its previous set
+        // (magicsock.go:1412-1415, updateEndpoints 945-951); self_endpoints keeps no previous set,
+        // so the reflexive endpoints are still published and only the interface-derived
+        // candidates are missing until the next tick.
+        let ifaces = if wildcard || self.enable_ipv6 {
+            match (self.interface_addrs)() {
+                Ok(ifaces) => ifaces,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "self_endpoints: interface enumeration failed; advertising no interface \
+                         addresses"
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
         if let Some(local) = local {
-            locals.push(local);
+            if !wildcard {
+                // Bound to one address: offer it, not the addresses of other interfaces (Go: "Do
+                // not offer addresses on other local interfaces"). The gated IPv6 enumeration
+                // below is separate and unchanged.
+                locals.push(local);
+            } else if local.is_ipv4() {
+                // Go `determineEndpoints` (`magicsock.go`, "localAddr.IP.IsUnspecified()"): one
+                // Local endpoint per interface address on the bound port. IPv4 only, because this
+                // socket cannot send IPv6.
+                for ip in crate::local_addrs::local_addresses(&ifaces) {
+                    if ip.is_ipv4() {
+                        locals.push(SocketAddr::new(ip, local.port()));
+                    }
+                }
+            }
         }
 
         // Local IPv6 candidate enumeration (gated on `enable_ipv6`; default `false` ⇒ this whole
         // block is skipped and the candidate set is byte-for-byte the prior IPv4-only behavior).
         //
-        // For a dual-stack `[::]:0` underlay bind, `local_addr()` above yields the UNSPECIFIED
-        // address `[::]:port`, which a peer cannot dial — so no usable local v6 candidate would
-        // ever be advertised and a direct v6 path could never form. STUN is v4-only here, so v6
-        // reflexive addresses only ever arrive via peer pongs; this fills the local-candidate gap
-        // by advertising the host's real global-unicast IPv6 interface addresses paired with the
-        // bound socket's port.
+        // A dual-stack `[::]:0` underlay bind has no dialable address of its own, so without this
+        // no usable local v6 candidate would ever be advertised and a direct v6 path could never
+        // form. STUN is v4-only here, so v6 reflexive addresses only ever arrive via peer pongs;
+        // this fills the local-candidate gap by advertising the host's real global-unicast IPv6
+        // interface addresses paired with the bound socket's port.
         //
-        // Each enumerated v6 address is filtered through the SAME `is_pingable_candidate` the
-        // peer-accept side uses (built into a `SocketAddr` on the local port), so the set of v6
-        // addresses we advertise as local candidates EXACTLY matches what a peer will accept and
-        // probe — one source of truth for the v6 acceptance rules (rejects `::`, `::1`, ULA
-        // `fc00::/7`, link-local `fe80::/10`, multicast; accepts only global unicast).
+        // Each enumerated v6 address is filtered through `is_pingable_candidate` (built into a
+        // `SocketAddr` on the local port), so only global unicast is advertised (rejects `::`,
+        // `::1`, ULA `fc00::/7`, link-local `fe80::/10`, multicast). A peer applying
+        // `is_learnable_candidate` accepts all of these.
         //
         // Fail-safe, not fail-closed: if interface enumeration errors we simply add no v6 locals
         // (a missing v6 candidate only means v6 falls back to DERP relay, which is safe) — it must
@@ -970,37 +1168,28 @@ impl MagicSock {
             && let Some(local) = local
         {
             let local_port = local.port();
-            match if_addrs::get_if_addrs() {
-                Ok(ifaces) => {
-                    for iface in ifaces {
-                        let IpAddr::V6(v6) = iface.ip() else {
-                            continue;
-                        };
-                        let cand = SocketAddr::new(IpAddr::V6(v6), local_port);
-                        if !self.is_pingable_candidate(&cand) {
-                            continue;
-                        }
-                        locals.push(cand);
-                    }
+            for iface in &ifaces {
+                let IpAddr::V6(v6) = iface.ip else {
+                    continue;
+                };
+                let cand = SocketAddr::new(IpAddr::V6(v6), local_port);
+                if !self.is_pingable_candidate(&cand) {
+                    continue;
                 }
-                Err(e) => {
-                    tracing::debug!(
-                        error = %e,
-                        "self_endpoints: get_if_addrs failed; advertising no local IPv6 candidates"
-                    );
-                }
+                locals.push(cand);
             }
         }
 
         // Collect the reflexive set into owned `Vec`s and drop the guard before the O(n²) dedup/
         // guess loop below: the critical section is the cheap copy, not the candidate assembly.
+        // Every stored entry, unfiltered: expiry happens only at a STUN sweep
+        // ([`expire_reflexive`](Self::expire_reflexive)), so an idle node keeps advertising its
+        // last-known addresses as Go does (`wgengine/magicsock/magicsock.go:995`).
         let (all_reflexive, v4_reflexive): (Vec<SocketAddr>, Vec<SocketAddr>) = {
-            let reflexive = lock(&self.reflexive);
-            let mut all: Vec<SocketAddr> = reflexive.iter().copied().collect();
-            // A deterministic order for the STUN group, so the advertiser's ordered comparison
-            // does not see a change when a re-filled set iterates differently (Go compares
-            // endpoint sets order-insensitively, `endpointSetsEqual`).
-            all.sort();
+            // `addrs()` is sorted: a deterministic order for the STUN group, so the advertiser's
+            // ordered comparison does not see a change when a re-filled set iterates differently
+            // (Go compares endpoint sets order-insensitively, `endpointSetsEqual`).
+            let all = lock(&self.reflexive).addrs();
             let v4: Vec<SocketAddr> = all.iter().filter(|a| a.is_ipv4()).copied().collect();
             (all, v4)
         };
@@ -1044,6 +1233,13 @@ impl MagicSock {
             }
         }
 
+        // The one filter in front of both consumers: control's endpoint list and every
+        // `CallMeMaybe` are built from this result. A reflexive or port-mapped address is
+        // externally reported, so it passes through here too. (`all_reflexive` stays unfiltered: it
+        // is evidence for the STUN facts, not an advertised endpoint.)
+        let bound_to_loopback = local.is_some_and(|l| l.ip().is_loopback());
+        eps.retain(|e| crate::local_addrs::is_advertisable(e.addr.ip(), bound_to_loopback));
+
         (eps, all_reflexive)
     }
 
@@ -1064,6 +1260,24 @@ impl MagicSock {
             }
             None => None,
         }
+    }
+
+    /// A STUN sweep is starting: expire reflexive addresses no sweep has re-observed within
+    /// [`REFLEXIVE_LIFETIME`](crate::reflexive::REFLEXIVE_LIFETIME) (see
+    /// [`ReflexiveSet::sweep`](crate::reflexive::ReflexiveSet::sweep) for why the cut is taken
+    /// at the previous sweep's start).
+    ///
+    /// Go evaluates `endpointTracker` expiry only inside `determineEndpoints`
+    /// (`wgengine/magicsock/magicsock.go:1405`), i.e. once per STUN sweep, so an idle node keeps
+    /// advertising its last endpoints (`magicsock.go:995`). Called by the STUN prober before each
+    /// periodic and on-demand sweep.
+    pub fn expire_reflexive(&self) {
+        self.expire_reflexive_at(Instant::now());
+    }
+
+    /// [`expire_reflexive`](Self::expire_reflexive) for a sweep starting at `now`.
+    fn expire_reflexive_at(&self, now: Instant) {
+        lock(&self.reflexive).sweep(now);
     }
 
     /// Whether to treat this node as behind a symmetric (endpoint-dependent-mapping) NAT, which is
@@ -1158,9 +1372,8 @@ impl MagicSock {
     /// peer will disco-ping us and open a direct path. Sent over DERP by the caller.
     ///
     /// The endpoint set is exactly [`MagicSock::self_endpoints`] — the same addresses already
-    /// advertised to control — and every one of them was observed on this single bound socket. No
-    /// host-identifying address beyond what control already receives is disclosed, preserving the
-    /// anti-leak posture.
+    /// advertised to control (Go builds its CallMeMaybe from the same `lastEndpoints`,
+    /// magicsock.go:2683-2687). No address beyond what control already receives is disclosed.
     pub fn seal_call_me_maybe(&self, receiver: &DiscoPublicKey) -> Result<Vec<u8>, Error> {
         let endpoints: Vec<SocketAddr> =
             self.self_endpoints().into_iter().map(|e| e.addr).collect();
@@ -1175,6 +1388,11 @@ impl MagicSock {
     /// traffic (an inbound ping's source address, or a CallMeMaybe). These are preserved across
     /// netmap reconciliation; only [`MagicSock::set_netmap_endpoints`] prunes control-advertised
     /// paths.
+    ///
+    /// The caller must have authenticated the message: a ping that passed the binding verifier,
+    /// or a `CallMeMaybe` relayed over DERP by the node bound to its sealing disco key. Private
+    /// addresses are accepted (see `is_learnable_candidate`), so
+    /// an unauthenticated address must never reach this function.
     pub fn add_peer_endpoints(
         &self,
         peer: DiscoPublicKey,
@@ -1183,12 +1401,13 @@ impl MagicSock {
         // These addresses are peer-supplied (a CallMeMaybe's endpoint list, or an inbound
         // ping's source). Sanitize them before they can become disco-ping targets emitted from
         // the real host socket: drop anything that must never be probed (loopback, link-local,
-        // private, multicast, IPv6, etc). Fail-closed — a dropped candidate just means the peer
-        // stays on DERP, which is the safe default. See [`is_pingable_candidate`].
+        // multicast, unspecified, gated IPv6). Private and hairpin addresses pass, as in Go.
+        // Fail-closed — a dropped candidate just means the peer stays on DERP. See
+        // [`is_learnable_candidate`].
         let eps: Vec<SocketAddr> = endpoints
             .into_iter()
             .filter(|ep| {
-                let ok = self.is_pingable_candidate(ep);
+                let ok = self.is_learnable_candidate(ep);
                 if !ok {
                     tracing::debug!(%ep, "dropping non-pingable peer candidate endpoint");
                 }
@@ -1220,6 +1439,14 @@ impl MagicSock {
             // peer's known endpoint and hijack inbound-data attribution. First writer wins for
             // learned candidates; only the authoritative netmap path ([`set_netmap_endpoints`]) may
             // reassign an address across peers.
+            //
+            // This is a divergence from Go, whose `peerMap.setNodeKeyForEpAddr`
+            // (wgengine/magicsock/peermap.go:187-205) is last-writer-wins and is written only from
+            // a ping (magicsock.go:2581-2584) and a solicited pong (endpoint.go:1759); Go never
+            // stores a `CallMeMaybe` endpoint in that map. Attributing data to a `CallMeMaybe`
+            // endpoint here is this tree's own choice. A misattribution costs only the under-load
+            // cookie reply (ts_tunnel `Endpoint::recv_from`) and the silent-disco trust stamp,
+            // because the tunnel routes data by WireGuard session id.
             match a2d.get(ep) {
                 Some(existing) if *existing != peer => {
                     tracing::debug!(
@@ -1234,7 +1461,7 @@ impl MagicSock {
         }
     }
 
-    /// Test-only: register candidate endpoints *without* the [`is_pingable_candidate`] filter.
+    /// Test-only: register candidate endpoints *without* the [`is_learnable_candidate`] filter.
     ///
     /// The end-to-end tests run two magicsocks over loopback, but loopback is (correctly)
     /// rejected by the production filter. This seam lets those tests exercise the real
@@ -1271,7 +1498,7 @@ impl MagicSock {
     /// only made every discovery sweep attempt and fail that send. Go keeps such an endpoint and
     /// has `sendUDPStd` report its failed send as "not sent, no error" while `noV6` is set
     /// (`magicsock.go`); this tree knows the socket family up front and drops the endpoint
-    /// instead, the way `is_pingable_candidate` already drops a disco-learned one.
+    /// instead, the way `is_learnable_candidate` already drops a disco-learned one.
     pub fn set_netmap_endpoints(
         &self,
         peer: DiscoPublicKey,
@@ -1418,21 +1645,28 @@ impl MagicSock {
     ///
     /// Call this periodically and on path-trust expiry to keep direct paths alive.
     pub async fn send_pings(&self) -> Result<usize, Error> {
-        let now = Instant::now();
+        self.send_pings_at(Instant::now()).await
+    }
 
+    /// [`send_pings`](Self::send_pings) as of `now`, for a caller that drives the pinger from its
+    /// own clock.
+    ///
+    /// Only peers with recent traffic are pinged ([`PeerPaths::pings_due`]): this is Go magicsock's
+    /// `endpoint.heartbeat`, which runs only while the session is active. An idle peer gets no
+    /// heartbeat and no discovery until [`note_peer_activity`](Self::note_peer_activity) reports
+    /// traffic again, or it sends us a `CallMeMaybe`.
+    pub async fn send_pings_at(&self, now: Instant) -> Result<usize, Error> {
         // Snapshot the work to do without holding the lock across awaits.
         let mut to_ping: Vec<(DiscoPublicKey, SocketAddr, disco::TxId)> = Vec::new();
         {
             let mut paths = lock(&self.paths);
             for (peer, pp) in paths.iter_mut() {
-                if !pp.needs_refresh(now) {
-                    continue;
-                }
-                // Apply Go's cadence gates (5s discovery floor on non-best candidates, good-enough
-                // quiet-down, 60s upgrade re-probe) so the on-wire ping rate matches a stock client
-                // rather than pinging every candidate every 2s tick. The confirmed best is always
-                // included so its trust still refreshes on the `REFRESH_BEFORE_EXPIRY` schedule.
-                for addr in pp.candidates_to_ping(now) {
+                // Apply Go's cadence gates (heartbeat only while active, 5s discovery floor on
+                // non-best candidates, good-enough quiet-down, 60s upgrade re-probe) so the on-wire
+                // ping rate matches a stock client rather than pinging every candidate every 2s
+                // tick. The confirmed best of an active peer is always included so its trust still
+                // refreshes on the `REFRESH_BEFORE_EXPIRY` schedule.
+                for addr in pp.pings_due(now) {
                     let tx_id = disco::random_tx_id();
                     pp.note_ping_sent(tx_id, addr, now);
                     to_ping.push((*peer, addr, tx_id));
@@ -1445,6 +1679,59 @@ impl MagicSock {
         // back to DERP exactly like a direct one.
         let relayed = self.send_relay_pings().await?;
         Ok(direct + relayed)
+    }
+
+    /// Record traffic with `peer` at `now` — data sent to it or received from it, over any path —
+    /// so its paths are discovered and kept alive for the next
+    /// [`SESSION_ACTIVE_TIMEOUT`](crate::SESSION_ACTIVE_TIMEOUT). Go magicsock
+    /// `endpoint.noteTxActivityExtTriggerLocked`, which `endpoint.send` calls for every WireGuard
+    /// packet.
+    ///
+    /// Returns `true` when the peer was idle until now. The caller should then start discovery at
+    /// once with [`send_discovery_pings`](Self::send_discovery_pings) (and a `CallMeMaybe`), as
+    /// Go's `endpoint.send` does, instead of leaving the first packets on DERP until the next
+    /// pinger tick.
+    pub fn note_peer_activity(&self, peer: &DiscoPublicKey, now: Instant) -> bool {
+        let mut paths = lock(&self.paths);
+        self.peer_paths_entry(&mut paths, *peer).note_active(now)
+    }
+
+    /// Whether `peer` has had traffic within
+    /// [`SESSION_ACTIVE_TIMEOUT`](crate::SESSION_ACTIVE_TIMEOUT) of `now`. Proactive discovery —
+    /// the periodic pings and `CallMeMaybe` — is only for active peers.
+    pub fn is_peer_active(&self, peer: &DiscoPublicKey, now: Instant) -> bool {
+        let paths = lock(&self.paths);
+        paths.get(peer).is_some_and(|pp| pp.is_active(now))
+    }
+
+    /// Start discovery for one peer that has just become active — the
+    /// `sendDiscoPingsLocked(now, true)` Go's `endpoint.send` runs when it has no trusted direct
+    /// path. Pings every candidate not pinged within the 5s discovery floor and returns the number
+    /// sent; sends nothing when the peer already has a trusted direct path or is unknown.
+    pub async fn send_discovery_pings(
+        &self,
+        peer: &DiscoPublicKey,
+        now: Instant,
+    ) -> Result<usize, Error> {
+        let to_ping: Vec<(DiscoPublicKey, SocketAddr, disco::TxId)> = {
+            let mut paths = lock(&self.paths);
+            let Some(pp) = paths.get_mut(peer) else {
+                return Ok(0);
+            };
+            if pp.best_addr(now).is_some() {
+                return Ok(0);
+            }
+            pp.candidates_to_ping(now)
+                .into_iter()
+                .map(|addr| {
+                    let tx_id = disco::random_tx_id();
+                    pp.note_ping_sent(tx_id, addr, now);
+                    (*peer, addr, tx_id)
+                })
+                .collect()
+        };
+
+        self.emit_disco_pings(to_ping).await
     }
 
     /// Force an immediate disco ping to **every** candidate endpoint of one peer, bypassing the
@@ -1568,6 +1855,10 @@ impl MagicSock {
             let Some(pp) = paths.get_mut(peer) else {
                 return Ok(None);
             };
+            // An explicit ping counts as activity, so the peer's paths are discovered and kept
+            // alive for the next `SESSION_ACTIVE_TIMEOUT` (Go `startDiscoPingLocked` calls
+            // `noteTxActivityExtTriggerLocked` for a `pingCLI`).
+            pp.note_active(now);
             let Some(addr) = pp
                 .best_addr(now)
                 .or_else(|| pp.candidate_addrs().first().copied())
@@ -1719,18 +2010,21 @@ impl MagicSock {
             && !self.only_tcp_443()
             && let Some(addr) = self.best_addr(peer)
         {
-            let sock = self.sock().await;
+            // Only an open connected socket batches; the bytes that open one are counted per
+            // packet by `send_udp`, once each is sent.
             let connected = {
                 let mut c = lock(&self.connected);
                 if c.batched_io() {
-                    let bytes = pkts.iter().map(|p| p.as_ref().len()).sum();
-                    c.socket_for(addr, bytes, &sock)
+                    c.socket_for(addr)
                 } else {
                     None
                 }
             };
             if let Some(c) = connected {
                 let sent = crate::batch::send(&c, pkts).await;
+                if sent > 0 {
+                    lock(&self.connected).note_send_result(addr, &c, true);
+                }
                 let m = crate::metrics::metrics();
                 for p in &pkts[..sent] {
                     m.send_udp.inc();
@@ -1802,26 +2096,56 @@ impl MagicSock {
         let mut rebound = self.sock.subscribe();
         let sock = Self::bound_socket(&mut rebound).await;
         if let Some(receiver) = &mut state.receiver {
-            let batch = tokio::select! {
-                r = receiver.recv(&sock, None) => crate::receive_batch::Received::Batch(r?),
-                Some(batch) = state.connected.recv() => batch,
+            let (batch, shared) = tokio::select! {
+                r = receiver.recv(&sock, None) => (crate::receive_batch::Received::Batch(r?), true),
+                Some(batch) = state.connected.recv() => (batch, false),
                 _ = rebound.changed() => return Ok(()),
             };
+            if shared {
+                self.note_shared_recv(&batch);
+            }
             // No await between consuming the kernel/channel batch and saving its tail.
             state.pending.extend(batch);
         } else {
             let buf = &mut state.ordinary_buffer;
-            let batch = tokio::select! {
+            let (batch, shared) = tokio::select! {
                 r = sock.recv_from(buf) => {
                     let (n, from) = r?;
-                    crate::receive_batch::Received::One((PacketMut::from(&buf[..n]), from))
+                    (crate::receive_batch::Received::One((PacketMut::from(&buf[..n]), from)), true)
                 },
-                Some(batch) = state.connected.recv() => batch,
+                Some(batch) = state.connected.recv() => (batch, false),
                 _ = rebound.changed() => return Ok(()),
             };
+            if shared {
+                self.note_shared_recv(&batch);
+            }
             state.pending.extend(batch);
         }
         Ok(())
+    }
+
+    /// Tell the connected sockets which addresses the shared socket heard from, so one that
+    /// receives nothing while its peer is heard here goes back to the shared socket.
+    fn note_shared_recv(
+        &self,
+        batch: &crate::receive_batch::Received<crate::receive_batch::Datagram>,
+    ) {
+        if !self.connected_sockets {
+            return;
+        }
+        let mut c = lock(&self.connected);
+        if !c.any_ready() {
+            return;
+        }
+        let now = Instant::now();
+        match batch {
+            crate::receive_batch::Received::One((_, from)) => c.note_shared_recv(*from, now),
+            crate::receive_batch::Received::Batch(datagrams) => {
+                for (_, from) in datagrams {
+                    c.note_shared_recv(*from, now);
+                }
+            }
+        }
     }
 
     async fn demux_datagram(
@@ -1927,8 +2251,8 @@ impl MagicSock {
     /// drops both call-me-maybes on the UDP socket):
     ///
     /// - [`Inbound::CallMeMaybe`] is handled by [`add_peer_endpoints`](Self::add_peer_endpoints)
-    ///   (peer-supplied candidate endpoints, each sanitized by `is_pingable_candidate` before it can
-    ///   become a ping target) followed by an immediate
+    ///   (peer-supplied candidate endpoints, each sanitized by `is_learnable_candidate` before it
+    ///   can become a ping target) followed by an immediate
     ///   [`send_pings_to_peer_now`](Self::send_pings_to_peer_now) — those pings go to the sanitized
     ///   candidate set over the real UDP socket (the proper hole-punch target), never to the
     ///   nonexistent relay source.
@@ -1985,7 +2309,12 @@ impl MagicSock {
                     // The relayed CallMeMaybe is the canonical hard-NAT hole-punch: both peers are
                     // behind NAT, so this "ping me now" signal arriving over DERP is precisely when
                     // a prompt simultaneous-open matters most. Non-fatal on send error (the periodic
-                    // prober retries); the frame is still consumed either way.
+                    // prober retries while the peer is active); the frame is still consumed either
+                    // way.
+                    //
+                    // Not gated on activity, and it does not make the peer active: Go's
+                    // `handleCallMeMaybe` pings an idle endpoint too, but leaves `lastSendExt` (and
+                    // so the heartbeat) alone.
                     if let Err(e) = self.send_pings_to_peer_now(&sender).await {
                         tracing::debug!(error = %e, "relayed call-me-maybe immediate ping failed");
                     }
@@ -2105,13 +2434,14 @@ impl MagicSock {
     ///    so any other pair is a peer trying to make us handshake against an endpoint that is not
     ///    ours.
     /// 2. **Every relay address must pass [`is_pingable_candidate`](Self::is_pingable_candidate)**
-    ///    — the same sanitizer a `CallMeMaybe` endpoint goes through. Without it a peer could name
-    ///    `127.0.0.1:*` or an RFC 1918 address and have us emit host-sourced probes into the local
-    ///    network. If nothing survives, we do nothing and the peer stays on DERP. This gate is
-    ///    **deliberately stricter than upstream**, which sends a bind message to every advertised
-    ///    `AddrPort` that is merely non-zero; see [`relay_addr_allowed`](Self::relay_addr_allowed)
-    ///    for why it is kept, and for what it costs in interop. Because it is a divergence with a
-    ///    real interop cost, it is counted (`magicsock_peer_relay_addr_refused`, and
+    ///    — stricter than the filter a `CallMeMaybe` endpoint goes through. Without it a peer
+    ///    could name `127.0.0.1:*` or an RFC 1918 address and have us emit host-sourced probes into
+    ///    the local network. If nothing survives, we do nothing and the peer stays on DERP. This
+    ///    gate is **deliberately stricter than upstream**, which sends a bind message to every
+    ///    advertised `AddrPort` that is merely non-zero; see
+    ///    [`relay_addr_allowed`](Self::relay_addr_allowed) for why it is kept, and for what it
+    ///    costs in interop. Because it is a divergence with a real interop cost, it is counted
+    ///    (`magicsock_peer_relay_addr_refused`, and
     ///    `magicsock_peer_relay_endpoint_all_addrs_refused` when nothing survived) and warned about
     ///    once per socket, rather than dropping the endpoint silently.
     /// 3. **The allocation must supersede what we have.** Upstream orders competing allocations for
@@ -2665,8 +2995,10 @@ impl MagicSock {
     /// Whether a relay `addr:port` may be handshaked with.
     ///
     /// The production rule is exactly [`is_pingable_candidate`](Self::is_pingable_candidate) — a
-    /// relay address is peer-supplied and becomes a host-sourced send target, so it gets the same
-    /// sanitizer a `CallMeMaybe` endpoint does.
+    /// relay address is peer-supplied and becomes a host-sourced send target. It is stricter than
+    /// [`is_learnable_candidate`](Self::is_learnable_candidate), which a `CallMeMaybe` endpoint
+    /// goes through: that one admits private addresses so a peer on the same LAN or behind the
+    /// same router can be reached directly, as in Go.
     ///
     /// # Deliberately stricter than upstream
     ///
@@ -2712,8 +3044,8 @@ impl MagicSock {
     /// The one relaxation available is IPv6: with [`with_enable_ipv6`](Self::with_enable_ipv6)
     /// set, a relay server on a global-unicast IPv6 address is handshaked with normally (ULA and
     /// link-local stay refused, mirroring the IPv4 clauses). There is deliberately no knob that
-    /// admits a *private IPv4* relay address, because this fork supports no direct-LAN path for
-    /// one to serve — see the `is_pingable_candidate` note on relaxing that clause.
+    /// admits a *private IPv4* relay address. A peer on the same LAN is reached directly, through
+    /// a learned private candidate, and needs no relay.
     ///
     /// [`relayManager.handshakeServerEndpoint`]: https://github.com/tailscale/tailscale/blob/49e148c4a30b4f8098f69468fd27a7021d85ea02/wgengine/magicsock/relaymanager.go
     fn relay_addr_allowed(&self, addr: &SocketAddr) -> bool {
@@ -2904,6 +3236,24 @@ impl MagicSock {
         }
     }
 
+    /// Log a disco pong that failed to send (e.g. `EHOSTUNREACH` to an on-link host the OS will
+    /// not let us reach): a warning at most once per [`PONG_SEND_FAILURE_LOG_WINDOW`], carrying
+    /// how many were suppressed since the last one, and debug otherwise.
+    fn note_pong_send_failure(&self, sender: &DiscoPublicKey, to: SocketAddr, error: &Error) {
+        let admitted =
+            lock(&self.pong_send_failures).admit(Instant::now(), PONG_SEND_FAILURE_LOG_WINDOW);
+        match admitted {
+            Some(suppressed) => tracing::warn!(
+                %sender,
+                %to,
+                %error,
+                suppressed,
+                "magicsock: disco pong failed to send; still receiving"
+            ),
+            None => tracing::debug!(%sender, %to, %error, "magicsock: disco pong failed to send"),
+        }
+    }
+
     /// Emit the "no binding verifier installed" warning at most once.
     fn warn_no_verifier_once(&self) {
         if !self.warned_no_verifier.swap(true, Ordering::Relaxed) {
@@ -2924,28 +3274,34 @@ impl MagicSock {
         }
     }
 
-    /// Record `addr` as a reflexive (STUN-equivalent) endpoint we may advertise, bounded by
-    /// [`MAX_REFLEXIVE_ADDRS`].
+    /// Record that `source` observed this socket's traffic arriving from `addr`, a reflexive
+    /// endpoint we may advertise, bounded by
+    /// [`MAX_REFLEXIVE_ADDRS`](crate::reflexive::MAX_REFLEXIVE_ADDRS) and aged per [`ReflexiveSet`].
     ///
     /// This is the single insertion point shared by the disco pong-harvest path (the peer echoes
     /// the `src` it saw our ping arrive from) and the active-STUN path
-    /// ([`MagicSock::handle_stun_response`]), so both observe the same cap and the same dedup via
-    /// the `HashSet`. When the cap is reached a novel address is ignored fail-safe (we keep the
-    /// addresses already trusted rather than churn). Locked disjointly from every other map.
-    fn note_reflexive(&self, addr: SocketAddr) {
-        let inserted = {
-            let mut reflexive = lock(&self.reflexive);
-            if reflexive.contains(&addr) {
-                false
-            } else if reflexive.len() < MAX_REFLEXIVE_ADDRS {
-                reflexive.insert(addr)
-            } else {
-                tracing::debug!(%addr, "reflexive address set full, ignoring new endpoint");
-                false
-            }
-        };
-        // Count only a genuinely new reflexive address (off the lock), not a duplicate or a
-        // cap-rejected one — `reflexive_learned` measures distinct learned addresses.
+    /// ([`MagicSock::handle_stun_response`]). Locked disjointly from every other map.
+    ///
+    /// A pong's `src` is recorded only when it is an address a remote peer would accept as a
+    /// candidate ([`is_pingable_candidate`](Self::is_pingable_candidate)) and not in the shared
+    /// `100.64.0.0/10` space. A pong that hairpinned through our own router (the peer is on our
+    /// LAN, or reached us at our public address from behind the same NAT) reports a LAN-side
+    /// address such as `192.168.1.1:1024`; advertising it to every peer is wrong, and it is no
+    /// evidence of how the NAT maps traffic to the internet. Go advertises no pong `src` at all
+    /// (see [`crate::reflexive`]).
+    fn note_reflexive(&self, addr: SocketAddr, source: ReflexiveSource) {
+        self.note_reflexive_at(addr, source, Instant::now());
+    }
+
+    /// [`note_reflexive`](Self::note_reflexive) at `now`.
+    fn note_reflexive_at(&self, addr: SocketAddr, source: ReflexiveSource, now: Instant) {
+        if source == ReflexiveSource::PeerPong && !self.is_global_peer_observation(&addr) {
+            tracing::debug!(%addr, "not advertising a pong-observed address that is not global");
+            return;
+        }
+        let inserted = lock(&self.reflexive).note(addr, source, now);
+        // Count only an admission (off the lock), not a refresh of a stored address or a rejected
+        // one. An address admitted again after a sweep expired it or it was replaced counts again.
         if inserted {
             crate::metrics::metrics().reflexive_learned.inc();
         }
@@ -3077,7 +3433,7 @@ impl MagicSock {
         match crate::stun::parse_binding_response(buf, tx_id) {
             Some(v4) => {
                 // A valid IPv4 reflexive mapping observed on the one bound socket.
-                self.note_reflexive(SocketAddr::V4(v4));
+                self.note_reflexive(SocketAddr::V4(v4), ReflexiveSource::Stun);
                 true
             }
             None => {
@@ -3146,9 +3502,18 @@ impl MagicSock {
                 // A pong is UDP like any other disco frame, so the TCP-443-only gate refuses it —
                 // silently, and without moving `disco_pong_sent`. The peer that pinged us falls
                 // back to DERP for us exactly as it would for a node it cannot reach directly.
-                if self.send_udp(&pong, from).await? {
-                    tracing::trace!(%sender, %from, ?tx_id, "magicsock: disco pong sent");
-                    m.disco_pong_sent.inc();
+                // A failed send is the reply's failure, not the receive's: it is logged and the receive
+                // goes on. Go isolates it by sending the pong on its own goroutine (`handlePingLocked`,
+                // `wgengine/magicsock/magicsock.go:2640`) and only logging `sendDiscoMessage`'s error
+                // (`magicsock.go:2076-2078`). Here the send still runs inline, so only the error is
+                // detached from the receive, not the send's latency.
+                match self.send_udp(&pong, from).await {
+                    Ok(true) => {
+                        tracing::trace!(%sender, %from, ?tx_id, "magicsock: disco pong sent");
+                        m.disco_pong_sent.inc();
+                    }
+                    Ok(false) => {}
+                    Err(e) => self.note_pong_send_failure(&sender, from, &e),
                 }
             }
             Inbound::Pong { sender, tx_id, src } => {
@@ -3195,15 +3560,15 @@ impl MagicSock {
                 //      `src` is the peer-claimed reflexive field and is independent of the pong's UDP
                 //      source, so a `from == to` check never protected it — the member gate does.)
                 // A real peer's solicited pong from a netmap member still harvests its reflexive
-                // `src` — this is how the fork learns its public address; the legitimate
-                // NAT-traversal path is unchanged. Locked disjointly from `paths` above (never
-                // nested).
+                // `src` — this is how the fork learns its public address when STUN cannot — but
+                // `note_reflexive` keeps only a global address, recorded as a peer observation
+                // that ages out. Locked disjointly from `paths` above (never nested).
                 if solicited {
                     // A solicited pong matched an outstanding ping we sent — this confirms a direct
                     // path and feeds the direct-vs-DERP ratio.
                     crate::metrics::metrics().disco_pong_recv_solicited.inc();
                     if self.disco_sender_is_member(&sender) {
-                        self.note_reflexive(src);
+                        self.note_reflexive(src, ReflexiveSource::PeerPong);
                     }
                 }
             }
@@ -3464,6 +3829,7 @@ mod tests {
     use core::net::SocketAddrV4;
 
     use super::*;
+    use crate::reflexive::MAX_REFLEXIVE_ADDRS;
 
     #[tokio::test]
     async fn receive_bridge_coalesces_ready_packets_with_a_bound_and_peer_fifo() {
@@ -3669,6 +4035,87 @@ mod tests {
         assert_eq!(packets[0].as_ref(), b"after-error");
     }
 
+    /// A pong that fails to send (`EHOSTUNREACH`, as to an on-link host the OS will not let us
+    /// reach) is the reply's failure, not the receive's: the WireGuard datagram the peer sends
+    /// next still comes out of both receive calls, and no error does.
+    #[tokio::test]
+    async fn pong_send_failure_does_not_fail_receive() {
+        let sender_disco = DiscoPrivateKey::random();
+        let sender_node = ts_keys::NodePrivateKey::random().public_key();
+        let our_disco = DiscoPrivateKey::random();
+        let sock = MagicSock::bind(
+            localhost(),
+            our_disco.clone(),
+            ts_keys::NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap()
+        .with_binding_verifier(verifier_for(sender_disco.public_key(), sender_node));
+        let to = sock.local_addr().unwrap();
+        let peer = UdpSocket::bind(localhost()).await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        sock.addr_to_disco
+            .lock()
+            .unwrap()
+            .insert(peer_addr, sender_disco.public_key());
+        lock(&sock.unreachable).insert(peer_addr);
+
+        for batched in [false, true] {
+            let ping = disco::seal_ping(
+                &sender_disco,
+                sender_node,
+                &our_disco.public_key(),
+                disco::random_tx_id(),
+            )
+            .unwrap();
+            peer.send_to(&ping, to).await.unwrap();
+            peer.send_to(b"after-ping", to).await.unwrap();
+            let received = tokio::time::timeout(Duration::from_secs(2), async {
+                if !batched {
+                    return sock.recv_data().await.map(Option::unwrap);
+                }
+                loop {
+                    // The ping's batch is consumed as control traffic and yields nothing.
+                    if let Some(data) = sock.recv_data_batch().await?.into_iter().next() {
+                        return Ok(data);
+                    }
+                }
+            })
+            .await
+            .expect("timed out waiting for the datagram after the ping");
+            let data = received.expect("a failed pong send must not fail the receive");
+            assert_eq!(data.data.as_ref(), b"after-ping", "batched: {batched}");
+            assert_eq!(data.from_disco, sender_disco.public_key());
+        }
+    }
+
+    /// A peer pinging an unreachable candidate every 5 s for five minutes gets one warning a
+    /// minute, each counting the failures suppressed since the last.
+    #[test]
+    fn pong_send_failure_log_is_rate_limited() {
+        let start = Instant::now();
+        let mut budget = WarnBudget::default();
+        let warnings: Vec<_> = (0..300)
+            .step_by(5)
+            .filter_map(|secs| {
+                budget
+                    .admit(
+                        start + Duration::from_secs(secs),
+                        PONG_SEND_FAILURE_LOG_WINDOW,
+                    )
+                    .map(|suppressed| (secs, suppressed))
+            })
+            .collect();
+        assert_eq!(
+            warnings,
+            [(0, 0), (60, 11), (120, 11), (180, 11), (240, 11)]
+        );
+        assert_eq!(
+            budget.suppressed, 11,
+            "the last minute waits for the next warning"
+        );
+    }
+
     #[tokio::test]
     async fn direct_demux_transfers_owned_buffer_and_preserves_truncation() {
         let sock = plain_sock().await;
@@ -3866,6 +4313,7 @@ mod tests {
         let node_addr = old.local_addr().unwrap();
         old.set_netmap_endpoints(laptop_pub, [laptop_addr]);
         laptop.set_netmap_endpoints(old_disco.public_key(), [node_addr]);
+        old.note_peer_activity(&laptop_pub, Instant::now());
         assert_eq!(old.send_pings().await.unwrap(), 1);
         laptop
             .handle_disco(receive_one(&laptop).await, node_addr)
@@ -3875,6 +4323,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(old.best_addr(&laptop_pub), Some(laptop_addr));
+        laptop.note_peer_activity(&old_disco.public_key(), Instant::now());
         assert_eq!(laptop.send_pings().await.unwrap(), 1);
         old.handle_disco(receive_one(&old).await, laptop_addr)
             .await
@@ -3894,6 +4343,7 @@ mod tests {
             .unwrap()
             .with_binding_verifier(allow_all());
         restarted.set_netmap_endpoints(laptop_pub, [laptop_addr]);
+        restarted.note_peer_activity(&laptop_pub, Instant::now());
         assert_eq!(restarted.send_pings().await.unwrap(), 1);
         let early = receive_one(&laptop).await;
         assert!(matches!(early, Inbound::Ping { sender, .. } if sender == new_pub));
@@ -4433,9 +4883,9 @@ mod tests {
         );
     }
 
-    /// A peer-supplied candidate that is a forbidden target (e.g. a loopback or private
-    /// address) must never be learned as a path, so `send_pings` cannot emit a host-sourced
-    /// probe to it. A public candidate offered alongside it is still accepted.
+    /// A peer-supplied candidate that is a forbidden target (a loopback or link-local address)
+    /// must never be learned as a path, so `send_pings` cannot emit a host-sourced probe to it.
+    /// Private and public candidates offered alongside it are accepted, as Go accepts them.
     #[tokio::test]
     async fn add_peer_endpoints_drops_forbidden_candidates() {
         let a = MagicSock::bind(
@@ -4448,34 +4898,41 @@ mod tests {
 
         let peer = DiscoPrivateKey::random().public_key();
         let loopback: SocketAddr = "127.0.0.1:41641".parse().unwrap();
+        let link_local: SocketAddr = "169.254.169.254:80".parse().unwrap();
         let private: SocketAddr = "192.168.1.50:41641".parse().unwrap();
         let public: SocketAddr = "203.0.113.9:41641".parse().unwrap();
 
-        a.add_peer_endpoints(peer, [loopback, private, public]);
+        a.add_peer_endpoints(peer, [loopback, link_local, private, public]);
 
-        let candidates = {
+        let mut candidates = {
             let paths = a.paths.lock().unwrap();
             paths.get(&peer).unwrap().candidate_addrs()
         };
+        candidates.sort();
         assert_eq!(
             candidates,
-            vec![public],
-            "only the public candidate should be retained: {candidates:?}"
+            vec![private, public],
+            "only the private and public candidates should be retained: {candidates:?}"
         );
 
         // And the reverse attribution map must not have learned the forbidden addresses.
         let a2d = a.addr_to_disco.lock().unwrap();
         assert!(a2d.contains_key(&public), "public addr is attributed");
+        assert!(a2d.contains_key(&private), "private addr is attributed");
         assert!(!a2d.contains_key(&loopback), "loopback must not be learned");
-        assert!(!a2d.contains_key(&private), "private must not be learned");
+        assert!(
+            !a2d.contains_key(&link_local),
+            "link-local must not be learned"
+        );
     }
 
     /// End-to-end through the live ingress (`add_peer_endpoints`): the per-peer learned cap holds
-    /// across the `is_pingable_candidate` filter, and the filter runs FIRST so forbidden candidates
-    /// don't consume cap budget. This is the composition the per-message (disco) and per-peer (path)
-    /// caps only exercise in isolation — and the same sink the inbound-ping-source path feeds, so it
-    /// also covers that ingress's bound. Cap value mirrors `path::MAX_LEARNED_CANDIDATES_PER_PEER`
-    /// (private to `path`; hardcoded here as the sibling tests hardcode their fixtures).
+    /// across the `is_learnable_candidate` filter, and the filter runs FIRST so forbidden
+    /// candidates don't consume cap budget. This is the composition the per-message (disco) and
+    /// per-peer (path) caps only exercise in isolation — and the same sink the inbound-ping-source
+    /// path feeds, so it also covers that ingress's bound. Cap value mirrors
+    /// `path::MAX_LEARNED_CANDIDATES_PER_PEER` (private to `path`; hardcoded here as the sibling
+    /// tests hardcode their fixtures).
     #[tokio::test]
     async fn add_peer_endpoints_caps_learned_after_filtering() {
         const MAX_LEARNED_PER_PEER: usize = 32;
@@ -4489,25 +4946,25 @@ mod tests {
         .unwrap();
         let peer = DiscoPrivateKey::random().public_key();
 
-        // A flood of private addresses — all dropped by `is_pingable_candidate` — must NOT consume
-        // cap budget (the filter runs before the per-peer cap).
+        // A flood of loopback and link-local addresses — all dropped by `is_learnable_candidate` —
+        // must NOT consume cap budget (the filter runs before the per-peer cap).
         let junk: Vec<SocketAddr> = (0..40)
-            .map(|i| format!("192.168.1.{}:41641", i).parse().unwrap())
+            .map(|i| format!("127.0.0.{}:41641", i).parse().unwrap())
+            .chain((0..40).map(|i| format!("169.254.1.{}:41641", i).parse().unwrap()))
             .collect();
         a.add_peer_endpoints(peer, junk);
 
-        // Then more PUBLIC candidates than the cap, across two batches (mimicking repeated
-        // CallMeMaybes): the learned set clamps to exactly the per-peer cap.
-        for batch in 0..2u16 {
-            let public: Vec<SocketAddr> = (0..30)
-                .map(|i| {
-                    format!("203.0.113.{}:{}", batch + 1, 40000 + i as u16)
-                        .parse()
-                        .unwrap()
-                })
-                .collect();
-            a.add_peer_endpoints(peer, public);
-        }
+        // Then more candidates than the cap, across two batches (mimicking repeated
+        // CallMeMaybes): the learned set clamps to exactly the per-peer cap. The first batch is
+        // private, so a private address counts against the same cap a public one does.
+        a.add_peer_endpoints(
+            peer,
+            (0..30).map(|i| format!("192.168.1.{}:41641", i).parse().unwrap()),
+        );
+        a.add_peer_endpoints(
+            peer,
+            (0..30).map(|i| format!("203.0.113.2:{}", 40000 + i as u16).parse().unwrap()),
+        );
 
         let n = {
             let paths = a.paths.lock().unwrap();
@@ -4535,7 +4992,7 @@ mod tests {
         // (the `accepted` set includes already-present addresses, so the re-add re-attributes
         // idempotently). Guards against a future "only attribute fresh inserts" regression that
         // would silently drop an established peer's address from attribution.
-        let already: SocketAddr = "203.0.113.1:40000".parse().unwrap();
+        let already: SocketAddr = "192.168.1.0:41641".parse().unwrap();
         a.add_peer_endpoints(peer, [already]);
         {
             let a2d = a.addr_to_disco.lock().unwrap();
@@ -4625,7 +5082,7 @@ mod tests {
             peer,
             [
                 "127.0.0.1:1".parse().unwrap(),
-                "10.0.0.1:2".parse().unwrap(),
+                "169.254.0.1:2".parse().unwrap(),
             ],
         );
 
@@ -4637,6 +5094,273 @@ mod tests {
             a.addr_to_disco.lock().unwrap().is_empty(),
             "no attribution should be learned"
         );
+    }
+
+    /// The address classes a peer's own direct candidate may come from. Go filters none of them
+    /// on a ping source and only IPv6 link-local in a `CallMeMaybe`; the remaining rejections are
+    /// this fork's. The relay filter, `is_pingable_candidate`, still refuses every private class
+    /// (see `is_pingable_candidate_rejects_forbidden_classes`).
+    #[tokio::test]
+    async fn is_learnable_candidate_admits_private_and_hairpin_addresses() {
+        let v4 = sock_with_ipv6(false).await;
+        for s in [
+            "192.168.50.1:41392", // a router's hairpin source
+            "192.168.50.118:41392",
+            "10.0.0.5:41641",
+            "172.16.3.4:41641",
+            "100.100.7.8:41641", // carrier-grade NAT
+            "203.0.113.7:41641",
+        ] {
+            let addr: SocketAddr = s.parse().unwrap();
+            assert!(v4.is_learnable_candidate(&addr), "{s} must be learnable");
+        }
+        for s in [
+            "0.0.0.0:41641",
+            "127.0.0.1:41641",
+            "169.254.169.254:80",
+            "224.0.0.251:5353",
+            "255.255.255.255:41641",
+            "[fd00::1]:41641", // IPv6 gate off
+            "[2001:db8::1]:41641",
+        ] {
+            let addr: SocketAddr = s.parse().unwrap();
+            assert!(
+                !v4.is_learnable_candidate(&addr),
+                "{s} must not be learnable"
+            );
+        }
+
+        let v6 = sock_with_ipv6(true).await;
+        for s in ["[2001:db8::1]:41641", "[fd00::1]:41641"] {
+            let addr: SocketAddr = s.parse().unwrap();
+            assert!(v6.is_learnable_candidate(&addr), "{s} must be learnable");
+        }
+        for s in [
+            "[::]:41641",
+            "[::1]:41641",
+            "[fe80::1]:41641",
+            "[ff02::1]:41641",
+        ] {
+            let addr: SocketAddr = s.parse().unwrap();
+            assert!(
+                !v6.is_learnable_candidate(&addr),
+                "{s} must not be learnable"
+            );
+        }
+    }
+
+    /// A loopback-bound node whose binding verifier knows exactly one peer, and that peer's keys.
+    ///
+    /// The node's replies to a private address fail to send, because its socket is bound to
+    /// loopback, so nothing leaves the host. The tests look only at what the node learns.
+    struct LanFixture {
+        node: MagicSock,
+        node_disco: DiscoPublicKey,
+        peer_disco: DiscoPrivateKey,
+        peer_node: NodePublicKey,
+    }
+
+    impl LanFixture {
+        async fn new() -> Self {
+            let node_disco = DiscoPrivateKey::random();
+            let peer_disco = DiscoPrivateKey::random();
+            let peer_node = ts_keys::NodePrivateKey::random().public_key();
+            let node = MagicSock::bind(
+                localhost(),
+                node_disco.clone(),
+                ts_keys::NodePrivateKey::random().public_key(),
+            )
+            .await
+            .unwrap()
+            .with_binding_verifier(verifier_for(peer_disco.public_key(), peer_node));
+            Self {
+                node,
+                node_disco: node_disco.public_key(),
+                peer_disco,
+                peer_node,
+            }
+        }
+
+        /// Demux `bytes` as a datagram from `from`. A ping's pong to a private address fails to
+        /// send and returns an error here, after the ping has been handled.
+        async fn receive(&self, bytes: &[u8], from: SocketAddr) -> Option<ReceivedData> {
+            self.node
+                .demux_datagram((PacketMut::from(bytes), from))
+                .await
+                .ok()
+                .flatten()
+        }
+
+        /// Record a ping of ours to `to` and deliver the peer's pong to it from `from`.
+        async fn pong(&self, to: SocketAddr, from: SocketAddr) {
+            let tx_id = disco::random_tx_id();
+            lock(&self.node.paths)
+                .get_mut(&self.peer_disco.public_key())
+                .unwrap()
+                .note_ping_sent(tx_id, to, Instant::now());
+            let our_src = "203.0.113.10:41642".parse().unwrap();
+            let pong =
+                disco::seal_pong(&self.peer_disco, &self.node_disco, tx_id, our_src).unwrap();
+            assert!(self.receive(&pong, from).await.is_none());
+        }
+    }
+
+    /// A peer on the same LAN reached this node only through the router's hairpin NAT, so its
+    /// authenticated pings arrived from the router's LAN address. A Go client learns that source
+    /// and goes direct. This node answered the pings without learning the source, so it stayed on
+    /// DERP. The source must become a candidate, our own ping and its pong must confirm it, and
+    /// WireGuard data from it must be accepted.
+    #[tokio::test]
+    async fn private_ping_source_becomes_candidate() {
+        let fx = LanFixture::new().await;
+        let peer = fx.peer_disco.public_key();
+        let hairpin: SocketAddr = "192.168.50.1:41392".parse().unwrap();
+
+        assert!(
+            fx.receive(b"wireguard", hairpin).await.is_none(),
+            "data from an unknown source is dropped"
+        );
+
+        let ping = disco::seal_ping(
+            &fx.peer_disco,
+            fx.peer_node,
+            &fx.node_disco,
+            disco::random_tx_id(),
+        )
+        .unwrap();
+        fx.receive(&ping, hairpin).await;
+        assert_eq!(
+            fx.node.candidate_addrs(&peer),
+            vec![hairpin],
+            "an authenticated ping's private source is learned"
+        );
+
+        let data = fx
+            .receive(b"wireguard", hairpin)
+            .await
+            .expect("data from a learned candidate is accepted");
+        assert_eq!((data.from_disco, data.from_addr), (peer, hairpin));
+
+        assert_eq!(
+            fx.node.best_addr(&peer),
+            None,
+            "an inbound ping alone confirms nothing"
+        );
+        fx.pong(hairpin, hairpin).await;
+        assert_eq!(fx.node.best_addr(&peer), Some(hairpin));
+    }
+
+    /// Only disco that authenticates as the peer can add a candidate. None of these teach the node
+    /// a private source, and data from it stays dropped:
+    /// - a ping sealed by a disco key the netmap does not know;
+    /// - a ping from the peer's disco key claiming another node's key;
+    /// - a stranger's ping with the peer's disco key written into its header, which then fails to
+    ///   open;
+    /// - the peer's genuine `CallMeMaybe`, but on the UDP socket instead of over DERP;
+    /// - the same `CallMeMaybe` relayed over DERP on another node's connection.
+    #[tokio::test]
+    async fn unauthenticated_ping_source_is_not_learned() {
+        let fx = LanFixture::new().await;
+        let peer = fx.peer_disco.public_key();
+        let stranger = DiscoPrivateKey::random();
+        let lan: SocketAddr = "192.168.50.118:41392".parse().unwrap();
+        let ping = |sender: &DiscoPrivateKey, node: NodePublicKey| {
+            disco::seal_ping(sender, node, &fx.node_disco, disco::random_tx_id()).unwrap()
+        };
+
+        let unbound = ping(&stranger, fx.peer_node);
+        let wrong_node = ping(
+            &fx.peer_disco,
+            ts_keys::NodePrivateKey::random().public_key(),
+        );
+        let mut forged = ping(&stranger, fx.peer_node);
+        let key = stranger.public_key().to_bytes();
+        let at = forged
+            .windows(key.len())
+            .position(|w| w == key)
+            .expect("the sender key is in the header");
+        forged[at..at + key.len()].copy_from_slice(&peer.to_bytes());
+        let cmm = disco::seal_call_me_maybe(&fx.peer_disco, &fx.node_disco, &[lan]).unwrap();
+
+        for frame in [&unbound, &wrong_node, &forged, &cmm] {
+            fx.receive(frame, lan).await;
+        }
+        let out = fx
+            .node
+            .handle_relayed_disco(&mut cmm.clone(), derp_src())
+            .await;
+        assert_eq!(out, RelayedDisco::Consumed);
+
+        assert!(fx.node.candidate_addrs(&peer).is_empty());
+        assert!(fx.node.candidate_addrs(&stranger.public_key()).is_empty());
+        assert!(lock(&fx.node.addr_to_disco).is_empty());
+        assert!(fx.receive(b"wireguard", lan).await.is_none());
+    }
+
+    /// The `CallMeMaybe` half: a peer behind the same router advertises its LAN address over DERP.
+    /// Its private and carrier-grade NAT endpoints are learned and the forbidden ones dropped.
+    /// Our ping of the LAN address is answered through the router's hairpin, so the pong comes
+    /// from another address than the one pinged. As in Go, it confirms the pinged address. Go also
+    /// attributes the pong's own source to the peer (`handlePongConnLocked`); this tree does not
+    /// yet, so that source is neither a candidate nor attributed. An unsolicited pong changes
+    /// nothing.
+    #[tokio::test]
+    async fn private_cmm_and_asymmetric_pong() {
+        let fx = LanFixture::new().await;
+        let peer = fx.peer_disco.public_key();
+        let lan: SocketAddr = "192.168.50.118:41392".parse().unwrap();
+        let ten: SocketAddr = "10.20.30.40:41392".parse().unwrap();
+        let cgnat: SocketAddr = "100.100.7.8:41392".parse().unwrap();
+        let hairpin: SocketAddr = "192.168.50.1:41392".parse().unwrap();
+        let mut endpoints = vec![lan, ten, cgnat];
+        endpoints.extend(
+            [
+                "0.0.0.0:41392",
+                "127.0.0.1:41392",
+                "169.254.169.254:80",
+                "224.0.0.251:5353",
+                "255.255.255.255:41392",
+            ]
+            .map(|s| s.parse::<SocketAddr>().unwrap()),
+        );
+
+        let mut cmm =
+            disco::seal_call_me_maybe(&fx.peer_disco, &fx.node_disco, &endpoints).unwrap();
+        let out = fx
+            .node
+            .handle_relayed_disco(&mut cmm, derp_src_of(fx.peer_node))
+            .await;
+        assert_eq!(out, RelayedDisco::Consumed);
+        let mut learned = fx.node.candidate_addrs(&peer);
+        learned.sort();
+        let mut want = vec![lan, ten, cgnat];
+        want.sort();
+        assert_eq!(learned, want);
+        let data = fx
+            .receive(b"wireguard", lan)
+            .await
+            .expect("data from a CallMeMaybe endpoint is accepted");
+        assert_eq!(data.from_disco, peer);
+
+        fx.pong(lan, hairpin).await;
+        assert_eq!(fx.node.best_addr(&peer), Some(lan));
+        assert!(!fx.node.candidate_addrs(&peer).contains(&hairpin));
+        assert!(!lock(&fx.node.addr_to_disco).contains_key(&hairpin));
+
+        let stray: SocketAddr = "192.168.50.77:41392".parse().unwrap();
+        let unsolicited = disco::seal_pong(
+            &fx.peer_disco,
+            &fx.node_disco,
+            disco::random_tx_id(),
+            "203.0.113.10:41642".parse().unwrap(),
+        )
+        .unwrap();
+        assert!(fx.receive(&unsolicited, stray).await.is_none());
+        let mut after = fx.node.candidate_addrs(&peer);
+        after.sort();
+        assert_eq!(after, want);
+        assert!(!lock(&fx.node.addr_to_disco).contains_key(&stray));
+        assert_eq!(fx.node.best_addr(&peer), Some(lan));
     }
 
     // ---------------------------------------------------------------------------------------
@@ -6385,6 +7109,7 @@ mod tests {
 
         // A learns B's endpoint and pings it.
         a.add_peer_endpoints_unfiltered(b_disco.public_key(), [b_addr]);
+        a.note_peer_activity(&b_disco.public_key(), Instant::now());
         let sent = a.send_pings().await.unwrap();
         assert_eq!(sent, 1, "should ping B's one endpoint");
 
@@ -6475,11 +7200,15 @@ mod tests {
             }
             // Open the old connected socket without a megabyte of irrelevant test traffic.
             let shared = node.sock().await;
-            let connected = lock(&node.connected).socket_for(
-                old_addr,
-                crate::connected::CONNECT_AFTER_BYTES as usize,
-                &shared,
-            );
+            let connected = {
+                let mut c = lock(&node.connected);
+                c.note_sent(
+                    old_addr,
+                    crate::connected::CONNECT_AFTER_BYTES as usize,
+                    &shared,
+                );
+                c.socket_for(old_addr)
+            };
             assert_eq!(connected.is_some(), enabled);
             assert!(node.best_addr(&peer).is_none());
 
@@ -6500,6 +7229,7 @@ mod tests {
             );
             node.add_peer_endpoints_unfiltered(peer, [source]);
             node.set_netmap_endpoints(peer, [old_addr, advertised.local_addr().unwrap()]);
+            node.note_peer_activity(&peer, Instant::now());
             assert_eq!(node.send_pings().await.unwrap(), 3);
             let (mut ping, from) = receive(&moved).await;
             assert_eq!(from, local);
@@ -6517,11 +7247,15 @@ mod tests {
             // A stale ready entry remains, yet cannot override the freshly-confirmed address.
             assert_eq!(lock(&node.connected).ready_count(), usize::from(enabled));
             let shared = node.sock().await;
-            let current = lock(&node.connected).socket_for(
-                source,
-                crate::connected::CONNECT_AFTER_BYTES as usize,
-                &shared,
-            );
+            let current = {
+                let mut c = lock(&node.connected);
+                c.note_sent(
+                    source,
+                    crate::connected::CONNECT_AFTER_BYTES as usize,
+                    &shared,
+                );
+                c.socket_for(source)
+            };
             assert_eq!(current.is_some(), enabled);
             node.send_wireguard_batch(&peer, &[b"one", b"two"])
                 .await
@@ -6581,7 +7315,9 @@ mod tests {
         let (a_pump, mut a_rx) = pump(a.clone());
         let (b_pump, mut b_rx) = pump(b.clone());
 
+        a.note_peer_activity(&b_disco.public_key(), Instant::now());
         a.send_pings().await.unwrap();
+        b.note_peer_activity(&a_disco.public_key(), Instant::now());
         b.send_pings().await.unwrap();
         let confirmed = async {
             while a.best_addr(&b_disco.public_key()).is_none()
@@ -6646,6 +7382,154 @@ mod tests {
 
         a_pump.abort();
         b_pump.abort();
+    }
+
+    /// A loopback magicsock with connected sockets on, DF and batching off.
+    #[cfg(unix)]
+    async fn connected_sock() -> MagicSock {
+        MagicSock::bind_with(
+            localhost(),
+            DiscoPrivateKey::random(),
+            ts_keys::NodePrivateKey::random().public_key(),
+            crate::connected::Settings {
+                connected_sockets: true,
+                dont_fragment: false,
+                batched_io: false,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Only bytes the kernel accepted count toward a connected socket. A megabyte of sends that
+    /// all fail (a loopback socket cannot reach a documentation address) counts nothing and opens
+    /// nothing; a megabyte that goes out opens one, and not a datagram earlier.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connected_counts_completed_sends() {
+        let node = connected_sock().await;
+        let chunk = [7u8; 1200];
+        let sends = crate::connected::CONNECT_AFTER_BYTES as usize / chunk.len() + 1;
+
+        let unreachable: SocketAddr = "192.0.2.1:41641".parse().unwrap();
+        for _ in 0..sends {
+            assert!(node.send_udp(&chunk, unreachable).await.is_err());
+        }
+        assert_eq!(lock(&node.connected).ready_count(), 0);
+        assert_eq!(
+            lock(&node.connected).counted(unreachable),
+            Some(0),
+            "failed sends must not count"
+        );
+
+        let peer = UdpSocket::bind(localhost()).await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let drain = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while peer.recv_from(&mut buf).await.is_ok() {}
+        });
+        for _ in 0..sends - 1 {
+            assert!(node.send_udp(&chunk, peer_addr).await.unwrap());
+        }
+        assert_eq!(
+            lock(&node.connected).ready_count(),
+            0,
+            "one datagram short of the threshold"
+        );
+        assert!(node.send_udp(&chunk, peer_addr).await.unwrap());
+        assert_eq!(lock(&node.connected).ready_count(), 1);
+        drain.abort();
+    }
+
+    /// A connected socket that stops working goes back to the shared socket: when its sends keep
+    /// failing, and when the shared socket hears its peer while it has heard nothing for
+    /// `SILENT_REVERT`. Either way the address counts from zero again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connected_failed_flow_reverts_to_shared() {
+        use crate::connected::{
+            CONNECT_AFTER_BYTES, MAX_SEND_FAILURES, SILENT_REVERT, reuse_port_socket,
+        };
+        async fn receive(node: &MagicSock, peer: &UdpSocket, to: SocketAddr, payload: &[u8]) {
+            peer.send_to(payload, to).await.unwrap();
+            let data = tokio::time::timeout(Duration::from_secs(2), node.recv_data())
+                .await
+                .expect("the shared socket must deliver the peer's datagram")
+                .unwrap()
+                .unwrap();
+            assert_eq!(data.data.as_ref(), payload);
+        }
+        let node = connected_sock().await;
+        let peer = UdpSocket::bind(localhost()).await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let ready = || lock(&node.connected).ready_count();
+
+        // Sends that keep failing: a datagram too large for UDP fails on every socket.
+        let shared = node.sock().await;
+        lock(&node.connected).note_sent(peer_addr, CONNECT_AFTER_BYTES as usize, &shared);
+        assert_eq!(ready(), 1);
+        let oversize = vec![0u8; 65_536];
+        for _ in 1..MAX_SEND_FAILURES {
+            assert!(node.send_udp(&oversize, peer_addr).await.is_err());
+        }
+        assert_eq!(ready(), 1, "a few failures keep the connected socket");
+        assert!(node.send_udp(&oversize, peer_addr).await.is_err());
+        assert_eq!(ready(), 0, "sends that keep failing close it");
+        assert_eq!(lock(&node.connected).counted(peer_addr), Some(0));
+        assert!(node.send_udp(b"shared", peer_addr).await.unwrap());
+        let mut buf = [0u8; 64];
+        let (n, from) = peer.recv_from(&mut buf).await.unwrap();
+        assert_eq!(
+            (&buf[..n], from),
+            (&b"shared"[..], node.local_addr().unwrap())
+        );
+
+        // A silent flow: the connected socket is on a local address the peer no longer reaches
+        // (here another port; after an address change, the old address), so the peer's datagrams
+        // arrive on the shared socket instead.
+        let stale = UdpSocket::from_std(reuse_port_socket(localhost()).unwrap().into()).unwrap();
+        lock(&node.connected).note_sent(peer_addr, CONNECT_AFTER_BYTES as usize, &stale);
+        assert_eq!(ready(), 1);
+        let peer_disco = DiscoPrivateKey::random().public_key();
+        node.addr_to_disco
+            .lock()
+            .unwrap()
+            .insert(peer_addr, peer_disco);
+        // The connected socket hears its peer (its local address is stale's port): it is kept
+        // however long it had been quiet before.
+        receive(&node, &peer, stale.local_addr().unwrap(), b"heard").await;
+        lock(&node.connected).age_quiet(peer_addr, SILENT_REVERT);
+        receive(&node, &peer, node.local_addr().unwrap(), b"early").await;
+        assert_eq!(ready(), 1, "a connected socket that hears its peer is kept");
+        assert_eq!(lock(&node.connected).counted(peer_addr), None);
+        lock(&node.connected).age_quiet(peer_addr, SILENT_REVERT);
+        receive(&node, &peer, node.local_addr().unwrap(), b"late").await;
+        assert_eq!(
+            ready(),
+            0,
+            "a silent connected socket whose peer is heard closes"
+        );
+        assert_eq!(lock(&node.connected).counted(peer_addr), Some(0));
+    }
+
+    /// A send that completes on a socket a rebind has since replaced counts nothing, so it cannot
+    /// open a connected socket on the old socket's port; sends on the new socket still count.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connected_send_racing_a_rebind_counts_nothing() {
+        let node = connected_sock().await;
+        let peer: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let old = node.sock().await;
+        node.rebind().await.unwrap();
+        let new = node.sock().await;
+        assert!(!Arc::ptr_eq(&old, &new));
+
+        let threshold = crate::connected::CONNECT_AFTER_BYTES as usize;
+        node.note_shared_sent(peer, threshold, &old);
+        assert_eq!(lock(&node.connected).counted(peer), Some(0));
+        assert_eq!(lock(&node.connected).ready_count(), 0);
+        node.note_shared_sent(peer, threshold, &new);
+        assert_eq!(lock(&node.connected).ready_count(), 1);
     }
 
     /// `ping_now` sends a disco ping on demand and returns the FRESH round-trip latency + the
@@ -6926,6 +7810,7 @@ mod tests {
 
         // A learns B's endpoint and pings it (carrying A's real node key, matching the binding).
         a.add_peer_endpoints_unfiltered(b_disco.public_key(), [b_addr]);
+        a.note_peer_activity(&b_disco.public_key(), Instant::now());
         let sent = a.send_pings().await.unwrap();
         assert_eq!(sent, 1, "should ping B's one endpoint");
 
@@ -6951,11 +7836,12 @@ mod tests {
         b_task.abort();
     }
 
-    /// Before any pong, `self_endpoints` reports only the bound local address (no reflexive addr
-    /// is known yet). After A pings B and B pongs, A has learned its reflexive address from the
-    /// echoed `src` and reports it as a `Stun` endpoint — all on the one bound socket.
+    /// A real ping/pong exchange over loopback: A's ping is ponged and confirms the path, but the
+    /// `src` B echoes is A's loopback address, which is not a global address, so A does not
+    /// advertise it. (A global `src` from a member's solicited pong is learned: see
+    /// `pong_from_non_member_does_not_harvest_reflexive`.)
     #[tokio::test]
-    async fn self_endpoints_learns_reflexive_from_pong() {
+    async fn self_endpoints_does_not_learn_loopback_pong_src() {
         let a_disco = DiscoPrivateKey::random();
         let b_disco = DiscoPrivateKey::random();
         let a_node = ts_keys::NodePrivateKey::random().public_key();
@@ -6998,43 +7884,210 @@ mod tests {
 
         // Loopback is rejected by the production filter; use the test-only unfiltered seam.
         a.add_peer_endpoints_unfiltered(b_disco.public_key(), [b_addr]);
+        a.note_peer_activity(&b_disco.public_key(), Instant::now());
         a.send_pings().await.unwrap();
 
-        // Wait until A has learned a reflexive endpoint (driven by B's pong echoing A's src).
-        let learned = async {
-            loop {
-                if a.self_endpoints()
-                    .iter()
-                    .any(|e| e.ty == SelfEndpointType::Stun)
-                {
-                    break;
-                }
+        // Wait until B's pong has confirmed the path, so it has been through the harvest.
+        let confirmed = async {
+            while a.best_addr(&b_disco.public_key()).is_none() {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         };
-        tokio::time::timeout(std::time::Duration::from_secs(2), learned)
+        tokio::time::timeout(std::time::Duration::from_secs(2), confirmed)
             .await
-            .expect("timed out waiting to learn a reflexive endpoint");
+            .expect("timed out waiting for B's pong");
 
         let eps = a.self_endpoints();
-        let stun: Vec<_> = eps
-            .iter()
-            .filter(|e| e.ty == SelfEndpointType::Stun)
-            .collect();
-        assert_eq!(stun.len(), 1, "exactly one reflexive endpoint: {eps:?}");
-        // On loopback the reflexive address B observed is A's own bound address.
-        assert_eq!(stun[0].addr, a_addr, "reflexive addr is A's loopback src");
-        // The local address equals the reflexive one here, so it is listed once, as the
-        // higher-priority STUN kind (Go's `determineEndpoints` de-duplicates the same way).
-        assert_eq!(
-            eps.iter().filter(|e| e.addr == a_addr).count(),
-            1,
-            "one entry per address: {eps:?}"
-        );
-        assert!(!eps.iter().any(|e| e.ty == SelfEndpointType::Local));
+        assert_eq!(eps.len(), 1, "only the local endpoint: {eps:?}");
+        assert_eq!(eps[0].ty, SelfEndpointType::Local);
+        assert!(a.reflexive.lock().unwrap().is_empty());
 
         a_pump.abort();
         b_pump.abort();
+    }
+
+    /// Reflexive addresses carry their provenance, age out, and a full set makes room for new
+    /// ones. Router-side addresses a hairpinned pong reports are never recorded, so they are
+    /// neither advertised nor counted as symmetric-NAT evidence. Before the fix every pong `src`
+    /// went into an immortal first-16 set: hairpin addresses were advertised, and once the set
+    /// filled a new public mapping was ignored until a rebind.
+    #[tokio::test]
+    async fn reflexive_provenance_expiry_and_capacity() {
+        use crate::reflexive::REFLEXIVE_LIFETIME;
+
+        let sock = plain_sock().await;
+        let stun = |eps: &[SelfEndpoint]| -> Vec<SocketAddr> {
+            eps.iter()
+                .filter(|e| e.ty == SelfEndpointType::Stun)
+                .map(|e| e.addr)
+                .collect()
+        };
+        let t0 = Instant::now();
+
+        // Hairpin and other non-global pong sources: nothing recorded, nothing advertised, no
+        // hard-NAT guess derived from them.
+        for hairpin in [
+            "192.168.50.1:1024",
+            "192.168.50.1:1038",
+            "192.168.50.1:1041",
+            "192.168.50.1:41642",
+            "10.1.2.3:41642",
+            "100.64.1.2:41642",
+            "127.0.0.1:41642",
+        ] {
+            sock.note_reflexive_at(hairpin.parse().unwrap(), ReflexiveSource::PeerPong, t0);
+        }
+        assert!(sock.reflexive.lock().unwrap().is_empty());
+        let eps = sock.self_endpoints();
+        assert!(
+            eps.iter().all(|e| e.ty == SelfEndpointType::Local),
+            "{eps:?}"
+        );
+
+        // A global pong source is recorded as a peer observation.
+        let pong_src: SocketAddr = "198.51.100.200:40000".parse().unwrap();
+        sock.note_reflexive_at(pong_src, ReflexiveSource::PeerPong, t0);
+        assert_eq!(
+            sock.reflexive.lock().unwrap().source(&pong_src, t0),
+            Some(ReflexiveSource::PeerPong)
+        );
+
+        // Fill the set with peer observations at t0.
+        let stale: Vec<SocketAddr> = (1..MAX_REFLEXIVE_ADDRS as u16)
+            .map(|i| SocketAddr::new("198.51.100.7".parse().unwrap(), 40000 + i))
+            .collect();
+        for addr in &stale {
+            sock.note_reflexive_at(*addr, ReflexiveSource::PeerPong, t0);
+        }
+        assert_eq!(sock.reflexive.lock().unwrap().len(), MAX_REFLEXIVE_ADDRS);
+
+        // Full set, still fresh: a STUN result replaces the stalest peer observation.
+        let stun_a: SocketAddr = "203.0.113.5:51000".parse().unwrap();
+        let t1 = t0 + Duration::from_secs(1);
+        sock.note_reflexive_at(stun_a, ReflexiveSource::Stun, t1);
+        assert_eq!(sock.reflexive.lock().unwrap().len(), MAX_REFLEXIVE_ADDRS);
+        assert!(stun(&sock.self_endpoints()).contains(&stun_a));
+
+        // Past the lifetime with no sweep in between (an idle node), everything is still
+        // advertised: Go reads its last determination unfiltered (`magicsock.go:995`).
+        let t2 = t0 + REFLEXIVE_LIFETIME + Duration::from_nanos(1);
+        let eps = sock.self_endpoints();
+        assert_eq!(stun(&eps).len(), MAX_REFLEXIVE_ADDRS, "{eps:?}");
+
+        // An expiry at the lifetime keeps everything: an entry is live up to and including
+        // `REFLEXIVE_LIFETIME` after its last observation.
+        sock.reflexive
+            .lock()
+            .unwrap()
+            .prune(t0 + REFLEXIVE_LIFETIME);
+        assert_eq!(stun(&sock.self_endpoints()).len(), MAX_REFLEXIVE_ADDRS);
+
+        // One past it, the peer observations are no longer advertised, nor a reason to emit
+        // hard-NAT guesses.
+        sock.reflexive.lock().unwrap().prune(t2);
+        let eps = sock.self_endpoints();
+        assert_eq!(stun(&eps), [stun_a], "{eps:?}");
+        assert!(
+            !eps.iter().any(|e| e.ty == SelfEndpointType::Stun4LocalPort),
+            "{eps:?}"
+        );
+        assert_eq!(
+            sock.reflexive.lock().unwrap().source(&stun_a, t2),
+            Some(ReflexiveSource::Stun)
+        );
+        assert_eq!(sock.reflexive.lock().unwrap().source(&pong_src, t2), None);
+        sock.note_reflexive_at(stun_a, ReflexiveSource::Stun, t2);
+
+        // A new mapping after the stale entries expired is learned (it used to be ignored once
+        // 16 addresses had ever been seen).
+        let stun_b: SocketAddr = "203.0.113.6:52000".parse().unwrap();
+        sock.note_reflexive_at(stun_b, ReflexiveSource::Stun, t2);
+        assert_eq!(stun(&sock.self_endpoints()), [stun_a, stun_b]);
+
+        // A set full of STUN results: a peer observation cannot displace any of them.
+        let t3 = t2 + Duration::from_secs(1);
+        let stun_full: Vec<SocketAddr> = (0..MAX_REFLEXIVE_ADDRS as u16)
+            .map(|i| SocketAddr::new("203.0.113.9".parse().unwrap(), 50000 + i))
+            .collect();
+        for addr in &stun_full {
+            sock.note_reflexive_at(*addr, ReflexiveSource::Stun, t3);
+        }
+        let before = sock.reflexive.lock().unwrap().addrs();
+        sock.note_reflexive_at(pong_src, ReflexiveSource::PeerPong, t3);
+        assert_eq!(sock.reflexive.lock().unwrap().addrs(), before);
+
+        // An address both sources report keeps STUN's protection only while its STUN observation
+        // is live. Later, kept alive by pongs alone, it is a peer observation that a new peer
+        // observation may replace.
+        let both = stun_full[0];
+        let t4 = t3 + REFLEXIVE_LIFETIME / 2;
+        sock.note_reflexive_at(both, ReflexiveSource::PeerPong, t4);
+        assert_eq!(
+            sock.reflexive.lock().unwrap().source(&both, t4),
+            Some(ReflexiveSource::Stun)
+        );
+        let t5 = t3 + REFLEXIVE_LIFETIME + Duration::from_secs(1);
+        sock.reflexive.lock().unwrap().prune(t5);
+        assert_eq!(stun(&sock.self_endpoints()), [both]);
+        assert_eq!(
+            sock.reflexive.lock().unwrap().source(&both, t5),
+            Some(ReflexiveSource::PeerPong)
+        );
+        // Refill with STUN results so the set is full again at t5, then a new peer observation
+        // replaces `both`, the only peer observation.
+        for i in 0..MAX_REFLEXIVE_ADDRS as u16 - 1 {
+            let addr = SocketAddr::new("203.0.113.10".parse().unwrap(), 50000 + i);
+            sock.note_reflexive_at(addr, ReflexiveSource::Stun, t5);
+        }
+        sock.note_reflexive_at(pong_src, ReflexiveSource::PeerPong, t5);
+        let live = sock.reflexive.lock().unwrap().addrs();
+        assert!(
+            live.contains(&pong_src) && !live.contains(&both),
+            "{live:?}"
+        );
+    }
+
+    /// Reflexive expiry runs only at a STUN sweep, never on read, so an idle node (whose sweeps
+    /// have stopped) keeps advertising its last addresses, as Go does: Go expires cached
+    /// endpoints only inside `determineEndpoints` (`wgengine/magicsock/magicsock.go:1405`) and
+    /// advertises its last determination until the next (`magicsock.go:995`). Before the fix the
+    /// read filtered on the clock, so 5 min 10 s into idleness every STUN endpoint was withdrawn
+    /// from control.
+    #[tokio::test]
+    async fn reflexive_addresses_expire_only_at_a_stun_sweep() {
+        use crate::reflexive::REFLEXIVE_LIFETIME;
+
+        let sock = plain_sock().await;
+        let stun = |sock: &MagicSock| -> Vec<SocketAddr> {
+            sock.self_endpoints()
+                .into_iter()
+                .filter(|e| e.ty == SelfEndpointType::Stun)
+                .map(|e| e.addr)
+                .collect()
+        };
+        let stale: SocketAddr = "203.0.113.5:51000".parse().unwrap();
+        let kept: SocketAddr = "203.0.113.5:51001".parse().unwrap();
+        let t0 = Instant::now();
+        sock.expire_reflexive_at(t0);
+        sock.note_reflexive_at(stale, ReflexiveSource::Stun, t0);
+        sock.note_reflexive_at(kept, ReflexiveSource::Stun, t0);
+
+        // Idle for twice the lifetime, no sweep, and a pong as traffic resumes: still advertised.
+        let t1 = t0 + 2 * REFLEXIVE_LIFETIME;
+        let pong: SocketAddr = "198.51.100.200:40000".parse().unwrap();
+        sock.note_reflexive_at(pong, ReflexiveSource::PeerPong, t1);
+        assert_eq!(stun(&sock), [pong, stale, kept]);
+
+        // The first sweep after the idle applies the previous sweep's decision, when both were
+        // fresh, so nothing is withdrawn while its STUN responses are in flight.
+        sock.expire_reflexive_at(t1);
+        assert_eq!(stun(&sock), [pong, stale, kept]);
+        // That sweep re-observes `kept` only.
+        sock.note_reflexive_at(kept, ReflexiveSource::Stun, t1 + Duration::from_millis(50));
+
+        // The next sweep drops what the previous one did not re-observe.
+        sock.expire_reflexive_at(t1 + Duration::from_secs(23));
+        assert_eq!(stun(&sock), [pong, kept]);
     }
 
     /// The disco-pong reflexive harvest is gated on netmap membership: a pong sealed by a disco key
@@ -7164,6 +8217,127 @@ mod tests {
             sock.reflexive.lock().unwrap().is_empty(),
             "an unsolicited pong (no matching in-flight ping) must not harvest its src"
         );
+    }
+
+    /// A socket bound to `0.0.0.0` must advertise the host's interface addresses, never the
+    /// wildcard itself: control and every `CallMeMaybe` are built from `self_endpoints`, and a peer
+    /// handed `0.0.0.0:port` pings its own unspecified address (Go logs `sendto: no route to host`
+    /// on every discovery cycle). Interfaces are injected so the expansion is deterministic.
+    #[tokio::test]
+    async fn wildcard_expands_before_advertisement() {
+        use crate::local_addrs::InterfaceAddr;
+        use std::sync::atomic::AtomicUsize;
+
+        fn iface(name: &str, ip: &str, up: bool) -> InterfaceAddr {
+            InterfaceAddr {
+                name: name.into(),
+                ip: ip.parse().unwrap(),
+                prefix_len: 24,
+                up,
+                loopback_iface: name.starts_with("lo"),
+            }
+        }
+        fn unusable(addr: &SocketAddr) -> bool {
+            let ip = addr.ip();
+            ip.is_unspecified() || ip.is_loopback() || ip.is_multicast()
+        }
+        async fn bind_with_ifaces(
+            bind: &str,
+            ifaces: std::io::Result<Vec<InterfaceAddr>>,
+            calls: Arc<AtomicUsize>,
+        ) -> MagicSock {
+            let ifaces = ifaces.map_err(|e| e.kind());
+            MagicSock::bind(
+                bind.parse().unwrap(),
+                DiscoPrivateKey::random(),
+                ts_keys::NodePrivateKey::random().public_key(),
+            )
+            .await
+            .unwrap()
+            .with_interface_addrs(move || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                ifaces.clone().map_err(std::io::Error::from)
+            })
+        }
+        let host = || {
+            vec![
+                iface("lo0", "127.0.0.1", true),
+                iface("lo0", "::1", true),
+                iface("en0", "fe80::1", true),
+                iface("en0", "192.168.50.76", true),
+                iface("en0", "2001:db8:1::1", true),
+                iface("en5", "169.254.10.20", true),
+                iface("en7", "192.168.60.5", false),
+                iface("utun4", "100.101.102.103", true),
+                iface("zt0", "10.147.17.5", true),
+            ]
+        };
+
+        // Wildcard bind: the usable LAN address on the bound port, nothing else local. A bogus
+        // peer-reported reflexive (`0.0.0.0`) is dropped too; a real one is kept.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sock = bind_with_ifaces("0.0.0.0:0", Ok(host()), calls.clone()).await;
+        let port = sock.local_addr().unwrap().port();
+        {
+            let mut r = sock.reflexive.lock().unwrap();
+            r.insert("0.0.0.0:41642".parse().unwrap());
+            r.insert("203.0.113.5:51000".parse().unwrap());
+        }
+        let eps = sock.self_endpoints();
+        let locals: Vec<SocketAddr> = eps
+            .iter()
+            .filter(|e| e.ty == SelfEndpointType::Local)
+            .map(|e| e.addr)
+            .collect();
+        assert_eq!(
+            locals,
+            [SocketAddr::new("192.168.50.76".parse().unwrap(), port)],
+            "{eps:?}"
+        );
+        assert!(!eps.iter().any(|e| unusable(&e.addr)), "{eps:?}");
+        assert!(
+            eps.iter().any(|e| e.ty == SelfEndpointType::Stun
+                && e.addr == "203.0.113.5:51000".parse().unwrap()),
+            "{eps:?}"
+        );
+
+        // The CallMeMaybe a peer decrypts carries exactly that set.
+        let peer = DiscoPrivateKey::random();
+        let mut frame = sock.seal_call_me_maybe(&peer.public_key()).unwrap();
+        match disco::open(&peer, &mut frame).unwrap() {
+            Inbound::CallMeMaybe { endpoints, .. } => {
+                let want: Vec<SocketAddr> = eps.iter().map(|e| e.addr).collect();
+                assert_eq!(endpoints, want);
+                assert!(!endpoints.iter().any(unusable), "{endpoints:?}");
+            }
+            other => panic!("expected CallMeMaybe, got {other:?}"),
+        }
+
+        // Only loopback and IPv4 link-local: Go's fallback offers the link-local address.
+        let only_link_local = vec![
+            iface("lo0", "127.0.0.1", true),
+            iface("en0", "169.254.10.20", true),
+        ];
+        let sock = bind_with_ifaces("0.0.0.0:0", Ok(only_link_local), calls.clone()).await;
+        let port = sock.local_addr().unwrap().port();
+        let addrs: Vec<SocketAddr> = sock.self_endpoints().iter().map(|e| e.addr).collect();
+        assert_eq!(
+            addrs,
+            [SocketAddr::new("169.254.10.20".parse().unwrap(), port)]
+        );
+
+        // Enumeration failure: no local candidate, and still never the wildcard.
+        let failed = Err(std::io::Error::other("getifaddrs failed"));
+        let sock = bind_with_ifaces("0.0.0.0:0", failed, calls.clone()).await;
+        let eps = sock.self_endpoints();
+        assert!(eps.is_empty(), "{eps:?}");
+
+        // A concrete bind offers only its own address and never reads the interfaces.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sock = bind_with_ifaces("127.0.0.1:0", Ok(host()), calls.clone()).await;
+        let addrs: Vec<SocketAddr> = sock.self_endpoints().iter().map(|e| e.addr).collect();
+        assert_eq!(addrs, [sock.local_addr().unwrap()]);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -7328,6 +8502,7 @@ mod tests {
 
         // A learns B's endpoint and pings it; the pumps confirm the path.
         a_sock.add_peer_endpoints_unfiltered(b_disco.public_key(), [b_addr]);
+        a_sock.note_peer_activity(&b_disco.public_key(), Instant::now());
         a_sock.send_pings().await.unwrap();
 
         let confirm = async {
@@ -7416,6 +8591,70 @@ mod tests {
         );
 
         pump.abort();
+    }
+
+    /// Go `endpoint.handleCallMeMaybe`: a `CallMeMaybe` relayed over DERP pings the sender's
+    /// candidates at once even when there has been no traffic with it. It does not count as
+    /// traffic, though, so it starts no heartbeat and the idle peer is not pinged again afterwards.
+    #[tokio::test]
+    async fn an_inbound_call_me_maybe_pings_an_idle_peer_without_starting_its_heartbeat() {
+        let peer_disco = DiscoPrivateKey::random();
+        let peer_node = ts_keys::NodePrivateKey::random().public_key();
+        let peer = peer_disco.public_key();
+        let recv_disco = DiscoPrivateKey::random();
+        let recv = MagicSock::bind(
+            localhost(),
+            recv_disco.clone(),
+            ts_keys::NodePrivateKey::random().public_key(),
+        )
+        .await
+        .unwrap()
+        .with_binding_verifier(allow_all());
+
+        // A netmap endpoint on loopback, where a sink sees the pings. The CallMeMaybe itself
+        // advertises nothing, so every probe stays on loopback.
+        let sink = tokio::net::UdpSocket::bind(localhost()).await.unwrap();
+        recv.set_netmap_endpoints(peer, [sink.local_addr().unwrap()]);
+        let start = Instant::now();
+        assert!(
+            !recv.is_peer_active(&peer, start),
+            "precondition: no traffic with the peer"
+        );
+
+        let mut cmm =
+            disco::seal_call_me_maybe(&peer_disco, &recv_disco.public_key(), &[]).unwrap();
+        assert_eq!(
+            recv.handle_relayed_disco(&mut cmm, derp_src_of(peer_node))
+                .await,
+            RelayedDisco::Consumed
+        );
+
+        let mut buf = [0u8; 1500];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), sink.recv_from(&mut buf))
+            .await
+            .expect("an inbound CallMeMaybe must ping an idle peer at once")
+            .unwrap();
+        assert!(
+            matches!(
+                disco::open(&peer_disco, &mut buf[..n]).unwrap(),
+                Inbound::Ping { .. }
+            ),
+            "the sink must receive a disco ping"
+        );
+
+        // Two minutes of pinger ticks after the CallMeMaybe send nothing more.
+        for secs in (2..=120).step_by(2) {
+            let now = start + Duration::from_secs(secs);
+            assert_eq!(
+                recv.send_pings_at(now).await.unwrap(),
+                0,
+                "a CallMeMaybe must not start a heartbeat for an idle peer ({secs}s later)"
+            );
+        }
+        assert!(
+            !recv.is_peer_active(&peer, start),
+            "a CallMeMaybe is not traffic with the peer"
+        );
     }
 
     /// A DERP-borne CallMeMaybe is bound to the node whose DERP connection delivered it, not merely
@@ -8377,6 +9616,7 @@ mod tests {
         sock.add_peer_endpoints_unfiltered(peer, [target, other]);
 
         let before = CounterSnapshot::take();
+        sock.note_peer_activity(&peer, Instant::now());
         let sent = sock.send_pings().await.unwrap();
         let after = CounterSnapshot::take();
         assert!(
@@ -8424,7 +9664,7 @@ mod tests {
         // Dedup is pinned deterministically on the per-socket set (no global-counter race): the set
         // already holds `mapped`, and re-noting it leaves the size unchanged.
         let size_before = s.reflexive.lock().unwrap().len();
-        s.note_reflexive(SocketAddr::V4(mapped));
+        s.note_reflexive(SocketAddr::V4(mapped), ReflexiveSource::Stun);
         let size_after = s.reflexive.lock().unwrap().len();
         assert_eq!(
             size_before, size_after,
@@ -8644,7 +9884,7 @@ mod tests {
         let sock = plain_sock().await;
 
         // Seed mapping-derived state: a reflexive address, and a peer with a candidate endpoint.
-        sock.note_reflexive("203.0.113.9:41641".parse().unwrap());
+        sock.note_reflexive("203.0.113.9:41641".parse().unwrap(), ReflexiveSource::Stun);
         assert!(
             !lock(&sock.reflexive).is_empty(),
             "precondition: a reflexive addr is learned"
@@ -8879,6 +10119,7 @@ mod tests {
         sock.add_peer_endpoints_unfiltered(peer, [target, other]);
 
         // First periodic sweep pings both candidates and stamps their `last_ping`.
+        sock.note_peer_activity(&peer, Instant::now());
         let first = sock.send_pings().await.unwrap();
         assert_eq!(first, 2, "the first periodic sweep pings both candidates");
 
@@ -9187,8 +10428,10 @@ mod tests {
                 .needs_refresh(tick),
             "precondition: the prober's gate is open — the refusal is at the socket, not here"
         );
+        // The peer has traffic, so the heartbeat is due rather than skipped as idle.
+        sock.note_peer_activity(&peer_pub, tick);
         assert_eq!(
-            sock.send_pings().await.unwrap(),
+            sock.send_pings_at(tick).await.unwrap(),
             0,
             "the periodic prober puts nothing on the wire under the attribute"
         );
@@ -9202,6 +10445,13 @@ mod tests {
                 .best_addr(lapsed)
                 .is_none(),
             "an unrefreshed path must lapse, which is what puts this peer on DERP"
+        );
+
+        sock.set_only_tcp_443(false);
+        assert_eq!(
+            sock.send_pings_at(tick).await.unwrap(),
+            1,
+            "control withdrawing the attribute restores the heartbeat"
         );
     }
 
@@ -9475,6 +10725,7 @@ mod tests {
             recv.candidate_addrs(&sender_pub).is_empty(),
             "a CallMeMaybe on the UDP socket must learn no endpoint"
         );
+        recv.note_peer_activity(&sender_pub, Instant::now());
         assert_eq!(
             recv.send_pings().await.unwrap(),
             0,
@@ -9555,6 +10806,7 @@ mod tests {
             vec![public_ep],
             "the relayed CallMeMaybe's endpoint must be learned"
         );
+        recv.note_peer_activity(&peer_disco.public_key(), Instant::now());
         assert_eq!(
             recv.send_pings().await.unwrap(),
             0,

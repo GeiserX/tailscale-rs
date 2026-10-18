@@ -1319,9 +1319,9 @@ mod tests {
         assert!(sock.candidate_addrs(&peer_disco.public_key()).is_empty());
     }
 
-    /// A relayed `CallMeMaybe` advertising a forbidden candidate (loopback/private/IPv6) has that
-    /// endpoint filtered by `is_pingable_candidate` before it can become a host-sourced ping
-    /// target; only the public candidate offered alongside it is learned.
+    /// A relayed `CallMeMaybe` advertising a forbidden candidate (loopback) has that endpoint
+    /// filtered by `is_learnable_candidate` before it can become a host-sourced ping target; the
+    /// private and public candidates offered alongside it are learned, as in Go.
     #[tokio::test]
     async fn relayed_call_me_maybe_forbidden_endpoints_filtered() {
         let our_disco = DiscoPrivateKey::random();
@@ -1352,10 +1352,12 @@ mod tests {
         .data;
         assert!(out.is_empty(), "the CallMeMaybe is consumed, not forwarded");
 
+        let mut learned = sock.candidate_addrs(&peer_disco.public_key());
+        learned.sort();
         assert_eq!(
-            sock.candidate_addrs(&peer_disco.public_key()),
-            vec![public],
-            "only the public candidate survives the pingable-candidate filter"
+            learned,
+            vec![private, public],
+            "only the loopback candidate is filtered"
         );
     }
 
