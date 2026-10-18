@@ -4,6 +4,10 @@ Record breaking or significant changes here. All dates are UTC.
 
 ## Unreleased
 
+### Bug Fixes
+
+* **magicsock:** with connected sockets on, only datagrams the kernel accepted count toward opening one, and a connected socket whose sends keep failing, or that hears nothing while the shared socket hears its peer, closes and the address goes back to the shared socket; failed sends to an unreachable LAN host no longer open a socket that drops that peer's traffic.
+
 ### Performance
 
 * **exit node:** forwarded TCP flows run without Nagle, the underlay UDP sockets ask for Go's 7 MiB buffers, netstack egress goes out in batches of up to 64 packets, and the netstack tracks 32 receive holes for uploads. Kernel receive batching, splice coalescing, targeted replay and Apple connected UDP sockets are opt-in experiments, off unless their variable is `1`.
