@@ -63,8 +63,9 @@ pub(crate) struct MagicsockMetrics {
     /// (`handle_stun_response` returned `true`, including responses consumed but unusable such as
     /// IPv6-mapped or malformed) (`magicsock_stun_recv`).
     pub stun_recv: &'static Metric,
-    /// Reflexive (STUN-equivalent) addresses actually recorded as NEW by `note_reflexive` — counts
-    /// only fresh inserts, not duplicates of an address already learned (`magicsock_reflexive_learned`).
+    /// Admissions into the reflexive set by `note_reflexive`: a new address, or one admitted again
+    /// after a sweep expired it or it was replaced; not a refresh of a stored address nor a
+    /// rejected one (`magicsock_reflexive_learned`).
     pub reflexive_learned: &'static Metric,
 
     /// Inbound disco `CallMeMaybeVia` frames ACCEPTED: the relaying peer is relay capable and bound

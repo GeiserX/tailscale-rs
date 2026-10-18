@@ -40,8 +40,8 @@ use ts_transport::{
 use crate::{
     Env, Error,
     dataplane::{
-        DatapathActivity, DataplaneActor, NewUnderlayTransport, UnderlayFromDataplane,
-        UnderlayToDataplane,
+        DatapathActivity, DataplaneActor, NewUnderlayTransport, PeerActivity,
+        UnderlayFromDataplane, UnderlayToDataplane,
     },
     multiderp::{self, Multiderp},
     peer_tracker::{DiscoKeyMatch, PeerDb, PeerState},
@@ -315,6 +315,10 @@ pub struct DirectManager {
     /// [`should_do_periodic_restun`]). An `AtomicBool` rather than a bus message or an actor `ask`
     /// because the reader is a plain task and the value is one independent bit.
     force_background_stun: Arc<AtomicBool>,
+    /// Which peers have had traffic lately (`Env::peer_activity`). Read by the
+    /// [`run_discovery_on_traffic`] task; held here so departed peers can be pruned from it on each
+    /// netmap.
+    peer_activity: PeerActivity,
     /// The NAT port-mapper driver's handle, when the port mapper runs (see [`crate::portmap`]).
     /// Rebinds invalidate through it synchronously; `re_stun`, the first peer and a lifted
     /// `only-tcp-443` kick it.
@@ -425,9 +429,10 @@ impl DirectManager {
     ///
     /// 1. [`MagicSock::rebind`] — swap the socket; clear reflexive + every confirmed best path
     ///    (keeping candidates), so peers fail closed to DERP and re-probe over the new socket.
-    /// 2. [`MagicSock::send_pings`] — re-ping all candidates **now** on the freshly-swapped socket,
-    ///    so a still-reachable peer re-confirms its direct path immediately instead of after up to a
-    ///    full `PING_INTERVAL`.
+    /// 2. [`MagicSock::send_pings`] — re-ping the candidates of every peer with recent traffic
+    ///    **now** on the freshly-swapped socket (idle peers are probed when their traffic resumes,
+    ///    as after Go's noteConnectivityChange), so a still-reachable active peer re-confirms its
+    ///    direct path immediately instead of after up to a full `PING_INTERVAL`.
     /// 3. An immediate STUN sweep to the derp map's v4 STUN servers (same source + gate as the
     ///    periodic [`run_stun_prober`]): re-learn our reflexive/public address on the new socket
     ///    now, rather than waiting out the jittered ~23s timer.
@@ -460,9 +465,9 @@ impl DirectManager {
         self.portmap_note_rebind(sock);
         rebound?;
 
-        // 2. Re-ping all candidates now on the new socket (every best is None post-rebind, so this
-        //    re-pings everything under the normal cadence gates). A send error is non-fatal: the
-        //    periodic pinger backstops it.
+        // 2. Re-ping candidates now on the new socket (every best is None post-rebind, so this
+        //    re-pings every candidate of every active peer under the normal cadence gates; idle
+        //    peers wait for traffic). A send error is non-fatal: the periodic pinger backstops it.
         if let Err(e) = sock.send_pings().await {
             tracing::trace!(error = %e, "rebind-and-reprobe: re-ping after rebind");
         }
@@ -528,6 +533,9 @@ impl DirectManager {
     /// per-server fan-out live in one place.
     async fn stun_sweep_once(&self, sock: &MagicSock) {
         if stun_probe_should_run(&self.peer_db) {
+            // Go's `ReSTUN` re-runs `determineEndpoints`, the only place its endpoint tracker
+            // expires anything (`wgengine/magicsock/magicsock.go:1405`, `:3695`).
+            sock.expire_reflexive();
             match self.multiderp.ask(multiderp::StunServersV4).await {
                 Ok((servers,)) => probe_stun_servers_once(sock, &servers, &self.stun_cursor).await,
                 Err(e) => {
@@ -788,7 +796,15 @@ async fn handoff_received(
     }
 }
 
-/// Periodically (re)ping candidate endpoints to confirm and keep direct paths alive.
+/// The instant path discovery is scheduled against: tokio's clock, the one the discovery timers
+/// tick on, so a test that pauses it drives the whole schedule. Outside such a test it is
+/// `Instant::now()`.
+fn discovery_now() -> std::time::Instant {
+    tokio::time::Instant::now().into_std()
+}
+
+/// Periodically (re)ping candidate endpoints to confirm and keep direct paths alive. Only peers
+/// with recent traffic are pinged; see [`MagicSock::send_pings_at`].
 async fn run_pinger(sock: Arc<MagicSock>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(PING_INTERVAL);
     // If a tick is missed (e.g. send_pings ran long under load), space the next tick a full period
@@ -799,7 +815,7 @@ async fn run_pinger(sock: Arc<MagicSock>, mut shutdown: tokio::sync::watch::Rece
         tokio::select! {
             _ = shutdown.changed() => break,
             _ = interval.tick() => {
-                if let Err(e) = sock.send_pings().await {
+                if let Err(e) = sock.send_pings_at(discovery_now()).await {
                     tracing::trace!(error = %e, "sending disco pings");
                 }
             }
@@ -842,6 +858,11 @@ async fn run_stun_prober(
                 if !should_do_periodic_restun(&peer_db, &activity, &force_background_stun) {
                     continue;
                 }
+
+                // Expire reflexive addresses at the sweep, as Go's `determineEndpoints` does
+                // (`wgengine/magicsock/magicsock.go:1405`). Skipped sweeps expire nothing, so an
+                // idle node keeps advertising its last addresses.
+                sock.expire_reflexive();
 
                 // Best-effort: if multiderp is unavailable just skip this round (pong-harvest
                 // still runs), matching how the other loops treat multiderp send errors.
@@ -1080,6 +1101,49 @@ async fn run_advertiser<F, Fut>(
     }
 }
 
+/// Where `CallMeMaybe`s are relayed: [`Multiderp`] in production, a recorder in tests.
+trait DiscoRelay: Send + Sync {
+    /// The DERP region to reach `node` on when the netmap gave none for it.
+    fn region_for_node(
+        &self,
+        node: NodePublicKey,
+    ) -> impl Future<Output = Option<ts_derp::RegionId>> + Send;
+
+    /// Relay the sealed disco `frame` to `peer` through `region`.
+    fn send_disco(
+        &self,
+        peer: NodePublicKey,
+        region: ts_derp::RegionId,
+        frame: Vec<u8>,
+    ) -> impl Future<Output = ()> + Send;
+}
+
+impl DiscoRelay for ActorRef<Multiderp> {
+    async fn region_for_node(&self, node: NodePublicKey) -> Option<ts_derp::RegionId> {
+        // PeerId lookup + region inference both live in multiderp; ask it.
+        match self.ask(multiderp::RegionForNode { node }).await {
+            Ok(region) => region,
+            Err(e) => {
+                tracing::trace!(error = %e, "inferring call-me-maybe relay region");
+                None
+            }
+        }
+    }
+
+    async fn send_disco(&self, peer: NodePublicKey, region: ts_derp::RegionId, frame: Vec<u8>) {
+        if let Err(e) = self
+            .tell(multiderp::SendDisco {
+                peer,
+                region,
+                frame,
+            })
+            .await
+        {
+            tracing::trace!(error = %e, "relaying call-me-maybe to multiderp");
+        }
+    }
+}
+
 /// Whether `eps` holds a candidate a remote peer could reach across the internet: a STUN
 /// reflexive address or a port mapping. (This gate is a Rust addition; Go's `enqueueCallMeMaybe`
 /// sends whatever endpoints it last determined.)
@@ -1092,23 +1156,67 @@ fn has_reflexive_candidate(eps: &[SelfEndpoint]) -> bool {
     })
 }
 
-/// Periodically send a `CallMeMaybe` over DERP to each peer that has no confirmed direct path
-/// yet, prompting it to disco-ping our candidate endpoints so a direct path can open. Gated on
-/// [`MagicSock::best_addr`] being `None`: once a path is confirmed we stop relaying to that peer,
-/// so this never spams DERP for peers that are already direct.
+/// Whether a `CallMeMaybe` from us is worth sending at all.
 ///
-/// We only target peers that have a disco key. The relay region is the peer's netmap home region
-/// when control supplied one, else the inferred region from [`Multiderp::region_for_peer`] (an
-/// observed route, or our own home region as a last resort) — the same connectivity-floor inference
-/// the route updater uses, so a peer whose netmap carried no region can still be prompted to open a
-/// direct path (issue #24: without this the WireGuard floor came up over DERP but the direct upgrade
-/// was never even attempted for a no-region peer). The frame carries our
-/// [`MagicSock::self_endpoints`] — the same set advertised to control — so no host-identifying
-/// address beyond that is disclosed.
+/// A CallMeMaybe is only actionable to a remote peer if we have a reflexive (STUN-discovered) or
+/// port-mapped candidate it can actually reach across the internet; a purely local LAN address is
+/// useless to relay over DERP. See [`has_reflexive_candidate`].
+fn have_reflexive(sock: &MagicSock) -> bool {
+    has_reflexive_candidate(&sock.self_endpoints())
+}
+
+/// Seal a `CallMeMaybe` to `disco` and relay it to `node_key` over DERP.
+///
+/// The relay region is the peer's netmap home region when control supplied one, else the inferred
+/// region from [`Multiderp::region_for_peer`] (an observed route, or our own home region as a last
+/// resort) — the same connectivity-floor inference the route updater uses, so a peer whose netmap
+/// carried no region can still be prompted to open a direct path (issue #24: without this the
+/// WireGuard floor came up over DERP but the direct upgrade was never even attempted for a
+/// no-region peer). The frame carries our [`MagicSock::self_endpoints`] — the same set advertised
+/// to control — so no host-identifying address beyond that is disclosed.
+async fn send_call_me_maybe(
+    sock: &MagicSock,
+    relay: &impl DiscoRelay,
+    node_key: NodePublicKey,
+    disco: DiscoPublicKey,
+    netmap_region: Option<ts_derp::RegionId>,
+) {
+    let region = match netmap_region {
+        Some(region) => Some(region),
+        None => relay.region_for_node(node_key).await,
+    };
+    let Some(region) = region else {
+        // No region from netmap, no observed route, no home region yet: nothing to relay through
+        // this round. Recovered on the next cadence once one appears.
+        return;
+    };
+
+    let frame = match sock.seal_call_me_maybe(&disco) {
+        Ok(frame) => frame,
+        Err(e) => {
+            tracing::trace!(error = %e, "sealing call-me-maybe");
+            return;
+        }
+    };
+
+    relay.send_disco(node_key, region, frame).await;
+}
+
+/// Periodically send a `CallMeMaybe` over DERP to each peer with recent traffic that has no
+/// confirmed direct path yet, prompting it to disco-ping our candidate endpoints so a direct path
+/// can open.
+///
+/// Gated on [`MagicSock::best_addr`] being `None`: once a path is confirmed we stop relaying to
+/// that peer, so this never spams DERP for peers that are already direct. Gated on
+/// [`MagicSock::is_peer_active`] too: Go only sends a `CallMeMaybe` from `sendDiscoPingsLocked`,
+/// which runs from `endpoint.send` and `endpoint.heartbeat`, both driven by traffic. A peer we
+/// exchange nothing with is left on DERP rather than prompted every few seconds forever.
+///
+/// We only target peers that have a disco key; see [`send_call_me_maybe`] for the relay region.
 async fn run_call_me_maybe(
     sock: Arc<MagicSock>,
     peer_db: Arc<RwLock<Option<Arc<PeerDb>>>>,
-    multiderp: ActorRef<Multiderp>,
+    relay: impl DiscoRelay,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut interval = tokio::time::interval(ADVERTISE_INTERVAL);
@@ -1118,21 +1226,18 @@ async fn run_call_me_maybe(
         tokio::select! {
             _ = shutdown.changed() => break,
             _ = interval.tick() => {
-                // A CallMeMaybe is only actionable to a remote peer if we have a reflexive
-                // (STUN-discovered) candidate it can actually reach across the internet; a purely
-                // local LAN address is useless to relay over DERP. Skip the whole cadence until we
-                // have one, so peers that can never go direct don't incur perpetual relay load.
-                // Snapshot self_endpoints once per tick (it locks the reflexive set internally).
-                let have_reflexive = has_reflexive_candidate(&sock.self_endpoints());
-                if !have_reflexive {
+                // Skip the whole cadence until we have a reflexive or port-mapped candidate, so
+                // peers that can never go direct don't incur perpetual relay load.
+                if !have_reflexive(&sock) {
                     continue;
                 }
 
                 // Snapshot the targets under the read lock, then release it before any await.
                 // `region` is the netmap home region when control gave one, else `None` to be
-                // resolved via the fallback below (outside the lock — it's an actor `ask`). We keep
-                // the peer either way so a no-region peer is still prompted to go direct.
-                let targets: Vec<(ts_keys::NodePublicKey, DiscoPublicKey, Option<ts_derp::RegionId>)> = {
+                // resolved via the fallback (outside the lock — it's an actor `ask`). We keep the
+                // peer either way so a no-region peer is still prompted to go direct.
+                let now = discovery_now();
+                let targets: Vec<(NodePublicKey, DiscoPublicKey, Option<ts_derp::RegionId>)> = {
                     let db = poisoned_read(&peer_db);
                     let Some(db) = db.as_ref() else { continue; };
 
@@ -1140,8 +1245,9 @@ async fn run_call_me_maybe(
                         .values()
                         .filter_map(|node| {
                             let disco = node.disco_key?;
-                            // Only prompt peers that don't already have a confirmed direct path.
-                            if sock.best_addr(&disco).is_some() {
+                            // Only prompt peers with traffic that don't already have a confirmed
+                            // direct path.
+                            if !sock.is_peer_active(&disco, now) || sock.best_addr(&disco).is_some() {
                                 return None;
                             }
                             Some((node.node_key, disco, node.derp_region))
@@ -1150,48 +1256,92 @@ async fn run_call_me_maybe(
                 };
 
                 for (node_key, disco, netmap_region) in targets {
-                    // Resolve the relay region: netmap home region, else the inferred fallback
-                    // (observed route / our home region) — the same floor the route updater uses.
-                    let region = match netmap_region {
-                        Some(region) => Some(region),
-                        None => {
-                            // PeerId lookup + region inference both live in multiderp; ask it.
-                            match multiderp.ask(multiderp::RegionForNode { node: node_key }).await {
-                                Ok(region) => region,
-                                Err(e) => {
-                                    tracing::trace!(error = %e, "inferring call-me-maybe relay region");
-                                    None
-                                }
-                            }
-                        }
-                    };
-                    let Some(region) = region else {
-                        // No region from netmap, no observed route, no home region yet: nothing to
-                        // relay through this round. Recovered on the next cadence once one appears.
-                        continue;
-                    };
-
-                    let frame = match sock.seal_call_me_maybe(&disco) {
-                        Ok(frame) => frame,
-                        Err(e) => {
-                            tracing::trace!(error = %e, "sealing call-me-maybe");
-                            continue;
-                        }
-                    };
-
-                    if let Err(e) = multiderp
-                        .tell(multiderp::SendDisco {
-                            peer: node_key,
-                            region,
-                            frame,
-                        })
-                        .await
-                    {
-                        tracing::trace!(error = %e, "relaying call-me-maybe to multiderp");
-                    }
+                    send_call_me_maybe(&sock, &relay, node_key, disco, netmap_region).await;
                 }
             }
         }
+    }
+}
+
+/// Start path discovery for a peer the moment traffic with it resumes — Go magicsock's
+/// `endpoint.send`, which arms the heartbeat (`noteTxActivityExtTriggerLocked`) and, with no
+/// trusted direct path, pings the peer's candidates and sends a `CallMeMaybe` straight away
+/// (`sendDiscoPingsLocked(now, true)`).
+///
+/// The traffic is reported by [`PeerActivity`], fed by every underlay. Each report marks the peer
+/// active on the magicsock, which keeps the periodic pinger and `CallMeMaybe` loop running for it
+/// for the next 45s. A peer that was idle until now is also probed here at once, so its first
+/// packets leave DERP within a round trip rather than after the next pinger and `CallMeMaybe`
+/// ticks.
+///
+/// Unlike Go, which re-runs discovery on every send while the direct path is untrusted
+/// (endpoint.go:1066-1071), only the idle-to-active edge is handled here; a trust lapse during an
+/// active session is picked up by the next pinger tick (`PING_INTERVAL`, 2 s) and the
+/// `CallMeMaybe` loop (5 s), so the extra delay over Go is at most about 2 s.
+async fn run_discovery_on_traffic(
+    sock: Arc<MagicSock>,
+    peer_db: Arc<RwLock<Option<Arc<PeerDb>>>>,
+    activity: PeerActivity,
+    relay: impl DiscoRelay,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    while !*shutdown.borrow() {
+        let peers = tokio::select! {
+            _ = shutdown.changed() => break,
+            peers = activity.next() => peers,
+        };
+        for peer in peers {
+            discover_on_traffic(&sock, &peer_db, &relay, peer).await;
+        }
+    }
+}
+
+/// One peer's report for [`run_discovery_on_traffic`].
+///
+/// The `CallMeMaybe` goes only when at least one ping went out, as Go's `sendDiscoPingsLocked`
+/// requires (`sentAny`, endpoint.go:1394). It is not gated on a reflexive address: Go sends the
+/// `CallMeMaybe` with whatever endpoints it last learned (magicsock.go:2680-2685), re-STUNing first
+/// only when they are older than 27 s (magicsock.go:2662-2677). The re-STUN is left to the
+/// periodic prober here; the periodic `CallMeMaybe` loop keeps its reflexive gate so a peer that
+/// can never go direct is not prompted every 5 s.
+async fn discover_on_traffic(
+    sock: &MagicSock,
+    peer_db: &RwLock<Option<Arc<PeerDb>>>,
+    relay: &impl DiscoRelay,
+    peer: PeerId,
+) {
+    let target = {
+        let db = poisoned_read(peer_db);
+        db.as_ref()
+            .and_then(|db| db.get(&peer))
+            .and_then(|(_, node)| Some((node.node_key, node.disco_key?, node.derp_region)))
+    };
+    let Some((node_key, disco, netmap_region)) = target else {
+        return;
+    };
+
+    let now = discovery_now();
+    if !sock.note_peer_activity(&disco, now) {
+        // Already active: the periodic pinger and CallMeMaybe loop have it.
+        return;
+    }
+    if sock.best_addr(&disco).is_some() {
+        // A trusted direct path already exists; the pinger's heartbeat keeps it.
+        return;
+    }
+
+    let sent = match sock.send_discovery_pings(&disco, now).await {
+        Ok(sent) => {
+            tracing::trace!(%disco, sent, "traffic resumed; starting path discovery");
+            sent
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, %disco, "starting path discovery on traffic");
+            0
+        }
+    };
+    if sent > 0 {
+        send_call_me_maybe(sock, relay, node_key, disco, netmap_region).await;
     }
 }
 
@@ -1285,6 +1435,7 @@ impl kameo::Actor for DirectManager {
                     multiderp,
                     stun_cursor,
                     force_background_stun,
+                    peer_activity: env.peer_activity.clone(),
                     #[cfg(feature = "portmapper")]
                     portmap: None,
                     tasks,
@@ -1348,6 +1499,17 @@ impl kameo::Actor for DirectManager {
             tracing::warn!(error = %e, "could not install direct socket on multiderp");
         }
 
+        // Path discovery is driven by traffic: start it the moment a peer that was idle has
+        // traffic again, and keep it running (the pinger above, the CallMeMaybe loop below) while
+        // the peer stays active.
+        tasks.spawn(run_discovery_on_traffic(
+            sock.clone(),
+            peer_db.clone(),
+            env.peer_activity.clone(),
+            multiderp.clone(),
+            env.shutdown.clone(),
+        ));
+
         // Clone for the struct field (the on-demand STUN sweep in `RebindAndReprobe` needs it)
         // before `run_call_me_maybe` consumes the original.
         let multiderp_for_field = multiderp.clone();
@@ -1394,6 +1556,7 @@ impl kameo::Actor for DirectManager {
             multiderp: multiderp_for_field,
             stun_cursor,
             force_background_stun,
+            peer_activity: env.peer_activity.clone(),
             #[cfg(feature = "portmapper")]
             portmap,
             tasks,
@@ -1634,6 +1797,10 @@ impl Message<Arc<PeerState>> for DirectManager {
             }
         }
 
+        // Forget the traffic record of peers that left the netmap.
+        self.peer_activity
+            .retain(|peer| msg.peers.get(&peer).is_some());
+
         let had_peers = stun_probe_should_run(&self.peer_db);
         {
             let mut db = poisoned_write(&self.peer_db);
@@ -1666,7 +1833,7 @@ mod tests {
     async fn receive_handoff_bounds_chunks_and_preserves_peer_fifo_and_tails() {
         for limit in [4, usize::MAX] {
             for count in [0, 1, 4, 5, 16, 64, 65] {
-                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                let (tx, mut rx) = UnderlayToDataplane::for_test(PeerActivity::default());
                 let producer = tokio::spawn(async move {
                     for peer in [PeerId(1), PeerId(2)] {
                         let packets = (0..count)
@@ -1697,7 +1864,7 @@ mod tests {
 
     #[tokio::test]
     async fn receive_handoff_yields_between_chunks_and_stops_on_closed_channel() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = UnderlayToDataplane::for_test(PeerActivity::default());
         let producer = tokio::spawn(async move {
             handoff_received(
                 &tx,
@@ -3056,7 +3223,7 @@ mod tests {
     /// The assertion is the count of datagrams that actually left the socket, one per candidate the
     /// rotation carried onto the new key. The candidates are control-advertised (the netmap seam
     /// takes an address as given); a peer-learned loopback address would be dropped by the
-    /// `is_pingable_candidate` sanitizer, which is not what this test is about.
+    /// `is_learnable_candidate` sanitizer, which is not what this test is about.
     #[tokio::test]
     async fn a_rotated_peer_is_reprobed_immediately() {
         let sock = MagicSock::bind(
@@ -3108,5 +3275,223 @@ mod tests {
             0,
             "a peer with no path state is skipped rather than failing the sweep"
         );
+    }
+
+    /// The relay a test's `CallMeMaybe`s go to: records who each one was for.
+    #[derive(Clone, Default)]
+    struct RecordingRelay(Arc<std::sync::Mutex<Vec<NodePublicKey>>>);
+
+    impl RecordingRelay {
+        fn sent_to(&self, node: NodePublicKey) -> usize {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|n| **n == node)
+                .count()
+        }
+    }
+
+    impl DiscoRelay for RecordingRelay {
+        async fn region_for_node(&self, _node: NodePublicKey) -> Option<ts_derp::RegionId> {
+            Some(ts_derp::RegionId(core::num::NonZeroU32::new(1).unwrap()))
+        }
+
+        async fn send_disco(&self, peer: NodePublicKey, _region: ts_derp::RegionId, _: Vec<u8>) {
+            self.0.lock().unwrap().push(peer);
+        }
+    }
+
+    /// A loopback magicsock that has learned a reflexive address from a loopback STUN responder,
+    /// so it has something to offer in a `CallMeMaybe`. Its receive loop keeps running.
+    async fn sock_with_reflexive() -> Arc<MagicSock> {
+        let allow_all: BindingVerifier = Arc::new(|_, _| true);
+        let sock = Arc::new(
+            MagicSock::bind(
+                "127.0.0.1:0".parse().unwrap(),
+                DiscoPrivateKey::random(),
+                NodePrivateKey::random().public_key(),
+            )
+            .await
+            .unwrap()
+            .with_binding_verifier(allow_all),
+        );
+        let recv = sock.clone();
+        tokio::spawn(async move { while let Ok(Some(_)) = recv.recv_data().await {} });
+
+        let stun = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        probe_stun_servers_once(&sock, &[stun.local_addr().unwrap()], &Mutex::new(0)).await;
+        let mut request = [0u8; 64];
+        let (_, from) = tokio::time::timeout(Duration::from_secs(2), stun.recv_from(&mut request))
+            .await
+            .expect("a STUN binding request")
+            .unwrap();
+
+        // A Binding Success Response for that transaction with an IPv4 XOR-MAPPED-ADDRESS of
+        // 192.0.2.10:41641 (RFC 5389 §15.2: port and address XORed with the magic cookie).
+        const COOKIE: u32 = 0x2112_A442;
+        let mut response = Vec::new();
+        response.extend_from_slice(&0x0101u16.to_be_bytes());
+        response.extend_from_slice(&12u16.to_be_bytes());
+        response.extend_from_slice(&COOKIE.to_be_bytes());
+        response.extend_from_slice(&request[8..20]);
+        response.extend_from_slice(&0x0020u16.to_be_bytes());
+        response.extend_from_slice(&8u16.to_be_bytes());
+        response.extend_from_slice(&[0x00, 0x01]);
+        response.extend_from_slice(&(41641u16 ^ (COOKIE >> 16) as u16).to_be_bytes());
+        response
+            .extend_from_slice(&(u32::from(Ipv4Addr::new(192, 0, 2, 10)) ^ COOKIE).to_be_bytes());
+        stun.send_to(&response, from).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !have_reflexive(&sock) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the STUN response taught us a reflexive address");
+        sock
+    }
+
+    /// A loopback sink for one peer's pings, read without the tokio reactor so a paused clock
+    /// cannot hide a datagram that has already arrived.
+    fn ping_sink() -> std::net::UdpSocket {
+        let sink = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sink.set_nonblocking(true).unwrap();
+        sink
+    }
+
+    /// How many datagrams have reached `sink` since it was last drained.
+    fn drain(sink: &std::net::UdpSocket) -> usize {
+        let mut buf = [0u8; 2048];
+        let mut n = 0;
+        while sink.recv_from(&mut buf).is_ok() {
+            n += 1;
+        }
+        n
+    }
+
+    /// Go `endpoint.heartbeat` runs only while a session is active (`sessionActiveTimeout`, 45s),
+    /// and `CallMeMaybe` is only sent from the discovery it drives. A peer we exchange no traffic
+    /// with is never pinged and never sent a `CallMeMaybe`; one whose traffic stopped gets neither
+    /// once its 45s are up. Before this, both went on every few seconds for the life of the node.
+    #[tokio::test]
+    async fn an_idle_peer_gets_no_pings_and_no_call_me_maybe() {
+        let sock = sock_with_reflexive().await;
+        tokio::time::pause();
+
+        let (idle_sink, quiet_sink) = (ping_sink(), ping_sink());
+        let (idle_disco, quiet_disco) = (
+            DiscoPrivateKey::random().public_key(),
+            DiscoPrivateKey::random().public_key(),
+        );
+        let (idle_node, quiet_node) = (
+            NodePrivateKey::random().public_key(),
+            NodePrivateKey::random().public_key(),
+        );
+        sock.set_netmap_endpoints(idle_disco, [idle_sink.local_addr().unwrap()]);
+        sock.set_netmap_endpoints(quiet_disco, [quiet_sink.local_addr().unwrap()]);
+        let peer_db = Arc::new(RwLock::new(Some(Arc::new(db_of([
+            node_with_keys(idle_disco, idle_node, "idle"),
+            node_with_keys(quiet_disco, quiet_node, "quiet"),
+        ])))));
+
+        // The quiet peer had traffic just now; the idle one never has.
+        sock.note_peer_activity(&quiet_disco, discovery_now());
+
+        let relay = RecordingRelay::default();
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let pinger = tokio::spawn(run_pinger(sock.clone(), stopped.clone()));
+        let cmm = tokio::spawn(run_call_me_maybe(
+            sock.clone(),
+            peer_db,
+            relay.clone(),
+            stopped,
+        ));
+
+        // The quiet peer's session, and a little more.
+        tokio::time::sleep(ts_magicsock::SESSION_ACTIVE_TIMEOUT + Duration::from_secs(5)).await;
+        assert!(drain(&quiet_sink) > 0, "an active peer is pinged");
+        let quiet_cmm = relay.sent_to(quiet_node);
+        assert!(quiet_cmm > 0, "an active peer is sent a CallMeMaybe");
+
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        assert_eq!(
+            drain(&quiet_sink),
+            0,
+            "no pings once the session has been idle for SESSION_ACTIVE_TIMEOUT"
+        );
+        assert_eq!(
+            relay.sent_to(quiet_node),
+            quiet_cmm,
+            "no CallMeMaybe once the session has been idle for SESSION_ACTIVE_TIMEOUT"
+        );
+        assert_eq!(
+            drain(&idle_sink),
+            0,
+            "a peer with no traffic is never pinged"
+        );
+        assert_eq!(
+            relay.sent_to(idle_node),
+            0,
+            "a peer with no traffic is never sent a CallMeMaybe"
+        );
+
+        stop.send(true).unwrap();
+        pinger.await.unwrap();
+        cmm.await.unwrap();
+    }
+
+    /// The first packet to an idle peer starts discovery at once, as Go's `endpoint.send` does
+    /// (`sendDiscoPingsLocked(now, true)`): its candidates are pinged and it is sent a
+    /// `CallMeMaybe` without waiting for the periodic pinger or `CallMeMaybe` tick. Neither loop
+    /// runs here, so the packet is the only thing that can start it.
+    #[tokio::test]
+    async fn traffic_to_an_idle_peer_starts_discovery_at_once() {
+        let sock = sock_with_reflexive().await;
+        tokio::time::pause();
+
+        let sink = ping_sink();
+        let disco = DiscoPrivateKey::random().public_key();
+        let node_key = NodePrivateKey::random().public_key();
+        sock.set_netmap_endpoints(disco, [sink.local_addr().unwrap()]);
+        let mut db = PeerDb::default();
+        let peer = db.upsert(&node_with_keys(disco, node_key, "peer"));
+        let peer_db = Arc::new(RwLock::new(Some(Arc::new(db))));
+
+        let activity = PeerActivity::default();
+        let relay = RecordingRelay::default();
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let kicker = tokio::spawn(run_discovery_on_traffic(
+            sock.clone(),
+            peer_db,
+            activity.clone(),
+            relay.clone(),
+            stopped,
+        ));
+
+        // The first data packet for the idle peer, taken by an underlay the way the dataplane hands
+        // it over.
+        let (mut from_dataplane, dataplane) = UnderlayFromDataplane::for_test(activity);
+        let data = ts_packet::PacketMut::from([vec![4u8, 0, 0, 0], vec![0; 60]].concat());
+        dataplane.send((peer, vec![data])).unwrap();
+        assert_eq!(from_dataplane.recv().await.unwrap().0, peer);
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while relay.sent_to(node_key) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("traffic to an idle peer must send it a CallMeMaybe at once");
+        assert_eq!(relay.sent_to(node_key), 1);
+        assert_eq!(
+            drain(&sink),
+            1,
+            "traffic to an idle peer must ping its candidate at once"
+        );
+
+        stop.send(true).unwrap();
+        kicker.await.unwrap();
     }
 }
