@@ -134,11 +134,48 @@ i=0
 INDEX_MAX_RETRIES=12
 INDEX_WAIT=20
 
+# A crate that is not on crates.io yet cannot be created through trusted publishing, which only
+# covers crates that already exist. NEW_CRATE_TOKEN (repo secret CRATES_IO_NEW_CRATE_TOKEN, scopes
+# publish-new, publish-update and trusted-publishing on geiserx_*) uploads such a crate's first
+# version, and then registers this repo's release.yml as its trusted publisher, so every later
+# release goes through OIDC like the rest. A crate that exists but has no trusted publisher (a
+# run that died between the two steps) is registered on the next run.
+CRATES_API=https://crates.io/api/v1
+UA="geiserx tailscale-rs release (github.com/GeiserX/tailscale-rs)"
+REPO_SLUG="${GITHUB_REPOSITORY:-GeiserX/tailscale-rs}"
+crate_exists() { [ "$(curl -s -o /dev/null -w '%{http_code}' -A "$UA" "$CRATES_API/crates/$1")" = 200 ]; }
+ensure_trusted_publisher() {
+  local crate=$1 n body
+  [ -n "$DRY" ] && return 0
+  [ -z "${NEW_CRATE_TOKEN:-}" ] && return 0
+  n=$(curl -s -A "$UA" -H "Authorization: $NEW_CRATE_TOKEN" \
+    "$CRATES_API/trusted_publishing/github_configs?crate=$crate" | jq '.github_configs | length')
+  [ "${n:-0}" -gt 0 ] && return 0
+  body=$(jq -n --arg c "$crate" --arg o "${REPO_SLUG%%/*}" --arg r "${REPO_SLUG#*/}" \
+    '{github_config: {crate: $c, repository_owner: $o, repository_name: $r, workflow_filename: "release.yml", environment: null}}')
+  if curl -sf -A "$UA" -H "Authorization: $NEW_CRATE_TOKEN" -H 'Content-Type: application/json' \
+      -X POST -d "$body" "$CRATES_API/trusted_publishing/github_configs" >/dev/null; then
+    echo "   registered $REPO_SLUG release.yml as the trusted publisher of $crate."
+  else
+    echo "ERROR: could not register the trusted publisher of $crate." >&2
+    exit 1
+  fi
+}
+
 for crate in "${CRATES[@]}"; do
   i=$((i+1))
   echo ""
   echo "==== [$i/$total] $crate ===="
   index_retries=0
+  token="${CARGO_REGISTRY_TOKEN:-}"
+  if [ -z "$DRY" ] && ! crate_exists "$crate"; then
+    if [ -z "${NEW_CRATE_TOKEN:-}" ]; then
+      echo "ERROR: $crate is not on crates.io yet; its first upload needs NEW_CRATE_TOKEN." >&2
+      exit 1
+    fi
+    echo "   new crate: first upload with NEW_CRATE_TOKEN."
+    token="$NEW_CRATE_TOKEN"
+  fi
   while :; do
     # Capture the single publish attempt's combined output so we can branch on the failure reason.
     # `--allow-dirty`: publishing crate N updates `Cargo.lock` (recording each just-published dep's
@@ -146,15 +183,17 @@ for crate in "${CRATES[@]}"; do
     # "files in the working directory contain changes not yet committed". CI checks out a clean tag,
     # so the only dirt is cargo's own lockfile churn mid-publish — benign and expected. (This bit the
     # first v0.13.0 attempt at the facade crate, which has the most published deps.)
-    out=$(cargo publish -p "$crate" --allow-dirty $DRY 2>&1) && rc=0 || rc=$?
+    out=$(CARGO_REGISTRY_TOKEN="$token" cargo publish -p "$crate" --allow-dirty $DRY 2>&1) && rc=0 || rc=$?
     printf '%s\n' "$out"
     if [ "$rc" -eq 0 ]; then
       [ -n "$DRY" ] && break
+      ensure_trusted_publisher "$crate"
       echo "   published; settling before next crate ..."
       sleep 15
       break
     elif [ "${SKIP_PUBLISHED:-}" = "1" ] && printf '%s' "$out" | grep -qiE "already (exists|uploaded)"; then
       echo "   already on crates.io, skipping."
+      ensure_trusted_publisher "$crate"
       break
     elif printf '%s' "$out" | grep -qiE "429 Too Many Requests|published too many"; then
       # Parse "Please try again after <Day, DD Mon YYYY HH:MM:SS GMT>" and wait until then (+30s).

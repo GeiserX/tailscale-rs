@@ -57,6 +57,8 @@ jobs:
         env:
           # The publish script reads CARGO_REGISTRY_TOKEN; feed it the OIDC-minted token.
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          # First upload of a crate that is not on crates.io yet, and its trusted-publisher registration.
+          NEW_CRATE_TOKEN: ${{ secrets.CRATES_IO_NEW_CRATE_TOKEN }}
           # The script gates real publishes behind this explicit opt-in (guards against accidental runs).
           TS_RS_EXPERIMENT: this_is_unstable_software
           # Tolerate already-published crates so a re-dispatch after a partial/rate-limited run resumes.
