@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Publish all 44 geiserx_* workspace crates to crates.io in leaf-first dependency order.
+# Publish every geiserx_* workspace crate to crates.io in leaf-first dependency order.
 #
 # Names on crates.io are GLOBAL and PERMANENT — once published they cannot be deleted (only
 # yanked) or reused. Run this only when you are sure.
@@ -64,6 +64,7 @@ fi
 
 # Leaf-first publish order (topologically sorted; facade at #41, bindings last).
 CRATES=(
+  geiserx_ts_portmapper
   geiserx_ts_bitset
   geiserx_ts_capabilityversion
   geiserx_ts_dns_wire
@@ -111,9 +112,21 @@ CRATES=(
 )
 
 total=${#CRATES[@]}
+
+# The list above is hand-ordered, so it drifts when a crate is added: 0.58.0 stopped at crate 40
+# of 44 because the new geiserx_ts_portmapper was missing. Compare it with the workspace's
+# publishable crates before anything is uploaded.
+WANT=$(cargo metadata --no-deps --format-version 1 \
+  | jq -r '.packages[] | select(.publish == null) | .name' | grep '^geiserx_' | sort)
+HAVE=$(printf '%s\n' "${CRATES[@]}" | sort)
+if [ "$WANT" != "$HAVE" ]; then
+  echo "ERROR: CRATES does not match the workspace's publishable geiserx_* crates:" >&2
+  diff <(echo "$HAVE") <(echo "$WANT") >&2 || true
+  exit 1
+fi
 i=0
 # crates.io heavily rate-limits NEW crate names (~1 new crate per 10 min after a small burst).
-# On a 429 we parse its "try again after <RFC2822>" and sleep until then, so a 44-new-crate split
+# On a 429 we parse its "try again after <RFC2822>" and sleep until then, so a many-new-crate split
 # publishes unattended (it just takes hours). Publishing new *versions* of existing crates is not
 # limited, so a resume after the burst flies through already-published ones via SKIP_PUBLISHED.
 # Max attempts to wait out a crates.io index-propagation lag for a single crate before giving up
