@@ -14,7 +14,7 @@ version into your `Cargo.toml`. The line it adds looks like this:
 ```toml
 [dependencies]
 # Published as `geiserx_tailscale`; imported as `tailscale`.
-tailscale = { package = "geiserx_tailscale", version = "0.57.8" }
+tailscale = { package = "geiserx_tailscale", version = "0.58.0" }
 ```
 
 <!-- x-release-please-end -->
@@ -77,7 +77,7 @@ typed returns — so you get Go's lifecycle *shape* without giving up Rust's typ
 
 ```toml
 [dependencies]
-tailscale = { package = "geiserx_tailscale", version = "0.57.8", features = ["tsnet"] }
+tailscale = { package = "geiserx_tailscale", version = "0.58.0", features = ["tsnet"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
