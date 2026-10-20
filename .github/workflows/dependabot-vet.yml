@@ -1,0 +1,60 @@
+# Keep cargo vet green on Dependabot pull requests without a person.
+#
+# supply-chain/config.toml exempts each dependency at one exact version, so every Dependabot bump
+# fails the `cargo vet --locked` step in ci.yml until the exemptions move to the new versions.
+# This job makes that edit (scripts/vet-exempt-bumps.py), checks vet passes, and pushes it to the
+# Dependabot branch. A push made with GITHUB_TOKEN starts no workflow, so the job then dispatches
+# ci.yml on the branch, and its checks land on the new head of the pull request.
+name: dependabot vet
+
+on:
+  pull_request:
+    paths:
+      - Cargo.lock
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: dependabot-vet-${{ github.head_ref }}
+  cancel-in-progress: true
+
+jobs:
+  exempt:
+    if: ${{ github.actor == 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the Dependabot branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.head_ref }}
+      - name: binstall
+        uses: cargo-bins/cargo-binstall@422f3094be6a0843857aa008b499caaf6bce0da8 #v1.24.0
+      - name: Install cargo-vet
+        run: |
+          cargo binstall --no-confirm --force cargo-vet@0.10.2
+          cargo vet --version
+      - name: Exempt the bumped versions
+        id: exempt
+        run: |
+          if cargo vet --locked; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          cargo vet --locked --output-format json > "$RUNNER_TEMP/vet.json" || true
+          python3 -I scripts/vet-exempt-bumps.py < "$RUNNER_TEMP/vet.json"
+          cargo vet --locked
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+      - name: Push the exemptions and run CI on the new head
+        if: ${{ steps.exempt.outputs.changed == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          git config user.name GeiserX
+          git config user.email 9169332+GeiserX@users.noreply.github.com
+          git add supply-chain/config.toml
+          git commit -m "build(supply-chain): exempt the versions this bump brings in for cargo vet"
+          git push origin "HEAD:$BRANCH"
+          gh workflow run ci.yml --ref "$BRANCH"
