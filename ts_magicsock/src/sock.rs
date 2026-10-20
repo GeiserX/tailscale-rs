@@ -362,6 +362,19 @@ pub struct MagicSock {
     /// it that way; do not hold two at once, or the inconsistent acquisition order across methods
     /// becomes a deadlock.
     addr_to_disco: Arc<Mutex<HashMap<SocketAddr, DiscoPublicKey>>>,
+    /// Serializes every change to which peer owns an address: the candidate set in `paths`, the
+    /// `addr_to_disco` attribution, and the connected socket an eviction closes. Those locks are
+    /// taken one at a time, so without this two updates could interleave between them: an
+    /// eviction could release an address another update had just restored to the same peer, or
+    /// close a connected socket that now belongs to another peer, or attribute an address that a
+    /// concurrent eviction had already removed from the candidate set.
+    ///
+    /// Held for the whole of [`add_peer_endpoints`](MagicSock::add_peer_endpoints),
+    /// [`set_netmap_endpoints`](MagicSock::set_netmap_endpoints),
+    /// [`changed_active_disco`](MagicSock::changed_active_disco) and
+    /// [`retain_peers`](MagicSock::retain_peers), all synchronous, so never across an await. It is
+    /// always taken first, before any of the locks above, and never while holding one.
+    endpoint_owners: Mutex<()>,
     /// Reflexive addresses: where STUN servers and peers' pongs saw this socket's traffic come
     /// from, each with its provenance and last observation (see [`ReflexiveSet`]). Live entries are
     /// advertised to control and offered in `CallMeMaybe` so peers behind NAT can reach us.
@@ -587,6 +600,7 @@ impl MagicSock {
             our_node_key,
             paths: Default::default(),
             addr_to_disco: Default::default(),
+            endpoint_owners: Mutex::new(()),
             reflexive: Default::default(),
             portmapped: Mutex::new(None),
             stun_in_flight: Default::default(),
@@ -1419,20 +1433,34 @@ impl MagicSock {
             return;
         }
 
-        // Add to the path set FIRST: `add_learned_candidates` enforces the per-peer learned cap
-        // ([`MAX_LEARNED_CANDIDATES_PER_PEER`]) and returns only the addresses it actually accepted.
-        // We then attribute ONLY those in `addr_to_disco`. Inserting every filtered `ep` into the
-        // reverse map unconditionally (the old behavior) let an authenticated peer flood fresh
+        let _owners = lock(&self.endpoint_owners);
+        // Add to the path set FIRST: `add_learned_candidates_at` enforces the per-peer learned cap
+        // ([`MAX_LEARNED_CANDIDATES_PER_PEER`]) by evicting the stalest learned candidate, and
+        // reports what it accepted and evicted. We attribute ONLY the accepted addresses in
+        // `addr_to_disco` and release the evicted ones (attribution and connected socket).
+        // Inserting every filtered `ep` into the reverse map unconditionally (the old behavior) let an authenticated peer flood fresh
         // over-cap addresses that the path set dropped yet the reverse map retained forever — an
         // unbounded per-peer attribution-map leak. Keeping the two in lockstep bounds both.
-        let accepted = {
+        let crate::path::LearnedCandidates { accepted, evicted } = {
             let mut paths = lock(&self.paths);
             self.peer_paths_entry(&mut paths, peer)
-                .add_learned_candidates(eps)
+                .add_learned_candidates_at(eps, Instant::now())
         };
 
-        tracing::trace!(%peer, ?accepted, "magicsock: learned peer candidates");
+        tracing::trace!(%peer, ?accepted, ?evicted, "magicsock: learned peer candidates");
         let mut a2d = lock(&self.addr_to_disco);
+        // An evicted address is no longer this peer's: drop its attribution and, below, its
+        // connected socket, unless another peer owns the address.
+        let mut released = Vec::with_capacity(evicted.len());
+        for ep in &evicted {
+            match a2d.get(ep) {
+                Some(owner) if *owner != peer => {}
+                _ => {
+                    a2d.remove(ep);
+                    released.push(*ep);
+                }
+            }
+        }
         for ep in &accepted {
             // Don't let a learned (disco-supplied) candidate steal an address already attributed to
             // a *different* peer: an authenticated-but-malicious peer could otherwise claim a victim
@@ -1441,8 +1469,8 @@ impl MagicSock {
             // reassign an address across peers.
             //
             // This is a divergence from Go, whose `peerMap.setNodeKeyForEpAddr`
-            // (wgengine/magicsock/peermap.go:187-205) is last-writer-wins and is written only from
-            // a ping (magicsock.go:2581-2584) and a solicited pong (endpoint.go:1759); Go never
+            // (wgengine/magicsock/peermap.go:209) is last-writer-wins and is written only from a
+            // ping (magicsock.go:2598) and a solicited pong (endpoint.go:1970); Go never
             // stores a `CallMeMaybe` endpoint in that map. Attributing data to a `CallMeMaybe`
             // endpoint here is this tree's own choice. A misattribution costs only the under-load
             // cookie reply (ts_tunnel `Endpoint::recv_from`) and the silent-disco trust stamp,
@@ -1457,6 +1485,14 @@ impl MagicSock {
                 _ => {
                     a2d.insert(*ep, peer);
                 }
+            }
+        }
+        drop(a2d);
+
+        if !released.is_empty() {
+            let mut connected = lock(&self.connected);
+            for ep in released {
+                connected.remove(ep);
             }
         }
     }
@@ -1474,6 +1510,7 @@ impl MagicSock {
         endpoints: impl IntoIterator<Item = SocketAddr>,
     ) {
         let eps: Vec<SocketAddr> = endpoints.into_iter().collect();
+        let _owners = lock(&self.endpoint_owners);
         {
             let mut a2d = self.addr_to_disco.lock().unwrap();
             for ep in &eps {
@@ -1519,6 +1556,7 @@ impl MagicSock {
             })
             .collect();
 
+        let _owners = lock(&self.endpoint_owners);
         let removed = {
             let mut paths = lock(&self.paths);
             self.peer_paths_entry(&mut paths, peer)
@@ -1585,6 +1623,7 @@ impl MagicSock {
             return false;
         }
 
+        let _owners = lock(&self.endpoint_owners);
         // Locked disjointly, never nested (as in `rebind`).
         let (moved, needs_probe) = {
             let mut paths = lock(&self.paths);
@@ -1632,6 +1671,7 @@ impl MagicSock {
     /// Called after a netmap update so peers removed from the tailnet stop being ping targets and
     /// release their `addr -> disco` attributions, bounding the growth of both maps.
     pub fn retain_peers(&self, live: &std::collections::HashSet<DiscoPublicKey>) {
+        let _owners = lock(&self.endpoint_owners);
         let mut paths = lock(&self.paths);
         paths.retain(|peer, _| live.contains(peer));
         drop(paths);
@@ -5248,6 +5288,181 @@ mod tests {
         );
         fx.pong(hairpin, hairpin).await;
         assert_eq!(fx.node.best_addr(&peer), Some(hairpin));
+    }
+
+    /// A peer that held a full learned set of stale sources moves to a new address and changes its
+    /// disco key. Its first authenticated ping from the new address must still be learned and
+    /// attributed to it, so its WireGuard is accepted and our own ping to it confirms a path.
+    ///
+    /// Before the fix, the peer had MAX_LEARNED_CANDIDATES_PER_PEER learned candidates (one per
+    /// symmetric-NAT mapping it had pinged from), none of which ever expired, and the disco-key
+    /// change carried them over. The full set refused the new source. Its pings were still answered,
+    /// so the peer went direct, but its WireGuard came from an address with no attribution and was
+    /// dropped as "unknown source". No handshake response was sent and nothing timed out, so the
+    /// peer never recovered.
+    #[tokio::test]
+    async fn moved_peer_is_learned_past_a_full_set_of_stale_sources() {
+        async fn demux(node: &MagicSock, bytes: &[u8], from: SocketAddr) -> Option<ReceivedData> {
+            node.demux_datagram((PacketMut::from(bytes), from))
+                .await
+                .ok()
+                .flatten()
+        }
+
+        let node_disco = DiscoPrivateKey::random();
+        let old = DiscoPrivateKey::random();
+        let new = DiscoPrivateKey::random();
+        let peer_node = ts_keys::NodePrivateKey::random().public_key();
+        let (old_pub, new_pub) = (old.public_key(), new.public_key());
+        let verifier: BindingVerifier = Arc::new(move |d, claimed| {
+            (*d == old_pub || *d == new_pub) && claimed.is_none_or(|c| *c == peer_node)
+        });
+        let node = MagicSock::bind_with(
+            localhost(),
+            node_disco.clone(),
+            ts_keys::NodePrivateKey::random().public_key(),
+            crate::connected::Settings {
+                connected_sockets: true,
+                dont_fragment: false,
+                batched_io: false,
+            },
+        )
+        .await
+        .unwrap()
+        .with_binding_verifier(verifier);
+        let ping = |from: &DiscoPrivateKey| {
+            disco::seal_ping(
+                from,
+                peer_node,
+                &node_disco.public_key(),
+                disco::random_tx_id(),
+            )
+            .unwrap()
+        };
+
+        // Each wake on the old network pinged us from a new symmetric-NAT port.
+        for i in 0..crate::path::MAX_LEARNED_CANDIDATES_PER_PEER {
+            let src = SocketAddr::from(([203, 0, 113, 1], 20000 + i as u16));
+            demux(&node, &ping(&old), src).await;
+        }
+        assert_eq!(
+            node.candidate_addrs(&old_pub).len(),
+            crate::path::MAX_LEARNED_CANDIDATES_PER_PEER
+        );
+        // The oldest source has had a connected socket opened toward it (or tried to).
+        let oldest = SocketAddr::from(([203, 0, 113, 1], 20000));
+        let shared = node.sock().await;
+        lock(&node.connected).note_sent(
+            oldest,
+            crate::connected::CONNECT_AFTER_BYTES as usize,
+            &shared,
+        );
+        #[cfg(unix)]
+        assert_eq!(lock(&node.connected).counted(oldest), None);
+
+        // The peer restarts on another network: control reports the new disco key.
+        assert!(node.changed_active_disco(&old_pub, &new_pub));
+        node.retain_peers(&std::collections::HashSet::from([new_pub]));
+
+        let moved: SocketAddr = "198.51.100.7:41641".parse().unwrap();
+        demux(&node, &ping(&new), moved).await;
+        let cands = node.candidate_addrs(&new_pub);
+        assert!(
+            cands.contains(&moved),
+            "an authenticated ping's new source is learned even with the learned set full"
+        );
+        assert_eq!(
+            cands.len(),
+            crate::path::MAX_LEARNED_CANDIDATES_PER_PEER,
+            "the learned set stays bounded"
+        );
+
+        // The least recently named source made room, and it is released: no attribution, so its
+        // data is dropped, and no connected socket.
+        assert!(!cands.contains(&oldest));
+        assert!(
+            demux(&node, b"wireguard initiation", oldest)
+                .await
+                .is_none()
+        );
+        #[cfg(unix)]
+        assert_eq!(lock(&node.connected).counted(oldest), Some(0));
+
+        let data = demux(&node, b"wireguard initiation", moved)
+            .await
+            .expect("WireGuard from the peer's new address is attributed, not dropped");
+        assert_eq!((data.from_disco, data.from_addr), (new_pub, moved));
+
+        // Our own ping to the new address and its pong confirm the path data is sent on.
+        let tx_id = disco::random_tx_id();
+        lock(&node.paths)
+            .get_mut(&new_pub)
+            .unwrap()
+            .note_ping_sent(tx_id, moved, Instant::now());
+        let our_src = "203.0.113.10:41642".parse().unwrap();
+        let pong = disco::seal_pong(&new, &node_disco.public_key(), tx_id, our_src).unwrap();
+        assert!(demux(&node, &pong, moved).await.is_none());
+        assert_eq!(node.best_addr(&new_pub), Some(moved));
+    }
+
+    /// Each update to who owns an address runs as one transaction under `endpoint_owners`, taken
+    /// before it touches the candidate set, the attribution map or a connected socket. Otherwise
+    /// an eviction could interleave with another update between those locks: release an address
+    /// a netmap update had just restored and confirmed as the peer's best, attribute addresses a
+    /// concurrent eviction had already dropped (growing the map past the cap), or close another
+    /// peer's connected socket. Each method must wait for the guard and change nothing meanwhile.
+    #[tokio::test]
+    async fn address_ownership_updates_are_serialized() {
+        let node = Arc::new(plain_sock().await);
+        let peer = DiscoPrivateKey::random().public_key();
+        let rotated = DiscoPrivateKey::random().public_key();
+        let addr = |i: u16| SocketAddr::from(([203, 0, 113, 2], 20000 + i));
+        for i in 0..crate::path::MAX_LEARNED_CANDIDATES_PER_PEER as u16 {
+            node.add_peer_endpoints(peer, [addr(i)]);
+        }
+        let snapshot = |node: &MagicSock| {
+            let mut c = node.candidate_addrs(&peer);
+            c.extend(node.candidate_addrs(&rotated));
+            c.sort();
+            let mut a: Vec<_> = lock(&node.addr_to_disco)
+                .iter()
+                .map(|(a, d)| (*a, *d))
+                .collect();
+            a.sort_by_key(|(a, _)| *a);
+            (c, a)
+        };
+        type Update = Box<dyn Fn(&MagicSock) + Send>;
+        let updates: [Update; 4] = [
+            Box::new(move |n| n.add_peer_endpoints(peer, [addr(100)])),
+            Box::new(move |n| n.set_netmap_endpoints(peer, [addr(200)])),
+            Box::new(move |n| {
+                n.changed_active_disco(&peer, &rotated);
+            }),
+            Box::new(|n| n.retain_peers(&std::collections::HashSet::new())),
+        ];
+        for update in updates {
+            let before = snapshot(&node);
+            let owners = lock(&node.endpoint_owners);
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let other = node.clone();
+            let worker = std::thread::spawn(move || {
+                update(&other);
+                done_tx.send(()).unwrap();
+            });
+            assert!(
+                done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                "the update waits for the ownership guard"
+            );
+            assert_eq!(
+                snapshot(&node),
+                before,
+                "and changes nothing until it has it"
+            );
+            drop(owners);
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            worker.join().unwrap();
+            assert_ne!(snapshot(&node), before);
+        }
     }
 
     /// Only disco that authenticates as the peer can add a candidate. None of these teach the node
