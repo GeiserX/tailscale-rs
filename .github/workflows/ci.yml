@@ -176,6 +176,7 @@ jobs:
       # exempted in `supply-chain/config.toml`. `--locked` uses `supply-chain/imports.lock` as
       # committed and never fetches, so the result depends only on the tree under test. A dependency
       # change that fails here needs `cargo vet regenerate exemptions` (or a real audit) committed.
+      # On a Dependabot pull request, dependabot-vet.yml commits that edit for the bumped crates.
       - name: Install cargo-vet
         run: |
           cargo vet --version 2>/dev/null | grep -qx 'cargo-vet 0.10.2' \
