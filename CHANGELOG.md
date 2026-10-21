@@ -12,6 +12,14 @@ Record breaking or significant changes here. All dates are UTC.
 
 * **exit node:** forwarded TCP flows run without Nagle, the underlay UDP sockets ask for Go's 7 MiB buffers, netstack egress goes out in batches of up to 64 packets, and the netstack tracks 32 receive holes for uploads. Kernel receive batching, splice coalescing, targeted replay and Apple connected UDP sockets are opt-in experiments, off unless their variable is `1`.
 
+## [0.58.2](https://github.com/GeiserX/tailscale-rs/compare/v0.58.1...v0.58.2) (2026-10-21)
+
+
+### Bug Fixes
+
+* **deps:** close two russh SSH server advisories by moving to 0.64.1 ([#658](https://github.com/GeiserX/tailscale-rs/issues/658)) ([4a74801](https://github.com/GeiserX/tailscale-rs/commit/4a748012366e65c2ccd0acab0e4100c6b0ffa8b9))
+* **magicsock:** evict the stalest learned candidate instead of refusing a peer's new address ([#654](https://github.com/GeiserX/tailscale-rs/issues/654)) ([c3eb639](https://github.com/GeiserX/tailscale-rs/commit/c3eb639c55e7bfd3de1feb6fff754ff6b446414c))
+
 ## [0.58.1](https://github.com/GeiserX/tailscale-rs/compare/v0.58.0...v0.58.1) (2026-10-20)
 
 
