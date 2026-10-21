@@ -183,11 +183,22 @@ pub const SESSION_ACTIVE_TIMEOUT: Duration = Duration::from_secs(45);
 /// clamping, while bounding abuse. Netmap candidates are not counted (control-authoritative,
 /// already bounded by reconcile).
 ///
-/// Go expires these instead (`endpointState.shouldDeleteLocked`, wgengine/magicsock/endpoint.go:456-468:
-/// 45 s since `lastGotPing`, `sessionActiveTimeout` at magicsock.go:4024; `CallMeMaybe` endpoints
-/// are replaced per message, endpoint.go:1994-1999) and only additionally prunes past 100 endpoints
-/// (endpoint.go:1630). This tree does not expire them, and the 32 cap stands in for that expiry.
-const MAX_LEARNED_CANDIDATES_PER_PEER: usize = 32;
+/// At the cap a new learned endpoint evicts the one the peer named least recently (never the
+/// current best), so the cap bounds the set without locking out a peer that moved. Refusing the new
+/// endpoint instead, as this tree used to, left a peer that had filled the set with stale
+/// symmetric-NAT mappings unable to be learned anywhere new: its pings were answered, but its
+/// WireGuard from the new address had no `addr -> disco` attribution and was dropped.
+///
+/// Go expires learned endpoints by time instead (`endpointState.shouldDeleteLocked`,
+/// wgengine/magicsock/endpoint.go:456-467: 45 s since `lastGotPing`, `sessionActiveTimeout` at
+/// magicsock.go:4024; `CallMeMaybe` endpoints are replaced per message, endpoint.go:1994-1999) and
+/// prunes past 100 endpoints (endpoint.go:1630-1638). This tree does not, because here a learned
+/// candidate also carries the address's attribution, without which WireGuard from it is dropped.
+/// Go's address-to-peer map (`peerMap.setNodeKeyForEpAddr`, magicsock.go:2582) does not expire
+/// with the candidate, and Go hands WireGuard from an unknown address to wireguard-go anyway
+/// (`lazyEndpoint`, magicsock.go:1903-1905). Expiring by time here would drop the WireGuard of a peer
+/// that sends data without pinging, as one under `silent-disco` does.
+pub(crate) const MAX_LEARNED_CANDIDATES_PER_PEER: usize = 32;
 
 /// Where a candidate endpoint came from, which decides how it is reconciled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -196,10 +207,11 @@ enum CandidateSource {
     /// a netmap candidate that control stops advertising is pruned.
     Netmap,
     /// Learned from authenticated disco traffic (an inbound ping's source, or a CallMeMaybe).
-    /// Preserved across netmap updates — only dropped when the whole peer leaves the netmap.
-    /// Go expires these (`shouldDeleteLocked`, 45 s since `lastGotPing`; `CallMeMaybe` endpoints
-    /// replaced per message); this tree does not, and [`MAX_LEARNED_CANDIDATES_PER_PEER`] stands
-    /// in for that expiry.
+    /// Preserved across netmap updates. Dropped when the whole peer leaves the netmap, or evicted
+    /// when the peer's learned set is full and the peer names a new address (the one it named
+    /// least recently goes; see [`MAX_LEARNED_CANDIDATES_PER_PEER`]). Go expires these by time
+    /// instead (`shouldDeleteLocked`, 45 s since `lastGotPing`; `CallMeMaybe` endpoints are
+    /// replaced per message).
     #[default]
     Learned,
 }
@@ -217,6 +229,20 @@ struct Candidate {
     /// Go's `st.lastPing = now` at ping dispatch — so a candidate whose pong is lost still waits the
     /// full interval before the next probe.
     last_ping: Option<Instant>,
+    /// When an authenticated disco message (an inbound ping from this address, or a `CallMeMaybe`
+    /// listing it) last named this endpoint. Learned candidates only; decides which one is evicted
+    /// when the learned set is full.
+    last_learned: Option<Instant>,
+}
+
+/// The outcome of adding learned candidates: the addresses now in the candidate set, and the
+/// learned addresses evicted to keep the set within [`MAX_LEARNED_CANDIDATES_PER_PEER`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LearnedCandidates {
+    /// Addresses in the candidate set after the call (newly inserted, or already present).
+    pub accepted: Vec<SocketAddr>,
+    /// Learned addresses removed to make room.
+    pub evicted: Vec<SocketAddr>,
 }
 
 /// A ping we sent and are awaiting a pong for.
@@ -271,43 +297,71 @@ impl PeerPaths {
     /// Anti-amplification: the number of [`CandidateSource::Learned`] candidates a single peer can
     /// accumulate is bounded by [`MAX_LEARNED_CANDIDATES_PER_PEER`]. The per-message cap in
     /// `disco::open` bounds one `CallMeMaybe`, but a peer could otherwise send many of them over
-    /// time (each carrying fresh addresses) to grow the learned set without limit — and learned
-    /// candidates persist across netmap reconcile, so they'd never be pruned. Once at the cap, *new*
-    /// learned endpoints are dropped (existing candidates stay — an established/confirmed path must
-    /// not be evicted by a flood of junk). Netmap (control-authoritative) candidates are never
-    /// capped: control is trusted and `reconcile_netmap_candidates` already bounds them to the
-    /// advertised set.
-    /// Returns the addresses that were actually accepted into the candidate set (newly inserted, or
-    /// already present) — i.e. *not* the ones dropped at the learned cap. The caller uses this to
-    /// keep the socket's reverse `addr -> disco` attribution map in lockstep, so a flood of
-    /// over-cap learned addresses can't grow that map with entries the path set never accepted.
+    /// time (each carrying fresh addresses) to grow the learned set without limit. Once at the cap,
+    /// a *new* learned endpoint evicts the learned candidate that an authenticated disco message
+    /// named least recently, so the set stays bounded and a peer that moved is still learned at its
+    /// new address. The current best path is never evicted. Netmap (control-authoritative)
+    /// candidates are never capped or evicted: control is trusted and
+    /// `reconcile_netmap_candidates` already bounds them to the advertised set.
+    ///
+    /// Returns the addresses accepted into the candidate set (newly inserted, or already present)
+    /// and the learned addresses evicted to make room. The caller uses both to keep the socket's
+    /// reverse `addr -> disco` attribution map in lockstep with the candidate set.
     fn add_candidates(
         &mut self,
         endpoints: impl IntoIterator<Item = SocketAddr>,
         source: CandidateSource,
-    ) -> Vec<SocketAddr> {
-        let mut accepted = Vec::new();
-        for ep in endpoints {
-            // For learned candidates, refuse to grow the learned set past the cap. Updating an
-            // endpoint we already track is always fine (no growth); only a brand-new learned address
-            // is gated.
+        now: Instant,
+    ) -> LearnedCandidates {
+        let mut out = LearnedCandidates::default();
+        // Every address this call names is protected from eviction by it, wherever it sits in the
+        // list: evicting one named later would only drop its state and re-add it.
+        let endpoints: Vec<SocketAddr> = endpoints.into_iter().collect();
+        for &ep in &endpoints {
             if source == CandidateSource::Learned
                 && !self.candidates.contains_key(&ep)
                 && self.learned_candidate_count() >= MAX_LEARNED_CANDIDATES_PER_PEER
             {
+                let Some(stalest) = self.stalest_evictable_learned(&endpoints) else {
+                    tracing::debug!(
+                        %ep,
+                        "dropping learned candidate: peer at MAX_LEARNED_CANDIDATES_PER_PEER"
+                    );
+                    continue;
+                };
                 tracing::debug!(
                     %ep,
-                    "dropping learned candidate: peer at MAX_LEARNED_CANDIDATES_PER_PEER"
+                    evicted = %stalest,
+                    "learned set full; evicting the least recently named learned candidate"
                 );
-                continue;
+                self.candidates.remove(&stalest);
+                self.in_flight.retain(|_, inflight| inflight.to != stalest);
+                out.evicted.push(stalest);
             }
             let cand = self.candidates.entry(ep).or_default();
-            if source == CandidateSource::Netmap {
-                cand.source = CandidateSource::Netmap;
+            match source {
+                CandidateSource::Netmap => cand.source = CandidateSource::Netmap,
+                CandidateSource::Learned => cand.last_learned = Some(now),
             }
-            accepted.push(ep);
+            out.accepted.push(ep);
         }
-        accepted
+        out
+    }
+
+    /// The learned candidate an authenticated disco message named least recently, excluding the
+    /// current best path and the addresses `named_now` (every address the message being added
+    /// names, so it never evicts its own endpoints). Ties (and candidates with no stamp) break on
+    /// the address so the choice is deterministic.
+    fn stalest_evictable_learned(&self, named_now: &[SocketAddr]) -> Option<SocketAddr> {
+        self.candidates
+            .iter()
+            .filter(|(addr, c)| {
+                c.source == CandidateSource::Learned
+                    && self.best != Some(**addr)
+                    && !named_now.contains(addr)
+            })
+            .min_by_key(|(addr, c)| (c.last_learned, **addr))
+            .map(|(addr, _)| *addr)
     }
 
     /// The number of candidates currently tracked with [`CandidateSource::Learned`].
@@ -320,21 +374,32 @@ impl PeerPaths {
 
     /// Add candidate endpoints advertised by the control netmap.
     pub fn add_netmap_candidates(&mut self, endpoints: impl IntoIterator<Item = SocketAddr>) {
-        self.add_candidates(endpoints, CandidateSource::Netmap);
+        self.add_candidates(endpoints, CandidateSource::Netmap, Instant::now());
     }
 
     /// Add candidate endpoints learned from authenticated disco traffic, returning the addresses
-    /// actually accepted (those not dropped at `MAX_LEARNED_CANDIDATES_PER_PEER`). The caller
-    /// (`MagicSock::add_peer_endpoints`) inserts only the accepted addresses into the reverse
-    /// `addr -> disco` map, keeping it bounded in lockstep with the capped candidate set — so a flood
-    /// of over-cap learned addresses can't grow the attribution map with entries the path set
-    /// dropped. (Not `#[must_use]`: the lone production caller consumes the return, and the test
-    /// seams legitimately ignore it.)
+    /// accepted. See [`add_learned_candidates_at`](Self::add_learned_candidates_at), which also
+    /// reports the addresses evicted at `MAX_LEARNED_CANDIDATES_PER_PEER`.
     pub fn add_learned_candidates(
         &mut self,
         endpoints: impl IntoIterator<Item = SocketAddr>,
     ) -> Vec<SocketAddr> {
-        self.add_candidates(endpoints, CandidateSource::Learned)
+        self.add_learned_candidates_at(endpoints, Instant::now())
+            .accepted
+    }
+
+    /// Add candidate endpoints learned from authenticated disco traffic at `now`. Each one is
+    /// stamped as named at `now`, so a source the peer keeps pinging from ranks ahead of every
+    /// address it named earlier when the full set must evict one. No address named in this call is
+    /// evicted by it. The caller (`MagicSock::add_peer_endpoints`) attributes the accepted
+    /// addresses in the reverse `addr -> disco` map and releases the evicted ones, keeping that map
+    /// bounded in lockstep with the capped candidate set.
+    pub fn add_learned_candidates_at(
+        &mut self,
+        endpoints: impl IntoIterator<Item = SocketAddr>,
+        now: Instant,
+    ) -> LearnedCandidates {
+        self.add_candidates(endpoints, CandidateSource::Learned, now)
     }
 
     /// Set whether control has switched this node's disco heartbeat off for this peer — Go
@@ -452,6 +517,10 @@ impl PeerPaths {
     ///   `invalidateDiscoPathLocked`, whose point is to re-discover the path now rather than coast
     ///   until trust lapses on its own).
     ///
+    /// Each candidate's `last_learned` stamp is kept, as Go keeps `lastGotPing`: it records when
+    /// the peer named the address, not a measurement, and it decides which learned candidate a
+    /// full set evicts.
+    ///
     /// `best` itself and the candidate set are deliberately **kept**, which is the whole shape of
     /// the upstream call: "keep bestAddr so that we can still send data while we find a new path".
     /// The addresses are still where the peer is believed to live — control advertised them, or the
@@ -480,9 +549,13 @@ impl PeerPaths {
         self.in_flight.clear();
         self.last_full_ping = None;
         for cand in self.candidates.values_mut() {
-            // Keep only where the candidate came from; every measurement is pre-rotation.
+            // Keep where the candidate came from and when the peer last named it; every measurement
+            // is pre-rotation. Go keeps `lastGotPing` across the rotation too (it only zeroes
+            // `lastPing`, `invalidateDiscoPathLocked`), so a source the peer named just before it
+            // rotated still outranks one it named a day ago when the learned set is full.
             *cand = Candidate {
                 source: cand.source,
+                last_learned: cand.last_learned,
                 ..Candidate::default()
             };
         }
@@ -1195,7 +1268,7 @@ mod tests {
 
     /// Anti-amplification: learned candidates per peer are bounded by
     /// `MAX_LEARNED_CANDIDATES_PER_PEER`. Feeding more (as a peer drip-feeding CallMeMaybes over
-    /// time would) does not grow the set past the cap — excess new learned addresses are dropped.
+    /// time would) does not grow the set past the cap — each new one evicts a stale one.
     #[test]
     fn learned_candidates_capped_per_peer() {
         let mut p = PeerPaths::default();
@@ -1209,6 +1282,108 @@ mod tests {
             p.candidate_addrs().len(),
             MAX_LEARNED_CANDIDATES_PER_PEER,
             "learned candidates must be bounded by MAX_LEARNED_CANDIDATES_PER_PEER"
+        );
+    }
+
+    /// At the cap, a new learned address evicts the one the peer named least recently, never the
+    /// confirmed best path and never a netmap candidate, and the eviction is reported so the socket
+    /// can drop the address's attribution. A source the peer keeps naming is refreshed and kept.
+    #[test]
+    fn full_learned_set_evicts_the_least_recently_named() {
+        let mut p = PeerPaths::default();
+        let t0 = Instant::now();
+        let addr =
+            |i: usize| -> SocketAddr { format!("203.0.113.7:{}", 40000 + i).parse().unwrap() };
+        for i in 0..MAX_LEARNED_CANDIDATES_PER_PEER {
+            p.add_learned_candidates_at([addr(i)], t0 + Duration::from_secs(i as u64));
+        }
+        let netmap: SocketAddr = "198.51.100.9:3478".parse().unwrap();
+        p.add_netmap_candidates([netmap]);
+
+        // addr(0) is the oldest but is the confirmed best; addr(1) was named again just now.
+        let now = t0 + Duration::from_secs(100);
+        let tx = tx(9);
+        p.note_ping_sent(tx, addr(0), now);
+        p.note_pong(tx, addr(0), now);
+        assert_eq!(p.best_addr(now), Some(addr(0)));
+        p.add_learned_candidates_at([addr(1)], now);
+
+        let moved: SocketAddr = "198.51.100.7:41641".parse().unwrap();
+        let out = p.add_learned_candidates_at([moved], now);
+        assert_eq!(out.accepted, vec![moved]);
+        assert_eq!(
+            out.evicted,
+            vec![addr(2)],
+            "the least recently named, non-best learned"
+        );
+
+        let cands = p.candidate_addrs();
+        assert!(cands.contains(&moved) && cands.contains(&addr(0)) && cands.contains(&addr(1)));
+        assert!(
+            cands.contains(&netmap),
+            "netmap candidates are never evicted"
+        );
+        assert_eq!(p.learned_candidate_count(), MAX_LEARNED_CANDIDATES_PER_PEER);
+        assert_eq!(p.best_addr(now), Some(addr(0)));
+    }
+
+    /// Neither a disco-key change nor the message being added decides eviction order wrongly: the
+    /// rotation keeps each learned candidate's stamp (Go keeps `lastGotPing`), so the source the
+    /// peer named just before it rotated outlives older ones, and a message that names more new
+    /// addresses than there is room for never evicts its own.
+    #[test]
+    fn learned_eviction_keeps_recency_across_a_disco_key_change() {
+        let mut p = PeerPaths::default();
+        let t0 = Instant::now();
+        let addr =
+            |i: usize| -> SocketAddr { format!("203.0.113.8:{}", 40000 + i).parse().unwrap() };
+        // addr(0) is named last, so it is the freshest despite the lowest address.
+        for i in (0..MAX_LEARNED_CANDIDATES_PER_PEER).rev() {
+            let at = t0 + Duration::from_secs((MAX_LEARNED_CANDIDATES_PER_PEER - i) as u64);
+            p.add_learned_candidates_at([addr(i)], at);
+        }
+        p.invalidate_disco_path();
+
+        let now = t0 + Duration::from_secs(100);
+        let moved: SocketAddr = "198.51.100.8:41641".parse().unwrap();
+        let out = p.add_learned_candidates_at([moved], now);
+        assert_eq!(
+            out.evicted,
+            vec![addr(MAX_LEARNED_CANDIDATES_PER_PEER - 1)],
+            "the oldest pre-rotation source goes, not the one the peer named just before rotating"
+        );
+        assert!(p.candidate_addrs().contains(&addr(0)));
+
+        // One message naming new addresses when every tracked one is just as fresh: each is
+        // admitted, and none evicts another the same message named (they tie on the stamp and
+        // sort lowest, so only the exclusion keeps them).
+        p.add_learned_candidates_at(p.candidate_addrs(), now);
+        let burst: Vec<SocketAddr> = (0..16)
+            .map(|i| format!("198.51.100.9:{}", 50000 + i).parse().unwrap())
+            .collect();
+        let out = p.add_learned_candidates_at(burst.iter().copied(), now);
+        assert_eq!(out.accepted, burst);
+        assert_eq!(out.evicted.len(), burst.len());
+        assert!(out.evicted.iter().all(|e| !burst.contains(e)));
+        let cands = p.candidate_addrs();
+        assert!(burst.iter().all(|b| cands.contains(b)));
+        assert_eq!(p.learned_candidate_count(), MAX_LEARNED_CANDIDATES_PER_PEER);
+
+        // Protection covers the whole message, not just the addresses before the one being added:
+        // `[new, stalest]` must not evict `stalest` for `new` and then re-add it, which would drop
+        // its in-flight probe and state.
+        let later = now + Duration::from_secs(10);
+        let stalest = p.stalest_evictable_learned(&[]).unwrap();
+        p.note_ping_sent(tx(7), stalest, later);
+        let fresh: SocketAddr = "198.51.100.10:41641".parse().unwrap();
+        let out = p.add_learned_candidates_at([fresh, stalest], later);
+        assert_eq!(out.accepted, vec![fresh, stalest]);
+        assert_eq!(out.evicted.len(), 1);
+        assert!(!out.evicted.contains(&stalest) && !out.evicted.contains(&fresh));
+        assert_eq!(
+            p.note_pong(tx(7), stalest, later + Duration::from_millis(5)),
+            Some(Duration::from_millis(5)),
+            "the named address kept its in-flight probe"
         );
     }
 
