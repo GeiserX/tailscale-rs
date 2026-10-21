@@ -1610,7 +1610,7 @@ version = "0.2.11"
 criteria = "safe-to-deploy"
 
 [[exemptions.russh]]
-version = "0.63.3"
+version = "0.64.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.russh-cryptovec]]
