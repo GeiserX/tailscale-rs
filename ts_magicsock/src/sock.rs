@@ -1469,8 +1469,8 @@ impl MagicSock {
             // reassign an address across peers.
             //
             // This is a divergence from Go, whose `peerMap.setNodeKeyForEpAddr`
-            // (wgengine/magicsock/peermap.go:209) is last-writer-wins and is written only from a
-            // ping (magicsock.go:2598) and a solicited pong (endpoint.go:1970); Go never
+            // (wgengine/magicsock/peermap.go:187) is last-writer-wins and is written only from a
+            // ping (magicsock.go:2582) and a solicited pong (endpoint.go:1759); Go never
             // stores a `CallMeMaybe` endpoint in that map. Attributing data to a `CallMeMaybe`
             // endpoint here is this tree's own choice. A misattribution costs only the under-load
             // cookie reply (ts_tunnel `Endpoint::recv_from`) and the silent-disco trust stamp,

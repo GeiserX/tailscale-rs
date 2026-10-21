@@ -190,13 +190,13 @@ pub const SESSION_ACTIVE_TIMEOUT: Duration = Duration::from_secs(45);
 /// WireGuard from the new address had no `addr -> disco` attribution and was dropped.
 ///
 /// Go expires learned endpoints by time instead (`endpointState.shouldDeleteLocked`,
-/// wgengine/magicsock/endpoint.go:510-521: 45 s since `lastGotPing`, `sessionActiveTimeout` at
-/// magicsock.go:4068; `CallMeMaybe` endpoints are replaced per message, endpoint.go:2165-2209) and
-/// prunes past 100 endpoints (endpoint.go:1840-1848). This tree does not, because here a learned
+/// wgengine/magicsock/endpoint.go:456-467: 45 s since `lastGotPing`, `sessionActiveTimeout` at
+/// magicsock.go:4024; `CallMeMaybe` endpoints are replaced per message, endpoint.go:1994-1999) and
+/// prunes past 100 endpoints (endpoint.go:1630-1638). This tree does not, because here a learned
 /// candidate also carries the address's attribution, without which WireGuard from it is dropped.
-/// Go's address-to-peer map (`peerMap.setNodeKeyForEpAddr`, magicsock.go:2598) does not expire
+/// Go's address-to-peer map (`peerMap.setNodeKeyForEpAddr`, magicsock.go:2582) does not expire
 /// with the candidate, and Go hands WireGuard from an unknown address to wireguard-go anyway
-/// (`lazyEndpoint`, magicsock.go:1893). Expiring by time here would drop the WireGuard of a peer
+/// (`lazyEndpoint`, magicsock.go:1903-1905). Expiring by time here would drop the WireGuard of a peer
 /// that sends data without pinging, as one under `silent-disco` does.
 pub(crate) const MAX_LEARNED_CANDIDATES_PER_PEER: usize = 32;
 
