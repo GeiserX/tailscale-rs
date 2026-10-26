@@ -1466,7 +1466,7 @@ version = "0.14.3"
 criteria = "safe-to-run"
 
 [[exemptions.pty-process]]
-version = "0.5.3"
+version = "0.5.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.pyo3]]
@@ -1630,7 +1630,7 @@ version = "0.4.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustix]]
-version = "1.1.4"
+version = "1.1.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustler]]
@@ -1846,7 +1846,7 @@ version = "0.4.12"
 criteria = "safe-to-deploy"
 
 [[exemptions.smallvec]]
-version = "1.16.3"
+version = "1.16.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.smoltcp]]
@@ -1915,6 +1915,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.sync_wrapper]]
 version = "1.0.2"
+criteria = "safe-to-deploy"
+
+[[exemptions.synstructure]]
+version = "0.14.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.system-configuration]]
@@ -1986,7 +1990,7 @@ version = "1.11.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.tokio]]
-version = "1.53.3"
+version = "1.54.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.tokio-macros]]
@@ -2098,7 +2102,7 @@ version = "0.2.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.tun-rs]]
-version = "2.8.12"
+version = "2.8.13"
 criteria = "safe-to-deploy"
 
 [[exemptions.twox-hash]]
@@ -2210,7 +2214,7 @@ version = "1.0.10"
 criteria = "safe-to-run"
 
 [[exemptions.webpki-roots]]
-version = "1.0.10"
+version = "1.0.11"
 criteria = "safe-to-deploy"
 
 [[exemptions.wezterm-bidi]]
@@ -2430,11 +2434,11 @@ version = "0.5.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.yoke]]
-version = "0.8.3"
+version = "0.8.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.yoke-derive]]
-version = "0.8.2"
+version = "0.8.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.zerocopy]]
