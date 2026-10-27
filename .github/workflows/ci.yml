@@ -61,7 +61,10 @@ jobs:
     # Self-hosted Linux/X64 runner (Docker container on the maintainer's infra) — keeps CI off paid
     # GitHub-hosted minutes. The inherited `build_test`/`arch_independent` matrices target other
     # self-hosted labels (`linux-x86_64-16cpu`, …) that don't exist here and stay owner-gated.
-    runs-on: ubuntu-latest
+    # Pinned to 24.04, not `ubuntu-latest`: the ts_python pyo3 cdylib links libpython3.12, which
+    # 24.04 ships and 26.04 (the `ubuntu-latest` image since late October 2026) does not. The
+    # target/ cache key carries no image name, so a moved image also restores a 3.12 build config.
+    runs-on: ubuntu-24.04
     # Skip on tag pushes: this lane verifies code, and `publish` (which fires on tags) deliberately
     # does NOT depend on it, so re-running the full build+test on every release tag gates nothing.
     # SECURITY: this runs on a self-hosted runner with Docker-socket access. Never let a PR from a
