@@ -35,6 +35,10 @@ use crate::{
 ///
 /// All-`None` (the initial state, before any signal) applies nothing to the builder, so a node that
 /// has not yet learned anything sends no `NetInfo` at all — byte-identical to the prior behavior.
+///
+/// The last advertised endpoints ride along for the same reason, although they are not part of
+/// `NetInfo`: Go attaches `c.endpoints` to every map request too
+/// (`control/controlclient/direct.go:1048-1104`).
 #[derive(Debug, Clone, Default)]
 struct CarriedNetInfo {
     /// Smoothed home DERP region (Go `NetInfo.PreferredDERP`), set by `SetDerpHomeRegion`.
@@ -51,12 +55,35 @@ struct CarriedNetInfo {
     /// `SetEndpoints` when the runtime runs a port mapper. `None` (no port mapper) sends none of
     /// them, like Go without a portmapper.
     port_map: Option<crate::PortMapFacets>,
+    /// The endpoints from the last `SetEndpoints` (Go `MapRequest.Endpoints`/`EndpointTypes`),
+    /// empty until the first one. Control treats a map request with `OmitPeers`, without `Stream`
+    /// and without `ReadOnly` as an endpoint update (tailcfg `MapRequest.OmitPeers`), so such a
+    /// request without them clears the node's endpoints. A peer that starts from a fresh netmap
+    /// then has no candidate to ping, and Go sends a `CallMeMaybe` only after a ping
+    /// (`wgengine/magicsock/endpoint.go:1446-1462`), so it cannot start a direct path to us.
+    endpoints: Vec<ts_control_serde::Endpoint>,
 }
 
 impl CarriedNetInfo {
-    /// Apply the carried NetInfo to a [`MapRequestBuilder`], setting only the `Some` facets. An
-    /// all-`None` carried state is a no-op (leaves `host_info.net_info == None`, wire-identical to
-    /// sending no NetInfo). Called on EVERY map request so NetInfo is always whole, never partial.
+    /// Record a `SetEndpoints`: the endpoints and the NAT facets that come with them. Both ride on
+    /// every later request, including those after a reconnect, so endpoints whose own request was
+    /// lost are sent again.
+    fn set_endpoints(
+        &mut self,
+        endpoints: Vec<ts_control_serde::Endpoint>,
+        stun: crate::StunFacts,
+        port_map: Option<crate::PortMapFacets>,
+    ) {
+        self.working_udp = Some(stun.working_udp);
+        self.mapping_varies_by_dest_ip = Some(stun.mapping_varies);
+        self.port_map = port_map;
+        self.endpoints = endpoints;
+    }
+
+    /// Apply the carried NetInfo and endpoints to a [`MapRequestBuilder`], setting only the `Some`
+    /// facets. An all-`None` carried state with no endpoints is a no-op (leaves
+    /// `host_info.net_info == None`, wire-identical to sending no NetInfo). Called on EVERY map
+    /// request so NetInfo and endpoints are always whole, never partial.
     fn apply<'a>(&'a self, mut builder: MapRequestBuilder<'a>) -> MapRequestBuilder<'a> {
         if let Some(derp) = self.preferred_derp {
             builder = builder.preferred_derp(derp);
@@ -85,7 +112,7 @@ impl CarriedNetInfo {
                 builder = builder.have_port_map(true);
             }
         }
-        builder
+        builder.endpoints(self.endpoints.iter().copied())
     }
 }
 
@@ -876,13 +903,17 @@ async fn run_once(
             }
 
             command = command_rx.recv() => {
-                match command.unwrap() {
-                    Command::SetDerpHomeRegion { id, latencies } => {
-                        // Mutate the carried NetInfo, then apply the WHOLE thing below — so this
-                        // request also carries any previously-learned working_udp/mapping_varies
-                        // rather than nulling them at control.
-                        net_info.preferred_derp = Some(id);
-                        net_info.derp_latency = Some(latencies);
+                let command = command.unwrap();
+                if !hostinfo_sent && !matches!(command, Command::Reauth) {
+                    watchdog.set_phase(PollPhase::StartupMapRequest);
+                }
+                begin_side_command(&command, net_info, hostinfo_update.as_mut(), &mut hostinfo_sent)
+                    .await;
+                match command {
+                    Command::SetDerpHomeRegion { .. } => {
+                        // `begin_side_command` updated the carried NetInfo; apply the WHOLE thing
+                        // below — so this request also carries any previously-learned
+                        // working_udp/mapping_varies rather than nulling them at control.
                         let mut builder = with_hostinfo(MapRequestBuilder::new(node_keys))
                             .keep_alive(false)
                             .omit_peers(true)
@@ -898,20 +929,13 @@ async fn run_once(
                         watchdog.set_phase(PollPhase::SetDerpHomeRegion);
                         drop(send_map_request(req, &map_url, &h2_client).await?);
                     },
-                    Command::SetEndpoints { endpoints, stun, port_map } => {
-                        // The NAT facets come with the endpoints, computed by the runtime from the
-                        // reflexive set before de-duplication (a reflexive address equal to the
-                        // port-mapped one still counts): working_udp = a STUN reflexive was
-                        // learned; mapping_varies = >= 2 DISTINCT IPv4 reflexive addrs.
-                        net_info.working_udp = Some(stun.working_udp);
-                        net_info.mapping_varies_by_dest_ip = Some(stun.mapping_varies);
-                        net_info.port_map = port_map;
+                    Command::SetEndpoints { .. } => {
+                        // `begin_side_command` recorded the endpoints and their NAT facets.
                         let mut builder = with_hostinfo(MapRequestBuilder::new(node_keys))
                             .keep_alive(false)
                             .omit_peers(true)
                             .stream(false)
-                            .routable_ips(config.advertised_routes())
-                            .endpoints(endpoints);
+                            .routable_ips(config.advertised_routes());
                         builder = net_info.apply(builder);
 
                         if let Some(hostname) = &config.hostname {
@@ -978,6 +1002,46 @@ async fn run_once(
     }
 
     Ok(())
+}
+
+/// Start a side command: record the state it carries, then finish the post-connect Hostinfo
+/// update if it is still unsent or in flight. The caller then sends the command's own update.
+///
+/// The Hostinfo update carries the state from when the poll started; a side command sends newer
+/// state. Both are separate requests on the same connection, so if they overlapped, the older one
+/// could be applied last and undo the newer one, for example clearing endpoints the command had
+/// just advertised. Go sends all of these from one `updateRoutine`, one at a time
+/// (`control/controlclient/auto.go:61-109`).
+///
+/// The state is recorded first because the wait can end in a watchdog restart, which drops the
+/// command. The carried state outlives the poll, so the next one sends it.
+async fn begin_side_command(
+    command: &Command,
+    carried: &mut CarriedNetInfo,
+    startup: core::pin::Pin<&mut impl core::future::Future<Output = ()>>,
+    startup_sent: &mut bool,
+) {
+    match command {
+        Command::SetDerpHomeRegion { id, latencies } => {
+            carried.preferred_derp = Some(*id);
+            carried.derp_latency = Some(latencies.clone());
+        }
+        // The NAT facets come with the endpoints, computed by the runtime from the reflexive set
+        // before de-duplication (a reflexive address equal to the port-mapped one still counts):
+        // working_udp = a STUN reflexive was learned; mapping_varies = >= 2 DISTINCT IPv4
+        // reflexive addrs.
+        Command::SetEndpoints {
+            endpoints,
+            stun,
+            port_map,
+        } => carried.set_endpoints(endpoints.clone(), *stun, *port_map),
+        Command::Reauth => return,
+        Command::SetRoutableIPs { .. } | Command::SetHostname { .. } => {}
+    }
+    if !*startup_sent {
+        startup.await;
+        *startup_sent = true;
+    }
 }
 
 fn netmap_stream(
@@ -1425,6 +1489,161 @@ mod tests {
         assert!(ni.derp_latency.is_some(), "derp latency must persist too");
         assert_eq!(ni.working_udp, Some(true));
         assert_eq!(ni.mapping_varies_by_dest_ip, Some(true));
+    }
+
+    /// Control takes the endpoints of every endpoint update (a non-streaming, non-read-only map
+    /// request) as the node's endpoints, so the home-region update and the post-connect Hostinfo
+    /// update must repeat the last advertised ones. Without them control dropped the node's
+    /// endpoints after a reconnect until they next changed.
+    #[allow(clippy::field_reassign_with_default)]
+    #[test]
+    fn every_request_carries_the_last_advertised_endpoints() {
+        use ts_control_serde::EndpointType::{Local, PortMapped};
+        let node_keys = ts_keys::NodeState::generate();
+        let mut carried = CarriedNetInfo::default();
+
+        // SetEndpoints, as its run-loop arm records it.
+        let endpoints = vec![
+            ep("203.0.113.7:41642", PortMapped),
+            ep("192.168.1.2:41642", Local),
+        ];
+        let stun = crate::StunFacts::from_reflexive(&[]);
+        carried.set_endpoints(endpoints.clone(), stun, None);
+        // Then a SetDerpHomeRegion, which changes only the home region.
+        carried.preferred_derp = Some(region(4));
+        let after_reconnect = carried.clone();
+
+        let lite = || {
+            MapRequestBuilder::new(&node_keys)
+                .keep_alive(false)
+                .omit_peers(true)
+                .stream(false)
+        };
+        let requests = [
+            ("home-region update", carried.apply(lite()).build()),
+            (
+                "hostinfo update after a reconnect",
+                after_reconnect.apply(lite()).build(),
+            ),
+            (
+                "streaming poll",
+                carried
+                    .apply(
+                        MapRequestBuilder::new(&node_keys)
+                            .keep_alive(true)
+                            .stream(true),
+                    )
+                    .build(),
+            ),
+        ];
+        for (what, req) in &requests {
+            assert_eq!(req.endpoints, endpoints, "{what}");
+            let json = serde_json::to_value(req).unwrap();
+            assert_eq!(
+                json["Endpoints"],
+                serde_json::json!(["203.0.113.7:41642", "192.168.1.2:41642"]),
+                "{what}"
+            );
+            assert_eq!(json["EndpointTypes"], serde_json::json!([3, 1]), "{what}");
+        }
+
+        // A later SetEndpoints replaces them...
+        let moved = vec![ep("198.51.100.9:41642", PortMapped)];
+        carried.set_endpoints(moved.clone(), stun, None);
+        carried.preferred_derp = Some(region(8));
+        assert_eq!(carried.apply(lite()).build().endpoints, moved);
+
+        // ...and one with no endpoints withdraws them: empty is wire-absent (Go `omitempty`),
+        // which is also all that every request but `SetEndpoints` sent before.
+        carried.set_endpoints(Vec::new(), stun, None);
+        let json = serde_json::to_value(carried.apply(lite()).build()).unwrap();
+        assert!(json.get("Endpoints").is_none(), "{json}");
+        assert!(json.get("EndpointTypes").is_none(), "{json}");
+    }
+
+    /// A side command that arrives while the post-connect Hostinfo update is unsent or in flight
+    /// must wait for it. Otherwise control could apply that older snapshot after the command's
+    /// update and undo it.
+    #[tokio::test]
+    async fn startup_update_is_applied_before_a_side_update() {
+        use std::sync::Mutex;
+
+        for in_flight in [false, true] {
+            // Control applies each update when its request completes; the last one applied wins.
+            let applied = Arc::new(Mutex::new(Vec::new()));
+            let (release_startup, released) = tokio::sync::oneshot::channel::<()>();
+            let startup = {
+                let applied = applied.clone();
+                async move {
+                    let _ = released.await;
+                    applied.lock().unwrap().push("startup snapshot");
+                }
+            };
+            let mut startup = core::pin::pin!(startup);
+            let mut sent = false;
+            if in_flight {
+                // Sent, but control has not answered yet.
+                let polled =
+                    core::future::poll_fn(|cx| core::task::Poll::Ready(startup.as_mut().poll(cx)))
+                        .await;
+                assert!(polled.is_pending());
+            }
+
+            let command = Command::SetHostname {
+                hostname: "renamed".to_owned(),
+            };
+            let mut carried = CarriedNetInfo::default();
+            let side_update = async {
+                begin_side_command(&command, &mut carried, startup.as_mut(), &mut sent).await;
+                applied.lock().unwrap().push("side update");
+            };
+            let respond = async {
+                tokio::task::yield_now().await;
+                release_startup.send(()).unwrap();
+            };
+            tokio::join!(side_update, respond);
+
+            assert!(sent, "in_flight={in_flight}");
+            assert_eq!(
+                *applied.lock().unwrap(),
+                ["startup snapshot", "side update"],
+                "in_flight={in_flight}"
+            );
+        }
+    }
+
+    /// A side command's state is recorded before it waits for the post-connect Hostinfo update.
+    /// If that update stalls, the watchdog drops the poll and the dequeued command with it; the
+    /// next poll must still send the command's endpoints, because the runtime does not advertise
+    /// an unchanged set again.
+    #[tokio::test(start_paused = true)]
+    async fn side_command_state_survives_a_watchdog_restart_while_waiting_for_startup() {
+        use ts_control_serde::EndpointType::PortMapped;
+        let node_keys = ts_keys::NodeState::generate();
+        let endpoints = vec![ep("203.0.113.7:41642", PortMapped)];
+        let command = Command::SetEndpoints {
+            endpoints: endpoints.clone(),
+            stun: crate::StunFacts::from_reflexive(&[]),
+            port_map: None,
+        };
+        let mut carried = CarriedNetInfo::default();
+
+        let watchdog = MapPollWatchdog::new(watch::channel(false).0);
+        let poll = async {
+            // Control never answers the Hostinfo update.
+            let mut startup = core::pin::pin!(core::future::pending::<()>());
+            let mut sent = false;
+            begin_side_command(&command, &mut carried, startup.as_mut(), &mut sent).await;
+            Ok(())
+        };
+        assert!(
+            watchdog.run(poll).await.is_err(),
+            "the watchdog restarts the poll"
+        );
+
+        // The next poll's requests, built from the carried state.
+        let req = carried.apply(MapRequestBuilder::new(&node_keys)).build();
+        assert_eq!(req.endpoints, endpoints);
     }
 
     /// The port-mapping facets ride on every request built from the carried state (the
