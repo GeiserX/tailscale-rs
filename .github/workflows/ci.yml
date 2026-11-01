@@ -170,11 +170,19 @@ jobs:
       # Machine-enforce the ring-only / no-aws-lc supply-chain invariant on every push, on the
       # runtime graph this lane builds (default features, no `ssh`). `--exclude-dev` drops the
       # `reqwest` default-tls dev-dependency of ts_derp/ts_netcheck, the one remaining aws-lc path in
-      # the workspace. The aws-lc ban in `deny.toml` must hold here. The `--all-features` audit (with
-      # `ssh`, whose russh is on its ring backend) is the upstream `arch_independent` job's concern
-      # and is run locally by `bin/check`. `TS_RS_EXPERIMENT` is set at job-level.
+      # the workspace. The aws-lc ban in `deny.toml` must hold here. The full `--all-features` check
+      # (with `ssh`, whose russh is on its ring backend) is the upstream `arch_independent` job's
+      # concern and is run locally by `bin/check`; its advisory part runs in the next step.
+      # `TS_RS_EXPERIMENT` is set at job-level.
       - name: Supply-chain audit (cargo deny, ring-only graph)
         run: cargo deny --no-default-features --exclude-dev check all
+      # Scan advisories on the full feature graph too. The step above turns `ssh` off, so a
+      # vulnerability that lives only under an optional feature (russh's RustCrypto stack, for
+      # example RUSTSEC-2026-0387 in crypto-bigint) passed it, and the upstream `arch_independent`
+      # job that runs `--all-features` never runs on this fork. Advisories only: `check all` here
+      # would trip the aws-lc ban, which is scoped to the ring-only graph on purpose.
+      - name: Advisory audit (cargo deny, all features)
+        run: cargo deny --workspace --all-features check advisories
       # Every third-party crate in Cargo.lock must be audited, imported from a trusted audit set, or
       # exempted in `supply-chain/config.toml`. `--locked` uses `supply-chain/imports.lock` as
       # committed and never fetches, so the result depends only on the tree under test. A dependency
