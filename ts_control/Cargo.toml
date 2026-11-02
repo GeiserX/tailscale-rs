@@ -90,6 +90,13 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"]
 # `test-util` provides the paused virtual clock (`#[tokio::test(start_paused = true)]`) the map-poll
 # read-watchdog tests use to fire the 120s timeout instantly.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "test-util"] }
+# The fake control server the send-site tests run against (`tokio::fake_control`): hyper's h2c
+# server half plus hyper-util's tokio glue and http-body-util to read the request bodies. All three
+# are already in the workspace graph (the root crate's SSH recording tests use the same server), and
+# none reaches a shipped build.
+hyper = { workspace = true, features = ["server"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+http-body-util.workspace = true
 
 [features]
 default = ["async_tokio"]
