@@ -2040,7 +2040,7 @@ rows were ported in the interval.
   `DERPLatency` map keyed `"<rid>-v4"`/`"-v6"`, `WorkingIPv6`, `OSHasIPv6`, `WorkingUDP`,
   `WorkingICMPv4`, `PreferredDERP` and `FirewallMode`, and hands it to a callback that ships it on the
   next map request — de-duplicated by `BasicallyEqual`, so an unchanged report is not re-uploaded.
-  `ts_control::tokio::client`'s `CarriedNetInfo` models eight of those — `preferred_derp`,
+  `ts_control::tokio::client`'s `CarriedNodeState` models eight of those — `preferred_derp`,
   `derp_latency`, `working_udp`, `mapping_varies_by_dest_ip`, and from the port mapper `UPnP`,
   `PMP`, `PCP` and `HavePortMap` — and applies the whole of it to every map request, which is Go's
   `hi.NetInfo = c.netinfo.Clone()` invariant and is already tested here. `UPnP` is never set (so

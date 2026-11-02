@@ -7,6 +7,7 @@ Record breaking or significant changes here. All dates are UTC.
 ### Bug Fixes
 
 * **control:** send the node's advertised endpoints on every map request, not only on `SetEndpoints`; the post-connect Hostinfo, DERP-home, routes and hostname updates cleared them at control, leaving peers without a direct candidate.
+* **control:** keep the routes and hostname set at runtime on every later map request and on the re-register after a reconnect; the next DERP-home or endpoints update, and every request after a reconnect, rebuilt them from the start-up config and reverted them at control.
 
 ### Performance
 

@@ -6,6 +6,8 @@ use ts_control_serde::{HostInfo, RegisterAuth, RegisterRequest, RegisterResponse
 use ts_http_util::{BytesBody, ClientExt, Http2, ResponseExt};
 use url::Url;
 
+use super::client::CarriedNodeState;
+
 const LOAD_BALANCER_HEADER_KEY: &str = "Ts-Lb";
 
 #[derive(Debug, thiserror::Error, Clone, Eq, PartialEq)]
@@ -145,9 +147,64 @@ fn classify_register_response(resp: &RegisterResponse) -> Result<(), Registratio
     Ok(())
 }
 
+/// The Hostinfo of a register request. The routes and hostname are the node's current ones from
+/// `carried`, like every map request's, so the re-register on a reconnect does not revert a
+/// runtime change at control (Go `doLogin` builds it with the same `hostInfoLocked`).
+pub(super) fn register_hostinfo<'a>(
+    config: &'a crate::Config,
+    carried: &'a CarriedNodeState,
+    client_name: &'a str,
+    host: &'a crate::hostinfo::HostInfoData,
+    services_hash: &'a str,
+) -> HostInfo<'a> {
+    HostInfo {
+        hostname: carried
+            .current_hostname(config)
+            .map(std::borrow::Cow::Borrowed),
+        app: client_name,
+        ipn_version: &host.ipn_version,
+        os: &host.os,
+        os_version: &host.os_version,
+        go_arch: &host.go_arch,
+        go_version: &host.go_version,
+        machine: &host.machine,
+        package: crate::hostinfo::PACKAGE_TSNET,
+        userspace: Some(true),
+        routable_ips: {
+            let routes = carried.current_routes(config);
+            (!routes.is_empty()).then_some(routes)
+        },
+        request_tags: {
+            let tags: Vec<&str> = config.tags.iter().map(String::as_str).collect();
+            (!tags.is_empty()).then_some(tags)
+        },
+        services: {
+            let services = config.advertised_services();
+            (!services.is_empty()).then_some(services)
+        },
+        // capver-113 Funnel "wire me up server-side" signal. IngressEnabled stays false:
+        // listen_funnel is fail-closed in this fork, so no Funnel endpoint ever goes live.
+        wire_ingress: config.wire_ingress,
+        // App-connector advertise (Go `Prefs.AppConnector.Advertise` ->
+        // `hi.AppConnector.Set(advertise)`, called UNCONDITIONALLY): always send the key —
+        // `true` -> `AppConnector:true`, `false` (default) -> `AppConnector:false` (Go's `.Set(false)`
+        // is a non-empty `opt.Bool` that marshals to `false`, NOT omitted). `Some(value)` here so a
+        // default node's wire bytes match Go's; omitting it would be a not-tailscaled tell.
+        // Advertise the capability bool only; the data path is separate.
+        app_connector: Some(config.advertise_app_connector),
+        // Auto-update-apply advertise (Go `Prefs.AutoUpdate.Apply` -> `hi.AllowsUpdate`): the node
+        // accepts admin-console remote update triggers. This fork runs no updater; advertise only.
+        allows_update: config.auto_update_apply == Some(true),
+        // Advertise-side VIP services hash (empty when no services are advertised).
+        services_hash,
+        ..Default::default()
+    }
+}
+
 #[tracing::instrument(skip_all, fields(%control_url))]
 pub async fn register(
     config: &crate::Config,
+    carried: &CarriedNodeState,
     control_url: &Url,
     auth_key: Option<&str>,
     followup: Option<&Url>,
@@ -177,46 +234,7 @@ pub async fn register(
         version: CapabilityVersion::CURRENT,
         node_key: node_public_key,
         old_node_key: node_keystate.old_node_key,
-        hostinfo: HostInfo {
-            hostname: config.hostname.as_deref().map(std::borrow::Cow::Borrowed),
-            app: &client_name,
-            ipn_version: &host.ipn_version,
-            os: &host.os,
-            os_version: &host.os_version,
-            go_arch: &host.go_arch,
-            go_version: &host.go_version,
-            machine: &host.machine,
-            package: crate::hostinfo::PACKAGE_TSNET,
-            userspace: Some(true),
-            routable_ips: {
-                let routes = config.advertised_routes();
-                (!routes.is_empty()).then_some(routes)
-            },
-            request_tags: {
-                let tags: Vec<&str> = config.tags.iter().map(String::as_str).collect();
-                (!tags.is_empty()).then_some(tags)
-            },
-            services: {
-                let services = config.advertised_services();
-                (!services.is_empty()).then_some(services)
-            },
-            // capver-113 Funnel "wire me up server-side" signal. IngressEnabled stays false:
-            // listen_funnel is fail-closed in this fork, so no Funnel endpoint ever goes live.
-            wire_ingress: config.wire_ingress,
-            // App-connector advertise (Go `Prefs.AppConnector.Advertise` ->
-            // `hi.AppConnector.Set(advertise)`, called UNCONDITIONALLY): always send the key —
-            // `true` -> `AppConnector:true`, `false` (default) -> `AppConnector:false` (Go's `.Set(false)`
-            // is a non-empty `opt.Bool` that marshals to `false`, NOT omitted). `Some(value)` here so a
-            // default node's wire bytes match Go's; omitting it would be a not-tailscaled tell.
-            // Advertise the capability bool only; the data path is separate.
-            app_connector: Some(config.advertise_app_connector),
-            // Auto-update-apply advertise (Go `Prefs.AutoUpdate.Apply` -> `hi.AllowsUpdate`): the node
-            // accepts admin-console remote update triggers. This fork runs no updater; advertise only.
-            allows_update: config.auto_update_apply == Some(true),
-            // Advertise-side VIP services hash (empty when no services are advertised).
-            services_hash: &services_hash,
-            ..Default::default()
-        },
+        hostinfo: register_hostinfo(config, carried, &client_name, &host, &services_hash),
         nl_key: Some(network_lock_public_key),
         auth: auth_key.map(RegisterAuth::from),
         // When set, control long-polls this registration until the AuthURL is visited, instead of
