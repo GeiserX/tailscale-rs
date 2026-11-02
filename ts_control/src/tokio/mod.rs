@@ -22,6 +22,8 @@ pub use tka_sync::{
 
 mod client;
 mod connect;
+#[cfg(test)]
+mod fake_control;
 mod id_token;
 mod logout;
 mod map_stream;

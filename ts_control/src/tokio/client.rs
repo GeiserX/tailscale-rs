@@ -6,6 +6,7 @@ use tokio::{
     task::JoinSet,
 };
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+use ts_http_util::{BytesBody, Http2};
 use url::Url;
 
 use crate::{
@@ -813,6 +814,46 @@ async fn run_once(
         )
         .await?;
 
+    poll_connection(
+        &h2_client,
+        state_tx,
+        command_rx,
+        control_url,
+        node_keys,
+        auth_key,
+        config,
+        control_dialer,
+        session,
+        carried,
+        received_frame,
+        reauth_requested,
+        register_succeeded,
+        auth_url_tx,
+        watchdog,
+    )
+    .await
+}
+
+/// Register and run the map poll over an established control connection: the part of
+/// [`run_once`] after the connect, split out so tests can drive it over a fake control connection
+/// and read the requests it sends.
+async fn poll_connection(
+    h2_client: &Http2<BytesBody>,
+    state_tx: &broadcast::Sender<Arc<StateUpdate>>,
+    command_rx: &mut mpsc::Receiver<Command>,
+    control_url: &Url,
+    node_keys: &ts_keys::NodeState,
+    auth_key: Option<&str>,
+    config: &crate::Config,
+    control_dialer: &mut ControlDialer,
+    session: &mut MapSession,
+    carried: &mut CarriedNodeState,
+    received_frame: &mut bool,
+    reauth_requested: &mut bool,
+    register_succeeded: &mut bool,
+    auth_url_tx: &watch::Sender<Option<Url>>,
+    watchdog: &MapPollWatchdog,
+) -> Result<(), Error> {
     // Re-register on every reconnect. On a mid-session re-auth (key expiry/revoke) control answers
     // `MachineNotAuthorized(Some(url))`: surface that URL to the embedder (→ "needs login") via
     // `surface_reauth_url`, then still propagate the error so `run` backs off and retries — Go's
@@ -827,7 +868,7 @@ async fn run_once(
         auth_key,
         None,
         node_keys,
-        &h2_client,
+        h2_client,
     )
     .await;
     match registered {
@@ -859,7 +900,7 @@ async fn run_once(
     let map_url = control_url.join("machine/map").unwrap();
 
     watchdog.set_phase(PollPhase::MapResponseHeaders);
-    let reader = send_map_request(request, &map_url, &h2_client).await?;
+    let reader = send_map_request(request, &map_url, h2_client).await?;
 
     // The netmap cache is maintained from inside the stream, on the raw frame bytes, because that
     // is the only place they still exist — a `StateUpdate` is the decoded netmap, not the wire
@@ -879,7 +920,7 @@ async fn run_once(
     let startup_request = requests.update(&startup_state);
     let mut hostinfo_update = core::pin::pin!(async {
         watchdog.startup_request_started();
-        if let Err(e) = send_map_request(startup_request, &map_url, &h2_client).await {
+        if let Err(e) = send_map_request(startup_request, &map_url, h2_client).await {
             tracing::warn!(error = %e, "initial hostinfo update failed");
         }
         watchdog.startup_request_finished();
@@ -922,7 +963,7 @@ async fn run_once(
                 advance_session(session, &state_update);
 
                 watchdog.set_phase(PollPhase::C2nPing);
-                let _ = handle_ping(&state_update, control_url, &h2_client, config).await;
+                let _ = handle_ping(&state_update, control_url, h2_client, config).await;
                 watchdog.set_phase(PollPhase::ProcessingResponse);
 
                 if let Some(dial_plan) = &state_update.dial_plan
@@ -966,7 +1007,7 @@ async fn run_once(
                 // hostname reach here only through their commands: `config` is a frozen clone.
                 let req = requests.update(carried);
                 watchdog.set_phase(phase);
-                drop(send_map_request(req, &map_url, &h2_client).await?);
+                drop(send_map_request(req, &map_url, h2_client).await?);
             }
         }
     }
@@ -2057,6 +2098,163 @@ mod tests {
             matches!(cmd, Command::Reauth),
             "reauth() must enqueue Command::Reauth, got {cmd:?}"
         );
+    }
+
+    /// The side updates the poll sends carry the whole current state on the wire: after a
+    /// `SetEndpoints` and a `SetRoutableIPs`, both the `SetRoutableIPs` update and a later
+    /// `SetDerpHomeRegion` update carry the runtime routes and the last endpoints, not the start-up
+    /// ones from `config`. Read from the requests a fake control server received, so a send site
+    /// that built its request from `config` fails here even though the builders are right.
+    #[tokio::test]
+    async fn side_updates_on_the_wire_carry_runtime_routes_and_last_endpoints() {
+        let runtime: ipnet::IpNet = "192.168.50.0/24".parse().unwrap();
+        let config = crate::Config {
+            advertise_routes: vec!["10.0.0.0/24".parse().unwrap()],
+            ..Default::default()
+        };
+        let node_keys = ts_keys::NodeState::generate();
+        let control_url: Url = "http://control.example/".parse().unwrap();
+        let (h2_client, mut received) = crate::tokio::fake_control::connect().await;
+
+        let (command_tx, mut command_rx) = mpsc::channel(4);
+        let commands = [
+            Command::SetEndpoints {
+                endpoints: vec![ep(
+                    "203.0.113.7:41642",
+                    ts_control_serde::EndpointType::Local,
+                )],
+                stun: crate::StunFacts::from_reflexive(&[]),
+                port_map: None,
+            },
+            Command::SetRoutableIPs {
+                routes: vec![runtime],
+            },
+            Command::SetDerpHomeRegion {
+                id: region(4),
+                latencies: BTreeMap::new(),
+            },
+        ];
+        for command in commands {
+            command_tx.send(command).await.unwrap();
+        }
+
+        let (state_tx, _state_rx) = broadcast::channel(4);
+        let watchdog = MapPollWatchdog::new(watch::channel(false).0);
+        let (auth_url_tx, _auth_url_rx) = watch::channel(None);
+        let mut dialer = ControlDialer::default();
+        let mut session = MapSession::default();
+        let mut carried = CarriedNodeState::default();
+        let (mut received_frame, mut reauth_requested, mut register_succeeded) =
+            (false, false, false);
+        let poll = poll_connection(
+            &h2_client,
+            &state_tx,
+            &mut command_rx,
+            &control_url,
+            &node_keys,
+            None,
+            &config,
+            &mut dialer,
+            &mut session,
+            &mut carried,
+            &mut received_frame,
+            &mut reauth_requested,
+            &mut register_succeeded,
+            &auth_url_tx,
+            &watchdog,
+        );
+        // The non-streaming map requests, in order: the post-connect Hostinfo update, then one
+        // per side command. Each is sent only after the one before it was answered.
+        let updates = async {
+            let mut updates = Vec::new();
+            while updates.len() < 4 {
+                let (path, json) = received.recv().await.expect("the poll is still running");
+                if path == "/machine/map" && json["Stream"] != true {
+                    updates.push(json);
+                }
+            }
+            updates
+        };
+        let updates = tokio::time::timeout(core::time::Duration::from_secs(10), async {
+            tokio::select! {
+                outcome = poll => panic!("the poll ended early: {outcome:?}"),
+                updates = updates => updates,
+            }
+        })
+        .await
+        .expect("four map updates within 10s");
+
+        for (what, update) in [
+            ("SetRoutableIPs", &updates[2]),
+            ("SetDerpHomeRegion", &updates[3]),
+        ] {
+            assert_eq!(
+                update["Hostinfo"]["RoutableIPs"],
+                serde_json::json!(["192.168.50.0/24"]),
+                "{what}: {update}"
+            );
+            assert_eq!(
+                update["Endpoints"],
+                serde_json::json!(["203.0.113.7:41642"]),
+                "{what}: {update}"
+            );
+        }
+        assert_eq!(
+            updates[3]["Hostinfo"]["NetInfo"]["PreferredDERP"], 4,
+            "{}",
+            updates[3]
+        );
+    }
+
+    /// The register request `register()` sends carries the carried runtime routes and hostname in
+    /// its Hostinfo, not the start-up ones from `config`, so the re-register on a reconnect does
+    /// not revert them at control. Read from the request body a fake control server received.
+    #[tokio::test]
+    async fn register_on_the_wire_carries_runtime_routes_and_hostname() {
+        let config = crate::Config {
+            advertise_routes: vec!["10.0.0.0/24".parse().unwrap()],
+            hostname: Some("start-up".to_owned()),
+            ..Default::default()
+        };
+        let mut carried = CarriedNodeState::default();
+        record(
+            &mut carried,
+            Command::SetRoutableIPs {
+                routes: vec!["192.168.50.0/24".parse().unwrap()],
+            },
+        )
+        .await;
+        record(
+            &mut carried,
+            Command::SetHostname {
+                hostname: "renamed".to_owned(),
+            },
+        )
+        .await;
+
+        let node_keys = ts_keys::NodeState::generate();
+        let control_url: Url = "http://control.example/".parse().unwrap();
+        let (h2_client, mut received) = crate::tokio::fake_control::connect().await;
+        crate::tokio::register(
+            &config,
+            &carried,
+            &control_url,
+            None,
+            None,
+            &node_keys,
+            &h2_client,
+        )
+        .await
+        .expect("the fake control accepts the registration");
+
+        let (path, json) = received.try_recv().expect("a register request");
+        assert_eq!(path, "/machine/register");
+        assert_eq!(
+            json["Hostinfo"]["RoutableIPs"],
+            serde_json::json!(["192.168.50.0/24"]),
+            "{json}"
+        );
+        assert_eq!(json["Hostinfo"]["Hostname"], "renamed", "{json}");
     }
 }
 
