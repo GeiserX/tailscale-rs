@@ -2105,7 +2105,8 @@ mod tests {
     /// runtime), as after a reconnect: the re-register, the streaming map request and the
     /// post-connect Hostinfo update carry that state, not the start-up one from `config`. Then,
     /// after a `SetEndpoints` and a `SetRoutableIPs`, both the `SetRoutableIPs` update and a later
-    /// `SetDerpHomeRegion` update carry the new routes and the last endpoints. Read from the
+    /// `SetDerpHomeRegion` update carry the new routes and the last endpoints, and a final empty
+    /// `SetRoutableIPs` withdraws every route instead of falling back to `config`. Read from the
     /// requests a fake control server received, so a send site that built its request from
     /// `config` (or from a fresh state) fails here even though the builders are right.
     #[tokio::test]
@@ -2157,6 +2158,7 @@ mod tests {
                 id: region(4),
                 latencies: BTreeMap::new(),
             },
+            Command::SetRoutableIPs { routes: Vec::new() },
         ];
         for command in commands {
             command_tx.send(command).await.unwrap();
@@ -2192,7 +2194,7 @@ mod tests {
         let requests = async {
             let mut requests = Vec::new();
             let mut updates = 0;
-            while updates < 4 {
+            while updates < 5 {
                 let (path, json) = received.recv().await.expect("the poll is still running");
                 if path == "/machine/map" && json["Stream"] != true {
                     updates += 1;
@@ -2208,12 +2210,13 @@ mod tests {
             }
         })
         .await
-        .expect("four map updates within 10s");
+        .expect("five map updates within 10s");
         let paths: Vec<&str> = requests.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
             paths,
             [
                 "/machine/register",
+                "/machine/map",
                 "/machine/map",
                 "/machine/map",
                 "/machine/map",
@@ -2226,7 +2229,11 @@ mod tests {
         let updates: Vec<&serde_json::Value> = requests[2..].iter().map(|(_, j)| j).collect();
 
         // The reconnect's requests carry the state the earlier connection left.
-        for (what, request) in [("register", register), ("post-connect update", updates[0])] {
+        for (what, request) in [
+            ("register", register),
+            ("streaming", streaming),
+            ("post-connect update", updates[0]),
+        ] {
             assert_eq!(
                 request["Hostinfo"]["RoutableIPs"],
                 serde_json::json!(["172.16.0.0/24"]),
@@ -2237,7 +2244,7 @@ mod tests {
                 "{what}: {request}"
             );
         }
-        // Control ignores Hostinfo on the streaming request; its endpoints still count.
+        // The endpoints ride on the streaming request and the post-connect update too.
         for (what, request) in [
             ("streaming", streaming),
             ("post-connect update", updates[0]),
@@ -2273,6 +2280,19 @@ mod tests {
             updates[3]["Hostinfo"]["NetInfo"]["PreferredDERP"], 4,
             "{}",
             updates[3]
+        );
+
+        // An empty SetRoutableIPs withdraws every route; the start-up routes do not come back.
+        assert_eq!(
+            updates[4]["Hostinfo"]["RoutableIPs"],
+            serde_json::Value::Null,
+            "empty SetRoutableIPs: {}",
+            updates[4]
+        );
+        assert_eq!(
+            updates[4]["Hostinfo"]["Hostname"], "renamed",
+            "{}",
+            updates[4]
         );
     }
 
