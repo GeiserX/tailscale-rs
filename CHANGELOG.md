@@ -13,6 +13,13 @@ Record breaking or significant changes here. All dates are UTC.
 
 * **exit node:** forwarded TCP flows run without Nagle, the underlay UDP sockets ask for Go's 7 MiB buffers, netstack egress goes out in batches of up to 64 packets, and the netstack tracks 32 receive holes for uploads. Kernel receive batching, splice coalescing, targeted replay and Apple connected UDP sockets are opt-in experiments, off unless their variable is `1`.
 
+## [0.58.6](https://github.com/GeiserX/tailscale-rs/compare/v0.58.5...v0.58.6) (2026-11-02)
+
+
+### Bug Fixes
+
+* **control:** keep runtime routes and hostname from reverting at control ([#671](https://github.com/GeiserX/tailscale-rs/issues/671)) ([3ef9771](https://github.com/GeiserX/tailscale-rs/commit/3ef97711c60e827cb82d12da13cede3f46fbd2f6))
+
 ## [0.58.5](https://github.com/GeiserX/tailscale-rs/compare/v0.58.4...v0.58.5) (2026-11-01)
 
 
