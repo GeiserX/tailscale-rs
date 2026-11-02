@@ -2100,18 +2100,42 @@ mod tests {
         );
     }
 
-    /// The side updates the poll sends carry the whole current state on the wire: after a
-    /// `SetEndpoints` and a `SetRoutableIPs`, both the `SetRoutableIPs` update and a later
-    /// `SetDerpHomeRegion` update carry the runtime routes and the last endpoints, not the start-up
-    /// ones from `config`. Read from the requests a fake control server received, so a send site
-    /// that built its request from `config` fails here even though the builders are right.
+    /// Every request a poll sends carries the whole current state on the wire. The poll starts
+    /// from a carried state left by an earlier connection (routes, hostname and endpoints set at
+    /// runtime), as after a reconnect: the re-register, the streaming map request and the
+    /// post-connect Hostinfo update carry that state, not the start-up one from `config`. Then,
+    /// after a `SetEndpoints` and a `SetRoutableIPs`, both the `SetRoutableIPs` update and a later
+    /// `SetDerpHomeRegion` update carry the new routes and the last endpoints. Read from the
+    /// requests a fake control server received, so a send site that built its request from
+    /// `config` (or from a fresh state) fails here even though the builders are right.
     #[tokio::test]
     async fn side_updates_on_the_wire_carry_runtime_routes_and_last_endpoints() {
         let runtime: ipnet::IpNet = "192.168.50.0/24".parse().unwrap();
         let config = crate::Config {
             advertise_routes: vec!["10.0.0.0/24".parse().unwrap()],
+            hostname: Some("start-up".to_owned()),
             ..Default::default()
         };
+        // The state an earlier connection left behind.
+        let mut carried = CarriedNodeState::default();
+        for command in [
+            Command::SetEndpoints {
+                endpoints: vec![ep(
+                    "198.51.100.1:41641",
+                    ts_control_serde::EndpointType::Local,
+                )],
+                stun: crate::StunFacts::from_reflexive(&[]),
+                port_map: None,
+            },
+            Command::SetRoutableIPs {
+                routes: vec!["172.16.0.0/24".parse().unwrap()],
+            },
+            Command::SetHostname {
+                hostname: "renamed".to_owned(),
+            },
+        ] {
+            record(&mut carried, command).await;
+        }
         let node_keys = ts_keys::NodeState::generate();
         let control_url: Url = "http://control.example/".parse().unwrap();
         let (h2_client, mut received) = crate::tokio::fake_control::connect().await;
@@ -2143,7 +2167,6 @@ mod tests {
         let (auth_url_tx, _auth_url_rx) = watch::channel(None);
         let mut dialer = ControlDialer::default();
         let mut session = MapSession::default();
-        let mut carried = CarriedNodeState::default();
         let (mut received_frame, mut reauth_requested, mut register_succeeded) =
             (false, false, false);
         let poll = poll_connection(
@@ -2163,27 +2186,70 @@ mod tests {
             &auth_url_tx,
             &watchdog,
         );
-        // The non-streaming map requests, in order: the post-connect Hostinfo update, then one
-        // per side command. Each is sent only after the one before it was answered.
-        let updates = async {
-            let mut updates = Vec::new();
-            while updates.len() < 4 {
+        // Every request, in order: the register, the streaming map request, then the non-streaming
+        // map requests (the post-connect Hostinfo update and one per side command). Each is sent
+        // only after the one before it was answered.
+        let requests = async {
+            let mut requests = Vec::new();
+            let mut updates = 0;
+            while updates < 4 {
                 let (path, json) = received.recv().await.expect("the poll is still running");
                 if path == "/machine/map" && json["Stream"] != true {
-                    updates.push(json);
+                    updates += 1;
                 }
+                requests.push((path, json));
             }
-            updates
+            requests
         };
-        let updates = tokio::time::timeout(core::time::Duration::from_secs(10), async {
+        let requests = tokio::time::timeout(core::time::Duration::from_secs(10), async {
             tokio::select! {
                 outcome = poll => panic!("the poll ended early: {outcome:?}"),
-                updates = updates => updates,
+                requests = requests => requests,
             }
         })
         .await
         .expect("four map updates within 10s");
+        let paths: Vec<&str> = requests.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "/machine/register",
+                "/machine/map",
+                "/machine/map",
+                "/machine/map",
+                "/machine/map",
+                "/machine/map"
+            ]
+        );
+        let (register, streaming) = (&requests[0].1, &requests[1].1);
+        assert_eq!(streaming["Stream"], true, "{streaming}");
+        let updates: Vec<&serde_json::Value> = requests[2..].iter().map(|(_, j)| j).collect();
 
+        // The reconnect's requests carry the state the earlier connection left.
+        for (what, request) in [("register", register), ("post-connect update", updates[0])] {
+            assert_eq!(
+                request["Hostinfo"]["RoutableIPs"],
+                serde_json::json!(["172.16.0.0/24"]),
+                "{what}: {request}"
+            );
+            assert_eq!(
+                request["Hostinfo"]["Hostname"], "renamed",
+                "{what}: {request}"
+            );
+        }
+        // Control ignores Hostinfo on the streaming request; its endpoints still count.
+        for (what, request) in [
+            ("streaming", streaming),
+            ("post-connect update", updates[0]),
+        ] {
+            assert_eq!(
+                request["Endpoints"],
+                serde_json::json!(["198.51.100.1:41641"]),
+                "{what}: {request}"
+            );
+        }
+
+        // The side updates carry the new routes and the last endpoints, and keep the hostname.
         for (what, update) in [
             ("SetRoutableIPs", &updates[2]),
             ("SetDerpHomeRegion", &updates[3]),
@@ -2196,6 +2262,10 @@ mod tests {
             assert_eq!(
                 update["Endpoints"],
                 serde_json::json!(["203.0.113.7:41642"]),
+                "{what}: {update}"
+            );
+            assert_eq!(
+                update["Hostinfo"]["Hostname"], "renamed",
                 "{what}: {update}"
             );
         }
