@@ -45,9 +45,10 @@ use crate::{
 /// each non-streaming update, so a request that rebuilt them from the start-up `config` would revert
 /// a runtime `SetRoutableIPs` or `SetHostname` at control. Go builds every request's Hostinfo from
 /// one current `c.hostinfo` (`hostInfoLocked`, `control/controlclient/direct.go:575-579`), which
-/// `SetHostinfo` replaces (`direct.go:441-457`).
+/// `SetHostinfo` replaces (`direct.go:441-457`). That includes the register request sent on every
+/// reconnect (`doLogin`, `direct.go:644`).
 #[derive(Debug, Clone, Default)]
-struct CarriedNodeState {
+pub(super) struct CarriedNodeState {
     /// Smoothed home DERP region (Go `NetInfo.PreferredDERP`), set by `SetDerpHomeRegion`.
     preferred_derp: Option<ts_derp::RegionId>,
     /// Per-region DERP latency map (Go `NetInfo.DERPLatency`), set by `SetDerpHomeRegion`.
@@ -102,14 +103,24 @@ impl CarriedNodeState {
         builder: MapRequestBuilder<'a>,
         config: &'a crate::Config,
     ) -> MapRequestBuilder<'a> {
-        let mut builder = match &self.routes {
-            Some(routes) => builder.routable_ips(routes.iter().copied()),
-            None => builder.routable_ips(config.advertised_routes()),
-        };
-        if let Some(hostname) = self.hostname.as_ref().or(config.hostname.as_ref()) {
+        let mut builder = builder.routable_ips(self.current_routes(config));
+        if let Some(hostname) = self.current_hostname(config) {
             builder = builder.hostname(hostname);
         }
         self.apply(builder)
+    }
+
+    /// The node's current routes: those from the last `SetRoutableIPs`, else the start-up ones.
+    pub(super) fn current_routes(&self, config: &crate::Config) -> Vec<ipnet::IpNet> {
+        match &self.routes {
+            Some(routes) => routes.clone(),
+            None => config.advertised_routes(),
+        }
+    }
+
+    /// The node's current hostname: the one from the last `SetHostname`, else the start-up one.
+    pub(super) fn current_hostname<'a>(&'a self, config: &'a crate::Config) -> Option<&'a str> {
+        self.hostname.as_deref().or(config.hostname.as_deref())
     }
 
     /// Apply the carried NetInfo and endpoints to a [`MapRequestBuilder`], setting only the `Some`
@@ -178,6 +189,7 @@ impl AsyncControlClient {
 
         crate::tokio::register(
             config,
+            &CarriedNodeState::default(),
             control_url,
             auth_key,
             followup,
@@ -226,7 +238,16 @@ impl AsyncControlClient {
         .await?;
         tracing::info!("connected to control, registering");
 
-        crate::tokio::register(config, control_url, auth_key, None, node_keys, &h2_client).await?;
+        crate::tokio::register(
+            config,
+            &CarriedNodeState::default(),
+            control_url,
+            auth_key,
+            None,
+            node_keys,
+            &h2_client,
+        )
+        .await?;
 
         tracing::info!("registered, starting netmap stream");
 
@@ -796,8 +817,20 @@ async fn run_once(
     // `MachineNotAuthorized(Some(url))`: surface that URL to the embedder (→ "needs login") via
     // `surface_reauth_url`, then still propagate the error so `run` backs off and retries — Go's
     // `authRoutine` keeps the URL and keeps polling, and a later successful re-register recovers.
+    // It sends the carried routes and hostname too, like every map request, so a reconnect does not
+    // briefly revert a runtime change at control (Go `doLogin` uses the same `hostInfoLocked`).
     watchdog.set_phase(PollPhase::Register);
-    match crate::tokio::register(config, control_url, auth_key, None, node_keys, &h2_client).await {
+    let registered = crate::tokio::register(
+        config,
+        carried,
+        control_url,
+        auth_key,
+        None,
+        node_keys,
+        &h2_client,
+    )
+    .await;
+    match registered {
         Ok(()) => {
             // Re-register succeeded — clear any pending re-auth URL NOW (not at stream end), so a
             // recovering poll empties the cell BEFORE the runtime bridge can wake and re-read a
@@ -817,28 +850,11 @@ async fn run_once(
         }
     }
 
-    let client_name = config.format_client_name();
-    // Host-environment facts advertised on every map poll, so control persistently sees a dense,
-    // genuine-looking Hostinfo (OS / version / arch / machine) rather than an empty shell. Bound here
-    // so its owned strings outlive the borrowing builder.
-    let host = crate::hostinfo::HostInfoData::detect();
-    // Advertise-side VIP services: hash the validated hosted-service set into
-    // `HostInfo.ServicesHash`. Empty config -> empty hash -> wire field omitted (unchanged behavior).
-    let advertised_vip_services = config.advertised_vip_services();
-    let services_hash = crate::services_hash(&advertised_vip_services);
-    // Every map request carries the complete Hostinfo; see `with_hostinfo`.
-    let with_hostinfo = |b| with_hostinfo(b, config, &client_name, &host, &services_hash);
-    let builder = with_hostinfo(
-        MapRequestBuilder::new(node_keys)
-            .keep_alive(true)
-            .omit_peers(false)
-            .stream(true),
-    )
-    .map_session(&session.handle, session.seq);
+    let requests = MapRequests::new(node_keys, config);
     // Carry the whole current state on the streaming re-register too (Go attaches `c.netinfo` and
     // `c.hostinfo` to every `sendMapRequest`), so a reconnect re-advertises the last-known
     // home/UDP/NAT facets, routes and hostname instead of the start-up ones.
-    let request = carried.apply_hostinfo(builder, config).build();
+    let request = requests.streaming(session, carried);
 
     let map_url = control_url.join("machine/map").unwrap();
 
@@ -860,11 +876,7 @@ async fn run_once(
     // server must not hold up the first netmap on every reconnect. It is dropped with the poll.
     // The carried state is cloned because the loop below mutates it.
     let startup_state = carried.clone();
-    let builder = with_hostinfo(MapRequestBuilder::new(node_keys))
-        .keep_alive(false)
-        .omit_peers(true)
-        .stream(false);
-    let startup_request = startup_state.apply_hostinfo(builder, config).build();
+    let startup_request = requests.update(&startup_state);
     let mut hostinfo_update = core::pin::pin!(async {
         watchdog.startup_request_started();
         if let Err(e) = send_map_request(startup_request, &map_url, &h2_client).await {
@@ -931,43 +943,11 @@ async fn run_once(
                 }
                 begin_side_command(&command, carried, hostinfo_update.as_mut(), &mut hostinfo_sent)
                     .await;
-                // Every side update is built the same way, from the whole carried state that
-                // `begin_side_command` just updated.
-                let side_request = || {
-                    let builder = with_hostinfo(MapRequestBuilder::new(node_keys))
-                        .keep_alive(false)
-                        .omit_peers(true)
-                        .stream(false);
-                    carried.apply_hostinfo(builder, config).build()
-                };
-                match command {
-                    Command::SetDerpHomeRegion { .. } => {
-                        // The WHOLE carried state goes out, so this request also carries any
-                        // previously-learned working_udp/mapping_varies, endpoints, routes and
-                        // hostname rather than nulling them at control.
-                        let req = side_request();
-                        watchdog.set_phase(PollPhase::SetDerpHomeRegion);
-                        drop(send_map_request(req, &map_url, &h2_client).await?);
-                    },
-                    Command::SetEndpoints { .. } => {
-                        let req = side_request();
-                        watchdog.set_phase(PollPhase::SetEndpoints);
-                        drop(send_map_request(req, &map_url, &h2_client).await?);
-                    },
-                    Command::SetRoutableIPs { .. } => {
-                        // The routes came in the command, NOT from `config.advertised_routes()`:
-                        // `config` is a frozen clone captured when this loop started, so a runtime
-                        // route change can only reach here through the command itself.
-                        let req = side_request();
-                        watchdog.set_phase(PollPhase::SetRoutableIps);
-                        drop(send_map_request(req, &map_url, &h2_client).await?);
-                    },
-                    Command::SetHostname { .. } => {
-                        // Likewise the hostname came in the command, NOT from `config.hostname`.
-                        let req = side_request();
-                        watchdog.set_phase(PollPhase::SetHostname);
-                        drop(send_map_request(req, &map_url, &h2_client).await?);
-                    },
+                let phase = match command {
+                    Command::SetDerpHomeRegion { .. } => PollPhase::SetDerpHomeRegion,
+                    Command::SetEndpoints { .. } => PollPhase::SetEndpoints,
+                    Command::SetRoutableIPs { .. } => PollPhase::SetRoutableIps,
+                    Command::SetHostname { .. } => PollPhase::SetHostname,
                     Command::Reauth => {
                         // A node-key rotation cannot be applied here: `run_once` only borrows
                         // `node_keys` `&`, while a rotation mutates it. Signal `run` (which OWNS the
@@ -979,7 +959,14 @@ async fn run_once(
                         *reauth_requested = true;
                         break;
                     },
-                }
+                };
+                // Every side update sends the WHOLE carried state that `begin_side_command` just
+                // updated, so it also carries the previously learned NetInfo, endpoints, routes
+                // and hostname rather than nulling or reverting them at control. Runtime routes and
+                // hostname reach here only through their commands: `config` is a frozen clone.
+                let req = requests.update(carried);
+                watchdog.set_phase(phase);
+                drop(send_map_request(req, &map_url, &h2_client).await?);
             }
         }
     }
@@ -1038,6 +1025,71 @@ fn netmap_stream(
 
         x.ok()
     })
+}
+
+/// Builds the map requests a poll sends, each from the whole current [`CarriedNodeState`], so none
+/// of them reverts a runtime change at control.
+struct MapRequests<'a> {
+    node_keys: &'a ts_keys::NodeState,
+    config: &'a crate::Config,
+    client_name: String,
+    /// Host-environment facts advertised on every map poll, so control persistently sees a dense,
+    /// genuine-looking Hostinfo (OS / version / arch / machine) rather than an empty shell.
+    host: crate::hostinfo::HostInfoData,
+    /// Advertise-side VIP services: the validated hosted-service set hashed into
+    /// `HostInfo.ServicesHash`. Empty config -> empty hash -> wire field omitted.
+    services_hash: String,
+}
+
+impl<'a> MapRequests<'a> {
+    fn new(node_keys: &'a ts_keys::NodeState, config: &'a crate::Config) -> Self {
+        Self {
+            node_keys,
+            config,
+            client_name: config.format_client_name(),
+            host: crate::hostinfo::HostInfoData::detect(),
+            services_hash: crate::services_hash(&config.advertised_vip_services()),
+        }
+    }
+
+    /// The streaming request that opens the netmap poll, resuming `session`.
+    fn streaming<'b>(
+        &'b self,
+        session: &'b MapSession,
+        carried: &'b CarriedNodeState,
+    ) -> ts_control_serde::MapRequest<'b> {
+        let builder = MapRequestBuilder::new(self.node_keys)
+            .keep_alive(true)
+            .omit_peers(false)
+            .stream(true);
+        let builder = self
+            .with_hostinfo(builder)
+            .map_session(&session.handle, session.seq);
+        carried.apply_hostinfo(builder, self.config).build()
+    }
+
+    /// A non-streaming Hostinfo update: the one sent once the poll is up, and each side
+    /// command's.
+    fn update<'b>(&'b self, carried: &'b CarriedNodeState) -> ts_control_serde::MapRequest<'b> {
+        let builder = MapRequestBuilder::new(self.node_keys)
+            .keep_alive(false)
+            .omit_peers(true)
+            .stream(false);
+        carried
+            .apply_hostinfo(self.with_hostinfo(builder), self.config)
+            .build()
+    }
+
+    /// Every map request carries the complete Hostinfo; see [`with_hostinfo`].
+    fn with_hostinfo<'b>(&'b self, builder: MapRequestBuilder<'b>) -> MapRequestBuilder<'b> {
+        with_hostinfo(
+            builder,
+            self.config,
+            &self.client_name,
+            &self.host,
+            &self.services_hash,
+        )
+    }
 }
 
 /// Add this node's complete Hostinfo to a map request. Control replaces a node's Hostinfo
@@ -1639,41 +1691,83 @@ mod tests {
     /// Which request, and the `HostInfo.RoutableIPs` and `HostInfo.Hostname` it sent.
     type Sent = (&'static str, Option<Vec<ipnet::IpNet>>, Option<String>);
 
-    /// The routes and hostname of each kind of map request the run loop builds from `carried`: a
-    /// side update, and after a reconnect the streaming re-register and the post-connect Hostinfo
-    /// update.
-    fn routes_and_hostname(carried: &CarriedNodeState, config: &crate::Config) -> [Sent; 3] {
+    /// The routes and hostname of each request the run loop builds from `carried`: a side update,
+    /// and after a reconnect the re-register, the streaming map request and the post-connect
+    /// Hostinfo update. Built with the run loop's own [`MapRequests`] and `register_hostinfo`.
+    fn routes_and_hostname(carried: &CarriedNodeState, config: &crate::Config) -> [Sent; 4] {
         let node_keys = ts_keys::NodeState::generate();
+        let requests = MapRequests::new(&node_keys, config);
+        let session = MapSession::default();
         let after_reconnect = carried.clone();
-        let lite = || {
-            MapRequestBuilder::new(&node_keys)
-                .keep_alive(false)
-                .omit_peers(true)
-                .stream(false)
-        };
-        let streaming = MapRequestBuilder::new(&node_keys)
-            .keep_alive(true)
-            .omit_peers(false)
-            .stream(true);
-        let fields = |what, req: ts_control_serde::MapRequest<'_>| {
-            let hi = req.host_info.expect("hostinfo present");
+        let fields = |what, hi: ts_control_serde::HostInfo<'_>| {
             (what, hi.routable_ips, hi.hostname.map(|h| h.into_owned()))
         };
+        let map = |what, req: ts_control_serde::MapRequest<'_>| {
+            fields(what, req.host_info.expect("hostinfo present"))
+        };
         [
-            (
-                "side update",
-                carried.apply_hostinfo(lite(), config).build(),
+            map("side update", requests.update(carried)),
+            fields(
+                "re-register after a reconnect",
+                crate::tokio::register::register_hostinfo(
+                    config,
+                    &after_reconnect,
+                    &requests.client_name,
+                    &requests.host,
+                    &requests.services_hash,
+                ),
             ),
-            (
-                "streaming re-register after a reconnect",
-                after_reconnect.apply_hostinfo(streaming, config).build(),
+            map(
+                "streaming map request after a reconnect",
+                requests.streaming(&session, &after_reconnect),
             ),
-            (
+            map(
                 "hostinfo update after a reconnect",
-                after_reconnect.apply_hostinfo(lite(), config).build(),
+                requests.update(&after_reconnect),
             ),
         ]
-        .map(|(what, req)| fields(what, req))
+    }
+
+    /// Runtime routes and hostname are recorded before the wait for the post-connect Hostinfo
+    /// update, like endpoints, so a watchdog restart during that wait does not lose them.
+    #[tokio::test(start_paused = true)]
+    async fn runtime_routes_and_hostname_survive_a_watchdog_restart_while_waiting_for_startup() {
+        let runtime: ipnet::IpNet = "192.168.50.0/24".parse().unwrap();
+        let config = crate::Config {
+            advertise_routes: vec!["10.0.0.0/24".parse().unwrap()],
+            hostname: Some("start-up".to_owned()),
+            ..Default::default()
+        };
+        let mut carried = CarriedNodeState::default();
+
+        let commands = [
+            Command::SetRoutableIPs {
+                routes: vec![runtime],
+            },
+            Command::SetHostname {
+                hostname: "renamed".to_owned(),
+            },
+        ];
+        for command in commands {
+            let watchdog = MapPollWatchdog::new(watch::channel(false).0);
+            let poll = async {
+                // Control never answers the Hostinfo update.
+                let mut startup = core::pin::pin!(core::future::pending::<()>());
+                let mut sent = false;
+                begin_side_command(&command, &mut carried, startup.as_mut(), &mut sent).await;
+                Ok(())
+            };
+            assert!(
+                watchdog.run(poll).await.is_err(),
+                "{command:?}: the watchdog restarts the poll"
+            );
+        }
+
+        // The next poll's requests, built from the carried state.
+        for (what, routes, hostname) in routes_and_hostname(&carried, &config) {
+            assert_eq!(routes, Some(vec![runtime]), "{what}");
+            assert_eq!(hostname.as_deref(), Some("renamed"), "{what}");
+        }
     }
 
     /// Routes set at runtime ride on every later map request. Control replaces the node's Hostinfo
