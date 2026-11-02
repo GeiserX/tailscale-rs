@@ -164,7 +164,7 @@ jobs:
       - name: Anti-leak firewall checks (cargo run -p checks)
         run: cargo run -p checks
       - name: binstall
-        uses: cargo-bins/cargo-binstall@422f3094be6a0843857aa008b499caaf6bce0da8 #v1.24.0
+        uses: cargo-bins/cargo-binstall@81df5c23b0dc775b009efdfc9895c5965b7a4e40 #v1.26.1
       - name: Install cargo-deny
         run: command -v cargo-deny || cargo binstall --no-confirm cargo-deny
       # Machine-enforce the ring-only / no-aws-lc supply-chain invariant on every push, on the
@@ -214,7 +214,7 @@ jobs:
           ls "${llvm_bin}/llvm-ar" "${llvm_bin}/llvm-lib"
       - name: Restore the MSVC headers (cargo-xwin)
         id: xwin-cache
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/cargo-xwin
           key: cargo-xwin-0.23.1-x86_64-pc-windows-msvc
@@ -222,7 +222,7 @@ jobs:
         run: cargo xwin env --target x86_64-pc-windows-msvc > /dev/null
       - name: Save the MSVC headers (cargo-xwin)
         if: steps.xwin-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/cargo-xwin
           key: cargo-xwin-0.23.1-x86_64-pc-windows-msvc
@@ -376,7 +376,7 @@ jobs:
           # while preventing the cross-container artifact collision.
           cache-key: musl-${{ matrix.target.triple }}
       - name: Install cross
-        uses: cargo-bins/cargo-binstall@422f3094be6a0843857aa008b499caaf6bce0da8 #v1.24.0
+        uses: cargo-bins/cargo-binstall@81df5c23b0dc775b009efdfc9895c5965b7a4e40 #v1.26.1
       - name: Install cross (binary)
         run: command -v cross || cargo binstall --no-confirm cross
       - name: Build static musl (cross build --no-default-features)
@@ -411,7 +411,7 @@ jobs:
           components: rustfmt
       - &binstall
         name: binstall
-        uses: cargo-bins/cargo-binstall@422f3094be6a0843857aa008b499caaf6bce0da8 #v1.24.0
+        uses: cargo-bins/cargo-binstall@81df5c23b0dc775b009efdfc9895c5965b7a4e40 #v1.26.1
       - name: Install cargo-deny
         run: command -v cargo-deny || cargo binstall --no-confirm cargo-deny
       - &cargo_ws
@@ -452,7 +452,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
         id: auth
         with:
           url: ${{ case(inputs.crates_repo == 'prod', 'https://crates.io', startsWith(github.ref, 'refs/tags/'), 'https://crates.io', 'https://staging.crates.io') }}
