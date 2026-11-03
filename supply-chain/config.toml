@@ -2102,7 +2102,7 @@ version = "0.2.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.tun-rs]]
-version = "2.8.13"
+version = "2.8.16"
 criteria = "safe-to-deploy"
 
 [[exemptions.twox-hash]]
