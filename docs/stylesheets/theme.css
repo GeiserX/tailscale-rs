@@ -3,7 +3,7 @@
  * banner.svg draws on #1e1a17: the ring of the mark in rust #c4502a, the
  * network inside it in #e07a4a with #f2b36b nodes, the wordmark in #f6ede4
  * and the tagline in #f2b36b. The header and the dark page use the banner
- * background; links and the accent use #e07a4a. mkdocs.yml sets primary and
+ * background; links and the accent use #e07a4a. zensical.toml sets primary and
  * accent to custom, so nothing is painted until these variables exist.
  */
 :root {
@@ -42,9 +42,15 @@
    Only the first topic is styled; Material puts the page title in a second
    .md-header__topic and swaps them on scroll. */
 .md-header__topic:first-child .md-ellipsis {
-  color: #f6ede4;
   font-weight: 800;
   letter-spacing: -0.01em;
+}
+
+/* That colour only on the dark scheme: Zensical's modern header takes the page
+   background, so on the light scheme it is white and a light name would vanish.
+   There the name keeps the default text colour. */
+[data-md-color-scheme="slate"] .md-header__topic:first-child .md-ellipsis {
+  color: #f6ede4;
 }
 
 /* Keep the mark and the name close, so they read as one unit. */
