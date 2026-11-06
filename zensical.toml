@@ -1,0 +1,102 @@
+# Generated from mkdocs.yml by mkdocs-to-zensical.py; the why of every block is in
+# new-repo/templates/zensical.toml. Edit this file, not mkdocs.yml, which is gone.
+
+[project]
+site_name = "tailscale-rs"
+site_url = "https://geiserx.github.io/tailscale-rs/"
+site_description = "A work-in-progress Tailscale library written in Rust. Embed a Tailscale node in your app, with bindings to C, Elixir and Python."
+repo_url = "https://github.com/GeiserX/tailscale-rs"
+repo_name = "GeiserX/tailscale-rs"
+edit_uri = "edit/main/docs/"
+strict = true
+extra_css = ["stylesheets/theme.css"]
+exclude_docs = """
+[A-Z]*.md
+design/
+research/
+notes/
+requirements-docs.txt
+restock-beads.json
+"""
+nav = [
+  { Home = "index.md" },
+  { "Get started" = [
+      { "Getting started" = "getting-started.md" },
+      { "Caveats, versioning and platform support" = "caveats.md" },
+    ] },
+  { Reference = [
+      { "How it works" = "how-it-works.md" },
+      { Status = "status.md" },
+    ] },
+]
+
+[project.validation]
+invalid_links = true
+invalid_link_anchors = true
+
+[project.theme]
+language = "en"
+variant = "modern"
+logo = "images/logo.svg"
+favicon = "images/icon.svg"
+font = false
+features = [
+  "navigation.tabs",
+  "navigation.sections",
+  "navigation.expand",
+  "navigation.top",
+  "content.code.copy",
+  "content.action.edit",
+  "search.highlight",
+  "toc.follow",
+  "navigation.instant",
+  "navigation.instant.progress",
+  "content.action.copy",
+]
+icon.repo = "fontawesome/brands/github"
+
+[[project.theme.palette]]
+scheme = "slate"
+primary = "custom"
+accent = "custom"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to light mode"
+
+[[project.theme.palette]]
+scheme = "default"
+primary = "custom"
+accent = "custom"
+toggle.icon = "lucide/moon"
+toggle.name = "Switch to dark mode"
+
+[[project.extra.social]]
+icon = "fontawesome/brands/github"
+link = "https://github.com/GeiserX/tailscale-rs"
+
+[[project.extra.social]]
+icon = "fontawesome/brands/rust"
+link = "https://crates.io/crates/geiserx_tailscale"
+
+[project.plugins.search]
+
+[project.plugins.llmstxt.sections]
+Documentation = ["*.md", "*/*.md"]
+
+[project.markdown_extensions]
+admonition = {}
+"pymdownx.details" = {}
+"pymdownx.superfences".custom_fences = [
+  { name = "mermaid", class = "mermaid", format = "pymdownx.superfences.fence_code_format" },
+]
+"pymdownx.tabbed".alternate_style = true
+"pymdownx.highlight".anchor_linenums = true
+"pymdownx.inlinehilite" = {}
+"pymdownx.snippets".base_path = [".", "docs"]
+"pymdownx.snippets".check_paths = true
+"pymdownx.mark" = {}
+attr_list = {}
+md_in_html = {}
+"pymdownx.emoji".emoji_index = "zensical.extensions.emoji.twemoji"
+"pymdownx.emoji".emoji_generator = "zensical.extensions.emoji.to_svg"
+tables = {}
+toc.permalink = true
