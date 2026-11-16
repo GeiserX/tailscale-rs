@@ -6375,9 +6375,9 @@ dependencies = [
 
 [[package]]
 name = "tracing-panic"
-version = "0.1.3"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "266defe05fdcc26661f5a5395fc114040b20c44626becc54e8422c6f17d56ed2"
+checksum = "3784294477b4ce7455a4fc15800f9c4f24df5e78602e53fdd2f503a3680d0e5c"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -6798,9 +6798,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.11"
+version = "1.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
+checksum = "7265c9301c16a8711c992c2d8da90ee77ef54b1ed51482d6dfeb00dc756b1297"
 dependencies = [
  "rustls-pki-types",
 ]
