@@ -2061,7 +2061,6 @@ dependencies = [
  "rcgen",
  "ring",
  "rustls-pemfile",
- "ruzstd",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -5382,15 +5381,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ruzstd"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69e4ce4a039f42bf25920b95667e4d789e98749ab11bbb8d2c2936f788421bb5"
-dependencies = [
- "twox-hash",
-]
-
-[[package]]
 name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6716,12 +6706,6 @@ dependencies = [
  "windows-sys 0.61.2",
  "winreg",
 ]
-
-[[package]]
-name = "twox-hash"
-version = "2.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ea3136b675547379c4bd395ca6b938e5ad3c3d20fad76e7fe85f9e0d011419c"
 
 [[package]]
 name = "typenum"

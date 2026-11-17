@@ -195,19 +195,16 @@ const MAX_NETMAP_FRAME: u32 = 16 * 1024 * 1024;
 /// decoder runs under (`klauspost/compress` `WithDecoderMaxMemory` default) and is far above any real
 /// netmap's decoded size, so it never rejects legitimate traffic.
 ///
-/// This output cap is the *binding* allocation bound. ruzstd allocates its decode buffer lazily —
-/// `RingBuffer::new()` starts at zero capacity and grows only as decoded bytes are produced — so a
-/// frame's declared *window* / content-size header drives no eager allocation (a frame declaring
-/// the largest window [`MAX_ZSTD_WINDOW`] admits with a tiny body decompresses with only kilobytes
-/// of working set; a larger declared window is refused before any block is read). Because
-/// the [`decompress_frame`] reader reads through a [`std::io::Read::take`] of `MAX_DECODED_NETMAP + 1`,
-/// the output `Vec` (and with it ruzstd's window) cannot grow past the cap. That rests on the
-/// decoder refusing a block that decompresses past zstd's own 128 KiB block limit, because a block
-/// is expanded whole before the `take` sees any of it; ruzstd checks this from 0.9.1 on
-/// (RUSTSEC-2026-0344), which is why the workspace requires at least that version. Peak *transient*
-/// allocation is a small constant multiple of the cap (the output `Vec`'s amortized-doubling growth
-/// plus ruzstd's internal window/block buffers), all bounded by the cap, freed when the frame is
-/// dropped, and non-stacking (the map poll drives a single frame reader per node).
+/// This output cap is the *binding* allocation bound. [`decompress_frame`] passes it to zrip as the
+/// output limit, and zrip enforces it inside the decoder: a raw, RLE or literals-only block is
+/// checked before it is written, and sequence execution stops at the limit and at zstd's own
+/// 128 KiB block limit (RFC 8878 `Block_Maximum_Size`), so no block expands past the cap first. A
+/// frame that declares a content size above the cap is refused before any block is read; a smaller
+/// declared size is reserved once and is also the most that frame may write. A declared *window*
+/// drives no allocation: the one-shot decoder writes into a single flat output buffer. Peak
+/// *transient* allocation is therefore about the cap (the output `Vec`, grown by doubling when no
+/// content size is declared, plus the context's kilobytes of decoder tables), freed when the frame
+/// is dropped, and non-stacking (the map poll drives a single frame reader per node).
 const MAX_DECODED_NETMAP: u64 = 64 * 1024 * 1024;
 
 /// The largest window a zstd frame may declare, in its window descriptor or (for a single-segment
@@ -216,10 +213,23 @@ const MAX_DECODED_NETMAP: u64 = 64 * 1024 * 1024;
 /// 512 MiB is the limit Go's client runs under: `control/controlclient/direct.go` `decodeMsg` calls
 /// `zstdframe.AppendDecode` with no options, which leaves `klauspost/compress`'s
 /// `zstd.MaxWindowSize` (`1 << 29`) in force, and a frame above it fails with
-/// `ErrWindowSizeExceeded`. It is set explicitly because ruzstd's own default is 128 MiB
-/// (`DEFAULT_MAX_WINDOW_SIZE`), which would refuse frames Go accepts. The limit is a refusal only:
-/// the window is not allocated up front, so [`MAX_DECODED_NETMAP`] stays the allocation bound.
+/// `ErrWindowSizeExceeded`. zrip has no per-decoder window setting and refuses windows above its
+/// own 128 MiB (`zrip::frame::MAX_WINDOW_SIZE`), which would refuse frames Go accepts, so
+/// [`decompress_frame`] checks this limit itself and lowers a window between the two to zrip's
+/// (see [`ZRIP_WINDOW_DESCRIPTOR`]). The limit is a refusal only: the window is not allocated up
+/// front, so [`MAX_DECODED_NETMAP`] stays the allocation bound.
 const MAX_ZSTD_WINDOW: u64 = 1 << 29;
+
+/// The `Window_Descriptor` byte (RFC 8878) for zrip's window cap, `zrip::frame::MAX_WINDOW_SIZE`.
+///
+/// [`decompress_frame`] writes it over the descriptor of a frame whose window is above zrip's cap
+/// but within [`MAX_ZSTD_WINDOW`]. That changes nothing about what decodes: the one-shot decoder
+/// checks each match offset against the bytes already decoded, not against the declared window,
+/// and a frame that fits [`MAX_DECODED_NETMAP`] cannot reach back past zrip's cap anyway.
+const ZRIP_WINDOW_DESCRIPTOR: u8 =
+    ((zrip::frame::MAX_WINDOW_SIZE.trailing_zeros() - 10) << 3) as u8;
+const _: () = assert!(zrip::frame::MAX_WINDOW_SIZE.is_power_of_two());
+const _: () = assert!(MAX_DECODED_NETMAP <= zrip::frame::MAX_WINDOW_SIZE);
 
 /// The 4-byte zstd frame magic (`0xFD2FB528`, little-endian on the wire). Used to distinguish a
 /// `Compress = "zstd"` framed response from an uncompressed one, so a control plane that ignored the
@@ -229,10 +239,11 @@ const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 /// Decompress one raw map-poll frame into the JSON bytes to deserialize.
 ///
 /// Control answers every streaming map poll `Compress = "zstd"` framed (we advertise it on every
-/// request, like Go), so the common path is: recognize the zstd magic, then stream-decompress the
-/// frame while bounding the decompressed size to [`MAX_DECODED_NETMAP`] (the zip-bomb guard — a tiny
-/// frame can otherwise expand to gigabytes). To bound it, we read **one byte past** the limit and
-/// reject if that many bytes were produced.
+/// request, like Go), so the common path is: recognize the zstd magic, check the declared window
+/// against [`MAX_ZSTD_WINDOW`], then decompress the frame with `zstd` (one context per map poll,
+/// reused across frames) under an output limit of [`MAX_DECODED_NETMAP`] (the zip-bomb guard — a
+/// tiny frame can otherwise expand to gigabytes). Only the first frame is decoded; any bytes after
+/// it are ignored.
 ///
 /// A frame that does *not* begin with the zstd magic is returned verbatim: a control plane may ignore
 /// the `Compress` request and reply uncompressed (Go's own `decodeMsg` keeps a keep-alive fast-path
@@ -243,46 +254,60 @@ const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 /// Returns `None` on a malformed or oversized zstd frame, or one declaring a window above
 /// [`MAX_ZSTD_WINDOW`], which the caller turns into "end the stream
 /// and reconnect" — the same recovery as every other frame-read failure in [`map_stream_with_watchdog`].
-fn decompress_frame(frame: &[u8]) -> Option<alloc::vec::Vec<u8>> {
-    use std::io::Read as _;
-
+fn decompress_frame(
+    zstd: &mut zrip::DecompressContext,
+    frame: &[u8],
+) -> Option<alloc::vec::Vec<u8>> {
     // Not zstd-framed: a control plane that replied uncompressed. Return the bytes as-is.
     if frame.len() < ZSTD_MAGIC.len() || frame[..ZSTD_MAGIC.len()] != ZSTD_MAGIC {
         return Some(frame.to_vec());
     }
 
-    let mut decoder =
-        ruzstd::decoding::StreamingDecoder::new_with_max_window_size(frame, MAX_ZSTD_WINDOW)
-            .inspect_err(
-                |e| tracing::error!(error = %e, "initializing zstd decoder for netmap frame"),
-            )
-            .ok()?;
-
-    // Read at most `MAX_DECODED_NETMAP + 1` bytes: if the decoder yields that many, the frame
-    // decompresses to more than the bound and is rejected (zip-bomb guard) rather than allowed to
-    // drive an unbounded allocation. The output `Vec` grows on demand (it is NOT pre-reserved to the
-    // cap: pre-reserving would force a 64 MiB allocation on every keep-alive and small netmap — the
-    // overwhelmingly common case — to bound an overshoot that only occurs for a frame decompressing
-    // *near* the cap, which is either nonexistent for a real netmap or an attack frame we reject on
-    // the next line anyway). The amortized-doubling growth therefore peaks at a small constant
-    // multiple of the actual decoded size, bounded by the cap and freed when the frame is dropped.
-    let mut decoded = alloc::vec::Vec::new();
-    decoder
-        .by_ref()
-        .take(MAX_DECODED_NETMAP + 1)
-        .read_to_end(&mut decoded)
-        .inspect_err(|e| tracing::error!(error = %e, "decompressing netmap frame"))
+    let header = zrip::frame::header::parse_frame_header(frame)
+        .inspect_err(|e| tracing::error!(error = %e, "initializing zstd decoder for netmap frame"))
         .ok()?;
-
-    if decoded.len() as u64 > MAX_DECODED_NETMAP {
+    if header.window_size > MAX_ZSTD_WINDOW {
         tracing::error!(
-            max = MAX_DECODED_NETMAP,
-            "decompressed netmap frame exceeds bound; ending stream"
+            window = header.window_size,
+            max = MAX_ZSTD_WINDOW,
+            "zstd netmap frame window exceeds bound; ending stream"
         );
         return None;
     }
 
-    Some(decoded)
+    // zrip refuses a window above its own cap; lower one that Go accepts to that cap. The window
+    // descriptor directly follows the magic and the frame header descriptor.
+    let frame = if !header.single_segment && header.window_size > zrip::frame::MAX_WINDOW_SIZE {
+        let mut lowered = frame.to_vec();
+        lowered[ZSTD_MAGIC.len() + 1] = ZRIP_WINDOW_DESCRIPTOR;
+        alloc::borrow::Cow::Owned(lowered)
+    } else {
+        alloc::borrow::Cow::Borrowed(frame)
+    };
+
+    // zrip stops at `MAX_DECODED_NETMAP` (zip-bomb guard) instead of letting the frame drive an
+    // unbounded allocation. The output `Vec` is NOT pre-reserved to the cap: that would force a
+    // 64 MiB allocation on every keep-alive and small netmap. zrip reserves a declared content size
+    // once (refusing one above the cap), and otherwise grows the `Vec` as blocks decode.
+    let mut decoded = alloc::vec::Vec::new();
+    match zstd.decompress_after_magic_into(
+        &frame[ZSTD_MAGIC.len()..],
+        &mut decoded,
+        MAX_DECODED_NETMAP as usize,
+    ) {
+        Ok(_) => Some(decoded),
+        Err(zrip::DecompressError::OutputTooSmall) => {
+            tracing::error!(
+                max = MAX_DECODED_NETMAP,
+                "decompressed netmap frame exceeds bound; ending stream"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "decompressing netmap frame");
+            None
+        }
+    }
 }
 
 /// Runs the live map poll's per-frame work on one raw frame at a time.
@@ -292,12 +317,14 @@ fn decompress_frame(frame: &[u8]) -> Option<alloc::vec::Vec<u8>> {
 /// `state_update_from_frame`); it is not part of the supported public surface.
 #[doc(hidden)]
 #[derive(Default)]
-pub struct NetmapFrameDecoder {}
+pub struct NetmapFrameDecoder {
+    zstd: zrip::DecompressContext,
+}
 
 impl NetmapFrameDecoder {
     /// Decompresses one raw map-poll frame into its JSON bytes, as the live map poll does.
     pub fn decompress(&mut self, frame: &[u8]) -> Option<alloc::vec::Vec<u8>> {
-        decompress_frame(frame)
+        decompress_frame(&mut self.zstd, frame)
     }
 
     /// Decompresses one raw map-poll frame and decodes it into a [`StateUpdate`].
@@ -354,9 +381,10 @@ fn map_stream_inner(
     cache: Option<NetmapCache>,
     watchdog: Option<&MapPollWatchdog>,
 ) -> impl Stream<Item = StateUpdate> {
+    // One zstd context per map poll: its decoder tables and buffers are reused across frames.
     futures_util::stream::unfold(
-        (reader, cache, watchdog),
-        async |(mut reader, cache, watchdog)| {
+        (reader, cache, watchdog, zrip::DecompressContext::new()),
+        async |(mut reader, cache, watchdog, mut zstd)| {
             // One deadline for the complete response: a late prefix must not extend the body wait.
             let deadline = tokio::time::Instant::now() + MAP_READ_WATCHDOG;
             // Watchdog the length read: this is where the stream idles between frames, so a silently
@@ -446,7 +474,7 @@ fn map_stream_inner(
             // as-is — graceful degradation, never a silent stall, at no wire-fingerprint cost (the
             // request is byte-identical to Go's either way). A malformed/oversized zstd frame ends the
             // stream (`None`) so the caller reconnects, mirroring the other frame-read failure paths.
-            let decoded = decompress_frame(buf.as_ref())?;
+            let decoded = decompress_frame(&mut zstd, buf.as_ref())?;
 
             let update = state_update_from_frame(&decoded)?;
             if let Some(watchdog) = watchdog {
@@ -461,7 +489,7 @@ fn map_stream_inner(
                 cache.observe(&update, &decoded).await;
             }
 
-            Some((update, (reader, cache, watchdog)))
+            Some((update, (reader, cache, watchdog, zstd)))
         },
     )
 }
@@ -677,10 +705,7 @@ mod tests {
     fn frame(bodies: &[&str]) -> Vec<u8> {
         let mut buf = Vec::new();
         for body in bodies {
-            let compressed = ruzstd::encoding::compress_to_vec(
-                body.as_bytes(),
-                ruzstd::encoding::CompressionLevel::Fastest,
-            );
+            let compressed = zrip::compress(body.as_bytes(), 1).expect("compress test frame");
             buf.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
             buf.extend_from_slice(&compressed);
         }
@@ -1037,8 +1062,8 @@ mod tests {
     /// `zstd` CLI v1.5.7, `zstd -c -19`) must decode to the original JSON and drive a `StateUpdate`.
     /// This is the property that actually matters in production — control (Go's `klauspost/compress`
     /// zstd encoder) frames each `MapResponse`, and we must decode *its* output, not just frames our
-    /// own `ruzstd` round-trips. A foreign-encoder vector proves real interop. Embedded as a const so
-    /// the test is hermetic (no CLI needed at test time).
+    /// own test encoder round-trips. A foreign-encoder vector proves real interop. Embedded as a
+    /// const so the test is hermetic (no CLI needed at test time).
     #[tokio::test]
     async fn decodes_foreign_zstd_frame_interop_kat() {
         // zstd frame for {"MapSessionHandle":"sess-golden","Seq":7}
@@ -1051,7 +1076,7 @@ mod tests {
         ];
 
         // Sanity: the embedded vector is a real zstd frame (magic), produced by a different encoder
-        // than the one under test (its content/checksum differs from what `ruzstd` would emit).
+        // than the tests' own (`zrip::compress`). It carries a content checksum, which is verified.
         assert_eq!(&GOLDEN_ZSTD_FRAME[..4], &ZSTD_MAGIC);
 
         // Length-prefix it as control would on the wire, then feed it through the reader.
@@ -1105,18 +1130,16 @@ mod tests {
 
     /// Zip-bomb guard: a small zstd frame that decompresses to MORE than `MAX_DECODED_NETMAP` must be
     /// rejected (the stream ends, `None`) rather than driving an unbounded allocation. We build a
-    /// frame whose decompressed size is just over the bound; `decompress_frame` reads one byte past
-    /// the limit, sees it exceeded, and bails. This is the decompression-amplification defense that
-    /// the on-wire `MAX_NETMAP_FRAME` (compressed-size) bound cannot provide.
+    /// frame whose decompressed size is just over the bound; it declares that size, so zrip refuses
+    /// it before decoding a block (`zstd_output_limit_without_content_size` covers frames that do
+    /// not declare it). This is the decompression-amplification defense that the on-wire
+    /// `MAX_NETMAP_FRAME` (compressed-size) bound cannot provide.
     #[tokio::test]
     async fn rejects_zstd_bomb_exceeding_decoded_bound() {
         // Highly compressible payload (all zero bytes) just over the decoded bound. It is NOT valid
         // JSON, but the size guard fires during decompression, before any deserialize is attempted.
         let oversized = alloc::vec![0u8; (MAX_DECODED_NETMAP + 1) as usize];
-        let compressed = ruzstd::encoding::compress_to_vec(
-            oversized.as_slice(),
-            ruzstd::encoding::CompressionLevel::Fastest,
-        );
+        let compressed = zrip::compress(&oversized, 1).expect("compress bomb");
         // The bomb is tiny on the wire (well under the compressed-frame cap) yet expands past the
         // decoded cap — exactly the amplification the guard exists for.
         assert!((compressed.len() as u32) < MAX_NETMAP_FRAME);
@@ -1168,26 +1191,71 @@ mod tests {
         frame
     }
 
-    /// The per-block half of the zip-bomb guard (RUSTSEC-2026-0344). zstd caps what one block may
-    /// decompress to at 128 KiB (RFC 8878 `Block_Maximum_Size`), and the decoder has to enforce
-    /// that itself: it expands a whole block before `decompress_frame`'s `take` sees a byte of it,
-    /// so a block that ignores the cap allocates its full output first. `ruzstd` before 0.9.1 did
-    /// not check, and a frame under 128 KB could ask for gigabytes. The largest frame here decodes
-    /// to about 2 MB — far inside `MAX_DECODED_NETMAP`, so only the block limit can refuse it.
+    /// The per-block half of the zip-bomb guard (RUSTSEC-2026-0344, in the previous decoder). zstd
+    /// caps what one block may decompress to at 128 KiB (RFC 8878 `Block_Maximum_Size`), and the
+    /// decoder has to enforce that itself: a decoder that expands a whole block before checking any
+    /// limit lets a frame under 128 KB ask for gigabytes. The largest frame here decodes to about
+    /// 2 MB — far inside `MAX_DECODED_NETMAP`, so only the block limit can refuse it.
     #[test]
     fn rejects_zstd_block_decompressing_past_the_block_limit() {
         // One sequence stays inside the limit and decodes, so the frames built here are well-formed
         // and the refusals below are the limit's doing.
-        let decoded = decompress_frame(&one_block_frame(1)).expect("a block inside the limit");
+        let decoded = decompress(&one_block_frame(1)).expect("a block inside the limit");
         assert_eq!(decoded.len(), 65_540);
         assert!(decoded.iter().all(|&byte| byte == b'a'));
 
         // Two sequences are the first step past it: 131,080 bytes against a limit of 131,072.
-        assert_eq!(decompress_frame(&one_block_frame(2)).map(|d| d.len()), None);
+        assert_eq!(decompress(&one_block_frame(2)).map(|d| d.len()), None);
 
         let bomb = one_block_frame(31);
         assert!(bomb.len() < 100);
-        assert_eq!(decompress_frame(&bomb).map(|d| d.len()), None);
+        assert_eq!(decompress(&bomb).map(|d| d.len()), None);
+    }
+
+    /// [`decompress_frame`] with a fresh zstd context.
+    fn decompress(frame: &[u8]) -> Option<Vec<u8>> {
+        decompress_frame(&mut zrip::DecompressContext::new(), frame)
+    }
+
+    /// A zstd frame without a content size, holding RLE blocks of `b'a'` that add up to `len`.
+    fn rle_frame(len: usize) -> Vec<u8> {
+        const BLOCK: usize = 128 * 1024;
+        let mut frame = ZSTD_MAGIC.to_vec();
+        // Frame header: no content size, no checksum, no dictionary; then a 1 MiB window.
+        frame.extend_from_slice(&[0x00, 10 << 3]);
+        let mut left = len;
+        while left > 0 {
+            let size = left.min(BLOCK);
+            left -= size;
+            // Block header: RLE, its regenerated size, and the last-block bit; then the byte.
+            let header = (size as u32) << 3 | 0b010 | u32::from(left == 0);
+            frame.extend_from_slice(&header.to_le_bytes()[..3]);
+            frame.push(b'a');
+        }
+        frame
+    }
+
+    /// The decoded-size bound holds for a frame that does not declare its content size, where the
+    /// decoder only learns the size block by block: exactly `MAX_DECODED_NETMAP` bytes decode, one
+    /// more byte ends the stream.
+    #[test]
+    fn zstd_output_limit_without_content_size() {
+        let max = MAX_DECODED_NETMAP as usize;
+        let at_limit = rle_frame(max);
+        assert!(at_limit.len() < 4096, "a tiny frame on the wire");
+        assert_eq!(decompress(&at_limit).map(|d| d.len()), Some(max));
+        assert_eq!(decompress(&rle_frame(max + 1)).map(|d| d.len()), None);
+    }
+
+    /// A frame whose content checksum does not match its content ends the stream, as in Go
+    /// (`klauspost/compress` verifies the checksum by default).
+    #[test]
+    fn rejects_zstd_frame_with_bad_checksum() {
+        let mut frame = raw_block_frame(10 << 3);
+        // Set the checksum flag in the frame header descriptor and append a wrong checksum.
+        frame[ZSTD_MAGIC.len()] |= 0x04;
+        frame.extend_from_slice(&[0; 4]);
+        assert_eq!(decompress(&frame), None);
     }
 
     /// A zstd frame of one 3-byte raw block behind the given `Window_Descriptor` byte (RFC 8878:
@@ -1204,14 +1272,15 @@ mod tests {
 
     /// The declared-window limit is Go's, not the decoder's default. Go's client decodes a map-poll
     /// frame under `klauspost/compress`'s `zstd.MaxWindowSize` of 512 MiB and fails one above it
-    /// with `ErrWindowSizeExceeded`. `ruzstd` from 0.9.1 defaults to 128 MiB, which would refuse
-    /// frames Go accepts, so `decompress_frame` asks for [`MAX_ZSTD_WINDOW`] instead.
+    /// with `ErrWindowSizeExceeded`. zrip refuses windows above 128 MiB, which would refuse frames
+    /// Go accepts, so `decompress_frame` checks [`MAX_ZSTD_WINDOW`] itself and lowers a window
+    /// between the two to zrip's.
     #[test]
     fn zstd_window_limit_matches_go() {
-        // 256 MiB is past ruzstd's default and inside Go's; 512 MiB is Go's limit exactly.
+        // 256 MiB is past zrip's own cap and inside Go's; 512 MiB is Go's limit exactly.
         for (log2, descriptor) in [(28, 18 << 3), (29, 19 << 3)] {
             assert_eq!(
-                decompress_frame(&raw_block_frame(descriptor)).as_deref(),
+                decompress(&raw_block_frame(descriptor)).as_deref(),
                 Some(&b"abc"[..]),
                 "a 2^{log2}-byte window is inside the limit and must decode"
             );
@@ -1222,7 +1291,7 @@ mod tests {
         // is the kind of header a hostile frame would carry.
         for descriptor in [(19 << 3) | 1, 30 << 3] {
             assert_eq!(
-                decompress_frame(&raw_block_frame(descriptor)),
+                decompress(&raw_block_frame(descriptor)),
                 None,
                 "a window past Go's 512 MiB limit must end the stream"
             );

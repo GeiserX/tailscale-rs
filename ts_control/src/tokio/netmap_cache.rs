@@ -604,10 +604,7 @@ mod tests {
     /// [`NetmapCache::observe`] directly is deliberate — the tests then exercise the same path a
     /// live netmap takes, frame bytes and all.
     fn frame(body: &str) -> Vec<u8> {
-        let compressed = ruzstd::encoding::compress_to_vec(
-            body.as_bytes(),
-            ruzstd::encoding::CompressionLevel::Fastest,
-        );
+        let compressed = zrip::compress(body.as_bytes(), 1).expect("compress test frame");
         let mut buf = (compressed.len() as u32).to_le_bytes().to_vec();
         buf.extend_from_slice(&compressed);
         buf

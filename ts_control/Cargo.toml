@@ -45,8 +45,8 @@ rustls-pemfile = "2"
 # Pure-Rust zstd decoder for the streaming map-poll responses. Go control answers every map poll
 # `Compress = "zstd"` framed (`direct.go`), so the map-poll frame reader decompresses each frame
 # before deserializing. Pure-Rust (no C zstd-sys / aws-lc / openssl), preserving the ring-only,
-# musl-static posture. Decode-only: only `decoding::StreamingDecoder` is used.
-ruzstd.workspace = true
+# musl-static posture. Decode-only: a reusable `DecompressContext` and the frame header parser.
+zrip.workspace = true
 chrono = { workspace = true, features = ["serde"] }
 gethostname.workspace = true
 ipnet = { workspace = true, features = ["serde"] }
