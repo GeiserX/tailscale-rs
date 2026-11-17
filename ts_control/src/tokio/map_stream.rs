@@ -285,6 +285,27 @@ fn decompress_frame(frame: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     Some(decoded)
 }
 
+/// Runs the live map poll's per-frame work on one raw frame at a time.
+///
+/// **Unstable benchmark seam**: `#[doc(hidden)]`, no semver guarantee. It is `pub` only so
+/// `benches/netmap_decode.rs` can drive the private frame path (`decompress_frame`, then
+/// `state_update_from_frame`); it is not part of the supported public surface.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct NetmapFrameDecoder {}
+
+impl NetmapFrameDecoder {
+    /// Decompresses one raw map-poll frame into its JSON bytes, as the live map poll does.
+    pub fn decompress(&mut self, frame: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+        decompress_frame(frame)
+    }
+
+    /// Decompresses one raw map-poll frame and decodes it into a [`StateUpdate`].
+    pub fn state_update(&mut self, frame: &[u8]) -> Option<StateUpdate> {
+        state_update_from_frame(&self.decompress(frame)?)
+    }
+}
+
 #[cfg(test)]
 pub fn map_stream(
     reader: impl AsyncRead + Unpin,

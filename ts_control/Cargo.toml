@@ -97,6 +97,15 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 hyper = { workspace = true, features = ["server"] }
 hyper-util = { workspace = true, features = ["tokio"] }
 http-body-util.workspace = true
+# `benches/netmap_decode.rs`: the harness, and the encoder that builds its zstd fixtures (fixed
+# level 1, so the input bytes stay the same across decoder changes). Dev-only.
+criterion = "0.8"
+zrip = "0.8"
+
+[[bench]]
+name = "netmap_decode"
+harness = false
+required-features = ["async_tokio"]
 
 [features]
 default = ["async_tokio"]
