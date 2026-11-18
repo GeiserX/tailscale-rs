@@ -213,23 +213,10 @@ const MAX_DECODED_NETMAP: u64 = 64 * 1024 * 1024;
 /// 512 MiB is the limit Go's client runs under: `control/controlclient/direct.go` `decodeMsg` calls
 /// `zstdframe.AppendDecode` with no options, which leaves `klauspost/compress`'s
 /// `zstd.MaxWindowSize` (`1 << 29`) in force, and a frame above it fails with
-/// `ErrWindowSizeExceeded`. zrip has no per-decoder window setting and refuses windows above its
-/// own 128 MiB (`zrip::frame::MAX_WINDOW_SIZE`), which would refuse frames Go accepts, so
-/// [`decompress_frame`] checks this limit itself and lowers a window between the two to zrip's
-/// (see [`ZRIP_WINDOW_DESCRIPTOR`]). The limit is a refusal only: the window is not allocated up
-/// front, so [`MAX_DECODED_NETMAP`] stays the allocation bound.
+/// `ErrWindowSizeExceeded`. zrip's one-shot decoder sets no window cap of its own (its output
+/// buffer is the history), so [`decompress_frame`] checks this limit itself. The limit is a refusal
+/// only: the window is not allocated up front, so [`MAX_DECODED_NETMAP`] stays the allocation bound.
 const MAX_ZSTD_WINDOW: u64 = 1 << 29;
-
-/// The `Window_Descriptor` byte (RFC 8878) for zrip's window cap, `zrip::frame::MAX_WINDOW_SIZE`.
-///
-/// [`decompress_frame`] writes it over the descriptor of a frame whose window is above zrip's cap
-/// but within [`MAX_ZSTD_WINDOW`]. That changes nothing about what decodes: the one-shot decoder
-/// checks each match offset against the bytes already decoded, not against the declared window,
-/// and a frame that fits [`MAX_DECODED_NETMAP`] cannot reach back past zrip's cap anyway.
-const ZRIP_WINDOW_DESCRIPTOR: u8 =
-    ((zrip::frame::MAX_WINDOW_SIZE.trailing_zeros() - 10) << 3) as u8;
-const _: () = assert!(zrip::frame::MAX_WINDOW_SIZE.is_power_of_two());
-const _: () = assert!(MAX_DECODED_NETMAP <= zrip::frame::MAX_WINDOW_SIZE);
 
 /// The 4-byte zstd frame magic (`0xFD2FB528`, little-endian on the wire). Used to distinguish a
 /// `Compress = "zstd"` framed response from an uncompressed one, so a control plane that ignored the
@@ -274,16 +261,6 @@ fn decompress_frame(
         );
         return None;
     }
-
-    // zrip refuses a window above its own cap; lower one that Go accepts to that cap. The window
-    // descriptor directly follows the magic and the frame header descriptor.
-    let frame = if !header.single_segment && header.window_size > zrip::frame::MAX_WINDOW_SIZE {
-        let mut lowered = frame.to_vec();
-        lowered[ZSTD_MAGIC.len() + 1] = ZRIP_WINDOW_DESCRIPTOR;
-        alloc::borrow::Cow::Owned(lowered)
-    } else {
-        alloc::borrow::Cow::Borrowed(frame)
-    };
 
     // zrip stops at `MAX_DECODED_NETMAP` (zip-bomb guard) instead of letting the frame drive an
     // unbounded allocation. The output `Vec` is NOT pre-reserved to the cap: that would force a
@@ -1272,9 +1249,8 @@ mod tests {
 
     /// The declared-window limit is Go's, not the decoder's default. Go's client decodes a map-poll
     /// frame under `klauspost/compress`'s `zstd.MaxWindowSize` of 512 MiB and fails one above it
-    /// with `ErrWindowSizeExceeded`. zrip refuses windows above 128 MiB, which would refuse frames
-    /// Go accepts, so `decompress_frame` checks [`MAX_ZSTD_WINDOW`] itself and lowers a window
-    /// between the two to zrip's.
+    /// with `ErrWindowSizeExceeded`. zrip's one-shot decoder has no window cap of its own, so
+    /// `decompress_frame` checks [`MAX_ZSTD_WINDOW`] itself.
     #[test]
     fn zstd_window_limit_matches_go() {
         // 256 MiB is past zrip's own cap and inside Go's; 512 MiB is Go's limit exactly.

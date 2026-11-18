@@ -100,7 +100,7 @@ http-body-util.workspace = true
 # `benches/netmap_decode.rs`: the harness, and the encoder that builds its zstd fixtures (fixed
 # level 1, so the input bytes stay the same across decoder changes). Dev-only.
 criterion = "0.8"
-zrip = "0.8"
+zrip = "0.8.18"
 
 [[bench]]
 name = "netmap_decode"

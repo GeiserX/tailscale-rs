@@ -147,9 +147,9 @@ zeroize = { version = "1.8", default-features = false, features = ["derive"] }
 # C `zstd-sys`, no `aws-lc`/openssl/ring), so it keeps the ring-only / musl-static egress posture
 # intact. Only the one-shot decoder (`DecompressContext`) and the frame header parser are used (a
 # request body is never compressed). `std` + `simd` is the decoder's fast path; the default
-# `frame` (streaming) and `ldm` (encoder) features are not needed. 0.8.17 is the release this was
-# ported and tested against.
-zrip = { version = "0.8.17", default-features = false, features = ["std", "simd"] }
+# `frame` (streaming) and `ldm` (encoder) features are not needed. 0.8.18 is the first release whose
+# one-shot decoder takes windows above 128 MiB, which Go's 512 MiB window limit needs.
+zrip = { version = "0.8.18", default-features = false, features = ["std", "simd"] }
 
 # local workspace deps
 tailscale = { path = ".", package = "geiserx_tailscale", version = "0.58.8" } # x-release-please-version
