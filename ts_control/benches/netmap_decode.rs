@@ -16,9 +16,9 @@
 //! cargo bench -p geiserx_ts_control --bench netmap_decode
 //! ```
 
-use std::hint::black_box;
+use std::sync::LazyLock;
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use divan::{Bencher, black_box, counter::BytesCount};
 use serde_json::{Value, json};
 use ts_control::{NetmapFrameDecoder, PeerUpdate};
 
@@ -378,41 +378,44 @@ fn fixtures() -> Vec<Fixture> {
         .collect()
 }
 
-fn bench_netmap_decode(c: &mut Criterion) {
-    let fixtures = fixtures();
+/// Built once, on the first bench that needs them.
+static FIXTURES: LazyLock<Vec<Fixture>> = LazyLock::new(fixtures);
 
-    let mut group = c.benchmark_group("netmap_decompress");
-    for fixture in &fixtures {
-        group.throughput(Throughput::Bytes(fixture.json.len() as u64));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(fixture.name),
-            &fixture.frame,
-            |b, frame| {
-                let mut decoder = NetmapFrameDecoder::default();
-                b.iter(|| decoder.decompress(black_box(frame)).expect("decompress"));
-            },
-        );
-    }
-    group.finish();
+const FIXTURE_NAMES: &[&str] = &["delta_update", "full_100_peers", "full_500_peers"];
 
-    let mut group = c.benchmark_group("netmap_state_update");
-    for fixture in &fixtures {
-        group.throughput(Throughput::Bytes(fixture.json.len() as u64));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(fixture.name),
-            &fixture.frame,
-            |b, frame| {
-                let mut decoder = NetmapFrameDecoder::default();
-                b.iter(|| {
-                    decoder
-                        .state_update(black_box(frame))
-                        .expect("state update")
-                });
-            },
-        );
-    }
-    group.finish();
+fn fixture(name: &str) -> &'static Fixture {
+    FIXTURES
+        .iter()
+        .find(|fixture| fixture.name == name)
+        .expect("known fixture")
 }
 
-criterion_group!(benches, bench_netmap_decode);
-criterion_main!(benches);
+fn main() {
+    divan::main();
+}
+
+#[divan::bench(args = FIXTURE_NAMES)]
+fn netmap_decompress(bencher: Bencher, name: &str) {
+    let fixture = fixture(name);
+    let mut decoder = NetmapFrameDecoder::default();
+    bencher
+        .counter(BytesCount::new(fixture.json.len()))
+        .bench_local(|| {
+            decoder
+                .decompress(black_box(&fixture.frame))
+                .expect("decompress")
+        });
+}
+
+#[divan::bench(args = FIXTURE_NAMES)]
+fn netmap_state_update(bencher: Bencher, name: &str) {
+    let fixture = fixture(name);
+    let mut decoder = NetmapFrameDecoder::default();
+    bencher
+        .counter(BytesCount::new(fixture.json.len()))
+        .bench_local(|| {
+            decoder
+                .state_update(black_box(&fixture.frame))
+                .expect("state update")
+        });
+}

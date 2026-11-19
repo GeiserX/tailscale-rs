@@ -177,17 +177,9 @@ criteria = "safe-to-deploy"
 version = "1.1.4"
 criteria = "safe-to-deploy"
 
-[[exemptions.alloca]]
-version = "0.4.0"
-criteria = "safe-to-run"
-
 [[exemptions.allocator-api2]]
 version = "0.2.21"
 criteria = "safe-to-deploy"
-
-[[exemptions.anes]]
-version = "0.1.6"
-criteria = "safe-to-run"
 
 [[exemptions.anstream]]
 version = "1.0.0"
@@ -345,10 +337,6 @@ criteria = "safe-to-deploy"
 version = "1.12.1"
 criteria = "safe-to-deploy"
 
-[[exemptions.cast]]
-version = "0.3.0"
-criteria = "safe-to-run"
-
 [[exemptions.castaway]]
 version = "0.2.4"
 criteria = "safe-to-deploy"
@@ -388,18 +376,6 @@ criteria = "safe-to-deploy"
 [[exemptions.chrono]]
 version = "0.4.45"
 criteria = "safe-to-deploy"
-
-[[exemptions.ciborium]]
-version = "0.2.2"
-criteria = "safe-to-run"
-
-[[exemptions.ciborium-io]]
-version = "0.2.2"
-criteria = "safe-to-run"
-
-[[exemptions.ciborium-ll]]
-version = "0.2.2"
-criteria = "safe-to-run"
 
 [[exemptions.cipher]]
 version = "0.4.4"
@@ -493,14 +469,6 @@ criteria = "safe-to-deploy"
 version = "1.5.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.criterion]]
-version = "0.8.2"
-criteria = "safe-to-run"
-
-[[exemptions.criterion-plot]]
-version = "0.8.2"
-criteria = "safe-to-run"
-
 [[exemptions.critical-section]]
 version = "1.2.0"
 criteria = "safe-to-deploy"
@@ -524,10 +492,6 @@ criteria = "safe-to-deploy"
 [[exemptions.crossterm_winapi]]
 version = "0.9.1"
 criteria = "safe-to-deploy"
-
-[[exemptions.crunchy]]
-version = "0.2.4"
-criteria = "safe-to-run"
 
 [[exemptions.crypto-bigint]]
 version = "0.7.10"
@@ -877,10 +841,6 @@ criteria = "safe-to-deploy"
 version = "0.4.19"
 criteria = "safe-to-deploy"
 
-[[exemptions.half]]
-version = "2.7.1"
-criteria = "safe-to-run"
-
 [[exemptions.hash32]]
 version = "0.3.1"
 criteria = "safe-to-deploy"
@@ -1056,10 +1016,6 @@ criteria = "safe-to-deploy"
 [[exemptions.is_terminal_polyfill]]
 version = "1.70.2"
 criteria = "safe-to-deploy"
-
-[[exemptions.itertools]]
-version = "0.13.0"
-criteria = "safe-to-run"
 
 [[exemptions.itertools]]
 version = "0.14.0"
@@ -1309,10 +1265,6 @@ criteria = "safe-to-deploy"
 version = "1.70.2"
 criteria = "safe-to-deploy"
 
-[[exemptions.oorandom]]
-version = "11.1.5"
-criteria = "safe-to-run"
-
 [[exemptions.opaque-debug]]
 version = "0.3.1"
 criteria = "safe-to-deploy"
@@ -1336,10 +1288,6 @@ criteria = "safe-to-deploy"
 [[exemptions.p521]]
 version = "0.14.0"
 criteria = "safe-to-deploy"
-
-[[exemptions.page_size]]
-version = "0.6.0"
-criteria = "safe-to-run"
 
 [[exemptions.pageant]]
 version = "0.2.5"
@@ -1464,18 +1412,6 @@ criteria = "safe-to-deploy"
 [[exemptions.pkg-config]]
 version = "0.3.32"
 criteria = "safe-to-deploy"
-
-[[exemptions.plotters]]
-version = "0.3.7"
-criteria = "safe-to-run"
-
-[[exemptions.plotters-backend]]
-version = "0.3.7"
-criteria = "safe-to-run"
-
-[[exemptions.plotters-svg]]
-version = "0.3.7"
-criteria = "safe-to-run"
 
 [[exemptions.poly1305]]
 version = "0.8.0"
@@ -1628,14 +1564,6 @@ criteria = "safe-to-deploy"
 [[exemptions.ratatui-widgets]]
 version = "0.3.2"
 criteria = "safe-to-deploy"
-
-[[exemptions.rayon]]
-version = "1.12.0"
-criteria = "safe-to-run"
-
-[[exemptions.rayon-core]]
-version = "1.13.0"
-criteria = "safe-to-run"
 
 [[exemptions.rcgen]]
 version = "0.13.2"
@@ -2056,10 +1984,6 @@ criteria = "safe-to-deploy"
 [[exemptions.tinystr]]
 version = "0.8.3"
 criteria = "safe-to-deploy"
-
-[[exemptions.tinytemplate]]
-version = "1.2.1"
-criteria = "safe-to-run"
 
 [[exemptions.tinyvec]]
 version = "1.11.0"
