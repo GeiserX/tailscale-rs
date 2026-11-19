@@ -1253,7 +1253,8 @@ mod tests {
     /// `decompress_frame` checks [`MAX_ZSTD_WINDOW`] itself.
     #[test]
     fn zstd_window_limit_matches_go() {
-        // 256 MiB is past zrip's own cap and inside Go's; 512 MiB is Go's limit exactly.
+        // 256 MiB is past ruzstd's old default and zrip's streaming cap, and inside Go's limit;
+        // 512 MiB is Go's limit exactly.
         for (log2, descriptor) in [(28, 18 << 3), (29, 19 << 3)] {
             assert_eq!(
                 decompress(&raw_block_frame(descriptor)).as_deref(),
