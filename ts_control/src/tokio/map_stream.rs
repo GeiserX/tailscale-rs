@@ -1121,6 +1121,12 @@ mod tests {
         // decoded cap — exactly the amplification the guard exists for.
         assert!((compressed.len() as u32) < MAX_NETMAP_FRAME);
 
+        // The payload is not JSON, so the stream below ends even without the bound. Check the
+        // decoder itself: the frame declares its size, and that size is refused.
+        let header = zrip::frame::header::parse_frame_header(&compressed).expect("bomb header");
+        assert_eq!(header.frame_content_size, Some(MAX_DECODED_NETMAP + 1));
+        assert_eq!(decompress(&compressed).map(|d| d.len()), None);
+
         let mut buf = (compressed.len() as u32).to_le_bytes().to_vec();
         buf.extend_from_slice(&compressed);
 
