@@ -16,6 +16,11 @@ ignore = [
     # `paste` is gone from the tun transport's dependency tree.
     { id = "RUSTSEC-2024-0436", reason = "paste is archived/unmaintained; transitive via netlink-packet-core -> tun-rs under the tun transport. Not yet fixed upstream" },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is unmaintained (functionality folded into rustls-pki-types >=1.9); transitive via the TLS stack, no published vulnerability. Pre-existing advisory, unrelated to the supply-chain ban below." },
+    # `chrono` is unmaintained: every version is flagged and no release fixes it. It is a direct
+    # dependency of ts_control, ts_control_serde and ts_runtime, and ts_runtime exposes
+    # `chrono::DateTime<Utc>` on a public field (`StatusNode.last_seen`), so moving to `jiff` or
+    # `time` is a breaking API change of its own. Drop this entry when that migration lands.
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, with no patched version and no published vulnerability. Direct dependency for control-plane timestamps; ts_runtime exposes chrono::DateTime publicly, so the jiff/time migration is a separate breaking change" },
 ]
 # NOTE: `ts_tunnel`'s constant-time leakage bench no longer depends on `dudect-bencher` -- its
 # t-test is vendored into `ts_tunnel/benches/dudect/mod.rs`. That crate's newest release (0.7.0)

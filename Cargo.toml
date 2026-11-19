@@ -87,7 +87,7 @@ futures = { version = "0.3", default-features = false }
 futures-util = { version = "0.3", default-features = false }
 gethostname = "1.1"
 hashbrown = "0.17"
-heapless = "0.9"
+heapless = "0.9.4"
 hex = "0.4"
 hkdf = { version = "0.12", features = ["std"] }
 http = "1.4"
