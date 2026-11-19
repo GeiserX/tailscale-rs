@@ -19,13 +19,11 @@ Record breaking or significant changes here. All dates are UTC.
 
 ### Bug Fixes
 
-* **deps:** turn main's supply-chain audit green again with heapless 0.9.4 ([36ba684](https://github.com/GeiserX/tailscale-rs/commit/36ba6845dbd1a38f3067be5c767ab1194f355ebd))
 * **deps:** turn main's supply-chain audit green again with heapless 0.9.4 ([#686](https://github.com/GeiserX/tailscale-rs/issues/686)) ([36ba684](https://github.com/GeiserX/tailscale-rs/commit/36ba6845dbd1a38f3067be5c767ab1194f355ebd))
 
 
 ### Performance Improvements
 
-* **ts_control:** decode netmap frames with zrip ([893a51b](https://github.com/GeiserX/tailscale-rs/commit/893a51b47b5265eebc9efff1e6e7523672548ef8))
 * **ts_control:** decode zstd map-poll frames 3-5x faster with zrip ([#685](https://github.com/GeiserX/tailscale-rs/issues/685)) ([3f4ad59](https://github.com/GeiserX/tailscale-rs/commit/3f4ad595478186a58ede64043be00623fe75155f))
 
 ## [0.58.8](https://github.com/GeiserX/tailscale-rs/compare/v0.58.7...v0.58.8) (2026-11-06)
