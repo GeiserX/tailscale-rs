@@ -11,6 +11,7 @@ Record breaking or significant changes here. All dates are UTC.
 
 ### Performance
 
+* **control:** zstd map-poll frames decode with zrip instead of ruzstd, 3.7-4.8x faster (1.3-2x with the `MapResponse` parse). The 64 MiB output bound, Go's 512 MiB window limit and checksum verification are unchanged.
 * **exit node:** forwarded TCP flows run without Nagle, the underlay UDP sockets ask for Go's 7 MiB buffers, netstack egress goes out in batches of up to 64 packets, and the netstack tracks 32 receive holes for uploads. Kernel receive batching, splice coalescing, targeted replay and Apple connected UDP sockets are opt-in experiments, off unless their variable is `1`.
 
 ## [0.58.8](https://github.com/GeiserX/tailscale-rs/compare/v0.58.7...v0.58.8) (2026-11-06)

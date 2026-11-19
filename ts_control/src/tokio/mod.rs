@@ -5,7 +5,7 @@ pub use connect::{
 };
 pub use id_token::{IdTokenError, fetch_id_token};
 pub use logout::{LogoutError, LogoutInternalErrorKind, logout};
-pub use map_stream::{FilterUpdate, PeerUpdate, StateUpdate};
+pub use map_stream::{FilterUpdate, NetmapFrameDecoder, PeerUpdate, StateUpdate};
 pub use netmap_cache::{
     NETMAP_CACHE_FILE, NODE_ATTR_CACHE_NETWORK_MAPS, NODE_ATTR_DISABLE_CACHE_NETWORK_MAPS,
     NetmapCache, TKA_CHAIN_CACHE_FILE, netmap_caching_enabled,

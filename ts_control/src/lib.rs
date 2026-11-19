@@ -108,6 +108,10 @@ pub mod tls {
     pub use tokio_rustls::{TlsAcceptor, rustls::sign::CertifiedKey, server::TlsStream};
 }
 
+// Unstable benchmark seam for `benches/netmap_decode.rs`.
+#[cfg(feature = "async_tokio")]
+#[doc(hidden)]
+pub use crate::tokio::NetmapFrameDecoder;
 #[cfg(feature = "async_tokio")]
 pub use crate::tokio::{
     AsyncControlClient, FilterUpdate, IdTokenError, LogoutError, LogoutInternalErrorKind,

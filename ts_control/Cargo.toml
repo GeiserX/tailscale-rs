@@ -45,8 +45,8 @@ rustls-pemfile = "2"
 # Pure-Rust zstd decoder for the streaming map-poll responses. Go control answers every map poll
 # `Compress = "zstd"` framed (`direct.go`), so the map-poll frame reader decompresses each frame
 # before deserializing. Pure-Rust (no C zstd-sys / aws-lc / openssl), preserving the ring-only,
-# musl-static posture. Decode-only: only `decoding::StreamingDecoder` is used.
-ruzstd.workspace = true
+# musl-static posture. Decode-only: a reusable `DecompressContext` and the frame header parser.
+zrip.workspace = true
 chrono = { workspace = true, features = ["serde"] }
 gethostname.workspace = true
 ipnet = { workspace = true, features = ["serde"] }
@@ -97,6 +97,15 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 hyper = { workspace = true, features = ["server"] }
 hyper-util = { workspace = true, features = ["tokio"] }
 http-body-util.workspace = true
+# `benches/netmap_decode.rs`: the workspace's bench harness. The bench builds its zstd fixtures with
+# `zrip::compress` from the normal dependency above (fixed level 1, so the input bytes stay the same
+# across decoder changes).
+divan.workspace = true
+
+[[bench]]
+name = "netmap_decode"
+harness = false
+required-features = ["async_tokio"]
 
 [features]
 default = ["async_tokio"]
