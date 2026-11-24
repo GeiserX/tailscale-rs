@@ -148,8 +148,10 @@ zeroize = { version = "1.8", default-features = false, features = ["derive"] }
 # intact. Only the one-shot decoder (`DecompressContext`) and the frame header parser are used (a
 # request body is never compressed). `std` + `simd` is the decoder's fast path; the default
 # `frame` (streaming) and `ldm` (encoder) features are not needed. 0.8.18 is the first release whose
-# one-shot decoder takes windows above 128 MiB, which Go's 512 MiB window limit needs.
-zrip = { version = "0.8.18", default-features = false, features = ["std", "simd"] }
+# one-shot decoder takes windows above 128 MiB, which Go's 512 MiB window limit needs. 0.8.17 moved
+# one-shot block size checks to C zstd 1.5.7's rules, which the map_stream zip-bomb tests pin, and
+# 0.8.24 decodes frames with Huffman weights past 12, which C zstd accepts and 0.8.23 refused.
+zrip = { version = "0.8.24", default-features = false, features = ["std", "simd"] }
 
 # local workspace deps
 tailscale = { path = ".", package = "geiserx_tailscale", version = "0.58.9" } # x-release-please-version
