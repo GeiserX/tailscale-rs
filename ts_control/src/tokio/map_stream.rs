@@ -197,8 +197,10 @@ const MAX_NETMAP_FRAME: u32 = 16 * 1024 * 1024;
 ///
 /// This output cap is the *binding* allocation bound. [`decompress_frame`] passes it to zrip as the
 /// output limit, and zrip enforces it inside the decoder: a raw, RLE or literals-only block is
-/// checked before it is written, and sequence execution stops at the limit and at zstd's own
-/// 128 KiB block limit (RFC 8878 `Block_Maximum_Size`), so no block expands past the cap first. A
+/// checked before it is written, and sequence execution stops at the limit, so no block expands
+/// past the cap first. zstd's own 128 KiB block limit (RFC 8878 `Block_Maximum_Size`) is not that
+/// bound: like C zstd's one-shot decoder, zrip holds a block to it (plus 32 bytes) only when the
+/// block's literals go to the output, and lets a block with in-place raw literals fill the cap. A
 /// frame that declares a content size above the cap is refused before any block is read; a smaller
 /// declared size is reserved once and is also the most that frame may write. A declared *window*
 /// drives no allocation: the one-shot decoder writes into a single flat output buffer. Peak
@@ -1141,23 +1143,41 @@ mod tests {
     /// conforming encoder will emit a block this dense. Each sequence is one literal `a` followed by
     /// a 65539-byte match at offset 1, so the block decompresses to `sequences * 65540` bytes of `a`
     /// from two bytes of bitstream per sequence.
-    fn one_block_frame(sequences: u8) -> Vec<u8> {
-        // The one-byte forms of the literals header and the sequence count top out here.
-        assert!((1..=31).contains(&sequences));
+    ///
+    /// The literals are RLE (one `a` byte for all of them), or raw (`sequences` bytes of `a` in the
+    /// block) when `raw_literals` is set. The two differ in where the decoder keeps them, and that
+    /// decides whether zstd's 128 KiB block limit applies to the block's output (see
+    /// `zstd_block_cannot_expand_past_the_decoded_bound`).
+    fn one_block_frame(sequences: u16, raw_literals: bool) -> Vec<u8> {
+        // The two-byte forms of the literals header and the sequence count top out here.
+        assert!((1..4096).contains(&sequences));
 
-        let mut block = alloc::vec![
-            // Literals section: RLE, `sequences` copies of the byte that follows.
-            (sequences << 3) | 0b01,
-            b'a',
-            // Sequences section: the count, then all three tables in RLE mode — literals-length
-            // code 1 (one literal), offset code 0 (repeat the last offset, initially 1), and
-            // match-length code 52 (65539 plus 16 extra bits).
-            sequences,
-            0b0101_0100,
-            1,
-            0,
-            52,
-        ];
+        let mut block = Vec::new();
+        // Literals section header (RFC 8878 3.1.1.3.1.1): the type in the low two bits (raw 0,
+        // RLE 1), then the regenerated size, in one byte up to 31 or two bytes up to 4095.
+        let literals_type = if raw_literals { 0b00 } else { 0b01 };
+        if sequences < 32 {
+            block.push((sequences as u8) << 3 | literals_type);
+        } else {
+            block.push(((sequences & 0xf) as u8) << 4 | 0b0100 | literals_type);
+            block.push((sequences >> 4) as u8);
+        }
+        if raw_literals {
+            block.resize(block.len() + usize::from(sequences), b'a');
+        } else {
+            block.push(b'a');
+        }
+        // Sequences section: the count, in one byte below 128 or two bytes below 0x7f00.
+        if sequences < 128 {
+            block.push(sequences as u8);
+        } else {
+            block.push((sequences >> 8) as u8 | 0x80);
+            block.push(sequences as u8);
+        }
+        // All three tables in RLE mode: literals-length code 1 (one literal), offset code 0
+        // (repeat the last offset, initially 1), and match-length code 52 (65539 plus 16 extra
+        // bits).
+        block.extend_from_slice(&[0b0101_0100, 1, 0, 52]);
         // The bitstream: RLE tables carry no state bits, so each sequence is just its 16 zero
         // match-length extra bits. It is read backwards from a final byte holding the end mark.
         block.resize(block.len() + 2 * usize::from(sequences), 0);
@@ -1175,23 +1195,49 @@ mod tests {
     }
 
     /// The per-block half of the zip-bomb guard (RUSTSEC-2026-0344, in the previous decoder). zstd
-    /// caps what one block may decompress to at 128 KiB (RFC 8878 `Block_Maximum_Size`), and the
-    /// decoder has to enforce that itself: a decoder that expands a whole block before checking any
-    /// limit lets a frame under 128 KB ask for gigabytes. The largest frame here decodes to about
-    /// 2 MB — far inside `MAX_DECODED_NETMAP`, so only the block limit can refuse it.
+    /// caps what one block may decompress to at 128 KiB (RFC 8878 `Block_Maximum_Size`), and C
+    /// zstd's one-shot decoder enforces it, with 32 bytes of slack, on a block whose literals it
+    /// places in the output buffer, as it does RLE literals. A decoder that expands a whole block
+    /// before checking any limit lets a frame under 128 KB ask for gigabytes. The largest frame
+    /// here decodes to about 2 MB, far inside `MAX_DECODED_NETMAP`, so only the block limit can
+    /// refuse it.
     #[test]
     fn rejects_zstd_block_decompressing_past_the_block_limit() {
         // One sequence stays inside the limit and decodes, so the frames built here are well-formed
         // and the refusals below are the limit's doing.
-        let decoded = decompress(&one_block_frame(1)).expect("a block inside the limit");
+        let decoded = decompress(&one_block_frame(1, false)).expect("a block inside the limit");
         assert_eq!(decoded.len(), 65_540);
         assert!(decoded.iter().all(|&byte| byte == b'a'));
 
-        // Two sequences are the first step past it: 131,080 bytes against a limit of 131,072.
-        assert_eq!(decompress(&one_block_frame(2)).map(|d| d.len()), None);
+        // Three sequences are the first step past the limit and its slack: 196,620 bytes against
+        // 131,104. (Two, 131,080 bytes, fall inside the slack, which C zstd 1.5.7 allows too.)
+        assert_eq!(
+            decompress(&one_block_frame(3, false)).map(|d| d.len()),
+            None
+        );
 
-        let bomb = one_block_frame(31);
+        let bomb = one_block_frame(31, false);
         assert!(bomb.len() < 100);
+        assert_eq!(decompress(&bomb).map(|d| d.len()), None);
+    }
+
+    /// The decoded-size bound holds inside a single compressed block. C zstd's one-shot decoder
+    /// leaves raw literals in the block when at least 32 bytes follow them, and then lets the
+    /// block's sequences fill the whole output buffer, past the 128 KiB block limit; zrip does the
+    /// same since 0.8.17. For such a block the block limit refuses nothing and `MAX_DECODED_NETMAP`
+    /// is the only bound. A frame of about 3 KB here asks one block for about 72 MB, and must be
+    /// refused before it is written.
+    #[test]
+    fn zstd_block_cannot_expand_past_the_decoded_bound() {
+        // The premise: with raw literals, a block eight times the block limit (16 sequences,
+        // 1,048,640 bytes) decodes, so the refusal below is the decoded-size bound's doing.
+        let decoded = decompress(&one_block_frame(16, true)).expect("a raw-literals block");
+        assert_eq!(decoded.len(), 1_048_640);
+        assert!(decoded.iter().all(|&byte| byte == b'a'));
+
+        let bomb = one_block_frame(1100, true);
+        assert!(bomb.len() < 4096, "a tiny frame on the wire");
+        const { assert!(1100 * 65_540 > MAX_DECODED_NETMAP) };
         assert_eq!(decompress(&bomb).map(|d| d.len()), None);
     }
 
