@@ -121,29 +121,33 @@ jobs:
       # Keep the release PR mergeable: up to date with main, with its required checks run.
       #
       # release-please pushes the release branch with the built-in token, and GitHub starts
-      # no real workflow run from a push made with that token (it records a `pull_request`
+      # no real workflow run from an event made with that token (it records a `pull_request`
       # run that fails at once with no jobs), so the release PR's required checks never
-      # report. A `workflow_dispatch` is exempt from that rule, and branch protection
-      # matches a required check by name on the head commit, so a run dispatched on the
-      # release branch satisfies it.
+      # report. A `workflow_dispatch` does not help: its check runs land on the head commit,
+      # but GitHub leaves them out of the pull request, so the branch rules stay blocked
+      # (tested on #677). The checks must come from a `pull_request` event made by a real
+      # identity, so this step acts with the RELEASE_PR_TOKEN secret, a fine-grained PAT
+      # with Contents and Pull requests write on this repository.
       #
       # release-please only pushes the branch when the release notes change, so a commit
       # that adds no notes (chore:, ci:, a Dependabot bump) leaves the PR behind main, and
-      # main requires branches to be up to date. So this step also updates a release
-      # branch that is behind.
+      # main requires branches to be up to date. A branch that is behind is updated with
+      # the PAT, which starts CI on the new head. Otherwise, a head without its required
+      # checks gets the PR closed and reopened with the PAT, which starts CI the same way.
       #
-      # Whether to dispatch is decided by the head commit itself: a workflow is dispatched
-      # only when its required check is absent there. So a rerun repairs a run that died
-      # between the update and the dispatch, and an unchanged PR is not checked twice.
-      # This step runs last so that its failure can never skip the dispatch above.
-      # With the RELEASE_PLEASE_TOKEN PAT configured, release-please and the branch update
-      # push as that identity, which starts CI by itself, so nothing is dispatched.
+      # The decision comes from the head commit, so a rerun repairs an interrupted run and
+      # an unchanged PR is left alone. release-please itself keeps the built-in token, so
+      # the tag push still starts nothing and the dispatch above stays the only build.
+      # This step runs last so that its failure can never skip that dispatch.
       - name: Keep the release PR up to date and checked
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
-          HAS_RELEASE_PAT: ${{ env.HAS_RELEASE_PAT }}
+          GH_TOKEN: ${{ secrets.RELEASE_PR_TOKEN }}
         run: |
           set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::RELEASE_PR_TOKEN is not set, so the release PR cannot get its required checks."
+            exit 1
+          fi
           pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --label 'autorelease: pending' \
             --json number,headRefName,baseRefName,headRefOid --jq '.[0] // empty')
           if [ -z "$pr" ]; then echo "No open release PR."; exit 0; fi
@@ -156,25 +160,17 @@ jobs:
             echo "Release PR #$number is $behind commit(s) behind $base; updating its branch."
             gh api -X PUT "repos/$GITHUB_REPOSITORY/pulls/$number/update-branch" \
               -f expected_head_sha="$head" >/dev/null
-            # The update is asynchronous: wait for the new head before checking it.
-            old=$head
-            for _ in $(seq 1 30); do
-              head=$(gh pr view "$number" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)
-              [ "$head" != "$old" ] && break
-              sleep 4
-            done
-            if [ "$head" = "$old" ]; then echo "::error::The branch of release PR #$number did not move."; exit 1; fi
+            exit 0
           fi
-          if [ "${HAS_RELEASE_PAT:-false}" = "true" ]; then exit 0; fi
           checks=$(gh api "repos/$GITHUB_REPOSITORY/commits/$head/check-runs?per_page=100" \
             --jq '.check_runs[].name')
-          dispatch_unless_checked() {
-            if grep -qxF "$2" <<<"$checks"; then
-              echo "'$2' already exists on $head; not dispatching $1."
-            else
-              echo "Dispatching $1 on $branch ($head) for release PR #$number."
-              gh workflow run "$1" --repo "$GITHUB_REPOSITORY" --ref "$branch"
+          required_checks=('musl static (x86_64-unknown-linux-musl)' 'build (strict)')
+          for required in "${required_checks[@]}"; do
+            if ! grep -qxF "$required" <<<"$checks"; then
+              echo "'$required' is missing on $head; closing and reopening release PR #$number."
+              gh pr close "$number" --repo "$GITHUB_REPOSITORY"
+              gh pr reopen "$number" --repo "$GITHUB_REPOSITORY"
+              exit 0
             fi
-          }
-          dispatch_unless_checked ci.yml 'musl static (x86_64-unknown-linux-musl)'
-          dispatch_unless_checked docs.yml 'build (strict)'
+          done
+          echo "Release PR #$number is up to date and its required checks exist on $head."
