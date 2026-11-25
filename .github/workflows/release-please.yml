@@ -70,6 +70,13 @@ permissions:
   pull-requests: write
   actions: write
 
+# One run at a time, never cancelled: two quick pushes to main must not interleave a
+# release-please force-push with the close and reopen in the last step. A queued run
+# that a newer one replaces loses nothing, because release-please reads the current state.
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
 jobs:
   release-please:
     name: maintain release PR · cut release on merge
@@ -124,20 +131,26 @@ jobs:
       # no real workflow run from an event made with that token (it records a `pull_request`
       # run that fails at once with no jobs), so the release PR's required checks never
       # report. A `workflow_dispatch` does not help: its check runs land on the head commit,
-      # but GitHub leaves them out of the pull request, so the branch rules stay blocked
-      # (tested on #677). The checks must come from a `pull_request` event made by a real
-      # identity, so this step acts with the RELEASE_PR_TOKEN secret, a fine-grained PAT
-      # with Contents and Pull requests write on this repository.
+      # but GitHub leaves them out of the pull request, so the branch rules stay blocked.
+      # The checks must come from a `pull_request` event made by a real identity, so this
+      # step acts with the RELEASE_PR_TOKEN secret: a fine-grained PAT for this repository
+      # with Contents, Pull requests and Workflows write (Workflows, because updating the
+      # branch can bring workflow changes from main into it).
       #
       # release-please only pushes the branch when the release notes change, so a commit
       # that adds no notes (chore:, ci:, a Dependabot bump) leaves the PR behind main, and
       # main requires branches to be up to date. A branch that is behind is updated with
       # the PAT, which starts CI on the new head. Otherwise, a head without its required
-      # checks gets the PR closed and reopened with the PAT, which starts CI the same way.
+      # checks from a `pull_request` run gets the PR closed and reopened with the PAT,
+      # which starts CI the same way.
       #
-      # The decision comes from the head commit, so a rerun repairs an interrupted run and
-      # an unchanged PR is left alone. release-please itself keeps the built-in token, so
-      # the tag push still starts nothing and the dispatch above stays the only build.
+      # The decision comes from the branch and its head commit, so a rerun repairs an
+      # interrupted run and an unchanged PR is left alone. The PR is found with a plain
+      # list, not `--label` (that goes through search, which lags a PR opened a second
+      # ago), and the head is read from the branch ref, not from the PR record, which can
+      # lag a force-push.
+      # release-please itself uses the built-in token while RELEASE_PLEASE_TOKEN is unset, so
+      # the tag push starts nothing and the dispatch above stays the only publish.
       # This step runs last so that its failure can never skip that dispatch.
       - name: Keep the release PR up to date and checked
         env:
@@ -148,29 +161,45 @@ jobs:
             echo "::error::RELEASE_PR_TOKEN is not set, so the release PR cannot get its required checks."
             exit 1
           fi
-          pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --label 'autorelease: pending' \
-            --json number,headRefName,baseRefName,headRefOid --jq '.[0] // empty')
+          repo=$GITHUB_REPOSITORY
+          pr=$(gh pr list --repo "$repo" --state open --limit 200 --json number,headRefName,baseRefName,labels \
+            --jq '[.[] | select(any(.labels[]; .name == "autorelease: pending"))][0] // empty')
           if [ -z "$pr" ]; then echo "No open release PR."; exit 0; fi
           number=$(jq -r .number <<<"$pr")
           branch=$(jq -r .headRefName <<<"$pr")
           base=$(jq -r .baseRefName <<<"$pr")
-          head=$(jq -r .headRefOid <<<"$pr")
-          behind=$(gh api "repos/$GITHUB_REPOSITORY/compare/$base...$branch" --jq .behind_by)
+          head=$(gh api "repos/$repo/git/ref/heads/$branch" --jq .object.sha)
+
+          behind=$(gh api "repos/$repo/compare/$base...$head" --jq .behind_by)
           if [ "$behind" -gt 0 ]; then
             echo "Release PR #$number is $behind commit(s) behind $base; updating its branch."
-            gh api -X PUT "repos/$GITHUB_REPOSITORY/pulls/$number/update-branch" \
-              -f expected_head_sha="$head" >/dev/null
+            if ! gh api -X PUT "repos/$repo/pulls/$number/update-branch" \
+                -f expected_head_sha="$head" >/dev/null; then
+              echo "::error::Could not update the branch of release PR #$number (a merge conflict?). Update it by hand."
+              exit 1
+            fi
             exit 0
           fi
-          checks=$(gh api "repos/$GITHUB_REPOSITORY/commits/$head/check-runs?per_page=100" \
-            --jq '.check_runs[].name')
+
+          # Required checks that came from a pull_request run on this head. Dispatched runs
+          # do not count for the PR, and the bot's instant-fail run has no check runs.
+          suites=$(gh api --paginate "repos/$repo/actions/runs?head_sha=$head&event=pull_request&per_page=100" \
+            --jq '[.workflow_runs[].check_suite_id]' | jq -s 'add // []')
+          checks=$(gh api --paginate "repos/$repo/commits/$head/check-runs?per_page=100" \
+            --jq '.check_runs[] | {suite: .check_suite.id, name}' \
+            | jq -r --argjson suites "$suites" 'select(.suite as $s | $suites | index($s)) | .name')
           required_checks=('musl static (x86_64-unknown-linux-musl)' 'build (strict)')
           for required in "${required_checks[@]}"; do
             if ! grep -qxF "$required" <<<"$checks"; then
-              echo "'$required' is missing on $head; closing and reopening release PR #$number."
-              gh pr close "$number" --repo "$GITHUB_REPOSITORY"
-              gh pr reopen "$number" --repo "$GITHUB_REPOSITORY"
+              echo "'$required' has no pull_request run on $head; closing and reopening release PR #$number."
+              # Reopen only once the PR record shows this head, so CI runs on it.
+              for _ in $(seq 1 15); do
+                [ "$(gh pr view "$number" --repo "$repo" --json headRefOid --jq .headRefOid)" = "$head" ] && break
+                sleep 4
+              done
+              gh pr close "$number" --repo "$repo"
+              gh pr reopen "$number" --repo "$repo" || { sleep 10; gh pr reopen "$number" --repo "$repo"; }
               exit 0
             fi
           done
-          echo "Release PR #$number is up to date and its required checks exist on $head."
+          echo "Release PR #$number is up to date and its required checks ran on $head."
