@@ -105,6 +105,58 @@ jobs:
           echo "Enabling auto-merge on release PR #${pr_number}"
           gh pr merge --squash --auto --repo "${GITHUB_REPOSITORY}" "${pr_number}"
 
+      # Keep the release PR mergeable: up to date with main, with its required checks run.
+      #
+      # release-please pushes the release branch with the built-in token, and GitHub starts
+      # no workflow from a push made with that token, so `pull_request` never fires for the
+      # release PR and its required checks never report. A `workflow_dispatch` is exempt
+      # from that rule, and branch protection matches a required check by name on the head
+      # commit, so a run dispatched on the release branch satisfies it.
+      #
+      # release-please only pushes the branch when the release notes change, so a commit
+      # that adds no notes (chore:, ci:, a Dependabot bump) leaves the PR behind main, and
+      # main requires branches to be up to date. So this step also updates a release
+      # branch that is behind, then runs the checks on the new head.
+      #
+      # `steps.release.outputs.pr` is set only when this run opened or updated the PR,
+      # which is exactly when its head changed. Nothing is dispatched otherwise.
+      # With the RELEASE_PLEASE_TOKEN PAT configured, release-please and the branch update
+      # push as that identity, which starts CI by itself, so nothing is dispatched.
+      - name: Keep the release PR up to date and checked
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
+          PR_JSON: ${{ steps.release.outputs.pr }}
+          HAS_RELEASE_PAT: ${{ env.HAS_RELEASE_PAT }}
+        run: |
+          set -euo pipefail
+          pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --label 'autorelease: pending' \
+            --json number,headRefName,baseRefName,headRefOid --jq '.[0] // empty')
+          if [ -z "$pr" ]; then echo "No open release PR."; exit 0; fi
+          number=$(jq -r .number <<<"$pr")
+          branch=$(jq -r .headRefName <<<"$pr")
+          base=$(jq -r .baseRefName <<<"$pr")
+          head=$(jq -r .headRefOid <<<"$pr")
+          behind=$(gh api "repos/$GITHUB_REPOSITORY/compare/$base...$branch" --jq .behind_by)
+          if [ "$behind" -gt 0 ]; then
+            echo "Release PR #$number is $behind commit(s) behind $base; updating its branch."
+            gh api -X PUT "repos/$GITHUB_REPOSITORY/pulls/$number/update-branch" \
+              -f expected_head_sha="$head" >/dev/null
+            # The update is asynchronous: wait for the new head before dispatching on it.
+            for _ in $(seq 1 30); do
+              new=$(gh pr view "$number" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)
+              [ "$new" != "$head" ] && break
+              sleep 4
+            done
+            if [ "$new" = "$head" ]; then echo "::error::The branch of release PR #$number did not move."; exit 1; fi
+          elif [ -z "$PR_JSON" ]; then
+            echo "Release PR #$number is unchanged and up to date; its checks already ran."
+            exit 0
+          fi
+          if [ "${HAS_RELEASE_PAT:-false}" = "true" ]; then exit 0; fi
+          echo "Running the required checks on $branch for release PR #$number."
+          gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$branch"
+          gh workflow run docs.yml --repo "$GITHUB_REPOSITORY" --ref "$branch"
+
       # Kick off the crates.io publish + binary build for the freshly-pushed tag.
       # (Why dispatch instead of relying on release.yml's own `on: push: tags`: the
       # release-please tag push uses the runner token, which GitHub deliberately does
